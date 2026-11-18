@@ -24,7 +24,9 @@
 //!   took, and a paced sender, whose gaps outrun the bound, starts no run.
 //!
 //! Every hold goes through the runtime's `ShardContext::hold_idle_window`, under the idle spin's ceiling (A-361), and is
-//! counted by its site, the fast path's non-vacuity count.
+//! counted by its site, the fast path's non-vacuity count. A hold pays only where a held shard polls: on Linux's epoll and
+//! Windows' completion port, which harvest without sleeping. On macOS a held shard naps 12–15 µs a turn in its
+//! zero-timeout `kevent` (A-218), so no shard is held there, as A-387 decided for the closed-loop hold ([`hold`]).
 
 use slates_transport::rtt::RttEstimator;
 
@@ -86,10 +88,21 @@ pub(crate) fn remaining(from_ns: u64, window_ns: u64, now_ns: u64) -> u64 {
 }
 
 /// Holds this shard's idle window open for `window_ns` from now (`ShardContext::hold_idle_window`, under the idle spin's
-/// ceiling): whether a hold was made, none for an empty window or off a shard.
+/// ceiling), where a held shard's idle spin polls its driver without sleeping (epoll, a completion port; A-387): whether
+/// a hold was made, none for an empty window or off a shard.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn hold(window_ns: u64) -> bool {
   window_ns > 0
     && slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(window_ns)).is_some()
+}
+
+/// On macOS: never (A-387's rule, the closed-loop hold's). macOS's idle spin naps 12–15 µs a turn in its zero-timeout
+/// `kevent`, an involuntary switch each (A-218), so a held shard reads a socket's answer or a kick half a nap late on
+/// average where a parked one is woken in 3–6 µs (measured on a quiet M4 Max, A-387), and spends the naps' CPU besides:
+/// no length of hold pays there. The windows are still learned, the same code on every host.
+#[cfg(target_os = "macos")]
+pub(crate) fn hold(_window_ns: u64) -> bool {
+  false
 }
 
 #[cfg(test)]

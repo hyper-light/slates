@@ -89,8 +89,8 @@ pub mod volume;
 pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
-  KindMismatch, Missing, MountFault, MountMissing, Note, PathFault, ProtocolFault, RetryCause,
-  Stale, StartFault, Unreported, Unsupported, Unusable,
+  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
+  RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
 };
 pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
@@ -102,7 +102,7 @@ pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage}
 pub use outcome::{
   ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
   MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, MergeRecord,
-  RebaseOutcome, Summary, Work,
+  MoveProgress, RebaseOutcome, Summary, Work,
 };
 pub use page::Page;
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
@@ -205,9 +205,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`Reactor`]: provisioning from every source, a snapshot, a status and a destroy, awaited on the host's own loop
 /// through the client's driver; [`AsyncInstance::into_instance`] stops the completion signal, so the synchronous form's
 /// waits are woken; R6) (A-299; the same day).
+/// 32: `AuditKind::GrantExpired`, the record a grant's end at its term leaves in the audit (A-266) (the same day).
+/// 33: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and `Instance::member`,
+/// `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`,
+/// `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 34: `Instance::capture_base`, an overlay's base captured whole so
+/// its clones move (A-291, the same day). 35: only a granted landing ends its audit trail when refused: one whose grant
+/// the daemon held as it began, so every such [`AuditKind::LandingFinished`] names its manifest and its verdict. A
+/// landing under a grant the daemon does not hold is presented once planned, and refused before its plan it is a
+/// refused request with no trail; under 30 it wrote an end naming no manifest (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 31;
+pub const CONTRACT: u32 = 35;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

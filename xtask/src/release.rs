@@ -1007,13 +1007,41 @@ fn release_documents(gathered: &[Gathered], release: &Release<'_>) -> Result<Doc
   })
 }
 
+/// The runner image a copy's smoke record names (`ImageOS` and `ImageVersion`, [`RUNNER_VARIABLES`]), when it names
+/// both.
+fn runner_image(record: &Value) -> Option<String> {
+  let runner = record.get("runner")?;
+  let system = runner.get("ImageOS")?.as_str()?;
+  let version = runner.get("ImageVersion")?.as_str()?;
+  Some(format!("{system} {version}"))
+}
+
 /// Checks one target's two builds against their records and against each other: only bytes a smoke test ran ship,
 /// and only bytes a second runner built the same (AC-9.5).
+///
+/// Two copies built on different runner images are refused with both images named (A-407). An image carries its own
+/// toolchain, and MSVC's static C runtime is linked into the Windows binary: during GitHub's rollout of
+/// `windows-2025` 20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11), the tag `v0.1.0`'s x86_64
+/// copies differed in 2,559,679 of 15,139,328 bytes, while each image built the same bytes every time (run
+/// 44347535833). Such a pair says nothing about the build, so the refusal says to run one copy again until both share
+/// an image, rather than call the build not reproducible.
 fn checked_build(entry: &Gathered) -> Result<Checked, Failure> {
   let sha256 = check_record(entry.asset, "build", &entry.record, &entry.bytes)?;
   let rebuilt = check_record(entry.asset, "rebuild", &entry.rebuild, &entry.rebuild_bytes)?;
   if rebuilt != sha256 {
     let (count, shown) = differences(&entry.bytes, &entry.rebuild_bytes);
+    if let (Some(built_on), Some(rebuilt_on)) =
+      (runner_image(&entry.record), runner_image(&entry.rebuild))
+      && built_on != rebuilt_on
+    {
+      return Err(Failure(format!(
+        "release-artifacts: {}'s two copies ran on different runner images ({built_on} and {rebuilt_on}), and \
+         differ in {count} of {} bytes (sha256 {sha256} and {rebuilt}): an image's toolchain can make that difference, \
+         so AC-9.5 is judged on one image; run one copy again until both run on the same image",
+        entry.asset,
+        entry.bytes.len()
+      )));
+    }
     return Err(Failure(format!(
       "release-artifacts: {} is not reproducible (AC-9.5): its rebuild on a separate runner differs in {count} of {} \
        bytes (sha256 {sha256} and {rebuilt}), first at offsets {shown:?}",
@@ -1223,6 +1251,63 @@ mod tests {
       commit: "0123abcd",
       run_url: "https://github.com/hyper-light/slates/actions/runs/1",
     }
+  }
+
+  /// AC-9.5, A-407: do gather a target whose two copies differ and whose records name two runner images (the tag
+  /// `v0.1.0`'s x86_64 Windows pair, `windows-2025` 20261116.315.1 and 20261103.298.1); expect it refused, naming both
+  /// images and saying to run one copy again. Do the same with one image named twice; expect the plain refusal, which
+  /// names no image. Do gather identical copies from two images (the tag's arm64 Windows pair); expect the release
+  /// made.
+  #[test]
+  fn copies_from_two_runner_images_are_refused_naming_both() {
+    let first: Vec<u8> = (0..4096u32).map(|at| (at % 251) as u8).collect();
+    let mut second = first.clone();
+    second
+      .iter_mut()
+      .skip(60)
+      .take(2)
+      .for_each(|byte| *byte ^= 0xff);
+    let ran_on = |version: &str| json!({ "ImageOS": "win25-vs2026", "ImageVersion": version });
+    let pair = |rebuild_bytes: &[u8], built_on: &str, rebuilt_on: &str| {
+      let mut entry = gathered("slates-windows-x64.exe", &first, None);
+      entry.record["runner"] = ran_on(built_on);
+      entry.rebuild = json!({
+        "asset": entry.asset,
+        "sha256": sha256_hex(rebuild_bytes),
+        "runner": ran_on(rebuilt_on),
+      });
+      entry.rebuild_bytes = rebuild_bytes.to_vec();
+      entry
+    };
+    let two_images = pair(&second, "20261116.315.1", "20261103.298.1");
+    match release_documents(&[two_images], &release(&RELEASE_TAG)) {
+      Ok(_) => panic!("copies from two runner images that differ were accepted"),
+      Err(Failure(message)) => {
+        assert!(message.contains("slates-windows-x64.exe"), "{message}");
+        assert!(
+          message.contains("win25-vs2026 20261116.315.1 and win25-vs2026 20261103.298.1"),
+          "{message}"
+        );
+        assert!(message.contains("differ in 2 of 4096 bytes"), "{message}");
+        assert!(message.contains("run one copy again"), "{message}");
+      }
+    }
+    let one_image = pair(&second, "20261103.298.1", "20261103.298.1");
+    match release_documents(&[one_image], &release(&RELEASE_TAG)) {
+      Ok(_) => panic!("copies from one runner image that differ were accepted"),
+      Err(Failure(message)) => {
+        assert!(
+          message.contains("is not reproducible (AC-9.5)"),
+          "{message}"
+        );
+        assert!(!message.contains("runner images"), "{message}");
+      }
+    }
+    let same_bytes = pair(&first, "20261115.219.1", "20261112.217.1");
+    assert!(
+      release_documents(&[same_bytes], &release(&RELEASE_TAG)).is_ok(),
+      "identical copies from two runner images were refused"
+    );
   }
 
   /// AC-9.5, A-320: do gather a target whose second build differs from its first in its 4-byte link timestamp and its

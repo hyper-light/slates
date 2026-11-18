@@ -94,9 +94,13 @@ impl Query {
   }
 
   /// Reuse this client's most recent route, else the owner this node's own routing names (A-338), else the id's live
-  /// creator when it is still in the object's home. A dead creator never turns into a rendezvous guess over unrelated
-  /// members. Never this node: a verb is forwarded only when this node does not serve the object, and the creator is
-  /// this node itself only for an object it lost to a successor (A-334, A-338), which only the location round can find.
+  /// first owner when it is still in the object's home: the owner a moved object's exception names (A-291; §4.8
+  /// "Lookup": "an ownership or home move is a configuration exception naming the affected volume"), else its creator. A
+  /// dead one never turns into a rendezvous guess over unrelated members. Never this node: a verb is forwarded only when
+  /// this node does not serve the object, and the first owner is this node itself only for an object it lost to a
+  /// successor (A-334, A-338), which only the location round can find. Asked on the control shard, where the council's
+  /// configuration is. A holder of a moved object's copy follows the exception in its routing
+  /// (`crate::moves::follow_moved_objects`), so the two agree wherever both are known.
   pub(crate) fn known_owner(
     self,
     state: &ShardState,
@@ -119,7 +123,13 @@ impl Query {
           .filter(|owner| *owner != local && eligible(state, *owner, RegionId(self.region)))
       })
       .or_else(|| {
-        eligible(state, object.creator(), RegionId(self.region)).then_some(object.creator())
+        let first = state
+          .council
+          .configuration()
+          .moved
+          .get(&object.placement_key())
+          .map_or_else(|| object.creator(), |moved| moved.owner);
+        eligible(state, first, RegionId(self.region)).then_some(first)
       })
       .filter(|owner| *owner != local)
   }

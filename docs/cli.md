@@ -14,8 +14,8 @@ loses RAM by design.
 that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). Its term is its
 holder's (design A-384): every verb that names it renews it, and `slates attach ID --write --hold` keeps it alive from
 that process until the process ends, however long the attachment sits idle. One that nothing renews lasts at most the
-daemon's failover delay after its last use (about a second on a laptop, a few seconds in a fleet; `slates status` shows
-the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
+daemon's failover delay after its last use (about two seconds on a laptop, its anchor's supervision window and the
+recovery; a few seconds in a fleet; `slates status` shows the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
 It ends at the term's lapse with the write lease it held. A verb that names it after is refused
 `AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount; on a host whose AppArmor
@@ -309,6 +309,7 @@ slates audit [--since N] [--json]
 slates enroll [--account UID] [--json]
 slates revoke CONSUMER [--json]
 slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
+slates move ID --to HOST [--json]
 slates run [--keep] [--json] -- CMD [ARG ...]
 slates exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
 slates apparmor profile [--executable PATH]
@@ -323,6 +324,7 @@ slates promote-region REGION [--json]
 slates base read ID PATH
 slates base rewitness ID [PATH ...] [--json]
 slates base pin ID [PATH ...] [--json]
+slates base capture ID [--json]
 slates profile [--quick] [--json]
 slates mcp [--instance NAME] [--http PORT]
 ```
@@ -330,6 +332,26 @@ slates mcp [--instance NAME] [--http PORT]
 `slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
 is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).
 It needs `admin` on the volume, as `share` does.
+
+`slates move ID --to HOST [--json]` asks the volume's owner to move it to another fleet member, named by the host id
+`status` gives its members (design A-291). The owner freezes the volume, places its records and reports the move; from
+the switch every node forwards its verbs to the member, which adopts the volume, serves it and seals it under its own
+placement, and only then does the old owner let its copy go. One call is one ask: it prints `moving HOST` while the move
+is under way and `moved HOST` once the member owns it, so call it again until it says `moved`; the member answers
+`Overloaded` (retry) until it serves the volume. The volume must be a plain volume (no base directory) with no
+attachment (detach first), no clones of its own, and no snapshot but its head (a move carries the head), and the member
+must be in the owner's neighbourhood; otherwise it is refused `MoveRefused` naming why (`NotPlain`, `Attached`,
+`Lineage`, `Snapshots`, `Target`, `Neighbourhood`, `Unplaced`, `Pending`). A clone moves when it reads no base
+directory. Share the volume with the account that will use it on the member before moving it. It needs `admin` on the
+volume.
+
+`slates base capture ID [--json]` captures an overlay's whole base directory into the volume (design §4.15
+`capture_base`, A-291) and prints the snapshot that holds it: every file's bytes and every link's target become the
+volume's own, so `slates volume clone ID SNAPSHOT NAME` makes clones that read no directory at all, outlive it, and move
+between fleet members with `slates move`. Capture only a directory nothing writes while it runs (a commit checked out
+for it): a file that changes while it is read is refused `DigestUnverified` (ask again), and a capture the directory
+moved under `ConsistentBaseUnavailable`. A volume with no base directory is refused. It needs `write` on the volume and
+holds the whole directory in memory.
 
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
 Ids are 32 hexadecimal characters as `create` prints them.

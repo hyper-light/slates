@@ -1667,20 +1667,61 @@ jobs:
         env:
           SLATES_TEST_FSX: "1"
         run: cargo test -p xtask --bin xtask a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record -- --nocapture
+      # The plain run is the live-shipped pair's plain arm below, so it is a run directory as `compare` reads one:
+      # `<dir>/records` and `<dir>/scratch`.
       - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
-        run: cargo xtask conformance all --records target/conformance-records --scratch target/conformance-scratch --keep
+        run: cargo xtask conformance all --records target/conformance/plain/records --scratch target/conformance/plain/scratch --keep
+      # A-200's conformance (the supervisor's task of 2026-11-05: a live-shipped volume conforms exactly as a plain one
+      # does): fsx, fsstress and pjdfstest again, each over a volume live-shipped on an f = 1 fleet (three anchors from one
+      # manifest over loopback, the volume created and mounted on node a, `slates live-ship ID`), over every transport
+      # the plain run used. A live run fails its verdict unless the owner's log ends durable at its head with both
+      # candidates holding it, so a fleet that stopped shipping cannot pass. `plan` gives the live arm the skip records
+      # the plain `all` wrote, so both arms name the same cells. Each suite is its own step, so a hung one is bounded alone
+      # and the next still runs.
+      # Each live step's bound is about three times the slowest that step measured on the lane's runners and a Mac
+      # Studio (diagnostics runs 44362281881 and 44371380372, kiln r56; 2026-11-18): fsx 3 min 46 s, fsstress 1 min 44 s,
+      # pjdfstest 10 min 0 s, all on ubuntu-24.04-arm; the stopped-candidates test 2 min 36 s on the Studio, its
+      # candidates held for 120 s. A hang (a live fsstress ran three hours on 2026-11-06) is bounded alone.
+      - name: Plan the live-shipped arm
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance plan --records target/conformance/live/records
+      - name: Live-shipped fsx (its verdict gates the step; records kept)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: cargo xtask conformance run --suite fsx --live-ship --records target/conformance/live/records --scratch target/conformance/live/scratch --keep
+      - name: Live-shipped fsstress (its verdict gates the step; records kept)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: cargo xtask conformance run --suite fsstress --live-ship --records target/conformance/live/records --scratch target/conformance/live/scratch --keep
+      - name: Live-shipped pjdfstest (its verdict gates the step; records kept)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite pjdfstest --live-ship --records target/conformance/live/records --scratch target/conformance/live/scratch --keep
+      # Every kept pjdfstest case by its verdict's kind and every record's outcome, plain against live, over the three
+      # suites the live arm ran: any difference fails (`docs/wip/conformance.md`, the live-shipped pair).
+      - name: Compare the live-shipped runs with the plain ones (any difference fails)
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance compare --plain target/conformance/plain --live target/conformance/live --suites fsx,fsstress,pjdfstest
+      # A-200's backpressure: with both candidates of a live-shipped volume stopped (SIGSTOP), a size change through the
+      # mount waits for them and then succeeds, where a soft mount once failed it `ETIMEDOUT` (A-229).
+      - name: A writer waits for stopped candidates (A-200, A-229)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          SLATES_TEST_LIVE_CONFORMANCE: "1"
+        run: SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates" cargo test -p xtask --bin xtask a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail -- --nocapture
       - name: Upload the records
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-records-${{ matrix.os }}
-          path: target/conformance-records
+          path: target/conformance/plain/records
       - name: Upload pjdfstest's per-file output (the expected-failure review input)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pjdfstest-output-${{ matrix.os }}
-          path: target/conformance-scratch/*/pjdfstest-output
+          path: target/conformance/plain/scratch/*/pjdfstest-output
           if-no-files-found: ignore
       # The anchor logs: a daemon that stopped answering mid-suite (the macOS runner's fsstress run of
       # 2026-09-16) explains itself only there; the record carries their tail, the artifact the whole.
@@ -1689,7 +1730,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: conformance-anchor-logs-${{ matrix.os }}
-          path: target/conformance-scratch/*/*.log
+          path: target/conformance/plain/scratch/*/*.log
+          if-no-files-found: ignore
+      # The live-shipped arm whole: its records (each carries the owner's and the candidates' live logs and the
+      # fleet.live counters), pjdfstest's per-file output, fsstress's output and the three nodes' anchor logs.
+      - name: Upload the live-shipped arm
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-live-${{ matrix.os }}
+          path: |
+            target/conformance/live/records
+            target/conformance/live/scratch/*/pjdfstest-output
+            target/conformance/live/scratch/*/*.log
+            target/conformance/live/scratch/*/*.txt
           if-no-files-found: ignore
 
   # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two

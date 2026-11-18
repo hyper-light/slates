@@ -354,6 +354,52 @@ fn a_name_is_held_once_by_a_volume_or_an_alias() {
   ));
 }
 
+/// A-400 (a work made on its client's shard holds its name here by an alias; A-247's pending creation). Do: hold a name
+/// at the name's partition as a work pending its green's admission, then reserve an alias for it from another shard; and
+/// the other way round. Expect: each second holder refused `AlreadyExists`, whichever came first, so a work made here
+/// and a work made elsewhere never share a name. The reservation's guard did not look at a pending creation before.
+#[test]
+fn a_name_pending_a_works_admission_and_an_alias_exclude_each_other() {
+  let mut segment = segment(&format!("slates-db-alias-pending-{}", std::process::id()));
+  let mut pair = recovered(&mut segment);
+  let pending = |name: &str, n: u64| Op::WorkCreationPending {
+    record: slates_db::catalog::PendingCreationRecord {
+      name: name.to_owned(),
+      work: vid(NAME_PARTITION, n),
+      origin: 1,
+      client: 1,
+      sequence: u32::try_from(n).unwrap(),
+    },
+  };
+  let reserve = |name: &str, n: u64| Op::NameAliasReserved {
+    record: NameAliasRecord {
+      name: name.to_owned(),
+      volume: vid(CLONE_PARTITION, n),
+      confirmed: false,
+    },
+  };
+  pair
+    .name
+    .mutate(&mut segment, &pending("admitted-here", 1), 0)
+    .unwrap();
+  assert!(matches!(
+    pair
+      .name
+      .mutate(&mut segment, &reserve("admitted-here", 1), 0),
+    Err(DbError::AlreadyExists { .. })
+  ));
+  pair
+    .name
+    .mutate(&mut segment, &reserve("made-elsewhere", 2), 0)
+    .unwrap();
+  assert!(matches!(
+    pair
+      .name
+      .mutate(&mut segment, &pending("made-elsewhere", 2), 0),
+    Err(DbError::AlreadyExists { .. })
+  ));
+}
+
 /// A-236 (the snapshot's appended field). Do: hold a confirmed and a reserved alias, take the partition's snapshot,
 /// encode and decode it, and rebuild a partition from it. Expect: both aliases back as they were, the reserved one still
 /// resolving nothing and still holding its name.

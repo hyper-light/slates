@@ -39,8 +39,11 @@
 //!   its timer at a stated second until a measurement exists. Every term reports the measurements behind it, so a
 //!   reader tells a prior from a measurement.
 //!
-//! **Laptop.** With `f = 0` there is no peer to detect and no council to confirm, so `D` and `E` are absent and `F` is the
-//! recovery alone: the same derivation at its degenerate inputs (R8), never a branch.
+//! **Laptop.** With `f = 0` there is no peer to detect it and no council to confirm, so `E` is absent, and `D` is the one
+//! detector it has: its anchor's supervision, which ends a stuck daemon after the watchdog's window and starts it again
+//! (A-232), so `D` is that window ([`Failover::supervised`], A-405). `F` is then the window and the recovery: the same
+//! derivation at its degenerate inputs (R8), never a branch; a node whose peers' detector has run a period takes that
+//! detector's term instead.
 //!
 //! What it does not do yet (A-363, owed): the waits that bound a failover (a forward's bound, the location round's cap,
 //! a live takeover's fetch, the takeover's attempts) and the lease terms still read the operator's placeholder; each
@@ -230,6 +233,8 @@ pub struct Failover {
   recovery: Recovery,
   detection: Option<Term>,
   confirmation: Option<Term>,
+  /// The detection a node has with no peer's detector to judge it: its anchor's supervision window ([`Failover::supervised`]).
+  supervision: Option<Term>,
 }
 
 impl Default for Failover {
@@ -247,7 +252,20 @@ impl Failover {
       recovery: Recovery::new(),
       detection: None,
       confirmation: None,
+      supervision: None,
     }
+  }
+
+  /// This estimator for a node its anchor supervises within `window_ns` (A-405): a stuck daemon is ended by its watchdog
+  /// after that window and started again by its anchor (A-232), so where no peer's detector judges the node (a laptop, a
+  /// fleet node before its detector's first period) its detection term is that window, with no measurement behind it.
+  #[must_use]
+  pub fn supervised(mut self, window_ns: u64) -> Failover {
+    self.supervision = Some(Term {
+      ns: window_ns,
+      samples: 0,
+    });
+    self
   }
 
   /// A coordinator period began at `now_ns`: the time since the one before is a sample of the period's length. A clock
@@ -288,7 +306,7 @@ impl Failover {
   /// timing the ratified recovery budget (`slates_db::replay::RECOVERY_BUDGET_NS`).
   pub fn estimate(&self) -> FailoverEstimate {
     FailoverEstimate {
-      detection: self.detection,
+      detection: self.detection.or(self.supervision),
       confirmation: self.confirmation,
       recovery: self.recovery.term(slates_db::replay::RECOVERY_BUDGET_NS),
     }
@@ -511,6 +529,48 @@ mod tests {
     assert!(
       recovered < 2 * 7 * 128_000_000,
       "the stall is forgotten as periods run at their pace: {recovered}"
+    );
+  }
+
+  /// A-405. Do: ask a supervised estimator with no peer detection, then refresh it with a detector's term, then with
+  /// none again. Expect the supervision window as its detection (the laptop's degenerate: its anchor detects it), its
+  /// failover delay that window and the recovery prior; the detector's own term in its place once measured; and the
+  /// supervision again when no peer detects.
+  #[test]
+  fn a_node_no_peer_detects_is_detected_by_its_supervision_window() {
+    let window = 10 * HEARTBEAT;
+    let mut failover = Failover::new().supervised(window);
+    let laptop = failover.estimate();
+    assert_eq!(
+      laptop.detection,
+      Some(Term {
+        ns: window,
+        samples: 0,
+      })
+    );
+    assert_eq!(laptop.confirmation, None);
+    assert_eq!(
+      laptop.total_ns(),
+      window + slates_db::replay::RECOVERY_BUDGET_NS
+    );
+    let peers = Some(Term {
+      ns: 900_000_000,
+      samples: 7,
+    });
+    assert_eq!(
+      failover
+        .refresh(peers, &ElectionTiming::floor(), HEARTBEAT)
+        .detection,
+      peers
+    );
+    assert_eq!(
+      failover
+        .refresh(None, &ElectionTiming::floor(), HEARTBEAT)
+        .detection,
+      Some(Term {
+        ns: window,
+        samples: 0,
+      })
     );
   }
 

@@ -462,8 +462,10 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
   }
 }
 
-/// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), run on
-/// the control shard at each install, before the held acceptors' authority is reconciled to their owners:
+/// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), before the held
+/// acceptors' authority is reconciled to their owners; an install's walk does it a copy a turn
+/// ([`resolve_held_object`], `fleet::install_on_copy`, A-398), and this whole pass is that walk's oracle in the daemon's
+/// unit tests:
 ///
 /// - an object whose owner a kept retirement names is moved to the successor its lineage ranks, and remembers
 ///   the retired host whose takeover it is recovered in (`departed_owners`, the lease gate's record);
@@ -474,56 +476,70 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309), unless the
 ///   kept retirement shows the object's settled cohorts within tolerance, when it goes the same way (A-341);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
+#[cfg(test)]
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   let regional = state.council.configuration().clone();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
-    let Some(owner) = state.fleet.object_owner(object) else {
-      continue;
-    };
-    if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
-      match stale_after_confirmation(state, &regional, object, owner, local) {
-        Confirmation::Stale => let_go_stale(state, object),
-        Confirmation::Covered => {
-          state.count(TAKEOVER_UNASKED_COVERED, 1);
-          let_go_stale(state, object);
-        }
-        Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
-        Confirmation::None => {}
+    resolve_held_object(state, local, &regional, object);
+  }
+}
+
+/// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
+/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests.
+pub(crate) fn resolve_held_object(
+  state: &mut ShardState,
+  local: HostId,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+) {
+  let Some(owner) = state.fleet.object_owner(object) else {
+    return;
+  };
+  if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
+    match stale_after_confirmation(state, regional, object, owner, local) {
+      Confirmation::Stale => let_go_stale(state, object),
+      Confirmation::Covered => {
+        state.count(TAKEOVER_UNASKED_COVERED, 1);
+        let_go_stale(state, object);
       }
-      continue;
+      Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
+      Confirmation::None => {}
     }
-    match regional.lineage(owner, object) {
-      Lineage::Successor {
-        departed,
-        successor,
-      } => {
-        track_owner_on_every_shard(state, object, successor);
-        let since_version = regional
-          .retired
-          .get(&departed)
-          .map_or(regional.version, |retirement| retirement.version);
-        state.departed_owners.insert(
-          object,
-          crate::lease::DepartedOwner {
-            owner: departed,
-            since_version,
-          },
-        );
-      }
-      // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272), counted so
-      // it shows what it keeps that no takeover will recover (A-340).
-      Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
-      Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
-      Lineage::Settled { takeover } => {
-        if regional.settled_for(takeover, local) {
-          let_go_stale(state, object);
-        } else {
-          state.count(TAKEOVER_KEPT_UNASKED, 1);
-        }
+    return;
+  }
+  match regional.lineage(owner, object) {
+    Lineage::Successor {
+      departed,
+      successor,
+    } => {
+      track_owner_on_every_shard(state, object, successor);
+      let since_version = regional
+        .retired
+        .get(&departed)
+        .map_or(regional.version, |retirement| retirement.version);
+      state.departed_owners.insert(
+        object,
+        crate::lease::DepartedOwner {
+          owner: departed,
+          since_version,
+        },
+      );
+    }
+    // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272), counted so
+    // it shows what it keeps that no takeover will recover (A-340).
+    Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
+    Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
+    Lineage::Settled { takeover } => {
+      if regional.settled_for(takeover, local) {
+        let_go_stale(state, object);
+      } else {
+        state.count(TAKEOVER_KEPT_UNASKED, 1);
       }
     }
   }
+  // A copy the configuration moved to another member (A-291) follows its move.
+  crate::moves::follow_moved_objects(state);
 }
 
 /// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
@@ -629,12 +645,20 @@ pub(crate) fn forget_owner_on_every_shard(state: &mut ShardState, object: Object
   }
 }
 
+/// Drops this holder's stale copy of `object` after a takeover ([`drop_copy`]). Reached only through [`let_go_stale`],
+/// once the retention rule left no whole content for the object here (A-335). Counted [`TAKEOVER_RECLAIMED`].
+fn reclaim(state: &mut ShardState, object: ObjectId) {
+  drop_copy(state, object);
+  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
-/// reclaimed with its records, never kept for a head this holder no longer backs). Reached only through
-/// [`let_go_stale`], once the retention rule left no whole content for the object here (A-335). Counted
-/// [`TAKEOVER_RECLAIMED`].
-fn reclaim(state: &mut ShardState, object: ObjectId) {
+/// reclaimed with its records, never kept for a head this holder no longer backs). A takeover's reclaim ([`reclaim`])
+/// and a planned move's (A-291, `crate::moves::follow_moved_objects`, once the move's new owner has sealed the volume
+/// under its own placement, which leaves this holder out) both end a copy so.
+pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
   state.held_content.forget_object(
     &mut crate::content_holder::hold_space(&mut state.store),
@@ -643,8 +667,8 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
-  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
-  *count = count.saturating_add(1);
+  // Its durable checkpoint goes with it (A-404).
+  crate::merge_service::forget_checkpoint(state, object);
 }
 
 /// Answers one page of a successor's takeover round on [`TAKEOVER_STREAM`] (§4.8): after checking the asker is
@@ -1825,6 +1849,33 @@ async fn adopt(
   Some(dispatch)
 }
 
+/// Adopts `object` as [`adopt`] does, at `epoch`: a moved volume's adoption (A-291, `crate::moves`), whose round over
+/// the move's cohort is no takeover's, names its own epoch, and names this node as `departed` (no takeover round is kept
+/// for it). Returns the dispatch to settle and whether the record was placed.
+pub(crate) async fn adopt_at(
+  departed: HostId,
+  object: ObjectId,
+  adopted: Accepted,
+  epoch: HostEpoch,
+  local: HostId,
+  budget: CommitBudget,
+) -> (Option<Dispatch>, bool) {
+  let Some((dispatch, record, placement)) =
+    commit_adopted_at(object, adopted, epoch, local, budget).await
+  else {
+    return (None, false);
+  };
+  let placed = placement.is_ok();
+  state::with_state(|s| match placement {
+    Ok(placement) => record_adoption(s, departed, object, &record, placement, local),
+    Err(unplaced_cause) => {
+      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+      s.count(unplaced_cause, 1);
+    }
+  });
+  (Some(dispatch), placed)
+}
+
 /// Re-commits `adopted`, a record of `object` the round of `departed`'s takeover learned, under this node (`local`) at
 /// the round's epoch and the configuration's generation, on the object's placement (phase two of the takeover: the
 /// record accepted again under the new epoch, BUG-12), and keeps the acceptor that holds it. The dispatch whose
@@ -1838,6 +1889,20 @@ async fn commit_adopted(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
+  let epoch =
+    state::with_state(|s| s.host_takeovers.get(&departed).map(|take| take.epoch)).flatten()?;
+  commit_adopted_at(object, adopted, epoch, local, budget).await
+}
+
+/// [`commit_adopted`] at `epoch`, the round's: a takeover's round names its own, and a moved volume's adoption (A-291,
+/// `crate::moves`) the epoch of its round over the move's cohort, which no takeover round is kept for.
+async fn commit_adopted_at(
+  object: ObjectId,
+  adopted: Accepted,
+  epoch: HostEpoch,
+  local: HostId,
+  budget: CommitBudget,
+) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
   let (mut acceptor, shape, quorum, record, replaces) = state::with_state(|s| {
     let config = s.fleet.configuration();
     let generation = config.version;
@@ -1846,7 +1911,6 @@ async fn commit_adopted(
       acked: Vec::new(),
       ..config.place(object)
     };
-    let epoch = s.host_takeovers.get(&departed)?.epoch;
     let mut acceptor = s.holder_records.remove(&object).unwrap_or_else(|| {
       Acceptor::new(
         local,
@@ -2676,6 +2740,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       state.pending_green_materializations.insert(
         green,

@@ -87,13 +87,14 @@ mod member_task;
 mod merge_origin;
 pub mod merge_service;
 mod mirror;
+/// The planned move of a volume to another fleet member (§4.10, A-291).
+mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
 mod readmission;
 mod remote_attach;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
-// stream's (Linux, macOS; A-316, A-339).
-#[cfg(unix)]
+// stream's (every platform; A-316, A-339, A-402).
 mod write_log;
 // Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365).
 #[cfg(unix)]

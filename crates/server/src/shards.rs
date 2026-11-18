@@ -232,12 +232,15 @@ const RESYNC_TAKEN: &str = "shards.resync_taken";
 #[cfg(unix)]
 const RESYNC_ABANDONED: &str = "shards.resync_abandoned";
 /// Counter: a stream resynced after a death whose daemon acknowledged writes its write log could not keep (the log
-/// overflowed and the publication that would have emptied it was refused): its guest is not told which writes it lost,
-/// as a FUSE mount's is (`LostWrites`; GAPS), so the loss is counted, never silent (A-339).
+/// overflowed and the publication that would have emptied it was refused): its guest is told every file it had open
+/// may have lost writes, as a taken-over FUSE mount's kernel is (`LostWrites`; A-393).
 #[cfg(unix)]
-const RESYNC_WRITES_UNREPORTED: &str = "shards.resync_writes_unreported";
+const RESYNC_WRITES_LOST: &str = "shards.resync_writes_lost";
 /// Counter: a reply made and never written, under the test-support switch `shards_withhold_replies` (A-316).
 const REPLY_WITHHELD: &str = "shards.reply_withheld";
+/// Counter: a `close`'s `FLUSH` answered with no publication of its own, since the write log held every write the shard
+/// acknowledged (A-399, A-63's flush rule): the fast path's non-vacuity count.
+const FLUSH_LOGGED: &str = "shards.flush_logged";
 /// Format: the refusal-ledger name of a resync end's release the anchor's channel refused (A-316): the anchor keeps the
 /// end until the next daemon releases it as one no record of its kind claims, so the device reads the channel's end
 /// only then.
@@ -362,6 +365,11 @@ pub(crate) struct ShardsStream {
   /// ask byte, the bound on a fresh stream's first control frame, past which it is refused before anything is allocated
   /// for it.
   restore_most: usize,
+  /// The files whose acknowledged writes its dead daemon's death lost, for a stream served again after it (A-393): every
+  /// file, where that daemon's write log overflowed; none otherwise, and none for a stream no daemon died under. Told
+  /// to the guest as a taken-over FUSE mount's kernel is told (`LostWrites`): a handle from before the death answers
+  /// its `flush` `EIO` until an `fsync` through it has, once.
+  lost: slates_bridge_core::LostWrites,
   /// The stream's resync channel (A-316): its token, and the daemon's own copy of its end while the anchor holds one, so
   /// a successor can hand the device a fresh stream. None where the channel was not made (or the platform makes none).
   #[cfg(unix)]
@@ -424,6 +432,7 @@ impl ShardsStream {
       restorable: true,
       setxattr_ext: false,
       restore_most,
+      lost: slates_bridge_core::LostWrites::default(),
       #[cfg(unix)]
       resync: None,
       #[cfg(unix)]
@@ -2036,7 +2045,8 @@ fn serve_request(
     )
     .offering_dax(dax_offer)
     .viewing_owners(stream.owners)
-    .serving_a_guest();
+    .serving_a_guest()
+    .with_lost_writes(&mut stream.lost);
     // The guest's kernel sends `SETXATTR` in the form its `INIT` reply kept, or the saved guest's did (A-378).
     slates_bridge_core::Bridge::set_setxattr_ext(&mut bridge, stream.setxattr_ext);
     let mut scoped = None;
@@ -2048,8 +2058,8 @@ fn serve_request(
   kept_at_init(s, stream, &answered);
   release_forgotten(s, stream, total, &answered);
   // A write the guest is told succeeded outlives this daemon in the shard's write log, as a FUSE mount's does (A-63):
-  // it is acknowledged before the next publication, and a death first would otherwise take it from the volume (A-316).
-  #[cfg(unix)]
+  // it is acknowledged before the next publication, and a death first would otherwise take it from the volume (A-316;
+  // every platform, A-402).
   log_write(s, stream, total, &answered);
   #[cfg(unix)]
   log_forgets(s, stream, total, &answered);
@@ -2059,9 +2069,23 @@ fn serve_request(
   // (D-18): a change the volume's next restart must hold (`needs_barrier`), an inode number no committed publication
   // reserves (A-150), or a release of an open the committed publication counts (A-154).
   let awaits_publication = crate::verbs::awaits_publication(s, stream.volume);
+  // A `close`'s `FLUSH` owes no publication of its own while the write log holds every write the shard acknowledged
+  // (A-399, A-63's flush rule): a successor replays them all, kept stream or not, and a `FLUSH` the device resends after
+  // a death is answered again, changing nothing. Published anyway when the log overflowed, as a mount's is.
+  let flush_logged = answered.opcode == Some(Opcode::Flush)
+    && s
+      .write_log
+      .as_ref()
+      .is_some_and(crate::write_log::WriteLog::holds_every_write);
+  if flush_logged {
+    s.count(FLUSH_LOGGED, 1);
+  }
   // An ingest that wrote the guest's stores before this request is published before its reply too (step 3).
   let mut refused = false;
-  if needs_barrier(answered.opcode, answered.error) || awaits_publication || ingested.wrote {
+  if (needs_barrier(answered.opcode, answered.error) && !flush_logged)
+    || awaits_publication
+    || ingested.wrote
+  {
     // The reply rides the publication with its effect (A-61's rule), so a daemon that dies before writing it leaves a
     // successor that resyncs the stream the answer to the request the device resends, never a second application.
     #[cfg(unix)]
@@ -2139,7 +2163,6 @@ fn keep_pending_reply(s: &mut ShardState, stream: &ShardsStream, answered: &Answ
 /// origin of a clone's inherited file): as `fuse`'s `log_write` does for a mount, a log with no room forces a publication
 /// that carries the write, and only a refused publication leaves it unlogged, marked as an overflow so the next daemon
 /// reports the loss rather than replaying around it.
-#[cfg(unix)]
 fn log_write(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: &Answered) {
   if answered.opcode != Some(Opcode::Write) || answered.error != 0 {
     return;
@@ -2192,7 +2215,6 @@ fn log_forgets(s: &mut ShardState, stream: &ShardsStream, total: usize, answered
 }
 
 /// The node, offset and bytes of the `WRITE` request `request` is; `None` for any other.
-#[cfg(unix)]
 fn written(request: &[u8]) -> Option<(u64, u64, &[u8])> {
   let parsed = slates_bridge_fuse::request::Request::parse(request).ok()?;
   if parsed.opcode != Some(Opcode::Write) {
@@ -2483,6 +2505,9 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
   );
   stream.owners = kept.owners;
   stream.setxattr_ext = kept.setxattr_ext;
+  // What the dead daemon's death lost of the writes it acknowledged: every file, where its log overflowed (A-393).
+  stream.lost =
+    slates_bridge_core::LostWrites::new(std::collections::BTreeSet::new(), s.writes_lost);
   stream.restorable = false;
   // The successor's copy of the held end is kept as the attach's daemon kept its own (`resync`'s module notes).
   stream.resync = Some(resync::Resync {
@@ -2518,7 +2543,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
   }
   s.count(RESYNCED, 1);
   if s.writes_lost {
-    s.count(RESYNC_WRITES_UNREPORTED, 1);
+    s.count(RESYNC_WRITES_LOST, 1);
   }
 }
 
