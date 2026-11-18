@@ -39,7 +39,7 @@ fn main() -> ExitCode {
   if args.first().map(String::as_str) == Some(PREFIX) {
     return slates_api::role::main(&args[..1], &args[1..]);
   }
-  let tests: [(&str, fn()); 8] = [
+  let tests: [(&str, fn()); 9] = [
     (
       "an_instance_starts_from_the_hosts_own_executable_serves_and_stops",
       an_instance_starts_from_the_hosts_own_executable_serves_and_stops,
@@ -71,6 +71,10 @@ fn main() -> ExitCode {
     (
       "the_launchers_secret_proves_its_policy_across_a_daemon_restart",
       the_launchers_secret_proves_its_policy_across_a_daemon_restart,
+    ),
+    (
+      "an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret",
+      an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret,
     ),
   ];
   let filter = args.iter().find(|arg| !arg.starts_with('-'));
@@ -371,4 +375,65 @@ fn the_launchers_secret_proves_its_policy_across_a_daemon_restart() {
     );
   }
   assert_eq!(anchor.stop(), Some(0));
+}
+
+/// A-299 (g263's ask: kiln starts its anchor under `systemd-run --user --scope -- ...` so the instance outlives the
+/// runner). Do: start an anchor under an exec wrapper (`/usr/bin/env`, which execs what follows it in the same process,
+/// as `systemd-run --scope` does) with a launcher secret, wait for it, and set a volume's write policy under the secret.
+/// Expect: the instance answers, the launcher's proof verifies (so the record reached the anchor through the wrapper on
+/// its standard input), and the wrapped process, now the anchor, stops gracefully at `SIGTERM`, exit 0.
+fn an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret() {
+  #[cfg(unix)]
+  {
+    use slates_api::{PolicySubject, WriteMode, WritePolicy};
+    /// Stops the wrapped anchor when dropped (`SIGTERM`, then its exit), so a failed assertion leaves no instance.
+    struct Wrapped(Option<std::process::Child>);
+    impl Wrapped {
+      fn stop(mut self) -> Option<i32> {
+        let mut child = self.0.take().unwrap();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        child.wait().unwrap().code()
+      }
+    }
+    impl Drop for Wrapped {
+      fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+          let _killed = child.kill();
+          let _waited = child.wait();
+        }
+      }
+    }
+    let instance = instance_name("wrapped");
+    let secret = slates_api::LauncherSecret::generate().unwrap();
+    let mut command = spec(&instance)
+      .with_launcher(secret.clone())
+      .anchor_command_under(&[std::ffi::OsStr::new("/usr/bin/env")])
+      .unwrap();
+    let mut wrapped = Wrapped(Some(command.spawn().unwrap()));
+    let mut slates = Instance::wait_for(&instance, wrapped.0.as_mut(), None).unwrap();
+    slates.ensure_group().unwrap();
+    let volume = slates
+      .provision(&slates_api::VolumeSpec::empty("wrapped", ROOM))
+      .unwrap()
+      .volume();
+    let bypass = WritePolicy {
+      merge: WriteMode::Bypass,
+      land: WriteMode::Bypass,
+      require_signed_merges: false,
+    };
+    slates
+      .set_write_policy(
+        PolicySubject::Volume(volume),
+        &bypass,
+        &slates_api::Issuer::from_launcher_secret(&secret),
+      )
+      .unwrap();
+    drop(slates);
+    assert_eq!(
+      wrapped.stop(),
+      Some(0),
+      "the wrapped anchor stops gracefully"
+    );
+  }
 }

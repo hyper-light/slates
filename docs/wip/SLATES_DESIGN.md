@@ -7251,6 +7251,10 @@ it builds against the contract and adds to it rather than around it.
 > text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
 > service names their watcher `merge`), and now reads with no base
 > (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
+> **`CONTRACT` = 9:** `StartSpec::anchor_command_under(wrapper)`, the anchor's command under a
+> wrapper that execs it (`systemd-run --user --scope -- ...`, kiln's Linux start), the launcher's
+> record kept on its standard input; proven under `/usr/bin/env`, an exec wrapper, by a policy set
+> under the launcher's secret.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21812,6 +21816,11 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
   `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
   `tests/api.rs`.
+- **`CONTRACT` 9, the same day (g263's ask):** `StartSpec::anchor_command_under(wrapper)`, since a host cannot take
+  a `Command`'s standard input out to hand its wrapper's: the wrapper's words, then the anchor's program, prefix and
+  role, with the launcher's record on standard input, the marker and the process group. Proven by
+  `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret` (`/usr/bin/env` execs the anchor; a policy set
+  under the launcher's secret verifies; the anchor stops at `SIGTERM`, exit 0).
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

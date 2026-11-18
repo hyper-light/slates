@@ -38,7 +38,9 @@ fn main() -> ExitCode {
   until the instance answers, and makes the consensus group of an instance run alone. If the anchor
   exits first, the start is refused `StartFault::AnchorExited` with its exit code; the anchor's log
   lines on standard error say why.
-- `StartSpec::anchor_command()` is the same command for a host that launches the anchor its own way,
+- `StartSpec::anchor_command()` is the same command for a host that launches the anchor its own way
+  (`anchor_command_under(&wrapper)`, with `wrapper` the `OsStr` words of `systemd-run --user --scope
+  --`, runs it under a wrapper that execs it, keeping the launcher's secret on its standard input),
   for example under its service manager so the instance outlives the host's process. Such a host
   waits with `Instance::wait_for(name, None, Some(deadline))`.
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
