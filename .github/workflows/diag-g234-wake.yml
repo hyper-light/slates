@@ -1,0 +1,65 @@
+name: diag-g234-wake
+
+# Diagnostics only, never on main (A-223's open item (C), goal g234): why a parked Windows shard waits 50-100 ms to run
+# again beside two spinners a logical CPU. The wake probe (crates/rt/examples/wake_load.rs, on this branch only) times a
+# kicked waiter by primitive (the runtime's completion port, an event, WaitOnAddress, the runtime's own shard), by its
+# wake's boost and its base priority, pinned and not; and measures a turn on a CPU two threads share. Quiet and loaded
+# (two spinning shell loops per logical CPU, as provision_bench's loaded rows), two rounds alternating.
+on:
+  push:
+    branches: ["diag-g234-wake-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  probe:
+    name: wake probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: Build the probe
+        run: |
+          cargo build --release --locked -p slates-rt --example wake_load > build.log 2>&1; status=$?
+          tail -30 build.log
+          exit $status
+      - name: Quiet and loaded, two rounds
+        run: |
+          set +e +o pipefail
+          cpus=$NUMBER_OF_PROCESSORS
+          B=target/release/examples/wake_load.exe
+          echo "runner ${{ matrix.os }}, $cpus logical CPUs, $(date -u)" | tee -a results.txt
+          for round in 1 2; do
+            for cond in quiet loaded; do
+              pids=""
+              if [ $cond = loaded ]; then
+                for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                sleep 3
+                pwsh -NoProfile -Command "Get-Process bash | Select-Object -First 4 Id,PriorityClass,BasePriority | Format-Table -AutoSize | Out-String -Width 200" | tee -a results.txt
+              fi
+              echo "== round $round $cond $(date -u +%H:%M:%S)" | tee -a results.txt
+              timeout 2400 $B $cond 2>&1 | tee -a results.txt
+              echo "== exit ${PIPESTATUS[0]}" | tee -a results.txt
+              for p in $pids; do kill $p 2>/dev/null; done
+              wait 2>/dev/null
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wake-${{ matrix.os }}
+          path: results.txt
