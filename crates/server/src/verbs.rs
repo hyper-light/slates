@@ -15123,6 +15123,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // content put only once a publish carrying it commits.
   let mut held = crate::content_holder::held_image(state);
   let whole = crate::content_holder::whole_of(&held);
+  let owned = crate::content_holder::owned_of(&held);
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
@@ -15172,6 +15173,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
   crate::content_holder::held_committed(state, whole, true);
+  crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
@@ -15439,6 +15441,7 @@ fn publish_delta_into(
     state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
   crate::content_holder::held_committed(state, held.whole, false);
+  crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
   #[cfg(target_os = "linux")]
   clear_write_log(

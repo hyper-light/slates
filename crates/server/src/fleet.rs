@@ -2488,11 +2488,29 @@ pub(crate) fn retire_done_tombstones(state: &mut ShardState, local: HostId) -> V
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const TOMBSTONE_RETIRE_REFUSED: &str = "fleet.tombstone.retire_refused";
 
+/// The promotion epoch `object`'s volume was taken over at, as the volume's record keeps it (A-325's
+/// `VolumeRecord::taken_over`; `object` its head register or its catalog's): what this owner writes the volume's records
+/// and ships its live log under once a warm restart has forgotten `placed_heads` (A-344). Before, a successor restarted
+/// warm wrote them at its own host's epoch, below the fence its takeover had raised at every holder, so none placed and
+/// its live log never shipped: its write was not answered within the client's 30 s deadline (a Mac Studio, 2026-11-18).
+/// `None` for a volume this node did not take over.
+pub(crate) fn promotion_epoch(state: &ShardState, object: ObjectId) -> Option<HostEpoch> {
+  let volume = DbVolumeId {
+    bytes: object.placement_key().0,
+  };
+  state
+    .db
+    .partition()
+    .volume(volume)?
+    .taken_over
+    .map(|takeover| HostEpoch(takeover.epoch))
+}
+
 /// The record of `object` at `sequence` with `value`, as this owner still owes it to some remote candidate —
 /// its full candidate set, the candidates that already hold it and the quorum — or `None` once every remote
-/// candidate holds it. The record is written at the greater of the host's epoch and the epoch the object was
-/// last written or adopted under: a taken-over object's holders fenced it at its promotion epoch (see
-/// `PlacedHead`).
+/// candidate holds it. The record is written at the greater of the host's epoch, the epoch the object was
+/// last written or adopted under, and the promotion epoch its volume's record keeps: a taken-over object's holders
+/// fenced it at its promotion epoch (see `PlacedHead`), and a restart forgets `placed_heads` ([`promotion_epoch`]).
 fn owed_record(
   state: &ShardState,
   config: &slates_db::register::Configuration,
@@ -2508,7 +2526,8 @@ fn owed_record(
     .unwrap_or_default();
   let epoch = recorded
     .map_or(config.host_epoch, |head| head.epoch)
-    .max(config.host_epoch);
+    .max(config.host_epoch)
+    .max(promotion_epoch(state, object).unwrap_or(config.host_epoch));
   // Every remote candidate that has not acked still needs the record; when none remain it is done.
   let outstanding = placement
     .candidates
