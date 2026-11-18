@@ -7908,6 +7908,10 @@ it builds against the contract and adds to it rather than around it.
 > way. `HostFault` renders in words, the daemon's `TargetUnavailable` by that name. Both were lost when the CLI moved
 > onto the library (A-278); the integrator's Windows lane found them (run 44257181904,
 > `docs/bugs/2026-11-18-the-cli-on-the-library-lost-two-windows-refusals-words.md`).
+> **`CONTRACT` = 17:** the daemon's database refusals are typed on the wire (`Refusal::Database { refusal:
+> DatabaseRefusal }`, appended). `refusal_of_db` is exhaustive: its catch-all sent a corrupt record, a regressed
+> NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding as `BadRequest` words. The
+> contract classes each `Unusable::Database`, a fault on the daemon's side to report.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -8430,6 +8434,40 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `the_spin_window_is_the_budget_held_to_the_builds_measured_cost` (`crates/server/src/watchdog.rs`),
 > `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat` (`crates/server/tests/liveness.rs`), and
 > the build-cost tests (`crates/machine/src/build_cost.rs`).
+
+> **Status (2026-11-18, A-336): a shard waiting on memory while the host reports a memory stall is starved, not
+> wedged.** A thread waiting on a page-in, a reclaim or a refault is neither running nor runnable, as a deadlocked one
+> is, so A-228's rule judged it wedged: a lone daemon at a few hundred megabytes free ended itself (exit 4, fleet test
+> binaries at 0.2 to 1 GB free on a 15-CPU Mac, 2026-11-17), and an anchor judged a daemon paging whole by the start's
+> rule and killed it at its lapse. A-308 kept only the watchdog's own gaps out of the verdict. Now, at a look that
+> suspects a shard, the watchdog reads the host's memory stall (`slates_machine::memory_stall`), and a still shard off
+> the CPU in a wait memory shows as, while the host reported a stall since the look before, has moved, as a runnable
+> one has (`watchdog::held_for_memory`); once a window passes with no CPU it is `Starved { of: Memory }`, logged with
+> its kernel wait, and it beats. A stuck shard is still judged wedged a window after the stall clears. One rule on every
+> platform, each reading what it can:
+> - Linux: PSI's memory `some` total risen since the look before (`/proc/pressure/memory`), and the thread held in the
+>   kernel past signals (`D`); a thread asleep in a futex, a poll or a sleep (`S`) is never excused. `some`, not `full`:
+>   FULL holds on a CPU only while nothing there is productive, so a thread waiting on memory on a busy machine never
+>   shows in it (`kernel/sched/psi.c`); a delayed thread is itself `some` on its CPU, so the total rises while it waits.
+>   The thread's `wchan` names the wait in the log line.
+> - macOS: `kern.memorystatus_vm_pressure_level` above normal (XNU's dispatch level, warning or critical); XNU reports
+>   a user page fault's wait as it does a lock's, so any blocked wait counts while it is raised.
+> - Windows: the low-memory resource notification signaled; any blocked wait counts (the wait reason is not read yet).
+> - No reading (PSI absent, `psi=0`, a refused read, Miri): nothing excuses a still shard, as before.
+>
+> The anchor's start and lapse judgment run the same rule over the whole process (`slates_rt::process_run_reading`:
+> runnable when any thread is; else held in the kernel when any thread is, on Linux). A shard waiting on another
+> thread that is held in the kernel reads as that thread does (A-228's transitive wait). Regressions:
+> `a_shard_waiting_on_memory_while_the_host_stalls_is_starved_and_wedged_a_window_after_the_stall_clears`,
+> `a_shard_asleep_or_unread_is_wedged_within_the_window_however_the_host_stalls` and the rule's table
+> (`crates/server/src/watchdog.rs`); `a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after`
+> and, on Linux, `a_shard_asleep_while_the_host_stalls_stops_the_beat` (`crates/server/tests/liveness.rs`, the
+> host's reading put in its place through `Daemon::inject_memory_stall`, a shard held in the kernel by a vfork's wait);
+> `a_process_waiting_on_memory_is_spared_while_the_host_stalls_and_stuck_a_window_after` (`crates/api/src/role/anchor.rs`);
+> the readers' own tests (`crates/machine/src/memory_stall.rs`, `crates/rt/src/thread_clock.rs`). Not yet: an
+> observation's and a cross-shard call's wait (`observe::ShardTime`) take the same excuse next; a shard asleep on a
+> lock whose holder pages is still judged wedged on Linux (the holder is not named, GAPS); Windows' per-thread wait
+> reason is not read.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -17040,6 +17078,10 @@ is preempted, and raising its thread's priority removes the wait (run 4205929431
 is not yet a measured gain and no priority has been changed.
 Applied in the same change to: GAPS, BENCHMARKS, `crates/bridge-winfsp/src/reply.rs`, `host.rs`, `dispatcher.rs` and `lib.rs`.
 
+**A window per kind of request (2026-11-18): measured in two forms and rejected (A-348).** One window for every kind
+stays: parking at once the kinds whose replies miss it freed arm64's loaded shards (a loaded write 42.3 µs faster at the
+p50) and cost x86_64 a wake at each p50 it moved (a loaded stat 42.5 µs slower).
+
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
 
@@ -17234,6 +17276,9 @@ Applied in the same change to:
   −2,375 µs (8 to 9 of 10), write's and unlink's p50 and write's p99 beyond the control's spread. No x86_64 loaded p99
   moves beyond the control's. The cost is a quiet stat: p50 +8.1 µs on arm64 and +4.0 µs on x86_64, the post's wake costing
   about what the round did when the shard is idle.
+- **Amended by A-348 (2026-11-18).** The mount's request channel held one request, so the request after an open waited in
+  its post until the shard had taken the confirmation; it holds two now, and the post never waits. The variant that posts
+  without the wake deadlocked over the one-request channel and, over two, measured slower: the wake stays.
 
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
@@ -25222,3 +25267,78 @@ Applied in the same change to:
   mounts as a node that does not hold it: an NFS request `NFS3ERR_STALE` and no root at a mount, as the router answers a
   handle of a volume outside the node's set; a FUSE mount fenced as a revoked one is, its kernel's cache dropped, its
   requests refused `ENOTCONN`, and the mount ended. The client mounts the volume through its successor's node.
+
+### A-348 — The mount's request channel holds the receive worker's posted confirmation beside its next call; the post's wake stays, and the per-kind spin choice is measured and rejected (2026-11-18, goal g258, audit step 7 continued; amends A-274, records against A-212)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `crates/bridge-winfsp/src/host.rs`: `REQUEST_BOUND` is `CALLS_WAITED_FOR + CONFIRMATIONS_POSTED`, two; the test
+  `host::channel::the_next_request_is_posted_while_a_confirmation_waits_untaken`.
+- A-274: its record names this amendment.
+- BENCHMARKS ("Step 7, continued"), GAPS (the Step 7 entry).
+- **What was there.** The mount's request channel was a `sync_channel` of one request: "the one receiver waits for its
+  current callback's answer before sending another request". A-274 made that untrue: the worker posts an open's
+  confirmation and goes on, so the confirmation can still be in the channel when the worker's next callback posts its
+  call, and that post waited for room until the shard took the confirmation. On main the confirmation's own wake brings
+  the shard, so the wait was a shard wake on the worker's path, the kind of wait A-274 took off it. A worker that posted
+  without the wake waited for good: cut (c)'s no-wake variant stalled both Windows runners in its first run, a drive's
+  first look on arm64 and the warm-up's next round on x86_64 never answered, and its live CLI suite hung (diag-g258-1,
+  run 44271751211).
+- **The rule.** The channel holds every request the one receive worker can have outstanding: the call it waits for and
+  the one confirmation it posted without waiting (A-274 refuses a second over it, `inflight::settle`). No post waits for
+  the shard to take what is in the channel. Red at one request on both Windows runners, green at two (diag-g258-4, run
+  44278926773). Measured dead even against main: no p50 or p99 cell beyond the control on x86_64, only tails both ways on
+  arm64 (the same run, ten runs a runner). It lands on A-274's rule, not for speed.
+- **The post's wake stays.** Over the two-request channel the no-wake variant measured slower beyond the control: arm64's
+  loaded write p50 +48.4 µs (0 of 10 runs faster), rename, unlink, create_security and quiet write, and x86_64's loaded
+  p99 open +636 µs (0 of 10); only arm64's loaded fsync was faster (−13.8, 10 of 10). Woken at the post, the shard serves
+  the confirmation while the worker sends, and the request after an open finds it awake.
+- **A-212's spin, one window for every kind, stays.** Cut (b) let each kind of shard request choose between spinning the
+  window and parking at once, by its own recent replies, each stamped with its shard's send instant: by the 2-competitive
+  costs (diag-g258-2) and by whether its median reply came within the window (diag-g258-7). Both lost on x86_64, about a
+  wake at each p50 that moved (the 2-competitive form's loaded close +16.7 µs, 0 of 10 faster; the median form's loaded
+  stat +42.5) and traded on arm64 (the median form's loaded write −42.3 and rename −35.2, 10 of 10 each, against loaded stat
+  +11.7 and quiet fsync +10.9). Neither lands: a spin that misses costs arm64's loaded shards a CPU they need, a park costs
+  x86_64 a wake, and a choice that takes the first without the second needs a signal of contention (open in GAPS).
+
+### A-336 — A shard waiting on memory while the host reports a memory stall is starved, not wedged, in the watchdog's verdict and the anchor's (2026-11-18, goal g251: every open slates bug fixed; the supervisor's decision by A-228's rule)
+Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (the A-308 entry's open item, closed; a 2026-11-18
+entry), `docs/cli.md` (the anchor), `crates/machine/src/memory_stall.rs` (new: `StallReading`, `read`, `source`,
+`stalled_between`), `crates/rt/src/thread_clock.rs` (`RunReading::uninterruptible`, `process_run_reading` replacing
+`process_runnable`, `kernel_wait_name`), `crates/rt/src/registry.rs` (`shard_run_readings`' transitive wait,
+`shard_kernel_wait_name`), `crates/server/src/watchdog.rs` (`held_for_memory`, `Want`, `Verdict::Starved`'s `of`,
+`Look::memory`, `MemoryStallSource`, the start line and the starved-for-memory line), `crates/server/src/daemon.rs`
+(`Daemon::inject_memory_stall`), `crates/api/src/role/anchor.rs` (`judge_start_of`'s reading), `unsafe-budget.toml`
+(slates-machine 79 → 81).
+- **Why.** A-228's rule calls a shard wedged after a window with no CPU progress in which the scheduler never had it
+  runnable. A thread waiting on a page-in, a reclaim or a refault is exactly that, as a deadlocked one is. On a host
+  short of memory a lone daemon ended its own process (exit 4; fleet test binaries at 0.2 to 1 GB free on a 15-CPU Mac,
+  load 62 to 131, g231, 2026-11-17), and an anchor that found a daemon's watchdog silent judged the process by the
+  start's rule and killed it. A-308 kept the watchdog's own gaps out of the verdict and left this open. The supervisor's
+  decision of 2026-11-18, by A-228's rule (the anchor never kills a starved-but-live daemon and still kills a hung one,
+  on every OS): the memory-pressure option, with the thread's own kernel wait on Linux.
+- **The rule.** At a look that suspects a shard, a shard off the CPU in a wait memory can show as, while the host
+  reported a memory stall since the look before, has moved, as a runnable one has: its still time starts again, and a
+  window with no CPU makes it `Starved { of: Memory }`, which beats. Once the stall clears nothing excuses it, so a
+  stuck shard is judged wedged a window after the last stalled look. The host's stall is each platform's own
+  classification, so no threshold is chosen here (R3): Linux PSI's memory `some` total risen; macOS's
+  `kern.memorystatus_vm_pressure_level` above normal; Windows' low-memory resource notification signaled. The thread's
+  wait: Linux `D` (held in the kernel past signals; never `S`), any blocked wait where the platform does not tell (macOS
+  reports a user page fault's wait as it does a lock's; Windows' wait reason is not read). No reading of either, no
+  excuse. The anchor's start and lapse judgment apply it to the whole process: runnable when any thread is, else held
+  when any thread is held.
+- **`some`, not `full`.** The decision named PSI's `full` line. It would miss the case the rule is for: FULL holds on a
+  CPU only while no task there is productive (`tFULL[cpu] = time(nr_delayed_tasks[cpu] && !nr_productive_tasks[cpu])`,
+  `kernel/sched/psi.c` at 6f88f6cbb), and a busy machine, the normal case, runs something else on the CPU of a thread
+  that waits on memory. A delayed thread is itself `some` on its CPU, so the `some` total rises while it waits, by that
+  CPU's share of the machine's non-idle time; with the thread's own `D` beside it, the reading is the thread's, not a
+  neighbour's.
+- **Cost.** A look that suspects no shard reads nothing new. One that does reads the host once (a 50-byte pseudo-file
+  on Linux, one sysctl on macOS, one query on Windows) beside the scheduler readings it already took. The `wchan` is
+  read once an episode, for its log line.
+- **What it does not change.** The spinning verdict (a poll whose CPU is the kernel's reclaim on its behalf can still
+  run a window of it), the CPU-starved rule, A-308's gaps, the window, and a lone daemon's end on a stuck verdict.
+- **Owed.** The same excuse in an observation's and a cross-shard call's wait (`observe::ShardTime`, A-228's sibling);
+  a shard asleep on a lock whose holder pages, judged wedged on Linux (the holder is not named, as for a starved
+  holder); Windows' per-thread wait reason (`WrPageIn` and its kin) as the thread's own reading there; and a run of a
+  daemon in a host truly short of memory (a bounded container with swap), the measurer's.

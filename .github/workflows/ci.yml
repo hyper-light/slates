@@ -1653,6 +1653,59 @@ jobs:
       - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
         run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
 
+  # live_chaos every night (Ada, 2026-11-18: long CI lanes are allowed; CLAUDE.md §2 item 13 removed): every flow of
+  # crates/cli/tests/live_chaos.rs across real processes, injected latency, loss, partitions, kills and the nemesis,
+  # with every register invariant judged (TotalOrder, Continuity, StaleNeverCommits, ReadSafety, NoLoss). Each flow runs
+  # on its own, capped, with its log kept, so one hung flow (a takeover reported, then nothing, seen twice on
+  # 2026-11-18) cannot hide the others. The cap is four times the slowest passing flow recorded (425 s under load,
+  # 2026-11-18). Nightly only: a full run takes hours on a hosted runner.
+  live-chaos-nightly:
+    name: live_chaos (every flow, capped; nightly)
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: live_chaos, each flow on its own, capped, logs kept
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          echo "nofile $(ulimit -n); cores $(nproc); $(free -g | sed -n 2p); load $(cat /proc/loadavg)"
+          mkdir -p target/chaos
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          slowest_pass_s=425
+          cap_s=$((slowest_pass_s * 4))
+          failed=0
+          for flow in $("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p'); do
+            echo "=== ${flow}"
+            if ! timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "target/chaos/${flow}.log" 2>&1; then
+              echo "FAILED (or past ${cap_s} s): ${flow}"
+              tail -60 "target/chaos/${flow}.log"
+              failed=$((failed + 1))
+            fi
+          done
+          echo "flows failed: ${failed}"
+          [ "${failed}" -eq 0 ]
+      - name: Upload the chaos logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-chaos-nightly-${{ matrix.os }}
+          path: target/chaos/
+
   # Part 6 "Concurrency", nightly: ThreadSanitizer over the crates whose tests run real threads against
   # shared state (mem, rt, ipc, client), with the standard library rebuilt instrumented. `cargo xtask tsan`
   # first requires a report from a deliberate race (`crates/mem/tests/race_canary.rs`), so a clean run

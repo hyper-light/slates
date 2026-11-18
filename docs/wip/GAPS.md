@@ -489,8 +489,9 @@
 >   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
 >   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
 >   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. Owed: `refusal_of_db`'s last catch-all sends `Corrupt`, `NfsInstanceRegressed`,
->   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as `BadRequest` words;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+>   database's memory refusal does. `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
+>   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as words, is gone: each is `Refusal::Database {
+>   DatabaseRefusal }`, appended, which the contract classes `Unusable::Database` (`CONTRACT` = 17);) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
@@ -1802,12 +1803,41 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open: a
-> shard held in the kernel past a watched window (a page-in at that pressure) is still judged wedged; telling `D` and
-> XNU's uninterruptible wait from a sleep is the 2026-10-22 entry's owed decision. Also from the same report, a test's
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
+> pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
+> Also from the same report, a test's
 > bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
 > loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
 > the loop now runs to the call's bound after the exit.
+
+> **A shard waiting on memory was judged wedged (found 2026-11-17, decided and fixed 2026-11-18, A-336).** A thread
+> waiting on a page-in, a reclaim or a refault is neither running nor runnable, so A-228's rule called it wedged: a lone
+> daemon at a few hundred megabytes free ended itself (exit 4; fleet test binaries at 0.2 to 1 GB free on a 15-CPU Mac,
+> g231), and an anchor that found a daemon's watchdog silent judged the paging process stuck and killed it. Decided by
+> the supervisor by A-228's rule: at a look that suspects a shard the watchdog reads the host's memory stall (Linux PSI
+> memory `some` risen, macOS `kern.memorystatus_vm_pressure_level` above normal, Windows' low-memory notification), and
+> a still shard off the CPU in a wait memory shows as (Linux `D`; any blocked wait where the platform does not tell)
+> while the host stalled is `Starved { of: Memory }`, which beats; it is judged wedged a window after the stall clears.
+> The anchor's start and lapse judgment apply it to the whole process. `some`, not the decision's `full`: FULL never
+> holds on a busy machine's CPU that runs anything else (`kernel/sched/psi.c`), which is the case the rule is for.
+> Regressions: the watchdog's replays and table (`crates/server/src/watchdog.rs`), the watchdog's loop with the host's
+> reading put in its place and a shard held in the kernel by a vfork's wait (`crates/server/tests/liveness.rs`), the
+> anchor's judgment of a held child process (`crates/api/src/role/anchor.rs`), and the readers' tests. Open:
+> - **The waits judged in a shard's own time (A-228's sibling).** An observation and a cross-shard call
+>   (`observe::ShardTime`) still give up on a shard that waits on memory through a window: an observation ends
+>   `Deadline`, a cross-shard verb is refused. Next piece (g251).
+> - **A shard asleep on a lock whose holder pages (Linux).** Its own state is `S`, so it is judged wedged however the
+>   host stalls; the holder is not named, as for a starved holder ("the lock a starved test thread held is not named").
+>   macOS and Windows excuse any blocked wait while the host stalls, so they do not judge it.
+> - **Windows' per-thread wait reason.** The snapshot the watchdog already takes holds each thread's `WaitReason`
+>   (`WrPageIn`, `WrFreePage`, `WrVirtualMemory` and their kin), which would be the thread's own reading there, as `D` is
+>   on Linux. Not read; needs a Windows run.
+> - **A spinning verdict for the kernel's reclaim.** A poll whose CPU is direct reclaim on its behalf runs CPU without a
+>   step and can be judged spinning; not seen.
+> - **Evidence under real pressure.** The rule is proven by the readings put in place and by a thread held in the
+>   kernel; a daemon in a host truly short of memory (a bounded container with swap, a few hundred MB) is the
+>   measurer's run.
 
 > **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
 > Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
@@ -2569,10 +2599,23 @@
 > - Owed for each: a refusal (typed) of a path on a mount this daemon serves, decided before any open, with a test that
 >   asks for one.
 
-> **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open).** Diagnostics run
+> **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open; arm64 alone since
+> 2026-11-18).** Diagnostics run
 > 42130583401 (BENCHMARKS, "Step 7's measured state") measured main's one-worker receiver against `71cf09ac`'s DLL
 > dispatcher, five runs a runner, quiet and loaded. It was beyond the DLL's spread in 13 cells on arm64 (quiet stat p50
 > 147.3 against at most 117.1 µs; loaded write p50 212.0 against 102.6) and in 15 on x86_64.
+> - **2026-11-18, after cut (c) (goal g258; BENCHMARKS, "Step 7, continued"):** ten runs a runner against the DLL arm
+>   (diag-g258-6, run 44292211799). x86_64: 5 cells of 36 beyond its spread, four by under 5 µs (quiet close, open and
+>   read p50, loaded close p50) and the loaded rename p99; loaded, main is faster than the DLL arm at every other p50.
+>   arm64: 10 cells of 36, within each run a quiet stat +42.4 µs, rename +81.5, unlink +40.2, and loaded write +86.9,
+>   rename +74.8, unlink +31.2. Cut (c)'s no-wake variant and cut (b), the per-kind spin choice, were measured and
+>   rejected; the request channel's bound was fixed (A-348). Main lost no more than about 9 µs of this since cut (c)
+>   (diag-g258-5).
+> - **Open, the levers left** (each in BENCHMARKS' record): a spin choice that reads contention (the per-kind median form
+>   took 42.3 µs off arm64's loaded write p50 and lost a wake on x86_64); a fresh per-phase profile of arm64's quiet stat,
+>   rename and unlink (the last attributed 18 µs of a stat to crash safety); and, **a decision for Ada**, the shard threads
+>   above normal priority on Windows (one instrumented arm64 run: a loaded SetSize hop 67.6 to 15.7 µs), which changes how
+>   the whole daemon competes with the user's programs. Or Ada accepts what remains on arm64.
 > - A-219's second worker found no win in any form timed. Its probe, run off the mount's path, put the daemon's own I/O
 >   on a volume the daemon serves, and a kill then strands it. WinFsp's processing queue is never cancelled
 >   (`FSP_IOQ_PROCESS_NO_CANCEL`), so every killed probing role outlived the 10 s reap. So A-219's runtime (`e070f31e`,
@@ -2583,12 +2626,9 @@
 >   purged range through it. A kill while one of those requests is delivered strands the daemon as the probe did, for one
 >   purge's request rather than a whole probe; no run has been seen to hit it. The fix is to run the purge's client in a
 >   child process. Bug record: `docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`.
-> - **Owed:** the five-arm A/B with every worker count fixed at build time and no probe: the DLL, the separate form at
->   one and two workers, and A-215's combined form at one and two (diagnostics run on `diag-winfsp-overlap-24`, with the
->   combined form's live oracles at both counts).
->   - If combined + 2 is within the DLL's spread at the p50 and p99 on both runners, quiet and loaded, it replaces the
->     separate form.
->   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
+> - ~~**Owed:** the five-arm A/B with every worker count fixed at build time and no probe~~ **done 2026-11-07**
+>   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
+>   and A-215's combined form is measured and rejected; main's separate form ships.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a

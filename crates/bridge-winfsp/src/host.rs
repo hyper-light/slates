@@ -173,8 +173,16 @@ const VOLUME_INFO_TIMEOUT_MS: u32 = 0;
 /// Format: `VolumeInfoTimeoutValid`, bit 0 of the version-1 flag word (`fsctl.h`): the volume-information timeout is
 /// set apart from `FileInfoTimeout`.
 const VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
-/// Shape: the one receiver waits for its current callback's answer before sending another request to the shard.
-pub const REQUEST_BOUND: usize = 1;
+/// Shape: the requests one receive worker waits for at once: its current callback's, before it sends another.
+const CALLS_WAITED_FOR: usize = 1;
+/// Shape: the opens' confirmations the receive worker posts without waiting for them (A-274): one, whose answer it takes
+/// before its next save, so it never posts a second over it (`inflight::settle`).
+const CONFIRMATIONS_POSTED: usize = 1;
+/// Derived: the mount's request channel holds every request its one receive worker can have outstanding at once, a
+/// confirmation it posted and the call it then waits for, so no post waits for the shard to take what is in it (A-348).
+/// At one request, the call after an open waited in its post until the shard took the confirmation (and for good when
+/// nothing woke the shard: cut (c)'s no-wake variant stalled both Windows runners, diag-g258-1, run 44271751211).
+pub const REQUEST_BOUND: usize = CALLS_WAITED_FOR.saturating_add(CONFIRMATIONS_POSTED);
 /// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
 /// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
 const OUTCOME_BOUND: usize = 4;
@@ -3049,3 +3057,41 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/support/transact.rs"]
 mod transact_bench;
+
+#[cfg(test)]
+mod channel {
+  //! The mount's request channel against the receive worker's most outstanding requests (audit step 7, cut (c) and its
+  //! no-wake variant, goal g258).
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use super::*;
+  use std::time::Duration;
+
+  /// Shape: a wait no post to a channel with room outlasts; a post still waiting past it is one waiting for the shard.
+  const LONG: Duration = Duration::from_secs(10);
+
+  /// A-274, goal g258. Do: post an open's confirmation, then the receive worker's next request, with the mount's task
+  /// taking neither. Expect: the second post returns at once: the worker never waits for the shard to take a
+  /// confirmation it posted without waiting for. Red with a channel of one request: the post waited until the test
+  /// drained the channel, as the worker's did for the shard to wake (and for good when the post woke nothing: the
+  /// no-wake variant stalled both runners' first run, diag-g258-1, run 44271751211).
+  #[test]
+  fn the_next_request_is_posted_while_a_confirmation_waits_untaken() {
+    let (requests, mount) = sync_channel::<Request>(REQUEST_BOUND);
+    let _confirming = post_confirm(&requests, Waker::noop(), 1).unwrap();
+    let (done, finished) = sync_channel::<bool>(1);
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        let posted = post(&requests, Op::VolumeInfo).is_some();
+        done.send(posted).unwrap();
+      });
+      let posted = finished.recv_timeout(LONG);
+      // A post still waiting for room is released before the scope joins it, so a red run fails rather than hangs.
+      while mount.try_recv().is_ok() {}
+      assert_eq!(
+        posted,
+        Ok(true),
+        "the next request waited for the shard to take the confirmation"
+      );
+    });
+  }
+}
