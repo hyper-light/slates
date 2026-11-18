@@ -8402,8 +8402,9 @@ command and every host start, mount and grant through one implementation.
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
   without a daemon whether the machine can mount and what is missing, and `mount::unmount_busy` lets
   go of a mount a leftover process still holds, detached on Linux and forced on macOS and the BSDs) or as a descriptor a
-  VMM takes (the Shards
-  stream, A-161; the vhost-user socket); landing and merging under the caller's write mode, and
+  VMM takes (the Shards stream, A-161, whose guest is offered DAX per file, held through the library by
+  `a_shards_stream_end_serves_the_volume_it_was_made_for`; the vhost-user socket); landing and merging under the
+  caller's write mode, and
   approving exactly the manifest shown (the consumer contract below, A-299, which replaced A-278's
   `land_approved`); observation (daemon status, audit, grants, telemetry). `Instance::client` lends
   the whole typed client for the rest (a work volume's declared edits, the file verbs).
@@ -8531,7 +8532,10 @@ it builds against the contract and adds to it rather than around it.
   does the same for the records the log keeps. A variant appended is published in its change by
   the test's `--ignored` writer, which refuses to publish a moved tag. Anything else fails, naming
   the enum and the first tag that moved (since 2026-11-18, after `SubmitApproved` moved from 69 to
-  71; it stays at 71).
+  71; it stays at 71). The history a consumer reads is held the same way: `CONTRACT`'s doc comment
+  names what each version changed, and a doc-truth test fails a raised number without its line, a
+  line out of order or one past the number (`the_contract_history_names_every_version_in_order`,
+  `crates/api/src/lib.rs`).
 - *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
   laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
   not confirmed) are variants a laptop never sends.
