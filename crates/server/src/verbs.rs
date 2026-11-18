@@ -2077,10 +2077,16 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   // A volume a planned move took to another member (A-291) is that member's from the switch on, the routing following
   // the configuration: its verbs go there, whether this node has let its copy go or still keeps it frozen until the
   // move is adopted. A volume held here and not moving is served here, whatever the routing says.
-  let moved_away = state
-    .fleet
-    .object_owner(ObjectId(volume.bytes))
-    .is_some_and(|owner| owner != host)
+  // The move's own verb on a copy this node froze for it is answered here, from the move's own state (`Moved` once the
+  // routing follows the configuration to its target), whatever the target does after the switch: forwarded to a target
+  // that died before adopting, it was never answered at all.
+  let asks_its_own_move =
+    matches!(body, RequestBody::Move { .. }) && state.moves_out.contains_key(&id);
+  let moved_away = !asks_its_own_move
+    && state
+      .fleet
+      .object_owner(ObjectId(volume.bytes))
+      .is_some_and(|owner| owner != host)
     && (!held || state.moves_out.contains_key(&id));
   // A volume this node lost to a successor is the successor's, whoever created it and whatever this catalog still holds
   // of it: its verbs go there, as any other node's do (`lost_to_a_successor`: A-338's fenced log, A-334's yield).
