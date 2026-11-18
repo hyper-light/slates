@@ -277,6 +277,26 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
+  /// Exports `snapshot` of `volume` as its archive (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-441): a new volume
+  /// `name`, the caller's own, whose root holds one file, [`crate::ARCHIVE_FILE`], the snapshot's content-addressed
+  /// archive. Read it a page at a time with [`Instance::read`] and keep it wherever bytes are kept (an object store),
+  /// then destroy the volume. The archive carries every file's bytes and every entry's metadata, verified by identity
+  /// on the way back in; its `manifest` is the tree's identity, the same for the same tree wherever it is exported. It
+  /// waits for the export, which walks the snapshot in slices on its owner. `read` on the volume is required; a
+  /// snapshot whose entries still read an overlay's base is refused [`crate::Unsupported::Feature`] (capture the base
+  /// first, [`Instance::capture_base`], and export the captured snapshot); a merge volume's is refused too.
+  pub fn export_archive(
+    &mut self,
+    volume: VolumeId,
+    snapshot: SnapshotId,
+    name: &str,
+  ) -> Result<crate::ArchiveExported, Error> {
+    self
+      .client
+      .archive_export(volume, snapshot, name)
+      .map_err(|e| self.fail(e, Some(Missing::Snapshot { volume, snapshot })))
+  }
+
   /// Destroys a snapshot, returning what only it held to the shard; refused while a clone pins it.
   pub fn destroy_snapshot(&mut self, volume: VolumeId, snapshot: SnapshotId) -> Result<(), Error> {
     self

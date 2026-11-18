@@ -57,11 +57,50 @@ pub(crate) enum CallbackError {
   NoState,
 }
 
-/// One connection's outbox: the callback records waiting to be written, and the waker of the task that writes them.
+/// One connection's outbox: the callback records waiting to be written, the waker of the task that writes them, and
+/// the round trips of the callbacks it carried (A-442), which end with the connection.
 #[derive(Default)]
 struct Outbox {
   queue: VecDeque<Vec<u8>>,
   waker: Option<Waker>,
+  times: crate::learned_wait::LearnedWait,
+}
+
+/// Derived: how long a callback on `sessionid`'s back channel waits for its reply (A-442, R3's class B): the round
+/// trips its carrying connection measured, learned (`crate::learned_wait::LearnedWait`: their tail plus a liveness window,
+/// doubled after a callback that got no reply), as RFC 8881 §2.10.6.3 has a client expect a callback's reply "within the
+/// average round-trip time". Never backed off past the NFSv4 lease (`crate::nfs::v4_lease_ns`, A-425): a server must not
+/// resend a callback on the connection it sent it on (§2.10.6.2), so one unanswered that long leaves the back channel down
+/// for its client to bind again, and a recalled delegation is revoked at a lease anyway (§10.4.5). With no carrier here,
+/// the bound with nothing learned: a liveness window. Read by the back channel's probe and by a delegation's recall.
+pub(crate) fn bound_ns(s: &crate::state::ShardState, sessionid: &SessionId) -> u64 {
+  let ceiling = crate::nfs::v4_lease_ns(s);
+  s.callbacks
+    .carriers
+    .get(sessionid)
+    .and_then(|connection| s.callbacks.outboxes.get(connection))
+    .map_or(crate::daemon::LIVENESS_BUDGET_NS, |outbox| {
+      outbox.times.bound_ns(ceiling)
+    })
+}
+
+/// Folds one callback's outcome into the round trips of the connection that carried it (A-442): a reply, accepted or
+/// not, is a completed round trip and a sample; one that never came within its bound backs the bound off (Karn's rule:
+/// no sample); a lost connection or a state out of reach teaches nothing.
+fn fold_round_trip(
+  s: &mut crate::state::ShardState,
+  connection: u64,
+  outcome: &Result<Vec<u8>, CallbackError>,
+  round_trip_ns: u64,
+) {
+  let Some(outbox) = s.callbacks.outboxes.get_mut(&connection) else {
+    return;
+  };
+  match outcome {
+    Ok(_) | Err(CallbackError::Refused) => outbox.times.completed(round_trip_ns),
+    Err(CallbackError::Timeout) => outbox.times.ran_out(),
+    Err(_) => {}
+  }
 }
 
 /// A callback awaiting its reply.
@@ -308,6 +347,7 @@ async fn call_once(
   deadline_ns: u64,
 ) -> Result<Vec<u8>, CallbackError> {
   let xid = queue(sessionid, (program, credential), args)?;
+  let sent = slates_rt::futures::now_ns();
   let waited = slates_rt::futures::within(
     deadline_ns,
     std::future::poll_fn(|cx| {
@@ -329,12 +369,18 @@ async fn call_once(
     }),
   )
   .await;
-  let _ = state::with_state_counted(|s| s.callbacks.pending.remove(&xid));
-  match waited {
+  let round_trip_ns = slates_rt::futures::now_ns().saturating_sub(sent);
+  let outcome = match waited {
     Ok(Some(reply)) => reply,
     Ok(None) => Err(CallbackError::Timeout),
     Err(_) => Err(CallbackError::NoState),
-  }
+  };
+  let _ = state::with_state_counted(|s| {
+    if let Some(pending) = s.callbacks.pending.remove(&xid) {
+      fold_round_trip(s, pending.connection, &outcome, round_trip_ns);
+    }
+  });
+  outcome
 }
 
 /// Queues one callback record for `sessionid`'s carrier and records it pending: its xid.
@@ -394,4 +440,129 @@ fn record(xid: u32, (program, credential): (u32, &[u8]), args: &[u8]) -> Vec<u8>
   body.u32(0);
   body.fixed(args);
   slates_bridge_nfs::rpc::write_record(body.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  use slates_bridge_nfs::xdr::XdrWriter;
+
+  use super::{CallbackError, Outbox, call_once, deliver};
+  use crate::daemon::LIVENESS_BUDGET_NS;
+
+  /// Shape: the session the tests' callbacks ride.
+  const SESSION: [u8; 16] = [5; 16];
+  /// Shape: a round trip the slow channel measured: a liveness window and a fifth.
+  const SLOW_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 5;
+  /// Shape: a round trip the quick channel measured: 40 µs.
+  const QUICK_NS: u64 = 40_000;
+  /// Shape: when the slow channel's reply comes: a liveness window and a half after the send, past the one window a
+  /// callback waited before A-442.
+  const REPLY_AFTER: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2);
+  /// Shape: how long the test thread waits for a callback's outcome: four liveness windows, past either bound here.
+  const OUTCOME_WAIT: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+
+  /// Registers a connection carrying [`SESSION`] on `state`, its round trips seeded with eight completed callbacks of
+  /// `seed_ns` each, directly on the state an observation lends (a nested `with_state` would be refused).
+  fn carried(state: &mut crate::state::ShardState, seed_ns: u64) {
+    let table = &mut state.callbacks;
+    table.next_connection = table.next_connection.saturating_add(1);
+    let id = table.next_connection;
+    let mut outbox = Outbox::default();
+    for _ in 0..8 {
+      outbox.times.completed(seed_ns);
+    }
+    table.outboxes.insert(id, outbox);
+    table.carriers.insert(SESSION, id);
+  }
+
+  /// An accepted, successful RPC reply to `xid`, its results one word.
+  fn reply(xid: u32) -> Vec<u8> {
+    let mut body = XdrWriter::new();
+    for word in [
+      xid,
+      super::RPC_REPLY,
+      super::ACCEPTED,
+      super::AUTH_NONE,
+      0,
+      super::ACCEPTED,
+      0,
+    ] {
+      body.u32(word);
+    }
+    body.as_slice().to_vec()
+  }
+
+  /// Starts one callback on [`SESSION`] from a task of `daemon`'s first shard, under the bound that shard derives
+  /// (`bound_ns`): its outcome comes back on the channel returned.
+  fn start_callback(
+    daemon: &crate::daemon::Daemon,
+  ) -> std::sync::mpsc::Receiver<Result<Vec<u8>, CallbackError>> {
+    let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(daemon, move |_state| {
+      let task = slates_rt::futures::spawn(async move {
+        let bound =
+          crate::state::with_state(|s| super::bound_ns(s, &SESSION)).unwrap_or(LIVENESS_BUDGET_NS);
+        let _ = sent.send(call_once(SESSION, (0, &[]), &[], bound).await);
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    outcome
+  }
+
+  /// R3's class B (B-c, A-442; RFC 8881 §2.10.6.3). Do: on a shard, carry a session's back channel on a connection whose
+  /// callbacks measured slow round trips (a window and a fifth each); send a callback and answer it a window and a half
+  /// later, past the one window a callback waited before. Expect: the callback answered. Before, it was given up
+  /// `Timeout` at one liveness window, and the back channel marked down while its client was answering.
+  #[test]
+  // The test thread stands for the client answering late.
+  #[allow(clippy::disallowed_methods)]
+  fn a_callback_on_a_slow_back_channel_is_answered_past_one_window() {
+    let daemon = crate::daemon::audit_daemon();
+    crate::daemon::observe_first(&daemon, |state| carried(state, SLOW_NS));
+    let outcome = start_callback(&daemon);
+    std::thread::sleep(REPLY_AFTER);
+    crate::daemon::observe_first(&daemon, |state| {
+      // A callback already given up has left the pending table: nothing is answered, and the outcome says so.
+      if let Some(xid) = state.callbacks.pending.keys().next().copied() {
+        let task = slates_rt::futures::spawn(async move { deliver(&reply(xid)) }).unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      }
+    });
+    let answered = outcome.recv_timeout(OUTCOME_WAIT).unwrap();
+    daemon.stop();
+    assert!(
+      answered.is_ok(),
+      "the slow channel's callback was answered: {answered:?}"
+    );
+  }
+
+  /// RFC 8881 §2.10.6.2, A-442. Do: on a shard, carry a session's back channel on a connection whose callbacks measured
+  /// quick round trips; send a callback and never answer it. Expect: it ends `Timeout` within its bound (a liveness window
+  /// and the channel's tail) and a window's slack, and the channel's bound is backed off for the next callback.
+  #[test]
+  fn a_callback_on_a_dead_back_channel_still_ends_within_its_bound() {
+    let daemon = crate::daemon::audit_daemon();
+    let bound = crate::daemon::observe_first(&daemon, |state| {
+      carried(state, QUICK_NS);
+      super::bound_ns(state, &SESSION)
+    });
+    let began = std::time::Instant::now();
+    let outcome = start_callback(&daemon);
+    let ended = outcome.recv_timeout(OUTCOME_WAIT).unwrap();
+    let took = began.elapsed();
+    let backed = crate::daemon::observe_first(&daemon, |state| super::bound_ns(state, &SESSION));
+    daemon.stop();
+    assert_eq!(ended, Err(CallbackError::Timeout));
+    assert!(
+      took < Duration::from_nanos(bound + LIVENESS_BUDGET_NS),
+      "the dead channel's callback ended within its bound: {took:?} against {bound} ns"
+    );
+    assert!(
+      backed > bound,
+      "the channel's bound backed off for the next callback"
+    );
+  }
 }

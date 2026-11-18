@@ -3736,7 +3736,10 @@
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
 >   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
->   the path's measured round-trip tail, `verbs::forward_stall_ns`) and the forward lane's stall (2026-11-18, A-315,
+>   the path's measured round-trip tail, `verbs::forward_stall_ns`), every callback on an NFSv4.1 back channel (A-442:
+>   one liveness window; now the carrying connection's learned round trip, RFC 6298 with Karn's rule, backed off after a
+>   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`) and the forward
+>   lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
@@ -11265,6 +11268,16 @@ Owed:
 
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
+
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
+
+> - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
+>   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
+>   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
+>   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
+> - **Owed.** The volume made from an archive (import), through `slates_archive::Planning` as a takeover restores
+>   (`fleet::restore_in_turns`, `verbs::populate_making`), with hostile archives refused by kind: the next piece. A
+>   streamed encoder: the archive is held whole while it is encoded, one unit of its size.
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 

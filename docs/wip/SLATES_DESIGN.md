@@ -8411,6 +8411,18 @@ the format floor.
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** A restore's output is sparse again (5106abc2; AUD-29-57 closed, A-55).
 
+> **Status (2026-11-18, A-441: a snapshot exported as its archive through the library).** `ArchiveExport`
+> (`Instance::export_archive`, contract 38) renders a snapshot as its archive file, `ARCHIVE_FILE`, in a new volume of
+> the caller's, as an image build renders an ext2 file (`crate::image`): checked at once (the volume, `read`, the name,
+> the snapshot), then walked in slices by a task of the owner shard (`slates_vfs::export::SnapshotArchiver`), the
+> snapshot pinned until the file is written, the volume and the request's completion committed as one atom. A consumer
+> reads the file a page at a time (`read`) and keeps it where it keeps bytes (Mantle, kiln's object store, CP-T10.4).
+> The archive carries every file's bytes and every entry's metadata, each chunk and the whole verified by identity on
+> the way back in; its manifest identity, which the reply names, is the tree's. A snapshot whose entries still read an
+> overlay's base is refused `Unsupported` (capture the base first); a merge volume's too. Owed: the volume made from an
+> archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
+> archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
+
 ### 4.12 Agent surfaces (D-19)
 
 > **Correction (2026-09-17, CLI process gate).** `run` and `exec` accept global flags before
@@ -30794,3 +30806,73 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
 - **Owed.** A Windows stream's DAX sections held by the anchor (A-365 is Unix's; a Windows stream gives its resync up at
   its first map, A-427); and Shards' device half, which takes the `Resync` through its spawner's grants (its
   coordinator's condition 4c).
+
+### A-442 — An NFSv4.1 callback waits its back channel's learned round trip, backed off after a timeout up to the NFSv4 lease; the told wait and the callbacks share one learner (2026-11-18, built for goal g255; R3's class B, item B-c; RFC 8881 §2.10.6.2, §2.10.6.3, §10.4.5; A-78, A-79, A-425, A-431)
+- **What was there.** Every callback on a session's back channel (the probe that proves it, `nfs::probe_back_channel`,
+  and a delegation's recall, `delegation`) waited one liveness window for the client's reply, then was given up
+  `Timeout` and the back channel marked down, whatever the path to the client measured. RFC 8881 §2.10.6.3 has a client
+  expect a callback's reply "within the average round-trip time", and §2.10.6.2 forbids resending a request on the
+  connection it was sent on, so a give-up before a slow client's reply marks a live back channel down for its client to
+  bind again.
+- **The rule.** Each connection that carries a back channel learns its callbacks' round trips (`callback::Outbox`'s
+  `times`, ending with the connection): a reply, accepted or not, is a sample; a callback that got no reply backs the
+  bound off (Karn's rule, RFC 6298 §5.5). A callback waits that learned bound (`callback::bound_ns`): the round trips'
+  tail plus a liveness window, doubled after each timeout, never backed off past the NFSv4 lease (`nfs::v4_lease_ns`,
+  A-425), since a callback unanswered for a lease leaves the back channel down for its client to bind again and a
+  recalled delegation is revoked at a lease anyway (§10.4.5). A session with no carrier here waits a liveness window.
+  The learner is A-431's, moved into `learned_wait::LearnedWait` and shared by the told wait (per shard) and the
+  callbacks (per connection), so the two rules cannot drift apart.
+- **`send_note`.** Its wait (a note to another shard about a session or a client) was already judged in its target's
+  own time (`xshard::within_shard_time`, A-65); its window is the liveness window every such wait takes, stated where it
+  is made. No change.
+- **Tests.** `a_callback_on_a_slow_back_channel_is_answered_past_one_window` and
+  `a_callback_on_a_dead_back_channel_still_ends_within_its_bound` (`crate::callback`, on a shard: a channel measured at a
+  window and a fifth a round trip answers a callback a window and a half after it was sent; a channel measured quick
+  whose callback is never answered ends `Timeout` within its bound and backs it off), and the learner's own two tests
+  (`learned_wait`, moved from `told`).
+  Run on the Mac Studio (kiln, 2026-11-18, load 5-7, debug build, `cargo test --locked -p slates-server --lib --
+  callback learned_wait told delegation`): 5 of 5. Red-checked once: with a callback's bound back at one window, the
+  slow channel's callback is given up before its answer. The NFSv4 delegation and callback flows are filed for main's
+  run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{learned_wait,told,
+callback,nfs,delegation,lib}.rs`.
+
+### A-441 — A snapshot exported as its archive through the library (2026-11-18, goal g268; Mantle's CP-T10.4, "Slates snapshots on Mantle"; §4.11 "Archive", D-17; §4.12 the consumer contract, A-299)
+Applied in the same change to: `crates/ipc` (`RequestBody::ArchiveExport`, `ReplyBody::ArchiveExported`,
+`ARCHIVE_FILE`, appended and published in `tests/wire_order.txt`); `crates/server/src/image.rs` (`archive_verb`,
+`ArchiveJob`, `run_archive`), `verbs.rs` (its dispatch, its new volume's name, its durability claim as a creation's) and
+`merge_service.rs` (`StoreVerb::Archive`); `crates/client` (`Client::archive_export`, `ArchiveExported`);
+`crates/api` (`Instance::export_archive`, `ArchiveExported` and `ARCHIVE_FILE` re-exported, `CONTRACT` 38, the test
+`a_snapshot_exported_as_its_archive_carries_every_file_and_entry`); §4.11's status; GAPS (2026-11-18).
+
+- **Why.** Kiln keeps every byte it holds on Mantle (plan T10), Slates snapshots among them (CP-T10.4). The archive
+  format has existed since Phase 7 as the fleet's replication unit (`slates_vfs::export`), but no consumer could ask
+  for one: no verb exported a snapshot.
+- **The shape.** The export is a volume, as an image build is: a new volume of the caller's holding one file, the
+  archive. Every path a consumer already has then serves it: the paged `read` streams it out (a reply rides one bulk
+  chunk), the volume's size policy bounds it, its destroy lets it go, and a restart keeps it, since it is published.
+  No buffer or token of its own needs a bound, an expiry or a reaper. The archive's bytes are slates' own wire format
+  (§4.11): header, chunk records, manifest, seek table, trailer, every chunk named by the BLAKE3 of its bytes, the
+  whole hashed.
+- **Running.** As `image build` runs (§4.6, A-160): the verb checks the volume, `read` on it, the name and the snapshot
+  at once and defers its reply to a task of the owner shard. The task pins the snapshot and walks it with
+  `SnapshotArchiver` a unit at a time within the slice budget. It encodes the archive, admits the volume sized to it
+  (rounded up to whole chunks), and writes the file a chunk a unit. It then records and publishes the volume with the
+  request's completion as one atom, and lets the pin go. A refusal at any step discards the volume and the pin.
+- **Rights.** `read`: an archive copies only what a reader can read, and the snapshot's pin lasts only while the export
+  runs. An image build needs `write`, since its volume pins the snapshot for good.
+- **Refusals.** A snapshot the volume does not hold, `NotFound` (`Missing::Snapshot`). A name held, `AlreadyExists`. A
+  snapshot whose entries still read an overlay's base, `Unsupported`, with the way out (`capture_base`, then export the
+  captured snapshot). A merge volume, `Unsupported`. A shard without consensus, `ConsensusNotInitialized`. Room, by the
+  admission's own refusals.
+- **Owed.** The volume made from an archive (import), the next piece. A streamed encoder: the archive is held whole
+  while it is walked and encoded (the encoding is one unit of the archive's size), then written in slices; a shard
+  exporting a snapshot near its memory holds it twice for that moment.
+- **Evidence (Mac Studio, 2026-11-18, debug).** `a_snapshot_exported_as_its_archive_carries_every_file_and_entry`
+  passes in 0.80 s. It exports a snapshot of a small file, a 300 KiB file and an empty one in nested directories, and
+  reads back a 308,524-byte archive. That archive decodes, names the manifest the export named, and restores every
+  file's bytes, length and mode and both directories, without the write made after the snapshot. A second export
+  names the same manifest. A snapshot never taken is `NotFound` and a held name `AlreadyExists`. The wire's order test
+  holds the two appended variants, and the contract's history names 38. With the file's writing removed, it was red
+  once: an empty file where the export named 308,524 bytes.

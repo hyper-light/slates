@@ -1114,6 +1114,19 @@ pub enum RequestBody {
     /// The overlay.
     volume: VolumeId,
   },
+  /// Export a snapshot as an archive (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-441): a new volume `name` holding one
+  /// file, [`ARCHIVE_FILE`], the snapshot's content-addressed archive, which a caller reads a page at a time
+  /// (`ReadRange`) and keeps wherever it keeps bytes. The reply waits for the export, which walks the snapshot in
+  /// slices on the volume's owner shard, the snapshot pinned until its archive is written. `read` on the volume is
+  /// required. Appended.
+  ArchiveExport {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot exported.
+    snapshot: SnapshotId,
+    /// The archive volume's name.
+    name: String,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1134,6 +1147,10 @@ pub enum EditBytes {
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
 pub const IMAGE_FILE: &str = "image.ext2";
+
+/// Format: the name of the archive file in an archive volume's root (`ArchiveExport`, A-441): the snapshot's archive in
+/// the format of `slates_archive` (§4.11), its own magic and version inside.
+pub const ARCHIVE_FILE: &str = "snapshot.slatesarchive";
 
 /// What an image merge did (§4.6, A-160), counted.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1869,7 +1886,8 @@ impl RequestBody {
       | RequestBody::DetachOf { volume, .. }
       | RequestBody::RemoteReap { volume, .. }
       | RequestBody::Move { volume, .. }
-      | RequestBody::CaptureBase { volume } => Some(*volume),
+      | RequestBody::CaptureBase { volume }
+      | RequestBody::ArchiveExport { volume, .. } => Some(*volume),
     }
   }
 
@@ -4721,6 +4739,16 @@ pub enum ReplyBody {
   BaseCaptured {
     /// The snapshot.
     snapshot: SnapshotId,
+  },
+  /// A snapshot was exported as an archive (`ArchiveExport`, A-441). Appended.
+  ArchiveExported {
+    /// The archive volume, whose root holds [`ARCHIVE_FILE`].
+    id: VolumeId,
+    /// The archive file's length in bytes.
+    archive_bytes: u64,
+    /// The archive's manifest identity: the BLAKE3 Merkle root of the snapshot's tree (D-17), the same for the same
+    /// tree wherever it is exported.
+    manifest: [u8; 32],
   },
 }
 
