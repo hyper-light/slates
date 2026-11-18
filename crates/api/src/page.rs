@@ -44,11 +44,7 @@ impl Instance {
   pub fn grants_page(&mut self, after: Option<u64>) -> Result<Page<GrantRecord, u64>, Error> {
     let page = self.client.grants_page(after).map_err(|e| self.error(e))?;
     Ok(Page {
-      items: page
-        .items
-        .into_iter()
-        .map(grant_of)
-        .collect::<Result<_, _>>()?,
+      items: page.items.into_iter().map(grant_of).collect(),
       next: page.next,
     })
   }
@@ -60,11 +56,7 @@ impl Instance {
   pub fn audit_page(&mut self, since: u64) -> Result<Page<AuditRecord, u64>, Error> {
     let page = self.client.audit_page(since).map_err(|e| self.error(e))?;
     Ok(Page {
-      items: page
-        .items
-        .into_iter()
-        .map(audit_of)
-        .collect::<Result<_, _>>()?,
+      items: page.items.into_iter().map(audit_of).collect(),
       next: page.next,
     })
   }
