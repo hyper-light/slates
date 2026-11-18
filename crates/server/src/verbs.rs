@@ -2615,6 +2615,11 @@ fn run_recorded(
   principal: &Principal,
   body: RequestBody,
 ) -> Option<ReplyBody> {
+  // A verb whose reply could be held for durability meets the held replies' bound before it runs, never after its
+  // effects commit (A-200; `live_ship::refuse_over_bound`).
+  if let Some(refusal) = crate::live_ship::refuse_over_bound(state, &body) {
+    return Some(refusal);
+  }
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
@@ -2696,7 +2701,8 @@ fn run_recorded(
   if let Some(destroy_target) = destroy_target
     && !matches!(reply, ReplyBody::Refused { .. })
   {
-    return crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+    crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+    return None;
   }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
@@ -13129,8 +13135,10 @@ fn restore_held_image(
     )
   });
   match recovered_hold {
-    Ok(hold) => {
+    Ok(mut hold) => {
       rebuilt.replicas = hold.manifest_count();
+      // The image it was rebuilt from carries every piece of it, so no change is owed to the next publication (A-376).
+      hold.clear_changes();
       state.held_content = hold;
     }
     Err(e) => {

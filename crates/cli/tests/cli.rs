@@ -7574,7 +7574,7 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
     .output()
     .unwrap();
   let report: serde_json::Value = serde_json::from_slice(&check.stdout)
-    .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {:?}", check));
+    .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {check:?}"));
   let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
   match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
     Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),

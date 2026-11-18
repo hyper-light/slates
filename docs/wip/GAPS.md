@@ -2595,6 +2595,16 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-376): every version re-published the whole content hold.** The content hold's image was
+> one piece (A-270), every chunk, manifest and stage a holder keeps, recomputed at every publication and re-put whenever
+> it changed, which at `f > 0` is every version of a green: after A-372 about a tenth of a holder's time at 1,000
+> versions (`sample`, Mac Studio, debug), and deltas big enough that the journal checkpointed about as often as it
+> logged. Now the hold is a piece per chunk, per held manifest and per stage, it notes each piece it changes, and a delta
+> carries those (image version 30). Test: `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold`
+> (`daemon.rs`): on main's code a put's delta grew 158 bytes a put, now one size. With A-367, A-372 and this, the
+> late-submit test's late median at 300 versions is 2.28 to 2.37 ms against early 2.31 to 2.49, and at 1,000 versions
+> 3.76 against 6.00 (kiln r3543, Mac Studio, debug): no growth with a green's history left at `f = 1` on the commit path.
+>
 > **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
 > retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the
 > object, each by decoding the ledger position at its placed sequence (`content_retention::retain_object`), so a green's
@@ -3049,6 +3059,20 @@
 > - ~~**Owed:** the five-arm A/B with every worker count fixed at build time and no probe~~ **done 2026-11-07**
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
+
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
+> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
+> which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
+> directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
+> supervisor. A recorded verb now meets the bound before it runs (`live_ship::refuse_over_bound` in
+> `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`).
+> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
+>   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
+>   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
+>   such a reply from the task's start, refused `Overloaded` before the task runs.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
@@ -3592,7 +3616,11 @@
 >   could not run and no draft was made). A-223 had imported three kernel32 functions that Nano Server's kernel32
 >   lacks (`EnableThreadProfiling`, `ReadThreadProfilingData`, `DisableThreadProfiling`). `slates-machine` now finds
 >   them at run time, and where they are missing the switch count is unknown, as when the OS refuses the profiling.
->   Only the release lane runs the Nano Server check, so no push to main showed it. Record:
+>   Only the release lane ran the Nano Server check, so no push to main showed it. Since the same day CI's Windows lane
+>   starts its debug binary there on every push (the Visual C++ runtime's DLLs beside it), through the action
+>   release.yml uses too (`.github/actions/nano-server-start`), which also starts Docker's engine when a runner left
+>   it stopped (1 of 11 `windows-2025` runners sampled; it failed the tag `v0.1.0`'s first Windows x86_64 build). It
+>   refused main before the fix with 0xC0000139 and adds 21 s to the lane (run 44354728411). Record:
 >   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
