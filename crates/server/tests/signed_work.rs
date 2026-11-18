@@ -507,10 +507,12 @@ fn a_signed_merge_off_its_greens_shard_is_judged_there() {
   daemon.stop();
 }
 
-/// A-321, provenance is durable: do merge a signed work and an unsigned one, restart the daemon over the same segment,
-/// and read both versions' merge records back. Expect the verdicts as they were judged before the restart — the signed
-/// version verified naming its key, the other unsigned — never judged again: the first version's entry was folded into
-/// a checkpoint before the restart (each work moved past it), so its verdict comes back from the checkpoint.
+/// A-321, provenance is durable on both of its records. Do: with a lagging work holding the green's floor at 0, merge a
+/// signed work and an unsigned one, and restart the daemon over the same segment; read both versions' merge records;
+/// destroy the lagging work, so a checkpoint folds both versions' chain entries, restart again and read them again.
+/// Expect, after each restart, the verdicts as they were judged — the signed version verified naming its key, the other
+/// unsigned — never judged again: after the first from the chain entries replayed (no checkpoint was taken), after the
+/// second from the checkpoint that folded them; and the signer set kept at its version.
 #[test]
 fn a_merges_verdict_survives_a_daemon_restart() {
   let instance = format!("signed-restart-{}", std::process::id());
@@ -528,12 +530,13 @@ fn a_merges_verdict_survives_a_daemon_restart() {
   )
   .unwrap();
   segment.publish_launcher_secret(&LAUNCHER).unwrap();
-  let rendezvous = HeldRendezvous::hold(&config.instance).unwrap();
-  let first = start_over(&config, (&segment, &rendezvous));
+  let anchor = (&segment, &HeldRendezvous::hold(&config.instance).unwrap());
+  let first = start_over(&config, anchor);
   let mut client = connect(&instance);
   let green = client.create_green("kept-green", false).unwrap();
   let key = TestSigner::fresh();
   trust(&mut client, &LAUNCHER, green, &[&key]);
+  let (laggard, _) = client.create_work(green, "laggard").unwrap();
   let signed_work = work_with(&mut client, green, "signed", b"signed before the restart");
   let signature = signed(&mut client, signed_work, &key);
   assert_eq!(
@@ -549,32 +552,48 @@ fn a_merges_verdict_survives_a_daemon_restart() {
     b"unsigned before the restart",
   );
   assert_eq!(client.submit(unsigned).unwrap(), Submitted::Accepted(2));
-  assert!(
-    counter(&first, "merge.checkpoint.taken") > 0,
-    "the signed version was folded into a checkpoint before the restart"
+  assert_eq!(
+    counter(&first, "merge.checkpoint.taken"),
+    0,
+    "the lagging work held every version in the chain"
   );
   drop(client);
   first.stop();
-  let second = start_over(&config, (&segment, &rendezvous));
+  let second = start_over(&config, anchor);
   let mut client = connect(&instance);
-  assert_eq!(
-    client.merge_record(green, 1).unwrap().verification,
-    signer_of(&key)
-  );
-  assert_eq!(
-    client.merge_record(green, 2).unwrap().verification,
-    Verification::Unsigned
-  );
-  assert_eq!(
-    client
-      .policy(PolicySubject::Volume { volume: green })
-      .unwrap()
-      .1,
-    1,
-    "the signer set survived too, at its version"
+  expect_the_verdicts_kept(&mut client, green, &key, "from the replayed chain entries");
+  client.destroy(laggard).unwrap();
+  assert!(
+    counter(&second, "merge.checkpoint.taken") > 0,
+    "the floor rose past both versions, and a checkpoint folded them"
   );
   drop(client);
   second.stop();
+  let third = start_over(&config, anchor);
+  let mut client = connect(&instance);
+  expect_the_verdicts_kept(&mut client, green, &key, "from the checkpoint");
+  drop(client);
+  third.stop();
+}
+
+/// The reads of `a_merges_verdict_survives_a_daemon_restart` after a restart: version 1 verified naming `key`, version
+/// 2 unsigned, and the green's signer set at version 1, each read `from` where the test says.
+fn expect_the_verdicts_kept(client: &mut Client, green: VolumeId, key: &TestSigner, from: &str) {
+  assert_eq!(
+    client.merge_record(green, 1).unwrap().verification,
+    signer_of(key),
+    "version 1, {from}"
+  );
+  assert_eq!(
+    client.merge_record(green, 2).unwrap().verification,
+    Verification::Unsigned,
+    "version 2, {from}"
+  );
+  assert_eq!(
+    client.signers(green).unwrap(),
+    (vec![key.public()], 1),
+    "the signer set at its version"
+  );
 }
 
 /// A daemon over the segment and rendezvous the test holds as its anchor, its local consensus group made if it has
