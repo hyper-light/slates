@@ -4516,6 +4516,17 @@
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
 
+> **A root learner behind its asker's root refused every location round: fixed (2026-11-18, A-489, §4.8 Lookup).** The
+> same test failed 2 of 3 on main's quiet Mac Studio (main 3022c6894 and 2a5bf7264) with `OwnerUnreachable`. The
+> successor, a root learner, counted `root_view_differs` once for each of the foreign voter's 58 and 68 rounds until the
+> lookup's budget ran out. A seat change moves the root's version (A-406) and nothing a learner compared, so a learner
+> that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
+> learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
+> fleet test's runs are filed for main. **Open:** the converse. An asker behind its peers' root is refused with an empty
+> reply that tells it nothing, so it needs a refusal that names the peer's version: a reply format change (SLATES_DESIGN
+> A-489, owed). Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
 > one slab, and a page that empties goes back for any class (`crates/vfs/src/dirblocks.rs`). AC-1.5 at 10^6 files is

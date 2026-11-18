@@ -1915,8 +1915,12 @@ async fn serve_peer_records(
           }
           crate::owner_location::STREAM => {
             injected_serve_delay().await;
-            state::with_state(
-              |state| match crate::owner_location::serve(state, &request) {
+            state::with_state(|state| {
+              let peer_host = state
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host);
+              match crate::owner_location::serve(state, peer_host, &request) {
                 Ok((reply, declined)) => {
                   if let Some(declined) = declined {
                     state.count(declined, 1);
@@ -1927,8 +1931,8 @@ async fn serve_peer_records(
                   state.count(error.counter(), 1);
                   Vec::new()
                 }
-              },
-            )
+              }
+            })
             .unwrap_or_default()
           }
           _ => Vec::new(),
@@ -9225,7 +9229,9 @@ fn alive_regions(state: &ShardState) -> Vec<RegionId> {
 /// reactively (§4.8, D-14), the cross-region parallel of [`membership_diverges_from_config`]. Compared as
 /// sets over [`alive_regions`] and the root configuration's regions; equal in steady state, so a converged
 /// learner fetches nothing. (This rests on the all-to-all mesh, where a node's SWIM sees every region's
-/// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM.)
+/// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM. One
+/// version-carrying signal exists: a location query bound to a newer root than this node holds, [`root_learner_fetch`],
+/// A-489, since a seat change moves the version and neither comparison here.)
 /// A root voter it knows that its membership no longer holds alive is the same signal for the voters (A-406): the
 /// group has replaced it or will, and the configuration records who votes once it has, while a region whose
 /// representative died stays in the regions and moves nothing the first comparison sees.
@@ -9296,29 +9302,15 @@ async fn drive_root_group(
     // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
     // reactively, only when its own alive view of the regions, or of the root voters it knows, diverges from the
     // root configuration it holds ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel
-    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406).
+    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406), and a peer whose
+    // location query showed it a newer root (A-489, [`root_learner_fetch`]).
     // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
     let now = futures::now_ns();
-    let wanted = state::with_state(|s| {
-      if s.recovery.root.is_some() {
-        s.root_learner_pace.reset();
-        true
-      } else if !s.root.initialized() {
-        let due = s.root_learner_pace.due(now);
-        if !due {
-          s.count(LEARNER_FETCH_PACED, 1);
-        }
-        due
-      } else {
-        s.root_learner_pace.reset();
-        root_diverges(s)
-      }
-    })
-    .unwrap_or(false);
+    let fetch = state::with_state(|s| root_learner_fetch(s, now)).unwrap_or(RootLearnerFetch::Idle);
 
-    if wanted {
+    if let RootLearnerFetch::Due { shown_by } = fetch {
       let known = state::with_state(|s| s.root.known_voters()).unwrap_or_else(|| voters.clone());
-      let targets = root_learner_targets(&known, local);
+      let targets = with_shown_peer(root_learner_targets(&known, local), shown_by, local);
       drive_root_learner_fetch(&targets, budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         let still = !s.root.initialized();
@@ -9490,6 +9482,74 @@ async fn drive_root_election(
   };
   // Phase two — the real vote round over the same sessions.
   drive_vote_round(Group::Root, vote, sessions, budget, in_flight).await;
+}
+
+/// What a root learner does this period ([`root_learner_fetch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootLearnerFetch {
+  /// No fetch.
+  Idle,
+  /// A fetch from the voters it knows ([`root_learner_targets`]) and, when a peer's location query showed it a newer
+  /// root (A-489), from that peer too, which holds it.
+  Due {
+    /// The peer that showed this node a newer root than it holds, if one did since its last fetch.
+    shown_by: Option<HostId>,
+  },
+}
+
+/// Whether this root learner fetches the committed root configuration this period (§4.8, D-14), on the control shard:
+/// recovery fetches at once; an uninitialized root paces its fetches; an initialized one fetches when its view of the
+/// regions or of the voters it knows differs from the root it holds ([`root_diverges`]), or when a peer showed it a newer
+/// root than it holds ([`ShardState::root_newer_seen`], taken here). Before A-489 the last was missing: a seat change
+/// moves the root's version and nothing a learner compares (A-406), so a learner left behind at formation never fetched,
+/// and refused every location round a peer on the newer root asked (`RootViewDiffers`), for the lookup's whole budget.
+pub(crate) fn root_learner_fetch(state: &mut ShardState, now: u64) -> RootLearnerFetch {
+  let held = state.root.configuration().version;
+  let shown = state
+    .root_newer_seen
+    .filter(|(version, _)| *version > held)
+    .map(|(_, peer)| peer);
+  let due = if state.recovery.root.is_some() {
+    state.root_learner_pace.reset();
+    true
+  } else if !state.root.initialized() {
+    let due = state.root_learner_pace.due(now);
+    if !due {
+      state.count(LEARNER_FETCH_PACED, 1);
+    }
+    due
+  } else {
+    state.root_learner_pace.reset();
+    root_diverges(state) || shown.is_some()
+  };
+  if due || shown.is_none() {
+    // Taken by this fetch, or already reached: a version this node holds now needs nothing more.
+    state.root_newer_seen = None;
+  }
+  if due {
+    RootLearnerFetch::Due { shown_by: shown }
+  } else {
+    RootLearnerFetch::Idle
+  }
+}
+
+/// The hosts a root learner's fetch asks: `targets` ([`root_learner_targets`]) and `shown_by`, the peer that showed it a
+/// newer root (A-489), since the voters it knows can be as far behind as it is. An empty `targets` asks every session
+/// the learner holds ([`drive_root_learner_fetch`]), the shown peer's among them, so it stays empty; this node is never
+/// asked.
+fn with_shown_peer(
+  mut targets: Vec<HostId>,
+  shown_by: Option<HostId>,
+  local: HostId,
+) -> Vec<HostId> {
+  if let Some(peer) = shown_by
+    && peer != local
+    && !targets.is_empty()
+    && !targets.contains(&peer)
+  {
+    targets.push(peer);
+  }
+  targets
 }
 
 /// Whom a root learner asks for the committed root configuration: the voters it knows. The voters it last learned
@@ -12258,5 +12318,37 @@ mod tests {
         "no placement was fanned"
       );
     });
+  }
+}
+
+#[cfg(test)]
+mod root_learner_tests {
+  use super::{HostId, with_shown_peer};
+
+  /// A-489 (§4.8, D-14 root learners): a root learner's fetch asks the peer that showed it a newer root beside the voters
+  /// it knows, since those can be as far behind as it is. Do: add a shown peer to a list of one known voter, to a list
+  /// already naming it, to an empty list, and add this node itself; and add no peer. Expect: the voter and the peer; the
+  /// list unchanged (never asked twice); the empty list kept empty, which asks every session the learner holds, the
+  /// peer's among them; this node never asked; the list unchanged.
+  #[test]
+  fn a_root_learners_fetch_asks_the_peer_that_showed_it_a_newer_root() {
+    let (voter, peer, local) = (HostId(1), HostId(2), HostId(3));
+    assert_eq!(
+      with_shown_peer(vec![voter], Some(peer), local),
+      vec![voter, peer]
+    );
+    assert_eq!(
+      with_shown_peer(vec![voter, peer], Some(peer), local),
+      vec![voter, peer]
+    );
+    assert_eq!(
+      with_shown_peer(Vec::new(), Some(peer), local),
+      Vec::<HostId>::new()
+    );
+    assert_eq!(
+      with_shown_peer(vec![voter], Some(local), local),
+      vec![voter]
+    );
+    assert_eq!(with_shown_peer(vec![voter], None, local), vec![voter]);
   }
 }

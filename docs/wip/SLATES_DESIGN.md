@@ -5718,7 +5718,10 @@ The root configuration records the root group's voters the same way (A-406: `Roo
 `RootConfiguration::seat`, recorded by the root leader once no change is in flight), so a root learner asks and keeps
 contact with the root voters its configuration names, not its join's. A root learner fetches when its alive view of the
 regions differs from the configuration's, and also when a root voter it knows is no longer alive: a region whose
-representative died stays a region, so only the voters show it.
+representative died stays a region, so only the voters show it. It fetches as well when a peer's location query is bound
+to a newer root version than the one it holds (A-489), and asks that peer beside the voters it knows
+(`fleet::root_learner_fetch`). A seat change moves the root's version and neither of the other two signals, so a learner
+that missed it at formation kept its older root and refused every location round a peer on the newer root asked.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -6679,6 +6682,18 @@ version.
 >   (AC-8.14: "after one stable configuration change a stale lookup refreshes once").
 > - Regressions: `a_node_whose_placement_lags_its_council_still_claims_what_it_owns`,
 >   `a_peer_that_is_not_the_owner_never_takes_away_a_claim`.
+>
+> **Status (2026-11-18, A-489).** "Replies bind the root version" refused the owner for a lookup's whole budget when the
+> owner was a root learner behind the asker's root. A seat change moves the root's version (A-406), and a learner fetched
+> only when its regions or its known voters looked wrong, so one that missed the change at formation never caught up.
+> Main's quiet Mac Studio runs failed 2 of 3 with `OwnerUnreachable`: the successor counted `root_view_differs` once for
+> each of the foreign voter's 58 and 68 rounds. The binding stands: a query under another root view is refused. A query
+> bound to a newer view than the peer holds now also tells the peer that it is behind and that the asker holds the newer
+> root, so the peer's root learner fetches from the asker at its next period. The asker looks again every poll interval,
+> and that look is answered. Counted `fleet.owner_location.root_behind`. Regression:
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. Owed: the converse. An asker
+> behind its peers' root learns nothing from their refusal, which is an empty reply, so its rounds are refused until its
+> own learner fetches for another reason (A-489's owed item).
 
 > **A forward waits for the owner's session (2026-09-25).** A forward took the owner's record session once
 > and, when a coordinator dispatch or a discovery page had it out, refused the client `HomedElsewhere` at
@@ -32537,6 +32552,41 @@ record `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its
 Applied in the same change to: A-435's entry (its owed item done), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, its
 owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-after-its-answer-was-lost.md`,
 `crates/server/src/{state,verbs,moves}.rs`.
+
+### A-489 — A location query bound to a newer root than its peer holds sends the peer's root learner to fetch from the asker (2026-11-18, g229, UI goal 85 bug 4; §4.8 "Lookup" and learners, D-14; A-406)
+- **What was there.** A location query is bound to its asker's root version, and a peer under another root view refuses
+  it (`RootViewDiffers`, an empty reply). A root learner fetched the root only when its alive regions or the voters it
+  knew differed from the root it held (`fleet::root_diverges`). A seat change moves the root's version (A-406) and neither
+  signal, so a learner whose last fetch at formation came before it held its older root indefinitely. Representatives
+  are the lowest host id of each region, so the death of an owner that is none changes no voter either.
+- **What failed.** `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` (crates/server/tests/fleet.rs),
+  2 of 3 on main's quiet Mac Studio (main 3022c6894 and 2a5bf7264), `OwnerUnreachable { region: 0 }`. The foreign node is
+  region 1's only member, so a root voter on the newest root. Each of its rounds was refused by two of the three survivors
+  and answered "not mine" by region 0's representative. The successor, a root learner, counted `root_view_differs` 58 and
+  68 times, once a round, until the lookup's budget ran out (the foreign node's `budget_spent` 1, `gave_up` 1).
+- **The rule.** The binding stands. A query bound to a newer view than the peer holds also tells the peer that it is
+  behind and that the asker holds the newer root (`owner_location::serve`, which now takes the asker, and
+  `note_newer_root`: the newest such version and its asker, `ShardState::root_newer_seen`, counted
+  `fleet.owner_location.root_behind`). The root learner's next period fetches, from the voters it knows and from that
+  asker (`fleet::root_learner_fetch`, `with_shown_peer`), and takes the record. The asker looks again every poll interval
+  for its lookup's budget (`verbs::locate_within_horizon`), and the look after the learner adopts is answered. A learner
+  fetches for this only after a query showed it a newer root, at most once a period however many did.
+- **Why this and not another.** Learners fetching every period would cost a fetch a period on every learner forever, which
+  A-406 declined. Binding the reply to a homes-only version would leave the learner on a stale root for everything else
+  the root records. The query already carries the version, so it is the signal `root_diverges` called owed ("a
+  version-carrying signal").
+- **Owed.** The converse direction. An asker that is a root learner behind its peers is refused by them with an empty
+  reply, which tells it nothing, so its rounds fail until its own learner fetches for another reason. A refusal that
+  names the peer's root version, or a reply under the peer's own view, would let it fetch: a reply format change.
+- **Tests.** `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`
+  (`crates/server/src/owner_location.rs`, on a shard: the older and the newer views refused and its own served, three
+  newer views counted; no fetch from a shown peer before the queries, a fetch from the one that showed the newest after
+  them, none at the next period), and `a_root_learners_fetch_asks_the_peer_that_showed_it_a_newer_root`
+  (`crates/server/src/fleet.rs`). The fleet test is filed for main.
+
+Applied in the same change to: §4.8 "Lookup" (the owner location status) and learners, GAPS (the location test's
+entry), `crates/server/src/{owner_location,fleet,state,daemon}.rs`, and the bug record
+`docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 ### A-492 — The socket route waits on what it waits for: an offer while its client lives, an exchange while its client's connection does (2026-11-19, g232; UI goal 86, R3's class C, C-c part 1; §4.6 the Shards route, A-161, A-173, A-440)
 
