@@ -1086,8 +1086,9 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
 
 /// The stream a *ledger* phase-one prepare rides on a holder connection — distinct from every other RPC kind on
 /// the connection, so a holder serving several tells them apart.
-/// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives.
-const LEDGER_PROMOTE_STREAM: u64 = 3;
+/// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives. Public so the
+/// daemon's check that every kind on its record session is its own lists it.
+pub const LEDGER_PROMOTE_STREAM: u64 = 3;
 
 /// A confirmed ledger promotion: the holders that promised, and the log the new owner adopts — per
 /// position, the identity carried under the highest epoch across the phase-one quorum ([`ledger::adopt`]).

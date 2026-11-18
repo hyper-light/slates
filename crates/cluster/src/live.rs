@@ -34,8 +34,10 @@ pub const LIVE_STATE_STREAM: u64 = 23;
 /// The request kind a batch of entries rides (`slates_db::live::encode_batch`, A-200 amended 2026-11-17): the entries a
 /// holder lacks in one exchange. Its sender holds a batch to the session's congestion window, so it rides the `Control`
 /// class with single entries without holding that class longer than a round of the window.
-/// Format: as [`LIVE_ENTRY_STREAM`]; the next kind after the fleet's death reports (24).
-pub const LIVE_ENTRIES_STREAM: u64 = 25;
+/// Format: as [`LIVE_ENTRY_STREAM`]; the next kind after a work route's question (25, A-288), which took 25 while this
+/// kind was on its branch claiming it too: the record session dispatches by kind, so every batch went to the route's
+/// handler, was answered with nothing, and was sent again at once, about 500 batches a second (2026-11-17).
+pub const LIVE_ENTRIES_STREAM: u64 = 26;
 
 /// What one dispatch left: the sessions that answered, for the next write, and those still in flight.
 pub struct Shipped {

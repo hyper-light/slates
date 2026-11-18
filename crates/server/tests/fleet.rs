@@ -9915,6 +9915,8 @@ const LIVE_APPENDED: &str = "fleet.live.appended";
 const LIVE_BATCHES: &str = "fleet.live.batches";
 /// Format: the owner's count of entries those batches carried.
 const LIVE_BATCHED: &str = "fleet.live.batched";
+/// Format: a holder's count of live entries it took into its copy (`live_ship::LIVE_HELD`), alone or in a batch.
+const LIVE_HELD: &str = "fleet.live.held";
 
 /// A write attachment of `volume` through `client`.
 fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
@@ -10126,6 +10128,8 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
     .map(|kind| refusal_count(daemon, kind).unwrap())
   };
   let before = counts(&daemons[0]);
+  let taken = |daemon: &Daemon| refusal_count(daemon, LIVE_HELD).unwrap();
+  let taken_before = [taken(&daemons[1]), taken(&daemons[2])];
   let writers: Vec<(Client, u64)> = (0..BURST_WRITERS)
     .map(|_| {
       let mut writer = Client::connect(&owner);
@@ -10175,12 +10179,26 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   });
   let held: Vec<_> = holds.into_iter().map(|hold| hold.answer()).collect();
   let after = counts(&daemons[0]);
+  // The holders' takes are counted as each answers, after the writes it made durable were answered: polled.
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut taken_after = taken_before;
+  let burst = u64::try_from(BURST_WRITERS).unwrap();
+  let all_taken = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    taken_after = [taken(&daemons[1]), taken(&daemons[2])];
+    Ok(
+      taken_after
+        .iter()
+        .zip(taken_before)
+        .all(|(after, before)| after.saturating_sub(before) >= burst),
+    )
+  });
+  drop(observed);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
     "burst: whole, no-credit, appended, batches, batched before {before:?} after {after:?}; deepest in flight \
-     {deepest}; holds {held:?}"
+     {deepest}; holds {held:?}; holders took {taken_before:?} -> {taken_after:?}"
   );
   assert!(
     replies
@@ -10211,6 +10229,10 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   assert!(
     batches > 0 && batched > batches,
     "the entries the held holders lacked went as batches, several an exchange ({batches} batches, {batched} entries)"
+  );
+  assert!(
+    all_taken,
+    "each holder took every entry of the burst: {taken_before:?} -> {taken_after:?}"
   );
 }
 

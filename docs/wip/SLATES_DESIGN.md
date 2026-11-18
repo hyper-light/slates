@@ -15643,15 +15643,18 @@ each entry in its own exchange and waited for the answer before the next (`live_
 burst piled up behind a lane's first reached the holder one round trip each, and a holder back from a stall caught up on
 the retained tail a round trip an entry (two hundred entries over an 80 ms path is 16 s). With the credit in bytes a
 burst's entries are all in flight at once, so the lane now sends the entries of one volume that follow each other as one
-message (`slates_db::live::encode_batch`, `decode_batch`; request kind 25, `LIVE_ENTRIES_STREAM`, the `Control` class)
+message (`slates_db::live::encode_batch`, `decode_batch`; request kind 26, `LIVE_ENTRIES_STREAM`, the `Control` class)
 while it fits the session's congestion window (`live_ship::take_batch`, derived: one window, the bytes the session may
 have in flight a round trip, RFC 9002 §7, so a batch never holds the class past a round of it; the first entry always
 goes). The holder applies a batch's entries in order exactly as it applies one (`live_ship::serve_entries`: checked,
 kept and committed each, stopping at the first gap, fence or bound) and answers once with the head it reached, which the
 owner folds as any answer. Nothing a holder accepts changes, so the register invariants rest on the same per-entry
 rules; a batch is refused whole when its header and an entry disagree (`decode_batch`). Every node of a fleet runs one
-build: a holder that does not know kind 25 answers nothing a batch can be acknowledged by, and no fallback to single
-entries is kept (CLAUDE.md §2 item 7).
+build: a holder that does not know kind 26 answers nothing a batch can be acknowledged by, and no fallback to single
+entries is kept (CLAUDE.md §2 item 7). The kind was 25 on its branch until A-288's work routes took 25 on main the same
+day: merged, every batch reached the route's handler, was answered with nothing and was sent again at once (about 500
+a second), and the holders took none of a burst; every kind on a fleet connection is now held distinct by a test
+(`fleet::request_kind_tests`; `docs/bugs/2026-11-17-live-batches-shared-the-work-routes-request-kind.md`).
 **Applied in the same change to:** `crates/db/src/live.rs` (the batch codec), `crates/cluster/src/live.rs`
 (`LIVE_ENTRIES_STREAM`, `serve_entries`), `crates/server/src/{live_ship,fleet}.rs` (`take_batch`, `serve_entries`, the
 serve arm), the tests (`crates/db/tests/live.rs` hostile batches; `crates/cluster/tests/live.rs` a batch durable in one

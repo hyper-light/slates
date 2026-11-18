@@ -131,7 +131,8 @@
 >   bytes shipped, and the write's p50/p99/p999 (`fleet.live.whole`, `fleet.live.refused.no_credit`).
 > - **Fixed the same day:** a lane shipped a holder's entries one exchange at a time (`live_ship::ship_lane`), so a burst
 >   of `n` entries reached a holder in `n` round trips; the entries a holder lacks now go as one batch a congestion
->   window (`take_batch`, `serve_entries`, request kind 25; A-200's second amendment of 2026-11-17). Owed (measurement):
+>   window (`take_batch`, `serve_entries`, request kind 26; A-200's second amendment of 2026-11-17; 25 collided with
+>   A-288's work route on merge, caught and fixed the same day, every fleet request kind now held distinct by a test). Owed (measurement):
 >   a stalled holder's catch-up time and a burst's last-write latency, before and after, on a WAN-shaped path.
 
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
