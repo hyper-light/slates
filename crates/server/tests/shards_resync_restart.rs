@@ -35,6 +35,9 @@ const WAIT: Duration = Duration::from_secs(20);
 const LOOKUP: u32 = 1;
 const READ: u32 = 15;
 const WRITE: u32 = 16;
+const SETXATTR: u32 = 21;
+const GETXATTR: u32 = 22;
+const INIT: u32 = 26;
 const CREATE: u32 = 35;
 /// Format: a FUSE request's in-header, and the reply's out-header (length, errno, unique).
 const IN_HEADER_LEN: usize = 40;
@@ -44,6 +47,13 @@ const CREATE_EXCLUSIVE: u32 = 0o302;
 const FILE_MODE: u32 = 0o100_644;
 /// Format: Linux's `EEXIST`.
 const EEXIST: i32 = 17;
+/// Format: `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT` in `fuse_init_in.flags` (`include/uapi/linux/fuse.h`), which a Linux
+/// guest's kernel offers; and where the anchor's session of a stream keeps its form (past the token and the owner
+/// view's four words), with the form's bit for the extended SETXATTR (A-378).
+const INIT_POSIX_ACL: u32 = 1 << 20;
+const INIT_SETXATTR_EXT: u32 = 1 << 29;
+const SESSION_FORM_AT: usize = slates_bridge_fuse::shards_resync::TOKEN_BYTES + 16;
+const FORM_SETXATTR_EXT: u64 = 1;
 /// The bytes the second stream writes after the last publication before the death.
 const WRITTEN: &[u8] = b"acknowledged after the last publication";
 /// Shape: how long the successor's `Resync`s wait in the devices' channels while another thread opens and closes
@@ -335,6 +345,58 @@ fn create_unanswered_then_write(
   (data, fh)
 }
 
+/// Before the death, A-378: `writer`'s kernel sends the INIT a Linux guest's sends, offering `FUSE_POSIX_ACL` and
+/// `FUSE_SETXATTR_EXT`; it is answered, and the anchor told a session for `hold`'s attachment keeping the extended form,
+/// which becomes the session the anchor hands the successor.
+fn init_in_the_extended_form(anchor: &OwnedFd, writer: &mut Guest, hold: &mut Hold) {
+  let mut init = Vec::new();
+  for word in [7u32, 41, 128 << 10, INIT_POSIX_ACL | INIT_SETXATTR_EXT] {
+    init.extend_from_slice(&word.to_le_bytes());
+  }
+  let (errno, _, _) = writer.ask(&request(INIT, 10, 0, &init));
+  assert_eq!(errno, 0, "the guest's INIT is answered");
+  let Incoming::Session {
+    attachment,
+    session,
+  } = next_held(anchor)
+  else {
+    panic!("the INIT told the anchor no session");
+  };
+  assert_eq!(attachment, hold.attachment);
+  let form = u64::from_le_bytes(
+    session[SESSION_FORM_AT..SESSION_FORM_AT + 8]
+      .try_into()
+      .unwrap(),
+  );
+  assert_eq!(
+    form, FORM_SETXATTR_EXT,
+    "the session keeps the extended form"
+  );
+  hold.session = session;
+}
+
+/// After the death, A-378: the successor parses `writer`'s SETXATTR in the extended form its kernel took before the
+/// death (the size, the flags, the setter's flags and a pad before the name), which no INIT on the fresh stream repeats:
+/// a user attribute set on `data` that way is served and read back.
+fn the_successor_parses_the_extended_form(writer: &mut Guest, data: u64) {
+  let value = b"set in the extended form";
+  let mut set = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  set.extend_from_slice(&[0u8; 12]);
+  set.extend_from_slice(b"user.form\0");
+  set.extend_from_slice(value);
+  let (errno, _, _) = writer.ask(&request(SETXATTR, 14, data, &set));
+  assert_eq!(errno, 0, "the extended SETXATTR is served after the resync");
+  let mut get = 64u32.to_le_bytes().to_vec();
+  get.extend_from_slice(&0u32.to_le_bytes());
+  get.extend_from_slice(b"user.form\0");
+  let (errno, _, read) = writer.ask(&request(GETXATTR, 15, data, &get));
+  assert_eq!(
+    (errno, read.as_slice()),
+    (0, &value[..]),
+    "its name and value were found past the extended head"
+  );
+}
+
 /// After the death: each device's resync end (the first of each pair) brings a `Resync` naming its attachment and the
 /// token its `Attached` (the second) named, with one descriptor, the end of the fresh stream it is served on, live (a
 /// flush in flight zeroes its receive buffer, A-339). Returns each fresh end, in the pairs' order.
@@ -435,18 +497,20 @@ fn answered_once_and_kept(
   );
 }
 
-/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too). Do: as the anchor, hand a daemon
-/// the hold channel; attach a volume three times in the Shards form; create a file and open it on the second stream;
-/// withhold the daemon's replies and send an exclusive CREATE on the first stream, whose barrier publishes it with its
-/// reply; then write on the second stream, acknowledged after that last publication; kill the daemon (a fenced stop: no
-/// record ended, no hold released); start a second daemon over the same segment with the held ends handed back, while
-/// another thread opens and closes sockets and the devices leave their `Resync`s unread for a while; then the third
-/// device goes without a byte on its fresh stream. Expect each device to be handed a fresh stream in a `Resync` that
-/// names its attachment and the token its `Attached` named, with one descriptor, live; the resent CREATE answered with
-/// success under its unique, from the published reply (a second application would answer `EEXIST`), counted as
-/// replayed; the acknowledged write read back on the second stream (the write log); the file there once, a new
-/// exclusive CREATE of it refused `EEXIST`; each writing device counted as having taken its fresh end; and the third
-/// attachment ended, its hold released, counted as abandoned.
+/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too), A-378. Do: as the anchor, hand
+/// a daemon the hold channel; attach a volume three times in the Shards form; the second stream's kernel sends an INIT
+/// taking the extended SETXATTR form; create a file and open it on the second stream; withhold the daemon's replies and
+/// send an exclusive CREATE on the first stream, whose barrier publishes it with its reply; then write on the second
+/// stream, acknowledged after that last publication; kill the daemon (a fenced stop: no record ended, no hold
+/// released); start a second daemon over the same segment with the held ends handed back, while another thread opens
+/// and closes sockets and the devices leave their `Resync`s unread for a while; then the third device goes without a
+/// byte on its fresh stream. Expect each device to be handed a fresh stream in a `Resync` that names its attachment and
+/// the token its `Attached` named, with one descriptor, live; the resent CREATE answered with success under its unique,
+/// from the published reply (a second application would answer `EEXIST`), counted as replayed; the acknowledged write
+/// read back on the second stream (the write log); a SETXATTR in the extended form served there and read back, parsed
+/// as before the death though no INIT repeated it; the file there once, a new exclusive CREATE of it refused `EEXIST`;
+/// each writing device counted as having taken its fresh end; and the third attachment ended, its hold released,
+/// counted as abandoned.
 #[test]
 fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once() {
   let (anchor, daemon_end) = held::channel().unwrap();
@@ -476,11 +540,12 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
       base: None,
     })
     .unwrap();
-  let [creating, writing, leaving] =
+  let [creating, mut writing, leaving] =
     [(); 3].map(|()| attach_and_hold(&mut client, volume, &anchor));
 
   let mut old_writer = Guest::over(writing.stream);
   let mut old_creator = Guest::over(creating.stream);
+  init_in_the_extended_form(&anchor, &mut old_writer, &mut writing.hold);
   let file = create_unanswered_then_write(&first, &mut old_creator, &mut old_writer);
   first.inject_consensus_failure().unwrap();
   first.stop();
@@ -498,6 +563,7 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
   ]);
   let (mut creator, mut writer) = (Guest::over(creator), Guest::over(writer));
   answered_once_and_kept(&second, &mut creator, &mut writer, file);
+  the_successor_parses_the_extended_form(&mut writer, file.0);
   a_device_gone_before_its_first_frame_ends_its_attachment(
     &second,
     &anchor,

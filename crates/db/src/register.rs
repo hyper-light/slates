@@ -230,8 +230,9 @@ pub enum RegisterError {
     /// The holder's current generation.
     current: u64,
   },
-  /// A different value offered at a ledger position that already holds one — a committed position is
-  /// never rewritten (§4.8, BUG-12).
+  /// A second value offered at a ledger position under the epoch it already holds a value at: one ballot proposes one
+  /// value a position (§4.8, BUG-12). A higher epoch's different value replaces a held one, which never committed
+  /// (A-373).
   ConflictingPosition,
 }
 
@@ -1926,9 +1927,10 @@ impl Acceptor {
   /// Accepts `record` under this holder's authority and fence, storing it before acknowledging, or
   /// refusing with a typed reason. The order is authority (a stale or foreign configuration generation, or
   /// an unauthorized owner, refuses before touching the fence), then the fence (a stale epoch refuses), then
-  /// the position (a *different* value at a position already accepted is a conflict — a committed position is
-  /// never rewritten; the *same* value re-acknowledges idempotently). On acceptance the promise is raised and
-  /// the accepted `(epoch, value)` recorded — recording the new epoch even when the value is unchanged
+  /// the position (a *different* value under the epoch the position already holds, or a lower one, is a conflict — one
+  /// ballot proposes one value a position; a higher epoch's replaces it, since a value that committed is the one every
+  /// higher epoch's phase one adopts, A-373; the *same* value re-acknowledges idempotently). On acceptance the promise
+  /// is raised and the accepted `(epoch, value)` recorded — recording the new epoch even when the value is unchanged
   /// (BUG-12) — before the [`Ack`] is returned.
   ///
   /// The configuration-generation gate is split by direction, so the sender learns *which way* it is out of
@@ -2057,8 +2059,14 @@ impl Acceptor {
       });
     }
     let position = (record.object, record.sequence);
-    if let Some((_, existing)) = self.accepted.get(&position)
+    // One ballot proposes one value a position: a second value under the epoch the position already holds is refused. A
+    // higher epoch's different value replaces the held one, as Paxos's acceptor accepts any proposal at or above its
+    // promise (the fence above refuses a lower one): the value it replaces never committed, or that epoch's phase one
+    // would have adopted it (A-373; `docs/wip/models/FencedLedger.tla`'s `Accept`, under which Agreement and
+    // Continuity hold). Refused before, a successor holding such a value could never commit the one its round adopted.
+    if let Some((held_epoch, existing)) = self.accepted.get(&position)
       && existing != &record.value
+      && *held_epoch >= record.epoch
     {
       return Err(RegisterError::ConflictingPosition);
     }
@@ -2644,7 +2652,9 @@ pub enum Lineage {
   /// of its own that completed, and a survivor confirms only once every object it learned was adopted (A-272). Positive
   /// evidence, never inferred from a retirement no longer kept (A-309). A holder that took part in that takeover holds a
   /// stale copy: its answers taught the successors every copy it held, so each was adopted
-  /// ([`RegionalConfiguration::settled_for`]); a holder outside it was never asked, and nothing shows its copy adopted.
+  /// ([`RegionalConfiguration::settled_for`]); a holder outside it was never asked, and nothing shows its copy adopted:
+  /// the completion record keeps no neighbourhood to judge the object's recovery by (A-341,
+  /// [`RegionalConfiguration::within_tolerance`]).
   Settled {
     /// The retired host whose completed takeover the line ends at.
     takeover: HostId,
@@ -2727,6 +2737,12 @@ pub struct RegionalConfiguration {
   /// ([`forget_moved`](RegionalConfiguration::forget_moved)), so it holds only live moved objects; a move past the
   /// bound its proposer derives is refused before it is proposed.
   pub moved: std::collections::BTreeMap<ObjectId, Moved>,
+  /// The council's voters as the configuration last recorded them (§4.8 learners, A-380): the voter set the council's
+  /// last committed seat change left, in id order, recorded by its leader once that change has committed
+  /// ([`seat`](RegionalConfiguration::seat)). A learner takes no part in the council's Raft, so it knows who votes from
+  /// the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until the
+  /// first seat is recorded. Bounded by the members.
+  pub voters: Vec<HostId>,
 }
 
 /// One object's explicit move off its creator's line ([`RegionalConfiguration::moved`]).
@@ -2749,6 +2765,14 @@ pub struct Adoption {
   pub head: Vec<u8>,
   /// The adopted catalog record.
   pub catalog: Vec<u8>,
+}
+
+/// `hosts` in id order with no repeat: a voter set's one form, so two that name the same hosts compare equal.
+fn in_id_order(hosts: &[HostId]) -> Vec<HostId> {
+  let mut ordered = hosts.to_vec();
+  ordered.sort_unstable_by_key(|host| host.0);
+  ordered.dedup();
+  ordered
 }
 
 impl RegionalConfiguration {
@@ -2778,6 +2802,7 @@ impl RegionalConfiguration {
       adoptions: std::collections::BTreeMap::new(),
       completed: std::collections::BTreeMap::new(),
       moved: std::collections::BTreeMap::new(),
+      voters: Vec::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2787,6 +2812,32 @@ impl RegionalConfiguration {
       .map(|(owner, neighbourhood)| (*owner, Settled::of(neighbourhood, &config.domains)))
       .collect();
     config
+  }
+
+  /// Whether recording `voters` as the council's voters would change the configuration ([`seat`]): they differ, as a
+  /// set, from the voters it records.
+  ///
+  /// [`seat`]: RegionalConfiguration::seat
+  pub fn seats(&self, voters: &[HostId]) -> bool {
+    in_id_order(voters) != self.voters
+  }
+
+  /// Records `voters` as the council's voters, in id order, once the council has committed the seat change that left
+  /// them, and advances the version, so every learner learns of the change as of any other (A-380). A set equal to the
+  /// one recorded, or a version with no successor, changes nothing. Returns whether the configuration changed.
+  pub fn seat(&mut self, voters: &[HostId]) -> bool {
+    let voters = in_id_order(voters);
+    if voters == self.voters {
+      return false;
+    }
+    // A version with no successor refuses the change before anything moves, identically on every replica that applies
+    // it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.voters = voters;
+    self.version = version;
+    true
   }
 
   /// Fixes every member's bounded neighbourhood from the current membership (`select_neighbourhood`): the
@@ -3327,6 +3378,28 @@ impl RegionalConfiguration {
       .collect()
   }
 
+  /// Whether `object` of the retired `departed` is recovered within tolerance (A-341): `departed`'s retirement is kept and
+  /// each of the object's settled recovery cohorts ([`recovery_cohorts`]) keeps at least its recovery quorum of members.
+  /// Every record committed for the object is on `f + 1` of each settled cohort, or on all of a smaller one: the owner's
+  /// settle report placed it there, or its joint write did. So a round that adopted the object heard a recovery quorum of
+  /// each and learned a record at least as new as any committed one, and a copy held anywhere else is stale. False once
+  /// the retirement is no longer kept, since a completion record keeps no neighbourhood to judge by, and false past
+  /// tolerance, where a copy outside the cohorts may be the only one of a record no round learned (a joiner holding a
+  /// bootstrap owner's joint write, its settled cohort the owner alone: `crates/db/tests/lineage_model.rs`).
+  ///
+  /// [`recovery_cohorts`]: RegionalConfiguration::recovery_cohorts
+  pub fn within_tolerance(&self, departed: HostId, object: ObjectId) -> bool {
+    let cohorts = self.recovery_cohorts(departed, object);
+    !cohorts.is_empty()
+      && cohorts.iter().all(|cohort| {
+        cohort
+          .iter()
+          .filter(|host| self.members.contains(host))
+          .count()
+          >= self.quorum.recovery(cohort.len())
+      })
+  }
+
   /// The member that takes `object` of the retired `departed` over: the one rendezvous ranks first among the
   /// survivors of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)), or, when no
   /// survivor is in any of them, among all the retirement's survivors (A-309): every object then ranks one, so the
@@ -3401,7 +3474,9 @@ impl RegionalConfiguration {
   /// confirmed its own share of that completed takeover, so it was a member of its recovery neighbourhoods throughout its
   /// round and answered every successor in full before any confirmed, and every copy it held that fell to a successor
   /// was learned and adopted. A holder outside those neighbourhoods was never asked: its copy may be the only one of an
-  /// object no successor learned (a neighbourhood the owner wrote to before it settled elsewhere), so it keeps it.
+  /// object no successor learned (a neighbourhood the owner wrote to before it settled elsewhere), so it keeps it, unless
+  /// a successor's confirmation in the kept retirement shows the object recovered within tolerance
+  /// ([`RegionalConfiguration::within_tolerance`], A-341).
   pub fn settled_for(&self, takeover: HostId, holder: HostId) -> bool {
     self
       .completed
@@ -5016,6 +5091,36 @@ mod tests {
     );
   }
 
+  /// A-380 (§4.8 learners): the configuration records the council's voters, in id order, and a recorded change advances
+  /// its version as any change does. Do: in a five-member region, seat three voters given out of order, seat the same
+  /// set again in another order, then seat another set. Expect the first and the last to change the configuration, each
+  /// advancing the version by one and recording the set in id order, and the repeat to change nothing (`seats` false).
+  #[test]
+  fn a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change() {
+    let (mut regional, _) = wide_region();
+    let before = regional.version;
+    let voters = [HostId(3), HostId(1), HostId(2)];
+    assert!(regional.seats(&voters) && regional.seat(&voters));
+    assert_eq!(
+      (regional.version, regional.voters.clone()),
+      (before + 1, vec![HostId(1), HostId(2), HostId(3)]),
+      "the voters recorded in id order, one version on"
+    );
+    let again = [HostId(2), HostId(3), HostId(1)];
+    assert!(
+      !regional.seats(&again) && !regional.seat(&again),
+      "the same set in another order is no change"
+    );
+    assert_eq!(regional.version, before + 1, "nothing moved");
+    let other = [HostId(4), HostId(2), HostId(3)];
+    assert!(regional.seat(&other));
+    assert_eq!(
+      (regional.version, regional.voters.clone()),
+      (before + 2, vec![HostId(2), HostId(3), HostId(4)]),
+      "a new set recorded, one version on"
+    );
+  }
+
   /// §4.8 "Authority scope" and "Lookup", §4.10 "operators keep an explicit move" (T-8.14's configuration half). Do: in
   /// a five-member region, move host 1's object to host 2, then try every move that is not its owner's; move it on to
   /// host 3; move it back to its creator. Expect each owner's move to change the configuration once, the exception to
@@ -6047,6 +6152,56 @@ mod tests {
       matches!(resolved, Lineage::Successor { departed, successor }
         if departed == owner && survivors.contains(&successor)),
       "{resolved:?}"
+    );
+  }
+
+  /// A-373 (§4.8 "For each ledger position ... Phase-two acceptance at a new epoch records that epoch", BUG-12; the
+  /// acceptor of `docs/wip/models/FencedLedger.tla`): a held position yields to a higher epoch's different value, as
+  /// Paxos's acceptor accepts any proposal at or above its promise, and only one ballot's second value there is refused.
+  /// Do: accept `v` at position 3 under epoch 1 (a dying owner's last proposal, reaching this holder alone); offer `w` at
+  /// position 3 under epoch 2 (a successor whose phase one did not see `v`, so `v` never committed); then `u` at position
+  /// 3 under epoch 2 (a second value in that ballot); then `v` again under epoch 1. Expect: `w` accepted and held at
+  /// position 3 under epoch 2, the model's `Accept`; `u` refused `ConflictingPosition`; `v` refused by the fence. Before,
+  /// `w` was refused `ConflictingPosition` whatever its epoch, so a successor holding such a stale value could never
+  /// commit the value its round adopted there, nor could any holder that kept one count toward its quorum.
+  #[test]
+  fn a_held_position_yields_to_a_higher_epochs_value_and_refuses_a_second_in_one_epoch() {
+    let owner = HostId(1);
+    let object = ObjectId::new(owner, 7);
+    let mut acceptor = Acceptor::new(
+      HostId(2),
+      Authority {
+        generation: 1,
+        owner,
+      },
+    );
+    let record = |epoch: u64, value: &[u8]| Record {
+      owner,
+      object,
+      sequence: 3,
+      epoch: HostEpoch(epoch),
+      generation: 1,
+      value: value.to_vec(),
+    };
+    acceptor.accept(&record(1, b"v")).unwrap();
+    assert!(
+      acceptor.accept(&record(2, b"w")).is_ok(),
+      "a higher epoch's different value is accepted"
+    );
+    assert_eq!(
+      acceptor.position(object, 3),
+      Some((HostEpoch(2), b"w".as_slice())),
+      "held under the higher epoch"
+    );
+    assert_eq!(
+      acceptor.accept(&record(2, b"u")),
+      Err(RegisterError::ConflictingPosition),
+      "one ballot proposes one value a position"
+    );
+    assert_eq!(
+      acceptor.accept(&record(1, b"v")),
+      Err(RegisterError::StaleEpoch { current: 2 }),
+      "the fence refuses the lower epoch"
     );
   }
 

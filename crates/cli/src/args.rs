@@ -36,7 +36,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
-  attach ID [--read | --write] [--snapshot N]
+  attach ID [--read | --write] [--snapshot N] [--hold]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
@@ -60,7 +60,11 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   revoke CONSUMER [--json]                         revoke a consumer's enrollment
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
-  exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
+  exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
+            run CMD with the volume at PATH (Linux); --apparmor-profile makes its namespace under slates'
+            AppArmor profile where the host restricts unprivileged user namespaces (off unless given)
+  apparmor profile [--executable PATH]            print slates' AppArmor profile for this binary (or PATH)
+  apparmor check [--json]                         can `exec` make its namespace here; how to load the profile
   shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
   shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
@@ -380,6 +384,17 @@ pub(crate) enum Verb {
     /// `--oci-source` to `--oci-destination` (§4.6 A-9).
     form: slates_client::AttachRequest,
   },
+  /// Attach in the CLI's form and keep the attachment alive from this process until it ends (`slates attach --hold`,
+  /// A-384): a renewer of its own renews it at the cadence the daemon names; the process ending ends the renewals, and
+  /// the attachment lapses at its holder's pace.
+  Hold {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The intent.
+    intent: Intent,
+  },
   /// Detach.
   Detach {
     /// The attachment.
@@ -530,15 +545,19 @@ pub(crate) struct ClientRequest {
   pub json: bool,
 }
 
-/// A `slates exec` request: the volume, the path to show it at, and the command to run.
+/// A `slates apparmor` request (A-370): print slates' AppArmor profile, or check whether `exec` can make its namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExecRequest {
-  /// The volume to make visible.
-  pub volume: String,
-  /// The path to make it visible at.
-  pub at: String,
-  /// The command and its arguments.
-  pub command: Vec<String>,
+pub(crate) enum AppArmorRequest {
+  /// Print the profile for `executable`, else for this binary's own path.
+  Profile {
+    /// The executable the profile attaches to, when not this binary.
+    executable: Option<String>,
+  },
+  /// Report the host's restriction, this binary's profile, and how to load it.
+  Check {
+    /// Emit machine-readable JSON.
+    json: bool,
+  },
 }
 
 /// A `slates run` request: the harness verb (§4.13) — enroll a consumer, deliver its capability to
@@ -623,8 +642,10 @@ pub(crate) struct PmemRequest {
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-  /// The launcher.
-  Exec(ExecRequest),
+  /// The launcher (its request is every surface's, A-370).
+  Exec(slates_client::exec::ExecSpec),
+  /// slates' AppArmor profile for the launcher: print it, or check the host (A-370).
+  AppArmor(AppArmorRequest),
   /// The harness verb.
   Run(RunRequest),
   /// A command run with a Shards stream end.
@@ -697,6 +718,7 @@ const VALUES: &[&str] = &[
   "--resync-fd",
   "--tag",
   "--dax-window",
+  "--executable",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -716,6 +738,8 @@ const SWITCHES: &[&str] = &[
   "--session",
   "--require-evidence",
   "--keep",
+  "--apparmor-profile",
+  "--hold",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -749,13 +773,14 @@ fn parse_run(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError>
   }))
 }
 
-/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
+/// Parses `exec --volume V --at PATH [--apparmor-profile] -- CMD ...`: the flags before `--`, the command after it. The
+/// AppArmor option is off unless `--apparmor-profile` is given (A-370).
 fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
   let command = command_after(arguments)?;
   refuse_extra_command_words(taken)?;
   taken.only(&Spec {
     values: &["--volume", "--at"],
-    switches: &[],
+    switches: &["--apparmor-profile"],
   })?;
   let volume = taken
     .value("--volume")
@@ -765,11 +790,40 @@ fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError
     .value("--at")
     .ok_or(ParseError::Missing("--at"))?
     .to_owned();
-  Ok(Command::Exec(ExecRequest {
+  let apparmor = if taken.switch("--apparmor-profile") {
+    slates_client::exec::AppArmor::Profile
+  } else {
+    slates_client::exec::AppArmor::Off
+  };
+  Ok(Command::Exec(slates_client::exec::ExecSpec {
     volume,
     at,
     command,
+    apparmor,
   }))
+}
+
+/// Parses `apparmor profile [--executable PATH]` and `apparmor check [--json]` (A-370).
+fn parse_apparmor(taken: &Taken, rest: &[&str]) -> Result<Command, ParseError> {
+  match rest {
+    ["profile"] => {
+      taken.only(&Spec {
+        values: &["--executable"],
+        switches: &[],
+      })?;
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: taken.value("--executable").map(str::to_owned),
+      }))
+    }
+    ["check"] => {
+      taken.only(&NONE)?;
+      Ok(Command::AppArmor(AppArmorRequest::Check {
+        json: taken.json(),
+      }))
+    }
+    [] => Err(ParseError::Missing("`profile` or `check`")),
+    [other, ..] => Err(ParseError::UnknownCommand(format!("apparmor {other}"))),
+  }
 }
 
 /// Format: the lowest descriptor number `shards --fd` takes: standard input, output and error are 0, 1 and 2, which a
@@ -1589,10 +1643,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       }))
     }
     ["volume", rest @ ..] => parse_volume(&taken, rest),
+    ["apparmor", rest @ ..] => parse_apparmor(&taken, rest),
     ["attach", id] => {
       taken.only(&Spec {
         values: &["--snapshot", "--oci-source", "--oci-destination"],
-        switches: &["--read", "--write"],
+        switches: &["--read", "--write", "--hold"],
       })?;
       let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
       let intent = if taken.switch("--write") {
@@ -1600,6 +1655,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       } else {
         Intent::Read
       };
+      // `--hold`: this process keeps the CLI attachment alive until it ends (A-384); a container bind has its own life.
+      if taken.switch("--hold") {
+        if taken.value("--oci-source").is_some() || taken.value("--oci-destination").is_some() {
+          return Err(ParseError::Missing(
+            "no --oci-source or --oci-destination with --hold: a container bind is not held",
+          ));
+        }
+        return Ok(client(
+          &taken,
+          Verb::Hold {
+            volume: volume(id)?,
+            snapshot,
+            intent,
+          },
+        ));
+      }
       let form = match (
         taken.value("--oci-source"),
         taken.value("--oci-destination"),
@@ -2323,6 +2394,28 @@ mod tests {
         form: slates_client::AttachRequest::Termed,
       }
     );
+    // `--hold` keeps the CLI attachment alive from this process (A-384); a container bind is not held.
+    let Command::Client(request) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --hold",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Hold {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+      }
+    );
+    assert!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --hold --oci-source /a --oci-destination /b",
+      ))
+      .is_err(),
+      "a container bind is not held"
+    );
     assert_eq!(
       parse(&args("anchor --quick --shards 2 --instance z")),
       Ok(Command::Anchor(ProcessOptions {
@@ -2771,10 +2864,11 @@ mod tests {
       parse(&args(
         "--instance outer exec --volume scratch --at /p -- child --volume inner --help"
       )),
-      Ok(Command::Exec(ExecRequest {
+      Ok(Command::Exec(slates_client::exec::ExecSpec {
         volume: "scratch".into(),
         at: "/p".into(),
         command: args("child --volume inner --help"),
+        apparmor: slates_client::exec::AppArmor::Off,
       }))
     );
   }
@@ -2824,6 +2918,84 @@ mod tests {
       parse(&args("exec --at /p -- cmd")),
       Err(ParseError::Missing("--volume"))
     ));
+  }
+
+  /// A-370, the flag's plumbing in the CLI. Do: parse `exec` with and without `--apparmor-profile`, then parse the
+  /// arguments every other surface builds for a request (`ExecSpec::arguments`: slates-api's command, the SDKs') with the
+  /// option on and off. Expect: the option off unless the switch is given, on when it is, and every surface's arguments
+  /// read back by this grammar to the request they were built from, so the CLI and the library never disagree on it.
+  #[test]
+  fn exec_takes_the_apparmor_option_off_unless_named_and_reads_every_surfaces_arguments() {
+    use slates_client::exec::{AppArmor, ExecSpec};
+    let Command::Exec(plain) = parse(&args("exec --volume v --at /p -- true")).unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(plain.apparmor, AppArmor::Off, "off unless named");
+    let Command::Exec(asked) = parse(&args(
+      "--instance i exec --apparmor-profile --volume v --at /p -- true",
+    ))
+    .unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(asked.apparmor, AppArmor::Profile);
+    for apparmor in [AppArmor::Off, AppArmor::Profile] {
+      let spec = ExecSpec {
+        volume: "-scratch".into(),
+        at: "/home/u/build=1".into(),
+        command: args("cargo build -- --apparmor-profile --help"),
+        apparmor,
+      };
+      assert_eq!(parse(&spec.arguments()), Ok(Command::Exec(spec)));
+    }
+    assert_eq!(
+      parse(&args(
+        "exec --apparmor-profile=yes --volume v --at /p -- true"
+      )),
+      Err(ParseError::BadValue {
+        what: "switch",
+        reason: "`--apparmor-profile` takes no value".into()
+      })
+    );
+    assert_eq!(
+      parse(&args("volume list --apparmor-profile")),
+      Err(ParseError::UnknownFlag("--apparmor-profile".into())),
+      "the switch is exec's alone"
+    );
+  }
+
+  /// A-370. Do: parse `apparmor profile` with and without `--executable`, `apparmor check` with `--json`, and the verb
+  /// with no or an unknown word. Expect: the profile for the named path or this binary's own, the check's JSON switch,
+  /// and refusals naming the words it takes.
+  #[test]
+  fn apparmor_prints_the_profile_or_checks_the_host() {
+    assert_eq!(
+      parse(&args("apparmor profile")),
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: None
+      }))
+    );
+    assert_eq!(
+      parse(&args("apparmor profile --executable /usr/local/bin/slates")),
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: Some("/usr/local/bin/slates".into())
+      }))
+    );
+    assert_eq!(
+      parse(&args("apparmor check --json")),
+      Ok(Command::AppArmor(AppArmorRequest::Check { json: true }))
+    );
+    assert_eq!(
+      parse(&args("apparmor")),
+      Err(ParseError::Missing("`profile` or `check`"))
+    );
+    assert_eq!(
+      parse(&args("apparmor install")),
+      Err(ParseError::UnknownCommand("apparmor install".into()))
+    );
+    assert_eq!(
+      parse(&args("apparmor check --executable /x")),
+      Err(ParseError::UnknownFlag("--executable".into()))
+    );
   }
 
   /// A-161 (Shards part 1 step 4). Do: parse `shards` as Unix hands its end, with every flag and with the fewest.

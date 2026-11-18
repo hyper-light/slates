@@ -12675,6 +12675,144 @@ quiet p50, and a write, a rename and an unlink 31 to 87 µs more loaded. The lev
   account for 42.
 - Crash safety's price (the journal, the ledger, A-198's barriers) stays, as the supervisor decided on 2026-11-07 (R4).
 
+### Main after A-348 against the DLL and against 69cd38b2, and where Step 7, continued closes (2026-11-18)
+
+**The A/B.** Diag `diag-g258-9` (run 44325673298), four arms interleaved on one VM of each runner, quiet and loaded (two
+spinners a logical CPU), ten runs a lane planned: main (`093fef96`: A-348 landed, and A-223 and A-326 since 69cd38b2), a
+control (main's binary copied), the DLL arm (`71cf09ac`, built from its own tree as above) and before (`69cd38b2`, the
+main every A/B in this section measured), with 69cd38b2's `mount_bench` (nine operations). Read as diag-g258-6 above.
+- windows-11-arm, 14:56–16:20 UTC: 5 runs done, 0 failed, no daemon lapsed in any arm. Run 6 was lost with the runner
+  itself ("The hosted runner lost communication with the server", the job ended 17:21 UTC), so its numbers are none.
+- windows-latest (AMD Family 25 Model 1, image win25-vs2026 20261116.315.1; diag-g258-6's was Family 26 Model 2, so the
+  two lanes' microseconds do not compare), 15:02–17:25 UTC: 2 runs done (5 and 7), 5 failed (1–4 and 6); run 8 was
+  cancelled when the goal closed. Each failed run lost a drive when its daemon was killed under the loaded pass ("the
+  daemon's heartbeat lapsed (1121–1154 ms old, past 1077–1082 ms …); killing it"). Kills over the seven runs: main 5,
+  control 4, the DLL arm 1, before 0 (before's daemon exited 143 and was restarted once in runs 1 and 3–7; its older
+  anchor prints no lapse line). Main's and the control's are A-223's: its window, priced on a hundred times the wake
+  estimate, let a one-shard daemon spin for seconds after a WinFsp request until its watchdog withheld the beat; A-361
+  (goal g234, landed `519969ed9`) holds every idle spin under the watchdog's window. This lane measured main before A-361
+  under load, so its two runs are recorded and not read as a verdict.
+
+**Verdict.**
+- **windows-11-arm: 10 cells of 36 beyond the DLL's spread, as in diag-g258-6 (10 of 36).** At the p50, within each
+  run: quiet create +19.6 µs, stat +44.9, read +5.6, rename +76.3, unlink +41.1; loaded write +85.3, stat +2.7, rename
+  +43.4, unlink +21.3; and the loaded rename p99. The control's differences sit within 8 µs of main's at each p50 there.
+- **Main against 69cd38b2 on windows-11-arm** (before − main within each run, against the control's spread): within it in
+  32 of 36 p50 and p99 cells; 69cd38b2 slower at the loaded open p50 (+139.4 µs) and p99 (+5,544), faster at the quiet
+  create p99 (−113.5) and close p99 (−622.7). What main took since (A-223, A-326, A-348) neither closed nor widened the
+  arm64 gap at the p50.
+- **windows-latest: 13 cells of 36 beyond the DLL's slowest run, no verdict.** Each p50 among them is beyond it by under
+  50 µs (quiet close 5.4, read 1.6, unlink 8.1; loaded write 0.8, fsync 8.2, open 7.2, rename 49.8), but two runs make
+  each arm's spread two values wide, and main lapsed in the five runs that failed.
+
+**Where Step 7, continued closes** (the supervisor, 2026-11-18, for Ada: "close it at its stated condition"). The cuts
+were made and measured on both Windows runners, quiet and loaded, and every run's numbers are in this section: A-348 (the
+request channel's bound) landed; cut (c)'s no-wake variant and cut (b)'s two per-kind spin choices are measured and
+rejected; the bench's `create_security` op landed. What remains against the DLL is arm64's p50 gap above, unchanged
+since diag-g258-6, and its levers are the list just above (a spin choice that reads contention, shard threads above
+normal priority, a fresh per-phase profile), none started under this goal. Owed to whoever takes the next cut: the
+x86_64 lane again with A-361 in main.
+
+#### arm64 (windows-11-arm), run 44325673298: 5 runs done, 0 failed
+
+arm64 (windows-11-arm), run 44325673298, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 228.2 | 220.6 | **worse** by 7.6 | +16.3 +19.4 +19.6 +20.2 +26.4 | +19.6 | +21.9 |
+| create | p99 | 548.6 | 1049.6 | within | -16.9 +45.0 +76.0 +86.0 +154.3 | +76.0 | +72.9 |
+| write | p50 | 99.9 | 108.8 | within | -2.0 -0.3 +0.8 +2.8 +6.7 | +0.8 | +2.2 |
+| write | p99 | 278.4 | 1460.1 | within | +12.5 +16.4 +33.4 +79.6 +329.2 | +33.4 | +46.9 |
+| fsync | p50 | 114.8 | 118.9 | within | -0.8 -0.4 +0.6 +6.7 +7.0 | +0.6 | +2.0 |
+| fsync | p99 | 204.9 | 1317.2 | within | -731.6 +8.5 +9.7 +14.2 +37.6 | +9.7 | +17.1 |
+| close | p50 | 3931.4 | 4325.3 | within | -3000.5 -633.2 -137.9 +76.6 +483.6 | -137.9 | +207.0 |
+| close | p99 | 7132.6 | 16884.7 | within | -7670.8 -1258.1 -867.2 -522.1 -217.5 | -867.2 | -372.1 |
+| stat | p50 | 168.6 | 125.1 | **worse** by 43.5 | +28.9 +43.1 +44.9 +46.3 +65.7 | +44.9 | +50.2 |
+| stat | p99 | 247.5 | 303.8 | within | +36.8 +37.1 +37.9 +43.1 +182.0 | +37.9 | +114.1 |
+| open | p50 | 2110.4 | 4002.0 | within | -1726.0 -70.3 +4.3 +50.2 +2666.5 | +4.3 | +381.5 |
+| open | p99 | 6196.7 | 7153.3 | within | -216.0 -98.2 -6.9 +245.5 +2217.1 | -6.9 | +92.2 |
+| read | p50 | 49.2 | 47.5 | **worse** by 1.7 | -2.1 +2.2 +5.6 +5.7 +7.9 | +5.6 | +4.7 |
+| read | p99 | 78.6 | 82.1 | within | -2.5 +0.3 +2.0 +11.5 +12.2 | +2.0 | +4.8 |
+| rename | p50 | 480.2 | 450.0 | **worse** by 30.2 | +63.4 +74.6 +76.3 +78.6 +87.2 | +76.3 | +84.0 |
+| rename | p99 | 925.8 | 2916.5 | within | -333.7 -80.8 +16.0 +115.6 +1199.3 | +16.0 | +705.5 |
+| unlink | p50 | 297.0 | 271.0 | **worse** by 26.0 | +35.8 +38.5 +41.1 +41.4 +52.3 | +41.1 | +39.4 |
+| unlink | p99 | 585.3 | 591.2 | within | -7.0 +25.1 +139.7 +158.2 +980.9 | +139.7 | +156.4 |
+
+arm64 (windows-11-arm), run 44325673298, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 220.8 | 244.2 | within | -10.1 -4.0 -0.8 +1.8 +14.9 | -0.8 | -0.2 |
+| create | p99 | 1361.6 | 1770.3 | within | -889.4 -217.4 +571.4 +658.6 +2639.4 | +571.4 | +86.7 |
+| write | p50 | 186.9 | 105.5 | **worse** by 81.4 | +76.7 +83.3 +85.3 +85.6 +86.1 | +85.3 | +83.1 |
+| write | p99 | 590.0 | 638.9 | within | -119.4 +50.0 +146.4 +1186.7 +2359.5 | +146.4 | +1385.9 |
+| fsync | p50 | 115.2 | 135.7 | within | -17.7 -15.9 -15.1 -7.6 -4.6 | -15.1 | -11.2 |
+| fsync | p99 | 415.2 | 13004.2 | within | -12542.9 -3359.7 -2372.0 -1207.9 -277.0 | -2372.0 | -2401.5 |
+| close | p50 | 4571.5 | 5293.4 | within | -549.0 -484.0 -462.8 -423.9 +193.7 | -462.8 | -393.6 |
+| close | p99 | 41087.4 | 50972.1 | within | -9884.7 -8801.1 -6841.0 -3310.6 -1203.2 | -6841.0 | -7087.1 |
+| stat | p50 | 152.5 | 152.4 | **worse** by 0.1 | +0.1 +2.1 +2.7 +4.0 +6.9 | +2.7 | +3.2 |
+| stat | p99 | 769.2 | 37763.8 | within | -37060.3 -33527.5 -32417.1 -30189.9 -25042.9 | -32417.1 | -32918.4 |
+| open | p50 | 3964.8 | 4425.2 | within | -380.7 -278.4 -275.1 -162.0 -71.2 | -275.1 | -256.5 |
+| open | p99 | 40151.0 | 49127.7 | within | -8976.7 -6605.6 -5982.0 -3614.5 -2155.8 | -5982.0 | -4637.0 |
+| read | p50 | 47.3 | 51.5 | within | -4.4 -1.5 -1.2 -0.1 +0.0 | -1.2 | -1.2 |
+| read | p99 | 87.7 | 90.3 | within | -8.4 -4.2 -0.9 -0.5 +2.4 | -0.9 | -3.5 |
+| rename | p50 | 510.3 | 476.4 | **worse** by 33.9 | +33.1 +37.8 +43.4 +44.0 +55.4 | +43.4 | +46.4 |
+| rename | p99 | 36336.1 | 34345.6 | **worse** by 1990.5 | +2679.5 +3377.7 +3760.8 +4167.9 +7536.0 | +3760.8 | +3526.9 |
+| unlink | p50 | 347.8 | 332.4 | **worse** by 15.4 | +14.5 +19.7 +21.3 +25.6 +30.2 | +21.3 | +25.3 |
+| unlink | p99 | 28273.7 | 41467.2 | within | -12844.4 -12234.7 -11627.4 -11404.6 -10234.8 | -11627.4 | -12049.2 |
+
+cells worse than the DLL's spread: 10 of 36
+
+#### x86_64 (windows-latest), run 44325673298: 2 runs done, 5 failed
+
+x86_64 (windows-latest), run 44325673298, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 910.6 | 983.6 | within | -91.5 +9.5 | +9.5 | -3.9 |
+| create | p99 | 1647.2 | 1929.3 | within | -342.9 +10.3 | +10.3 | -17.9 |
+| write | p50 | 81.7 | 109.1 | within | -27.4 +5.3 | +5.3 | +5.2 |
+| write | p99 | 214.9 | 222.2 | within | -39.1 +32.0 | +32.0 | +30.6 |
+| fsync | p50 | 126.4 | 166.4 | within | -40.0 -3.1 | -3.1 | -2.2 |
+| fsync | p99 | 254.0 | 338.6 | within | -100.1 +22.4 | +22.4 | +17.2 |
+| close | p50 | 67.1 | 61.7 | **worse** by 5.4 | +5.2 +6.9 | +6.9 | +6.9 |
+| close | p99 | 140.5 | 147.9 | within | -13.2 +14.9 | +14.9 | +9.4 |
+| stat | p50 | 261.9 | 333.7 | within | -71.8 +9.8 | +9.8 | +9.4 |
+| stat | p99 | 391.6 | 520.6 | within | -129.0 +27.7 | +27.7 | +27.3 |
+| open | p50 | 168.1 | 189.3 | within | -21.2 +18.5 | +18.5 | +18.1 |
+| open | p99 | 289.1 | 303.1 | within | -14.0 -1.9 | -1.9 | +2.9 |
+| read | p50 | 14.0 | 12.4 | **worse** by 1.6 | +1.5 +1.9 | +1.9 | +1.9 |
+| read | p99 | 32.2 | 20.3 | **worse** by 11.9 | +6.0 +11.9 | +11.9 | +13.9 |
+| rename | p50 | 595.1 | 689.1 | within | -94.0 +50.9 | +50.9 | +53.1 |
+| rename | p99 | 1102.6 | 1396.3 | within | -293.7 +162.4 | +162.4 | +302.2 |
+| unlink | p50 | 378.3 | 370.2 | **worse** by 8.1 | +8.1 +57.1 | +57.1 | +58.2 |
+| unlink | p99 | 869.9 | 867.2 | **worse** by 2.7 | +2.7 +48.4 | +48.4 | +72.0 |
+
+x86_64 (windows-latest), run 44325673298, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 1609.0 | 1681.7 | within | -72.7 -22.0 | -22.0 | -14.7 |
+| create | p99 | 98278.9 | 234223.1 | within | -137034.3 -135944.2 | -135944.2 | -132828.6 |
+| write | p50 | 124.7 | 123.9 | **worse** by 0.8 | +0.8 +1.7 | +1.7 | +1.6 |
+| write | p99 | 398.5 | 22153.6 | within | -21755.5 -11.5 | -11.5 | -7.9 |
+| fsync | p50 | 200.2 | 192.0 | **worse** by 8.2 | +7.5 +9.4 | +9.4 | +8.9 |
+| fsync | p99 | 467.8 | 435.9 | **worse** by 31.9 | -9.5 +109.1 | +109.1 | +703.4 |
+| close | p50 | 81.1 | 97.1 | within | -16.4 -16.0 | -16.0 | -16.0 |
+| close | p99 | 213.7 | 170.9 | **worse** by 42.8 | +28.1 +42.8 | +42.8 | +43.6 |
+| stat | p50 | 356.3 | 361.8 | within | -6.3 -5.5 | -5.5 | -7.2 |
+| stat | p99 | 30476.5 | 114279.2 | within | -85470.2 -81569.4 | -81569.4 | -86485.8 |
+| open | p50 | 248.4 | 241.2 | **worse** by 7.2 | +7.2 +7.8 | +7.8 | +6.9 |
+| open | p99 | 1595.8 | 548.7 | **worse** by 1047.1 | +1047.1 +1078.8 | +1078.8 | +785.4 |
+| read | p50 | 107.6 | 125.5 | within | -20.0 -17.9 | -17.9 | -20.4 |
+| read | p99 | 243.6 | 226.8 | **worse** by 16.8 | +16.8 +28.6 | +28.6 | +859.1 |
+| rename | p50 | 880.1 | 830.3 | **worse** by 49.8 | +49.8 +50.6 | +50.6 | +49.7 |
+| rename | p99 | 62878.4 | 63484.4 | within | -1453.3 +4003.5 | +4003.5 | +6820.6 |
+| unlink | p50 | 477.3 | 494.1 | within | -17.7 -13.3 | -13.3 | -12.7 |
+| unlink | p99 | 33280.9 | 132952.3 | within | -100125.9 -93657.2 | -93657.2 | -93074.7 |
+
+cells worse than the DLL's spread: 13 of 36
+
 ## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
 
 `agents/reland-a207-3` (`CreateGreen { base }` walked, hashed and seeded in slices with its reply deferred; the
@@ -13236,6 +13374,63 @@ The paced-client test failed 6 of 6 on Linux before the rule (diag-liveness-36: 
 - **The paced-client test's non-vacuity bound is the estimate passing its boot prior, not a multiple of it.** At ten times the prior one macOS run of three missed (5.9 times, diag-liveness-37); at four, three of ten missed (1.06–1.8 times, diag-liveness-38), every window held at F. With the window at F the shards stop spinning and stop queueing each other's wakes, so the estimate rises far less than under ×100 (23–200 times). A window priced on the estimate passes its boot value as soon as the estimate passes the prior, so that is the bound that tells the rules apart.
 - **Windows is ×100, unchanged.** Its window is the estimate's multiple wherever that passes F (a 7–18 µs estimate gives 0.7–1.8 ms), so it computes what step 3's ×100 arm did, and its paced CPU sits in that arm's spread (177–435 quiet, 693–782 loaded). windows-latest's quiet p99, 53.8–86.7 µs against the ×100 arm's 31.4–39.9 µs, comes from identical window arithmetic; it is recorded as the runner's, and step 6 measures the arms interleaved on one runner.
 
+## Windows' own window: the raised wait and R9's floor (A-361; R9; CI; 2026-11-18)
+
+**Why a parked Windows shard woke late under load** (`diag-g234-wake-1`, run 44325923565; the probe
+`crates/rt/examples/wake_load.rs` on that branch only, release; a TIME_CRITICAL kicker on CPU 0, the waiter on CPU 1
+unless unpinned, 200 wakes an arm, two rounds; loaded = two `while :; do :; done` shell loops per logical CPU at the
+job's own BelowNormal level). Priority after the wake, then the wake's median and p99, rounds 1 · 2:
+
+| arm | windows-latest (Server 2025, 4 vCPU) | windows-11-arm (Win11 26200, 4 vCPU) |
+|---|---|---|
+| completion port (the shard's wait) | 6; 29.1 · 29.1 ms, p99 102 · 108 ms | 6; 14.0 · 14.0 ms, p99 48 · 48 ms |
+| completion port, unpinned | 6; 43.5 · 41.1 ms, p99 65 · 62 ms | 6; 20.0 · 20.6 ms, p99 27 · 31 ms |
+| completion port, boost disabled | 6; 29.5 · 29.1 ms | 6; 14.0 · 14.0 ms |
+| completion port, base one level up | 7; 19 · 15 µs | 7; 6 · 7 µs |
+| completion port, raised for the wait alone | 7; 17 · 15 µs | 7; 6 · 7 µs |
+| event | 7; 17 · 15 µs | 7; 6 · 6 µs |
+| event, boost disabled | 6; 29.2 · 29.1 ms | 6; 14.0 · 14.0 ms |
+| WaitOnAddress | 7; 15 · 15 µs | 7; 7 · 7 µs |
+| the runtime's shard | 6; 29.6 · 25.5 ms, p99 112 · 95 ms | 6; 14.0 · 14.0 ms, p99 32 · 32 ms |
+| the runtime's shard, one level up | 7; 16 · 16 µs | 7; 8 · 8 µs |
+
+Quiet, every arm's median was 6–15 µs. Two threads at one level on one CPU took turns of 31.6–32.2 ms (gaps' median),
+quiet, on both. A raise and its restore cost 0.77–0.88 µs a pair quiet, 1.3–5.5 µs loaded (x86_64).
+
+**The test** (`cargo test -p slates-rt --test wake_estimate a_parked_shard_wakes_beside_spinners -- --nocapture`, debug,
+two spinning threads per logical CPU in the test, 32 wakes of each kind; `diag-g234-loadedwake-{red,green}-{1,2}`):
+median shard wake against a parked thread's, three rounds a run, two runs:
+
+| tree | windows-latest | windows-11-arm |
+|---|---|---|
+| main (red, 6 of 6 failed) | 38.0 / 42.0 / 40.7 ms, 38.7 / 41.5 / 39.4 ms against 20–23 µs | 21.5 / 23.4 / 21.5 ms, 23.5 / 33.8 / 21.7 ms against 11–13 µs |
+| the raise (green, 6 of 6) | 57.7 / 56.5 / 59.2 µs, 46.9 / 51.9 / 47.5 µs against 18–23 µs | 32.8 / 33.6 / 33.4 µs, 35.4 / 36.0 / 36.3 µs against 10–11 µs |
+
+**The rule, by provision_bench** (`diag-g234-winbench-1`, run 44338692795: `PROVISION_BENCH_SHARDS=2
+PROVISION_BENCH_FORMS=spinning_1,parked_1 provision_bench`, release, each arm in its own tree and target, three rounds
+interleaved, loaded as above; main = a2693b1eb with the x100 multiple; raise = the raised wait with it; raiseF = the
+raised wait and R9's floor alone). Each cell the median of nine runs (three rounds of the bench's three):
+
+| runner | cond | arm | spinning_1 p50 | spinning_1 p99 (runs past 1 ms) | paced CPU, thousandths of a core | paced p99 |
+|---|---|---|---|---|---|---|
+| windows-latest | quiet | main | 11.2 µs | 26.4 µs | 94 (0–656) | 189 µs |
+| windows-latest | quiet | raise | 11.9 µs | 23.5 µs | 210 (3–299) | 199 µs |
+| windows-latest | quiet | raiseF | 12.7 µs | 24.4 µs | 7 (0–81) | 176 µs |
+| windows-latest | loaded | main | 13.5 µs | 157 µs (4 of 9: 56.3, 57.1, 79.9, 82.9 ms) | 756 (617–792) | 125.6 ms |
+| windows-latest | loaded | raise | 13.3 µs | 54.1 µs (0) | 732 (157–823) | 59.1 ms |
+| windows-latest | loaded | raiseF | 13.9 µs | 130.5 µs (0; max 151) | 20 (8–30) | 49.9 ms |
+| windows-11-arm | quiet | main | 15.7 µs | 31.7 µs | 199 (116–253) | 356 µs |
+| windows-11-arm | quiet | raise | 15.1 µs | 29.9 µs | 225 (146–312) | 355 µs |
+| windows-11-arm | quiet | raiseF | 15.3 µs | 31.4 µs | 25 (15–40) | 323 µs |
+| windows-11-arm | loaded | main | 17.2 µs | 108 µs (1 of 9: 31.9 ms) | 787 (761–800) | 63.2 ms |
+| windows-11-arm | loaded | raise | 16.4 µs | 89.5 µs (0) | 777 (707–795) | 57.1 ms |
+| windows-11-arm | loaded | raiseF | 16.7 µs | 147.6 µs (0; max 192) | 20 (10–34) | 27.7 ms |
+
+raiseF is the rule landed: the paced cost falls ten- to forty-fold, the loaded p99's millisecond runs are gone, and the
+quiet rows stay within main's spread. The raise alone holds the loaded p99 lower (54 and 90 µs) at main's paced cost,
+which the window's multiple spends. The paced p99 under load, 28–126 ms in every arm, is not explained by these runs
+(the bench's paced client pauses in a timed `park_timeout`, whose own wake was not measured).
+
 ## The idle window's rule at three and more shards: R9's floor alone fails a closed loop; a fixed S-scaled window fails a paced client (A-223 step 6, A-326; R9; CI and adacachy2; 2026-11-12)
 
 **What it is.** The plan's step 6 ran the rule as built (`adb383f26`) against main (`29ef4521`) at each runner's
@@ -13622,6 +13817,78 @@ records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carry
   build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
   whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
   which is still an outage of every writer's connection.
+
+## Where a 1,000-client request's time goes, and a client's ring that wakes only its shard: parks down 59%, daemon CPU down 20-34%, latency moving with the box (A-381; goals 231 and 257; 2026-11-18)
+
+**What it is.** Goal 257's agent (g083) profiled the 1,000-client rung's loaded tail, the harness against the product,
+then cut the first thing the profile named. The profile is a diagnostic build never on main (branch `diag-g083-trace`):
+each shard's span sink sized to hold a whole run (`SLATES_DIAG_SPAN_CAPACITY`), the owner's answer to each ask and each
+resumed verb spanned under its request's id, and `load_bench --trace` joining every attempt it timed with every span of
+its request. The harness on main since `f6d37937b` stamps a send before it reaches the ring and a reply after its ring
+was read, and prints each attempt's `floor` (the daemon and the ring's share, whatever the harness's sweep did).
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO) `load_bench`
+with the daemon in its process (23 shards derived), Linux v7.4-rc1 `kernel/`. Shared: other agents' builds and tests
+ran throughout, and the one-minute load at the runs' starts went from 14 to 52.
+
+**Command.** `[SLATES_DIAG_SPAN_CAPACITY=1500000] load_bench --tree <linux-v7.4-rc1>/kernel --clients 1000 --hot-files
+800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us Z [--trace]`, the scripts `diag_run.sh` and `ab.sh` of
+`~/.cache/slates-scratch/g083/scripts/` (the measuring agent's), every bench.log kept whole on the Studio in
+`~/.cache/g083-runs/`.
+
+**The profile (2026-11-18 17:05 UTC, load 14 to 17, the diagnostic on main `f6d37937b`).** Each leg of an attempt's
+time, p50 / p99 / p999 in µs: the request in the client's ring until its shard read it (`to_read`), the hop to the
+work's shard (`hop_in`), the verb's own steps (`ops`), an ask's wait to reach the green's owner, its batch and queue
+(`ask_out`), the owner's answer (`ask_serve`), the answer back (`ask_back`), the reply home (`hop_out`), and the
+harness taking the reply (`to_take`).
+
+| Z, verdicts/s | kind | to_read | hop_in | ops | ask_out | ask_serve | ask_back | hop_out | to_take | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 50 ms, 1,121 | Edit | 35 / 634 / 4,666 | 17 / 267 / 2,417 | 12 / 54 / 102 | 0 / 397 / 3,532 | 0 / 13 / 42 | 0 / 127 / 1,034 | 33 / 238 / 2,023 | 1 / 25 / 2,744 | 141 / 2,218 / 20,449 |
+| 50 ms, 1,121 | Accepted | 35 / 513 / 4,326 | 16 / 271 / 2,000 | 50 / 138 / 227 | 34 / 786 / 5,837 | 51 / 135 / 224 | 16 / 214 / 2,253 | 11 / 187 / 1,465 | 1 / 23 / 2,246 | 240 / 2,684 / 16,994 |
+| 50 ms, 1,121 | ReadHead | 34 / 589 / 4,483 | 19 / 599 / 6,217 | 4 / 26 / 61 | | | | 39 / 261 / 2,410 | 1 / 25 / 1,479 | 114 / 1,863 / 14,024 |
+| 20 ms, 2,682 | Edit | 28 / 421 / 6,027 | 23 / 351 / 3,440 | 13 / 68 / 120 | 0 / 1,028 / 13,563 | 0 / 15 / 47 | 0 / 188 / 1,118 | 39 / 358 / 2,586 | 1 / 51 / 37,916 | 178 / 3,308 / 46,533 |
+| 20 ms, 2,682 | Accepted | 29 / 389 / 3,934 | 21 / 312 / 2,148 | 53 / 167 / 261 | 74 / 1,935 / 31,262 | 49 / 150 / 250 | 24 / 271 / 1,766 | 18 / 320 / 1,677 | 1 / 48 / 45,177 | 329 / 5,021 / 46,865 |
+
+The floor's p99 was 1.6 to 2.7 ms at 50 ms (every kind) against a latency p99 of 1.9 to 3.7 ms, and 2.2 to 4.6 ms at
+20 ms. Every shard parked and woke 344,631 to 379,811 times in the 49.3 s level (about 7,500 a second), alike on shards
+serving one connection and two; the owner ran 33% of a core at 50 ms and 51% at 20 ms, every other shard 13 to 28%.
+
+**The A/B of A-381 (17:40 to 17:49 UTC).** Before is main `79aee2a17` with the diagnostic (`diag-g083-base`), after is
+A-381's branch on it (`diag-g083-a381`); no span sink enlarged and no `--trace`. Back to back, the order alternating by
+round. `waits` is every shard's parks summed over the level (49 to 55 s at 50 ms, 23 to 30 s at 20 ms), `CPU` the
+shards' CPU summed, in thousandths of a core; latencies in ms.
+
+| Z, round | arm | load before → after | verdicts/s | waits | CPU | Edit p50 / p99 | Edit floor p99 | Accepted p99 |
+|---|---|---|---|---|---|---|---|---|
+| 50, 1 | before | 14.5 → 31.0 | 1,058 | 5,240,411 | 4,936 | 0.51 / 29.2 | 26.8 | 36.8 |
+| 50, 1 | after | 31.0 → 28.4 | 1,031 | 1,777,236 | 3,445 | 0.40 / 23.4 | 15.3 | 30.2 |
+| 50, 2 | after | 40.0 → 43.7 | 1,038 | 1,816,524 | 2,945 | 0.48 / 22.0 | 11.7 | 29.2 |
+| 50, 2 | before | 43.7 → 51.9 | 1,101 | 4,281,536 | 3,891 | 0.67 / 15.1 | 9.4 | 22.2 |
+| 50, 3 | before | 47.0 → 46.3 | 1,080 | 4,602,849 | 4,024 | 0.49 / 15.1 | 7.8 | 32.4 |
+| 50, 3 | after | 46.3 → 31.7 | 1,095 | 2,157,207 | 2,097 | 0.11 / 1.48 | 1.31 | 2.04 |
+| 20, 1 | before | 28.4 → 37.7 | 2,165 | 2,325,470 | 6,224 | 2.26 / 40.6 | 35.2 | 45.3 |
+| 20, 1 | after | 37.7 → 40.0 | 2,208 | 1,151,770 | 5,004 | 1.00 / 31.3 | 28.7 | 35.6 |
+| 20, 2 | after | 51.9 → 49.6 | 2,166 | 1,049,246 | 5,203 | 1.75 / 33.0 | 28.3 | 38.7 |
+| 20, 2 | before | 49.6 → 47.0 | 2,471 | 2,885,394 | 6,510 | 0.82 / 23.0 | 20.5 | 26.7 |
+| 20, 3 | before | 31.7 → 28.8 | 2,703 | 3,021,147 | 6,979 | 0.19 / 1.32 | 1.23 | 2.24 |
+| 20, 3 | after | 28.8 → 31.2 | 2,627 | 1,190,604 | 5,498 | 0.23 / 2.57 | 2.36 | 3.33 |
+
+Every run's oracle had 0 failures; 11 to 44 clients a run gave up (starved past 64 resolutions a round, the shape's).
+
+**What it means.**
+- **The p99 is the product's, the p999 partly the harness's.** At the p99 the harness took 25 to 51 µs to take a reply,
+  and the floor was 85% of the latency or more; past the p99 a worker kept off its CPU for up to 96 to 126 ms (the
+  `max_sweep_ns` of every run) shows in `to_take` (a p999 of 2.7 to 45 ms).
+- **The product's time is waiting, not work.** A verb's own steps took 12 to 50 µs at the median and the owner's answer
+  13 to 135 µs at the p99; the rest of a slow request was its turn at four or five thread hand-offs: the client's shard
+  reading the ring, the hop to the work's shard, the ask's way to the owner, its way back, and the reply home, each with
+  a p99 of 127 to 786 µs at 50 ms and up to 1.9 ms at 20 ms. The ask to the owner grows fastest with load.
+- **A-381 cut what it was for and moved no latency this box can show.** Each shard's parks fell by 59% at both loads
+  (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms, means of three) and the shards' CPU by 34% at
+  50 ms and 20% at 20 ms. The latencies swung by ten to twenty times with the box's load within each arm (Edit p99 1.3
+  to 40.6 ms), so these six pairs cannot tell the two apart; the round at the lowest load favoured A-381 at 50 ms and
+  main at 20 ms.
 
 ## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
 

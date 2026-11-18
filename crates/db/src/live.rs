@@ -502,33 +502,122 @@ pub fn decode_reported(bytes: &[u8]) -> Result<(Result<Option<Head>, LiveError>,
   Ok((decode_reply(reader.bytes), kept))
 }
 
-/// A holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor) and the payloads it
-/// keeps, in order, each `u32`-length-prefixed.
-pub fn encode_fetched(reply: &Result<Option<Head>, LiveError>, payloads: &[Vec<u8>]) -> Vec<u8> {
+/// Format: the bytes of the length that prefixes each payload of a holder's answer to a [`Fetch`] (a `u32` LE).
+pub const FETCHED_PREFIX_BYTES: usize = size_of::<u32>();
+
+/// The start of a holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor),
+/// `u32`-length-prefixed, in a buffer with room for `payload_bytes` more. The payloads it keeps follow in order, each
+/// appended by [`push_fetched`], so a candidate lays a long log out a slice at a time (g251) and no payload is copied
+/// twice: laid out whole in one turn, after a clone of every entry, a 300 MB log was two copies of it in the turn.
+pub fn fetched_reply(reply: &Result<Option<Head>, LiveError>, payload_bytes: usize) -> Vec<u8> {
   let head = encode_reply(reply);
-  let mut out = Vec::new();
+  let mut out = Vec::with_capacity(
+    FETCHED_PREFIX_BYTES
+      .saturating_add(head.len())
+      .saturating_add(payload_bytes),
+  );
   out.extend_from_slice(&u32::try_from(head.len()).unwrap_or(u32::MAX).to_le_bytes());
   out.extend_from_slice(&head);
-  for payload in payloads {
-    out.extend_from_slice(
-      &u32::try_from(payload.len())
-        .unwrap_or(u32::MAX)
-        .to_le_bytes(),
-    );
-    out.extend_from_slice(payload);
-  }
   out
 }
 
-/// Parses a holder's answer to a [`Fetch`], refusing any payload over `cap` before it is copied.
-pub fn decode_fetched(bytes: &[u8], cap: usize) -> Result<(Option<Head>, Vec<Vec<u8>>), LiveError> {
-  let mut reader = Reader { bytes };
-  let head = decode_reply(&reader.prefixed(cap)?)?;
-  let mut payloads = Vec::new();
-  while !reader.bytes.is_empty() {
-    payloads.push(reader.prefixed(cap)?);
+/// Appends one payload to an answer [`fetched_reply`] began: its length and its bytes.
+pub fn push_fetched(out: &mut Vec<u8>, payload: &[u8]) {
+  out.extend_from_slice(
+    &u32::try_from(payload.len())
+      .unwrap_or(u32::MAX)
+      .to_le_bytes(),
+  );
+  out.extend_from_slice(payload);
+}
+
+/// A holder's answer to a [`Fetch`] as it crossed the network (g251): its reply decoded, its payloads left in place in
+/// the answer's bytes and read one at a time ([`FetchedLog::next_payload`]), each refused over the cap before it is
+/// used. Copied out whole, a 300 MB log's payloads took one turn of the successor's control shard; read in place, each
+/// costs only its own apply, in whichever turn the rebuild applies it.
+#[derive(Debug)]
+pub struct FetchedLog {
+  /// The answer's bytes.
+  bytes: Vec<u8>,
+  /// Where the next payload's length begins.
+  next: usize,
+  /// The largest payload taken.
+  cap: usize,
+  /// The payloads taken so far.
+  taken: usize,
+}
+
+impl FetchedLog {
+  /// Parses a holder's answer: its reply, refused [`LiveError::Malformed`] when cut short or over `cap`, and the log of
+  /// its payloads, each read and checked against `cap` only when it is taken.
+  pub fn decode(bytes: Vec<u8>, cap: usize) -> Result<(Option<Head>, FetchedLog), LiveError> {
+    let mut reader = Reader { bytes: &bytes };
+    let head = decode_reply(&reader.prefixed(cap)?)?;
+    let next = bytes
+      .len()
+      .checked_sub(reader.bytes.len())
+      .ok_or(LiveError::Malformed)?;
+    Ok((
+      head,
+      FetchedLog {
+        bytes,
+        next,
+        cap,
+        taken: 0,
+      },
+    ))
   }
-  Ok((head, payloads))
+
+  /// The next payload, `None` once every one was taken. Refused [`LiveError::Malformed`] when its length runs past the
+  /// answer or over the cap, after which the log is spent.
+  pub fn next_payload(&mut self) -> Option<Result<&[u8], LiveError>> {
+    match self.peek()? {
+      Ok(length) => {
+        let start = self.next.saturating_add(FETCHED_PREFIX_BYTES);
+        let end = start.saturating_add(length);
+        self.next = end;
+        self.taken = self.taken.saturating_add(1);
+        self.bytes.get(start..end).map(Ok)
+      }
+      Err(refusal) => {
+        self.next = self.bytes.len();
+        Some(Err(refusal))
+      }
+    }
+  }
+
+  /// The next payload without taking it (a log's first, whose sealing a takeover reads before its rebuild begins);
+  /// `None` when every one was taken or the next is malformed.
+  pub fn first(&self) -> Option<&[u8]> {
+    let length = self.peek()?.ok()?;
+    let start = self.next.saturating_add(FETCHED_PREFIX_BYTES);
+    self.bytes.get(start..start.saturating_add(length))
+  }
+
+  /// Whether every payload was taken.
+  pub fn is_spent(&self) -> bool {
+    self.next >= self.bytes.len()
+  }
+
+  /// The payloads taken so far.
+  pub fn taken(&self) -> usize {
+    self.taken
+  }
+
+  /// The next payload's length, checked to lie within the answer and the cap; `None` when none is left.
+  fn peek(&self) -> Option<Result<usize, LiveError>> {
+    let rest = self
+      .bytes
+      .get(self.next..)
+      .filter(|rest| !rest.is_empty())?;
+    let mut reader = Reader { bytes: rest };
+    Some(reader.count().and_then(|length| {
+      if length > self.cap || reader.bytes.len() < length {
+        return Err(LiveError::Malformed);
+      }
+      Ok(length)
+    }))
+  }
 }
 
 /// A holder's answer to an entry or an install: the head it holds after it (`Ok(None)`: nothing), or a refusal.

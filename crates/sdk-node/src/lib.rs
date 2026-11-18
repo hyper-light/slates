@@ -108,11 +108,30 @@ fn parse_volume(hex: &str) -> Result<VolumeId> {
   Ok(VolumeId { bytes })
 }
 
+/// One drifted entry of an overlay (§4.15 "Drift"): its path and what the disk did to it (`Modified`, `Deleted`,
+/// `Replaced`, `TypeChanged`).
+#[napi(object)]
+pub struct DriftEntryJs {
+  pub path: String,
+  pub kind: String,
+}
+
+/// An overlay's whole drift (§4.4 `status`, A-267), read a page at a time: every entry the disk changed after the
+/// volume witnessed it, every one whose re-check the host refused now (`unverified`), and the entries too long for any
+/// reply (`oversized`), which no page carries.
+#[napi(object)]
+pub struct DriftedResult {
+  pub drifted: Vec<DriftEntryJs>,
+  pub unverified: Vec<String>,
+  pub oversized: u32,
+}
+
 /// A volume's status as a plain JS object (§4.4) — the fields `slates status` prints, with napi's
 /// camelCase keys (`referencedBytes`, `nfsPort`, `mirrorAgeNs`, `hostEpoch`, …). Ids cross as hex; every
 /// `u64` count is range-checked to a JS-safe integer before the object is built; the placement (§4.8,
 /// D-18) is flattened to `placed`/`mirrorAgeNs`/`hostEpoch`; `nfsPort` is the daemon's `mount_nfs` port
-/// or `null`; `drifted` is the full list of drifted overlay paths (the CLI shows only the count).
+/// or `null`; `drifted` holds the drifted overlay paths that fit beside the report's other fields in one reply, and
+/// `driftedElided` counts the rest, which `slates status --drift` walks (A-267).
 #[napi(object)]
 pub struct VolumeStatus {
   pub id: String,
@@ -125,6 +144,7 @@ pub struct VolumeStatus {
   pub snapshots: u32,
   pub watcher: String,
   pub drifted: Vec<String>,
+  pub drifted_elided: u32,
   pub nfs_port: Option<u32>,
   pub placed: bool,
   pub mirror_age_ns: Option<i64>,
@@ -234,6 +254,8 @@ pub struct LandingOutcomeJs {
   pub held: i64,
   pub durability: LandingDurabilityJs,
   pub degraded: Vec<LandingDegradationJs>,
+  /// Degraded cells past what one reply holds (A-267).
+  pub degraded_elided: i64,
   pub barriers: i64,
 }
 
@@ -333,6 +355,8 @@ pub struct LandingResult {
   pub manifest: Option<String>,
   pub summary: Option<LandingSummaryJs>,
   pub conflicts: Option<Vec<String>>,
+  /// Conflicts past what one reply holds (A-267): every entry, its conflict among it, is read from the presentation.
+  pub conflicts_elided: Option<i64>,
   pub grant_with: Option<String>,
 }
 
@@ -373,12 +397,14 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
           .iter()
           .map(degradation_js)
           .collect::<Result<Vec<_>>>()?,
+        degraded_elided: i64::from(o.degraded_elided),
         barriers: status_i64(o.barriers, "barriers")?,
       }),
       landing: None,
       manifest: None,
       summary: None,
       conflicts: None,
+      conflicts_elided: None,
       grant_with: None,
     }),
     Landing::GrantRequired {
@@ -386,6 +412,7 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       let mut by_action = Vec::with_capacity(summary.by_action.len());
       for action in summary.by_action {
@@ -405,6 +432,7 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
           filtered_out: status_i64(summary.filtered_out, "filteredOut")?,
         }),
         conflicts: Some(conflicts),
+        conflicts_elided: Some(i64::from(conflicts_elided)),
         grant_with: Some(format!("slates grant {landing}")),
       })
     }
@@ -427,6 +455,7 @@ fn volume_status(report: StatusReport) -> Result<VolumeStatus> {
     snapshots: report.snapshots,
     watcher: report.watcher,
     drifted: report.drifted,
+    drifted_elided: report.drifted_elided,
     nfs_port: report.nfs_port.map(u32::from),
     placed: report.placed.region,
     mirror_age_ns: status_opt_i64(report.placed.mirror_age_ns, "mirrorAgeNs")?,
@@ -738,6 +767,27 @@ impl Client {
     volume_status(report)
   }
 
+  /// Reads an overlay's whole drift (§4.4 `status`, A-267) as a [`DriftedResult`]: a status carries the first drifted
+  /// entries that fit beside its other fields and counts the rest (`driftedElided`); this reads every one, a page at a
+  /// time, each page re-checking the entries it passes against the disk.
+  #[napi]
+  pub fn drifted(&mut self, volume: String) -> Result<DriftedResult> {
+    let id = parse_volume(&volume)?;
+    let whole = self.inner.drifted(id).map_err(refusal)?;
+    Ok(DriftedResult {
+      drifted: whole
+        .drifted
+        .into_iter()
+        .map(|entry| DriftEntryJs {
+          path: entry.path,
+          kind: format!("{:?}", entry.kind),
+        })
+        .collect(),
+      unverified: whole.unverified,
+      oversized: whole.oversized,
+    })
+  }
+
   // The async surface's low-level primitives (R6, D-19): begin-and-spin returns the request id word
   // and the reply if it landed within the spin (the fast path); poll takes it by word once the
   // completion fd signals; completionFd / arm / disarm / takeReady drive the JS `AsyncClient`'s libuv
@@ -943,6 +993,13 @@ impl Client {
   #[napi]
   pub fn finish(&mut self, ticket: String) -> Result<()> {
     self.driver.finish(parse_word(&ticket)?);
+    Ok(())
+  }
+
+  /// Keeps a call whose poll answered nothing yet because it took a chained step: its next reply is reported.
+  #[napi]
+  pub fn continued(&mut self, ticket: String) -> Result<()> {
+    self.driver.continued(parse_word(&ticket)?);
     Ok(())
   }
 
@@ -1663,4 +1720,62 @@ impl Client {
     )?;
     Ok(UnitBegin { word, fast })
   }
+}
+
+/// Format: the executable [`exec_command`] runs unless its caller names another: the `slates` binary, found on the
+/// `PATH` as a shell finds it. slates' AppArmor profile attaches to the binary's real path (A-370).
+const SLATES_PROGRAM: &str = "slates";
+
+/// What [`exec_command`] takes beside the request: `{ apparmorProfile, program }` in JS.
+#[napi(object)]
+pub struct ExecOptions {
+  /// The launcher's AppArmor option (A-370), off unless `true`: on a host whose AppArmor restricts unprivileged user
+  /// namespaces (Ubuntu 24.04 and later), the launcher makes its namespace under slates' AppArmor profile for `program`,
+  /// which an administrator loads as root ([`apparmor_profile`]); off, it never uses that profile.
+  pub apparmor_profile: Option<bool>,
+  /// The executable that serves the launcher: `slates` (found on the `PATH`) unless named.
+  pub program: Option<String>,
+}
+
+/// The command that runs slates' chosen-path launcher (`slates exec`, §4.6 "The launcher"; A-370): `volume` shown at
+/// the existing directory `at` for `command`, in a namespace of its own (Linux). It returns the argument list for
+/// `child_process.spawn(argv[0], argv.slice(1))`, so the program spawns and awaits it as it would any command; the
+/// launcher finds the volume under `SLATES_ROOT` in the environment it is given. The grammar is every surface's
+/// (`slates_client::exec::ExecSpec`), so the `slates` command reads back exactly this request. `execCommand` in JS.
+#[napi]
+pub fn exec_command(
+  volume: String,
+  at: String,
+  command: Vec<String>,
+  options: Option<ExecOptions>,
+) -> Result<Vec<String>> {
+  if command.is_empty() {
+    return Err(Error::from_reason("exec needs a command"));
+  }
+  let (apparmor_profile, program) = match options {
+    Some(options) => (options.apparmor_profile.unwrap_or(false), options.program),
+    None => (false, None),
+  };
+  let spec = slates_client::exec::ExecSpec {
+    volume,
+    at,
+    command,
+    apparmor: if apparmor_profile {
+      slates_client::exec::AppArmor::Profile
+    } else {
+      slates_client::exec::AppArmor::Off
+    },
+  };
+  let mut argv = vec![program.unwrap_or_else(|| SLATES_PROGRAM.to_owned())];
+  argv.extend(spec.arguments());
+  Ok(argv)
+}
+
+/// slates' AppArmor profile for `executable`, the absolute real path of the binary that runs the launcher (A-370): the
+/// text an administrator saves under `/etc/apparmor.d` and loads with `apparmor_parser -r`, as root. It grants that
+/// executable `userns,` and nothing else. Throws for a path the profile cannot name exactly. `apparmorProfile` in JS.
+#[napi]
+pub fn apparmor_profile(executable: String) -> Result<String> {
+  slates_client::exec::profile(&executable)
+    .map_err(|refusal| Error::from_reason(refusal.to_string()))
 }
