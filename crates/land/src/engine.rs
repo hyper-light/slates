@@ -1064,10 +1064,18 @@ impl<H: LandFs> Landing<'_, H> {
   /// (`ModifyModify`); bytes to write are staged with the metadata decided; bytes the disk already holds are kept,
   /// and where the file lacks a field the clone set, that field alone is set (the entry applies, without its bytes).
   /// Anything else keeps its verdict.
-  fn judge_replaced_meta(&mut self, entry: &LandingEntry, content: Verdict, disk: DiskState) -> Verdict {
-    let (Action::Replace, Some(witness), Some(overlay), DiskState::File { fingerprint, .. }) =
-      (&entry.action, entry.witnessed.as_ref(), entry.overlay.as_ref(), disk)
-    else {
+  fn judge_replaced_meta(
+    &mut self,
+    entry: &LandingEntry,
+    content: Verdict,
+    disk: DiskState,
+  ) -> Verdict {
+    let (Action::Replace, Some(witness), Some(overlay), DiskState::File { fingerprint, .. }) = (
+      &entry.action,
+      entry.witnessed.as_ref(),
+      entry.overlay.as_ref(),
+      disk,
+    ) else {
       return content;
     };
     if !matches!(content, Verdict::Apply | Verdict::AcceptIdentical) {
@@ -1242,7 +1250,9 @@ impl<H: LandFs> Landing<'_, H> {
         Some(skipped) => skipped,
         None => {
           cx.observer.before_write(self.host, entry);
-          if matches!(entry.action, Action::Create | Action::Replace) && !self.sets_meta_alone(entry) {
+          if matches!(entry.action, Action::Create | Action::Replace)
+            && !self.sets_meta_alone(entry)
+          {
             return self.begin_file(entry, index, cx, progress);
           }
           return EntryStep::Done(self.write_entry(entry));

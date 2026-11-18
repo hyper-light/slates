@@ -329,9 +329,7 @@ fn an_overlays_replacement_over_an_outsiders_mode_is_refused_and_the_mode_kept()
     let mut overlay = vol.with_host(&mut host);
     overlay.truncate(&mut store, no, 0).unwrap();
     overlay
-      .write(&mut store, no, 0, b"#!/bin/sh
-echo rewritten
-")
+      .write(&mut store, no, 0, b"#!/bin/sh\necho rewritten\n")
       .unwrap();
   }
   host.advance_ns(1);
