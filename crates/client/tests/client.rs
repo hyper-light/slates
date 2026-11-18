@@ -19,7 +19,7 @@ use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, Submitted,
 };
 use slates_ipc::HeldRendezvous;
-use slates_ipc::protocol::{Refusal, RequestBody};
+use slates_ipc::protocol::{Refusal, RequestBody, VolumeRefusal};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -1221,8 +1221,9 @@ fn a_long_writable_map_is_waited_for_while_the_daemon_lives() {
 
 /// AC-A-186: a writable map needs the caller's own write attachment, as a file verb does, and a regular file. Do: on a
 /// volume holding a file and a directory, ask `map_write` under an attachment that does not exist, under a read
-/// attachment, for the directory and for a missing file. Expect: `NotFound`, `Forbidden`, `BadRequest` and `NotFound`,
-/// and no copy made.
+/// attachment, for the directory and for a missing file. Expect: `NotFound`, `Forbidden`, the volume core's typed
+/// `IsDirectory` (A-299: a file verb's refusal reaches the consumer typed, never as words) and `NotFound`, and no copy
+/// made.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_writable_map_needs_a_write_attachment_and_a_file() {
@@ -1257,11 +1258,11 @@ fn a_writable_map_needs_a_write_attachment_and_a_file() {
     ),
     "a read attachment"
   );
-  assert!(
-    matches!(
-      refused(client.map_write((id, writing), "/d", slates_client::page_bytes().unwrap())),
-      Refusal::BadRequest { .. }
-    ),
+  assert_eq!(
+    refused(client.map_write((id, writing), "/d", slates_client::page_bytes().unwrap())),
+    Refusal::Volume {
+      refusal: VolumeRefusal::IsDirectory
+    },
     "a directory"
   );
   assert_eq!(

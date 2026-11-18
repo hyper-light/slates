@@ -652,6 +652,21 @@ pub struct ShardState {
   /// unambiguous; `None` between requests, and for work whose cause crossed a boundary that carried
   /// none (the span then declares its cause missing).
   pub current_span: Option<slates_wire::observe::SpanContext>,
+  /// The idle window a forward made for the request now being served holds its owner open for (§4.7; A-326), 0 for
+  /// none (`verbs::loop_hold`). Set by `serve_client` around each request, as `current_span` is; 0 between requests.
+  pub forward_hold_ns: u64,
+  /// The requests this shard has read in a row, each within F of its last client I/O: the length of its closed loop so
+  /// far, which caps a forward's hold (`verbs::loop_hold`; A-326). 0 after a pause longer than F.
+  pub loop_run: u64,
+  /// The end of this shard's last round of its clients' loop I/O (their requests read, the replies to them written),
+  /// one clock read a round: what judges whether a request continues a closed loop (`verbs::loop_hold`; A-326). Unlike
+  /// `last_work_ns`, the shard's own background work (a destroy's slices, a lease's expiry, a kept forward's retry)
+  /// never moves it, nor a client's acknowledgement after a pause, or a paced client's pause would look like a loop's.
+  /// 0 before the first.
+  pub last_client_io_ns: u64,
+  /// Whether the round now running read a request of a client's loop or wrote a reply to one (`verbs::serve_round`
+  /// stamps `last_client_io_ns` at its end when it did; A-326).
+  pub loop_io: bool,
   /// Where the verb now running would reply (§4.16 "Commit"; AUD-11): the shard and ring slot the
   /// reply is written to, set by the serve path or the forward task before the verb runs and cleared
   /// after it, so a verb whose acceptance must wait for a fleet commit (`submit` at `f > 0`) can hand
@@ -1112,6 +1127,8 @@ pub struct PendingForward {
   /// The origin's `ring.request` span context (§4.14), carried to the owner so the verb's `shard.op`
   /// opens within it — one trace across the shard boundary, its cause named.
   pub cause: Option<slates_wire::observe::SpanContext>,
+  /// The idle window the forward holds its owner open for, 0 for none (`ShardState::forward_hold_ns`; A-326).
+  pub hold_ns: u64,
 }
 
 impl std::fmt::Debug for PendingForward {
