@@ -10775,15 +10775,23 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
     "the successor gives the volume up naming the promises it waited for, within {SERVE_DEADLINE:?}; its last reply \
      {last:?}; its counters {counted:?}"
   );
-  let counted = counted.unwrap_or_default();
-  for name in [
-    "fleet.takeover.unpromised.past_bound",
-    "fleet.takeover.given_up",
-  ] {
+  expect_the_successor_counted(
+    &counted.unwrap_or_default(),
+    &[
+      "fleet.takeover.unpromised.past_bound",
+      "fleet.takeover.given_up",
+    ],
+  );
+}
+
+/// Test support: expects each of `names` counted above zero among a successor's takeover counters (`counted`, as
+/// [`takeover_counters`] lists them), naming the counters in the failure.
+fn expect_the_successor_counted(counted: &[(&'static str, u64)], names: &[&str]) {
+  for name in names {
     assert!(
       counted
         .iter()
-        .any(|(counter, count)| *counter == name && *count > 0),
+        .any(|(counter, count)| counter == name && *count > 0),
       "the successor counted {name}: {counted:?}"
     );
   }
@@ -12182,8 +12190,20 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
   );
   assert!(second.is_some(), "the second seal was taken on a");
   assert!(served, "the successor serves the volume");
-  let (sealed_loss, owner_epoch) =
-    sealed_loss.expect("a reported its loss window at its placed seal");
+  expect_the_loss_window_reported(sealed_loss, unsealed_loss, taken_loss);
+  expect_only_the_placed_seal_served(&sealed_read, &unplaced_read, &unsealed_read);
+}
+
+/// The reports of `a_successor_reports_the_loss_window_its_takeover_left` (AC-8.3): the owner's at its placed seal
+/// (`sealed`, with the owner's epoch), the owner's after the later writes (`unsealed`) and the successor's (`taken`).
+/// Expect nothing at risk at the placed seal, which the report names; the later writes at risk with the same seal named
+/// (the unplaced one moves nothing); and the successor serving from that seal, not a live log, under a later epoch.
+fn expect_the_loss_window_reported(
+  sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  taken: Option<(slates_ipc::protocol::LossReport, u64)>,
+) {
+  let (sealed_loss, owner_epoch) = sealed.expect("a reported its loss window at its placed seal");
   let at_seal = sealed_loss
     .placed_sequence
     .expect("a named its placed seal's head sequence");
@@ -12191,28 +12211,36 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
     sealed_loss.at_risk_ns == Some(0) && !sealed_loss.live_shipped,
     "nothing is at risk while the volume is exactly its placed seal: {sealed_loss:?}"
   );
-  let (unsealed_loss, _) =
-    unsealed_loss.expect("a reported its loss window after the later writes");
+  let (unsealed_loss, _) = unsealed.expect("a reported its loss window after the later writes");
   assert!(
     unsealed_loss.at_risk_ns.is_some_and(|ns| ns > 0)
       && unsealed_loss.placed_sequence == Some(at_seal),
     "the writes after the placed seal are at risk, and the unplaced seal moves nothing: {unsealed_loss:?}"
   );
-  let taken = taken_loss
+  let taken = taken
     .and_then(|(loss, _)| loss.taken_over)
     .expect("the successor reports its takeover");
   assert!(
     !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
     "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
   );
+}
+
+/// The reads of `a_successor_reports_the_loss_window_its_takeover_left` on the successor: the sealed file served, and
+/// the files written after the placed seal (`unplaced`, `unsealed`) gone with the window.
+fn expect_only_the_placed_seal_served(
+  sealed: &ReplyBody,
+  unplaced: &ReplyBody,
+  unsealed: &ReplyBody,
+) {
   assert!(
-    matches!(&sealed_read, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
-    "the sealed file survived: {sealed_read:?}"
+    matches!(sealed, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
+    "the sealed file survived: {sealed:?}"
   );
   assert!(
-    !matches!(unplaced_read, ReplyBody::ReadBytes { .. })
-      && !matches!(unsealed_read, ReplyBody::ReadBytes { .. }),
-    "the writes after the placed seal were the window, and are gone: {unplaced_read:?} {unsealed_read:?}"
+    !matches!(unplaced, ReplyBody::ReadBytes { .. })
+      && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
+    "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
   );
 }
 

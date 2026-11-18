@@ -1232,6 +1232,38 @@ mod tests {
     daemon.stop();
   }
 
+  /// Test support for `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it`: takes messages off the stand-in
+  /// slot's channel ([`take`]), running each task to its end at once as a drain does, until `bound` replies have run
+  /// (`replied` counts them); the number of messages taken. A message that is not a task, or none within
+  /// [`MESSAGE_WAIT`], fails the test.
+  fn drain_until_replied(
+    receiver: &std::sync::mpsc::Receiver<Control>,
+    registration: &registry::Registration,
+    bound: usize,
+    replied: &std::sync::atomic::AtomicUsize,
+  ) -> usize {
+    use std::sync::atomic::Ordering;
+    let mut ran = 0_usize;
+    while replied.load(Ordering::Acquire) < bound {
+      match take(receiver, registration) {
+        Ok(Control::Spawn(mut request)) => {
+          let mut context = Context::from_waker(Waker::noop());
+          assert!(
+            request.future.as_mut().poll(&mut context).is_ready(),
+            "a message's task runs to its end at once"
+          );
+        }
+        Ok(_) => panic!("only tasks were sent"),
+        Err(error) => panic!(
+          "{} of {bound} replies arrived, then none within {MESSAGE_WAIT:?}: {error:?}",
+          replied.load(Ordering::Acquire)
+        ),
+      }
+      ran += 1;
+    }
+    ran
+  }
+
   /// The carrier keeps at most its bound, sends what it keeps in order, and refuses one past the bound to its sender,
   /// counted (§4.3; CLAUDE.md §2 item 8; goal 238). Do: start a one-shard daemon with one client a shard, so its
   /// derived bound (`DaemonConfig::kept_bound`) is about one task arena; on its shard, register a stand-in slot whose
@@ -1307,24 +1339,7 @@ mod tests {
       (bound_waits, bound_waits),
       "every kept reply is a wait for room, all held at once"
     );
-    let mut ran = 0_usize;
-    while NEXT.load(Ordering::Acquire) < bound {
-      match take(&receiver, &registration) {
-        Ok(Control::Spawn(mut request)) => {
-          let mut context = Context::from_waker(Waker::noop());
-          assert!(
-            request.future.as_mut().poll(&mut context).is_ready(),
-            "a message's task runs to its end at once"
-          );
-        }
-        Ok(_) => panic!("only tasks were sent"),
-        Err(error) => panic!(
-          "{} of {bound} replies arrived, then none within {MESSAGE_WAIT:?}: {error:?}",
-          NEXT.load(Ordering::Acquire)
-        ),
-      }
-      ran += 1;
-    }
+    let ran = drain_until_replied(&receiver, &registration, bound, &NEXT);
     let after = crate::daemon::observe_first(&daemon, |_| room_waits());
     assert_eq!(
       ran,
