@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "The library an embedding host drives slates through (§4.12 \"Embedding\", A-278): attach to an instance, create, clone, snapshot and destroy volumes, serve them as a host mount or as a descriptor a VMM takes, read their drift, plan landings and land them under a grant the host's confirmation surface issues, and observe the daemon, every failure a typed refusal."
+description = "The library an embedding host drives slates through, and its typed consumer contract (§4.12 \"Embedding\", A-278; A-299): start or attach to an instance, provision, snapshot and destroy volumes, serve them as a host mount or as a descriptor a VMM takes, read their drift, land and merge under the write mode the user granted, and observe the daemon; every answer a typed outcome, every failure a closed typed error."
 
 [features]
 # Forwards blake3's pure-Rust backend (no C build script) so a downstream crate can cross-lint for a Windows target from
@@ -40,6 +40,9 @@ slates-rt = { workspace = true }
 slates-vfs = { workspace = true }
 # The fleet manifest the roles read (`role::fleet`).
 serde_json = { workspace = true }
+# The merge engine's conflict classes, which a merge window names by discriminant on the wire (§4.16, D-27): the
+# contract reads them against the engine's own enum (A-299). The server links it already.
+slates-merge = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

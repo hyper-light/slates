@@ -27,7 +27,7 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
-use slates_ipc::protocol::{EntriesCursor, GrantProofBody, PlannedEntry};
+use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, WritePolicy};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
@@ -204,8 +204,6 @@ pub enum Landing {
     landing: u64,
     /// The manifest hash the grant must bind.
     manifest: [u8; 32],
-    /// The nonce a signed grant's statement carries (A-285).
-    nonce: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
     /// Conflicts found before any write.
@@ -915,13 +913,11 @@ fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
     ReplyBody::GrantRequired {
       landing,
       manifest,
-      nonce,
       summary,
       conflicts,
     } => Ok(Landing::GrantRequired {
       landing,
       manifest,
-      nonce,
       summary,
       conflicts,
     }),
@@ -3907,13 +3903,11 @@ impl Client {
       ReplyBody::GrantRequired {
         landing,
         manifest,
-        nonce,
         summary,
         conflicts,
       } => Ok(Landing::GrantRequired {
         landing,
         manifest,
-        nonce,
         summary,
         conflicts,
       }),
@@ -3921,9 +3915,9 @@ impl Client {
     }
   }
 
-  /// Issues the grant a presented landing needs, carrying the human authority's proof (§4.13 "Grants",
-  /// A-285): a signature by a key the human registered over the grant statement, or the keyed hash under
-  /// the anchor's issuer secret (a bare `[u8; 32]`) until the signed form replaces it. Returns the grant id `land`
+  /// Issues the grant a presented landing needs, carrying the human surface's proof of issuer authority
+  /// (§4.13 "Grants"; the proof is `slates_server::landing::grant_proof` under the anchor's issuer
+  /// secret — only a caller that maps the anchor segment can make one). Returns the grant id `land`
   /// then consumes. Refused `GrantIssuerUnverified` when the proof does not verify, `GrantMismatch` when
   /// the approved manifest is not the presented one, `NotFound` when nothing awaits under `landing`.
   pub fn grant(
@@ -3932,17 +3926,44 @@ impl Client {
     manifest: [u8; 32],
     scope: GrantScope,
     term_ns: u64,
-    proof: impl Into<GrantProofBody>,
+    proof: [u8; 32],
   ) -> Result<u64, ClientError> {
     match self.call(&RequestBody::Grant {
       landing,
       manifest,
       scope,
       term_ns,
-      proof: proof.into(),
+      proof,
     })? {
       ReplyBody::Granted { grant } => Ok(grant),
       _ => Err(ClientError::UnexpectedReply { verb: "grant" }),
+    }
+  }
+
+  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by `proof`, the keyed hash under the
+  /// instance's issuer secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound
+  /// channel (an agent never sets its own policy) and `GrantIssuerUnverified` without the proof.
+  pub fn set_policy(
+    &mut self,
+    subject: PolicySubject,
+    policy: WritePolicy,
+    proof: [u8; 32],
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetPolicy {
+      subject,
+      policy,
+      proof,
+    })? {
+      ReplyBody::PolicySet => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "set_policy" }),
+    }
+  }
+
+  /// A write policy (A-285): `None` while none is set, which is ask.
+  pub fn policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, ClientError> {
+    match self.call(&RequestBody::Policy { subject })? {
+      ReplyBody::Policy { policy } => Ok(policy),
+      _ => Err(ClientError::UnexpectedReply { verb: "policy" }),
     }
   }
 

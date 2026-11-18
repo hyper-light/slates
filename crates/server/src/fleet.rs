@@ -1196,6 +1196,9 @@ pub async fn run_membership(transport: FleetTransport) {
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
   spawn_detached(run_record_plane(local), LOOP_SPAWN_REFUSED);
+  // The work route keeper (A-288): parked until a takeover adopts a work's route, then each period asks the greens'
+  // owners about the routes this node keeps, on its own task so a slow question never holds the coordinator.
+  spawn_detached(crate::work_route::run(local), LOOP_SPAWN_REFUSED);
 }
 
 /// Shared immutable dial inputs: handles of what the control shard keeps for its life (its identity, its
@@ -1565,6 +1568,22 @@ async fn serve_peer_records(
           injected_serve_delay().await;
           verbs::injected_forward_silence(&request).await;
           verbs::serve_forward(control, peer_anchor, &request).await
+        });
+        if let Some(reply) = served
+          && endpoint.reply(stream_id, &reply).is_err()
+        {
+          return;
+        }
+        continue;
+      }
+      // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if kind == crate::work_route::STREAM && enrolled => {
+        let served = forwards.spawn(stream_id, async move {
+          crate::work_route::serve(control, &request).await
         });
         if let Some(reply) = served
           && endpoint.reply(stream_id, &reply).is_err()
@@ -3924,17 +3943,28 @@ async fn materialize_adopted_objects(origin: u16, local: HostId, budget: CommitB
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
 /// adopted placement, so that shard's record plane ships the tombstone's remaining stages to the successor's
-/// candidates and retires it. A tombstone the shard already holds is already owed there; a refused record
-/// (the partition's volume capacity is full) is counted and retried next period.
+/// candidates and retires it. A tombstone the shard already holds is already owed there; one the shard refuses (the
+/// partition's volume capacity is full, or a live volume already holds the id), one it does not answer within the
+/// period, and one whose partition has no shard here are counted by that reason and attempted again next period.
+///
+/// **Bounded** (2026-11-18, as the taken-over volumes and greens are; CLAUDE.md §2 item 8): past
+/// [`takeover_attempts`] it is given up on (`state::PendingTombstone::count_attempt`): counted
+/// ([`TOMBSTONE_ADOPT_GIVEN_UP`]), logged with the reason, and attempted no more. Its tombstone record is already
+/// placed under this node at the quorum (the adoption re-committed it), so the destroyed volume is never served again;
+/// what is lost is the retirement this shard would have shipped, which leaves the candidates holding the tombstone, the
+/// safe state. It stays marked in `pending_tombstones`, so the volume is still known destroyed here and its catalog
+/// register is never rebuilt. Before, a tombstone whose partition has no shard here was skipped every period, uncounted,
+/// and a refused one retried every period, for as long as the daemon ran.
 async fn adopt_pending_tombstones(origin: u16) {
   let pending: Vec<(ObjectId, u64, Option<PlacedHead>, Option<u16>)> = state::with_state(|s| {
     s.pending_tombstones
       .iter()
-      .map(|(object, sequence)| {
+      .filter(|(_, pending)| !pending.given_up)
+      .map(|(object, pending)| {
         let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
         (
           *object,
-          *sequence,
+          pending.sequence,
           s.placed_heads.get(object).cloned(),
           s.shards.get(usize::from(partition)).copied(),
         )
@@ -3943,51 +3973,86 @@ async fn adopt_pending_tombstones(origin: u16) {
   })
   .unwrap_or_default();
   for (object, sequence, placed, target) in pending {
-    let Some(target) = target else {
-      continue;
-    };
-    let adopted = call_within(
-      origin,
-      target,
-      move |s| {
-        let tombstone = Tombstone {
-          volume: DbVolumeId { bytes: object.0 },
-          sequence,
-        };
-        let now = s.clock.monotonic_ns();
-        let recorded = match s.db.mutate(
-          &mut s.segment,
-          &slates_db::op::Op::TombstoneAdopted { tombstone },
-          now,
-        ) {
-          Ok(_) => true,
-          Err(slates_db::error::DbError::AlreadyExists { .. }) => {
-            s.db.partition().tombstone(tombstone.volume).is_some()
+    let waited = match target {
+      None => TOMBSTONE_WAITS_SHARD,
+      Some(target) => {
+        let adopted = call_within(
+          origin,
+          target,
+          move |s| {
+            let tombstone = Tombstone {
+              volume: DbVolumeId { bytes: object.0 },
+              sequence,
+            };
+            let now = s.clock.monotonic_ns();
+            let recorded = match s.db.mutate(
+              &mut s.segment,
+              &slates_db::op::Op::TombstoneAdopted { tombstone },
+              now,
+            ) {
+              Ok(_) => true,
+              Err(slates_db::error::DbError::AlreadyExists { .. }) => {
+                s.db.partition().tombstone(tombstone.volume).is_some()
+              }
+              Err(_) => false,
+            };
+            if recorded && let Some(placed) = placed {
+              s.placed_heads.insert(object, placed);
+            }
+            recorded
+          },
+          HEARTBEAT_NS,
+        )
+        .await;
+        match adopted {
+          Some(true) => {
+            state::with_state(|s| s.pending_tombstones.remove(&object));
+            continue;
           }
-          Err(_) => false,
-        };
-        if recorded && let Some(placed) = placed {
-          s.placed_heads.insert(object, placed);
+          Some(false) => TOMBSTONE_ADOPT_REFUSED,
+          None => TOMBSTONE_ADOPT_UNANSWERED,
         }
-        recorded
-      },
-      HEARTBEAT_NS,
-    )
-    .await;
-    state::with_state(|s| {
-      if adopted == Some(true) {
-        s.pending_tombstones.remove(&object);
-      } else {
-        s.count(TOMBSTONE_ADOPT_REFUSED, 1);
       }
-    });
+    };
+    let given_up = state::with_state(|s| {
+      s.count(waited, 1);
+      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let pending = s.pending_tombstones.get_mut(&object)?;
+      let attempts = pending.attempts.saturating_add(1);
+      let given_up = pending.count_attempt(bound);
+      if given_up {
+        s.count(TOMBSTONE_ADOPT_GIVEN_UP, 1);
+      }
+      given_up.then_some(attempts)
+    })
+    .flatten();
+    if let Some(attempts) = given_up {
+      slates_machine::log_line!(
+        "slates daemon: a taken-over tombstone {} was not recorded after {attempts} attempts, one a period (the failover \
+         SLO's worth), the last counted {waited}; it is attempted no more and its volume stays destroyed here",
+        crate::verbs::hex_of(&object.0)
+      );
+    }
   }
 }
 
-/// The status refusal count under which a successor records an adopted tombstone its owner shard could not
-/// record this period (AUD-29-43); it stays pending and is retried.
+/// The status refusal count under which a successor records an adopted tombstone its owner shard refused to record
+/// this period (AUD-29-43): the partition's volume capacity is full, or a live volume holds the id. It stays pending,
+/// and is attempted again next period up to its bound ([`adopt_pending_tombstones`]).
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const TOMBSTONE_ADOPT_REFUSED: &str = "fleet.tombstone.adopt_refused";
+/// Counter: an adopted tombstone's owner shard did not answer within the period; it is attempted again next period up to
+/// its bound. Counted as [`TOMBSTONE_ADOPT_REFUSED`] before 2026-11-18.
+/// Format: a counter name in the daemon's status report.
+const TOMBSTONE_ADOPT_UNANSWERED: &str = "fleet.tombstone.adopt_unanswered";
+/// Counter: an adopted tombstone whose partition has no runtime shard here; it is attempted again next period up to its
+/// bound. Skipped without a count before 2026-11-18.
+/// Format: a counter name in the daemon's status report.
+const TOMBSTONE_WAITS_SHARD: &str = "fleet.tombstone.waits.shard";
+/// Counter: an adopted tombstone given up on past its attempts ([`takeover_attempts`]): its retirement is not shipped
+/// from here, and the candidates keep the tombstone. Zero is the healthy reading.
+/// Format: a counter name in the daemon's status report.
+const TOMBSTONE_ADOPT_GIVEN_UP: &str = "fleet.tombstone.given_up";
 
 /// Materializes each taken-over **green** whose newest merge record this node adopted (§4.16
 /// owner-loss recovery; AUD-14) into an owned green **on the shard its id routes to**: the chain is
@@ -8236,7 +8301,7 @@ fn keep_recipient(
 
 /// One request to `host` over its record session, within the round's budget: the reply, or `None` when no session to
 /// it is reachable or the exchange failed (an empty reply is a refusal).
-async fn request_peer(
+pub(crate) async fn request_peer(
   host: HostId,
   stream: u64,
   request: &[u8],
@@ -8344,11 +8409,16 @@ async fn retire_shard_tombstones(
     // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
     // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for
     // good, while the other survivor answered `NotFound` (6 of 6 runs, 2026-11-06, `crates/cli/tests/live_chaos.rs`:
-    // an unanswered destroy, then its owner's loss).
-    let _ = state::with_state(|s| {
+    // an unanswered destroy, then its owner's loss). On every shard, since the takeover tracked it on every shard.
+    // A successor's own copies go too (A-288): the takeover kept its acceptor of each register in `holder_records` and
+    // this shard's placement of an adopted catalog, and nothing drops them once every candidate has dropped its own, so
+    // a retired work's route, or a destroyed taken-over volume, would stay held here for good.
+    let _ = state::with_state_counted(|s| {
       for register in [object, object.catalog()] {
-        s.fleet.forget_object(register);
+        crate::takeover::forget_owner_on_every_shard(s, register);
         s.departed_owners.remove(&register);
+        s.holder_records.remove(&register);
+        s.placed_heads.remove(&register);
       }
     });
   }

@@ -2675,6 +2675,17 @@ pub fn record_completion(
   id: RequestId,
   reply: ReplyBody,
 ) -> ReplyBody {
+  record_completion_routed(state, (origin, id), reply, None)
+}
+
+/// [`record_completion`], for a completion a green's successor adopted with `work`, the work whose submit it completes
+/// (A-288): the partition keeps the completion counted under the work while it retains it, which keeps the work's route.
+fn record_completion_routed(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  reply: ReplyBody,
+  work: Option<DbVolumeId>,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   let record = Op::CompletionRecorded {
     record: CompletionRecord {
@@ -2682,6 +2693,7 @@ pub fn record_completion(
       client: id.client,
       sequence: id.sequence,
       result: reply.to_bytes(),
+      work,
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
@@ -4006,6 +4018,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
+    Refusal::PolicyForbids { .. } => "policy_forbids",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4471,6 +4484,12 @@ fn dispatch_inner(
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
     RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::SetPolicy {
+      subject,
+      policy,
+      proof,
+    } => crate::landing::set_policy_verb(state, principal, subject, policy, proof),
+    RequestBody::Policy { subject } => crate::landing::policy_verb(state, principal, subject),
     RequestBody::Share {
       volume,
       principal: subject,
@@ -5146,6 +5165,7 @@ fn create(
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5822,6 +5842,7 @@ fn found_green(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6115,6 +6136,7 @@ fn create_work(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6888,7 +6910,7 @@ fn submit(
       // The durable head is the checkpoint's version and the increments after it (W3).
       if let Err(refusal) = record_accepted(
         state,
-        green_id,
+        (green_id, work_id),
         version,
         (&increment_bytes, &inc),
         applied.as_deref(),
@@ -6905,7 +6927,7 @@ fn submit(
       reset_accepted_work(state, work_id, version);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
-      let completion = crate::merge_service::SubmitCompletion::of_current(state);
+      let completion = crate::merge_service::SubmitCompletion::of_current(state, work_id);
       crate::merge_service::enqueue_record(
         state,
         green_id,
@@ -6961,12 +6983,12 @@ fn submit(
 /// last accept (a work destroyed or rebased), and a full chain refuses every submit whose accept would take the
 /// checkpoint, so without it the green stayed full for good. What is still full is refused `TableAtCapacity`.
 /// Appends accepted `version`'s entry to `green`'s durable chain, unless an idempotent accept already holds it (A-257): the
-/// increment as submitted and what its verdict resolved it to. At a version whose record goes to holders the head's identity
-/// is read anyway, and goes beside it for a replay to compare; at `f = 0` the entries after the last checkpoint are checked
-/// by their digest alone.
+/// increment as submitted and what its verdict resolved it to, with the completion key of the submit from `work` that made
+/// it (A-255, A-288). At a version whose record goes to holders the head's identity is read anyway, and goes beside it for
+/// a replay to compare; at `f = 0` the entries after the last checkpoint are checked by their digest alone.
 fn record_accepted(
   state: &mut ShardState,
-  green: DbVolumeId,
+  (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
   (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
   applied: Option<&[slates_merge::chain_entry::Applied]>,
@@ -6988,7 +7010,7 @@ fn record_accepted(
       increment_bytes,
       increment,
       applied.unwrap_or_default(),
-      crate::merge_service::SubmitCompletion::of_current(state)
+      crate::merge_service::SubmitCompletion::of_current(state, work)
         .map(crate::merge_service::SubmitCompletion::to_entry),
       identity,
     ),
@@ -9549,7 +9571,7 @@ fn await_placed(
 
 /// Format: the head register's sequence at a volume's creation — the "epoch-one head record" that names
 /// no content yet (§4.4 create); each snapshot's placement then writes the next sequence.
-const CREATION_HEAD_SEQUENCE: u64 = 0;
+pub(crate) const CREATION_HEAD_SEQUENCE: u64 = 0;
 
 /// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
 /// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
@@ -9603,6 +9625,7 @@ pub(crate) fn materialize_taken_over_green(
         },
         live_shipped: false,
         live_holders: None,
+        write: None,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -9736,7 +9759,10 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 
 /// Records, on a taken-over green's partition, the completions its merge records carried (A-255; RIFL §3, "If the
 /// object migrates, then the completion record must move with it"): each submit's resend after the takeover is then
-/// answered its version here, the request's key the one it was accepted under, and never run again.
+/// answered its version here, the request's key the one it was accepted under, and never run again. Each a resend can
+/// reach only through its work's route (a client of another node than the work's owner) is recorded under that work
+/// (A-288), so the partition counts what the route still leads to, and the route's adopter retires it once nothing is
+/// left to answer.
 ///
 /// Bounded per client as any client's records are ([`completion_bound`]): a client holds at most that many unacknowledged
 /// at once, so its newest that many submits are the ones it may still resend. Older ones it had acknowledged (the
@@ -9747,7 +9773,7 @@ fn record_taken_over_completions(
   completions: &[Option<crate::merge_service::SubmitCompletion>],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
-  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64)>> =
+  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64, Option<DbVolumeId>)>> =
     std::collections::BTreeMap::new();
   for (index, key) in completions.iter().enumerate() {
     let Some(key) = key else {
@@ -9757,7 +9783,7 @@ fn record_taken_over_completions(
     by_client
       .entry((key.origin, key.client))
       .or_default()
-      .push((key.sequence, version));
+      .push((key.sequence, version, key.work));
   }
   for ((origin, client), mut submits) in by_client {
     submits.sort_unstable();
@@ -9766,15 +9792,15 @@ fn record_taken_over_completions(
       TAKEN_OVER_COMPLETION_PAST_BOUND,
       u64::try_from(past).unwrap_or(u64::MAX),
     );
-    for (sequence, version) in submits.into_iter().skip(past) {
-      let reply = record_completion(
+    for (sequence, version, work) in submits.into_iter().skip(past) {
+      let reply = record_completion_routed(
         state,
-        origin,
-        RequestId { client, sequence },
+        (origin, RequestId { client, sequence }),
         ReplyBody::Submitted {
           version: Some(version),
           conflicts: Vec::new(),
         },
+        work,
       );
       let counter = if matches!(reply, ReplyBody::Refused { .. }) {
         TAKEN_OVER_COMPLETION_UNRECORDED
@@ -9978,6 +10004,7 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
+      write: None,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -13210,6 +13237,7 @@ mod tests {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),

@@ -29,7 +29,8 @@ use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
 };
 use slates_ipc::protocol::{
-  AuditEntry, GrantProofBody, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
+  AuditEntry, GrantScope, GrantSummary, PolicySubject, Refusal, ReplyBody, SnapshotId, VolumeId,
+  WriteAct, WriteMode, WritePolicy,
 };
 use slates_land::engine::Audit;
 #[cfg(unix)]
@@ -173,11 +174,6 @@ pub struct Awaiting {
   pub principal: Principal,
   /// The client that presented it: its retirement abandons the presentation (AUD-29-07).
   pub client: u32,
-  /// The nonce a signed grant's statement must carry (A-285): drawn from the system's random source at the
-  /// presentation, sent with it, and spent by the first signed grant it proves.
-  pub nonce: [u8; crate::grant_signature::NONCE_BYTES],
-  /// Whether a signed grant has spent the nonce: a replay of the same signature is refused.
-  pub nonce_spent: bool,
   /// Its manifest's entries, in the manifest's order: the full entry list a person may ask for (§4.15 step 2;
   /// `LandingEntries` pages them, `crate::landing_entries`). Moved from the plan, never copied, and held as long as the
   /// presentation is, which A-46 bounds: consumed by its landing, replaced by its client's next, abandoned with its
@@ -508,6 +504,17 @@ fn land_verb_unix(
   if !rights_of(&record, principal).write {
     return forbidden("land");
   }
+  // The write policy (A-285): a forbidding mode refuses every landing, granted or not, before any host access; a
+  // bypass mode grants the landing the daemon presents and lands it in the same request.
+  let mode = land_mode(&record);
+  if mode == slates_db::catalog::WriteMode::Forbid {
+    state.count(POLICY_FORBIDS_LAND, 1);
+    return refused(Refusal::PolicyForbids {
+      act: WriteAct::Land,
+      by: PolicySubject::Volume { volume },
+    });
+  }
+  let bypass = grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
   let db_volume = to_db_volume(volume);
   // A landing without a grant ends in a presentation, and the shard holds only so many: past the bound it
   // is refused before any host access, id or record (AUD-29-07).
@@ -543,6 +550,11 @@ fn land_verb_unix(
     principal: principal.clone(),
     client: client_id,
     grant,
+    bypass: bypass.then(|| Requested {
+      volume,
+      snapshot,
+      filter: filter.clone(),
+    }),
   };
   match grant {
     // A presentation writes nothing and takes no lease; it is planned in slices and answered when planned.
@@ -550,6 +562,22 @@ fn land_verb_unix(
     // A granted landing runs as an owned task under its target's lease (AUD-29-03).
     Some(_) => defer_granted_landing(state, prepared),
   }
+}
+
+/// Format: the counter of landings a forbidding write policy refused (A-285).
+#[cfg(unix)]
+const POLICY_FORBIDS_LAND: &str = "policy_forbids.land";
+/// Format: the counter of landings a bypass write policy granted (A-285).
+#[cfg(unix)]
+const POLICY_GRANTED_LAND: &str = "policy_granted.land";
+
+/// What a landing request named, kept by a bypass presentation (A-285) to land it under the grant the policy issues:
+/// the request's own volume, snapshot (the head when `None`) and filter.
+#[cfg(unix)]
+struct Requested {
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  filter: slates_ipc::protocol::Filter,
 }
 
 /// A landing ready to run: its volume, its opened target and what its request and records name.
@@ -566,6 +594,9 @@ struct Prepared {
   principal: Principal,
   client: u32,
   grant: Option<u64>,
+  /// What to land under the grant a bypass policy issues once the presentation is planned (A-285); `None` for a
+  /// presentation that waits for an approval, and for a granted landing.
+  bypass: Option<Requested>,
 }
 
 /// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
@@ -676,6 +707,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     implicit,
     writer,
     beginning,
+    bypass: prepared.bypass,
   };
   crate::image::defer(state, run_presentation(job))
 }
@@ -705,6 +737,7 @@ struct PresentJob {
   implicit: Option<slates_vfs::ids::SnapshotId>,
   writer: Writer,
   beginning: slates_land::engine::Beginning,
+  bypass: Option<Requested>,
 }
 
 #[cfg(unix)]
@@ -746,6 +779,14 @@ async fn run_presentation(mut job: PresentJob) {
   let request = job.request_id;
   let _ = crate::state::with_state(|s| {
     job.settle(s);
+    // A bypass policy (A-285): a planned presentation is granted by the policy and landed in this same request.
+    let ended = match (job.bypass.take(), ended) {
+      (Some(requested), Some(Ok(slates_land::engine::Planned::Presented(plan)))) => {
+        land_under_policy(s, &job, request, requested, plan);
+        return;
+      }
+      (_, ended) => ended,
+    };
     let (reply, route) = crate::image::complete(s, request, |s| {
       let ids = LandingIds {
         landing_id: job.landing_id,
@@ -773,6 +814,89 @@ async fn run_presentation(mut job: PresentJob) {
     });
     crate::image::deliver(s, reply, route);
   });
+}
+
+/// Lands a planned presentation under a bypass policy (A-285): the presentation is recorded, the policy issues its
+/// grant (`Issuer::Policy`), and the landing runs under that grant in the request that presented it, as a granted
+/// landing's request does (`defer_granted_landing` takes the request and its reply route over). One transaction holds
+/// the presentation, the grant and, when the landing could not start, the request's completion: a landing that starts
+/// answers the request itself when it ends. The landing plans again under the grant, so a volume changed since the
+/// presentation lands what the grant bound or is refused `GrantMismatch`, never something no one planned.
+#[cfg(unix)]
+fn land_under_policy(
+  s: &mut ShardState,
+  job: &PresentJob,
+  request: (u64, slates_wire::request::RequestId),
+  requested: Requested,
+  plan: Box<slates_land::engine::Presented>,
+) {
+  let route = crate::image::take_in_flight(s, request);
+  s.db.begin();
+  s.current_request = Some(request);
+  s.reply_route = route;
+  let ids = LandingIds {
+    landing_id: job.landing_id,
+    fresh: true,
+    volume: job.volume,
+    snapshot: job.snapshot,
+    target: &job.target,
+    rebased: false,
+  };
+  let presenter = Presenter {
+    client: job.client,
+    principal: &job.principal,
+  };
+  let presented = present(s, presenter, &ids, plan);
+  let reply = if matches!(presented, ReplyBody::GrantRequired { .. }) {
+    // The grant needs to stand only until the landing that follows checks it: the operator's failover bound, the
+    // term the landing's own target lease runs under.
+    let term = s.config.failover_slo_ns;
+    match issue_grant(
+      s,
+      &job.principal,
+      job.landing_id,
+      (GrantScope::Once, term),
+      Issuer::Policy,
+    ) {
+      Ok(grant) => {
+        s.count(POLICY_GRANTED_LAND, 1);
+        land_verb_unix(
+          s,
+          job.client,
+          &job.principal,
+          LandCall {
+            volume: requested.volume,
+            snapshot: requested.snapshot,
+            target: &job.target,
+            filter: &requested.filter,
+            grant: Some(grant),
+          },
+        )
+      }
+      Err(refusal) => refused(refusal),
+    }
+  } else {
+    presented
+  };
+  s.current_request = None;
+  let route = s.reply_route.take();
+  let (origin, id) = request;
+  if std::mem::take(&mut s.acceptance_deferred) {
+    // The granted landing took the request over and answers it when it ends; what led to it commits now.
+    if s.db.commit(&mut s.segment).is_err() {
+      crate::verbs::reconcile_unpublished_effects(s);
+    }
+    return;
+  }
+  let reply = crate::verbs::record_completion(s, origin, id, reply);
+  let reply = match s.db.commit(&mut s.segment) {
+    Ok(_) => reply,
+    Err(e) => {
+      crate::verbs::reconcile_unpublished_effects(s);
+      refused(crate::error::refusal_of_db(&e))
+    }
+  };
+  crate::image::deliver(s, reply, route);
 }
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
@@ -2232,12 +2356,6 @@ fn present(
     })
     .collect();
   let Presenter { client, principal } = presenter;
-  let mut nonce = [0u8; crate::grant_signature::NONCE_BYTES];
-  if aws_lc_rs::rand::fill(&mut nonce).is_err() {
-    return refused(Refusal::Unsupported {
-      feature: "a presentation's nonce: the system's random source refused".to_owned(),
-    });
-  }
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
   let summary = summary_of(&manifest);
@@ -2257,8 +2375,6 @@ fn present(
       target: ids.target.to_owned(),
       principal: principal.clone(),
       client,
-      nonce,
-      nonce_spent: false,
       // The full entry list on demand (§4.15 step 2): the manifest's own entries, moved here.
       entries: manifest.entries,
       conflicts: crate::landing_entries::conflicts_of(&preliminary),
@@ -2299,7 +2415,6 @@ fn present(
   ReplyBody::GrantRequired {
     landing: landing_id,
     manifest: hash,
-    nonce,
     summary,
     conflicts,
   }
@@ -2542,15 +2657,14 @@ pub fn grant_proof(
   *hasher.finalize().as_bytes()
 }
 
-/// Serves a `Grant` request (§4.13 "Grants", §4.15 step 3): verifies the human authority's proof (A-285: a signature
-/// by a registered key over the grant statement, [`verify_signed_grant`]; or the keyed hash under the issuer secret
-/// this daemon published), and the approved manifest against the presented landing's, then issues the grant. Refuses
-/// `GrantIssuerUnverified` — counted `grant_issuer_unverified`, and a signature's own reason under its counter — on a
-/// proof that does not verify (forged, replayed, by an unregistered key, over a modified plan, expired, or from a
-/// channel that carries no authority: the MCP server and the SDKs hold neither a key nor the secret), `GrantMismatch`
-/// when the human approved a manifest other than the one presented (the plan changed under the approval), and
-/// `NotFound` for a landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
-/// keyed hash is compared in constant time over its whole width so a wrong proof leaks nothing by timing.
+/// Serves a `Grant` request (§4.13 "Grants", §4.15 step 3): verifies the proof of issuer authority against
+/// the secret this daemon published, and the approved manifest against the presented landing's, then
+/// issues the grant. Refuses `GrantIssuerUnverified` — counted `grant_issuer_unverified` — on a proof that
+/// does not verify (a forged, replayed or modified-plan approval, or one from a channel that carries no
+/// authority: the MCP server and the SDKs never hold the secret), `GrantMismatch` when the human approved
+/// a manifest other than the one presented (the plan changed under the approval), and `NotFound` for a
+/// landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
+/// comparison of the proof is constant-time over its whole width so a wrong proof leaks nothing by timing.
 pub fn grant_verb(
   state: &mut ShardState,
   principal: &Principal,
@@ -2558,123 +2672,29 @@ pub fn grant_verb(
   manifest: [u8; 32],
   scope: GrantScope,
   term_ns: u64,
-  proof: GrantProofBody,
+  proof: [u8; 32],
 ) -> ReplyBody {
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };
-  let signed = matches!(proof, GrantProofBody::SshSignature { .. });
-  let verified = match proof {
-    GrantProofBody::IssuerHash { proof } => {
-      let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
-      constant_time_eq(&expected, &proof)
-    }
-    GrantProofBody::SshSignature {
-      signature,
-      expires_unix_s,
-    } => {
-      let claim = SignedClaim {
-        landing: landing_id,
-        manifest,
-        scope,
-        term_ns,
-        expires_unix_s,
-      };
-      match verify_signed_grant(
-        &awaiting,
-        &state.grant_keys,
-        &claim,
-        &signature,
-        unix_now_s(),
-      ) {
-        Ok(()) => true,
-        Err(refusal) => {
-          state.count(refusal.counter(), 1);
-          false
-        }
-      }
-    }
-  };
-  if !verified {
+  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
+  if !constant_time_eq(&expected, &proof) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
   if awaiting.manifest != manifest {
     return crate::verbs::refused(Refusal::GrantMismatch);
   }
-  if signed && let Some(presented) = state.landing.awaiting.get_mut(&landing_id) {
-    presented.nonce_spent = true;
-  }
-  match issue_grant(state, principal, landing_id, scope, term_ns) {
+  match issue_grant(
+    state,
+    principal,
+    landing_id,
+    (scope, term_ns),
+    Issuer::Human,
+  ) {
     Ok(grant) => ReplyBody::Granted { grant },
     Err(refusal) => crate::verbs::refused(refusal),
   }
-}
-
-/// What a signed `Grant` claims besides the signature: the fields of the statement the request names.
-#[derive(Clone, Copy, Debug)]
-pub struct SignedClaim {
-  /// The presented landing.
-  pub landing: u64,
-  /// The manifest hash the human approved.
-  pub manifest: [u8; 32],
-  /// The scope.
-  pub scope: GrantScope,
-  /// The term, in nanoseconds.
-  pub term_ns: u64,
-  /// The statement's expiry, in Unix seconds.
-  pub expires_unix_s: u64,
-}
-
-/// The statement a signed grant of `claim` over the presentation `awaiting` must have signed (A-285): the request's
-/// landing, manifest, scope, term and expiry, with the presentation's own target and nonce, which the request does
-/// not name, so a signature over another target or another presentation's nonce never verifies.
-#[must_use]
-pub fn signed_statement(
-  awaiting: &Awaiting,
-  claim: &SignedClaim,
-) -> crate::grant_signature::GrantStatement {
-  crate::grant_signature::GrantStatement {
-    landing: claim.landing,
-    manifest: claim.manifest,
-    target: awaiting.target.clone(),
-    scope: match claim.scope {
-      GrantScope::Once => crate::grant_signature::StatementScope::Once,
-      GrantScope::Session => crate::grant_signature::StatementScope::Session,
-    },
-    term_ns: claim.term_ns,
-    nonce: awaiting.nonce,
-    expires_unix_s: claim.expires_unix_s,
-  }
-}
-
-/// Decides a signed grant (A-285): the presentation's nonce not yet spent, then the signature over
-/// [`signed_statement`] by one of `keys` at wall-clock second `now_unix_s`. Pure over its arguments, so the decision
-/// is tested whole without a daemon.
-///
-/// # Errors
-/// [`SignatureRefusal::Replayed`] for a spent nonce, or the signature's own refusal.
-pub fn verify_signed_grant(
-  awaiting: &Awaiting,
-  keys: &[crate::grant_signature::RegisteredKey],
-  claim: &SignedClaim,
-  signature: &[u8],
-  now_unix_s: u64,
-) -> Result<(), crate::grant_signature::SignatureRefusal> {
-  if awaiting.nonce_spent {
-    return Err(crate::grant_signature::SignatureRefusal::Replayed);
-  }
-  let statement = signed_statement(awaiting, claim);
-  crate::grant_signature::verify_grant_signature(signature, &statement, keys, now_unix_s)
-    .map(|_| ())
-}
-
-/// The wall clock's second (Unix time), which a signed statement's expiry is stated in; a clock set before 1970 reads
-/// as zero, so no statement is refused as expired by it.
-fn unix_now_s() -> u64 {
-  std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Format: the domain tags that separate the issuer secret's uses — an enrollment proof can never
@@ -2729,17 +2749,153 @@ pub(crate) fn constant_time_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool
   difference == 0
 }
 
-/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached only through
-/// [`grant_verb`], whose proof of issuer authority has verified, so a grant a human did not make cannot
-/// exist. The grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
-/// record gains the grant. Returns the grant id.
+/// Who issues a grant (A-285, R10): the launcher's or the harness's approval, proven under the issuer secret
+/// ([`grant_verb`]), or the volume's bypass policy, which that same authority set ([`set_policy_verb`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Issuer {
+  /// An approval proven under the issuer secret, recorded as the command line's surface.
+  Human,
+  /// The daemon itself, under the volume's bypass policy, recorded as the policy's surface.
+  Policy,
+}
+
+/// Format: the domain tag of a policy proof, so it never verifies as a grant, enrollment or revocation proof.
+const POLICY_DOMAIN: &[u8] = b"slates.policy";
+
+/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the issuer secret, of the policy domain
+/// tag, the subject and the policy, in their wire encodings. Only the launcher or the harness, which holds the issuer,
+/// can make one; an agent's consumer channel never holds it.
+pub fn policy_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  subject: &PolicySubject,
+  policy: &WritePolicy,
+) -> [u8; 32] {
+  let mut bytes = Vec::new();
+  slates_wire::Wire::encode(subject, &mut bytes);
+  slates_wire::Wire::encode(policy, &mut bytes);
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(POLICY_DOMAIN);
+  hasher.update(&bytes);
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves `SetPolicy` (A-285): refused `Forbidden` on a consumer-bound channel, whatever its proof, so an agent never
+/// sets (and so never raises) its own policy, counted `policy_set_by_consumer`; `GrantIssuerUnverified` when the proof
+/// does not verify; a volume's policy recorded durably in its record. A consumer's own policy is not built yet
+/// (GAPS, A-285) and is refused `Unsupported`.
+pub fn set_policy_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  subject: PolicySubject,
+  policy: WritePolicy,
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("policy_set_by_consumer", 1);
+    return crate::verbs::forbidden("set_policy");
+  }
+  let expected = policy_proof(&state.issuer_secret, &subject, &policy);
+  if !constant_time_eq(&expected, &proof) {
+    state.count("grant_issuer_unverified", 1);
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  let PolicySubject::Volume { volume } = subject else {
+    return crate::verbs::refused(Refusal::Unsupported {
+      feature: "a consumer's write policy (A-285, owed)".to_owned(),
+    });
+  };
+  if let Err(reply) = crate::verbs::find(state, volume) {
+    return *reply;
+  }
+  let now = state.clock.monotonic_ns();
+  let op = Op::VolumeWritePolicySet {
+    id: crate::verbs::to_db_volume(volume),
+    policy: db_policy(policy),
+  };
+  match state.db.mutate(&mut state.segment, &op, now) {
+    Ok(_) => ReplyBody::PolicySet,
+    Err(e) => crate::verbs::refused(crate::error::refusal_of_db(&e)),
+  }
+}
+
+/// Serves `Policy` (A-285): a volume's write policy to a principal that may read the volume, `None` while none is set
+/// (which is ask). A consumer's own policy is not built yet and is refused `Unsupported`.
+pub fn policy_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  subject: PolicySubject,
+) -> ReplyBody {
+  let PolicySubject::Volume { volume } = subject else {
+    return crate::verbs::refused(Refusal::Unsupported {
+      feature: "a consumer's write policy (A-285, owed)".to_owned(),
+    });
+  };
+  let record = match crate::verbs::find(state, volume) {
+    Ok((_, record)) => record,
+    Err(reply) => return *reply,
+  };
+  if !crate::verbs::rights_of(&record, principal).read {
+    return crate::verbs::forbidden("policy");
+  }
+  ReplyBody::Policy {
+    policy: record.policy.write.map(wire_policy),
+  }
+}
+
+/// A volume's landing mode (A-285): its policy's, or ask while none is set.
+#[cfg(unix)]
+fn land_mode(record: &slates_db::catalog::VolumeRecord) -> slates_db::catalog::WriteMode {
+  record
+    .policy
+    .write
+    .map_or(slates_db::catalog::WriteMode::Ask, |policy| policy.land)
+}
+
+/// A wire policy as the catalog records it.
+fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy {
+  slates_db::catalog::WritePolicy {
+    merge: db_mode(policy.merge),
+    land: db_mode(policy.land),
+  }
+}
+
+/// A wire mode as the catalog records it.
+fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
+  match mode {
+    WriteMode::Bypass => slates_db::catalog::WriteMode::Bypass,
+    WriteMode::Ask => slates_db::catalog::WriteMode::Ask,
+    WriteMode::Forbid => slates_db::catalog::WriteMode::Forbid,
+  }
+}
+
+/// A recorded policy as the wire carries it.
+fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
+  let mode = |mode| match mode {
+    slates_db::catalog::WriteMode::Bypass => WriteMode::Bypass,
+    slates_db::catalog::WriteMode::Ask => WriteMode::Ask,
+    slates_db::catalog::WriteMode::Forbid => WriteMode::Forbid,
+  };
+  WritePolicy {
+    merge: mode(policy.merge),
+    land: mode(policy.land),
+  }
+}
+
+/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached through [`grant_verb`],
+/// whose proof of the launcher's authority has verified, or a bypass presentation, under the policy that authority set
+/// (A-285); `issuer` says which, for the record. The grant is issued into the runtime grants and persisted as a
+/// `GrantRecord`; the landing's record gains the grant. Returns the grant id.
 pub fn issue_grant(
   state: &mut ShardState,
   principal: &Principal,
   landing_id: u64,
-  scope: GrantScope,
-  term_ns: u64,
+  (scope, term_ns): (GrantScope, u64),
+  issuer: Issuer,
 ) -> Result<u64, Refusal> {
+  let (surface, grant_surface) = match issuer {
+    Issuer::Human => (Surface::Cli, GrantSurface::Cli),
+    Issuer::Policy => (Surface::Policy, GrantSurface::Policy),
+  };
   let awaiting = state
     .landing
     .awaiting
@@ -2758,7 +2914,7 @@ pub fn issue_grant(
     .landing
     .grants
     .issue(
-      Surface::Cli,
+      surface,
       awaiting.manifest,
       awaiting.binding.clone(),
       land_scope,
@@ -2772,7 +2928,7 @@ pub fn issue_grant(
   let record = DbGrantRecord {
     id: id.0,
     principal: awaiting.principal.clone(),
-    surface: GrantSurface::Cli,
+    surface: grant_surface,
     volume: awaiting.volume,
     snapshot: awaiting.snapshot,
     target: awaiting.target.clone(),
@@ -2820,6 +2976,7 @@ pub fn restore_grants(state: &mut ShardState) {
       surface: match record.surface {
         GrantSurface::Cli => Surface::Cli,
         GrantSurface::Confirmation { .. } => Surface::Confirmation,
+        GrantSurface::Policy => Surface::Policy,
       },
       manifest: record.manifest,
       binding: GrantBinding {
@@ -3321,128 +3478,6 @@ mod tests {
         *h.finalize().as_bytes()
       }),
       "the domain tag is part of the proof"
-    );
-  }
-
-  /// A presentation awaiting a grant into `/srv/project`, with a fresh nonce.
-  fn awaiting(nonce_byte: u8) -> super::Awaiting {
-    super::Awaiting {
-      manifest: [7; 32],
-      binding: slates_land::grant::GrantBinding {
-        consumer: Box::new([1]),
-        volume: [2; 16],
-        snapshot: 3,
-        target: slates_land::grant::TargetIdentity {
-          key: "/srv/project".into(),
-          device: 1,
-          inode: 4,
-        },
-      },
-      volume: super::DbVolumeId { bytes: [2; 16] },
-      snapshot: super::DbSnapshotId { value: 3 },
-      target: "/srv/project".to_owned(),
-      principal: super::Principal::Uid {
-        host: slates_db::HostId(0),
-        uid: 501,
-      },
-      client: 9,
-      nonce: [nonce_byte; crate::grant_signature::NONCE_BYTES],
-      nonce_spent: false,
-      entries: Vec::new(),
-      conflicts: std::collections::BTreeMap::new(),
-    }
-  }
-
-  /// A claim of the presentation's own manifest, once, expiring at `EXPIRES`.
-  fn claim() -> super::SignedClaim {
-    super::SignedClaim {
-      landing: 5,
-      manifest: [7; 32],
-      scope: slates_ipc::protocol::GrantScope::Once,
-      term_ns: 0,
-      expires_unix_s: EXPIRES,
-    }
-  }
-
-  /// Shape: the claim's expiry, and a wall clock before it.
-  const EXPIRES: u64 = 2_000_000_000;
-  /// Shape: see [`EXPIRES`].
-  const BEFORE: u64 = 1_900_000_000;
-
-  /// A-285: a registered key's signature over the presentation's statement verifies; the same signature after the
-  /// grant spent the nonce is refused `Replayed`.
-  #[test]
-  fn a_signed_grant_verifies_once_and_its_replay_is_refused() {
-    use crate::grant_signature::{SignatureRefusal, TestSigner};
-    let signer = TestSigner::new();
-    let keys = vec![signer.registered()];
-    let mut presented = awaiting(1);
-    let signature = signer.sign(&super::signed_statement(&presented, &claim()));
-    assert_eq!(
-      super::verify_signed_grant(&presented, &keys, &claim(), &signature, BEFORE),
-      Ok(())
-    );
-    presented.nonce_spent = true;
-    assert_eq!(
-      super::verify_signed_grant(&presented, &keys, &claim(), &signature, BEFORE),
-      Err(SignatureRefusal::Replayed)
-    );
-  }
-
-  /// A-285: a forged signature, an unregistered key, a changed manifest, another presentation's nonce (a signature
-  /// made before this presentation) and another target are each refused, and an expired statement too.
-  #[test]
-  fn a_signed_grant_is_refused_forged_unregistered_changed_or_for_another_presentation() {
-    use crate::grant_signature::{SignatureRefusal, TestSigner};
-    let signer = TestSigner::new();
-    let keys = vec![signer.registered()];
-    let presented = awaiting(1);
-    let signature = signer.sign(&super::signed_statement(&presented, &claim()));
-    let mut forged = signature.clone();
-    if let Some(last) = forged.last_mut() {
-      *last ^= 1;
-    }
-    let decide =
-      |presented: &super::Awaiting,
-       claim: &super::SignedClaim,
-       signature: &[u8],
-       keys: &[_],
-       now| { super::verify_signed_grant(presented, keys, claim, signature, now) };
-    assert_eq!(
-      decide(&presented, &claim(), &forged, &keys, BEFORE),
-      Err(SignatureRefusal::BadSignature),
-      "forged"
-    );
-    let stranger = TestSigner::new();
-    let theirs = stranger.sign(&super::signed_statement(&presented, &claim()));
-    assert_eq!(
-      decide(&presented, &claim(), &theirs, &keys, BEFORE),
-      Err(SignatureRefusal::UnregisteredKey),
-      "unregistered"
-    );
-    let mut changed = claim();
-    changed.manifest[0] ^= 1;
-    assert_eq!(
-      decide(&presented, &changed, &signature, &keys, BEFORE),
-      Err(SignatureRefusal::BadSignature),
-      "changed manifest"
-    );
-    assert_eq!(
-      decide(&awaiting(2), &claim(), &signature, &keys, BEFORE),
-      Err(SignatureRefusal::BadSignature),
-      "another presentation's nonce"
-    );
-    let mut elsewhere = awaiting(1);
-    elsewhere.target = "/srv/other".to_owned();
-    assert_eq!(
-      decide(&elsewhere, &claim(), &signature, &keys, BEFORE),
-      Err(SignatureRefusal::BadSignature),
-      "another target"
-    );
-    assert_eq!(
-      decide(&presented, &claim(), &signature, &keys, EXPIRES + 1),
-      Err(SignatureRefusal::Expired),
-      "expired"
     );
   }
 }

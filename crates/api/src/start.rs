@@ -15,9 +15,10 @@
 //! started anchor's exit ends the wait at once with its exit code ([`StartFault::AnchorExited`]); a wait without a
 //! child to watch ends at the host's deadline, as `Unavailable`.
 //!
-//! **The issuer is not handed over.** A started instance gives its starter no grant authority (§4.13, R10): under
-//! Ada's decision of 2026-11-18 a grant is proved by a key only the human holds, presented through
-//! [`Instance::grant`] whoever starts the instance.
+//! **The launcher's authority (A-299).** Under Ada's rule of 2026-11-18 the launcher — whoever starts the instance —
+//! sets agents' write modes and approves what an ask mode holds, so the starter is to be handed the instance's issuer
+//! on every platform (owed, the A-299 row of GAPS): today it holds the issuer only where the anchor's handoff reaches it
+//! (the anchor's own children on Linux, the exported pairs elsewhere, [`crate::Issuer`]).
 
 use std::ffi::OsString;
 use std::path::PathBuf;

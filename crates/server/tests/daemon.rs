@@ -1129,7 +1129,7 @@ fn grant_request(landing: u64, manifest: [u8; 32], proof: [u8; 32]) -> RequestBo
     manifest,
     scope: GrantScope::Once,
     term_ns: DEADLINE_NS,
-    proof: proof.into(),
+    proof,
   }
 }
 
