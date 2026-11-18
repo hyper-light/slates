@@ -35,9 +35,12 @@ struct MountPaths {
 }
 
 impl MountPaths {
-  fn new() -> Self {
+  /// The directories of their own for the test named `tag`: the tests of this file run at once, and each one's drop
+  /// unmounts and removes its whole root, so two tests sharing one would mount over, unmount and remove each other's
+  /// (`coherence_mount`'s `scratch` is the same rule). `tag` is short: the socket's path must fit `sockaddr_un`.
+  fn new(tag: &str) -> Self {
     let root = format!(
-      "{}/slates-ipc-{}",
+      "{}/slates-ipc-{tag}-{}",
       env!("CARGO_TARGET_TMPDIR"),
       std::process::id()
     );
@@ -324,7 +327,7 @@ fn verify_isolation(paths: &MountPaths, original: &LiveIpc) {
 #[test]
 fn fifo_and_socket_communication_is_local_to_each_clone() {
   std::thread::scope(|scope| {
-    let paths = MountPaths::new();
+    let paths = MountPaths::new("ipc");
     // This proof binds a unix socket *inside* the mount, and A-50 puts the mount in the build output rather
     // than `/tmp`, so on a host whose build directory is deep the socket's path is longer than `sockaddr_un`
     // can hold and `bind` answers `ENAMETOOLONG`. That is the shape of the host, not a fault in the bridge, so
@@ -409,7 +412,7 @@ fn device_image() -> VolumeImage {
 #[test]
 fn a_device_node_reaches_the_mount_with_its_number_and_is_never_opened() {
   std::thread::scope(|scope| {
-    let paths = MountPaths::new();
+    let paths = MountPaths::new("dev");
     let mounted = match mount(&paths.original, &[], MOUNT_WAIT) {
       Ok(mounted) => mounted,
       Err(MountError::NoDevice { .. } | MountError::Helper { .. } | MountError::Spawn { .. }) => {
