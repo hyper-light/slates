@@ -60,6 +60,21 @@ const SHARDS_VARIABLE: &str = "PROVISION_BENCH_SHARDS";
 const REST_WINDOW: Duration = Duration::from_secs(3);
 
 /// The CPU this process has run, nanoseconds: every thread's, the daemon's shards and the bench's clients alike.
+/// Diagnostics only (g234): the process's voluntary and involuntary context switches now.
+fn switches_now() -> (i64, i64) {
+  // SAFETY: an all-zero rusage is a valid record; the call fills this frame's own.
+  let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+  // SAFETY: as above.
+  unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+  (i64::from(usage.ru_nvcsw), i64::from(usage.ru_nivcsw))
+}
+
+/// Diagnostics only (g234): whether the form `key` is asked for (`PROVISION_BENCH_FORMS`, comma-separated; all when
+/// unset).
+fn form_asked(key: &str) -> bool {
+  std::env::var("PROVISION_BENCH_FORMS").map_or(true, |forms| forms.split(',').any(|form| form == key))
+}
+
 fn cpu_now_ns() -> u64 {
   process_cpu(std::process::id()).map_or(0, |cpu| cpu.spent_ns)
 }
@@ -383,8 +398,19 @@ fn main() {
   let mut failed = false;
   for clients in CLIENT_COUNTS {
     let key = format!("spinning_{clients}");
+    if !form_asked(&key) {
+      continue;
+    }
+    let switched = switches_now();
     let before = daemon.shard_pulses();
     let (rows, cpu) = form(&instance, &key, *clients, SPINNING_SAMPLES, None);
+    let (voluntary, involuntary) = switches_now();
+    let creates = i64::try_from(RUNS * clients * SPINNING_SAMPLES).unwrap_or(1).max(1);
+    println!(
+      "  diag.{key} process switches per 1000 creates: voluntary {} involuntary {}",
+      (voluntary - switched.0) * 1000 / creates,
+      (involuntary - switched.1) * 1000 / creates
+    );
     print_cpu(&key, shards, &cpu);
     print_parks(
       &key,
@@ -420,6 +446,10 @@ fn main() {
   }
   // The channel and the completion record alone: a status of one volume, one client, so the
   // create's own cost is the difference (informational).
+  if !form_asked("status_1") && !form_asked("parked_1") {
+    daemon.stop();
+    std::process::exit(i32::from(failed));
+  }
   let rows = status_form(&instance);
   for (name, values) in &rows {
     let mut sorted = values.clone();
