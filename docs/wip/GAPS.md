@@ -4156,6 +4156,13 @@
 >   it stopped (1 of 11 `windows-2025` runners sampled; it failed the tag `v0.1.0`'s first Windows x86_64 build). It
 >   refused main before the fix with 0xC0000139 and adds 21 s to the lane (run 44354728411). Record:
 >   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
+> - **Open (2026-11-18, A-407): AC-9.5 holds on one runner image.** The Windows binaries link MSVC's static C
+>   runtime, so the Visual Studio of the runner's image is in their bytes. During GitHub's rollout of `windows-2025`
+>   20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11), the tag `v0.1.0`'s two x86_64 copies landed on
+>   different images and differed in 2,559,679 of 15,139,328 bytes, while each image built the same bytes every time
+>   (d3498b4f twice, 871a057d three times, test 4's included; run 44347535833). The artifacts task now names both images
+>   in its refusal, and one copy is run again until the pair shares an image. Owed: pin the MSVC toolset and the
+>   Windows SDK the Windows binaries link, so a tag's bytes do not depend on which image a runner has.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six

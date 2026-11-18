@@ -29103,6 +29103,23 @@ closed; the model table: nine `InstallInTurns` runs), `docs/wip/models/InstallIn
   itself (g255's A-392); the successor's run to be told apart on main. The whole-map passes stay, as the daemon's
   unit-test oracle of the per-copy steps.
 
+### A-407 — AC-9.5 is judged on one runner image: the artifacts task names both images when a pair's copies ran on two (2026-11-18, the release goals g236 and g237; the tag `v0.1.0`'s run)
+Applied in the same change to: `xtask/src/release.rs` (`runner_image`, `checked_build`, and the test
+`copies_from_two_runner_images_are_refused_naming_both`), GAPS (the binary release lane's entry) and `docs/publish.md`
+("The binary release").
+- **What happened.** The tag `v0.1.0`'s run (44347535833) built `slates-windows-x64.exe` during GitHub's rollout of the
+  `windows-2025` image 20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11). Its two copies landed on
+  different images and differed in 2,559,679 of 15,139,328 bytes, and `stage` called the target not reproducible. Each
+  image built the same bytes every time: d3498b4f on the new image twice, 871a057d on the old three times (test 4's
+  copies included). The Windows binaries link MSVC's static C runtime, so the image's toolchain is in their bytes. The
+  arm64 Windows pair ran on two images too (20261115.219.1 and 20261112.217.1) and matched.
+- **The decision.** A pair from two images says nothing about the build, yet accepting one would ship bytes no second
+  runner reproduced. So it is still refused, but the refusal names both images (from each copy's smoke record,
+  `ImageOS` and `ImageVersion`) and says to run one copy again until both share an image. A pair from one image that
+  differs keeps the plain refusal: that is a reproducibility bug.
+- **Owed.** Pin the MSVC toolset and the Windows SDK the Windows binaries link, so a tag's bytes do not depend on which
+  image a runner has (GAPS).
+
 ### A-400 — A work lives on the shard that serves its creation, its client's own; its name is held where the name hashes to, by an alias (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Where a work lives")
 Applied in the same change to: §4.16 (A-247's rule, "Where a work lives"), GAPS (the load test's entry),
 `crates/server/src/verbs.rs` (`serve`: a local client's `CreateWork` is served on its own shard; `create_work`,
