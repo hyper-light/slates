@@ -970,12 +970,24 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 **Refusals.** `ProfileUnavailable` (segment unreadable), `ProfileStale` (identity mismatch while a
 volume requires a matching profile), `MeasurementTimeout`.
 
+> **Status (2026-11-06, A-223: the Windows wake is a confirmed sleeper's too).** Windows has no per-thread wait
+> state short of a system-wide snapshot. So the probe's waker kicks a waiter only once it has announced its park and
+> two reads of its cycle count (`QueryThreadCycleTime`) agree. It drops and counts (`WakeLatency::woke_running`) a wake
+> whose count moved again before the kick, or across whose wait the waiter's own context-switch count
+> (`ReadThreadProfilingData`, `slates_machine::switches`) did not move. The cycle count alone is no proof: a spinning
+> thread read the same twice in 2.4–18 % of back-to-back pairs on CI's x86_64 runner. The shards' online estimate drops
+> a Windows park that never switched out by the same count, as Linux does by its voluntary switches. Before this, the
+> announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
+> times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The daemon's idle window, which it then scaled, is
+> R9's floor on Linux and macOS since A-223's window rule (§4.7, 2026-11-11); Windows keeps the multiple (GAPS).
+
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
 > **Status (2026-11-07, a starved wake probe measures; a stuck one refuses).** Past its wall (`PROBE_WALL_BUDGET`, 250 ms) the probe runs on while each round's waiter runs at all, rounds doubling from one window to `PROBE_WALL_BUDGET · 2^(WAKE_ROUNDS − 1)` (4 s), and refuses `MeasurementTimeout` after a round whose waiter was never scheduled. That is the watchdog's rule (A-228) and the anchor's start judgment applied to the probe: slow progress is starvation, no progress is stuck. The extension past the wall is bounded by 31 windows (7.75 s). Under 144 nice-19 spinners on 18 CPUs a wake took 68-174 ms at the median, the floor needed over a second, and the 250 ms wall refused the quick profile, and the anchor's boot with it, 19 times in 20. Record: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`.
 
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
-expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
+expected cost of parking, and the wake's heavy tail is part of that cost, not noise), the runtime's own
+spin-then-park; the daemon's idle window is §4.7's, which no estimate prices on Linux and macOS (A-223); the cooperative
 step quantum = wake_ns.mean — both as the prior of the online estimate a shard and a client refine
 from their own confirmed wakes (A-31), weighted over about 2^shift wakes with shift =
 ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉, the sample size at which the estimate is as
@@ -1579,7 +1591,9 @@ platform cannot attribute (macOS off the CPU, Windows everywhere): counted unatt
 
 **Derived constants.** Task arena size = admission limit (Little's law on measured request rate ×
 p99 service time); batch bound = latency budget / measured per-item cost; idle spin window =
-the shard's wake estimate × the spin-to-park ratio; the step quantum (the I/O harvest cadence, the
+max(F, the shard's wake estimate × the idle ratio), where the runtime's own spin-then-park has ratio 1 and no F (the
+2-competitive spin) and the daemon's has §4.7's: F, R9's provisioning floor, and the platform's multiple (A-223); the
+step quantum (the I/O harvest cadence, the
 slices of a destroy, an archive or a pre-fault, and the long-step count) = the shard's wake estimate,
 seeded with wake_ns.mean and refined from the shard's own confirmed wakes over about 2^shift of them
 (shift from the probe's spread).
@@ -4688,7 +4702,8 @@ slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2)
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
 the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
 mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
-cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
+cannot tell, so there the client confirms its own sleep by its switch count across the wait, and learns
+nothing where the OS refuses the count, A-223), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
 return from its wait while the client is armed and a reply waits in its ring: a level, never an edge
@@ -4721,6 +4736,20 @@ drops.
 > returned and its confirmation is final. The region's layout goes to version 3. Interleaved, 100 runs each, the
 > learning case failed 100 of 100 before and 0 of 100 after on one CPU with two busy loops, and 89 and 0 on two
 > CPUs with four. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
+
+> **Status (2026-11-11, A-223 sibling (d): the Windows client's wake is a confirmed sleeper's).** Windows' auto-reset
+> Event cannot say whether its signal met a sleeper, and a signal set before the wait is consumed without blocking, so
+> the client took any stamp inside its wait. A reply that landed between its re-check and its block was learned as an
+> on-CPU handoff. Now the client reads its own context-switch count (`slates_machine::switches`) before and after the
+> wait, as the shards judge their parks, and a wait across which the count did not move, or whose count the OS
+> refused, teaches nothing (`wait_may_teach` in `crates/ipc/src/endpoint.rs`); Linux and macOS keep the daemon's
+> confirmation. The race is rare for the client. Against a daemon replying the instant the flag rose, 11–95 of 16,384
+> parks a run on CI's Windows runners never switched out, and main learned 11–48 of them a run;
+> `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (`crates/ipc/tests/rings.rs`) reads the client
+> thread's own count around each trip, and failed 10 runs in 10 on main and passed 10 in 10 with the check
+> (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
+> 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
+> against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -4785,8 +4814,24 @@ drops.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
-= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the shard's wake estimate ×
-measured spin-to-park ratio target.
+= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = max(F, the shard's wake estimate ×
+the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which
+the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
+on Linux and macOS and 100 on Windows (A-223's window rule, below).
+
+> **Status (2026-11-11, A-223's window rule: the idle window is R9's floor, not a multiple of the estimate).** The
+> window was the shard's live wake estimate × 100. The estimate counts the time a woken shard waits for a CPU, which
+> its own spinning lengthens, so under load the window followed it to hundreds of milliseconds, and on Linux a client
+> paced at 1 ms kept its shards spinning at 1.5–2.0 cores even quiet. Now the window is `max(F, wake × multiple)`:
+> F, R9's 50 µs floor, keeps a closed-loop client that meets R9 (its next request within F of its last reply) on
+> polling shards, and the multiple is 0 on Linux and macOS, so there no estimate prices the window and a shard's
+> spinning cannot lengthen it. The boot probe's smallest confirmed wake was weighed as the other input and dropped: on
+> a quiet boot it is the smallest of many confirmed wakes (5.4–6.6 µs on Linux), but a daemon booted beside spinners
+> read 6.8–346 µs, past F in 5 of 9 boots on each Linux runner, and the daemon cannot tell a loaded boot from a slow
+> machine. Windows keeps the multiple of 100: a Windows shard parked under load waits 50–100 ms to run again, and at
+> F alone every loaded request paid it (GAPS, open). Both live readers, the shard's idle spin and the serve loop,
+> read the one window (`ShardContext::idle_window_ns`); the step quantum still reads the estimate's mean. Measured: BENCHMARKS, "The idle window's rule"; test:
+> `crates/server/tests/idle_window.rs`.
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
@@ -11478,8 +11523,8 @@ connection; the handoff's `activate` and `ACTIVATION_LOST` removed; `Daemon::idl
   0.08–0.11 % of a CPU after its client (1.6–1.8 % before); idle fleet pods at 2.3–3.6 s of CPU in 190 s
   (28–62 s before). The fleet suite passes 59 of 59 and the CLI suite 13 of 13.
 - What it does not change: the serve loop's polling window and its doorbell protocol; the window's
-  length (the shard's wake estimate × `IDLE_WINDOW_RATIO`); a request after a quiet window pays one kick,
-  as before.
+  length (then the shard's wake estimate × 100; R9's floor on Linux and macOS since A-223's window rule); a request
+  after a quiet window pays one kick, as before.
 
 ### A-43 — A landing removes an entry only as the object it moved aside and checked (2026-09-29)
 Applied in the same change to: §4.15 (step 6's removals, step 11's resume, "Exchange fallback", the
@@ -15220,6 +15265,69 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
 - **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
   and an acknowledgement's own refusal on the client's shard, which is still its reply.
 - **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
+
+### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
+Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
+constants and a status), A-42's entry (its wording), GAPS (A-223's entry, §5), BENCHMARKS ("The idle window's rule"),
+`crates/server` (`config.rs`: `PROVISION_FLOOR`, `loaded_wake_ratio` and `idle_window_ns` replace the idle
+ratio of 100; `daemon.rs`: the serve loop reads the shard's window, `ShardPulse` reports it), `crates/rt`
+(`WakeTracking::idle_floor_ns`, `ShardContext::idle_window_ns`, `Pulse::idle_window_ns`), `provision_bench` (it reads
+F from the library), and the tests `crates/server/tests/idle_window.rs`, `crates/rt/tests/wake_estimate.rs` and the
+rule's table in `config.rs`.
+- **The defect.** The idle window was the shard's live wake estimate × 100. The estimate learns each kicked park,
+  including the time the woken shard waits for a CPU, and a spinning shard lengthens that wait for everyone. So the
+  window fed on its own spinning. Under two spinners a logical CPU the estimates reached 0.2–6.1 ms and the windows
+  hundreds of milliseconds. Even quiet, a Linux client paced at 1 ms kept its owner shard spinning at 1.5–2.0 cores on
+  main, because its live estimate of 34–70 µs made a 3.4–7.0 ms window over a 1 ms pause.
+- **The rule.** `W = max(F, wake × loaded_wake_ratio())`. F is R9's provisioning floor, 50 µs, written as a `derived!`
+  whose formula is R9's bound (AC-2.1): it is a requirement, not a measurement, so no load moves it, and the bench's
+  gate reads the same constant. A closed-loop client that meets R9 sends its next request within F of its last reply,
+  so it finds its shards still polling. The multiple is 0 on Linux and macOS, so there no estimate prices the window,
+  and item (i), the window cannot count delay its own spinning causes, holds by construction. On Windows it is the
+  old 100, kept until Windows' own window is measured. Both live readers read the one window: the shard's idle spin,
+  and the serve loop. The step quantum still reads the estimate's mean. (A kept forward's re-send no longer reads it:
+  since A-279, 2026-11-17, the owner's drain tells the sender.)
+- **Why not the boot probe's smallest wake.** Option 2 as proposed was `max(F, the probe's smallest confirmed wake)`.
+  On a quiet boot that minimum is trustworthy: it is taken once, before any client, as the smallest of many confirmed
+  wakes (5.4–6.6 µs on CI's Linux runners, 0.9–2.8 µs on macOS, 3.1–7.1 µs on Windows). But a daemon booted beside two
+  spinners a CPU read 6.8–259 µs on ubuntu-latest and 8.2–346 µs on ubuntu-24.04-arm, past F in 5 of 9 boots on each.
+  The daemon cannot tell a loaded boot from a slow machine, and the term only ever lengthened the window, so it was
+  dropped.
+- **Measured and rejected** (BENCHMARKS, "The idle window's rule"): the floor of confirmed wakes (it queued as well,
+  0.33–33.8 ms at two shards); that floor less Linux's run-queue time (0–1.75 µs, so the shards parked between a
+  client's requests); the live floor × 100 capped at 4F (no better on any criterion, at twice the paced CPU on Linux).
+- **Measured** (diag-liveness-35, two shards, every N in BENCHMARKS). On Linux the paced client's CPU fell from main's
+  1,451–2,023 to 155–224 thousandths of a core. The loaded single-client p99 halved (8.0 → 4.0 ms on x86_64, 9.8 → 4.0
+  ms on arm64). The quiet p99 stayed within main's spread. macOS's paced CPU fell from 105–333 to 85–112. Built
+  (diag-liveness-37, every N in BENCHMARKS "The idle window's rule as built"): Linux's paced client costs 188–219
+  thousandths of a core quiet and 293–365 loaded (main 859–1,051), its loaded p99 0.34–5.60 ms. The plan's bar of 150
+  quiet is not met on Linux or on Windows (131–341, the ×100 it keeps); what a shorter window costs in p99 is the
+  plan's step 6. The paced-client test failed 6 of 6 on Linux before the rule and passed 6 of 6 after.
+- **Not decided here: Windows' window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
+  so F alone made that every loaded request's latency (97–100 ms on windows-latest, 48–56 ms on windows-11-arm,
+  against 125–127 µs at the multiple). GAPS holds it open, and §5 lists the 100 as a residual literal.
+
+### A-223 — The Windows wake estimate confirms its sleeper (accepted and built 2026-11-06)
+Applied in the same change to: §4.1 (a status note), §4.3 (the online estimate's unslept filter on Windows), GAPS,
+`crates/machine` (`switches.rs`, `wake.rs`, profile format 5), `crates/rt` (`attribution.rs`), the workspace's
+`windows-sys` features, `unsafe-budget.toml`, and the bug record of 2026-11-06.
+- **The defect.** On Windows both wake measurements took a handoff for a wake. The probe trusted the waiter's
+  announcement; the shards learned kicks that landed before their thread blocked. jupiter's shards read 0.62–0.83 µs.
+  Their owner parked during 221–546 of 2,000 single-client creates, and 20–21 of each run's 21 slowest creates had
+  their owner park during the create.
+- **The decision.** The waiter's own context-switch count is the Windows proof of a sleep, per wait, at 14–49 ns a
+  read. The cycle count of the waiter is the waker's gate before a kick, which keeps the dropped wakes few (0–2 a
+  profile). The supervisor's plan named the cycle count; CI showed it is not proof alone, so both are used.
+- **Measured.** At two shards on both CI Windows runners, owner parks per 1,000 single-client creates fell to 0–1, and
+  the quiet single-client p99 fell by 4–32 %. The 8-client p99 moved within 7 %. CPU with no client stayed 0–0.005 core.
+- **Not decided here.** The idle window's ratio to the wake now costs 0.21–0.38 core under a client paced at 1 ms, and
+  follows a loaded shard's run-queue wait. GAPS holds it open.
+- **The client (sibling (d), built 2026-11-11).** The ipc client's Windows wait learned an unconfirmed stamp, since the
+  Event cannot report a sleeper found. It now reads its own switch count across the wait and drops a wait that never
+  switched out, or whose count the OS refused, keeping its seed then. On CI's Windows runners main learned 11–48 of
+  the 11–49 racing parks a run (of 16,384) that never switched out, and the fixed client none. Applied to §4.7 (wake
+  strategy, status), `crates/ipc` (`endpoint.rs`, `tests/rings.rs`) and `crates/client` (`Client::wake_estimate`,
+  provision_bench's `client wake` line).
 
 ### A-218 — The macOS idle spin's policy (measured and rejected 2026-11-05; main's spin stays)
 Applied in the same change to: §4.3 (its "Loop" paragraph: on macOS the zero-timeout harvest sleeps about 15 µs, kept),

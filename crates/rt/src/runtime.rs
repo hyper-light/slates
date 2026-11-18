@@ -99,7 +99,13 @@ pub struct WakeTracking {
   /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
   /// daemon's idle window sets its ratio).
   pub idle_ratio: u64,
+  /// The least idle spin window, nanoseconds, whatever the estimate (none for the runtime's own spin-then-park;
+  /// the daemon sets R9's provisioning floor, A-223).
+  pub idle_floor_ns: u64,
 }
+
+/// Format: no least idle window: the runtime's own spin-then-park is its wake estimate alone.
+pub const NO_IDLE_FLOOR_NS: u64 = 0;
 
 /// A shard's wake-ring size from the profile's derived `ring_entries` (Little's law at the overflow target), at
 /// least the ring's smallest admitted capacity ([`slates_mem::mpsc::MIN_CAPACITY`]): on a machine whose wake p99
@@ -153,6 +159,7 @@ impl RuntimeConfig {
         prior_ns: d.spin_before_park_ns.get(),
         shift: profile.wake.estimate_shift(),
         idle_ratio: 1,
+        idle_floor_ns: NO_IDLE_FLOOR_NS,
       }),
     };
     config.batch = config.calibrate_batch(latency_budget_ns).get();

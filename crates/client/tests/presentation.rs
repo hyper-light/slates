@@ -3,8 +3,10 @@
 //! test binary re-invoked is the presenter (an environment variable selects the role), so the death is a real
 //! `SIGKILL` of a real process: an in-process client never reads as gone, because the reaper retires only a
 //! silent client whose process or control socket has gone. Its own binary, so no other test's reaping moves
-//! the daemon's process-wide counters under it.
-
+//! the daemon's process-wide counters under it. Unix only, as the landing verb is: the landing engine's one
+//! writer is the Unix `os` module, and a Windows daemon refuses the verb `Unsupported { feature: "landing" }`
+//! until the Windows writer exists (`crates/server/src/landing.rs`; GAPS, A-262), so there is nothing to present.
+#![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

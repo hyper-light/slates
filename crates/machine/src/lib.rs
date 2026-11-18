@@ -54,6 +54,7 @@ pub mod process_clock;
 pub mod profile;
 pub mod segment;
 pub mod stats;
+pub mod switches;
 pub mod wake;
 
 pub use derived::Derived;
