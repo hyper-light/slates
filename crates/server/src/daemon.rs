@@ -4535,6 +4535,7 @@ async fn init_shard(
     loop_io: false,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
+    told_times: crate::told::ToldTimes::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
@@ -6369,8 +6370,8 @@ fn log_late_beat(
 }
 
 /// Shape: a beat that late — this share of the liveness budget or more after the last — is logged as a near
-/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A writer waits for
-/// its volume's FUSE mounts no longer than that ([`crate::told::TOLD_WAIT_NS`], AC-3.3).
+/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A scatter's part
+/// waits for room a window of that share at a time (`crate::verbs::PART_ROOM_BUDGET_NS`, A-426).
 pub(crate) const LATE_BEAT_SHARE: u64 = 2;
 
 /// Format: nanoseconds per millisecond, for the late-beat log.
