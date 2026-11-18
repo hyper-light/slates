@@ -1,0 +1,10 @@
+--- a/crates/land/src/engine.rs
++++ b/crates/land/src/engine.rs
+@@ -3995,7 +3995,6 @@
+     uid: witness.uid,
+     gid: witness.gid,
+     birth_ns: witness.birth_ns,
+-    windows: (after.windows & !MOVE_SETS) | (witness.windows & MOVE_SETS),
+     ..*after
+   } == *witness
+ }

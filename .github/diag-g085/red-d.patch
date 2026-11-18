@@ -1,0 +1,11 @@
+--- a/crates/land/src/os_windows.rs
++++ b/crates/land/src/os_windows.rs
+@@ -494,7 +494,7 @@
+   } else {
+     // SAFETY: the token just opened, owned here alone and closed on drop.
+     let token = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
+-    [TokenIdentity::User, TokenIdentity::DefaultOwner]
++    [TokenIdentity::User]
+       .into_iter()
+       .try_fold(false, |found, identity| {
+         if found {

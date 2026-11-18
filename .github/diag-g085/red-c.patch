@@ -1,0 +1,14 @@
+--- a/crates/base/src/windows.rs
++++ b/crates/base/src/windows.rs
+@@ -714,11 +714,6 @@
+   else {
+     return Err(WalkRefusal::NotAbsolute);
+   };
+-  if let Some(drive) = drive_of(prefix)
+-    && drive_is_own(&drive).map_err(WalkRefusal::Host)?
+-  {
+-    return Err(WalkRefusal::OwnMount);
+-  }
+   let mut root = std::path::PathBuf::from(prefix.as_os_str());
+   root.push(std::path::MAIN_SEPARATOR_STR);
+   // structural: allow — a read-only open of the volume's root directory; nothing is written (R1).

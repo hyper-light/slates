@@ -1,0 +1,11 @@
+--- a/crates/land/src/os_windows.rs
++++ b/crates/land/src/os_windows.rs
+@@ -844,7 +844,7 @@
+   /// ([`attributes_for_mode`]).
+   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
+     let handle = self.file(file)?;
+-    let wanted = attributes_for_mode(attributes(handle)?, mode);
++    let wanted = if mode & WRITE_BITS == 0 { FILE_ATTRIBUTE_READONLY } else { FILE_ATTRIBUTE_NORMAL };
+     set_basic(
+       handle,
+       &FILE_BASIC_INFO {
