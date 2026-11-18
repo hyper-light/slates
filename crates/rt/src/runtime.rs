@@ -111,10 +111,17 @@ pub struct WakeTracking {
   /// The least idle spin window, nanoseconds, whatever the estimate (none for the runtime's own spin-then-park;
   /// the daemon sets R9's provisioning floor, A-223).
   pub idle_floor_ns: u64,
+  /// The longest one idle spin may run, nanoseconds, whatever its window, its estimate or a hold asks (A-361): a spin
+  /// is no step, so a watcher that judges a shard by CPU run without a step must never see an idle spin reach its
+  /// window. The daemon derives it from its watchdog's (`slates_server::config::IDLE_SPIN_CEILING`); none for a
+  /// runtime nothing watches.
+  pub idle_ceiling_ns: u64,
 }
 
 /// Format: no least idle window: the runtime's own spin-then-park is its wake estimate alone.
 pub const NO_IDLE_FLOOR_NS: u64 = 0;
+/// Format: no ceiling on an idle spin: a runtime that no watcher judges by its steps.
+pub const NO_IDLE_CEILING_NS: u64 = u64::MAX;
 
 /// A shard's wake-ring size from the profile's derived `ring_entries` (Little's law at the overflow target), at
 /// least the ring's smallest admitted capacity ([`slates_mem::mpsc::MIN_CAPACITY`]): on a machine whose wake p99
@@ -169,6 +176,7 @@ impl RuntimeConfig {
         shift: profile.wake.estimate_shift(),
         idle_ratio: 1,
         idle_floor_ns: NO_IDLE_FLOOR_NS,
+        idle_ceiling_ns: NO_IDLE_CEILING_NS,
       }),
     };
     config.batch = config.calibrate_batch(latency_budget_ns).get();

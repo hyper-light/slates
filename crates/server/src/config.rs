@@ -96,31 +96,44 @@ pub const PROVISION_FLOOR: Derived<u64> = derived!(
 );
 /// F in nanoseconds ([`PROVISION_FLOOR`]), for arithmetic and the bench's gate.
 pub const PROVISION_FLOOR_NS: u64 = PROVISION_FLOOR.get();
-/// The idle window's multiple of the shard's wake estimate on Linux and macOS: none. Two shards beside two spinners a
-/// logical CPU parked between a 1 ms-paced client's requests at R9's floor alone, and their loaded single-client p99
-/// halved against main's (8.0 to 4.0 ms on ubuntu-latest, 9.8 to 4.0 ms on ubuntu-24.04-arm, macOS even), so no
-/// estimate, which load lengthens, prices the window there (A-223).
-#[cfg(not(windows))]
-pub const fn loaded_wake_ratio() -> Derived<u64> {
-  derived!(
-    0,
-    "none: the window is F alone where a loaded wake was measured cheap",
-    ["diag-liveness-35", "A-223"]
-  )
-}
-/// The idle window's multiple of the shard's wake estimate on Windows: the hundred it had before A-223, kept by the
-/// supervisor's decision (2026-11-11) until Windows' own window is measured. A Windows shard parked beside two spinners
-/// a logical CPU waits 50-100 ms to run again, so at R9's floor alone every loaded request paid it (single-client p99
-/// 97-100 ms on windows-latest, 48-56 ms on windows-11-arm) where this multiple held 125-127 µs medians. Ratified as a
-/// residual literal in GAPS §5.
-#[cfg(windows)]
-pub const fn loaded_wake_ratio() -> Derived<u64> {
-  derived!(
-    100,
-    "the pre-A-223 multiple, kept on Windows: R9's floor alone cost a loaded p99 of 48-100 ms",
-    ["diag-liveness-35", "GAPS §5"]
-  )
-}
+/// The idle window's multiple of the shard's wake estimate, on every platform: none, so no estimate, which load
+/// lengthens, prices the window (A-223 (i), A-361). Linux and macOS took R9's floor alone on 2026-11-11, when two shards
+/// beside two spinners a logical CPU parked between a 1 ms-paced client's requests and their loaded single-client p99
+/// halved (8.0 to 4.0 ms on ubuntu-latest, 9.8 to 4.0 ms on ubuntu-24.04-arm, macOS even). Windows kept the hundred it
+/// had before A-223, since a shard parked there beside spinners waited 50-100 ms to run again; that wait was a wake
+/// without the priority boost Windows gives every other waiter (A-361, which raises a blocked wait a level), and the
+/// hundred, priced on an estimate that counted it, made idle windows of seconds: a daemon on CI's windows-latest beside
+/// two spinners a CPU spun past its watchdog's window after a WinFsp request and was killed for a lapsed beat in 3 of 3
+/// runs (g258's now-x86 lane, 2026-11-18).
+pub const NO_ESTIMATE_MULTIPLE: Derived<u64> = derived!(
+  0,
+  "none: the window is R9's floor alone on every platform",
+  ["A-223", "A-361"]
+);
+
+/// The longest one idle spin may run, nanoseconds, whatever its window, its estimate or a hold asks: the liveness budget
+/// less one beat. The watchdog judges a shard spinning once it has run its spin window of CPU with no step and no park
+/// (`crate::watchdog::spin_window_ns`, the budget held to the build and never below it, A-318), and an idle spin is
+/// neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a step's quantum. A
+/// spin held under the budget by a beat can therefore never reach the verdict, on any platform and in any build: an
+/// idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are R9's floor and
+/// a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is what keeps a
+/// rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did (A-361).
+pub const IDLE_SPIN_CEILING: Derived<u64> = derived!(
+  crate::daemon::LIVENESS_BUDGET_NS.saturating_sub(crate::daemon::HEARTBEAT_NS),
+  "liveness budget − one beat: under the least spin window the watchdog judges by",
+  ["LIVENESS_BUDGET_NS", "HEARTBEAT_NS", "A-318", "A-361"]
+);
+/// The idle spin's ceiling in nanoseconds ([`IDLE_SPIN_CEILING`]).
+pub const IDLE_SPIN_CEILING_NS: u64 = IDLE_SPIN_CEILING.get();
+// By construction (A-361): an idle spin ends before the least CPU the watchdog judges spinning, the liveness budget (its
+// spin window is the budget held to the build, never below it), with a beat to spare for the empty step before it and the
+// idle slice after it.
+const _: () = assert!(
+  IDLE_SPIN_CEILING_NS > 0
+    && IDLE_SPIN_CEILING_NS < crate::daemon::LIVENESS_BUDGET_NS
+    && IDLE_SPIN_CEILING_NS + crate::daemon::HEARTBEAT_NS <= crate::daemon::LIVENESS_BUDGET_NS
+);
 
 /// Format: R9 holds a create's p99 (AC-2.1), so one request in this many may fall in the tail: the share of a closed
 /// loop's requests a held window may leave to find their shard parked ([`loop_revisit_cycles`]).
@@ -177,19 +190,6 @@ pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
   )
 }
 
-/// The idle window for a shard whose wake estimate is `wake_ns`: `max(F, wake × loaded_wake_ratio())` (§4.3, §4.7;
-/// A-223). R9's floor keeps a closed-loop client's own shard awake (the others its loop goes round are held by
-/// [`closed_loop_hold`], A-326); the platform's multiple covers a loaded wake where parking costs more than spinning
-/// saves. Where the multiple is zero (Linux, macOS) no estimate moves the window, so a
-/// shard's own spinning, which lengthens the wakes it measures, cannot lengthen it.
-pub const fn idle_window_ns(wake_ns: u64) -> u64 {
-  let covered = wake_ns.saturating_mul(loaded_wake_ratio().get());
-  if covered > PROVISION_FLOOR_NS {
-    covered
-  } else {
-    PROVISION_FLOOR_NS
-  }
-}
 /// The divisor between a shard's metadata class and one slab dimension's units. The class is split
 /// among the inode dimension (a version slot and a table slot per inode), the directory dimension
 /// (a node and a block per directory) and the volume records (journals and objects) — three parts
@@ -1035,19 +1035,21 @@ impl DaemonConfig {
     // poll rings while any client has activity within the measured idle window"), so a
     // request from an active client, or a forward from another shard, never pays a wake.
     derivations.push(note("provision_floor_ns", &PROVISION_FLOOR));
-    derivations.push(note("loaded_wake_ratio", &loaded_wake_ratio()));
+    derivations.push(note("idle_estimate_multiple", &NO_ESTIMATE_MULTIPLE));
     let idle_window: Derived<u64> = derived!(
-      idle_window_ns(d.spin_before_park_ns.get()),
-      "max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns",
-      ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"]
+      PROVISION_FLOOR_NS,
+      "provision_floor_ns: R9's floor alone, which no wake estimate moves on any platform",
+      ["provision_floor_ns", "idle_estimate_multiple"]
     );
     derivations.push(note("idle_window_ns", &idle_window));
+    derivations.push(note("idle_spin_ceiling_ns", &IDLE_SPIN_CEILING));
     runtime.spin_ns = idle_window.get();
-    // A shard's spin follows its online wake estimate by the same rule (§4.3): the platform's multiple, at least
-    // R9's floor. `spin_ns` is the boot value, kept by a runtime that tracks no estimate.
+    // A shard that tracks its wake keeps the same window (§4.3): no multiple of the estimate, R9's floor, and every spin
+    // under the watchdog's window whatever a hold asks. `spin_ns` is the window of a runtime that tracks no estimate.
     if let Some(tracking) = runtime.wake_tracking.as_mut() {
-      tracking.idle_ratio = loaded_wake_ratio().get();
+      tracking.idle_ratio = NO_ESTIMATE_MULTIPLE.get();
       tracking.idle_floor_ns = PROVISION_FLOOR_NS;
+      tracking.idle_ceiling_ns = IDLE_SPIN_CEILING_NS;
     }
     // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
     // the loop's revisit at R9's percentile (§4.7; A-326).
@@ -1786,44 +1788,6 @@ mod tests {
     assert!(
       closed_loop_hold(STEP_SIX_SHARDS).get() >= CLOSED_LOOP_CYCLE_NS * u64::from(STEP_SIX_SHARDS)
     );
-  }
-
-  /// A-223, §4.3, §4.7. Do: run a table of wake estimates through the idle window's rule: zero, one under F, the
-  /// unqueued 6 µs Linux's probe reads quiet, the 346 µs a loaded boot's probe read (above F), a queued 2 ms, and a
-  /// saturated estimate. Expect: every window at least F, never zero, and no overflow. On Linux and macOS every window
-  /// is F, so no estimate, however load inflated it, moves the window; on Windows the window is F or the estimate's
-  /// multiple, whichever is longer, so it is also at least the estimate.
-  #[test]
-  fn the_idle_window_is_the_floor_or_the_platforms_cover_of_a_loaded_wake() {
-    /// Shape: a wake under F.
-    const UNDER_FLOOR_NS: u64 = 100;
-    /// Measured: the boot probe's smallest wake on a quiet ubuntu-latest (5.9-6.2 µs, diag-liveness-35).
-    const QUIET_BOOT_NS: u64 = 6_000;
-    /// Measured: the boot probe's smallest wake on a loaded ubuntu-24.04-arm (diag-liveness-35).
-    const LOADED_BOOT_NS: u64 = 346_000;
-    /// Shape: a wake queued behind spinners, milliseconds.
-    const QUEUED_NS: u64 = 2_000_000;
-    for wake in [
-      0,
-      UNDER_FLOOR_NS,
-      QUIET_BOOT_NS,
-      LOADED_BOOT_NS,
-      QUEUED_NS,
-      u64::MAX,
-    ] {
-      let window = idle_window_ns(wake);
-      assert!(window >= PROVISION_FLOOR_NS, "{wake} ns gave {window} ns");
-      if cfg!(windows) {
-        assert!(window >= wake, "{wake} ns gave {window} ns");
-        assert_eq!(
-          window,
-          PROVISION_FLOOR_NS.max(wake.saturating_mul(loaded_wake_ratio().get())),
-          "{wake} ns"
-        );
-      } else {
-        assert_eq!(window, PROVISION_FLOOR_NS, "{wake} ns");
-      }
-    }
   }
 
   /// AC-A-171 (G-direct step 2): the direct maps' copies a shard may hold follow the process's limits. Do: derive it for
