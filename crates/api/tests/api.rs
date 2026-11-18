@@ -46,6 +46,10 @@ mod signer;
 const PROBE_MS: u64 = 5;
 /// Shape: one shard per test daemon: the library's verbs are the subject, not placement.
 const TEST_SHARDS: u16 = 1;
+/// Shape: the shards of the daemon kiln starts (`crates/kiln/src/workspace/slates.rs`, `SHARDS`): two on every
+/// machine, so each shard's reserve is a sixth of the machine's memory (three memory classes) while kiln's volume asks
+/// a quarter.
+const KILN_SHARDS: u16 = 2;
 /// Shape: how long a test waits for its daemon's rendezvous to answer after the start.
 const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: a scratch volume's quota and an overlay's growth bound: room for the few small files a test writes.
@@ -70,7 +74,7 @@ fn profile() -> MachineProfile {
     .expect("the machine profile measures");
   static RESERVED: OnceLock<bool> = OnceLock::new();
   let _ = RESERVED.get_or_init(|| {
-    let largest = DaemonConfig::derive(&profile, "api-reserve", Some(TEST_SHARDS));
+    let largest = DaemonConfig::derive(&profile, "api-reserve", Some(TEST_SHARDS.max(KILN_SHARDS)));
     slates_server::seal_keys::reserve(largest.seal_key_slots)
   });
   profile
@@ -79,11 +83,16 @@ fn profile() -> MachineProfile {
 /// A daemon of this process named after `tag` (its consensus group not made: [`Instance::ensure_group`] makes it), and
 /// an instance attached to it, retried while the rendezvous comes up.
 fn daemon(tag: &str) -> (Daemon, Instance) {
+  daemon_on(tag, TEST_SHARDS)
+}
+
+/// [`daemon`] on `shards` shards.
+fn daemon_on(tag: &str, shards: u16) -> (Daemon, Instance) {
   static NEXT: AtomicU64 = AtomicU64::new(0);
   let profile = profile();
   let serial = NEXT.fetch_add(1, Ordering::Relaxed);
   let instance = format!("api-{tag}-{}-{serial}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -108,6 +117,14 @@ fn daemon(tag: &str) -> (Daemon, Instance) {
 /// A daemon and an instance with its consensus group made, as a host makes it for an instance it runs alone.
 fn grouped(tag: &str) -> (Daemon, Instance) {
   let (daemon, mut instance) = daemon(tag);
+  instance.ensure_group().unwrap();
+  (daemon, instance)
+}
+
+/// [`grouped`] on the shards of the daemon kiln starts ([`KILN_SHARDS`]).
+#[cfg(unix)]
+fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
+  let (daemon, mut instance) = daemon_on(tag, KILN_SHARDS);
   instance.ensure_group().unwrap();
   (daemon, instance)
 }
@@ -939,6 +956,118 @@ fn a_merge_follows_its_greens_write_mode() {
       reason: PolicyReason::Forbidden,
     })
   );
+  daemon.stop();
+}
+
+/// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in
+/// whole GiB, at least one and at most 64.
+#[cfg(unix)]
+fn kiln_volume_max() -> u64 {
+  /// Format: kiln's `MAX_VOLUME_GIB`.
+  const MAX_VOLUME_GIB: u64 = 64;
+  ((profile().facts.memory.total / 4) >> 30).clamp(1, MAX_VOLUME_GIB) << 30
+}
+
+/// The daemon's own count of each shard's inode-version slab (§4.2 inode dimension), printed beside a test's verdict
+/// as its evidence: the slots, those committed to volumes' allowances, and those snapshots retain.
+#[cfg(unix)]
+fn print_version_slabs(instance: &mut Instance, when: &str) {
+  for shard in instance.daemon_status().unwrap().shards {
+    eprintln!(
+      "{when}: shard {} version_slots {} committed_versions {} retained_versions {} volumes {}",
+      shard.partition,
+      shard.version_slots,
+      shard.committed_versions,
+      shard.retained_versions,
+      shard.volumes
+    );
+  }
+}
+
+/// P1 (2026-11-18, kiln's review over a microVM's volume, which failed `agents.change` with "reading .gitignore: a
+/// bound is reached: Quota"; A-342, `docs/bugs/2026-11-18-a-dynamic-volume-reserved-the-whole-version-slab.md`). Do:
+/// what kiln does, on the daemon kiln starts ([`KILN_SHARDS`]) with kiln's own volume spec (a quarter of the machine's
+/// memory):
+/// the agent's three edits and its lookup of the project's `.gitignore` (git reads it); then review: snapshot, present
+/// that snapshot's landing without writing and list its entries, read `.gitignore` at the head as kiln's ignore rules
+/// do, and a base file nothing looked up before the snapshot. Expect: each file's bytes as the disk holds them — a read
+/// of a file nobody changed is never refused for space.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() {
+  let (daemon, mut instance) = kiln_grouped("review-read");
+  let folder = Folder::new();
+  let ignores = b"target/\n*.log\n";
+  let readme = b"the project\n";
+  folder.write(".gitignore", ignores);
+  folder.write("README.md", readme);
+  folder.write("src/lib.rs", b"pub fn a() {}\n");
+  folder.write(".git/HEAD", b"ref: refs/heads/main\n");
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("kiln-review", &folder.path, kiln_volume_max()),
+  );
+  write_file(
+    &mut instance,
+    volume,
+    "/src/lib.rs",
+    b"pub fn a() { b() }\n",
+  );
+  write_file(&mut instance, volume, "/src/new.rs", b"pub fn b() {}\n");
+  write_file(&mut instance, volume, "/notes.txt", b"done\n");
+  assert_eq!(read_file(&mut instance, volume, "/.gitignore"), ignores);
+  let snapshot = instance.snapshot(volume).unwrap();
+  let request = slates_api::LandingRequest {
+    snapshot: Some(snapshot),
+    ..landing_into(volume, &folder)
+  };
+  let LandOutcome::ApprovalRequired(approval) = instance.plan_landing(&request).unwrap() else {
+    panic!("the agent's edits are presented");
+  };
+  assert_eq!(instance.approval_entries(&approval).unwrap().len(), 3);
+  print_version_slabs(&mut instance, "review");
+  assert_eq!(
+    instance.read(volume, "/.gitignore", slates_api::ReadAt::Head),
+    Ok(ignores.to_vec()),
+    "an unchanged base file looked up before the snapshot reads at the head"
+  );
+  assert_eq!(
+    instance.read(volume, "/README.md", slates_api::ReadAt::Head),
+    Ok(readme.to_vec()),
+    "an unchanged base file first looked up after the snapshot reads at the head"
+  );
+  instance.destroy_snapshot(volume, snapshot).unwrap();
+  daemon.stop();
+}
+
+/// P1's sibling (2026-11-18, the same bound, A-342): do provision one more of kiln's workspaces (kiln's own volume
+/// spec, a quarter of the machine's memory each) than the daemon kiln starts has shards, through one instance, as kiln
+/// does for its agents' sessions. Expect every one made: a workspace that may grow to a quarter of the machine holds
+/// none of its shard's room before it grows (§4.2: dynamic growth consumes only unpromised capacity).
+#[cfg(unix)]
+#[test]
+fn kilns_workspaces_are_provisioned_side_by_side() {
+  let (daemon, mut instance) = kiln_grouped("side-by-side");
+  let folders: Vec<Folder> = (0..=KILN_SHARDS)
+    .map(|_| {
+      let folder = Folder::new();
+      folder.write("README.md", b"the project\n");
+      folder
+    })
+    .collect();
+  let mut made = Vec::new();
+  for (serial, folder) in folders.iter().enumerate() {
+    let spec = VolumeSpec::overlay(&format!("kiln-{serial}"), &folder.path, kiln_volume_max());
+    let provisioned = instance.provision(&spec);
+    print_version_slabs(&mut instance, &format!("after workspace {serial}"));
+    made.push(provisioned.map(|made| made.volume()));
+  }
+  for (serial, volume) in made.iter().enumerate() {
+    assert!(volume.is_ok(), "workspace {serial}: {volume:?}");
+  }
+  for volume in made.into_iter().flatten() {
+    instance.destroy(volume).unwrap();
+  }
   daemon.stop();
 }
 

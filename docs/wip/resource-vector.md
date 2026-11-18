@@ -20,11 +20,14 @@
 > debiting it — so two dynamic volumes cannot spend the same capacity, a dynamic volume cannot consume
 > a bounded volume's entitlement, and the hold is accounted through teardown and recovery. This is
 > proven through the real write path, no mount, in `crates/bridge-core/tests/admission.rs` (the five
-> histories). The **inode dimension's reservation is now landed too**: a volume's logical inode
+> histories). The **inode dimension's reservation is now landed too**: a bounded claim's logical inode
 > allowance is reserved against a per-shard `VersionBudget` over the version slab (`store.max_inodes`,
-> crates/mem/src/budget.rs) at create — bounded and dynamic alike, on both the scratch-create and
-> clone-create paths and re-acquired on recovery — and released on destroy, so the *sum* of advertised
-> allowances is physically backed by the slab, not merely capped against `SlabFull`. An earlier
+> crates/mem/src/budget.rs) at create, on both the scratch-create and clone-create paths and re-acquired
+> on recovery, and released on destroy, so the *sum* of advertised claims is physically backed by the
+> slab, not merely capped against `SlabFull`. A dynamic volume reserves none of its allowance (A-342,
+> 2026-11-18; before, it reserved its maximum's whole share, which a large maximum made the whole slab):
+> it holds a slot per live inode taken from the unpromised slots as the inode is issued, never given
+> back while it lives and returned at teardown, as its byte growth is. An earlier
 > version of this note deferred it as waiting on a *measured* `operation_headroom` (the peak of
 > transient CoW versions under write load); **that was wrong.** The design defines `operation_headroom`
 > as "bounded temporary coexistence during copy-up" with "measured *or structural* anchors" (§4.2,
