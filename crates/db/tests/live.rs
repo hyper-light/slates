@@ -1489,9 +1489,9 @@ fn a_live_log_resumed_past_its_durable_position_alone_breaks_agreement() {
 
 /// A-344: do make an owner's shipper, ship positions 0 to 5 to holder 2 (holder 3 holds nothing), restart it as
 /// resumed past position 5 under the same epoch, and append once. Expect its next position 6 before the append and the
-/// entry at 6 after it, nothing durable before any holder acknowledges this chain; holder 2, on the old chain at 5, and
-/// holder 3, holding nothing, each refuse the entry and are owed an install, which each applies; the entry durable at 6
-/// once one of them reports it.
+/// entry at 6 after it, one entry in flight and nothing durable before any holder acknowledges this chain; holder 2, on
+/// the old chain at 5, and holder 3, holding nothing, each refuse the entry and are owed an install, which each
+/// applies; the entry durable at 6 once one of them reports it.
 #[test]
 fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
   let hosts = [HostId(1), HostId(2), HostId(3)];
@@ -1524,6 +1524,11 @@ fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
   );
   assert_eq!(resumed.next_position(), Some(7));
   assert_eq!(resumed.durable(), None, "no holder holds this chain yet");
+  assert_eq!(
+    resumed.in_flight(),
+    1,
+    "only the entry appended here is in flight, not the positions before it"
+  );
   let mut empty = Replica::new(hosts[0], OBJECT);
   for (holder, replica) in [(hosts[1], &mut old), (hosts[2], &mut empty)] {
     let refused = replica.check(&entry);
