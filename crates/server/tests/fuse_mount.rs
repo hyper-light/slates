@@ -331,6 +331,74 @@ fn left_dead_until_its_user_unmounts(point: &str, what: &str) {
   );
 }
 
+/// A-346 on Linux (§4.8 "Leases and reads", A-338): a FUSE mount of a volume its node lost to a takeover ends as a revoked
+/// mount ends, FUSE's form of the `NFS3ERR_STALE` an NFS mount of it answers. Do: create a volume, mount it over FUSE,
+/// write `f` and read it back; mark the node superseded on the volume (`Daemon::inject_superseded`, as a holder's answer
+/// with a later fence marks it); read `f` afresh until refused. Expect the read before served, a read after refused
+/// `ENOTCONN` (the revoked mount's answer, and the kernel's once the mount ended), and the shards' count of mounts ended
+/// for a takeover moved. Before, the mount went on answering from the node's copy.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own files, read and written through the slates mount: RAM, not disk
+fn a_superseded_volumes_fuse_mount_ends() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-superseded-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "fuse-superseded"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut owner = connect(&instance);
+  let volume = owner.create(&scratch("fuse-superseded")).unwrap();
+  let point = target_dir();
+  owner
+    .attach_fuse(volume, Intent::Write, &point.path)
+    .unwrap();
+  std::fs::write(format!("{}/f", point.path), b"the node's copy").unwrap();
+  let before = std::fs::read(format!("{}/f", point.path));
+  daemon.inject_superseded(volume, 2).unwrap();
+  let mut after = None;
+  let refused = eventually(|| {
+    let read = std::fs::read(format!("{}/f", point.path));
+    let done = read.is_err();
+    after = Some(read.map_err(|error| error.raw_os_error()));
+    done
+  });
+  let ended = daemon
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("fuse.superseded_ended").copied().unwrap_or(0))
+    .unwrap_or(0);
+  let _ = Command::new("fusermount3")
+    .args(["-u", "-z", &point.path])
+    .status();
+  daemon.stop();
+  assert_eq!(
+    before.map_err(|error| error.raw_os_error()),
+    Ok(b"the node's copy".to_vec()),
+    "the mount served the file before"
+  );
+  assert!(refused, "a read after the takeover was refused: {after:?}");
+  assert_eq!(
+    after,
+    Some(Err(Some(rustix::io::Errno::NOTCONN.raw_os_error()))),
+    "refused as a revoked mount's request is"
+  );
+  assert!(
+    ended >= 1,
+    "the shard counted the mount ended for the takeover"
+  );
+}
+
 /// AUD-29-84 on Linux (§4.13 "every later effect", A-28): a consumer's revocation must fence its FUSE mount, as it
 /// fences its NFS mount on macOS (`a_revoked_consumers_mount_capability_reaches_nothing`). Do: the account creates a
 /// volume, mounts it, writes `f` there and shares the volume with an enrolled consumer; a workload bound to the consumer

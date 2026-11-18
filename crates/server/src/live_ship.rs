@@ -1371,6 +1371,55 @@ fn fenced(state: &ShardState, volume: [u8; 16]) -> Option<HostEpoch> {
   }
 }
 
+/// A later epoch holds `volume` (a holder answered with its fence): this owner was superseded on it. It ships no more of
+/// it and tells every write waiting on it so; a fence learned now is kept before anyone is told, as a holder keeps a
+/// fence it raised, so a restart does not forget it (A-344; a refused publication leaves the mark for the next); and
+/// its mounts of the volume learn of it at once (A-346): a FUSE mount ends as a revoked one does
+/// (`crate::fuse::superseded`), and an NFS mount answers `NFS3ERR_STALE` at its next request (`crate::nfs`'s gate reads
+/// [`superseded`]). Nothing for a volume this shard ships no log of.
+fn learn_superseded(state: &mut ShardState, volume: [u8; 16], current: HostEpoch) {
+  let Some(live) = state.live.shipping.get_mut(&volume) else {
+    return;
+  };
+  let learned = live.fenced.is_none_or(|known| known < current);
+  live.fenced = Some(current);
+  if learned {
+    state.live.owned_dirty.insert(volume);
+    if crate::verbs::publish_shard(state).is_err() {
+      state.count(LIVE_FENCE_UNPUBLISHED, 1);
+    }
+    #[cfg(target_os = "linux")]
+    crate::fuse::superseded(state, slates_db::catalog::VolumeId { bytes: volume });
+  }
+  refuse_awaiting(state, volume, current);
+  wake_parked(state, volume);
+}
+
+/// Test support (`Daemon::inject_superseded`, never reachable from the wire): this owner is found superseded on `id` at
+/// `epoch`, as a holder's fence answer finds it ([`learn_superseded`]); a volume this shard ships no log of is marked by
+/// a kept fence, as a restart over one would find it (A-344), and its mounts told the same way. So a mount's answer to a
+/// takeover is driven without a fleet.
+pub(crate) fn inject_superseded(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  epoch: u64,
+) {
+  if state.live.shipping.contains_key(&id.bytes) {
+    learn_superseded(state, id.bytes, HostEpoch(epoch));
+    return;
+  }
+  state.live.resumed.insert(
+    id.bytes,
+    OwnedLive {
+      epoch,
+      next: 0,
+      fenced: Some(epoch),
+    },
+  );
+  #[cfg(target_os = "linux")]
+  crate::fuse::superseded(state, id);
+}
+
 /// Counter: a superseded owner's fence that its learning could not publish at once (A-344); the next publication keeps
 /// it.
 /// Format: a counter name in the daemon's status report.
@@ -2863,21 +2912,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     let held_before = live.shipper.held_by(host);
     let reply = decode_reply(&bytes);
     if let Next::Fenced(current) = live.shipper.on_reply(host, reply) {
-      // A later epoch holds the volume: this owner was superseded, ships no more of it, and tells every write waiting
-      // on it so.
-      let learned = live.fenced.is_none_or(|known| known < current);
-      live.fenced = Some(current);
-      if learned {
-        // Kept before anyone is told, as a holder keeps a fence it raised: a restart must not forget that this owner was
-        // superseded, or it answers reads from the copy its successor's writes have passed (A-344). A refused
-        // publication leaves the mark for the next.
-        state.live.owned_dirty.insert(object.0);
-        if crate::verbs::publish_shard(state).is_err() {
-          state.count(LIVE_FENCE_UNPUBLISHED, 1);
-        }
-      }
-      refuse_awaiting(state, object.0, current);
-      wake_parked(state, object.0);
+      learn_superseded(state, object.0, current);
       continue;
     }
     // Only an answer that moved the holder forward on the chain is followed at once; anything else (a refusal, a holder

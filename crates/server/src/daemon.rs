@@ -2828,6 +2828,24 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: this node is found superseded on `volume` at `epoch`, as a holder's answer with a later fence finds it
+  /// (`live_ship::inject_superseded`, never reachable from the wire), so its mounts of the volume learn of the takeover
+  /// as they would (A-346) without a fleet. Delivered on the volume's owner shard; `Ok` once installed, else the typed
+  /// refusal.
+  pub fn inject_superseded(
+    &self,
+    volume: slates_ipc::protocol::VolumeId,
+    epoch: u64,
+  ) -> Result<(), ObserveError> {
+    let id = slates_db::catalog::VolumeId {
+      bytes: volume.bytes,
+    };
+    self.observe(
+      self.shard_of_object(slates_db::register::ObjectId(volume.bytes)),
+      move |s| crate::live_ship::inject_superseded(s, id, epoch),
+    )
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like

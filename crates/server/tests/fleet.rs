@@ -55,7 +55,7 @@ use std::net::TcpStream;
 use common::guest::{message, my_uid, reply_error, round_trip, start_guest, with_guest};
 use common::nfs::{
   NFS3ERR_JUKEBOX, create, lookup, lookup_carries_attributes, lookup_status, mount,
-  owner_and_mode_status, read_bytes_status, read_status, write,
+  owner_and_mode_status, read_bytes_status, read_status, write, write_status,
 };
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
@@ -14185,6 +14185,83 @@ fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() 
   assert!(
     read,
     "a read through a after its warm restart answers the successor's write: {last:?}"
+  );
+}
+
+/// A live-shipped volume named `name` through `client`, shared with `fleet`, with nothing written: the volume.
+fn live_volume_named(client: &mut Client, fleet: &[Daemon], name: &str) -> VolumeId {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume {name} was created");
+  };
+  share_with_fleet(client, id, fleet);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  id
+}
+
+/// A-346 (§4.8 "Leases and reads", A-338, A-344): an NFS mount on a superseded owner learns of the takeover: once the old
+/// owner knows its log is fenced, a request through its mount answers `NFS3ERR_STALE`, as a non-owner node's mount
+/// answers its handles. Do: three nodes at `f = 1`; on a, a live-shipped volume shared with the fleet; mount it over NFS
+/// on a's port, create a file there and write it; cut a off on the probe plane alone until the survivor the volume ranks
+/// first takes it over, then give it back; then read the file through the same mount, writing it once more between reads
+/// so a's log meets the fence. Expect a read answered `NFS3ERR_STALE` within the wait. Before, the mount answered the
+/// reads from a's own copy, which the successor's writes may have passed, and the writes retry-later for good.
+#[test]
+fn a_superseded_owners_nfs_mount_answers_stale() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let name = "superseded-nfs";
+  let mut client = Client::connect(daemons[0].instance());
+  let id = live_volume_named(&mut client, &daemons, name);
+  drop(client);
+  let port = daemons[0].nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &capability_path(&daemons[0], name), 1);
+  let file_fh = create(&mut stream, &root_fh, "over-nfs.txt", 2);
+  write(&mut stream, &file_fh, b"before the takeover", 3);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let successor = &daemons[if successor == hosts[1] { 1 } else { 2 }];
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, successor);
+  let mut xid = 3;
+  let mut statuses = Vec::new();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let stale = poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+    xid += 1;
+    let read = read_status(&mut stream, &file_fh, xid);
+    statuses.push(("read", read));
+    if read == NFS3ERR_STALE {
+      return Ok(true);
+    }
+    xid += 1;
+    statuses.push((
+      "write",
+      write_status(&mut stream, &file_fh, b"after the takeover", xid),
+    ));
+    Ok(false)
+  });
+  drop(observed);
+  drop(stream);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a superseded owner's NFS mount: taken {taken}, statuses {:?}",
+    statuses.iter().rev().take(6).collect::<Vec<_>>()
+  );
+  assert!(
+    taken,
+    "the successor took the volume over from its live log"
+  );
+  assert!(
+    stale,
+    "a read through the old owner's mount answered NFS3ERR_STALE: {statuses:?}"
   );
 }
 
