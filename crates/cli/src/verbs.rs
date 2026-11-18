@@ -1176,14 +1176,12 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
     Landing::GrantRequired {
       landing,
       manifest,
-      nonce,
       summary,
       conflicts,
     } => serde_json::json!({
       "grant_required": true,
       "landing": landing,
       "manifest": hex32(manifest),
-      "nonce": hex32(nonce),
       "summary": slates_mcp::landing_summary_json(summary),
       "conflicts": conflicts,
       "grant_with": format!("slates grant {landing}"),
@@ -2073,9 +2071,6 @@ fn emit_grant(
   let claim = slates_api::GrantClaim {
     landing,
     manifest,
-    // The keyed hash under the issuer secret does not cover the nonce; `slates grant` signs the statement, which
-    // does, once its signing piece lands (A-285, GAPS 2026-11-18).
-    nonce: [0; 32],
     scope,
     term_ns,
   };
@@ -2130,13 +2125,11 @@ fn print_landing(landing: slates_client::Landing) {
     slates_client::Landing::GrantRequired {
       landing,
       manifest,
-      nonce,
       summary,
       conflicts,
     } => {
       slates_machine::out_line!("landing: {landing}");
       slates_machine::out_line!("manifest: {}", hex32(&manifest));
-      slates_machine::out_line!("nonce: {}", hex32(&nonce));
       for action in &summary.by_action {
         slates_machine::out_line!("action {}: {}", action.action, action.count);
       }

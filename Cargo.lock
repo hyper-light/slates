@@ -1686,6 +1686,7 @@ dependencies = [
 name = "slates-server"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "blake3",
  "hyper-datagram",
  "hyper-seal",
