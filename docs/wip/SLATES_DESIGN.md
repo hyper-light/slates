@@ -7429,6 +7429,18 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > standard error held three windows while each shard logs; exit 4 within the stall before) and
 > `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`).
 
+> **Status (2026-11-18, A-308): a wedge is judged only over a window the watchdog watched.** The rule calls a shard
+> wedged once a window passed with no CPU progress and never seen runnable, and "never seen" is sampled at each look. A
+> look a window or more after the watchdog's previous one asked nothing in between: its own thread was kept off its CPU,
+> as a process frozen whole or paging is, so the shard's stillness across that gap is the process's. A fleet test binary
+> was ended with exit 4 on a wedge verdict that came 146 s past its window, the whole process unscheduled at 0.2 to 1 GB
+> free (g231, load 62 to 131 on a 15-CPU Mac). Now such a look starts the shard's still time again (`ShardWatch::judge`),
+> and a stuck shard is still judged a window after the watchdog's looks come back; the verdict's named lateness `L`
+> still runs from the look before the gap, so A-232's bound `W + B + L` holds by its terms. Regression:
+> `a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`. Open: a shard that stays off the CPU in the kernel (a
+> page-in under that pressure, Linux `D`, XNU's uninterruptible wait) past a watched window is still judged wedged; the
+> scheduler states that would tell it from a sleep are not read yet (GAPS, 2026-10-22).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -21163,3 +21175,17 @@ shard routed, stopped after them).
   without end.
 - **What it does not change.** The watchdog's verdicts, window and ends (A-228, A-232); the lines' text; the CLI's, the
   anchor's and every other thread's direct writes, whose order with their output stays as it was.
+
+### A-308 — The watchdog judges a wedge only over a window it watched (2026-11-18, goal g251: every open slates bug fixed)
+Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/server/src/watchdog.rs`
+(`ShardWatch::judge`).
+- **Why.** A-228 calls a shard wedged after a window with no CPU progress and never seen runnable, and the state is
+  sampled at each look, a beat apart. When the watchdog's own thread is held off its CPU for a window or more (a process
+  frozen whole, or paging at a few hundred megabytes free), the look after the gap found every shard still for the whole
+  gap and never asked whether it waited for a CPU in it; a daemon nobody supervises then ended itself (A-232). Seen as a
+  fleet test binary's exit 4 with a verdict 146 s past its window (g231, the supervisor's report of 2026-11-18).
+- **The rule.** A look a window or more after the previous one counts as movement for every shard: the still time
+  starts again there. A stuck shard is judged a watched window later. The verdict's lateness keeps running from the look
+  before the gap, so the end line's `W + B + L` bound holds as A-232 states it.
+- **What it does not change.** A spinning verdict (a window of the shard's own CPU without a step), the starved rule, the
+  anchor's lapse judgment (A-232 step 5), and the window.

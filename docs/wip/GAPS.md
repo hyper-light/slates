@@ -785,6 +785,17 @@
 > a starved thread can hold (the allocator's) still wedge a shard behind it the same way: the holder is not named (the
 > watchdog's entry, "the lock a starved test thread held is not named"), and that decision is still owed.
 
+> **A lone daemon ended itself for its own watchdog's freeze (found 2026-11-17, fixed 2026-11-18, A-308).** The server
+> `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
+> 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
+> it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open: a
+> shard held in the kernel past a watched window (a page-in at that pressure) is still judged wedged; telling `D` and
+> XNU's uninterruptible wait from a sleep is the 2026-10-22 entry's owed decision. Also from the same report, a test's
+> bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
+> loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
+> the loop now runs to the call's bound after the exit.
+
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
 > WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and
