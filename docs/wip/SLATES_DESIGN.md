@@ -30672,7 +30672,10 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
   window and a fifth a round trip answers a callback a window and a half after it was sent; a channel measured quick
   whose callback is never answered ends `Timeout` within its bound and backs it off), and the learner's own two tests
   (`learned_wait`, moved from `told`).
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 5-7, debug build, `cargo test --locked -p slates-server --lib --
+  callback learned_wait told delegation`): 5 of 5. Red-checked once: with a callback's bound back at one window, the
+  slow channel's callback is given up before its answer. The NFSv4 delegation and callback flows are filed for main's
+  run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{learned_wait,told,
 callback,nfs,delegation,lib}.rs`.
