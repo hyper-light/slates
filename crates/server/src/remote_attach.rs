@@ -9,8 +9,9 @@
 //! **How a remote attachment ends.** A detach routed by its volume (`DetachOf`; an attachment id names its owner
 //! partition, not its host); its host's reap of the dead client (`RemoteReap`, which B sends the owner of each volume
 //! it remembers the client attached, a set bounded per client); its host's retirement from the fleet (`end_retired`);
-//! and the volume's destroy, as every attachment. A silent holder's write lease ends at its term, `failover_slo_ns`
-//! (`verbs::take_write_lease`, D-16), whatever ends its record.
+//! and the volume's destroy, as every attachment. The volume's write lease stays its holder's while the record lives,
+//! renewed at each lapse, and lasts one term (the node's failover delay) after the record ends, whatever ends it
+//! (`verbs::lease_kept_until`, D-16, A-414).
 //!
 //! **R8.** At one node nothing is forwarded, no attachment is `Remote`, and every rule here holds the same way for a
 //! local requester: the requester's host is this node's, and a local attachment is its own.

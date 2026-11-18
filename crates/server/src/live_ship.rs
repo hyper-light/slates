@@ -669,6 +669,11 @@ pub(crate) struct LiveState {
   /// whose copy was let go, one whose admission went unanswered, and each a warm restart's copies route to. Bounded by
   /// the partitions.
   claims_dirty: BTreeSet<u16>,
+  /// On the control shard: the claims admitted at an owner's ask before it turned the volume's live shipping on
+  /// ([`serve_admit`]), by object, each with when: kept by every reconciliation until the log's first entry is held, or
+  /// for the failover delay at most, past which the owner refused its own live-ship (another candidate had no room) or
+  /// was lost, and a successor that ships asks again. Bounded by the claims.
+  promised: BTreeMap<ObjectId, u64>,
   /// The live volumes the publication in progress recorded, with their record (`None`: the publication was a
   /// checkpoint, so the whole image ships): shipped once it commits ([`ship_captured`]), dropped if it is refused.
   pub(crate) captured: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
@@ -5193,6 +5198,7 @@ fn learn_claim(state: &mut ShardState, object: ObjectId, bytes: u64) {
 pub(crate) async fn reconcile_claims(origin: u16) {
   let read_ns = slates_rt::futures::now_ns();
   let marked = state::with_state(|s| {
+    settle_promised(s);
     std::mem::take(&mut s.live.claims_dirty)
       .into_iter()
       .filter_map(|partition| {
@@ -5226,7 +5232,7 @@ pub(crate) async fn reconcile_claims(origin: u16) {
 }
 
 /// The volumes routed to `partition` whose claims a reconciliation keeps ([`reconcile_claims`]): each copy this node holds
-/// entries of, and each admission running.
+/// entries of, each admission running, and each claim an owner's ask made that still awaits its log ([`serve_admit`]).
 fn claims_kept(state: &ShardState, partition: u16) -> BTreeSet<slates_db::catalog::VolumeId> {
   state
     .live
@@ -5235,9 +5241,302 @@ fn claims_kept(state: &ShardState, partition: u16) -> BTreeSet<slates_db::catalo
     .filter(|(_, held)| !held.entries.is_empty())
     .map(|(object, _)| *object)
     .chain(state.live.admitting.keys().copied())
+    .chain(state.live.promised.keys().copied())
     .filter(|object| partition_of(*object) == partition)
     .map(|object| slates_db::catalog::VolumeId { bytes: object.0 })
     .collect()
+}
+
+/// Lets go of the claims an owner's ask made ([`serve_admit`]) whose log has come, which a held copy keeps from now, and
+/// of those whose log has not come within the failover delay, whose partitions the next reconciliation then releases them
+/// from ([`reconcile_claims`]).
+fn settle_promised(state: &mut ShardState) {
+  let now = slates_rt::futures::now_ns();
+  let bound = state.failover_ns;
+  let settled: Vec<ObjectId> = state
+    .live
+    .promised
+    .iter()
+    .filter(|(object, admitted)| {
+      state
+        .live
+        .held
+        .get(object)
+        .is_some_and(|held| !held.entries.is_empty())
+        || now.saturating_sub(**admitted) >= bound
+    })
+    .map(|(object, _)| *object)
+    .collect();
+  for object in settled {
+    state.live.promised.remove(&object);
+    let holds_log = state
+      .live
+      .held
+      .get(&object)
+      .is_some_and(|held| !held.entries.is_empty());
+    if !holds_log {
+      state.live.claims.remove(&object);
+      state.live.claims_dirty.insert(partition_of(object));
+      state.count(CLAIM_PROMISE_LAPSED, 1);
+    }
+  }
+}
+
+/// Counter: a claim an owner's ask made whose log did not come within the failover delay, released (§4.2, A-401).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_PROMISE_LAPSED: &str = "fleet.live.claim_promise_lapsed";
+/// Counter: an owner's admission ask this candidate admitted (§4.2, A-401).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_ASK_ADMITTED: &str = "fleet.live.claim_ask_admitted";
+
+/// A candidate's answer to an owner's ask that it make a volume's admission before the owner turns live shipping on
+/// (§4.2, A-401; [`slates_db::live::Admit`]): authorized as a content placement is (`fleet::content_authority`, the
+/// volume's acting owner placing at a candidate; no catalog is needed, the ask names the claim), the claim reserved on
+/// the shard the volume's id routes to as a first entry's is ([`admit_claim`]), and kept until the log's first entry
+/// comes or the failover delay passes ([`settle_promised`]). Answered with the empty head when the claim is held,
+/// `NoRoom` when it cannot be, and nothing for a sender this node does not serve or an admission it could not finish
+/// within its call. Every ask is answered by the volume's shard, whose admission answers a claim it holds already, and
+/// not by this shard's view of its claims ([`LiveState::claims`]), which a reconciliation may have left behind the
+/// shard; so an admitted answer always names a claim the shard holds, and its promise starts again at each ask. Run on
+/// the control shard by the record plane.
+pub(crate) async fn serve_admit(
+  origin: u16,
+  local: HostId,
+  peer: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let Ok(admit) = slates_db::live::Admit::decode(request) else {
+    let _ = state::with_state_counted(|s| count_refused(s, REFUSED_MALFORMED));
+    return Vec::new();
+  };
+  let object = admit.object;
+  let begun = state::with_state(|s| {
+    let authority = crate::fleet::content_authority(
+      s.council.configuration(),
+      s.holder_records.as_map(),
+      local,
+      peer,
+      slates_cluster::content::ContentAccess::Place,
+      object,
+    );
+    if let Err(why) = authority {
+      count_refused(s, not_owner_counter(why));
+      return Err(Vec::new());
+    }
+    let target = s
+      .shards
+      .get(usize::from(partition_of(object)))
+      .copied()
+      .ok_or_else(Vec::new)?;
+    let now = slates_rt::futures::now_ns();
+    if s
+      .live
+      .admitting
+      .get(&object)
+      .is_some_and(|began| now.saturating_sub(*began) < ADMISSION_WAIT_NS)
+    {
+      s.count(CLAIM_NOT_NOW, 1);
+      return Err(Vec::new());
+    }
+    s.live.admitting.insert(object, now);
+    Ok(target)
+  });
+  let target = match begun {
+    Some(Ok(target)) => target,
+    Some(Err(answer)) => return answer,
+    None => return Vec::new(),
+  };
+  let id = slates_db::catalog::VolumeId { bytes: object.0 };
+  let size = crate::verbs::wire_size(admit.size);
+  let require_locked = admit.require_locked;
+  let answer = crate::xshard::call_within(
+    origin,
+    target,
+    move |s| crate::verbs::admit_candidate_claim(s, id, size, require_locked),
+    ADMISSION_WAIT_NS,
+  )
+  .await;
+  state::with_state(|s| match finish_admission(s, object, answer) {
+    Admission::Serve => {
+      s.live.promised.insert(object, slates_rt::futures::now_ns());
+      s.count(CLAIM_ASK_ADMITTED, 1);
+      encode_reply(&Ok(None))
+    }
+    refused => refused.refusal().unwrap_or_default(),
+  })
+  .unwrap_or_default()
+}
+
+/// What an owner's admission asks came to ([`admission_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Asked {
+  /// Every candidate that answered holds the claim. `unanswered` gave no answer within the exchange; each makes its
+  /// admission as it takes the log's first entry ([`admit_claim`]).
+  Admitted {
+    /// The candidates that gave no answer.
+    unanswered: usize,
+  },
+  /// A candidate has no room for the claim: the least any refusing candidate could admit.
+  NoRoom(u64),
+}
+
+/// The verdict of an owner's admission asks to `candidates` from their `answers` (§4.2, A-401): `NoRoom` with the least
+/// room a refusing candidate named when any refused, else admitted, counting those that gave no answer.
+pub(crate) fn admission_verdict(candidates: &[HostId], answers: &[(HostId, Vec<u8>)]) -> Asked {
+  let mut least: Option<u64> = None;
+  let mut answered = 0usize;
+  for host in candidates {
+    let reply = answers
+      .iter()
+      .find(|(from, _)| from == host)
+      .map(|(_, bytes)| decode_reply(bytes));
+    match reply {
+      Some(Ok(_)) => answered = answered.saturating_add(1),
+      Some(Err(LiveError::NoRoom { available })) => {
+        answered = answered.saturating_add(1);
+        least = Some(least.map_or(available, |least| least.min(available)));
+      }
+      _ => {}
+    }
+  }
+  match least {
+    Some(available) => Asked::NoRoom(available),
+    None => Asked::Admitted {
+      unanswered: candidates.len().saturating_sub(answered),
+    },
+  }
+}
+
+/// Asks each of `candidates` to make `admit`'s admission (§4.2, A-401), over this control shard's record sessions within
+/// the live exchange's budget: each answer, as its candidate gave it. The stragglers are finished here, as a lane's are
+/// ([`finish_stragglers`]), but a late answer is dropped ([`drop_late_answers`]): the verdict is taken without it, and an
+/// admission's answer is no holder's reply to a shipper, so it must not reach [`fold_into`]. Only a shard that can no
+/// longer time the wait, at its shutdown, leaves the rest to the drain ([`drain_stragglers`]).
+pub(crate) async fn ask_admissions(
+  admit: slates_db::live::Admit,
+  candidates: Vec<HostId>,
+) -> Vec<(HostId, Vec<u8>)> {
+  let sessions = crate::fleet::take_sessions("fleet.lent_to.live_admission", |host| {
+    candidates.contains(&host)
+  });
+  let request = admit.encode();
+  let exchanged = slates_cluster::live::exchange(
+    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    sessions,
+    crate::fleet::live_budget(),
+    |_, _| false,
+  )
+  .await;
+  let (replies, mut stragglers) = settle_sessions(exchanged);
+  let (late, done) = stragglers.settle().await;
+  drop_late_answers(late);
+  if !done {
+    settle_stragglers(
+      state::with_state(|s| s.shard).unwrap_or_default(),
+      admit.object,
+      stragglers,
+    );
+  }
+  replies
+}
+
+/// Counter: an admission ask's answer that came after its exchange gave up, dropped (§4.2, A-401; [`ask_admissions`]).
+/// Format: a counter name in the daemon's status report.
+const LIVE_ADMISSION_LATE: &str = "fleet.live.admission_late";
+
+/// Puts an admission exchange's late stragglers' sessions back (on the control shard): each answered holder's session to
+/// the pool, each unanswered holder's link dropped to be dialed afresh, as [`deliver_late`] does; their answers are
+/// counted and dropped, since the verdict they would have joined is taken.
+fn drop_late_answers(
+  late: Vec<(
+    HostId,
+    slates_cluster::TimedReply,
+    slates_transport::endpoint::Endpoint,
+  )>,
+) {
+  let mut sessions = Vec::new();
+  let mut lost = Vec::new();
+  for (host, reply, endpoint) in late {
+    if reply.round_trip_ns.is_none() {
+      lost.push(host);
+    } else {
+      sessions.push((host, endpoint));
+    }
+  }
+  let dropped = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+  lose_links(&lost);
+  crate::fleet::return_sessions(sessions);
+  if dropped > 0 {
+    let _ = state::with_state_counted(|s| s.count(LIVE_ADMISSION_LATE, dropped));
+  }
+}
+
+/// Counter: a `live-ship` refused `BudgetExceeded` because a candidate had no room for the volume's claim (A-401).
+/// Format: a counter name in the daemon's status report.
+const LIVE_SHIP_NO_ROOM: &str = "fleet.live.ship_refused.no_room";
+/// Counter: candidates that gave no answer to a `live-ship`'s admission ask; each makes its admission at the first entry.
+/// Format: a counter name in the daemon's status report.
+const LIVE_SHIP_UNANSWERED: &str = "fleet.live.ship_unanswered";
+
+/// What a `live-ship` that turns `volume`'s live shipping on answers once its candidates' admissions are judged (§4.2,
+/// A-401): the flag recorded when none refused, the candidates that gave no answer counted; `BudgetExceeded` with the
+/// least room a candidate named otherwise, the flag left as it was. The same whether the verdict came from a task's asks
+/// ([`admit_then_ship`]) or there was no candidate to ask (`verbs::live_ship`).
+pub(crate) fn ship_after(
+  state: &mut ShardState,
+  volume: slates_ipc::protocol::VolumeId,
+  verdict: Asked,
+) -> slates_ipc::protocol::ReplyBody {
+  match verdict {
+    Asked::Admitted { unanswered } => {
+      if unanswered > 0 {
+        state.count(
+          LIVE_SHIP_UNANSWERED,
+          u64::try_from(unanswered).unwrap_or(u64::MAX),
+        );
+      }
+      crate::verbs::set_live_shipping(state, volume, true)
+    }
+    Asked::NoRoom(available) => {
+      state.count(LIVE_SHIP_NO_ROOM, 1);
+      slates_ipc::protocol::ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::BudgetExceeded { available },
+      }
+    }
+  }
+}
+
+/// The task a `live-ship` that turns a volume's live shipping on runs (§4.2, A-401; `verbs::live_ship`): on its owner
+/// shard `origin`, it asks every candidate of the volume's placement to make the claim's admission, from the control
+/// shard `control`, which holds the sessions ([`ask_admissions`]), then completes the request as one atom
+/// (`image::complete`): the flag recorded when no candidate refused, else `BudgetExceeded` with the least room a
+/// candidate named, nothing recorded but the outcome ([`ship_after`]). So nothing is published before every candidate
+/// that answered holds its claim. The asks are awaited in the control shard's own time (A-408's rule for a wait on
+/// another shard of this daemon, `xshard::task_in_shard_time`) over the exchange's own bound: a busy or starved control
+/// shard is waited for, and only one that ran nothing for a whole window is given up, its candidates then counted as
+/// unanswered.
+pub(crate) async fn admit_then_ship(
+  (origin, control): (u16, u16),
+  request: (u64, slates_wire::request::RequestId),
+  volume: slates_ipc::protocol::VolumeId,
+  admit: slates_db::live::Admit,
+  candidates: Vec<HostId>,
+) {
+  let asked = candidates.clone();
+  let answers = crate::xshard::task_in_shard_time(
+    origin,
+    control,
+    move || ask_admissions(admit, asked),
+    crate::fleet::live_budget().max_deadline_ns(),
+  )
+  .await
+  .unwrap_or_default();
+  let verdict = admission_verdict(&candidates, &answers);
+  let completed =
+    state::with_state(|s| crate::image::complete(s, request, |s| ship_after(s, volume, verdict)));
+  if let Some((reply, route)) = completed {
+    let _ = state::with_state_counted(|s| crate::image::deliver(s, reply, route));
+  }
 }
 
 /// Applies a partition's answer to a reconciliation ([`reconcile_claims`]): a claim held there is learned, one taken
@@ -6816,6 +7115,47 @@ mod tests {
       entries,
       vec![vec![KIND_WHOLE, 3], vec![KIND_DELTA, 4]],
       "the newest whole entry first, what came before it dropped"
+    );
+  }
+
+  /// §4.2 (A-401): an owner's admission asks are judged by each candidate's answer. Any `NoRoom` refuses the live-ship
+  /// with the least room named; otherwise the candidates that gave no admission answer are counted, and they make
+  /// their admission at the log's first entry. Do judge no candidates, every one admitted, one silent, one answering
+  /// nothing it can act on, two refusing, one refusing beside one admitted, and a refusal from a host not asked.
+  /// Expect admitted with nothing unanswered, the same, one unanswered twice, the least room, that one's room, and the
+  /// stranger ignored.
+  #[test]
+  fn an_owners_admission_asks_are_judged_by_the_least_room_and_the_unanswered() {
+    let (b, c) = (HostId(2), HostId(3));
+    let admitted = encode_reply(&Ok(None));
+    let no_room = |available| encode_reply(&Err(LiveError::NoRoom { available }));
+    assert_eq!(
+      admission_verdict(&[], &[]),
+      Asked::Admitted { unanswered: 0 }
+    );
+    assert_eq!(
+      admission_verdict(&[b, c], &[(b, admitted.clone()), (c, admitted.clone())]),
+      Asked::Admitted { unanswered: 0 }
+    );
+    assert_eq!(
+      admission_verdict(&[b, c], &[(b, admitted.clone())]),
+      Asked::Admitted { unanswered: 1 }
+    );
+    assert_eq!(
+      admission_verdict(&[b, c], &[(b, admitted.clone()), (c, Vec::new())]),
+      Asked::Admitted { unanswered: 1 }
+    );
+    assert_eq!(
+      admission_verdict(&[b, c], &[(b, no_room(7)), (c, no_room(3))]),
+      Asked::NoRoom(3)
+    );
+    assert_eq!(
+      admission_verdict(&[b, c], &[(b, admitted), (c, no_room(9))]),
+      Asked::NoRoom(9)
+    );
+    assert_eq!(
+      admission_verdict(&[b], &[(c, no_room(1))]),
+      Asked::Admitted { unanswered: 1 }
     );
   }
 

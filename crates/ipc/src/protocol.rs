@@ -1621,8 +1621,8 @@ pub struct DbSnapshotReport {
   pub log_bytes_appended: u64,
   /// The log since the last snapshot, bytes.
   pub tail_bytes: u64,
-  /// The replay work its commits measured (each record's append and apply), nanoseconds: the next snapshot comes once
-  /// it reaches `budget_ns` and `tail_bytes` reaches `floor_bytes`.
+  /// The replay work its commits measured (each record's encode, decode, checksum and copy, and its apply; A-420),
+  /// nanoseconds: the next snapshot comes once it reaches `budget_ns` and `tail_bytes` reaches `floor_bytes`.
   pub tail_replay_ns: u64,
   /// The recovery budget the tail's work is held to, nanoseconds.
   pub budget_ns: u64,
