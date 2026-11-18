@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        run: [1, 2]
+        run: [3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,5 +39,5 @@ jobs:
         shell: bash
         run: |
           grep -oE 'or after [0-9]+ ms of CPU without a step|runs compiled code [0-9.]+ times as slowly[^;)]*' tsan.log | sort | uniq -c | sort -rn | head -20
-          grep -E 'is spinning|is wedged|ends the daemon.s process \(exit' tsan.log | cut -c1-300 | head -20
-          grep -E '^test result: FAILED|process didn.t exit|panicked at' tsan.log | cut -c1-300 | head -20
+          grep -E 'is spinning|is wedged|ends the daemon.s process \(exit' tsan.log | cut -c1-300 | head -20 || true
+          grep -E '^test result: FAILED|process didn.t exit|panicked at' tsan.log | cut -c1-300 | head -20 || true
