@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 3
+          fetch-depth: 4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
@@ -32,7 +32,7 @@ jobs:
           set +e
           F=crates/bridge-fuse/tests/ipc_mount.rs
           cp "$F" fixed.rs
-          git show HEAD~1:"$F" > "$F"
+          git show d4073d843:"$F" > "$F"
           echo "pid-named root: $(grep -c 'slates-ipc-{}' "$F") site"
           for run in 1 2 3; do
             cargo test --locked -p slates-bridge-fuse --test ipc_mount > red-$run.log 2>&1
