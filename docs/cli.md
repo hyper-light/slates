@@ -30,8 +30,9 @@ slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
 segment in RAM, publishes the profile into it, and supervises `slates daemon` as a child with
 the segment handed over in its environment. It restarts a daemon that exits, kills one whose
-heartbeat lapses, and gives up on a crash loop (the bound is derived from the recovery budget
-and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
+heartbeat lapses because a shard is stuck (never one whose shards are only starved: kept off their
+CPUs, or waiting on memory while the host reports a memory stall), and gives up on a crash loop
+(the bound is derived from the recovery budget and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
 an anonymous shared segment alone does not establish locked residency or no swapping.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).

@@ -23,12 +23,19 @@
 //! - Linux: the state in `/proc/self/task/<tid>/stat` (`R` is on a CPU or waiting for one) and the run-queue wait in
 //!   `schedstat`'s second field [A: kernel docs, `Documentation/scheduler/sched-stats`]. The wait alone will not do: the
 //!   kernel credits it only when the task reaches a CPU or leaves the queue (`kernel/sched/stats.h`), so a thread kept
-//!   off a CPU for 5.7-7.9 s showed growth of 0 (measured 2026-11-08 on CachyOS 7.3 and Fedora 6.19).
+//!   off a CPU for 5.7-7.9 s showed growth of 0 (measured 2026-11-08 on CachyOS 7.3 and Fedora 6.19). The same letter
+//!   tells a blocked thread's kind of wait ([`RunReading::uninterruptible`], A-336): `D` is a wait the kernel holds the
+//!   thread in past signals, which is what a page-in, a reclaim's throttle or a refault shows as (the folio waits are
+//!   `TASK_KILLABLE` or `TASK_UNINTERRUPTIBLE`, both `D` in `/proc`), and a futex, a poll or a sleep never is (`S`).
+//!   The thread's `wchan` names the kernel function it waits in, for a log line ([`kernel_wait_name`]).
 //! - macOS: `thread_basic_info`'s `run_state`, whose `TH_STATE_RUNNING` is XNU's `TH_RUN`, "running or on runq". No
-//!   per-thread runnable time exists; `ri_runnable_time` is the whole process's, so the wait is `None`.
+//!   per-thread runnable time exists; `ri_runnable_time` is the whole process's, so the wait is `None`. Nor does the
+//!   state tell a memory wait from a lock's: XNU reports a user page fault's wait as an abortable one
+//!   (`TH_STATE_WAITING`), as it does a lock's, so the kind of wait is `None`.
 //! - Windows: `ThreadState` from `NtQuerySystemInformation(SystemProcessInformation)`, linked at run time as Microsoft
 //!   directs, one whole-system snapshot (3.1 ms at p50, 5.3 ms at most, measured 2026-11-08) for every thread asked
-//!   about, which is why the read takes a batch. It holds no ready-wait time, so the wait is `None`.
+//!   about, which is why the read takes a batch. It holds no ready-wait time, so the wait is `None`, and the kind of
+//!   wait is `None` too (the snapshot's wait reason is not read yet).
 //! - Miri, or a source that cannot be read: `None`.
 //!
 //! The liveness watchdog (`slates_server::watchdog`) calls a shard stuck only after a whole window with no CPU progress,
@@ -64,6 +71,10 @@ pub struct RunReading {
   pub state: RunState,
   /// The time it has waited for a CPU so far, nanoseconds, where the platform keeps one (Linux).
   pub waited_ns: Option<u64>,
+  /// Of a blocked thread, whether the kernel holds it in its wait past signals (Linux `D`): what a page-in, a reclaim's
+  /// throttle or a refault shows as, and a futex, a poll or a sleep never does (A-336). `None` where the platform does
+  /// not tell such a wait from any other (macOS, Windows), and always `false` of a runnable thread where it does.
+  pub uninterruptible: Option<bool>,
 }
 
 impl CpuReading {
@@ -191,6 +202,8 @@ pub(crate) fn run_readings(handles: &[u64]) -> Vec<Option<RunReading>> {
           RunState::Blocked
         },
         waited_ns: None,
+        // A user page fault's wait reads `TH_STATE_WAITING`, as a lock's does: the kind of wait is not told here.
+        uninterruptible: None,
       })
     })
     .collect()
@@ -213,9 +226,11 @@ pub(crate) fn run_readings(handles: &[u64]) -> Vec<Option<RunReading>> {
     let tid = (handle & !TAG) >> TID_SHIFT;
     let stat = task_file(tid, "stat")?;
     let schedstat = task_file(tid, "schedstat");
+    let letter = state_letter_of_stat(&stat)?;
     Some(RunReading {
-      state: state_of_stat(&stat)?,
+      state: run_state_of_letter(letter),
       waited_ns: schedstat.as_deref().and_then(wait_of_schedstat),
+      uninterruptible: Some(letter == UNINTERRUPTIBLE_LETTER),
     })
   }
   handles.iter().map(|handle| reading(*handle)).collect()
@@ -241,6 +256,8 @@ pub(crate) fn run_readings(handles: &[u64]) -> Vec<Option<RunReading>> {
       thread_state_in(&snapshot, process, thread).map(|state| RunReading {
         state: run_state_of_thread_state(state),
         waited_ns: None,
+        // The snapshot's wait reason is not read: the kind of wait is not told here.
+        uninterruptible: None,
       })
     })
     .collect()
@@ -308,41 +325,41 @@ pub(crate) fn run_readings(handles: &[u64]) -> Vec<Option<RunReading>> {
   vec![None; handles.len()]
 }
 
-/// Whether any thread of process `pid` is runnable, on a CPU or waiting for one: what tells a starting process that is
-/// starved from one that is stuck, as [`run_readings`] tells a shard's thread (A-228's sibling: the anchor judges a
-/// start in the whole process's CPU time, and a start held off its CPUs for a window was killed as stuck, "made no
-/// progress for 1014 ms", on CI's Windows runner). `None` where the process is gone or nothing can be read.
+/// What the scheduler says of process `pid` as a whole: runnable when any of its threads is, on a CPU or waiting for
+/// one; otherwise blocked, and held in the kernel past signals ([`RunReading::uninterruptible`]) when any of its threads
+/// is, where the platform tells (Linux). What tells a starting process that is starved from one that is stuck, as
+/// [`run_readings`] tells a shard's thread (A-228's sibling: the anchor judges a start in the whole process's CPU time,
+/// and a start held off its CPUs for a window was killed as stuck, "made no progress for 1014 ms", on CI's Windows
+/// runner); and a process waiting on memory from a frozen one (A-336: the anchor judges a daemon whose watchdog stopped
+/// looking by the same rule, and a process paging whole stops its watchdog with it). `None` where the process is gone
+/// or nothing can be read. No wait is read for a whole process.
 /// - Linux: the state in every `/proc/<pid>/task/<tid>/stat`.
 /// - macOS: `proc_pidinfo(PROC_PIDTASKALLINFO)`'s `pti_numrunning`, the threads in XNU's `TH_RUN`, running or on the run
 ///   queue [B: XNU `bsd/kern/proc_info.c`, `fill_taskprocinfo`].
 /// - Windows: the process's threads in one system snapshot, their `ThreadState`.
-pub fn process_runnable(pid: u32) -> Option<bool> {
-  process_runnable_in(pid)
+pub fn process_run_reading(pid: u32) -> Option<RunReading> {
+  process_run_reading_in(pid)
 }
 
 #[cfg(all(target_os = "linux", not(miri)))]
-fn process_runnable_in(pid: u32) -> Option<bool> {
+fn process_run_reading_in(pid: u32) -> Option<RunReading> {
   // structural: allow: a listing of the kernel's pseudo-directory of another process's threads; no host path is named.
   let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
-  let mut read_any = false;
+  let mut letters = Vec::new();
   for task in tasks.flatten() {
     // structural: allow: a query of the kernel's pseudo-file for one thread of that process; no host path is named.
     let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
       continue;
     };
-    let Some(state) = state_of_stat(&stat) else {
-      continue;
-    };
-    read_any = true;
-    if state == RunState::Runnable {
-      return Some(true);
+    if let Some(letter) = state_letter_of_stat(&stat) {
+      letters.push(letter.to_owned());
     }
   }
-  read_any.then_some(false)
+  process_reading_of_letters(letters.iter().map(String::as_str))
 }
 
 #[cfg(all(target_os = "macos", not(miri)))]
-fn process_runnable_in(pid: u32) -> Option<bool> {
+fn process_run_reading_in(pid: u32) -> Option<RunReading> {
   let pid = libc::c_int::try_from(pid).ok()?;
   // SAFETY: an all-zero `proc_taskallinfo` is a valid value of the C struct (integers and byte arrays only).
   let mut info: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
@@ -358,36 +375,113 @@ fn process_runnable_in(pid: u32) -> Option<bool> {
       size,
     )
   };
-  (wrote == size).then_some(info.ptinfo.pti_numrunning > 0)
+  (wrote == size).then_some(RunReading {
+    state: if info.ptinfo.pti_numrunning > 0 {
+      RunState::Runnable
+    } else {
+      RunState::Blocked
+    },
+    waited_ns: None,
+    uninterruptible: None,
+  })
 }
 
 #[cfg(all(windows, not(miri)))]
-fn process_runnable_in(pid: u32) -> Option<bool> {
+fn process_run_reading_in(pid: u32) -> Option<RunReading> {
   let snapshot = system_snapshot()?;
-  process_thread_states_in(&snapshot, pid).map(|states| {
-    states
+  process_thread_states_in(&snapshot, pid).map(|states| RunReading {
+    state: if states
       .into_iter()
       .any(|state| run_state_of_thread_state(state) == RunState::Runnable)
+    {
+      RunState::Runnable
+    } else {
+      RunState::Blocked
+    },
+    waited_ns: None,
+    uninterruptible: None,
   })
 }
 
 #[cfg(any(not(any(target_os = "linux", target_os = "macos", windows)), miri))]
-fn process_runnable_in(_pid: u32) -> Option<bool> {
+fn process_run_reading_in(_pid: u32) -> Option<RunReading> {
   None
 }
 
-/// The state in a thread's `/proc/.../stat`: `R` is on a CPU or waiting for one, every other letter is off them both
-/// (sleeping, in the kernel, stopped, dead). `None` for a line with no state. The state follows the last `)`, since the
-/// thread's name, in parentheses before it, may hold anything.
+/// A whole process's reading from its threads' `/proc` state letters: runnable when any thread is (`R`); otherwise
+/// blocked, held in the kernel when any thread is (`D`). `None` when no letter was read.
 #[cfg(any(all(target_os = "linux", not(miri)), test))]
-fn state_of_stat(stat: &str) -> Option<RunState> {
+fn process_reading_of_letters<'a>(letters: impl Iterator<Item = &'a str>) -> Option<RunReading> {
+  let mut read_any = false;
+  let mut uninterruptible = false;
+  for letter in letters {
+    read_any = true;
+    if run_state_of_letter(letter) == RunState::Runnable {
+      return Some(RunReading {
+        state: RunState::Runnable,
+        waited_ns: None,
+        uninterruptible: Some(false),
+      });
+    }
+    uninterruptible |= letter == UNINTERRUPTIBLE_LETTER;
+  }
+  read_any.then_some(RunReading {
+    state: RunState::Blocked,
+    waited_ns: None,
+    uninterruptible: Some(uninterruptible),
+  })
+}
+
+/// Format: the `/proc` state letter of a thread on a CPU or waiting for one (`TASK_RUNNING`).
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+const RUNNING_LETTER: &str = "R";
+/// Format: the `/proc` state letter of a thread the kernel holds in its wait past signals (`TASK_UNINTERRUPTIBLE`, and
+/// `TASK_KILLABLE`, which holds it past every signal but a fatal one), "disk sleep" [B: man 5 proc, `fs/proc/array.c`
+/// `task_state_array`].
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+const UNINTERRUPTIBLE_LETTER: &str = "D";
+
+/// The state letter in a thread's `/proc/.../stat`. `None` for a line with no state. The state follows the last `)`,
+/// since the thread's name, in parentheses before it, may hold anything.
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+fn state_letter_of_stat(stat: &str) -> Option<&str> {
   let (_, after_name) = stat.rsplit_once(')')?;
-  let letter = after_name.split_ascii_whitespace().next()?;
-  Some(if letter == "R" {
+  after_name.split_ascii_whitespace().next()
+}
+
+/// The run state a `/proc` state letter means: `R` is on a CPU or waiting for one, every other letter is off them both
+/// (sleeping, in the kernel, stopped, dead).
+#[cfg(any(all(target_os = "linux", not(miri)), test))]
+fn run_state_of_letter(letter: &str) -> RunState {
+  if letter == RUNNING_LETTER {
     RunState::Runnable
   } else {
     RunState::Blocked
-  })
+  }
+}
+
+/// The kernel function the thread `handle` names waits in, from its `/proc/self/task/<tid>/wchan`, for a log line that
+/// names a wait (A-336): `None` where the platform names none (macOS, Windows), the thread is gone, or the kernel gives
+/// `0` (a running thread, or a kernel built without symbols).
+pub(crate) fn kernel_wait_name(handle: u64) -> Option<String> {
+  kernel_wait_name_of(handle)
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+fn kernel_wait_name_of(handle: u64) -> Option<String> {
+  if handle & TAG == 0 {
+    return None;
+  }
+  let tid = (handle & !TAG) >> TID_SHIFT;
+  // structural: allow: a query of the kernel's pseudo-file for this process's own thread; no host path is named.
+  let name = std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan")).ok()?;
+  let name = name.trim();
+  (!name.is_empty() && name != "0").then(|| name.to_owned())
+}
+
+#[cfg(any(not(target_os = "linux"), miri))]
+fn kernel_wait_name_of(_handle: u64) -> Option<String> {
+  None
 }
 
 /// The run-queue wait in a thread's `schedstat`, its second field, nanoseconds; `None` for a line without one.
@@ -673,31 +767,181 @@ mod tests {
     });
   }
 
-  /// A-228, hostile input. Do: read the state from `/proc/.../stat` lines: plain ones, a name holding `)`, spaces and a
-  /// decoy state, the states that are off the CPU, and lines cut short or empty. Expect: the state after the last `)`, or
-  /// `None` where there is none, and no panic.
+  /// A-228, A-336, hostile input. Do: read the state from `/proc/.../stat` lines: plain ones, a name holding `)`, spaces
+  /// and a decoy state, the states that are off the CPU, and lines cut short or empty. Expect: the letter after the last
+  /// `)`, or `None` where there is none, and no panic; `R` alone runnable, and `D` alone the wait the kernel holds a
+  /// thread in past signals.
   #[test]
   fn a_stat_line_gives_the_state_after_the_last_parenthesis() {
-    use super::{RunState, state_of_stat};
+    use super::{RunState, UNINTERRUPTIBLE_LETTER, run_state_of_letter, state_letter_of_stat};
+    let state = |stat: &str| state_letter_of_stat(stat).map(run_state_of_letter);
     assert_eq!(
-      state_of_stat("12 (slates-shard-0) R 1 2 3\n"),
+      state("12 (slates-shard-0) R 1 2 3\n"),
       Some(RunState::Runnable)
     );
     assert_eq!(
-      state_of_stat("12 (a) R b) S 1 2"),
+      state("12 (a) R b) S 1 2"),
       Some(RunState::Blocked),
       "the name may hold `) R`"
     );
-    assert_eq!(state_of_stat("12 (x (y)) R 1"), Some(RunState::Runnable));
+    assert_eq!(state("12 (x (y)) R 1"), Some(RunState::Runnable));
     for off_cpu in ["S", "D", "T", "t", "Z", "X", "I"] {
+      let stat = format!("12 (x) {off_cpu} 1");
+      assert_eq!(state(&stat), Some(RunState::Blocked), "{off_cpu}");
       assert_eq!(
-        state_of_stat(&format!("12 (x) {off_cpu} 1")),
-        Some(RunState::Blocked),
-        "{off_cpu}"
+        state_letter_of_stat(&stat) == Some(UNINTERRUPTIBLE_LETTER),
+        off_cpu == "D",
+        "{off_cpu}: only D is held in the kernel"
       );
     }
+    assert_eq!(
+      state_letter_of_stat("12 (a) D b) S 1 2"),
+      Some("S"),
+      "the name may hold `) D`"
+    );
     for short in ["", "12", "12 (x", "12 (x)", "12 (x)   \n", "\u{0}"] {
-      assert_eq!(state_of_stat(short), None, "{short:?}");
+      assert_eq!(state(short), None, "{short:?}");
+    }
+  }
+
+  /// A-336. Do: read a whole process from its threads' state letters: one runnable among blocked ones, one held in the
+  /// kernel among sleeping ones, all asleep, all stopped, and none read. Expect: runnable when any thread is; else blocked,
+  /// held in the kernel when any thread is (`D`), and not when none is; no reading when no letter was read.
+  #[test]
+  fn a_process_reads_runnable_if_any_thread_is_and_held_if_any_is_held() {
+    use super::{RunReading, RunState, process_reading_of_letters};
+    let read = |letters: &[&str]| process_reading_of_letters(letters.iter().copied());
+    let blocked = |held| {
+      Some(RunReading {
+        state: RunState::Blocked,
+        waited_ns: None,
+        uninterruptible: Some(held),
+      })
+    };
+    assert_eq!(
+      read(&["S", "D", "R", "S"]).map(|reading| reading.state),
+      Some(RunState::Runnable)
+    );
+    assert_eq!(read(&["S", "D", "S"]), blocked(true));
+    assert_eq!(read(&["S", "S"]), blocked(false));
+    assert_eq!(read(&["T", "t"]), blocked(false), "a stopped process");
+    assert_eq!(read(&[]), None);
+  }
+
+  /// Shape: the stack the held thread's child runs its two calls on (a read and an exit).
+  #[cfg(all(target_os = "linux", not(miri)))]
+  const CHILD_STACK: usize = 64 * 1024;
+  /// Shape: how long the test waits for the kernel to report a thread in the state it was put in.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  const SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+  /// The child of [`hold_in_the_kernel`]: reads one byte from the pipe whose read end `fd` points at, then exits. It
+  /// runs on its own stack in the parent's memory, so it makes no allocation and takes no lock: two system calls.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  extern "C" fn read_one_byte_then_exit(fd: *mut libc::c_void) -> libc::c_int {
+    let mut byte = 0_u8;
+    // SAFETY: `fd` points at the parent's descriptor number, on the parent's frame, which stays put while the parent
+    // waits for this child (`CLONE_VFORK`); `byte` is this frame's own.
+    unsafe {
+      libc::syscall(
+        libc::SYS_read,
+        libc::c_long::from(*fd.cast::<libc::c_int>()),
+        (&raw mut byte).cast::<libc::c_void>(),
+        1_usize,
+      );
+      libc::_exit(0)
+    }
+  }
+
+  /// Holds the calling thread where the kernel holds a thread waiting on a page-in: in a wait past signals (`D`). It
+  /// clones a child that shares its memory and makes it wait (`CLONE_VM | CLONE_VFORK`, as `vfork` and `posix_spawn`
+  /// do), so the kernel keeps it in `wait_for_vfork_done` (`TASK_KILLABLE`) until the child, reading `read_end`, has
+  /// read a byte and exited; then reaps the child.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn hold_in_the_kernel(read_end: libc::c_int) {
+    let mut stack = vec![0_u8; CHILD_STACK];
+    let top = stack.as_mut_ptr().wrapping_add(CHILD_STACK);
+    let mut fd = read_end;
+    // SAFETY: the child runs `read_one_byte_then_exit` on `stack`, which outlives it (the call returns only once the
+    // child has exited, `CLONE_VFORK`), and reads `fd` on this frame, which stays put meanwhile; it shares this
+    // process's memory and touches nothing else.
+    let child = unsafe {
+      libc::clone(
+        read_one_byte_then_exit,
+        top.cast(),
+        libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+        (&raw mut fd).cast(),
+      )
+    };
+    assert!(child > 0, "the child was cloned");
+    let mut status = 0;
+    // SAFETY: reaps this thread's own child; `status` is this frame's own.
+    unsafe { libc::waitpid(child, &raw mut status, 0) };
+    drop(stack);
+  }
+
+  /// A-336, by use (Linux). Do: hold one thread in the wait the kernel keeps a vfork's parent in, past signals, as it
+  /// keeps a thread waiting on a page-in; put another to sleep on a channel; read both from this thread until each
+  /// settles, then let both go. Expect: both blocked; the first held in the kernel (`D`), the second not (`S`).
+  #[test]
+  #[cfg(all(target_os = "linux", not(miri)))]
+  fn a_thread_the_kernel_holds_reads_uninterruptible_and_a_sleeping_one_does_not() {
+    use std::sync::mpsc;
+    let reading = |handle: u64| super::run_readings(&[handle]).pop().flatten();
+    let mut ends: [libc::c_int; 2] = [0; 2];
+    // SAFETY: `ends` is this frame's own pair for the call to fill; the status is checked.
+    let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(made, 0, "a pipe for the held thread's child");
+    let [read_end, write_end] = ends;
+    let (handles, handed) = mpsc::channel();
+    let (release, waited) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+      let held_handle = handles.clone();
+      scope.spawn(move || {
+        let _ = held_handle.send(super::current());
+        hold_in_the_kernel(read_end);
+      });
+      scope.spawn(move || {
+        let _ = handles.send(super::current());
+        let _ = waited.recv();
+      });
+      let first = handed.recv().ok().flatten().unwrap();
+      let second = handed.recv().ok().flatten().unwrap();
+      let settled = std::time::Instant::now();
+      let held_in_kernel = |read: Option<super::RunReading>| {
+        read.is_some_and(|read| {
+          read.state == super::RunState::Blocked && read.uninterruptible == Some(true)
+        })
+      };
+      let asleep = |read: Option<super::RunReading>| {
+        read.is_some_and(|read| {
+          read.state == super::RunState::Blocked && read.uninterruptible == Some(false)
+        })
+      };
+      // Which thread sent first is a race; read both until one is held and the other asleep.
+      let mut seen = (None, None);
+      while settled.elapsed() < SETTLE {
+        seen = (reading(first), reading(second));
+        if (held_in_kernel(seen.0) && asleep(seen.1)) || (held_in_kernel(seen.1) && asleep(seen.0))
+        {
+          break;
+        }
+        std::thread::yield_now();
+      }
+      let byte = [1_u8];
+      // SAFETY: writes one byte from this frame's own buffer to the pipe's write end, which this test owns.
+      let wrote = unsafe { libc::write(write_end, byte.as_ptr().cast(), 1) };
+      let _ = release.send(());
+      assert_eq!(wrote, 1, "the held thread's child was let go");
+      assert!(
+        (held_in_kernel(seen.0) && asleep(seen.1)) || (held_in_kernel(seen.1) && asleep(seen.0)),
+        "one thread held in the kernel and one asleep: {seen:?}"
+      );
+    });
+    // SAFETY: closes this test's own two pipe ends, once each.
+    unsafe {
+      libc::close(read_end);
+      libc::close(write_end);
     }
   }
 
@@ -794,21 +1038,21 @@ mod tests {
     assert_eq!(thread_state_in(&just_past, 9, 70), None);
   }
 
-  /// A-228's sibling, the anchor's start judgment, by use. Do: ask whether this test's own process has a runnable thread,
-  /// from the thread asking, which is on a CPU as it asks; and ask of a process id no process holds. Expect: runnable
-  /// on every platform with a reader (Linux, macOS, Windows), and no answer for the missing process.
+  /// A-228's sibling, the anchor's start judgment, by use. Do: read this test's own process, from the thread asking,
+  /// which is on a CPU as it asks; and read a process id no process holds. Expect: runnable on every platform with a
+  /// reader (Linux, macOS, Windows), and no answer for the missing process.
   #[test]
   #[cfg(not(miri))]
   fn a_running_process_reads_runnable() {
     let readable = cfg!(any(target_os = "linux", target_os = "macos", windows));
-    let ours = super::process_runnable(std::process::id());
+    let ours = super::process_run_reading(std::process::id()).map(|reading| reading.state);
     assert_eq!(
       ours,
-      readable.then_some(true),
+      readable.then_some(super::RunState::Runnable),
       "this process, running as it asks"
     );
     assert_eq!(
-      super::process_runnable(u32::MAX - 1),
+      super::process_run_reading(u32::MAX - 1),
       None,
       "no such process"
     );

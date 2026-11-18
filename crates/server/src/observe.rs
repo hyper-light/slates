@@ -700,11 +700,12 @@ mod tests {
     move || readings.next()
   }
 
-  /// The scheduler's answer of `state`, with no wait time (macOS and Windows keep none).
+  /// The scheduler's answer of `state`, with no wait time and no kind of wait (macOS and Windows keep neither).
   fn seen(state: RunState) -> Option<RunReading> {
     Some(RunReading {
       state,
       waited_ns: None,
+      uninterruptible: None,
     })
   }
 
