@@ -3616,18 +3616,49 @@ fn held_entry(state: &mut ShardState, owner: HostId, object: ObjectId) -> &mut H
   held
 }
 
-/// A candidate's answer to a successor's takeover fetch (A-200): authorized as a read of the object
-/// (`fleet::content_authorized`: the acting owner, a candidate, or a recovery cohort), the fence raised to the
-/// successor's epoch, and the head and the sealed entries kept. A stale successor is refused by the fence.
-pub(crate) fn serve_fetch(
+/// A candidate's answer to a successor's takeover fetch (A-200), laid out in turns of this shard (g251): authorized as a
+/// read of the object (`fleet::content_authorized`: the acting owner, a candidate, or a recovery cohort), the fence raised
+/// to the successor's epoch and published (a promise that outlives a restart before it is told), and then the head and
+/// the sealed entries kept, appended to the answer a slice of [`fetch_slice_bytes`] a turn ([`FetchAnswer`]). A stale
+/// successor is refused by the fence. Laid out in one turn, the answer cloned every entry and then copied them all into
+/// one buffer grown as it went: 34,814 entries of a 406 MB log in a nemesis run (seed 18189587465523915115), with a
+/// control shard's single 557 ms poll beside it. Run on its own task of the serve loop, so the turns hold no other
+/// request of the peer.
+pub(crate) async fn serve_fetch(local: HostId, peer: HostId, request: Vec<u8>) -> Vec<u8> {
+  let begun = state::with_state(|s| begin_fetch_answer(s, local, peer, &request));
+  let mut answer = match begun {
+    Some(Ok(answer)) => answer,
+    Some(Err(refused)) => return refused,
+    // The control shard's state out of reach (its shutdown): nothing is answered.
+    None => return Vec::new(),
+  };
+  loop {
+    let laid = state::with_state(|s| {
+      let slice_bytes = fetch_slice_bytes(s);
+      let whole = answer.lay_out(s, slice_bytes);
+      s.count(LIVE_FETCH_SLICES, 1);
+      whole
+    });
+    match laid {
+      Some(true) => return answer.into_reply(),
+      Some(false) => slates_rt::futures::yield_now().await,
+      None => return Vec::new(),
+    }
+  }
+}
+
+/// The first turn of a fetch's answer ([`serve_fetch`]): the request decoded and authorized, the copy fenced at the
+/// successor's epoch and handed to it, and the fence published before anything is told. `Err` with the whole reply when
+/// it is a refusal (an empty one when the publication was refused, which the successor reads as no answer).
+fn begin_fetch_answer(
   state: &mut ShardState,
   local: HostId,
   peer: HostId,
   request: &[u8],
-) -> Vec<u8> {
+) -> Result<FetchAnswer, Vec<u8>> {
   let Ok(fetch) = slates_db::live::Fetch::decode(request) else {
     count_refused(state, REFUSED_MALFORMED);
-    return slates_db::live::encode_fetched(&Err(LiveError::Malformed), &[]);
+    return Err(slates_db::live::fetched_reply(&Err(LiveError::Malformed), 0));
   };
   let regional = state.council.configuration();
   let reading = slates_cluster::content::ContentAccess::Read;
@@ -3640,19 +3671,121 @@ pub(crate) fn serve_fetch(
     fetch.object,
   ) {
     count_refused(state, "fleet.live.hold_refused.fetch_unauthorized");
-    return slates_db::live::encode_fetched(&Err(LiveError::Unauthorized), &[]);
+    return Err(slates_db::live::fetched_reply(
+      &Err(LiveError::Unauthorized),
+      0,
+    ));
   }
-  match fenced_copy(state, peer, fetch.object, fetch.epoch) {
+  let answer = match fenced_copy(state, peer, fetch.object, fetch.epoch) {
     Ok(held) => {
       held.replica.reassign(peer);
-      let head = held.replica.head();
-      let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
-      state.count(LIVE_FETCHED, 1);
-      // The fence this raised is a promise too: it outlives a restart before it is told.
-      let reply = slates_db::live::encode_fetched(&Ok(head), &entries);
-      acknowledged(state, reply)
+      FetchAnswer::of(held, fetch.object, fetch.epoch)
     }
-    Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
+    Err(refusal) => return Err(slates_db::live::fetched_reply(&Err(refusal), 0)),
+  };
+  state.count(LIVE_FETCHED, 1);
+  // The fence this raised is a promise too: it outlives a restart before it is told.
+  if crate::verbs::publish_shard(state).is_err() {
+    state.count(LIVE_UNPUBLISHED, 1);
+    return Err(Vec::new());
+  }
+  Ok(answer)
+}
+
+/// Counter: the turns a takeover fetch's answer took to lay out on this node, a candidate's for a successor or a
+/// successor's of its own copy (g251, [`FetchAnswer`]).
+const LIVE_FETCH_SLICES: &str = "fleet.live.fetch_slices";
+
+/// The bytes of entries one turn of a fetch's answer lays out on this shard: the copy-bound slice of the turn's quantum
+/// at the machine's measured memcpy rate (`DaemonConfig::copy_slice_bytes_within`), an entry at least, the quantum
+/// being the one a takeover's other turns are cut by (`fleet::seal_quantum_ns`), so a test that cuts it lays out an
+/// entry a turn.
+fn fetch_slice_bytes(state: &ShardState) -> usize {
+  let slice = state
+    .config
+    .copy_slice_bytes_within(crate::fleet::seal_quantum_ns(state));
+  usize::try_from(slice).unwrap_or(usize::MAX)
+}
+
+/// A takeover fetch's answer while it is laid out (g251): the copy's head when it was fenced, its entries from slot
+/// `next` to `end` still to append, and the answer so far (`slates_db::live::fetched_reply`, room for every entry
+/// reserved). Under the fence nothing ships to the copy, so its entries hold still between the turns; a copy that moved
+/// all the same (a later successor's fence above the epoch, another head, entries gone, the copy let go) is answered as
+/// a fetch arriving then would be, and the successor that asked fetches again or stands down.
+pub(crate) struct FetchAnswer {
+  object: ObjectId,
+  epoch: slates_db::register::HostEpoch,
+  head: Option<Head>,
+  next: u64,
+  end: u64,
+  reply: Vec<u8>,
+}
+
+impl FetchAnswer {
+  /// The answer for `held`, the copy of `object` fenced at `epoch`: its head, its slots, room for its entries.
+  fn of(held: &Held, object: ObjectId, epoch: slates_db::register::HostEpoch) -> FetchAnswer {
+    let head = held.replica.head();
+    let (next, end) = held.slots();
+    let entries = held.entries.len();
+    let room = held
+      .bytes
+      .saturating_add(entries.saturating_mul(slates_db::live::FETCHED_PREFIX_BYTES));
+    FetchAnswer {
+      object,
+      epoch,
+      head,
+      next,
+      end,
+      reply: slates_db::live::fetched_reply(&Ok(head), room),
+    }
+  }
+
+  /// One turn: the copy's next entries appended until `slice_bytes` of them are laid out, an entry at least; `true`
+  /// once the answer is whole. A copy that moved since the answer began makes it that copy's answer now, whole.
+  fn lay_out(&mut self, state: &ShardState, slice_bytes: usize) -> bool {
+    let held = state.live.held.get(&self.object);
+    let Some(held) = held.filter(|held| {
+      held.replica.fence() <= self.epoch
+        && held.replica.head() == self.head
+        && held.slots().0 <= self.next
+    }) else {
+      self.reply = moved_answer(held, self.epoch);
+      return true;
+    };
+    let mut laid = 0usize;
+    while self.next < self.end {
+      let Some(entry) = held.entry_at(self.next) else {
+        self.reply = moved_answer(Some(held), self.epoch);
+        return true;
+      };
+      slates_db::live::push_fetched(&mut self.reply, entry);
+      self.next = self.next.saturating_add(1);
+      laid = laid.saturating_add(entry.len());
+      if laid >= slice_bytes {
+        break;
+      }
+    }
+    self.next >= self.end
+  }
+
+  /// The answer, laid out whole.
+  fn into_reply(self) -> Vec<u8> {
+    self.reply
+  }
+}
+
+/// What a fetch would be told by a copy that moved while its answer was laid out: the fence above `epoch` refuses it;
+/// otherwise the head held now, without entries, which the successor finds is not the head it adopted.
+fn moved_answer(held: Option<&Held>, epoch: slates_db::register::HostEpoch) -> Vec<u8> {
+  match held {
+    Some(held) if held.replica.fence() > epoch => slates_db::live::fetched_reply(
+      &Err(LiveError::StaleEpoch {
+        current: held.replica.fence(),
+      }),
+      0,
+    ),
+    Some(held) => slates_db::live::fetched_reply(&Ok(held.replica.head()), 0),
+    None => slates_db::live::fetched_reply(&Ok(None), 0),
   }
 }
 
@@ -3728,7 +3861,8 @@ fn fenced_copy(
   Ok(held)
 }
 
-/// A candidate's answer on the whole-state kind: a fetch or an install, by its tag.
+/// A candidate's answer on the whole-state kind in one turn: a report or an install, by its tag. A fetch never comes
+/// here: the serve loop answers it in turns on a task of its own ([`serve_fetch`]).
 pub(crate) fn serve_state(
   state: &mut ShardState,
   local: HostId,
@@ -3737,8 +3871,6 @@ pub(crate) fn serve_state(
 ) -> Vec<u8> {
   if slates_db::live::is_report(request) {
     serve_report(state, local, peer, request)
-  } else if slates_db::live::is_fetch(request) {
-    serve_fetch(state, local, peer, request)
   } else {
     serve_install(state, local, peer, request)
   }
@@ -3782,6 +3914,11 @@ const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_fir
 /// Counter: a takeover refused because the rebuilt image could not be laid out as an archive (no root, a cycle,
 /// content missing for an extent).
 const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
+/// Counter: a takeover's rebuild stopped at a payload whose framing in the fetched answer ran past the answer or over the
+/// hold's cap (g251: the payloads are read in place, each as it is applied). The answer's, not the log's: it is not
+/// among the [`REBUILD_REFUSALS`] [`note_rebuild`] keeps, so the next attempt fetches the log again, as a fetch whose
+/// answer did not decode always has.
+const REFUSED_FETCHED: &str = "fleet.live.takeover_refused.fetched";
 /// Counter: a taken-over live volume rebuilt from the adopted log.
 const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 /// Counter: a live takeover's phase one adopted past tolerance (A-309): fewer than `f + 1` recorded holders were still
@@ -3794,7 +3931,8 @@ const LIVE_TAKEN_OVER_PAST_TOLERANCE: &str = "fleet.live.taken_over_past_toleran
 pub(crate) struct Fetched {
   /// The head adopted, which the payloads end at.
   pub(crate) head: Head,
-  pub(crate) payloads: Vec<Vec<u8>>,
+  /// The payloads, in place in the answer that carried them (g251).
+  pub(crate) log: slates_db::live::FetchedLog,
   pub(crate) lineage: Option<([u8; 16], Vec<u8>)>,
   pub(crate) naming: Option<crate::head::HeadNaming>,
   /// The first payload's sealing, when the log is sealed: kept with a refusal for a missing key ([`Refused`]).
@@ -3961,28 +4099,21 @@ pub(crate) async fn fetch(
     NextFetch::WaitsKey => return Err(LIVE_TAKEOVER_WAITS_KEY),
     NextFetch::KeyExhausted => return Err(LIVE_TAKEOVER_NO_KEY_EXHAUSTED),
   }
-  let payloads = if holder == local {
-    state::with_state(|s| {
-      s.live
-        .held
-        .get(&object)
-        .map(|held| held.entries.iter().cloned().collect::<Vec<_>>())
-    })
-    .flatten()
-    .unwrap_or_default()
+  let log = if holder == local {
+    own_log(object, epoch, head, cap).await?
   } else {
     let bytes = kept.get(&holder).copied().unwrap_or(0);
     fetch_log(object, epoch, (holder, head), bytes, cap).await?
   };
-  let sealing = payloads
+  let sealing = log
     .first()
-    .and_then(|first| sealed_body(first))
+    .and_then(sealed_body)
     .and_then(|body| body.sealing);
   let lineage = lineage_for_rebuild(object, sealing.as_ref(), handed, &answered).await;
   let naming = sealing.as_ref().and_then(|sealing| sealing.naming.clone());
   Ok(Some(Fetched {
     head,
-    payloads,
+    log,
     lineage,
     naming,
     sealing,
@@ -4293,7 +4424,7 @@ async fn fetch_log(
   (holder, head): (HostId, Head),
   bytes: u64,
   cap: usize,
-) -> Result<Vec<Vec<u8>>, &'static str> {
+) -> Result<slates_db::live::FetchedLog, &'static str> {
   let session = crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| host == holder);
   if session.is_empty() {
     return Err("fleet.live.takeover_waits_log_session");
@@ -4317,8 +4448,46 @@ async fn fetch_log(
     .into_iter()
     .find(|(host, _)| *host == holder)
     .ok_or("fleet.live.takeover_waits_log")?;
-  match slates_db::live::decode_fetched(&fetched.1, cap) {
-    Ok((Some(fetched_head), payloads)) if fetched_head == head => Ok(payloads),
+  // Its reply alone is read here; the payloads stay in place in the answer, each read when the rebuild applies it.
+  match slates_db::live::FetchedLog::decode(fetched.1, cap) {
+    Ok((Some(fetched_head), log)) if fetched_head == head => Ok(log),
+    _ => Err("fleet.live.takeover_waits_log"),
+  }
+}
+
+/// The successor's own copy of the log, when phase one adopted it (g251): laid out as a candidate lays out its answer to
+/// a fetch ([`FetchAnswer`]), a slice a turn of this (control) shard, and read in place as a fetched log is. Cloned
+/// whole in one turn, it was a copy of the whole log in the coordinator's turn. Refused as a fetch from another holder
+/// is ("fleet.live.takeover_waits_log") when the copy moved before it was whole.
+async fn own_log(
+  object: ObjectId,
+  epoch: slates_db::register::HostEpoch,
+  head: Head,
+  cap: usize,
+) -> Result<slates_db::live::FetchedLog, &'static str> {
+  let begun = state::with_state(|s| {
+    s.live
+      .held
+      .get(&object)
+      .map(|held| FetchAnswer::of(held, object, epoch))
+  })
+  .flatten();
+  let mut answer = begun.ok_or("fleet.live.takeover_waits_log")?;
+  loop {
+    let laid = state::with_state(|s| {
+      let slice_bytes = fetch_slice_bytes(s);
+      let whole = answer.lay_out(s, slice_bytes);
+      s.count(LIVE_FETCH_SLICES, 1);
+      whole
+    })
+    .ok_or("fleet.live.takeover_waits_state")?;
+    if laid {
+      break;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  match slates_db::live::FetchedLog::decode(answer.into_reply(), cap) {
+    Ok((Some(laid_head), log)) if laid_head == head => Ok(log),
     _ => Err("fleet.live.takeover_waits_log"),
   }
 }
@@ -4371,8 +4540,8 @@ pub(crate) fn taken_over(state: &mut ShardState) {
 pub(crate) struct Rebuilding {
   /// The lineage key and namer the payloads are opened under, when the log is sealed.
   keys: Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
-  /// The payloads not yet applied, in order.
-  payloads: std::vec::IntoIter<Vec<u8>>,
+  /// The payloads, in place in the answer that carried them; the next one taken is the next to apply.
+  payloads: slates_db::live::FetchedLog,
   /// The image the payloads applied so far describe; `None` before the first whole record.
   image: Option<slates_vfs::recover::VolumeImage>,
   /// The content runs they name, by inode and offset.
@@ -4393,7 +4562,7 @@ impl Rebuilding {
     id: slates_db::catalog::VolumeId,
     owner: &slates_db::catalog::Principal,
     (lineage, naming): (Option<([u8; 16], Vec<u8>)>, Option<crate::head::HeadNaming>),
-    payloads: Vec<Vec<u8>>,
+    payloads: slates_db::live::FetchedLog,
   ) -> Result<Rebuilding, &'static str> {
     if let Some(lineage) = lineage {
       crate::seal_keys::adopt_lineage(state, id, owner, lineage, naming.as_ref())
@@ -4419,7 +4588,7 @@ impl Rebuilding {
     keys_for_rebuild(sealed, keys.is_some())?;
     Ok(Rebuilding {
       keys,
-      payloads: payloads.into_iter(),
+      payloads,
       image: None,
       runs: BTreeMap::new(),
       volume_local: ObjectId(id.bytes).local(),
@@ -4432,11 +4601,17 @@ impl Rebuilding {
   /// [`REFUSED_NOT_WHOLE_FIRST`].
   pub(crate) fn advance(&mut self, mut spent: impl FnMut() -> bool) -> Result<bool, &'static str> {
     loop {
-      let Some(payload) = self.payloads.next() else {
+      let Some(payload) = self.payloads.next_payload() else {
         return Ok(true);
       };
-      self.apply(&payload)?;
-      if self.payloads.len() == 0 {
+      // Its framing broken in transit, not the log's bytes: fetched again ([`REFUSED_FETCHED`]).
+      let payload = payload.map_err(|_| REFUSED_FETCHED)?;
+      apply_payload(
+        self.keys.as_ref(),
+        (&mut self.image, &mut self.runs),
+        payload,
+      )?;
+      if self.payloads.is_spent() {
         return Ok(true);
       }
       if spent() {
@@ -4445,30 +4620,9 @@ impl Rebuilding {
     }
   }
 
-  /// One payload opened, decoded and applied, its runs kept.
-  fn apply(&mut self, payload: &[u8]) -> Result<(), &'static str> {
-    let publication = open_payload(self.keys.as_ref(), payload).ok_or(REFUSED_OPEN)?;
-    let record =
-      <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
-    match (record, self.image.as_mut()) {
-      (VolumeRecord::Full { image: whole }, _) => {
-        self.image = Some(whole);
-        self.runs.clear();
-      }
-      (VolumeRecord::Delta { delta }, Some(image)) => {
-        slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
-      }
-      (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
-    }
-    for run in publication.runs {
-      self.runs.insert((run.inode, run.offset), run.bytes);
-    }
-    Ok(())
-  }
-
-  /// The payloads not yet applied.
-  pub(crate) fn left(&self) -> usize {
-    self.payloads.len()
+  /// The payloads applied so far.
+  pub(crate) fn applied(&self) -> usize {
+    self.payloads.taken()
   }
 
   /// The rebuilt volume laid out as the archive `materialize_taken_over` restores; refused
@@ -4477,6 +4631,35 @@ impl Rebuilding {
     let image = self.image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
     archive_of(&image, &self.runs, self.volume_local, self.page)
   }
+}
+
+/// One payload of a live log opened under `keys`, decoded and applied to the rebuild's image, its runs kept: a whole
+/// record begins the image again, a delta applies to it, and a delta before any whole one is refused.
+fn apply_payload(
+  keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
+  (image, runs): (
+    &mut Option<slates_vfs::recover::VolumeImage>,
+    &mut BTreeMap<(u64, u64), Vec<u8>>,
+  ),
+  payload: &[u8],
+) -> Result<(), &'static str> {
+  let publication = open_payload(keys, payload).ok_or(REFUSED_OPEN)?;
+  let record =
+    <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
+  match (record, image.as_mut()) {
+    (VolumeRecord::Full { image: whole }, _) => {
+      *image = Some(whole);
+      runs.clear();
+    }
+    (VolumeRecord::Delta { delta }, Some(image)) => {
+      slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
+    }
+    (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
+  }
+  for run in publication.runs {
+    runs.insert((run.inode, run.offset), run.bytes);
+  }
+  Ok(())
 }
 
 /// A publication's body sealed under the volume's lineage key, in pieces of at most an archive chunk's bytes
@@ -5186,6 +5369,75 @@ mod tests {
       vec![vec![KIND_WHOLE, 3], vec![KIND_DELTA, 4]],
       "the newest whole entry first, what came before it dropped"
     );
+  }
+
+  /// g251 (the nemesis's control-shard poll of 557 ms beside a 406 MB log): a takeover fetch's answer laid out an entry a
+  /// turn is the answer laid out at once. Do keep a copy of six entries (a whole one, then deltas) at a head, fence it at
+  /// epoch 2, and lay its answer out at a slice of nothing and at a slice of everything; then begin again and, between
+  /// two turns, raise the fence past the epoch, and once more let the copy go. Expect six turns and one, the same bytes,
+  /// read back in place in order at the head held; the raised fence's answer its stale-epoch refusal; and the let-go
+  /// copy's the empty head, without entries, which a successor finds is not the head it adopted.
+  #[test]
+  fn a_fetch_answered_an_entry_a_turn_is_the_answer_laid_out_at_once() {
+    crate::daemon::audit_on_shard(|s| {
+      let object = ObjectId([7; 16]);
+      let head = Head {
+        epoch: HostEpoch(1),
+        position: 5,
+        identity: [3; 32],
+      };
+      let payloads: Vec<Vec<u8>> = (0..6u8)
+        .map(|n| vec![if n == 0 { KIND_WHOLE } else { KIND_DELTA }, n, n])
+        .collect();
+      let mut held = Held::for_test(HostId(1), object, 0);
+      for payload in &payloads {
+        keep(&mut held, payload, 1 << 20).unwrap();
+      }
+      held.replica.commit(HostEpoch(1), head);
+      held.replica.prepare(HostEpoch(2)).unwrap();
+      s.live.held.insert(object, held);
+      let laid_out = |s: &ShardState, slice_bytes: usize| {
+        let mut answer = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(2));
+        let mut turns = 0;
+        while !answer.lay_out(s, slice_bytes) {
+          turns += 1;
+        }
+        (turns + 1, answer.into_reply())
+      };
+      let (entry_a_turn, by_entry) = laid_out(s, 0);
+      let (at_once, whole) = laid_out(s, usize::MAX);
+      assert_eq!((entry_a_turn, at_once), (payloads.len(), 1));
+      assert_eq!(by_entry, whole, "the same answer");
+      let (answered, mut log) = slates_db::live::FetchedLog::decode(by_entry, 1 << 20).unwrap();
+      assert_eq!(answered, Some(head));
+      let read: Vec<Vec<u8>> = std::iter::from_fn(|| log.next_payload())
+        .map(|payload| payload.unwrap().to_vec())
+        .collect();
+      assert_eq!(read, payloads, "every entry, in order");
+      let mut raised = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(2));
+      assert!(!raised.lay_out(s, 0));
+      s.live
+        .held
+        .get_mut(&object)
+        .unwrap()
+        .replica
+        .prepare(HostEpoch(3))
+        .unwrap();
+      assert!(raised.lay_out(s, 0), "a moved copy ends the answer");
+      assert_eq!(
+        slates_db::live::FetchedLog::decode(raised.into_reply(), 1 << 20).map(|(head, _)| head),
+        Err(LiveError::StaleEpoch {
+          current: HostEpoch(3)
+        })
+      );
+      let mut gone = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(3));
+      assert!(!gone.lay_out(s, 0));
+      s.live.held.remove(&object);
+      assert!(gone.lay_out(s, 0));
+      let (answered, mut log) = slates_db::live::FetchedLog::decode(gone.into_reply(), 1 << 20).unwrap();
+      assert_eq!(answered, None, "the let-go copy's empty head");
+      assert!(log.next_payload().is_none(), "and no entries");
+    });
   }
 
   /// Format: the key generation the tests' keys carry.
