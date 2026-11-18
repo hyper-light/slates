@@ -143,7 +143,8 @@ and Rust's `canonicalize` each ask for it):
 reg add HKLM\SOFTWARE\WOW6432Node\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f
 ```
 
-Without it `slates mount` is refused `MountManagerNotAllowed`. A drive is then the machine's, seen
+Without it `slates mount` is refused `MountManagerNotAllowed`, and the library's
+`mount::available()` answers `MountManager` before anything is mounted. A drive is then the machine's, seen
 in every session, and only its account, SYSTEM and the Administrators may open what is on it.
 
 ## Quickstart

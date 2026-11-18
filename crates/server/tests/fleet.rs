@@ -14549,6 +14549,112 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   );
 }
 
+/// Shape: the writes of [`a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`]'s closed
+/// loop: enough for every stream to run past its first message and every answer window to be timed, with room to spare.
+const HELD_LOOP_WRITES: usize = 32;
+/// Format: the owner's count of replies held for durability that asked its shard to hold its idle window (`live_ship`,
+/// A-396).
+const LIVE_HOLD_ANSWER: &str = "fleet.live.hold.answer";
+/// Format: the owner's count of exchanges its control shard was asked to hold its idle window through (A-396).
+const LIVE_HOLD_EXCHANGE: &str = "fleet.live.hold.exchange";
+/// Format: the owner's count of dispatches after which its control shard was asked to hold its window for the next
+/// (A-396).
+const LIVE_HOLD_DISPATCHES: &str = "fleet.live.hold.dispatches";
+/// Format: a holder's count of entries after which it was asked to hold its window for the owner's next (A-396).
+const LIVE_HOLD_ENTRIES: &str = "fleet.live.hold.entries";
+/// Format: a node's count of the live holds asked of its shards that they declined, a shard's measured idle turn no
+/// shorter than its wake (A-387's predicate).
+const LIVE_HOLD_DECLINED: &str = "fleet.live.hold.declined";
+
+/// A-396 (§4.10 "Live shipping", §4.7): do write a live-shipped volume over and over from one client, each write sent as
+/// soon as the last was answered (a closed loop). Expect every write answered at durability, and each shard on the
+/// write's path to have been asked to hold its idle window rather than park, with a window learned from the traffic: the
+/// owner while a reply waited for durability, its node's control shard through an exchange and for the next dispatch, and
+/// the holders for the owner's next entry. These counts are the holds' non-vacuity check: parked, each of those steps cost
+/// a thread's wake (the contract command measured live shipping adding 136-291 µs to a stable write at the median on main
+/// and 63-120 µs held, adacachy, 2026-11-18). Whether a shard keeps a hold is the runtime's decision from its own
+/// measurements (A-387: a shard whose idle turn naps, as a macOS shard's `kevent` does, declines), so the test asks only
+/// that every site asked, and prints the declines.
+#[test]
+fn a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "held".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BURST_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the held volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let replies: Vec<ReplyBody> = (0..HELD_LOOP_WRITES)
+    .map(|write| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: "/looped".to_owned(),
+        bytes: vec![u8::try_from(write % 251).unwrap(); BURST_WRITE_BYTES],
+        mode: 0o644,
+      })
+    })
+    .collect();
+  let owners = [LIVE_HOLD_ANSWER, LIVE_HOLD_EXCHANGE, LIVE_HOLD_DISPATCHES]
+    .map(|kind| refusal_count(&daemons[0], kind).unwrap());
+  let holders =
+    [&daemons[1], &daemons[2]].map(|holder| refusal_count(holder, LIVE_HOLD_ENTRIES).unwrap());
+  let declined = [&daemons[0], &daemons[1], &daemons[2]]
+    .map(|daemon| refusal_count(daemon, LIVE_HOLD_DECLINED).unwrap());
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "held loop: the owner's answer, exchange and dispatch holds asked {owners:?}; the holders' entry holds asked \
+     {holders:?}; declined by each node's shards {declined:?}"
+  );
+  assert!(
+    replies
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write of the loop is answered at durability: {replies:?}"
+  );
+  assert!(
+    owners[0] > 0,
+    "a reply held for durability asked the owner's shard to hold: {owners:?}"
+  );
+  assert!(
+    owners[1] > 0,
+    "the control shard was asked to hold through an exchange: {owners:?}"
+  );
+  assert!(
+    owners[2] > 0,
+    "the control shard was asked to hold for its next dispatch: {owners:?}"
+  );
+  assert!(
+    holders.iter().any(|asked| *asked > 0),
+    "a holder was asked to hold for the owner's next entry: {holders:?}"
+  );
+  assert!(
+    declined[0] <= owners.iter().sum::<u64>()
+      && declined[1] <= holders[0]
+      && declined[2] <= holders[1],
+    "no node declined more holds than its shards were asked: {declined:?} of {owners:?}, {holders:?}"
+  );
+}
+
 /// The volume of `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume` before its burst. Do: write
 /// volume `id` through `attachment` with half a MiB of base files, live-ship it, and write it once more, its log's first
 /// entry then the whole state. Expect every write answered at durability and the volume live-shipped.
@@ -25410,6 +25516,108 @@ fn a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_gr
       at_head: Ok(b"hello world!?".to_vec()),
     },
     "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
+/// A-412 (§4.16 "Apply on holders"; the bug record of 2026-11-18 on a holder behind its own records): a holder whose
+/// replica trails a version a takeover committed to it again through the register path, without its inputs, catches up
+/// from its own ledger, fetching the inputs from the new owner, and recomputes the next version. Do: three nodes at
+/// `f = 1`; on a, a green advanced to version 2 and recomputed by both holders; the holder rendezvous does not rank first
+/// for the green then withholding every merge record and refusing every content put, so version 3 commits at a and the
+/// successor alone; a dies; the successor adopts version 3 and commits it again to both survivors, the other holder
+/// taking the record and not its inputs; the faults lifted, version 4 is submitted on the successor. Expect version 4 to
+/// commit with the other holder, the only other member, and to be recomputed there, the other holder having fetched
+/// version 3's inputs. Before, the other holder's replica at 2 answered version 4 out of order for good, so version 4
+/// never reached its quorum.
+#[test]
+fn a_holder_behind_its_own_records_after_a_takeover_fetches_their_inputs_and_takes_the_next_version()
+ {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "behind-its-records", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + other_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+      refuse_work_catalogs: false,
+    })
+    .expect("the other holder's refusals install");
+  commit_version(&mut client, work, (11, "!"), 3);
+  let successor_at_three = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + successor_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(3))
+    },
+  );
+  let other_at_death = daemons[1 + other_index]
+    .merge_holder_state(green)
+    .map(|state| state.version);
+
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 3)
+  });
+  daemons[other_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .expect("the other holder's refusals lift");
+  let next = submit_next_on_successor(&daemons, successor_index, other_index, green);
+  let counted = daemons[other_index].refusals_on_every_shard();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let counted = counted.expect("the other holder's counters are read");
+  let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(successor_at_three, "the successor recomputed version 3");
+  assert_eq!(
+    other_at_death,
+    Ok(Some(2)),
+    "the other holder was one version behind when the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor placed the taken-over green at version 3"
+  );
+  assert!(
+    next,
+    "version 4 committed with the other holder and was recomputed there (out of order {}, fetches begun {}, inputs fetched {})",
+    count_of("merge.out_of_order"),
+    count_of("merge.catch_up.begun"),
+    count_of("merge.catch_up.fetched"),
+  );
+  assert!(
+    count_of("merge.catch_up.fetched") >= 1,
+    "the other holder fetched version 3's inputs from the successor"
   );
 }
 

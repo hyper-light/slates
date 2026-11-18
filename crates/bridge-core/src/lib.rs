@@ -470,7 +470,9 @@ pub trait Bridge {
   /// FUSE resolves node id 1 to it; NFS mints the export's root file handle from it.
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError>;
   /// Whether an effect a client keeps across a restart waits for the volume's next publication
-  /// ([`slates_vfs::volume::Volume::awaits_publication`]): a transport's reply then waits for the owner's barrier (D-18).
+  /// ([`slates_vfs::volume::Volume::awaits_publication`]), or a write this bridge took was not kept by the write log
+  /// its transport keeps writes in (A-410, [`VolumeBridge::logging_writes`]): a transport's reply then waits for the
+  /// owner's barrier (D-18).
   fn awaits_publication(&self) -> bool;
   /// Whether `cx` may change this volume at all (`ReadOnly` for an attachment that may read but not write or a
   /// snapshot's view, `NotPermitted` for one with no rights or of another volume), asked before a transport grants
