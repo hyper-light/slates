@@ -30344,7 +30344,9 @@ work_home,observe}.rs` (`observe::held_to_this_build` shared with the room rule)
   `an_overdue_told_wait_backs_the_bound_off_to_the_failover_delay_and_a_told_one_ends_it` (`crates/server/src/told.rs`,
   host-independent: the learner over scripted waits). The told wait itself runs only where FUSE mounts do (Linux): the
   FUSE told suite, the guest device's and the Shards stream's told counts are filed for main's Linux run.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-8, debug build, `cargo test --locked -p slates-server --lib -- told
+  virtiofs`): 3 of 3, both new tests among them. Red-checked once: with the bound ignoring the waits it measured, the
+  first test fails at its quick waits' bound.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, AUD-29-84's line), `crates/server/src/
 {told,state,daemon,virtiofs,verbs}.rs`.
