@@ -30648,3 +30648,31 @@ daemon}.rs`.
   assertion. The promotion's and the forwarded verbs' fleet flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/verbs.rs`.
+
+### A-442 — An NFSv4.1 callback waits its back channel's learned round trip, backed off after a timeout up to the NFSv4 lease; the told wait and the callbacks share one learner (2026-11-18, built for goal g255; R3's class B, item B-c; RFC 8881 §2.10.6.2, §2.10.6.3, §10.4.5; A-78, A-79, A-425, A-431)
+- **What was there.** Every callback on a session's back channel (the probe that proves it, `nfs::probe_back_channel`,
+  and a delegation's recall, `delegation`) waited one liveness window for the client's reply, then was given up
+  `Timeout` and the back channel marked down, whatever the path to the client measured. RFC 8881 §2.10.6.3 has a client
+  expect a callback's reply "within the average round-trip time", and §2.10.6.2 forbids resending a request on the
+  connection it was sent on, so a give-up before a slow client's reply marks a live back channel down for its client to
+  bind again.
+- **The rule.** Each connection that carries a back channel learns its callbacks' round trips (`callback::Outbox`'s
+  `times`, ending with the connection): a reply, accepted or not, is a sample; a callback that got no reply backs the
+  bound off (Karn's rule, RFC 6298 §5.5). A callback waits that learned bound (`callback::bound_ns`): the round trips'
+  tail plus a liveness window, doubled after each timeout, never backed off past the NFSv4 lease (`nfs::v4_lease_ns`,
+  A-425), since a callback unanswered for a lease leaves the back channel down for its client to bind again and a
+  recalled delegation is revoked at a lease anyway (§10.4.5). A session with no carrier here waits a liveness window.
+  The learner is A-431's, moved into `learned_wait::LearnedWait` and shared by the told wait (per shard) and the
+  callbacks (per connection), so the two rules cannot drift apart.
+- **`send_note`.** Its wait (a note to another shard about a session or a client) was already judged in its target's
+  own time (`xshard::within_shard_time`, A-65); its window is the liveness window every such wait takes, stated where it
+  is made. No change.
+- **Tests.** `a_callback_on_a_slow_back_channel_is_answered_past_one_window` and
+  `a_callback_on_a_dead_back_channel_still_ends_within_its_bound` (`crate::callback`, on a shard: a channel measured at a
+  window and a fifth a round trip answers a callback a window and a half after it was sent; a channel measured quick
+  whose callback is never answered ends `Timeout` within its bound and backs it off), and the learner's own two tests
+  (`learned_wait`, moved from `told`).
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{learned_wait,told,
+callback,nfs,delegation,lib}.rs`.
