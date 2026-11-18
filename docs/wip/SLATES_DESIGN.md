@@ -5901,8 +5901,31 @@ version.
 > the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
 > `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
 > `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
-> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
-> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed then, built by A-315 (below): a forward
+> still queued was given up at its stall budget while its lane moved, so the backlog was cycled once a budget on the
+> control shard.
+
+> **Status (2026-11-18, A-315: a lane's silence is judged in its shard's own time).** A forwarder gave its batch up at
+> the first look past its stall budget. An origin whose control shard was kept off its CPU past a budget woke with its
+> owner's replies unread in its socket, and its waiting forwarders, woken by their timers ahead of the lane's driver,
+> gave those batches up to a live owner. Now a batch quiet for its budget is given up only once a turn of its lane,
+> begun after the silence was first seen, has read the session's own socket empty: the record link's sessions read
+> their own sockets (`Endpoint::client`), so that turn has read everything that reached the socket before. A turn that
+> finds the peer with no session at all counts as one that read it empty, since a dropped session's replies never
+> reach the lane (a survivor's forward to a stopped owner was otherwise held to its failover bound). The shard's
+> waits in its driver (A-292's receiver rule) do not prove it here: the shard waits while another borrower (the link's
+> discovery page) holds the session, and a shard kept busy by other forwards' replies rarely waits at all. A forward
+> still queued, of
+> which nothing was sent, counts its lane's progress as its own (a forward begun, a reply taken, bytes of a reply
+> read), so a backlog that moves is no longer given up and resent once a budget (A-306's owed item). An open forward
+> still counts only its own reply's bytes (the 298 forwards of 2026-11-07). Both are bounded by the failover bound from
+> the forward's first send, which `resolve_and_forward` passes to every send: the lane's progress holds a queued
+> forward only until then, and past it a silence is given up without waiting for the receiver. The judge
+> (`forward_lane::Stall`) is pure and reads no CPU clock and keeps no poll pace, so it holds alike on every platform;
+> loadtest-scale's lane poll clock (`6da9670d`, reverted from the B13 stack) assumed an idle shard's timer fires on
+> time, which Windows' 15.6 ms tick breaks. Tests: the rule's unit and model tests, a queued forward behind a moving
+> lane, and `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (`crates/server/tests/fleet.rs`;
+> `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`).
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -6076,7 +6099,9 @@ peer dials it there, so both ends of every session are computed from the same fi
 disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
 the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
 and the base of the same block, A-277); it serves there while every peer still dials its advertised
-ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+ports, and the mapping between them is the operator's. It announces the advertised ports alone, the record
+plane's too (A-330), since a peer prefers the announcement to the manifest at every later dial: announced at
+its bound port, every redial of a record link went around the mapping. A manifest with fewer than `f + 1` nodes, a
 repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
 the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
@@ -6979,6 +7004,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
 >   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
 >   invariant is judged across whatever takeovers they cause, Continuity from the samples.
+> - **The relay never carried the record plane (fixed 2026-11-18, A-330).** The first gated runs (the integrator: macOS
+>   arm64, main bfc34cace; Linux x86_64 and arm64, 69cd38b22) failed StaleNeverCommits in the three flows that cut a
+>   running owner off: it acknowledged 2,086 (cut both ways), 3,528 (deafened) and 2,412 (muted) writes sent to it
+>   after the cut, each in under a millisecond, until it was taken over. Every one was durable on a candidate (NoLoss
+>   held on the successor), and 41 datagrams toward the owner reached the relay during the cut. A node announced its
+>   record plane at its bound port, so formation's redial of every record link went straight to the peer's own socket,
+>   and only the probes crossed the relay: every relayed flow was vacuous on the plane its writes are made durable on.
+>   The announcement now carries the advertised port, and every relayed flow requires the relay to have carried at least
+>   one record-plane datagram per acknowledged write (`judge_relayed`, its non-vacuity count;
+>   `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -23094,6 +23129,103 @@ Applied in the same change to:
   with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
   owed apart (GAPS).
 
+### A-315 — A forward lane's silence is judged once its shard has read what came, and a queued forward counts its lane's progress until its failover bound (2026-11-18, built for goal g255; A-306's owed item; supersedes loadtest-scale's lane poll clock, `6da9670d`, never on main)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-315), and A-306's status, whose owed item this builds.
+- `crates/server/src/forward_lane.rs`: `Stall` (pure, with `Heard`, `Verdict`, `GaveUp` and `Noted`), the lane's
+  `progress_ns` (a forward begun, a reply taken, bytes of a reply read), `turns_begun` and `drained_turn` (`begin_turn`,
+  `mark_drained`: the latest turn that read the session's own socket empty, `left_empty`; `note_sessionless_turn`: a
+  driving turn that found the peer with no session at all), `look_in` and `answer_with`
+  (the view and the reply's bookkeeping apart from the shard and the session), `failover_bound_from`; the counts
+  `fleet.forward.given_up_silent`, `fleet.forward.given_up_at_bound`, `fleet.forward.silence_awaited_receiver`,
+  `fleet.forward.held_by_lane` and `fleet.forward.sessionless_turn`; the module doc. `crates/server/src/fleet.rs`
+  (`forward_batch_over_leader_session` takes the bound; `forward_over_leader_session` passes one from its own send) and
+  `crates/server/src/verbs.rs` (`resolve_and_forward` passes its failover bound, from the first send, to every send
+  through `forward_once`).
+  `crates/transport/src/endpoint.rs`: `Endpoint::datagrams_received`, the datagrams an established session took, by
+  which a lane's turn knows it read the socket empty (stream bytes would not tell: a datagram of acknowledgements alone
+  consumes none), and `Endpoint::reads_its_own_socket`, since only a session that reads its own socket proves the
+  socket empty by an empty read.
+- Tests: in `forward_lane.rs`, `a_silence_is_given_up_only_once_a_turn_begun_after_it_reads_the_socket_empty`,
+  `progress_while_a_silence_awaits_its_receiver_starts_the_quiet_again`,
+  `a_queued_forward_counts_its_lanes_progress_until_its_failover_bound`,
+  `a_silence_past_its_bound_is_given_up_without_its_receiver`,
+  `a_batch_whose_own_forwards_progress_is_never_given_up_at_its_bound`,
+  `a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget` and the model test
+  `a_stall_judges_every_history_as_the_rule_reads_it`; in `crates/server/tests/fleet.rs`,
+  `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`, and
+  `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages`, which failed without the sessionless turn.
+- GAPS: the load test's "dead record session" entry (A-306's open item, closed) and the R3 debt of
+  `LIVENESS_BUDGET_NS` (class B, the forward lane). The bug record:
+  `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`.
+- **What was there.** A forwarder looked at its batch whenever it woke, and gave it up once none of its forwards had
+  progressed for its stall budget on the wall clock: a liveness budget plus the path's measured round-trip tail. Two
+  things counted against a live owner. An origin whose control shard was kept off its CPU past a budget woke with the
+  owner's replies unread in its socket, and the waiting forwarders, woken by their timers, ran ahead of the lane's
+  driver, which reads one datagram a turn, and gave those batches up. And a forward still queued behind the session's
+  stream credit, of which nothing had been sent, was given up at its budget while its lane moved, and resent: behind a
+  256-client burst, 17,000 to 52,000 batches a run cycled through the control shard that way (A-306).
+- **The rule.** A batch is quiet from the latest of its start, its own forwards' progress and, while one of them is
+  still queued, its lane's progress, the last counted only up to the failover bound from the forward's first send. A
+  batch quiet for its stall budget before the bound is given up only once a driving turn of its lane, begun after the
+  silence was first seen, has read the session's own socket empty (`forward_lane::left_empty`: its drive took no
+  datagram, or one more receive that does not wait took none, counted by `Endpoint::datagrams_received`;
+  `Lane::drained_turn`) or has found the peer with no session at all (`forward_lane::note_sessionless_turn`), looking
+  again every poll interval (`HEARTBEAT_NS / POLL_PER_PERIOD`); progress meanwhile ends
+  the confirmation, and a later silence is confirmed afresh. Past the bound a quiet batch is given up at once. A batch
+  whose own forwards progress is never given up: a long read stalls only when no byte of it comes for a budget, never
+  at a deadline.
+- **Why.** The record link's sessions read their own sockets (`Endpoint::client`), so a turn that reads its socket
+  empty has read every datagram that reached it before, its settles putting the replies into the lane; begun after the
+  silence was first seen, it has read everything that came before the silence was judged. Turns are ordered by the
+  lane's own count (`Lane::turns_begun`), exact on the one shard thread, where clock readings within one step need not
+  be. A lane whose peer has no session at all has nothing left to read: a dropped session is never put back
+  (`fleet::return_sessions` drops a late return), so none of its replies reaches the lane, and a forward begun on it is
+  answered unanswered by the next session's settle; one lent to another borrower is not such a lane, since that
+  borrower reads the socket and the lane settles it on the session's return. Without the sessionless turn a survivor's
+  forward to a stopped owner, whose session its link dropped before the forward's silence was seen, was held to its
+  failover bound (`fleet.forward.no_session` and `fleet.forward.given_up_at_bound` 1 each, 3 of 3 runs). Two proofs
+  were tried first, and the CI runs refused both. The control shard's two waits in its driver since the
+  silence (A-292's receiver rule) gave all 7 waiting batches up in 2 of 18 runs of the held-origin test, each run's lane
+  having found its session lent to the link (`fleet.lent_to.link` 1): the shard waits while the link's discovery page
+  holds the session, the lane's replies unsettled. And a turn begun after those waits that took nothing kept a forward
+  its owner never answered open in 2 of 3 runs of `a_silent_forward_gives_up_while_its_session_carries_others` on
+  ubuntu-latest (a session busy with other replies is never found so), while the waits themselves, made the
+  precondition of an empty read, held one past its test's window in 1 of 6 on the merged tree, its shard kept busy by
+  3,035 other replies. The lane's state lives on its shard, so the verdict needs no further look, as A-292's
+  hand-off to a volume's shard does. A queued forward has sent nothing, so its lane moving is the only progress it can
+  make; an open one keeps to its own reply's bytes, since bytes of other forwards' replies kept forwards an owner never
+  answered open for good (the 298 forwards of 2026-11-07). The failover bound is the operator's bound on how long an
+  owner may go unserved, the bound the caller's resends already keep, so nothing here waits past it for a receiver that
+  never waits (always busy) or a lane that never begins a forward.
+- **Why not loadtest-scale's poll clock.** `6da9670d` counted the quiet on a clock each lane's driving turns credited:
+  a turn's wall time up to the larger of a 10 ms poll pace and the CPU its shard ran. It assumed an idle shard's timer
+  fires on time. Windows' completion-port wait keeps the system's 15.6 ms tick (`crates/rt/src/iocp.rs` asks no finer
+  timer), and Windows charges a thread's CPU time a tick at a time, so by the code an idle origin's clock ran at about
+  two thirds of the wall there. The test that wants a forward resent at its budget saw none resent, 5 of 5 on
+  `windows-latest` (`an_unanswered_forward_is_sent_again_within_the_takeover_bound`, run 44230887960), and it was
+  reverted from the B13 stack (`b458723c9`). The receiver's waits are counted the same way on every platform.
+- **Evidence.** `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (eight reads through b, a's
+  answers delayed half a budget, b's control shard held 1.5 budgets once the forwards were begun), on GitHub's
+  ubuntu-latest, macos-latest and windows-latest runners (2026-11-18): main's lane failed 9 of 9, each run giving up
+  and resending 7 of the 8 batches (run 44253485264); A-315 as landed passed 16 of 16 on ubuntu-latest and
+  windows-latest on the merged tree, none given up, 6 or 7 silences held for the receiver a run (run 44260700333), with
+  the lane's other promises kept (the silent forward given up while others flow, 12 of 12; a forward resent at its
+  budget, 6 of 6; the dead-session tests, 6 of 6 each). Each of six mutations of the rule turns a unit test red (run
+  44260700876). The server suite found the sessionless case before landing:
+  `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages` failed 8 of 8 on ubuntu-latest without the
+  sessionless turn, its serve poll lasting 10.01 s, the bound (run 44269560693), where main passed it 8 of 8 (run
+  44269560657); with it, 8 of 8, and 4 of 4 on windows-latest where it had failed 3 of 3 (runs 44271632046 and
+  44271632037), the lane's other tests unchanged, and sixteen runs a side served its volumes in 2.11 to 3.13 s, main
+  in 2.15 to 3.37 s (runs 44272364924 and 44272413371). With A-317 over it, the held-origin test passed 3 of 3 on each
+  of the three runners, macos-latest among them, and the takeover test 6 of 6 on each (run 44273659893). The bug
+  record has the forms that did not land.
+- **Cost.** A look reads the lane's two turn counts. A silence awaiting its receiver looks again every poll interval
+  while it lasts, and a turn that read a datagram makes one more receive that does not wait. The lane's progress is one
+  stored instant per begin, reply and byte-bearing turn.
+- **Owed.** The supervisor's runs of the fleet suite under load and on Windows, and the load test's count of batches
+  given up behind a burst (A-306's 17,000 to 52,000 a run), which this should bring near none.
+
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
@@ -24115,6 +24247,31 @@ Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 
 - **What it does not change.** The wedged and starved judgments (wall time, the budget), the anchor's lapse judgment,
   the beat, and a release build's window (its chain runs at machine code's speed, so the budget stands). Under Miri, which
   runs no machine code and has no thread clock, the watchdog judges by the wall as before.
+
+### A-330 — A node announces its record plane where it advertises it, never at its bound port (2026-11-18, goal g229, the chaos flows' first runs; completes A-277)
+Applied in the same change to: §4.8 "Deployment" (what a node announces), §4.10's chaos status, GAPS ("Chaos from
+outside the processes"), and the code below.
+- **What was there.** A-277 let a node bind elsewhere than it advertises and stated that it "still announces only" its
+  advertised address. Its discovery announcement carried the advertised IP with the port its record socket was bound
+  to (`fleet::run_membership`, `record_socket.local_addr()`), and a peer prefers an announced address to its manifest
+  at every dial (`fleet::resolve_peer_address`). Formation redials every record link once, when the peer's fresh
+  member id is learned, so from then on every record link went to the peer's bound socket directly.
+- **What it broke.** Behind the chaos harness's fault relay, only the probes crossed the relay: the owner partition
+  flows' owners lost their leases and were taken over, but went on shipping and acknowledging writes over record links
+  the relay never saw (2,086, 3,528 and 2,412 writes acknowledged after their cuts, each durable on a candidate), and
+  every relayed flow's faults missed the record plane. Behind a real port mapping, a record link's redial would dial
+  the advertised host at the inner port, which the mapping does not forward, and never come back.
+- **The rule.** A node announces each plane at the address its peers dial: the probe plane at its advertised address,
+  the record plane at the advertised block's next port (`FleetTransport::advertise_record`, set by the plan from the
+  advertised block, never the bind). Nothing a node publishes to a peer is read from a socket it bound.
+- **The failing test.** `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+  (`crates/server/tests/fleet.rs`): a three-node fleet whose candidates each sit behind a port mapping in the test; a
+  live write made while both mappings' record planes are cut must not be acknowledged, and must be once they heal.
+  With the bound port announced again, the owner redials around the mappings and the write is acknowledged while cut.
+- **The flows' non-vacuity.** Every relayed flow of `live_chaos.rs` now requires its relay to have carried at least
+  one record-plane datagram per acknowledged write (`judge_relayed`, over the relay's per-path record count): a stream
+  sends its next write only once the last is answered, so each acknowledgement is a distinct answer from a candidate.
+- Record: `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`.
 
 ### A-316 — A Shards stream outlives its daemon: a resync channel made at the attach, its token held with the daemon's end by the anchor, and a successor that serves the attachment on a fresh stream and hands the device its end (2026-11-18, built for goal g268, what Shards needs from slates; Linux)
 
