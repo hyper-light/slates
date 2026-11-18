@@ -216,10 +216,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// g076a; the same day). 37: [`mount::available`] on Windows answers [`MountMissing::MountManager`] where the machine
 /// does not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, which the driver reads at every mount,
 /// A-369); until then such a machine was told it could mount, and every mount there was refused afterwards (A-417; the
-/// same day).
+/// same day). 38: [`role::check_fleet`] reads a fleet manifest and plans its node exactly as the node's anchor and
+/// daemon do at their start, answering a [`role::FleetCheck`] or the start's own refusal, for a starter that writes the
+/// manifest itself (kiln's runners as a fleet, kiln goal 95101ef3; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 37;
+pub const CONTRACT: u32 = 38;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

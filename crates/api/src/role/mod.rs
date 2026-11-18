@@ -32,6 +32,7 @@ pub(crate) mod anchor;
 pub(crate) mod daemon;
 mod dumps;
 pub(crate) mod fleet;
+pub use fleet::{FleetCheck, check_fleet};
 // A-232 step 5: the liveness bound against this crate's own anchor (the test binary re-invoked as the anchor and
 // daemon). Unix only: the Windows anchor hands its daemon an explicit handle list, so the roles' shared standard input
 // is owed there.

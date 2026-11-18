@@ -1303,6 +1303,7 @@ dependencies = [
  "aws-lc-rs",
  "blake3",
  "libc",
+ "rcgen",
  "rustix",
  "serde_json",
  "slates-anchor",

@@ -851,8 +851,12 @@
 >   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 34) with the move of a clone of a captured
 >   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
 >   on its new owner and destroys the captured snapshot once the old owner let the clone go.
-> - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
->   seeds from kiln's runner directory); kiln's relocation of an agent with its volume (detach, move, attach on the
+> - **Kiln's runners as members (2026-11-18, kiln goal 95101ef3, its pieces K1-K3):** each runner's node key and its
+>   certificate from kiln's CA naming the fleet and the runner's failure domain (K1), the runners that join found
+>   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
+>   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
+>   `StartSpec.fleet` once `role::check_fleet` (contract 38) read the manifest it wrote as its start will (K3).
+> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
 >   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
