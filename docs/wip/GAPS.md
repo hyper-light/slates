@@ -3667,7 +3667,16 @@
 >   window on the wall, then `Overloaded`, or the asks answered unanswered, with the target alive and stepping; now the
 >   room wait goes on while the target steps or starves, judged by its step count, since a shard drains its channel at
 >   every step, and the owner's answer by `within_shard_time`: `xshard::given_room_in_shard_time`,
->   `call_in_shard_time_given_room`, `a_part_waits_for_room_while_its_target_steps`). Owed in class A: AC-3.3's told
+>   `call_in_shard_time_given_room`, `a_part_waits_for_room_while_its_target_steps`); the reaper's cleanup calls on each
+>   shard (a write-back, a client's presentations, its attachments' removal, its maps let go) and a granted landing's
+>   target-lease take, its compensation, its renewal and its release, and the audit append a landing's or a
+>   presentation's reply waits on (A-432, 2026-11-18, g251: each waited its budget on the wall, so a busy shard deferred
+>   the reap `Overloaded` or refused the take with the shard alive and working; now `call_in_shard_time` and
+>   `task_in_shard_time`, `a_reaps_calls_wait_for_a_shard_that_works_past_their_first_window`,
+>   `a_lease_take_waits_for_a_control_shard_that_works_past_its_term`). Kept on the wall by their reason, stated beside
+>   each: a live log's claim admissions (inside the peer's one-at-a-time serve, the owner asking again at its period),
+>   the claim reconciliation and re-admission (the record period's, before its materializations), and the live
+>   dispatch's wait (its lanes bounded by the live budget, its answer unread). Owed in class A: AC-3.3's told
 >   wait (`told::TOLD_WAIT_NS`, half a window on the wall while a FUSE mount's notifier and its kernel are told) and the
 >   park bound of a verb waiting on a green's owner (`work_home`, the lease bound on the wall). Class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch

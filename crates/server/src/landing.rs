@@ -1092,9 +1092,10 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
     if finished.is_some() {
       append_owed_audit(shard, term).await;
     }
-    // The lease goes before the reply, so the caller's next landing into the target finds it free.
+    // The lease goes before the reply, so the caller's next landing into the target finds it free: waited in the control
+    // shard's own time (A-432), so a control shard alive and busy is waited for and the lease never left to its term.
     let released = !held
-      || crate::xshard::call_within(
+      || crate::xshard::call_in_shard_time(
         shard,
         control,
         move |s| release_target_lease(s, &key, holder),
@@ -1410,7 +1411,9 @@ async fn keep_lease_alive(held: &mut impl KeptLease, ask: LeaseAsk, key: &str) {
   }
   let target = key.to_owned();
   let deadline = now.saturating_add(ask.term);
-  let renewed = crate::xshard::call_within(
+  // Waited in the control shard's own time (A-432): its answer is the renewal or a typed refusal, a take run past its
+  // deadline refusing itself (`take_target_lease`), so a busy control shard is waited for, never misread as gone.
+  let renewed = crate::xshard::call_in_shard_time(
     ask.shard,
     ask.control,
     move |s| take_target_lease(s, target, ask.holder, ask.term, deadline),
@@ -2432,10 +2435,12 @@ struct LeaseAsk {
   deadline: u64,
 }
 
-/// Takes the target lease `key` from the control shard for a landing attempt, waiting at most one term. A
-/// take whose answer does not come back in that time is compensated — the attempt's own lease released,
-/// should the take have landed; a take still queued refuses itself past the deadline — so a lease outlives
-/// an attempt that never learned of it only when the compensation fails as well, and then by its term.
+/// Takes the target lease `key` from the control shard for a landing attempt, waiting in the control shard's own time
+/// (A-432): a term, then on while the shard works or waits for a CPU, up to a term of its CPU, so a busy control shard
+/// answers the take or refuses it typed (a take run past its deadline refuses itself), where a wall term's end left the
+/// outcome unknown. A take whose answer still does not come (the shard stopped, or ran its budget) is compensated — the
+/// attempt's own lease released, should the take have landed — so a lease outlives an attempt that never learned of it
+/// only when the compensation fails as well, and then by its term.
 async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease, Refusal> {
   let LeaseAsk {
     shard,
@@ -2445,7 +2450,7 @@ async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease
     deadline,
   } = ask;
   let asked = key.clone();
-  if let Some(taken) = crate::xshard::call_within(
+  if let Some(taken) = crate::xshard::call_in_shard_time(
     shard,
     control,
     move |s| take_target_lease(s, asked, holder, term, deadline),
@@ -2455,7 +2460,7 @@ async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease
   {
     return taken;
   }
-  let compensated = crate::xshard::call_within(
+  let compensated = crate::xshard::call_in_shard_time(
     shard,
     control,
     move |s| release_target_lease(s, &key, holder),
@@ -3947,10 +3952,12 @@ pub(crate) fn resend_stuck_audit(state: &mut ShardState) {
   }
 }
 
-/// Sends what this shard's partition owes the audit to the control shard and waits for it, at most `budget_ns` (A-265):
-/// a presentation's or a granted landing's completion owed it, and its reply waits on it, so the caller's next `audit`
-/// reads it. Whether everything owed when it was called is appended; counted when not, and then still owed, durable,
-/// for the next send.
+/// Sends what this shard's partition owes the audit to the control shard and waits for it (A-265): a presentation's or a
+/// granted landing's completion owed it, and its reply waits on it, so the caller's next `audit` reads it. Waited in the
+/// control shard's own time (A-432): `budget_ns`, then on while the shard works or waits for a CPU, up to `budget_ns` of
+/// its CPU; it waited `budget_ns` on the wall, so a busy control shard left the record owed and the reply went without
+/// it. Whether everything owed when it was called is appended; counted when not, and then still owed, durable, for the
+/// next send.
 async fn append_owed_audit(shard: u16, budget_ns: u64) -> bool {
   let Some(Some(batch)) = crate::state::with_state(|s| owed_batch(s)) else {
     return true;
@@ -3959,7 +3966,7 @@ async fn append_owed_audit(shard: u16, budget_ns: u64) -> bool {
     crate::state::with_state(|s| crate::verbs::shard_of_partition(s, AUDIT_PARTITION)).flatten();
   let answered = match control {
     Some(control) => {
-      crate::xshard::call_within(
+      crate::xshard::call_in_shard_time(
         shard,
         control,
         move |s| append_audit_batch(s, batch),
@@ -4382,6 +4389,89 @@ mod tests {
       let taken = take_target_lease(state, target(2), 11, LONG_TERM_NS, deadline).unwrap();
       assert_eq!(taken.holder, 11);
     });
+  }
+
+  /// Shape: the term a take is waited in the busy-control test: a tenth of a second, short beside the control shard's
+  /// busy poll.
+  const WAIT_TERM_NS: u64 = 100_000_000;
+  /// Shape: the control shard's one busy poll on the wall: three terms, so a take waited one term on the wall gives up.
+  const BUSY_NS: u64 = 3 * WAIT_TERM_NS;
+  /// Shape: how long the test thread waits for the take's answer: ten busy polls.
+  const ANSWER_WAIT_NS: u64 = 10 * BUSY_NS;
+
+  /// R3's class A (A-432). Do: on a two-shard daemon, hold the second shard, standing for the control shard, in one poll
+  /// for three terms of wall time, on its CPU a fifth of it (a busy or starved shard); from the first shard take a
+  /// target's lease there with a term's window and the take's own deadline far, so only the wait decides; then take the
+  /// target for another attempt. Expect: the first take answered with its lease, after more than a term of waiting, and
+  /// the second refused `LandingLeaseHeld` by the first. The take waited one term on the wall, so it was compensated and
+  /// refused `Overloaded` with the control shard alive and working.
+  #[test]
+  fn a_lease_take_waits_for_a_control_shard_that_works_past_its_term() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let origin = state.shard;
+      let control = state
+        .shards
+        .iter()
+        .copied()
+        .find(|&shard| shard != origin)
+        .unwrap();
+      let deadline = far(state);
+      // The busy poll goes first on the control shard's channel, so the take waits behind it.
+      let busy = crate::xshard::call_on(origin, control, || {
+        crate::daemon::hold_busy(BUSY_NS);
+        Some(())
+      })
+      .unwrap();
+      drop(busy);
+      let take = slates_rt::futures::spawn(async move {
+        let started = std::time::Instant::now();
+        let ask = super::LeaseAsk {
+          shard: origin,
+          control,
+          holder: 1,
+          term: WAIT_TERM_NS,
+          deadline,
+        };
+        let taken = super::acquire_target_lease(ask, target(3)).await;
+        let waited = started.elapsed();
+        let second = crate::xshard::call_in_shard_time(
+          origin,
+          control,
+          move |s| take_target_lease(s, target(3), 2, WAIT_TERM_NS, deadline),
+          WAIT_TERM_NS,
+        )
+        .await;
+        let _ = sent.send((
+          taken.map(|lease| lease.holder),
+          waited,
+          second.map(|again| again.map(|lease| lease.holder)),
+        ));
+      })
+      .unwrap();
+      slates_rt::futures::detach(take).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_nanos(ANSWER_WAIT_NS));
+    daemon.stop();
+    let (taken, waited, second) = answer.expect("the take answered");
+    println!(
+      "a take behind a busy poll of {BUSY_NS} ns: {taken:?} after {waited:?}; another attempt's: {second:?}"
+    );
+    assert_eq!(
+      taken,
+      Ok(1),
+      "the take on a control shard alive and working was not answered (after {waited:?})"
+    );
+    assert!(
+      waited > std::time::Duration::from_nanos(WAIT_TERM_NS),
+      "the take ended within one term ({waited:?}), before the control shard's busy poll did"
+    );
+    assert_eq!(
+      second,
+      Some(Err(Refusal::LandingLeaseHeld { holder: 1 })),
+      "the first take holds the target"
+    );
   }
 
   /// §4.15 step 4, ban 8 (AUD-29-03): the control shard holds no more lease records than the leases live at

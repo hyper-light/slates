@@ -6527,8 +6527,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_daemon_configured, audit_on_shard, audit_on_shard_configured, observe_first,
-  test_profile,
+  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
+  audit_on_shard_configured, hold_busy, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -6726,6 +6726,44 @@ mod tests {
     let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     configure(&mut config);
     audit_daemon_with(&profile, config, instance)
+  }
+
+  /// A running audit daemon of `shards` shards, bootstrapped, for a test of one shard's call to another (a wait judged in
+  /// its target's own time, A-432); the test stops it.
+  pub(crate) fn audit_daemon_of(shards: u16) -> super::Daemon {
+    let profile = test_profile();
+    static NEXT_OF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-of-{}-{}",
+      std::process::id(),
+      NEXT_OF.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    audit_daemon_with(&profile, config, instance)
+  }
+
+  /// Shape: a busy poll's cycle ([`hold_busy`]): ten milliseconds.
+  const BUSY_CYCLE_NS: u64 = 10_000_000;
+  /// Shape: the part of each cycle a busy poll runs on its CPU: a fifth, so the shard runs about a fifth of the poll's
+  /// wall time, as a shard starved by its neighbours does (`crates/server/tests/cross_shard_wait.rs`'s control shard).
+  const BUSY_ON_CPU_NS: u64 = BUSY_CYCLE_NS / 5;
+
+  /// Holds the calling shard in one poll for `wall_ns`: a fifth of each cycle spinning on its CPU, the rest asleep, so the
+  /// shard makes progress at a fifth of the wall's pace while every message on its channel waits for the poll's end (a
+  /// busy or starved target, which a wait judged in its own time waits for, A-432).
+  // The busy poll stands for a shard held off its CPU most of each cycle: it must sleep on the shard's thread.
+  #[allow(clippy::disallowed_methods)]
+  pub(crate) fn hold_busy(wall_ns: u64) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_nanos(wall_ns) {
+      let cycle = std::time::Instant::now();
+      while cycle.elapsed() < std::time::Duration::from_nanos(BUSY_ON_CPU_NS) {
+        std::hint::spin_loop();
+      }
+      std::thread::sleep(std::time::Duration::from_nanos(
+        BUSY_CYCLE_NS - BUSY_ON_CPU_NS,
+      ));
+    }
   }
 
   /// Runs `history` on `daemon`'s first shard (an [`audit_daemon`]'s one), as [`audit_on_shard`] does, leaving the
