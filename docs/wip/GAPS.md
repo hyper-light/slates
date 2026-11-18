@@ -18572,8 +18572,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
   owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
   `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
-  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute
-  bits); and
+  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
+  own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
+  under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:
+  Linux's `FICLONE` and macOS's `clonefile`, duplicates across batches, and the measured gain); A-262's landing half
+  (the volume's other attribute bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

@@ -27,6 +27,9 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+// The regions a ReFS block clone shares a file in (A-445): the Windows writer's, and pure, so its tests run on every host.
+#[cfg(any(windows, test))]
+mod block_clone;
 #[cfg(test)]
 mod captured_tests;
 pub mod engine;
