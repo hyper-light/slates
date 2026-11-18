@@ -17520,9 +17520,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     the refill test compares the whole range (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
   - **Verified:** this Mac, Shards 25 of 25; fedora, the three tests green, and all three red with `read_whole` cut to
     one call.
-  - **Open, siblings found by the sweep:** WinFsp's host answers a Windows read with one bridge read, so a read past
-    256 KiB returns short mid-file, which Windows may zero-fill on a paging read (to measure on Windows); FSKit's shim
-    does the same.
+  - **Siblings found by the sweep:** WinFsp's host answered a Windows read with one bridge read, so a read past
+    256 KiB returned short mid-file, which a program takes for the file's end and Windows zero-fills on a paging read.
+    **Fixed 2026-11-18 (g079, goal 83):** the host answers a read through `read_whole`, in as many bridge reads as the
+    cap takes, stopping short only at the file's end. The failing test is
+    `a_read_longer_than_the_bridges_cap_returns_every_byte_asked_for` (`crates/cli/tests/winfsp.rs`: one unbuffered
+    1 MiB read from a longer file's start; it reads 256 KiB without the fix). It is a live-drive test on CI's Windows
+    lanes, filed for main's run (`run-requests.md`); `cargo xwin check` is clean. Record:
+    `docs/bugs/2026-11-18-a-winfsp-read-past-the-bridges-cap-came-back-short.md`. FSKit's shim does the same and is
+    not shipped: slates never mounts through FSKit.
 
 - **The direct map on macOS (A-173, G-direct step 4, 2026-10-25): built, and proven on this Mac by a real client.**
   - **What:** a `MapRead` on macOS is answered `MapOffered`. The file's copy is a shared-memory object whose name went
