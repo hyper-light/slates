@@ -1634,7 +1634,8 @@ fn the_daemon_is_observed_through_the_library() {
   daemon.stop();
 }
 
-/// The Shards route by use (§4.6, A-161): the stream end the library hands a VMM serves the volume.
+/// The Shards route by use (§4.6, A-161): the stream end the library hands a VMM serves the volume, and offers its guest
+/// DAX.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod shards {
   use std::io::{Read, Write};
@@ -1652,6 +1653,24 @@ mod shards {
   const MAJOR: u32 = 7;
   const MINOR: u32 = 31;
   const MAX_READAHEAD: u32 = 128 << 10;
+  /// Format: `FUSE_MAP_ALIGNMENT` and `FUSE_INIT_EXT` in `fuse_init_in.flags`, and `FUSE_HAS_INODE_DAX` in its `flags2`,
+  /// which `FUSE_INIT_EXT` announces: what a `dax=inode` guest offers (Linux `include/uapi/linux/fuse.h`).
+  const INIT_MAP_ALIGNMENT: u32 = 1 << 26;
+  const INIT_EXT: u32 = 1 << 30;
+  const INIT2_HAS_INODE_DAX: u32 = 1 << 1;
+  /// Format: the unused words that end an extended `fuse_init_in` after `flags2` (eleven `u32`s).
+  const INIT_UNUSED_BYTES: usize = 44;
+  /// Format: where `fuse_init_out` keeps its `flags`, its `max_pages` and `map_alignment` pair, and its `flags2`, past
+  /// the reply's header.
+  const INIT_OUT_FLAGS_AT: usize = 12;
+  const INIT_OUT_ALIGNMENT_AT: usize = 28;
+  const INIT_OUT_FLAGS2_AT: usize = 32;
+  /// Format: `fuse_attr.flags`' `FUSE_ATTR_DAX`, the guest maps this file with DAX, and where it lies in a LOOKUP reply
+  /// (`fuse_entry_out`: 40 bytes before its `fuse_attr`, whose last word is `flags`, at 84).
+  const ATTR_DAX: u32 = 1 << 1;
+  const ENTRY_ATTR_FLAGS_AT: usize = OUT_HEADER_LEN + 40 + 84;
+  /// Shape: a file of a DAX range and a half (`FUSE_DAX_SZ`, the range a guest maps a file in): one the stream marks.
+  const LARGE_BYTES: u64 = slates_mem::DAX_RANGE_BYTES + slates_mem::DAX_RANGE_BYTES / 2;
 
   /// Shards' fs device as the end's holder speaks it: a little-endian length, then the FUSE request; one reply frame
   /// back.
@@ -1687,26 +1706,78 @@ mod shards {
     -i32::from_le_bytes(reply[4..8].try_into().unwrap())
   }
 
-  /// AC-5.12 / T-5.14 (A-278; §4.6, the Shards route, A-161): do serve a volume holding a file over the library's Shards stream, then
-  /// speak FUSE through the end as Shards' device does; expect INIT answered and the file found by LOOKUP, a name the
-  /// volume lacks answered `ENOENT` — the end serves that volume and no host mount is involved.
+  /// Whether a successful LOOKUP reply marks its file `FUSE_ATTR_DAX`.
+  fn marked_dax(reply: &[u8]) -> bool {
+    assert_eq!(errno(reply), 0, "the LOOKUP is answered");
+    let flags = &reply[ENTRY_ATTR_FLAGS_AT..ENTRY_ATTR_FLAGS_AT + 4];
+    u32::from_le_bytes(flags.try_into().unwrap()) & ATTR_DAX != 0
+  }
+
+  /// AC-5.12 / T-5.14 (A-278; §4.6, the Shards route, A-161; Shards part 3, the DAX offer): do serve a volume holding a
+  /// small file and one of a DAX range and a half over the library's Shards stream, then speak FUSE through the end as
+  /// Shards' device does, its `INIT` offering the DAX flags a `dax=inode` guest offers. Expect INIT answered keeping
+  /// `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` with the host's page as the alignment, both files found by LOOKUP,
+  /// the large one marked `FUSE_ATTR_DAX` and the small one not, and a name the volume lacks answered `ENOENT`: the end
+  /// serves that volume, offers its guest DAX per file, and no host mount is involved.
   #[test]
   fn a_shards_stream_end_serves_the_volume_it_was_made_for() {
     let (daemon, mut instance) = grouped("shards");
-    let volume = provision(&mut instance, &VolumeSpec::empty("guest", ROOM));
+    let large = vec![0x5a_u8; usize::try_from(LARGE_BYTES).unwrap()];
+    let volume = provision(
+      &mut instance,
+      &VolumeSpec::empty("guest", ROOM + LARGE_BYTES),
+    );
     write_file(&mut instance, volume, "/present", b"through the stream\n");
+    write_file(&mut instance, volume, "/large", &large);
     let served = instance.serve_shards(volume, Intent::Write, None).unwrap();
     let stream = UnixStream::from(served.stream);
     stream.set_read_timeout(Some(START_WAIT)).unwrap();
     let mut device = Device { stream, unique: 0 };
     let mut init = Vec::new();
-    for word in [MAJOR, MINOR, MAX_READAHEAD, 0] {
+    for word in [
+      MAJOR,
+      MINOR,
+      MAX_READAHEAD,
+      INIT_MAP_ALIGNMENT | INIT_EXT,
+      INIT2_HAS_INODE_DAX,
+    ] {
       init.extend_from_slice(&word.to_le_bytes());
     }
-    assert_eq!(errno(&device.ask(Opcode::Init, 0, &init)), 0, "INIT");
+    init.extend_from_slice(&[0u8; INIT_UNUSED_BYTES]);
+    let answered = device.ask(Opcode::Init, 0, &init);
+    assert_eq!(errno(&answered), 0, "INIT");
+    let word = |at: usize| {
+      u32::from_le_bytes(
+        answered[OUT_HEADER_LEN + at..OUT_HEADER_LEN + at + 4]
+          .try_into()
+          .unwrap(),
+      )
+    };
+    assert_ne!(
+      word(INIT_OUT_FLAGS_AT) & INIT_MAP_ALIGNMENT,
+      0,
+      "FUSE_MAP_ALIGNMENT kept"
+    );
+    assert_ne!(
+      word(INIT_OUT_FLAGS2_AT) & INIT2_HAS_INODE_DAX,
+      0,
+      "FUSE_HAS_INODE_DAX kept"
+    );
+    let page = u32::try_from(rustix::param::page_size()).unwrap();
+    assert_eq!(
+      word(INIT_OUT_ALIGNMENT_AT) >> 16,
+      page.trailing_zeros(),
+      "the host's page as the alignment"
+    );
     let found = device.ask(Opcode::Lookup, ROOT, b"present\0");
-    assert_eq!(errno(&found), 0, "LOOKUP of the volume's file");
-    assert!(found.len() > OUT_HEADER_LEN);
+    assert!(
+      !marked_dax(&found),
+      "the volume's small file is found and not marked"
+    );
+    assert!(
+      marked_dax(&device.ask(Opcode::Lookup, ROOT, b"large\0")),
+      "a file of a range or more is found and marked"
+    );
     let missing = device.ask(Opcode::Lookup, ROOT, b"absent\0");
     assert_eq!(errno(&missing), ENOENT, "a name the volume lacks is ENOENT");
     drop(device);

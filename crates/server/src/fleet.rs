@@ -5326,6 +5326,54 @@ async fn fetch_green_inputs(
   }
 }
 
+/// Counter (A-412): fetches a holder began of the inputs of versions its own ledger holds without them, its replica behind
+/// that ledger ([`fetch_ledger_inputs`]). Format: a refusal name in the daemon's status report.
+const CATCH_UP_BEGUN: &str = "merge.catch_up.begun";
+/// Counter (A-412): inputs such a fetch brought in whole, one a version. Format: a refusal name in the daemon's status
+/// report.
+const CATCH_UP_FETCHED: &str = "merge.catch_up.fetched";
+/// Counter (A-412): such a fetch whose task the shard's arena refused; the record's next shipment begins it again. Format:
+/// a refusal name in the daemon's status report.
+const CATCH_UP_UNSPAWNED: &str = "merge.catch_up.unspawned";
+
+/// Fetches by identity from `sender`, a merge record's owner, the inputs of the versions of the green `object` this holder's
+/// ledger holds without them (`unheld`, each version and manifest, lowest first), its replica behind that ledger (A-412,
+/// `merge_service::catch_up`): a takeover committed those versions again here through the register path, which carries no
+/// inputs. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
+/// ([`fetch_manifest_into_hold`]); the record's next shipment finds them held and advances the replica. One fetch a green
+/// at a time (`MergeShardState::catching_up`), in a detached task of this shard, each manifest within one live exchange's
+/// budget; it ends at the first manifest not fetched, and the next shipment begins another.
+pub(crate) fn fetch_ledger_inputs(
+  state: &mut ShardState,
+  object: ObjectId,
+  sender: HostId,
+  unheld: Vec<(u64, [u8; 32])>,
+) {
+  if !state.merge.catching_up.insert(object) {
+    return;
+  }
+  state.count(CATCH_UP_BEGUN, 1);
+  let fetching = async move {
+    let budget = live_budget();
+    for (version, manifest) in unheld {
+      if !fetch_manifest_into_hold(object, &[sender], move |_| version, manifest, budget).await {
+        break;
+      }
+      count_refusal(CATCH_UP_FETCHED);
+    }
+    let _ = state::with_state_counted(|s| s.merge.catching_up.remove(&object));
+  };
+  match futures::spawn(fetching) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => {
+      state.merge.catching_up.remove(&object);
+      state.count(CATCH_UP_UNSPAWNED, 1);
+    }
+  }
+}
+
 /// Which kind of taken-over object a give-up ends ([`give_up_taken_over`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TakenOver {
@@ -7151,7 +7199,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .holds_for(peer, state.fleet.host())
   {
     DirectContact::Holder
-  } else if state.council.known_voter(peer) || state.root.is_voter(peer) {
+  } else if state.council.known_voter(peer) || state.root.known_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
@@ -8867,6 +8915,9 @@ fn reconcile_root_membership(s: &mut ShardState) {
   s.root.reconcile_regions(&alive, &s.region_mirrors);
   let representatives = alive_representatives(s);
   s.root.reconcile_voters(&representatives);
+  // Once no change is in flight, the voters in force go into the root configuration, so a root learner learns them by
+  // its version (A-406): a seat change alone moves none.
+  s.root.record_voters();
 }
 
 /// One period as the **root** leader — the cross-region parallel of [`lead_council_period`]: reconcile the
@@ -9116,11 +9167,21 @@ fn alive_regions(state: &ShardState) -> Vec<RegionId> {
 /// sets over [`alive_regions`] and the root configuration's regions; equal in steady state, so a converged
 /// learner fetches nothing. (This rests on the all-to-all mesh, where a node's SWIM sees every region's
 /// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM.)
+/// A root voter it knows that its membership no longer holds alive is the same signal for the voters (A-406): the
+/// group has replaced it or will, and the configuration records who votes once it has, while a region whose
+/// representative died stays in the regions and moves nothing the first comparison sees.
 fn root_diverges(state: &ShardState) -> bool {
   let alive: std::collections::BTreeSet<RegionId> = alive_regions(state).into_iter().collect();
   let known: std::collections::BTreeSet<RegionId> =
     state.root.configuration().regions.iter().copied().collect();
   alive != known
+    || state.root.known_voters().iter().any(|voter| {
+      state
+        .fleet
+        .membership()
+        .state(*voter)
+        .is_none_or(|held| held.liveness != Liveness::Alive)
+    })
 }
 
 /// Drives this node's **root group** one period from the record-plane coordinator (§4.8, D-14 — the root
@@ -9174,9 +9235,9 @@ async fn drive_root_group(
   if !is_voter && !is_leader {
     // A root learner (a region member that is not its region's representative): it does not drive the Raft.
     // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
-    // reactively, only when its own alive view of the regions diverges from the root configuration it holds
-    // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
-    // learner's reactive fetch.
+    // reactively, only when its own alive view of the regions, or of the root voters it knows, diverges from the
+    // root configuration it holds ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel
+    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406).
     // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
     let now = futures::now_ns();
     let wanted = state::with_state(|s| {
@@ -9197,7 +9258,8 @@ async fn drive_root_group(
     .unwrap_or(false);
 
     if wanted {
-      let targets = root_learner_targets(&voters, local);
+      let known = state::with_state(|s| s.root.known_voters()).unwrap_or_else(|| voters.clone());
+      let targets = root_learner_targets(&known, local);
       drive_root_learner_fetch(&targets, budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         let still = !s.root.initialized();
