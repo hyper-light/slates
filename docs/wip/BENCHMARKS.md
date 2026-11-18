@@ -12668,6 +12668,64 @@ The paced-client test failed 6 of 6 on Linux before the rule (diag-liveness-36: 
 - **The paced-client test's non-vacuity bound is the estimate passing its boot prior, not a multiple of it.** At ten times the prior one macOS run of three missed (5.9 times, diag-liveness-37); at four, three of ten missed (1.06–1.8 times, diag-liveness-38), every window held at F. With the window at F the shards stop spinning and stop queueing each other's wakes, so the estimate rises far less than under ×100 (23–200 times). A window priced on the estimate passes its boot value as soon as the estimate passes the prior, so that is the bound that tells the rules apart.
 - **Windows is ×100, unchanged.** Its window is the estimate's multiple wherever that passes F (a 7–18 µs estimate gives 0.7–1.8 ms), so it computes what step 3's ×100 arm did, and its paced CPU sits in that arm's spread (177–435 quiet, 693–782 loaded). windows-latest's quiet p99, 53.8–86.7 µs against the ×100 arm's 31.4–39.9 µs, comes from identical window arithmetic; it is recorded as the runner's, and step 6 measures the arms interleaved on one runner.
 
+## The idle window's rule at three and more shards: R9's floor alone fails a closed loop; a fixed S-scaled window fails a paced client (A-223 step 6, A-326; R9; CI and adacachy2; 2026-11-12)
+
+**What it is.** The plan's step 6 ran the rule as built (`adb383f26`) against main (`29ef4521`) at each runner's
+derived shard count as well as two, and then two shard-scaled windows, on CI and on adacachy2. It found what A-326
+fixes. Recorded by goal g234 (2026-11-18) from liveness's notes, which keep every table whole
+(`~/.cache/slates-agents-scratch/a223/step6-*.md` on the supervisor's Mac).
+
+**Command.** `provision_bench` built `--release` for each arm, `PROVISION_BENCH_SHARDS` unset (derived) or 2; three
+rounds, arms interleaved, quiet and then with two spinning shell loops per logical CPU, each round three runs a job
+(diag-liveness-42, -43, -44: ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, 4 CPUs, 3 on
+macOS). The shard-scaled arms are the rule's tree with a diagnostics-only `SLATES_DIAG_WINDOW_PER_SHARD=k` setting the
+floor to `k × F × shards` (15add74a, never on main). adacachy2: `abc-adacachy2.sh` (kiln r11, 32 CPUs, Linux,
+2026-11-12 19:47–19:57 UTC, the machine shared, load 3.8 to 16 in the quiet rounds), at its 15 derived shards.
+
+ubuntu-24.04-arm at its 3 derived shards, quiet (diag-liveness-42; µs):
+
+| arm | single-client p99 (N=9) | paced CPU, thousandths of a core (N=9) |
+|---|---|---|
+| main | 25.1, 26.5, 27.0, 27.0, 27.1, 27.1, 27.2, 27.5, 29.0 | 1776, 1788, 1853, 1950, 1977, 2108, 2203, 2414, 2556 |
+| ×100 (A-223 alone) | 26.9, 27.2, 27.5, 27.6, 28.0, 28.3, 29.0, 30.6, 32.4 | 1765, 1766, 1778, 1804, 1947, 2148, 2154, 2420, 2620 |
+| the rule (F) | 41.0, 43.6, 44.4, 113.9, 116.4, 118.3, 119.1, 119.3, 121.9 | 202, 204, 212, 217, 221, 228, 238, 239, 246 |
+
+The same runner, quiet, the shard-scaled windows (diag-liveness-43 and -44; spinning-form parks per 1,000 creates summed
+over the shards: 144–331 at F, 3–7 at `F × S`):
+
+| arm | single-client p99 (N=9) | paced CPU (N=9) |
+|---|---|---|
+| main (-43) | 25.6, 25.8, 26.6, 26.8, 27.5, 28.7, 28.8, 31.5, 32.4 | 1713, 1734, 1762, 1765, 1848, 1869, 1872, 1944, 1998 |
+| F (-43) | 44.8, 47.2, 113.3, 113.9, 114.7, 116.1, 121.8, 122.2, 140.1 | 203, 218, 221, 222, 223, 225, 235, 239, 249 |
+| F × S (-44) | 30.0, 33.7, 36.2, 36.4, 36.8, 37.1, 40.5, 212.6, 214.7 | 353, 357, 359, 364, 365, 369, 377, 380, 384 |
+| 2F × S (-44) | 26.7, 27.4, 29.0, 29.0, 29.5, 29.6, 31.0, 34.9, 363.7 | 567, 567, 571, 581, 584, 589, 597, 599, 604 |
+| 4F × S (-44) | 25.0, 25.4, 25.6, 26.2, 28.2, 30.6, 30.9, 31.9, 33.6 | 999, 1008, 1013, 1016, 1017, 1023, 1030, 1032, 1035 |
+
+adacachy2 at 15 derived shards, quiet (N=9 each; paced CPU in thousandths of a core):
+
+| arm | single-client p99 µs | paced CPU |
+|---|---|---|
+| main | 26.5, 34.4, 35.8, 47.2, 102.0, 113.2, 123.2, 126.9, 311.4 | 298, 352, 357, 640, 664, 728, 788, 794, 910 |
+| F | 83.4, 89.6, 105.1, 105.5, 106.7, 107.1, 108.4, 110.4, 116.8 | 171, 180, 194, 199, 222, 224, 226, 232, 237 |
+| F × S | 21.2, 22.0, 24.2, 24.6, 24.6, 26.1, 38.0, 41.0, 89.1 | 1349, 1350, 1354, 1356, 1386, 1389, 1399, 1400, 1407 |
+| 2F × S | 21.5, 23.9, 24.6, 25.0, 25.3, 27.8, 30.3, 34.3, 57.0 | 2265, 2266, 2272, 2288, 2289, 2291, 2313, 2320, 2325 |
+
+**What it shows.**
+- **R9's floor alone fails a closed loop over three or more shards.** At three shards the rule's p99 split into runs of
+  41–44 and 114–122 µs against main's 25–32. A create goes to the partition its name hashes to, so an owner hears from
+  the loop only after it has gone round the others, past F, and parks; main's window (the estimate × 100) kept every
+  owner polling. At two shards the bench's sequential names alternate the two partitions, so every owner returns within
+  F there and the failure did not show; arbitrary names would have shown it.
+- **A fixed shard-scaled window fixes the loop and spends it on a paced client too.** `2F × S` held main's spread at
+  three shards (29.5 µs), but a 1 ms-paced client then cost 584 thousandths of a core there and 2,289 at fifteen shards,
+  against main's 664 and F's 222. No fixed window met every criterion; the shard that reads a request is the one place
+  that can tell a closed loop from a paced client.
+- **Main fails R9 at fifteen shards already** (p99 median 102 µs); `F × S` brought it to 24.6 µs there.
+- **A-326** (§4.7) holds only a closed loop's shards, for its return at R9's percentile, never longer than the loop had
+  run (1.2 ms at three shards, 6.7 ms at fifteen, `2F × k`). Owed, the supervisor's runs on main: these tables again on
+  the built rule, with the spinning form's parks per 1,000 at three shards and the paced form's CPU, against main's
+  rows above (GAPS, A-223's entry).
+
 ## A-228 step 5: two weight-1 rungs on main, invalid, frozen (2026-11-09, fixtures)
 
 Recorded so no one reads them as a result. The command, per run: `bash rungs12-a228/run.sh` (and `run2.sh`) on adacachy

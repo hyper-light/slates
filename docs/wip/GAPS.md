@@ -558,7 +558,7 @@
 >   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
 >   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
 
-> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, Windows' own window open).**
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window open).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
 > kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
 > 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
@@ -590,6 +590,21 @@
 >     so R9's floor alone made that the loaded single-client p99 (97–100 ms on windows-latest, 48–56 ms on
 >     windows-11-arm, against 125–127 µs medians at the multiple). Windows keeps the multiple, and its paced client
 >     the cost (177–435 thousandths of a core quiet), until that wait is understood and a window measured for it.
+>   - **Fixed (A-326, 2026-11-18, goal g234): a closed loop's other shards parked at R9's floor alone.** The plan's
+>     step 6 (2026-11-12, diag-liveness-42 to -45 and adacachy2; every N in the A-223 plan's notes) found the rule
+>     fails a quiet single client over three shards: p99 116.4 µs against main's 27.1 on ubuntu-24.04-arm, 144–331
+>     parks per 1,000 creates, since a create goes to the partition its name hashes to and a loop returns to an owner
+>     only after going round the others. A fixed `F × S` or `2F × S` window fixed it there (36.8 and 29.5 µs) but spun
+>     for a paced client too (1,386–2,289 thousandths of a core at fifteen shards against main's 664). Now a forward
+>     made for a request read within F of its shard's last work holds its owner open for the loop's return at R9's
+>     percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, never more cycles than the loop had run (§4.7, A-326;
+>     `crates/server/tests/closed_loop.rs`). A paced client's requests hold nothing.
+>   - **Owed: the supervisor's measurement of A-223, its window rule and A-326 on main** (`provision_bench`, every N,
+>     quiet and two spinners a logical CPU): on ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest and
+>     windows-11-arm at 2 shards and the derived count, plus `PROVISION_BENCH_SHARDS=3` on Linux and a many-core Linux
+>     machine at its derived shards: the single-client p99 against main's (R9 at every count, main's 27.1 µs at three),
+>     owner parks per 1,000 in the spinning form (near 0) and the paced form (above 0), and the paced form's CPU
+>     (Linux main 1,451–2,023 thousandths of a core at two shards; the rule 155–232).
 > - **The client's Windows wake (sibling (d), fixed 2026-11-11).** The ipc client took any reply stamp inside its wait,
 >   since the Event cannot say a sleeper was found, so a reply sent before it blocked was learned as a handoff. It now
 >   judges its wait by its own switch count, as the shards do, and keeps its seed where the OS refuses the count. Of

@@ -1279,7 +1279,8 @@ impl ShardContext {
   }
 
   /// Spins out the rest of the idle window the last client activity opened
-  /// ([`ShardContext::note_activity`]), watching the rings, the pollers and the driver; true when
+  /// ([`ShardContext::note_activity`]), or the longer hold an activity asked for
+  /// ([`ShardContext::hold_idle_window`]), watching the rings, the pollers and the driver; true when
   /// something arrived or a timer fell due during the spin (either is work for the next step), false
   /// when the window ran out, or had already, with nothing to do. The window is measured from the
   /// activity, not from this idle moment: timers that fire after a client has gone quiet do not open a
@@ -1288,7 +1289,9 @@ impl ShardContext {
     let Some(activity) = self.activity_ns.get() else {
       return false;
     };
-    let window_end = activity.saturating_add(self.idle_window_ns());
+    let window_end = activity
+      .saturating_add(self.idle_window_ns())
+      .max(self.held_until_ns.get());
     if self.now_ns() >= window_end {
       return false;
     }

@@ -85,7 +85,8 @@ const FLEET_PLANES: usize = 2;
 const FLEET_LOOPS_PER_SHARD: usize = FLEET_PLANES * 2 + 1;
 /// F, R9's provisioning floor (AC-2.1, T-2.6): a create's single-client p99 is held to fifty microseconds. The idle
 /// window is at least this long, so a closed-loop client that meets R9 (its next request within F of its last reply)
-/// finds its shards still polling (A-223). It is the requirement itself, not a measurement, so no load moves it; the
+/// finds its own shard still polling (A-223), and the other shards its loop goes round are held for its return
+/// ([`closed_loop_hold`], A-326). It is the requirement itself, not a measurement, so no load moves it; the
 /// boot probe's smallest wake, the other input weighed, was measured at up to 259-346 µs on a loaded boot
 /// (BENCHMARKS, the idle window's rule). `provision_bench` gates on the same constant.
 pub const PROVISION_FLOOR: Derived<u64> = derived!(
@@ -177,8 +178,9 @@ pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
 }
 
 /// The idle window for a shard whose wake estimate is `wake_ns`: `max(F, wake × loaded_wake_ratio())` (§4.3, §4.7;
-/// A-223). R9's floor keeps a closed-loop client's shards awake; the platform's multiple covers a loaded wake where
-/// parking costs more than spinning saves. Where the multiple is zero (Linux, macOS) no estimate moves the window, so a
+/// A-223). R9's floor keeps a closed-loop client's own shard awake (the others its loop goes round are held by
+/// [`closed_loop_hold`], A-326); the platform's multiple covers a loaded wake where parking costs more than spinning
+/// saves. Where the multiple is zero (Linux, macOS) no estimate moves the window, so a
 /// shard's own spinning, which lengthens the wakes it measures, cannot lengthen it.
 pub const fn idle_window_ns(wake_ns: u64) -> u64 {
   let covered = wake_ns.saturating_mul(loaded_wake_ratio().get());

@@ -1592,7 +1592,8 @@ platform cannot attribute (macOS off the CPU, Windows everywhere): counted unatt
 **Derived constants.** Task arena size = admission limit (Little's law on measured request rate ×
 p99 service time); batch bound = latency budget / measured per-item cost; idle spin window =
 max(F, the shard's wake estimate × the idle ratio), where the runtime's own spin-then-park has ratio 1 and no F (the
-2-competitive spin) and the daemon's has §4.7's: F, R9's provisioning floor, and the platform's multiple (A-223); the
+2-competitive spin) and the daemon's has §4.7's: F, R9's provisioning floor, and the platform's multiple (A-223),
+held open longer for a closed loop's forwards by §4.7's closed-loop hold (`ShardContext::hold_idle_window`, A-326); the
 step quantum (the I/O harvest cadence, the
 slices of a destroy, an archive or a pre-fault, and the long-step count) = the shard's wake estimate,
 seeded with wake_ns.mean and refined from the shard's own confirmed wakes over about 2^shift of them
@@ -4817,7 +4818,10 @@ service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's 
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = max(F, the shard's wake estimate ×
 the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which
 the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
-on Linux and macOS and 100 on Windows (A-223's window rule, below).
+on Linux and macOS and 100 on Windows (A-223's window rule, below); closed-loop hold = 2F × the least k with
+((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::closed_loop_hold`: 700 µs at two shards, 1.2 ms at
+three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last work, and never
+more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below).
 
 > **Status (2026-11-11, A-223's window rule: the idle window is R9's floor, not a multiple of the estimate).** The
 > window was the shard's live wake estimate × 100. The estimate counts the time a woken shard waits for a CPU, which
@@ -4832,6 +4836,21 @@ on Linux and macOS and 100 on Windows (A-223's window rule, below).
 > F alone every loaded request paid it (GAPS, open). Both live readers, the shard's idle spin and the serve loop,
 > read the one window (`ShardContext::idle_window_ns`); the step quantum still reads the estimate's mean. Measured: BENCHMARKS, "The idle window's rule"; test:
 > `crates/server/tests/idle_window.rs`.
+
+> **Status (2026-11-18, A-326: a closed loop holds the shards it goes round).** R9's floor covers a closed loop's
+> return to its own shard, but a create goes to the partition its name hashes to and every later verb to its volume's
+> owner, so with S shards a loop comes back to a given owner only after a geometric number of cycles. At F alone a
+> quiet single client's p99 on ubuntu-24.04-arm's three shards was 116.4 µs against main's 27.1, its shards parking
+> 144–331 times per 1,000 creates (the A-223 plan's step 6, 2026-11-12); a fixed `F × S` window brought it to 36.8 µs
+> and `2F × S` to 29.5, but a fixed window costs a paced client the same spin (1,386–2,289 thousandths of a core at
+> fifteen shards against main's 664), so the rule had to tell the two clients apart. The shard that reads a request
+> does: one that came within F of the shard's last work continues a closed loop, R9's own definition of one, and a
+> forward made for it carries a hold for its owner (`ShardContext::hold_idle_window`) of the loop's return at R9's
+> percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, 2F being a cycle of a loop that meets R9 (its request and its
+> think time). A hold never spans more cycles than the loop had run before the request, so the spin a loop leaves
+> behind when it ends is at most what the loop itself took, and a paced client's create (after its pause) and its
+> destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
+> `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
@@ -15265,6 +15284,47 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
 - **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
   and an acknowledgement's own refusal on the client's shard, which is still its reply.
 - **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
+
+### A-326 — A closed loop's forwards hold the shards it goes round for its return at R9's percentile (accepted and built 2026-11-18, goal g234; amends A-223's window rule)
+Applied in the same change to: §4.3 (derived constants), §4.7 (derived constants and a status), GAPS (A-223's entry),
+BENCHMARKS ("The idle window's rule": step 6's multi-shard rows and what is owed), `crates/rt` (`ShardContext::
+hold_idle_window`, `Counters::idle_holds`, the spin reading the hold), `crates/server` (`config::closed_loop_hold`,
+`loop_revisit_cycles`, `PROVISION_TAIL`, `CLOSED_LOOP_CYCLE_NS`, `DaemonConfig::closed_loop_hold_ns`; `verbs::loop_hold`,
+the forward carrying its hold, `PendingForward::hold_ns`; `ShardState::forward_hold_ns`, `loop_run`), and the tests
+`crates/server/tests/closed_loop.rs`, `crates/rt/tests/idle_spin.rs` (the held window) and the hold's derivation in
+`config.rs`.
+- **The defect.** A-223's window rule keeps a closed loop's own shard polling: the client's next request comes within
+  F of its last reply. It does not keep the loop's other shards polling. A create goes to the partition its name hashes
+  to, and every later verb to its volume's owner, so with three or more shards an owner hears from the loop only after
+  the loop has gone round the others, longer than F. At F alone the A-223 plan's step 6 measured a quiet single
+  client's p99 of 116.4 µs on ubuntu-24.04-arm's three shards against main's 27.1 (runs split 41–44 and 114–122 µs),
+  its shards parking 144–331 times per 1,000 creates (diag-liveness-42, -43). Main kept the owners polling only
+  because its window was the estimate × 100, which also made a paced client spin; at fifteen shards main itself failed
+  R9 (102–176 µs on adacachy2).
+- **Why not a fixed window.** `F × S` measured 36.8 µs at three shards, 3–7 parks per 1,000; `2F × S` 29.5 µs, within
+  main's spread. But a fixed window spins for a paced client as long as for a closed one: a 1 ms-paced client cost
+  365–584 thousandths of a core at three shards and 1,386–2,289 at fifteen, against main's 664 there and F's 222
+  (step 6, diag-liveness-44 and adacachy2). The rule must tell the two clients apart, and only the shard that reads the
+  request can.
+- **The rule.** A request read within F of its shard's last work continues a closed loop, R9's definition of one (its
+  client's next request within F of its last reply); a forward made for it carries a hold, and the owner keeps its
+  idle window open at least that long (`ShardContext::hold_idle_window`; the longest hold asked stands). The hold is
+  2F × k, with 2F a cycle of a loop that meets R9 (its request within F at R9's percentile and its think time within F)
+  and k the least count with ((S − 1)/S)^k ≤ 1/100: each request lands on a given owner with probability 1/S, so the
+  cycles until the loop returns are geometric, and k covers all but R9's tail of returns (k = 7, 12, 67 at 2, 3, 15
+  shards: 0.7, 1.2, 6.7 ms). Its inputs are R9's floor, R9's percentile and the shard count, so no load moves it and
+  item (i) holds as before. A hold never spans more cycles of 2F than the loop had run before the request
+  (`verbs::loop_hold`), so the spin a loop leaves behind when it ends costs at most what the loop itself took, the
+  ski-rental bound counted in the loop's own cycles; a paced client's create, after its pause, ends any loop, and its
+  destroy, the first request of a new one, holds nothing.
+- **What it costs.** Nothing for a paced client, whose requests hold nothing (the paced form of `provision_bench` keeps
+  A-223's window rule's cost). For a client in a closed loop, every shard the loop goes round keeps polling while it
+  runs, as on main, and for at most its hold once it ends. On a loaded machine a loop's think time passes F and the
+  holds lapse, which keeps the window rule's loaded gain.
+- **Owed (the supervisor's measurement):** `provision_bench` at the derived and at three shards on every CI runner and
+  a many-core Linux machine, quiet and loaded, every N: single-client p99 against main's, parks per 1,000 in the
+  spinning and paced forms, and the paced form's CPU (GAPS, A-223's entry).
+- **Not decided here: Windows' window** (A-223's open item (C)). The hold applies on Windows too, beside the multiple.
 
 ### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
 Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
