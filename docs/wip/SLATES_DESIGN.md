@@ -5775,6 +5775,25 @@ refinement and revalidation before those results can be applied to the corrected
 > takeover questions unanswered, `Daemon::inject_takeover_silence`; the owner stops) and
 > `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`.
 
+> **Status (2026-11-18, A-351; a fleet settles on one configuration once its faults stop).** A round that gave objects
+> up kept its share unconfirmed and started over only on a new configuration or a fence, while a kept retirement refuses
+> its host's re-admission (`RegionalConfiguration::admits`). So a host retired on a false death whose takeover gave
+> anything up was never re-admitted when it was heard again: the leader proposed its admission each period and it
+> changed nothing, no configuration came, and the round never started over. The chaos nemesis ended split for good that
+> way (seeds 6876545201569229162 on both Linux arches and 7236833171758868842 on x86_64, CI diag 44311638654: the
+> survivors at two members, the retired owner at three). Now a round that gave objects up starts over once its retired
+> host is held alive at an incarnation newer than the one the round was last judged under
+> (`takeover::HostTakeover::heard_since`, counted `fleet.takeover.judged_afresh`), once a refutation: what held the
+> promises back (a partition that cut the host off, or the host's own probes holding the holders' gates, above) may
+> have ended with it. A round that gives up again waits for the next refutation, and an object it adopts clears its
+> record as on any restart. Held by `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` (three
+> nodes; the survivors silence each other's takeover questions while the owner is cut off on the probe plane until the
+> volume is given up; then they answer and the owner is healed; every node must hold one configuration of all three),
+> `a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retired_in_turn` (the nemesis's shape: the
+> volume's creator taken over and re-admitted, then the adopter deafened, its takeover resolved, healed) in
+> `crates/server/tests/fleet.rs`, and `a_round_that_gave_objects_up_starts_over_once_its_retired_host_is_heard_alive_again`
+> (`crates/server/src/takeover.rs`).
+
 > **Status (2026-11-18, A-309 piece 1; A-272 (ii)).** "A retirement is dropped once all have" now leaves a record: a
 > takeover whose every survivor confirmed its share, or left owing it and carried it into a takeover of its own that
 > completed, becomes a completion record (`RegionalConfiguration::completed`), and only such a record lets a line read
@@ -5990,6 +6009,20 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > says (`LeaseVerdict::LostToSuccessor`). Regression
 > `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
 > (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`).
+>
+> **Status (2026-11-18, A-351: the holder's gate counts only answers that can confirm).** A holder defers a promotion
+> while an answer it gave the departed owner may still feed that owner's lease, and only an answer that names the owner
+> a standing can (an owner is confirmed by a standing it recognizes and superseded by none). So an answer counts toward
+> the gate only when it names one (`AnswersGiven::answered`), and an answer to a host the configuration retired names
+> none. A former member's last counted answer is kept until its horizon passes (`AnswersGiven::retain_members`), where
+> the per-period prune had dropped it the period the member left, opening the gate while a lease built on it could still
+> hold. Before, a retired owner deaf to every answer, whose probes still reached the fleet (a member that hears nobody
+> condemns nobody, so it probes its suspects every period), was answered each period, and every holder deferred every
+> page for as long as it probed until A-304's bound gave its objects up (the chaos nemesis's deafened owner). Now the
+> gate opens a horizon after the holder's last answer to it as a member. Regressions
+> `a_holder_answering_a_retired_owners_probes_still_promises_its_objects` (`crates/server/src/daemon.rs`),
+> `an_answer_that_names_no_standing_never_holds_a_promotion_back` and
+> `a_former_members_last_answer_holds_its_promotion_until_its_horizon` (`crates/server/src/lease.rs`).
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the
@@ -9459,9 +9492,9 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > Inputs archives are chunked at the archive's largest chunk (1 MiB), so the kernel's origin is about 1,600 extents
 > rather than 100,000 to 400,000. Test: `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`
 > (`crates/server/tests/fleet.rs`). Owed: the measurement over the whole kernel; a restarted owner remakes version 0's
-> inputs before it re-ships the record (A-246), since the inputs' identity is not recorded; a takeover successor still
-> gathers version 0 from its hold in one call (`recover_green_inputs`); a large increment's archive is still remade from
-> its chain entry on each pass that ships it.
+> inputs before it re-ships the record (A-246), since the inputs' identity is not recorded; ~~a takeover successor still
+> gathers version 0 from its hold in one call (`recover_green_inputs`)~~ (since A-333 the successor adopts its replica
+> and gathers nothing); a large increment's archive is still remade from its chain entry on each pass that ships it.
 
 > **Status (2026-11-18, A-313: a restarted holder rebuilds its replica from what it kept).** A warm restart keeps the
 > merge records a holder accepted (its acceptor, §4.8 "Recovery") and the inputs it held (AUD-29-59), but a holder's
@@ -9479,6 +9512,46 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > commits only through b's rebuilt replica): with the rebuild removed, b answered version 2's record out of order 4,586
 > times and version 2 never placed within 60 s; with it, version 2 placed in 2.56 s (kiln r1017; the bug record of
 > 2026-11-18).
+
+> **Status (2026-11-18, A-333: a green's takeover successor adopts its holder ledger).** The successor rebuilt a
+> taken-over green beside its ledger, in one poll of each shard: version 0's inputs restored whole from its hold into one
+> dense copy, every increment's too, every accepted position cloned and decoded; then the origin's bytes recorded
+> (`GreenOriginated`) and every increment recorded again in its partition, and the green replayed twice. The partition's
+> merge budget is a quarter of a shard's metadata reserve, so a kernel-sized origin (1.67 GB, against about 333 MB a
+> shard on a 64 GB machine of 16 shards) was refused at its first record, the takeover given up at the failover bound,
+> and losing the primary lost the green. Now the successor adopts what it keeps anyway (`crate::green_adopt`):
+> - the partition records the green by its adoption, one operation (`Op::GreenAdopted`: the catalog record, the adopted
+>   version and identity, version 0's inputs manifest), and its chain holds only the versions after it; the versions up
+>   to it are the successor's holder ledger, whose records are never compacted and whose inputs are retained while named;
+> - the green's engine is the successor's own replica, taken at the adopted version, advanced to it from the increments
+>   the successor holds, or rebuilt from the ledger when it has none, a slice at a time, then moved by value to the owner
+>   shard (`verbs::adopt_taken_over_green`), with the submit completions the ledger's records carried gathered a slice of
+>   records at a time (A-255);
+> - a restarted successor re-adopts it at boot, after every partition has recovered and before any client is admitted:
+>   the engine rebuilt from the ledger through the adopted version (version 0 alone when a checkpoint past the adoption
+>   stands, which applies onto it), then the owner shard's own chain applied a slice a call; every verb on it answers
+>   `Overloaded` meanwhile, and the works over it are replayed after it. A green the ledger cannot rebuild is fenced;
+> - the green's record keeps the takeover that made this node its owner (`VolumeRecord::taken_over`: the promotion epoch
+>   and the adopted version), and a green's records are written at that epoch after a restart forgets `placed_heads`
+>   (`merge_service::record_epoch`, as `fleet::promotion_epoch` serves a volume's, A-344). A taken-over green recorded
+>   none before, so a restarted successor wrote its merge and catalog records at its own host's epoch, below the fence
+>   the takeover raised at every holder, and the green's next version never committed
+>   (`docs/bugs/2026-11-18-a-restarted-greens-successor-wrote-below-its-takeovers-fence.md`).
+>
+> A checkout of an adopted green compares its base by the manifest of the inputs its walked origin makes. Test:
+> `a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`
+> (`crates/server/tests/fleet.rs`: three nodes at `f = 1`, each partition's merge budget 1 MiB, a quarter of the 4 MiB
+> base the green's origin is walked from). Kiln r2370 on the Mac Studio, 2026-11-18, debug build: green in 4.92 s, the
+> successor adopting the green (`merge.takeover.adopted` 1, the ledger's completions gathered in 2 slices) and serving
+> version 0's base file, the head and a third version, then after its restart re-adopting it (`awaiting_adoption` 1, the
+> replica rebuilt through version 2 in 325 seed slices, `readopted` 1) and serving a fourth version and the edit of a work
+> made before the restart as the fifth; red on main's code, the takeover refused 100 times and given up
+> (`NotRecovered { TakeoverIncomplete { waited_on: "refused" } }`, 880 s); red without the takeover in the green's record,
+> version 3 never placed again after the restart and version 4 unanswered at the test's 60 s deadline (531 s); red with
+> the works over an awaiting green rebuilt at once, the kept work answered `NotFound` (5.5 s). Owed: a successor whose
+> ledger lacks records two or more versions below the adopted one (the ledger-prefix transfer of records, GAP-A9-7); a
+> new candidate holder that holds nothing of the green (AUD-14's transfer to a new candidate set); the adoption's
+> completions recorded in one call on the owner shard, up to each client's bound per client.
 
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
@@ -9522,7 +9595,8 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   Recovery applies the effects unconditionally (`slates_merge::chain_entry`, `Green::apply_recorded`). The position
 >   of a checkpoint no longer matters to replay, and a straggler pins nothing.
 > - A merge record's inputs are still the increment as submitted (`inputs_of`): holders ("Apply on holders") and a
->   successor (`recover_green_inputs`) judge it afresh, so a wrong resolution on the owner cannot reach them.
+>   successor (`recover_green_inputs`; since A-333 the replica it judged them into as a holder) judge it afresh, so a
+>   wrong resolution on the owner cannot reach them.
 > - Integrity: the digest on every entry; the head identity recorded and compared at every checkpoint, at every
 >   version whose record goes to holders, and at the head wherever one is recorded (`GreenFence::IdentityDiverged`).
 >   At f = 0 the entries after the last checkpoint are checked by digest alone: a divergence there is found at the
@@ -9709,7 +9783,8 @@ of its pending paths green has moved under (awareness, never load-bearing).
 in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
 and the inputs it held, and rebuilds its replica from them a slice at a time before it recomputes the next version,
 A-313). Green owner loss in a fleet: Degraded for the
-membership horizon, then Masked after takeover on a candidate that holds the ledger. Work volume owner loss before
+membership horizon, then Masked after takeover on a candidate that holds the ledger (the successor adopts its own holder
+ledger and replica, whatever the origin's size, and a restart of it re-adopts them at boot, A-333). Work volume owner loss before
 `submit`: the volume's loss window (D-18) applies to the unsubmitted work. Submitter crash after
 commit: the retry returns the original result; the version stands. Merge record with a stale
 host epoch: Refused (`StaleEpoch`) at the first holder, never applied; the stale owner drops the
@@ -17775,7 +17850,8 @@ Applied in the same change to:
   - Recovered at head 200, and version 201 is accepted.
   - From version 40 to 200 the partition's snapshot grows at most 39,168 bytes, against 1,329,920 before.
 - **Owed.**
-  - At `f > 0` the holders' replicas and records grow per version, and a takeover adopts the whole chain.
+  - At `f > 0` the holders' replicas and records grow per version. ~~A takeover adopts the whole chain.~~ Since A-333
+    (2026-11-18) a takeover records nothing of the chain up to the adopted version: its successor's holder ledger is it.
   - The 40 bytes a checkpoint keeps for each accepted identity.
   - The checkpoint walk is not sliced.
 
@@ -17817,8 +17893,9 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
 - **Owed.**
   - (2026-11-17, A-286) At `f > 0` version 0's inputs are made once a share at a time, shipped in bounded parts and
     seeded on each holder a share at a time; they were walked, encoded and archived in one poll on every pass.
-  - A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
-    fleet path).
+  - ~~A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
+    fleet path).~~ Since A-333 (2026-11-18) the successor records the green by its adoption of its own holder ledger,
+    which holds version 0's inputs by their manifest: no origin bytes in its partition.
   - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
     them after W2.
   - The overlay holds the pinned copy.
@@ -26278,3 +26355,126 @@ Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release 
   (`a_blocked_thread_switched_and_a_running_one_did_not`) passed on Windows x86_64 and arm64, where kernel32 has them.
 - **Not covered by a push.** Only the release lane runs the Nano Server check (a tag or a dry run). A regression of
   this kind shows on the next test tag, not on the push that makes it.
+
+### A-333 — A green's takeover successor adopts its holder ledger and the replica it built from it, instead of recording the green again; a restarted successor re-adopts it at boot (2026-11-18, built for goal g232, one primary and two replicas)
+Applied in the same change to:
+- §4.16: the failure matrix (green owner loss) and the status of 2026-11-18; A-217's, A-238's and A-286's owed items on
+  the takeover.
+- `crates/db`: `Op::GreenAdopted` (the green's catalog record, the adopted version, its identity and version 0's inputs
+  manifest, one operation checked as a creation is), `GreenAdoption`, `PartitionSnapshot::green_adoptions`,
+  `Partition::green_adoption` and `green_floor` (the version a green's chain begins after: its checkpoint, else its
+  adoption, else 0), `green_head` and the checkpoint's range from the floor, one check for every form of version 0
+  (`check_volume_created`, `check_version_zero_unrecorded`); `tombstone_sequence` from the green's head.
+- `crates/server/src/green_adopt.rs` (new): the engine at the adopted version (`engine_for_adoption`), the ledger's
+  completions gathered in slices (`gathered_completions`), the hand-off (`AdoptedGreen`, `give_back`), and the boot's
+  re-adoption (`readopt_at_boot`).
+- `crates/server/src/merge_origin.rs`: `advance_replica` (`ReplicaSeed::advance`, counted `merge.replica.advanced`),
+  `rebuild_replica_through`, `ledger_unheld`, `ledger_value`, `inputs_manifest_identity`.
+- `crates/server/src/fleet.rs`: `materialize_green` adopts (`served_already`, `ready_engine` before the placement as the
+  gather was, `handed_green` with the takeover's promotion epoch, `finish_green`), the waits `Started` and `Building`
+  (the latter, a build or a gathering still running, not counted against the bound), `fetch_green_inputs` given what to
+  fetch. `crates/server/src/merge_service.rs`: `recover_green_inputs`,
+  `GreenRecovery`, `green_ledger_values` and
+  `unheld_green_inputs` removed; `inputs_of` and the checkpoint from the green's floor; `GreenFence::LedgerUnavailable`;
+  the state `adoption_completions` and `awaiting_adoption`.
+- `crates/server/src/verbs.rs`: `adopt_taken_over_green` (replacing `materialize_taken_over_green`; the green's record
+  keeps its takeover, `VolumeRecord::taken_over`), `record_taken_over_completions` by version; at recovery
+  `await_adoption`, works over an awaiting green deferred; `begin_readoption`, `step_readoption`,
+  `fence_awaiting_adoption`; `chain_phase` from the floor; a verb on an awaiting green answered `Overloaded`
+  (`green_recovery_gate`). `crates/server/src/merge_service.rs`: `record_epoch` falls back to the takeover the green's
+  record keeps. `crates/server/src/daemon.rs`: the boot's re-adoption before the works' recovery;
+  `merge_chain_identities` of an adopted green. `crates/server/src/checkout.rs`: an adopted green's origin compared by
+  its inputs' manifest. `crates/server/src/tombstone.rs`: a tombstone drops gathered completions.
+- Tests: `an_adopted_greens_chain_begins_after_its_adoption_and_recovery_holds_it`,
+  `a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds` and the generated adoptions
+  (`crates/db/tests/model.rs`); `a_taken_over_green_is_recorded_by_its_adoption_and_served` and
+  `a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed` and
+  `a_green_awaiting_its_readoption_answers_overloaded_then_serves_the_engine_handed_to_it` (`verbs.rs`);
+  `an_inputs_manifest_identity_is_the_built_archives` and
+  `a_successor_behind_names_the_inputs_it_lacks_then_advances_to_the_adopted_version` (`merge_origin.rs`);
+  `a_ledgers_completions_keep_each_clients_newest_within_its_bound` and
+  `a_replica_off_the_adopted_identity_is_never_adopted` (`green_adopt.rs`);
+  `a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`
+  (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's ledger, after A-313's entry, and the signed-work sibling's function name. The bug record
+  `docs/bugs/2026-11-18-a-restarted-greens-successor-wrote-below-its-takeovers-fence.md`.
+- **What was there.** A green's successor is one of its holders: it keeps the green's ledger (the merge records it
+  accepted, durable across a warm restart, and the inputs they name, retained while named) and a replica of the green.
+  The takeover rebuilt the green beside all that: `recover_green_inputs` restored version 0's inputs and every
+  increment's whole from the hold and decoded every accepted position, in one poll of the control shard; then the owner
+  shard recorded the origin's bytes (`GreenOriginated`) and every increment again, replayed the green twice, and checked
+  the identity, in one poll. The partition's merge budget is a quarter of a shard's metadata reserve, so a kernel-sized
+  origin (1.67 GB, against about 333 MB a shard on a 64 GB machine of 16 shards) was refused at its first record: the
+  takeover was given up at the failover bound, and losing the primary lost the green.
+- **The rule.** The successor adopts the ledger: the partition records the green by `GreenAdopted` (a few dozen bytes
+  past the catalog record, whatever the tree), and its chain holds only the versions after the adopted one. The engine
+  is the successor's replica at the adopted version, which it holds already or brings there from what it holds (advanced
+  from its head, or rebuilt from the ledger when it has none), a slice at a time, then moves by value to the owner shard.
+  A restart cannot replay an adopted green from its partition, so the recovery leaves it awaiting and the boot re-adopts
+  it before admitting clients: the engine rebuilt from the ledger through the adopted version (version 0 alone when a
+  checkpoint past the adoption stands), handed to the owner shard, which applies its own chain after it a slice a call.
+  The ledger stays for as long as the green lives here: a green's holder records are never compacted, and its inputs are
+  retained while named.
+  The adoption keeps the takeover in the green's record (`VolumeRecord::taken_over`: the promotion epoch and the adopted
+  version), and the green's merge and catalog records are written at that epoch after a restart forgets
+  `placed_heads`; before, a restarted successor of any taken-over green wrote them at its own host's epoch, below the
+  holders' fence, and the green never advanced again (found by this change's test).
+- **Why.** The goal runs one primary and two replicas over the kernel; a takeover of its green must succeed whatever the
+  origin's size, and a successor's restart must keep the green. Copying what the ledger already holds into the
+  partition both doubled the bytes and could not fit them. Rejected: a local origin snapshot on the successor plus a
+  checkpoint at the adopted version (it doubles the origin's memory, and a checkpoint at the adopted version strands the
+  works based below it after the successor's next restart).
+- **Measured.** Kiln r2370, the Mac Studio, 2026-11-18, debug build (`a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`,
+  each partition's merge budget 1 MiB against a 4 MiB base): green in 4.92 s, adopted, re-adopted at boot after the
+  replica's rebuild through version 2 in 325 slices, five versions committed; red on main's code, the takeover refused
+  100 times and given up (880 s); red with no takeover in the green's record, the restarted successor never placed
+  version 3 again (531 s); red with the awaiting green's works rebuilt at once, the kept work `NotFound` (5.5 s); red with
+  the tombstone at the chain's length, 3 and 2 where 6 and 5 are owed.
+- **Cost.** No copy, record or replay at the takeover beyond the catalog record; a successor one version behind
+  recomputes one version, and one with no replica rebuilds it from the ledger as A-313's rebuild does. A restart rebuilds
+  the engine from the ledger at boot, as an owner's restart replays its own origin and chain. Found and fixed beside it:
+  a destroyed green's tombstone was written one past its chain's length, short after an A-238 checkpoint, so it could be
+  older than records the holders had accepted; it is now one past the green's head.
+
+### A-351 — A takeover the retired owner cannot lease against completes, and one that gave objects up starts over once its retired owner is heard again, so a fleet settles on one configuration once its faults stop (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 "Leases and reads", "Promotion and takeover", "Membership fed by SWIM"; the chaos nemesis, seeds 6876545201569229162 and 7236833171758868842; AUD-08, A-15, A-304)
+
+- **What was there.** Three rules met in a cycle. A holder defers a promotion of a departed owner's objects while an
+  answer it gave the owner may still feed the owner's lease (AUD-08), and it counted every answer to the owner's
+  probes, though an answer to a host the configuration retired names no standing and confirms no lease. A takeover round
+  gives an object up once its promises stop coming for the failover SLO's worth of periods, keeps the share unconfirmed
+  while it does, and starts over only on a new configuration or a fence (A-304). A kept retirement refuses its host's
+  re-admission (`RegionalConfiguration::admits`, A-309). In the nemesis the volume's creator was cut off and its volume
+  adopted by a survivor, the creator re-admitted, and then the adopter cut off (`Superseded(Deafened)`,
+  `Superseded(Stopped)`); its takeover gave the adopted volume and its catalog up, and once the adopter was heard again
+  the leader proposed its admission every period and nothing changed: no configuration came, so the round never started
+  over, so the retirement never completed. The fleet stayed split for good (CI diag 44311638654: the survivors at two
+  members, the adopter at three). In-process a deafened adopter reproduced it in 1 of 3 runs (Mac Studio, kiln r2219:
+  the holder deferred 103 pages, the successor gave 2 objects up, the survivors at configuration version 16 with two
+  members and the adopter at 12 with three); a deaf member condemns nobody and so probes every suspect every period, and
+  whether a holder's gate stayed shut turned on the phase between its per-period prune of non-members' answers and the
+  page's arrival. A-349 (g250) removed the other cause the nemesis's logs show: the superseded creator's own shipper held
+  the round's sessions.
+- **The rules.** (1) Only an answer that names the prober a standing counts toward the holder's gate
+  (`AnswersGiven::answered`), and a former member's last counted answer is kept until its horizon passes
+  (`AnswersGiven::retain_members`), so the gate opens a horizon after the holder last answered the owner as a member,
+  whatever the owner does since, and never earlier. (2) A round that gave objects up starts over once its retired host is
+  held alive at an incarnation newer than the one the round was last judged under (`takeover::HostTakeover::heard_since`,
+  counted `fleet.takeover.judged_afresh`), once a refutation.
+- **Why these and not others.** Dropping the gate for a retired owner would let a holder promise while a lease built on
+  its last answer as a member could still hold, the stale read AUD-08 exists to stop. Letting a retired host back in
+  under its id while its retirement is kept would let a line through that retirement name it the owner of objects its
+  successors adopted (A-309's reason for `admits`). A periodic retry of a given-up round would be a retry loop with no
+  bound (banned item 8); the host's refutation is the event that can end what held the promises back, and it comes once
+  per death the fleet declares.
+- **What it costs.** A holder that installs a retirement less than a horizon after it last answered the owner as a
+  member waits out the rest of that horizon before it promises (at most one horizon, `lease::horizon_ns`: 900 ms at the
+  100 ms beat), where the prune had let it promise at once. A round that gave objects up runs once more per refutation
+  of its host.
+- **What it does not change.** The lease's own rule (a standing recognized confirms it); A-304's bound and its typed
+  give-up; the admission rule; re-admission by refutation (A-15).
+
+Applied in the same change to: §4.8 "Leases and reads" (status) and "Promotion and takeover" (status), GAPS (the
+nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`, `crates/server/src/fleet.rs`,
+`crates/server/src/takeover.rs`, the tests in `crates/server/src/daemon.rs`, `crates/server/src/lease.rs`,
+`crates/server/src/takeover.rs` and `crates/server/tests/fleet.rs`, and the bug record
+`docs/bugs/2026-11-18-a-retired-owner-heard-again-was-never-readmitted-and-the-fleet-stayed-split.md`.
