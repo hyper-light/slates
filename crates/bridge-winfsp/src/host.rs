@@ -173,8 +173,16 @@ const VOLUME_INFO_TIMEOUT_MS: u32 = 0;
 /// Format: `VolumeInfoTimeoutValid`, bit 0 of the version-1 flag word (`fsctl.h`): the volume-information timeout is
 /// set apart from `FileInfoTimeout`.
 const VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
-/// Shape: the one receiver waits for its current callback's answer before sending another request to the shard.
-pub const REQUEST_BOUND: usize = 1;
+/// Shape: the requests one receive worker waits for at once: its current callback's, before it sends another.
+const CALLS_WAITED_FOR: usize = 1;
+/// Shape: the opens' confirmations the receive worker posts without waiting for them (A-274): one, whose answer it takes
+/// before its next save, so it never posts a second over it (`inflight::settle`).
+const CONFIRMATIONS_POSTED: usize = 1;
+/// Derived: the mount's request channel holds every request its one receive worker can have outstanding at once, a
+/// confirmation it posted and the call it then waits for, so no post waits for the shard to take what is in it. At one
+/// request, the call after an open waited in its post until the shard took the confirmation (and for good when nothing
+/// woke the shard: cut (c)'s no-wake variant stalled both Windows runners, diag-g258-1, run 44271751211).
+pub const REQUEST_BOUND: usize = CALLS_WAITED_FOR.saturating_add(CONFIRMATIONS_POSTED);
 /// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
 /// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
 const OUTCOME_BOUND: usize = 4;
