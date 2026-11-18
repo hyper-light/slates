@@ -10227,41 +10227,9 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
   let mut client = Client::connect(daemons[0].instance());
-  let mut volumes = Vec::new();
-  for index in 0..SLICED_LIVE_VOLUMES {
-    let ReplyBody::Created { id } = client.call(&scratch(&format!("sliced-{index}"))) else {
-      panic!("volume {index} was created");
-    };
-    let attachment = write_attachment(&mut client, id);
-    let shipped = client.call(&RequestBody::LiveShip {
-      volume: id,
-      live_shipped: true,
-    });
-    assert!(
-      matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
-      "volume {index} is live-shipped: {shipped:?}"
-    );
-    let written = client.call(&RequestBody::FsWrite {
-      volume: id,
-      attachment,
-      path: "/sliced".to_owned(),
-      bytes: vec![u8::try_from(index % 251).unwrap(); 64],
-      mode: 0o644,
-    });
-    assert!(
-      matches!(written, ReplyBody::FsDone { .. }),
-      "volume {index}'s write answered at durability: {written:?}"
-    );
-    // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`), which
-    // can sit below this test's volume count (a Mac Studio refused one `TableAtCapacity`, 2026-11-17); the log ships
-    // with no attachment held.
-    let detached = client.call(&RequestBody::Detach { attachment });
-    assert!(
-      matches!(detached, ReplyBody::Detached),
-      "volume {index}'s attachment was let go: {detached:?}"
-    );
-    volumes.push(id);
-  }
+  let volumes: Vec<VolumeId> = (0..SLICED_LIVE_VOLUMES)
+    .map(|index| live_shipped_volume_written_once(&mut client, index))
+    .collect();
   let counts = |daemon: &Daemon| {
     [LIVE_PERIODS, LIVE_PERIOD_SLICES].map(|kind| refusal_count(daemon, kind).unwrap())
   };
@@ -10300,6 +10268,44 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
   }
 }
 
+/// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
+/// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
+/// durability and the attachment let go. Returns the volume.
+fn live_shipped_volume_written_once(client: &mut Client, index: usize) -> VolumeId {
+  let ReplyBody::Created { id } = client.call(&scratch(&format!("sliced-{index}"))) else {
+    panic!("volume {index} was created");
+  };
+  let attachment = write_attachment(client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "volume {index} is live-shipped: {shipped:?}"
+  );
+  let written = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/sliced".to_owned(),
+    bytes: vec![u8::try_from(index % 251).unwrap(); 64],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "volume {index}'s write answered at durability: {written:?}"
+  );
+  // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`), which
+  // can sit below this test's volume count (a Mac Studio refused one `TableAtCapacity`, 2026-11-17); the log ships
+  // with no attachment held.
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "volume {index}'s attachment was let go: {detached:?}"
+  );
+  id
+}
+
 /// AC-8.9, A-200 amended 2026-11-17: a burst of barriers on one live volume ships its changes, not the volume. Do: three
 /// nodes at `f = 1`; on a, a volume of half a MiB, then live-shipped and written once (its log's first entry, the whole
 /// state, durable); hold both holders off their shards while sixteen clients each write half a page at once, so every write's
@@ -10327,38 +10333,7 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
     panic!("the burst volume was created");
   };
   let attachment = write_attachment(&mut client, id);
-  for file in 0..BURST_VOLUME_FILES {
-    let written = client.call(&RequestBody::FsWrite {
-      volume: id,
-      attachment,
-      path: format!("/base-{file}"),
-      bytes: vec![u8::try_from(file % 251).unwrap(); BURST_VOLUME_FILE_BYTES],
-      mode: 0o644,
-    });
-    assert!(
-      matches!(written, ReplyBody::FsDone { .. }),
-      "base file {file}: {written:?}"
-    );
-  }
-  let shipped = client.call(&RequestBody::LiveShip {
-    volume: id,
-    live_shipped: true,
-  });
-  assert!(
-    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
-    "the volume is live-shipped: {shipped:?}"
-  );
-  let first = client.call(&RequestBody::FsWrite {
-    volume: id,
-    attachment,
-    path: "/first".to_owned(),
-    bytes: vec![1; BURST_WRITE_BYTES],
-    mode: 0o644,
-  });
-  assert!(
-    matches!(first, ReplyBody::FsDone { .. }),
-    "the first live write is answered at durability: {first:?}"
-  );
+  live_ship_after_its_base_and_one_write(&mut client, id, attachment);
   let counts = |daemon: &Daemon| {
     [
       LIVE_WHOLE,
@@ -10475,6 +10450,44 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   assert!(
     all_taken,
     "each holder took every entry of the burst: {taken_before:?} -> {taken_after:?}"
+  );
+}
+
+/// The volume of `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume` before its burst. Do: write
+/// volume `id` through `attachment` with half a MiB of base files, live-ship it, and write it once more, its log's first
+/// entry then the whole state. Expect every write answered at durability and the volume live-shipped.
+fn live_ship_after_its_base_and_one_write(client: &mut Client, id: VolumeId, attachment: u64) {
+  for file in 0..BURST_VOLUME_FILES {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/base-{file}"),
+      bytes: vec![u8::try_from(file % 251).unwrap(); BURST_VOLUME_FILE_BYTES],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "base file {file}: {written:?}"
+    );
+  }
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let first = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/first".to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first live write is answered at durability: {first:?}"
   );
 }
 
@@ -16137,17 +16150,7 @@ fn a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time() {
     placed,
     "version 0 placed at f + 1 within {ORIGIN_PLACE_WAIT:?}: {counters:?}"
   );
-  for (holder, state) in holders.iter().enumerate() {
-    assert_eq!(
-      state.as_ref().ok().copied(),
-      Some(slates_server::merge_service::HolderMergeState {
-        version: Some(0),
-        refused: false,
-      }),
-      "holder {} holds the green's version 0",
-      holder + 1
-    );
-  }
+  expect_each_holder_at(&holders, 0, "holds the green's version 0");
   assert!(
     read_back.iter().all(|(_, read)| *read == Ok(true)),
     "version 0 reads every sampled file's bytes: {read_back:?}"
@@ -16167,17 +16170,44 @@ fn a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time() {
     ),
     "a submit after version 0 is accepted as version 1: {answers:?}"
   );
-  for (holder, state) in holders_after.iter().enumerate() {
+  expect_each_holder_at(
+    &holders_after,
+    1,
+    "recomputed version 1 on its seeded replica",
+  );
+  expect_the_origin_made_and_seeded_a_slice_at_a_time(&counters);
+  for (node, held) in longest.iter().enumerate() {
+    assert!(
+      *held * 2 < placing,
+      "node {node} kept no probe waiting for half the placement or more ({held:?} of {placing:?})"
+    );
+  }
+}
+
+/// The holders of `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`: expect each of `holders` (the nodes
+/// after the owner) to hold the green at `version`, not refused; `what` says what that shows.
+fn expect_each_holder_at(
+  holders: &[Result<slates_server::merge_service::HolderMergeState, ObserveError>],
+  version: u64,
+  what: &str,
+) {
+  for (holder, state) in holders.iter().enumerate() {
     assert_eq!(
       state.as_ref().ok().copied(),
       Some(slates_server::merge_service::HolderMergeState {
-        version: Some(1),
+        version: Some(version),
         refused: false,
       }),
-      "holder {} recomputed version 1 on its seeded replica",
+      "holder {} {what}",
       holder + 1
     );
   }
+}
+
+/// The counts of `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`, each node's (`counters`, the owner
+/// first). Expect the owner to have made version 0's inputs once, over more than one slice, and shipped them in parts;
+/// and each holder to have seeded its replica of version 0 once, over more than one slice.
+fn expect_the_origin_made_and_seeded_a_slice_at_a_time(counters: &[Vec<(String, u64)>]) {
   let owner = &counters[0];
   assert_eq!(
     counted(owner, "merge.origin_inputs.made"),
@@ -16201,12 +16231,6 @@ fn a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time() {
     assert!(
       counted(holder_counters, "merge.replica.seed_slices") > 1,
       "holder {holder} seeded its replica over more than one slice: {holder_counters:?}"
-    );
-  }
-  for (node, held) in longest.iter().enumerate() {
-    assert!(
-      *held * 2 < placing,
-      "node {node} kept no probe waiting for half the placement or more ({held:?} of {placing:?})"
     );
   }
 }
