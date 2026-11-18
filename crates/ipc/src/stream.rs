@@ -86,10 +86,7 @@ const RECEIVED_DESCRIPTORS: usize = 2;
 pub fn recv_message(end: BorrowedFd<'_>, into: &mut [u8]) -> Result<(usize, Vec<OwnedFd>), Errno> {
   let mut descriptors = Vec::new();
   let mut filled = 0usize;
-  loop {
-    let Some(room) = into.get_mut(filled..) else {
-      break;
-    };
+  while let Some(room) = into.get_mut(filled..) {
     let read = recv_part(end, room, &mut descriptors)?;
     filled = filled.saturating_add(read);
     if read == 0 || filled == into.len() || READS_ONE_PACKET {
@@ -417,6 +414,7 @@ mod tests {
       let read = recv_message(handed.as_fd(), &mut message).map(|(read, _)| read);
       (read, started.elapsed(), handed)
     });
+    #[allow(clippy::disallowed_methods)] // the test lets the read begin waiting before the close
     std::thread::sleep(READ_STARTS);
     drop(daemon);
     let (read, waited, handed) = reader.join().unwrap();

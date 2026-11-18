@@ -172,12 +172,14 @@ serves through epoll there; the GitHub runner uses io_uring), with nightly 2026-
 | `slates-client` | 14 | 0 |
 | `slates-server` (lib, `daemon`, `recovery`, `attach_forms`) | 195 | 0 |
 
-Two tests are skipped. Each is an assertion that the instrumentation itself falsifies, and each still runs
+Three tests are skipped. Each is an assertion that the instrumentation itself falsifies, and each still runs
 in every other lane:
 
 - `region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page`. ThreadSanitizer ignores
   `mlock` (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/munlockall` at verbosity 1),
   so the locked delta reads 0. The test passes uninstrumented in the same container.
+- `the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours`, for the same reason. Run
+  39540020206 read the kernel's locked count move by 0 where the test wants 16384.
 - `driver::tests::a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`. It asserts that 256
   zero-timeout waits never switch the thread out. Running the whole library, it failed 3 times in 12
   instrumented runs and 0 times in 10 plain runs. Run alone, it passed 20 of 20 either way. The likely
@@ -189,6 +191,16 @@ instrumentation on CI and not reproduced here: `a_poll_busy_on_the_cpu_past_the_
 extra unattributed step, run 37153112465) and `a_client_learns_its_wake_from_the_parks_a_reply_ended` (12 of
 32 wake samples, run 37142294661). The mechanism named in `xtask/src/tsan.rs` is a hypothesis; both run
 uninstrumented in every other lane.
+
+One more is skipped because the instrumentation cannot run it at all:
+`thread_clock::tests::a_thread_the_kernel_holds_reads_uninterruptible_and_a_sleeping_one_does_not` holds a
+thread in a vfork's wait with `clone(CLONE_VM | CLONE_VFORK)`. ThreadSanitizer's `clone` interceptor treats
+every clone as a fork. In the child, `ForkChildAfter` erases every other thread's `pthread_t` from the
+thread registry (`ThreadRegistry::OnFork`, compiler-rt). The child shares the parent's memory, so the
+parent's registry loses those threads too. The next `pthread_detach` of a test thread then aborts on
+`CHECK(t)` in `ConsumeThreadUserId`, as main 5a930fc64's run 44347203376 did on 2026-11-18. The test reads
+kernel thread states and shares no memory a race could touch. It runs uninstrumented in every other Linux
+lane.
 
 ## 5. Owed
 

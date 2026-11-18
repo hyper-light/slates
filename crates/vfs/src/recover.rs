@@ -2670,6 +2670,39 @@ impl Volume {
     Ok(())
   }
 
+  /// Where a snapshot's shared entry is already held in the rebuilt store: the inode table that holds it (a clone's
+  /// origin snapshot, the head, or an earlier snapshot) and its kind, so the entry resolves to that very inode.
+  fn shared_source(
+    &self,
+    store: &Store,
+    entry: &SharedInode,
+    refs: &SharingRefs,
+  ) -> Result<(Handle<TrieNode>, KindImage), VfsError> {
+    match entry.source {
+      SharedSource::Origin => {
+        let source_root = refs.origin_inode_root.ok_or(VfsError::RecoveryIncomplete)?;
+        let handle = trie::get(&store.tries, source_root, InodeNo(entry.number))
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        Ok((source_root, kind_image(store.inodes.get(handle)?.kind)))
+      }
+      SharedSource::Head => {
+        let image = refs
+          .head_images
+          .get(&entry.number)
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        Ok((refs.head_inode_root, image.kind))
+      }
+      SharedSource::Snapshot { at } => {
+        let image = refs
+          .canonical_inode
+          .get(&((at.index, at.generation), entry.number))
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        let source_root = self.snapshots.get(snapshot_slab_handle(at))?.inode_root;
+        Ok((source_root, image.kind))
+      }
+    }
+  }
+
   /// Rebuilds a snapshot's tree into the volume's current (snapshot) roots, sharing with the head
   /// every file or symlink the snapshot holds unchanged (an identical image) instead of rebuilding a
   /// private copy — the §4.2 CoW-sharing efficiency. Returns the inode numbers shared with the head,
@@ -2693,29 +2726,7 @@ impl Volume {
     let mut held_dirs: Vec<(&SharedInode, Handle<Inode>)> = Vec::new();
     for entry in &snap.shared {
       let no = InodeNo(entry.number);
-      let (source_root, kind) = match entry.source {
-        SharedSource::Origin => {
-          let source_root = refs.origin_inode_root.ok_or(VfsError::RecoveryIncomplete)?;
-          let handle =
-            trie::get(&store.tries, source_root, no).ok_or(VfsError::RecoveryIncomplete)?;
-          (source_root, kind_image(store.inodes.get(handle)?.kind))
-        }
-        SharedSource::Head => {
-          let image = refs
-            .head_images
-            .get(&entry.number)
-            .ok_or(VfsError::RecoveryIncomplete)?;
-          (refs.head_inode_root, image.kind)
-        }
-        SharedSource::Snapshot { at } => {
-          let image = refs
-            .canonical_inode
-            .get(&((at.index, at.generation), entry.number))
-            .ok_or(VfsError::RecoveryIncomplete)?;
-          let source_root = self.snapshots.get(snapshot_slab_handle(at))?.inode_root;
-          (source_root, image.kind)
-        }
-      };
+      let (source_root, kind) = self.shared_source(store, entry, refs)?;
       kinds.insert(entry.number, kind);
       let handle = trie::get(&store.tries, source_root, no).ok_or(VfsError::RecoveryIncomplete)?;
       self.table_set(store, no, handle)?;

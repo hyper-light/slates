@@ -60,6 +60,10 @@ binary per platform, no archive (Appendix B.2):
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `windows-2025` | `slates-windows-x64.exe` |
 | Windows arm64 | `aarch64-pc-windows-msvc` | `windows-11-arm` | `slates-windows-arm64.exe` |
 
+`cargo binstall --git https://github.com/hyper-light/slates slates-cli` installs the binary a release attached for
+the machine's target (A-413): the CLI manifest names each shipped target's asset, and `cargo xtask version` refuses an
+override that drifts from the shipped targets.
+
 Every target is built natively on its own runner. The Windows binaries link the C runtime
 statically (`+crt-static`), so they need no Visual C++ runtime. They are built with MSVC toolset 14.44 and Windows SDK
 10.0.26100.0, pinned, not the runner image's default toolset, which moves with each image update (A-411). The musl binaries are static.

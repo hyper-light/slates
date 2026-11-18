@@ -726,6 +726,7 @@ const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
 /// way, `LengthMismatch` the other), and a change that kept the length would have been read with a field defaulted
 /// (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was dropped and no retirement is
 /// kept, and A-291's when no object is moved, which only the version tells apart.
+/// Format: the regional layout's version, raised with each change of its fields' meaning (4 since A-291).
 const REGIONAL_LAYOUT: u32 = 4;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
