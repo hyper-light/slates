@@ -1,3 +1,8 @@
+ArchiveFault 0 ForeignMagic
+ArchiveFault 1 Unsupported
+ArchiveFault 2 Truncated
+ArchiveFault 3 Corrupt
+ArchiveFault 4 Malformed
 AttachRequest 0 Root
 AttachRequest 1 Oci
 AttachRequest 2 Guest
@@ -226,6 +231,7 @@ Refusal 70 Target
 Refusal 71 DurabilityPending
 Refusal 72 VerdictReplaced
 Refusal 73 MoveRefused
+Refusal 74 ArchiveRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -299,6 +305,7 @@ ReplyBody 69 Moving
 ReplyBody 70 Moved
 ReplyBody 71 BaseCaptured
 ReplyBody 72 ArchiveExported
+ReplyBody 73 ArchiveImported
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -380,6 +387,7 @@ RequestBody 77 Renew
 RequestBody 78 Move
 RequestBody 79 CaptureBase
 RequestBody 80 ArchiveExport
+RequestBody 81 ArchiveImport
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

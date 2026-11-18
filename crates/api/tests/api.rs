@@ -21,13 +21,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Exhausted,
-  Existing, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch, LandOutcome,
-  LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome,
-  MergeRecord, Missing, MountOptions, MoveTarget, PathFault, PolicyReason, PolicyRefusal,
-  PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source, TrustedSigner,
-  Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work, WorkSignature,
-  WriteAct, WriteMode, WritePolicy,
+  ArchiveFault, AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind,
+  Error, Exhausted, Existing, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch,
+  LandOutcome, LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval,
+  MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget, PathFault, PolicyReason,
+  PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source,
+  TrustedSigner, Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -1447,6 +1447,364 @@ fn a_snapshot_exported_as_its_archive_carries_every_file_and_entry() {
     ),
     "an archive volume's name already held"
   );
+  drop(instance);
+  daemon.stop();
+}
+
+/// Shape: the permission bits of the archive import test's private file and its private directory, unlike [`MODE`]
+/// and [`DIRECTORY_MODE`], so each entry's own mode is seen to come back.
+const PRIVATE_MODES: (u32, u32) = (0o600, 0o700);
+
+/// A volume's tree as an archive of it restores it, every inode number cleared: the files' bytes, the directories, and
+/// each entry's metadata and the root's. Two volumes holding the same tree compare equal by it, whatever numbers their
+/// inodes were given.
+type Tree = (
+  std::collections::BTreeMap<String, Vec<u8>>,
+  std::collections::BTreeSet<String>,
+  std::collections::BTreeMap<String, slates_archive::NodeMeta>,
+  slates_archive::NodeMeta,
+);
+
+/// The tree of `archive`'s bytes, restored in memory, its inode numbers cleared ([`Tree`]).
+fn tree_of(bytes: &[u8]) -> Tree {
+  let archive = slates_archive::Archive::decode(bytes).expect("the archive decodes whole");
+  let restored = slates_archive::restore(&archive, u64::MAX).unwrap();
+  let numberless = |meta: &slates_archive::NodeMeta| slates_archive::NodeMeta {
+    ino: 0,
+    ..meta.clone()
+  };
+  (
+    restored
+      .files
+      .iter()
+      .map(|(path, file)| (path.clone(), assembled(file)))
+      .collect(),
+    restored.directories.clone(),
+    restored
+      .metadata
+      .iter()
+      .map(|(path, meta)| (path.clone(), numberless(meta)))
+      .collect(),
+    numberless(&restored.root),
+  )
+}
+
+/// The tree `volume` holds at a new snapshot, through its export ([`tree_of`]); the export is destroyed after.
+fn tree_held(instance: &mut Instance, volume: VolumeId, export_name: &str) -> Tree {
+  let snapshot = instance.snapshot(volume).unwrap();
+  let exported = instance
+    .export_archive(volume, snapshot, export_name)
+    .unwrap();
+  let bytes = read_file(
+    instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  instance.destroy(exported.id).unwrap();
+  tree_of(&bytes)
+}
+
+/// Format: POSIX `S_IFLNK`, a symbolic link's type bits as an archive's metadata carries them, with every permission.
+const SYMLINK_MODE: u32 = 0o120_777;
+
+/// The archive `bytes` with a symbolic link `link` to `target` added in its root, as a consumer writing its own archive
+/// adds one: the target a raw chunk of its own, the link's inode number one no entry has (an exported archive's numbers
+/// carry the volume's prefix in their high bits), its owner and times the root's.
+fn with_symlink(bytes: &[u8], link: &str, target: &[u8]) -> Vec<u8> {
+  let mut archive = slates_archive::Archive::decode(bytes).unwrap();
+  let chunk = slates_archive::Archive::raw_chunk(target.to_vec());
+  let len = u64::try_from(target.len()).unwrap();
+  let root = archive.root_meta.clone();
+  let slates_archive::Node::Directory(entries) = &mut archive.manifest else {
+    panic!("an archive's root is a directory");
+  };
+  entries.push(slates_archive::Entry {
+    name: link.to_owned(),
+    meta: slates_archive::NodeMeta {
+      ino: u64::MAX,
+      mode: SYMLINK_MODE,
+      size: len,
+      nlink: 1,
+      uid: root.uid,
+      gid: root.gid,
+      atime_ns: root.atime_ns,
+      mtime_ns: root.mtime_ns,
+      ctime_ns: root.ctime_ns,
+      btime_ns: root.btime_ns,
+      ..Default::default()
+    },
+    node: slates_archive::Node::File(vec![slates_archive::Extent {
+      offset: 0,
+      len,
+      chunk: chunk.identity,
+      chunk_offset: 0,
+    }]),
+  });
+  archive.chunks.push(chunk);
+  archive.encode()
+}
+
+/// The daemon's volumes and the bytes committed to its bounded volumes, over its shards: what a refused import leaves
+/// as it found them.
+fn held(instance: &mut Instance) -> (u64, u64) {
+  let report = instance.daemon_status().unwrap();
+  report
+    .shards
+    .iter()
+    .fold((0, 0), |(volumes, bytes), shard| {
+      (volumes + shard.volumes, bytes + shard.committed_bytes)
+    })
+}
+
+/// Whether a volume named `name` is listed.
+fn listed(instance: &mut Instance, name: &str) -> bool {
+  instance
+    .list()
+    .unwrap()
+    .iter()
+    .any(|summary| summary.name == name)
+}
+
+/// The archive export test's tree written into a new volume `name` and snapshotted: a small file, a file spanning
+/// several chunks and an empty one, a private file and a private directory, in nested directories. The volume, the
+/// snapshot, and each file's path and bytes.
+fn archived_tree(
+  instance: &mut Instance,
+  name: &str,
+) -> (VolumeId, SnapshotId, Vec<(&'static str, Vec<u8>)>) {
+  let volume = provision(instance, &VolumeSpec::empty(name, ROOM));
+  let spanning: Vec<u8> = (0..SPANNING_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let files: Vec<(&'static str, Vec<u8>, u32)> = vec![
+    ("top.txt", b"the top file".to_vec(), MODE),
+    ("dir/spanning.bin", spanning, MODE),
+    ("dir/deeper/empty", Vec::new(), MODE),
+    ("private/key", b"a private file".to_vec(), PRIVATE_MODES.0),
+  ];
+  let attached = instance.attach_volume(volume, Intent::Write).unwrap();
+  for (directory, mode) in [
+    ("/dir", DIRECTORY_MODE),
+    ("/dir/deeper", DIRECTORY_MODE),
+    ("/private", PRIVATE_MODES.1),
+  ] {
+    instance
+      .client()
+      .fs_mkdir((volume, attached.attachment), directory, mode)
+      .unwrap();
+  }
+  for (path, bytes, mode) in &files {
+    instance
+      .client()
+      .fs_write(
+        (volume, attached.attachment),
+        &format!("/{path}"),
+        bytes,
+        *mode,
+      )
+      .unwrap();
+  }
+  instance.detach(attached.attachment).unwrap();
+  let snapshot = instance.snapshot(volume).unwrap();
+  (
+    volume,
+    snapshot,
+    files
+      .into_iter()
+      .map(|(path, bytes, _)| (path, bytes))
+      .collect(),
+  )
+}
+
+/// A-453 (§4.11 "Archive"; Mantle's CP-T10.4): a volume made from an exported archive holds the exported tree. Do:
+/// export a snapshot of a tree of files and directories of several modes; import the archive volume the export made
+/// into a new volume, and again into another. Expect: each import names the export's manifest; each file of the new
+/// volume reads back its bytes and length through `read`; the tree each new volume holds (exported again and restored
+/// in memory) is the exported tree in every file's bytes, every directory, and every entry's mode, length, owner and
+/// times, the root's too, save the inode numbers, which are each volume's own; and the two imports hold byte-identical
+/// trees. Then write into a scratch volume the archive with a symbolic link added, as a consumer writing its own
+/// archive would, and import that. Expect the link back as a link to its target, beside every file of the tree. And by
+/// kind: an import into a name a volume holds is `AlreadyExists`, and one whose tree outgrows the size it asks is
+/// `Exhausted::Memory` naming that size, with nothing made and the room given back.
+#[test]
+fn a_volume_imported_from_an_exported_archive_holds_the_exported_tree() {
+  let (daemon, mut instance) = grouped("archive-import");
+  let (volume, snapshot, files) = archived_tree(&mut instance, "import-source");
+  let exported = instance
+    .export_archive(volume, snapshot, "import-archive")
+    .unwrap();
+  let exported_bytes = read_file(
+    &mut instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  let exported_tree = tree_of(&exported_bytes);
+
+  let imported = instance
+    .import_archive(exported.id, "imported", ROOM)
+    .unwrap();
+  assert_eq!(
+    imported.manifest, exported.manifest,
+    "the import names the archive's manifest"
+  );
+  for (path, bytes) in &files {
+    assert_eq!(
+      &read_file(&mut instance, imported.id, &format!("/{path}")),
+      bytes,
+      "{path} reads back its bytes and length"
+    );
+  }
+  let imported_tree = tree_held(&mut instance, imported.id, "imported-export");
+  assert_eq!(
+    imported_tree, exported_tree,
+    "the new volume holds the exported tree, every entry's metadata with it"
+  );
+  let modes: Vec<u32> = ["private", "private/key"]
+    .iter()
+    .map(|path| imported_tree.2[*path].mode & 0o7777)
+    .collect();
+  assert_eq!(
+    modes,
+    [PRIVATE_MODES.1, PRIVATE_MODES.0],
+    "the private directory and file keep their own modes"
+  );
+  let again = instance
+    .import_archive(exported.id, "imported-again", ROOM)
+    .unwrap();
+  assert_eq!(again.manifest, exported.manifest);
+  assert_eq!(
+    tree_held(&mut instance, again.id, "imported-again-export"),
+    imported_tree,
+    "a second import of the archive holds a byte-identical tree"
+  );
+
+  let target = b"dir/spanning.bin";
+  let linked = with_symlink(&exported_bytes, "link", target);
+  let scratch = provision(&mut instance, &VolumeSpec::empty("import-own", ROOM));
+  write_file(
+    &mut instance,
+    scratch,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+    &linked,
+  );
+  let own = instance
+    .import_archive(scratch, "imported-own", ROOM)
+    .unwrap();
+  assert_eq!(
+    own.manifest,
+    slates_archive::Archive::decode(&linked)
+      .unwrap()
+      .manifest_identity()
+  );
+  let (own_files, own_directories, own_metadata, _) =
+    tree_held(&mut instance, own.id, "imported-own-export");
+  let (linked_files, linked_directories, _, _) = tree_of(&linked);
+  assert_eq!(
+    (own_files, own_directories),
+    (linked_files, linked_directories),
+    "the consumer's own archive comes back whole, the link's target with it"
+  );
+  assert_eq!(
+    (own_metadata["link"].mode, own_metadata["link"].size),
+    (SYMLINK_MODE, u64::try_from(target.len()).unwrap()),
+    "the link is a symbolic link as long as its target"
+  );
+
+  assert!(
+    matches!(
+      instance.import_archive(exported.id, "imported", ROOM),
+      Err(Error::AlreadyExists(_))
+    ),
+    "a name a volume holds"
+  );
+  let before = held(&mut instance);
+  let small = u64::try_from(SPANNING_BYTES / 2).unwrap();
+  assert_eq!(
+    instance
+      .import_archive(exported.id, "imported-small", small)
+      .unwrap_err(),
+    Error::Exhausted(Exhausted::Memory { available: small }),
+    "a tree past the size the import asks"
+  );
+  assert_eq!(
+    held(&mut instance),
+    before,
+    "the refused import made no volume and gave its room back"
+  );
+  assert!(!listed(&mut instance, "imported-small"));
+  drop(instance);
+  daemon.stop();
+}
+
+/// Shape: the bytes of an archive's header the truncated-header archive keeps: its magic and its first fields, short
+/// of the header's whole length.
+const HEADER_CUT: usize = 20;
+/// Format: the magic of a zip file's local header, `PK\x03\x04`: another format's file where an archive should be.
+const FOREIGN_MAGIC: [u8; 4] = *b"PK\x03\x04";
+
+/// A-453 (§4.9 hostile input; §4.11 "Archive"): bytes that are no whole archive make no volume. Do: export an archive,
+/// then write into a scratch volume of the caller's, one at a time, the archive re-encoded declaring a chunk length of
+/// `u32::MAX` (its checksum made whole again, so only the length is wrong), its first bytes cut short of the header,
+/// the archive with one bit flipped, and the archive under another format's magic; import each. Expect each refused
+/// `Invalid::Archive` by its kind (malformed, truncated, corrupt, foreign magic), no volume made and no room kept, the
+/// name free; then the whole archive imported under a name a refused import used.
+#[test]
+fn a_hostile_archive_is_refused_by_kind_with_nothing_made() {
+  let (daemon, mut instance) = grouped("archive-hostile");
+  let (volume, snapshot, _) = archived_tree(&mut instance, "hostile-source");
+  let exported = instance
+    .export_archive(volume, snapshot, "hostile-archive")
+    .unwrap();
+  let whole = read_file(
+    &mut instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  let mut declared = slates_archive::Archive::decode(&whole).unwrap();
+  declared.chunk_max = u32::MAX;
+  let mut flipped = whole.clone();
+  flipped[whole.len() / 2] ^= 1;
+  let mut foreign = whole.clone();
+  foreign[..FOREIGN_MAGIC.len()].copy_from_slice(&FOREIGN_MAGIC);
+  let hostile: [(&str, Vec<u8>, ArchiveFault); 4] = [
+    ("length", declared.encode(), ArchiveFault::Malformed),
+    (
+      "header",
+      whole[..HEADER_CUT].to_vec(),
+      ArchiveFault::Truncated,
+    ),
+    ("flipped", flipped, ArchiveFault::Corrupt),
+    ("foreign", foreign, ArchiveFault::ForeignMagic),
+  ];
+  for (kind, bytes, fault) in hostile {
+    let scratch = provision(
+      &mut instance,
+      &VolumeSpec::empty(&format!("hostile-{kind}"), ROOM),
+    );
+    write_file(
+      &mut instance,
+      scratch,
+      &format!("/{}", slates_api::ARCHIVE_FILE),
+      &bytes,
+    );
+    let before = held(&mut instance);
+    let name = format!("from-{kind}");
+    assert_eq!(
+      instance.import_archive(scratch, &name, ROOM).unwrap_err(),
+      Error::Invalid(Invalid::Archive(fault)),
+      "the {kind} archive is refused by its kind"
+    );
+    assert_eq!(
+      held(&mut instance),
+      before,
+      "the {kind} archive made no volume and kept no room"
+    );
+    assert!(!listed(&mut instance, &name), "{name} is free");
+  }
+  let made = instance
+    .import_archive(exported.id, "from-flipped", ROOM)
+    .unwrap();
+  assert_eq!(made.manifest, exported.manifest);
   drop(instance);
   daemon.stop();
 }

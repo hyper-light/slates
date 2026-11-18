@@ -4493,11 +4493,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   first descriptor goes to the device, and the shard's DAX range table in anchor RAM records each range answered and
   whether it was asked writable, a slot a range, its slots derived from the fill budget; a refusal of either gives the
   resync up, as a stream did at its first map before A-365, since the guest's stores live where only the device maps
-  them once the daemon is gone.
+  them once the daemon is gone. On Windows (A-448) the anchor holds a duplicate of each file's section that maps read
+  and write and may ask its size, which the section's confining descriptor lets no holder widen (A-175); its hold is an
+  exchange, so the answer naming the section waits for it, as a reply waits for the session's `Record`; its id is the
+  backing's marked apart from every attachment's, since the Windows anchor keeps one table of ids; and the sections are
+  held to a bound of their own, `shards × dax_range_slots`, past which a hold is refused `Bound` and the stream gives
+  its resync up, while the attachments' mounts and resync ends keep theirs.
   A successor takes the held DAX objects back while recovery rebuilds the shard, at the very handles their backings
   had, dormant through the write log's replay (each already holds every write the dead daemon made to its ranges, in
   order with its guest's stores), and its stream ingests their writable ranges before it serves anything, wakes them so
-  every change reaches them again, and answers the device's new asks with the same objects. It hands the device a fresh
+  every change reaches them again, and answers the device's new asks with the same objects: on Windows each ask after
+  the `Resync` gets the same section duplicated into the holder again, the holder's handle of the fresh stream being a
+  known holder's for the claim check (A-448), and a file whose section the anchor did not hand back is asked for again
+  at its next answer, never assumed held. It hands the device a fresh
   stream over the channel in a `Resync` naming the same token, and keeps its own copy of
   the fresh end until the device shows it holds its own, by its first bytes on the stream or by its end of the channel
   closing, which the stream's task watches for meanwhile (A-339: the `Resync` waits in the device's channel until the
@@ -8423,6 +8431,31 @@ the format floor.
 > archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
 > archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
 
+> **Status (2026-11-18, A-453: a volume made from an archive through the library).** `ArchiveImport`
+> (`Instance::import_archive`, contract 40) is the export's way back. A consumer writes the archive bytes it kept into
+> the root of a volume of its own as `ARCHIVE_FILE` (or names the volume an export made), and the daemon makes a new
+> volume holding the archive's tree. The verb checks the archive volume, `read` on it and the name at once, then a task
+> of that volume's owner shard does the rest a slice a turn, never in one long turn:
+> - the file's length is admitted before a byte is read: no longer than the archive volume's class cap (every byte a
+>   writer put there was charged to it, so only a file with holes is longer: refused `Malformed`), and no longer than
+>   the shard's room, since the file is held whole while it is decoded (refused `BudgetExceeded`);
+> - the file is read a copy slice a unit, then decoded and verified a piece a unit (`slates_archive::Decoding`: the
+>   header's fixed fields at once, the whole-archive BLAKE3 at most an archive slice of bytes a piece before anything
+>   past the header is decoded, then a chunk record a piece, then the manifest);
+> - the new volume is admitted as a create admits one, under the archive's own name policy;
+> - its tree is planned and restored (`Planning`, `Restoring`), admitted against the size the import asks and the
+>   shard's room by the rule a takeover's restore follows (`verbs::restore_budget`), and laid into the volume by the
+>   takeover's own `verbs::Populating`, every entry's mode, owner, times and attributes with it;
+> - the volume and the request's completion commit as one atom, as an export's do.
+>
+> Bytes that are no whole archive are refused `ArchiveRefused { fault }` by kind, with nothing made: `ForeignMagic`,
+> `Unsupported` (a newer major, flag or name policy), `Truncated`, `Corrupt` (the checksum or an identity fails),
+> `Malformed` (whole and matching its checksum, but breaking the format's rules). A tree past the asked size or the
+> room is refused `BudgetExceeded`, a held name `AlreadyExists`. Owners and set-id bits come back as the archive holds
+> them, as a takeover's restore brings them back; a host mount the daemon makes honours no set-id bit and opens no
+> device node (`nosuid,nodev`, A-94). Owed: a streamed decoder, since the file is held whole while it is decoded, as
+> the export's encoding is; and the manifest's decode and identity in pieces (one piece today: the whole tree's).
+
 ### 4.12 Agent surfaces (D-19)
 
 > **Correction (2026-09-17, CLI process gate).** `run` and `exec` accept global flags before
@@ -10526,6 +10559,15 @@ the work volume's base becomes `to`; if any is `Conflict`, return the windows an
 The agent reads green's bytes for each window (a read of the named version), rewrites its own
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
+
+**Rebase off the owner (A-273).** A shard that holds works of a green keeps a replica of it: the engine made from the
+owner's, fed the owner's versions and folds in order, its content the owner's sealed blocks read in place, so a rebase
+and a read at a version it holds need not cross to the owner's one thread. Each structure the replica adds is bounded
+by a derivation from the machine with a typed refusal: the replicas an owner takes (one on each other shard of its
+node and its rebuild's fresh one; none with one shard), a replica's own metadata (no more than its owner's per-green
+budget and its shard's room), the bytes an owner keeps for lagging ones (the room its per-green budget leaves beyond
+its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
+rebuilt. Built in the engine (steps 1 to 4); on the shards owed (step 5).
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25003,8 +25045,40 @@ released it (`Fed::Applied`'s `Passed`, `Green::acknowledge_replica`), and nothi
 (`Green::leave_replica`); step 1's frees by position now live in the sealed blocks. Proven by the sealed blocks' tests
 (a reader on another thread reads in place what its writer frees behind it; generated histories of seals, releases,
 joins, passes, late acknowledgements and leaves, every live block allocated and read as sealed) and the replica's
-oracle, which now holds every current file's bytes to be the owner's own memory. Its bounds (step 4) and the shards'
-use of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+oracle, which now holds every current file's bytes to be the owner's own memory. A replica's lifetime is bounded by
+its owner's (2026-11-18, found by Miri): the owner's holder makes every replica leave before it gives the owner up
+(`SealedBlocks::end`, refused while a reader is registered); an owner dropped with a replica still registered frees
+nothing, since the replica may still read, and is counted (`sealed::dropped_with_readers`; the bug record of
+2026-11-18, "a sealed-block writer dropped with a reader kept its blocks"). Step 4 built 2026-11-18 (g083): the
+bounds, each derived from the machine by a stated formula its holder applies (`crates/merge/src/replica.rs`) and each a
+typed refusal that ends with the replica rebuilt from the owner (`Replica::rebuild`) or given back (`Replica::leave`),
+its work going to the owner until one is made again. The replicas an owner takes: `replica_limit` = (shards − 1) × 2,
+one on each other shard of its node and beside it the fresh one its rebuild makes before the old one is given back;
+none with one shard (R8); past it `ReplicaRefusal::Full`, and a replica makes none (`ReplicaRefusal::NotAnOwner`). A
+replica's metadata (`Green::metadata_bytes`: piece lists, change index, IPC history, deltas, accepted record and its
+chunk table, running totals all): `replica_budget` = min(the per-green budget its owner's retention is folded to, the
+partition's `green_chain_bytes`, the most of its shard's table share one green's history may hold; the room its own
+shard has for it now); refused at its making and at a rebuild
+(`Unfit::OverBudget`, the fresh green's registration given back) and after a message that takes it past
+(`FeedRefusal::OverBudget`). The bytes an owner keeps for its replicas, which are charged to its own per-green budget:
+`held_limit` = that budget less the owner's own retention (`Green::retention_charge` less `Green::content_held_bytes`;
+`Green::set_replica_held_limit`), so a lagging replica never takes the room of the owner's own work. Past it the owner
+evicts its slowest replica, one at a time; every later message names it and it refuses the first it is given
+(`FeedRefusal::Evicted`, before any other check), keeping its frees until it leaves, so the bound costs a replica,
+never a read of freed bytes (`merge.replica.dropped_lagging`). A change made while the last was still unsent evicts
+every replica, which could not be fed in order (`merge.replica.dropped_unfed`), so the owner records one message's
+blocks at most. The key indexes, one entry a path, are the owner's own bound; a reader's live table is the owner's live
+blocks, and its adoption queue one message's. Proven by the sealed blocks' tests (a join past the limit refused; the
+slowest reader evicted past the held limit, reading what it holds until it leaves; a change left unfed evicting every
+reader; every writer ended once its readers left) and the replica's (each bound driven to its refusal at its derived
+value, the replica rebuilt or given back and made again; one shard takes no replica; an owner with no room beyond its
+own retention evicts at its first release; with the eviction past the held limit disabled at a release, both of the
+replica's held-limit tests and the sealed blocks' slowest-reader test fail, the unfed one passing: r316 on the Mac
+Studio, 2026-11-18). Owed (step 5): the holder on the shards applies the derivations to the machine's figures and logs
+them with the boot profile's, charges a replica's metadata to its shard's budget, routes a refused or evicted replica's
+rebases and reads to the owner, counted, gives back an idle one (its idle period derived from the feed's cost per
+version against the rebases it served), and makes a green's replicas leave before it gives the owner up. The text and
+its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -30815,8 +30889,8 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
   Windows. The real-process test (an anchor, a killed daemon, the probe reading the file through the stream its
   `Resync` names) and the Windows unit and suite runs are filed for main.
 - **Owed.** A Windows stream's DAX sections held by the anchor (A-365 is Unix's; a Windows stream gives its resync up at
-  its first map, A-427); and Shards' device half, which takes the `Resync` through its spawner's grants (its
-  coordinator's condition 4c).
+  its first map, A-427): built by A-448; and Shards' device half, which takes the `Resync` through its spawner's grants
+  (its coordinator's condition 4c).
 
 ### A-442 — An NFSv4.1 callback waits its back channel's learned round trip, backed off after a timeout up to the NFSv4 lease; the told wait and the callbacks share one learner (2026-11-18, built for goal g255; R3's class B, item B-c; RFC 8881 §2.10.6.2, §2.10.6.3, §10.4.5; A-78, A-79, A-425, A-431)
 - **What was there.** Every callback on a session's back channel (the probe that proves it, `nfs::probe_back_channel`,
@@ -31001,6 +31075,244 @@ two `windows-sys` features; `tests/oracle.rs` and `tests/os.rs`, a test each; `t
   directory (`SLATES_TEST_REFS_DIR`; skipped loudly without one). Compiled for `x86_64-pc-windows-msvc`.
 - **Owed.** Linux's `FICLONE` and macOS's `clonefile`, behind the same verb (their writers refuse it now and say no
   reflink); duplicates across batches; and the measured cost and gain the step waits on (the filed run reads both).
+
+### A-449 — `sweep_departed`'s wait stated, and the test support's session wait derived as the product waits for a lent session (2026-11-18, built for goal g255; R3's class B, item B-f, closing class B; A-65, A-222, A-408, A-437; the supervisor's ruling of 2026-11-07)
+- **`remote_attach::sweep_departed`.** The reap loop's look at departed hosts ends their attachments on every shard,
+  each through `xshard::call_in_shard_time` with a liveness window as its budget (A-408): a wall window, then more while
+  the shard runs or waits for a CPU, as every cross-shard wait judged in its target's own time takes (A-65). The
+  departure itself is decided by the fleet's membership and its own estimators (A-363). Its derivation is now stated
+  where it is made; no change.
+- **`daemon::SESSION_WAIT_NS` → `daemon::session_wait_ns()`.** Test support (`Daemon::hold_record_session`,
+  `Daemon::ask_live_reports`) waited one liveness window for a record session out of its link. It now waits as the
+  product does for a lent session (A-437's location round): one record-plane exchange's span
+  (`fleet::record_exchange_budget_ns`, the record plane's round budget over the slowest measured path), the bound every
+  borrower of a record session runs its exchange under, as the supervisor ruled on 2026-11-07. Test support only: no
+  product behaviour changes, so no failing test; the fleet tests that hold a session (`hold_record_session`'s four
+  callers) are filed for main's run.
+- With A-437, A-439, A-442, A-444 and A-446 this closes class B of `LIVENESS_BUDGET_NS`'s R3 debt.
+  Built and run on the Mac Studio (kiln, 2026-11-18, load 3-4, debug build, `cargo test --locked -p slates-server
+  --lib -- remote_attach session departed`): 8 of 8. No red-check: no product behaviour changed.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B line), `crates/server/src/{daemon,
+remote_attach}.rs`.
+
+### A-447 — A Windows claim waits while its daemon lives: the daemon's process mark in the bootstrap header, its exit waited on beside the claim (2026-11-18, goal 85 via g251; R3's class C, C-a's Windows half; §4.7 "Rendezvous"; A-143, A-159, A-176, A-443)
+
+- **What was there.** A-443 made a claim on Linux and macOS wait while its rendezvous's owner lives; a Windows claim still
+  gave up at the claim wait, a second, with its daemon alive, since opening the owner's named Event to probe it would
+  keep its name and refuse a successor its ownership while the probe held it (A-176).
+- **The rule.** The daemon writes its process mark into the bootstrap header before it publishes the header: its process
+  id (the slot A-159 had emptied) and its creation time (`GetProcessTimes`, 100 ns intervals since 1601), at 24 and 32,
+  in the layout `SLB3` (a claimant of `SLB2` would read no mark, so each refuses the other as another layout). A claim
+  with no live anchor reads the mark, opens the process for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` alone,
+  the least that reads its creation time, and judges it by that time: a process given the pid after the daemon's exit
+  is never taken for the daemon, and the claim reads it exited at once. The claim then waits on its Event and the
+  process together (`WaitForMultipleObjects`, any) and ends at the daemon's exit, the slot taken back if the daemon had
+  not taken it. A process handle keeps the process object, and so its pid, but none of the objects the process named:
+  the bootstrap section's and the owner token's names die with the daemon, and a successor's takeover is never refused
+  for it. Under a live anchor the restart bound still bounds the claim (a restarted daemon is another process). A
+  header of this layout with no mark refuses the claim typed.
+- **Read first.** Microsoft's documentation of `OpenProcess` (the access rights it grants), `GetProcessTimes` (which
+  needs `PROCESS_QUERY_INFORMATION` or `PROCESS_QUERY_LIMITED_INFORMATION`), `WaitForMultipleObjects` (a process handle
+  is signaled at the process's exit) and "Process Handles and Identifiers" (a pid is not reused while a handle to its
+  process is open).
+- **Tests.** `the_daemons_mark_is_little_endian_at_its_offsets_and_none_is_read_where_none_was_written` (the golden
+  vector at both offsets, the magic `SLB3`, and hostile images: unwritten, a zero pid or time, short, every bit set).
+  The waits are Windows' (`cargo xwin check` clean); the cross-process rendezvous file's Windows run, a claim served
+  past a second and one ended at its daemon's exit, is filed for main.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{rendezvous,exit_watch,
+wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).
+
+### A-452 — The macOS region fetch waits while its owner lives: no timeout, the kernel's send-once notification ending it at the owner's departure (2026-11-18, goal 85 via g251; R3's class C, C-a; §4.7 "Rendezvous"; GAP-A9-9, A-178, A-443)
+
+- **What was there.** A macOS claimant fetches its answered region from the instance's owner over the owner's token
+  (`mach_claim::fetch`, GAP-A9-9). The fetch waited a fixed second for its send to be queued and another for the answer
+  (the claim wait), so an owner alive and slow to answer (its thread descheduled on a busy machine) was reported gone,
+  and an owner that went away with the fetch queued was reported as keeping nothing for the claim: the kernel's notice
+  of the fetch's destroyed send-once right was read as a malformed answer.
+- **The rule.** The fetch waits while its owner lives, never by a clock, as a claim does (A-443): its send has no
+  timeout, so it waits for room in the owner's queue until it is queued or the owner's port dies (refused
+  `MACH_SEND_INVALID_DEST`); its receive has none, so it waits for the owner's answer until the kernel's send-once
+  notification (`MACH_NOTIFY_SEND_ONCE`) says the owner went away holding the fetch's reply right, or with the fetch
+  still in its queue, each refused as an owner that went away.
+- **Tests.** `a_fetch_answered_past_the_claim_wait_is_served` (the token held with nothing serving it, a region kept,
+  the fetch made, and the owner's service started half again the claim wait later: the region fetched) and
+  `a_fetch_whose_owner_went_away_is_refused_by_its_departure` (the token let go with the fetch queued: refused as an
+  owner that went away, at once). Red with the old timeouts: the first refused at the second, the second reported as
+  an owner keeping nothing.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{mach_claim,rendezvous}.rs`.
+
+### A-454 — The fleet tests' client waits in its daemon's own time: a connect is one claim, a full ring is waited out while its shard steps (2026-11-18, goal 85 via g251; R3's class C, C-a's second half; A-426, A-443, A-447)
+
+- **What was there.** The fleet suite's client (`crates/server/tests/fleet.rs`) retried a connect refused as unavailable,
+  and a send refused for a full request ring, for five seconds on the wall (`CREDIT_WAIT`). A daemon kept off its CPUs
+  could outlast it while alive, and the connect's retry dated from when a claim gave up at a second with its daemon
+  alive.
+- **The rule.** A connect is one claim: since A-443 and A-447 a claim waits while its daemon lives and ends at its
+  death, and every daemon of the suite opens its rendezvous before its start returns, so a refusal says no daemon holds
+  the instance's rendezvous and fails the test at once. A send that meets a full ring waits for room while the ring's
+  shard steps, since a shard drains its clients' rings at its steps (A-426's rule for room), and ends only once the
+  shard has taken no step for `FROZEN_CAP`, the suite's one wall bound for a daemon frozen or dead (`RoomWait`). No
+  product behaviour changes.
+- **Owed.** The same constant and the same two waits in `ack_release.rs`, `attach_forms.rs` and `shards.rs`.
+- **Checks.** `cargo test --locked -p slates-server --test fleet --no-run` (the suite's run is main's).
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/server/tests/fleet.rs`.
+
+### A-448 — The anchor holds a Windows Shards stream's DAX sections, so a stream whose guest maps files outlives its daemon (2026-11-18, goal 90, item b, piece five; A-365's Windows half; A-175's confinement, A-180's sections, A-433's successor)
+Applied in the same change to: §4.6, the Shards form's resync bullet; A-433's owed list; GAPS, A-281's entry (its
+Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's death); and:
+- `crates/anchor`: `handles.rs` (`WHAT_SHARDS_DAX`, `SHARDS_DAX_HANDLES`, `admits`; `HoldBounds`, each class of entry
+  held to its own bound); `held_windows.rs` (`Held::new(HoldBounds)`, the sections counted apart, refused `Bound` at
+  theirs); `supervise.rs` and `supervise_windows.rs` (`hold_handles(HoldBounds)`, the drain bound over every class).
+- `crates/api`: `role/anchor.rs` (the anchor's bounds: `held_device_bound` and `held_dax_bound`).
+- `crates/mem`: `dax_object.rs` (Windows `DaxObject::adopt`, a held section checked whole: its last range maps writable
+  and a duplicate of read, write and query is granted; `DaxObject::held`, the anchor's duplicate);
+  `tests/dax_section.rs` (`a_held_section_is_adopted_whole_and_never_widened`).
+- `crates/vfs`: `shards_backing.rs` (`BackingObject::held` on Windows).
+- `crates/cli`: `tests/shards.rs` (`slates_shards_keeps_its_programs_dax_section_across_its_daemons_kill`, the real-process
+  restart with a stored section, sharing A-433's restart harness, `read_across_a_kill`).
+- `crates/server`: `config.rs` (`held_dax_bound`, which `held_copy_bound` now adds); `anchor_hold_windows.rs`
+  (`HandedCopy`, `adopt` keeps a section entry for its shard, `hold_section`, `release_section`; the stand-in anchor's
+  section exchanges); `shards/dax_hold.rs` (on every platform: `marked`, `hold_asked`, Windows' `hold`, `release`,
+  `owed`, `hold_owed`, `settle_section`, `refuse_section`, `unroutable`); `shards.rs` (`section_owed`,
+  `Turned::Section`, `keep_resync_through_dax` and `give_up_resync_for_dax` on Windows, the successor's `claim` and
+  its holder named); `shards/dax.rs` (the Windows answer keeps the section; its end lets it go);
+  `shards/resync_handle.rs` (`send_resync` gives the holder's value back); `daemon.rs` (Windows' `ShardHolds`, the
+  sections split by partition, the range table opened on every platform); `state.rs`, `lib.rs`, `verbs.rs` and
+  `dax_ranges.rs` (the range table and the adoption on every platform).
+
+- **What was there.** A Windows stream gave its resync up at its guest's first DAX map (A-427): the guest's stores
+  through a section live in an object only the device maps once its daemon is gone, and no anchor held one, so a DAX
+  share ended at a daemon's death.
+- **The hold.** The daemon hands the anchor a duplicate of each section a resynced stream's guest maps, as Unix hands
+  it the object (A-365): before the answer naming the section goes out, with the attachment and the file as its
+  record, and released when the backing ends (the guest forgets the file, the stream ends, the resync is given up). The
+  duplicate maps read and write and may ask its size, the access a successor works the section by and a writable ask's
+  duplicate takes. It is made under the section's own `D:P(A;;RC;;;OW)` (A-175), so the anchor, and the successor it
+  hands the section to, can widen it no more than any holder. Windows' hold is an exchange, so the answer waits for
+  it, as a reply that rests on the session waits for its `Record` (A-427): the serve task asks it (`Turned::Section`).
+  Held, the section is the stream's; refused, past the anchor's bound or with the exchange failed, the stream gives its
+  resync up and its device learns its share ends with this daemon (A-365's rule); an answer that never came is
+  released all the same, since the anchor may hold it. Each range answered is recorded in the range table, which now
+  opens on every platform.
+- **Its id.** The section's backing's handle encoded with its partition, as on Unix, with the top bit set: the Windows
+  anchor keeps one table of ids for every kind, and a release and its answer name an entry by id alone, while an
+  attachment's id carries its partition in the same top 16 bits, so the two could be equal. A partition below 2^15
+  leaves the bit clear in both; under one past it no section is held and the stream gives its resync up.
+- **Its bound.** The anchor holds each class of entry to its own derived bound (`HoldBounds`): mounts and resync ends
+  one per live attachment (`shards × MAX_ATTACHMENTS`, as before), and sections one per range the shards' fill budgets
+  can count (`shards × dax_range_slots`, the derivation of A-365's copy bound), since each section held counts at least
+  one range against its shard's. A section past its bound is refused `Bound`, typed, and never crowds out a mount or a
+  resync end; the handoff names at most the two together, which the daemon parses at most.
+- **The successor.** Recovery takes each held section back as a held Unix object is taken (A-365): at its backing's
+  handle, in one ascending order, dormant through the write log's replay, checked whole (`DaxObject::adopt`: its last
+  range maps writable, so it spans the machine's size, and a duplicate of read, write and query is granted, which the
+  descriptor grants no handle lacking any of them). The stream's adoption claims them, wakes them and ingests their
+  writable ranges before it serves anything. Its device's asks after the `Resync` are answered with the same sections
+  duplicated into the holder again, so the guest's maps stay right: the holder's value of the fresh stream is a known
+  holder's, which a DAX ask names for the claim check (A-180). A file whose section the anchor did not hand back is
+  asked for again at its next answer (`hold_asked`), never taken for held; a section no kept stream claims is released.
+- **Not in the `Resync`.** The sections are offered again at the device's asks, as on Unix, and not named in the
+  `Resync`: A-418's 40-byte wire is what Shards' device half is built to, the device asks for a section at every
+  `FUSE_SETUPMAPPING` (`dax-protocol.md`, (a)), and a section duplicated into the VMM unasked would be a handle no one
+  closes in its process.
+- **Evidence.** Red first, on main at `0576faacf` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s
+  lib tests did not build (13 errors: no `HoldBounds`, `WHAT_SHARDS_DAX`, `SHARDS_DAX_HANDLES`), nor `slates-server`'s
+  (9 errors: no `marked`, `hold_asked`). Green on the tree as merged with main, the same day and machine:
+  `cargo test -p slates-anchor --lib handles` 14 of 14, among them `the_anchor_admits_each_kind_at_its_handle_counts_alone`
+  and `each_class_of_entry_is_refused_at_its_own_bound`; `cargo test -p slates-server --lib shards::` 8 of 8, among them
+  `a_sections_id_is_never_an_attachments_and_keeps_its_handle` and
+  `a_successor_that_finds_no_held_section_asks_the_anchor_again`; rustfmt's layout taken; and `cargo xwin check
+  --target x86_64-pc-windows-msvc` clean for `slates-anchor`, `slates-mem`, `slates-vfs`, `slates-server` and
+  `slates-api` (lib and tests) and `slates-cli` (bins and tests). The Windows tests (`dax_section.rs`'s adoption,
+  `held_windows.rs`'s bound, the stand-in anchor's section exchanges) and the real-process restart run only on Windows:
+  filed for main.
+- **Owed.** The real-process restart with DAX (`slates_shards_keeps_its_programs_dax_section_across_its_daemons_kill`:
+  a section stored into before the kill, the same section handed again by a fresh ask after it, the store read back
+  through the fresh stream) on CI's Windows runners, filed for main; Shards' device half (its coordinator's condition
+  4c). Found beside it (GAPS): the Windows handoff names every held entry in one environment variable, whose length
+  Windows bounds, and the anchor's bounds were never set against it.
+
+### A-453 — A volume made from an archive through the library (2026-11-18, goal g268; Mantle's CP-T10.4, "Slates snapshots on Mantle"; §4.11 "Archive", D-17; §4.9 hostile input; §4.12 the consumer contract, A-299; A-441, A-391)
+Applied in the same change to: `crates/archive` (`Decoding`, the decode a bounded piece at a time, `Archive::decode`
+now its pieces run to their end; the tests `an_archive_decoded_in_pieces_is_the_archive_decoded_whole` and
+`a_cut_or_flipped_archive_decoded_in_pieces_is_refused_as_whole`); `crates/vfs/src/export.rs`
+(`name_equivalence_of_id`, its test `an_archives_name_policy_names_its_volumes_back`); `crates/ipc`
+(`RequestBody::ArchiveImport`, `ReplyBody::ArchiveImported`, `Refusal::ArchiveRefused`, `ArchiveFault`, appended and
+published in `tests/wire_order.txt`); `crates/server/src/image.rs` (`import_verb`, `ImportJob`, `run_import`,
+`import_steps`), `verbs.rs` (its dispatch, its new volume's name, its durability claim as a creation's, its refusal's
+label, `restore_budget` shared with a takeover's restore) and `merge_service.rs` (`StoreVerb::ArchiveRead`);
+`crates/client` (`Client::archive_import`, `ArchiveImported`, `ArchiveFault`); `crates/api`
+(`Instance::import_archive`, `Invalid::Archive`, `ArchiveImported` and `ArchiveFault` re-exported, `CONTRACT` 40, the
+tests `a_volume_imported_from_an_exported_archive_holds_the_exported_tree` and
+`a_hostile_archive_is_refused_by_kind_with_nothing_made`); §4.11's status; GAPS (2026-11-18).
+
+- **Why.** A-441 let a consumer take a snapshot out as its archive and keep it where it keeps bytes (Mantle, kiln's
+  object store, CP-T10.4). Nothing brought one back: no verb made a volume from an archive a consumer held.
+- **The shape.** The way in mirrors the way out. The consumer writes the bytes it kept into the root of a volume of its
+  own as `ARCHIVE_FILE` (or names the volume an export made) and names that volume, a new volume's name and its size;
+  every path a consumer already has carries the bytes in (the file channel's staged write), and the archive volume's
+  own size policy bounds them. The new volume takes the archive's name policy, so names that differ only by case stay
+  apart where they were apart.
+- **Running.** A task of the archive volume's owner shard, a slice a turn under the slice budget, never in one long
+  turn (A-374's rule for a takeover's restore). The file's length is admitted first, then the file is read a copy slice
+  a unit and decoded a piece a unit (`Decoding`). The volume is admitted as a create admits one, the tree is planned and
+  restored a piece a unit (`Planning`, `Restoring`), and it is laid into the volume a piece a unit by the takeover's
+  `verbs::Populating`. The volume and the request's completion commit as one atom, and the import's leftovers (the
+  archive, the restored tree) are freed in slices after the reply. A refusal at any step discards the volume and gives
+  its room back.
+- **Hostile input (§4.9).** The length is checked against two caps before a byte is read. It must be no longer than
+  the archive volume's class cap: every byte a writer put there was charged to that volume, so only a file with holes
+  is longer, and no writer of an archive makes one. And it must be no longer than the shard's room, since the file is
+  held whole while it is decoded. The buffer is reserved fallibly and never zeroed whole. The header's fixed fields are
+  checked first (magic, major, flags, the declared chunk maximum against the format's cap). Then the whole-archive
+  BLAKE3 is checked, a slice a piece, before anything past the header is decoded. Each chunk record's declared sizes
+  are admitted before its payload is copied. The restore admits the tree's need before it allocates, against the size
+  the import asks and the shard's room, by the rule a takeover's restore follows (`verbs::restore_budget`).
+- **Refusals.** `ArchiveRefused { fault }` names the class of the reader's refusal a caller acts on alike, every
+  reader refusal classed by name in `image::refusal_of_import`:
+  - `ForeignMagic`: another format's file.
+  - `Unsupported`: a newer major, a required flag, or a name policy this daemon does not hold.
+  - `Truncated`: the stream ends before its frame, or its trailer magic is missing.
+  - `Corrupt`: the checksum, a chunk's identity or the manifest's identity fails.
+  - `Malformed`: whole and matching its checksum, but breaking the format's rules (a declared length past its cap, a
+    chunk out of canonical form, a total, extent, name or path that does not hold, a tree that does not lay).
+
+  A tree past the asked size or the room is `BudgetExceeded` (`Exhausted::Memory` in the contract), a held name
+  `AlreadyExists`, a missing archive volume or file `NotFound` (`Missing::Entry`), a merge volume `Unsupported`.
+  Nothing is made and the name stays free in every case.
+- **Rights.** `read` on the archive volume: the import only reads it. The new volume is the caller's own. Owners and
+  set-id bits come back as the archive holds them, as a takeover's restore brings them back. A host mount the daemon
+  makes honours no set-id bit and opens no device node (`nosuid,nodev`, A-94).
+- **Owed.** A streamed decoder: the file is held whole while it is decoded, and the decoded archive beside it until the
+  restore ends, so an import near the shard's room holds its tree about twice for that time (the export's encoder owes
+  the same). The manifest's decode and Merkle identity are one piece, a walk of the whole tree, as a takeover's restore
+  once was. Symlinks are not in the library test, which writes through the file channel and has no symlink verb; the
+  takeover's restore tests lay them through the same `Populating`.
+- **Evidence (Mac Studio, 2026-11-18, debug).**
+  - `a_volume_imported_from_an_exported_archive_holds_the_exported_tree` and
+    `a_hostile_archive_is_refused_by_kind_with_nothing_made` pass, the two in 1.13 s (kiln r318).
+  - The round trip exports a tree of a small file, a 300 KiB file spanning chunks, an empty file, and a private file
+    in a private directory, in nested directories. It imports that archive twice. Each import names the export's
+    manifest, and every file reads back its bytes and length through `read`. Each new volume, exported again and
+    restored, holds the exported tree: every byte, every directory, and every entry's mode, length, owner, link count
+    and all four times, the root's too, save the inode numbers. The second import's tree equals the first's.
+  - A consumer-written archive (the export with a symbolic link added) comes back whole, the link a link
+    (`0o120777`) as long as its target.
+  - A held name is `AlreadyExists`. A size of half the spanning file is `Exhausted::Memory` naming that size, and the
+    daemon's volume count and committed bytes stay as they were.
+  - The hostile archives, each written into a scratch volume and imported, are refused by kind, with no volume made,
+    no room kept and the name free: the archive re-encoded declaring a chunk length of `u32::MAX` is `Malformed`;
+    its first 20 bytes, `Truncated`; one bit flipped mid-archive, `Corrupt`; a zip's magic, `ForeignMagic`. The whole
+    archive then imports under a name a refused import used.
+  - Units (kiln r310): the archive crate's 22, among them the decode a byte of hash a step equal to the whole decode,
+    and every cut or flipped archive refused alike either way; the export's 6 (an archive's name policy names its
+    volume's back); the wire order's 2; the library's 64 (the contract's history names 40).
+  - Red once each (kiln r320): with the laying skipped, the round trip read no file (its first `read` refused); with a
+    foreign magic classed `Corrupt`, the hostile test met `Corrupt` where it asked `ForeignMagic`.
 
 ### A-451 — A Windows landing gives each file, directory and link it makes the volume's other attribute bits, read back, and a directory link lands as one (2026-11-18, g085; A-262's landing half, A-185's owed item)
 Applied in the same change to: §4.15 (A-185's status), A-262 (stage 3's landing half), A-438 (its directory link),

@@ -1,8 +1,9 @@
 //! The Windows transport of the anchor's hold (A-198; the counterpart of `crate::held`'s Unix socketpair): a
 //! message-mode named-pipe pair (`slates_ipc::stream::message_pair`) over which a daemon asks the anchor to hold its
-//! WinFsp handles, and its Shards streams' resync ends (A-423), across its death, and the duplication that moves each
-//! handle into the anchor. A held entry's record can be replaced while it is held (`HandleMessage::Record`): a resync
-//! end's record is its stream's session, which moves while the stream lives.
+//! WinFsp handles, its Shards streams' resync ends (A-423) and their DAX sections (A-448), across its death, and the
+//! duplication that moves each handle into the anchor. A held entry's record can be replaced while it is held
+//! (`HandleMessage::Record`): a resync end's record is its stream's session, which moves while the stream lives. Each
+//! class of entry is held against its own bound (`crate::handles::HoldBounds`).
 //!
 //! **Why a round trip, where Unix sends one way.** The Unix channel moves a descriptor with its message, by
 //! `SCM_RIGHTS`: once the daemon's `sendmsg` returns, the kernel holds the descriptor for the anchor's socket, so the
@@ -35,7 +36,8 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::handles::{
-  HandedEntry, HandleMessage, HandleRefusal, MESSAGE_BYTES, Reason, decode, encode, encode_env,
+  HandedEntry, HandleMessage, HandleRefusal, HoldBounds, MESSAGE_BYTES, Reason, WHAT_SHARDS_DAX,
+  decode, encode, encode_env,
 };
 
 /// This thread's last error code, read before any other call.
@@ -394,21 +396,43 @@ struct Entry {
   record: Vec<u8>,
 }
 
-/// The entries the anchor holds across daemon restarts on Windows (A-198), by id, at most `bound` at once. The channel
-/// lives beside it in the supervisor; `apply` takes a message read from it and answers.
+/// The entries the anchor holds across daemon restarts on Windows (A-198), by id, each class at most its bound at once
+/// (A-448). The channel lives beside it in the supervisor; `apply` takes a message read from it and answers.
 pub struct Held {
   entries: BTreeMap<u64, Entry>,
-  bound: usize,
+  bounds: HoldBounds,
+  /// How many of the entries are DAX sections, held against [`HoldBounds::sections`]; the rest are held against
+  /// [`HoldBounds::attachments`].
+  sections: usize,
   refused: u64,
 }
 
 impl Held {
-  /// An empty hold of at most `bound` entries.
-  pub fn new(bound: usize) -> Held {
+  /// An empty hold of at most `bounds` entries of each class.
+  pub fn new(bounds: HoldBounds) -> Held {
     Held {
       entries: BTreeMap::new(),
-      bound,
+      bounds,
+      sections: 0,
       refused: 0,
+    }
+  }
+
+  /// How many entries are held against the same bound as entries of `what`.
+  fn held_like(&self, what: u8) -> usize {
+    if what == WHAT_SHARDS_DAX {
+      self.sections
+    } else {
+      self.entries.len().saturating_sub(self.sections)
+    }
+  }
+
+  /// Drops entry `id`, closing its handles, and gives its room back to its class.
+  fn remove(&mut self, id: u64) {
+    if let Some(entry) = self.entries.remove(&id)
+      && entry.what == WHAT_SHARDS_DAX
+    {
+      self.sections = self.sections.saturating_sub(1);
     }
   }
 
@@ -422,9 +446,9 @@ impl Held {
     self.entries.is_empty()
   }
 
-  /// Holds against the bound.
-  pub fn bound(&self) -> usize {
-    self.bound
+  /// The bounds each class of entry is held against.
+  pub fn bounds(&self) -> HoldBounds {
+    self.bounds
   }
 
   /// Entries the anchor refused (the bound reached, or a handle it could not duplicate).
@@ -445,7 +469,7 @@ impl Held {
       } => Some(self.hold(daemon, id, what, &values, record)),
       HandleMessage::Record { id, record } => Some(self.record(id, record)),
       HandleMessage::Release { id } => {
-        self.entries.remove(&id);
+        self.remove(id);
         Some(HandleMessage::Released { id })
       }
       HandleMessage::Held { id }
@@ -461,9 +485,9 @@ impl Held {
   }
 
   /// Duplicates each of `values` out of `daemon` and holds them as entry `id`, or refuses: a kind the anchor does not
-  /// hold or a count of handles that kind never names (`crate::handles::admits`), the bound reached, the id already
-  /// held, or a handle that would not duplicate (a value that is not a handle of the daemon, or the daemon gone). On
-  /// refusal nothing of the entry is kept.
+  /// hold or a count of handles that kind never names (`crate::handles::admits`), the bound of its class reached, the
+  /// id already held, or a handle that would not duplicate (a value that is not a handle of the daemon, or the daemon
+  /// gone). On refusal nothing of the entry is kept.
   fn hold(
     &mut self,
     daemon: HANDLE,
@@ -486,7 +510,7 @@ impl Held {
         reason: Reason::Malformed,
       };
     }
-    if self.entries.len() >= self.bound {
+    if !self.bounds.admits_another(what, self.held_like(what)) {
       self.refused = self.refused.saturating_add(1);
       return HandleMessage::Refused {
         id,
@@ -523,6 +547,9 @@ impl Held {
         record,
       },
     );
+    if what == WHAT_SHARDS_DAX {
+      self.sections = self.sections.saturating_add(1);
+    }
     HandleMessage::Held { id }
   }
 
@@ -655,6 +682,14 @@ mod tests {
     unsafe { OwnedHandle::from_raw_handle(raw) }
   }
 
+  /// Bounds of `count` entries an attachment holds and no DAX section.
+  fn attachments(count: usize) -> HoldBounds {
+    HoldBounds {
+      attachments: count,
+      sections: 0,
+    }
+  }
+
   /// A hold of `values` as entry `id` with `record`.
   fn hold(id: u64, values: Vec<u64>, record: &[u8]) -> HandleMessage {
     HandleMessage::Hold {
@@ -693,7 +728,7 @@ mod tests {
   #[test]
   fn a_hold_duplicates_handles_and_the_handoff_names_them() {
     let (_anchor, daemon) = channel().unwrap();
-    let mut held = Held::new(8);
+    let mut held = Held::new(attachments(8));
     let event_handles = events(3);
     let values: Vec<u64> = event_handles
       .iter()
@@ -717,7 +752,7 @@ mod tests {
     let (_anchor, daemon) = channel().unwrap();
     let event = one_event();
     let values = vec![handle_value(event.as_raw_handle())];
-    let mut held = Held::new(2);
+    let mut held = Held::new(attachments(2));
     assert_eq!(
       held.apply(myself(), hold(1, values.clone(), b"kept")),
       Some(HandleMessage::Held { id: 1 })
@@ -747,7 +782,7 @@ mod tests {
   fn the_bound_and_a_duplicate_id_are_refused() {
     let event = one_event();
     let value = handle_value(event.as_raw_handle());
-    let mut held = Held::new(1);
+    let mut held = Held::new(attachments(1));
     let first = held.apply(myself(), hold(1, vec![value], b""));
     assert_eq!(first, Some(HandleMessage::Held { id: 1 }));
     let again = held.apply(myself(), hold(1, vec![value], b""));
@@ -781,7 +816,7 @@ mod tests {
   fn a_resync_end_is_held_alone_and_its_record_moves_with_its_session() {
     use crate::handles::{RECORD_CAP, WHAT_SHARDS_RESYNC};
     let (_anchor, daemon) = channel().unwrap();
-    let mut held = Held::new(4);
+    let mut held = Held::new(attachments(4));
     let (end, other) = (one_event(), one_event());
     let value = handle_value(end.as_raw_handle());
     let resync = |id, values: Vec<u64>| HandleMessage::Hold {
@@ -839,11 +874,86 @@ mod tests {
     );
   }
 
+  /// A-448. Do: with room for one mount and two DAX sections, hold two sections, a third, a mount and a second mount;
+  /// release a section and hold another; hand the holdings on. Expect: the third section refused `Bound` while the mount
+  /// is still held, the second mount refused `Bound` beside the room sections left; the released section's room taken by
+  /// the next; and the handoff naming the mount and both sections, each section under its kind with its one handle and
+  /// its record.
+  #[test]
+  fn dax_sections_are_held_against_their_own_bound() {
+    use crate::handles::WHAT_SHARDS_DAX;
+    let (_anchor, daemon) = channel().unwrap();
+    let mut held = Held::new(HoldBounds {
+      attachments: 1,
+      sections: 2,
+    });
+    let section = one_event();
+    let value = handle_value(section.as_raw_handle());
+    let dax = |id: u64| HandleMessage::Hold {
+      id,
+      what: WHAT_SHARDS_DAX,
+      values: vec![value],
+      record: id.to_le_bytes().to_vec(),
+    };
+    let refused = |id| {
+      Some(HandleMessage::Refused {
+        id,
+        reason: Reason::Bound,
+      })
+    };
+    assert_eq!(
+      held.apply(myself(), dax(11)),
+      Some(HandleMessage::Held { id: 11 })
+    );
+    assert_eq!(
+      held.apply(myself(), dax(12)),
+      Some(HandleMessage::Held { id: 12 })
+    );
+    assert_eq!(
+      held.apply(myself(), dax(13)),
+      refused(13),
+      "past the sections' bound"
+    );
+    assert_eq!(
+      held.apply(myself(), hold(1, vec![value], b"mount")),
+      Some(HandleMessage::Held { id: 1 }),
+      "a mount beside full sections"
+    );
+    assert_eq!(
+      held.apply(myself(), hold(2, vec![value], b"mount")),
+      refused(2)
+    );
+    assert_eq!(
+      held.apply(myself(), HandleMessage::Release { id: 11 }),
+      Some(HandleMessage::Released { id: 11 })
+    );
+    assert_eq!(
+      held.apply(myself(), dax(14)),
+      Some(HandleMessage::Held { id: 14 })
+    );
+    assert_eq!((held.len(), held.refusals()), (3, 2));
+    let (_, entries) =
+      crate::handles::parse_env(held.handoff(&daemon).unwrap().env(), held.bounds().total())
+        .unwrap();
+    let named: Vec<(u64, u8, usize, Vec<u8>)> = entries
+      .into_iter()
+      .map(|entry| (entry.id, entry.what, entry.values.len(), entry.record))
+      .collect();
+    assert_eq!(
+      named,
+      vec![
+        (1, crate::handles::WHAT_WINFSP_MOUNT, 1, b"mount".to_vec()),
+        (12, WHAT_SHARDS_DAX, 1, 12u64.to_le_bytes().to_vec()),
+        (14, WHAT_SHARDS_DAX, 1, 14u64.to_le_bytes().to_vec()),
+      ]
+    );
+  }
+
   /// A-198. Do: ask to hold a value that is not a handle of the daemon. Expect: refused `Duplicate`, counted, nothing
   /// kept.
   #[test]
   fn a_value_that_will_not_duplicate_is_refused() {
-    let mut held = Held::new(8);
+    let mut held = Held::new(attachments(8));
     // An odd, tiny value that is not a live handle of this process.
     let answer = held.apply(myself(), hold(1, vec![0x3], b""));
     assert_eq!(

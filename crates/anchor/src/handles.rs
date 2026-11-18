@@ -8,12 +8,17 @@
 //! committed record never names a hold the anchor was not given, the guarantee `SCM_RIGHTS` gives the Unix channel
 //! (`crate::held`).
 //!
-//! Two kinds of entry are held ([`admits`]): a WinFsp mount's handles (A-198), and a Shards stream's resync end (A-423,
+//! Three kinds of entry are held ([`admits`]): a WinFsp mount's handles (A-198); a Shards stream's resync end (A-423,
 //! for A-418's Windows resync), whose record is the stream's session: its token, the owner view its guest named, its
-//! kernel's form and the process that holds the stream. A session moves while the stream lives (the guest names its
-//! owner, its `INIT` is answered, a restore runs, a holder is named), so a daemon replaces a held entry's record with
-//! [`HandleMessage::Record`], answered as a hold is, where the Unix channel sends a new session (`crate::held`'s
-//! `Session`); the record names no handle, so nothing is duplicated for it.
+//! kernel's form and the process that holds the stream; and a Shards stream's DAX section (A-448, A-365's object on
+//! Windows), whose record names the stream's attachment and the file. A session moves while the stream lives (the guest
+//! names its owner, its `INIT` is answered, a restore runs, a holder is named), so a daemon replaces a held entry's
+//! record with [`HandleMessage::Record`], answered as a hold is, where the Unix channel sends a new session
+//! (`crate::held`'s `Session`); the record names no handle, so nothing is duplicated for it.
+//!
+//! **Each kind its own bound** ([`HoldBounds`], A-448): the entries an attachment holds (a mount, a resync end) one per
+//! live attachment, and the DAX sections one per range a shard's fill budget can count. A guest that maps many files
+//! is refused [`Reason::Bound`] at its own bound and never crowds a mount or a stream's resync end out of the anchor.
 //!
 //! Every message is [`MESSAGE_BYTES`] long, checksum-verified and checked by kind, counts and lengths before anything is kept: the channel
 //! crosses a process boundary, so its bytes are external input, and so is the environment a daemon parses. The
@@ -40,6 +45,16 @@ pub const WHAT_SHARDS_RESYNC: u8 = 2;
 /// Format: the handles a Shards stream's resync hold names: the daemon's end of its resync pipe.
 pub const SHARDS_RESYNC_HANDLES: usize = 1;
 
+/// Format: what a hold holds, its `what` byte: a Shards stream's DAX section (A-448; A-365's object on Windows): a
+/// duplicate of the confined section one file of the stream's guest is mapped from, which maps read and write and may
+/// ask its size, its record the stream's attachment and the file, which a successor adopts the section by. Its id is the
+/// section's backing named apart from every attachment's id (the server's `dax_hold::section_id`), since a release and
+/// an answer name an entry by id alone.
+pub const WHAT_SHARDS_DAX: u8 = 3;
+
+/// Format: the handles a Shards stream's DAX section hold names: the section.
+pub const SHARDS_DAX_HANDLES: usize = 1;
+
 /// Format: the room one hold's message has for handles: three, A-198's WinFsp mount, kept since A-369 so the message's
 /// layout, which an anchor and a daemon built apart across an upgrade both read, does not move; a hold names one to
 /// this many.
@@ -52,12 +67,54 @@ pub const RECORD_CAP: usize = (64 + 192 + 2) * size_of::<u16>() + size_of::<u8>(
 
 /// Whether the anchor admits a hold of `what` naming `count` handles: a WinFsp mount one to [`MAX_HANDLES`] (its
 /// daemon names [`WINFSP_MOUNT_HANDLES`]; the room stays as A-198 left it, for a daemon built apart across an upgrade),
-/// a Shards stream's resync end exactly [`SHARDS_RESYNC_HANDLES`], and no other kind at all.
+/// a Shards stream's resync end exactly [`SHARDS_RESYNC_HANDLES`], a DAX section exactly [`SHARDS_DAX_HANDLES`], and no
+/// other kind at all.
 pub fn admits(what: u8, count: usize) -> bool {
   match what {
     WHAT_WINFSP_MOUNT => (1..=MAX_HANDLES).contains(&count),
     WHAT_SHARDS_RESYNC => count == SHARDS_RESYNC_HANDLES,
+    WHAT_SHARDS_DAX => count == SHARDS_DAX_HANDLES,
     _ => false,
+  }
+}
+
+/// The anchor's bounds on the entries it holds for a daemon on Windows (A-198, A-448), one for each class of entry,
+/// each derived by the daemon's configuration and refused [`Reason::Bound`] at its own: so a guest that maps many files
+/// never crowds a mount or a stream's resync end out of the anchor, and no class grows past what its daemon can make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldBounds {
+  /// The entries an attachment holds, a WinFsp mount's or a Shards stream's resync end: one per live attachment the
+  /// daemon's shards can hold (the server's `held_device_bound`).
+  pub attachments: usize,
+  /// The Shards streams' DAX sections: one per range the daemon's shards' fill budgets can count, since each section
+  /// held counts at least one range against its shard's (the server's `held_dax_bound`, A-365's derivation).
+  pub sections: usize,
+}
+
+impl HoldBounds {
+  /// The bound entries of `what` are held against: a DAX section's own, and every other kind's the attachments'.
+  pub fn of(&self, what: u8) -> usize {
+    if what == WHAT_SHARDS_DAX {
+      self.sections
+    } else {
+      self.attachments
+    }
+  }
+
+  /// Whether `what` is held against the same bound as `other`.
+  pub fn shared(what: u8, other: u8) -> bool {
+    (what == WHAT_SHARDS_DAX) == (other == WHAT_SHARDS_DAX)
+  }
+
+  /// Every entry the anchor may hold at once, of every class: the most a handoff names, which a daemon parses at most
+  /// ([`parse_env`]'s bound), and the most messages one drain of the channel may meet.
+  pub fn total(&self) -> usize {
+    self.attachments.saturating_add(self.sections)
+  }
+
+  /// Whether one more entry of `what` fits, `held` of its class being held already.
+  pub fn admits_another(&self, what: u8, held: usize) -> bool {
+    held < self.of(what)
   }
 }
 
@@ -994,9 +1051,10 @@ mod tests {
     ));
   }
 
-  /// A-423. Do: ask whether the anchor admits a hold of each kind naming each count of handles from none to one past
-  /// the message's room, and of kinds no daemon sends. Expect: a WinFsp mount one to the room (its daemon names two,
-  /// the room kept since A-369), a Shards stream's resync end exactly one, and nothing of any other kind.
+  /// A-423, A-448. Do: ask whether the anchor admits a hold of each kind naming each count of handles from none to one
+  /// past the message's room, and of kinds no daemon sends. Expect: a WinFsp mount one to the room (its daemon names
+  /// two, the room kept since A-369), a Shards stream's resync end exactly one, a DAX section exactly one, and nothing of
+  /// any other kind.
   #[test]
   fn the_anchor_admits_each_kind_at_its_handle_counts_alone() {
     for count in 0..=MAX_HANDLES + 1 {
@@ -1010,9 +1068,60 @@ mod tests {
         count == SHARDS_RESYNC_HANDLES,
         "a resync end naming {count}"
       );
-      for what in [0, 3, u8::MAX] {
+      assert_eq!(
+        admits(WHAT_SHARDS_DAX, count),
+        count == SHARDS_DAX_HANDLES,
+        "a DAX section naming {count}"
+      );
+      for what in [0, 4, u8::MAX] {
         assert!(!admits(what, count), "kind {what} naming {count}");
       }
+    }
+  }
+
+  /// A-448. Do: fill each class of a hold's bounds in turn, asking after each entry whether one more of each kind fits.
+  /// Expect: DAX sections refused at their own bound while a mount and a resync end still fit, those refused at theirs
+  /// whatever the sections hold, nothing fitting bounds of none, and the handoff bound the two classes together.
+  #[test]
+  fn each_class_of_entry_is_refused_at_its_own_bound() {
+    let bounds = HoldBounds {
+      attachments: 2,
+      sections: 3,
+    };
+    assert_eq!(bounds.total(), 5);
+    for held in 0..3 {
+      assert!(
+        bounds.admits_another(WHAT_SHARDS_DAX, held),
+        "section {held}"
+      );
+    }
+    assert!(
+      !bounds.admits_another(WHAT_SHARDS_DAX, 3),
+      "past the sections' bound"
+    );
+    for what in [WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC] {
+      assert!(
+        bounds.admits_another(what, 0),
+        "kind {what} beside full sections"
+      );
+      assert!(
+        bounds.admits_another(what, 1),
+        "kind {what} beside full sections"
+      );
+      assert!(
+        !bounds.admits_another(what, 2),
+        "kind {what} past its bound"
+      );
+    }
+    assert!(HoldBounds::shared(WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC));
+    assert!(!HoldBounds::shared(WHAT_SHARDS_DAX, WHAT_SHARDS_RESYNC));
+    assert!(HoldBounds::shared(WHAT_SHARDS_DAX, WHAT_SHARDS_DAX));
+    let none = HoldBounds {
+      attachments: 0,
+      sections: 0,
+    };
+    for what in [WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC, WHAT_SHARDS_DAX] {
+      assert!(!none.admits_another(what, 0), "kind {what} with no room");
     }
   }
 }

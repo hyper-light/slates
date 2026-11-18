@@ -222,24 +222,28 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 39: [`role::check_fleet`] reads a fleet manifest and plans its node exactly as the node's anchor and
 /// daemon do at their start, answering a [`role::FleetCheck`] or the start's own refusal, for a starter that writes the
 /// manifest itself (kiln's runners as a fleet, kiln goal 95101ef3; the same day).
+/// 40: [`Instance::import_archive`], a volume made from an archive a volume of the caller's holds as [`ARCHIVE_FILE`]
+/// ([`ArchiveImported`]), and its refusal by kind, [`Invalid::Archive`] naming an [`ArchiveFault`] (Mantle's
+/// CP-T10.4, A-453; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 39;
+pub const CONTRACT: u32 = 40;
 
-/// A snapshot exported as its archive ([`Instance::export_archive`], A-441).
-pub use slates_client::ArchiveExported;
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
+/// A snapshot exported as its archive ([`Instance::export_archive`], A-441), and a volume made from one
+/// ([`Instance::import_archive`], A-453).
+pub use slates_client::{ArchiveExported, ArchiveImported};
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  ARCHIVE_FILE, AttachTransport, ChangedCursor, ConflictClass, DaemonReport, DatabaseRefusal,
-  FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport,
-  LandingDegradation, LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse,
-  PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt,
-  RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  ARCHIVE_FILE, ArchiveFault, AttachTransport, ChangedCursor, ConflictClass, DaemonReport,
+  DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostPathReason,
+  Intent, JournalReport, LandingDegradation, LandingDurability, LossReport, MountReport,
+  NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
+  Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport,
+  TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

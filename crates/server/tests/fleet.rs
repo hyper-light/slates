@@ -75,8 +75,44 @@ static DEADLINE_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
     .unwrap_or(30)
     .saturating_mul(1_000_000_000)
 });
-/// Shape: how long a client waits for the daemon or a full ring before giving up.
-const CREDIT_WAIT: Duration = Duration::from_secs(5);
+/// A wait for room in a full request ring, charged in the daemon's own time (A-454): it goes on while the ring's shard
+/// steps, since a shard drains its clients' rings at its steps, and ends only once the shard has taken no step for
+/// [`FROZEN_CAP`], the suite's one wall bound for a daemon frozen or dead. It waited five seconds on the wall
+/// (`CREDIT_WAIT`), which a shard kept off its CPUs could outlast while draining.
+struct RoomWait {
+  /// The shard the client's ring is pinned to (the runtime's shard id).
+  shard: u16,
+  /// Its steps at the last look.
+  seen: u64,
+  /// When its steps were last seen to move.
+  stepped: Instant,
+}
+
+impl RoomWait {
+  /// A wait for room in the ring `shard` drains.
+  fn on(shard: u16) -> RoomWait {
+    RoomWait {
+      shard,
+      seen: shard_steps(shard),
+      stepped: Instant::now(),
+    }
+  }
+
+  /// Whether the wait goes on: the shard stepped within [`FROZEN_CAP`].
+  fn goes_on(&mut self) -> bool {
+    let now = shard_steps(self.shard);
+    if now != self.seen {
+      self.seen = now;
+      self.stepped = Instant::now();
+    }
+    self.stepped.elapsed() < FROZEN_CAP
+  }
+}
+
+/// The steps `shard` has run (its registry pulse); zero where its slot holds no shard.
+fn shard_steps(shard: u16) -> u64 {
+  slates_rt::registry::with_entry(shard, |entry| entry.pulse.steps()).unwrap_or(0)
+}
 
 /// The TLS server name every fleet node presents (a single fleet's shared name; the certificate pins who).
 const NAME: &str = "slates-fleet";
@@ -9760,35 +9796,34 @@ struct Client {
 }
 
 impl Client {
+  /// Connects to `instance`'s daemon with one claim, which waits while the daemon lives and ends at its death (A-443,
+  /// A-447): every daemon here opens its rendezvous before its start returns, so a refusal says no daemon holds the
+  /// instance's rendezvous, and the test fails at once with it. It retried a refusal five seconds on the wall
+  /// (`CREDIT_WAIT`, A-454), from when a claim gave up at a second with its daemon alive.
   fn connect(instance: &str) -> Client {
     let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          if trace::enabled() {
-            trace::record(format_args!(
-              "client connect {instance} took {:.3}s",
-              started.elapsed().as_secs_f64()
-            ));
-          }
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-            acknowledged: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::thread::yield_now();
-        }
-        Err(e) => {
+    match connect(instance) {
+      Ok(connected) => {
+        if trace::enabled() {
           trace::record(format_args!(
-            "client connect {instance} failed after {:.3}s: {e}",
+            "client connect {instance} took {:.3}s",
             started.elapsed().as_secs_f64()
           ));
-          panic!("{e}")
         }
+        let client = connected.region.client_id();
+        Client {
+          end: ClientEnd::connected(connected),
+          client,
+          sequence: 0,
+          acknowledged: 0,
+        }
+      }
+      Err(e) => {
+        trace::record(format_args!(
+          "client connect {instance} failed after {:.3}s: {e}",
+          started.elapsed().as_secs_f64()
+        ));
+        panic!("{e}")
       }
     }
   }
@@ -9797,7 +9832,7 @@ impl Client {
   /// the claim wait is made again while `control`, its control shard, has run fewer than `periods` of its coordinator
   /// periods since the first, or until it ran none for [`FROZEN_CAP`], so a daemon kept off its CPUs, which answers a
   /// claim late, is never taken for one that is gone (A-232). At nice 19 beside two spinners a CPU a burst's connect
-  /// failed on [`CREDIT_WAIT`]'s wall in 1 of 20 runs (the integrator's diagnostics run 44274886122).
+  /// failed on `CREDIT_WAIT`'s wall in 1 of 20 runs (the integrator's diagnostics run 44274886122).
   fn connect_for_periods(instance: &str, control: u16, periods: u64) -> Client {
     let progress =
       || slates_rt::registry::with_entry(control, |entry| entry.pulse.progress()).unwrap_or(0);
@@ -9992,8 +10027,8 @@ impl Client {
   }
 
   /// Sends `count` requests of `body` under new ids without waiting for any reply, as an async client holds a ring of
-  /// them in flight; a full request ring is waited out within `CREDIT_WAIT`. Their replies are read with
-  /// [`collect`](Self::collect).
+  /// them in flight; a full request ring is waited out while its shard steps ([`RoomWait`], A-454). Their replies are
+  /// read with [`collect`](Self::collect).
   fn send_burst(&mut self, body: &RequestBody, count: usize) {
     for _ in 0..count {
       self.sequence += 1;
@@ -10010,11 +10045,11 @@ impl Client {
         body,
       )
       .unwrap();
-      let started = Instant::now();
+      let mut room = RoomWait::on(self.end.region().shard());
       loop {
         match self.end.send(&slot) {
           Ok(()) => break,
-          Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::thread::yield_now(),
+          Err(IpcError::RingFull) if room.goes_on() => std::thread::yield_now(),
           Err(e) => panic!("a burst's send: {e}"),
         }
       }
@@ -10133,10 +10168,11 @@ impl Client {
     // The verb's kind for the trace: the variant name, the first word of its debug form.
     let verb = format!("{body:?}");
     let verb = verb.split([' ', '{', '(']).next().unwrap_or("?").to_owned();
+    let mut room = RoomWait::on(self.end.region().shard());
     loop {
       match self.end.send(&slot) {
         Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::thread::yield_now(),
+        Err(IpcError::RingFull) if room.goes_on() => std::thread::yield_now(),
         Err(e) => {
           trace::record(format_args!(
             "client {verb} send failed after {:.3}s: {e}",

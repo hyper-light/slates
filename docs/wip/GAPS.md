@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1, 2 and 3 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -721,8 +721,21 @@
 > 2026-11-18, g083):** the green's content in sealed blocks (`slates_mem::sealed`), current files and history chunks
 > alike: a replica is made from the owner whole and reads the owner's blocks in place, holding no content of its own
 > (its current bytes are the owner's memory, by pointer, in the oracle); its replay adopts the owner's blocks in order,
-> checked byte for byte; the owner frees a released block once every replica has passed its release. **Owed, in
-> order:** the lag bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
+> checked byte for byte; the owner frees a released block once every replica has passed its release. A replica's
+> lifetime is bounded by its owner's: the owner's holder makes every replica leave before it gives the owner up
+> (`SealedBlocks::end`), and an owner dropped with one still registered frees nothing and is counted (Miri found a
+> test that never made its reader leave; the bug record of 2026-11-18). **Built (step 4, 2026-11-18, g083):** the
+> bounds, each derived from the machine by a stated formula (`crates/merge/src/replica.rs`) and each a typed refusal
+> after which the replica is rebuilt from the owner or given back, its work going to the owner: the replicas an owner
+> takes, `replica_limit` = (shards − 1) × 2, none with one shard (`ReplicaRefusal::Full`); a replica's metadata
+> (`Green::metadata_bytes`) against `replica_budget` = min(the owner's per-green budget, its shard's room)
+> (`OverBudget`, at its making, at a rebuild and after a message); the bytes an owner keeps for them against
+> `held_limit` = the per-green budget less the owner's own retention, past which its slowest replica is evicted
+> (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
+> replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
+> applies the derivations to the machine's figures and logs them, charges a replica to its shard's budget, routes a
+> refused or evicted replica's rebases and reads to the owner, counted, gives back an idle one, and makes a green's
+> replicas leave before it gives the owner up); the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -801,8 +814,16 @@
 >   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
 >   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
 >   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
->   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
->   first map). **Built since (A-402, 2026-11-18):** the write log on
+>   `{resync}` stands; and its DAX sections (A-448, the same day): the anchor holds a duplicate of each section a
+>   resynced stream's guest maps (read, write and query, under the section's confining descriptor) before the answer
+>   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
+>   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
+>   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
+>   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
+>   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
+>   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
+>   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -3741,11 +3762,20 @@
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
 >   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
 >   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
->   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Owed in C-a: Windows, where opening the owner's
->   named Event to probe it would keep the name and refuse a successor its ownership, so its claim still waits the claim
->   wait (a daemon's pid in the bootstrap header with an exit watch, or an open-only probe that cannot block a successor,
->   is the next step); the fleet tests' `CREDIT_WAIT` in daemon time; and the macOS region fetch's own wait for the
->   owner's turn (the Mach reply's send-once notification would end it at the owner's death). Class B (the
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Windows since A-447 (2026-11-18, g251): the
+>   daemon writes its process id and creation time into the bootstrap header (layout `SLB3`), and a claim with no live
+>   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
+>   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
+>   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
+>   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
+>   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
+>   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
+>   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
+>   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
+>   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
+>   seconds on the wall. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -3791,8 +3821,10 @@
 >   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
 >   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
 >   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
->   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
->   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
+>   Class B since closed (goal g255, 2026-11-18): the location round's own wait for silent peers (A-437), the leader
+>   forward (A-439), the NFS callback probe and recall (A-442), `fleet::live_budget` and a holder's live exchange (A-444),
+>   a held reply's durability window (A-446), and `sweep_departed`'s shard-time window stated with the test support's
+>   session wait derived from one record-plane exchange's span (A-449, `daemon::session_wait_ns`).
 >   Class C siblings found by A-352's starved runs, each a wait on a live daemon's answer on the wall: the rendezvous
 >   claim wait (`slates_ipc::rendezvous::CLAIM_WAIT_NS`, a second; a starved burst's connect met it in 1 of 20 runs) and
 >   the fleet tests' `CREDIT_WAIT` (5 s), which every fleet test's `Client::connect` and `send_burst` keep; the two
@@ -11289,15 +11321,36 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
+### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
+
+> - **Built.** `Instance::import_archive` (contract 40): a new volume holding the tree of the archive a volume of the
+>   caller's holds as `ARCHIVE_FILE`, run a slice a turn on that volume's owner shard: the file's length admitted
+>   before a byte is read, the file read, decoded and verified (`slates_archive::Decoding`), restored (`Planning`,
+>   `Restoring`) and laid into the volume (the takeover's `verbs::Populating`), the volume and the completion one atom.
+>   Bytes that make no volume are refused `ArchiveRefused { fault }` by kind (`ForeignMagic`, `Unsupported`,
+>   `Truncated`, `Corrupt`, `Malformed`), a tree past its room `BudgetExceeded`, with nothing made.
+> - **Proven (Mac Studio, debug, kiln r310, r318, r320).**
+>   - `a_volume_imported_from_an_exported_archive_holds_the_exported_tree`: two imports of an exported archive each
+>     hold the exported tree in every byte and every entry's metadata save inode numbers; a consumer-written archive
+>     with a symbolic link added comes back with the link; a held name `AlreadyExists`; a size too small
+>     `Exhausted::Memory`, its room given back.
+>   - `a_hostile_archive_is_refused_by_kind_with_nothing_made`: a declared chunk length of `u32::MAX` `Malformed`, a
+>     cut header `Truncated`, one bit flipped `Corrupt`, a zip's magic `ForeignMagic`, nothing made each time.
+>   - Red once each: the laying skipped, and a foreign magic classed `Corrupt`.
+> - **Owed.**
+>   - A streamed decoder: the file is held whole while it is decoded, and the decoded archive beside the restored tree
+>     until the restore ends, so an import near the shard's room holds its tree about twice for that time.
+>   - The manifest's decode and Merkle identity in pieces: one piece today, a walk of the whole tree.
+>   - The full api suite, Linux and Windows lanes: filed for main (run-requests.md, 2026-11-18).
+
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453)
 
 > - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
-> - **Owed.** The volume made from an archive (import), through `slates_archive::Planning` as a takeover restores
->   (`fleet::restore_in_turns`, `verbs::populate_making`), with hostile archives refused by kind: the next piece. A
->   streamed encoder: the archive is held whole while it is encoded, one unit of its size.
+> - **Owed.** A streamed encoder: the archive is held whole while it is encoded, one unit of its size. (The volume made
+>   from an archive is built: A-453, the entry above.)
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 
