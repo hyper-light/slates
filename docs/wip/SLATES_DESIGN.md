@@ -20863,7 +20863,8 @@ But the refusal comes from the length, not from a version or schema check: the c
 none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
 
 > **Status (2026-11-17, g230): the configuration's layout is versioned and refused by name.** A regional configuration
-> now begins with a magic ("RCFG") and a layout version (1), and a root configuration with its own ("RTCF", 1)
+> now begins with a magic ("RCFG") and a layout version (1: the layout with A-272's dropped confirmations and the
+> moved-object exceptions last), and a root configuration with its own ("RTCF", 1)
 > (`raft_wire::REGIONAL_MAGIC`, `REGIONAL_LAYOUT`, `ROOT_MAGIC`, `ROOT_LAYOUT`). A decoder reads them before any field
 > and refuses another kind or an unversioned layout `ForeignLayout { magic }` and another version
 > `LayoutVersion { layout }`, so no layout is ever read by another's positions. An unversioned configuration begins

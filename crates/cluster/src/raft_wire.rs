@@ -716,7 +716,7 @@ pub async fn request_raft(
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
 /// Format: the regional configuration's layout version: 1, the first versioned layout (with A-272's
-/// `dropped_unconfirmed`). A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read
+/// `dropped_unconfirmed` and the moved-object exceptions, `moved`, last). A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read
 /// another layout's fields by position: before it, a field appended to the layout was refused only by the accident of
 /// a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have been read
 /// with a field defaulted (GAPS, live-durability 2026-11-09).
