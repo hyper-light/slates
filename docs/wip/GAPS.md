@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **`slates land` keeps every `--include` and `--exclude` it is given (2026-11-17, §4.15 step 1).** The command line
+> kept the last value of each flag, so `--exclude /.git --exclude /target` landed `/.git` without a word, while the
+> wire's filter has always taken lists. Each flag now keeps every value in order (`--grant` and the other single-valued
+> flags still keep the last). Found by kiln's bare-metal engine, whose landings leave out `/.git` and what git ignores;
+> an embedding host passes them through `slates_api::Filter` (A-278). Test:
+> `args::tests::a_landing_keeps_every_include_and_exclude_given`. Record:
+> `docs/bugs/2026-11-17-land-kept-only-the-last-exclude.md`.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On

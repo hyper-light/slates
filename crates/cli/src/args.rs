@@ -50,7 +50,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base digest ID PATH [--json]                     a clean base file's verified content digest
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
-  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
   image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
   image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
   grants [--json]
@@ -1027,16 +1027,27 @@ struct Spec {
   switches: &'static [&'static str],
 }
 
-/// The arguments with the flags taken out: the words in order, the flags by name.
+/// The arguments with the flags taken out: the words in order, the flags by name, each with every value it was given,
+/// in order.
 struct Taken {
   words: Vec<String>,
-  values: BTreeMap<&'static str, String>,
+  values: BTreeMap<&'static str, Vec<String>>,
   switches: BTreeMap<&'static str, bool>,
 }
 
 impl Taken {
+  /// The value of a flag that takes one: the last given.
   fn value(&self, flag: &str) -> Option<&str> {
-    self.values.get(flag).map(String::as_str)
+    self
+      .values
+      .get(flag)
+      .and_then(|given| given.last())
+      .map(String::as_str)
+  }
+
+  /// Every value of a flag that may be given again (a landing's `--include` and `--exclude`), in the order given.
+  fn every(&self, flag: &str) -> Vec<String> {
+    self.values.get(flag).cloned().unwrap_or_default()
   }
 
   fn switch(&self, flag: &str) -> bool {
@@ -1108,7 +1119,7 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
           .cloned()
           .ok_or_else(|| ParseError::MissingValue(full.clone()))?,
       };
-      taken.values.insert(key, value);
+      taken.values.entry(key).or_default().push(value);
     } else if let Some(key) = known(SWITCHES, &full) {
       if inline.is_some() {
         return Err(ParseError::BadValue {
@@ -1763,17 +1774,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           })
         })
         .transpose()?;
+      // Each prefix as often as given (§4.15 step 1): the wire's filter takes several, and a harness leaves out more
+      // than one (git's own directory and what git ignores).
       let filter = slates_client::Filter {
-        include: taken
-          .value("--include")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
-        exclude: taken
-          .value("--exclude")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
+        include: taken.every("--include"),
+        exclude: taken.every("--exclude"),
       };
       Ok(client(
         &taken,
@@ -2186,6 +2191,35 @@ mod tests {
       assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
     }
     assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
+  }
+
+  /// §4.15 step 1 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a landing's `--include` and `--exclude` each keep
+  /// every prefix given, in order, as the wire's filter takes them; before, each kept its last value alone, so
+  /// `--exclude /.git --exclude /target` landed `/target`. A flag that takes one value keeps the last.
+  #[test]
+  fn a_landing_keeps_every_include_and_exclude_given() {
+    let id = "ab".repeat(16);
+    let Ok(Command::Client(request)) = parse(&args(&format!(
+      "land {id} /dir --exclude /.git --include /src --exclude /target --include /docs --grant 1 --grant 7"
+    ))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, grant, .. } = request.verb else {
+      panic!("land parses as a landing");
+    };
+    assert_eq!(filter.exclude, ["/.git", "/target"]);
+    assert_eq!(filter.include, ["/src", "/docs"]);
+    assert_eq!(grant, Some(7), "a flag that takes one value keeps the last");
+    let Ok(Command::Client(plain)) = parse(&args(&format!("land {id} /dir"))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, .. } = plain.verb else {
+      panic!("land parses as a landing");
+    };
+    assert!(
+      filter.include.is_empty() && filter.exclude.is_empty(),
+      "no filter keeps everything"
+    );
   }
 
   /// §4.6 (AUD-29-75): `export` names one volume, optionally read-only and scoped to a subtree; anything else is
