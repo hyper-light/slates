@@ -3048,6 +3048,20 @@
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
 
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
+> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
+> which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
+> directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
+> supervisor. A recorded verb now meets the bound before it runs (`live_ship::refuse_over_bound` in
+> `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`).
+> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
+>   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
+>   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
+>   such a reply from the task's start, refused `Overloaded` before the task runs.
+
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
 > live-shipped volume waits at most the daemon's liveness budget (1 s, `live_ship::DURABLE_WAIT_NS`) and is then answered
