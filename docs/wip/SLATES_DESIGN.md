@@ -23410,6 +23410,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   against itself, refused because no stated line differed.
 - **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
   run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.
+- **Amended by A-360 (2026-11-18).** The stated difference is WinFsp's driver's as released: a driver carrying
+  `docs/wip/winfsp-patches` forwards a hard link, and the drive makes it. Where a lane's driver makes links, the stated
+  lines stop differing and the harness fails them, so the list shrinks in that change.
 
 ### A-292 — A held durable reply gives up when its holders are silent, not at a deadline (2026-11-17, built for goal g244; found 2026-11-09 by bug-sweep)
 
@@ -26068,3 +26071,63 @@ Applied in the same change to: §4.14 (A-318's note), GAPS (A-318's entry: its s
 - **What it does not change.** A release build (its chain runs at machine code's speed), the wedged and starved
   judgments on the wall, the anchor's lapse bound and the beat.
 
+
+### A-360 — WinFsp hard links: a driver patch forwards `FileLinkInformation` to a volume that declares `HardLinks`, and the drive serves it (2026-11-18, goal g258, Ada via the supervisor: "research and figure out a way to make it work"; amends A-300)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `docs/wip/winfsp-patches/` (`0001`, `0002`, `README.md`): the driver patch, kept here as Shards' patches are and
+  never sent to WinFsp.
+- `crates/bridge-winfsp`: `ffi.rs` (`VOLUME_FLAG_HARD_LINKS`, bit 7), `host.rs` (`Op::Link`, `op_link`, `staging_name`,
+  `link`, the volume's flag, a file's link count in `FileInfo`), `dispatcher.rs` (the receive worker serves a link before
+  WinFsp's DLL), `inflight.rs` (`Link`, `Request::link`, `Request::successful_link`), `inflight/settle.rs` (a saved
+  successful link is answered as made on recovery). Tests: `inflight::tests::a_forwarded_link_names_its_open_its_new_name_and_whether_it_may_replace`,
+  `only_a_saved_successful_link_is_answered_as_saved`, `a_hostile_link_request_names_nothing`; in the host's tests
+  (`tests/support/host.rs`) `a_forwarded_link_gives_the_open_file_a_second_name`,
+  `a_link_to_a_taken_name_replaces_it_only_when_asked`, `a_link_never_replaces_a_directory_or_a_read_only_file`,
+  `a_link_onto_a_name_of_the_file_itself_changes_nothing`, `a_directory_takes_no_second_name`,
+  `a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was`.
+- `crates/cli/tests/winfsp_semantics.rs`: `a_hard_link_made_through_the_drive_names_the_same_file`, the live
+  `CreateHardLinkW` test, which skips loudly where the driver refuses the link itself.
+- A-300: its stated difference holds on WinFsp as released.
+- GAPS ("WinFsp hard links").
+- **What was there.** WinFsp's driver completes `FileLinkInformation` itself, `STATUS_NOT_SUPPORTED` with the comment "no
+  hard link support", before any file system is asked; `FileLinkInformationEx` falls to `STATUS_INVALID_PARAMETER`;
+  `NumberOfLinks` is hardcoded to 1; the `HardLinks` volume flag reads "unimplemented; set to 0"; and the advertisement of
+  `FILE_SUPPORTS_HARD_LINKS` is commented out (`src/sys/fileinfo.c` and `volinfo.c` at v2.1, at v2.2B5 of 2026-10-13
+  and at v2.2, the 2026 release, `ada6de15`). WinFsp's NTFS-compatibility page lists hard links as unsupported, and its
+  author declined them in 2016 for the driver changes they need. So no WinFsp file system makes a hard link, and git's and
+  Mercurial's local clones copy on the drive (A-300).
+- **The routes weighed.** WinFsp's API: none, the refusal is in the driver. A newer WinFsp: none, through v2.2. Dokany's
+  driver forwards a set-information class it does not know to user mode, but serving Windows through it would put a
+  second mount framework beside WinFsp (CLAUDE.md §2 item 7). A patch to WinFsp's driver is the one route.
+- **The patch** (two commits on WinFsp v2.1; they apply to v2.2 by three-way merge). For a volume that declares
+  `HardLinks`, the driver forwards `FileLinkInformation` and `FileLinkInformationEx` as a SetInformation request in the
+  rename request's layout: the new name in `Info.Rename.NewFileName`, ReplaceIfExists in bit 0 of `Info.RenameEx.Flags`,
+  and the requestor's token when a name may be replaced. It refuses a directory (`STATUS_FILE_IS_A_DIRECTORY`, MS-FSA
+  2.1.5.15.7), a deleted file and a stream, and a name that may be replaced while it has an open handle, as a rename's
+  target. On success it invalidates the file's cached information, takes a replaced name's file node out of its name
+  table as a rename does, invalidates the new name's directory listing and tells that directory's watchers; the
+  completion runs on the file system's answering thread, so it acquires no other file node (one receive worker serves
+  this drive, and a request on that node could be waiting for it). `NumberOfLinks` is the file system's count where the
+  volume declares hard links, 1 for a directory as on NTFS; such a volume advertises `FILE_SUPPORTS_HARD_LINKS`. A volume
+  that does not declare `HardLinks` is answered as before.
+- **The drive's half.** The drive declares `HardLinks`, which WinFsp as released ignores. The receive worker reads a
+  forwarded link from the request's bytes and serves it before WinFsp's DLL, whose set-information operation has no case
+  for the class; the shard makes the name by Windows' rules: a taken name refused `STATUS_OBJECT_NAME_COLLISION` unless
+  the caller asked to replace it, a name of the file itself left as it is, a replaced name never a directory's or a
+  read-only file's (`STATUS_ACCESS_DENIED`, as a rename's replace, A-209 and A-262), a directory refused
+  `STATUS_FILE_IS_A_DIRECTORY`. A replace is made under a staging name of its own (`:` makes it a name no Windows program
+  can ask for) and renamed over the taken one, so a refusal at either step leaves the taken name as it was; one shard turn
+  serves the whole link, so no other request sees the staging name. Every access check the DLL's rename makes for a
+  replace passes on this drive, whose objects all carry the one Everyone descriptor, so the worker makes none. A file's
+  link count reaches `FileInfo.HardLinks` (0 for a directory). A saved successful link is answered as made on recovery,
+  as a saved rename is, since the volume holds the name; a cancellation would tell the caller a visible name was not
+  made, and the copy it fell back to would find the name taken.
+- **Proven so far.** The request decoding, the replay rule and the shard's rules by the tests above (diag lane, both
+  Windows runners). End to end on a test-signing Windows VM: owed in this entry's next record.
+- **What remains, and whose.** The patch reaches users only in a WinFsp release: upstream, which needs WinFsp's
+  contributor agreement signed (adding a name to `Contributors.asciidoc` assigns joint copyright to WinFsp's author), or
+  a slates-signed driver (an EV code-signing certificate and a Microsoft Partner Center account for attestation
+  signing). Both are Ada's. Until then the drive on WinFsp as released makes no hard link and A-300's stated difference
+  stands.
