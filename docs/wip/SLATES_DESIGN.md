@@ -30661,10 +30661,12 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
 - **`slates shards` on Windows** hands the command the device's end where `{resync}` stands in its arguments, beside
   `{handle}`, and keeps no copy of it; where the daemon made no channel, an ended one. A Unix command naming
   `{resync}` is refused as usage: its end is placed at a number (`--resync-fd`).
-- **Evidence.** Red first: on main the CLI's parse test did not build (no `resync_named`); green, the CLI's `shards`
-  parse tests on a Mac Studio. `cargo xwin check` of `slates-ipc`, `slates-server`, `slates-client` and `slates-cli`
-  with their tests is clean for Windows. The real-process test (an anchor, a killed daemon, the probe reading the file
-  through the stream its `Resync` names) and the Windows unit and suite runs are filed for main.
+- **Evidence.** Red first: on main the CLI's parse test did not build (2 errors, no `resync_named`). Green on a Mac
+  Studio on 2026-11-18, on the tree as merged with main: the CLI's 6 `shards_` parse tests (`cargo test -p slates-cli
+  --bin slates shards_`) and the resync module's 2 unit tests (`cargo test -p slates-server --lib shards::resync`).
+  `cargo xwin check` of `slates-ipc`, `slates-server`, `slates-client` and `slates-cli` with their tests is clean for
+  Windows. The real-process test (an anchor, a killed daemon, the probe reading the file through the stream its
+  `Resync` names) and the Windows unit and suite runs are filed for main.
 - **Owed.** A Windows stream's DAX sections held by the anchor (A-365 is Unix's; a Windows stream gives its resync up at
   its first map, A-427); and Shards' device half, which takes the `Resync` through its spawner's grants (its
   coordinator's condition 4c).
