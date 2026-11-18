@@ -5867,6 +5867,16 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
+> forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
+> again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
+> detector condemns a member, so a false death is refuted within it), on the wall from its first look, and gives up
+> only once a look begun after the horizon has found no owner: a round waiting on silent peers no longer spends the
+> whole budget, and a refutation the shard read while a round waited is seen before it gives up (clients' runs, nice 19
+> beside two spinners a CPU: 1 or 2 calls refused in every false death under one liveness budget of wall time). The
+> operator's failover SLO caps the whole on the wall. Counted: `fleet.owner_location.gave_up`, and the budget's two
+> ends, `budget_spent` and `slo_ended`.
+
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
 > origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
@@ -23249,6 +23259,51 @@ Applied in the same change to:
   stored instant per begin, reply and byte-bearing turn.
 - **Owed.** The supervisor's runs of the fleet suite under load and on Windows, and the load test's count of batches
   given up behind a burst (A-306's 17,000 to 52,000 a run), which this should bring near none.
+
+### A-317 — A forward's owner location is given the membership horizon, ended by a look begun after it, within the failover SLO (2026-11-18, built for goal g255; clients' class B, `3c072f490`, with the supervisor's derivation)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-317).
+- `crates/server/src/verbs.rs`: `locate_within_budget` (the give-up counted on the caller's side of the loop) and
+  `locate_within_horizon`, and the counts `fleet.owner_location.gave_up`, `.budget_spent` and `.slo_ended`.
+- Tests (`crates/server/tests/fleet.rs`): `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` and
+  `the_failover_slo_ends_a_forwards_location_budget` (new), and
+  `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, judged by the location's own counts
+  (clients' rewrite).
+- GAPS: the R3 debt of `LIVENESS_BUDGET_NS` (class B, the location budget).
+- **What was there.** A forward with no known owner gave its location one liveness budget of wall time, a fixed
+  second: the direct route, then a round, again every poll interval until the second ran out. A control shard kept off
+  its CPU ran out of it while the gossip that refutes a false death waited to be read, and its client was refused for
+  the machine's load (clients' runs at nice 19 beside two spinners a CPU, 1 or 2 calls in every false death); and with
+  silent peers the first round's own wait spent the whole second, so the location never looked again.
+- **The rule.** The location looks (the direct route, a round, and the direct route again) every poll interval. It
+  gives up once a look begun after the membership horizon, on the wall from its first look, has found no owner, or once
+  the operator's failover SLO has passed.
+- **Why.** An owner is unfindable while live for the time a false death takes to be gossiped and refuted, which the
+  detector's own horizon bounds (the supervisor's derivation of 2026-11-07: the location budget is the membership
+  horizon), not for a liveness budget. Ending only with a look begun after it means a round that outlasted the horizon
+  is followed by one more look, and the direct route asked after each round sees what the shard read while the round
+  waited on its peers.
+- **The forms that did not land.** Clients' polls (a liveness budget's worth at the poll interval, capped by the
+  failover SLO): a round that waits a liveness budget on a silent peer makes each poll a second, so a forward's
+  location runs to the SLO, ten times main's second. And the horizon followed by two waits of the control shard in its
+  driver (A-292's receiver rule): a busy shard rarely waits, so it too runs to the SLO (A-315 found the same on the
+  forward lane). Built first on main as of `9addf53ef`, each rewrite, this one included, made the five-node takeover test
+  `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` fail there (2 of 6, 4 of 15
+  and 8 of 24 GitHub runs, against 0 of 9 on that base's own budget). On main as of `bfc34cace` this form passes it 16
+  of 16 on ubuntu-latest and windows-latest, as main does (`diag-g255-a255-green-1`, `-red-1`); what changed between
+  the two bases to make the difference was not traced.
+- **Evidence.** On GitHub's ubuntu-latest, macos-latest and windows-latest runners (2026-11-18):
+  `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` failed 3 of 3 on each over main's budget,
+  the location never looking again (`diag-g255-loc-red-1`, `-red-3`), and passed 3 of 3 on each with this form, as did
+  `the_failover_slo_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
+  (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 over main as of `bfc34cace` (above). Over
+  A-315 and main as of `1e8f4a49e` (`diag-g255-land2-1`, run 44273659893), on each of the three runners the four
+  location tests 3 of 3 each, the five-node takeover test and the left-out-head takeover test 6 of 6 each, and the
+  held-origin test 3 of 3; and fmt, clippy and the whole `slates-server` suite pass on ubuntu-latest, `fleet` 157 of
+  157.
+- **Cost.** None at the location's steady state: one more look at the direct route a round. A location that cannot find
+  its owner ends one look past the horizon: about a poll interval when its rounds are answered, and one round's wait
+  when they wait on a silent peer.
 
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.

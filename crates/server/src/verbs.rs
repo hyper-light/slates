@@ -1932,39 +1932,85 @@ enum WorkGreen {
 /// hold: refused `NotFound`, run nowhere (A-255).
 const WORK_GONE_HERE: &str = "fleet.owner_location.work_gone_here";
 
-/// The owner of `query`'s object, resolved again within the one liveness budget a forward allows for finding its owner:
-/// the direct route (the volume's creator while eligible) and then a location round, asked again every tenth of a
-/// heartbeat while the budget lasts. The requests are
-/// not sent until an owner is found, so a retry can never apply a verb twice. The owner can be briefly unfindable
-/// while it is live: the failure detector condemns a live member within its stated mistake allowance, the death is
-/// gossiped, and every node drops its routes and its link to that member until it refutes and is linked again
-/// (2026-10-08: a foreign node held a live successor dead that another node had condemned, 1 against an allowance of
-/// 4.9, and its client was refused `HomedElsewhere`). A takeover's adoption leaves the same window. Measured
+/// The owner of `query`'s object, resolved again for as long as the location budget allows: the direct route (the
+/// volume's creator while eligible) and then a location round, asked again every poll interval. The requests are not
+/// sent until an owner is found, so a retry can never apply a verb twice. The owner can be briefly unfindable while it
+/// is live: the failure detector condemns a live member within its stated mistake allowance, the death is gossiped,
+/// and every node drops its routes and its link to that member until it refutes and is linked again (2026-10-08: a
+/// foreign node held a live successor dead that another node had condemned, 1 against an allowance of 4.9, and its
+/// client was refused `HomedElsewhere`). A takeover's adoption leaves the same window. Measured
 /// (`a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, 10 false deaths per arm): without the
 /// retry every false death refused a call, and the next call 10 ms later was served after 22–217 ms; with location
 /// rounds alone, paced a heartbeat, 1 s and still refused; with the direct route first, paced a heartbeat, none refused
 /// and 111–224 ms; paced a tenth of a heartbeat, none refused and 21–218 ms. Each retry is counted
-/// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found.
+/// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found, counted by how it ended
+/// ([`LOCATION_SPENT`], [`LOCATION_SLO_ENDED`]) and in all ([`LOCATION_GAVE_UP`]).
+///
+/// The budget (A-317) is the membership horizon (`lease::horizon_ns`: the longest a live member can go unanswered
+/// before a detector declares it dead, the window in which a false death is gossiped and refuted; the supervisor's
+/// derivation of 2026-11-07), on the wall from the first look, and it ends only with a look begun after the horizon,
+/// which asks the direct route again once its round returns: a round waits on its peers while the shard runs its other
+/// work, so a refutation the shard read meanwhile is seen before the location gives up. Before, one liveness budget of
+/// wall time ran out on a control shard kept off its CPU while that gossip waited to be read (clients' runs, nice 19
+/// beside two spinners a CPU: 1 or 2 calls refused in every false death), and a single round waiting on silent peers
+/// spent it whole, so the location never looked again. Counted in polls (clients' `3c072f490`), a location whose
+/// rounds each wait a liveness budget on a silent peer ran to the failover SLO, ten times main's second; ended by the
+/// control shard's driver waits (A-292's rule), a busy shard, which rarely waits, held it to the SLO too (A-315 found
+/// the same on the forward lane). The operator's failover SLO caps the whole on the wall.
 async fn locate_within_budget(query: crate::owner_location::Query) -> Option<HostId> {
-  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+  let located = locate_within_horizon(query).await;
+  if located.is_none() {
+    // Counted here, so any way the location gives up is seen; its budget's own two ends are counted within it.
+    crate::state::with_state(|state| state.count(LOCATION_GAVE_UP, 1));
+  }
+  located
+}
+
+/// [`locate_within_budget`]'s loop: a look every poll interval (the direct route, a round, and the direct route again,
+/// with what the shard read while the round waited), until an owner is found, a look begun after the membership
+/// horizon has found none, or the failover SLO has passed.
+async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<HostId> {
+  let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+  let began = slates_rt::futures::now_ns();
+  let horizon = crate::lease::horizon_ns();
+  let ceiling = crate::state::with_state(|state| state.config.failover_slo_ns).unwrap_or(horizon);
+  let known = || crate::state::with_state(|state| query.known_owner(state, None)).flatten();
   loop {
+    let look_began = slates_rt::futures::now_ns().saturating_sub(began);
     // The direct route first (the volume's creator, while eligible), as a fresh call would take it.
-    if let Some(owner) = crate::state::with_state(|state| query.known_owner(state, None)).flatten()
-    {
+    if let Some(owner) = known() {
       return Some(owner);
     }
     if let Ok(owner) = crate::owner_location::locate(query).await {
       return Some(owner);
     }
-    let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-    if slates_rt::futures::now_ns().saturating_add(pace) >= deadline
-      || slates_rt::futures::sleep(pace).await.is_err()
-    {
+    // The round waited on its peers while the shard ran its other work: a refutation read meanwhile is seen now.
+    if let Some(owner) = known() {
+      return Some(owner);
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= ceiling {
+      crate::state::with_state(|state| state.count(LOCATION_SLO_ENDED, 1));
+      return None;
+    }
+    if look_began >= horizon {
+      crate::state::with_state(|state| state.count(LOCATION_SPENT, 1));
+      return None;
+    }
+    if slates_rt::futures::sleep(pace).await.is_err() {
       return None;
     }
     crate::state::with_state(|state| state.count("fleet.owner_location.retried", 1));
   }
 }
+
+/// Counter: a forward's owner location ended by the operator's failover SLO, the owner still not found.
+const LOCATION_SLO_ENDED: &str = "fleet.owner_location.slo_ended";
+/// Counter: a forward's owner location spent its budget, a look begun past the membership horizon having found no
+/// owner.
+const LOCATION_SPENT: &str = "fleet.owner_location.budget_spent";
+/// Counter: a forward's owner location gave up with no owner found, for any reason: at most the budget's two ends,
+/// [`LOCATION_SLO_ENDED`] and [`LOCATION_SPENT`], when nothing gives up early (the shard stopping).
+const LOCATION_GAVE_UP: &str = "fleet.owner_location.gave_up";
 
 /// The refusal for a verb on a volume this node owns but has not materialized yet, asked on the control shard where
 /// the routing lives: the routing names this node the owner (it adopted the head in a takeover), yet the verb is being

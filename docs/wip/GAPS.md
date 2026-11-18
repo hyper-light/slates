@@ -2242,6 +2242,20 @@
 >   budget (R3 debt). Found on the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation`
 >   takes a uid only), and two server unit tests of landing fail on Windows, where CI does not run them. Record:
 >   `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+> - **Class B, the location budget: done (2026-11-18, A-317, goal g255; clients' `3c072f490` of 2026-11-09).** A
+>   forward with no known owner looked for it for one liveness budget of wall time, which a starved control shard spent
+>   before reading the gossip that refutes a false death (clients' runs at nice 19 beside two spinners a CPU: 1 or 2
+>   calls refused in every false death), and which a single round waiting on silent peers spent whole. It now looks for
+>   the membership horizon on the wall and ends only with a look begun after it, the direct route asked again after
+>   each round, within the failover SLO (`fleet.owner_location.gave_up`, `.budget_spent`, `.slo_ended`;
+>   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget`,
+>   `the_failover_slo_ends_a_forwards_location_budget`). Two longer budgets did not land: clients' polls and the horizon
+>   followed by the control shard's two driver waits each run a forward's location to the failover SLO, the polls when
+>   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
+>   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
+>   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
+>   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
+>   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
