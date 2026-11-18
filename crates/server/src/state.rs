@@ -1532,6 +1532,10 @@ pub struct PendingVolume {
   /// adopted, since the retirement may complete and be let go before the log is fetched. Empty for a volume no round
   /// adopted (a mirror's promotion).
   pub cohort_hosts: Vec<slates_db::register::HostId>,
+  /// Set when its head register was adopted past tolerance (A-309, A-332): the first cohort short of its recovery quorum,
+  /// which the volume's loss report names once it is served (`slates_db::catalog::TakeoverPastTolerance::registers`).
+  /// `None` within tolerance and for a volume no round adopted.
+  pub registers_short: Option<slates_db::catalog::RecoveryShortfall>,
 }
 
 impl PendingVolume {
@@ -1549,6 +1553,7 @@ impl PendingVolume {
       most_staged: None,
       round_seen: None,
       cohort_hosts,
+      registers_short: None,
     }
   }
 

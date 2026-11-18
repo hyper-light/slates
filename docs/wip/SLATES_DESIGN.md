@@ -8058,6 +8058,12 @@ it builds against the contract and adds to it rather than around it.
 > (`a_signed_landing_is_judged_and_read_back_through_the_contract`: a plan states the landing
 > unsigned, the statement signed by the trusted key is asked again verified with nothing written,
 > its approval lands it verified, and its planned and finished records read back verified).
+> **`CONTRACT` = 21 (A-332):** a takeover past the volume's tolerance shows in its loss report.
+> `VolumeTakeover::past_tolerance`, appended, is a `PastTolerance` naming the `Shortfall` (the hosts recovery needed,
+> and how many remained members) of its head register's cohort and of its live log's recorded holders, each `None`
+> when that part was recovered within tolerance; the takeover record keeps it with the volume, so it survives the
+> successor's restart. `slates status` prints `taken_over_past_tolerance: registers <remaining>/<needed>|within
+> live_log ...`, and the JSON (CLI and MCP) carries it under `loss.taken_over.past_tolerance`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -25879,3 +25885,101 @@ Applied in the same change to: §4.10's chaos status, GAPS ("Chaos from outside 
 - **Sibling, owed.** A-309 piece 2 (the register takeover past tolerance, `slates_db::takeover`) passes over a falsely
   retired holder of the newest register record the same way.
 - Record: `docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`.
+
+### A-332 — A takeover past the volume's tolerance shows in its loss report (2026-11-18, kiln goal g250; §4.10 "Auto-seal", AC-8.3, §4.12 "The consumer contract"; A-309, A-325)
+
+- **What was there.** Past tolerance (more of a cohort lost than `f`) A-309 recovers a volume from the newest copy the
+  members that exist now hold, counted on the successor (`fleet.takeover.recovered_past_tolerance` for its registers,
+  `fleet.live.taken_over_past_tolerance` for its live log). A write acknowledged only to the lost hosts may be gone, and
+  nothing a consumer reads said so: the volume's loss report named the takeover (A-325) the same whether it kept every
+  acknowledged write or not.
+- **The rule.** The takeover records how it went past tolerance with the volume (`TakeoverRecord::past_tolerance`, a
+  `TakeoverPastTolerance` of two `RecoveryShortfall`s, appended), and the loss report carries it
+  (`VolumeTakeover::past_tolerance`, a `PastTolerance` of two `Shortfall`s, appended; `CONTRACT` 21):
+  - `registers`: the head register's first cohort short of its recovery quorum when the round adopted the newest record
+    every surviving member of the volume's cohorts held (`Readiness::ReadyPastTolerance`'s `needed` and `members`,
+    kept by the round per object and handed to the volume's pending materialization at its adoption);
+  - `live_log`: `f + 1` of the log's recorded holders and how many of them were members when phase one adopted past
+    tolerance (`live_ship::fetch`).
+  Each is `None` when its part was recovered within tolerance, and the whole is `None` when both were. The catalog
+  register shares the head's cohorts, so the head's verdict stands for both.
+- **Surfaces.** `slates status` prints `taken_over_past_tolerance: registers <remaining>/<needed>|within live_log ...`;
+  the JSON (CLI and MCP, one schema) carries `loss.taken_over.past_tolerance`.
+- **Left to Ada (Decisions).** Whether such a volume also refuses writes until an operator acknowledges the loss: the
+  report is what that acknowledgement would read.
+
+Held by `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report` (`crates/server/src/verbs.rs`: a takeover
+recorded past tolerance and one within, each volume's status read as its owner), the AC-8.3 fleet test
+(`a_successor_reports_the_loss_window_its_takeover_left`: within tolerance, `None`), and the store-destroyed chaos flow,
+which holds each part of the report to the successor's own past-tolerance counts (the supervisor's run).
+
+Applied in the same change to: §4.12 (the `CONTRACT` 21 status line), GAPS (A-272 (ii)'s entry),
+`crates/db/src/catalog.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/{takeover,state,live_ship,fleet,verbs}.rs`,
+`crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`, `crates/api/src/lib.rs`, and the tests named above.
+
+### A-359 — The liveness window is derived from the recovery budget by rent or buy, its machine floor checked at boot; every use of it listed by class; the failover SLO's derivation waits on its lease consumers (2026-11-18, built for goal g255; the supervisor's decision "W derived, the measured scheduling delay its floor, reported", and Ada's rule of 2026-11-18 "F derived from the measured detection, confirmation and recovery paths")
+Applied in the same change to:
+- `crates/server/src/daemon.rs`: `LIVENESS_BUDGET_NS` is `slates_db::replay::RECOVERY_BUDGET_NS` (was the `Shape:` literal "a
+  second"), and `HEARTBEAT_NS` is `LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN` (was the literal 100 ms):
+  the same values, now each a stated derivation.
+- `crates/server/src/config.rs`: `LivenessWindow` and `liveness_window`, the boot's check of the machine's floor,
+  recorded in `DaemonConfig::derivations` (the daemon's boot log), with its unit test
+  `a_machine_whose_scheduling_delay_passes_the_window_is_reported_needing_its_floor`.
+- GAPS: the R3 debt of `LIVENESS_BUDGET_NS`.
+- **The derivation.** `W` is how long a daemon, a shard or a peer may show no progress before it is judged stuck or
+  silent and its recovery begins. A verdict starts a recovery that costs the recovery budget `T` (ratified, RAMCloud's
+  second; GAPS §5): judged sooner, a stall shorter than `T` is paid with `T`; judged after waiting as long as the
+  recovery costs, the cost is within twice the best possible whatever the stall turns out to be. That is the rent-or-buy
+  rule [A: Karlin, Manasse, Rudolph & Sleator 1988], the rule the wake probe's spin-then-park already follows, so `W =
+  T`. The heartbeat is `W / ELECTION_MARGIN` (A-129: the leader beats ten times per election timeout, and the
+  death-confirmation window is the election timeout).
+- **Why not from the failover SLO.** The supervisor decided `W` from `F`; Ada's rule makes `F` itself derived from the
+  measured detection, confirmation and recovery paths. Those paths' timers are multiples of this window's heartbeat
+  (the membership horizon is nine heartbeats, the election timeout ten), so `F = D + E + T` is `2.9 T` here and cannot
+  also set `W`: any `W` is a fixed point. The one ratified time in the chain, `T`, anchors it, and `F` follows.
+- **The floor.** The machine's measured scheduling delay at boot, the wake probe's p99 (how long a parked thread waits
+  to run again once woken), is the window's floor: where it passes `W` the daemon cannot meet its window on that
+  machine, and its boot log says so with the window it needs (`liveness_budget_ns = LivenessWindow { window_ns,
+  floor_ns, needed_ns, floor_past_window }`). A-228 already judges a shard kept off its CPU starved, never stuck, so the
+  window's verdicts stay safe there. Owed (step 2): `W` held at runtime, so the daemon runs at the floor where it is
+  past `W` rather than only saying so; every use below then reads it.
+- **The failover SLO, owed in pieces.** `F = D + E + T`, the membership horizon, the council's confirmation window and
+  the recovery budget, is 2.9 s with today's timers, against the 10 s placeholder (`config::FAILOVER_SLO_NS`). It
+  cannot replace the placeholder yet: `F` is also the term of every lease that names it, and those terms are not failover
+  delays. A granted landing's target lease (`landing.rs`, its keepalive owed by AUD-29-25) would expire a landing longer
+  than 2.9 s; a CLI attachment's term (A-230, `verbs::attachment_term`) would lapse an attach-for-write idle for 2.9 s;
+  and the NFSv4 and delegation leases, the anchor's restart backoff cap and the takeover's attempts change with it.
+  Each consumer first takes its own term from its own measurements (§4.4: "lease term = k × measured renewal RTT p99"),
+  then `F` is derived. The forward's bound already never runs below its path's measured floor (A-352).
+- **Every use of `LIVENESS_BUDGET_NS`, by what it waits for** (main as of `0019cd510`; `~` marks a site whose own
+  derivation is still owed):
+  - The definition, and what is derived from it: `daemon.rs` `LIVENESS_BUDGET_NS`, `HEARTBEAT_NS`,
+    `OBSERVE_BUDGET_NS` (ten windows), `SESSION_WAIT_NS` (test support: `Daemon::hold_record_session`), `told.rs`
+    `TOLD_WAIT_NS` (half a window), `verbs.rs` `PART_ROOM_BUDGET_NS` (half a window).
+  - Class A, a wait for another shard of this daemon, judged in the target's own time (A-65's rule over `W`): `verbs.rs`
+    `consensus_on_control`, `serve_forward`, `answer_forwarded_write`, `named_if_unshared`, `await_deferred_completion`,
+    `set_consumer_policy_everywhere`, `consumer_policy_on_channel`, `revoke_everywhere`, `attest_on_channel`,
+    `clone_named_elsewhere`; `nfs.rs` `serve_remote`, `gather_entries`, `call_owner`; `direct_map.rs` `hand_off`;
+    `delegation.rs` `send_recalls`; `remote_attach.rs` `serve_unforwardable`; `work_route.rs` `answer_on_green_shard`.
+    `~` on the wall still: the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`,
+    `drop_pending_creations`, `reconcile_work_floors`, `reconcile_name_aliases`, `retained_client_ids`) and the image's
+    alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one window.
+  - Class B, a wait on another host: the forward lane (`verbs::forward_once`'s stall budget base, judged in the lane's
+    own time, A-315; `forward_lane.rs` `REPLACEMENT_ANSWER_PERIODS`, `path_floor_ns`, `FailoverBound::from_now`'s
+    fallback, A-352); `fleet.rs` `return_sessions` (the transport's silence floor) and `live_budget` (A-200's
+    exchange); `owner_location.rs` `locate_round` and `wait_for_returning_sessions` `~` (the supervisor's 2026-11-07
+    decision: the slowest asked peer's tail plus the record exchange budget); `verbs.rs`
+    `promote_region_here_or_forward` `~` (the leader forward); `nfs.rs` `probe_back_channel` `~` (the NFSv4 callback
+    probe) and `send_note`; `live_ship.rs` `DURABLE_WAIT_NS`; `remote_attach.rs` `sweep_departed`.
+  - Class C, a client's wait on its daemon (A-232: it waits while its daemon lives; `W` is the cadence of that
+    question): `slates-api` `deadlines` (`Deadlines::derive`) and `mount.rs` `MOUNT_CALL_DEADLINE`; `shards_route.rs`
+    `OFFER_LIFE_NS`, `EXCHANGE_NS`; `nfs.rs` `UNMOUNT_CONFIRM_NS` and `routed`; `fuse.rs` and `winfsp.rs`
+    `open_journal_reader`; `nfs_writeback.rs` `tracking`; `verbs.rs` `await_materialization`. `~` the same second by
+    another name: the rendezvous's claim wait (`slates_ipc::rendezvous::CLAIM_WAIT_NS`), which refuses a claim a live
+    daemon has not answered within it (a starved burst's connect met it once in 20 runs, A-352's record).
+  - Class D, supervision (A-228, A-232): `watchdog.rs` (the window, the spin window, the verdict's lateness, its log);
+    `slates-api` `role/anchor.rs` (`stop_gracefully`, `judge_start_by`, `on_lapse`, `start_stuck`, `observe`,
+    `lapse_bound_ns`); `daemon.rs` `reap_loop`, `log_late_beat`, `starved_share_ns`, `stop_parts`, `start_with_fleet`;
+    `anchor_hold_windows.rs` `HOLD_BUDGET_NS`, `RELEASE_ATTEMPT_NS`; `held_copy.rs` `reconnect_budget_ns`.
+- **Evidence.** The values are unchanged (1 s and 100 ms), so nothing a test asserts moves; the derivation's check is
+  the unit test above. The sweep is `git grep -n LIVENESS_BUDGET_NS -- 'crates/*/src'` at `0019cd510`, each site read.
