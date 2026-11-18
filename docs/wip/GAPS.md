@@ -2656,6 +2656,26 @@
 >     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
 >     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
 >
+>     **Where a slow request's time goes (2026-11-18, g083's trace diagnostic, never on main).** Each attempt the
+>     harness timed was joined with every span the daemon's shards held for its request (each shard's sink sized to
+>     hold the run; the owner's answer to each ask and each resumed verb spanned too), on the Mac Studio at 1,000
+>     clients over 23 shards, main `f6d37937b`'s code with the diagnostic, in-process, load 14 to 17. At a think mean of 50 ms (1,121
+>     verdicts a second) an edit's p50 was 141 µs and its p99 2.2 ms; of it the verb itself took 12 µs at the median
+>     and the owner's answer 13 µs at the p99, and the rest was waiting for a thread: the request in the client's ring
+>     until its shard read it (p99 634 µs), the hop to the work's shard (267 µs), the ask out to the owner, batch and
+>     queue (397 µs), the answer back (127 µs), the reply home (238 µs), and the harness taking it (25 µs at the p99,
+>     2.7 ms at the p999). In the slowest 1% the means were 1.8, 0.9, 2.1, 0.4, 0.7 and 3.6 ms; at 20 ms (2,682
+>     verdicts a second) 2.2, 1.6, 4.5, 0.5, 1.2 and 8.5 ms. Each `floor` p99 (the product's alone) was 1.6 to 2.7 ms at
+>     50 ms and 2.2 to 4.6 ms at 20 ms. Every shard parked and woke about 7,500 times a second: the doorbell's herd
+>     (A-381, closed below). The owner ran at 33% and 51% of a core; every other shard at 13 to 28%.
+>     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
+>       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
+>       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
+>       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
+>       verdict, a rebase and a read of the green each queue on the owner's one thread.
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
