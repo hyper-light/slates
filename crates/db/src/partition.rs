@@ -1295,6 +1295,7 @@ impl Partition {
       // The catalog register carries the policy (A-285), so its version moves as the live-shipping flag's does.
       Op::VolumeWritePolicySet { id, policy } => self.update_volume(*id, |v| {
         v.policy.write = Some(*policy);
+        v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {

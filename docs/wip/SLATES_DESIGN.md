@@ -21389,9 +21389,12 @@ never landed whatever the mode (a reviewer's read of a bypass volume's changes w
 the stricter of the work's and the green's merge mode, forbid refused before the seal, ask answered
 `MergeApprovalRequired` with the increment's identity and its path count and merged by `SubmitApproved` under the
 launcher's proof of exactly that identity (`landing::merge_approval_proof`), a volume with no merge mode set merging at
-once as every merge did before policies. Owed, in order: the launcher secret (g262's, steps 1-4) and launcher-class
-proofs under it with a policy version against replay (mine), a consumer's own policy, the MCP and SDK land verb gated by
-the policy, then signed work. The
+once as every merge did before policies. Built the same day: every launcher-class proof (grant, policy, merge
+approval, enroll, revoke) verifies under the daemon's issuer secret or the launcher secret its starter handed the anchor
+(`landing::proven_by_launcher`), so a launcher keeps its authority across its own restarts and the daemon's; and a
+`SetPolicy` names the policy version it replaces (`PolicyRecord.write_version`, covered by the proof), so a captured
+proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Owed, in order: a consumer's own policy, the
+MCP and SDK land verb gated by the policy, then signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
@@ -21491,6 +21494,16 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   `merge_approval_proof`; a changed increment merges nothing and is asked again); `merge` takes evidence;
   `plan_landing` presents through the daemon's `Present`, whatever the mode, and its bypass refusal and
   `Unsupported::WritePolicies` are gone.
+- **The launcher secret, piece 1 (the segment's field), the same day.** The launcher's authority must outlive the
+  launcher's own restart: handing kiln the anchor segment's descriptor (Linux keeps the segment as a memfd) would die
+  with kiln's process, after which no approval or policy could be proven without restarting the instance and losing its
+  volumes. So the launcher provides a secret of its own at every start and keeps it; the anchor publishes it into the
+  supervision block (`SUP_LAUNCHER_PRESENT` 320, `SUP_LAUNCHER_SECRET` 328, 32 bytes, beside the issuer and session
+  secrets; zero in an older anchor's segment, read as none), and the daemon verifies launcher-class proofs under it as
+  under the issuer secret (A-285's owner, agreed 2026-11-18). The issuer secret stays minted per boot: the client
+  regions' names and the boot incarnation derive from it (A-176). Built here: `AnchorSegment::publish_launcher_secret`
+  and `launcher_secret` (`crates/anchor`), with `a_published_launcher_secret_is_read_by_a_later_attachment`. Next: the
+  starter's delivery on the anchor's standard input and `Issuer::from_launcher_secret`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

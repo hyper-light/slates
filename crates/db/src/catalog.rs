@@ -273,8 +273,12 @@ pub struct PolicyRecord {
   /// a durable entry is held by. `None` until a shipper commits one. Appended.
   pub live_holders: Option<LiveHolders>,
   /// The volume's write policy (A-285): how a merge and a landing of it are permitted, set by the launcher or the
-  /// harness through the issuer, never by an agent. `None` until one is set, which is ask. Appended.
+  /// harness through the issuer, never by an agent. `None` until one is set: merges at once, lands under approval.
+  /// Appended.
   pub write: Option<WritePolicy>,
+  /// How many times the write policy was set (A-285): a setter names the version it read, so a captured proof sets
+  /// nothing once the policy has moved. Appended.
+  pub write_version: u64,
 }
 
 /// How one kind of write is permitted (A-285): the mode the user gave the harness or agent.
