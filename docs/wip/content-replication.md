@@ -25,9 +25,10 @@ owed.
 
 **The failing test first.** `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`
 (`crates/server/tests/fleet.rs`): a three-node `f = 1` fleet; the owner seals once (a prompt first round
-leaves readings), then the first-round candidate's control shard is held busy for three liveness
-budgets (`HEDGE_STARVATION_NS = 3 s`, the same hold the SWIM starvation test uses) and the owner seals
-again. The seal must place through the *other* candidate while the first is still held.
+leaves readings), then the first-round candidate's control shard is held busy and the owner seals
+again. The owner must count a hedge round (`fleet.seal.hedged`) while the first is still held; the hold
+ends when it does (`HEDGE_STARVATION_NS` is a ceiling of twenty liveness budgets), and the other candidate
+must then hold the content.
 
 ```
 cargo test -p slates-server --test fleet a_slow_first_round_candidate_is_hedged_after_the_measured_p95 -- --exact --nocapture

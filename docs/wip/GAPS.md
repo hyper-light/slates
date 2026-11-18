@@ -1194,9 +1194,21 @@
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
 >   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
->   transport's round-trip estimate) is open. C+D (A-232): the client's part is done, since a call waits while its
->   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
->   itself, `W`, is still a fixed budget (R3 debt). Found on
+>   transport's round-trip estimate, the bug record's definition) is open. The fleet's four timing tests are done
+>   (clients, 2026-11-09, which its branch called class B): they judge by the daemon's own count or by order, never by a
+>   wall bound. `a_forward_waits_for_the_owners_session_while_it_is_out` holds the session until a forward has met it;
+>   `forwards_to_one_owner_never_wait_behind_each_other` asks that the free shard's read be answered while the hold
+>   stands; `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` counts the hedge round (`fleet.seal.hedged`)
+>   and ends the hold at placement; `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget` asks
+>   that the forward's location never give up before its budget ends (`fleet.owner_location.gave_up` at most
+>   `slo_ended` plus `polls_spent`). At nice 19 beside two spinners a CPU on CI's Linux runners (10 runs, arm64 /
+>   x86_64), main's four passed 7/6, 0/0, 2/1 and 0/0; the rewrites 10/6, 10/10, 8/9, and each is red against the fault
+>   it names. Found with them and fixed: a forward's location budget ran on the wall, so a starved node refused a false
+>   death (now counted in its own polls, `verbs::LOCATION_POLLS`, capped by the failover SLO, so a genuinely stuck
+>   owner's client waits up to the SLO where it was refused after about 1 s); and the seal's hedge compared two clocks
+>   (`docs/bugs/2026-11-08-a-seals-hedge-compared-two-clocks.md`). C+D (A-232): the client's part is done, since a call
+>   waits while its daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`);
+>   the forward lane's stall budget is done (below); the window itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 >   **C+D, done for the forward lane's stall budget (2026-11-09, loadtest-scale, on the supervisor's ruling):** a
@@ -1206,8 +1218,9 @@
 >   shard ran, so a starved shard is told from an idle or a busy one; the wall still bounds it at the failover SLO
 >   (`forward_lane::Quiet`). `a_starved_origin_keeps_its_forward_to_a_live_owner`, b's control
 >   shard at nice 19 beside two spinners: main gave up 2 to 1,208 batches in 6 of 6 runs, the fix none
->   (`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). Still open in C+D: the client's
->   own reply deadline (clients) and the location budget's wall (`verbs::locate_within_budget`).
+>   (`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). The two C+D items this
+>   paragraph left open are closed in the same stack (B13): the client's own reply deadline by A-232, and the location
+>   budget's wall by clients' polls (`verbs::LOCATION_POLLS`, above).
 >   Its cost, about 60 ms at the median on a deaf session's first answer (142 against 84 ms), is in BENCHMARKS beside the
 >   A/B. **Unexplained, kept open:** one run of the dead-session test missed its 1.1 s bound at 1.33 s (adacachy2, load
 >   41, `2577aa61` with an uncommitted diagnostic: a probe client's 20 s Status read through b, issued just after the
