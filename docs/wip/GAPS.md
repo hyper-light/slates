@@ -865,6 +865,27 @@
 > re-recorded from the x86_64 run. **Open:** the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor,
 > watcher) are owed a Windows form.
 
+> **A delete racing a coherent purge can hang its caller in the WinFsp drive (found 2026-11-18 by A-360's race on the
+> test-signing VM; open, Windows; the dropped delete found beside it is fixed, docs/bugs/2026-11-18-a-delete-a-purges-last-handle-carried-was-dropped.md).**
+> The race: `a<n>` linked to `b<n>`, `a<n>` held open so the mount's next round purges it (A-190), a write through
+> `b<n>`, then `a<n>` closed and deleted at once (`vm-delete-race.ps1`). In 4 of 4 runs, the deleter hung within 60
+> rounds: at rounds 28 and 17 before the fix, and at 60 and 1 after it. Its thread waits in `NtClose` (`IopCloseFile`) for its
+> cleanup IRP. Local kernel debugging at round 1 (`kd -kl`, 2026-11-18 18:52 UTC) showed:
+> - one file node's Main and Paging resources held shared by an owner pointer, which is a WinFsp request;
+> - one exclusive waiter, a system worker thread;
+> - the daemon's receive worker idle, waiting for the next request through FltMgr;
+> - the purge client idle on its pipe.
+> So the stuck request is not in user mode.
+> - **Impact when unrecovered.** The process cannot exit while the daemon lives, and on the first run the daemon did not
+>   exit when its anchor was killed. Windows' restart then hung past 15 minutes, and a reset was needed.
+> - **Not known yet:** which request holds the node (the owner pointer's `Kind` and IRP), and whether WinFsp as released
+>   reaches the hang. There, a purge follows a change from outside a file's open names (A-190) rather than a hard link's.
+> - **Also open:** 3 of 59 deletes were refused `ERROR_ACCESS_DENIED` in that race with the fix in place, where NTFS
+>   deletes.
+> - **Owed** (filed to main, run-requests 2026-11-18): `vm-hang-probe2.ps1` on the VM, which dumps the owner request
+>   and its IRP when the race stops, and the same race on WinFsp's own driver with an outside writer in place of the
+>   link.
+
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
 > every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`

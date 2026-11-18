@@ -31,8 +31,14 @@ volume kept the name. The deleter was told the file was gone, and the next looku
 `change_of` passed over a purge's cleanup too (`if !object.purge`), so the file's other names were never told that
 the link count fell.
 
-The new shard test `a_delete_a_purges_last_handle_carries_is_made` serves exactly that cleanup. Before the change it
-fails: the name is still in the volume and nothing is owed. After the change it passes.
+The new shard test `a_delete_a_purges_last_handle_carries_is_made` serves exactly that cleanup. Red-checked once, in
+diagnostics run 44359955657 (`diag-g258-22`) on both Windows runners. With the fix's `host.rs` change reversed, the
+test fails at its first assertion: "the delete the purge's last handle carried was not made". With the change, it
+passes, beside the 21 link tests and the 5 other shared-change tests.
+
+On the test-signing VM, a race (`a<n>` linked to `b<n>`, `a<n>` held open, a write through `b<n>`, then `a<n>`
+deleted right after its close) showed the same loss before the fix. The volume kept 21 of 28 deleted names in one
+run and 2 of 16 in another (`a94026fa8`). With the fix it kept 0 of 59 (`35eb55dc5`).
 
 ## Impact
 
@@ -52,6 +58,12 @@ to its close, a few milliseconds a file. Hard links widen it, because every writ
   count (A-360).
 - The host's module doc says a purge's cleanup can carry another caller's delete.
 - Test: `a_delete_a_purges_last_handle_carries_is_made` (`crates/bridge-winfsp/tests/support/host.rs`), failing first.
+
+## Seen beside it, not fixed here
+
+The same VM race also hung the deleter, before the fix and after it. That hang is a separate open gap (GAPS, "A
+delete racing a coherent purge can hang its caller"). Three deletes of 59 were also refused `ERROR_ACCESS_DENIED`
+with the fix in place, where NTFS would delete; their cause is open with the hang.
 
 ## Siblings swept
 

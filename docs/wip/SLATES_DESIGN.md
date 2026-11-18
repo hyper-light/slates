@@ -27471,8 +27471,12 @@ Applied in the same change to:
   carries the delete, and the shard answered a purge's cleanup without making it: Windows was told the name was
   gone, and the volume kept it. One live run of three saw the other name count two links for good. The delete is
   now made whoever's cleanup carries it, behind the publication barrier, and it owes the other names their count
-  (`a_delete_a_purges_last_handle_carries_is_made`). The window predates hard links (A-190, any purged file); hard
-  links widen it, since a write through one name purges the others.
+  (`a_delete_a_purges_last_handle_carries_is_made`, red at the reversed change and green with it on both Windows
+  runners, diagnostics run 44359955657). The window predates hard links (A-190, any purged file); hard links widen it,
+  since a write through one name purges the others. On the VM a race of a write through one name and the other
+  name's delete lost 21 of 28 and 2 of 16 deletes before the change, 0 of 59 after it. The same race also hangs the
+  deleter in its cleanup, before the change and after it: open, GAPS ("A delete racing a coherent purge can hang its
+  caller").
 - **Proven.** The request decoding, the replay rule, the shard's rules and the owed words by the tests above, green on
   both Windows runners (diagnostics run 44350120133 at `28ad74fcd`; the notification and decoding tests also on the
   Mac Studio, kiln r3516). End to end on a Windows Server 2025 evaluation under KVM on adacachy, test signing on,
