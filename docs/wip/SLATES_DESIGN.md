@@ -6848,8 +6848,10 @@ command and every host start, mount and grant through one implementation.
   the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
-  rewitness; serving as a host mount (§4.6, every platform's own mechanism) or as a descriptor a VMM
-  takes (the Shards stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
+  rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
+  without a daemon whether the machine can mount and what is missing, and `mount::unmount_lazy` lets
+  go of a mount a leftover process still holds, Linux) or as a descriptor a VMM takes (the Shards
+  stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
   `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
   the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
   whole typed client for the rest (the merge verbs of §4.16, the file verbs).
@@ -6870,7 +6872,8 @@ command and every host start, mount and grant through one implementation.
 > and (piece 2) the anchor and daemon roles moved from the CLI (`role`), served by a host's own
 > executable through `role::main`, with `Instance::start`, `StartSpec::anchor_command`,
 > `Instance::wait_for` and `Anchor::stop`; and (A-287, g266) a landing plan's per-path entries,
-> paged, `Instance::landing_entries(&plan)`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
+> paged, `Instance::landing_entries(&plan)`; and (piece 3) `mount::available` and
+> `mount::unmount_lazy`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
 > `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call it. Proven by use over an
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
@@ -20689,6 +20692,13 @@ Applied in the same change to:
   Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
   prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
   could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+- **Piece 3, the same day** (kiln's asks, g263): `mount::available() -> Result<MountKind, MountFault>`, the machine's
+  mount mechanism with no daemon (macOS: `mount(2)`, always; the BSDs: `mount_nfs` on the `PATH`; Linux:
+  `fusermount3` on the `PATH` and a `/dev/fuse` the user may read and write; Windows: WinFsp's library loads), each
+  missing piece refused by its own reason, the macOS mount's own check now the same function; and
+  `mount::unmount_lazy(path)`, `fusermount3 -u -z` on Linux, refused `Unsupported` elsewhere. Applied to
+  `crates/api/src/mount.rs` (with pure `fuse_available`/`nfs_available` tested on every host), `lib.rs`
+  (`MountKind`), `docs/library.md`, §4.12's text and status, GAPS.
 - **Owed, in order.** (1) An async form over a host's reactor (R6). (2) A seam trait with a simulator and a
   conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`). A landing plan's per-path
   entries, paged, were built by A-287 the same day (`Instance::landing_entries`).
