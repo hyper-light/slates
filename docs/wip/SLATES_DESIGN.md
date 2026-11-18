@@ -30931,3 +30931,21 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/rendezvous.rs`,
 `crates/ipc/tests/rendezvous.rs`.
+
+### A-446 — A held reply's durability window is the session plane's floor of a gone holder path (2026-11-18, built for goal g255; R3's class B, item B-e; A-292, A-354, A-444; RFC 9002 §7.6.1)
+- **What was there.** A transport's reply held for its volume's durability (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`,
+  WinFsp's) was told "not durable" once a window passed with nothing heard on its durability path, an ask of the
+  owner's unanswered for a window, and the receiver drained (A-292's rule, `slates_bridge_core::durable_bound`), the
+  failover delay bounding the whole wait (A-354, A-375). The window was one liveness window (`DURABLE_WAIT_NS`), under
+  the floor below which the session plane never takes a holder's path for gone (A-444), so a reply could be told "not
+  durable" while its holders' sessions still counted them live.
+- **The rule.** The window is that floor (`live_ship::durable_wait_ns`, read from `fleet::live_budget`, A-444: RFC 9002
+  §7.6.1's persistent-congestion duration from the estimator, each probe timeout the initial one): a holder silent
+  shorter than it may still answer, and one silent past it, with its receiver drained, is given up as before. One number
+  names the window for the held replies and for the transports' give-up records (FUSE, virtio-fs, WinFsp).
+- **Test.** `a_held_reply_is_given_up_silent_only_past_the_holder_paths_gone_floor` (`crate::live_ship`): a reply held
+  with its holders silent and its receiver idling is given up silent past a liveness window and a half and within the
+  floor and the three looks that confirm it.
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/live_ship.rs`.

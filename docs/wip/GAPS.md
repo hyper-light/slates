@@ -3755,7 +3755,9 @@
 >   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`), a live exchange to a
 >   holder (A-444: one liveness window, hard; now its session's persistent-congestion duration, RFC 9002 §7.6.1 from the
 >   session plane's estimator, plus the transfer, and that duration's floor where no session is at hand,
->   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout)
+>   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout),
+>   a held reply's durability window (A-446: one liveness window; now that same floor of a gone holder path, its
+>   silence still judged after a drained receiver, `live_ship::durable_wait_ns`)
 >   and the forward
 >   lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
