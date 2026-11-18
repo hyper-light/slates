@@ -1,0 +1,56 @@
+# Diagnostics only, never merged (g251): crates/bridge-fuse/tests/ipc_mount.rs on CI's ubuntu runner. Red: main's file
+# (both tests under one pid-named root) run as libtest runs it, at once, three times; the hypothesis: the same file one
+# test at a time, twice; green: each test under its own root, at once, five times.
+name: diag-g251-ipcmount
+
+on:
+  push:
+    branches: [diag-g251-ipcmount]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  ipc-mount:
+    name: ipc_mount on ubuntu (g251)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The runner
+        run: |
+          uname -r; grep PRETTY /etc/os-release; command -v fusermount3; ls -l /dev/fuse
+      - name: Red (main's file, the tests at once)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          F=crates/bridge-fuse/tests/ipc_mount.rs
+          cp "$F" fixed.rs
+          git show HEAD~1:"$F" > "$F"
+          echo "pid-named root: $(grep -c 'slates-ipc-{}' "$F") site"
+          for run in 1 2 3; do
+            cargo test --locked -p slates-bridge-fuse --test ipc_mount > red-$run.log 2>&1
+            echo "red run $run exit $?: $(grep -E '^test result' red-$run.log | tail -1)"
+            grep -E 'panicked at|left:|right:|skipping' red-$run.log | head -6
+          done
+          for run in 1 2; do
+            cargo test --locked -p slates-bridge-fuse --test ipc_mount -- --test-threads=1 > serial-$run.log 2>&1
+            echo "serial run $run exit $?: $(grep -E '^test result' serial-$run.log | tail -1)"
+            grep -E 'panicked at|skipping' serial-$run.log | head -4
+          done
+          cp fixed.rs "$F"
+      - name: Green (each test under its own root, at once)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -o pipefail
+          for run in 1 2 3 4 5; do
+            cargo test --locked -p slates-bridge-fuse --test ipc_mount 2>&1 | tee green-$run.log | grep -E '^test |^test result|skipping'
+          done
+          ! grep -q 'skipping' green-*.log
