@@ -1,0 +1,27 @@
+# DIAG (not for main): red-check of the hypothesis that Supervisor::start loses a serving mark made before record_start
+# zeroes it (spawn_child, then record_start): the serve-then-kill test x5 as main has it, then x5 with a 200 ms pause
+# injected between the spawn and record_start (expected red every time, "left: ([], None)").
+name: diag-integrator-anchorrace
+on:
+  push:
+    branches: ['diag-integrator-anchorrace-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  anchor-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Control and injected pause
+        run: bash .github/diag-integrator-anchorrace.sh
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anchorrace-results
+          path: target/anchorrace-*
