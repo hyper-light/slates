@@ -1035,17 +1035,20 @@ impl Run {
       owner.shipper.holders().to_vec()
     };
     let head = owner.shipper.head().map(|head| head.position);
+    let next = owner.shipper.next_position().unwrap();
     let durable = owner.shipper.durable();
     if between {
       owner.state.push(value);
     }
     owner.shipper = match rule {
       Restart::PastShipped => {
-        // The image kept the position its last publication took (the head), or would have taken (one past it).
+        // The image kept the position its last publication's entry took (one before the next), or, when the crash fell
+        // between the image and the append, the one it would have taken (the next): what the daemon's kept piece holds,
+        // whether or not this incarnation appended anything.
         let past = if between {
-          head.map_or(Some(0), |head| head.checked_add(1))
+          Some(next)
         } else {
-          head
+          next.checked_sub(1)
         };
         Shipper::resumed(
           (host, OBJECT, epoch),
@@ -1161,6 +1164,10 @@ impl Run {
   fn settle(&mut self) {
     self.cut.clear();
     self.everyone_learns();
+    // A restarted owner ships its log again at its next publication (A-344): one write, if it made none since.
+    if self.restarts > 0 && self.owners[self.current].shipper.head().is_none() {
+      self.write(self.current);
+    }
     while self.following.is_some() && u64::try_from(self.configuration.len()).unwrap() < 2 * self.f
     {
       self.reconfigure();
