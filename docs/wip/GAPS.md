@@ -2666,7 +2666,8 @@
 >   5% of its time and a slice to a heartbeat period; 16 greens over a held 78-file tree recovered in 2.82 s of CPU in 959
 >   slices with the beat never older than 496 ms, where main went 2.20 s without a beat
 >   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
-> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
+> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients).
+>   Closed by A-468 (2026-11-18): a reconnect waits while the instance's anchor lives, however long the restart takes;
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
 > - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
 >   wake probe now runs past its wall while each round's waiter runs at all, rounds doubling from one window to 4 s (7.75 s
@@ -3885,15 +3886,30 @@
 >   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
 >   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
 >   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
->   left (twice it); a Windows claim's wait under a live anchor (at least it; A-468 replaces it with the anchor's
->   life); one more of it for a claim the daemon took to answer; and the async connect's pacing (a tenth of it,
->   `Connecting::next_poll_ns`). Owed in C-b: the reply deadline's other users,
+>   left (twice it); and the pacing of an async connect's and a reconnect's polls (a tenth of it,
+>   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
+>   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
+>   C-b: the reply deadline's other users,
 >   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
 >   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own; then the reconnect budget (part 2) and macOS's `MOUNT_CALL_DEADLINE` (part
->   3). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   borrows the reply deadline for its own; and macOS's `MOUNT_CALL_DEADLINE` (part 3). The reconnect since A-468
+>   (2026-11-18, g251b; C-b's second part): a client whose daemon was gone reconnected for the reconnect budget
+>   (`Deadlines::reconnect_ns`, the recovery budget and a liveness window, two seconds), and a claim under a live anchor
+>   waited at most that budget, so a restart slower than it failed the anchor's clients and a daemon nothing would
+>   restart was reported gone two seconds late. Now a claim carries no restart bound and waits while its rendezvous's
+>   holder lives (the anchor across restarts, or the daemon holding its own; on Windows the anchor's process id and
+>   creation time in the bootstrap header, layout `SLB4`), and a refused claim asks `slates_ipc::holder_lives`: a holder,
+>   and the client claims again; none, and it fails `DaemonGone` at once
+>   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
+>   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
+>   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
+>   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `Client::call_through_transient`), owed to the failover delay the daemon reports; and the server's reclaim of a
+>   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") still mirrors the old
+>   reconnect budget, a fixed two seconds R3 forbids, owed. macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
@@ -4172,7 +4188,8 @@
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
->   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stays open here;
+>   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stayed open here until
+>   A-468 (2026-11-18), when a reconnect came to wait while the instance's anchor lives, however long the start takes;
 >   recovery in one poll closed the same day (below). Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
 >   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
 >   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).

@@ -5153,7 +5153,8 @@ drops.
 > 10 runs were red on both Linux runners, 44 calls failed 2.152 to 8.929 s after sending, and no beat was withheld. Now
 > every wait a call makes keeps one rule: the driver's tick, the synchronous round trip, and the wait for a slot on a
 > full ring. Each reply deadline that passes asks the daemon's liveness. Gone, the client recovers or reconnects and
-> fails `DaemonGone` past the reconnect budget, as before. Alive, the deadline re-arms and the call waits; a stopped
+> fails `DaemonGone` past the reconnect budget, as before (until A-468, below: a reconnect waits while the instance's
+> rendezvous has a holder, and fails at once with none). Alive, the deadline re-arms and the call waits; a stopped
 > daemon's call waits until it resumes or is cancelled.
 >
 > The rule is safe because a daemon that will never answer is ended. An anchored (`FromEnv`) daemon is killed by its
@@ -5189,6 +5190,23 @@ drops.
 > eventfd's only reader then, and gives the pipe's level back as it ends. The synchronous round trip waits so; the
 > reply deadline still paces the waits that cannot see the departure yet (the async driver's tick, the wait for a slot
 > on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS.
+
+> **Status (2026-11-18, A-468): a client whose daemon is gone reconnects while its instance's rendezvous has a holder,
+> and fails `DaemonGone` at once when it has none.** Until A-468 a reconnect was tried for the reconnect budget (`T + W`,
+> the recovery budget and the liveness window, two seconds), and a claim under a live anchor waited at most that budget
+> as its restart bound. So a restart slower than two seconds (a starved start, a long recovery) failed the anchor's
+> clients while the anchor was still restarting their daemon, and a client whose daemon nothing would restart waited
+> out the whole budget before it was told. Now a claim carries no clock: it waits while the rendezvous's holder lives
+> (`slates_ipc::begin_connect_as`), the anchor that holds the rendezvous across restarts (A-114) or the daemon that
+> holds its own. On Linux the holder is the listening socket, which the anchor keeps across a restart and whose queued
+> claims the kernel resets when its last holder closes it; on macOS the owner's bootstrap name, which the anchor holds
+> while it holds the rendezvous; on Windows the anchor's process, named in the bootstrap header by its process id and
+> creation time (the layout `SLB4`), else the daemon's (A-447) with its start stamp. A claim refused for now (no claim
+> slot free, the restarted daemon not yet published, the daemon gone mid-answer) asks `slates_ipc::holder_lives`: with a
+> holder the client claims again, paced as an async connect polls (doubling, at most a tenth of the claim wait); with
+> none it fails `DaemonGone` at once. The synchronous reconnect and the async driver's recovery keep that one rule.
+> `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
+> its resend, the pause between resends, `call_through_transient`), whose own bound, the failover delay, is owed in GAPS.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
@@ -32922,6 +32940,55 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   old life, a withdrawn offer is not counted retired.
 - **Owed.** A cross-process test of a client killed before its claim (the reaper retiring it lets its offer go and its
   stream's attachment end), as `crates/client/tests/reap.rs` kills a client; main's to run.
+
+### A-468 — A client whose daemon is gone reconnects while its instance's rendezvous has a holder, and fails `DaemonGone` at once with none: a claim carries no restart bound (2026-11-18, UI goal 86 via g251b; R3's class C, C-b's second part; §4.7 "Rendezvous", "Failure matrix"; A-114, A-443, A-447, A-456)
+
+- **What was there.** A client whose daemon was found gone reconnected under its id for the reconnect budget
+  (`Deadlines::reconnect_ns`, `T + W`: the recovery budget and the liveness window, two seconds), the synchronous
+  reconnect and the async driver's recovery alike, and failed `DaemonGone` past it. Each claim it made under a live
+  anchor took that budget as its restart bound (A-443 kept a bound only there, since an anchor's life says nothing of
+  its daemon's), and a Windows claim under a live anchor waited at least the claim wait. So a restart slower than two
+  seconds failed the anchor's clients while the anchor was still restarting their daemon: the chaos record in
+  `docs/wip/BENCHMARKS.md` (100 clients, the daemon killed 3.5 s into the run) had the anchor restart three
+  successors before the fourth recovered, and by then every client had passed its budget, 0 reconnects. And a client
+  whose daemon nothing would restart waited out the whole budget before it was told.
+- **The rule.** A claim waits while its rendezvous's holder lives, by no clock (`begin_connect_as(instance, wanted)`,
+  `connect_as`; the restart-bound argument is gone): the anchor that holds the rendezvous across its daemon's restarts,
+  or the daemon that holds its own. Linux: the listening socket, which the anchor keeps across a restart, a claim
+  queued in its backlog until the next daemon accepts it, and whose queued claims the kernel resets when its last
+  holder closes it. macOS: the owner's bootstrap name, which the anchor holds while it holds the rendezvous and
+  launchd takes back at its holder's death, looked up on A-443's doubling. Windows: the anchor writes its creation time
+  beside its process id into the bootstrap header (offset 40; the layout's magic moves to `SLB4`, so each of `SLB3` and
+  `SLB4` refuses the other), and a claim under a live anchor waits on the claim's Event beside the anchor's process
+  handle, judged by both (a reused pid is never taken for the anchor); with none it waits on the daemon's as A-447 did.
+- **The reconnect.** A claim refused for now (no claim slot free, the restarted daemon not yet published, a daemon gone
+  mid-answer) asks `slates_ipc::holder_lives(instance)`: Linux, whether a connect to the listening socket is taken or
+  queued (`EAGAIN`, a full backlog, counts as held; `ECONNREFUSED` or `ENOENT` as none); macOS, whether the owner's
+  name is held; Windows, whether the anchor the header names lives, or else the daemon it names lives with its start
+  stamp published (no object by the name reads none, a header not yet written reads held, since its maker lives while
+  it writes it, and another layout's is refused as a claim refuses it). With a holder the client claims again, paced
+  as an async connect polls (`next_pause_ns`, doubling, at most a tenth of `CLAIM_WAIT_NS`); with none it fails
+  `DaemonGone` at once, its `after_ns` the time since the reconnect began. `Client::try_reconnect` (the driver's step)
+  and `Client::reconnect` (the synchronous one) share the rule (`refused_reconnect`, `adopt_reconnected`); the
+  driver's `Lost` no longer keeps when it began.
+- **What stays.** `Deadlines::reconnect_ns` keeps its derivation and now bounds only the waits on a fleet owner's
+  takeover: the window in which a request refused for now is held for its resend under its id, the pause between
+  such resends (a tenth of it) and `call_through_transient`; their own bound, the failover delay the daemon reports, is
+  owed (GAPS, class C). The server's reclaim of a taken-back map no holder claims (`held_copy::reconnect_budget_ns`)
+  mirrors the old budget, owed beside them. `CLAIM_WAIT_NS` keeps its users less the two A-468 removes (a Windows
+  claim's wait under a live anchor, and the further one for a claim the daemon took to answer).
+- **Tests (each written red first).** `rendezvous::platform::tests`, on every platform:
+  `a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget` (a daemon end stops before
+  answering; after 2.5 s, a quarter again the old budget, another opens over the held rendezvous; the claim is due all
+  the while and then connected to the region the second made for it) and
+  `a_claim_under_an_anchor_ends_at_the_anchors_going` (refused within the claim wait of the anchor's going; on Linux
+  with `holder_lives` read before and after); on macOS and Windows also
+  `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`, and the header's golden vector and hostile
+  images, now both marks (`the_process_marks_are_little_endian_at_their_offsets`,
+  `no_mark_is_read_where_none_was_written_and_a_hostile_one_is_read_as_written`; `SLB4`). The client's
+  `crates/client/tests/waits.rs` gone case is now `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`: a
+  killed daemon that held its own rendezvous ends both calls `DaemonGone` before the old budget, where it asserted they
+  took at least it.
 
 ### A-497 — Version-control servers over greens and works: the shared mapping (2026-11-18, g261 for UI goal 91; new §4.17 and D-28; §4.8, §4.16)
 - **What it adds.** §4.17's frame and its shared part, §4.17.1: how a stock git, Mercurial or Subversion client's
