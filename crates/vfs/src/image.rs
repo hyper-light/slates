@@ -65,7 +65,7 @@ use slates_mem::Handle;
 use crate::dir::{Child, DirCursor, DirNode};
 use crate::error::VfsError;
 use crate::ids::{InodeNo, SnapshotId};
-use crate::inode::{Attrs, Kind};
+use crate::inode::{Attrs, DeviceNumber, SpecialNode};
 use crate::names::NameEquivalence;
 use crate::volume::{Store, Volume};
 
@@ -102,10 +102,15 @@ pub enum ImageError {
     /// The path of the link.
     path: String,
   },
-  /// The image holds a node a volume cannot: a character or block device.
-  NodeUnsupported {
+  /// A device node's number does not fit the image's encoding, the Linux kernel's 12-bit major and 20-bit minor
+  /// (A-294): the volume keeps NFS's two 32-bit words, which a macOS or hostile client may fill past them.
+  DeviceNumberUnencodable {
     /// The path of the node.
     path: String,
+    /// Its major number.
+    major: u32,
+    /// Its minor number.
+    minor: u32,
   },
   /// The merge's own bookkeeping disagreed with itself: a defect, refused rather than guessed around.
   Inconsistent {
@@ -350,7 +355,12 @@ impl SnapshotWalk {
           .inode,
         Some(handle),
       ),
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => (no, None),
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => (no, None),
       Child::Whiteout => return Ok(cost),
     };
     let known = self.linked.get(&no).copied();
@@ -370,6 +380,26 @@ impl SnapshotWalk {
           }
           Child::Fifo(_) => ImageKind::Fifo,
           Child::Socket(_) => ImageKind::Socket,
+          Child::BlockDevice(_) => ImageKind::BlockDevice {
+            rdev: linux_device(
+              volume,
+              store,
+              self.snapshot,
+              self.reading.as_ref(),
+              no,
+              &row.name,
+            )?,
+          },
+          Child::CharDevice(_) => ImageKind::CharDevice {
+            rdev: linux_device(
+              volume,
+              store,
+              self.snapshot,
+              self.reading.as_ref(),
+              no,
+              &row.name,
+            )?,
+          },
           Child::Whiteout => return Ok(cost),
         };
         let id = grower.add_node(node_of(kind, &attrs))?;
@@ -385,6 +415,35 @@ impl SnapshotWalk {
     grower.add_entry(row.name.into_bytes(), id)?;
     Ok(cost)
   }
+}
+
+/// Device node `no`'s number in the image's encoding (A-294), the Linux kernel's 12-bit major and 20-bit minor, or a
+/// refusal naming the node's path (entry `name` of the directory `reading` reads) when its number does not fit.
+fn linux_device(
+  volume: &Volume,
+  store: &Store,
+  snapshot: SnapshotId,
+  reading: Option<&Reading>,
+  no: InodeNo,
+  name: &str,
+) -> Result<u32, ImageError> {
+  let number = volume
+    .device_in(store, snapshot, no)?
+    .ok_or(ImageError::Inconsistent {
+      reason: "a device entry whose inode holds no device number",
+    })?;
+  number.to_linux().ok_or_else(|| {
+    // A cold path: the walk keeps no paths, so the refusal finds this one from the directory's inode.
+    let directory = reading
+      .and_then(|reading| store.dirs.get(reading.directory).ok())
+      .and_then(|node| volume.path_of_dir_in(store, snapshot, node.inode))
+      .unwrap_or_default();
+    ImageError::DeviceNumberUnencodable {
+      path: format!("{}/{name}", directory.trim_end_matches('/')),
+      major: number.major,
+      minor: number.minor,
+    }
+  })
 }
 
 /// The image node of `kind` with a volume inode's attributes.
@@ -817,6 +876,11 @@ impl Merge {
       (ImageKind::Symlink { target: image }, ImageKind::Symlink { target: built }) => {
         image == built
       }
+      // A device node is its number (A-294): one the guest renumbered is another node.
+      (ImageKind::BlockDevice { rdev: image }, ImageKind::BlockDevice { rdev: built })
+      | (ImageKind::CharDevice { rdev: image }, ImageKind::CharDevice { rdev: built }) => {
+        image == built
+      }
       _ => false,
     };
     same.then_some(base)
@@ -1150,13 +1214,23 @@ impl Merge {
         })?;
         clone.symlink_no(store, parent, name, target)?
       }
-      ImageKind::Fifo => clone.mknod_no(store, parent, name, permissions, Kind::Fifo)?,
-      ImageKind::Socket => clone.mknod_no(store, parent, name, permissions, Kind::Socket)?,
-      ImageKind::CharDevice { .. } | ImageKind::BlockDevice { .. } => {
-        return Err(ImageError::NodeUnsupported {
-          path: self.path_of(directory, name.as_bytes()),
-        });
-      }
+      ImageKind::Fifo => clone.mknod_no(store, parent, name, permissions, SpecialNode::Fifo)?,
+      ImageKind::Socket => clone.mknod_no(store, parent, name, permissions, SpecialNode::Socket)?,
+      // A device node the guest made is kept as one, its number as the image carries it (A-294).
+      ImageKind::CharDevice { rdev } => clone.mknod_no(
+        store,
+        parent,
+        name,
+        permissions,
+        SpecialNode::CharDevice(DeviceNumber::from_linux(*rdev)),
+      )?,
+      ImageKind::BlockDevice { rdev } => clone.mknod_no(
+        store,
+        parent,
+        name,
+        permissions,
+        SpecialNode::BlockDevice(DeviceNumber::from_linux(*rdev)),
+      )?,
     };
     self.report.created = self.report.created.saturating_add(1);
     self.set_inode(child, no);

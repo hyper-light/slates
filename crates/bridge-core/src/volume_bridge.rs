@@ -28,7 +28,7 @@ use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::{InodeNo, RefOwner};
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{Kind, SpecialNode};
 
 /// Format: the set-group-ID mode bit (`<sys/stat.h>` `S_ISGID`): on a directory, what is created in it takes
 /// the directory's group, and a directory created in it takes the bit too.
@@ -618,13 +618,8 @@ impl<'v> VolumeBridge<'v> {
     parent: InodeNo,
     cx: &OpContext,
   ) -> Result<(), VfsError> {
-    let uid = match (cx.owner_uid, &cx.subject) {
-      (Some(uid), _) => uid,
-      (None, Principal::Uid { uid, .. }) => *uid,
-      // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
-      // account's, as the host filesystem will report it.
-      (None, Principal::Consumer { account, .. }) => *account,
-      (None, Principal::Sid { .. } | Principal::Certificate { .. }) => return Ok(()),
+    let Some(uid) = creating_uid(cx) else {
+      return Ok(());
     };
     let parent_attrs = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).stat(self.store, parent),
@@ -646,8 +641,8 @@ impl<'v> VolumeBridge<'v> {
     Ok(())
   }
 
-  /// What a node of kind `kind`, asked for with `mode` by a creator whose umask is `umask`, takes from directory
-  /// `parent` (A-314; Linux's `posix_acl_create`, `fs/posix_acl.c`). Under a default ACL the umask is not applied: the
+  /// What a node asked for with `mode` by a creator whose umask is `umask` takes from directory `parent`, `directory`
+  /// saying whether the node is one (A-314; Linux's `posix_acl_create`, `fs/posix_acl.c`). Under a default ACL the umask is not applied: the
   /// mode keeps only what the default's owner, mask and other entries grant, and the node is given the default's
   /// entries as its access ACL when they say more than its mode, a directory the default as well. Without one, the
   /// mode less the umask, and no ACL. A default ACL the volume keeps that no parse takes is refused `Integrity`: only a
@@ -657,7 +652,7 @@ impl<'v> VolumeBridge<'v> {
     parent: InodeNo,
     mode: u32,
     umask: Option<u32>,
-    kind: Kind,
+    directory: bool,
   ) -> Result<Creation, VfsError> {
     let masked = Creation {
       mode: mode & !umask.unwrap_or(0),
@@ -683,7 +678,7 @@ impl<'v> VolumeBridge<'v> {
     Ok(Creation {
       mode,
       access: access.map(|access| access.to_bytes()),
-      default: (kind == Kind::Dir).then_some(value),
+      default: directory.then_some(value),
     })
   }
 
@@ -822,6 +817,20 @@ struct Creation {
   default: Option<Vec<u8>>,
 }
 
+/// The uid request `cx` creates as: the transport's per-request caller (an NFS `AUTH_SYS` uid, a FUSE request
+/// header's), else the enrolled subject's own Unix account; `None` for a subject that is no Unix user (a Windows SID, a
+/// certificate — never on the POSIX mount path), whose platform's own ownership model governs.
+fn creating_uid(cx: &OpContext) -> Option<u32> {
+  match (cx.owner_uid, &cx.subject) {
+    (Some(uid), _) => Some(uid),
+    (None, Principal::Uid { uid, .. }) => Some(*uid),
+    // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
+    // account's, as the host filesystem will report it.
+    (None, Principal::Consumer { account, .. }) => Some(*account),
+    (None, Principal::Sid { .. } | Principal::Certificate { .. }) => None,
+  }
+}
+
 /// A neutral [`NodeAttr`] from what the volume observes of inode `no`. Generation is 0 until
 /// generation-tracked reuse lands (§4.6 `(no, gen)`).
 fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
@@ -841,6 +850,7 @@ fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
     btime: attrs.btime,
     windows: observed.windows.bits(),
     change: observed.change,
+    device: observed.device,
   }
 }
 
@@ -1216,7 +1226,7 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<(NodeAttr, u64), VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
-    let creation = self.creation(parent_no, mode, cx.umask, Kind::File)?;
+    let creation = self.creation(parent_no, mode, cx.umask, false)?;
     // Through the overlay rules for an overlay volume: a name the base holds is `EEXIST`, not a
     // second file shadowing the disk's (§4.6; AC-1.17).
     let no = match host_for(&mut self.host, self.volume.is_overlay())? {
@@ -1351,21 +1361,27 @@ impl Bridge for VolumeBridge<'_> {
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
+    // A device node other than a whiteout is made for a caller acting as root alone (A-294,
+    // `crate::access::needs_superuser`): a kernel asks `CAP_MKNOD` before a FUSE or virtio-fs request reaches here, and
+    // this holds every other transport to the same rule.
+    if crate::access::needs_superuser(node) && creating_uid(cx) != Some(crate::access::ROOT_UID) {
+      return Err(VfsError::NotPermitted);
+    }
     let parent_no = InodeNo(parent.inode);
-    let creation = self.creation(parent_no, mode, cx.umask, kind)?;
+    let creation = self.creation(parent_no, mode, cx.umask, false)?;
     let no = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => {
         self
           .volume
           .with_host(host)
-          .mknod_no(self.store, parent_no, name, creation.mode, kind)
+          .mknod_no(self.store, parent_no, name, creation.mode, node)
       }
       None => self
         .volume
-        .mknod_no(self.store, parent_no, name, creation.mode, kind),
+        .mknod_no(self.store, parent_no, name, creation.mode, node),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
     if let Err(refusal) = self.give_acls(no, &creation) {
@@ -1383,7 +1399,7 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
-    let creation = self.creation(parent_no, mode, cx.umask, Kind::Dir)?;
+    let creation = self.creation(parent_no, mode, cx.umask, true)?;
     // Through the overlay rules for an overlay volume: a name the base holds is `EEXIST`, and the
     // new directory is opaque (only overlay entries show), so it is in the diverged set the landing
     // plans from (§4.5 "Mutation"; AC-1.10).
