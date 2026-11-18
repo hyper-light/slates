@@ -8,23 +8,24 @@
 //! SetSize's for 6.5 %; on the x86_64 runner, loaded, a Create's for 3.9 %, a Rename's for 2.4 % and a directory
 //! listing's for 1.0 % (diagnostics run 42506936806, `diag-winfsp-overlap-50`, five runs a pass).
 //!
-//! So each kind of request chooses for itself, by the same model's costs over its own recent replies, between spinning
-//! the window and parking at once. A wait that spins costs the time it spins; a park costs one wake, which is the
-//! window. A reply that came `T` after its request was posted cost a spinning wait `T` when `T` was within the window,
-//! and twice the window when it was not (spun out, then woken); parking at once would have cost the window either way.
-//! A kind spins while the weighted mean of what spinning cost its replies is at most the window: exactly when, by its
-//! recent replies, spinning is expected to cost no more than parking. A kind whose replies mostly come within the window
-//! spins as A-212 does; one whose replies mostly come after it parks at once and leaves the CPU to the shards.
+//! So each kind of request chooses for itself, by its own recent replies, between spinning the window and parking at
+//! once: it spins while at least half of its replies come within the window, so the spin catches the kind's median
+//! reply. A kind whose median reply comes past the window gains nothing at its median from spinning, and under load its
+//! spin is a CPU the shards wait for: on the arm64 runner, loaded, a write (a SetSize, caught 6.5 % of the time) was
+//! 18 to 41 µs faster at the p50 with its kind parking at once (`diag-g258-2`, run 44273781244). The choice is not the
+//! 2-competitive costs' (a spin costs the time spun, a park one wake): that form parked kinds whose median reply the spin
+//! caught, such as x86_64's Release at 63 %, and paid a wake at their median, a close 16.7 µs slower loaded in 9 of 9
+//! runs, with no op faster anywhere on that runner (the same run).
 //!
 //! Every reply carries the instant the shard sent it (`crate::host::Served::send`), so `T` is known however a wait
 //! ended. A kind that parks keeps learning from each reply, and spins again once its replies come within the window:
 //! no wait is spent probing.
 //!
-//! The mean is exponentially weighted over about [`WEIGHED`] replies, the precision an online estimate of the wake asks
+//! The share is exponentially weighted over about [`WEIGHED`] replies, the precision an online estimate of the wake asks
 //! of itself (`slates_machine::wake::WakeLatency::estimate_window`), and kept in fixed point as that estimate is
 //! (`slates_machine::wake::WakeEstimate`), so a small correction is never rounded away. A kind with no reply yet stands
-//! at the window, where the two choices cost the same; ties spin, as A-212 did for every kind. The choice is pure and
-//! tested on every host; the Windows worker (`crate::reply`) asks it before each wait and tells it each reply.
+//! at half, the threshold; ties spin, as A-212 did for every kind. The choice is pure and tested on every host; the
+//! Windows worker (`crate::reply`) asks it before each wait and tells it each reply.
 
 use std::time::Duration;
 
@@ -163,19 +164,24 @@ const KINDS: usize = ReplyKind::ALL.len();
 /// profile's wake probe takes it (`slates_machine::wake`).
 const Z_95_PERMILLE: u64 = 1960;
 
-/// Derived: the replies a kind's mean spinning cost weighs: `N = ⌈z · σ / (h · W)⌉²`, as an online estimate of the wake
-/// sizes itself (`slates_machine::wake::WakeLatency::estimate_window`), with `z` the 95 % normal quantile, `h` half the
-/// probe's stopping-rule width (`slates_machine::stats::CONVERGED_WIDTH_PERMILLE`) and `σ` at most the window `W`,
-/// since a spinning cost lies between none and twice the window: `⌈1.96 / 0.05⌉² = 40² = 1,600` replies, so a kind's
-/// mean is within ±5 % of the window at 95 %.
+/// Derived: the replies a kind's share weighs: `N = ⌈z · σ / (h · p)⌉²`, as an online estimate of the wake sizes itself
+/// (`slates_machine::wake::WakeLatency::estimate_window`), with `z` the 95 % normal quantile, `h` half the probe's
+/// stopping-rule width (`slates_machine::stats::CONVERGED_WIDTH_PERMILLE`), `p` the threshold, a half, and `σ` a reply's
+/// spread at it, also a half: `⌈1.96 / 0.05⌉² = 40² = 1,600` replies, so a kind's share is within ±5 % of the threshold
+/// at 95 %.
 pub const WEIGHED: u64 = weighed();
 
 /// Derived: the exponential weighting's shift, `⌈log₂ WEIGHED⌉` (11), as the wake estimate takes its own
 /// (`slates_machine::wake::WakeLatency::estimate_shift`).
 const SHIFT: u32 = shift_of(WEIGHED);
 
-/// Derived: the fixed point's unit, `2^SHIFT`: a mean is kept multiplied by it.
+/// Derived: the fixed point's unit, `2^SHIFT`: a share is kept multiplied by it twice, once as each reply's weight and
+/// once as the weighting's.
 const SCALE: u128 = 2u128.saturating_pow(SHIFT);
+/// Derived: a kind's whole share in fixed point (every reply within the window), `SCALE²`; the threshold is half of it.
+const WHOLE: u128 = SCALE.saturating_mul(SCALE);
+/// Format: parts per thousand, for the closing report's share.
+const PERMILLE: u128 = 1000;
 
 const fn weighed() -> u64 {
   match slates_machine::stats::CONVERGED_WIDTH_PERMILLE.checked_div(2) {
@@ -195,10 +201,10 @@ const fn shift_of(replies: u64) -> u32 {
   }
 }
 
-/// One kind's standing: its weighted mean spinning cost, and what its choice did.
+/// One kind's standing: the weighted share of its replies that came within the window, and what its choice did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Standing {
-  /// The weighted mean spinning cost in nanoseconds, multiplied by [`SCALE`]; `None` before the kind's first reply.
+  /// The weighted share of replies within the window, out of [`WHOLE`]; `None` before the kind's first reply.
   scaled: Option<u128>,
   /// Waits that spun the window.
   spun: u64,
@@ -213,8 +219,8 @@ pub struct Counts {
   pub spun: u64,
   /// Waits the kind's choice parked at once.
   pub parked_at_once: u64,
-  /// The kind's weighted mean spinning cost, nanoseconds; `None` before its first reply.
-  pub mean_cost_ns: Option<u64>,
+  /// The kind's weighted share of replies within the window, in thousandths; `None` before its first reply.
+  pub within_permille: Option<u64>,
 }
 
 /// One worker's choices, a kind at a time.
@@ -241,8 +247,8 @@ impl SpinChoices {
     }
   }
 
-  /// How long a wait for a `kind` reply spins before it parks: the window, or none when the kind's replies say parking at
-  /// once costs less. A zero window spins for none whatever the kind, and is counted as neither choice.
+  /// How long a wait for a `kind` reply spins before it parks: the window while at least half of the kind's replies came
+  /// within it, else none. A zero window spins for none whatever the kind, and is counted as neither choice.
   pub fn spin_for(&mut self, kind: ReplyKind, window: Duration) -> Duration {
     let Some(standing) = self.kinds.get_mut(kind.index()) else {
       return window;
@@ -250,8 +256,10 @@ impl SpinChoices {
     if window.is_zero() {
       return Duration::ZERO;
     }
-    let threshold = window.as_nanos().saturating_mul(SCALE);
-    if standing.scaled.is_none_or(|scaled| scaled <= threshold) {
+    if standing
+      .scaled
+      .is_none_or(|scaled| scaled.saturating_mul(2) >= WHOLE)
+    {
       standing.spun = standing.spun.saturating_add(1);
       window
     } else {
@@ -260,29 +268,22 @@ impl SpinChoices {
     }
   }
 
-  /// Folds in a `kind` reply that came `came_after` its request was posted, against `window`: what a spinning wait cost
-  /// it (`came_after` within the window, twice the window past it), whichever way the wait went.
+  /// Folds in a `kind` reply that came `came_after` its request was posted: within `window` or past it, whichever way the
+  /// wait went.
   pub fn record(&mut self, kind: ReplyKind, came_after: Duration, window: Duration) {
     let Some(standing) = self.kinds.get_mut(kind.index()) else {
       return;
     };
-    let window_ns = window.as_nanos();
-    let cost = if came_after <= window {
-      came_after.as_nanos()
-    } else {
-      window_ns.saturating_mul(2)
-    };
-    let scaled = standing
-      .scaled
-      .unwrap_or_else(|| window_ns.saturating_mul(SCALE));
+    let weight = if came_after <= window { SCALE } else { 0 };
+    let scaled = standing.scaled.unwrap_or(WHOLE.checked_div(2).unwrap_or(0));
     standing.scaled = Some(
       scaled
         .saturating_sub(scaled.checked_div(SCALE).unwrap_or(0))
-        .saturating_add(cost),
+        .saturating_add(weight),
     );
   }
 
-  /// What `kind`'s choice did, and where its mean stands.
+  /// What `kind`'s choice did, and where its share stands.
   pub fn counts(&self, kind: ReplyKind) -> Counts {
     self
       .kinds
@@ -290,9 +291,13 @@ impl SpinChoices {
       .map(|standing| Counts {
         spun: standing.spun,
         parked_at_once: standing.parked_at_once,
-        mean_cost_ns: standing
-          .scaled
-          .map(|scaled| u64::try_from(scaled.checked_div(SCALE).unwrap_or(0)).unwrap_or(u64::MAX)),
+        within_permille: standing.scaled.map(|scaled| {
+          let permille = scaled
+            .saturating_mul(PERMILLE)
+            .checked_div(WHOLE)
+            .unwrap_or(0);
+          u64::try_from(permille).unwrap_or(u64::MAX)
+        }),
       })
       .unwrap_or_default()
   }
@@ -419,47 +424,38 @@ mod tests {
     }
   }
 
-  /// The rule in floating point: what a spinning wait cost a reply that came `came_after`.
-  fn spinning_cost(came_after: Duration) -> f64 {
-    if came_after <= WINDOW {
-      came_after.as_nanos() as f64
-    } else {
-      2.0 * WINDOW.as_nanos() as f64
-    }
-  }
-
   /// Feeds one kind replies `permille_within` thousandths within the window, comparing each choice with the rule's
-  /// reference mean; answers how many choices were compared.
+  /// reference share; answers how many choices were compared.
   fn compare_with_the_rule(permille_within: u64) -> u64 {
-    let window_ns = WINDOW.as_nanos() as f64;
     let weight = 1.0 / SCALE as f64;
     let mut replies = Replies(0x9E37_79B9_7F4A_7C15 ^ permille_within);
     let mut choices = SpinChoices::new();
-    let mut reference = window_ns;
+    let mut reference = 0.5;
     let mut compared = 0;
     for _ in 0..WEIGHED * SETTLED * 2 {
       let spins = choices.spin_for(ReplyKind::Write, WINDOW) == WINDOW;
-      let clear_of_the_threshold = (reference - window_ns).abs() > window_ns / 100.0;
+      let clear_of_the_threshold = (reference - 0.5f64).abs() > 0.01;
       assert!(
-        !clear_of_the_threshold || spins == (reference <= window_ns),
-        "{permille_within} permille within: the rule's mean {reference:.1} ns against the window {window_ns} ns"
+        !clear_of_the_threshold || spins == (reference >= 0.5),
+        "{permille_within} permille within: the rule's share {reference:.4} against a half"
       );
       compared += u64::from(clear_of_the_threshold);
       let came_after = replies.reply(permille_within);
       choices.record(ReplyKind::Write, came_after, WINDOW);
-      reference += (spinning_cost(came_after) - reference) * weight;
+      let within = if came_after <= WINDOW { 1.0 } else { 0.0 };
+      reference += (within - reference) * weight;
     }
     compared
   }
 
-  /// Cut (b), the 2-competitive model per kind. Do: feed kinds mixtures of replies within and past the window, in a fixed
+  /// Cut (b), the median rule per kind. Do: feed kinds mixtures of replies within and past the window, in a fixed
   /// pseudo-random order, and compare each choice with the rule stated in floating point over the same weighting: spin
-  /// while the weighted mean of `T` (within the window) or twice the window (past it) is at most the window. Expect: the
-  /// same choice wherever the rule's mean is more than a hundredth of the window from it, where fixed and floating point
-  /// may round apart; and a mixture on each side of the threshold among them.
+  /// while the weighted share of replies within the window is at least a half. Expect: the same choice wherever the
+  /// rule's share is more than a hundredth from a half, where fixed and floating point may round apart; and mixtures on
+  /// each side of the threshold among them.
   #[test]
-  fn the_choice_is_the_competitive_rule_over_each_kinds_replies() {
-    for permille_within in [0, 200, 450, 500, 550, 800, 1000] {
+  fn the_choice_is_the_median_rule_over_each_kinds_replies() {
+    for permille_within in [0, 200, 450, 550, 800, 1000] {
       assert!(
         compare_with_the_rule(permille_within) > 0,
         "{permille_within} permille: nothing compared"

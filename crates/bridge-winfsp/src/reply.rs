@@ -9,7 +9,7 @@
 //! same channel, once as it starts, off every data path.
 //!
 //! Whether a wait spins the window at all is chosen kind by kind (audit step 7, cut (b), `crate::spin_choice`): a kind of
-//! request whose replies mostly come after the window parks at once, by the same model's costs over its own replies.
+//! request whose median reply comes after the window parks at once.
 //! Each reply comes stamped with the instant its shard sent it ([`Stamped`]), so every wait tells the choice how long its
 //! reply took, however it waited.
 
@@ -124,7 +124,8 @@ pub(crate) fn await_reply<T>(
 }
 
 /// Logs what this thread's choice did for each kind it waited on: its waits that spun, those it parked at once, and the
-/// kind's mean spinning cost against the window (cut (b)'s non-vacuity count, in the daemon's log as the worker ends).
+/// kind's weighted share of replies within the window (cut (b)'s non-vacuity count, in the daemon's log as the worker
+/// ends).
 pub(crate) fn report() {
   let window = WINDOW.get();
   let kinds = CHOICES.with_borrow(|choices| {
@@ -135,11 +136,11 @@ pub(crate) fn report() {
         let waits = counts.spun.saturating_add(counts.parked_at_once);
         (waits > 0).then(|| {
           format!(
-            "{} spun {} parked {} cost {} ns",
+            "{} spun {} parked {} within {} permille",
             kind.name(),
             counts.spun,
             counts.parked_at_once,
-            counts.mean_cost_ns.unwrap_or(0)
+            counts.within_permille.unwrap_or(0)
           )
         })
       })
