@@ -1,0 +1,65 @@
+# DIAG (not for main), run 2 on the merged tree: A-285's siblings -- an agent's consumer-bound channel enrolls and revokes no consumer.
+# Each guard is red-checked alone (the job removes one guard from its own checkout), then the green tree runs the
+# write_policy and consumers suites, the server's unit tests and clippy, on Linux x86_64 and macOS arm64.
+name: diag-supervisor-a285sib
+on:
+  push:
+    branches: ['diag-supervisor-a285sib-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  siblings:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        variant: [green]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: a285sib-${{ matrix.variant }}
+      - name: Remove one guard (red variants only)
+        if: matrix.variant != 'green'
+        run: |
+          python3 - "${{ matrix.variant }}" <<'PY'
+          import sys
+          verb = {"red-enroll": "enroll", "red-revoke": "revoke"}[sys.argv[1]]
+          path = "crates/server/src/verbs.rs"
+          s = open(path).read()
+          tail = 'Served::Reply(forbidden("revoke"))' if verb == "revoke" else 'forbidden("enroll")'
+          guard = ('  if matches!(principal, Principal::Consumer { .. }) {\n'
+                   f'    state.count("{verb}_by_consumer", 1);\n'
+                   f'    return {tail};\n'
+                   '  }\n')
+          assert s.count(guard) == 1, "guard not found"
+          open(path, "w").write(s.replace(guard, "  let _ = principal;\n", 1))
+          PY
+          git diff --stat
+      - name: The siblings' test (red variants must fail at their own assertion)
+        run: |
+          mkdir -p target
+          set +e
+          cargo test --locked -p slates-server --test write_policy an_agent_cannot_enroll_or_revoke_a_consumer -- --nocapture > target/sib.log 2>&1
+          code=$?
+          set -e
+          grep -E "^test |test result|panicked|consumer-bound|launcher's revocation|error(\[|:)" target/sib.log | tail -20
+          echo "exit=$code variant=${{ matrix.variant }}"
+          case "${{ matrix.variant }}" in
+            green) exit "$code" ;;
+            red-enroll) [ "$code" -ne 0 ] && grep -q "enrolls no consumer" target/sib.log ;;
+            red-revoke) [ "$code" -ne 0 ] && grep -q "revokes no consumer" target/sib.log ;;
+          esac
+      - name: write_policy and consumers suites and the server's unit tests (green only)
+        if: matrix.variant == 'green'
+        run: cargo test --locked -p slates-server --test write_policy --test consumers --lib 2>&1 | grep -E "^test |test result|panicked|FAILED" | tail -60; exit "${PIPESTATUS[0]}"
+      - name: clippy (green only; informational, main's own clippy findings are others')
+        if: matrix.variant == 'green'
+        continue-on-error: true
+        run: cargo clippy --locked -p slates-server --all-targets -- -D warnings
