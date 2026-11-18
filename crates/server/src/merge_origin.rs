@@ -560,14 +560,14 @@ impl OriginInputsJob {
 
 /// The bytes one unit of hash-bound work takes on this shard now (an encoding share, whose bytes are hashed twice — the
 /// identity and the chunks — and an engine's seeding share): its archive slice, at least one byte.
-fn hash_share(state: &ShardState) -> usize {
+pub(crate) fn hash_share(state: &ShardState) -> usize {
   usize::try_from(state.config.archive_slice_bytes())
     .unwrap_or(usize::MAX)
     .max(1)
 }
 
 /// The bytes one unit of copy-bound work takes on this shard now (a decoding share): its copy slice, at least one byte.
-fn copy_share(state: &ShardState) -> usize {
+pub(crate) fn copy_share(state: &ShardState) -> usize {
   usize::try_from(state.config.copy_slice_bytes())
     .unwrap_or(usize::MAX)
     .max(1)
