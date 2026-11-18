@@ -53,9 +53,6 @@ impl ExitWatch {
     })
   }
 
-  /// Whether the watched process has exited, without waiting. A watch that can no longer be read
-  /// answers exited, as an unusable control socket does on Linux: either way the daemon cannot be
-  /// vouched for, and the caller's recovery reconnects to whichever daemon holds the instance now.
   /// A watch on the process `pid` names only if it is the one created at `created` (`GetProcessTimes`' creation time,
   /// in 100 ns intervals since 1601): a process exited and its pid reused by another is never taken for it, and the watch
   /// reads exited at once. The handle is opened for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` alone, the
@@ -82,6 +79,9 @@ impl ExitWatch {
     platform::own_creation()
   }
 
+  /// Whether the watched process has exited, without waiting. A watch that can no longer be read
+  /// answers exited, as an unusable control socket does on Linux: either way the daemon cannot be
+  /// vouched for, and the caller's recovery reconnects to whichever daemon holds the instance now.
   pub fn exited(&self) -> bool {
     self.inner.exited()
   }
