@@ -7626,7 +7626,7 @@ fn refused_before_the_seal(
 fn approval_answer(
   mode: slates_db::catalog::WriteMode,
   approval: Approval,
-  (work, inc): (VolumeId, &slates_merge::engine::Increment),
+  (work, green, inc): (DbVolumeId, DbVolumeId, &slates_merge::engine::Increment),
   signed: &JudgedSignature,
 ) -> Option<ReplyBody> {
   let asks = mode == slates_db::catalog::WriteMode::Ask
@@ -7638,10 +7638,10 @@ fn approval_answer(
     Approval::Of(identity) if identity == inc.id => None,
     Approval::Of(_) => Some(refused(Refusal::GrantMismatch)),
     Approval::None | Approval::Held => Some(ReplyBody::MergeApprovalRequired {
-      work,
+      work: to_wire_volume(work),
       identity: inc.id,
       paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
-      statement: signed.statement.clone(),
+      statement: crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id),
       verification: signed.verification,
     }),
   }
@@ -7652,70 +7652,78 @@ fn approval_answer(
 /// to the verdict ([`SubmitPolicy`]) as it carries its work's merge mode.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SignedRules {
-  /// The trusted signers, in SSH wire form.
+  /// The trusted signers, in SSH wire form: read only for a submit that carries a signature, the only one they judge.
   pub(crate) signers: Vec<Vec<u8>>,
   /// Whether merges from (a work) or into (a green) the volume must be signed.
   pub(crate) required: bool,
 }
 
-/// `id`'s signed-work rules as its record on this shard holds them: none, for a volume this shard does not hold.
-pub(crate) fn signed_rules_of(state: &ShardState, id: DbVolumeId) -> SignedRules {
+/// Whether `id`'s policy, as its record on this shard holds it, requires signed merges (A-321): never for a volume this
+/// shard does not hold.
+pub(crate) fn requires_signed_merges(state: &ShardState, id: DbVolumeId) -> bool {
   state
     .db
     .partition()
     .volume(id)
-    .map_or_else(SignedRules::default, |record| SignedRules {
-      signers: record.policy.signers.clone(),
-      required: record
-        .policy
-        .write
-        .is_some_and(|policy| policy.require_signed_merges),
-    })
+    .and_then(|record| record.policy.write)
+    .is_some_and(|policy| policy.require_signed_merges)
+}
+
+/// `id`'s trusted signers as its record on this shard holds them (A-321): none, for a volume this shard does not hold.
+pub(crate) fn signers_of(state: &ShardState, id: DbVolumeId) -> &[Vec<u8>] {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .map_or(&[], |record| record.policy.signers.as_slice())
 }
 
 /// A submit's signature as its verdict judged it (A-321): over the merge's statement, under the work's and the green's
 /// trusted signers together.
-pub(crate) struct JudgedSignature {
+struct JudgedSignature {
   /// Whether the submit carried a signature: its reply is then `SubmittedSigned`.
   carried: bool,
   /// How it was judged.
   verification: slates_ipc::protocol::Verification,
-  /// The merge's statement, which a signer signs (`crate::signed_work::merge_statement`).
-  statement: Vec<u8>,
   /// The volume whose policy requires signed merges, when either does: the work's first, as a tie of merge modes is.
   required_by: Option<DbVolumeId>,
 }
 
 /// Judges the signature `policy` carries for `inc`, the increment of `work` into `green` (A-321), on the green's owner,
-/// where the green's record is; the work's rules came with the submit. Counted per verdict.
+/// where the green's record is; the work's rules came with the submit. An unsigned submit costs two reads of the
+/// records' flags: the statement is built and the signers parsed only for a signature. Counted per verdict.
 fn judge_signature(
   state: &mut ShardState,
   (work, green): (DbVolumeId, DbVolumeId),
   inc: &slates_merge::engine::Increment,
   policy: &SubmitPolicy,
 ) -> JudgedSignature {
-  let green_rules = signed_rules_of(state, green);
-  let statement = crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id);
-  let trusted = crate::signed_work::trusted_of(
-    policy
-      .work_signed
-      .signers
-      .iter()
-      .chain(green_rules.signers.iter()),
-  );
-  let verification = crate::signed_work::judge(policy.signature.as_deref(), &statement, &trusted);
+  let verification = match policy.signature.as_deref() {
+    None => slates_ipc::protocol::Verification::Unsigned,
+    Some(signature) => {
+      let statement =
+        crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id);
+      let trusted = crate::signed_work::trusted_of(
+        policy
+          .work_signed
+          .signers
+          .iter()
+          .chain(signers_of(state, green)),
+      );
+      crate::signed_work::judge(Some(signature), &statement, &trusted)
+    }
+  };
   if let Some(counter) = crate::signed_work::counter(&verification) {
     state.count(counter, 1);
   }
   let required_by = if policy.work_signed.required {
     Some(work)
   } else {
-    green_rules.required.then_some(green)
+    requires_signed_merges(state, green).then_some(green)
   };
   JudgedSignature {
     carried: policy.signature.is_some(),
     verification,
-    statement,
     required_by,
   }
 }
@@ -7789,7 +7797,7 @@ pub(crate) struct SubmitPolicy {
   pub(crate) approval: Approval,
   /// The signature the submit carries over its merge's statement (A-321).
   pub(crate) signature: Option<Vec<u8>>,
-  /// The work's signed-work rules ([`signed_rules_of`]).
+  /// The work's signed-work rules ([`requires_signed_merges`], [`signers_of`]).
   pub(crate) work_signed: SignedRules,
 }
 
@@ -7803,8 +7811,15 @@ impl SubmitPolicy {
     SubmitPolicy {
       work_mode: merge_mode_of(state, work),
       approval,
+      work_signed: SignedRules {
+        signers: if signature.is_some() {
+          signers_of(state, work).to_vec()
+        } else {
+          Vec::new()
+        },
+        required: requires_signed_merges(state, work),
+      },
       signature,
-      work_signed: signed_rules_of(state, work),
     }
   }
 }
@@ -7958,7 +7973,7 @@ fn judge_submission(
   if let Some(answer) = approval_answer(
     mode,
     policy.approval,
-    (to_wire_volume(sealed.work), &inc),
+    (sealed.work, green_id, &inc),
     &signed,
   ) {
     return answer;

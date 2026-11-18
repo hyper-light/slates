@@ -21,10 +21,14 @@
 //!   length in bytes so no path can forge a later line, and the manifest hash (§4.15 step 2), which binds every entry
 //!   written.
 //!
-//! A signer learns a merge's increment identity from a held submit (`SubmitHeld`, answered `MergeApprovalRequired`
-//! with it, nothing merged) and a landing's manifest from a presentation (`Present`, answered `GrantRequired`), then
-//! signs the statement built from them. A statement names one act exactly, so it carries no expiry: once the work or
-//! the planned landing changes, its signature no longer verifies.
+//! A signer gets a merge's statement from a held submit (`SubmitHeld`, answered `MergeApprovalRequired` with the
+//! increment's identity and the statement, nothing merged) and signs it. A statement names one act exactly, so it carries
+//! no expiry: once the work changes, its signature no longer verifies.
+//!
+//! **Where it stands.** Merges are signed work: judged on the green's owner (`verbs::judge_signature`), the verdict
+//! recorded in the version's chain entry and the green's accepted record, which a checkpoint keeps (`to_entry`,
+//! `of_entry`), and read back by `MergeRecord`. A landing's statement is defined here and its verdict is owed (GAPS,
+//! A-321): a landing's manifest is what a presentation (`Present`, `GrantRequired`) shows a signer.
 //!
 //! **Trusted signers.** A volume's signers are public keys the launcher sets (`SetSigners`, proven as a write policy
 //! is, refused on an agent's own channel). A merge verifies under its work's signers and its green's together; a
