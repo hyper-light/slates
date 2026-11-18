@@ -131,7 +131,7 @@ pub(crate) struct HandedResync {
 /// section, and its record, the stream's attachment and the file (`crate::shards::dax_hold::DaxRecord`).
 #[derive(Debug)]
 pub(crate) struct HandedCopy {
-  /// The section's id: its dead daemon's backing, named apart from every attachment (`dax_hold::section_id`).
+  /// The section's id: its dead daemon's backing, named apart from every attachment (`dax_hold::marked`).
   pub(crate) copy: u64,
   /// The section, as the anchor held it: mapping read and write and asking its size.
   pub(crate) object: OwnedHandle,
@@ -162,11 +162,14 @@ pub(crate) struct Handed {
   pub(crate) channel: Option<OwnedHandle>,
 }
 
-/// Adopts the explicitly inherited channel and held entries exactly once, before handle values can be reused. `bound` is
-/// every entry the anchor may hold for this daemon, of every class (`HoldBounds::total`, A-448). The entries come in the
-/// handoff table, read from the inherited section [`handles::ENV_HANDLES`] names (A-460), never from the environment
-/// itself, which a table at the bounds would pass.
-pub(crate) fn adopt(bound: usize) -> Handed {
+/// Adopts the explicitly inherited channel and held entries exactly once, before handle values can be reused. The table
+/// is read against every entry the anchor may hold for this daemon, of every class, as `config` derives them
+/// (`HoldBounds::total`, A-448). The entries come in the handoff table, read from the inherited section
+/// [`handles::ENV_HANDLES`] names (A-460), never from the environment itself, which a table at the bounds would pass.
+pub(crate) fn adopt(config: &crate::config::DaemonConfig) -> Handed {
+  let bound = config
+    .held_device_bound()
+    .saturating_add(config.held_dax_bound());
   let mut handed = Handed::default();
   let Ok(value) = std::env::var(handles::ENV_HANDLES) else {
     return handed;
@@ -529,24 +532,47 @@ mod tests {
   const RESYNC_END: u64 = 0x2c4;
   /// Format: the handle value the scripted DAX section hold names.
   const SECTION: u64 = 0x2d8;
-  /// Format: the scripted section's id, a backing's named apart from every attachment (`dax_hold::section_id`).
+  /// Format: the scripted section's id, a backing's named apart from every attachment (`dax_hold::marked`).
   const SECTION_ID: u64 = (1 << 63) | 0x0100_0002;
+
+  /// One scripted exchange, not yet run: an exchange's future runs only when awaited.
+  type Scripted = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HoldRefusal>>>>;
+
+  /// The scripted exchanges, in the order the stand-in anchor answers them: the mounts' (A-206), the resync end's (A-427)
+  /// and the DAX section's (A-448).
+  fn script() -> Vec<Scripted> {
+    vec![
+      Box::pin(release_mount(7)),
+      Box::pin(hold_mount(8, vec![1], Vec::new())),
+      Box::pin(release_mount(9)),
+      Box::pin(release_mount(9)),
+      Box::pin(hold_resync(
+        10,
+        RESYNC_END,
+        b"the attach's session".to_vec(),
+      )),
+      Box::pin(record_resync(10, b"the guest named its owner".to_vec())),
+      Box::pin(record_resync(11, Vec::new())),
+      Box::pin(release_resync(10)),
+      Box::pin(hold_section(
+        SECTION_ID,
+        SECTION,
+        b"attachment and file".to_vec(),
+      )),
+      Box::pin(hold_section(
+        SECTION_ID,
+        SECTION,
+        b"attachment and file".to_vec(),
+      )),
+      Box::pin(release_section(SECTION_ID)),
+    ]
+  }
 
   /// The scripted exchanges, in order, on the shard that owns the pipe; each answer goes back with how long it took.
   async fn scripted(answers: Sender<(Result<(), String>, u64)>) {
-    for step in 0..11u8 {
+    for exchange in script() {
       let began = futures::now_ns();
-      let answer = match step {
-        0 => release_mount(7).await,
-        1 => hold_mount(8, vec![1], Vec::new()).await,
-        2 | 3 => release_mount(9).await,
-        4 => hold_resync(10, RESYNC_END, b"the attach's session".to_vec()).await,
-        5 => record_resync(10, b"the guest named its owner".to_vec()).await,
-        6 => record_resync(11, Vec::new()).await,
-        7 => release_resync(10).await,
-        8 | 9 => hold_section(SECTION_ID, SECTION, b"attachment and file".to_vec()).await,
-        _ => release_section(SECTION_ID).await,
-      };
+      let answer = exchange.await;
       let took = futures::now_ns().saturating_sub(began);
       let sent = answers.send((answer.map_err(|refusal| refusal.to_string()), took));
       if sent.is_err() {

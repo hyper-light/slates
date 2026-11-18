@@ -1,7 +1,7 @@
 //! A Shards stream outlives its daemon's death (§4.6, the Shards form; A-316, Shards' coordinator's conditions 4a and
 //! 4b), with this test as the anchor and as the device. The test makes the anchor's hold channel and hands it to each
-//! daemon as the anchor does (`SLATES_ANCHOR_DEVICES`, the held resync ends with their sessions for the second), which
-//! a daemon adopts once per process into a process-wide cell: hence a binary of its own with one test. A daemon's death
+//! daemon as the anchor does (the handoff table `SLATES_ANCHOR_HELD` names, A-462: the held resync ends with their
+//! sessions for the second), which a daemon adopts once per process into a process-wide cell: hence a binary of its own with one test. A daemon's death
 //! is a fenced stop, which ends no record and releases no hold, as a killed process does. Linux and macOS (A-339), where
 //! the client claims both ends on the socket route.
 
@@ -231,8 +231,8 @@ fn counted(daemon: &Daemon, kind: &str, at_least: u64) -> u64 {
   }
 }
 
-/// The value the anchor hands a daemon in `SLATES_ANCHOR_DEVICES`: its channel end, then each held end with its session
-/// (`slates_anchor::held::Held::env_value`'s form), each a copy the daemon may own.
+/// The devices part of the table the anchor hands a daemon (A-462): its channel end, then each held end with its session
+/// (`slates_anchor::held::Held::devices_part`'s form), each a copy the daemon may own.
 fn handed_back(channel: &OwnedFd, holds: &[&Hold]) -> String {
   let copy = |fd: &OwnedFd| {
     rustix::io::fcntl_dupfd_cloexec(fd, 3)
@@ -307,12 +307,19 @@ fn successor_under_churn(
   })
 }
 
-/// Sets `SLATES_ANCHOR_DEVICES` for the daemon about to start.
+/// Hands the daemon about to start a table of `value` as its devices part (A-462), through `SLATES_ANCHOR_HELD`.
 fn hand_to_next_daemon(value: &str) {
   // SAFETY: this binary holds this one test; it sets the variable only between daemons, each of which reads it once at
   // its start, and no other thread of this process reads the environment meanwhile.
   unsafe {
-    std::env::set_var(held::ENV_DEVICES, value);
+    std::env::set_var(
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices: value.to_owned(),
+        ..held::Table::default()
+      })
+      .unwrap(),
+    );
   }
 }
 

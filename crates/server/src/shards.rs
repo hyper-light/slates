@@ -1397,11 +1397,9 @@ async fn serve(attachment: u64) {
           let _ = state::with_state_counted(|s| abandoned(s, attachment));
           continue;
         }
+        // A session change made outside the task is told by the turn it wakes, which owes it (`Turned::Session`).
         #[cfg(windows)]
-        Woke::Session => {
-          resync_handle::tell(attachment).await;
-          continue;
-        }
+        Woke::Session => Ok(()),
       }
     };
     if ready.is_err() {
@@ -1440,9 +1438,7 @@ async fn serve(attachment: u64) {
           let _ = state::with_state_counted(|s| settle_durable(s, attachment, durable));
         }
         #[cfg(windows)]
-        Some(Turned::Session) => resync_handle::tell(attachment).await,
-        #[cfg(windows)]
-        Some(Turned::Section) => dax_hold::hold_owed(attachment).await,
+        Some(owed @ (Turned::Session | Turned::Section)) => anchor_owed(attachment, &owed).await,
         Some(Turned::Told(owed)) => {
           // Every FUSE mount of the volume is told of the change, or the bound passes, before the reply goes out
           // (AC-3.3); the next turn sends it. Shards' VMM sends nothing more meanwhile, since it waits for this reply.
@@ -1459,6 +1455,17 @@ async fn serve(attachment: u64) {
         }
       }
     }
+  }
+}
+
+/// The anchor's part a Windows stream's turn owes before its reply goes out (A-427, A-448): the DAX section the answer
+/// hands held (`dax_hold::hold_owed`), or the session told (`resync_handle::tell`).
+#[cfg(windows)]
+async fn anchor_owed(attachment: u64, owed: &Turned) {
+  if matches!(owed, Turned::Section) {
+    dax_hold::hold_owed(attachment).await;
+  } else {
+    resync_handle::tell(attachment).await;
   }
 }
 

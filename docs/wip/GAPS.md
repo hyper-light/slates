@@ -826,12 +826,17 @@
 >   `ENTRY_TEXT_CAP`, about 1,100 characters for a mount, about 90 for a DAX section), while the anchor's bounds admit
 >   `shards × 4096` mounts. The table now rides an inherited read-only section of its own length, and the variable names
 >   only that section and the length (at most 33 characters); its real-process restart past the limit is filed for
->   main. **Found beside it, open (Unix):** the same table rides environment variables on Linux and macOS too
->   (`SLATES_ANCHOR_DEVICES`, up to about 109 characters a device with a 40-byte resync session; `SLATES_ANCHOR_COPIES`,
->   about 77 a DAX object), and Linux refuses an `execve` whose single string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32`
->   (`include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, so about 1,200 held devices or 1,700 copies), and
->   macOS bounds arguments and environment together (`kern.argmax`, 1 MiB, from memory, to verify); the bounds admit
->   `shards × 4096` devices, so a large Unix holding would leave the anchor unable to start its next daemon. **Built
+>   main. **Found beside it (Unix), built since (A-462, the same day):** the same table rode environment variables on
+>   Linux and macOS (`SLATES_ANCHOR_DEVICES`, up to 157 characters a device with a session at its 64-byte cap;
+>   `SLATES_ANCHOR_CONNECTIONS`; `SLATES_ANCHOR_COPIES`, up to 157 a copy), and Linux refuses an `execve` whose single
+>   string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` ("the limit per string is 32 pages": `execve(2)`;
+>   `include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, about 800 devices with full sessions), failing
+>   `E2BIG`, and macOS bounds the arguments and the environment together at `ARG_MAX`, 1,048,576 bytes (`getconf
+>   ARG_MAX` and `kern.argmax` on the Mac Studio, macOS 26.4, 2026-11-18), while the bounds admit `shards × 4096`
+>   devices: a large holding would leave the anchor unable to start its next daemon. The three parts now ride one sealed,
+>   read-only object of their own length (a memfd sealed as a DAX peer's copy is on Linux; an unlinked shared-memory
+>   object handed read alone on macOS), and `SLATES_ANCHOR_HELD` names only its descriptor and the length (at most 27
+>   characters); its real-process supervised restarts past the old limit are filed for main. **Built
 >   since (A-402,
 >   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows

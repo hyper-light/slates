@@ -888,13 +888,9 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
     // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
-    // connections, served again on the listener's shard below. Windows parses at most every entry its anchor may hold,
-    // of every class: the attachments' and the DAX sections' (A-448).
-    let handed = crate::anchor_hold::adopt(
-      config
-        .held_device_bound()
-        .saturating_add(config.held_dax_bound()),
-    );
+    // connections, served again on the listener's shard below. Each platform reads the handoff table against every
+    // entry its anchor may hold, as the configuration derives the anchor's bounds (A-448, A-460, A-462).
+    let handed = crate::anchor_hold::adopt(&config);
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that

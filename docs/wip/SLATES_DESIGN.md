@@ -2846,7 +2846,9 @@ before the report is published, so a tool never reads attributes newer than the 
 > header; and the session a restarted daemon needs travels as two checked bytes, with golden and hostile-input
 > tests (`crates/bridge-fuse/src/session.rs`). The anchor's channel is built too (`crates/anchor/src/devices.rs`).
 > The anchor opens it at start, bounded at `shards × MAX_ATTACHMENTS` devices, drains it every supervision step
-> and before every spawn, and hands the channel and every held device to each daemon in `SLATES_ANCHOR_DEVICES`.
+> and before every spawn, and hands the channel and every held device to each daemon in `SLATES_ANCHOR_DEVICES`
+> (since A-462 in one table of devices, connections and copies, written into a sealed object whose descriptor and
+> length `SLATES_ANCHOR_HELD` names, since a variable past `MAX_ARG_STRLEN` fails the exec).
 > Every message is checked by kind, length and descriptor count. Proven across real processes: a daemon sends a
 > device and its session, then exits; the restarted daemon inherits that same device and reads what the first
 > one left in it (`crates/anchor/tests/anchor.rs`). The daemon's half, holding and taking over, and the exact
@@ -31499,7 +31501,7 @@ handoff's length built, the Unix sibling found); and:
 - **Found beside it** (GAPS): the Unix handoff rides environment variables too (`SLATES_ANCHOR_DEVICES`, about 109
   characters a device with a resync session; `SLATES_ANCHOR_COPIES`, about 77 a DAX object), and Linux refuses an
   `execve` with a single string past `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` (`include/uapi/linux/binfmts.h`: 131,072 bytes
-  on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Open; not this change's.
+  on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Not this change's: built by A-462.
 
 ### A-450 — A consumer moves an agent with its volume through the library alone (2026-11-18, g267, kiln goal 95101ef3 K4; §4.10 "Ownership follows the writer", A-291)
 
@@ -31526,3 +31528,70 @@ handoff's length built, the Unix sibling found); and:
   three-daemon tests A-291 names; no library change was needed. The live move between two Mac runners is filed for main.
 
 Applied in the same change to: §4.10's status (the consumer's paragraph), GAPS (g267).
+
+### A-462 — The Unix anchor hands its held entries on in a sealed object, never in environment variables, whose exec limits a table at the bounds passes (2026-11-18, goal 90; A-460's Unix half; A-61's, A-113's and A-197's handoff)
+Applied in the same change to: §4.6's A-61 status (the table); A-460's entry (its found line); GAPS, A-281's entry (the
+Unix sibling built); and:
+- `crates/anchor`: `held.rs` (`ENV_HELD` replaces `ENV_DEVICES`, `ENV_CONNECTIONS` and `ENV_COPIES`; the parts'
+  encoders and parsers named for what they are, `Held::devices_part`, `connections_part`, `copies_part`,
+  `parse_devices`, `parse_connections`, `parse_copies`; `Table`, `TableBounds`, `table_cap`, `encode_table`,
+  `decode_table`, `encode_pointer`, `parse_pointer`, `check_table_owner`; `TableObject`, `hand_in_process`,
+  `read_table`; the module's notes); `supervise.rs` (`device_env` writes the table into its object, kept until the spawn
+  holds its copy; a table that cannot be made refuses the spawn); `error.rs` (`AnchorError::Handoff`);
+  `tests/anchor.rs` (the children read their table; `a_table_past_the_old_exec_limit_reaches_the_successor_whole`).
+- `crates/server`: `anchor_hold.rs` (`adopt` reads the table the pointer names, `handed_table`, against the daemon's
+  own bounds); `anchor_hold_windows.rs` and `daemon.rs` (`adopt` takes the configuration on both platforms);
+  `fleet.rs` (the adoption's notes); the tests that play the anchor in-process (`shards_resync.rs`,
+  `shards_resync_restart.rs`, `shards_resync_dax.rs`, `held_copy_replay.rs`) hand their daemon a table.
+- `crates/cli`: `tests/cli.rs` (the garbling daemon reads a copy of its table and leaves the object for the daemon it
+  becomes).
+
+- **What was there.** The anchor handed a spawned daemon its channel and every held device, connection and copy in three
+  environment variables (`SLATES_ANCHOR_DEVICES`, `SLATES_ANCHOR_CONNECTIONS`, `SLATES_ANCHOR_COPIES`; A-61, A-113,
+  A-197). Linux refuses an `execve` whose single argument or environment string passes `MAX_ARG_STRLEN`, `PAGE_SIZE *
+  32` ("the limit per string is 32 pages", failing `E2BIG`: `execve(2)`; `include/uapi/linux/binfmts.h`), 131,072
+  bytes on 4 KiB pages; macOS bounds an exec's arguments and environment together at `ARG_MAX`, 1,048,576 bytes
+  (`getconf ARG_MAX` and `sysctl kern.argmax` on the Mac Studio, macOS 26.4, measured 2026-11-18). A held device takes
+  up to 157 characters with a session at its 64-byte cap, so the devices' variable passed Linux's limit at about 800
+  devices, while the bounds admit `shards × 4096`: past it the anchor could not start its next daemon at all.
+- **The rule.** The three parts, unchanged, become one table, a line each and a CRC32C after them, written into an
+  object of its own length sealed and read-only as a DAX peer's copy is (`slates_mem::PeerObject`, `PeerAccess::Read`:
+  on Linux a memfd sealed `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, the anchor's own view,
+  made before the seals, its only writer; on macOS an unlinked shared-memory object whose handed descriptor was opened
+  read alone). The spawn inherits that descriptor beside the ones the table names, and `SLATES_ANCHOR_HELD` carries only
+  its number and the table's length, `FD:LEN_HEX`, at most 27 characters. The daemon checks both against the most a
+  table of its own bounds takes (`table_cap`: each device and copy at 157 characters, each connection at 28, and the
+  frame) before it maps a byte, reads the object read alone and closes it, checks the checksum and the three lines, and
+  refuses whole a table that names its own descriptor again; then adopts each part as before. A table the anchor cannot
+  make refuses the spawn, typed (`AnchorError::Handoff`), rather than start a daemon that would take every held entry
+  for none. The write seal is the "future" one, the DAX peer objects': `F_SEAL_WRITE` refuses while any writable map
+  exists, and the anchor's view writes the table; the daemon's descriptor can neither write nor resize the object.
+- **Why one object, not the hold channel.** The channel is a datagram socketpair the daemon writes and the anchor
+  drains; a table of thousands of entries would cross it a datagram at a time while the daemon starts, and the
+  descriptors would ride beside them in `SCM_RIGHTS` batches of their own. The object costs the table's own length, only
+  at a spawn, and its descriptor is inherited as every held one already is.
+- **Tests.** On every Unix host (`held.rs`): `a_table_past_execs_string_limit_round_trips_through_the_codec_and_the_handoff`
+  (1,000 devices with sessions at the cap and 256 connections and copies, a table past 131,072 bytes, its pointer
+  within 27 characters, every part back whole, the table's object holding its bytes and refusing a write and a resize
+  through the descriptor a daemon is handed; the cap's own length taken and one more byte refused before a read),
+  `hostile_handoff_pointers_and_tables_are_refused`, `a_tables_own_descriptor_is_never_named_again`. Real processes
+  (`tests/anchor.rs`, Linux and macOS): `a_table_past_the_old_exec_limit_reaches_the_successor_whole`, a real supervisor
+  whose first daemon holds enough devices with full sessions to pass the platform's old limit by a tenth (about 975 on
+  Linux, 7,800 on macOS) and whose successor reads every one live from the table.
+- **Evidence.** Red first, on main at `b2909fc` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s lib
+  tests did not build (49 errors: no `Table`, `TableBounds`, `TableObject`, `encode_table`, `decode_table`,
+  `encode_pointer`, `parse_pointer`, `table_cap`, `read_table`, `check_table_owner`, `POINTER_TEXT_CAP`, nor the parts
+  named for what they are). Green on the tree as merged with main, the same day and machine: `cargo test -p
+  slates-anchor --lib -- handles:: held::` 34 of 34, the three above among them, the sealed object made and read on
+  macOS; `cargo check` of `slates-anchor`, `slates-server` (the in-process tests that play the anchor) and
+  `slates-cli` (`--test cli`) clean; `cargo xwin check` of `slates-anchor` and `slates-server` (lib and tests) and
+  `slates-cli` (tests) clean; rustfmt's layout taken; `cargo clippy --all-targets -D warnings` clean for
+  `slates-anchor` and `slates-rt` on macOS and for `slates-anchor` on Windows, and for `slates-server` but for seven
+  findings in code this change does not touch (filed for main). The x86_64 Linux check and the real-process restarts
+  are filed for main.
+- **Found beside it, and fixed in the same landing** (main's workspace clippy and `xtask check`, r343): four findings in
+  `handles.rs` (a test past the complexity bound, a constant assertion, a string sliced by index, and
+  `WHAT_SHARDS_DAX`'s `Format:` line out of the literal check's four-line reach); the same kinds in this change's
+  siblings (`held.rs`'s and `held_windows.rs`'s tests, `tests/handles_windows.rs`'s `full_role`, the server's stand-in
+  anchor script and the Windows serve loop, whose anchor waits now share one call); `held_turn.rs`'s `1_u64`, which the
+  literal check reads as `1_`.
