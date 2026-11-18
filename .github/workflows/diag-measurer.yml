@@ -1,0 +1,116 @@
+name: diag-measurer
+
+# The supervisor's measurer: g230's landing (A-323, the envelope wrap in turns; A-324, a returned holder's walk in
+# turns) measured at scale with the harness in .github/measurer/g230m_harness.rs, appended to the fleet test only on
+# this branch: a 1,024 MiB volume sealed (the owner shard's longest step, the seal's wall time to placed, the wrap's
+# turns) once, and a holder's return over 1,000 and 4,000 live volumes (the owner's longest step, the return's wall
+# time) three rounds, quiet then under two spinning loops a logical CPU (loaded: main only). main (MAIN) everywhere; main before the landing
+# (BEFORE) on ubuntu-latest as well, as the record of what the turns replaced. A diagnostics lane run only from
+# `diag-measurer-*` branches (never main).
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  MAIN: 1eca77263d0b200ded5d22382af19ab2d1b4a20b
+  BEFORE: 7e2bfc310b8e02ad4644fb30f037780024bea978
+
+jobs:
+  measure:
+    name: g230 landing at scale (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the fleet test with the harness, each arm
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/msr"; mkdir -p "$W/logs"
+          native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+          export CARGO_TARGET_DIR="$(native "$W/target")"
+          arms="$MAIN"; [ "${{ matrix.os }}" = ubuntu-latest ] && arms="$MAIN $BEFORE"
+          echo "$arms" > "$W/arms"
+          for arm in $arms; do
+            s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
+            git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
+            cat .github/measurer/g230m_harness.rs >> "$W/src-$s/crates/server/tests/fleet.rs"
+            touch "$W/marker-$s"
+            ( cd "$W/src-$s" && cargo test --release --locked -p slates-server --test fleet --no-run ) > "$W/logs/build-$s.log" 2>&1 \
+              || { grep -E -A 12 "^error" "$W/logs/build-$s.log" | head -80; tail -20 "$W/logs/build-$s.log"; exit 1; }
+            exe=$(find "$W/target/release/deps" -maxdepth 1 -type f -name "fleet-*" -newer "$W/marker-$s" \( -name "*.exe" -o ! -name "*.*" \) | head -1)
+            [ -n "$exe" ] || { echo "no fleet test binary for $s"; ls -la "$W/target/release/deps" | grep fleet; exit 1; }
+            cp "$exe" "$W/bin-$s/"; ls -la "$W/bin-$s"
+          done
+      - name: Measure, quiet then loaded
+        env:
+          SLATES_TEST_MEASURE: "1"
+          SLATES_MEASURE_DEADLINE_SECS: "3600"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          set +e
+          W="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/msr"
+          cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "cpus $cpus"; uname -a; (free -g 2>/dev/null || sysctl -n hw.memsize 2>/dev/null) | head -3
+          load() { uptime 2>/dev/null || echo "windows (no load average)"; }
+          bound() { if command -v timeout >/dev/null 2>&1; then timeout 3900 "$@"; else perl -e 'alarm shift; exec @ARGV' 3900 "$@"; fi; }
+          one() { mode=$1; round=$2; arm=$3; name=$4; test=$5; shift 5; s="${arm:0:9}"
+            exe=$(ls "$W/bin-$s"/fleet-* | head -1); L="$W/logs/$mode-$s-$name-r$round.log"
+            echo "== $mode round $round arm $s $name $(date -u +%FT%TZ) load: $(load)" > "$L"
+            ( export "$@"; bound "$exe" --exact "$test" --nocapture --test-threads 1 ) </dev/null >> "$L" 2>&1
+            echo "exit $? $(date -u +%FT%TZ) load: $(load)" >> "$L"
+            grep -E "^== |^measure-|test result|watchdog|panicked|^exit" "$L" | cut -c1-700
+          }
+          rounds() { mode=$1; arms=$2
+            for arm in $arms; do
+              one $mode 1 $arm seal measure_a_large_volume_seals_in_turns SLATES_MEASURE_SEAL_MIB=1024
+            done
+            for round in 1 2 3; do
+              for arm in $arms; do
+                if [ "$arm" = "$BEFORE" ] && [ $round -gt 1 ]; then continue; fi
+                one $mode $round $arm return1000 measure_a_holders_return_over_thousands_of_live_volumes SLATES_MEASURE_LIVE_VOLUMES=1000
+                one $mode $round $arm return4000 measure_a_holders_return_over_thousands_of_live_volumes SLATES_MEASURE_LIVE_VOLUMES=4000
+              done
+            done
+          }
+          rounds quiet "$(cat "$W/arms")"
+          pids=""; for i in $(seq 1 $((2 * cpus))); do ( while :; do :; done ) & pids="$pids $!"; done
+          sleep 5
+          rounds loaded "$MAIN"
+          kill $pids 2>/dev/null; wait $pids 2>/dev/null
+          exit 0
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurer-g230m-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
