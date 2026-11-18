@@ -7199,8 +7199,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
 > twice (g232's finding). Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
-> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
-> in `defer`, after its commit (GAPS, OPEN).
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome that may wait so (a mapped file's write-back, a checkout)
+> takes a seat among the held replies as its task begins (`live_ship::take_seat`), refused `Overloaded` at the bound
+> before it writes anything; its wait fills the seat (`defer`, which no longer refuses for room), or it gives the seat
+> back when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back
+> answers, so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no
+> seat (that release, or one whose volume turned live-shipped while it ran) is held past the bound, counted
+> (`fleet.live.held_past_bound`), rather than refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`: before, the sync was
+> refused `Overloaded` with its stores already in the file.
 >
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
@@ -26761,9 +26767,10 @@ Applied in the same change to:
     `set_consumer_policy_everywhere`, `consumer_policy_on_channel`, `revoke_everywhere`, `attest_on_channel`,
     `clone_named_elsewhere`; `nfs.rs` `serve_remote`, `gather_entries`, `call_owner`; `direct_map.rs` `hand_off`;
     `delegation.rs` `send_recalls`; `remote_attach.rs` `serve_unforwardable`; `work_route.rs` `answer_on_green_shard`.
-    `~` on the wall still: the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`,
-    `drop_pending_creations`, `reconcile_work_floors`, `reconcile_name_aliases`, `retained_client_ids`) and the image's
-    alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one window.
+    Since A-403 the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`, `drop_pending_creations`,
+    `reconcile_work_floors`, `reconcile_name_aliases`; `retained_client_ids` judged its target's progress already) and the
+    image's alias steps (`image.rs` `reserve`, `settle`) wait in their target's own time too (`xshard::call_in_shard_time`),
+    where each was `xshard::call_within` one window on the wall.
   - Class B, a wait on another host: the forward lane (`verbs::forward_once`'s stall budget base, judged in the lane's
     own time, A-315; `forward_lane.rs` `REPLACEMENT_ANSWER_PERIODS`, `path_floor_ns`, `FailoverBound::from_now`'s
     fallback, A-352); `fleet.rs` `return_sessions` (the transport's silence floor) and `live_budget` (A-200's
@@ -28890,3 +28897,25 @@ Applied in the same change to: §4.2's status, GAPS (the load test's ledger),
   directory and snapshot unit tests 17 of 17, and the server's recovery tests 58 of 58 passed on the same tree; kiln
   r340: the vfs image, retained-bytes, retention, clone, content-in-place and chunk-ownership tests passed (45), and
   with the vfs change reverted the new vfs test held 5 inodes where the live volume held 3.
+
+### A-403 — The recovery's cross-shard passes and the image's alias steps wait in their target's own time: the liveness window's floor for them is the target's measured progress, never a boot snapshot (2026-11-18, built for goal g255; item 1's "W's floor from the running wake estimate"; A-65, A-228, A-359)
+
+- **What was there.** A-359's class A list kept seven call families on the wall: the daemon's recovery passes over the
+  other shards (`rebuild_remote_works` 4 calls, `drop_pending_creations`, `reconcile_work_floors` 3,
+  `reconcile_name_aliases` 3) and the image's alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one
+  liveness window of wall time. They run while every shard is busy with its own recovery, so a target alive and working
+  on its CPU could outlast one wall window and its pass was skipped: the very case A-228 rules a target starved, not
+  stuck. A-359 measured the machine's floor once at boot (the wake probe's p99), which Ada's rule of 2026-11-18 rules out:
+  a value computed once at boot is still a constant.
+- **The rule.** Each waits by `xshard::call_in_shard_time` (A-65's rule, `xshard::within_shard_time`), as the class A
+  verbs have since 2026-11-06: a wait goes on while its target makes progress on its CPU, and gives up only when the target
+  made none for a window or ran its budget, judged in the target's own CPU time. The floor of each wait is then the
+  target's own measured progress, live, never a number. The room probe (`free_room_of`, a heartbeat's bound on a
+  question it can ask again next pass) is not a liveness wait and stays.
+- **Owed.** The boot log's floor line (`config::liveness_window(wake.p99_ns)`) is kept as the A/B record; the running
+  overrun each shard mirrors in its pulse (`Pulse::scheduler_overrun_ns`) is the live floor a published window would
+  follow. A failing test of a recovery pass beside a target kept busy past a window is filed for main (the recovery and
+  cross-shard suites).
+
+Applied in the same change to: the design's A-359 class A list, GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/server/src/{daemon,image}.rs`.

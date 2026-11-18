@@ -3432,7 +3432,9 @@
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
-> sum is kept only as the A/B baseline, a build of its own, never a mode.
+> sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the recovery's cross-shard passes and the image's alias steps** (A-359's
+> class A list on the wall) wait in their target's own time (`xshard::call_in_shard_time`), so W's floor for them is the
+> target's measured progress, not a boot snapshot.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -3545,8 +3547,8 @@
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
 
-> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
-> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; CLOSED: recorded
+> verbs, and asynchronous outcomes the same day, below).** `live_ship::defer` judged the shard's bound on replies held for
 > durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
 > which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
 > directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
@@ -3554,10 +3556,17 @@
 > `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
 > (`crates/server/tests/fleet.rs`).
-> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
->   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
->   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
->   such a reply from the task's start, refused `Overloaded` before the task runs.
+> - **CLOSED 2026-11-18 (g076a), the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and
+>   of a checkout (`image::complete_once_durable`) reached `defer` after their commit and could be refused there: a
+>   sync refused `Overloaded` had already written the map's stores into the file. Their held count changes across their
+>   awaits, so the bound cannot be judged when they end. Each now takes a seat among the held replies as its task begins
+>   (`live_ship::take_seat`: `direct_map::sync_then`, `checkout::checkout_verb`), refused `Overloaded` at the bound
+>   before it writes anything. Its wait fills the seat (`defer` no longer refuses for room), or it gives the seat back
+>   when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back answers,
+>   so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no seat
+>   (that release, or one whose volume turned live-shipped while it ran) is held past the bound and counted
+>   (`fleet.live.held_past_bound`), never refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`
+>   (`crates/server/tests/fleet.rs`): red before, with the file holding the store the refused sync had written.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; CLOSED 2026-11-18 on
 > macOS and Linux, below; Windows OPEN, raft).**
