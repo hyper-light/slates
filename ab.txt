@@ -6457,3 +6457,5 @@ slates daemon: kept_bound = 349409: 2 × forward_lane_bound + control_shard_capa
 slates daemon: the watchdog beats every 100 ms and finds a shard stuck after a 1000 ms window without a step, with no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard waiting for a CPU is starved, not stuck, and the beat goes on; an anchor reads the beat, so a stuck shard withholds it
 slates daemon: instance fsb-336-10-nowake serving on 1 shards under the anchor
 ## run 10 of 10 done, 2026-11-18T13:18:14Z
+To https://github.com/hyper-light/slates
+   c2e7aef..bf806ac  bf806ac1a6813d033537963118d101f19ade594a -> diag-results/g258-44278926773-bound-x86
