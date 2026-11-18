@@ -814,6 +814,47 @@ impl ShardImage {
     Ok(Self::read_committed(slots)?.map(|(_, image)| image))
   }
 
+  /// The image the committed shard image in `slots` holds for the volume keyed `key`, with the committed slot it read
+  /// (A-430): what [`ShardImage::read_committed`] would decode for it, decoded one volume at a time in key order and
+  /// stopped once past the key, so only the slot's bytes and one volume's image are held, never every volume's.
+  /// `Ok(None)` when nothing committed; the slot with `None` when the image holds no such volume. Refused as
+  /// `read_committed` refuses: another build's version, or a malformed field.
+  pub(crate) fn committed_volume<S: ImageRead + ?Sized>(
+    slots: &S,
+    key: &[u8; 16],
+  ) -> Result<Option<(CommittedSlot, Option<VolumeImage>)>, VfsError> {
+    let Some((committed, payload)) = recover_committed(slots)? else {
+      return Ok(None);
+    };
+    let mut input = payload
+      .get(SLOT_GEN_WIDTH..)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    match read_header(input) {
+      Some((magic, version)) if magic == SHARD_MAGIC && version != IMAGE_VERSION => {
+        return Err(VfsError::RecoveryVersion {
+          found: version,
+          expected: IMAGE_VERSION,
+        });
+      }
+      Some((magic, _)) if magic == SHARD_MAGIC => {}
+      _ => return Err(VfsError::RecoveryIncomplete),
+    }
+    u32::decode(&mut input).map_err(|_| VfsError::RecoveryIncomplete)?;
+    u16::decode(&mut input).map_err(|_| VfsError::RecoveryIncomplete)?;
+    let volumes =
+      slates_wire::codec::take_len(&mut input).map_err(|_| VfsError::RecoveryIncomplete)?;
+    for _ in 0..volumes {
+      let keyed = KeyedImage::decode(&mut input).map_err(|_| VfsError::RecoveryIncomplete)?;
+      if keyed.key == *key {
+        return Ok(Some((committed, Some(keyed.image))));
+      }
+      if keyed.key > *key {
+        break;
+      }
+    }
+    Ok(Some((committed, None)))
+  }
+
   /// [`ShardImage::read_from`] with the committed slot it read: the committed frame found, read and checked once.
   pub fn read_committed<S: ImageRead + ?Sized>(
     slots: &S,

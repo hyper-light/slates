@@ -841,3 +841,141 @@ fn a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new() {
     }
   }
 }
+
+/// Shape: the keys of the committed-record test's volumes, in key order, and one never published.
+const CARRIED_KEYS: [[u8; 16]; 5] = [[1; 16], [2; 16], [3; 16], [4; 16], [9; 16]];
+
+/// A volume in its own store holding [`SEEDED`] files and one named `marker`, so each volume's image is its own.
+fn marked(marker: &str) -> (Store, Volume) {
+  let mut store = store();
+  let mut vol = seeded(&mut store);
+  create(&mut vol, &mut store, marker, marker.as_bytes());
+  (store, vol)
+}
+
+/// A-430: the image a recovery would rebuild for one volume, read without rebuilding the others. Do: checkpoint three
+/// volumes; log a delta changing the first, one carrying the second whole, one removing the third and one adding a
+/// fourth; ask `committed_volume` for each key and for one never published. Expect: each the image `Journal::recover`
+/// rebuilds for that key (the oracle), the removed and the never-published ones none; and the first's is not its
+/// checkpointed image, so its delta was applied (non-vacuity).
+#[test]
+fn a_volumes_committed_record_is_what_a_recovery_rebuilds_for_it() {
+  use slates_vfs::checkpoint_log::committed_volume;
+  use slates_vfs::delta::VolumeRecord;
+  let [first_key, second_key, third_key, fourth_key, _] = CARRIED_KEYS;
+  let (first_store, mut first) = marked("first");
+  let (mut second_store, mut second) = marked("second");
+  let (third_store, third) = marked("third");
+  let (fourth_store, fourth) = marked("fourth");
+  let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let mut journal = Journal::default();
+  let checkpointed_first = first.to_image(&first_store, None).unwrap();
+  journal
+    .checkpoint(
+      &mut checkpoints,
+      &ShardImage::new(vec![
+        KeyedImage {
+          key: first_key,
+          image: checkpointed_first.clone(),
+        },
+        KeyedImage {
+          key: second_key,
+          image: second.to_image(&second_store, None).unwrap(),
+        },
+        KeyedImage {
+          key: third_key,
+          image: third.to_image(&third_store, None).unwrap(),
+        },
+      ]),
+    )
+    .unwrap();
+  first.mark_published(&first_store);
+  let mut first_store = first_store;
+  create(
+    &mut first,
+    &mut first_store,
+    "changed",
+    b"after the checkpoint",
+  );
+  let delta = |volumes: Vec<KeyedRecord>, removed: Vec<[u8; 16]>| {
+    ShardDelta::new(volumes, removed, (Vec::new(), Vec::new()), None)
+  };
+  let changed = first.publication(&first_store, None).unwrap();
+  assert!(
+    matches!(changed, VolumeRecord::Delta { .. }),
+    "the first volume's change is a delta"
+  );
+  journal
+    .append(
+      &mut log,
+      &delta(
+        vec![KeyedRecord {
+          key: first_key,
+          record: changed,
+        }],
+        Vec::new(),
+      ),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  create(&mut second, &mut second_store, "whole", b"carried whole");
+  let whole = second.to_image(&second_store, None).unwrap();
+  journal
+    .append(
+      &mut log,
+      &delta(
+        vec![KeyedRecord {
+          key: second_key,
+          record: VolumeRecord::Full { image: whole },
+        }],
+        Vec::new(),
+      ),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  journal
+    .append(
+      &mut log,
+      &delta(Vec::new(), vec![third_key]),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  let added = fourth.to_image(&fourth_store, None).unwrap();
+  journal
+    .append(
+      &mut log,
+      &delta(
+        vec![KeyedRecord {
+          key: fourth_key,
+          record: VolumeRecord::Full { image: added },
+        }],
+        Vec::new(),
+      ),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let recovered = recovered.unwrap();
+  for key in &CARRIED_KEYS {
+    let rebuilt = recovered
+      .volumes
+      .iter()
+      .find(|keyed| keyed.key == *key)
+      .map(|keyed| keyed.image.clone());
+    assert_eq!(
+      committed_volume(&checkpoints, &log, key).unwrap(),
+      rebuilt,
+      "the record of {key:?}"
+    );
+  }
+  assert_eq!(
+    committed_volume(&checkpoints, &log, &third_key).unwrap(),
+    None,
+    "the removed volume has no record"
+  );
+  assert_ne!(
+    committed_volume(&checkpoints, &log, &first_key).unwrap(),
+    Some(checkpointed_first),
+    "the first volume's delta was applied"
+  );
+}

@@ -11212,8 +11212,14 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >     `an_overflow_marked_before_a_restamp_stays_reported`.
 >   - The run through a real daemon restart is main's (`run-requests.md`, 2026-11-18).
 > - **Open (siblings, from reading).**
->   1. A checkpoint leaves a volume it cannot image out entirely, where a delta keeps its committed record. Recovery
->      then refuses that volume until a later publication captures it whole.
+>   1. **Fixed 2026-11-18 (A-430):** a checkpoint left a volume it could not image out entirely, where a delta kept its
+>      committed record, so recovery refused that volume until a later publication captured it; a checkpoint now
+>      carries the record. Reading the delta path for it found the record kept there named blocks the first commit
+>      handed out again; a publication that keeps a left-out record now keeps every deferred block
+>      (`docs/bugs/2026-11-18-a-checkpoint-left-out-a-volume-it-could-not-image-and-a-kept-record-named-reused-blocks.md`).
+>      **Owed:** the precise set (only the blocks the kept records name, with A-118's trimmed pieces), should a lasting
+>      left-out volume show in `arena.deferred_kept_for_left_out`: until it is captured, its shard reclaims no freed
+>      block.
 >   2. **Fixed 2026-11-18 (A-429):** the replay wrote an overlay's logged write without the overlay's host, so a base
 >      file the image held uncopied had the bytes of its window before the write read as zeros. The replay now writes
 >      through the host, copying the file up first, as the bridge did
