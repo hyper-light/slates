@@ -375,7 +375,7 @@ pub fn answer_ledger(
     Err(_) => return None,
   }
   let mut used = LEDGER_PROMISE_HEADER_BYTES;
-  for accepted in acceptor.positions(prepare.object, prepare.from, prepare.to) {
+  for accepted in acceptor.positions_between(prepare.object, prepare.from, prepare.to) {
     let size = LedgerPromise::position_bytes(&accepted);
     if !promise.positions.is_empty() && used.saturating_add(size) > budget {
       promise.next = Some(accepted.sequence);

@@ -1941,7 +1941,7 @@ fn ledger_question(
     let own = state
       .holder_records
       .get(&object)
-      .map(|acceptor| acceptor.positions(object, from, to))
+      .map(|acceptor| acceptor.positions_between(object, from, to))
       .unwrap_or_default();
     answers.insert(
       local,

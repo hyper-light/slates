@@ -7216,6 +7216,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > that main's own spread can show at the median: 65–79 µs, against main's 65–76 µs and the whole image's 207–225 µs
 > (BENCHMARKS). Still carried whole when changed: the content hold's image and the mirror records.
 >
+> **A held register is a head and its positions (2026-11-18, A-367; image version 29).** A held register was one piece
+> holding every position its acceptor kept, and a green's register on its holders is a ledger, never compacted: each
+> version's acknowledgement re-encoded and re-wrote every version the holder kept, so a commit at `f > 0` grew by a
+> position's bytes a version. Now a register is a head piece (its authority, fence and moved-from owner) and a piece per
+> accepted position, keyed by its sequence; a holder's acceptor keeps which positions it accepted or dropped since its
+> last committed publication (`Acceptor::tracking_changes`), and a delta carries the head and those positions only. An
+> acceptor whose changes do not account for its positions against what was published (one put in place of another) is
+> carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
+> chunk, at each publication that changed it) and the mirror records.
+>
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
 > - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
@@ -7302,7 +7312,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > turn's messages dispatched before the next; a turn the shard does not answer ends the walk, and the period sends the
 > rest. Counted `fleet.live.reached_slices`. Held by `a_holders_return_is_walked_in_turns_and_it_takes_every_log`
 > (`crates/server/tests/fleet.rs`: 12 live volumes, a holder held off its shard for two liveness budgets while each is
-> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume). Owed
+> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume; held again,
+> up to four times, until the owner has dialed the holder afresh, since an owner judging its lanes in its own time under
+> load need not end the link in one hold: "0 turns for 12 volumes" under a full suite, 2026-11-18). Owed
 > (measurement): the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
 > Until A-347 the turns over the control shard's own volumes ran in one poll (an inline call; `xshard::Turns`, §4.10's
 > A-347 status): the measurer's longest steps of at most 12.0 and 42.0 ms over 1,000 and 4,000 volumes grew with the
@@ -7905,7 +7917,14 @@ command and every host start, mount and grant through one implementation.
   prefix and `--instance NAME`, and a host finds exactly its own instance's processes. The start
   waits for the first answer at the anchor's heartbeat cadence while the anchor lives, and makes
   the group of an instance run alone; a host that launches the anchor under its service manager
-  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
+  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`, while the
+  anchor lives when it holds the anchor's child and by a deadline of its own when it does not. A
+  starter that has attached nothing yet asks `StartSpec::until_served` (A-366): an anchor whose
+  daemons crash-loop before any of them has served (none reached its serving mark,
+  `Supervisor::ever_served`) stops, exit 5, and the wait ends `StartFault::NeverServed`, since no
+  client could be waiting on an instance that never answered; an anchor that has served once never
+  gives its instance up (A-119), asked or not. So no host bounds its wait by a second it picked,
+  which a slow start under load outlasts (kiln's 30 s at load 28, 2026-11-18). The starter
   is the launcher: under Ada's rule of 2026-11-18 (A-285 as revised, A-299) write permission
   follows each agent's mode and the launcher's authority is the instance's issuer, which the start
   is to hand its starter on every platform (owed; today the starter holds it where the anchor's
@@ -26635,6 +26654,68 @@ Applied in the same change to: §4.8 (learners and direct contact), GAPS, `crate
 `crates/server/src/state.rs`, `crates/server/src/daemon.rs` (the state's initializer and the test
 `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it`) and the bug record
 `docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
+
+### A-366 — A host waits on its anchor while it lives; an anchor its starter asked stops when none of its daemons ever served (2026-11-18, kiln goal g264; §4.12 "Embedding", §2.6 step 1, A-119, A-232, A-278)
+
+- **What was wrong.** A starter that held the anchor's child still bounded its wait by a second it picked: kiln's
+  start of its machine's instance waited 30 s (`UP_WAIT`), and a slow start under load outlasted it (kiln's
+  `slates_roles` test, Mac Studio at load average 28 during a parallel build, 2026-11-18: "the anchor didn't answer
+  within 30s"; passed at load 16-18 in 24-27 s). Without a deadline the wait could last for good: an anchor never gives
+  its instance up (A-119), so a daemon that cannot start is restarted after a backoff forever, and the starter sees
+  nothing but "no rendezvous yet".
+- **The rule.** The anchor already judges its starting daemon by the daemon's own CPU progress, never a second (A-232),
+  so a host that holds the anchor's child waits while the anchor lives (`Instance::wait_for(name, Some(child), None)`).
+  A starter that has attached nothing yet asks `StartSpec::until_served` (handed to the anchor as the environment word
+  `SLATES_UNTIL_SERVED`, as the launcher's record is): an anchor none of whose daemons has reached its serving mark
+  (`layout::SUP_SERVING`; `Supervisor::ever_served`, which also sees a daemon that marked and died at its exit step)
+  stops at their crash loop (two failed starts in a row, A-311), exit `role::EXIT_NEVER_SERVED` (5), and the wait ends
+  `StartFault::NeverServed`. No client can hold a mount on an instance that never answered, which is what A-119
+  protects; an anchor that has served once never gives its instance up, asked or not. CONTRACT 23.
+- **What remains.** The serving mark comes right after the daemon's start returns, so a client that attached during
+  the start of a daemon that then died before marking is the one case the rule cannot see; a starter that asks makes
+  no mount before its own wait and first call succeed, as kiln does.
+- **Applied in the same change to** `crates/anchor/src/supervise.rs` (`ever_served`), `crates/api/src/start.rs`
+  (`StartSpec::until_served`, the wait's mapping, the module doc), `crates/api/src/error.rs`
+  (`StartFault::NeverServed`), `crates/api/src/role/{mod,anchor}.rs` (`EXIT_NEVER_SERVED`, `Failure::NeverServed`, the
+  stop), `crates/api/src/lib.rs` (CONTRACT 23), `crates/cli/src/main.rs` (the command's mapping, exit 5), §4.12
+  "Embedding", `docs/library.md`; tests `crates/anchor/tests/anchor.rs` (the two crash-loop tests say whether a
+  daemon served) and `crates/api/tests/start.rs`
+  (`an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves`).
+
+### A-367 — A holder publishes each register position once: a held register is a head piece and a piece per accepted position, and a delta carries the head and the positions accepted or dropped since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 29)
+Applied in the same change to: §4.8 (A-270's status: "A held register is a head and its positions"), GAPS (the load
+test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::tracking_changes`, `changes`,
+`clear_changes`, `position`, `positions`, `position_count`, `persisted_head`), `crates/server/src/content_holder.rs`
+(`HeldPosition`, `KIND_REGISTER_POSITION`, `register_head_piece`, `position_piece`, `register_changes`, `changes_cover`,
+`registers_committed`, `join_positions`, `PublishedHeld::registers`, `HeldRefused::PositionWithoutHead`),
+`crates/server/src/fleet.rs` (`hold_checked_record` makes a tracking acceptor), `crates/vfs/src/recover.rs`
+(`IMAGE_VERSION` 29), `Daemon::fleet_held_positions` (test support), and the tests below.
+- **What was there.** A-270 made what a shard holds for other owners keyed pieces, one per held register, so a delta
+  carried the registers marked changed. A register's piece was its acceptor's whole persisted state, every accepted
+  position. A green's merge register on its holders is a ledger (`Acceptor::compact_below` keeps a successor's every
+  version), and a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+  re-wrote every version the holder kept. On the Mac Studio, a debug build, three nodes at `f = 1`, the median submit of
+  the last 50 of 300 was 4.3 to 7.1 ms against 1.9 to 3.6 ms for the first 50 (about 10 µs a version), and at the goal's
+  300,000 versions a version's publication would be about 60 MB of positions on each replica.
+- **The rule.** A held register is a head piece, its object's authority, fence and moved-from owner, and a piece per
+  accepted position, keyed by the position's object and sequence. A holder's acceptor keeps which positions it accepted
+  (new, or again at a newer epoch) and which it dropped (compacted, forgotten) since its last committed publication; a
+  delta carries the head of every register the tracked map marked and those positions; a register dropped whole has its
+  head and every published position removed, from the positions the shard knows it published. A position held but
+  neither written since nor published cannot be, since tracking counts what an acceptor holds as written when it begins
+  and a recovery clears it only because the image it was rebuilt from carries every position; so an acceptor whose
+  changes do not account for its positions against what was published (one put in place of another under the same
+  object) is carried whole, as its pieces.
+- **Tests.** `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger`
+  (`crates/server/tests/recovery.rs`: 64 positions of one ledger held through the production path, then a warm
+  restart). Kiln r3432 on the Mac Studio, 2026-11-18, debug build: on main's code each delta carried every position held,
+  2,165 bytes at the second position and 67,885 at the sixty-fourth (32 deltas, 32 sizes); with this change every delta
+  carried one size, and all 64 positions were held after the restart. The held-pieces oracle (`folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`,
+  `daemon.rs`) now grows registers a position at a time, accepts again at a newer epoch, compacts and replaces them;
+  `a_tracking_acceptor_names_every_position_written_or_dropped_since_its_last_clear` (`slates-db`).
+- **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
+  compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
+  growth, in the content's bytes.
 
 Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
 the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and

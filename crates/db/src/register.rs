@@ -1660,6 +1660,39 @@ pub struct Acceptor {
   moved_from: Option<HostId>,
   fence: Fence,
   accepted: std::collections::BTreeMap<(ObjectId, u64), (HostEpoch, Vec<u8>)>,
+  /// What changed of `accepted` since [`Acceptor::clear_changes`], kept only by an acceptor whose holder publishes each
+  /// position as its own piece ([`Acceptor::tracking_changes`], A-367).
+  changes: Option<PositionChanges>,
+}
+
+/// What changed of a tracking acceptor's accepted positions since its changes were last cleared (A-367; §4.8
+/// "persistence before reply"): the positions accepted — new, or accepted again at a newer epoch — and those dropped —
+/// compacted below a newer one, or the object forgotten — and not accepted again since. A holder's recovery image carries
+/// each position as its own piece, so its publication puts the positions written and removes those dropped, and never
+/// re-encodes a ledger it already carries. Kept only by an acceptor that asked ([`Acceptor::tracking_changes`]): an
+/// owner's acceptor, whose positions no image carries, keeps none. Bounded by what changed since the holder's last
+/// committed publication, which clears them ([`Acceptor::clear_changes`]); a holder publishes each accept before it
+/// acknowledges it, so that is a handful.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PositionChanges {
+  /// The positions accepted since the last clear, each as its object and sequence.
+  pub written: std::collections::BTreeSet<(ObjectId, u64)>,
+  /// The positions dropped since the last clear and not accepted again since, each as its object and sequence.
+  pub dropped: std::collections::BTreeSet<(ObjectId, u64)>,
+}
+
+impl PositionChanges {
+  /// Notes `position` accepted: written, and no longer dropped.
+  fn note_written(&mut self, position: (ObjectId, u64)) {
+    self.dropped.remove(&position);
+    self.written.insert(position);
+  }
+
+  /// Notes `position` dropped: dropped, and no longer written.
+  fn note_dropped(&mut self, position: (ObjectId, u64)) {
+    self.written.remove(&position);
+    self.dropped.insert(position);
+  }
 }
 
 /// A holder's durable accepted positions, for recovery: `(object, sequence, epoch, value)` per entry.
@@ -1710,6 +1743,72 @@ impl Acceptor {
       moved_from: None,
       fence: Fence::new(),
       accepted: std::collections::BTreeMap::new(),
+      changes: None,
+    }
+  }
+
+  /// This acceptor, keeping from now on what changes of its accepted positions (A-367, [`PositionChanges`]): what a
+  /// holder whose recovery image carries each position as its own piece publishes from. The positions it already holds
+  /// count as written, since no publication is known to carry them; a holder rebuilding it from the image that does
+  /// carry them clears them at once ([`Acceptor::clear_changes`]). So a position it holds is either written or carried
+  /// by what was last published, and a publication judged by its changes misses none.
+  #[must_use]
+  pub fn tracking_changes(mut self) -> Acceptor {
+    if self.changes.is_none() {
+      self.changes = Some(PositionChanges {
+        written: self.accepted.keys().copied().collect(),
+        dropped: std::collections::BTreeSet::new(),
+      });
+    }
+    self
+  }
+
+  /// What changed of its accepted positions since [`Acceptor::clear_changes`]; `None` for an acceptor that keeps none.
+  pub fn changes(&self) -> Option<&PositionChanges> {
+    self.changes.as_ref()
+  }
+
+  /// Forgets what changed of its accepted positions: the holder's publication carrying it committed (A-367).
+  pub fn clear_changes(&mut self) {
+    if let Some(changes) = self.changes.as_mut() {
+      changes.written.clear();
+      changes.dropped.clear();
+    }
+  }
+
+  /// How many positions this acceptor holds, every object's: one read.
+  pub fn position_count(&self) -> usize {
+    self.accepted.len()
+  }
+
+  /// The epoch and value accepted for `object` at `sequence`, if this acceptor holds that position: one lookup.
+  pub fn position(&self, object: ObjectId, sequence: u64) -> Option<(HostEpoch, &[u8])> {
+    self
+      .accepted
+      .get(&(object, sequence))
+      .map(|(epoch, value)| (*epoch, value.as_slice()))
+  }
+
+  /// Every accepted position, in key order, as its object, sequence, epoch and value: what a whole publication carries
+  /// one piece each (A-367), without the copy [`Acceptor::persisted`] makes.
+  pub fn positions(&self) -> impl Iterator<Item = (ObjectId, u64, HostEpoch, &[u8])> + '_ {
+    self
+      .accepted
+      .iter()
+      .map(|(&(object, sequence), (epoch, value))| (object, sequence, *epoch, value.as_slice()))
+  }
+
+  /// This acceptor's durable state but its positions (A-367): the owner and generation it serves under, the epoch its
+  /// fence has seen and the retired owner an install last moved it from, which a recovery image keeps as the register's
+  /// head piece beside a piece per position. [`Acceptor::from_persisted`] rebuilds the acceptor from it with the
+  /// positions put back into `accepted`.
+  pub fn persisted_head(&self) -> PersistedAcceptor {
+    PersistedAcceptor {
+      owner: self.authority.owner,
+      generation: self.authority.generation,
+      promised: self.fence.seen.0,
+      accepted: Vec::new(),
+      moved_from: self.moved_from,
     }
   }
 
@@ -1734,6 +1833,7 @@ impl Acceptor {
       moved_from: None,
       fence,
       accepted,
+      changes: None,
     }
   }
 
@@ -1848,6 +1948,9 @@ impl Acceptor {
       (record.object, record.sequence),
       (record.epoch, record.value.clone()),
     );
+    if let Some(changes) = self.changes.as_mut() {
+      changes.note_written((record.object, record.sequence));
+    }
     Ok(Ack {
       holder: self.id,
       object: record.object,
@@ -1863,9 +1966,14 @@ impl Acceptor {
   /// and keeping them is unbounded growth, one position per seal. A **ledger** (a green's merge chain) must
   /// not be compacted: a successor replays every version. The owner of the value class decides which it is.
   pub fn compact_below(&mut self, object: ObjectId, sequence: u64) {
-    self
-      .accepted
-      .retain(|&(held, position), _| held != object || position >= sequence);
+    let changes = &mut self.changes;
+    self.accepted.retain(|&(held, position), _| {
+      let kept = held != object || position >= sequence;
+      if !kept && let Some(changes) = changes.as_mut() {
+        changes.note_dropped((held, position));
+      }
+      kept
+    });
   }
 
   /// The highest accepted position of `object` — by sequence, then epoch, as phase one ranks them — as its
@@ -1889,7 +1997,8 @@ impl Acceptor {
 
   /// Every position of `object` this acceptor accepted in `from..to`, ascending, each with the epoch it was accepted
   /// under: a ledger's answer to a successor's question for the positions it lacks (A-364, [`LedgerPrepare`]).
-  pub fn positions(&self, object: ObjectId, from: u64, to: u64) -> Vec<Accepted> {
+  /// [`Acceptor::positions`] walks every position of every object.
+  pub fn positions_between(&self, object: ObjectId, from: u64, to: u64) -> Vec<Accepted> {
     if from >= to {
       return Vec::new();
     }
@@ -1915,7 +2024,14 @@ impl Acceptor {
   /// Drops every accepted position of `object` (AUD-29-43): the object's registers are retired — a destroyed
   /// volume whose tombstone every candidate holds — so nothing of it can be adopted again.
   pub fn forget_object(&mut self, object: ObjectId) {
-    self.accepted.retain(|&(held, _), _| held != object);
+    let changes = &mut self.changes;
+    self.accepted.retain(|&(held, position), _| {
+      let kept = held != object;
+      if !kept && let Some(changes) = changes.as_mut() {
+        changes.note_dropped((held, position));
+      }
+      kept
+    });
   }
 
   /// Checks authority, epoch and position without changing the promise or accepted history (§4.8).
@@ -3774,6 +3890,96 @@ mod tests {
     acceptor.forget_object(second);
     assert!(positions(&acceptor, second).is_empty());
     assert_eq!(acceptor.prepare(&prepare(second)).unwrap().highest, None);
+  }
+
+  /// §4.8 "persistence before reply", A-367: a holder's acceptor that tracks its changes names exactly the positions a
+  /// publication must put and remove, and one that does not names none. Do: on a tracking acceptor, accept positions 1
+  /// to 3 of a ledger and 1 of another object, clear; accept position 4, accept position 2 again at a newer epoch, compact
+  /// the other object below 2 after accepting its 2 (at the newer epoch, the fence being the acceptor's), then forget the
+  /// ledger and accept its 5; on an acceptor made without
+  /// tracking, accept a position. Expect after the clear nothing changed; then written {ledger 5, other 2} and dropped
+  /// {ledger 1 to 4, other 1}, with the epoch of a written position readable by `position`; the untracked acceptor's
+  /// changes `None`; an acceptor that holds a position when it begins to track counts it written, and a clear empties it.
+  #[test]
+  fn a_tracking_acceptor_names_every_position_written_or_dropped_since_its_last_clear() {
+    let config = Configuration::solo(HostId(1));
+    let authority = Authority {
+      generation: config.version,
+      owner: config.owner,
+    };
+    let mut acceptor = Acceptor::new(config.owner, authority).tracking_changes();
+    let accept = |acceptor: &mut Acceptor, object: u64, sequence: u64, epoch: u64| {
+      acceptor
+        .accept(&record_under(
+          &config,
+          object,
+          sequence,
+          HostEpoch(epoch),
+          &sequence.to_le_bytes(),
+        ))
+        .unwrap();
+    };
+    for sequence in 1..=3 {
+      accept(&mut acceptor, 7, sequence, 1);
+    }
+    accept(&mut acceptor, 8, 1, 1);
+    acceptor.clear_changes();
+    let cleared = acceptor.changes().cloned();
+    let (ledger, other) = (
+      ObjectId::new(config.owner, 7),
+      ObjectId::new(config.owner, 8),
+    );
+    accept(&mut acceptor, 7, 4, 1);
+    accept(&mut acceptor, 7, 2, 2);
+    accept(&mut acceptor, 8, 2, 2);
+    acceptor.compact_below(other, 2);
+    acceptor.forget_object(ledger);
+    accept(&mut acceptor, 7, 5, 2);
+    let changes = acceptor.changes().cloned().unwrap();
+    let mut untracked = Acceptor::new(config.owner, authority);
+    accept(&mut untracked, 7, 1, 1);
+    let mut tracked_late = Acceptor::new(config.owner, authority);
+    accept(&mut tracked_late, 9, 1, 1);
+    let mut tracked_late = tracked_late.tracking_changes();
+    let late_written = tracked_late
+      .changes()
+      .map(|changes| changes.written.clone());
+    tracked_late.clear_changes();
+    assert_eq!(
+      cleared,
+      Some(PositionChanges::default()),
+      "nothing changed since the clear"
+    );
+    assert_eq!(
+      changes.written.into_iter().collect::<Vec<_>>(),
+      vec![(ledger, 5), (other, 2)],
+      "the positions accepted and still held"
+    );
+    assert_eq!(
+      changes.dropped.into_iter().collect::<Vec<_>>(),
+      vec![
+        (ledger, 1),
+        (ledger, 2),
+        (ledger, 3),
+        (ledger, 4),
+        (other, 1)
+      ],
+      "the positions compacted or forgotten and not accepted again"
+    );
+    assert_eq!(
+      acceptor.position(ledger, 5).map(|(epoch, _)| epoch),
+      Some(HostEpoch(2))
+    );
+    assert!(
+      untracked.changes().is_none(),
+      "an untracked acceptor keeps none"
+    );
+    assert_eq!(
+      late_written,
+      Some([(ObjectId::new(config.owner, 9), 1)].into_iter().collect()),
+      "an acceptor tracked once it holds a position counts that position written"
+    );
+    assert_eq!(tracked_late.changes(), Some(&PositionChanges::default()));
   }
 
   /// Shape: the largest `f` the exhaustive quorum oracles enumerate — cohorts up to `2f + 1 = 7` hosts, so
@@ -6011,7 +6217,7 @@ mod tests {
     }
     acceptor.accept(&record(ledger, 3, 2)).unwrap();
     acceptor.accept(&record(other, 2, 2)).unwrap();
-    let read = acceptor.positions(ledger, 1, 4);
+    let read = acceptor.positions_between(ledger, 1, 4);
     assert_eq!(
       read
         .iter()
@@ -6019,7 +6225,7 @@ mod tests {
         .collect::<Vec<_>>(),
       vec![(1, 1), (2, 1), (3, 2)]
     );
-    assert!(acceptor.positions(ledger, 4, 4).is_empty());
+    assert!(acceptor.positions_between(ledger, 4, 4).is_empty());
   }
 
   /// A sample answer to a takeover page: two objects' records, a next page and a fence above the epoch.

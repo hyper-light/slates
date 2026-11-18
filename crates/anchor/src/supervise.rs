@@ -180,6 +180,9 @@ pub struct Supervisor {
   /// When a step first saw the current daemon's serving mark, on this supervisor's clock: its start's end. `None` until
   /// then, and again at every start, since a start zeroes the mark.
   serving_seen_ns: Option<u64>,
+  /// Whether any daemon this supervisor started has reached its serving mark (`layout::SUP_SERVING`): from then a
+  /// client may hold a mount on the instance, so supervision never gives up on it (A-119). Never cleared.
+  ever_served: bool,
   /// When a crash loop's backed-off restart is due (A-119); `None` outside a crash loop.
   retry_at_ns: Option<u64>,
   /// The backoff the last crash loop waited, doubled by the next ([`crash_loop_backoff`]); `None` until a crash loop,
@@ -285,6 +288,7 @@ impl Supervisor {
       child: None,
       failed_in_a_row: 0,
       serving_seen_ns: None,
+      ever_served: false,
       retry_at_ns: None,
       backoff_ns: None,
       started_at_ns: 0,
@@ -772,6 +776,7 @@ impl Supervisor {
       self.serving_seen_ns = None;
       return Ok(false);
     }
+    self.ever_served = true;
     if supervision.recovered_since().is_some() {
       return Ok(true);
     }
@@ -781,6 +786,14 @@ impl Supervisor {
       supervision.mark_recovered(now_ns);
     }
     Ok(recovered)
+  }
+
+  /// Whether any daemon this supervisor started has reached its serving mark, its exit step included (a daemon that
+  /// marked and died at once is seen at its exit). From then a client may have attached to the instance and hold a
+  /// mount on it, which waits on a daemon, so nothing gives the instance up (A-119); before, none could have, and an
+  /// owner whose starter asked for it may stop the anchor when its daemons crash-loop without ever serving (A-366).
+  pub fn ever_served(&self) -> bool {
+    self.ever_served
   }
 
   /// Whether the current daemon has been judged recovered (`layout::SUP_RECOVERED`): until then its owner looks at it

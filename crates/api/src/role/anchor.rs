@@ -650,6 +650,8 @@ fn observe(
   let mut quiet = Quiet::default();
   // The daemon whose recovery the log has said (A-311), so each daemon's is said once.
   let mut said_recovered = None;
+  // Its starter asked it to stop if no daemon ever serves (A-366, `StartSpec::until_served`).
+  let until_served = crate::start::until_served_asked();
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -745,6 +747,16 @@ fn observe(
         exit_code,
         retry_in_ns,
       } => {
+        // A starter that asked for it (A-366) is told the instance never served: no daemon of this anchor reached its
+        // serving mark, so no client can hold a mount on it, and the loop would only keep its starter waiting.
+        if until_served && !supervisor.ever_served() {
+          slates_machine::log_line!(
+            "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}) and none of its starts has served; \
+             its starter asked the anchor to stop then (A-366)"
+          );
+          supervisor.stop().map_err(|e| failed("stop", e))?;
+          return Err(Failure::NeverServed);
+        }
         // Never given up on (A-119): every hard mount waits for the daemon. The loop is recorded for the health
         // plane and the restart comes after the backoff.
         slates_machine::log_line!(
