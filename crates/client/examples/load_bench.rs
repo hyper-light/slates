@@ -27,7 +27,8 @@
 //! touched must equal the version-ordered replay of the accepted submits over the files' version-0 bytes.
 //!
 //! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then `oracle\t<n>\t…` lines;
-//! a nonzero `oracle_failures` exits 1.
+//! a nonzero `oracle_failures` exits 1. Last, the daemon's own counts of what it lost and of its waits for room, read
+//! from its report at the end of the run: `lost\t<counter>\t<count>` and `room\t<counter>\t<count>`.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -1830,6 +1831,56 @@ fn arg(name: &str) -> Option<String> {
   args.find(|a| a == name).and_then(|_| args.next())
 }
 
+/// Format: the daemon's counters of a reply, a result or a release it lost, printed at the end of a run as
+/// `lost\t<counter>\t<count>`, every shard summed, a zero printed too. Since A-232 a client waits for a lost reply while
+/// its daemon lives, so a run's latencies alone cannot show one (goal 238: about 4,200 `xshard.reply_dropped` a run of
+/// the 3,000-client rung on main before the carrier).
+const LOSS_COUNTERS: [&str; 11] = [
+  "xshard.reply_dropped",
+  "xshard.keep_refused",
+  "xshard.unstarted_unanswered",
+  "ack.release_refused",
+  "fuse.reply_undelivered",
+  "image.reply_undelivered",
+  "landing.reply_undelivered",
+  "lease.wait.undelivered",
+  "fleet.live.undelivered",
+  "merge.acceptance_undelivered",
+  "winfsp.reply_undelivered",
+];
+
+/// Prints [`LOSS_COUNTERS`] and the daemon's waits for room (`room\t<counter>\t<count>`: begun and ended summed over
+/// the shards, and the most any one shard held at once) from its own report, through a connection made now, as the
+/// oracle reads. A report the daemon could not give is printed, not fatal: the run's rows stand without it.
+fn report_losses(instance: &str) {
+  let report = match connect(first_instance(instance)).and_then(|mut reader| reader.daemon_status())
+  {
+    Ok(report) => report,
+    Err(error) => {
+      println!("lost\tunavailable\t{error:?}");
+      return;
+    }
+  };
+  let per_shard = |name: &'static str| {
+    report.shards.iter().map(move |shard| {
+      shard
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.kind == name)
+        .map(|refusal| refusal.count)
+        .sum::<u64>()
+    })
+  };
+  for name in LOSS_COUNTERS {
+    println!("lost\t{name}\t{}", per_shard(name).sum::<u64>());
+  }
+  for name in ["xshard.room_waits_started", "xshard.room_waits_ended"] {
+    println!("room\t{name}\t{}", per_shard(name).sum::<u64>());
+  }
+  let peak = per_shard("xshard.room_waits_peak").max().unwrap_or(0);
+  println!("room\txshard.room_waits_peak\t{peak}");
+}
+
 fn main() {
   let tree = arg("--tree").unwrap_or_default();
   let levels: Vec<usize> = arg("--clients")
@@ -1903,6 +1954,7 @@ fn main() {
       workers.min(n),
     );
   }
+  report_losses(&instance);
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();
