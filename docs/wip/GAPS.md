@@ -2545,6 +2545,17 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
+> retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the
+> object, each by decoding the ledger position at its placed sequence (`content_retention::retain_object`), so a green's
+> every version decoded every version's record before it: on the Mac Studio, a debug build, `sample` of the late-submit
+> test at 1,000 versions found a fifth of each holder's time in that rule (1,364 to 1,413 samples of about 6,570), the
+> late median at 18.2 ms against the early 2.16. A ledger never rewrites an accepted position, so its inputs placed below
+> its newest accepted version were judged when their records came; now the rule judges those placed at or past it
+> (`ContentHold::retain_placed_from`, over the hold's manifests indexed by placed sequence, charged with them), and the
+> newest placement is one read. Test: `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change`
+> (`content_retention.rs`): the last of 64 versions judges one manifest, every input still held.
+>
 > **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
 > one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
 > compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and

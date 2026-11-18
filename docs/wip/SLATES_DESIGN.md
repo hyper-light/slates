@@ -26705,3 +26705,23 @@ test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::track
 - **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
   compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
   growth, in the content's bytes.
+
+### A-372 — A holder judges only the content a new record or put can change: a ledger's inputs placed below its newest accepted version were judged when their records came (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree)
+Applied in the same change to: §4.10 "a late copy is redundant and reclaimed" (its rule's cost), GAPS (the load test's
+ledger), `crates/cluster/src/content.rs` (`Held::by_sequence`, charged in `manifest_entry_bytes` and
+`object_entry_bytes`; `ContentHold::retain_placed_from`; `newest_placed` one read), `crates/server/src/content_retention.rs`
+(`judged_from`, `retain_object` from it, the counter `fleet.content.retention_judged`), and the tests below.
+- **What was there.** The retention rule (AUD-29-43) runs on a holder after every record it accepts and every put it
+  holds, and judged every manifest held for the object: for a green, the ledger position at each manifest's placed
+  sequence looked up and decoded. Every version of a green therefore decoded every earlier version's record on each
+  holder, twice (its put and its record). `sample` of the late-submit test at 1,000 versions on the Mac Studio (debug
+  build) found about a fifth of each holder's time in it, and the submit's late median at 18.2 ms against an early 2.16.
+- **The rule.** A green's ledger accepts its versions in order and never rewrites an accepted position, and the rule at
+  the door refuses a put its records supersede; so an input placed below the ledger's newest accepted version was judged
+  when that version's record came, and named then is named for good. The rule judges the content placed at or past the
+  newest accepted version (and the object's stage), found in one step through the hold's manifests indexed by placed
+  sequence; a head, a tombstone or an object with no record is judged whole, as before (a head's register keeps one
+  position, a tombstone releases everything once). The index is charged with the manifests it indexes.
+- **Tests.** `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change` (`content_retention.rs`: 64
+  versions, the last judges one manifest); `a_retention_from_a_sequence_judges_only_the_content_placed_at_or_past_it`
+  (`slates-cluster`); the hold's model test keeps every charge balanced with the index charged.
