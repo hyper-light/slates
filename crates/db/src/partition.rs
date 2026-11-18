@@ -160,6 +160,12 @@ pub struct PartitionSnapshot {
   pub audit_dropped: u64,
   /// The highest grant id ever issued here (A-266; appended): the table holds live grants only.
   pub grants_issued_through: u64,
+  /// The audit records owed the control partition and not yet acknowledged, oldest first (A-265's crossing; appended).
+  pub audit_outbox: Vec<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265; appended).
+  pub audit_outbox_next: u64,
+  /// On the control partition, what each owing partition has delivered (A-265; appended), by partition order.
+  pub audit_received: Vec<crate::catalog::AuditReceivedMark>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -258,6 +264,17 @@ pub struct Partition {
   /// The sequence the next audit record takes (A-265): a counter of the partition's own, snapshotted, so the numbers
   /// never depend on which records are retained.
   audit_next_seq: u64,
+  /// The audit records this partition owes the control partition and has not had acknowledged, oldest first, each
+  /// carrying its crossing sequence in `seq` (A-265's crossing, made durable 2026-11-18): kept from the atom that made
+  /// it until the control partition has appended it, so a crash between the two loses none. At most
+  /// `caps.audit_records`; past it the oldest leaves, counted in `audit_dropped`, as the control partition's window
+  /// would drop it.
+  audit_outbox: std::collections::VecDeque<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265), snapshotted: the records before it were owed already.
+  audit_outbox_next: u64,
+  /// On the control partition: for each partition that owes it records, the crossing sequence of the first it has not
+  /// appended (A-265), snapshotted, so a batch sent again appends only what is new. One entry a partition.
+  audit_received: BTreeMap<u16, u64>,
   /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
   /// what keeps an ended grant's id from being issued again after a restart.
   grants_issued_through: u64,
@@ -389,6 +406,9 @@ impl Partition {
       green_adoptions: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
       audit_next_seq: 0,
+      audit_outbox: std::collections::VecDeque::new(),
+      audit_outbox_next: 0,
+      audit_received: BTreeMap::new(),
       grants_issued_through: 0,
       tombstones: BTreeMap::new(),
     }
@@ -1154,6 +1174,67 @@ impl Partition {
     }
   }
 
+  /// The audit records this partition owes the control partition, oldest first, each carrying its crossing sequence in
+  /// `seq` (A-265): what a batch sends, from the oldest, so a batch that was lost is in the next one.
+  pub fn audit_outbox(&self) -> impl Iterator<Item = &AuditRecord> {
+    self.audit_outbox.iter()
+  }
+
+  /// On the control partition: the crossing sequence of the first record partition `origin` owes that is not appended
+  /// here (A-265); 0 for a partition that delivered none.
+  pub fn audit_received(&self, origin: u16) -> u64 {
+    self.audit_received.get(&origin).copied().unwrap_or(0)
+  }
+
+  /// The audit crossing's three records (A-265), unconditional so a replay repeats them:
+  /// - `AuditOwed`: the record enters the outbox under the next crossing sequence; past the bound the oldest leaves,
+  ///   counted, from the caps alone, as `append_audit`'s window does.
+  /// - `AuditDelivered`: the records before `through` leave the outbox; an older acknowledgement than one already
+  ///   applied removes nothing.
+  /// - `AuditBatchAppended`: the records at or past `origin`'s mark are appended, in order, and the mark moves to the
+  ///   batch's end; a record before the mark was appended by an earlier batch and is passed over. A batch whose first
+  ///   record is past the mark appends from its first: the records between were dropped from the outbox's bound, and
+  ///   counted there.
+  fn apply_audit_crossing(&mut self, op: &Op) {
+    match op {
+      Op::AuditOwed { record } => {
+        let mut record = record.clone();
+        record.seq = self.audit_outbox_next;
+        self.audit_outbox_next = self.audit_outbox_next.saturating_add(1);
+        self.audit_outbox.push_back(record);
+        while self.audit_outbox.len() > self.caps.audit_records {
+          self.audit_outbox.pop_front();
+          self.audit_dropped = self.audit_dropped.saturating_add(1);
+        }
+      }
+      Op::AuditDelivered { through } => {
+        while self
+          .audit_outbox
+          .front()
+          .is_some_and(|record| record.seq < *through)
+        {
+          self.audit_outbox.pop_front();
+        }
+      }
+      Op::AuditBatchAppended {
+        origin,
+        first,
+        records,
+      } => {
+        let from = self.audit_received(*origin);
+        for (crossing, record) in (*first..).zip(records) {
+          if crossing >= from {
+            self.append_audit(record);
+          }
+        }
+        let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let end = first.saturating_add(count);
+        self.audit_received.insert(*origin, from.max(end));
+      }
+      _ => {}
+    }
+  }
+
   // ------------------------------------------------------------------ the guard
 
   /// [`Partition::check`] for a name alias (A-236) and a CLI attachment's term (A-230).
@@ -1403,7 +1484,11 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
-      Op::AuditAppended { .. } => Ok(()),
+      // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
+      Op::AuditAppended { .. }
+      | Op::AuditOwed { .. }
+      | Op::AuditDelivered { .. }
+      | Op::AuditBatchAppended { .. } => Ok(()),
       Op::GreenAdvanced { green, increment } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
@@ -1922,6 +2007,10 @@ impl Partition {
         self.append_audit(record);
         Ok(())
       }
+      Op::AuditOwed { .. } | Op::AuditDelivered { .. } | Op::AuditBatchAppended { .. } => {
+        self.apply_audit_crossing(op);
+        Ok(())
+      }
       Op::GreenAdvanced { green, increment } => {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(increment.len());
         self
@@ -2245,6 +2334,16 @@ impl Partition {
       audit_next_seq: self.audit_next_seq,
       audit_dropped: self.audit_dropped,
       grants_issued_through: self.grants_issued_through,
+      audit_outbox: self.audit_outbox.iter().cloned().collect(),
+      audit_outbox_next: self.audit_outbox_next,
+      audit_received: self
+        .audit_received
+        .iter()
+        .map(|(origin, through)| crate::catalog::AuditReceivedMark {
+          origin: *origin,
+          through: *through,
+        })
+        .collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -2443,6 +2542,13 @@ impl Partition {
     p.audit_dropped = snapshot.audit_dropped;
     p.audit_next_seq = snapshot.audit_next_seq;
     p.grants_issued_through = snapshot.grants_issued_through;
+    p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
+    p.audit_outbox_next = snapshot.audit_outbox_next;
+    p.audit_received = snapshot
+      .audit_received
+      .iter()
+      .map(|mark| (mark.origin, mark.through))
+      .collect();
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);

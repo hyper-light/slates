@@ -81,6 +81,8 @@ pub enum AuditKind {
   EntryRefused,
   /// A landing finished.
   LandingFinished,
+  /// A grant reached its term unused and ended (A-266), recorded under the principal it was made for.
+  GrantExpired,
 }
 
 /// A landing's stage (§4.15 "State machines"): the four terminal states a finished landing reports
@@ -139,6 +141,7 @@ pub(crate) fn audit_of(entry: AuditEntry) -> AuditRecord {
       wire::AuditKind::EntryWritten => AuditKind::EntryWritten,
       wire::AuditKind::EntryRefused => AuditKind::EntryRefused,
       wire::AuditKind::LandingFinished => AuditKind::LandingFinished,
+      wire::AuditKind::GrantExpired => AuditKind::GrantExpired,
     },
     grant: entry.grant,
     landing: entry.landing,
@@ -220,6 +223,7 @@ mod tests {
       (wire::AuditKind::EntryWritten, AuditKind::EntryWritten),
       (wire::AuditKind::EntryRefused, AuditKind::EntryRefused),
       (wire::AuditKind::LandingFinished, AuditKind::LandingFinished),
+      (wire::AuditKind::GrantExpired, AuditKind::GrantExpired),
     ] {
       assert_eq!(audit_of(entry(typed, None)).kind, kind);
     }

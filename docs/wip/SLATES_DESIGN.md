@@ -9239,7 +9239,7 @@ enum Verdict { Apply, Skip /* disk already holds it */, AcceptIdentical, Conflic
 enum ConflictClass { ModifyModify, ModifyDelete, DeleteModify, RenameRename, CreateCreate, TypeChanged, TargetInUse }
 struct LandingLease { target: CanonicalTarget /* device and inode */, holder: AttemptId /* one landing attempt (A-47) */,
                       generation: u64 /* the take's log sequence on the control partition */, expires: Monotonic }
-struct AuditRecord { seq: u64, at: Monotonic, kind: AuditKind /* GrantIssued | GrantRevoked | LandingPlanned | LandingValidated | EntryWritten | EntryRefused | LandingFinished */,
+struct AuditRecord { seq: u64, at: Monotonic, kind: AuditKind /* GrantIssued | GrantRevoked | LandingPlanned | LandingValidated | EntryWritten | EntryRefused | LandingFinished | GrantExpired (A-266) */,
                      grant: Option<GrantId>, landing: Option<RequestId>, manifest: Option<Blake3>, outcome: Option<LandingState>,
                      signature: Option<SignatureVerdict> /* A-321: how a landing's signature was judged, on its LandingPlanned and LandingFinished records */ }
 ```
@@ -27791,8 +27791,26 @@ send after a verb's transaction), `crates/ipc/src/protocol.rs` (`Audit { since }
 - **The crossing:** a record made on another shard is owed to the control partition by its atom and sent as one batch
   once the atom commits: a presentation's and a granted landing's completion wait for it before replying, and a grant
   (a sync verb) sends after its transaction, a refusal counted (`landing.audit_unappended`). On the control shard the
-  records stay in the atom. A crash between the owner's commit and the batch loses the batch; the owner's records and
-  the completion stand.
+  records stay in the atom.
+- **The crossing durable (2026-11-18, goal g247; AC-2.10):** until then an owed record lived in the owning shard's
+  memory between its atom's commit and its batch, so a crash there lost it while the effect it recorded stood. Now:
+  - the owing atom records it in its own partition (`Op::AuditOwed`, the partition's outbox, numbered by a crossing
+    sequence of its own), so it is durable with its effect;
+  - a batch carries the outbox from its oldest record, so a lost batch is in the next, and the control partition
+    appends it in one record (`Op::AuditBatchAppended`) whose apply passes over what that partition already delivered
+    (a mark per partition), so a batch sent again appends nothing twice;
+  - the control shard acknowledges, and the owner records the acknowledgement (`Op::AuditDelivered`), which empties
+    the outbox; the reap tick sends again an outbox whose front has not moved over a tick (`landing.audit_resent`),
+    which brings a restarted daemon's owed records to the audit;
+  - the outbox is bounded by the window (`caps.audit_records`), the oldest dropped and counted past it, as the window
+    would drop it. Its records and the marks are in the partition's snapshot, so the anchor's layout is version 10.
+  Applied to `crates/db/src/{op,partition,catalog}.rs`, `crates/anchor/src/layout.rs`, `crates/server/src/landing.rs`
+  (`write_audit`, `owed_batch`, `append_audit_batch`, `record_delivered`, `send_owed_audit`, `resend_stuck_audit`,
+  `append_owed_audit`), `crates/server/src/daemon.rs` (the reap tick; `withhold_audit_crossing`,
+  `withhold_audit_acknowledgement`), `crates/server/src/verbs.rs` (a rollback takes the outbox back with the rest).
+  Tests: `crates/db/tests/audit.rs` (owed until delivered, across a replay and a snapshot; a batch sent again appends
+  only what is new; the outbox's bound) and `crates/server/tests/audit_crossing.rs` (a record owed across shards
+  survives a restart before its batch; a batch sent again after a lost acknowledgement appends nothing twice).
 - **Cost:** a granted landing of 1,000 files of 1 KiB from the shard that is not the control shard, its 1,000 `entry_written` records and its others crossing as one batch (`crates/server/tests/audit_land_cost.rs`, release, two shards, this Mac at load 40 to 100, before and after alternated ABBA three times, 2026-11-09): before, a landing's median 968 ms and fastest 430 ms; after, 827 ms and 424 ms (25 landings each, the first pair dropped as the warm-up). No cost shows within the noise: the crossing is one message and one transaction against a landing's own writes and fsyncs.
 - **A seek (2026-11-17, goal g247):** a page of the audit filtered the whole window from its oldest record, so a walk
   of the window cost its square; it seeks to `since` (`Partition::audit_from`, a binary search over the window, which
@@ -27829,7 +27847,22 @@ tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/
   names the target, in the statement a signature signs: a presentation whose reply would not fit one reply beside its
   summary and verdict is refused the same way before anything is recorded, naming the longest that one holds
   (`presentation_overflow`).
-- **Open:** an expiry writes no audit record.
+- **An expiry is audited (2026-11-18, goal g247; closes this entry's open item).** Applied to §4.15 (`AuditRecord`'s
+  kinds), `crates/db/src/catalog.rs` (`AuditKind::GrantExpired`, appended and published, D-15),
+  `crates/server/src/landing.rs` (`end_expired_grants`, `record_expiry`), `crates/land/src/grant.rs` (`check`),
+  `crates/ipc/src/protocol.rs` (the wire's typed `AuditKind::GrantExpired`, appended and published), `crates/api`
+  (`AuditKind::GrantExpired`, `CONTRACT` 32), GAPS,
+  `docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`.
+  - The sweep records each expiry with a `grant_expired` record in one atom, under the principal the grant was made
+    for (no one acted) and the manifest it bound; on another shard the committed atoms' records are owed to the
+    control partition and sent as the sweep's one batch, so AC-2.10's "every grant" holds for its end as for its issue.
+  - A check only reads. A landing's check marked a grant past its term expired in its shard's table alone, and the
+    sweep, which takes issued grants past their term, passed it over: it was never recorded ended, stayed listed as
+    issued, and stayed in the table until a restart. Now it is refused as expired and left for the sweep.
+  - A grant whose issue was refused is held nowhere (AC-2.3): the shard's table issued it before the durable record,
+    and a refused record or a rolled-back atom left it there, bound to the presented landing, so a landing naming its
+    id ran under a grant the approval was told was not made. A refused record ends it; a rollback keeps in the table
+    only what the durable one holds (`reconcile_unpublished_effects`, `Grants::retain`).
 
 ### A-267 — A status's drift is carried as far as one reply holds, counted past it, and paged (accepted 2026-11-08)
 Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/protocol.rs` (`StatusReport::drifted_elided`,

@@ -1307,15 +1307,36 @@
 >   found every record numbered 0, the audit unbounded in memory and snapshots, and each shard keeping its own, a client
 >   reading its own shard's alone. Now numbered in `apply`, a derived window kept (`table_bytes / size_of::<AuditRecord>()`,
 >   the oldest dropped and counted; the operator horizon waits for a measured landing rate), the unwritten audit ring
->   removed, every record held by the control shard's partition, and the read paged. **Open:** a record made on another
->   shard reaches the control partition after its own atom commits, so a crash between the two loses that batch
+>   removed, every record held by the control shard's partition, and the read paged
 >   (`docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`).
+>   - **A record owed across shards survives a crash: fixed (2026-11-18, goal g247; AC-2.10).** A record made on
+>     another shard reached the control partition after its own atom committed, so a crash between the two lost that
+>     batch. It is now owed in its atom (the partition's outbox), sent from the oldest owed until the control shard's
+>     acknowledgement is recorded, sent again by the reap tick when it was not, and appended once however often it is
+>     sent (a per-partition mark the batch's own record moves). Anchor layout version 10. Tests:
+>     `crates/db/tests/audit.rs`, `crates/server/tests/audit_crossing.rs`
+>     (`docs/bugs/2026-11-18-an-audit-record-owed-across-shards-was-lost-to-a-crash.md`).
 > - **`grants`: paged, and the table holds live grants (A-266, 2026-11-08).** Refused between 25 and 50 grants; paging
 >   it found every grant kept for the daemon's life and none ended at its term. Now paged in grant-id order, a grant
 >   leaves the table at its terminal step (its history is the audit), the reap ends grants past their term, and a
->   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting. **Open:** an expiry
->   writes no audit record, so an expired grant's history is its `grant_issued` alone
+>   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting
 >   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
+>   - **An expiry is audited, and a grant a landing found past its term ends too: fixed (2026-11-18, goal g247).** An
+>     expiry wrote no audit record, so an expired grant's history was its `grant_issued` alone; each is now recorded
+>     with a `grant_expired` record in one atom (`record_expiry`), sent to the control partition from another shard as
+>     the sweep's one batch. And a landing's check marked a grant past its term expired in its shard's table alone,
+>     which the sweep, taking issued grants, passed over: the grant was never recorded ended, stayed listed as issued
+>     and stayed in the table until a restart. The check now only reads. Tests:
+>     `every_grant_ended_at_its_term_leaves_its_expiry_in_the_audit` and
+>     `a_grant_a_landing_found_past_its_term_still_ends_and_is_audited` (`crates/server/tests/grants_pages.rs`),
+>     `a_grant_a_landing_found_past_its_term_is_still_due_for_the_sweep` (`crates/land/src/grant.rs`)
+>     (`docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`).
+>   - **A grant whose issue was refused covers nothing: fixed (sibling, 2026-11-18, goal g247).** `issue_grant` issues
+>     in the shard's table before the durable `GrantIssued`, and nothing took the grant back when that record or its
+>     atom's commit was refused: the approval was answered `Unpublished`, and a landing naming the id the refused issue
+>     took ran under it. A refused record now ends the grant there, and a rolled-back atom's grants leave the shard's
+>     table (`reconcile_unpublished_effects`, `Grants::retain`). Test: `a_grant_whose_issue_was_refused_covers_no_landing`
+>     (`crates/server/tests/grants_pages.rs`).
 > - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
 >   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
 >   page at a time, `slates status --drift` walks it, and both SDKs read it whole with `drifted(volume)`. Since

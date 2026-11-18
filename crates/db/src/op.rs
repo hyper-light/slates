@@ -546,6 +546,30 @@ pub enum Op {
     /// archived); `None` for a green with no origin.
     origin: Option<[u8; 32]>,
   },
+  /// An audit record this partition owes the control partition (A-265's crossing, made durable 2026-11-18): kept in the
+  /// partition's outbox, numbered by its own crossing sequence in `apply`, until the control partition acknowledges it,
+  /// so it commits with the atom that made it and a crash before its batch arrives loses nothing. Appended.
+  AuditOwed {
+    /// The record; its `seq` is set in `apply`.
+    record: AuditRecord,
+  },
+  /// The control partition appended this partition's owed records before crossing sequence `through` (A-265): they
+  /// leave the outbox. Appended.
+  AuditDelivered {
+    /// The first crossing sequence the control partition has not appended.
+    through: u64,
+  },
+  /// On the control partition: a batch of the records partition `origin` owes, the first at crossing sequence `first`
+  /// (A-265). `apply` appends only those past what `origin` already delivered, and marks `origin` delivered through the
+  /// batch's end, so a batch sent again, after a crash or a lost acknowledgement, appends nothing twice. Appended.
+  AuditBatchAppended {
+    /// The partition that owed the records.
+    origin: u16,
+    /// The crossing sequence of the batch's first record.
+    first: u64,
+    /// The records, in crossing order.
+    records: Vec<AuditRecord>,
+  },
 }
 
 impl Op {
@@ -628,6 +652,9 @@ impl Op {
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
       Op::VolumeSignersSet { .. } => "volume_signers_set",
       Op::VolumeRelinquished { .. } => "volume_relinquished",
+      Op::AuditOwed { .. } => "audit_owed",
+      Op::AuditDelivered { .. } => "audit_delivered",
+      Op::AuditBatchAppended { .. } => "audit_batch_appended",
     }
   }
 }

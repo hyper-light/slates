@@ -205,9 +205,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`Reactor`]: provisioning from every source, a snapshot, a status and a destroy, awaited on the host's own loop
 /// through the client's driver; [`AsyncInstance::into_instance`] stops the completion signal, so the synchronous form's
 /// waits are woken; R6) (A-299; the same day).
+/// 32: `AuditKind::GrantExpired`, the record a grant's end at its term leaves in the audit (A-266) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 31;
+pub const CONTRACT: u32 = 32;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
