@@ -313,9 +313,6 @@ fn plain_page(
   };
   match listed {
     Ok(rows) => plain_page_of(rows, want, room),
-    Err(slates_vfs::error::VfsError::NotDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is not a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }

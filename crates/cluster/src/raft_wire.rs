@@ -715,15 +715,17 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 2 since A-309, which put the completion records (`completed`)
-/// where layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence
-/// byte, then its settled form, after its unconfirmed hosts); the moved-object exceptions, `moved`, stay last. Layout 1
-/// was the first versioned layout. A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than
-/// read another layout's fields by position: before the version, a field appended to the layout was refused only by the
+/// Format: the regional configuration's layout version: 3 since A-291's planned move, which gave each moved-object
+/// exception the member a move took it from and the cohort its records sit in (a flag, then, when it is set, the host
+/// and the cohort's hosts), after its owner and version. Layout 2 (A-309) put the completion records (`completed`) where
+/// layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence byte,
+/// then its settled form, after its unconfirmed hosts); the moved-object exceptions, `moved`, stay last. Layout 1 was
+/// the first versioned layout. A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read
+/// another layout's fields by position: before the version, a field appended to the layout was refused only by the
 /// accident of a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have
 /// been read with a field defaulted (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was
-/// dropped and no retirement is kept, which only the version tells apart.
-const REGIONAL_LAYOUT: u32 = 2;
+/// dropped and no retirement is kept, and A-291's when no object is moved, which only the version tells apart.
+const REGIONAL_LAYOUT: u32 = 3;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
@@ -2159,10 +2161,10 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x02\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x03\x00\x00\x00".as_slice()),
         Some(b"RTCF\x01\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 2 since A-309"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 3 since A-291"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));

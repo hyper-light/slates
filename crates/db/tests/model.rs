@@ -365,6 +365,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       live_holders: None,
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
@@ -377,6 +378,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     access: vec![],
     created_ns: 0,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 

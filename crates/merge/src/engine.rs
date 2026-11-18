@@ -469,6 +469,11 @@ pub struct Green {
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
   accepted: BTreeMap<[u8; 32], u64>,
+  /// How the signature of each version's submit was judged, for every version a signed submit committed (signed work,
+  /// A-321): the version's provenance, kept with the accepted record and bounded as it is (at most one entry per
+  /// committed version), carried by the chain entries and then by the checkpoint that folds them, so a version's verdict
+  /// reads back for as long as the green answers its idempotency record.
+  signatures: BTreeMap<u64, crate::chain_entry::Signature>,
   /// The **rejected-result cache** (§4.16; AUD-16): the conflict windows of increments that were
   /// refused, kept so a retry of the same increment is answered without re-judging — but a conflict
   /// is not in the chain, so nothing else bounds this; it is bounded here by `rejected_budget` bytes,
@@ -892,6 +897,11 @@ impl Green {
         .filter(|(_, version)| **version <= at)
         .map(|(id, version)| (*id, *version))
         .collect(),
+      signatures: self
+        .signatures
+        .range(..=at)
+        .map(|(version, signature)| (*version, *signature))
+        .collect(),
       files: self.changed_content_at(at),
       dirs: self
         .dir_history
@@ -955,6 +965,7 @@ impl Green {
       green.restore_xattr(changed);
     }
     green.accepted = checkpoint.accepted.iter().copied().collect();
+    green.signatures = checkpoint.signatures.iter().copied().collect();
     green.deltas_from = checkpoint.version;
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
@@ -1812,6 +1823,7 @@ impl Green {
       .saturating_add(self.history_lists)
       .saturating_sub(self.history_current)
       .saturating_add(self.special_history_bytes)
+      .saturating_add(self.chunks.held_bytes())
   }
 
   /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
@@ -2813,6 +2825,26 @@ impl Green {
     version
   }
 
+  /// Records how the signature of the submit that committed `version` was judged (signed work, A-321): what the service
+  /// does once the version's chain entry is durable, and recovery as it replays the entry. A version past the head is
+  /// never committed, so it is not recorded, and its answer is `false`.
+  pub fn record_signature(
+    &mut self,
+    version: u64,
+    signature: crate::chain_entry::Signature,
+  ) -> bool {
+    if version == 0 || version > self.head() {
+      return false;
+    }
+    self.signatures.insert(version, signature);
+    true
+  }
+
+  /// How the signature of the submit that committed `version` was judged, if that submit carried one (A-321).
+  pub fn signature(&self, version: u64) -> Option<crate::chain_entry::Signature> {
+    self.signatures.get(&version).copied()
+  }
+
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
   fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
     use crate::chain_entry::Applied;
@@ -3057,6 +3089,42 @@ impl Green {
     }
   }
 
+  /// The feed position the content this green releases now is stamped with (A-273): the position of the next
+  /// message its owner sends its replicas. Each version accepted and each fold of the history is one message, sent in
+  /// order, and the owner calls [`Green::advance_feed`] as it sends one.
+  pub fn feed_position(&self) -> u64 {
+    self.chunks.position()
+  }
+
+  /// The owner sent its replicas the feed message at [`Green::feed_position`] (a version accepted or a fold of the
+  /// history): content released from now on is stamped with the next position (A-273).
+  pub fn advance_feed(&mut self) {
+    self.chunks.advance();
+  }
+
+  /// A replica built from this green now begins reading its content in place (A-273): until it acknowledges the feed
+  /// message that released a chunk, or leaves, that chunk stays where it is, its bytes unchanged and its room unreused.
+  /// The replica's holder id.
+  pub fn hold_content(&mut self) -> u64 {
+    self.chunks.hold()
+  }
+
+  /// `holder` has applied the feed message at `position` and dropped what it released: content every holder has
+  /// passed is freed (A-273).
+  pub fn acknowledge_content(&mut self, holder: u64, position: u64) {
+    self.chunks.acknowledge(holder, position);
+  }
+
+  /// `holder` reads this green's content no more (dropped, rebuilt or ended): it holds no free from now on (A-273).
+  pub fn leave_content(&mut self, holder: u64) {
+    self.chunks.leave(holder);
+  }
+
+  /// The frees of content held for a replica since this green was made: A-273's non-vacuity counter.
+  pub fn content_frees_held(&self) -> u64 {
+    self.chunks.frees_held()
+  }
+
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
   /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
   /// their piece lists, less the current values, and every earlier IPC node.
@@ -3080,6 +3148,7 @@ impl Green {
       .saturating_add(values().map(crate::history::Value::list_bytes).sum())
       .saturating_sub(current)
       .saturating_add(self.special_history_recounted())
+      .saturating_add(self.chunks.held_bytes_recounted())
   }
 
   /// The IPC history's earlier nodes, recounted: every node but each path's latest.

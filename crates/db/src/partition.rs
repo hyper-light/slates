@@ -1202,6 +1202,7 @@ impl Partition {
       | Op::LiveShippingChanged { id, .. }
       | Op::LiveHoldersCommitted { id, .. }
       | Op::VolumeWritePolicySet { id, .. }
+      | Op::VolumeSignersSet { id, .. }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -1535,6 +1536,13 @@ impl Partition {
       // The catalog register carries the policy (A-285), so its version moves as the live-shipping flag's does.
       Op::VolumeWritePolicySet { id, policy } => self.update_volume(*id, |v| {
         v.policy.write = Some(*policy);
+        v.policy.write_version = v.policy.write_version.saturating_add(1);
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
+      // The signers are part of the policy (A-321): its version moves with them, so a captured setting of either names
+      // a version the other has moved past.
+      Op::VolumeSignersSet { id, keys } => self.update_volume(*id, |v| {
+        v.policy.signers.clone_from(keys);
         v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),

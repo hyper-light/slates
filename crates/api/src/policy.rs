@@ -22,7 +22,6 @@ use std::fmt;
 
 use slates_ipc::protocol::{self as wire, VolumeId};
 
-use crate::error::{Error, Unsupported};
 use crate::signed::Verification;
 
 /// What a write mode governs.
@@ -66,9 +65,10 @@ pub struct WritePolicy {
   pub merge: WriteMode,
   /// The mode a landing follows.
   pub land: WriteMode,
-  /// Merges must carry a signature that verifies (signed work, [`crate::signed`]): on a volume, every merge into it;
-  /// on a consumer, every merge it makes. A requirement on what is accepted, never a permission: an unsigned merge into
-  /// such a volume is refused even in bypass, and a signed one still follows its mode.
+  /// Merges must carry a signature that verifies under a trusted signer (signed work, [`crate::signed`], A-321): on a
+  /// green, every merge into it; on a work volume, every merge from it. A requirement on what the volume accepts, never a
+  /// permission: an unsigned or invalid merge is refused even in bypass, and a verified one still follows its mode. A
+  /// volume's rule alone: a consumer's policy that sets it is refused [`crate::Invalid::SignedMergesNotAVolume`].
   pub require_signed_merges: bool,
 }
 
@@ -172,25 +172,21 @@ impl WriteMode {
 }
 
 impl WritePolicy {
-  /// The policy as the wire carries it (A-285). The wire keeps no signed-merge requirement yet, so a policy that sets
-  /// one is refused [`Unsupported::SignedWork`] here, before anything is sent: a requirement the daemon would drop is
-  /// never sent as if it held.
-  pub(crate) fn wire(&self) -> Result<wire::WritePolicy, Error> {
-    if self.require_signed_merges {
-      return Err(Error::Unsupported(Unsupported::SignedWork));
-    }
-    Ok(wire::WritePolicy {
+  /// The policy as the wire carries it (A-285, A-321).
+  pub(crate) fn wire(&self) -> wire::WritePolicy {
+    wire::WritePolicy {
       merge: self.merge.wire(),
       land: self.land.wire(),
-    })
+      require_signed_merges: self.require_signed_merges,
+    }
   }
 
-  /// The policy as the wire names it; no signed-merge requirement, which the wire does not keep yet.
+  /// The policy as the wire names it.
   pub(crate) fn of_wire(policy: wire::WritePolicy) -> WritePolicy {
     WritePolicy {
       merge: WriteMode::of_wire(policy.merge),
       land: WriteMode::of_wire(policy.land),
-      require_signed_merges: false,
+      require_signed_merges: policy.require_signed_merges,
     }
   }
 }
@@ -220,6 +216,21 @@ impl PolicyRefusal {
       act: WriteAct::of_wire(act),
       by: PolicySubject::of_wire(by),
       reason: PolicyReason::Forbidden,
+    }
+  }
+
+  /// The daemon's `SignatureRequired { by, verification }` (A-321): `by` requires signed merges, and the merge's
+  /// signature was absent or did not verify.
+  pub(crate) fn signature_required(
+    by: wire::PolicySubject,
+    verification: wire::Verification,
+  ) -> PolicyRefusal {
+    PolicyRefusal {
+      act: WriteAct::Merge,
+      by: PolicySubject::of_wire(by),
+      reason: PolicyReason::SignatureRequired {
+        verification: Verification::of_wire(verification),
+      },
     }
   }
 }
