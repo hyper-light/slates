@@ -2095,13 +2095,22 @@
 >     of its successor). Continuity: the successor's first head is past every position an owner reported durable under
 >     an earlier epoch, in the samples or a last look at the owner before its loss, since its log goes on from the head
 >     it adopted (`slates_db::live::Shipper::new`).
+>   - ReadSafety is judged in the flows that take nothing over too (2026-11-17): the candidates partitioned in turn (all
+>     four kinds), the random stalls, the slow candidate and the lossy phases read the stream's newest acknowledged
+>     writes through every node mid-fault (halfway through each partition, while the stalls and the slowness last, in
+>     each lossy phase) and again once it ends (`judge_reads`). Every read must answer its write or a refusal, through
+>     the partitioned node too; the owner must answer every one with its write, since its lease needs one healthy
+>     candidate's confirmation of two (§4.8 "Leases and reads"); and at least one read must be judged through every
+>     node, the non-vacuity count (a read is judged once it was sent after its write's acknowledgement, which the
+>     stream publishes as it goes, `NewestAcknowledged`). Agreement is named for what it is, the models' TotalOrder
+>     judged over every copy that answers rather than the committed ones alone.
 >   - The client side of StaleNeverCommits in the owner-partition flows is now every write sent to the old owner while
 >     it was partitioned refused. Until 2026-11-17 the SIGSTOP flow refused every write sent after the resume instead,
 >     but a re-admitted old node forwards a write to the volume's owner (§4.8 "Lookup"), so an acknowledgement through
 >     it after the heal can be right; such writes are held to NoLoss on the successor with every other acknowledged one.
->   - The relay's own six tests (in-process sockets, no daemon) pass on macOS (kiln on Adas-MacBook-Pro-3, 2026-11-17):
->     forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and duplication,
->     attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
+>   - The relay's own six tests (in-process sockets, no daemon) pass on macOS (kiln run r265, Adas-MacBook-Pro-2,
+>     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
+>     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
 >     Linux's census has run nowhere yet.
 >

@@ -6,7 +6,9 @@
 //! `crates/db/tests/live.rs` checks inside one process, here checked from outside the processes:
 //!
 //! - **Agreement**: two copies of a volume's log at one epoch and position carry one chain identity. Every node's `live`
-//!   status lines are sampled throughout the run ([`Sampler`]); the identity binds every entry before the head.
+//!   status lines are sampled throughout the run ([`Sampler`]); the identity binds every entry before the head. This is
+//!   the models' TotalOrder (no two different committed records share an epoch and position,
+//!   `docs/wip/models/FencedRegister.tla`), judged over every copy that answers rather than the committed ones alone.
 //! - **NoLoss**: every write a client was told succeeded is served byte for byte at the end, by whichever node serves the
 //!   volume then; and no file is ever served torn (a write not acknowledged is absent or whole).
 //! - **StaleNeverCommits**: once a volume has been taken over, every copy of its log that answers is fenced at or above
@@ -17,18 +19,22 @@
 //!   log is durable at its head with nothing owed.
 //! - **ReadSafety**: a latest-state read sent through any node after a write's acknowledgement arrived answers that
 //!   write's bytes or a refusal, never other bytes and never missing ([`read_safety`]); read through every survivor after
-//!   a takeover ([`judge_takeover`]), and through a partitioned owner while it runs cut off or the moment it resumes
-//!   ([`an_owner_partitioned`]).
+//!   a takeover ([`judge_takeover`]), through a partitioned owner while it runs cut off or the moment it resumes
+//!   ([`an_owner_partitioned`]), and through every node, a partitioned, stalled or slowed one included, while a flow that
+//!   takes nothing over runs ([`judge_reads`]).
 //! - **Continuity**: a successor's first head is past every position an owner reported durable under an earlier epoch,
 //!   in the samples or in a last look at the owner before its loss, since its log goes on from the head its takeover
 //!   adopted ([`continuity`]).
 //!
 //! Every flow that takes a live volume over ends with NoLoss, StaleNeverCommits, ReadSafety and Continuity, and with
 //! Agreement and Convergence too where it samples the copies and heals them: all but the big-entry flow, which samples
-//! nothing, and the fresh-member flow, whose dropped holders are noted rather than converged. The others judge what
-//! their subject owes: the destroys, that nothing destroyed is served again; the clients killed or cut off, that no
-//! reply is held and a green stays whole, its successor at exactly the head and files committed before (the green's own
-//! Continuity); and the kill at an acknowledgement, NoLoss at that instant, which a last look before the kill would move.
+//! nothing, and the fresh-member flow, whose dropped holders are noted rather than converged. Every flow that partitions,
+//! stalls, slows or loses datagrams while its owner serves throughout ends with Agreement, NoLoss, Convergence and
+//! ReadSafety, its reads sent through every node mid-fault and again once it ends, with the owner answering every one:
+//! its lease needs one healthy candidate's confirmation of two. The others judge what their subject owes: the destroys,
+//! that nothing destroyed is served again; the clients killed or cut off, that no reply is held and a green stays whole,
+//! its successor at exactly the head and files committed before (the green's own Continuity); and the kill at an
+//! acknowledgement, NoLoss at that instant, which a last look before the kill would move.
 //!
 //! SIGSTOP freezes a whole process and drops nothing, so the flows that lose, delay, duplicate or reorder datagrams, or
 //! cut a running node off in one direction or both, put the fault relay of `support/relay.rs` between the daemons
@@ -59,7 +65,7 @@ mod relay;
 
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use relay::{PathRule, Relay, RelayedNode};
@@ -978,6 +984,27 @@ fn chaos_path(file: usize) -> String {
   format!("chaos-{file}")
 }
 
+/// The newest write a stream has had acknowledged, published as the stream goes (goal g229), so a chaos running beside it
+/// reads back writes already acknowledged: [`read_safety`] judges a read only once it was sent after its write's
+/// acknowledgement, and a read of a write still in flight claims nothing. A stream writes its files in order, one at a
+/// time, so the newest acknowledged is the highest.
+#[derive(Default)]
+struct NewestAcknowledged(AtomicUsize);
+
+impl NewestAcknowledged {
+  /// Records that the write of `file` was acknowledged. Stored as `file + 1`, so zero is "none yet".
+  fn mark(&self, file: usize) {
+    self.0.store(file.saturating_add(1), Ordering::Release);
+  }
+
+  /// The `count` files up to and including the newest acknowledged, newest first; empty before any acknowledgement. An
+  /// older one may have been refused, which [`read_safety`] then leaves unjudged; the newest never was.
+  fn newest(&self, count: usize) -> Vec<usize> {
+    let marked = self.0.load(Ordering::Acquire);
+    (marked.saturating_sub(count)..marked).rev().collect()
+  }
+}
+
 /// One streamed write as its client saw it.
 #[derive(Debug, Clone)]
 struct Outcome {
@@ -1014,6 +1041,17 @@ impl Stream<'_> {
   /// Writes `/chaos-N` for each N in `files` until `stop` is set, each once its previous one is answered. A refused
   /// write is recorded and the stream reconnects (the session may be what failed) and goes on with the next file.
   fn run(&self, files: std::ops::Range<usize>, stop: &AtomicBool) -> Vec<Outcome> {
+    self.run_marking(files, stop, None)
+  }
+
+  /// [`Stream::run`], marking each write in `newest` as its acknowledgement arrives, so a chaos running beside the
+  /// stream knows which writes it may read back ([`NewestAcknowledged`]).
+  fn run_marking(
+    &self,
+    files: std::ops::Range<usize>,
+    stop: &AtomicBool,
+    newest: Option<&NewestAcknowledged>,
+  ) -> Vec<Outcome> {
     let mut outcomes = Vec::new();
     let Some((mut client, mut attachment)) = self.attach() else {
       return outcomes;
@@ -1034,6 +1072,10 @@ impl Stream<'_> {
       let took = started.elapsed();
       let refused = written.err().map(|error| error.to_string());
       let failed = refused.is_some();
+      // Marked once `took` is read, so a read sent after the mark is sent after the acknowledgement `read_safety` dates.
+      if !failed && let Some(newest) = newest {
+        newest.mark(file);
+      }
       outcomes.push(Outcome {
         file,
         sent,
@@ -1471,18 +1513,10 @@ fn read_each(instance: &str, volume: &str, files: &[usize], began: &Instant) -> 
 /// answers that write's bytes or a refusal, never other bytes and never missing. A read sent before the
 /// acknowledgement, or of a write never acknowledged, claims nothing. The violations.
 fn read_safety(probes: &[ReadProbe], outcomes: &[Outcome]) -> Vec<String> {
-  let acknowledged: BTreeMap<usize, Duration> = outcomes
-    .iter()
-    .filter(|outcome| outcome.refused.is_none())
-    .map(|outcome| (outcome.file, outcome.sent + outcome.took))
-    .collect();
+  let acknowledged = acknowledged_at(outcomes);
   probes
     .iter()
-    .filter(|probe| {
-      acknowledged
-        .get(&probe.file)
-        .is_some_and(|acknowledged_at| *acknowledged_at <= probe.began)
-    })
+    .filter(|probe| judged(probe, &acknowledged))
     .filter(|probe| matches!(probe.answer, ReadAnswer::Other { .. } | ReadAnswer::Missing))
     .map(|probe| {
       format!(
@@ -1491,6 +1525,23 @@ fn read_safety(probes: &[ReadProbe], outcomes: &[Outcome]) -> Vec<String> {
       )
     })
     .collect()
+}
+
+/// When each acknowledged write of `outcomes` was acknowledged, by file, from the flow's start: its send plus its wait.
+fn acknowledged_at(outcomes: &[Outcome]) -> BTreeMap<usize, Duration> {
+  outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_none())
+    .map(|outcome| (outcome.file, outcome.sent + outcome.took))
+    .collect()
+}
+
+/// Whether [`read_safety`] judges `probe`: it was sent once its file's write had been acknowledged (`acknowledged`, from
+/// [`acknowledged_at`]). A read sent earlier, or of a write never acknowledged, claims nothing.
+fn judged(probe: &ReadProbe, acknowledged: &BTreeMap<usize, Duration>) -> bool {
+  acknowledged
+    .get(&probe.file)
+    .is_some_and(|acknowledged_at| *acknowledged_at <= probe.began)
 }
 
 /// Continuity (`docs/wip/models/FencedRegister.tla`: a promoted epoch's base is at least as new as every record
@@ -1628,6 +1679,100 @@ fn read_through(
     }
     (reads.join().unwrap(), healed)
   })
+}
+
+/// Reads the newest [`READ_PROBES`] writes the stream has had acknowledged (`newest`) through every node of `fleet` at
+/// once, a thread for each ([`read_through`], never healing), while `during` runs on this thread: a fault's own course
+/// (the rest of its length, then its end), so every read is sent while the fault lasts. A node that cannot answer while
+/// it lasts answers once it ends, or refuses; one still silent a fleet wait past its bound has its daemon killed, which
+/// fails the flow. What each read answered.
+fn read_everywhere_during<F: FnOnce()>(
+  fleet: &Fleet,
+  volume: &str,
+  newest: &NewestAcknowledged,
+  began: &Instant,
+  during: F,
+) -> Vec<ReadProbe> {
+  let files = newest.newest(READ_PROBES);
+  let files = files.as_slice();
+  std::thread::scope(|scope| {
+    let readers: Vec<_> = (0..fleet.instances.len())
+      .map(|reader| {
+        scope.spawn(move || read_through(fleet, reader, (volume, files), began, false).0)
+      })
+      .collect();
+    during();
+    readers
+      .into_iter()
+      .flat_map(|reader| reader.join().unwrap())
+      .collect()
+  })
+}
+
+/// [`read_everywhere_during`] with no fault to wait out: the newest acknowledged writes read through every node now.
+fn read_everywhere(
+  fleet: &Fleet,
+  volume: &str,
+  newest: &NewestAcknowledged,
+  began: &Instant,
+) -> Vec<ReadProbe> {
+  read_everywhere_during(fleet, volume, newest, began, || {})
+}
+
+/// ReadSafety over the reads a flow sent through every node (`instances`) while its `owner` served throughout (goal g229;
+/// AC-8.1's ReadSafety, `docs/wip/models/FencedRegister.tla`), against the stream's `outcomes`. Expect: every read sent
+/// after its write's acknowledgement answered that write or a refusal, never other bytes and never missing
+/// ([`read_safety`]): a candidate forwards a latest-state read to the owner, so none may answer from its own copy,
+/// however its partition made it judge the owner; at least one read judged through every node, so reads that all came
+/// before any acknowledgement, or only of writes refused, cannot pass for a held invariant (the non-vacuity count); and
+/// every judged read through the owner answered with its write, since an owner whose lease one healthy candidate
+/// confirms serves its latest state (§4.8 "Leases and reads": `min(f, others)` confirmations, one of two at `f = 1`).
+fn judge_reads(
+  verdict: &mut Verdict,
+  (owner, instances): (&str, &[String]),
+  probes: &[ReadProbe],
+  outcomes: &[Outcome],
+) {
+  let acknowledged = acknowledged_at(outcomes);
+  let judged_reads: Vec<&ReadProbe> = probes
+    .iter()
+    .filter(|probe| judged(probe, &acknowledged))
+    .collect();
+  let mut counts = Vec::new();
+  let mut unjudged = Vec::new();
+  for instance in instances {
+    let through: Vec<&&ReadProbe> = judged_reads
+      .iter()
+      .filter(|probe| probe.through == *instance)
+      .collect();
+    let answered = through
+      .iter()
+      .filter(|probe| probe.answer == ReadAnswer::Current)
+      .count();
+    counts.push(format!(
+      "{instance} {} judged, {answered} answered",
+      through.len()
+    ));
+    if through.is_empty() {
+      unjudged.push(format!(
+        "no read through {instance} was sent after its write's acknowledgement"
+      ));
+    }
+  }
+  verdict.note(format!("reads through every node: {}", counts.join("; ")));
+  verdict.check(
+    "ReadSafety (reads through every node)",
+    read_safety(probes, outcomes),
+  );
+  verdict.check("ReadSafety judged a read through every node", unjudged);
+  verdict.check(
+    "the owner answered every read",
+    judged_reads
+      .iter()
+      .filter(|probe| probe.through == owner && probe.answer != ReadAnswer::Current)
+      .map(|probe| probe.to_string())
+      .collect(),
+  );
 }
 
 /// What a takeover owes beyond NoLoss and the fences, judged from outside the processes (goal g229; AC-8.1's Continuity
@@ -1778,12 +1923,26 @@ fn stream_through<F: FnOnce(&Instant)>(
   files: std::ops::Range<usize>,
   chaos: F,
 ) -> (Vec<Outcome>, Vec<Sample>) {
-  stream_through_holding(instances, owner, volume, files, |began, _| chaos(began))
+  stream_through_holding(instances, owner, volume, files, |began, _, _| chaos(began))
+}
+
+/// [`stream_through`], for a chaos that reads back what the stream has had acknowledged while it runs: it gets the
+/// stream's [`NewestAcknowledged`] too.
+fn stream_through_reading<F: FnOnce(&Instant, &NewestAcknowledged)>(
+  instances: &[String],
+  owner: &str,
+  volume: &str,
+  files: std::ops::Range<usize>,
+  chaos: F,
+) -> (Vec<Outcome>, Vec<Sample>) {
+  stream_through_holding(instances, owner, volume, files, |began, _, newest| {
+    chaos(began, newest);
+  })
 }
 
 /// [`stream_through`], for a chaos that stops a node and leaves it stopped past the stream's end: it gets the
-/// [`SamplerHolds`] to take that node out of the sampling first.
-fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds)>(
+/// [`SamplerHolds`] to take that node out of the sampling first, and the stream's [`NewestAcknowledged`].
+fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds, &NewestAcknowledged)>(
   instances: &[String],
   owner: &str,
   volume: &str,
@@ -1792,6 +1951,7 @@ fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds)>(
 ) -> (Vec<Outcome>, Vec<Sample>) {
   let began = Instant::now();
   let holds = SamplerHolds::new(instances.len());
+  let newest = NewestAcknowledged::default();
   let stop_stream = AtomicBool::new(false);
   let stop_sampling = AtomicBool::new(false);
   std::thread::scope(|scope| {
@@ -1810,7 +1970,7 @@ fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds)>(
         volume: volume_id_of(volume),
         began,
       }
-      .run(files, &stop_stream)
+      .run_marking(files, &stop_stream, Some(&newest))
     });
     // Both threads stop however the chaos ends: a failed assertion in it unwinds through this guard, and the scope,
     // which joins its threads before it passes a panic on, would otherwise wait on threads that never stop.
@@ -1824,8 +1984,10 @@ fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds)>(
     let stop = StopAll(&stop_stream, &stop_sampling);
     // The chaos's own failure is passed on only after the stream is in hand, or a write never answered would hang the
     // scope's join behind it (one run did until its timeout, 2026-11-06).
-    let failed =
-      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chaos(&began, &holds))).err();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      chaos(&began, &holds, &newest)
+    }))
+    .err();
     drop(stop);
     // A write the daemon never answers would hang the join for good (one run hung 20 minutes, 2026-11-06): past the
     // fleet wait, the fleet is shown whole and its daemons killed, so the client is told and the flow fails.
@@ -2192,10 +2354,12 @@ fn judge_healed(
 const CANDIDATE_PARTITION: Duration = Duration::from_secs(2);
 
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and partition each candidate
-/// in turn for [`CANDIDATE_PARTITION`] as `partition` says, the stream running throughout, then end the partition.
+/// in turn for [`CANDIDATE_PARTITION`] as `partition` says, the stream running throughout, then end the partition; read
+/// the newest acknowledged writes through every node halfway through each partition and again once it has ended.
 /// Expect every write acknowledged (durable through whichever candidate answers), none lost, both candidates caught up
-/// once healed, one chain identity at every head any copy reported, and no takeover ([`no_takeover`]): a partitioned
-/// candidate is not its owner's loss, however the partition makes it judge the owner.
+/// once healed, one chain identity at every head any copy reported, no takeover ([`no_takeover`]): a partitioned
+/// candidate is not its owner's loss, however the partition makes it judge the owner; and every read answering its
+/// write or a refusal, through the partitioned candidate too, the owner's every one its write ([`judge_reads`]).
 fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Partition) {
   if !gated(tag) {
     return;
@@ -2207,25 +2371,24 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
   let volume = fleet.create_volume(&owner, tag, true);
   let mut verdict = Verdict::new(flow);
   let mut epoch_before = None;
-  let (outcomes, samples) = stream_through(
+  let mut probes = Vec::new();
+  let (outcomes, samples) = stream_through_reading(
     &fleet.instances,
     &owner,
     &volume,
     0..STREAM_FILES,
-    |began| {
+    |began, newest| {
       for index in fleet.others(owner_index) {
         after_writes(&owner, &volume, BETWEEN_EVENTS);
         if epoch_before.is_none() {
           epoch_before = Some(serving_epoch(&owner, &volume));
         }
-        partition.begin(&fleet, index);
-        let from = began.elapsed();
-        sleep(CANDIDATE_PARTITION);
-        partition.end(&fleet, index);
+        let ((from, to), read) =
+          partition_a_candidate(&fleet, (index, &volume), partition, (began, newest));
+        probes.extend(read);
         verdict.note(format!(
-          "{} {partition:?} from {from:?} to {:?}",
-          fleet.instances[index],
-          began.elapsed()
+          "{} {partition:?} from {from:?} to {to:?}",
+          fleet.instances[index]
         ));
       }
       after_writes(&owner, &volume, BETWEEN_EVENTS);
@@ -2244,11 +2407,35 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
     "no takeover while the owner served (a partitioned candidate deposes no one)",
     no_takeover(&owner, &candidates, &volume, epoch_before.unwrap_or(0)),
   );
+  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
   if let Some(relay) = &fleet.relay {
     verdict.note(relay.report().summary());
   }
   drop(fleet);
   verdict.judge();
+}
+
+/// Partitions `fleet`'s node `index` as `partition` says for [`CANDIDATE_PARTITION`], reading the stream's newest
+/// acknowledged writes (`newest`) through every node halfway in, when the partitioned node has judged its peers from its
+/// side for a liveness budget, and again once the partition has ended ([`read_everywhere_during`]). When the partition
+/// began and ended (from the stream's start, `began`), and the reads.
+fn partition_a_candidate(
+  fleet: &Fleet,
+  (index, volume): (usize, &str),
+  partition: Partition,
+  (began, newest): (&Instant, &NewestAcknowledged),
+) -> ((Duration, Duration), Vec<ReadProbe>) {
+  partition.begin(fleet, index);
+  let from = began.elapsed();
+  sleep(CANDIDATE_PARTITION / 2);
+  let mut ended = from;
+  let mut probes = read_everywhere_during(fleet, volume, newest, began, || {
+    sleep(CANDIDATE_PARTITION / 2);
+    partition.end(fleet, index);
+    ended = began.elapsed();
+  });
+  probes.extend(read_everywhere(fleet, volume, newest, began));
+  ((from, ended), probes)
 }
 
 /// That no survivor took `volume` over while its owner still served it: the owner ships under the epoch it shipped under
@@ -2314,8 +2501,10 @@ fn candidates_muted_in_turn_lose_nothing_and_depose_no_one() {
 
 /// A-200 under injected jitter: do stream writes to a live volume while each candidate's process is stopped for a
 /// random [`STALL_MIN`]–[`STALL_MAX`] at random gaps of up to [`GAP_MAX`], the two independently (so at times both are
-/// stopped and no write can become durable until one resumes). Expect every write acknowledged and none lost, both
-/// candidates caught up, one identity at every head; the client-seen p50, p99, p999 and max are printed.
+/// stopped and no write can become durable until one resumes); read the newest acknowledged writes through every node
+/// halfway through the stalls and once they have ended. Expect every write acknowledged and none lost, both candidates
+/// caught up, one identity at every head, and every read answering its write or a refusal, the owner's every one its
+/// write ([`judge_reads`]); the client-seen p50, p99, p999 and max are printed.
 #[test]
 fn writes_stream_through_random_candidate_stalls() {
   /// Shape: the shortest stall: a scheduling hiccup.
@@ -2341,10 +2530,15 @@ fn writes_stream_through_random_candidate_stalls() {
     .map(|index| fleet.daemon_pid(index))
     .collect();
   let mut stalls = 0u64;
-  let (outcomes, samples) =
-    stream_through(&fleet.instances, &owner, &volume, 0..STREAM_FILES, |_| {
+  let mut probes = Vec::new();
+  let (outcomes, samples) = stream_through_reading(
+    &fleet.instances,
+    &owner,
+    &volume,
+    0..STREAM_FILES,
+    |began, newest| {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
-      stalls = std::thread::scope(|scope| {
+      std::thread::scope(|scope| {
         let handles: Vec<_> = pids
           .iter()
           .enumerate()
@@ -2371,13 +2565,18 @@ fn writes_stream_through_random_candidate_stalls() {
             })
           })
           .collect();
-        handles
+        // Halfway through the stalls, read through every node while they go on.
+        sleep(STALLING / 2);
+        probes.extend(read_everywhere(&fleet, &volume, newest, began));
+        stalls = handles
           .into_iter()
           .map(|handle| handle.join().unwrap())
-          .sum()
+          .sum();
       });
       after_writes(&owner, &volume, BETWEEN_EVENTS);
-    });
+      probes.extend(read_everywhere(&fleet, &volume, newest, began));
+    },
+  );
   verdict.note(format!("{stalls} stalls over {STALLING:?}"));
   let refused: Vec<&Outcome> = outcomes.iter().filter(|o| o.refused.is_some()).collect();
   verdict.check(
@@ -2392,6 +2591,7 @@ fn writes_stream_through_random_candidate_stalls() {
     &outcomes,
     &samples,
   );
+  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
   drop(fleet);
   verdict.judge();
 }
@@ -3660,7 +3860,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     &owner,
     &volume,
     0..STREAM_FILES,
-    |began, holds| {
+    |began, holds, _| {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
       let holders = wait_holders(&fleet_cell.borrow(), &volume, 2);
       // A member that holds none of the log is replaced: its successor joins under a fresh identity. One without a seat
@@ -4331,11 +4531,12 @@ fn light_loss() -> PathRule {
 
 /// A-200 over lossy, delayed paths (goal g229; AC-8.1 and AC-8.2's invariants across real processes; the fault relay,
 /// A-277): do stream writes to a live volume while every path of the fleet holds each datagram 20 ms ± 5 ms one way and
-/// loses 1 % of them, then 5 %, then 1 % with 2 % duplicated; heal; then, back under the light profile, SIGKILL the
-/// owner and write through the survivor that takes the volume over. Expect every write acknowledged and none lost or
-/// torn, both candidates at the owner's head once healed, one identity at every head; and the takeover, over the lossy
-/// paths, serving every acknowledged write, every surviving copy fenced at its epoch, and held to Continuity and
-/// ReadSafety ([`judge_takeover`]).
+/// loses 1 % of them, then 5 %, then 1 % with 2 % duplicated, reading the newest acknowledged writes through every node
+/// in each phase; heal and read again; then, back under the light profile, SIGKILL the owner and write through the
+/// survivor that takes the volume over. Expect every write acknowledged and none lost or torn, both candidates at the
+/// owner's head once healed, one identity at every head, every read answering its write or a refusal, the owner's every
+/// one its write ([`judge_reads`]); and the takeover, over the lossy paths, serving every acknowledged write, every
+/// surviving copy fenced at its epoch, and held to Continuity and ReadSafety ([`judge_takeover`]).
 #[test]
 fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
   if !gated("lossy-paths") {
@@ -4348,12 +4549,13 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
   let volume = fleet.create_volume(&owner, "lossy", true);
   let mut verdict = Verdict::new("writes through lossy paths, then a takeover over them");
-  let (outcomes, samples) = stream_through(
+  let mut probes = Vec::new();
+  let (outcomes, samples) = stream_through_reading(
     &fleet.instances,
     &owner,
     &volume,
     0..STREAM_FILES,
-    |began| {
+    |began, newest| {
       let relay = fleet.relay();
       for (phase, rule) in [
         ("1 % lost", light_loss()),
@@ -4378,8 +4580,10 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
           began.elapsed()
         ));
         after_writes(&owner, &volume, BETWEEN_EVENTS);
+        probes.extend(read_everywhere(&fleet, &volume, newest, began));
       }
       relay.heal();
+      probes.extend(read_everywhere(&fleet, &volume, newest, began));
     },
   );
   verdict.check("every write acknowledged", refused_lines(&outcomes));
@@ -4391,6 +4595,7 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
     &outcomes,
     &samples,
   );
+  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
   fleet.relay().shape_all(light_loss());
   // The owner's last word before its loss, for Continuity: what it held durable then.
   let last_look = live_states(&owner, &volume).unwrap_or_default();
@@ -4440,9 +4645,11 @@ const SLOW_WRITES: u64 = 4 * BETWEEN_EVENTS;
 
 /// A-200 and AC-8.12's straggler immunity across real processes (goal g229, injected latency on one replica; T-8.3's
 /// slow candidate, whose probation half is not built): do stream writes to a live volume, then hold every datagram to and
-/// from one candidate 200 ms ± 50 ms each way for [`SLOW_WRITES`] durable writes, then heal. Expect every write
-/// acknowledged and none lost, both candidates caught up once healed, one identity at every head, and no write waiting
-/// on the slow candidate ([`slow_candidate_waited`]).
+/// from one candidate 200 ms ± 50 ms each way for [`SLOW_WRITES`] durable writes, reading the newest acknowledged writes
+/// through every node as it begins, then heal and read again. Expect every write acknowledged and none lost, both
+/// candidates caught up once healed, one identity at every head, no write waiting on the slow candidate
+/// ([`slow_candidate_waited`]), and every read answering its write or a refusal, the owner's every one its write
+/// ([`judge_reads`]).
 #[test]
 fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
   if !gated("slow-candidate") {
@@ -4456,12 +4663,13 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
   let volume = fleet.create_volume(&owner, "slow", true);
   let mut verdict = Verdict::new("writes past a slow candidate");
   let mut slowed = (Duration::ZERO, Duration::ZERO);
-  let (outcomes, samples) = stream_through(
+  let mut probes = Vec::new();
+  let (outcomes, samples) = stream_through_reading(
     &fleet.instances,
     &owner,
     &volume,
     0..STREAM_FILES,
-    |began| {
+    |began, newest| {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
       fleet.relay().shape_node(
         slow,
@@ -4472,10 +4680,21 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
         },
       );
       let from = began.elapsed();
-      after_writes(&owner, &volume, SLOW_WRITES);
-      slowed = (from, began.elapsed());
+      let mut to = from;
+      probes.extend(read_everywhere_during(
+        &fleet,
+        &volume,
+        newest,
+        began,
+        || {
+          after_writes(&owner, &volume, SLOW_WRITES);
+          to = began.elapsed();
+        },
+      ));
+      slowed = (from, to);
       fleet.relay().heal();
       after_writes(&owner, &volume, BETWEEN_EVENTS);
+      probes.extend(read_everywhere(&fleet, &volume, newest, began));
     },
   );
   verdict.note(format!(
@@ -4495,6 +4714,7 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
     &outcomes,
     &samples,
   );
+  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
   verdict.note(fleet.relay().report().summary());
   drop(fleet);
   verdict.judge();

@@ -6431,7 +6431,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   these and the SIGSTOP and SIGKILL ones, now also judges ReadSafety (a read through any survivor, or through the
 >   partitioned owner while it is cut off or the moment its stopped process resumes, never answers less than was
 >   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
->   from outside the processes.
+>   from outside the processes. The flows that take nothing over (candidates partitioned, stalled or slowed, and the
+>   lossy phases) read through every node mid-fault and after it, held to ReadSafety too, with the owner answering every
+>   read: its lease needs one healthy candidate's confirmation of two.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
