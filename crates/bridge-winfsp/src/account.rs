@@ -153,8 +153,11 @@ mod tests {
     let mut buffer = vec![0u64; words];
     let mut bytes: Vec<u8> = vec![0; words * size_of::<u64>()];
     bytes[2 * size_of::<u64>()..][..sid.len()].copy_from_slice(&sid);
-    for (word, chunk) in buffer.iter_mut().zip(bytes.chunks_exact(size_of::<u64>())) {
-      *word = u64::from_ne_bytes(chunk.try_into().unwrap());
+    for (word, chunk) in buffer
+      .iter_mut()
+      .zip(bytes.as_chunks::<{ size_of::<u64>() }>().0)
+    {
+      *word = u64::from_ne_bytes(*chunk);
     }
     let base = u64::try_from(buffer.as_ptr().addr()).unwrap();
     buffer[0] = base + 2 * 8;
