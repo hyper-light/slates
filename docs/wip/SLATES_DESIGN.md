@@ -8585,7 +8585,9 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > its records lack, or inputs it no longer holds, installs nothing (counted); another identity refuses the green on the
 > holder for good, as a record's mismatch does. Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
 > (`crates/server/tests/fleet.rs`: holder b restarted over its segment, holder c withholding records, so version 2
-> commits only through b's rebuilt replica); its red check and runs are in the bug record of 2026-11-18.
+> commits only through b's rebuilt replica): with the rebuild removed, b answered version 2's record out of order 4,586
+> times and version 2 never placed within 60 s; with it, version 2 placed in 2.56 s (kiln r1017; the bug record of
+> 2026-11-18).
 
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
@@ -22736,8 +22738,8 @@ Applied in the same change to:
   identity, as a record's own recomputation does.
 - **Why.** The failure matrix masked an owner's restart and not a holder's. Goal g232 runs one primary and two replicas
   at `f = 1`: each version commits at the owner and one holder, so one holder's restart left the green one answer from
-  stalling, and a second restart, or the other holder's loss, stalled every submit. The red check and the runs are in
-  the bug record.
+  stalling, and a second restart, or the other holder's loss, stalled every submit. Red: the restarted holder refused
+  version 2's record out of order 4,586 times and it never placed within 60 s; green: placed in 2.56 s (kiln r1017).
 - **Cost.** Only at a restart, and only for a green whose record arrives: one version's recomputation per version the
   holder accepted, as its first acceptance cost, in slices. A rebuilt replica holds what the replica held before the
   restart; its growth per version is the open item it was (GAPS).

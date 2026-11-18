@@ -1493,8 +1493,10 @@
 > replicas at `f = 1`, one replica's restart left every version one holder's answer from stalling, and a second stalled
 > the green. Now the holder rebuilds the replica from its records and held inputs a slice at a time before it judges the
 > record (`merge_origin::rebuild_replica`). Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
-> (`crates/server/tests/fleet.rs`), with its red check in the bug record
-> (`docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`). Still open, found beside it:
+> (`crates/server/tests/fleet.rs`): red, the restarted holder answered version 2's record out of order 4,586 times and
+> version 2 never placed within the test's 60 s; green, placed in 2.56 s with one rebuild counted (kiln r1017,
+> 2026-11-18; `docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`). Still open,
+> found beside it:
 > - a restarted holder's `merge.refused` (a green refused for good after a mismatch) is in memory too, so the restarted
 >   holder rebuilds such a green and refuses it again only at the version that mismatched;
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three

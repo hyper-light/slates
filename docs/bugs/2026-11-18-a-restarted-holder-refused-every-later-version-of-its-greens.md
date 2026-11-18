@@ -30,6 +30,18 @@ submit answered `Submitted { version: Some(2) }`, version 2 placed at the quorum
 replica at version 2, `merge.replica.rebuilt` moved on b and `merge.record_withheld` on c. The runs, red and green,
 follow.
 
+Run r1017 (kiln, 2026-11-18, the Mac Studio `d1323898`, debug build, a clone of `agents/g232-100-000-clients-holder-restart`
+at 2b7b35ef9; logs `~/.cache/g232-logs/holder-restart-4/` there):
+- **Red** (the rebuild's hook replaced by `Rebuild::Nothing` in a copy, main's behaviour): the first submit was accepted
+  as version 1 on both holders in 102 ms; after its restart holder b held no replica (`version: None`) and answered
+  every record of version 2 `merge.out_of_order`, 4,586 times while the owner shipped it again each pass, and c withheld
+  4,590; the second submit ended `DeadlineExceeded` at the test's 60 s bound, version 2 never placed, and b was still
+  without a replica. Failed after 470.9 s.
+- **Green**: the same steps answered `Submitted { version: Some(2) }` and placed version 2; b went from no replica after
+  its restart to version 2, counted `merge.replica.rebuilt` 1, `merge.replica.rebuilt_versions` 1 and
+  `merge.replica.seed_slices` 4; c withheld 5 records. Passed in 2.56 s.
+- Unit: `merge_origin`'s 6 tests, the two new ones among them, passed.
+
 ## Root cause
 
 The replica is derived state: everything it holds follows from the records the holder accepted and the inputs they
