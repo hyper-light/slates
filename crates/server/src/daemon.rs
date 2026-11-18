@@ -6481,6 +6481,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       };
       let record = Record {
         owner,
@@ -7580,6 +7581,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       };
       let record = Record {
         owner,

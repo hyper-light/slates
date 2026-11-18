@@ -13,6 +13,16 @@
 //!   the serving owner's epoch, and a write made through the superseded owner is refused, never acknowledged.
 //! - **Convergence**: once healed, every candidate holds the owner's head (epoch, position and identity), and the owner's
 //!   log is durable at its head with nothing owed.
+//! - **ReadSafety** (so far in the flows that partition a running owner): a latest-state read sent through a node after a
+//!   write's acknowledgement arrived answers that write's bytes or a refusal, never other bytes and never missing
+//!   ([`read_safety`]).
+//! - **Continuity** (so far in the relayed flows' takeovers): a successor's first head is past every position an owner
+//!   reported durable under an earlier epoch, since its log goes on from the head its takeover adopted ([`continuity`]).
+//!
+//! SIGSTOP freezes a whole process and drops nothing, so the flows that lose, delay, duplicate or reorder datagrams, or
+//! cut a running node off in one direction or both, put the fault relay of `support/relay.rs` between the daemons
+//! ([`Fleet::start_relayed`]): each node advertises a port block the relay owns and binds its own (the manifest's `bind`,
+//! A-277), with no privilege, where T-8.7 named iptables or pf, which R10 rules out. Every relayed flow prints its seed.
 //!
 //! Each flow prints the client-seen latency of its writes (p50, p99, p999, max). The fleet helpers are copies of
 //! `live_fleet.rs`'s (where they are private), extended with anchored nodes, so a daemon can be killed and succeeded.
@@ -32,12 +42,17 @@
 #[allow(dead_code)]
 mod nfs;
 
+// The fault relay the relayed flows put between the daemons (goal g229, A-277).
+#[path = "support/relay.rs"]
+mod relay;
+
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, Deadlines, Intent, ReadAt, VolumeId};
+use relay::{PathRule, Relay, RelayedNode};
+use slates_client::{Client, ClientError, Deadlines, Intent, ReadAt, Refusal, VolumeId};
 
 /// Shape: how long a fleet step may take on a loaded box: the formation wait of the process flows.
 const FLEET_WAIT: Duration = Duration::from_secs(40);
@@ -173,6 +188,47 @@ fn write_manifest(dir: &str, names: &[&str], bases: &[u16]) -> String {
   let path = format!("{dir}/fleet.json");
   std::fs::write(&path, manifest.to_string()).unwrap();
   path
+}
+
+/// [`write_manifest`] for a fleet behind the fault relay (A-277): each node advertised at the relay's block for it and
+/// bound at its own, so every datagram between two nodes passes through the relay.
+#[allow(clippy::disallowed_methods)]
+fn write_relayed_manifest(dir: &str, names: &[&str], advertised: &[u16], bound: &[u16]) -> String {
+  let nodes: Vec<serde_json::Value> = names
+    .iter()
+    .zip(advertised.iter().zip(bound))
+    .map(|(node, (advertised, bound))| {
+      serde_json::json!({
+        "node": node,
+        "address": format!("127.0.0.1:{advertised}"),
+        "bind": format!("127.0.0.1:{bound}"),
+        "certificate": format!("{node}.crt.der"),
+        "key": format!("{node}.key.der"),
+      })
+    })
+    .collect();
+  let manifest = serde_json::json!({ "name": FLEET_NAME, "f": FLEET_F, "nodes": nodes });
+  let path = format!("{dir}/fleet.json");
+  std::fs::write(&path, manifest.to_string()).unwrap();
+  path
+}
+
+/// Format: the variable that fixes the relay's seed, to replay a run's draws; each relayed flow prints its seed.
+const CHAOS_SEED: &str = "SLATES_CHAOS_SEED";
+
+/// The relay's seed for flow `tag`: [`CHAOS_SEED`] when set, else this process's id mixed with the tag, so each run
+/// draws its own schedule and names it.
+fn chaos_seed(tag: &str) -> u64 {
+  std::env::var(CHAOS_SEED)
+    .ok()
+    .and_then(|text| text.parse().ok())
+    .unwrap_or_else(|| {
+      tag
+        .bytes()
+        .fold(u64::from(std::process::id()), |seed, byte| {
+          seed.rotate_left(8) ^ u64::from(byte)
+        })
+    })
 }
 
 struct HeldBlock {
@@ -589,6 +645,9 @@ struct Fleet {
   bootstrap: usize,
   /// The manifest's node names, one per node index.
   nodes: &'static [&'static str],
+  /// The fault relay every datagram between the nodes passes through, for a fleet started relayed
+  /// ([`Fleet::start_relayed`]). Last, so it stops after the processes are gone.
+  relay: Option<Relay>,
 }
 
 impl Fleet {
@@ -599,6 +658,30 @@ impl Fleet {
 
   /// Starts the nodes `nodes` names from one manifest, waits until they form, and bootstraps the root once.
   fn start_with(tag: &str, supervision: Supervision, nodes: &'static [&'static str]) -> Fleet {
+    Fleet::launch(tag, supervision, nodes, false)
+  }
+
+  /// [`Fleet::start_with`] behind the fault relay (goal g229, A-277): each node advertises a block the relay holds and
+  /// binds one of its own, so every datagram between two nodes passes the relay, where a flow can cut, delay, lose or
+  /// duplicate it ([`Fleet::relay`]) while every process runs on. The relay forwards everything at once until told.
+  fn start_relayed(tag: &str, supervision: Supervision, nodes: &'static [&'static str]) -> Fleet {
+    Fleet::launch(tag, supervision, nodes, true)
+  }
+
+  /// The fault relay of a fleet started with [`Fleet::start_relayed`].
+  fn relay(&self) -> &Relay {
+    self
+      .relay
+      .as_ref()
+      .expect("a relayed fleet (Fleet::start_relayed)")
+  }
+
+  fn launch(
+    tag: &str,
+    supervision: Supervision,
+    nodes: &'static [&'static str],
+    relayed: bool,
+  ) -> Fleet {
     let pid = std::process::id();
     let scratch = scratch_dir(tag);
     for node in nodes {
@@ -606,7 +689,33 @@ impl Fleet {
     }
     let blocks = port_blocks(nodes.len());
     let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
-    let manifest = write_manifest(&scratch.path, nodes, &bases);
+    let (manifest, relay) = if relayed {
+      // The relay's blocks are held while the nodes' are, so the two sets never share a port.
+      let advertised = port_blocks(nodes.len());
+      let advertised_bases: Vec<u16> = advertised.iter().map(|held| held.base).collect();
+      let manifest = write_relayed_manifest(&scratch.path, nodes, &advertised_bases, &bases);
+      let seed = chaos_seed(tag);
+      let relay = Relay::start(
+        advertised
+          .into_iter()
+          .zip(&bases)
+          .map(|(held, base)| RelayedNode {
+            advertised: held.sockets.try_into().unwrap(),
+            bound: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, *base),
+          })
+          .collect(),
+        seed,
+      );
+      // A node's serve sockets are its bind block, known up front; only its record links' ports need a census.
+      for (index, base) in bases.iter().enumerate() {
+        relay.claim(*base, index);
+        relay.claim(base.checked_add(1).unwrap(), index);
+      }
+      eprintln!("chaos: fleet {tag} relayed, seed {seed} (set {CHAOS_SEED} to replay its draws)");
+      (manifest, Some(relay))
+    } else {
+      (write_manifest(&scratch.path, nodes, &bases), None)
+    };
     let instances: Vec<String> = nodes
       .iter()
       .map(|node| format!("chaos-{tag}-{node}-{pid}"))
@@ -619,8 +728,12 @@ impl Fleet {
       .iter()
       .zip(&instances)
       .zip(&blocks)
-      .map(|((node, instance), held)| {
+      .enumerate()
+      .map(|(index, ((node, instance), held))| {
         let process = start_node(instance, &manifest, node, held, supervision);
+        if let Some(relay) = &relay {
+          relay.root(index, process.child.id());
+        }
         wait_answers(instance);
         Some(process)
       })
@@ -653,6 +766,7 @@ impl Fleet {
       supervision,
       bootstrap,
       nodes,
+      relay,
     }
   }
 
@@ -740,13 +854,18 @@ impl Fleet {
   /// member identity), as a replaced machine or pod is.
   fn replace_node(&mut self, index: usize) {
     assert!(self.processes[index].is_none());
-    self.processes[index] = Some(start_node(
+    let process = start_node(
       &self.instances[index],
       &self.manifest,
       self.nodes[index],
       &self.blocks[index],
       self.supervision,
-    ));
+    );
+    // The replacement's processes are the node's now: the relay attributes its sockets by them.
+    if let Some(relay) = &self.relay {
+      relay.root(index, process.child.id());
+    }
+    self.processes[index] = Some(process);
     wait_answers(&self.instances[index]);
   }
 
@@ -1244,6 +1363,137 @@ fn fenced_at_or_above(instances: &[&str], volume: &str, epoch: u64) -> Vec<Strin
         .map(move |state| format!("{instance} holds a copy fenced below {epoch}: {state:?}"))
     })
     .collect()
+}
+
+/// What a latest-state read through one node answered its client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReadAnswer {
+  /// The file's own bytes.
+  Current,
+  /// Other bytes than the file's write.
+  Other { length: usize },
+  /// Missing: `NotFound`. An owner-location round never answers `NotFound` for a view it cannot reach
+  /// (`owner_location::LocationError`), so this is a claim that the file does not exist.
+  Missing,
+  /// Any other refusal: an answer that claims nothing about the file.
+  Refused(String),
+}
+
+impl std::fmt::Display for ReadAnswer {
+  fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      ReadAnswer::Current => write!(out, "its own bytes"),
+      ReadAnswer::Other { length } => write!(out, "other bytes ({length} of them)"),
+      ReadAnswer::Missing => write!(out, "missing"),
+      ReadAnswer::Refused(why) => write!(out, "refused: {why}"),
+    }
+  }
+}
+
+/// One latest-state read through one node, as its client saw it.
+#[derive(Clone, Debug)]
+struct ReadProbe {
+  file: usize,
+  /// When the read was sent, from the flow's start.
+  began: Duration,
+  answer: ReadAnswer,
+}
+
+impl std::fmt::Display for ReadProbe {
+  fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      out,
+      "{} read at {:?}: {}",
+      chaos_path(self.file),
+      self.began,
+      self.answer
+    )
+  }
+}
+
+/// Reads each of `files` once through `instance` at the head, in order, timing each from `began`: what each answered.
+/// A client that cannot connect answers every read refused.
+fn read_each(instance: &str, volume: &str, files: &[usize], began: &Instant) -> Vec<ReadProbe> {
+  let id = volume_id_of(volume);
+  let mut client = Client::connect(instance, deadlines());
+  files
+    .iter()
+    .map(|file| {
+      let at = began.elapsed();
+      let answer = match client
+        .as_mut()
+        .map(|client| client.read(id, &format!("/{}", chaos_path(*file)), ReadAt::Head))
+      {
+        Ok(Ok(bytes)) if bytes == chaos_body(*file) => ReadAnswer::Current,
+        Ok(Ok(bytes)) => ReadAnswer::Other {
+          length: bytes.len(),
+        },
+        Ok(Err(ClientError::Refused(Refusal::NotFound))) => ReadAnswer::Missing,
+        Ok(Err(error)) => ReadAnswer::Refused(error.to_string()),
+        Err(error) => ReadAnswer::Refused(format!("connect: {error}")),
+      };
+      ReadProbe {
+        file: *file,
+        began: at,
+        answer,
+      }
+    })
+    .collect()
+}
+
+/// ReadSafety (`docs/wip/models/FencedRegister.tla` and `Reconfig.tla`: every read quorum holds a record at least as new
+/// as every committed one), as a client sees it: a latest-state read sent after a write's acknowledgement arrived
+/// answers that write's bytes or a refusal, never other bytes and never missing. A read sent before the
+/// acknowledgement, or of a write never acknowledged, claims nothing. The violations.
+fn read_safety(probes: &[ReadProbe], outcomes: &[Outcome]) -> Vec<String> {
+  let acknowledged: BTreeMap<usize, Duration> = outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_none())
+    .map(|outcome| (outcome.file, outcome.sent + outcome.took))
+    .collect();
+  probes
+    .iter()
+    .filter(|probe| {
+      acknowledged
+        .get(&probe.file)
+        .is_some_and(|acknowledged_at| *acknowledged_at <= probe.began)
+    })
+    .filter(|probe| matches!(probe.answer, ReadAnswer::Other { .. } | ReadAnswer::Missing))
+    .map(|probe| {
+      format!(
+        "{probe}, though acknowledged at {:?}",
+        acknowledged.get(&probe.file)
+      )
+    })
+    .collect()
+}
+
+/// Continuity (`docs/wip/models/FencedRegister.tla`: a promoted epoch's base is at least as new as every record
+/// committed below it), the live log's side. A successor's log starts at the head its takeover adopted and its
+/// positions go on from there (`slates_db::live::Shipper::new`'s `start`), and it ships only from its first publication,
+/// so `first_head` is its head after its first acknowledged write: the adopted position plus one, or more if its record
+/// period appended too. That head must be past every position an owner reported durable under an epoch below `epoch`,
+/// which never fails falsely: an adopted head at or past those positions puts the first head beyond them. With no head
+/// shown (no write acknowledged), nothing is judged here; the flow's own check of that write says so. The highest
+/// earlier durable position, and the violations.
+fn continuity(
+  samples: &[Sample],
+  first_head: Option<u64>,
+  epoch: u64,
+) -> (Option<u64>, Vec<String>) {
+  let durable_before = samples
+    .iter()
+    .filter(|sample| !sample.state.holding && sample.state.fence < epoch)
+    .filter_map(|sample| sample.state.durable)
+    .max();
+  let violations = match (durable_before, first_head) {
+    (Some(durable), Some(head)) if head <= durable => vec![format!(
+      "the successor's head after its first write under epoch {epoch} is position {head}, not past position \
+       {durable} made durable under an earlier epoch: it adopted a head below it"
+    )],
+    _ => Vec::new(),
+  };
+  (durable_before, violations)
 }
 
 /// The register invariants a flow ends with, printed whole; panics naming every violation.
@@ -3788,4 +4038,446 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
   }
   drop(fleet);
   verdict.judge();
+}
+
+// ── Flows behind the fault relay (goal g229, A-277): loss across real processes, and an owner partitioned while it runs ─
+
+/// Shape: the one-way hold of every path under the lossy profile: a metro WAN's 20 ms, a quarter of KIND's `wan` profile
+/// (80 ms ± 20 ms), so each write's round trip leaves the flow well inside the fleet wait.
+const LOSSY_HOLD: Duration = Duration::from_millis(20);
+/// Shape: the hold's spread, a quarter of it, as KIND's profile spreads 80 ms by 20.
+const LOSSY_SPREAD: Duration = Duration::from_millis(5);
+/// Shape: the light loss, KIND's `wan-loss` rate (1 %).
+const LIGHT_LOSS_PPM: u32 = 10_000;
+/// Shape: the heavy loss, five times the light.
+const HEAVY_LOSS_PPM: u32 = 50_000;
+/// Shape: the duplication of the last lossy phase (2 %).
+const DUPLICATE_PPM: u32 = 20_000;
+/// Shape: how many files a successor's first write may take: one each until one is acknowledged, so a refusal while it
+/// finishes its takeover is not taken for a head it never showed.
+const FIRST_WRITE_FILES: usize = 20;
+/// Shape: the reads through a partitioned owner, of the last writes its successor acknowledged.
+const READ_PROBES: usize = 5;
+/// Shape: how long reads through a partitioned owner may take before the flow heals the partition anyway: many times its
+/// lease bound and liveness budget, each about a second.
+const READ_WAIT: Duration = Duration::from_secs(10);
+
+/// The light lossy profile: every datagram held 20 ms ± 5 ms one way, 1 % lost.
+fn light_loss() -> PathRule {
+  PathRule {
+    delay: LOSSY_HOLD,
+    jitter: LOSSY_SPREAD,
+    loss_ppm: LIGHT_LOSS_PPM,
+    ..PathRule::default()
+  }
+}
+
+/// Writes through `successor` one file at a time from `files`, until one is acknowledged or the fleet wait passes, then
+/// reads the head it ships `volume` from: its first head, the one [`continuity`] judges (`None` if no write was
+/// acknowledged). Every outcome comes back too, for NoLoss.
+fn first_write_through(
+  successor: &str,
+  volume: &str,
+  files: std::ops::Range<usize>,
+  began: &Instant,
+) -> (Option<u64>, Vec<Outcome>) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  let mut written = Vec::new();
+  for file in files {
+    let outcome = Stream {
+      instance: successor,
+      volume: volume_id_of(volume),
+      began: *began,
+    }
+    .run(file..file + 1, &AtomicBool::new(false));
+    let acknowledged = outcome.iter().any(|outcome| outcome.refused.is_none());
+    written.extend(outcome);
+    if acknowledged || Instant::now() >= deadline {
+      break;
+    }
+    pause();
+  }
+  let head = if written.iter().any(|outcome| outcome.refused.is_none()) {
+    live_states(successor, volume)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| !state.holding)
+      .and_then(|state| state.head)
+  } else {
+    None
+  };
+  (head, written)
+}
+
+/// The refused outcomes, one line each.
+fn refused_lines(outcomes: &[Outcome]) -> Vec<String> {
+  outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_some())
+    .map(|outcome| format!("{outcome:?}"))
+    .collect()
+}
+
+/// A-200 over lossy, delayed paths (goal g229; AC-8.1 and AC-8.2's invariants across real processes; the fault relay,
+/// A-277): do stream writes to a live volume while every path of the fleet holds each datagram 20 ms ± 5 ms one way and
+/// loses 1 % of them, then 5 %, then 1 % with 2 % duplicated; heal; then, back under the light profile, SIGKILL the
+/// owner and write through the survivor that takes the volume over. Expect every write acknowledged and none lost or
+/// torn, both candidates at the owner's head once healed, one identity at every head; and the takeover, over the lossy
+/// paths, serving every acknowledged write, every surviving copy fenced at its epoch, its first write acknowledged and
+/// its first head past every position durable before (Continuity).
+#[test]
+fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
+  if !gated("lossy-paths") {
+    return;
+  }
+  let mut fleet = Fleet::start_relayed("lossy", Supervision::Bare, &FLEET_NODES);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
+  let volume = fleet.create_volume(&owner, "lossy", true);
+  let mut verdict = Verdict::new("writes through lossy paths, then a takeover over them");
+  let (outcomes, samples) = stream_through(
+    &fleet.instances,
+    &owner,
+    &volume,
+    0..STREAM_FILES,
+    |began| {
+      let relay = fleet.relay();
+      for (phase, rule) in [
+        ("1 % lost", light_loss()),
+        (
+          "5 % lost",
+          PathRule {
+            loss_ppm: HEAVY_LOSS_PPM,
+            ..light_loss()
+          },
+        ),
+        (
+          "1 % lost, 2 % duplicated",
+          PathRule {
+            duplicate_ppm: DUPLICATE_PPM,
+            ..light_loss()
+          },
+        ),
+      ] {
+        relay.shape_all(rule);
+        verdict.note(format!(
+          "every path held {LOSSY_HOLD:?} ± {LOSSY_SPREAD:?}, {phase}, from {:?}",
+          began.elapsed()
+        ));
+        after_writes(&owner, &volume, BETWEEN_EVENTS);
+      }
+      relay.heal();
+    },
+  );
+  verdict.check("every write acknowledged", refused_lines(&outcomes));
+  judge_healed(
+    &mut verdict,
+    &owner,
+    &candidates,
+    &volume,
+    &outcomes,
+    &samples,
+  );
+  fleet.relay().shape_all(light_loss());
+  fleet.kill_node(owner_index);
+  match wait_serving(&survivors, &volume, &outcomes) {
+    Some((successor, took)) => {
+      verdict.note(format!(
+        "taken over by {successor} {took:?} after the owner's death, over lossy paths"
+      ));
+      verdict.check("NoLoss (successor)", no_loss(successor, &volume, &outcomes));
+      let epoch = takeover_epoch(successor, &volume);
+      verdict.check(
+        "StaleNeverCommits (fences)",
+        fenced_at_or_above(&survivors, &volume, epoch),
+      );
+      let began = Instant::now();
+      let (first_head, first) = first_write_through(
+        successor,
+        &volume,
+        STREAM_FILES..STREAM_FILES + FIRST_WRITE_FILES,
+        &began,
+      );
+      let (durable_before, broken) = continuity(&samples, first_head, epoch);
+      verdict.note(format!(
+        "Continuity: durable before {durable_before:?}, the successor's first head {first_head:?} under epoch {epoch}"
+      ));
+      verdict.check("Continuity", broken);
+      verdict.check(
+        "the successor's first write acknowledged",
+        if first.iter().any(|outcome| outcome.refused.is_none()) {
+          Vec::new()
+        } else {
+          refused_lines(&first)
+        },
+      );
+      verdict.check(
+        "NoLoss (the successor's writes)",
+        no_loss(successor, &volume, &first),
+      );
+    }
+    None => verdict.check(
+      "NoLoss (successor)",
+      vec![format!(
+        "no survivor served the volume within the fleet wait:\n{}",
+        diagnosis(&candidates, &volume)
+      )],
+    ),
+  }
+  verdict.note(fleet.relay().report().summary());
+  drop(fleet);
+  verdict.judge();
+}
+
+/// How a relayed flow partitions the owner while its process runs on.
+#[derive(Clone, Copy, Debug)]
+enum RunningPartition {
+  /// Cut off both ways: it hears no peer and no peer hears it.
+  Isolated,
+  /// It speaks to every peer and hears none.
+  Deafened,
+}
+
+/// Reads `files` through the partitioned `owner` on a thread of its own, healing the relay if the reads are not answered
+/// within [`READ_WAIT`] (so the owner can answer at all), and ending the owner's daemon past the fleet wait after that
+/// (so its client is told and the flow fails rather than hangs). What each read answered.
+fn read_through_partition(
+  fleet: &Fleet,
+  owner_index: usize,
+  volume: &str,
+  files: &[usize],
+  began: &Instant,
+) -> Vec<ReadProbe> {
+  let owner = &fleet.instances[owner_index];
+  std::thread::scope(|scope| {
+    let reader = scope.spawn(|| read_each(owner, volume, files, began));
+    let waited = Instant::now();
+    while !reader.is_finished() && waited.elapsed() < READ_WAIT {
+      pause();
+    }
+    if !reader.is_finished() {
+      eprintln!(
+        "chaos: reads through the partitioned {owner} unanswered within {READ_WAIT:?}; healing"
+      );
+      fleet.relay().heal();
+      let healed = Instant::now();
+      while !reader.is_finished() && healed.elapsed() < FLEET_WAIT {
+        pause();
+      }
+      if !reader.is_finished() {
+        eprintln!(
+          "chaos: reads through {owner} unanswered past the fleet wait after the heal; killing its daemon"
+        );
+        send_signal(fleet.daemon_pid(owner_index), rustix::process::Signal::KILL);
+      }
+    }
+    reader.join().unwrap()
+  })
+}
+
+/// A-200, StaleNeverCommits, ReadSafety and Continuity with the owner partitioned while it runs (goal g229; AC-8.1 and
+/// AC-8.2's invariants across real processes; the fault relay, A-277). SIGSTOP freezes a process with its timers; here
+/// the owner keeps running, so its lease lapses unrenewed while it still serves its clients, and from its side its
+/// peers fall silent. Do: stream writes to a live volume through its owner; partition the owner as `partition` says;
+/// once a survivor has taken the volume over, write through the successor and read the last of those writes through
+/// the partitioned owner; then heal. Expect: no write sent to the partitioned owner after the partition ever
+/// acknowledged; every read through it of a write the successor acknowledged refused or answered with that write, never
+/// older bytes and never missing (ReadSafety); every write either owner acknowledged served by the successor (NoLoss);
+/// the successor's first head past every position durable under the old epoch (Continuity); every copy fenced at or
+/// above the successor's epoch; one identity at every head; and, healed, every other copy at the successor's head.
+fn an_owner_partitioned_while_running(tag: &str, flow: &'static str, partition: RunningPartition) {
+  if !gated(tag) {
+    return;
+  }
+  let fleet = Fleet::start_relayed(tag, Supervision::Bare, &FLEET_NODES);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
+  let volume = fleet.create_volume(&owner, tag, true);
+  let mut verdict = Verdict::new(flow);
+  let mut partitioned_at = Duration::ZERO;
+  let mut healed_at = Duration::ZERO;
+  let mut successor = None;
+  let mut first_head = None;
+  let mut successor_outcomes = Vec::new();
+  let mut probes = Vec::new();
+  let (outcomes, samples) = stream_through(
+    &fleet.instances,
+    &owner,
+    &volume,
+    0..STREAM_FILES,
+    |began| {
+      let relay = fleet.relay();
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      match partition {
+        RunningPartition::Isolated => relay.isolate(owner_index),
+        RunningPartition::Deafened => relay.deafen(owner_index),
+      }
+      partitioned_at = began.elapsed();
+      let taken = wait_taken_over(&survivors, &volume);
+      verdict.note(format!(
+        "owner {partition:?} at {partitioned_at:?}; taken over: {taken:?}"
+      ));
+      if let Some((taken_by, _)) = taken {
+        successor = Some(taken_by.to_owned());
+        let (head, first) = first_write_through(
+          taken_by,
+          &volume,
+          STREAM_FILES..STREAM_FILES + FIRST_WRITE_FILES,
+          began,
+        );
+        first_head = head;
+        successor_outcomes = first;
+        let stop = AtomicBool::new(false);
+        let more = std::thread::scope(|scope| {
+          let streamer = scope.spawn(|| {
+            Stream {
+              instance: taken_by,
+              volume: volume_id_of(&volume),
+              began: *began,
+            }
+            .run(STREAM_FILES + FIRST_WRITE_FILES..2 * STREAM_FILES, &stop)
+          });
+          after_writes(taken_by, &volume, BETWEEN_EVENTS);
+          stop.store(true, Ordering::Release);
+          streamer.join().unwrap()
+        });
+        successor_outcomes.extend(more);
+        let last: Vec<usize> = successor_outcomes
+          .iter()
+          .filter(|outcome| outcome.refused.is_none())
+          .map(|outcome| outcome.file)
+          .rev()
+          .take(READ_PROBES)
+          .collect();
+        probes = read_through_partition(&fleet, owner_index, &volume, &last, began);
+      }
+      relay.heal();
+      healed_at = began.elapsed();
+      // Long enough for the old owner's stream to send several writes after the heal.
+      sleep(Duration::from_secs(2));
+    },
+  );
+  verdict.note(format!(
+    "old owner: {}; successor: {}",
+    latency_line(&outcomes),
+    latency_line(&successor_outcomes)
+  ));
+  let stale_acknowledged: Vec<String> = outcomes
+    .iter()
+    .filter(|outcome| outcome.sent > partitioned_at && outcome.refused.is_none())
+    .map(|outcome| format!("{outcome:?}"))
+    .collect();
+  verdict.note(format!(
+    "{} writes sent to the old owner after it was partitioned at {partitioned_at:?}, healed at {healed_at:?}",
+    outcomes
+      .iter()
+      .filter(|outcome| outcome.sent > partitioned_at)
+      .count()
+  ));
+  verdict.check(
+    "StaleNeverCommits (no write sent to the partitioned owner acknowledged)",
+    stale_acknowledged,
+  );
+  verdict.note(format!(
+    "reads through the partitioned owner: {}",
+    probes
+      .iter()
+      .map(ReadProbe::to_string)
+      .collect::<Vec<_>>()
+      .join("; ")
+  ));
+  verdict.check(
+    "ReadSafety (reads through the partitioned owner)",
+    read_safety(&probes, &successor_outcomes),
+  );
+  let Some(successor) = successor else {
+    verdict.check(
+      "takeover",
+      vec![format!(
+        "no survivor took the volume over:\n{}",
+        diagnosis(&fleet.instances, &volume)
+      )],
+    );
+    verdict.note(fleet.relay().report().summary());
+    drop(fleet);
+    return verdict.judge();
+  };
+  let (heads, disagreements) = agreement(&samples);
+  verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
+  verdict.check("Agreement", disagreements);
+  let every: Vec<Outcome> = outcomes
+    .iter()
+    .chain(&successor_outcomes)
+    .cloned()
+    .collect();
+  verdict.check("NoLoss (successor)", no_loss(&successor, &volume, &every));
+  let epoch = takeover_epoch(&successor, &volume);
+  let (durable_before, broken) = continuity(&samples, first_head, epoch);
+  verdict.note(format!(
+    "Continuity: durable before {durable_before:?}, the successor's first head {first_head:?} under epoch {epoch}"
+  ));
+  verdict.check("Continuity", broken);
+  verdict.check(
+    "the successor's first write acknowledged",
+    if first_head.is_some() {
+      Vec::new()
+    } else {
+      vec![format!(
+        "no write through {successor} acknowledged with a head shown: {:?}",
+        refused_lines(&successor_outcomes)
+      )]
+    },
+  );
+  let mut all: Vec<&str> = vec![owner.as_str()];
+  all.extend(&survivors);
+  verdict.check(
+    "StaleNeverCommits (fences)",
+    fenced_at_or_above(&all, &volume, epoch),
+  );
+  let others: Vec<String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != successor)
+    .cloned()
+    .collect();
+  let refs: Vec<&str> = others.iter().map(String::as_str).collect();
+  let (caught_up, last) = converged(&successor, &refs, &volume);
+  verdict.note(format!("converged on the successor: {caught_up}: {last}"));
+  verdict.check(
+    "Convergence",
+    if caught_up { Vec::new() } else { vec![last] },
+  );
+  verdict.note(fleet.relay().report().summary());
+  drop(fleet);
+  verdict.judge();
+}
+
+/// An owner cut off from every peer while it runs (goal g229; AC-8.1, AC-8.2): [`an_owner_partitioned_while_running`]
+/// with the owner isolated both ways. Expect what it states: superseded, never acknowledging a write after the cut,
+/// never answering a read with less than its successor acknowledged, and every invariant held.
+#[test]
+fn an_owner_cut_off_while_running_is_superseded_and_serves_nothing_stale() {
+  an_owner_partitioned_while_running(
+    "cut-off",
+    "an owner cut off while running",
+    RunningPartition::Isolated,
+  );
+}
+
+/// An owner that still speaks to its peers but hears none of them (goal g229; AC-8.1, AC-8.2): the one-way partition
+/// [`an_owner_partitioned_while_running`] runs with the owner deafened. Its entries still reach the candidates, which
+/// cannot answer it, so its writes never become durable from its side while its peers judge it gone. Expect what the
+/// flow states: superseded, never acknowledging a write after the partition, never answering a read with less than its
+/// successor acknowledged, and every invariant held.
+#[test]
+fn an_owner_that_hears_nothing_while_it_still_speaks_is_superseded_and_serves_nothing_stale() {
+  an_owner_partitioned_while_running(
+    "deafened",
+    "an owner that hears nothing while it still speaks",
+    RunningPartition::Deafened,
+  );
 }
