@@ -2681,8 +2681,11 @@ pub fn grant_verb(
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };
-  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
-  if !constant_time_eq(&expected, &proof) {
+  if !proven_by_launcher(
+    state,
+    |secret| grant_proof(secret, landing_id, &manifest, scope, term_ns),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
@@ -2766,21 +2769,41 @@ pub enum Issuer {
 /// Format: the domain tag of a policy proof, so it never verifies as a grant, enrollment or revocation proof.
 const POLICY_DOMAIN: &[u8] = b"slates.policy";
 
-/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the issuer secret, of the policy domain
-/// tag, the subject and the policy, in their wire encodings. Only the launcher or the harness, which holds the issuer,
-/// can make one; an agent's consumer channel never holds it.
+/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the launcher's secret, of the policy domain
+/// tag, the subject and the policy in their wire encodings, and the policy version the setter read. Only the launcher
+/// or the harness can make one; an agent's consumer channel never holds the secret. The version makes a captured proof
+/// good for one change: once the policy has moved past it, the proof is refused `PolicyChanged`.
 pub fn policy_proof(
   secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
   subject: &PolicySubject,
   policy: &WritePolicy,
+  version: u64,
 ) -> [u8; 32] {
   let mut bytes = Vec::new();
   slates_wire::Wire::encode(subject, &mut bytes);
   slates_wire::Wire::encode(policy, &mut bytes);
+  bytes.extend_from_slice(&version.to_le_bytes());
   let mut hasher = blake3::Hasher::new_keyed(secret);
   hasher.update(POLICY_DOMAIN);
   hasher.update(&bytes);
   *hasher.finalize().as_bytes()
+}
+
+/// Whether `proof` is the launcher's (A-285, R10): `make`'s proof under the secret this daemon minted at its start (the
+/// issuer, held by the anchor's tree), or under the launcher secret its starter handed the anchor (kept by the launcher
+/// across its own restarts and the daemon's), compared in constant time. The same formula and domain under either:
+/// the launcher's authority is one, however it is held.
+pub(crate) fn proven_by_launcher(
+  state: &ShardState,
+  make: impl Fn(&[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> [u8; 32],
+  proof: &[u8; 32],
+) -> bool {
+  let by_issuer = constant_time_eq(&make(&state.issuer_secret), proof);
+  let by_launcher = state
+    .launcher_secret
+    .as_ref()
+    .is_some_and(|secret| constant_time_eq(&make(secret), proof));
+  by_issuer | by_launcher
 }
 
 /// Format: the domain tag of a merge approval's proof.
@@ -2802,31 +2825,40 @@ pub fn merge_approval_proof(
 
 /// Serves `SetPolicy` (A-285): refused `Forbidden` on a consumer-bound channel, whatever its proof, so an agent never
 /// sets (and so never raises) its own policy, counted `policy_set_by_consumer`; `GrantIssuerUnverified` when the proof
-/// does not verify; a volume's policy recorded durably in its record. A consumer's own policy is not built yet
-/// (GAPS, A-285) and is refused `Unsupported`.
+/// does not verify; a volume's policy recorded durably in its record. A consumer's policy is set on the channel
+/// (`verbs::set_consumer_policy_on_channel`), which reaches every shard's bound slots.
 pub fn set_policy_verb(
   state: &mut ShardState,
   principal: &Principal,
-  subject: PolicySubject,
-  policy: WritePolicy,
+  (subject, policy, version): (PolicySubject, WritePolicy, u64),
   proof: [u8; 32],
 ) -> ReplyBody {
   if matches!(principal, Principal::Consumer { .. }) {
     state.count("policy_set_by_consumer", 1);
     return crate::verbs::forbidden("set_policy");
   }
-  let expected = policy_proof(&state.issuer_secret, &subject, &policy);
-  if !constant_time_eq(&expected, &proof) {
+  if !proven_by_launcher(
+    state,
+    |secret| policy_proof(secret, &subject, &policy, version),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
   let PolicySubject::Volume { volume } = subject else {
-    return crate::verbs::refused(Refusal::Unsupported {
-      feature: "a consumer's write policy (A-285, owed)".to_owned(),
+    return crate::verbs::refused(Refusal::BadRequest {
+      reason: "a consumer's policy is set on its channel".to_owned(),
     });
   };
-  if let Err(reply) = policy_record(state, volume) {
-    return *reply;
+  let current = match policy_record(state, volume) {
+    Ok(record) => record.policy.write_version,
+    Err(reply) => return *reply,
+  };
+  // The setter's version is the one the policy is at (A-285): a proof made for an earlier state of the policy, a
+  // replayed or a raced one, changes nothing.
+  if version != current {
+    state.count("policy_changed", 1);
+    return crate::verbs::refused(Refusal::PolicyChanged { current });
   }
   let now = state.clock.monotonic_ns();
   let op = Op::VolumeWritePolicySet {
@@ -2839,27 +2871,23 @@ pub fn set_policy_verb(
   }
 }
 
-/// Serves `Policy` (A-285): a volume's write policy to a principal that may read the volume, `None` while none is set
-/// (which is ask). A consumer's own policy is not built yet and is refused `Unsupported`.
-pub fn policy_verb(
-  state: &mut ShardState,
-  principal: &Principal,
-  subject: PolicySubject,
-) -> ReplyBody {
+/// Serves `Policy` (A-285): a volume's write policy and its version, `None` while none is set (merges at once, lands
+/// under approval). Any principal may read it: it holds only the modes the launcher set, which an agent meets anyway in
+/// its own merges' and landings' answers, and a launcher setting a policy on an agent's own volume must read the
+/// version it replaces. A consumer's policy is read on the channel (`verbs::consumer_policy_on_channel`).
+pub fn policy_verb(state: &mut ShardState, subject: PolicySubject) -> ReplyBody {
   let PolicySubject::Volume { volume } = subject else {
-    return crate::verbs::refused(Refusal::Unsupported {
-      feature: "a consumer's write policy (A-285, owed)".to_owned(),
+    return crate::verbs::refused(Refusal::BadRequest {
+      reason: "a consumer's policy is read on its channel".to_owned(),
     });
   };
   let record = match policy_record(state, volume) {
     Ok(record) => record,
     Err(reply) => return *reply,
   };
-  if !crate::verbs::rights_of(&record, principal).read {
-    return crate::verbs::forbidden("policy");
-  }
   ReplyBody::Policy {
     policy: record.policy.write.map(wire_policy),
+    version: record.policy.write_version,
   }
 }
 
@@ -2894,7 +2922,7 @@ fn land_mode(record: &slates_db::catalog::VolumeRecord) -> slates_db::catalog::W
 }
 
 /// A wire policy as the catalog records it.
-fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy {
+pub(crate) fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy {
   slates_db::catalog::WritePolicy {
     merge: db_mode(policy.merge),
     land: db_mode(policy.land),
@@ -2911,7 +2939,7 @@ fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
 }
 
 /// A recorded policy as the wire carries it.
-fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
+pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
   let mode = |mode| match mode {
     slates_db::catalog::WriteMode::Bypass => WriteMode::Bypass,
     slates_db::catalog::WriteMode::Ask => WriteMode::Ask,

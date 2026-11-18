@@ -20,11 +20,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  Approval, AuditKind, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error,
-  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome,
-  LandingConflict, LandingStage, LandingState, MergeOutcome, Missing, PathFault, PolicyReason,
-  PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable,
-  Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode, WritePolicy,
+  AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter,
+  GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome, LandingApproval,
+  LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome, Missing, PathFault,
+  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported,
+  Unusable, Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode,
+  WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -355,7 +356,7 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   let LandOutcome::ApprovalRequired(approval) = instance.land(&request, None).unwrap() else {
     panic!("a landing with changes asks under today's mode");
   };
-  assert_eq!(approval.awaiting, Awaiting::Landing(request.clone()));
+  assert_eq!(approval.request, request);
   assert_eq!(approval.verification, Verification::Unsigned);
   assert_eq!(
     (
@@ -399,18 +400,18 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   }
 
   let issuer = issuer_of(&daemon);
-  let stale = Approval {
+  let stale = LandingApproval {
     manifest: [0u8; 32],
     ..approval.clone()
   };
-  let changed = instance.approve(&stale, &issuer).unwrap();
+  let changed = instance.approve_landing(&stale, &issuer).unwrap();
   assert!(
     matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
     "an approval of another manifest is no approval of this one: {changed:?}"
   );
   assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
 
-  let landed = instance.approve(&approval, &issuer).unwrap();
+  let landed = instance.approve_landing(&approval, &issuer).unwrap();
   let LandOutcome::Written(report) = landed else {
     panic!("the approved manifest lands: {landed:?}");
   };
@@ -500,10 +501,9 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
 /// AC-5.10 / AC-5.12 (A-299, A-285; Ada's rule of 2026-11-18): do set overlays' write policies with the launcher's
 /// authority — one bypass, one forbid — and land each, plan the bypass one, and ask for a policy that requires signed
 /// merges. Expect: an unset volume's policy reads back as none; the bypass volume read back as set and landed in the one
-/// call, `Written` and `Done`, its file on the disk; its plan refused `Unsupported(WritePolicies)` before anything is
-/// written, since no verb presents a bypass landing alone yet; the forbid volume's landing answered `Refused` by its own
-/// policy and nothing written; and the signed-merge requirement refused `Unsupported(SignedWork)` before anything is
-/// sent, since the daemon does not keep it yet.
+/// call, `Written` and `Done`, its file on the disk; its plan presented and nothing written (the daemon's present-only
+/// verb); the forbid volume's landing answered `Refused` by its own policy and nothing written; and the signed-merge
+/// requirement refused `Unsupported(SignedWork)` before anything is sent, since the daemon does not keep it yet.
 #[cfg(unix)]
 #[test]
 fn a_landing_follows_its_volumes_write_mode() {
@@ -538,12 +538,14 @@ fn a_landing_follows_its_volumes_write_mode() {
   );
   write_file(&mut instance, open, "/w.txt", b"written at once\n");
   let request = landing_into(open, &bypassed);
-  assert_eq!(
-    instance.plan_landing(&request),
-    Err(Error::Unsupported(Unsupported::WritePolicies)),
-    "a plan never writes"
+  assert!(
+    matches!(
+      instance.plan_landing(&request).unwrap(),
+      LandOutcome::ApprovalRequired(_)
+    ),
+    "a plan presents, whatever the mode"
   );
-  assert_eq!(bypassed.read("w.txt"), None);
+  assert_eq!(bypassed.read("w.txt"), None, "a plan never writes");
   let LandOutcome::Written(report) = instance.land(&request, None).unwrap() else {
     panic!("a bypass volume lands in the one call");
   };
@@ -616,11 +618,11 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     .edit(seed.volume, "f", 0, 0, b"aaaaaaaa")
     .unwrap();
   assert_eq!(
-    instance.merge(&seed, Some(&a_signature())),
+    instance.merge(&seed, &[], Some(&a_signature())),
     Err(Error::Unsupported(Unsupported::SignedWork))
   );
   assert_eq!(
-    instance.merge(&seed, None).unwrap(),
+    instance.merge(&seed, &[], None).unwrap(),
     MergeOutcome::Merged {
       version: 1,
       verification: Verification::Unsigned
@@ -634,14 +636,14 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     .edit(first.volume, "f", 0, 4, b"XXXX")
     .unwrap();
   assert!(matches!(
-    instance.merge(&first, None).unwrap(),
+    instance.merge(&first, &[], None).unwrap(),
     MergeOutcome::Merged { version: 2, .. }
   ));
   instance
     .client()
     .edit(second.volume, "f", 0, 4, b"YYYY")
     .unwrap();
-  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, None).unwrap() else {
+  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, &[], None).unwrap() else {
     panic!("a rewrite of bytes the green changed since the base conflicts");
   };
   assert_eq!(conflicts.head, 2);
@@ -661,9 +663,99 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     RebaseOutcome::Rebased { version: 2 }
   );
   assert!(matches!(
-    instance.merge(&third, None).unwrap(),
+    instance.merge(&third, &[], None).unwrap(),
     MergeOutcome::Merged { version: 3, .. }
   ));
+  daemon.stop();
+}
+
+/// AC-5.12 (A-299, A-285; §4.16): do set a green's merge mode to ask with the launcher's authority, merge a work into
+/// it, approve an increment the approver never saw, then approve the one shown; then forbid the green's merges and merge
+/// another work. Expect: the merge held `ApprovalRequired` with the increment's identity and its one path, nothing
+/// merged (the green's head stays 0); the stranger's approval merging nothing and asking again with the same identity;
+/// the shown one `Merged` at version 1; and the forbidden merge answered `Refused` by the green's own policy.
+#[test]
+fn a_merge_follows_its_greens_write_mode() {
+  let (daemon, mut instance) = grouped("merge-modes");
+  let launcher = issuer_of(&daemon);
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "held-green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let ask = WritePolicy {
+    merge: WriteMode::Ask,
+    land: WriteMode::Ask,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(green), &ask, &launcher)
+    .unwrap();
+  let Provisioned::Work { work, .. } = instance
+    .provision(&VolumeSpec::work("held", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  instance
+    .client()
+    .edit(work.volume, "f", 0, 0, b"held")
+    .unwrap();
+  let MergeOutcome::ApprovalRequired(approval) = instance.merge(&work, &[], None).unwrap() else {
+    panic!("an ask green holds the merge");
+  };
+  assert_eq!((approval.work, approval.paths), (work, 1), "{approval:?}");
+  assert_eq!(
+    instance.client().versions(green).unwrap(),
+    0,
+    "nothing merged"
+  );
+  let stranger = MergeApproval {
+    identity: [0u8; 32],
+    ..approval.clone()
+  };
+  assert!(
+    matches!(
+      instance.approve_merge(&stranger, &launcher).unwrap(),
+      MergeOutcome::ApprovalRequired(again) if again.identity == approval.identity
+    ),
+    "an approval of another increment merges nothing and asks again"
+  );
+  assert_eq!(instance.client().versions(green).unwrap(), 0);
+  assert!(matches!(
+    instance.approve_merge(&approval, &launcher).unwrap(),
+    MergeOutcome::Merged { version: 1, .. }
+  ));
+  let forbid = WritePolicy {
+    merge: WriteMode::Forbid,
+    ..ask
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(green), &forbid, &launcher)
+    .unwrap();
+  let Provisioned::Work { work: late, .. } = instance
+    .provision(&VolumeSpec::work("late", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  instance
+    .client()
+    .edit(late.volume, "g", 0, 0, b"no")
+    .unwrap();
+  assert_eq!(
+    instance.merge(&late, &[], None).unwrap(),
+    MergeOutcome::Refused(PolicyRefusal {
+      act: WriteAct::Merge,
+      by: PolicySubject::Volume(green),
+      reason: PolicyReason::Forbidden,
+    })
+  );
   daemon.stop();
 }
 
