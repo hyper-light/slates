@@ -6935,6 +6935,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
 >   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
 >   invariant is judged across whatever takeovers they cause, Continuity from the samples.
+> - **A successor's log began again at genesis (fixed 2026-11-18, A-329).** The flows' first gated run (macOS, main
+>   bfc34cace, kiln r1246) failed Continuity in five takeover flows: the successor's head after its first write was
+>   position 1, against 72 to 1,000 made durable under the dead owner's epoch. `Shipper::new` takes the head a takeover
+>   adopted as its start, and `live_ship::published` had passed none since A-200's first slice, so every successor's
+>   log began at position 0; ranks still grew by epoch, so holders took it, and NoLoss held. The successor's owner
+>   shard now keeps the adopted head from its takeover (`live_ship::adopt_head`) until the volume's shipper is made,
+>   which starts there: its first entry is numbered one past the adopted head, which is at or past every durable position.
+>   Held by `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (`live_ship`'s unit tests) and
+>   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Owed: the
+>   adopted head lives in the successor shard's memory until the volume's first publication, as the volume's own image
+>   does (GAPS, A-325's live-shipped item).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -23645,3 +23656,22 @@ Applied in the same change to:
   over from its seal is published before it is served; a refused publication keeps the takeover pending, and its next
   attempt, finding the volume made, publishes again. A live-shipped volume is published by its first write, as before
   (owed: publishing it at the takeover starts its successor's live log there).
+
+### A-329 — A successor's live log goes on from the head its takeover adopted (2026-11-18, g230, scale-out; Continuity, T-8.6)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status (a successor's log began again at genesis).
+- `crates/server/src/live_ship.rs`: `LiveState::adopted`, `adopt_head`; `published` makes a new shipper from the
+  adopted head when there is one (`Shipper::new`'s `start`); `forget` drops it with the volume.
+  `crates/server/src/fleet.rs`: the live takeover records the head it adopted on the owner shard.
+- Tests: `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (`live_ship`'s unit tests) and
+  `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** `Shipper::new` has always taken a start ("a takeover's adopted head otherwise"), and the shipper
+  counts it settled and on its chain. `live_ship::published` passed none, so a successor's first entry was position 0
+  at genesis under its higher epoch. Holders judge by rank (epoch, then position), which still grew, so they took the
+  successor's log and no acknowledged write was lost; but T-8.6's Continuity is positional, "the successor's first head
+  is past every position durable under an earlier epoch", and five chaos flows failed it (position 1 against 72 to
+  1,000).
+- **The rule.** The live takeover records, on the owner shard where it materializes the volume, the head phase one
+  adopted. The volume's shipper, made at its first publication, starts from that head and takes it once. A volume
+  made on its own node starts from nothing, as before.

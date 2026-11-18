@@ -5271,6 +5271,8 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
         })
         .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
+        crate::live_ship::adopt_head(s, id, fetched.head);
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
         return Ok(());

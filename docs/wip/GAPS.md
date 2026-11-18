@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A successor's live log began again at position 0: it goes on from the head its takeover adopted (2026-11-18, A-329,
+> Continuity, T-8.6; g230).** `live_ship::published` made every shipper with no start, so a successor's first entry was
+> position 0 at genesis under its higher epoch: holders took it by rank and NoLoss held, but the chaos flows' Continuity
+> failed in five takeover flows (macOS, main bfc34cace, kiln r1246: position 1 against 72 to 1,000 durable before).
+> The live takeover now records the adopted head on the owner shard (`live_ship::adopt_head`), and the volume's shipper
+> starts from it. Tests: `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (live_ship) and
+> `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
+> - **Owed (the supervisor's):** the five chaos flows' Continuity on the fix, and the nemesis line "node a holds fence 2
+>   at head 14078, behind b's fence-1 durable head 14309" (seed 12136749566337968553) re-judged: numbering or a lag.
+> - **Owed:** the adopted head lives in the successor shard's memory until the volume's first publication, as the
+>   volume's own image does for a live-shipped takeover (A-325's owed item): a successor restarted before then loses
+>   both.
+
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,

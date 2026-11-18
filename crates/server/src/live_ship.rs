@@ -91,6 +91,7 @@ const LIVE_LET_GO: &str = "fleet.live.let_go";
 /// never will be durable), and every parked transport reply is woken to answer "not durable" ([`wait_durable`]). Kept
 /// before, each destroyed live volume's shipper held a whole copy of it on its owner for good.
 pub(crate) fn forget(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+  state.live.adopted.remove(&id.bytes);
   if state.live.shipping.remove(&id.bytes).is_none() {
     return;
   }
@@ -461,6 +462,10 @@ pub(crate) struct LiveState {
   /// Test support (`Daemon::inject_live_period_quantum`, never set in production): the quantum the period's slices are
   /// cut by in place of the shard's step quantum ([`period_slice`]).
   pub(crate) period_quantum_ns: Option<u64>,
+  /// The head each live volume this shard took over was adopted at (A-329), until the volume's shipper is made at its
+  /// first publication, which starts from it ([`published`]). One entry a taken-over live volume not yet published,
+  /// removed then or when the volume is destroyed ([`forget`]), so bounded by the volumes this shard serves.
+  adopted: BTreeMap<[u8; 16], Head>,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -1217,6 +1222,12 @@ fn is_live(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
     .is_some_and(|volume| volume.policy.live_shipped)
 }
 
+/// Records, on the owner shard a live volume was just taken over on, the head its takeover adopted (A-329): the volume's
+/// shipper, made at its first publication ([`published`]), starts from it.
+pub(crate) fn adopt_head(state: &mut ShardState, id: slates_db::catalog::VolumeId, head: Head) {
+  state.live.adopted.insert(id.bytes, head);
+}
+
 /// The barrier's hook (A-200): `id`'s publication committed locally; `record` is its encoded record as the journal
 /// took it, or `None` when the publication was a checkpoint (the whole image is built here). Does nothing for a volume
 /// that is not live-shipped, or on a node with no fleet.
@@ -1272,6 +1283,16 @@ pub(crate) fn published(
   });
   let quorum = configuration.quorum;
   let reaches_size = kept_reaches_size(state, id);
+  // A successor's log goes on from the head its takeover adopted (A-329): its first entry is numbered past every
+  // position made durable under the dead owner's epoch (Continuity, T-8.6), its epoch above theirs, as
+  // `Shipper::new`'s start says. Until 2026-11-18 every shipper started from nothing, so a successor's first entry was
+  // position 0 at genesis, below every position the dead owner had made durable (`live_chaos`: 5 flows, positions
+  // 1 against 72 to 1,000). Taken only when the shipper is made: a volume shipping already goes on from its own head.
+  let start = if state.live.shipping.contains_key(&id.bytes) {
+    None
+  } else {
+    state.live.adopted.remove(&id.bytes)
+  };
   state
     .live
     .shipping
@@ -1281,7 +1302,7 @@ pub(crate) fn published(
         (local, object, epoch),
         quorum,
         &holders,
-        None,
+        start,
         // Nothing is known of the volume's whole state before its first whole record, which is this log's first entry
         // (`owes_whole`): admitted with nothing in flight, it sets the bounds (`Bounds::of_whole`, below).
         Bounds::default(),
@@ -4001,6 +4022,88 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Format: the head a test's takeover adopted: the dead owner's epoch and a position it had made durable.
+  const ADOPTED: Head = Head {
+    epoch: HostEpoch(1),
+    position: 142,
+    identity: [9; 32],
+  };
+
+  /// A live-shipped volume named `name` made on `state`'s shard through the verbs, with `adopted` recorded as the head
+  /// its takeover adopted before it ships anything; then published once ([`published`]). Its log's first entry.
+  fn first_entry_of(state: &mut ShardState, name: &str, adopted: Option<Head>) -> Option<Head> {
+    let principal = slates_db::catalog::Principal::Uid {
+      host: HostId(0),
+      uid: 1234,
+    };
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &principal,
+      slates_ipc::protocol::RequestBody::Create {
+        name: name.to_owned(),
+        size: slates_ipc::protocol::SizeClass::Dynamic { max: 1 << 20 },
+        names: slates_ipc::protocol::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::Created { id } = created else {
+      return None;
+    };
+    let volume = slates_db::catalog::VolumeId { bytes: id.bytes };
+    if let Some(head) = adopted {
+      adopt_head(state, volume, head);
+    }
+    let shipped = crate::verbs::dispatch(
+      state,
+      1,
+      &principal,
+      slates_ipc::protocol::RequestBody::LiveShip {
+        volume: id,
+        live_shipped: true,
+      },
+    );
+    if !matches!(
+      shipped,
+      slates_ipc::protocol::ReplyBody::LiveShippingSet { live_shipped: true }
+    ) {
+      return None;
+    }
+    published(state, volume, None);
+    state
+      .live
+      .shipping
+      .get(&id.bytes)
+      .and_then(|live| live.whole_entry)
+  }
+
+  /// A-329 (Continuity, T-8.6: "the successor's first head is past every position durable under an earlier epoch"): do
+  /// make two live-shipped volumes on one shard, record for one the head its takeover adopted (the dead owner's epoch 1,
+  /// position 142), and publish both. Expect the taken-over volume's first entry numbered 143, past the adopted head,
+  /// and the other's at 0, as a new volume's log begins. Before, every shipper started from nothing, so a successor's
+  /// first entry was position 0 at genesis, below every position the dead owner had made durable (`live_chaos`: five
+  /// takeover flows judged position 1 against 72 to 1,000).
+  #[test]
+  fn a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted() {
+    let (taken, fresh) = crate::daemon::audit_on_shard(|state| {
+      (
+        first_entry_of(state, "taken-over", Some(ADOPTED)),
+        first_entry_of(state, "made-here", None),
+      )
+    });
+    assert_eq!(
+      taken.map(|head| head.position),
+      Some(ADOPTED.position + 1),
+      "the successor's first entry follows the head it adopted: {taken:?}"
+    );
+    assert_eq!(
+      fresh.map(|head| head.position),
+      Some(0),
+      "a volume made here begins its log at genesis: {fresh:?}"
+    );
+  }
 
   /// A-240 with an install image beside the log: do ask whether the log covers candidates a and b when the last whole
   /// entry's anchors hold both keys and the install image's hold only a's. Expect not: a holder installed from the image
