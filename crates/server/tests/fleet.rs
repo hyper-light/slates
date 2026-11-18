@@ -11418,6 +11418,127 @@ fn live_volume_written(
   (id, written)
 }
 
+/// Shape: the files [`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: each
+/// write's publication is a payload of the log, so the successor's rebuild takes at least this many turns once its
+/// quantum is cut to one unit (a payload a turn).
+const LIVE_TURN_FILES: usize = 24;
+/// Format: the successor's count of the owner-shard turns its live rebuilds took (`fleet::make_live_in_turns`).
+const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
+/// Format: the successor's count of the live rebuilds it began, once a takeover however many attempts join it.
+const LIVE_REBUILDS_BEGUN: &str = "fleet.live.rebuilds_begun";
+/// Format: the successor's count of its attempts that found a live materialization running and joined it.
+const MATERIALIZE_WAITS_MAKING: &str = "fleet.materialize.waits.making";
+/// Format: the successor's count of live materializations begun while one of the same volume ran.
+const MAKING_ALREADY: &str = "fleet.materialize.making_already";
+
+/// g251 (the nemesis's watchdog kills of a successor; CLAUDE.md "Bounded work everywhere"), §4.10 live shipping, §4.8
+/// "Promotion and takeover": a live volume taken over is rebuilt from its log in turns of the successor's owner shard,
+/// and the successor's later attempts join the materialization running there rather than fetching and rebuilding the log
+/// again. Do: three nodes at `f = 1`, one shard a node; on a, a live-shipped volume written 24 files; on b and c, the seal
+/// quantum cut to one unit (a payload a turn) and a pause of half a period between a rebuild's turns, so the
+/// materialization outlasts the control shard's periods; stop a; once the survivor the volume ranks first serves it, read
+/// every file back through it. Expect every file read back; the rebuild in at least 24 turns; one rebuild begun, the later
+/// attempts joining it (`fleet.materialize.waits.making`, non-vacuous) and none begun twice; and the successor's longest
+/// step under the watchdog's window. Before, the whole log was rebuilt inside the one owner-shard turn that made the
+/// volume (0.68 to 1.08 s for the nemesis's 152 to 306 MB, past the spin window with the restore and the publication
+/// after it), and each period's attempt that the turn outlasted fetched and rebuilt the whole log again.
+#[test]
+fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("turns")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let written: Vec<ReplyBody> = (0..LIVE_TURN_FILES)
+    .map(|file| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/turns-{file}"),
+        bytes: continuity_body(file),
+        mode: 0o644,
+      })
+    })
+    .collect();
+  drop(client);
+  for daemon in &daemons[1..] {
+    daemon.inject_seal_walk_quantum(Some(0)).unwrap();
+    daemon
+      .inject_live_turn_pause(Some(HEARTBEAT_NS / 2))
+      .unwrap();
+  }
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..LIVE_TURN_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/turns-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+    })
+    .collect();
+  drop(reader);
+  let counters = summed_counters(&daemons[index]);
+  let counted = |name: &str| counters.get(name).copied().unwrap_or(0);
+  let (slices, begun, joined, twice) = (
+    counted(LIVE_REBUILD_SLICES),
+    counted(LIVE_REBUILDS_BEGUN),
+    counted(MATERIALIZE_WAITS_MAKING),
+    counted(MAKING_ALREADY),
+  );
+  let longest_step_ns = control_longest_poll_ns(&daemons[index]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a live takeover in turns: served {served}, read {read:?}, {slices} rebuild turns for {LIVE_TURN_FILES} files, \
+     {begun} rebuilds begun, {joined} attempts joined one running, {twice} begun twice, the successor's longest step \
+     {longest_step_ns} ns"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered: {written:?}"
+  );
+  assert!(served, "the successor serves the volume");
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+  assert!(
+    slices >= u64::try_from(LIVE_TURN_FILES).unwrap(),
+    "the log was rebuilt a payload a turn: {slices} turns for {LIVE_TURN_FILES} files"
+  );
+  assert_eq!(begun, 1, "the log was rebuilt once");
+  assert!(
+    joined >= 1,
+    "non-vacuity: the materialization outlasted an attempt, which joined it ({joined} joined)"
+  );
+  assert_eq!(
+    twice, 0,
+    "no materialization of the volume was begun while one ran"
+  );
+  assert!(
+    longest_step_ns < LIVENESS_BUDGET_NS,
+    "the successor's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+}
+
 /// What the Continuity test saw through the successor: whether it served the volume, its first write's reply, its log's
 /// head (epoch, position) after that write, and whether each file written on the owner read back.
 struct ThroughTheSuccessor {
