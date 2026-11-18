@@ -1,0 +1,24 @@
+record dial pinning test (diag: a pinning-only run, published as soon as its 20 runs end -- diagnostics only, never on main: a branch named diag-r) on aarch64, 4 CPUs; kernel 7.0.0-1017-azure
+commit c27d323161abeb6c7ac220e0053714a35e248005, parent 3861acae9247d2875adb60e3c30a6eed0a1cf3f3
+== build: exit 0 in 88 s (build.log)
+run 1: pass in 3 s
+run 2: pass in 2 s
+run 3: pass in 2 s
+run 4: pass in 2 s
+run 5: pass in 2 s
+run 6: pass in 2 s
+run 7: pass in 2 s
+run 8: pass in 2 s
+run 9: pass in 2 s
+run 10: pass in 3 s
+run 11: pass in 2 s
+run 12: pass in 2 s
+run 13: pass in 2 s
+run 14: pass in 2 s
+run 15: pass in 2 s
+run 16: pass in 2 s
+run 17: pass in 2 s
+run 18: pass in 2 s
+run 19: pass in 3 s
+run 20: pass in 2 s
+== pinning test: 20 passed, 0 failed of 20
