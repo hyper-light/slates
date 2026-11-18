@@ -21,6 +21,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::pin::Pin;
+use std::sync::atomic::{Ordering, fence};
 use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 
@@ -152,6 +153,13 @@ pub struct Counters {
   /// Readiness completions that found no registration waiting on their descriptor, because its future was
   /// dropped before the descriptor fired (A-149). Such a completion wakes no one.
   pub interests_unclaimed: u64,
+  /// Asks for room the target took: a task whose send a full control channel refused, asking to be told when that
+  /// channel next has room ([`ShardContext::want_room`], [`crate::room`]). An ask refused because the target is gone
+  /// is not counted: nothing waits on it.
+  pub room_waits: u64,
+  /// Tasks woken because a shard they asked for room drained its control channel, or left its loop
+  /// ([`crate::room`]): the room wake's non-vacuity count.
+  pub room_wakes: u64,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
@@ -271,6 +279,11 @@ pub struct ShardInner {
   /// Whether each slot is in `timer_waiters`, grown to the highest slot that waited (below the arena's
   /// capacity).
   timer_waiter_queued: Vec<bool>,
+  /// The tasks waiting to be told that another shard's full control channel has room ([`ShardContext::want_room`]):
+  /// keyed by that shard and the task's slot, each at most once, with the task's generation, so the map never holds
+  /// more than the arena's slots for each shard asked ([`crate::room`]). A shard's tell takes its waiters out and wakes
+  /// those still live; a waiter whose task ended meanwhile is dropped then, unwoken.
+  room_waiters: std::collections::BTreeMap<(u16, u32), u32>,
   /// The task the shard runs alone while it lives ([`ShardContext::spawn_alone`]): until its future ends, each step
   /// polls it and no other task, which stay queued in order. `None` when no task holds the shard.
   alone: Option<Handle<TaskSlot>>,
@@ -522,6 +535,7 @@ impl ShardContext {
         foreign,
         timer_waiters: std::collections::VecDeque::new(),
         timer_waiter_queued: Vec::new(),
+        room_waiters: std::collections::BTreeMap::new(),
         alone: None,
       }),
       kept: KeptValues::default(),
@@ -1054,6 +1068,38 @@ impl ShardContext {
       .ok_or(RtError::NotOnShardThread)?
   }
 
+  /// Asks shard `target` to tell this shard when its control channel next has room, for the task being polled here,
+  /// whose send to it was refused `ControlFull` (§4.3 "admission limit"; [`crate::room`]). The task is woken once
+  /// `target` drains a message after this call, or leaves its loop. The caller tries its send again after this returns,
+  /// and waits for any wake only if that try is refused too: the try either finds the room a drain made meanwhile, or
+  /// that drain finds this ask. Asking again before the wake replaces nothing: the task waits on `target` once.
+  /// Refused `ShardGone` when `target` has left its loop or its slot is free (no room will come; its sends are refused
+  /// the same way), and `NotOnShardThread` outside a task's poll on this shard.
+  pub fn want_room(&self, target: u16) -> Result<(), RtError> {
+    let task = self.current_task().ok_or(RtError::NotOnShardThread)?;
+    let key = (target, task.0.slot());
+    self
+      .with_inner(|inner| inner.room_waiters.insert(key, task.0.generation()))
+      .ok_or(RtError::NotOnShardThread)?;
+    // The mark, then the fence, then (the caller's) second try: the asking half of `crate::room`'s protocol. An exit
+    // marked before the fence is seen here; one after it takes this mark and tells this shard (`registry::note_exited`).
+    let exited = registry::with_entry(target, |entry| {
+      entry.room_wanted.insert(self.id);
+      fence(Ordering::SeqCst);
+      entry.exited.load(Ordering::Acquire)
+    });
+    if exited == Some(false) {
+      self.with_inner(|inner| {
+        inner.counters.room_waits = inner.counters.room_waits.saturating_add(1);
+      });
+      return Ok(());
+    }
+    // Refused: the waiter is withdrawn, so no task waits on a shard that will never drain. A refused borrow here (a
+    // nested one, counted) leaves it recorded, still one per task slot and shard asked, until a tell for that id.
+    let _ = self.with_inner(|inner| inner.room_waiters.remove(&key));
+    Err(RtError::ShardGone { shard: target })
+  }
+
   /// Queues the task `word` names to be woken when a timer frees — the path of a sleep that found the wheel
   /// full (AUD-29-39): it waits, never completing before its deadline, and arms on the poll that follows.
   /// A slot already queued is not queued twice. A word naming no live task is refused.
@@ -1578,6 +1624,29 @@ impl ShardContext {
     if !entry.control_pending.take() {
       return false;
     }
+    // A shard that drained since this one asked it for room says so by this flag, as a message does (`crate::room`).
+    let mut woke = false;
+    if entry.room_given.maybe_any() {
+      entry
+        .room_given
+        .take_each(|target| woke |= self.wake_room_waiters(inner, target));
+    }
+    let drained = self.take_control_batch(inner, entry);
+    if drained > 0 {
+      // Room made: the shards that asked for it are told. The fence orders this drain's taking of messages before the
+      // look at who asked, as each asker fences between its mark and its second try (`crate::room`).
+      fence(Ordering::SeqCst);
+      if entry.room_wanted.maybe_any() {
+        entry
+          .room_wanted
+          .take_each(|origin| registry::give_room(origin, self.id));
+      }
+    }
+    drained > 0 || woke
+  }
+
+  /// Takes at most one batch of control messages and handles each; how many it took.
+  fn take_control_batch(&self, inner: &mut ShardInner, entry: &Entry) -> usize {
     let batch = inner.config.batch.max(1);
     let mut drained = 0;
     while drained < batch {
@@ -1597,7 +1666,27 @@ impl ShardContext {
       // `docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md`).
       entry.control_pending.rearm();
     }
-    drained > 0
+    drained
+  }
+
+  /// Wakes this shard's tasks waiting for room on `target` ([`crate::room`]): each is taken out of the waiters and, if
+  /// its task still lives, queued to run, where it tries its send again. Whether any was woken.
+  fn wake_room_waiters(&self, inner: &mut ShardInner, target: u16) -> bool {
+    let waiting: Vec<(u32, u32)> = inner
+      .room_waiters
+      .range((target, 0)..=(target, u32::MAX))
+      .map(|(&(_, slot), &generation)| (slot, generation))
+      .collect();
+    let mut woke = false;
+    for (slot, generation) in waiting {
+      inner.room_waiters.remove(&(target, slot));
+      if inner.arena.contains(Handle::from_raw(slot, generation)) {
+        self.local.push(slot);
+        inner.counters.room_wakes = inner.counters.room_wakes.saturating_add(1);
+        woke = true;
+      }
+    }
+    woke
   }
 
   fn drain_inbound(&self, inner: &mut ShardInner) -> bool {

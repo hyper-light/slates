@@ -25,7 +25,7 @@
 //! after the filter: a non-dumpable process's `/proc/self` files belong to root, and an ordinary user's write
 //! to the filter is then refused — found under the harness's non-root user).
 
-use crate::Failure;
+use super::Failure;
 
 /// Format: the core size limit that writes no core, soft and hard.
 #[cfg(unix)]

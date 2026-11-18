@@ -529,6 +529,7 @@ the reading behind it, from EdenFS and Piper to Vertical Paxos and copysets, is 
 |---|---|
 | [CLI guide](docs/cli.md) | Every command, its output, and what is not finished |
 | [Python](crates/sdk-python/README.md) · [Node](crates/sdk-node/README.md) | SDK quickstarts |
+| [Embedding library](docs/library.md) | `slates-api`: how a host such as kiln drives slates without the command |
 | [Design](docs/wip/SLATES_DESIGN.md) | Rules, decisions, every subsystem, the build plan |
 | [Gap ledger](docs/wip/GAPS.md) | What is open and what closes it |
 | [Benchmarks](docs/wip/BENCHMARKS.md) | Every measurement with its command and machine |

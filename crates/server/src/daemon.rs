@@ -1113,6 +1113,29 @@ impl Daemon {
   /// Test support: [`Self::flood_control_channel`] on the shard at `partition` (A-216's refused release: a spawn sent to
   /// a full control channel is refused `ControlFull`). The flood clears by itself once that shard runs.
   pub fn flood_control_channel_of(&self, partition: usize) -> Result<usize, ObserveError> {
+    self.flood_with(partition, || async {})
+  }
+
+  /// Test support: [`Self::flood_control_channel_of`], each queued task adding one to `ran` when the shard runs it. The
+  /// shard runs its channel's messages in the order it took them, so `ran` is its progress through the flood, and a
+  /// message sent once the channel has room runs after the flood's last task (a whole channel: 41,125 tasks on an
+  /// 18-CPU Mac, drained in 64 ms to 4.33 s under 36 spinning threads, 2026-11-17).
+  pub fn flood_control_channel_counting(
+    &self,
+    partition: usize,
+    ran: &'static AtomicU64,
+  ) -> Result<usize, ObserveError> {
+    self.flood_with(partition, move || async move {
+      ran.fetch_add(1, Ordering::Relaxed);
+    })
+  }
+
+  /// Spawns `task()` on the shard at `partition` until its control channel refuses one as full; how many were queued.
+  fn flood_with<F: Future<Output = ()> + Send + 'static>(
+    &self,
+    partition: usize,
+    task: impl Fn() -> F,
+  ) -> Result<usize, ObserveError> {
     let shard = self
       .shards
       .get(partition)
@@ -1121,7 +1144,7 @@ impl Daemon {
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
     let mut queued: usize = 0;
     loop {
-      match runtime.spawn_on(shard, async {}) {
+      match runtime.spawn_on(shard, task()) {
         Ok(()) => queued = queued.saturating_add(1),
         Err(slates_rt::RtError::ControlFull { .. }) => return Ok(queued),
         Err(slates_rt::RtError::ShardGone { shard }) => {
@@ -3924,6 +3947,7 @@ async fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    grant_keys: Vec::new(),
     session_secret,
     seal_root,
     seal_state: sealing,
@@ -5079,18 +5103,17 @@ async fn serve_loop() {
       // pending is served now; one published later is rung, and the ring wakes this poller.
       let serve_instead = state::with_state(verbs::announce_idle).unwrap_or(false);
       // A forward its owner's full control channel refused is kept for the next round (§4.3, "backpressure, never a
-      // drop"), but no ring or kick says the channel has room: the owner drains it without a word to the shards that
-      // wait. So while one is kept the loop idles at most the idle window, then serves a round that sends it again.
-      // Idling until a ring woke it, a shard whose clients all waited on kept forwards slept until some other
-      // request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon idle
-      // (`crates/server/tests/forward_retry.rs`).
-      let kept = state::with_state(|s| !s.pending_forwards.is_empty()).unwrap_or(false);
+      // drop"). Before idling, the loop asks that owner to tell it when the channel has room and tries once more; it
+      // idles only if that try is refused too, and the owner's next drain wakes it (`slates_rt::room`). Until
+      // 2026-11-07 a kept forward had no wake at all, and a shard whose clients all waited on kept forwards slept
+      // until some other request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon
+      // idle. Until 2026-11-17 the loop polled for the room once per idle window, a timer a window that grows with
+      // the wake estimate
+      // (`docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`).
+      let serve_instead = serve_instead
+        || state::with_state_counted(verbs::ask_room_for_kept_forwards).unwrap_or(false);
       if !serve_instead {
-        if kept {
-          let _ = futures::within(idle_window_ns.max(1), futures::idle()).await;
-        } else {
-          futures::idle().await;
-        }
+        futures::idle().await;
       }
       state::with_state(verbs::announce_polling);
     }
@@ -6519,6 +6542,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       };
       let record = Record {
         owner,
@@ -7618,6 +7642,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       };
       let record = Record {
         owner,

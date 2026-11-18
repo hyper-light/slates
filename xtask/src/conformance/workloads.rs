@@ -12,7 +12,8 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::{Counts, WorkloadResult, WorkloadStatus};
 use slates_conformance::workload::{
-  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, Entry, EntryKind, Manifest, ROSTER, Workload, compare,
+  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ENVIRONMENT, Entry, EntryKind, Manifest, ROSTER, Workload,
+  compare,
 };
 
 use super::slates::{Session, folds_names};
@@ -22,29 +23,6 @@ use crate::Failure;
 /// Format: git's variable for configuration passed on its own command line (`git -c`), which a workload must not
 /// inherit from the process that started the harness ([`workload_environment`]).
 const GIT_CONFIG_PARAMETERS: &str = "GIT_CONFIG_PARAMETERS";
-
-/// Format: the fixed identity and date every git commit is made with, so object hashes match
-/// between the host run and the mounted run.
-pub(super) const GIT_IDENTITY: &[(&str, &str)] = &[
-  ("GIT_AUTHOR_NAME", "slates"),
-  ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
-  ("GIT_COMMITTER_NAME", "slates"),
-  ("GIT_COMMITTER_EMAIL", "slates@example.invalid"),
-  ("GIT_AUTHOR_DATE", "2026-09-14T00:00:00Z"),
-  ("GIT_COMMITTER_DATE", "2026-09-14T00:00:00Z"),
-  ("GIT_CONFIG_GLOBAL", "/dev/null"),
-  ("GIT_CONFIG_NOSYSTEM", "1"),
-  // None of the configuration a parent passes in the environment (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, read up
-  // to the count): kiln's agent sessions sign every commit that way, and a signature carries its signing time.
-  ("GIT_CONFIG_COUNT", "0"),
-  ("TZ", "UTC"),
-  ("LC_ALL", "C"),
-  ("npm_config_update_notifier", "false"),
-  ("npm_config_fund", "false"),
-  ("npm_config_audit", "false"),
-  // No npm log files: their path (in the cache) would be the one line that differs between runs.
-  ("npm_config_logs_max", "0"),
-];
 
 /// Format: a file's permission bits in `st_mode`.
 const PERMISSION_MASK: u32 = 0o7777;
@@ -144,11 +122,12 @@ pub(super) fn manifest_of(root: &Path) -> Result<Manifest, Failure> {
   Ok(Manifest { entries })
 }
 
-/// Sets `command`'s environment for a workload: the fixed git identity and dates, the tools' caches in `scratch`, the
+/// Sets `command`'s environment for a workload: the roster's shared environment (the fixed identities and dates, no
+/// configuration a parent passes; `slates_conformance::workload::ENVIRONMENT`), the tools' caches in `scratch`, the
 /// watch and busy bounds, and none of the parent's git configuration.
 fn workload_environment<'a>(command: &'a mut Command, scratch: &Path) -> &'a mut Command {
   command
-    .envs(GIT_IDENTITY.iter().copied())
+    .envs(ENVIRONMENT.iter().copied())
     .env_remove(GIT_CONFIG_PARAMETERS)
     .env("npm_config_cache", scratch.join("npm-cache"))
     .env(ENV_SQLITE_BUSY_MS, SQLITE_BUSY_MS.to_string())
@@ -208,11 +187,12 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       run.scratch.path(),
     )?;
     let status = compare(workload, &host, &mount);
-    if let WorkloadStatus::Differs { detail } = &status {
-      notes.push(format!("{}: {detail}", workload.name));
-      println!("workloads: {} differs: {detail}", workload.name);
-    } else {
-      println!("workloads: {}: {status:?}", workload.name);
+    match status.failure_note(workload.name) {
+      Some(note) => {
+        println!("workloads: {note}");
+        notes.push(note);
+      }
+      None => println!("workloads: {}: {status:?}", workload.name),
     }
     tools.push(WorkloadResult {
       name: workload.name.to_owned(),
@@ -221,9 +201,7 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   }
   notes.extend(session.size_note.clone());
   drop(session);
-  let ok = !tools
-    .iter()
-    .any(|t| matches!(t.status, WorkloadStatus::Differs { .. }));
+  let ok = !tools.iter().any(|t| t.status.fails_the_suite());
   let run_count = tools
     .iter()
     .filter(|t| !matches!(t.status, WorkloadStatus::Skipped { .. }))
@@ -323,6 +301,55 @@ mod tests {
     // Judged as the suite judges host against mount (the git index records stat times, so the reviewed
     // policy leaves it out).
     assert_eq!(compare(workload, first, second), WorkloadStatus::Identical);
+  }
+
+  /// The goal of 2026-11-18 (git, Mercurial and Subversion byte-identical on every route), its determinism gate. Do: run
+  /// each version-control workload of the roster twice on the host, in two directories of different names (as the host
+  /// run and the mounted run are) and a clock second or more apart. Expect: identical by the suite's own comparison —
+  /// same exit code 0, same output once each directory is the root token, same tree under the roster's exclusions — so
+  /// a difference over a mount is the mount's, never the tool's own nondeterminism or an absolute path the comparison
+  /// missed. Each absent tool skips loudly. Measured on this rule's first run (2026-11-17, macOS 26, git 2.50.1,
+  /// Mercurial 7.2): two runs of the Mercurial workload wrote its store's file list in two orders until the shared
+  /// environment fixed Python's hash seed, and a local clone's `undo.desc` and reflog name its source by absolute
+  /// path, which the roster now excludes with the reason.
+  #[test]
+  fn the_version_control_workloads_run_byte_identically_twice_on_the_host() {
+    let path =
+      crate::conformance::build_output(&format!("slates-vcs-twice-{}", std::process::id()))
+        .unwrap();
+    let scratch = super::super::Scratch { path, keep: false };
+    for name in ["git", "git-history", "mercurial", "subversion"] {
+      let workload = ROSTER
+        .iter()
+        .find(|workload| workload.name == name)
+        .unwrap();
+      if !tool_on_path(workload.tool) {
+        eprintln!(
+          "SKIP: the {name} workload twice on the host: {} is absent",
+          workload.tool
+        );
+        continue;
+      }
+      let first_root = scratch.fresh(&format!("{name}-first")).unwrap();
+      let first = execute(workload, &first_root.join(name), scratch.path()).unwrap();
+      // A clock second between the runs, so anything a workload stamps with the time differs between them.
+      #[allow(clippy::disallowed_methods)]
+      // the test thread waits out a whole second, no runtime involved
+      std::thread::sleep(std::time::Duration::from_millis(1_100));
+      let second_root = scratch.fresh(&format!("{name}-second-run")).unwrap();
+      let second = execute(workload, &second_root.join(name), scratch.path()).unwrap();
+      assert_eq!(first.exit_code, 0, "{name}, first run: {}", first.output);
+      assert_eq!(
+        compare(workload, &first, &second),
+        WorkloadStatus::Identical,
+        "{name}"
+      );
+      eprintln!(
+        "the {name} workload ran twice identically: {} entries, {} output lines",
+        first.manifest.entries.len(),
+        first.output.lines().count()
+      );
+    }
   }
 
   /// AC-3.2 / T-3.3: run the real editor save workload in ordinary and TMPDIR-matching paths.
