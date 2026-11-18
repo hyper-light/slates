@@ -21117,18 +21117,21 @@ fn a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder() {
   let (_serve_lease, serve) = mesh_serve_ports(names.len());
   let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
   let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+  let created = client.call(&RequestBody::CreateGreen {
     name: "repeats".to_owned(),
     require_evidence: false,
     base: None,
-  }) else {
-    panic!("create the green");
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    panic!("create the green: {created:?}");
   };
-  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+  // A volume's name is unique among the node's volumes, works and greens alike.
+  let created = client.call(&RequestBody::CreateWork {
     green,
-    name: "repeats".to_owned(),
-  }) else {
-    panic!("create the work");
+    name: "repeats-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = created else {
+    panic!("create the work: {created:?}");
   };
   let run = usize::try_from(REPEATED_RUN_CHUNKS * slates_archive::format::MAX_CHUNK_BYTES).unwrap();
   let edits = append_in_pages(&mut client, work, "repeated", &vec![REPEATED_RUN_BYTE; run]);
