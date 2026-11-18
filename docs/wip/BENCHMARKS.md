@@ -2745,6 +2745,27 @@ own filesystem and tmpfs.
   let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
 
 
+## A Shards stream's close no longer publishes what the write log holds (A-399; 2026-11-18)
+
+**Setup.** Apple M3 Ultra (Mac Studio, `Mac15,14`), one-minute load 19.6–22.3 from other sessions throughout. Two
+release test binaries, one built from main 89912e1e7 with the measurement added (`diag-g268-a399-before`), one with
+A-399 too (`diag-g268-a399-after`), run interleaved three times. Each run: one stream, one open file; 5 rounds of 200
+cycles, each cycle a 4 KiB write at the file's start and a `FLUSH` (the request every `close` sends), the `FLUSH`'s
+round trip timed alone. Command (from `crates/server`, each binary in turn):
+`cargo test --release -p slates-server --test shards -- --ignored --nocapture flush_cost`.
+
+| pass | before: best p50 / best p99 | after: best p50 / best p99 |
+|---|---|---|
+| 1 | 19.8 / 31.8 µs | 16.0 / 21.0 µs |
+| 2 | 20.0 / 30.1 µs | 16.0 / 20.8 µs |
+| 3 | 17.5 / 24.8 µs | 15.7 / 56.3 µs |
+
+- **Every `FLUSH` after the change published nothing** (`shards.flush_logged` 1,000 of 1,000; 0 before), and the write
+  it follows survives a death from the log alone (`shards_resync_restart`, A-399).
+- **The saving here is small, 2–4 µs at p50 (15–20%),** because each publication carried one changed chunk of one
+  file. A close after a burst of changes to many files publishes a delta as large as the burst; that is what the
+  stream no longer pays per close. p99 moves with the load, not with the change.
+
 ### 2026-10-06: the no-panic sweep costs nothing measurable on the hot paths
 
 The sweep turned every `[]` index and slice in shipped code into a `get`, among them the ART's child arrays, the
@@ -13430,6 +13451,112 @@ raiseF is the rule landed: the paced cost falls ten- to forty-fold, the loaded p
 quiet rows stay within main's spread. The raise alone holds the loaded p99 lower (54 and 90 µs) at main's paced cost,
 which the window's multiple spends. The paced p99 under load, 28–126 ms in every arm, is not explained by these runs
 (the bench's paced client pauses in a timed `park_timeout`, whose own wake was not measured).
+
+## The closed-loop hold on macOS: a held shard naps, so macOS holds none (A-387; R9; Mac Studios; 2026-11-18)
+
+**What was asked.** The measurer's quiet-gated A/B on the Mac Studio d1323898 (Apple M3 Ultra, 32 CPUs, its derived 23
+shards; each invocation started once a 2 s `top` sample read at least 85% idle, load 8–19; logs
+`~/.cache/measurer-logs/g234q-*.log` there, 2026-11-18 14:41–16:11 UTC) found the spinning single client slower once
+A-223's window rule and A-326's hold landed together (`3d7a36ab8` against `0db7ea28a`), one invocation of the bench's
+three runs a round:
+
+| commit | spinning_1 p50, µs | spinning_1 p99, µs | CPU, thousandths of a core |
+|---|---|---|---|
+| 3d7a36ab8, before | 48.7 · 86.9 · 48.5 | 200.3 · 251.3 · 226.7 | 2,430–3,825 |
+| 0db7ea28a, after | 97.6 · 105.8 · 102.0 | 262.1 · 298.1 · 296.2 | 1,991–5,913 |
+| 3915879e3, main then | 103.2 · 105.5 · 98.2 | 280.4 · 300.6 · 324.0 | 1,908–5,487 |
+
+At 15 shards the p50 went 90.4 · 52.3 · 47.8 → 93.7 · 105.2 · 95.7 µs and the p99 200.0 · 160.1 · 163.2 → 179.8 · 212.8
+· 215.7 µs. A-326 was the first suspect.
+
+**The A/B.** Adas-Mac-Studio-4 (kiln 2768d0d5, Apple M4 Max, 14 CPUs of which 10 performance, macOS 26.2), the
+quietest Mac that day. Four arms built on main `cef0f520e` on d1323898, each in its own tree and target directory
+(`agents/g234-macos-ab-*`, `agents/g234-macos-ab2-*`), release, copied over with their sha256 checked; every arm carries
+the same diagnostics, a form filter (`PROVISION_BENCH_FORMS=spinning_1`) and the process's context switches per 1,000
+creates (`getrusage`). Arms: **main**; **holdoff**, main with the hold set to none (what A-387 does on macOS);
+**window100**, main with A-223's window rule undone (100 times the estimate) and the hold kept; **truespin**, main with
+A-218's rejected true spin (every poll a `kevent64` with `KEVENT_FLAG_IMMEDIATE`). Three rounds, the arms interleaved,
+at 3 shards (`PROVISION_BENCH_SHARDS=3`) and the derived 9; scripts `mac-ab-run.sh` and `mac-ab-loaded.sh`
+(`~/.cache/slates-scratch/g234/xfer`), logs `~/.cache/g234-ab2/` on the Studio.
+
+**The noise floor** (the bench's jitter probe: the longest gap between two clock reads in 100 ms with nothing between,
+`jitter.rs` beside the scripts): before the rounds one thread read 14.9–115.2 µs over 10 probes and ten threads at once
+151.8–856.2 µs (each thread's worst); after them 10.2–60.8 and 23.2–155.6 µs. Before each invocation three probes read
+at worst 17.5–76.4 µs. Load 1.08–1.94 (one minute), free and inactive memory 12,466–12,687 MiB, `top` idle 80.9–96.3%,
+across the quiet invocations.
+
+**Quiet** (17:54–17:57 UTC). Each cell is the median and the range of nine runs (three invocations of the bench's three);
+CPU includes the client; switches and parks are per 1,000 creates, the parks per shard:
+
+| shards | arm | p50, µs | p99, µs | p999, µs | CPU, thousandths of a core | involuntary switches | parks |
+|---|---|---|---|---|---|---|---|
+| 3 | main | 42.1 (41.5–43.0) | 80.8 (73.8–141.2) | 124.5 (78.9–415.9) | 1,565–1,644 | 16,740–16,877 | 1–2 |
+| 3 | holdoff | 41.3 (41.0–42.4) | 65.6 (64.6–117.9) | 78.0 (74.0–365.5) | 1,500–1,566 | 11,942–11,962 | 200–214 |
+| 3 | window100 | 41.5 (41.3–42.8) | 74.2 (72.5–120.8) | 81.4 (78.1–382.0) | 1,577–1,672 | 16,646–16,799 | 0–1 |
+| 3 | truespin | 8.1 (7.3–14.4) | 21.8 (11.6–152.0) | 28.1 (13.1–471.8) | 3,528–3,969 | 50–62 | 1–10 |
+| 9 | main | 57.1 (51.4–60.0) | 92.0 (89.8–173.6) | 108.6 (102.8–416.2) | 2,859–3,046 | 63,395–63,678 | 1–4 |
+| 9 | holdoff | 41.8 (41.3–43.3) | 92.3 (84.6–152.5) | 128.6 (112.3–445.4) | 1,645–1,696 | 16,561–16,762 | 152–237 |
+| 9 | window100 | 58.5 (55.0–61.5) | 100.4 (91.3–175.7) | 133.5 (101.6–403.0) | 2,944–3,166 | 63,580–64,019 | 0–3 |
+| 9 | truespin | 17.1 (12.7–23.6) | 49.9 (24.3–169.8) | 143.4 (30.9–461.8) | 7,885–9,982 | 98–511 | 1–27 |
+
+Each invocation's first run starts cold (in every arm but truespin the median of its first 200 creates was 73.6–108.2
+µs, of its last 200 40.9–60.3 µs), and every p99 of main and holdoff above 100 µs is a first run's. Pairing every
+holdoff run with every main run (81 pairs), at nine shards holdoff's p50 was lower in all 81, its p99 in 50 and its p999
+in 22; at three shards its p99 was lower in 61 and its p999 in 58.
+
+**Beside two spinners a logical CPU** (17:59–18:00 UTC: 28 `while :; do :; done` shell loops, the script's own
+children, started 2 s before the first invocation, killed by PID at the end and 0 left; the one-minute load rose from
+4.0 at the first invocation to 22.4 at the last as its average caught up). Main and holdoff only, interleaved; CPU under
+load is what the scheduler gives and is not compared:
+
+| shards | arm | p50, µs | p99, ms | p999, ms | involuntary switches | parks |
+|---|---|---|---|---|---|---|
+| 3 | main | 83.0 (68.3–157.2) | 2.25 (1.30–2.73) | 3.26 (2.37–3.90) | 14,712–16,075 | 175–372 |
+| 3 | holdoff | 111.1 (41.4–147.4) | 2.43 (1.36–3.10) | 3.41 (2.57–4.26) | 12,413–12,818 | 334–464 |
+| 9 | main | 81.5 (62.3–92.8) | 1.87 (1.63–2.29) | 3.17 (2.84–3.52) | 53,320–59,727 | 90–196 |
+| 9 | holdoff | 73.0 (71.5–73.9) | 1.34 (0.85–1.80) | 2.69 (1.99–3.12) | 17,713–19,188 | 195–335 |
+
+At nine shards holdoff's p99 was lower in 75 of the 81 pairs and its p50 in 69; at three shards its p99 in 32 and its
+p50 in 39, which is even.
+
+**What it shows.** A held macOS shard is not polling. Each turn of its idle spin is a `kevent` with a zero timeout, which
+sleeps 12–15 µs with an involuntary switch (A-218), and a hold keeps every shard the loop goes round in that state: at
+nine shards main's process made 63 involuntary switches a create against holdoff's 17 and spent 2.9 cores against
+1.65. Unheld, an owner parks between the loop's returns (152–237 times per 1,000 creates at nine shards) and wakes on a
+kick in 3.1–6.0 µs (the bench's wake). The cost grows with the shards held: nothing in the p50 at three shards (three
+of ten performance cores), 15 µs at nine, and 57 µs at 23 (medians 101.7 against 44.9 µs on the 32-CPU Studio, below).
+Read with the
+switch counts, the held shards' naps crowd the cores the loop runs on; no probe here told that apart from the nap a
+request lands in, which ends before the shard reads its rings, since only a parked shard is kicked. The window rule is
+not the cause: window100 reads as main. The true spin would make a hold pay (p50 8–17 µs, R9 met in 5 of 6
+invocations), but at 3.5–10 cores quiet; A-218 measured and rejected it for its tails once the host has no idle core,
+and it stays rejected.
+
+**Decision (A-387).** macOS holds no shard for a closed loop (`config::closed_loop_hold`); Linux and Windows, whose held
+shards poll without sleeping, keep A-326's hold. The one adverse number is the quiet nine-shard p999, 108.6 against
+128.6 µs at the median, with the spreads overlapping (102.8–416.2 against 112.3–445.4 µs).
+
+**At 23 shards on the 32-CPU Studio** (d1323898, Apple M3 Ultra, 32 CPUs of which 24 performance, macOS 26.4; the same
+main and holdoff binaries; 18:09–18:31 UTC; `studio23-ab.sh` beside the other scripts, log `~/.cache/g234-ab/studio23.log`
+there). Each invocation waited up to 600 s for a 2 s `top` sample at least 85% idle, as the measurer's runs did, and ran
+anyway if none came. The box was shared: before the rounds `top` read 26% idle at load 22.9, one thread's jitter probe
+25.5–300.9 µs and 24 threads' at once 10.1–27.2 ms; after them 58% idle at load 29.4, 30.2–75.2 µs and 0.97–3.08 ms;
+before each invocation three probes read at worst 60.4–73.8 µs, and free and inactive memory was 27,596–29,056 MiB.
+Each invocation's three runs:
+
+| round | arm | at its start | p50, µs | p99, µs | p999, µs | CPU, thousandths of a core | involuntary switches | parks |
+|---|---|---|---|---|---|---|---|---|
+| 1 | main | 45% idle (bar unmet), load 21.7 | 99.3 · 102.3 · 101.7 | 284.3 · 290.8 · 319.2 | 326.5 · 3,082.7 · 3,620.3 | 4,372–5,284 | 88,606 | 78–125 |
+| 1 | holdoff | 89% idle, load 14.1 | 44.9 · 44.8 · 44.8 | 182.8 · 147.6 · 154.5 | 250.9 · 216.6 · 237.7 | 1,861–1,940 | 21,017 | 115–183 |
+| 2 | main | 88% idle, load 13.1 | 96.5 · 94.8 · 94.4 | 265.8 · 267.1 · 256.0 | 385.9 · 301.0 · 461.3 | 5,673–5,774 | 102,362 | 68–109 |
+| 2 | holdoff | 83% idle, load 11.3 | 45.3 · 44.7 · 44.8 | 187.4 · 168.0 · 160.6 | 330.5 · 251.0 · 262.1 | 1,891–2,021 | 21,260 | 117–185 |
+| 3 | main | 84% idle, load 10.3 | 115.2 · 112.7 · 114.7 | 376.0 · 343.0 · 337.2 | 531.2 · 450.2 · 405.6 | 3,433–3,584 | 56,638 | 110–163 |
+| 3 | holdoff | 38% idle (bar unmet; another agent's `load_bench` at 682% of a core), load 28.9 | 64.5 · 62.6 · 60.8 | 249.3 · 216.5 · 223.5 | 319.0 · 269.2 · 324.2 | 2,038–2,169 | 21,300 | 126–197 |
+
+Every holdoff run, the loaded one among them, beat every main run on the p50 (44.7–64.5 against 94.4–115.2 µs) and the
+p99 (147.6–249.3 against 256.0–376.0 µs), at 1.9–2.2 cores against 3.4–5.8. Unheld, the 23 shards read at or under the
+measurer's before arm of the afternoon (`3d7a36ab8`: p50 48.5–86.9 µs, p99 200.3–251.3 µs). Neither arm meets R9's 50 µs
+at 23 shards on this Mac (GAPS, A-223's entry).
 
 ## The idle window's rule at three and more shards: R9's floor alone fails a closed loop; a fixed S-scaled window fails a paced client (A-223 step 6, A-326; R9; CI and adacachy2; 2026-11-12)
 

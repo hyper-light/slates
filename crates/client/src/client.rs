@@ -1130,6 +1130,21 @@ fn mapped_access_refused(call: &'static str, error: &slates_mem::MemError) -> Cl
   })
 }
 
+/// Where a volume's move stands after one ask ([`Client::move_volume`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveState {
+  /// Under way: frozen, waiting for its records' placement or for the configuration to name its new owner.
+  Moving {
+    /// The member it moves to.
+    to: u64,
+  },
+  /// Done: the configuration names its new owner, where its verbs go now.
+  Moved {
+    /// The member it moved to.
+    to: u64,
+  },
+}
+
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
 /// through — the same rule [`Client::exchange`] applies to a synchronous reply.
 fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
@@ -2756,6 +2771,16 @@ impl Client {
   /// Clears the arm once a reply is taken, so a later fast-path reply costs the daemon no wake.
   pub fn disarm_async(&mut self) -> Result<(), ClientError> {
     self.end.disarm_async().map_err(ClientError::Ipc)
+  }
+
+  /// Ends the async completion channel ([`Self::enable_async_completion`]) for a caller going back to the synchronous
+  /// form, so its parked calls are woken by the daemon's wake rather than a bridge taking it (see
+  /// `ClientEnd::disable_async_completion`). The descriptor the async form polled is closed.
+  pub fn disable_async_completion(&mut self) -> Result<(), ClientError> {
+    self
+      .end
+      .disable_async_completion()
+      .map_err(ClientError::Ipc)
   }
 
   /// Clears the completion fd's readiness after the loop reports it readable.
@@ -4998,6 +5023,34 @@ impl Client {
     })? {
       ReplyBody::LiveShippingSet { live_shipped } => Ok(live_shipped),
       _ => Err(ClientError::UnexpectedReply { verb: "live-ship" }),
+    }
+  }
+
+  /// Captures an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291): every file's
+  /// bytes and every link's target become the volume's own, and the snapshot is recorded captured, so a clone of it
+  /// ([`Client::clone_snapshot`]) needs no base directory and moves between fleet members as a
+  /// plain volume does. The caller asserts nothing writes the source while it runs; a source that changed under it is
+  /// refused `ConsistentBaseUnavailable`. Waits for the walk, which reads the whole base. `write` on the volume is
+  /// required.
+  pub fn capture_base(&mut self, volume: VolumeId) -> Result<SnapshotId, ClientError> {
+    match self.call(&RequestBody::CaptureBase { volume })? {
+      ReplyBody::BaseCaptured { snapshot } => Ok(snapshot),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "capture_base",
+      }),
+    }
+  }
+
+  /// Asks the owner to move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer", A-291; `admin` on
+  /// the volume is required, and it must be a plain volume, a clone of a captured base among them, with no attachment,
+  /// clone of its own or snapshot but its head). One ask: the move goes on between asks, and the caller asks again
+  /// until it is done ([`MoveState::Moved`]). A volume that cannot move is refused `Refusal::MoveRefused`, its
+  /// `MoveRefusal` saying why.
+  pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveState, ClientError> {
+    match self.call(&RequestBody::Move { volume, to })? {
+      ReplyBody::Moving { to } => Ok(MoveState::Moving { to }),
+      ReplyBody::Moved { to } => Ok(MoveState::Moved { to }),
+      _ => Err(ClientError::UnexpectedReply { verb: "move" }),
     }
   }
 

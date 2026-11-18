@@ -543,6 +543,13 @@ impl ShardsBackings {
   /// before any other backing is kept, in ascending `index` order (the slab's [`Slab::insert_at`] contract). Refused, with
   /// nothing kept or counted, past the budget, past the registry's slots, or out of order.
   ///
+  /// **Kept dormant until woken** ([`ShardsBackings::wake`]), as [`ShardsBackings::adopt_vmm`] keeps a VMM's (A-389): no
+  /// write reaches it meanwhile. The copy already holds every write the dead daemon made to its file, in order with its
+  /// client's stores, so the write log's replay, which runs between its adoption and its wake, must not write a logged
+  /// write over a store the client made after it. Measured: kept awake, the replay wrote a logged write over the store
+  /// that followed it in the client's own map, and the client's sync then found nothing to write
+  /// (`a_clients_store_after_a_logged_write_outlives_that_writes_replay`, 2026-11-18).
+  ///
   /// [`Slab::insert_at`]: slates_mem::Slab::insert_at
   pub fn adopt_peer(
     &mut self,
@@ -561,10 +568,8 @@ impl ShardsBackings {
     let mut backing = ShardsBacking::for_peer(object, volume, inode);
     let ranges = object_bytes.div_ceil(DAX_RANGE_BYTES);
     backing.filled.extend(0..ranges);
-    let file = (volume, inode);
     match self.slab.insert_at(index, generation, backing) {
       Ok(handle) => {
-        self.by_file.entry(file).or_default().push(handle);
         self.peers = self.peers.saturating_add(1);
         self.peer_bytes = self.peer_bytes.saturating_add(object_bytes);
         Ok(handle)
@@ -618,8 +623,9 @@ impl ShardsBackings {
     }
   }
 
-  /// Wakes a backing [`ShardsBackings::adopt_vmm`] kept dormant: from now on every change of its file reaches it, as it
-  /// reaches every backing. Whether there was such a backing (a stale handle, or one awake already, changes nothing).
+  /// Wakes a backing [`ShardsBackings::adopt_vmm`] or [`ShardsBackings::adopt_peer`] kept dormant: from now on every
+  /// change of its file reaches it, as it reaches every backing. Whether there was such a backing (a stale handle, or one
+  /// awake already, changes nothing).
   pub fn wake(&mut self, handle: Handle<ShardsBacking>) -> bool {
     let Ok(backing) = self.slab.get(handle) else {
       return false;

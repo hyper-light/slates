@@ -384,14 +384,16 @@ mod tests {
     }
   }
 
-  /// A-200 (raft owns the fix; GAPS, "A live-shipped volume fails a waiting writer through a soft mount"). Do: on an
-  /// `f = 1` fleet, turn a volume live-shipped, mount it as the harness mounts a plain volume, create a file, stop both
+  /// A-200, A-229 (GAPS, "A live-shipped volume fails a waiting writer when its candidates are slow"). Do: on an `f = 1`
+  /// fleet, turn a volume live-shipped, mount it as the harness mounts a plain volume, create a file, stop both
   /// candidates (each anchor, then its daemon), ask the file for a new size, and resume the candidates after
-  /// [`FROZEN`] or once the change answers. Expect: the size change
+  /// [`FROZEN`] or once the change answers; then drop the session with the file still open. Expect: the size change
   /// waits for the candidates and then succeeds, as A-200 says ("Holders that never answer make the writer wait") and as
-  /// the same call on a plain volume succeeds at once. Red on 2026-11-05 on this Mac (below). Gated on
-  /// `SLATES_TEST_LIVE_CONFORMANCE=1` and `SLATES_TEST_BINARY` until the fix, so a red known to its owner does not turn main
-  /// red; it skips loudly otherwise.
+  /// the same call on a plain volume succeeds at once; and the session's mount goes with it. Red on 2026-11-05 on a Mac
+  /// through the soft mount (`ETIMEDOUT` after 57.1 s); green since A-229's hard mount (149.3 s on a Mac Studio,
+  /// 2026-11-18) and on Linux, whose NFS client retries `NFS3ERR_JUKEBOX` (124.3 s on `ubuntu-24.04-arm`). It needs a
+  /// built CLI and a real mount, so it is gated on `SLATES_TEST_LIVE_CONFORMANCE=1` and `SLATES_TEST_BINARY`, which CI's
+  /// conformance lane sets; it skips loudly otherwise.
   #[test]
   #[allow(clippy::disallowed_methods)] // the calls are a program's on the slates mount, the point of the test
   fn a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail() {
@@ -465,10 +467,22 @@ mod tests {
     eprintln!(
       "the size change answered after {answered:?} ({changed:?}); the owner's late stable replies: {late}"
     );
+    // The session goes with the file still open, as a suite killed mid-run leaves its files: its mount must go too.
+    // The macOS mount is hard (A-229), so one left behind with its daemon gone hangs whatever touches it (on CI, the
+    // cache's walk of `target/`); on 2026-11-18 this test left `slates:/livewait-vol` mounted, the plain unmount refused
+    // busy.
+    let mount_point = session.mount.path().to_path_buf();
     drop(session);
+    let left_mounted = super::super::slates::is_mounted(&mount_point);
+    drop(handle);
     assert!(
       changed.is_ok(),
       "a writer waiting for stopped candidates failed after {answered:?}: {changed:?} ({late} late stable replies)"
+    );
+    assert!(
+      !left_mounted,
+      "the session's mount {} outlived its session",
+      mount_point.display()
     );
   }
 }
