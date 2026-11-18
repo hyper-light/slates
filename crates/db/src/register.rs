@@ -5114,7 +5114,7 @@ mod tests {
       .find(|host| *host != adopter)
       .expect("a four-member region keeps another member");
     assert!(
-      regional.move_object(object, adopter, target),
+      regional.move_object(object, adopter, target, &[adopter]),
       "the member that adopted it moves an object whose record was let go"
     );
     assert_eq!(regional.owner_of(object), Some(target));
