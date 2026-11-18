@@ -105,14 +105,18 @@
 >   failing with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
 >   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
 >   carrying none, never held);
-> - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
+> - **found here; closed by A-265 (goal g247, landed with the bounded lists, 2026-11-18):** on a daemon of more than one
+>   shard `Audit` read only the partition of
 >   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
 >   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
 >   shard owns, its signed-work verdicts with them. kiln starts two shards. Measured on the Mac Studio (2026-11-18): a
 >   presented-then-granted landing on a two-shard daemon (`crates/server/tests/daemon.rs`'s fixture) read back no record
 >   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
 >   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
->   written where the design says;
+>   written where the design says. A-265 writes them where the design says: every record is held by the control
+>   shard's partition (a record made on another shard owed to it as one batch), `Audit` is served there a page at a
+>   time, one sequence numbers the daemon's audit, and `a_client_on_any_shard_reads_every_shards_audit`
+>   (`crates/server/tests/audit_pages.rs`) reads every record from clients on both of two shards;
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
 >   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
 >   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
