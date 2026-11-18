@@ -2936,7 +2936,7 @@ impl Daemon {
   }
 
   /// Test support: every shard waits `pause_ns` between the turns of a live takeover's rebuild it makes
-  /// (`fleet::make_live_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
+  /// (`fleet::rebuild_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
   /// attempts meet it running; `None` lifts it. `Ok` once installed on every shard, else the first typed refusal.
   pub fn inject_live_turn_pause(&self, pause_ns: Option<u64>) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -4594,6 +4594,7 @@ async fn init_shard(
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
     making_taken_over: std::collections::BTreeMap::new(),
+    making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
