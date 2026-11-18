@@ -855,10 +855,12 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     return Turned::Ended;
   };
   let told_before = mount.serve.told_through();
-  // A volume this node lost to a takeover ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too,
-  // for a mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a
-  // restart (A-344).
-  if crate::live_ship::superseded(s, mount.volume) && s.attachments.context(mount.registry).is_ok()
+  // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced, A-338, or yielded at this
+  // host's re-admission, A-334) ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too, for a
+  // mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a restart
+  // (A-344).
+  if crate::verbs::lost_to_a_successor(s, mount.volume)
+    && s.attachments.context(mount.registry).is_ok()
   {
     s.attachments.revoke(mount.registry);
     s.count(SUPERSEDED_ENDED, 1);
@@ -1355,22 +1357,13 @@ fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount)
   }
 }
 
-/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61), and closes every held
-/// device recovery found no record for. Each kept mount gets a registry attachment from its record (its rights,
-/// its durable owner, so the references recovery gave back are its own), the serve state its session restored,
-/// and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and never answered come back; then its
-/// serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61). Each kept mount gets a
+/// registry attachment from its record (its rights, its durable owner, so the references recovery gave back are its
+/// own), the serve state its session restored, and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and
+/// never answered come back; then its serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// A held device recovery found no record for is closed by `crate::shards::adopt_held`, which runs next on every Unix.
 pub(crate) fn adopt_held() {
-  let (kept, orphaned) = state::with_state(|s| {
-    (
-      std::mem::take(&mut s.adopt_fuse),
-      std::mem::take(&mut s.inherited_fuse),
-    )
-  })
-  .unwrap_or_default();
-  for held in orphaned {
-    let _ = crate::fuse_hold::release(held.attachment);
-  }
+  let kept = state::with_state(|s| std::mem::take(&mut s.adopt_fuse)).unwrap_or_default();
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
@@ -1516,11 +1509,12 @@ pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
   }
 }
 
-/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a takeover (A-346; its log
-/// fenced at a later epoch, A-338): each is fenced as a revoked mount is ([`fence_if_mounted`]), so its kernel drops what
-/// it cached of the volume, every request meanwhile is refused `ENOTCONN`, and the mount ends: FUSE's form of the
-/// `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a mount went on answering from this node's copy,
-/// which the successor's writes had passed, or, behind the lease gate, held its requests in the kernel for good.
+/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a successor (A-346; its log
+/// fenced at a later epoch, A-338, or yielded at this host's re-admission, A-334): each is fenced as a revoked mount is
+/// ([`fence_if_mounted`]), so its kernel drops what it cached of the volume, every request meanwhile is refused
+/// `ENOTCONN`, and the mount ends: FUSE's form of the `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a
+/// mount went on answering from this node's copy, which the successor's writes had passed, or, behind the lease gate,
+/// held its requests in the kernel for good.
 pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
   let mounts: Vec<u64> = s
     .fuse_mounts

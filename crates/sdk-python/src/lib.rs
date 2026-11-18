@@ -161,6 +161,7 @@ fn landing_dict(py: Python<'_>, landing: Landing) -> PyResult<Py<PyDict>> {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       dict.set_item("grant_required", true)?;
       dict.set_item("landing", landing)?;
@@ -178,6 +179,8 @@ fn landing_dict(py: Python<'_>, landing: Landing) -> PyResult<Py<PyDict>> {
       s.set_item("filtered_out", summary.filtered_out)?;
       dict.set_item("summary", s)?;
       dict.set_item("conflicts", conflicts)?;
+      // Conflicts past what one reply holds (A-267): every entry, its conflict among it, is read from the presentation.
+      dict.set_item("conflicts_elided", conflicts_elided)?;
       dict.set_item("grant_with", format!("slates grant {landing}"))?;
     }
   }
@@ -200,6 +203,7 @@ fn status_dict(py: Python<'_>, report: StatusReport) -> PyResult<Py<PyDict>> {
   dict.set_item("snapshots", report.snapshots)?;
   dict.set_item("watcher", report.watcher)?;
   dict.set_item("drifted", report.drifted)?;
+  dict.set_item("drifted_elided", report.drifted_elided)?;
   dict.set_item("nfs_port", report.nfs_port)?;
   dict.set_item("placed", report.placed.region)?;
   dict.set_item("mirror_age_ns", report.placed.mirror_age_ns)?;
@@ -358,14 +362,36 @@ impl Client {
   /// Reads the volume's status (§4.4) as a dict of plain Python values — the same fields `slates status`
   /// prints: its id and name, the byte accounting (`referenced_bytes`, `unique_bytes`), the held lease
   /// epoch (`None` when unheld), live `attachments`, the `head` snapshot sequence, `snapshots` held, the
-  /// overlay `watcher` state, and the `drifted` overlay paths (the full list; the CLI shows only the
-  /// count). The placement (§4.8, D-18) is flattened: `placed` is whether the head is placed in the
-  /// region, `mirror_age_ns` the mirror's lag (`None` where no mirror exists), `host_epoch` the owner's
-  /// authority. `nfs_port` is the daemon's loopback port for `mount_nfs`, or `None` when it serves no NFS.
+  /// overlay `watcher` state, and the `drifted` overlay paths (those that fit beside the report's other
+  /// fields in one reply; `drifted_elided` counts the rest, which `slates status --drift` walks, A-267). The
+  /// placement (§4.8, D-18) is flattened: `placed` is whether the head is placed in the region,
+  /// `mirror_age_ns` the mirror's lag (`None` where no mirror exists), `host_epoch` the owner's authority. `nfs_port` is the daemon's loopback port for `mount_nfs`, or `None` when it serves no NFS.
   fn status(&mut self, py: Python<'_>, volume: &str) -> PyResult<Py<PyDict>> {
     let id = parse_volume(volume)?;
     let report = self.inner.status(id).map_err(refusal)?;
     status_dict(py, report)
+  }
+
+  /// Reads an overlay's whole drift (§4.4 `status`, A-267) as a dict: `drifted`, a list of dicts each with its `path`
+  /// and its `kind` (`"Modified"`, `"Deleted"`, `"Replaced"`, `"TypeChanged"`); `unverified`, the paths whose re-check
+  /// the host refused now; and `oversized`, the entries too long for any reply. A status carries the first drifted
+  /// entries that fit beside its other fields and counts the rest (`drifted_elided`); this reads every one, a page at a
+  /// time, each page re-checking the entries it passes against the disk.
+  fn drifted(&mut self, py: Python<'_>, volume: &str) -> PyResult<Py<PyDict>> {
+    let id = parse_volume(volume)?;
+    let whole = self.inner.drifted(id).map_err(refusal)?;
+    let dict = PyDict::new_bound(py);
+    let mut drifted: Vec<Py<PyDict>> = Vec::with_capacity(whole.drifted.len());
+    for entry in whole.drifted {
+      let d = PyDict::new_bound(py);
+      d.set_item("path", entry.path)?;
+      d.set_item("kind", format!("{:?}", entry.kind))?;
+      drifted.push(d.into());
+    }
+    dict.set_item("drifted", drifted)?;
+    dict.set_item("unverified", whole.unverified)?;
+    dict.set_item("oversized", whole.oversized)?;
+    Ok(dict.into())
   }
 
   /// Lists the daemon's volumes (§4.4) as a list of dicts — each with its `id` (hex), `name`, the byte
@@ -1608,7 +1634,11 @@ fn settle_one(slf: &Bound<'_, AsyncClient>, event: Event) -> PyResult<()> {
         decode_pending(py, &mut this.inner, word, decode)
       };
       match decoded {
-        Ok(None) => return Ok(()),
+        // A chained call took a step: its next reply is reported again.
+        Ok(None) => {
+          slf.borrow_mut().driver.continued(ticket);
+          return Ok(());
+        }
         Ok(Some(value)) => (ticket, Ok(value)),
         Err(error) => (ticket, Err(error)),
       }
@@ -1762,11 +1792,62 @@ fn decode_pending(
   })
 }
 
-/// The `slates` extension module: the [`Client`] and [`AsyncClient`] classes and the SDK version.
+/// Format: the executable [`exec_command`] runs unless its caller names another: the `slates` binary, found on the
+/// `PATH` as a shell finds it. slates' AppArmor profile attaches to the binary's real path (A-370).
+const SLATES_PROGRAM: &str = "slates";
+
+/// The command that runs slates' chosen-path launcher (`slates exec`, §4.6 "The launcher"; A-370): `volume` shown at
+/// the existing directory `at` for `command`, in a namespace of its own (Linux). It returns the argument list for
+/// `subprocess.run` or `asyncio.create_subprocess_exec`, so the program spawns and awaits it as it would any command;
+/// the launcher finds the volume under `SLATES_ROOT` in the environment it is given. `apparmor_profile` is the
+/// launcher's AppArmor option, off unless `True`: on a host whose AppArmor restricts unprivileged user namespaces
+/// (Ubuntu 24.04 and later), the launcher then makes its namespace under slates' AppArmor profile for `program`, which
+/// an administrator loads as root ([`apparmor_profile`]); off, it never uses that profile. The grammar is every
+/// surface's (`slates_client::exec::ExecSpec`), so the `slates` command reads back exactly this request.
+#[pyfunction]
+#[pyo3(signature = (volume, at, command, *, apparmor_profile = false, program = None))]
+fn exec_command(
+  volume: String,
+  at: String,
+  command: Vec<String>,
+  apparmor_profile: bool,
+  program: Option<String>,
+) -> PyResult<Vec<String>> {
+  if command.is_empty() {
+    return Err(SlatesError::new_err("exec needs a command"));
+  }
+  let spec = slates_client::exec::ExecSpec {
+    volume,
+    at,
+    command,
+    apparmor: if apparmor_profile {
+      slates_client::exec::AppArmor::Profile
+    } else {
+      slates_client::exec::AppArmor::Off
+    },
+  };
+  let mut argv = vec![program.unwrap_or_else(|| SLATES_PROGRAM.to_owned())];
+  argv.extend(spec.arguments());
+  Ok(argv)
+}
+
+/// slates' AppArmor profile for `executable`, the absolute real path of the binary that runs the launcher (A-370): the
+/// text an administrator saves under `/etc/apparmor.d` and loads with `apparmor_parser -r`, as root. It grants that
+/// executable `userns,` and nothing else. Raises [`SlatesError`] for a path the profile cannot name exactly.
+#[pyfunction]
+fn apparmor_profile(executable: &str) -> PyResult<String> {
+  slates_client::exec::profile(executable)
+    .map_err(|refusal| SlatesError::new_err(refusal.to_string()))
+}
+
+/// The `slates` extension module: the [`Client`] and [`AsyncClient`] classes, the launcher's command and AppArmor
+/// profile (A-370), and the SDK version.
 #[pymodule]
 fn slates(module: &Bound<'_, PyModule>) -> PyResult<()> {
   module.add_class::<Client>()?;
   module.add_class::<AsyncClient>()?;
+  module.add_function(wrap_pyfunction!(exec_command, module)?)?;
+  module.add_function(wrap_pyfunction!(apparmor_profile, module)?)?;
   module.add("SlatesError", module.py().get_type_bound::<SlatesError>())?;
   module.add("__version__", env!("CARGO_PKG_VERSION"))?;
   Ok(())

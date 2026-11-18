@@ -27,8 +27,10 @@
 //!
 //! **Where it stands.** Merges are signed work: judged on the green's owner (`verbs::judge_signature`), the verdict
 //! recorded in the version's chain entry and the green's accepted record, which a checkpoint keeps (`to_entry`,
-//! `of_entry`), and read back by `MergeRecord`. A landing's statement is defined here and its verdict is owed (GAPS,
-//! A-321): a landing's manifest is what a presentation (`Present`, `GrantRequired`) shows a signer.
+//! `of_entry`), and read back by `MergeRecord`. Landings are signed work: judged on the volume's owner against the
+//! manifest a presentation shows or a granted landing writes (`landing::landing_verdict`), the verdict recorded in the
+//! landing's audit records (`to_record`, `of_record`) and read back by `Audit`. A presentation (`Present`,
+//! `GrantRequired`) hands a signer the landing's statement.
 //!
 //! **Trusted signers.** A volume's signers are public keys the launcher sets (`SetSigners`, proven as a write policy
 //! is, refused on an agent's own channel). A merge verifies under its work's signers and its green's together; a
@@ -532,6 +534,44 @@ pub fn to_entry(verification: &Verification) -> Option<slates_merge::chain_entry
       fingerprint: [0u8; FINGERPRINT_BYTES],
     }),
   }
+}
+
+/// `verification` as a landing's audit record keeps it (A-321): `None` for a landing that carried no signature.
+#[must_use]
+pub fn to_record(verification: &Verification) -> Option<slates_db::catalog::SignatureVerdict> {
+  to_entry(verification).map(shipped)
+}
+
+/// A chain entry's verdict in the form a record keeps and a merge record carries to holders and a takeover successor
+/// (A-321): the same three fields, in a type the wire encodes.
+#[must_use]
+pub fn shipped(
+  entry: slates_merge::chain_entry::Signature,
+) -> slates_db::catalog::SignatureVerdict {
+  slates_db::catalog::SignatureVerdict {
+    kind: entry.kind,
+    detail: entry.detail,
+    fingerprint: entry.fingerprint,
+  }
+}
+
+/// A shipped verdict as a chain entry records it (A-321): what a takeover successor's chain entry keeps for the version.
+#[must_use]
+pub fn adopted(
+  record: slates_db::catalog::SignatureVerdict,
+) -> slates_merge::chain_entry::Signature {
+  slates_merge::chain_entry::Signature {
+    kind: record.kind,
+    detail: record.detail,
+    fingerprint: record.fingerprint,
+  }
+}
+
+/// A record's verdict, read back as the wire names it: `Unsigned` for a record that keeps none, `None` for a verdict no
+/// code of this build names.
+#[must_use]
+pub fn of_record(recorded: Option<slates_db::catalog::SignatureVerdict>) -> Option<Verification> {
+  of_entry(recorded.map(adopted))
 }
 
 /// A chain entry's recorded verdict, read back as the wire names it: `Unsigned` for an entry that records none, `None`

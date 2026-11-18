@@ -2,9 +2,10 @@
 //! 4b), with this test as the anchor and as the device. The test makes the anchor's hold channel and hands it to each
 //! daemon as the anchor does (`SLATES_ANCHOR_DEVICES`, the held resync ends with their sessions for the second), which
 //! a daemon adopts once per process into a process-wide cell: hence a binary of its own with one test. A daemon's death
-//! is a fenced stop, which ends no record and releases no hold, as a killed process does.
+//! is a fenced stop, which ends no record and releases no hold, as a killed process does. Linux and macOS (A-339), where
+//! the client claims both ends on the socket route.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -15,11 +16,14 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_anchor::held::{self, Incoming};
 use slates_bridge_fuse::shards_resync::{RESYNC_MESSAGE_BYTES, ResyncKind, ResyncMessage};
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass};
+use slates_client::{
+  Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, VolumeId,
+};
 use slates_server::{Daemon, DaemonConfig};
 
 mod common;
@@ -31,6 +35,9 @@ const WAIT: Duration = Duration::from_secs(20);
 const LOOKUP: u32 = 1;
 const READ: u32 = 15;
 const WRITE: u32 = 16;
+const SETXATTR: u32 = 21;
+const GETXATTR: u32 = 22;
+const INIT: u32 = 26;
 const CREATE: u32 = 35;
 /// Format: a FUSE request's in-header, and the reply's out-header (length, errno, unique).
 const IN_HEADER_LEN: usize = 40;
@@ -40,8 +47,19 @@ const CREATE_EXCLUSIVE: u32 = 0o302;
 const FILE_MODE: u32 = 0o100_644;
 /// Format: Linux's `EEXIST`.
 const EEXIST: i32 = 17;
+/// Format: `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT` in `fuse_init_in.flags` (`include/uapi/linux/fuse.h`), which a Linux
+/// guest's kernel offers; and where the anchor's session of a stream keeps its form (past the token and the owner
+/// view's four words), with the form's bit for the extended SETXATTR (A-378).
+const INIT_POSIX_ACL: u32 = 1 << 20;
+const INIT_SETXATTR_EXT: u32 = 1 << 29;
+const SESSION_FORM_AT: usize = slates_bridge_fuse::shards_resync::TOKEN_BYTES + 16;
+const FORM_SETXATTR_EXT: u64 = 1;
 /// The bytes the second stream writes after the last publication before the death.
 const WRITTEN: &[u8] = b"acknowledged after the last publication";
+/// Shape: how long the successor's `Resync`s wait in the devices' channels while another thread opens and closes
+/// sockets: thousands of runs of XNU's collector of descriptors in flight, which flushed the anchor's held end in 3 of 3
+/// runs at this wait when its daemon kept no copy (A-339).
+const RESYNCS_IN_FLIGHT: Duration = Duration::from_millis(200);
 
 fn deadlines() -> Deadlines {
   Deadlines::derive(
@@ -112,7 +130,7 @@ fn take_hold(anchor: &OwnedFd) -> Hold {
 fn next_resync(end: &OwnedFd) -> (ResyncMessage, Vec<OwnedFd>) {
   rustix::net::sockopt::set_socket_timeout(end, rustix::net::sockopt::Timeout::Recv, Some(WAIT))
     .unwrap();
-  let mut bytes = [0u8; 2 * RESYNC_MESSAGE_BYTES];
+  let mut bytes = [0u8; RESYNC_MESSAGE_BYTES];
   let (read, descriptors) = slates_ipc::stream::recv_message(end.as_fd(), &mut bytes).unwrap();
   (ResyncMessage::parse(&bytes[..read]).unwrap(), descriptors)
 }
@@ -185,8 +203,8 @@ fn created(body: &[u8]) -> (u64, u64) {
   (word(0), word(128))
 }
 
-/// Waits until `daemon` has counted `kind` at least once.
-fn counted(daemon: &Daemon, kind: &str) -> u64 {
+/// Waits until `daemon` has counted `kind` at least `at_least` times, or [`WAIT`] passes: the count then.
+fn counted(daemon: &Daemon, kind: &str, at_least: u64) -> u64 {
   let started = Instant::now();
   loop {
     let count = daemon
@@ -195,7 +213,7 @@ fn counted(daemon: &Daemon, kind: &str) -> u64 {
       .get(kind)
       .copied()
       .unwrap_or(0);
-    if count > 0 || started.elapsed() > WAIT {
+    if count >= at_least || started.elapsed() > WAIT {
       return count;
     }
     std::thread::yield_now();
@@ -224,6 +242,58 @@ fn handed_back(channel: &OwnedFd, holds: &[&Hold]) -> String {
     ));
   }
   value
+}
+
+/// One Shards attach as the device and the anchor see it: the stream's end, the device's resync end and the `Attached`
+/// it read there first, and the hold the anchor was given.
+struct Attach {
+  stream: OwnedFd,
+  resync: OwnedFd,
+  attached: ResyncMessage,
+  hold: Hold,
+}
+
+/// Attaches `volume` in the Shards form through `client`, takes the hold the anchor is given, and reads the device's
+/// first message, `Attached`.
+fn attach_and_hold(client: &mut Client, volume: VolumeId, anchor: &OwnedFd) -> Attach {
+  let shards = client.attach_shards(volume, Intent::Write, None).unwrap();
+  let hold = take_hold(anchor);
+  let resync = shards
+    .resync
+    .expect("the daemon hands a resync end (Linux, macOS)");
+  let (attached, _) = next_resync(&resync);
+  assert_eq!(attached.kind, ResyncKind::Attached);
+  Attach {
+    stream: shards.stream,
+    resync,
+    attached,
+    hold,
+  }
+}
+
+/// Starts the successor over `segment` while another thread opens and closes Unix sockets, and holds the devices' reads
+/// of their `Resync`s off for [`RESYNCS_IN_FLIGHT`] once it has sent all `streams` of them (A-339).
+fn successor_under_churn(
+  profile: &slates_machine::MachineProfile,
+  config: DaemonConfig,
+  segment: &common::anchor::Anchor,
+  streams: u64,
+) -> Daemon {
+  let stop = AtomicBool::new(false);
+  std::thread::scope(|scope| {
+    scope.spawn(|| churn(&stop));
+    let _stop = StopOnDrop(&stop);
+    let second = Daemon::start(profile, config, source_of(segment)).unwrap();
+    assert_eq!(
+      counted(&second, "shards.resynced", streams),
+      streams,
+      "each kept stream is resynced"
+    );
+    // The test thread holds the devices' reads off while the churn runs; no runtime serves it (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(RESYNCS_IN_FLIGHT);
+    second
+  })
 }
 
 /// Sets `SLATES_ANCHOR_DEVICES` for the daemon about to start.
@@ -260,7 +330,7 @@ fn create_unanswered_then_write(
   daemon.withhold_shards_replies(true).unwrap();
   creator.send(&create(41, "once"));
   assert_eq!(
-    counted(daemon, "shards.reply_withheld"),
+    counted(daemon, "shards.reply_withheld", 1),
     1,
     "the exclusive CREATE was applied and published, its reply never written"
   );
@@ -275,10 +345,62 @@ fn create_unanswered_then_write(
   (data, fh)
 }
 
+/// Before the death, A-378: `writer`'s kernel sends the INIT a Linux guest's sends, offering `FUSE_POSIX_ACL` and
+/// `FUSE_SETXATTR_EXT`; it is answered, and the anchor told a session for `hold`'s attachment keeping the extended form,
+/// which becomes the session the anchor hands the successor.
+fn init_in_the_extended_form(anchor: &OwnedFd, writer: &mut Guest, hold: &mut Hold) {
+  let mut init = Vec::new();
+  for word in [7u32, 41, 128 << 10, INIT_POSIX_ACL | INIT_SETXATTR_EXT] {
+    init.extend_from_slice(&word.to_le_bytes());
+  }
+  let (errno, _, _) = writer.ask(&request(INIT, 10, 0, &init));
+  assert_eq!(errno, 0, "the guest's INIT is answered");
+  let Incoming::Session {
+    attachment,
+    session,
+  } = next_held(anchor)
+  else {
+    panic!("the INIT told the anchor no session");
+  };
+  assert_eq!(attachment, hold.attachment);
+  let form = u64::from_le_bytes(
+    session[SESSION_FORM_AT..SESSION_FORM_AT + 8]
+      .try_into()
+      .unwrap(),
+  );
+  assert_eq!(
+    form, FORM_SETXATTR_EXT,
+    "the session keeps the extended form"
+  );
+  hold.session = session;
+}
+
+/// After the death, A-378: the successor parses `writer`'s SETXATTR in the extended form its kernel took before the
+/// death (the size, the flags, the setter's flags and a pad before the name), which no INIT on the fresh stream repeats:
+/// a user attribute set on `data` that way is served and read back.
+fn the_successor_parses_the_extended_form(writer: &mut Guest, data: u64) {
+  let value = b"set in the extended form";
+  let mut set = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  set.extend_from_slice(&[0u8; 12]);
+  set.extend_from_slice(b"user.form\0");
+  set.extend_from_slice(value);
+  let (errno, _, _) = writer.ask(&request(SETXATTR, 14, data, &set));
+  assert_eq!(errno, 0, "the extended SETXATTR is served after the resync");
+  let mut get = 64u32.to_le_bytes().to_vec();
+  get.extend_from_slice(&0u32.to_le_bytes());
+  get.extend_from_slice(b"user.form\0");
+  let (errno, _, read) = writer.ask(&request(GETXATTR, 15, data, &get));
+  assert_eq!(
+    (errno, read.as_slice()),
+    (0, &value[..]),
+    "its name and value were found past the extended head"
+  );
+}
+
 /// After the death: each device's resync end (the first of each pair) brings a `Resync` naming its attachment and the
-/// token its `Attached` (the second) named, with one descriptor, the end of the fresh stream it is served on. Returns a
-/// guest over each fresh stream, in the pairs' order.
-fn resynced(ends: [(&OwnedFd, &ResyncMessage); 2]) -> [Guest; 2] {
+/// token its `Attached` (the second) named, with one descriptor, the end of the fresh stream it is served on, live (a
+/// flush in flight zeroes its receive buffer, A-339). Returns each fresh end, in the pairs' order.
+fn resynced<const N: usize>(ends: [(&OwnedFd, &ResyncMessage); N]) -> [OwnedFd; N] {
   ends.map(|(resync, attached)| {
     let (message, mut descriptors) = next_resync(resync);
     assert!(
@@ -286,8 +408,56 @@ fn resynced(ends: [(&OwnedFd, &ResyncMessage); 2]) -> [Guest; 2] {
       "a Resync naming the attachment and its token, with one descriptor: {message:?}, {} descriptors",
       descriptors.len()
     );
-    Guest::over(descriptors.pop().unwrap())
+    let fresh = descriptors.pop().unwrap();
+    assert_ne!(
+      rustix::net::sockopt::socket_recv_buffer_size(&fresh).unwrap(),
+      0,
+      "the fresh end arrives live: its daemon kept a copy while it rode the Resync"
+    );
+    fresh
   })
+}
+
+/// Sets its flag when dropped: the churn's stop, on every exit, a failed assertion included.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+  fn drop(&mut self) {
+    self.0.store(true, Ordering::Relaxed);
+  }
+}
+
+/// Opens and closes Unix socket pairs until `stop`: each close may run XNU's collector of descriptors in flight.
+fn churn(stop: &AtomicBool) {
+  while !stop.load(Ordering::Relaxed) {
+    drop(UnixStream::pair().unwrap());
+  }
+}
+
+/// The device of `leaving` goes before it takes its fresh stream: it closes the fresh end and its end of the resync
+/// channel without a byte. The anchor is then told to release `leaving`'s hold, as the attachment ended (its successor
+/// let its own copy of the fresh end go when the channel woke, so the stream saw its peer gone), counted.
+fn a_device_gone_before_its_first_frame_ends_its_attachment(
+  daemon: &Daemon,
+  anchor: &OwnedFd,
+  leaving: u64,
+  (fresh, resync): (OwnedFd, OwnedFd),
+) {
+  drop(fresh);
+  drop(resync);
+  let started = Instant::now();
+  loop {
+    if let Incoming::Release { attachment } = next_held(anchor)
+      && attachment == leaving
+    {
+      break;
+    }
+    assert!(
+      started.elapsed() < WAIT,
+      "the gone device's attachment never ended"
+    );
+  }
+  assert_eq!(counted(daemon, "shards.resync_abandoned", 1), 1);
 }
 
 /// On the fresh streams `daemon` serves: `creator` resends the exclusive CREATE whole, under its unique, and is answered
@@ -306,13 +476,17 @@ fn answered_once_and_kept(
     (0, 41),
     "the resent CREATE is answered from its published reply, never applied twice"
   );
-  assert_eq!(counted(daemon, "shards.replayed"), 1);
-  assert_eq!(counted(daemon, "shards.resynced"), 2);
+  assert_eq!(counted(daemon, "shards.replayed", 1), 1);
   let (errno, _, bytes) = writer.ask(&request(READ, 13, data, &io_in(fh, WRITTEN.len())));
   assert_eq!(
     (errno, bytes.as_slice()),
     (0, WRITTEN),
     "the write acknowledged after the last publication outlived the daemon"
+  );
+  assert_eq!(
+    counted(daemon, "shards.resync_taken", 2),
+    2,
+    "each device that wrote showed it held its fresh end, and its daemon's copy went"
   );
   let (errno, _, _) = creator.ask(&request(LOOKUP, 42, 1, b"once\0"));
   assert_eq!(errno, 0, "the file is there");
@@ -323,15 +497,20 @@ fn answered_once_and_kept(
   );
 }
 
-/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half). Do: as the anchor, hand a daemon the hold channel;
-/// attach a volume twice in the Shards form; create a file and open it on the second stream; withhold the daemon's
-/// replies and send an exclusive CREATE on the first stream, whose barrier publishes it with its reply; then write on the
-/// second stream, acknowledged after that last publication; kill the daemon (a fenced stop: no record ended, no hold
-/// released); start a second daemon over the same segment with the held ends handed back. Expect each device to be
-/// handed a fresh stream in a `Resync` that names its attachment and the token its `Attached` named, with one
-/// descriptor; the resent CREATE answered with success under its unique, from the published reply (a second
-/// application would answer `EEXIST`), counted as replayed; the acknowledged write read back on the second stream (the
-/// write log); and the file there once: a new exclusive CREATE of it refused `EEXIST`.
+/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too), A-378. Do: as the anchor, hand
+/// a daemon the hold channel; attach a volume three times in the Shards form; the second stream's kernel sends an INIT
+/// taking the extended SETXATTR form; create a file and open it on the second stream; withhold the daemon's replies and
+/// send an exclusive CREATE on the first stream, whose barrier publishes it with its reply; then write on the second
+/// stream, acknowledged after that last publication; kill the daemon (a fenced stop: no record ended, no hold
+/// released); start a second daemon over the same segment with the held ends handed back, while another thread opens
+/// and closes sockets and the devices leave their `Resync`s unread for a while; then the third device goes without a
+/// byte on its fresh stream. Expect each device to be handed a fresh stream in a `Resync` that names its attachment and
+/// the token its `Attached` named, with one descriptor, live; the resent CREATE answered with success under its unique,
+/// from the published reply (a second application would answer `EEXIST`), counted as replayed; the acknowledged write
+/// read back on the second stream (the write log); a SETXATTR in the extended form served there and read back, parsed
+/// as before the death though no INIT repeated it; the file there once, a new exclusive CREATE of it refused `EEXIST`;
+/// each writing device counted as having taken its fresh end; and the third attachment ended, its hold released,
+/// counted as abandoned.
 #[test]
 fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once() {
   let (anchor, daemon_end) = held::channel().unwrap();
@@ -361,35 +540,42 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
       base: None,
     })
     .unwrap();
-  let creating = client.attach_shards(volume, Intent::Write, None).unwrap();
-  let creating_hold = take_hold(&anchor);
-  let writing = client.attach_shards(volume, Intent::Write, None).unwrap();
-  let writing_hold = take_hold(&anchor);
-  let creating_resync = creating.resync.expect("Linux hands a resync end");
-  let writing_resync = writing.resync.expect("Linux hands a resync end");
-  let (creating_attached, _) = next_resync(&creating_resync);
-  let (writing_attached, _) = next_resync(&writing_resync);
-  assert_eq!(creating_attached.kind, ResyncKind::Attached);
+  let [creating, mut writing, leaving] =
+    [(); 3].map(|()| attach_and_hold(&mut client, volume, &anchor));
 
   let mut old_writer = Guest::over(writing.stream);
   let mut old_creator = Guest::over(creating.stream);
+  init_in_the_extended_form(&anchor, &mut old_writer, &mut writing.hold);
   let file = create_unanswered_then_write(&first, &mut old_creator, &mut old_writer);
   first.inject_consensus_failure().unwrap();
   first.stop();
   drop(client);
 
-  hand_to_next_daemon(&handed_back(&daemon_end, &[&creating_hold, &writing_hold]));
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-  let [mut creator, mut writer] = resynced([
-    (&creating_resync, &creating_attached),
-    (&writing_resync, &writing_attached),
+  hand_to_next_daemon(&handed_back(
+    &daemon_end,
+    &[&creating.hold, &writing.hold, &leaving.hold],
+  ));
+  let second = successor_under_churn(&profile, config, &segment, 3);
+  let [creator, writer, leaving_fresh] = resynced([
+    (&creating.resync, &creating.attached),
+    (&writing.resync, &writing.attached),
+    (&leaving.resync, &leaving.attached),
   ]);
+  let (mut creator, mut writer) = (Guest::over(creator), Guest::over(writer));
   answered_once_and_kept(&second, &mut creator, &mut writer, file);
+  the_successor_parses_the_extended_form(&mut writer, file.0);
+  a_device_gone_before_its_first_frame_ends_its_attachment(
+    &second,
+    &anchor,
+    leaving.hold.attachment,
+    (leaving_fresh, leaving.resync),
+  );
   drop(writer);
   drop(creator);
   second.stop();
   drop(old_writer);
   drop(old_creator);
+  drop(leaving.stream);
   drop(segment);
   drop(anchor);
 }

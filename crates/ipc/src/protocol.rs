@@ -239,7 +239,7 @@ pub struct GreenBase {
   pub snapshot: SnapshotId,
 }
 
-/// Which view of a volume a [`RequestBody::Read`] reads (§4.16 "Attachments and versions"; §4.12
+/// Which view of a volume a [`RequestBody::ReadRange`] reads (§4.16 "Attachments and versions"; §4.12
 /// `slates.fs.read`).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadAt {
@@ -302,12 +302,19 @@ pub enum RequestBody {
     /// The green.
     green: VolumeId,
   },
-  /// The files a green changed strictly after `version` (§4.16): what a lagging work reconciles.
+  /// One page of the paths a green changed strictly after `version` (§4.16, A-264): what a lagging work reconciles.
+  /// Read from the green's change index in version order from `from` (`None` begins), each page ending where one reply
+  /// chunk is full (§4.3) or where the shard's slice of its turn is spent, whichever comes first, so a page costs what
+  /// it passes and never the green's tree. A page may hold no path and still carry a cursor; the client walks to the
+  /// end. A path changed after `version` when the walk began is answered once, and once more if it changes again
+  /// during the walk. A version past the head is refused `UnknownBase`.
   ChangedSince {
     /// The green.
     green: VolumeId,
     /// The base version to compare against.
     version: u64,
+    /// Where the previous page stopped, or `None` for the first page.
+    from: Option<ChangedCursor>,
   },
   /// Create a work volume over a green (§4.16): an agent's private clone to declare operations on.
   CreateWork {
@@ -395,8 +402,13 @@ pub enum RequestBody {
     /// The volume.
     volume: VolumeId,
   },
-  /// List the caller's volumes.
-  List,
+  /// One page of the volumes the caller may read (§4.4 `list`), in volume-id order: `after` `None` begins, and each
+  /// page's `next` continues it. A page holds what one reply chunk holds (§4.3), so the client walks a listing of any
+  /// length; a volume that exists throughout the walk is listed exactly once. A read; never recorded.
+  List {
+    /// The last volume of the previous page, or `None` for the first page.
+    after: Option<VolumeId>,
+  },
   /// Acknowledge completions up to a sequence except the ids still owed (releases the others' records, §4.9).
   Acknowledge {
     /// Every sequence up to and including this one, except `owed`.
@@ -405,12 +417,16 @@ pub enum RequestBody {
     /// records stay: at most the ring's slots and the client's hold.
     owed: Vec<u32>,
   },
-  /// The base entry as the disk holds it now (§4.4 `read_base`).
+  /// One page of the base entry as the disk holds it now (§4.4 `read_base`, A-267): its bytes from `offset`, as many as
+  /// one reply holds, with the file's size and its fingerprint's stamp; a client walks the pages to the size and
+  /// refuses a file whose stamp moved between them. Neither a reply nor the daemon holds more than a page.
   ReadBase {
     /// The volume.
     volume: VolumeId,
     /// The path.
     path: String,
+    /// Where the page starts: 0, then the bytes read so far.
+    offset: u64,
   },
   /// Re-witness drifted entries (§4.4 `rewitness`).
   Rewitness {
@@ -522,10 +538,22 @@ pub enum RequestBody {
     filter: Filter,
     /// A grant the caller already holds (from `slates grant`), or none to be presented.
     grant: Option<u64>,
+    /// A signature over the landing's statement (signed work, A-321; `slates_server::signed_work::landing_statement`,
+    /// signed under the namespace `slates-work`): judged under the volume's trusted signers against the manifest the
+    /// landing writes (or presents), recorded with the landing's audit records and answered. It permits nothing: the
+    /// landing follows its write mode.
+    signature: Option<Vec<u8>>,
   },
-  /// The caller's grants (a read; creating a grant is off-ring).
-  Grants,
-  /// The audit log from a sequence (a read).
+  /// One page of the caller's grants (a read; creating a grant is off-ring), in grant-id order past `after`: `None`
+  /// begins, and each page's `next` continues it. A page holds what one reply chunk holds (§4.3), so a principal's
+  /// grants of any number are walked; a grant that exists throughout the walk is answered exactly once.
+  Grants {
+    /// The last grant of the previous page, or `None` for the first page.
+    after: Option<u64>,
+  },
+  /// One page of the audit (§4.15, A-265): the records from sequence `since` on, in sequence order, as many as one
+  /// reply chunk holds. One partition holds the audit, the control shard's, so the sequence numbers the daemon's
+  /// records and a walk continues from one past the last record a page held. A read.
   Audit {
     /// Every record at or after this sequence.
     since: u64,
@@ -556,9 +584,10 @@ pub enum RequestBody {
     /// The version to pin, or the head.
     version: Option<u64>,
   },
-  /// Read a file's bytes from a volume at a view (§4.12 `slates.fs.read`): a green's head or a named
-  /// version, the version an attachment pins, or a work's or plain volume's live tree. A read; never
-  /// recorded. Appended at the end for append-only evolution.
+  /// Retired (A-267): a whole file in one reply, which past a reply chunk's bytes was refused "reply too large for the
+  /// bulk area" after the daemon had read the whole file into its memory. A file is read a page at a time with
+  /// `ReadRange`, which the client walks; this verb is refused `Unsupported` and kept only so the tags after it hold
+  /// (D-15, `tests/wire_order.rs`).
   Read {
     /// The volume.
     volume: VolumeId,
@@ -942,6 +971,9 @@ pub enum RequestBody {
     target: String,
     /// The filter.
     filter: Filter,
+    /// A signature over the presented landing's statement, judged as `Land`'s is (A-321): what a held landing of an
+    /// asking session carries to its approval request.
+    signature: Option<Vec<u8>>,
   },
   /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
   /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
@@ -1027,6 +1059,39 @@ pub enum RequestBody {
     green: VolumeId,
     /// The version.
     version: u64,
+  },
+  /// One page of an overlay volume's drift (§4.4 `status`, A-267): the entries a status lists — every witnessed entry
+  /// whose disk no longer matches its witness, and every one whose re-check the host refuses now — in inode order past
+  /// `after`, re-checked now as a status re-checks them, as many as one reply chunk holds and its slice of the shard's
+  /// step allows. A walk of the pages re-checks each witnessed entry once, and an entry drifted for the whole walk is
+  /// answered once. A status carries the first that fit; this reads them all. A read; never recorded. Appended.
+  Drifted {
+    /// The overlay volume.
+    volume: VolumeId,
+    /// The inode the previous page ended at, or `None` for the first page.
+    after: Option<u64>,
+  },
+  /// One page of a work's last conflicting verdict (§4.16, A-267): the windows of the submit's or the rebase's verdict
+  /// `verdict` named, from position `from`, as many as one reply chunk holds. The work keeps the verdict until its next
+  /// submit or rebase; a verdict no longer kept is refused `VerdictReplaced`. Served on the work's owner. A read; never
+  /// recorded. Appended.
+  Conflicts {
+    /// The work volume.
+    work: VolumeId,
+    /// The verdict, as its `Submitted` or `Rebased` named it.
+    verdict: u64,
+    /// The position to read from: the windows the verdict's reply carried, then each page's `next`.
+    from: u32,
+  },
+  /// Renews a CLI attachment's term from whatever holds it (A-230, A-384): what `slates attach --hold` and the client
+  /// library's and the SDKs' attachment objects send while they live, so an attachment its holder keeps never lapses
+  /// for want of another verb naming it. Does nothing else. Served on the attachment's owner shard and answered
+  /// `Renewed` with the term now in force and when to renew again; refused as any use of the attachment is
+  /// (`AttachmentExpired` once its term lapsed), and `BadRequest` for an attachment with no term (a mount's renews
+  /// through its own activity). Appended.
+  Renew {
+    /// The attachment.
+    attachment: u64,
   },
 }
 
@@ -1502,6 +1567,9 @@ pub struct ShardReport {
   pub peers_unmeshed: u32,
   /// This node's council configuration fetches as a learner (control shard only; empty elsewhere). Appended.
   pub learner: LearnerReport,
+  /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
+  /// recovery prior alone. Appended.
+  pub failover: FailoverReport,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last
@@ -1649,6 +1717,38 @@ pub struct FleetReport {
   pub peers_unmeshed: u32,
   /// This node's council configuration fetches as a learner, from its control shard. Appended.
   pub learner: LearnerReport,
+  /// The failover delay as this node estimates it now, from its control shard (A-363): what an owner's loss costs its
+  /// objects' service, learned from the detector, the council and the recoveries this node timed. Nothing sets it.
+  /// Appended.
+  pub failover: FailoverReport,
+}
+
+/// The failover delay as a node estimates it now (§4.8 "Derived constants", A-363): from an owner's loss to its objects
+/// served again, detection plus confirmation plus recovery, each term the running estimate of the path it names, with
+/// the measurements behind it, so a reader tells a measured term from a prior. Nothing sets it; it moves with what the
+/// node measures. A laptop reports the recovery alone: no peer to detect and no council to confirm (R8).
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FailoverReport {
+  /// The failover delay, nanoseconds: the three terms summed.
+  pub total_ns: u64,
+  /// Detection: SWIM's count of the failure detector's periods from a crashed peer's last answer to its condemnation,
+  /// each at the running tail of the detector's measured period (Lifeguard's local health and each pair's NFD-E margin
+  /// stretch them), nanoseconds; zero where there is no peer to detect.
+  pub detection_ns: u64,
+  /// The detector periods timed behind it.
+  pub detection_samples: u64,
+  /// Confirmation: the council's death-confirmation window at the coordinator's measured period, with the retirement's
+  /// commit round and its install, nanoseconds; zero where there is no council.
+  pub confirmation_ns: u64,
+  /// The coordinator periods timed behind it.
+  pub confirmation_samples: u64,
+  /// Recovery: the larger tail of the takeovers and the volumes this node timed, nanoseconds; before any, the ratified
+  /// recovery budget, a prior.
+  pub recovery_ns: u64,
+  /// The takeovers this node timed, round begun to share confirmed.
+  pub takeovers_timed: u64,
+  /// The taken-over volumes this node timed, adopted to served.
+  pub volumes_timed: u64,
 }
 
 impl RequestBody {
@@ -1672,12 +1772,13 @@ impl RequestBody {
       | RequestBody::Resize { volume, .. }
       | RequestBody::Destroy { volume }
       | RequestBody::Status { volume }
+      | RequestBody::Drifted { volume, .. }
+      | RequestBody::Conflicts { work: volume, .. }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
       | RequestBody::Pin { volume, .. }
       | RequestBody::AwaitPlaced { volume, .. }
-      | RequestBody::Read { volume, .. }
       | RequestBody::MapRead { volume, .. }
       | RequestBody::MapWrite { volume, .. }
       | RequestBody::MapSync { volume, .. }
@@ -1723,14 +1824,14 @@ impl RequestBody {
       | RequestBody::Advance { .. }
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
-      | RequestBody::List
+      | RequestBody::List { .. }
       | RequestBody::DaemonStatus
       | RequestBody::DaemonStatusNext { .. }
       | RequestBody::Bootstrap { .. }
       | RequestBody::RecoveryPlan { .. }
       | RequestBody::Recover { .. }
       | RequestBody::PromoteRegion { .. }
-      | RequestBody::Grants
+      | RequestBody::Grants { .. }
       | RequestBody::Audit { .. }
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
@@ -1738,7 +1839,10 @@ impl RequestBody {
       | RequestBody::LandingEntries { .. }
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
-      | RequestBody::Revoke { .. } => None,
+      | RequestBody::Revoke { .. }
+      | RequestBody::Renew { .. } => None,
+      // Retired (A-267): refused where it arrives, so routed nowhere.
+      RequestBody::Read { .. } => None,
       RequestBody::Share { volume, .. }
       | RequestBody::LiveShip { volume, .. }
       | RequestBody::DetachOf { volume, .. }
@@ -1792,10 +1896,11 @@ impl RequestBody {
     matches!(
       self,
       RequestBody::Status { .. }
+        | RequestBody::Drifted { .. }
+        | RequestBody::Conflicts { .. }
         | RequestBody::Versions { .. }
         | RequestBody::MergeRecord { .. }
         | RequestBody::ChangedSince { .. }
-        | RequestBody::Read { .. }
         | RequestBody::ReadRange { .. }
         | RequestBody::ReadWindow { .. }
         | RequestBody::ReadDir { .. }
@@ -2338,6 +2443,9 @@ pub struct StatusReport {
   /// What an owner loss would lose of the volume now, and what the takeover that made this node its owner lost (§4.10
   /// "Auto-seal", AC-8.3, D-18). Appended.
   pub loss: LossReport,
+  /// Drifted or unverified entries the report did not carry (A-267; appended): `drifted` and `base`'s lists hold the
+  /// first that fit beside the report's other fields, the same entries in both, and `Drifted` reads every one.
+  pub drifted_elided: u32,
 }
 
 /// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
@@ -2406,8 +2514,9 @@ pub struct LossReport {
   /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
   /// at durability.
   pub live_shipped: bool,
-  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
-  /// this node's memory: a restart of this node forgets it.
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took, and
+  /// whether the takeover went past the volume's tolerance (A-332). Recorded with the volume (A-325), so it survives this
+  /// node's restart.
   pub taken_over: Option<VolumeTakeover>,
 }
 
@@ -2421,6 +2530,34 @@ pub struct VolumeTakeover {
   /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
   /// seal it names (its `placed_sequence` when it was lost) are the loss window.
   pub head_sequence: u64,
+  /// Set when the takeover recovered the volume past its tolerance (A-309, A-332): more of the hosts holding it were lost
+  /// than its placement tolerates, so it was rebuilt from the newest copy the hosts that remained held, and a write
+  /// acknowledged only to the lost hosts may be gone. `None` within tolerance, where every write the lost owner
+  /// acknowledged at durability survived. Appended.
+  pub past_tolerance: Option<PastTolerance>,
+}
+
+/// How a takeover went past a volume's tolerance (A-309, A-332): which of its parts were recovered from fewer surviving
+/// holders than recovery counts on, and by how much. At least one part is set.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PastTolerance {
+  /// The volume's head register: its first cohort short of the recovery quorum when the takeover adopted the newest
+  /// record every surviving member of the volume's cohorts held. `None` when it was recovered within tolerance.
+  pub registers: Option<Shortfall>,
+  /// The volume's live log (A-200): its recorded holders short of `f + 1` members when the takeover adopted the greatest
+  /// head every surviving recorded holder reported. `None` when the log was recovered within tolerance, or the volume
+  /// has none.
+  pub live_log: Option<Shortfall>,
+}
+
+/// A recovery count short of its quorum (A-332): the hosts recovery counts on, and how many of them were still members
+/// when the takeover recovered past tolerance.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortfall {
+  /// The hosts recovery needed: a cohort's recovery quorum, or `f + 1` of a live log's recorded holders.
+  pub needed: u64,
+  /// How many of the hosts that count were members then (fewer than `needed`).
+  pub remaining: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3106,13 +3243,19 @@ pub struct LandingOutcome {
   pub held: u64,
   /// The durability the landing achieved (§4.15 step 8).
   pub durability: LandingDurability,
-  /// Every Degraded cell the landing met, in the order met.
+  /// Every Degraded cell the landing met, in the order met, as many as one reply holds (A-267).
   pub degraded: Vec<LandingDegradation>,
   /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
   /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: u64,
   /// The terminal state, typed (A-299, 2026-11-18: until then a consumer read `state`'s name). Appended.
   pub stage: LandingStage,
+  /// How the landing's signature was judged against the manifest it wrote (signed work, A-321), as its finished
+  /// record keeps it: `Unsigned` when the landing carried none. Appended.
+  pub verification: Verification,
+  /// Degraded cells past what one reply holds (A-267), never sent: a host that refuses every directory's sync meets
+  /// one a directory, so `degraded` carries the first that fit beside the rest of the outcome. Appended.
+  pub degraded_elided: u32,
 }
 
 /// A landing's stage (§4.15 "State machines"): the four terminal states a finished landing reports and the stages
@@ -3256,6 +3399,16 @@ pub enum GrantState {
   Revoked,
 }
 
+/// Where a `changed_since` walk stands (§4.16, A-264): the green version it is in and how many of that version's
+/// changed paths it has passed. A committed version's paths never change, so the cursor stays valid as the green moves.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChangedCursor {
+  /// The version.
+  pub version: u64,
+  /// The entries of `version` passed.
+  pub passed: u32,
+}
+
 /// An audit record on the wire (§4.15).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct AuditEntry {
@@ -3277,6 +3430,10 @@ pub struct AuditEntry {
   pub audit_kind: AuditKind,
   /// The terminal state, typed, for a finished landing. Appended with `audit_kind`.
   pub stage: Option<LandingStage>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole: its
+  /// presentation's and a granted run's `LandingPlanned`, and its `LandingFinished` (`Unsigned` when it carried
+  /// none). `None` on every other record. Appended.
+  pub verification: Option<Verification>,
 }
 
 /// What an audit record records (§4.15). Append-only.
@@ -3389,8 +3546,11 @@ pub enum Refusal {
   },
   /// The landing hit conflicts; nothing was written (§4.15 step 4).
   LandingConflict {
-    /// The conflicting entries.
+    /// The conflicting entries: as many as one reply holds beside the count (§4.3; A-267).
     entries: Vec<String>,
+    /// Conflicting entries past what one reply holds (A-267), never sent: presenting the landing again lists every
+    /// one (`GrantRequired`, then `LandingEntries`).
+    entries_elided: u32,
   },
   /// Another session holds the target's landing lease (§4.15, AC-2.9).
   LandingLeaseHeld {
@@ -3556,7 +3716,7 @@ pub enum Refusal {
   /// A `MapRead` (§4.6, A-171) could not be served as a direct map — a different-uid, non-plain or non-head request,
   /// an overlay, a client served by another shard, a platform with no route yet, or a copy the daemon's budget or the
   /// OS refused — so the client reads the file by its normal paged read instead. The bytes are identical; only the
-  /// copy per read is paid, and the reply is never a single oversized `ReadBytes`. Appended.
+  /// copy per read is paid, and every reply is one page (`ReadPage`). Appended.
   MapUnavailable,
   /// An image could not be built or merged (§4.6, A-160): the image format refused the tree or the image (a name or a
   /// time it cannot hold, a capacity too small, a corrupt or hostile image), or the image holds what a volume cannot
@@ -3683,6 +3843,25 @@ pub enum Refusal {
     /// Why, typed.
     refusal: TargetRefusal,
   },
+  /// The verb ran and its effects are committed on its owner, but they were not held where its reply waits for them
+  /// (a live-shipped volume's log on the owner and `f` candidates, A-200; a destroy's tombstone placed at `f + 1`,
+  /// AUD-29-43) within the failover SLO from the hold: the total bound of the rule every transport judges a held reply
+  /// by (`slates_bridge_core::durable_bound`), the operator's bound on how long an object may go unserved before a
+  /// takeover serves it, past which a write not yet held is past what the fleet promises (A-354). Through a shorter
+  /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
+  /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
+  /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
+  /// not happen. Appended.
+  DurabilityPending {
+    /// How long the reply was held before it was told this, nanoseconds.
+    held_ns: u64,
+  },
+  /// A `Conflicts` read named a verdict the work no longer keeps (A-267): a later submit or rebase of the work replaced
+  /// it, or the daemon that judged it restarted. Submit or rebase again for a new verdict. Appended.
+  VerdictReplaced {
+    /// The work volume.
+    work: VolumeId,
+  },
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -3732,6 +3911,19 @@ pub enum TargetRefusal {
   AnchorHold,
   /// A detach of this drive already waits for the anchor's release.
   DetachPending,
+  /// This machine does not let WinFsp's driver make a Mount Manager drive (A-369), which a WinFsp drive must be for
+  /// Windows to resolve its files' final paths: an Administrator allows it once, with `MountUseMountmgrFromFSD` set to
+  /// 1 under WinFsp's key, as WinFsp itself is installed once.
+  MountManagerNotAllowed,
+  /// The drive letter names another volume: the Mount Manager gave it to another, or a definition local to the
+  /// daemon's session hides the machine's (A-369).
+  DriveLetterTaken,
+  /// The path is longer than the daemon takes where it must name it (A-266): a landing target past what a grant's
+  /// summary holds on one grants page, refused before anything is presented. Appended.
+  TooLong {
+    /// The longest path the daemon takes there, in bytes.
+    longest: u64,
+  },
 }
 
 /// What the daemon's database refused, where the refusals before [`Refusal::Database`] name nothing closer (A-299):
@@ -3963,10 +4155,13 @@ pub enum ReplyBody {
     /// The head version.
     head: u64,
   },
-  /// The files changed since a version.
+  /// One page of the paths changed since a version (`ChangedSince`).
   ChangedSince {
-    /// The changed file paths.
+    /// The changed paths this page answers.
     paths: Vec<String>,
+    /// Where the next page continues, or `None` when the walk is done. A version and a count, never a path, so a page
+    /// holding one long path need not hold it twice.
+    next: Option<ChangedCursor>,
   },
   /// A work volume was created over a green.
   WorkCreated {
@@ -3983,15 +4178,24 @@ pub enum ReplyBody {
   Submitted {
     /// The committed green version, when the increment was accepted; `None` on conflict.
     version: Option<u64>,
-    /// The conflict windows to rebase against, when not accepted.
+    /// The conflict windows to rebase against, when not accepted: as many as one reply holds (§4.3; A-267).
     conflicts: Vec<MergeWindow>,
+    /// Conflict windows past what one reply holds (A-267): the work keeps its verdict, and `Conflicts` reads every
+    /// window of it a page at a time.
+    conflicts_elided: u32,
+    /// The verdict the windows are of, kept with the work for `Conflicts`; 0 when there is none.
+    verdict: u64,
   },
   /// A work volume was rebased onto its green's head (§4.16). The green is unchanged.
   Rebased {
     /// The head the work is now based on, when every operation mapped cleanly; `None` on conflict.
     version: Option<u64>,
-    /// The conflict windows to resolve, when the rebase did not complete.
+    /// The conflict windows to resolve, when the rebase did not complete: as many as one reply holds (A-267).
     conflicts: Vec<MergeWindow>,
+    /// Conflict windows past what one reply holds (A-267), read with `Conflicts`.
+    conflicts_elided: u32,
+    /// The verdict the windows are of, kept with the work for `Conflicts`; 0 when there is none.
+    verdict: u64,
   },
   /// Cloned.
   Cloned {
@@ -4030,22 +4234,31 @@ pub enum ReplyBody {
     /// The report. Boxed: a cold, wide report that would otherwise size every reply's move.
     report: Box<StatusReport>,
   },
-  /// The listing.
+  /// One page of the listing (`List`), in volume-id order.
   Listed {
-    /// The volumes.
+    /// The volumes of this page.
     volumes: Vec<VolumeSummary>,
+    /// The cursor that continues the listing (the last volume of this page), or `None` when this page ends it.
+    next: Option<VolumeId>,
   },
   /// Acknowledged.
   Acknowledged,
-  /// The base bytes.
+  /// One page of a base entry's bytes (`ReadBase`, A-267).
   BaseBytes {
-    /// The bytes.
+    /// The bytes from the request's offset: as many as one reply holds, fewer at the file's end.
     bytes: Vec<u8>,
+    /// The file's size when this page was read.
+    total: u64,
+    /// The file's fingerprint when this page was read, folded to a word: a file changed or replaced between two pages
+    /// stamps them differently, and a reader joining pages refuses the mix.
+    stamp: u64,
   },
   /// Re-witnessed.
   Rewitnessed {
-    /// The paths re-witnessed.
+    /// The paths re-witnessed: as many as one reply holds beside the count (§4.3; A-267).
     paths: Vec<String>,
+    /// Paths re-witnessed past what one reply holds (A-267), never sent: the rewitness took them all.
+    paths_elided: u32,
   },
   /// Pinned.
   Pinned {
@@ -4080,23 +4293,37 @@ pub enum ReplyBody {
     manifest: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
-    /// Conflicts found before any write (empty when the landing is clean).
+    /// Conflicts found before any write (empty when the landing is clean), each `PATH (CLASS)`: as many as one reply
+    /// holds beside the rest of it (§4.3; A-267).
     conflicts: Vec<String>,
+    /// The exact statement a signature over this landing signs (signed work, A-321;
+    /// `slates_server::signed_work::landing_statement`: the volume, the target as the request named it and this
+    /// manifest, one field a line): sign it under the namespace `slates-work` and land with the signature.
+    statement: Vec<u8>,
+    /// How the request's signature was judged against this manifest (A-321): `Unsigned` when it carried none.
+    verification: Verification,
+    /// Conflicts past what one reply holds (A-267), never sent here: every entry of the presentation, its conflict
+    /// among it, is read a page at a time (`LandingEntries`).
+    conflicts_elided: u32,
   },
   /// A landing finished (or partially).
   Landed {
     /// The outcome.
     outcome: LandingOutcome,
   },
-  /// The caller's grants.
+  /// One page of the caller's grants (`Grants`), in grant-id order.
   Grants {
-    /// The grants.
+    /// The grants of this page.
     grants: Vec<GrantSummary>,
+    /// The cursor that continues the walk (the last grant of this page), or `None` when this page ends it.
+    next: Option<u64>,
   },
-  /// The audit log.
+  /// One page of the audit (`Audit`, A-265): records in sequence order, as many as one reply chunk holds (§4.3).
   Audit {
-    /// The records.
+    /// The records of this page.
     records: Vec<AuditEntry>,
+    /// Whether more follow: the next page is asked from one past the last record's sequence.
+    more: bool,
   },
   /// A grant was issued for a presented landing (the reply to a verified `Grant`).
   Granted {
@@ -4133,10 +4360,16 @@ pub enum ReplyBody {
   Advanced {
     /// The version the attachment now pins.
     version: u64,
-    /// The paths the move invalidated — those some version in the span changed, sorted.
+    /// The paths the move invalidated — those some version in the span changed, sorted: as many as one reply holds
+    /// beside the rest of it (§4.3; A-267).
     invalidated: Vec<String>,
+    /// Invalidated paths past what one reply holds (A-267), never sent: more changed than the reply carries, so a
+    /// holder of the view's reads treats every path as invalidated (a superset is always safe), or reads a green's
+    /// changes a page at a time (`ChangedSince`).
+    invalidated_elided: u32,
   },
-  /// A file's bytes at the requested view (§4.12 `read`). Appended for append-only evolution.
+  /// Retired with `RequestBody::Read` (A-267): never sent; kept only so the tags after it hold (D-15,
+  /// `tests/wire_order.rs`).
   ReadBytes {
     /// The bytes.
     bytes: Vec<u8>,
@@ -4358,10 +4591,15 @@ pub enum ReplyBody {
   SubmittedSigned {
     /// The committed green version, when the increment was accepted; `None` on conflict.
     version: Option<u64>,
-    /// The conflict windows to rebase against, when not accepted.
+    /// The conflict windows to rebase against, when not accepted: the first one reply holds, as `Submitted` carries
+    /// them (A-267).
     conflicts: Vec<MergeWindow>,
     /// How the signature was judged.
     verification: Verification,
+    /// The verdict's windows the reply did not carry, which `Conflicts` reads under `verdict` (A-267).
+    conflicts_elided: u32,
+    /// The conflicting verdict the work keeps, by which `Conflicts` reads it; 0 when none is kept (A-267).
+    verdict: u64,
   },
   /// A volume's trusted signers were set (A-321). Appended.
   SignersSet,
@@ -4372,6 +4610,37 @@ pub enum ReplyBody {
     version: u64,
     /// How the merge's signature was judged.
     verification: Verification,
+  },
+  /// One page of a volume's drifted entries (`Drifted`), typed as a status's `base` types them. Appended.
+  Drifted {
+    /// This page's entries the disk changed after the volume witnessed them, in inode order.
+    drifted: Vec<DriftEntry>,
+    /// This page's entries whose re-check the host refused now, by path, in inode order.
+    unverified: Vec<String>,
+    /// The inode the next page starts after, or `None` when this page ends the walk. A page may hold no entry and
+    /// still carry one: it spent its slice of the shard's step re-checking entries that had not drifted.
+    next: Option<u64>,
+    /// Entries in this page's range too long for any page alone (a host path near Linux's `PATH_MAX`), passed over
+    /// and counted, never sent as a reply no chunk holds.
+    oversized: u32,
+  },
+  /// One page of a work's kept verdict (`Conflicts`, A-267): its windows in the verdict's order. Appended.
+  Conflicts {
+    /// The windows of this page.
+    windows: Vec<MergeWindow>,
+    /// The position the next page reads from, or `None` when this page ends the verdict.
+    next: Option<u32>,
+  },
+  /// A CLI attachment's term was renewed (A-384): the term now in force from this renewal, and how soon its holder renews
+  /// again. Appended.
+  Renewed {
+    /// The term, nanoseconds: the attachment lapses this long after its last use.
+    term_ns: u64,
+    /// How soon the holder renews again, nanoseconds: a third of the shorter of the term and the daemon's liveness
+    /// window, so two renewals lost or late are survived, and a cadence that does not follow the term it shapes (one a
+    /// third of the term fed its own gaps back into the term, which grew to the failover delay: 1.0 s to 4.0 s in ten
+    /// renewals on the Mac Studio, 2026-11-18).
+    renew_every_ns: u64,
   },
 }
 

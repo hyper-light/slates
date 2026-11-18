@@ -164,6 +164,21 @@ impl Marker {
       .collect()
   }
 
+  /// The marker's SID as text (`S-1-5-21-…`), for the drive's access list (A-368: the purge client's restricted token
+  /// is granted through it); `None` only if the marker's own bytes did not read as a SID.
+  pub(crate) fn sid_text(self) -> Option<String> {
+    let Sid {
+      revision,
+      count,
+      authority,
+      subauthorities,
+    } = self.0;
+    let mut bytes = vec![revision, count];
+    bytes.extend_from_slice(&authority);
+    bytes.extend(subauthorities.iter().flat_map(|word| word.to_le_bytes()));
+    crate::account::sid_text(&bytes)
+  }
+
   /// The marker [`Marker::to_hex`] wrote; `None` for any other text.
   pub(crate) fn from_hex(text: &str) -> Option<Self> {
     let mut random = [0u8; RANDOM_BYTES];
@@ -316,5 +331,29 @@ mod tests {
     assert!(marker.matches(copied.as_handle()).unwrap());
     assert!(!other.matches(copied.as_handle()).unwrap());
     own.during(|| Ok(())).unwrap();
+  }
+
+  /// A-368: the drive's access list names the mount's purge marker by its text, through which the purge client's
+  /// restricted token is granted. Do: write a fresh marker's SID as text, and have Windows write the same SID
+  /// (`ConvertSidToStringSidW`). Expect one text.
+  #[test]
+  fn a_markers_sid_text_is_the_text_windows_writes_for_it() {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let marker = Marker::fresh().unwrap();
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the marker's SID is a valid SID laid out as Windows lays one out (`Sid`), alive across the call; the call
+    // allocates the text, freed once below.
+    let converted =
+      unsafe { ConvertSidToStringSidW((&raw const marker.0).cast_mut().cast(), &mut text) };
+    assert_ne!(converted, 0);
+    // SAFETY: the NUL-terminated text the call allocated, read whole and then freed once.
+    let windows = unsafe {
+      let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+      let owned = String::from_utf16(std::slice::from_raw_parts(text, length)).unwrap();
+      LocalFree(text.cast());
+      owned
+    };
+    assert_eq!(marker.sid_text().as_deref(), Some(windows.as_str()));
   }
 }

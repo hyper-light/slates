@@ -30,7 +30,7 @@
 //! Not yet: a holder's replicas do not survive its own daemon's restart.
 
 use slates_bridge_core::durable_bound::{DurableBound, GaveUp, Heard, Spans};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use slates_db::live::{
   Admitted, Bounds, Entry, Head, Install, LiveError, Next, Replica, Shipper, decode_reply,
@@ -717,12 +717,12 @@ fn note_asked(live: &mut LiveVolume, now_ns: u64) {
 const DURABLE_LOOK_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
 /// The spans a held reply's wait is judged in on this shard: windows of [`DURABLE_WAIT_NS`], looks [`DURABLE_LOOK_NS`]
-/// apart while a silence is confirmed, and at most the shard's failover SLO from the hold (10 s by default; the
-/// supervisor's landing condition of 2026-11-11, banned item 8).
+/// apart while a silence is confirmed, and at most the failover delay from the hold, this node's live estimate (A-363;
+/// the operator's 10 s placeholder before; the supervisor's landing condition of 2026-11-11, banned item 8).
 fn durable_spans(state: &ShardState) -> Spans {
   Spans {
     window_ns: DURABLE_WAIT_NS,
-    total_ns: state.config.failover_slo_ns,
+    total_ns: state.failover_ns,
     look_ns: DURABLE_LOOK_NS,
   }
 }
@@ -1029,7 +1029,31 @@ struct Awaiting {
   origin: u64,
   id: slates_wire::request::RequestId,
   reply: slates_ipc::protocol::ReplyBody,
+  /// When the reply was held, on the shard's clock: past the failover SLO from then the verb is refused
+  /// ([`judge_held`], A-354), and how long it was held is told with it.
+  held_since_ns: u64,
 }
+
+impl Awaiting {
+  /// A reply held from `now_ns`.
+  fn held((route, origin, id, reply): HeldReply, now_ns: u64) -> Awaiting {
+    Awaiting {
+      route,
+      origin,
+      id,
+      reply,
+      held_since_ns: now_ns,
+    }
+  }
+}
+
+/// What a held reply is made of ([`Awaiting::held`]): where to send it, its client's completion key and the reply.
+type HeldReply = (
+  Option<crate::merge_service::ReplyRoute>,
+  u64,
+  slates_wire::request::RequestId,
+  slates_ipc::protocol::ReplyBody,
+);
 
 /// Counter: verbs whose reply waited for durability.
 const LIVE_AWAITED: &str = "fleet.live.awaited";
@@ -1104,10 +1128,38 @@ fn owed_position(
   Some(target)
 }
 
+/// The refusal a verb about to run on this (its owner) shard meets before it runs, when its reply could be held here
+/// and the shard already holds its bound of such replies ([`awaiting_bound`]): `Overloaded`, counted. Judged before
+/// the verb, so a refused verb changed nothing and its resend under the same id runs it once, as on a plain volume. A
+/// verb could be held when it changes a live-shipped volume ([`defer`]), or destroys one while the fleet places
+/// tombstones (`f > 0`, [`defer_destroy`]). Until 2026-11-18 the bound was judged only in [`defer`], after the verb's
+/// effects had committed with no completion record: the resend ran the verb again over them, so a directory's resend
+/// was refused `AlreadyExists` and an append landed twice (g232's finding).
+pub(crate) fn refuse_over_bound(
+  state: &mut ShardState,
+  body: &slates_ipc::protocol::RequestBody,
+) -> Option<slates_ipc::protocol::ReplyBody> {
+  if held_replies(state) < awaiting_bound(state) {
+    return None;
+  }
+  let volume = body.volume().map(crate::verbs::to_db_volume)?;
+  let destroy = matches!(body, slates_ipc::protocol::RequestBody::Destroy { .. })
+    && state.fleet.configuration().quorum.f > 0;
+  let live = body.mutates_shard_image() && is_live(state, volume);
+  if !(destroy || live) {
+    return None;
+  }
+  state.count(LIVE_OVER_BOUND, 1);
+  Some(slates_ipc::protocol::ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
+  })
+}
+
 /// Holds a verb's reply until `volume`'s log is durable at `target` (A-200): its effects are committed, its completion
 /// is recorded and its reply delivered then ([`resolve`]): `None`. The reply to give now instead, `Overloaded`
 /// (counted, nothing recorded, so a retry runs the verb again), when the shard already holds its bound of such
-/// replies.
+/// replies: a recorded verb met the bound before it ran ([`refuse_over_bound`]), so only an asynchronous outcome
+/// (a mapped file's sync, an image build) meets it here.
 pub(crate) fn defer(
   state: &mut ShardState,
   (volume, target): (slates_db::catalog::VolumeId, u64),
@@ -1125,17 +1177,13 @@ pub(crate) fn defer(
       refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
     });
   }
+  let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
   state
     .live
     .awaiting
     .entry((volume.bytes, target))
     .or_default()
-    .push(Awaiting {
-      route,
-      origin,
-      id,
-      reply,
-    });
+    .push(held);
   state
     .live
     .awaiting_by_request
@@ -1157,16 +1205,20 @@ pub(crate) fn join(
     .copied()
   {
     let route = state.reply_route.take();
-    if let (Some((_, waiting)), Some(route)) = (state.live.destroys.get_mut(&volume), route)
-      && let Some(first) = waiting.first()
-    {
-      let (origin, id, reply) = (first.origin, first.id, first.reply.clone());
-      waiting.push(Awaiting {
-        route: Some(route),
-        origin,
-        id,
-        reply,
-      });
+    let first = state
+      .live
+      .destroys
+      .get(&volume)
+      .and_then(|(_, waiting)| waiting.first())
+      .map(|first| (first.origin, first.id, first.reply.clone()));
+    if let (Some((first_origin, first_id, reply)), Some(route)) = (first, route) {
+      let joined = Awaiting::held(
+        (Some(route), first_origin, first_id, reply),
+        slates_rt::futures::now_ns(),
+      );
+      if let Some((_, waiting)) = state.live.destroys.get_mut(&volume) {
+        waiting.push(joined);
+      }
     }
     return true;
   }
@@ -1179,16 +1231,20 @@ pub(crate) fn join(
     return false;
   };
   let route = state.reply_route.take();
-  if let (Some(waiting), Some(route)) = (state.live.awaiting.get_mut(&key), route)
-    && let Some(first) = waiting.first()
-  {
-    let (origin, id, reply) = (first.origin, first.id, first.reply.clone());
-    waiting.push(Awaiting {
-      route: Some(route),
-      origin,
-      id,
-      reply,
-    });
+  let first = state
+    .live
+    .awaiting
+    .get(&key)
+    .and_then(|waiting| waiting.first())
+    .map(|first| (first.origin, first.id, first.reply.clone()));
+  if let (Some((first_origin, first_id, reply)), Some(route)) = (first, route) {
+    let joined = Awaiting::held(
+      (Some(route), first_origin, first_id, reply),
+      slates_rt::futures::now_ns(),
+    );
+    if let Some(waiting) = state.live.awaiting.get_mut(&key) {
+      waiting.push(joined);
+    }
   }
   true
 }
@@ -1258,39 +1314,28 @@ fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool
 }
 
 /// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
-/// committed; its completion is recorded and its reply delivered then ([`resolve_destroys`]): `None`. `Overloaded` now
-/// instead (counted, nothing recorded, so a retry runs the verb again) at the shard's bound of held replies.
+/// committed; its completion is recorded and its reply delivered then ([`resolve_destroys`]). The shard's bound of held
+/// replies was judged before the destroy ran ([`refuse_over_bound`]), so it is never refused here, after its effects.
 pub(crate) fn defer_destroy(
   state: &mut ShardState,
   (volume, sequence): (slates_db::catalog::VolumeId, u64),
   (origin, id): (u64, slates_wire::request::RequestId),
   route: Option<crate::merge_service::ReplyRoute>,
   reply: slates_ipc::protocol::ReplyBody,
-) -> Option<slates_ipc::protocol::ReplyBody> {
-  if held_replies(state) >= awaiting_bound(state) {
-    state.count(LIVE_OVER_BOUND, 1);
-    return Some(slates_ipc::protocol::ReplyBody::Refused {
-      refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
-    });
-  }
+) {
+  let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
   let (target, waiting) = state
     .live
     .destroys
     .entry(volume.bytes)
     .or_insert_with(|| (sequence, Vec::new()));
   *target = (*target).max(sequence);
-  waiting.push(Awaiting {
-    route,
-    origin,
-    id,
-    reply,
-  });
+  waiting.push(held);
   state
     .live
     .destroys_by_request
     .insert((origin, id.client, id.sequence), volume.bytes);
   state.count(DESTROY_AWAITED, 1);
-  None
 }
 
 /// Answers the destroys waiting on `volume` once its tombstone is region-placed ([`defer_destroy`]).
@@ -1342,6 +1387,130 @@ fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
     .flatten()
     .collect()
 }
+
+/// Answers each verb whose reply `volume`'s log has held past the failover SLO [`Refusal::DurabilityPending`] (A-354):
+/// the total bound of the rule every transport judges a held reply by (`slates_bridge_core::durable_bound`), the
+/// operator's bound on how long an object may go unserved before a takeover serves it, past which a write not yet held
+/// is past what the fleet promises. Through a shorter silence the reply still waits, as the 2026-11-05 sweep chose for
+/// the slates protocol (a writer waits, never a false success; a transport answers its own failure earlier). The
+/// refusal is recorded as the verb's completion, as a fence's is ([`refuse_awaiting`]), so a retry under the same id
+/// meets it (§4.9): the verb's effects stay committed on the owner, nothing claims them durable, and a consumer runs the
+/// verb again under a new id. Judged at the period's visit to the volume ([`period_volume`]). Until 2026-11-18 a held
+/// reply ended only durable, fenced or destroyed, so a log that could never be held (its holders' catalog refused for
+/// good, A-353's case) kept its writer waiting without end.
+///
+/// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
+fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
+  let id = slates_db::catalog::VolumeId { bytes: volume };
+  let now = slates_rt::futures::now_ns();
+  // The rule's own total ([`durable_spans`]): the failover delay, so a held verb is bounded as the transports' held
+  // replies are and follows the failover estimate wherever it is published, never a number of its own.
+  let bound_ns = durable_spans(state).total_ns;
+  let keys: Vec<([u8; 16], u64)> = state
+    .live
+    .awaiting
+    .range((volume, 0)..=(volume, u64::MAX))
+    .map(|(key, _)| *key)
+    .collect();
+  for key in keys {
+    let Some(waiting) = state.live.awaiting.remove(&key) else {
+      continue;
+    };
+    let (past, kept) = held_past(waiting, now, bound_ns);
+    if !kept.is_empty() {
+      state.live.awaiting.insert(key, kept);
+    }
+    for (entry, held_ns) in past {
+      slates_machine::log_line!(
+        "slates-server: a held reply was refused after {} ms, the failover SLO (shard {}): {}",
+        held_ns / NS_PER_MS,
+        state.shard,
+        durability_report(state, id, key.1)
+      );
+      state.count(LIVE_HELD_GAVE_UP, 1);
+      answer(state, entry, durability_pending(held_ns));
+    }
+  }
+}
+
+/// Answers each destroy this shard has held past the failover SLO for its tombstone's placement
+/// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] answers a write: the same bound, the same refusal, recorded
+/// as the destroy's completion. Judged once a record period on each shard ([`period`]); bounded by the shard's held
+/// replies ([`awaiting_bound`]).
+///
+/// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
+fn judge_held_destroys(state: &mut ShardState) {
+  let now = slates_rt::futures::now_ns();
+  // The rule's own total, as [`judge_held`] reads it.
+  let bound_ns = durable_spans(state).total_ns;
+  let volumes: Vec<[u8; 16]> = state.live.destroys.keys().copied().collect();
+  for volume in volumes {
+    let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
+      continue;
+    };
+    let (past, kept) = held_past(waiting, now, bound_ns);
+    if !kept.is_empty() {
+      state.live.destroys.insert(volume, (sequence, kept));
+    }
+    for (entry, held_ns) in past {
+      slates_machine::log_line!(
+        "slates-server: a held destroy was refused after {} ms, the failover SLO (shard {}): volume {}'s tombstone at \
+         sequence {} not placed at f + 1",
+        held_ns / NS_PER_MS,
+        state.shard,
+        crate::verbs::hex_of(&volume),
+        sequence
+      );
+      state.count(DESTROY_HELD_GAVE_UP, 1);
+      answer(state, entry, durability_pending(held_ns));
+    }
+  }
+}
+
+/// `waiting` split at `now_ns` into the entries of the requests held at least `bound_ns`, each with how long its request
+/// was held, and the rest, each in its order. A request's entries (a retry that joined its wait, [`join`]) are judged by
+/// its first hold, so all of them are answered at once with one reply, the one outcome its id records (§4.9).
+fn held_past(
+  waiting: Vec<Awaiting>,
+  now_ns: u64,
+  bound_ns: u64,
+) -> (Vec<(Awaiting, u64)>, Vec<Awaiting>) {
+  let mut first: BTreeMap<(u64, u32, u32), u64> = BTreeMap::new();
+  for entry in &waiting {
+    first
+      .entry((entry.origin, entry.id.client, entry.id.sequence))
+      .and_modify(|since| *since = (*since).min(entry.held_since_ns))
+      .or_insert(entry.held_since_ns);
+  }
+  let mut past = Vec::new();
+  let mut kept = Vec::new();
+  for entry in waiting {
+    let held_ns = first
+      .get(&(entry.origin, entry.id.client, entry.id.sequence))
+      .map_or(0, |since| now_ns.saturating_sub(*since));
+    if held_ns >= bound_ns {
+      past.push((entry, held_ns));
+    } else {
+      kept.push(entry);
+    }
+  }
+  (past, kept)
+}
+
+/// The refusal a reply held `held_ns` past the failover SLO is answered with ([`judge_held`]).
+fn durability_pending(held_ns: u64) -> slates_ipc::protocol::ReplyBody {
+  slates_ipc::protocol::ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::DurabilityPending { held_ns },
+  }
+}
+
+/// Counter: a reply held for a live volume's durability, refused at the failover SLO ([`judge_held`], A-354).
+/// Format: a counter name in the daemon's status report.
+const LIVE_HELD_GAVE_UP: &str = "fleet.live.held_gave_up";
+
+/// Counter: a destroy held for its tombstone's placement, refused at the failover SLO ([`judge_held_destroys`], A-354).
+/// Format: a counter name in the daemon's status report.
+const DESTROY_HELD_GAVE_UP: &str = "fleet.destroy.held_gave_up";
 
 /// The refusal a superseded owner gives a write to the volume it lost.
 fn stale_epoch(current: HostEpoch) -> slates_ipc::protocol::ReplyBody {
@@ -3007,6 +3176,7 @@ pub(crate) async fn period(origin: u16, shard: u16) {
         move |s| {
           if counted {
             s.count(LIVE_PERIODS, 1);
+            judge_held_destroys(s);
           }
           period_slice(s, after)
         },
@@ -3074,8 +3244,10 @@ fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
     live.unreachable.clear();
   }
   // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
-  // neighbourhood settles, a pair delivered): answered here at the latest.
+  // neighbourhood settles, a pair delivered): answered here at the latest, and refused here once it has waited the
+  // failover SLO (A-354).
   resolve(s, volume);
+  judge_held(s, volume);
   // A log whose last whole entry no successor among the candidates could open is checkpointed again once this shard has
   // delivered the pairs that would let it ([`covers_candidates`]).
   if !covers_candidates(s, volume)
@@ -3627,6 +3799,9 @@ pub(crate) struct Fetched {
   pub(crate) naming: Option<crate::head::HeadNaming>,
   /// The first payload's sealing, when the log is sealed: kept with a refusal for a missing key ([`Refused`]).
   pub(crate) sealing: Option<crate::head::HeadSealing>,
+  /// Set when phase one adopted the head past tolerance (A-309, A-332): `f + 1` of the recorded holders, and how many of
+  /// them were members ([`live_shortfall`]). The volume's loss report names it.
+  pub(crate) past_tolerance: Option<slates_db::catalog::RecoveryShortfall>,
 }
 
 /// Phase one's question, on the control shard: each of `others` with a session in its link is asked to raise its copy
@@ -3667,13 +3842,14 @@ pub(crate) async fn ask_reports(
 /// candidate holds any of the volume's log (it was never shipped); `Err` with what the takeover waits for when too few
 /// holders answered.
 ///
-/// Past tolerance, when fewer than `f + 1` of the recorded holders are still members (`slates_db::live::past_tolerance`),
-/// that count can never be met, and the takeover waited for good (g240's finding at `f = 1`: {survivor, destroyed node}
-/// recorded, the replacement that caught up on the log not among them). Then the members that exist now recover it
-/// (A-309): every surviving recorded holder and every surviving member of `cohort_hosts` (where the retired owner placed
-/// the volume, settled and current, so where a joint transition shipped its log) must report, and the greatest head
-/// among all the reports is adopted (`slates_db::live::adopt_past_tolerance`), counted
-/// [`LIVE_TAKEN_OVER_PAST_TOLERANCE`]. This node's own report is known whatever it holds.
+/// Past tolerance, when fewer than `f + 1` of the recorded holders may still hold the log (`slates_db::live::past_tolerance`:
+/// members, and retired hosts this node never saw restart, which may return with their copies, A-345), that count can
+/// never be met, and the takeover waited for good (g240's finding at `f = 1`: {survivor, destroyed node} recorded, the
+/// replacement that caught up on the log not among them). Then the members that exist now recover it (A-309): every
+/// recorded holder that may still hold the log and every surviving member of `cohort_hosts` (where the retired owner
+/// placed the volume, settled and current, so where a joint transition shipped its log) must report, and the greatest
+/// head among all the reports is adopted (`slates_db::live::adopt_past_tolerance`), counted
+/// [`LIVE_TAKEN_OVER_PAST_TOLERANCE`]. This node's own report is known whatever it holds ([`past_tolerance_wait`]).
 pub(crate) async fn fetch(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
@@ -3712,9 +3888,19 @@ pub(crate) async fn fetch(
   }
   // Past tolerance (A-309): the recorded holders' count can never be met, so every surviving member that may hold the
   // log is waited for instead.
-  let members: Vec<HostId> =
-    state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
-  let wait = past_tolerance_wait(&holders, &cohort_hosts, &members, local, quorum);
+  let (members, restarted): (Vec<HostId>, BTreeSet<HostId>) =
+    state::with_state(|s| (s.council.configuration().members.clone(), restarted_ids(s)))
+      .unwrap_or_default();
+  let wait = past_tolerance_wait(
+    &holders,
+    &cohort_hosts,
+    (&members, &restarted),
+    local,
+    quorum,
+  );
+  let past_tolerance = wait
+    .as_ref()
+    .map(|_| live_shortfall(&holders, &members, quorum));
   let others = others_to_ask(candidates, &holders, wait.as_deref(), local);
   // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
   // each, within the liveness budget whatever the path.
@@ -3800,7 +3986,25 @@ pub(crate) async fn fetch(
     lineage,
     naming,
     sealing,
+    past_tolerance,
   }))
+}
+
+/// The shortfall a live phase one past tolerance recovered at (A-332): the `f + 1` of the recorded `holders` its count
+/// needs, and how many of them are `members`.
+fn live_shortfall(
+  holders: &[HostId],
+  members: &[HostId],
+  quorum: slates_db::register::Quorum,
+) -> slates_db::catalog::RecoveryShortfall {
+  let remaining = holders
+    .iter()
+    .filter(|holder| members.contains(holder))
+    .count();
+  slates_db::catalog::RecoveryShortfall {
+    needed: u64::from(quorum.f).saturating_add(1),
+    remaining: u64::try_from(remaining).unwrap_or(u64::MAX),
+  }
 }
 
 /// The lineage key a rebuild opens the log sealed under `sealing` with: this node's own entry; else the key a fellow
@@ -3894,29 +4098,52 @@ const LIVE_TAKEOVER_NO_KEY_EXHAUSTED: &str = "fleet.live.takeover_no_key_exhaust
 /// (`daemon::OBSERVE_BUDGET_NS`), past a pair's redelivery (once a record period) many times over.
 const NO_KEY_WAIT_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
 
-/// The surviving members a live phase one waits for past tolerance (A-309), `None` within it: when fewer than `f + 1` of
-/// the recorded `holders` are `members` (`slates_db::live::past_tolerance`), every recorded holder and every member of
-/// `cohort_hosts` (where the retired owner placed the volume) still a member, `local` aside, since this node's own copy
-/// is known whatever it holds.
+/// The hosts a live phase one waits for past tolerance (A-309), `None` within it. A recorded holder may still hold the log
+/// while it is one of the `members`, or while it is not but this node never saw it restart (`restarted`, A-345): a host
+/// retired on a death verdict that was false (a stopped process, a partition that healed) refutes with its copy whole,
+/// so it still counts toward tolerance, and within tolerance A-240's count waits for its report. A host seen restarted
+/// came back under another member id with its RAM copy gone. Past tolerance, when fewer than `f + 1` of the recorded
+/// `holders` may still hold the log (`slates_db::live::past_tolerance`), every recorded holder that may and every member
+/// of `cohort_hosts` (where the retired owner placed the volume) is waited for, `local` aside, since this node's own copy
+/// is known whatever it holds. Before A-345 a retired holder counted as gone: the fresh-member flow's owner died while
+/// the holder with its newest entries was stopped and retired, and the members that exist now adopted a stale head
+/// without it (chaos-166..169 lost; CI diag run 44288273676, Linux x86_64, 2026-11-18).
 fn past_tolerance_wait(
   holders: &[HostId],
   cohort_hosts: &[HostId],
-  members: &[HostId],
+  (members, restarted): (&[HostId], &BTreeSet<HostId>),
   local: HostId,
   quorum: slates_db::register::Quorum,
 ) -> Option<Vec<HostId>> {
-  if !slates_db::live::past_tolerance(holders, |host| members.contains(&host), quorum) {
+  let may_hold = |host: HostId| members.contains(&host) || !restarted.contains(&host);
+  if !slates_db::live::past_tolerance(holders, may_hold, quorum) {
     return None;
   }
   let mut wait: Vec<HostId> = holders
     .iter()
-    .chain(cohort_hosts)
     .copied()
-    .filter(|host| *host != local && members.contains(host))
+    .filter(|host| may_hold(*host))
+    .chain(
+      cohort_hosts
+        .iter()
+        .copied()
+        .filter(|host| members.contains(host)),
+    )
+    .filter(|host| *host != local)
     .collect();
   wait.sort_unstable_by_key(|host| host.0);
   wait.dedup();
   Some(wait)
+}
+
+/// The member ids this node saw end at a restart of their anchor (`state::LearnedMember::previous`, A-345): each came
+/// back under another id, its RAM copies gone with its process.
+fn restarted_ids(state: &ShardState) -> BTreeSet<HostId> {
+  state
+    .learned_members
+    .values()
+    .filter_map(|learned| learned.previous)
+    .collect()
 }
 
 /// The hosts phase one asks besides this node (`local`): every candidate, then every recorded holder and every host a
@@ -4118,71 +4345,115 @@ fn keys_for_rebuild(sealed: bool, keys_recorded: bool) -> Result<(), &'static st
   Ok(())
 }
 
-/// The volume a live log describes, rebuilt as a takeover's archive on the volume's new owner shard (A-200): the
-/// lineage key adopted, every payload opened, the deltas applied in order to the whole image, and the result laid out
-/// as `materialize_taken_over` restores (directories and files, a symlink as a file of its target, as the export lays
-/// it out). Refused, counted, when the log cannot be rebuilt whole: the volume is then not served from it.
-pub(crate) fn archive_from_live(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
-  fetched: &Fetched,
-) -> Result<slates_archive::Archive, &'static str> {
-  let rebuilt = rebuild(state, id, owner, fetched);
-  match &rebuilt {
-    Ok(_) => state.count(LIVE_TAKEN_OVER, 1),
-    Err(why) => {
-      // In total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals are counted: one counter for nine
-      // refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960, 42318867890: 1,512 refusals).
-      state.count(LIVE_TAKEOVER_REFUSED, 1);
-      state.count(why, 1);
-    }
-  }
-  rebuilt
+/// Counts a live takeover's rebuild refused, in total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals
+/// are counted: one counter for nine refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960,
+/// 42318867890: 1,512 refusals). The refusal, for its caller to return.
+pub(crate) fn rebuild_refused(state: &mut ShardState, why: &'static str) -> &'static str {
+  state.count(LIVE_TAKEOVER_REFUSED, 1);
+  state.count(why, 1);
+  why
 }
 
-fn rebuild(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
-  fetched: &Fetched,
-) -> Result<slates_archive::Archive, &'static str> {
-  if let Some(lineage) = fetched.lineage.clone() {
-    crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
-      .map_err(|_| REFUSED_LINEAGE)?;
+/// Counts a live volume taken over (`fleet.live.taken_over`): made from its rebuilt log and published, in the turn that
+/// makes it servable (A-343), so a count read means a volume a restart rebuilds.
+pub(crate) fn taken_over(state: &mut ShardState) {
+  state.count(LIVE_TAKEN_OVER, 1);
+}
+
+/// A live log's rebuild on its volume's new owner shard, its payloads opened, decoded and applied in order a slice at a
+/// time (g251, CLAUDE.md "Bounded work everywhere"). A takeover rebuilt the whole
+/// log inside the one owner-shard turn that made the volume: on a Mac Studio the nemesis's volumes, 16,737 to 27,430
+/// sealed payloads of 152 to 306 MB, took 0.24 to 0.62 s to open and 0.09 to 0.44 s to apply, and with the restore and
+/// the publication after them the turn ran past the watchdog's spin window, which ended the successor's process
+/// (`live_chaos`'s nemesis, seeds 17036665960917068132 and 2120743995065985386). Each payload is the unit: opened under
+/// the keys the rebuild began with, decoded, applied to the image a whole record began (a delta before any whole one is
+/// refused), and its content runs kept, a later run at the same place over an earlier one.
+pub(crate) struct Rebuilding {
+  /// The lineage key and namer the payloads are opened under, when the log is sealed.
+  keys: Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
+  /// The payloads not yet applied, in order.
+  payloads: std::vec::IntoIter<Vec<u8>>,
+  /// The image the payloads applied so far describe; `None` before the first whole record.
+  image: Option<slates_vfs::recover::VolumeImage>,
+  /// The content runs they name, by inode and offset.
+  runs: BTreeMap<(u64, u64), Vec<u8>>,
+  /// The volume's per-creator number, the archive header's field (`ObjectId::local`).
+  volume_local: u64,
+  /// The daemon's base page, the archive header's.
+  page: usize,
+}
+
+impl Rebuilding {
+  /// Begins the rebuild of the live log `payloads` of volume `id`, owned by `owner`: the lineage key adopted when the
+  /// takeover fetched one (`lineage`, with the head's `naming`), and the keys recorded here taken when the log is sealed.
+  /// Refused [`REFUSED_LINEAGE`] when the key will not adopt, and as [`keys_for_rebuild`] refuses a sealed log with no
+  /// key recorded.
+  pub(crate) fn begin(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+    owner: &slates_db::catalog::Principal,
+    (lineage, naming): (Option<([u8; 16], Vec<u8>)>, Option<crate::head::HeadNaming>),
+    payloads: Vec<Vec<u8>>,
+  ) -> Result<Rebuilding, &'static str> {
+    if let Some(lineage) = lineage {
+      crate::seal_keys::adopt_lineage(state, id, owner, lineage, naming.as_ref())
+        .map_err(|_| REFUSED_LINEAGE)?;
+    }
+    // Opened only under keys recorded here, never made ([`seal_keys::recorded_lineage`]).
+    let sealed = payloads
+      .first()
+      .is_some_and(|payload| sealed_body(payload).is_some());
+    let account = crate::seal_keys::tenant_of(owner);
+    let keys = if sealed {
+      crate::seal_keys::recorded_lineage(state, id, account)
+        .ok()
+        .flatten()
+        .zip(
+          crate::seal_keys::recorded_namer(state, id, account)
+            .ok()
+            .flatten(),
+        )
+    } else {
+      None
+    };
+    keys_for_rebuild(sealed, keys.is_some())?;
+    Ok(Rebuilding {
+      keys,
+      payloads: payloads.into_iter(),
+      image: None,
+      runs: BTreeMap::new(),
+      volume_local: ObjectId(id.bytes).local(),
+      page: state.config.page,
+    })
   }
-  // Opened only under keys recorded here, never made ([`seal_keys::recorded_lineage`]).
-  let sealed = fetched
-    .payloads
-    .first()
-    .is_some_and(|payload| sealed_body(payload).is_some());
-  let account = crate::seal_keys::tenant_of(owner);
-  let keys = if sealed {
-    crate::seal_keys::recorded_lineage(state, id, account)
-      .ok()
-      .flatten()
-      .zip(
-        crate::seal_keys::recorded_namer(state, id, account)
-          .ok()
-          .flatten(),
-      )
-  } else {
-    None
-  };
-  keys_for_rebuild(sealed, keys.is_some())?;
-  let mut publications = Vec::new();
-  for payload in &fetched.payloads {
-    publications.push(open_payload(keys.as_ref(), payload).ok_or(REFUSED_OPEN)?);
+
+  /// Applies the next payloads, one at least, until `spent` says the turn's share is spent; `Ok(true)` once every
+  /// payload is applied. Refused as the whole rebuild is: [`REFUSED_OPEN`], [`REFUSED_RECORD`], [`REFUSED_APPLY`],
+  /// [`REFUSED_NOT_WHOLE_FIRST`].
+  pub(crate) fn advance(&mut self, mut spent: impl FnMut() -> bool) -> Result<bool, &'static str> {
+    loop {
+      let Some(payload) = self.payloads.next() else {
+        return Ok(true);
+      };
+      self.apply(&payload)?;
+      if self.payloads.len() == 0 {
+        return Ok(true);
+      }
+      if spent() {
+        return Ok(false);
+      }
+    }
   }
-  let mut image = None;
-  let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
-  for publication in publications {
+
+  /// One payload opened, decoded and applied, its runs kept.
+  fn apply(&mut self, payload: &[u8]) -> Result<(), &'static str> {
+    let publication = open_payload(self.keys.as_ref(), payload).ok_or(REFUSED_OPEN)?;
     let record =
       <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
-    match (record, image.as_mut()) {
+    match (record, self.image.as_mut()) {
       (VolumeRecord::Full { image: whole }, _) => {
-        image = Some(whole);
-        runs.clear();
+        self.image = Some(whole);
+        self.runs.clear();
       }
       (VolumeRecord::Delta { delta }, Some(image)) => {
         slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
@@ -4190,11 +4461,22 @@ fn rebuild(
       (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
     }
     for run in publication.runs {
-      runs.insert((run.inode, run.offset), run.bytes);
+      self.runs.insert((run.inode, run.offset), run.bytes);
     }
+    Ok(())
   }
-  let image = image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
-  archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
+
+  /// The payloads not yet applied.
+  pub(crate) fn left(&self) -> usize {
+    self.payloads.len()
+  }
+
+  /// The rebuilt volume laid out as the archive `materialize_taken_over` restores; refused
+  /// [`REFUSED_NOT_WHOLE_FIRST`] when no whole record began the log.
+  pub(crate) fn archive(self) -> Result<slates_archive::Archive, &'static str> {
+    let image = self.image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
+    archive_of(&image, &self.runs, self.volume_local, self.page)
+  }
 }
 
 /// A publication's body sealed under the volume's lineage key, in pieces of at most an archive chunk's bytes
@@ -4554,6 +4836,82 @@ mod tests {
     );
   }
 
+  /// A-345, amending A-309 piece 3 (NoLoss through a falsely retired holder): the decision behind the fresh-member flow's
+  /// data loss (`crates/cli/tests/live_chaos.rs`, CI diag run 44288273676, Linux x86_64, 2026-11-18). Do: with the owner
+  /// gone, recorded holders b (this node, its copy stale at 167) and c (the newest entries, at 170), c retired on a death
+  /// verdict while it was stopped and never seen restarted, and the members b, d and e (which never held the log)
+  /// answering, decide phase one; let c, back, report 170 and decide again; then decide with c seen restarted instead.
+  /// Expect: phase one waits for c rather than adopting without it; once c reports, c's 170 is adopted; and with c seen
+  /// restarted (its copy gone with its process, A-309's store-destroyed case) phase one is past tolerance, waits for the
+  /// members and adopts the greatest head they hold, b's 167. Before A-345 the first decision was already past tolerance
+  /// and adopted b's 167, losing every entry only c held.
+  #[test]
+  fn a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted() {
+    let quorum = slates_db::register::Quorum { f: 1 };
+    let [b, c, d, e] = [HostId(2), HostId(3), HostId(4), HostId(5)];
+    let holders = [c, b];
+    let cohort_hosts = [b, c, d, e];
+    let members = [b, d, e];
+    let head = |position| {
+      Some(Head {
+        epoch: HostEpoch(1),
+        position,
+        identity: [u8::try_from(position % 251).unwrap(); 32],
+      })
+    };
+    let adopted = |chosen: Result<Option<(HostId, Head)>, &'static str>| {
+      chosen.map(|adopted| adopted.map(|(holder, head)| (holder, head.position)))
+    };
+    let without_c = [(b, head(167)), (d, None), (e, None)];
+    let with_c = [(b, head(167)), (d, None), (e, None), (c, head(170))];
+
+    let never_seen = BTreeSet::new();
+    let wait = past_tolerance_wait(&holders, &cohort_hosts, (&members, &never_seen), b, quorum);
+    assert_eq!(
+      wait, None,
+      "c, retired but never seen restarted, may return: within tolerance"
+    );
+    assert_eq!(
+      adopted(phase_one_choice(
+        &without_c,
+        &holders,
+        wait.as_deref(),
+        quorum
+      )),
+      Err("fleet.live.takeover_waits_quorum"),
+      "phase one waits for c rather than adopting b's stale head without it"
+    );
+    assert_eq!(
+      adopted(phase_one_choice(&with_c, &holders, wait.as_deref(), quorum)),
+      Ok(Some((c, 170))),
+      "once c reports, its newer head is adopted"
+    );
+
+    let seen_restarted = BTreeSet::from([c]);
+    let wait = past_tolerance_wait(
+      &holders,
+      &cohort_hosts,
+      (&members, &seen_restarted),
+      b,
+      quorum,
+    );
+    assert_eq!(
+      wait.as_deref(),
+      Some(&[d, e][..]),
+      "with c's copy gone, past tolerance waits for the members that exist now"
+    );
+    assert_eq!(
+      adopted(phase_one_choice(
+        &without_c,
+        &holders,
+        wait.as_deref(),
+        quorum
+      )),
+      Ok(Some((b, 167))),
+      "and adopts the greatest head they hold"
+    );
+  }
+
   /// A-240 with an install image beside the log: do ask whether the log covers candidates a and b when the last whole
   /// entry's anchors hold both keys and the install image's hold only a's. Expect not: a holder installed from the image
   /// keeps it as its log's first payload, and a successor adopting that holder could not open it for want of b's key. An
@@ -4683,6 +5041,9 @@ mod tests {
         live_shipped: true,
         live_holders: holders.map(|holders| slates_db::catalog::LiveHolders { epoch: 1, holders }),
         work_of: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
       }
       .to_record_bytes()
     };

@@ -45,13 +45,19 @@ use std::os::windows::io::{
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
 
-use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
+use slates_bridge_core::{
+  Bridge, CachedBytes, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
+};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Security::GetSecurityDescriptorLength;
+use windows_sys::Win32::Security::{
+  GetSecurityDescriptorLength, GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+  TokenPrimaryGroup, TokenUser,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::ffi::{
   self, Api, Boolean, DirInfo, FileInfo, FileSystem, Interface, Ntstatus, PSecurityDescriptor,
@@ -80,10 +86,17 @@ pub enum WinFspError {
     /// Its `NTSTATUS`.
     status: i32,
   },
-  /// The reference security descriptor could not be built (`ConvertStringSecurityDescriptor…`).
+  /// The drive's security descriptor could not be built: the daemon's token or its SIDs could not be read, or the
+  /// descriptor's SDDL was refused (`ConvertStringSecurityDescriptor…`; A-350).
   SecurityDescriptor,
   /// The mount thread could not be started, or ended without reporting.
   MountThread,
+  /// WinFsp's driver may make the mount's drive through the Mount Manager only where the machine allows it (A-369): an
+  /// Administrator sets `MountUseMountmgrFromFSD` to 1 under WinFsp's key, once, as WinFsp itself is installed once.
+  MountManagerNotAllowed,
+  /// The mount's drive letter names another volume: the Mount Manager gave it to another, or a definition local to
+  /// this session hides the machine's (A-369).
+  DriveLetterTaken,
   /// The held volume, drive or access record was malformed or did not match the catalog.
   Record(crate::held::Refusal),
   /// A checked open-ledger allocation, read or write was refused.
@@ -120,6 +133,12 @@ impl std::fmt::Display for WinFspError {
       Self::Api { call, status } => write!(f, "{call} answered NTSTATUS {status:#010x}"),
       Self::SecurityDescriptor => write!(f, "the mount's security descriptor could not be built"),
       Self::MountThread => write!(f, "the mount thread could not run"),
+      Self::MountManagerNotAllowed => write!(
+        f,
+        "this machine does not let WinFsp's driver make a Mount Manager drive: an Administrator sets it once with \
+         `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f`"
+      ),
+      Self::DriveLetterTaken => write!(f, "the drive letter names another volume"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
       Self::Intent(reason) => write!(f, "{reason}"),
@@ -196,12 +215,6 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 /// Format: the maximum file-name component length the mount reports (`MaxComponentLength`) — 255, the
 /// NTFS/`MAX_PATH` component limit, matching the volume core's own 255-byte name cap (§4.5).
 const MAX_COMPONENT_LENGTH: u16 = 255;
-/// Format: an "allow Everyone full access" security descriptor in SDDL — owner and group the built-in
-/// Administrators, a protected DACL granting `FA` (full access) to `WD` (Everyone). WinFsp requires a
-/// valid descriptor for its access checks; the volume's own rights are the attachment's, enforced by the
-/// shard on every request, so one fixed descriptor serves every object, as WinFsp's `memfs` sample starts
-/// from a single SDDL string.
-const EVERYONE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;WD)";
 /// Format: the cleanup flags that say the handle changed the file or asked for its deletion (`winfsp.h`
 /// `FspCleanupDelete`, `SetAllocationSize`, `SetArchiveBit`, `SetLastWriteTime`, `SetChangeTime`): such a close
 /// publishes before its reply, as a FUSE close's `flush` does. A close that only read (`SetLastAccessTime` alone, or
@@ -282,6 +295,14 @@ enum Op<T> {
   Rename {
     from: String,
     to: String,
+    replace: bool,
+  },
+  /// A hard link (A-360): `path` becomes another name of the file the open `object` names. Only a WinFsp driver with
+  /// `docs/wip/winfsp-patches` applied forwards one; the receive worker serves it before WinFsp's DLL, which has no case
+  /// for it. `replace` is ReplaceIfExists.
+  Link {
+    object: T,
+    path: String,
     replace: bool,
   },
   /// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it (WinFsp's
@@ -369,6 +390,7 @@ impl<T> Op<T> {
         | Op::SetTimes { .. }
         | Op::SetAllocation { .. }
         | Op::Rename { .. }
+        | Op::Link { .. }
         | Op::Flush { .. }
         | Op::FlushVolume
         | Op::Cleanup { .. }
@@ -448,6 +470,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        sibling: None,
         flush: false,
       };
     }
@@ -459,6 +482,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        sibling: None,
         flush: false,
       };
     }
@@ -488,11 +512,14 @@ impl Request {
     // retires nothing, so a replayed Cleanup's stale context stays a refusal.
     let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
+    let through =
+      context_of(&self.op).and_then(|context| names.name_of(context).map(str::to_owned));
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
+    let change = bound.as_ref().ok().and_then(|op| change_of(op, bridge, cx));
     let flush = matches!(&bound, Ok(Op::Flush { .. } | Op::FlushVolume));
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
@@ -514,6 +541,7 @@ impl Request {
     };
     reply = record_open_reply(reply, opened, self.hint, bridge, cx, names, ledger);
     reply = finish_context_effects(reply, closed, names, ledger);
+    let sibling = change.and_then(|change| change.sibling(&reply, through));
     Served {
       reply,
       sender: self.reply,
@@ -521,8 +549,127 @@ impl Request {
       echo,
       restored_read,
       flush,
+      sibling,
     }
   }
+}
+
+/// A change through one name of a file that has, or had, another (A-360): what the file's other names Windows holds
+/// open must be told of. Each other name has a file node and caches of its own in WinFsp's driver, which only a
+/// notification reaches; the name the change came through saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sibling {
+  /// The file.
+  pub ino: u64,
+  /// The name the change came through, as Windows' file node is named.
+  pub through: String,
+  /// The bytes it changed, `CachedBytes::Kept` for its information alone (times, a link count).
+  pub bytes: CachedBytes,
+}
+
+/// What a request does to a file that may have other names (A-360), decided before it runs.
+#[derive(Clone, Copy)]
+struct Change {
+  ino: u64,
+  bytes: CachedBytes,
+  count: Count,
+}
+
+/// How a [`Change`] learns whether the file has another name.
+#[derive(Clone, Copy)]
+enum Count {
+  /// From its reply, which carries the file's information and its link count with it.
+  Reported,
+  /// A link: the file has another name once it succeeds.
+  Link,
+  /// The delete of one name of a file that had this many.
+  Delete { names: u32 },
+}
+
+impl Change {
+  /// The [`Sibling`] the served request leaves owed, if it succeeded and the file has, or had, another name. With the
+  /// name it came through unknown, every name is told.
+  fn sibling(self, reply: &Reply, through: Option<String>) -> Option<Sibling> {
+    let shared = match (self.count, reply) {
+      (_, Reply::Err(_)) => false,
+      (Count::Reported, Reply::Wrote { info, .. } | Reply::Object { info, .. }) => {
+        info.hard_links > 1
+      }
+      (Count::Reported, _) => false,
+      (Count::Link, _) => true,
+      (Count::Delete { names }, _) => names > 1,
+    };
+    shared.then(|| Sibling {
+      ino: self.ino,
+      through: through.unwrap_or_default(),
+      bytes: self.bytes,
+    })
+  }
+}
+
+/// The open context a request names, when it acts through one.
+fn context_of(op: &Op<u64>) -> Option<u64> {
+  match op {
+    Op::Write { object, .. }
+    | Op::SetSize { object, .. }
+    | Op::Truncate { object, .. }
+    | Op::SetAllocation { object, .. }
+    | Op::SetTimes { object, .. }
+    | Op::Link { object, .. }
+    | Op::Cleanup { object, .. } => Some(*object),
+    _ => None,
+  }
+}
+
+/// The [`Change`] `op` makes: a write's bytes (from where it lands, when it appends), a size's or an overwrite's whole
+/// file, a time's or a link's information alone; their replies carry the link count. A delete reads the file's link
+/// count first, since its reply carries none. A purge's own echo is no change.
+fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<Change> {
+  let (object, bytes, count) = match op {
+    Op::Write { object, .. } if object.purge => return None,
+    Op::Write {
+      object,
+      offset,
+      data,
+      append,
+      ..
+    } => {
+      let bytes = if *append {
+        CachedBytes::From { at: *offset }
+      } else {
+        CachedBytes::Range {
+          at: *offset,
+          len: u64::try_from(data.len()).unwrap_or(u64::MAX),
+        }
+      };
+      (object, bytes, Count::Reported)
+    }
+    Op::SetSize { object, .. } | Op::Truncate { object, .. } | Op::SetAllocation { object, .. } => {
+      (object, CachedBytes::ALL, Count::Reported)
+    }
+    Op::SetTimes { object, .. } => (object, CachedBytes::Kept, Count::Reported),
+    Op::Link { object, .. } => (object, CachedBytes::Kept, Count::Link),
+    Op::Cleanup {
+      object,
+      delete: Some(_),
+    } if !object.purge => {
+      let attr = bridge.getattr(object.object, cx).ok()?;
+      if attr.kind == Kind::Dir {
+        return None;
+      }
+      (
+        object,
+        CachedBytes::Kept,
+        Count::Delete { names: attr.nlink },
+      )
+    }
+    _ => return None,
+  };
+  Some(Change {
+    ino: object.object.inode,
+    bytes,
+    count,
+  })
 }
 
 fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
@@ -692,6 +839,15 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       replace,
     },
     Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
+    Op::Link {
+      object,
+      path,
+      replace,
+    } => Op::Link {
+      object: ledger.get(object)?,
+      path,
+      replace,
+    },
     Op::CanDelete { object } => Op::CanDelete {
       object: ledger.get(object)?,
     },
@@ -757,6 +913,8 @@ pub struct Served {
   barrier: bool,
   echo: bool,
   restored_read: bool,
+  /// The request changed a file that has, or had, another name (A-360): see [`Served::sibling_change`].
+  sibling: Option<Sibling>,
   /// The request was a flush (of a handle, or of the volume): its success tells the caller its data is durable.
   flush: bool,
 }
@@ -772,6 +930,13 @@ impl Served {
   /// host (`crate::purge`).
   pub fn is_purge_echo(&self) -> bool {
     self.echo
+  }
+
+  /// The change this request made to a file that has, or had, another name (A-360). The mount's own requests are its
+  /// kernel's doing for the name they came through, so their journal records are passed over; but each other name
+  /// Windows holds open has a file node and caches of its own, so the mount's next round tells those names.
+  pub fn sibling_change(&self) -> Option<&Sibling> {
+    self.sibling.as_ref()
   }
 
   /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.
@@ -817,7 +982,13 @@ fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
     last_write_time: filetime_from_unix_ns(attr.mtime),
     change_time: filetime_from_unix_ns(attr.ctime),
     index_number: attr.ino,
-    hard_links: 0,
+    // A file's names (A-360): a driver with `docs/wip/winfsp-patches` reports them as `NumberOfLinks`; a directory
+    // has one there, as on NTFS, whatever POSIX counts for it.
+    hard_links: if attr.kind == Kind::Dir {
+      0
+    } else {
+      attr.nlink
+    },
     ea_size: 0,
   })
 }
@@ -971,6 +1142,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       object_reply(&attr, 0)?
     }
     Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
+    Op::Link {
+      object,
+      path,
+      replace,
+    } => op_link(bridge, cx, object.object, &path, replace)?,
     Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
     Op::SetAllocation { object, new_size } => {
       op_set_allocation(bridge, cx, object.object, new_size)?
@@ -1240,6 +1416,69 @@ fn op_rename(
   Ok(Reply::Ok)
 }
 
+/// A hard link (A-360; `FileLinkInformation`): `path` becomes another name of `object`, by Windows' rules (MS-FSA
+/// 2.1.5.15.7). A taken name is refused `STATUS_OBJECT_NAME_COLLISION` unless the caller asked to replace it; a name of
+/// the file itself is left as it is; a replaced name is never a directory's or a read-only file's (`STATUS_ACCESS_DENIED`,
+/// as a rename's, [`replaces_a_directory`], [`crate::refuses_replacement`]). A directory takes no second name
+/// (`STATUS_FILE_IS_A_DIRECTORY`; the driver refuses it first). A replace is made under a name of its own and renamed over
+/// the taken one, so a refusal at either step leaves the taken name as it was; one shard turn serves all of it, so no
+/// other request sees the name between.
+fn op_link(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  path: &str,
+  replace: bool,
+) -> Result<Reply, VfsError> {
+  if bridge.getattr(object, cx)?.kind == Kind::Dir {
+    return Err(VfsError::IsDirectory);
+  }
+  let (name, parent) = match split_parent(bridge, cx, path)? {
+    Ok(pair) => pair,
+    Err(status) => return Ok(Reply::Err(status)),
+  };
+  let taken = match bridge.lookup(parent, cx, name) {
+    Ok(attr) => attr,
+    Err(VfsError::NotFound) => {
+      bridge.link(object, parent, cx, name)?;
+      return Ok(Reply::Ok);
+    }
+    Err(error) => return Err(error),
+  };
+  if !replace {
+    return Err(VfsError::AlreadyExists);
+  }
+  if (taken.ino, taken.generation) == (object.inode, object.generation) {
+    return Ok(Reply::Ok);
+  }
+  if matches!(taken.kind, Kind::Dir) || crate::refuses_replacement(&taken) {
+    return Err(VfsError::NotPermitted);
+  }
+  let staging = staging_name(object);
+  match bridge.lookup(parent, cx, &staging) {
+    Err(VfsError::NotFound) => {}
+    Ok(_) => return Err(VfsError::AlreadyExists),
+    Err(error) => return Err(error),
+  }
+  bridge.link(object, parent, cx, &staging)?;
+  if let Err(error) = bridge.rename(parent, parent, cx, &staging, name, RenameFlags::default()) {
+    if let Err(undo) = bridge.unlink(parent, cx, &staging) {
+      slates_machine::log_line!(
+        "slates-winfsp: a refused link's staging name {staging} stays beside {name}: {undo:?}"
+      );
+    }
+    return Err(error);
+  }
+  Ok(Reply::Ok)
+}
+
+/// The name a replacing link is made under before it is renamed over the taken name: one per file, so two links of
+/// different files cannot meet, and a name no Windows program makes (`:` is refused in a component by Win32 and by
+/// WinFsp's driver). Never seen: the shard serves the link and the rename in one turn.
+fn staging_name(object: ObjectId) -> String {
+  format!(":slates-link:{:x}:{:x}", object.inode, object.generation)
+}
+
 /// Whether a rename asked to replace would replace a directory other than its own source: Windows never does
 /// (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` onto a directory answers `ERROR_ACCESS_DENIED`, WinFsp's memfs refuses
 /// it so; `t/base/04.t` case 26), where POSIX `rename` replaces an empty one. A name that resolves to the source itself (a
@@ -1406,12 +1645,14 @@ fn read_all_entries(
 // --------------------------------------------------------------------- the WinFsp callback handler
 
 /// The handler stored in the file system's `UserContext`: the channel to the mount's task, the waker of that task, and
-/// the one reference security descriptor every object reports. `Send + Sync` (a `SyncSender`, a `Waker` and a byte
-/// vector), so the owned receiver reaches it soundly. That single caller needs no DLL operation guard.
+/// the one security descriptor every object reports. `Send + Sync` (a `SyncSender`, a `Waker` and a byte vector), so
+/// the owned receiver reaches it soundly. That single caller needs no DLL operation guard.
 struct Handler {
   requests: SyncSender<Request>,
   wake: Waker,
-  /// A self-relative security descriptor as raw bytes (built once from [`EVERYONE_SDDL`]).
+  /// The drive's one descriptor as self-relative bytes, built once at the mount ([`drive_security_descriptor`]): the
+  /// account the drive is served for as owner, its primary group as group, and the access list that lets the shard
+  /// decide (A-350).
   security_descriptor: Vec<u8>,
 }
 
@@ -1453,9 +1694,9 @@ pub(crate) struct Confirming(Receiver<Reply>);
 /// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
 /// the worker's next request (audit step 7, cut (c)). The answer is taken by [`confirmed_open`] before the journal
 /// overwrites the open's settled response. A request answered without the shard can come next and would otherwise find
-/// it unapplied: the host registers no GetSecurity callback (`ffi.rs`, `get_security: None`), so WinFsp's own
-/// QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`),
-/// and QueryEa and QueryStreamInformation likewise (`fsop.c:1208`, `1478`).
+/// it unapplied: the host's GetSecurity answers QuerySecurity from the mount's one descriptor on the receiving thread
+/// ([`get_security`], A-350), and WinFsp's own QueryEa and QueryStreamInformation answer without calling the host at
+/// all (WinFsp v2.1 `src/dll/fsop.c:1208`, `1478`).
 pub(crate) fn post_confirm(
   requests: &SyncSender<Request>,
   wake: &Waker,
@@ -1659,6 +1900,24 @@ extern "C" fn get_security_by_name(
     Reply::Err(status) => status,
     _ => crate::status_object_name_not_found(),
   }
+}
+
+/// `GetSecurity` (WinFsp's `QuerySecurity`): the mount's one descriptor, as `get_security_by_name` reports it, copied on
+/// the receiving thread without the shard, since every object reports the same one (A-350). Without this callback
+/// WinFsp's DLL refused every query `STATUS_INVALID_DEVICE_REQUEST` (v2.1 `src/dll/fsop.c` 1444-1445), and Windows' I/O
+/// manager answered such a refusal with its world descriptor, owner Everyone (S-1-1-0), so git refused every repository
+/// on the drive as owned by someone else (CI run 44271637767). Answered here, the kernel driver also keeps the
+/// descriptor with the open file for `SecurityTimeout`, the mount's `FileInfoTimeout`.
+extern "C" fn get_security(
+  fs: *mut FileSystem,
+  _context: Pvoid,
+  security_descriptor: PSecurityDescriptor,
+  p_sd_size: *mut usize,
+) -> Ntstatus {
+  // SAFETY: our file system, for the life of the call.
+  let handler = unsafe { handler(fs) };
+  // SAFETY: `p_sd_size`/`security_descriptor` follow WinFsp's in/out size protocol.
+  unsafe { copy_security_descriptor(handler, security_descriptor, p_sd_size) }
 }
 
 /// WinFsp's in/out reparse buffer: the bytes it offers and the length to report back; `None` when it asks only
@@ -2254,6 +2513,29 @@ extern "C" fn rename(
   }
 }
 
+/// Serves a hard link the patched driver forwards (A-360) on the receive worker, which takes it before WinFsp's DLL: the
+/// DLL has no case for `FileLinkInformation` (`src/dll/fsop.c` answers it `STATUS_INVALID_PARAMETER`). The drive's
+/// objects all carry one descriptor (A-350, `drive_security_descriptor`), so a caller that opened the file holds the
+/// same access over the new name's directory and the name it replaces, and none of the checks a rename's replace makes
+/// in the DLL (`FspFileSystemRenameCheck`) is made here.
+///
+/// # Safety
+///
+/// `fs` is this host's live file system, as every callback's is.
+pub(crate) unsafe fn link(fs: *mut FileSystem, link: &crate::inflight::Link) -> Ntstatus {
+  // SAFETY: the caller's contract: our live file system.
+  let handler = unsafe { handler(fs) };
+  match handler.call(Op::Link {
+    object: link.context,
+    path: link.path.clone(),
+    replace: link.replace,
+  }) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
+}
+
 extern "C" fn read_directory(
   fs: *mut FileSystem,
   context: Pvoid,
@@ -2368,6 +2650,7 @@ static INTERFACE: Interface = Interface {
   set_file_size: Some(set_file_size),
   can_delete: Some(can_delete),
   rename: Some(rename),
+  get_security: Some(get_security),
   read_directory: Some(read_directory),
   resolve_reparse_points: Some(resolve_reparse_points),
   get_reparse_point: Some(get_reparse_point),
@@ -2415,7 +2698,7 @@ impl Mounted {
     read_only: bool,
     requests: SyncSender<Request>,
     wake: Waker,
-    inherited: Option<(Record, OwnedHandle, OwnedHandle)>,
+    inherited: Option<(Record, OwnedHandle)>,
     purge_intents: crate::purge_intents::Sender,
     private_opens: &crate::purge_intents::Intents,
   ) -> Result<Mounted, WinFspError> {
@@ -2436,7 +2719,7 @@ impl Mounted {
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     checked_dll(api)?;
     let purge_marker = crate::purge_token::Marker::fresh()?;
-    let security_descriptor = everyone_security_descriptor()?;
+    let security_descriptor = drive_security_descriptor(purge_marker)?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
       wake,
@@ -2469,6 +2752,9 @@ impl Mounted {
       // daemon itself holds no privilege (R10).
       | ffi::VOLUME_FLAG_REPARSE_POINTS
       | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
+      // The volume makes hard links (A-360): a driver with `docs/wip/winfsp-patches` forwards `FileLinkInformation`; the
+      // released driver ignores the bit and refuses the link itself.
+      | ffi::VOLUME_FLAG_HARD_LINKS
       // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed
       // that first box twice (run 40251802164); a stable token would likewise name the wrong open.
@@ -2516,7 +2802,7 @@ impl Mounted {
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
     }
-    if let Some((record, volume, link)) = inherited {
+    if let Some((record, volume)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point
         || record.read_only != read_only
       {
@@ -2531,7 +2817,7 @@ impl Mounted {
         (*file_system).volume_name = record.volume;
         drop(OwnedHandle::from_raw_handle(old));
       }
-      mounted.drive = Some(Drive::inherited(&record, link));
+      mounted.drive = Some(Drive::inherited());
       mounted.record = record;
     }
     // SAFETY: the DLL object now owns the final control handle (including substitution on adoption), and remains
@@ -2539,7 +2825,9 @@ impl Mounted {
     let control = unsafe { (*file_system).volume_handle };
     crate::dispatcher::announce_ready(control, private_opens)?;
     if mounted.drive.is_none() {
-      mounted.drive = Some(Drive::create(&mounted.record)?);
+      // SAFETY: the DLL object owns this live control handle for the whole of `mounted`; the borrow ends with the call.
+      let volume = unsafe { BorrowedHandle::borrow_raw(control) };
+      mounted.drive = Some(Drive::create(volume, &mounted.record)?);
     }
     Ok(mounted)
   }
@@ -2553,14 +2841,8 @@ impl Mounted {
         call: "duplicate volume control handle",
         code: error.raw_os_error(),
       })?;
-    let link = self
-      .drive
-      .as_ref()
-      .ok_or(WinFspError::MountThread)?
-      .duplicate()?;
     Ok(Offer {
       volume,
-      link,
       record: self.record.clone(),
     })
   }
@@ -2710,14 +2992,12 @@ impl Ready {
   pub fn handle_values(&self) -> Result<Vec<u64>, WinFspError> {
     let volume = u64::try_from(self.offer.volume.as_raw_handle().addr())
       .map_err(|_| WinFspError::MountThread)?;
-    let link = u64::try_from(self.offer.link.as_raw_handle().addr())
-      .map_err(|_| WinFspError::MountThread)?;
     let ledger = self
       .ledger
       .memory()
       .handle_value()
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
-    Ok(vec![volume, link, ledger])
+    Ok(vec![volume, ledger])
   }
 }
 
@@ -2874,7 +3154,6 @@ fn run_mount(
     let (mut ledger, inherited) = match inherited {
       Some(Inherited {
         volume,
-        link,
         ledger,
         record,
       }) => {
@@ -2882,7 +3161,7 @@ fn run_mount(
           .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
         (
           Ledger::recover(memory, open_bound).map_err(WinFspError::Ledger)?,
-          Some((record, volume, link)),
+          Some((record, volume)),
         )
       }
       None => {
@@ -3014,9 +3293,67 @@ fn run_mount(
   report(Outcome::Stopped);
 }
 
-/// Builds the "allow Everyone" reference security descriptor as self-relative bytes, from [`EVERYONE_SDDL`].
-fn everyone_security_descriptor() -> Result<Vec<u8>, WinFspError> {
-  let sddl = wide_nul(EVERYONE_SDDL);
+/// The drive's one security descriptor, as self-relative bytes: the account this daemon runs as, which every client of
+/// a Windows daemon is (its rendezvous admits that user's SID alone), as owner, the account's primary group as group
+/// (A-350), and an access list for that account, SYSTEM, the Administrators and the mount's purge `marker` alone
+/// (`crate::account::drive_sddl`, A-368). NTFS gives a file the account makes the same owner and group, unelevated.
+/// Refused `SecurityDescriptor` when the token, its SIDs or the marker's cannot be read.
+fn drive_security_descriptor(marker: crate::purge_token::Marker) -> Result<Vec<u8>, WinFspError> {
+  let mut token = std::ptr::null_mut();
+  // SAFETY: this process's pseudo-handle, which needs no closing, and an out-pointer to a local; the token is owned
+  // below.
+  if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+    || token.is_null()
+  {
+    return Err(WinFspError::SecurityDescriptor);
+  }
+  // SAFETY: the token handle just opened, owned here alone and closed on drop.
+  let token = unsafe { OwnedHandle::from_raw_handle(token) };
+  let sid = |class| {
+    token_information(&token, class)
+      .and_then(|buffer| crate::account::token_sid_text(&buffer))
+      .ok_or(WinFspError::SecurityDescriptor)
+  };
+  let marker = marker.sid_text().ok_or(WinFspError::SecurityDescriptor)?;
+  let sddl = crate::account::drive_sddl(&sid(TokenUser)?, &sid(TokenPrimaryGroup)?, &marker);
+  security_descriptor_of(&sddl)
+}
+
+/// The `class` information of `token`, in a buffer aligned for the token structures (each SID they point at lies in
+/// the same buffer, after them); `None` when the token refuses either query.
+fn token_information(token: &OwnedHandle, class: TOKEN_INFORMATION_CLASS) -> Option<Vec<u64>> {
+  let mut needed = 0u32;
+  // SAFETY: a size query with no buffer: it fails by design and writes the size it needs to a local.
+  unsafe {
+    GetTokenInformation(
+      token.as_raw_handle(),
+      class,
+      std::ptr::null_mut(),
+      0,
+      &mut needed,
+    )
+  };
+  let words = usize::try_from(needed).ok()?.div_ceil(size_of::<u64>());
+  if words == 0 {
+    return None;
+  }
+  let mut buffer = vec![0u64; words];
+  // SAFETY: `buffer` holds at least `needed` bytes, aligned for every token structure; the call writes no more.
+  let read = unsafe {
+    GetTokenInformation(
+      token.as_raw_handle(),
+      class,
+      buffer.as_mut_ptr().cast(),
+      needed,
+      &mut needed,
+    )
+  };
+  (read != 0).then_some(buffer)
+}
+
+/// A descriptor's self-relative bytes from its SDDL.
+fn security_descriptor_of(sddl: &str) -> Result<Vec<u8>, WinFspError> {
+  let sddl = wide_nul(sddl);
   let mut sd: PSecurityDescriptor = std::ptr::null_mut();
   let mut size: u32 = 0;
   // SAFETY: `sddl` is a NUL-terminated SDDL string; the call allocates a self-relative SD into `sd`

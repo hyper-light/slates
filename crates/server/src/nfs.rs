@@ -60,11 +60,17 @@
 //! procedure that succeeded therefore runs [`crate::verbs::publish_shard`] on the owner shard
 //! *before* its reply is sent ([`barrier`]), so the reply's stability claim — a `FILE_SYNC` write, a
 //! COMMIT, a create or a rename the protocol defines as stable — is true for daemon-restart survival.
-//! The one exception is an `UNSTABLE` write, answered `UNSTABLE` and made stable by the client's
-//! later COMMIT; the write verifier ([`crate::state::ShardState::write_verifier`], per boot) is how a
-//! client learns a restart lost the unstable writes it still holds and re-sends them (RFC 1813
-//! §3.3.7). A refused publish replaces the reply with `NFS3ERR_IO` — the effect is in the volume but
-//! not stable, and the client is told so rather than promised survival.
+//! An `UNSTABLE` write is published before its reply too, though it is answered `UNSTABLE` (A-358):
+//! left to the client's COMMIT, its bytes died with the daemon, and a client learns that only from the
+//! per-boot write verifier ([`crate::state::ShardState::write_verifier`]), after which RFC 1813 §3.3.7
+//! has it write them again. Apple's client does not: in a traced kill run on macOS 26.2 its COMMIT met
+//! a new verifier 3 times and it wrote nothing again, and the file whose bytes no publication had
+//! carried came back empty
+//! (docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md).
+//! What `UNSTABLE` still leaves to the COMMIT is durability past the daemon: only a reply that claims
+//! stability waits for a live-shipped volume's candidates (A-200). A refused publish replaces the reply
+//! with `NFS3ERR_IO` — the effect is in the volume but not stable, and the client is told so rather than
+//! promised survival.
 //!
 //! **NFSv4.1/4.2 (A-35).** Version 4 of the NFS program is served on the same listener: the v4 state
 //! (clients, sessions, opens) lives on the listener's shard, created with the first v4 call under the
@@ -195,11 +201,12 @@ impl VolumeSet for ShardVolumeSet {
       let Some((capability, rights)) = authorized_rights(s, volume, capability) else {
         return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
       };
-      // A volume this node lost to a takeover, its log fenced at a later epoch (A-338; kept across a restart, A-344), is
-      // answered as one this node does not hold: `NFS3ERR_STALE`, as a non-owner node's mount answers its handles, so the
-      // mount learns of the takeover (A-346). Before, the lease gate below answered its requests retry-later for good, or,
-      // its lease confirmed again, they were served from the copy the successor's writes had passed.
-      if s.by_id.contains_key(&volume) && crate::live_ship::superseded(s, volume) {
+      // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced at a later epoch, A-338, kept
+      // across a restart, A-344; or yielded when this host was admitted again under its id, A-334) is answered as one this
+      // node does not hold: `NFS3ERR_STALE`, as a non-owner node's mount answers its handles, so the mount learns of the
+      // takeover (A-346). Before, the lease gate below answered its requests retry-later for good, or, its lease confirmed
+      // again, they were served from the copy the successor's writes had passed.
+      if s.by_id.contains_key(&volume) && crate::verbs::lost_to_a_successor(s, volume) {
         s.count(SUPERSEDED_STALE, 1);
         return Some(Some(status_failure_reply(Nfsstat3::Stale, procedure)));
       }
@@ -249,8 +256,8 @@ impl VolumeSet for ShardVolumeSet {
       // volume's capability gets no root handle, so no volume can be mounted or entered without it. The
       // root handle returned carries the capability, so every later request self-authorizes.
       let (capability, rights) = authorized_rights(s, volume, capability)?;
-      // A volume this node lost to a takeover gives no root, as one it does not hold gives none (A-346, as `serve`).
-      if crate::live_ship::superseded(s, volume) {
+      // A volume this node lost to a successor gives no root, as one it does not hold gives none (A-346, as `serve`).
+      if crate::verbs::lost_to_a_successor(s, volume) {
         s.count(SUPERSEDED_STALE, 1);
         return None;
       }
@@ -388,7 +395,7 @@ fn with_export<R>(
   }
   export.set_dialect(dialect);
   // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
-  // learn its unstable writes were lost and re-send them.
+  // learn whether unstable writes were lost; each is published before its reply (A-358), so none are.
   export.set_write_verifier(write_verifier);
   export.set_capability(capability);
   if let Some(files) = nfs_v4_files.as_mut() {
@@ -435,10 +442,13 @@ fn admit_mount(
 }
 
 /// Whether a served call's effect must be in the shard's recovery image before its reply goes out
-/// (the §4.8 barrier, D-18): a mutating NFS procedure that succeeded — every one except an `UNSTABLE`
-/// write, which its client makes stable with a later COMMIT (itself a barrier). A refused call
-/// changed nothing, and a read never needs one.
-fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
+/// (the §4.8 barrier, D-18): a mutating NFS procedure that succeeded, a WRITE whatever stability it
+/// asked for included (A-358: its client cannot be relied on to write it again after a restart). A
+/// refused call changed nothing, and a read never needs one. It is also what changed what a shard
+/// publication makes durable (A-127): a recorded call rides the publication its barrier makes.
+/// Whether the reply then also waits for a live-shipped volume's candidates is [`unstable_write`]'s
+/// to say.
+fn needs_barrier(program: u32, procedure: u32, results: &[u8]) -> bool {
   if program != NFS_PROGRAM || !nfs_ok(results) {
     return false;
   }
@@ -448,14 +458,12 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
     let Some(inner_results) = results.get(size_of::<u32>()..) else {
       return false;
     };
-    return needs_barrier(program, inner, args, inner_results);
+    return needs_barrier(program, inner, inner_results);
   }
   match procedure {
-    NFSPROC3_WRITE => {
-      write_stable_how(&mut XdrReader::new(args)).is_none_or(|stable| !is_unstable(stable))
-    }
-    NFSPROC3_SETATTR | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK | NFSPROC3_MKNOD
-    | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK | NFSPROC3_COMMIT => true,
+    NFSPROC3_WRITE | NFSPROC3_SETATTR | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
+    | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK
+    | NFSPROC3_COMMIT => true,
     // The v4 front end's attribute changes (A-35) publish as any mutation does.
     slates_bridge_nfs::procedures::extension::XATTR_SET
     | slates_bridge_nfs::procedures::extension::XATTR_REMOVE => true,
@@ -463,12 +471,15 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
   }
 }
 
-/// Whether a served call changed what a shard publication makes durable (A-127): every call [`needs_barrier`] names,
-/// and an `UNSTABLE` write, whose change a later publication carries.
-fn changes_volume(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
-  let write = slates_bridge_nfs::procedures::state_io_inner(procedure).unwrap_or(procedure);
-  needs_barrier(program, procedure, args, results)
-    || (program == NFS_PROGRAM && write == NFSPROC3_WRITE && nfs_ok(results))
+/// Whether a call is a WRITE that asked for no stability (`UNSTABLE`), a state-carrying one (A-36) included: published
+/// before its reply as every write is (A-358), it claims nothing past its daemon, so its reply waits for no live-shipped
+/// volume's candidates (A-200); the client's COMMIT does. A WRITE whose arguments do not decode that far claims
+/// stability, as before A-358.
+fn unstable_write(program: u32, procedure: u32, args: &[u8]) -> bool {
+  let inner = slates_bridge_nfs::procedures::state_io_inner(procedure).unwrap_or(procedure);
+  program == NFS_PROGRAM
+    && inner == NFSPROC3_WRITE
+    && write_stable_how(&mut XdrReader::new(args)).is_some_and(is_unstable)
 }
 
 /// Counter: NFSv3 requests a dead daemon applied and left unanswered on a held connection, answered by its successor
@@ -547,17 +558,21 @@ fn nfs_ok(results: &[u8]) -> bool {
 /// survival). A publish that committed without the touched `volume` (a volume it could not image: its
 /// base unreadable, or the image refused) is counted as a
 /// refused barrier ([`crate::daemon::BARRIER_UNCAPTURED`]) and returns `NFS3ERR_IO`. No volume id
-/// or no publication also refuses: absence of a proof never becomes a stability guarantee.
+/// or no publication also refuses: absence of a proof never becomes a stability guarantee. A reply that
+/// `claims_stability` (all but an `UNSTABLE` write's, [`unstable_write`]) then waits for a live-shipped
+/// volume's candidates (A-200).
 fn barrier(
   procedure: u32,
   volume: Option<VolumeId>,
   reply: (AcceptStatus, Vec<u8>),
+  claims_stability: bool,
 ) -> (AcceptStatus, Vec<u8>) {
   let outcome = state::with_state(crate::verbs::publish_shard);
   let reply = publication_reply(procedure, volume, outcome, reply);
   // A live-shipped volume's stable reply waits until `f` candidates hold the publication (A-200): noted here, waited
-  // for by the serve's task (`stable_once_durable`), never inside this synchronous step.
-  if let Some(volume) = volume {
+  // for by the serve's task (`stable_once_durable`), never inside this synchronous step. An `UNSTABLE` write's reply
+  // claims no stability, so it waits for none (A-358): its publication is for its daemon's death alone.
+  if claims_stability && let Some(volume) = volume {
     let _ = state::with_state(|s| crate::live_ship::note_barrier(s, volume));
   }
   reply
@@ -1306,7 +1321,7 @@ fn answered_or_refused(
 
 /// A served call's record and barrier:
 /// - a recorded compound's call is recorded before the barrier, so the publication that makes its effect durable
-///   carries what it answered (A-127): a change to a volume rides that publication (an UNSTABLE write's, the next one);
+///   carries what it answered (A-127): a change to a volume rides that publication;
 /// - the barrier (§4.8, D-18) publishes a mutation's effect into anchor-owned RAM before its reply leaves this shard,
 ///   so the reply's stability claim is true for daemon-restart survival;
 /// - a held connection's mutation holds its reply before the barrier, so the publication carries both (A-128);
@@ -1320,7 +1335,7 @@ fn record_and_publish(
   if let Some(call) = call.as_ref()
     && matches!(served.0, AcceptStatus::Success)
   {
-    let changed = changes_volume(program, procedure, args, &served.1);
+    let changed = needs_barrier(program, procedure, &served.1);
     let _ = state::with_state_counted(|s| {
       crate::nfs_replay::record(s, call, procedure, &served.1, changed);
     });
@@ -1331,14 +1346,19 @@ fn record_and_publish(
     .and_then(|volume| state::with_state(|s| crate::verbs::awaits_publication(s, volume)))
     .unwrap_or(false);
   if !matches!(served.0, AcceptStatus::Success)
-    || !(needs_barrier(program, procedure, args, &served.1) || awaits_publication)
+    || !(needs_barrier(program, procedure, &served.1) || awaits_publication)
   {
     return served;
   }
   if let Some(connection) = held {
     let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &served));
   }
-  let barriered = barrier(procedure, target_volume(program, procedure, args), served);
+  let barriered = barrier(
+    procedure,
+    target_volume(program, procedure, args),
+    served,
+    !unstable_write(program, procedure, args),
+  );
   if let Some(connection) = held {
     let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &barriered));
   }

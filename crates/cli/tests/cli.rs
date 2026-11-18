@@ -1324,6 +1324,55 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   drop(anchor);
 }
 
+/// Shape: the volumes the paged-listing test creates through the CLI: about five listing pages' worth, at about 50 bytes
+/// a summary (`paged-NNNNN`, its id and counters) in a 4,096-byte reply chunk; past the 100 that one reply held.
+const PAGED_VOLUMES: usize = 400;
+
+/// §4.4 `list`, by use. Do: on a real anchor (two shards) create [`PAGED_VOLUMES`] volumes with `slates volume
+/// create`, then run `slates volume list` and `slates volume list --json`. Expect: both exit 0 and hold every volume
+/// exactly once. Before 2026-11-08 both were refused "reply too large for the bulk area" at 100 volumes (2,000 tried by
+/// hand: refused at every count from 100).
+#[test]
+fn volume_list_answers_a_listing_longer_than_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the paged volume listing: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-paged-list-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let mut ids = Vec::new();
+  for n in 0..PAGED_VOLUMES {
+    let name = format!("paged-{n:05}");
+    let (code, out, err) = run(&instance, &["volume", "create", &name, "--bounded", "1MiB"]);
+    assert_eq!(code, 0, "create {name}: {err}");
+    ids.push(value_of(&out, "id"));
+  }
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "volume list: {err}");
+  for id in &ids {
+    assert_eq!(
+      out
+        .lines()
+        .filter(|line| line.starts_with(id.as_str()))
+        .count(),
+      1,
+      "volume {id} listed once"
+    );
+  }
+  let (code, out, err) = run(&instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "volume list --json: {err}");
+  for id in &ids {
+    assert_eq!(
+      out.matches(&format!("\"id\":\"{id}\"")).count(),
+      1,
+      "volume {id} in the JSON once"
+    );
+  }
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`
@@ -7360,7 +7409,7 @@ fn shell(script: &str) -> String {
 }
 
 /// Format: the variable naming the daemon's root mount, where a volume appears as `<root>/<volume>`
-/// (`crates/cli/src/exec.rs`); the launcher has no default and refuses without it.
+/// (`crates/api/src/exec.rs`); the launcher has no default and refuses without it.
 #[cfg(target_os = "linux")]
 const ROOT_ENV: &str = "SLATES_ROOT";
 
@@ -7501,6 +7550,207 @@ fn the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it() {
     );
   }
   assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// Format: the variable a CI step sets to the AppArmor regime it arranged for this binary before the launcher's
+/// AppArmor test: `absent`, no slates profile loaded for it, or `loaded`, its profile loaded by the step as root. Unset,
+/// the test takes the regime the host has; set, a host in another regime fails it, so a profile the step failed to load
+/// or to unload is never passed off as the other case.
+#[cfg(target_os = "linux")]
+const APPARMOR_REGIME_ENV: &str = "SLATES_TEST_APPARMOR_PROFILE";
+
+/// Format: the launcher's refusal on a host whose AppArmor confines unprivileged user namespaces, word for word as it
+/// read before A-370, which it still reads with the option off and no profile loaded.
+#[cfg(target_os = "linux")]
+const CONFINED_REFUSAL: &str = "this host's AppArmor confines unprivileged user namespaces \
+  (kernel.apparmor_restrict_unprivileged_userns=1), so the launcher's namespace has no capability to bind the volume; an \
+  administrator can allow it with an AppArmor profile for the slates binary that grants `userns,`, or set the sysctl \
+  to 0";
+
+/// What one run of the launcher answered: its exit code, standard output and standard error.
+#[cfg(target_os = "linux")]
+struct Launched {
+  code: i32,
+  out: String,
+  err: String,
+}
+
+/// Runs `slates exec` over `root/vol` at `at`, with the AppArmor option on or off, running a command that reports what
+/// it sees, one line each: the volume's marker through the bind, its own AppArmor label, and whether a user namespace it
+/// makes itself gets the capability to mount (`grant-held`) or not (`grant-withheld`).
+#[cfg(target_os = "linux")]
+fn launch_reporting(root: &str, at: &str, apparmor: bool) -> Launched {
+  let script = format!(
+    "cat {at}/marker; echo; cat /proc/self/attr/apparmor/current 2>/dev/null || echo none; \
+     if unshare -Urm true 2>/dev/null; then echo grant-held; else echo grant-withheld; fi"
+  );
+  let mut command = slates();
+  command.args(["exec", "--volume", "vol", "--at", at]);
+  if apparmor {
+    command.arg("--apparmor-profile");
+  }
+  let output = command
+    .args(["--", "sh", "-c", &script])
+    .env(ROOT_ENV, root)
+    .output()
+    .unwrap();
+  Launched {
+    code: output.status.code().unwrap_or(-1),
+    out: String::from_utf8_lossy(&output.stdout).into_owned(),
+    err: String::from_utf8_lossy(&output.stderr).into_owned(),
+  }
+}
+
+/// A-370 (§4.6 "The launcher"; GAPS `8a-launcher-ci`), with no daemon: a plain directory stands in for the root mount.
+/// Do: ask `slates apparmor check --json` what the launcher will meet, then run `slates exec` with and without
+/// `--apparmor-profile`, its command reporting the volume's marker, its own AppArmor label, and whether a user namespace
+/// it makes itself gets the mount capability. Expect, by the host:
+/// - where AppArmor restricts unprivileged user namespaces and slates' profile is loaded for this binary: with the
+///   option, the command reads the volume, runs `unconfined`, and its own namespace is refused the capability, so it
+///   holds nothing the host withholds; without it, a refusal (exit 4) naming the option, the launcher having left the
+///   loaded profile;
+/// - where it restricts them and no profile is loaded: without the option, the refusal word for word as before A-370;
+///   with it, a refusal naming this binary's profile file and the command that loads it;
+/// - elsewhere (no restriction): the command reads the volume either way.
+///
+/// The host sees nothing at the chosen path after any of them. CI runs it on GitHub's Ubuntu runners in both regimes
+/// (`APPARMOR_REGIME_ENV`), loading the profile as root between them.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout)
+    .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {check:?}"));
+  let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
+  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
+    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
+    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
+    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
+    Err(_) => {}
+  }
+  let root = build_output_dir("slates-apparmor-root");
+  let at = build_output_dir("slates-apparmor-at");
+  shell(&format!(
+    "mkdir -p {root}/vol && printf through-the-bind > {root}/vol/marker"
+  ));
+  let off = launch_reporting(&root, &at, false);
+  let on = launch_reporting(&root, &at, true);
+  let left = shell(&format!("ls -A {at}"));
+  shell(&format!("rm -rf {root} {at}"));
+  let executable = report["executable"].as_str().unwrap_or_default();
+  match readiness.as_str() {
+    "profile-loaded" => {
+      assert_eq!(
+        on.code, 0,
+        "the profile's launcher runs the command: {}",
+        on.err
+      );
+      assert_eq!(
+        on.out.lines().collect::<Vec<_>>(),
+        ["through-the-bind", "unconfined", "grant-withheld"],
+        "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+      );
+      assert_eq!(
+        off.code, 4,
+        "without the option the launcher leaves the profile: {}",
+        off.err
+      );
+      assert!(
+        off.err.contains("--apparmor-profile") && off.err.contains(executable),
+        "the refusal names the option and the loaded profile: {}",
+        off.err
+      );
+    }
+    "profile-missing" => {
+      assert_eq!(off.code, 4, "{}", off.err);
+      assert_eq!(
+        off.err.trim(),
+        format!("slates: {CONFINED_REFUSAL}"),
+        "without the option, the refusal as it read before A-370"
+      );
+      assert_eq!(on.code, 4, "{}", on.err);
+      let file = report["profile_file"].as_str().unwrap_or_default();
+      assert!(
+        !file.is_empty()
+          && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+          && on.err.contains(executable),
+        "with the option, the refusal names this binary's profile and how to load it: {}",
+        on.err
+      );
+    }
+    _ if off.err.contains("cannot create a user+mount namespace") => {
+      eprintln!(
+        "SKIP: this host refuses unprivileged user namespaces outright: {}",
+        off.err
+      );
+    }
+    _ => {
+      for launched in [&off, &on] {
+        assert_eq!(launched.code, 0, "{}", launched.err);
+        assert_eq!(launched.out.lines().next(), Some("through-the-bind"));
+      }
+    }
+  }
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// A-370. Do: print slates' AppArmor profile for an installed path and for this binary's own, and check this host.
+/// Expect: the profile names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly
+/// is refused (exit 1) naming why; and the check reports the binary's path as the kernel records it, succeeding exactly
+/// where `exec` can make its namespace.
+#[test]
+fn apparmor_prints_the_profile_and_checks_the_host() {
+  let printed = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/usr/local/bin/slates",
+    ])
+    .output()
+    .unwrap();
+  assert!(printed.status.success(), "{printed:?}");
+  let text = String::from_utf8_lossy(&printed.stdout);
+  assert!(
+    text.contains("\nprofile /usr/local/bin/slates flags=(unconfined) {\n  userns,\n}"),
+    "{text}"
+  );
+  let refused = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/opt/my tools/slates",
+    ])
+    .output()
+    .unwrap();
+  assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+  assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot name exactly"));
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+  let readiness = report["readiness"].as_str().unwrap_or_default();
+  assert_eq!(
+    check.status.success(),
+    matches!(readiness, "unrestricted" | "profile-loaded"),
+    "{report}"
+  );
+  if cfg!(target_os = "linux") {
+    let own = std::fs::canonicalize(env!("CARGO_BIN_EXE_slates")).unwrap();
+    assert_eq!(report["executable"].as_str(), own.to_str(), "{report}");
+    let mine = slates().args(["apparmor", "profile"]).output().unwrap();
+    assert!(
+      String::from_utf8_lossy(&mine.stdout).contains(&format!("profile {} flags", own.display())),
+      "{mine:?}"
+    );
+  } else {
+    assert_eq!(readiness, "unsupported", "{report}");
+  }
 }
 
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
@@ -12852,6 +13102,167 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   );
   refused_not_recovered(&instance, &["volume", "snapshot", &id]);
   refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
+}
+
+/// A path under `root` exactly `bytes` long: components of at most 200 bytes, under the 255-byte name limit, so only
+/// the whole path's length is at stake.
+#[cfg(unix)]
+fn path_of_length(root: &str, bytes: usize) -> String {
+  let mut path = root.to_owned();
+  while path.len() < bytes {
+    let room = bytes - path.len() - 1;
+    path.push('/');
+    path.push_str(&"d".repeat(room.clamp(1, 200)));
+  }
+  assert_eq!(
+    path.len(),
+    bytes,
+    "a path of exactly {bytes} bytes under {root}"
+  );
+  path
+}
+
+/// §4.8, §4.4 `create` and `status` (A-263 on B9: the supervisor's bound on a recorded cause). A recovery cause names an
+/// overlay's base as recorded, so the base a volume records is bounded: the platform's path maximum, and no longer than
+/// the refusal every verb on an unrecovered volume answers holds whole (`slates_server::verbs::longest_recordable_base`).
+/// Do: create an overlay over a base of exactly that length, and try one a byte longer; snapshot the first, make its base
+/// unreadable to the daemon, and restart it in order. Expect: the longer base is refused `BaseUnavailable` before
+/// anything is made; the volume's `status` is refused `NotRecovered` naming `BaseUnavailable`, the whole base path and
+/// the host's refusal.
+#[cfg(unix)]
+#[test]
+fn the_longest_recorded_base_is_named_whole_by_status() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the longest recorded base: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-longbase-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-longbase"),
+  };
+  let longest = slates_server::verbs::longest_recordable_base();
+  let base = path_of_length(&scratch.path, longest);
+  shell(&format!("mkdir -p '{base}'"));
+  // Never made: it is refused before the daemon looks at the disk (on macOS no such directory can be made at all).
+  let longer = path_of_length(&scratch.path, longest + 1);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "too-long",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &longer,
+    ],
+  );
+  assert_ne!(code, 0, "a base past the bound is refused: {out}");
+  assert!(err.contains("BaseUnavailable"), "refused by kind: {err}");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "longest",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "a base of {longest} bytes is recorded: {err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("chmod 000 '{base}'"));
+  restart_in_order(&instance);
+  let (code, out, err) = run(&instance, &["status", &id]);
+  shell(&format!("chmod 755 '{base}'"));
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseUnavailable") && err.contains(&base),
+    "status names the {longest}-byte base whole, by kind: {err}"
+  );
+}
+
+/// Shape: the base files the drift test changes on disk after pinning: several replies' worth of drift.
+#[cfg(unix)]
+const CLI_DRIFTED: usize = 600;
+
+/// §4.4 `status`, A-267, by use. Do: overlay a host directory of 600 files, pin them, change every file on disk, and
+/// run `slates status ID --drift` until the drift is seen. Expect: it names all 600, once each, though the status reply
+/// carries only the first that fit; and `slates status ID` counts 600. Before, `--drift` printed the status's own list,
+/// and the text form counted only those.
+#[cfg(unix)]
+#[test]
+fn status_drift_names_every_drifted_entry_past_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping status --drift past one reply: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-drift-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-drift"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!(
+    "mkdir -p '{base}' && cd '{base}' && for n in $(seq -w 0 {}); do echo before > drifting-$n.txt; done",
+    CLI_DRIFTED - 1
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "drifting",
+      "--bounded",
+      "64MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["base", "pin", &id]);
+  assert_eq!(code, 0, "{err}");
+  shell(&format!(
+    "cd '{base}' && for f in drifting-*.txt; do echo 'after, and longer' > \"$f\"; done"
+  ));
+  let started = std::time::Instant::now();
+  let named = loop {
+    let (code, out, err) = run(&instance, &["status", &id, "--drift"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    if lines.len() >= CLI_DRIFTED || started.elapsed() > std::time::Duration::from_secs(30) {
+      break lines;
+    }
+    // A test waiting on the base's watcher between asks; the daemon is another process.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  };
+  assert_eq!(
+    named.len(),
+    CLI_DRIFTED,
+    "every drifted entry, once: {} named",
+    named.len()
+  );
+  let distinct: std::collections::BTreeSet<&String> = named.iter().collect();
+  assert_eq!(distinct.len(), CLI_DRIFTED, "each once");
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line == format!("drifted: {CLI_DRIFTED}")),
+    "the status counts every drifted entry: {out}"
+  );
 }
 
 /// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`

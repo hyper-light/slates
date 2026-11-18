@@ -88,11 +88,20 @@ use slates_transport::endpoint::{ConnectionId, Endpoint, EndpointError};
 use crate::state;
 
 /// The status count of a failed or silent session dropped (a peer's reset, the transport's silence rule, a discovery page
-/// that failed) whose replacement the lane had a reply on within a liveness budget of the drop: the property the
-/// forward path owes after any such drop, whoever dropped it.
+/// that failed) whose replacement the lane had a reply on within [`REPLACEMENT_ANSWER_PERIODS`] of the control shard's
+/// own periods: the property the forward path owes after any such drop, whoever dropped it.
 const REPLACED_ANSWERED_IN_BUDGET: &str = "fleet.forward.replaced_answered_in_budget";
-/// Of the same drops, those whose replacement's first reply came later than a liveness budget after the drop.
+/// Of the same drops, those whose replacement's first reply came later than that.
 const REPLACED_ANSWERED_PAST_BUDGET: &str = "fleet.forward.replaced_answered_past_budget";
+/// Derived: the coordinator periods within which the lane owes its first answer on a dropped session's replacement: the
+/// link dials again at its next pace (one period, `HEARTBEAT_NS`), and a forward begun on the new session is answered
+/// within its stall budget (a liveness budget, `LIVENESS_BUDGET_NS`), both counted in the control shard's own periods
+/// rather than on the wall, so a daemon kept off its CPUs is judged by what it did (A-228). On the wall the same bound
+/// read 1.1 s, which every recovery missed at nice 19 beside two spinners a CPU (2.3 to 13.7 s, 20 of 20 runs, the
+/// integrator's diagnostics run 44274886122) while no live session was dropped and no forward given up.
+const REPLACEMENT_ANSWER_PERIODS: u64 = (crate::daemon::LIVENESS_BUDGET_NS
+  + crate::daemon::HEARTBEAT_NS)
+  .div_ceil(crate::daemon::HEARTBEAT_NS);
 /// Format: nanoseconds per millisecond, for the lane's log lines.
 const NS_PER_MS: u64 = 1_000_000;
 /// The status count of a forward refused because its lane held [`lane_bound`] forwards already.
@@ -125,6 +134,11 @@ const SILENCE_AWAITED_RECEIVER: &str = "fleet.forward.silence_awaited_receiver";
 /// The status count of a driving turn that found its peer with no session at all, counted as a turn that read the
 /// session's socket empty ([`note_sessionless_turn`]): the non-vacuity count of that proof.
 const SESSIONLESS_TURN: &str = "fleet.forward.sessionless_turn";
+/// The status count of a lane whose path's measured floor passed the failover SLO ([`note_floor`]), once a crossing.
+const FLOOR_PAST_SLO: &str = "fleet.forward.floor_past_slo";
+/// The status count of a forward whose failover bound its path's floor held past the SLO ([`FailoverBound`]), once a
+/// forward: the non-vacuity count of the floor, so a test of a path slower than the SLO shows the floor held it.
+const HELD_PAST_SLO: &str = "fleet.forward.held_past_slo";
 /// The status count of a batch with a forward still queued that its lane's progress kept past its own stall budget
 /// ([`Stall`]), once a batch: the non-vacuity count of a queued forward's lane credit (A-315).
 const HELD_BY_LANE: &str = "fleet.forward.held_by_lane";
@@ -216,6 +230,9 @@ struct Lane {
   /// confirmed by ([`Stall`]): a turn begun after the silence was seen that read the socket empty has read everything
   /// that reached it before, and settled it into the lane, and one that found no session has nothing left to read.
   drained_turn: u64,
+  /// The floor of the path to the peer as the lane's latest driving turn measured it on the session it borrowed
+  /// ([`path_floor_ns`]); 0 before any. Each forward holds its failover bound at the largest it saw ([`FailoverBound`]).
+  floor_ns: u64,
 }
 
 /// Every peer's lane, in the control shard's state.
@@ -347,8 +364,13 @@ impl ForwardLanes {
 enum Look {
   /// Every ticket is done: the replies, in order.
   Done(Vec<Option<Vec<u8>>>),
-  /// Not all done; whether this forwarder should drive (nobody does), and what its stall is judged against.
-  Waiting { drive: bool, heard: Heard },
+  /// Not all done; whether this forwarder should drive (nobody does), what its stall is judged against, and the lane's
+  /// latest measured path floor ([`Lane::floor_ns`]).
+  Waiting {
+    drive: bool,
+    heard: Heard,
+    floor_ns: u64,
+  },
 }
 
 /// Looks at `tickets`; when this forwarder should drive, marks the lane driven by it.
@@ -394,16 +416,125 @@ fn look_in(lane: &mut Lane, tickets: &[u64]) -> Look {
       turns_begun: lane.turns_begun,
       drained_turn: lane.drained_turn,
     },
+    floor_ns: lane.floor_ns,
   }
 }
 
-/// The failover bound of a forward first sent at `first_send_ns`, on the wall: that instant plus the operator's failover
-/// SLO (`DaemonConfig::failover_slo_ns`, the takeover bound `verbs::resolve_and_forward` resends within), or plus one
-/// liveness budget where the shard's state is out of reach, as that caller falls back.
-pub(crate) fn failover_bound_from(first_send_ns: u64) -> u64 {
-  first_send_ns.saturating_add(
-    state::with_state(|s| s.config.failover_slo_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS),
-  )
+/// A forward's failover bound (A-315, A-352): the failover delay this node estimates (`ShardState::failover_ns`, A-363:
+/// the takeover bound `verbs::resolve_and_forward` resends within; the operator's 10 s placeholder before) from its first
+/// send, held longer while the path to its owner
+/// measures a longer floor ([`path_floor_ns`]), the longest it has measured in the forward's life. So a forward is never
+/// given up or refused below the floor of the path it waits on: where that floor is past the SLO, the SLO cannot be met
+/// on that path, and the forward runs at the floor, counted ([`HELD_PAST_SLO`]) and said in the log by the lane
+/// ([`note_floor`]), as A-129 runs the fleet's timers at their measured floors and reports the overrun. Before, a forward
+/// through a session that went silent was refused `OwnerUnreachable` at the SLO even where the transport could not yet
+/// have judged the session dead: at nice 19 beside two spinners a CPU, the starved path's silence window alone (about 9
+/// s) neared the 10 s SLO, and the probe of `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` was refused or
+/// cut off at its bound 20 of 20 times (the integrator's diagnostics run 44274886122). Kept by the caller across its
+/// resends, as its [`Place`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FailoverBound {
+  /// The forward's first send, on the wall.
+  first_send_ns: u64,
+  /// The failover delay this node estimated as the forward was first sent (A-363).
+  slo_ns: u64,
+  /// The longest floor the forward's path has measured; 0 before any.
+  floor_ns: u64,
+}
+
+impl FailoverBound {
+  /// The bound of a forward first sent at `first_send_ns` under a failover SLO of `slo_ns`.
+  pub(crate) fn new(first_send_ns: u64, slo_ns: u64) -> FailoverBound {
+    FailoverBound {
+      first_send_ns,
+      slo_ns,
+      floor_ns: 0,
+    }
+  }
+
+  /// The bound of a forward first sent now, under this shard's failover delay (A-363), or one liveness budget where the
+  /// shard's state is out of reach.
+  pub(crate) fn from_now() -> FailoverBound {
+    FailoverBound::new(
+      futures::now_ns(),
+      state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS),
+    )
+  }
+
+  /// Holds the bound to a path floor of `floor_ns` where it is longer than any measured before: whether this is what
+  /// first took the bound past the failover SLO.
+  pub(crate) fn hold(&mut self, floor_ns: u64) -> bool {
+    let was_past = self.floor_ns > self.slo_ns;
+    self.floor_ns = self.floor_ns.max(floor_ns);
+    !was_past && self.floor_ns > self.slo_ns
+  }
+
+  /// The bound on the wall: the first send plus the longer of the SLO and the floor.
+  pub(crate) fn at_ns(&self) -> u64 {
+    self
+      .first_send_ns
+      .saturating_add(self.slo_ns.max(self.floor_ns))
+  }
+}
+
+/// Shape: the round trips a dropped session's replacement takes before a forward on it is answered, each a probe timeout
+/// of the path: the tail a lane turn's stall budget allows past its liveness budget (`verbs::forward_once`), the
+/// replacement's handshake, its first discovery page, which installs it (`fleet::enroll_record_session`), and the
+/// forward's own exchange.
+const FLOOR_ROUND_TRIPS: u64 = 4;
+
+/// Derived: the floor of the path to a peer whose record session measures a persistent-congestion duration of
+/// `congestion_ns` and a probe timeout of `pto_ns` (RFC 9002 §6.2.1 and §7.6.1, `Endpoint::persistent_congestion_duration`
+/// and `Endpoint::pto`): the least time within which a forward on that path can be answered after its session goes
+/// silent. The session is judged dead once silent for the transport's window, the longer of a liveness budget and its
+/// persistent-congestion duration (`Endpoint::peer_silent_past`), at the next return of a borrower, whose hold is at most
+/// a lane turn's stall budget (a liveness budget and the path's tail, the tail counted below); the link dials again at
+/// its next pace (a heartbeat); and the replacement takes [`FLOOR_ROUND_TRIPS`] probe timeouts before the forward's
+/// answer is read. Every term is measured or the daemon's own: on loopback, quiet, about 3.1 s (the window floored at
+/// three initial probe timeouts, about 2 s); on a path whose probe timeout a starved process stretched to 3 s, about 22 s.
+fn path_floor_ns(congestion_ns: u64, pto_ns: u64) -> u64 {
+  crate::daemon::LIVENESS_BUDGET_NS
+    .max(congestion_ns)
+    .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+    .saturating_add(crate::daemon::HEARTBEAT_NS)
+    .saturating_add(pto_ns.saturating_mul(FLOOR_ROUND_TRIPS))
+}
+
+/// Measures the floor of the path to `peer` on the session a driving turn borrowed ([`Lane::floor_ns`]), and says in the
+/// log when it first passes the failover SLO, and when it falls back under it: while it is past, the lane's forwards run
+/// at the floor and cannot meet the SLO ([`FailoverBound`]).
+fn note_floor(peer: HostId, endpoint: &Endpoint) {
+  let congestion_ns = endpoint.persistent_congestion_duration();
+  let pto_ns = endpoint.pto();
+  let floor_ns = path_floor_ns(congestion_ns, pto_ns);
+  let crossed = state::with_state(|s| {
+    let slo_ns = s.failover_ns;
+    let lane = s.forward_lanes.lanes.get_mut(&peer)?;
+    let was_past = lane.floor_ns > slo_ns;
+    lane.floor_ns = floor_ns;
+    let past = floor_ns > slo_ns;
+    if past && !was_past {
+      s.count(FLOOR_PAST_SLO, 1);
+    }
+    (past != was_past).then_some((past, slo_ns))
+  })
+  .flatten();
+  match crossed {
+    Some((true, slo_ns)) => slates_machine::log_line!(
+      "slates-server: forward lane to {peer:?}: the path's measured floor {} ms is past the failover SLO {} ms (its \
+       silence window {} ms, its probe timeout {} ms): its forwards run at the floor and cannot meet the SLO",
+      floor_ns / NS_PER_MS,
+      slo_ns / NS_PER_MS,
+      crate::daemon::LIVENESS_BUDGET_NS.max(congestion_ns) / NS_PER_MS,
+      pto_ns / NS_PER_MS
+    ),
+    Some((false, slo_ns)) => slates_machine::log_line!(
+      "slates-server: forward lane to {peer:?}: the path's measured floor {} ms is back within the failover SLO {} ms",
+      floor_ns / NS_PER_MS,
+      slo_ns / NS_PER_MS
+    ),
+    None => {}
+  }
 }
 
 /// What a batch's stall is judged against at a look ([`Stall::judge`]): two instants on the wall and two counts, each
@@ -497,6 +628,12 @@ impl Stall {
     }
   }
 
+  /// Holds the failover bound at least to `bound_ns` on the wall, the forward's path having measured a floor past its
+  /// SLO ([`FailoverBound`]); never lowers it.
+  fn extend_to(&mut self, bound_ns: u64) {
+    self.bound_ns = self.bound_ns.max(bound_ns);
+  }
+
   /// Judges the batch at `now_ns`, having heard `heard`: give it up, or look again by an instant ([`Stall`]'s rules).
   fn judge(&mut self, heard: Heard, now_ns: u64) -> (Verdict, Noted) {
     let mut noted = Noted::default();
@@ -556,13 +693,14 @@ impl Drop for Held {
 /// `stall_ns` (nothing was begun). `streamed_bytes` and `streamed_ns` are this batch's own: its replies' bytes after
 /// the first, and the time from the first reply to the last (the session's bytes are no longer one batch's). The batch
 /// is queued at `place` ([`Place`]): a caller resending the same requests passes the place it kept from their first
-/// issue, which this records. Its stall is judged by [`Stall`] against `bound_ns`, the failover bound on the wall from
-/// the forward's first send. Called from the control shard, where the record sessions live.
+/// issue, which this records. Its stall is judged by [`Stall`] against `bound`, the forward's failover bound from its
+/// first send, which this holds to the floor its lane measures ([`FailoverBound`]); the caller keeps it across resends.
+/// Called from the control shard, where the record sessions live.
 pub(crate) async fn forward_batch(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
-  bound_ns: u64,
+  bound: &mut FailoverBound,
   place: &mut Place,
 ) -> Option<BatchReplies> {
   let (forwarder, tickets) = enqueue(peer, requests, place)?;
@@ -572,7 +710,7 @@ pub(crate) async fn forward_batch(
     tickets,
     driving: false,
   };
-  let mut stall = Stall::begin(futures::now_ns(), stall_ns, bound_ns);
+  let mut stall = Stall::begin(futures::now_ns(), stall_ns, bound.at_ns());
   let mut begun = false;
   let mut first_reply: Option<(u64, usize)> = None;
   let mut missed = false;
@@ -590,7 +728,14 @@ pub(crate) async fn forward_batch(
           streamed_ns: last_ns.saturating_sub(first_ns),
         });
       }
-      Look::Waiting { drive, heard } => (drive, heard),
+      Look::Waiting {
+        drive,
+        heard,
+        floor_ns,
+      } => {
+        hold_bound(bound, &mut stall, floor_ns);
+        (drive, heard)
+      }
     };
     held.driving = held.driving || drive;
     let now_ns = futures::now_ns();
@@ -633,6 +778,15 @@ pub(crate) async fn forward_batch(
       }
     }
   }
+}
+
+/// Holds a batch's failover bound, and its stall's, to the floor its lane measured ([`FailoverBound::hold`]), counting
+/// the forward the first time that takes it past the SLO ([`HELD_PAST_SLO`]).
+fn hold_bound(bound: &mut FailoverBound, stall: &mut Stall, floor_ns: u64) {
+  if bound.hold(floor_ns) {
+    state::with_state(|s| s.count(HELD_PAST_SLO, 1));
+  }
+  stall.extend_to(bound.at_ns());
 }
 
 /// Counts what a [`Stall::judge`] newly earned.
@@ -810,6 +964,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   };
   let this_turn = begin_turn(peer);
   let session = endpoint.connection_id().ok();
+  note_floor(peer, &endpoint);
   apply_injected_deafness(peer, &mut endpoint);
   let mut any_reply = settle(peer, &mut endpoint, session);
   let consumed = endpoint.bytes_consumed();
@@ -953,10 +1108,10 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
     if answered.any_reply
       && let Some(dropped) = s.dead_session_dropped_at.remove(&peer)
     {
-      let recovered = futures::now_ns().saturating_sub(dropped);
-      s.dead_session_recovered_ns = Some(recovered);
+      let recovered = state::WallAndPeriods::now(s).since(dropped);
+      s.dead_session_recovered = Some(recovered);
       s.count(
-        if recovered <= crate::daemon::LIVENESS_BUDGET_NS {
+        if recovered.periods <= REPLACEMENT_ANSWER_PERIODS {
           REPLACED_ANSWERED_IN_BUDGET
         } else {
           REPLACED_ANSWERED_PAST_BUDGET
@@ -964,8 +1119,10 @@ fn settle(peer: HostId, endpoint: &mut Endpoint, session: Option<ConnectionId>) 
         1,
       );
       slates_machine::log_line!(
-        "slates-server: forward lane to {peer:?}: first answer {} ms after its silent session was dropped",
-        recovered / NS_PER_MS
+        "slates-server: forward lane to {peer:?}: first answer {} ms and {} coordinator periods after its silent \
+         session was dropped (owed within {REPLACEMENT_ANSWER_PERIODS} periods)",
+        recovered.ns / NS_PER_MS,
+        recovered.periods
       );
     }
     Some((answered.any_reply, replaced, begun, woken))
@@ -1517,8 +1674,8 @@ mod stall_tests {
   use slates_transport::endpoint::{CONNECTION_ID_BYTES, ConnectionId};
 
   use super::{
-    Answered, CONFIRM_LOOK_NS, ForwardLanes, GaveUp, Heard, Look, Place, Stall, Verdict,
-    answer_with, begin_queued_with, look_in,
+    Answered, CONFIRM_LOOK_NS, FailoverBound, ForwardLanes, GaveUp, Heard, Look, Place, Stall,
+    Verdict, answer_with, begin_queued_with, look_in, path_floor_ns,
   };
 
   /// Shape: a batch's stall budget in these tests: one liveness budget, the path's tail near zero (loopback).
@@ -1701,6 +1858,73 @@ mod stall_tests {
       }
     }
     panic!("a silence held past its bound for {looks} looks was never given up");
+  }
+
+  /// A-352: do take a forward first sent at one budget under the default SLO, and hold its path's measured floors as a
+  /// lane's turns would: a quiet loopback path's, one a starved process stretched past the SLO, then the quiet one
+  /// again (the replacement session, its estimator fresh). Expect its bound the SLO from its first send until the long
+  /// floor, the floor from then on, never lowered by the later short one, and the crossing reported once.
+  #[test]
+  fn a_forwards_bound_is_its_slo_until_its_path_measures_a_longer_floor_and_never_falls_back() {
+    let first_send = STALL_NS;
+    let mut bound = FailoverBound::new(first_send, BOUND_NS);
+    // Loopback, quiet: the window floored at three initial probe timeouts (about 2 s), a probe timeout of a millisecond.
+    let quiet = path_floor_ns(1_998_000_000, 1_000_000);
+    assert!(
+      quiet < BOUND_NS,
+      "a quiet loopback path's floor lies within the SLO: {quiet}"
+    );
+    assert!(
+      !bound.hold(quiet),
+      "a floor within the SLO takes nothing past it"
+    );
+    assert_eq!(bound.at_ns(), first_send + BOUND_NS);
+    // Starved: a 3 s probe timeout, so a 9 s window.
+    let starved = path_floor_ns(9_000_000_000, 3_000_000_000);
+    assert!(
+      starved > BOUND_NS,
+      "a starved path's floor lies past the SLO: {starved}"
+    );
+    assert!(bound.hold(starved), "the floor past the SLO is reported");
+    assert_eq!(bound.at_ns(), first_send + starved);
+    assert!(!bound.hold(starved + 1), "reported once a forward");
+    assert!(!bound.hold(quiet), "a shorter floor later reports nothing");
+    assert_eq!(
+      bound.at_ns(),
+      first_send + starved + 1,
+      "and never lowers the bound: the forward waited on the starved path"
+    );
+  }
+
+  /// A-352: do keep a batch silent with a receiver that never waits, its bound the SLO, and hold it to a path floor past
+  /// the SLO. Expect it given up at the floor, unconfirmed, and not at the SLO: before A-352 it was given up at the SLO
+  /// even where its path could not yet have judged its session dead.
+  #[test]
+  fn a_silence_is_held_past_its_slo_to_its_paths_floor() {
+    let slo_bound = STALL_NS + STALL_NS / 2;
+    let floor_bound = slo_bound + 3 * STALL_NS;
+    let mut stall = Stall::begin(0, STALL_NS, slo_bound);
+    stall.extend_to(floor_bound);
+    stall.extend_to(slo_bound);
+    let mut now = STALL_NS;
+    let looks = (floor_bound - STALL_NS) / CONFIRM_LOOK_NS + 2;
+    for _ in 0..looks {
+      match stall.judge(idle(7), now).0 {
+        Verdict::LookBy(at) => {
+          assert!(
+            at > now && at <= floor_bound,
+            "a confirming look lies ahead and never passes the floor"
+          );
+          now = at;
+        }
+        Verdict::GiveUp(why) => {
+          assert_eq!(why, GaveUp::AtTheBound);
+          assert_eq!(now, floor_bound, "given up at the floor, never at the SLO");
+          return;
+        }
+      }
+    }
+    panic!("a silence held past its floor for {looks} looks was never given up");
   }
 
   /// §4.8 "Lookup", A-315: do give a batch its own progress every half budget for three failover bounds (a long read

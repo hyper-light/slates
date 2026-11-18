@@ -543,7 +543,11 @@ impl McpServer {
     let attachment = u64_arg(args, "attachment")?;
     let version = args.get("version").and_then(Value::as_u64);
     let advanced = self.client.advance(attachment, version).map_err(refusal)?;
-    Ok(json!({ "version": advanced.version, "invalidated": advanced.invalidated }))
+    Ok(json!({
+      "version": advanced.version,
+      "invalidated": advanced.invalidated,
+      "invalidated_elided": advanced.invalidated_elided,
+    }))
   }
 
   /// Reads a file at a view (§4.12 `slates.fs.read`): a green's head, its `version`, or the version
@@ -824,11 +828,14 @@ impl McpServer {
 
   fn rewitness(&mut self, args: &Value) -> Result<Value, McpError> {
     let volume = volume_arg(args, "volume")?;
-    let paths = self
+    let rewitnessed = self
       .client
       .rewitness(volume, paths_opt(args))
       .map_err(refusal)?;
-    Ok(json!({ "rewitnessed": paths }))
+    Ok(json!({
+      "rewitnessed": rewitnessed.paths,
+      "rewitnessed_elided": rewitnessed.paths_elided,
+    }))
   }
 
   fn pin(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -867,12 +874,14 @@ impl McpServer {
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       } => Ok(json!({
         "grant_required": true,
         "landing": landing,
         "manifest": hex32(&manifest),
         "summary": landing_summary_json(&summary),
         "conflicts": conflicts,
+        "conflicts_elided": conflicts_elided,
         "grant_with": format!("slates grant {landing}"),
       })),
       Landing::Landed(outcome) => Ok(json!({
@@ -1123,7 +1132,8 @@ fn tool_list() -> Vec<Value> {
     tool(
       "slates.merge.advance",
       "Re-pin a green attachment to `version` (or the head): the version pinned and the paths \
-       invalidated. An attachment's view never moves otherwise.",
+       invalidated, as many as one reply holds; `invalidated_elided` counts the rest, and then every path \
+       counts as invalidated. An attachment's view never moves otherwise.",
       json!({ "attachment": integer, "version": integer }),
       json!(["attachment"]),
     ),
@@ -1265,7 +1275,8 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.base.rewitness",
-      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted.",
+      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted, as many as \
+       one reply holds, and `rewitnessed_elided` counting the rest, which were re-witnessed too.",
       json!({ "volume": string, "paths": { "type": "array", "items": string } }),
       json!(["volume"]),
     ),
@@ -1503,6 +1514,11 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
   })
 }
 
+/// One part of a takeover past tolerance as JSON (A-332): the hosts its recovery needed and how many of them remained.
+fn shortfall_json(shortfall: &slates_ipc::protocol::Shortfall) -> Value {
+  json!({ "needed": shortfall.needed, "remaining": shortfall.remaining })
+}
+
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
 /// surface (§4.12 schema parity — one definition, two surfaces).
 pub fn status_json(r: &StatusReport) -> Value {
@@ -1528,12 +1544,17 @@ pub fn status_json(r: &StatusReport) -> Value {
         "epoch": taken.epoch,
         "head_sequence": taken.head_sequence,
         "from_live_log": taken.from_live_log,
+        "past_tolerance": taken.past_tolerance.as_ref().map(|past| json!({
+          "registers": past.registers.as_ref().map(shortfall_json),
+          "live_log": past.live_log.as_ref().map(shortfall_json),
+        })),
       })),
     },
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,
     "drifted": r.drifted,
+    "drifted_elided": r.drifted_elided,
     "nfs_port": r.nfs_port,
     "placed": {
       "region": r.placed.region,
@@ -1836,6 +1857,7 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
       "dirs": o.durability.dirs,
     },
     "degraded": o.degraded.iter().map(degradation_json).collect::<Vec<_>>(),
+    "degraded_elided": o.degraded_elided,
     "barriers": o.barriers,
   })
 }
@@ -2067,6 +2089,17 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "bytes_consumed": session.bytes_consumed,
         "path_mtu": session.path_mtu,
       })).collect::<Vec<_>>(),
+      // The failover delay as the daemon estimates it now, each term with the measurements behind it (A-363).
+      "failover": json!({
+        "total_ns": r.fleet.failover.total_ns,
+        "detection_ns": r.fleet.failover.detection_ns,
+        "detection_samples": r.fleet.failover.detection_samples,
+        "confirmation_ns": r.fleet.failover.confirmation_ns,
+        "confirmation_samples": r.fleet.failover.confirmation_samples,
+        "recovery_ns": r.fleet.failover.recovery_ns,
+        "takeovers_timed": r.fleet.failover.takeovers_timed,
+        "volumes_timed": r.fleet.failover.volumes_timed,
+      }),
     },
   });
   // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.

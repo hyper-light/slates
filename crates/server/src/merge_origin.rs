@@ -40,6 +40,18 @@
 //! gathered or a version recomputed a unit, every version's head compared with its record's identity. The records are
 //! read a version at a time (`Acceptor::value_at`), so nothing of a long chain is decoded up front.
 //!
+//! **A takeover successor's replica becomes the green's engine (A-333).** The successor the takeover round names is one
+//! of the green's holders, with a replica already at or near the version it adopted: `advance_replica` recomputes the
+//! versions after the replica's head from the increments this node holds, as the rebuild does, and
+//! `rebuild_replica_through` rebuilds one from the ledger when there is none (`crate::green_adopt`).
+//!
+//! **A replica follows its ledger when a position is replaced (A-373).** A holder's register accepts a higher epoch's
+//! different value at a position it holds, as the acceptor of `docs/wip/models/FencedLedger.tla` does: the value it
+//! replaces never committed. A replica that applied the replaced value cannot undo it, so it is rebuilt through the
+//! version before ([`rewind_replica`]); a holder the record plane ships the new value to holds it before its inputs, then
+//! recomputes it as the next version before acknowledging it, and a successor advances from there to the version it
+//! adopted. A build that read a version the ledger replaced meanwhile installs nothing.
+//!
 //! At `f = 0` none of it runs: the local append is the placement (R8).
 
 use slates_archive::Archive;
@@ -99,6 +111,18 @@ pub(crate) const REPLICA_REBUILT_VERSIONS: &str = "merge.replica.rebuilt_version
 /// replica is installed, and the green's later records stay unacknowledged here (A-313).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_RECORDS_SHORT: &str = "merge.replica.records_short";
+/// Counted on a takeover successor each time it advanced its replica of a green from its head to the version it adopted
+/// (A-333): the non-vacuity counter of an adoption whose replica was one or more versions behind.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_ADVANCED: &str = "merge.replica.advanced";
+/// Counted on a node each time it rewound its replica of a green below a version whose record its ledger replaced with
+/// a higher epoch's different value (A-373): the non-vacuity counter of a replica that follows its ledger.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_REWOUND: &str = "merge.replica.rewound";
+/// Counted on a node whose replica build ended at a version its ledger replaced while the build ran (A-373): nothing is
+/// installed, and the next record or adoption builds the replica again from the ledger.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_SUPERSEDED: &str = "merge.replica.superseded";
 
 /// Derived: the most raw bytes one chunk of an inputs archive holds — the archive's largest chunk, the most any reader
 /// admits (`slates_archive::format::MAX_CHUNK_BYTES`, AUD-29-13; 1 MiB). An inputs archive is one stream that no other
@@ -107,6 +131,37 @@ pub(crate) const REPLICA_RECORDS_SHORT: &str = "merge.replica.records_short";
 /// to offer with every bounded shipment or for a holder to read in one slice.
 pub(crate) fn inputs_chunk_bytes() -> usize {
   usize::try_from(MAX_CHUNK_BYTES).unwrap_or(usize::MAX)
+}
+
+/// The manifest identity of the inputs archive `bytes` make ([`InputsBuilder::whole`]'s, whatever header it is finished
+/// with), computed without copying a chunk: a raw chunk's identity is the BLAKE3 of its bytes, and the manifest names the
+/// chunks by those alone. What a checkout of a green its takeover adopted compares its base's walked origin by (A-333),
+/// the adoption recording version 0 by the manifest of its inputs.
+pub(crate) fn inputs_manifest_identity(bytes: &[u8]) -> [u8; 32] {
+  let mut offset = 0u64;
+  let extents: Vec<Extent> = bytes
+    .chunks(inputs_chunk_bytes().max(1))
+    .map(|piece| {
+      let len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+      let extent = Extent {
+        offset,
+        len,
+        chunk: slates_archive::archive::hash_of(piece),
+        chunk_offset: 0,
+      };
+      offset = offset.saturating_add(len);
+      extent
+    })
+    .collect();
+  let manifest = Node::Directory(vec![Entry {
+    name: INPUTS_ENTRY_NAME.to_owned(),
+    meta: NodeMeta {
+      size: offset,
+      ..NodeMeta::default()
+    },
+    node: Node::File(extents),
+  }]);
+  slates_archive::manifest::manifest_identity(&NodeMeta::default(), &manifest)
 }
 
 /// An inputs archive made as its bytes arrive (§4.16 "Commit", A-286): the bytes cut into raw chunks of
@@ -623,14 +678,32 @@ pub(crate) enum Rebuild {
 /// The first slice runs now, so a short chain is rebuilt in the exchange that asked; else a task of this shard goes on,
 /// owned by the green's entry in `seeding`.
 pub(crate) fn rebuild_replica(state: &mut ShardState, object: ObjectId) -> Rebuild {
+  let Some(through) = newest_accepted(state, object) else {
+    if state.merge.seeding.contains(&object) {
+      state.count(REPLICA_SEEDING, 1);
+      return Rebuild::Later;
+    }
+    return Rebuild::Nothing;
+  };
+  rebuild_replica_through(state, object, through)
+}
+
+/// [`rebuild_replica`] through `through` rather than the newest version accepted: version 0 alone for a successor whose
+/// green restores from its origin and a checkpoint past its adoption, the adopted version for one that adopted the
+/// green (A-333). Nothing to rebuild from when this holder accepted no record of the green.
+pub(crate) fn rebuild_replica_through(
+  state: &mut ShardState,
+  object: ObjectId,
+  through: u64,
+) -> Rebuild {
   if state.merge.seeding.contains(&object) {
     state.count(REPLICA_SEEDING, 1);
     return Rebuild::Later;
   }
-  let Some(through) = newest_accepted(state, object) else {
+  if newest_accepted(state, object).is_none() {
     return Rebuild::Nothing;
-  };
-  let Some(zero) = accepted_value(state, object, 0) else {
+  }
+  let Some(zero) = ledger_value(state, object, 0) else {
     state.count(REPLICA_RECORDS_SHORT, 1);
     return Rebuild::Later;
   };
@@ -644,6 +717,97 @@ pub(crate) fn rebuild_replica(state: &mut ShardState, object: ObjectId) -> Rebui
   }
 }
 
+/// Advances this node's replica of `object` from its head to `through` (A-333): the versions after its head recomputed
+/// from the records this node accepted and the increments it holds, a unit at a time, as a restarted holder's rebuild
+/// recomputes them (A-313); what a takeover successor one or more versions behind the version it adopted does before the
+/// replica becomes the green's engine. `Nothing` when this node holds no replica of the green (the caller rebuilds it);
+/// `Installed` at once when the replica is already at or past `through`.
+pub(crate) fn advance_replica(state: &mut ShardState, object: ObjectId, through: u64) -> Rebuild {
+  if state.merge.seeding.contains(&object) {
+    state.count(REPLICA_SEEDING, 1);
+    return Rebuild::Later;
+  }
+  let Some(replica) = state.merge.replicas.remove(&object) else {
+    return Rebuild::Nothing;
+  };
+  let head = replica.head();
+  if head >= through {
+    state.merge.replicas.insert(object, replica);
+    return Rebuild::Installed(head);
+  }
+  build(state, ReplicaSeed::advance(object, replica, through));
+  match state.merge.replicas.get(&object) {
+    Some(replica) => Rebuild::Installed(replica.head()),
+    None => Rebuild::Later,
+  }
+}
+
+/// Rewinds this node's replica of `object` below `version` (A-373): its ledger holds, or is about to hold, a higher
+/// epoch's different value there, which the replica did not apply, so no version from `version` on is the ledger's. A
+/// replica cannot undo a version, so it is dropped and rebuilt from the ledger through the version before, whose records
+/// are unchanged and whose inputs this node held to apply them (A-244); at version 0 none is left. `Installed` at the
+/// version before once the replica is there now, `Nothing` at version 0, `Later` while a build runs (this one, in a task
+/// of this shard, or one already running, whose install is checked against the ledger).
+pub(crate) fn rewind_replica(state: &mut ShardState, object: ObjectId, version: u64) -> Rebuild {
+  if state.merge.seeding.contains(&object) {
+    state.count(REPLICA_SEEDING, 1);
+    return Rebuild::Later;
+  }
+  state.merge.replicas.remove(&object);
+  state.count(REPLICA_REWOUND, 1);
+  match version.checked_sub(1) {
+    Some(before) => rebuild_replica_through(state, object, before),
+    None => Rebuild::Nothing,
+  }
+}
+
+/// Follows `record`, just accepted into this node's ledger in place of a different value held at its position (A-373),
+/// with this node's replica of the green it belongs to: a replica that applied the replaced value is rewound below it
+/// ([`rewind_replica`]). One that never reached the position, or already holds this very value there, is kept; a record
+/// of no green has no replica.
+pub(crate) fn rewind_past_replaced(state: &mut ShardState, record: &Record) {
+  let Some(value) = MergeRecordValue::from_record_bytes(&record.value) else {
+    return;
+  };
+  let Some(replica) = state.merge.replicas.get_mut(&record.object) else {
+    return;
+  };
+  let head = replica.head();
+  if head < record.sequence
+    || (head == record.sequence && replica.head_identity() == value.identity)
+  {
+    return;
+  }
+  // The green's next record or adoption reads the replica where this leaves it: rebuilt, or building.
+  let _ = rewind_replica(state, record.object, record.sequence);
+}
+
+/// The versions from `from` to `through` of `object`'s ledger on this node (A-333): `Ok` with the inputs manifest of
+/// each one whose inputs this node does not hold, lowest first, or `Err` with the first version whose record this node
+/// did not accept (no fetch by identity can fill a record; the ledger-prefix transfer of records is owed, GAP-A9-7). One
+/// lookup a version, never a decode of the whole ledger: a takeover asks it of the few versions its replica is behind.
+pub(crate) fn ledger_unheld(
+  state: &ShardState,
+  object: ObjectId,
+  (from, through): (u64, u64),
+) -> Result<Vec<(u64, [u8; 32])>, u64> {
+  let mut unheld = Vec::new();
+  let mut version = from;
+  while version <= through {
+    let value = ledger_value(state, object, version).ok_or(version)?;
+    if let Some(manifest) = value.inputs
+      && !state.held_content.holds_manifest(object, &manifest)
+    {
+      unheld.push((version, manifest));
+    }
+    let Some(next) = version.checked_add(1) else {
+      break;
+    };
+    version = next;
+  }
+  Ok(unheld)
+}
+
 /// The newest version of `object` this holder accepted (its acceptor's highest position), if it accepted any.
 fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
   state
@@ -653,9 +817,13 @@ fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
     .map(|(version, _)| version)
 }
 
-/// The merge record this holder accepted for `object` at `version`, if its acceptor holds that position and it is that
-/// version's: one lookup, never a walk of the green's whole ledger.
-fn accepted_value(state: &ShardState, object: ObjectId, version: u64) -> Option<MergeRecordValue> {
+/// The merge record this holder accepted for `object` at `version` — its ledger's — if its acceptor holds that position
+/// and it is that version's: one lookup, never a walk of the green's whole ledger (A-313, A-333).
+pub(crate) fn ledger_value(
+  state: &ShardState,
+  object: ObjectId,
+  version: u64,
+) -> Option<MergeRecordValue> {
   let bytes = state
     .holder_records
     .get(&object)?
@@ -724,6 +892,9 @@ pub(crate) struct ReplicaSeed {
   held: Option<[u8; 32]>,
   /// The version the build is at, for its log line.
   reached: u64,
+  /// The head of the replica an advance began from (A-333), `None` for a build that seeds version 0: what its install
+  /// counts.
+  advanced_from: Option<u64>,
   /// Where the build has reached.
   stage: SeedStage,
 }
@@ -844,7 +1015,29 @@ impl ReplicaSeed {
       through,
       held: manifest,
       reached: 0,
+      advanced_from: None,
       stage: SeedStage::Begin,
+    }
+  }
+
+  /// An advance of `object`'s `replica` from its head to version `through` (A-333): every version after the head
+  /// recomputed from the records this node accepted. The caller has checked that the head is below `through`.
+  fn advance(object: ObjectId, replica: Green, through: u64) -> ReplicaSeed {
+    let head = replica.head();
+    let next = head.saturating_add(1);
+    ReplicaSeed {
+      object,
+      manifest: None,
+      identity: [0; 32],
+      through,
+      held: None,
+      reached: next,
+      advanced_from: Some(head),
+      stage: SeedStage::Chain(Box::new(ChainStep {
+        replica,
+        version: next,
+        reading: None,
+      })),
     }
   }
 
@@ -982,7 +1175,7 @@ impl ReplicaSeed {
     mut step: Box<ChainStep>,
   ) -> Result<Option<()>, &'static str> {
     let Some((identity, mut gather)) = step.reading.take() else {
-      let value = accepted_value(state, self.object, step.version).ok_or(REPLICA_RECORDS_SHORT)?;
+      let value = ledger_value(state, self.object, step.version).ok_or(REPLICA_RECORDS_SHORT)?;
       let manifest = value.inputs.ok_or(INPUTS_UNDECODABLE)?;
       step.reading = Some((value.identity, Gather::of(state, self.object, manifest)?));
       self.stage = SeedStage::Chain(step);
@@ -1001,6 +1194,14 @@ impl ReplicaSeed {
     }
     self.held = Some(gather.manifest);
     self.check(state, &mut step.replica, identity)?;
+    // The version's provenance (A-321), as its record carries it: an adopted replica answers it as its owner judged it.
+    if let Some(signature) =
+      ledger_value(state, self.object, step.version).and_then(|value| value.signature)
+    {
+      step
+        .replica
+        .record_signature(step.version, crate::signed_work::adopted(signature));
+    }
     state.count(REPLICA_REBUILT_VERSIONS, 1);
     if step.version >= self.through {
       self.install(state, step.replica);
@@ -1034,17 +1235,28 @@ impl ReplicaSeed {
     Ok(())
   }
 
-  /// Installs the built `replica`: a green this holder refused meanwhile, or replicates already, keeps what it has.
-  fn install(&self, state: &mut ShardState, replica: Green) {
+  /// Installs the built `replica`: a green this holder refused meanwhile, or replicates already, keeps what it has. A
+  /// replica whose head is no longer its ledger's record there — replaced by a higher epoch's value while this build ran
+  /// (A-373) — is not installed: counted, and built again by the green's next record or adoption.
+  fn install(&self, state: &mut ShardState, mut replica: Green) {
     if state.merge.refused.contains(&self.object) {
+      return;
+    }
+    let head = replica.head();
+    if ledger_value(state, self.object, head)
+      .is_some_and(|value| value.identity != replica.head_identity())
+    {
+      state.count(REPLICA_SUPERSEDED, 1);
       return;
     }
     state.merge.replicas.entry(self.object).or_insert(replica);
     if self.manifest.is_some() {
       state.count(REPLICA_SEEDED, 1);
     }
-    if self.through > 0 {
-      state.count(REPLICA_REBUILT, 1);
+    match self.advanced_from {
+      Some(_) => state.count(REPLICA_ADVANCED, 1),
+      None if self.through > 0 => state.count(REPLICA_REBUILT, 1),
+      None => {}
     }
   }
 }
@@ -1164,6 +1376,33 @@ mod tests {
         .finish(0, 4096)
         .manifest_identity()
     );
+  }
+
+  /// §4.16 owner-loss recovery (A-333), A-201: a checkout of an adopted green compares its base's walked origin by the
+  /// manifest of the inputs it makes, computed without the archive. Do: compute it for a stream of several chunks, for
+  /// one of under a chunk and for an empty one. Expect each equal to the manifest identity of the archive the builder
+  /// makes of the same bytes, and the three distinct.
+  #[test]
+  fn an_inputs_manifest_identity_is_the_built_archives() {
+    let bytes = stream();
+    let cases: [&[u8]; 3] = [&bytes, bytes.get(..1000).unwrap(), &[]];
+    let identities: Vec<[u8; 32]> = cases
+      .iter()
+      .map(|case| {
+        let identity = inputs_manifest_identity(case);
+        assert_eq!(
+          identity,
+          InputsBuilder::whole(case)
+            .finish(7, 4096)
+            .manifest_identity(),
+          "{} bytes",
+          case.len()
+        );
+        identity
+      })
+      .collect();
+    assert_ne!(identities[0], identities[1]);
+    assert_ne!(identities[1], identities[2]);
   }
 
   /// §4.16 "Apply on holders" (A-286), CLAUDE.md §4 hostile input: a holder reads an inputs archive's one file and
@@ -1291,6 +1530,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       acceptor
         .accept(&Record {
@@ -1553,5 +1793,376 @@ mod tests {
       "another identity installs nothing and refuses the green"
     );
     assert_eq!(counts, [1, 1, 0], "short, mismatched, never rebuilt");
+  }
+
+  /// Shape: how long the advance test keeps asking for the engine: past a debug build's few slices on a loaded box.
+  const ADVANCE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+  /// §4.16 owner-loss recovery (A-333; GAP-A9-7's input half): a takeover successor one version behind the version it
+  /// adopted holds that version's record (its adoption committed it there) but not always its inputs: it names what it
+  /// lacks, and once it holds them advances its replica to the adopted version, the green's engine. Do: give a holder the
+  /// records of a green's versions 0 and 1 and a replica at version 0, version 1's increment not held; ask for the engine
+  /// at version 1; hold the increment; ask until the engine is ready. Expect the first answer to name version 1's
+  /// manifest; then the replica at version 1 with the serial engine's identity, ready, counted advanced once and never
+  /// rebuilt.
+  #[test]
+  fn a_successor_behind_names_the_inputs_it_lacks_then_advances_to_the_adopted_version() {
+    use crate::green_adopt::{Engine, engine_for_adoption};
+    let first = creating("new-1", b"one", 1, 0);
+    let object = ObjectId([39; 16]);
+    let daemon = crate::daemon::audit_daemon();
+    let (manifest, held, one, unheld) = crate::daemon::observe_first(&daemon, move |state| {
+      let mut serial = Green::new();
+      let zero = serial.head_identity();
+      let _ = serial.submit(&first);
+      let one = serial.head_identity();
+      let manifest = InputsBuilder::whole(&first.encode())
+        .finish(0, 4096)
+        .manifest_identity();
+      accept_records(state, object, &[(0, None, zero), (1, Some(manifest), one)]);
+      state.merge.replicas.insert(object, Green::new());
+      let unheld = engine_for_adoption(state, object, (1, one));
+      let held = hold_encoded(state, object, &first.encode());
+      (manifest, held, one, unheld)
+    });
+    let began = std::time::Instant::now();
+    let ready = loop {
+      let asked = crate::daemon::observe_first(&daemon, move |state| {
+        let engine = engine_for_adoption(state, object, (1, one));
+        let at = state
+          .merge
+          .replicas
+          .get_mut(&object)
+          .map(|replica| (replica.head(), replica.head_identity() == one));
+        let counts = [
+          count_of(state, REPLICA_ADVANCED),
+          count_of(state, REPLICA_REBUILT),
+        ];
+        (engine, at, counts)
+      });
+      if asked.0 == Engine::Ready || began.elapsed() > ADVANCE_WAIT {
+        break asked;
+      }
+    };
+    daemon.stop();
+    assert_eq!(
+      unheld,
+      Engine::Unheld(vec![(1, manifest)]),
+      "names the inputs it lacks"
+    );
+    assert_eq!(
+      held, manifest,
+      "the held increment is the one the record names"
+    );
+    assert_eq!(
+      ready,
+      (Engine::Ready, Some((1, true)), [1, 0]),
+      "advanced to version 1 at its identity, once, never rebuilt"
+    );
+  }
+
+  /// A merge record of `object` from `owner` under the configuration `generation`: `version` under `epoch`, naming
+  /// `inputs` and the head identity after it.
+  fn merge_record(
+    (owner, generation): (HostId, u64),
+    object: ObjectId,
+    (version, epoch): (u64, u64),
+    (inputs, identity): (Option<[u8; 32]>, [u8; 32]),
+  ) -> Record {
+    let value = MergeRecordValue {
+      version,
+      increment: [0; 32],
+      base: version.saturating_sub(1),
+      inputs,
+      identity,
+      evidence: Vec::new(),
+      name: "green".to_owned(),
+      require_evidence: false,
+      owner: slates_db::catalog::Principal::Uid {
+        host: owner,
+        uid: 0,
+      },
+      completion: None,
+      signature: None,
+    };
+    Record {
+      owner,
+      object,
+      sequence: version,
+      epoch: slates_db::HostEpoch(epoch),
+      generation,
+      value: value.to_record_bytes(),
+    }
+  }
+
+  /// Gives `state`, as the holder of a scratch green `object` that its own host owns, the records of versions 0 and 1
+  /// (`one`, its increment held here) under epoch 1 and a replica that applied both: what a holder keeps of a dying
+  /// owner's last version that reached it alone. The owner and generation its records carry.
+  fn holder_of_a_dying_owners_version(
+    state: &mut ShardState,
+    object: ObjectId,
+    one: &Increment,
+  ) -> (HostId, u64) {
+    let host = (state.fleet.host(), state.fleet.configuration().version);
+    let mut replica = Green::new();
+    let zero = replica.head_identity();
+    let _ = replica.submit(one);
+    let one_identity = replica.head_identity();
+    let one_inputs = hold_encoded(state, object, &one.encode());
+    let mut acceptor = slates_db::register::Acceptor::new(
+      host.0,
+      slates_db::register::Authority {
+        generation: host.1,
+        owner: host.0,
+      },
+    );
+    for record in [
+      merge_record(host, object, (0, 1), (None, zero)),
+      merge_record(host, object, (1, 1), (Some(one_inputs), one_identity)),
+    ] {
+      acceptor.accept(&record).unwrap();
+    }
+    state.holder_records.insert(object, acceptor);
+    state.merge.replicas.insert(object, replica);
+    host
+  }
+
+  /// The head identity after `increments`, applied in order to an empty green.
+  fn identity_after(increments: &[&Increment]) -> [u8; 32] {
+    let mut serial = Green::new();
+    for increment in increments {
+      let _ = serial.submit(increment);
+    }
+    serial.head_identity()
+  }
+
+  /// `object`'s replica on `state`: its head version and head identity.
+  fn replica_at(state: &mut ShardState, object: ObjectId) -> Option<(u64, [u8; 32])> {
+    state
+      .merge
+      .replicas
+      .get_mut(&object)
+      .map(|replica| (replica.head(), replica.head_identity()))
+  }
+
+  /// The merge shipment (`fleet::serve_merge_shipment`'s request) of `record`, carrying the whole inputs archive of
+  /// `increment` for its object and version, as the record plane ships a version to a holder that lacks its inputs.
+  fn shipment_of(record: &Record, increment: &Increment) -> Vec<u8> {
+    let archive = InputsBuilder::whole(&increment.encode()).finish(0, 4096);
+    let mut frames = vec![
+      record.encode(),
+      slates_cluster::content::offer_request(&archive, record.object, record.sequence),
+    ];
+    frames.extend(slates_cluster::content::chunk_requests(
+      &archive,
+      record.object,
+      record.sequence,
+      &archive.referenced_chunks(),
+    ));
+    crate::merge_service::encode_shipment(&frames)
+  }
+
+  /// §4.8 "For each ledger position ...", §4.16 "Apply on holders" and "Commit" (A-373; the acceptor of
+  /// `docs/wip/models/FencedLedger.tla`): a holder whose replica applied a version a dying owner proposed under epoch 1,
+  /// which never committed, follows a successor's different value for that version under epoch 2, shipped with its
+  /// inputs by the record plane: the value is held before its inputs, which the door admits only then, the replica is
+  /// rewound below it, and the value recomputed and acknowledged. A second value under epoch 2 is refused. Do: give the
+  /// holder versions 0 and 1 (`x`) under epoch 1 and a replica at version 1; serve it the shipments of version 1 as `y`
+  /// under epoch 2, then as `z` under epoch 2, then of version 2 built on `y`. Expect `y` acknowledged and held under
+  /// epoch 2, with the replica at version 1 at `y`'s identity, the register's replacement and the replica's rewind each
+  /// counted once; `z` refused and the replica unchanged; version 2 acknowledged, with the replica at its identity and
+  /// the green never refused. Red before: `y` refused `ConflictingPosition`; with the register's rule alone its inputs
+  /// were refused at the door; and with no rewind the replica kept `x`.
+  #[test]
+  fn a_holder_follows_a_higher_epochs_value_at_a_version_it_applied() {
+    use slates_db::register::Ack;
+    let x = creating("new-x", b"ex", 1, 0);
+    let y = creating("new-y", b"why", 2, 0);
+    let z = creating("new-z", b"zed", 3, 0);
+    let w = creating("new-w", b"double-u", 4, 1);
+    let object = ObjectId([40; 16]);
+    let (one_y, two) = (identity_after(&[&y]), identity_after(&[&y, &w]));
+    let one_z = identity_after(&[&z]);
+    let manifest = |increment: &Increment| {
+      InputsBuilder::whole(&increment.encode())
+        .finish(0, 4096)
+        .manifest_identity()
+    };
+    let (y_manifest, z_manifest, w_manifest) = (manifest(&y), manifest(&z), manifest(&w));
+    let (y_served, z_served, w_served, counts) = crate::daemon::audit_on_shard(move |state| {
+      let host = holder_of_a_dying_owners_version(state, object, &x);
+      // Served as the record plane serves a holder; acknowledged when the reply is the record's own acknowledgement.
+      let serve = |state: &mut ShardState, record: &Record, increment: &Increment| {
+        let reply = crate::fleet::serve_merge_shipment(
+          state,
+          host.0,
+          host.0,
+          &shipment_of(record, increment),
+        );
+        Ack::decode(&reply)
+          .is_ok_and(|ack| ack.sequence == record.sequence && ack.identity == record.identity())
+      };
+      let y_record = merge_record(host, object, (1, 2), (Some(y_manifest), one_y));
+      let y_acked = serve(state, &y_record, &y);
+      let y_held = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.position(object, 1))
+        .map(|(epoch, value)| (epoch, value == y_record.value.as_slice()));
+      let y_served = (y_acked, y_held, replica_at(state, object));
+      let z_record = merge_record(host, object, (1, 2), (Some(z_manifest), one_z));
+      let z_served = (serve(state, &z_record, &z), replica_at(state, object));
+      let w_record = merge_record(host, object, (2, 2), (Some(w_manifest), two));
+      let w_served = (
+        serve(state, &w_record, &w),
+        replica_at(state, object),
+        state.merge.refused.contains(&object),
+      );
+      let counts = [
+        count_of(state, "fleet.record.replaced"),
+        count_of(state, REPLICA_REWOUND),
+        count_of(state, INPUTS_UNHELD),
+      ];
+      (y_served, z_served, w_served, counts)
+    });
+    assert_eq!(
+      y_served,
+      (
+        true,
+        Some((slates_db::HostEpoch(2), true)),
+        Some((1, one_y))
+      ),
+      "the higher epoch's value acknowledged, held under its epoch, and recomputed (counts {counts:?})"
+    );
+    assert_eq!(
+      z_served,
+      (false, Some((1, one_y))),
+      "a second value in one epoch refused, the replica unchanged"
+    );
+    assert_eq!(
+      w_served,
+      (true, Some((2, two)), false),
+      "the next version built on the new value is served (counts {counts:?})"
+    );
+    assert_eq!(
+      counts,
+      [1, 1, 0],
+      "replaced once, rewound once, no inputs ever unheld"
+    );
+  }
+
+  /// §4.16 "Apply on holders" (A-373): a replica build that read a version its ledger replaced while it ran installs
+  /// nothing. Do: give a holder versions 0 and 1 (`x`) under epoch 1 and no replica; start a rebuild through version 1
+  /// and run it until it has read version 1's record; replace that position in the holder's register with `y` under
+  /// epoch 2; run the build to its end. Expect no replica installed, the green not refused, and the build counted
+  /// superseded once. Red without the check at the install: the replica installed at `x`'s identity.
+  #[test]
+  fn a_build_that_read_a_replaced_version_installs_nothing() {
+    let x = creating("new-x", b"ex", 1, 0);
+    let y = creating("new-y", b"why", 2, 0);
+    let object = ObjectId([42; 16]);
+    let (zero, one_y) = (identity_after(&[]), identity_after(&[&y]));
+    let y_manifest = InputsBuilder::whole(&y.encode())
+      .finish(0, 4096)
+      .manifest_identity();
+    let outcome = crate::daemon::audit_on_shard(move |state| {
+      let host = holder_of_a_dying_owners_version(state, object, &x);
+      state.merge.replicas.remove(&object);
+      let mut seed = ReplicaSeed::rebuild(object, None, zero, 1);
+      // Two units: version 0 built, then version 1's record read and its inputs' gathering begun.
+      let _ = seed.step(state);
+      let _ = seed.step(state);
+      let replaced = state.holder_records.get_mut(&object).map(|acceptor| {
+        acceptor
+          .accept(&merge_record(
+            host,
+            object,
+            (1, 2),
+            (Some(y_manifest), one_y),
+          ))
+          .is_ok()
+      });
+      seed_to_end(state, &mut seed);
+      (
+        replaced,
+        state.merge.replicas.contains_key(&object),
+        state.merge.refused.contains(&object),
+        count_of(state, REPLICA_SUPERSEDED),
+      )
+    });
+    assert_eq!(
+      outcome,
+      (Some(true), false, false, 1),
+      "replaced, nothing installed, never refused, counted superseded once"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover", §4.16 owner-loss recovery (A-373, A-333): a value a successor's adoption commits
+  /// again under its epoch reaches a holder through the register path, without its inputs, and replaces a lower epoch's
+  /// value the holder's replica applied. The replica is rewound below it, so an engine adopted there names the inputs it
+  /// lacks and advances to the new value. Do: give a holder versions 0 and 1 (`x`) under epoch 1 and a replica at
+  /// version 1; hold version 1 as `y` under epoch 2 through the register path (`fleet::accept_held_record`), `y`'s
+  /// increment not held; ask for the engine at version 1 with `y`'s identity; hold the increment; ask until the engine is
+  /// ready. Expect `y` acknowledged with the replica rewound to version 0, once; the first answer naming `y`'s manifest;
+  /// then the replica at version 1 at `y`'s identity, ready. Red before: the replica kept `x`, and the engine was refused
+  /// for good as an adoption mismatch.
+  #[test]
+  fn a_replica_rewinds_below_a_value_its_ledger_replaced_and_advances_to_the_new_one() {
+    use crate::green_adopt::{Engine, engine_for_adoption};
+    use slates_db::register::Ack;
+    let x = creating("new-x", b"ex", 1, 0);
+    let y = creating("new-y", b"why", 2, 0);
+    let object = ObjectId([41; 16]);
+    let (zero, one_y) = (identity_after(&[]), identity_after(&[&y]));
+    let manifest = InputsBuilder::whole(&y.encode())
+      .finish(0, 4096)
+      .manifest_identity();
+    let daemon = crate::daemon::audit_daemon();
+    let (acked, rewound, unheld, held) = crate::daemon::observe_first(&daemon, move |state| {
+      let host = holder_of_a_dying_owners_version(state, object, &x);
+      let reply = crate::fleet::accept_held_record(
+        state,
+        host.0,
+        host.0,
+        &merge_record(host, object, (1, 2), (Some(manifest), one_y)),
+      );
+      let rewound = (replica_at(state, object), count_of(state, REPLICA_REWOUND));
+      let unheld = engine_for_adoption(state, object, (1, one_y));
+      let held = hold_encoded(state, object, &y.encode());
+      (Ack::decode(&reply).is_ok(), rewound, unheld, held)
+    });
+    let began = std::time::Instant::now();
+    let ready = loop {
+      let asked = crate::daemon::observe_first(&daemon, move |state| {
+        (
+          engine_for_adoption(state, object, (1, one_y)),
+          replica_at(state, object),
+        )
+      });
+      if asked.0 == Engine::Ready || began.elapsed() > ADVANCE_WAIT {
+        break asked;
+      }
+    };
+    daemon.stop();
+    assert!(acked, "the adopted value is acknowledged");
+    assert_eq!(
+      rewound,
+      (Some((0, zero)), 1),
+      "rewound below the replaced version, once"
+    );
+    assert_eq!(
+      unheld,
+      Engine::Unheld(vec![(1, manifest)]),
+      "names the inputs it lacks"
+    );
+    assert_eq!(
+      held, manifest,
+      "the held increment is the one the record names"
+    );
+    assert_eq!(
+      ready,
+      (Engine::Ready, Some((1, one_y))),
+      "advanced to the new value"
+    );
   }
 }

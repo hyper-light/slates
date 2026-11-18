@@ -93,8 +93,10 @@ impl Query {
     CachedRoute { query: self, owner }
   }
 
-  /// Reuse this client's most recent route, or the id's live creator when it is still in the
-  /// object's home. A dead creator never turns into a rendezvous guess over unrelated members.
+  /// Reuse this client's most recent route, else the owner this node's own routing names (A-338), else the id's live
+  /// creator when it is still in the object's home. A dead creator never turns into a rendezvous guess over unrelated
+  /// members. Never this node: a verb is forwarded only when this node does not serve the object, and the creator is
+  /// this node itself only for an object it lost to a successor (A-334, A-338), which only the location round can find.
   pub(crate) fn known_owner(
     self,
     state: &ShardState,
@@ -102,7 +104,9 @@ impl Query {
   ) -> Option<HostId> {
     // This node's own routing names the owner of an object it holds a copy of, from the records it accepted and the
     // retirements it installed, so it is asked before the creator, which a takeover may have succeeded (A-338): routed
-    // to a creator its routing knew had lost the volume, every forward was redirected there again, for good.
+    // to a creator its routing knew had lost the volume, every forward was redirected there again, for good. And never
+    // this node (A-334): a verb is forwarded only when this node does not serve the object, so a creator or a route that
+    // names this node leaves the owner to the location round.
     let local = state.fleet.host();
     let object = ObjectId(self.object);
     cached
@@ -117,6 +121,7 @@ impl Query {
       .or_else(|| {
         eligible(state, object.creator(), RegionId(self.region)).then_some(object.creator())
       })
+      .filter(|owner| *owner != local)
   }
 }
 

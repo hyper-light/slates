@@ -18,21 +18,22 @@
 //! and [`Instance::approve_merge`] approve an ask with the launcher's authority, never more than the manifest or the
 //! increment the approver was shown.
 //!
-//! **Signed work (A-321).** A merge may carry a signature over its statement ([`Instance::merge_statement`]); its
-//! outcome says how the daemon judged it, the verdict is recorded with the version ([`Instance::merge_record`]), and a
-//! volume may require signed merges. The launcher sets a volume's trusted signers ([`Instance::set_signers`]). A
-//! landing's signature is the daemon's next piece (GAPS).
+//! **Signed work (A-321).** A merge or a landing may carry a signature over its statement — a merge's from
+//! [`Instance::merge_statement`], a landing's from any presentation ([`LandingApproval::statement`]); its outcome says
+//! how the daemon judged it, and the verdict is recorded: a merge's with the version ([`Instance::merge_record`]), a
+//! landing's on its audit records ([`Instance::audit`]). A volume may require signed merges. The launcher sets a
+//! volume's trusted signers ([`Instance::set_signers`]).
 
 use slates_client::{
-  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, Submitted,
-  VhostUserDevice,
+  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, Rewitnessed, ShardsStream,
+  SignedLanding, Submitted, VhostUserDevice,
 };
 use slates_ipc::protocol::{
   DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
   RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId, VolumeSummary,
 };
 
-use crate::error::{Error, Invalid, Missing, ProtocolFault, Unsupported};
+use crate::error::{Error, Invalid, Missing, ProtocolFault};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::observe::{AuditRecord, GrantRecord, audit_of, grant_of};
 use crate::outcome::{
@@ -74,6 +75,16 @@ enum Presented {
   Plan(LandingApproval),
   /// Anything else: written at once (nothing needed an approval), or conflicted.
   Settled(LandOutcome),
+}
+
+impl Presented {
+  /// What the presentation answers a consumer: its plan as an approval to ask for, or what settled it.
+  fn outcome(self) -> LandOutcome {
+    match self {
+      Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
+      Presented::Settled(outcome) => outcome,
+    }
+  }
 }
 
 impl Instance {
@@ -267,7 +278,8 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
-  /// The caller's volumes. The daemon answers them in one reply today; a paged listing is owed (GAPS, A-299).
+  /// The caller's volumes, in name order: every one, walked a page at a time (A-263; [`Instance::list_page`] reads one
+  /// page, for a consumer that shows them a screen at a time).
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, Error> {
     self.client.list().map_err(|e| self.error(e))
   }
@@ -284,12 +296,41 @@ impl Instance {
 
   /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
   /// happened — landing it would conflict — and each whose re-check the host refused now. `None` for a volume with no
-  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now.
+  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now. Every entry: what a status
+  /// could not carry is read a page at a time (A-267, [`Instance::drift_page`]), and [`DriftReport::elided`] then
+  /// counts only the entries too long for any reply.
   pub fn drift(&mut self, volume: VolumeId) -> Result<Option<DriftReport>, Error> {
-    match self.status(volume)?.base {
-      None => Ok(None),
-      Some(BaseState::Read(report)) => Ok(Some(report)),
-      Some(BaseState::Unreadable) => Err(Error::Host(crate::error::HostFault::BaseUnreadable)),
+    let report = match self.status(volume)?.base {
+      None => return Ok(None),
+      Some(BaseState::Read(report)) => report,
+      Some(BaseState::Unreadable) => {
+        return Err(Error::Host(crate::error::HostFault::BaseUnreadable));
+      }
+    };
+    if report.elided == 0 {
+      return Ok(Some(report));
+    }
+    let mut whole = DriftReport {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      watcher: report.watcher,
+      elided: 0,
+    };
+    let mut after = None;
+    loop {
+      let page = self.drift_page(volume, after)?;
+      whole.drifted.extend(page.drifted);
+      whole.unverified.extend(page.unverified);
+      whole.elided = whole.elided.saturating_add(page.oversized);
+      match page.next {
+        None => {
+          // The pages come in inode order; the report names its entries in path order, as a status does.
+          whole.drifted.sort_by(|a, b| a.path.cmp(&b.path));
+          whole.unverified.sort();
+          return Ok(Some(whole));
+        }
+        next => after = next,
+      }
     }
   }
 
@@ -309,12 +350,13 @@ impl Instance {
   }
 
   /// Takes the disk's present state of drifted entries as their new base (all of them when `paths` is `None`, §4.15
-  /// `rewitness`); the paths done. The volume's own changes to them stay its own.
+  /// `rewitness`); the paths done, as many as one reply holds, and the count of the rest (A-267), which were taken
+  /// too. The volume's own changes to them stay its own.
   pub fn rewitness(
     &mut self,
     volume: VolumeId,
     paths: Option<Vec<String>>,
-  ) -> Result<Vec<String>, Error> {
+  ) -> Result<Rewitnessed, Error> {
     self
       .client
       .rewitness(volume, paths)
@@ -375,34 +417,32 @@ impl Instance {
   /// Lands `request` under the caller's write mode (§4.15): [`LandOutcome::Written`] when it runs,
   /// [`LandOutcome::ApprovalRequired`] when the mode asks (what would be written, for [`Instance::approve_landing`]),
   /// [`LandOutcome::Conflicted`] when the disk changed entries the volume changed too, [`LandOutcome::Refused`] when a
-  /// policy forbids it. A `signature` makes the landing signed work ([`crate::signed`]); refused
-  /// `Unsupported(SignedWork)` until the daemon verifies a landing's signature (A-321's next piece; merges are signed
-  /// work already).
+  /// policy forbids it. A `signature` over the landing's statement ([`LandingApproval::statement`], which every
+  /// presentation states: [`Instance::plan_landing`]) makes the landing signed work (A-321): the daemon judges it under
+  /// the volume's trusted signers against the manifest it presents or writes, records the verdict on the landing's audit
+  /// records ([`Instance::audit`]) and answers it — in the report of what was written, or in the approval asked for,
+  /// which carries the signature on to [`Instance::approve_landing`]. A signature permits nothing: the mode decides.
   pub fn land(
     &mut self,
     request: &LandingRequest,
     signature: Option<&WorkSignature>,
   ) -> Result<LandOutcome, Error> {
-    if signature.is_some() {
-      return Err(Error::Unsupported(Unsupported::SignedWork));
-    }
-    let landing = self.land_with(request, None);
-    Ok(match self.presented(request, landing)? {
-      Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
-      Presented::Settled(outcome) => outcome,
-    })
+    let landing = self.land_with(request, None, signature);
+    self
+      .presented(request, signature, landing)
+      .map(Presented::outcome)
   }
 
   /// Presents the landing of `request` without writing it, whatever the caller's write mode (§4.15 steps 1–2; the
-  /// daemon's present-only verb, A-285): the plan as an approval (its manifest, its summary), or the conflicts found
-  /// before any write. What a reviewer asks before approving: [`Instance::approval_entries`] lists the plan path by
-  /// path. A forbidding mode presents too, since a reviewer reads changes it may not land.
+  /// daemon's present-only verb, A-285): the plan as an approval (its manifest, its summary, and the statement a signer
+  /// signs to make the landing signed work, A-321), or the conflicts found before any write. What a reviewer asks
+  /// before approving: [`Instance::approval_entries`] lists the plan path by path. A forbidding mode presents too, since
+  /// a reviewer reads changes it may not land.
   pub fn plan_landing(&mut self, request: &LandingRequest) -> Result<LandOutcome, Error> {
-    let presented = self.present_only(request);
-    Ok(match self.presented(request, presented)? {
-      Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
-      Presented::Settled(outcome) => outcome,
-    })
+    let presented = self.present_only(request, None);
+    self
+      .presented(request, None, presented)
+      .map(Presented::outcome)
   }
 
   /// Every entry an approved landing would write (§4.15 step 2, "the full entry list on demand"; A-287): path by path
@@ -435,15 +475,18 @@ impl Instance {
   /// the disk changed since, nothing is approved or written, and the answer is the new presentation
   /// ([`LandOutcome::ApprovalRequired`] to show instead, or [`LandOutcome::Conflicted`]). An approval never covers more
   /// than the manifest its approver saw, however long they took, and it works from any instance: it is bound to the
-  /// request and the manifest, never to the client that first presented it.
+  /// request and the manifest, never to the client that first presented it. The approval's signature
+  /// ([`LandingApproval::signature`], A-321) goes with the presentation and the landing, so the landing written is
+  /// recorded and answered with its verdict; it permits nothing.
   pub fn approve_landing(
     &mut self,
     approval: &LandingApproval,
     authority: &dyn GrantAuthority,
   ) -> Result<LandOutcome, Error> {
     let request = &approval.request;
-    let presented = self.present_only(request);
-    let fresh = match self.presented(request, presented)? {
+    let signature = approval.signature.as_ref();
+    let presented = self.present_only(request, signature);
+    let fresh = match self.presented(request, signature, presented)? {
       Presented::Plan(fresh) => fresh,
       Presented::Settled(outcome) => return Ok(outcome),
     };
@@ -458,30 +501,38 @@ impl Instance {
     };
     let proof = authority.prove(&claim)?;
     let grant = self.grant(&claim, &proof)?;
-    match self.land_with(request, Some(grant)) {
-      Ok(Landing::Landed(outcome)) => Ok(LandOutcome::Written(report_of(
-        outcome,
-        Verification::Unsigned,
-      )?)),
+    let landed = self.land_with(request, Some(grant), signature);
+    self.granted(request, (fresh.presentation, signature), landed)
+  }
+
+  /// A granted landing's reply, typed: written, with how its signature was judged; refused by a policy; or, when the
+  /// grant does not cover what is planned now or the disk moved between the grant and the landing's validation, nothing
+  /// written and what holds now presented, carrying `signature` again.
+  fn granted(
+    &mut self,
+    request: &LandingRequest,
+    (presentation, signature): (u64, Option<&WorkSignature>),
+    reply: Result<SignedLanding, ClientError>,
+  ) -> Result<LandOutcome, Error> {
+    match reply {
+      Ok(SignedLanding {
+        landing: Landing::Landed(outcome),
+        ..
+      }) => report_of(outcome).map(LandOutcome::Written),
       Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
         Ok(LandOutcome::Refused(PolicyRefusal::forbidden(act, by)))
       }
-      // The grant does not cover what is planned now, or the disk moved between the grant and the landing's
-      // validation: nothing was written; what holds now is presented.
-      Ok(Landing::GrantRequired { .. })
+      Ok(SignedLanding {
+        landing: Landing::GrantRequired { .. },
+        ..
+      })
       | Err(ClientError::Refused(Refusal::GrantMismatch | Refusal::LandingConflict { .. })) => {
-        let again = self.present_only(request);
-        Ok(match self.presented(request, again)? {
-          Presented::Plan(again) => LandOutcome::ApprovalRequired(again),
-          Presented::Settled(outcome) => outcome,
-        })
+        let again = self.present_only(request, signature);
+        self
+          .presented(request, signature, again)
+          .map(Presented::outcome)
       }
-      Err(error) => Err(self.fail(
-        error,
-        Some(Missing::Presentation {
-          id: fresh.presentation,
-        }),
-      )),
+      Err(error) => Err(self.fail(error, Some(Missing::Presentation { id: presentation }))),
     }
   }
 
@@ -503,36 +554,56 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Presentation { id: claim.landing })))
   }
 
-  /// A presentation's reply, typed: a plan to approve, conflicts, written at once, or refused by a policy.
+  /// A presentation's reply, typed: a plan to approve — how `signature` was judged against it, its statement, and the
+  /// signature carried on for its approval (A-321) — conflicts, written at once with its verdict, or refused by a policy.
   fn presented(
     &mut self,
     request: &LandingRequest,
-    reply: Result<Landing, ClientError>,
+    signature: Option<&WorkSignature>,
+    reply: Result<SignedLanding, ClientError>,
   ) -> Result<Presented, Error> {
     match reply {
-      Ok(Landing::Landed(outcome)) => Ok(Presented::Settled(LandOutcome::Written(report_of(
-        outcome,
-        Verification::Unsigned,
-      )?))),
-      Ok(Landing::GrantRequired {
-        landing,
-        manifest,
-        summary,
-        conflicts,
+      Ok(SignedLanding {
+        landing: Landing::Landed(outcome),
+        ..
+      }) => report_of(outcome).map(|report| Presented::Settled(LandOutcome::Written(report))),
+      Ok(SignedLanding {
+        landing:
+          Landing::GrantRequired {
+            landing,
+            manifest,
+            summary,
+            conflicts,
+            conflicts_elided,
+          },
+        verification,
+        statement: Some(statement),
       }) => {
         let approval = LandingApproval {
           request: request.clone(),
           presentation: landing,
           manifest,
           summary: summary_of(&summary),
-          verification: Verification::Unsigned,
+          verification: Verification::of_wire(verification),
+          statement,
+          signature: signature.cloned(),
         };
-        if conflicts.is_empty() {
+        // A reply carries the conflicts one reply holds and counts the rest (A-267): clean only when it has neither.
+        if conflicts.is_empty() && conflicts_elided == 0 {
           Ok(Presented::Plan(approval))
         } else {
           self.conflicts_of(&approval).map(Presented::Settled)
         }
       }
+      // The client states every presentation's statement (`slates_client::SignedLanding`); a presentation without one
+      // is a reply the verb does not expect.
+      Ok(SignedLanding {
+        landing: Landing::GrantRequired { .. },
+        statement: None,
+        ..
+      }) => Err(Error::Protocol(ProtocolFault::UnexpectedReply {
+        verb: "land",
+      })),
       Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => Ok(Presented::Settled(
         LandOutcome::Refused(PolicyRefusal::forbidden(act, by)),
       )),
@@ -557,28 +628,34 @@ impl Instance {
     Ok(LandOutcome::Conflicted(conflicts))
   }
 
-  /// One presentation of `request` that never writes, whatever the mode (the daemon's `Present`, A-285).
-  fn present_only(&mut self, request: &LandingRequest) -> Result<Landing, ClientError> {
-    self.client.present(
-      request.volume,
-      request.snapshot,
+  /// One presentation of `request` that never writes, whatever the mode (the daemon's `Present`, A-285), carrying
+  /// `signature` to be judged against what it presents (A-321).
+  fn present_only(
+    &mut self,
+    request: &LandingRequest,
+    signature: Option<&WorkSignature>,
+  ) -> Result<SignedLanding, ClientError> {
+    self.client.present_with_signature(
+      (request.volume, request.snapshot),
       &request.target,
       request.filter.clone(),
+      signature.map(WorkSignature::blob),
     )
   }
 
-  /// One `land` call: presented without a grant, run with one.
+  /// One `land` call carrying `signature` (A-321): presented without a grant, run with one.
   fn land_with(
     &mut self,
     request: &LandingRequest,
     grant: Option<u64>,
-  ) -> Result<Landing, ClientError> {
-    self.client.land(
-      request.volume,
-      request.snapshot,
+    signature: Option<&WorkSignature>,
+  ) -> Result<SignedLanding, ClientError> {
+    self.client.land_with_signature(
+      (request.volume, request.snapshot),
       &request.target,
       request.filter.clone(),
       grant,
+      signature.map(WorkSignature::blob),
     )
   }
 
@@ -825,7 +902,8 @@ impl Instance {
   }
 
   /// The audit log from record `since` (§4.15, §4.14), typed: grants, presentations, validations, entries and
-  /// landings finished, in order.
+  /// landings finished, in order; each record of a landing as a whole (planned, finished) with how its signature was
+  /// judged (A-321), the landing's provenance.
   pub fn audit(&mut self, since: u64) -> Result<Vec<AuditRecord>, Error> {
     Ok(
       self
