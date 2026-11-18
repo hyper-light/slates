@@ -20,6 +20,7 @@
 //! file checks that what it read is what the grant would land, and a landing of the same snapshot later presents the
 //! same manifest hash, or the plan changed.
 
+#[cfg(unix)]
 use std::collections::BTreeMap;
 
 use slates_db::catalog::Principal;

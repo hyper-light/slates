@@ -1085,7 +1085,9 @@ fn op_make_link(
       bridge.unlink(parent, cx, name)?;
       0
     }
-    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      return Err(VfsError::SpecialFileOperation);
+    }
   };
   let link = bridge.symlink(parent, cx, name, target)?;
   let link = bridge.setattr(

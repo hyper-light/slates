@@ -4966,7 +4966,17 @@ fn overlay_clones_read(
     matches!(own.as_deref(), Ok(bytes) if bytes == b"the clone's own"),
     "{when}: the clone reads its own file: {own:?}"
   );
-  for volume in [origin, other] {
+  clones_own_file_reads_in_no_other_volume(client, [origin, other], when);
+}
+
+/// The other half of `overlay_clones_read`: expect the file one clone wrote refused `NotFound` in each of `volumes`,
+/// `when` naming the moment for a failure's message.
+fn clones_own_file_reads_in_no_other_volume(
+  client: &mut Client,
+  volumes: [VolumeId; 2],
+  when: &str,
+) {
+  for volume in volumes {
     let absent = read_answered(client, volume, "clone.txt");
     assert!(
       matches!(absent, Err(ClientError::Refused(Refusal::NotFound))),

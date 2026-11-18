@@ -2107,7 +2107,8 @@ pub enum WorkOp {
     /// The attribute name.
     name: String,
   },
-  /// Create an IPC namespace inode with explicit metadata and no endpoint state.
+  /// Create a namespace inode with no content, with explicit metadata and no endpoint state: a FIFO or socket name
+  /// (A-26), or a device node and its number (A-294).
   Mknod {
     /// The new path.
     path: String,
@@ -2116,20 +2117,35 @@ pub enum WorkOp {
   },
 }
 
-/// A-26: a declared IPC kind. Device nodes have no wire representation here.
+/// A declared kind of name with no content: a FIFO or socket name (A-26), or a device node with its number, metadata
+/// nothing opens as a device (A-294). The device kinds are appended, so the two earlier tags are unchanged.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcNodeKind {
   /// A named pipe without queued bytes.
   Fifo,
   /// A socket name without a listener or connection.
   Socket,
+  /// A block device node (A-294).
+  BlockDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
+  /// A character device node (A-294); a whiteout is one numbered 0/0.
+  CharDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
 }
 
-/// Metadata supplied by a work's declared IPC creation (§4.16, A-26). These are volume
-/// metadata, not host credentials or endpoint authority. Replay never reads a local clock.
+/// Metadata supplied by a work's declared creation of a name with no content (§4.16, A-26, A-294). These are volume
+/// metadata, not host credentials, endpoint authority or device access. Replay never reads a local clock.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcNode {
-  /// The IPC kind.
+  /// The kind, with a device node's number.
   pub kind: IpcNodeKind,
   /// Permission bits.
   pub mode: u32,

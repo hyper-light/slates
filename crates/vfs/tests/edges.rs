@@ -614,7 +614,9 @@ fn content_refusal(kind: slates_vfs::inode::Kind) -> Option<VfsError> {
     Kind::File => None,
     Kind::Dir => Some(VfsError::IsDirectory),
     Kind::Symlink => Some(VfsError::Invalid),
-    Kind::Fifo | Kind::Socket => Some(VfsError::SpecialFileOperation),
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      Some(VfsError::SpecialFileOperation)
+    }
   }
 }
 
@@ -662,7 +664,8 @@ fn check_content_ops(
 
 /// The full (kind x content operation) refusal matrix: every content op (read, write, seek, truncate, allocate,
 /// edit) succeeds on a regular file and is refused on every other kind with its exact errno — a directory
-/// `IsDirectory` (`EISDIR`), a symlink `Invalid` (`EINVAL`), an IPC name `SpecialFileOperation`. This is the
+/// `IsDirectory` (`EISDIR`), a symlink `Invalid` (`EINVAL`), an IPC name or a device node (A-294)
+/// `SpecialFileOperation`. This is the
 /// generative guard the oracles lacked: `model.rs ino_of` picks only file inodes, and the differential follows a
 /// symlink by path, so neither ran a direct content op on a non-file inode — which is how the symlink content-op
 /// type confusion slipped past them. One table catches the whole class, including a future op or kind that forgets
@@ -670,7 +673,7 @@ fn check_content_ops(
 /// non-file's are refused with its errno.
 #[test]
 fn every_content_operation_is_refused_on_a_non_file_kind() {
-  use slates_vfs::inode::Kind;
+  use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
   let mut store = store();
   let mut vol = volume(&mut store, 1 << 20);
   let root = vol.root_inode(&store).unwrap();
@@ -690,13 +693,37 @@ fn every_content_operation_is_refused_on_a_non_file_kind() {
     (
       Kind::Fifo,
       vol
-        .mknod_no(&mut store, root, "p", 0o644, Kind::Fifo)
+        .mknod_no(&mut store, root, "p", 0o644, SpecialNode::Fifo)
         .unwrap(),
     ),
     (
       Kind::Socket,
       vol
-        .mknod_no(&mut store, root, "s", 0o644, Kind::Socket)
+        .mknod_no(&mut store, root, "s", 0o644, SpecialNode::Socket)
+        .unwrap(),
+    ),
+    (
+      Kind::BlockDevice,
+      vol
+        .mknod_no(
+          &mut store,
+          root,
+          "b",
+          0o644,
+          SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+        )
+        .unwrap(),
+    ),
+    (
+      Kind::CharDevice,
+      vol
+        .mknod_no(
+          &mut store,
+          root,
+          "c",
+          0o644,
+          SpecialNode::CharDevice(DeviceNumber::new(1, 3)),
+        )
         .unwrap(),
     ),
   ];
@@ -713,7 +740,7 @@ fn every_content_operation_is_refused_on_a_non_file_kind() {
 /// one of each kind; `read_in` each. Expect: the file reads its bytes; every non-file is refused with its errno.
 #[test]
 fn a_snapshot_read_of_a_non_file_is_refused_like_the_head() {
-  use slates_vfs::inode::Kind;
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
   let mut store = store();
   let mut vol = volume(&mut store, 1 << 20);
   let root = vol.root_inode(&store).unwrap();
@@ -722,7 +749,16 @@ fn a_snapshot_read_of_a_non_file_is_refused_like_the_head() {
   let dir = vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
   let link = vol.symlink_no(&mut store, root, "l", "target").unwrap();
   let fifo = vol
-    .mknod_no(&mut store, root, "p", 0o644, Kind::Fifo)
+    .mknod_no(&mut store, root, "p", 0o644, SpecialNode::Fifo)
+    .unwrap();
+  let device = vol
+    .mknod_no(
+      &mut store,
+      root,
+      "b",
+      0o644,
+      SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+    )
     .unwrap();
   let snap = vol.snapshot(&mut store).unwrap();
   let mut buf = [0u8; 16];
@@ -745,5 +781,10 @@ fn a_snapshot_read_of_a_non_file_is_refused_like_the_head() {
     vol.read_in(&store, snap, fifo, 0, &mut buf),
     Err(VfsError::SpecialFileOperation),
     "a snapshot read of an IPC name must be refused"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, device, 0, &mut buf),
+    Err(VfsError::SpecialFileOperation),
+    "a snapshot read of a device node must be refused (A-294)"
   );
 }

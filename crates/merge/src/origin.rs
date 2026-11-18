@@ -476,8 +476,7 @@ impl DecodeCursor {
       }
       Table::Specials => {
         let path = take_str(reader)?;
-        let node =
-          crate::special::SpecialNode::decode(reader.bytes(crate::special::ENCODED_BYTES)?)?;
+        let node = crate::special::SpecialNode::read(reader)?;
         origin.specials.push((path, node));
       }
     }
