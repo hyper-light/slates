@@ -7361,7 +7361,7 @@ fn judge_submission(
       // The durable head is the checkpoint's version and the increments after it (W3).
       if let Err(refusal) = record_accepted(
         state,
-        (green_id, work_id),
+        (green_id, sealed.work),
         version,
         (&increment_bytes, &inc),
         applied.as_deref(),
@@ -7370,7 +7370,7 @@ fn judge_submission(
       }
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
-      let completion = crate::merge_service::SubmitCompletion::of_current(state, work_id);
+      let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
       crate::merge_service::enqueue_record(
         state,
         green_id,
