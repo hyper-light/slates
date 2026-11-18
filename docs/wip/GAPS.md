@@ -275,16 +275,34 @@
 > Windows needed: the directory as the root token in each spelling its tools print (`D:\a`, `D:/a`, the shell's
 > `/d/a`, a lowercase drive, a canonical path's `\\?\D:\a`); Subversion's file URL in the drive form (`pwd -W`) and
 > `svnlook`'s carriage return dropped; and `ln -s` making a real link (`MSYS=winsymlinks:nativestrict`), so the git
-> workload's link goes through the drive's reparse points (A-275), not a copy. **The drive's stated difference:**
+> workload's link goes through the drive's reparse points (A-275), not a copy (on that `ln` alone since A-327, below). **The drive's stated difference:**
 > WinFsp's driver makes no hard link (v2.1 answers `FileLinkInformation` `STATUS_NOT_SUPPORTED` itself,
 > `src/sys/fileinfo.c`; its NTFS compatibility page lists hard links unsupported), so a local git or Mercurial clone
 > copies on the drive where NTFS links. The three lines that count a clone's files with two names are recorded with
 > both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
 > the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
-> keep the stated difference and offer the change upstream. **Open:** the lanes' first run is the supervisor's (CI);
-> the cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from it;
-> the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a Windows form.
+> keep the stated difference and offer the change upstream. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
+> drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
+> environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
+> (`compat/mingw.c` `mingw_platform_has_symlinks`), and with them on git resolves every change of directory through
+> `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` (`mingw_chdir`), which Windows answers `ERROR_UNRECOGNIZED_VOLUME`
+> (1005) for a drive `DefineDosDeviceW` made; only a drive the Mount Manager made has a final path, and the Mount
+> Manager takes Administrators alone (WinFsp issues 410 and 427, its maintainer: no workaround inside WinFsp).
+> Subversion failed on both sides: Git for Windows' shell rewrote the argument `^/trunk` as a path,
+> `^C:\Program Files\Git\trunk` (svn `E020024`). Fixed: the variable is set on the git workload's `ln -s` alone, so git
+> runs as Git for Windows ships it, its symbolic links off; and `MSYS_NO_PATHCONV=1` hands every argument on as
+> written. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
+> asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
+> WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
+> privilege is ever required, R10); (b) mount through the Mount Manager (`\\.\X:`), which works and needs an
+> Administrator, so only as a choice the person makes when elevated; (c) mount as a WinFsp network file system, whose
+> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
+> cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
+> first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
+> Windows form.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
