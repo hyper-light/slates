@@ -931,7 +931,7 @@
 >   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
 >   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
 
-> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window open).**
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window closed 2026-11-18 by A-361).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
 > kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
 > 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
@@ -946,8 +946,9 @@
 >   run-queue wait its own spinning causes, lengthened it to hundreds of milliseconds under load. Now the window is
 >   `max(F, the shard's wake estimate × the platform's multiple)` (`config::idle_window_ns`, §4.3, §4.7). F is R9's
 >   50 µs provisioning floor (`config::PROVISION_FLOOR`), which `provision_bench` gates on too. The multiple
->   (`config::loaded_wake_ratio`, paired `#[cfg]` functions) is 0 on Linux and macOS, so no estimate prices the window there and a shard's own
->   spinning cannot lengthen it (`crates/server/tests/idle_window.rs`), and 100 on Windows (§5).
+>   (`config::NO_ESTIMATE_MULTIPLE` since A-361) is 0 on every platform, so no estimate prices the window and a shard's
+>   own spinning cannot lengthen it (`crates/server/tests/idle_window.rs`, on Windows too since A-361); until A-361 it
+>   was 100 on Windows.
 >   - Measured at two shards on CI (diag-liveness-35, BENCHMARKS "The idle window's rule"): a 1 ms-paced client's CPU
 >     fell from main's 1,451–2,023 to 155–224 thousandths of a core on Linux, the loaded single-client p99 halved
 >     (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64), and the quiet p99 stayed within main's spread. As built
@@ -959,10 +960,18 @@
 >     run-queue time (0 to 1.75 µs, the shards parked through a client's requests), the live floor × 100 capped at 4F
 >     (twice the paced CPU), and the boot probe's smallest wake as a second input to `max` (6.8–346 µs on a loaded
 >     boot, past F in 5 of 9 boots on each Linux runner).
->   - **Open (C): Windows' own window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
->     so R9's floor alone made that the loaded single-client p99 (97–100 ms on windows-latest, 48–56 ms on
->     windows-11-arm, against 125–127 µs medians at the multiple). Windows keeps the multiple, and its paced client
->     the cost (177–435 thousandths of a core quiet), until that wait is understood and a window measured for it.
+>   - **Closed (C), A-361 (2026-11-18, goal g234): Windows' own window.** A Windows shard parked beside two spinners a CPU
+>     waited 14–42 ms to run again because a thread dequeued from an I/O completion port gets none of the priority boost
+>     Windows gives a thread woken from an event, a semaphore or an address, so the kicked shard queued at its own level
+>     until a spinner's 31.6 ms turn ended (`diag-g234-wake-1`: completion port 29 and 14 ms at the median on
+>     windows-latest and windows-11-arm, an event 15 and 6–7 µs, an event with its boost disabled 29 and 14 ms). Now a
+>     blocked wait sits one level up and the window is R9's floor on Windows too. The multiple it replaces had made
+>     windows of seconds from those waits, which spun past the watchdog's window after a WinFsp request: the anchor killed
+>     a live daemon in 3 of 3 runs of g258's now-x86 lane. At two shards the paced client's CPU fell from 94 and 199
+>     thousandths of a core quiet and 756 and 787 loaded to 7, 25 and 20, and the loaded single-client p99 from 157 µs
+>     with 4 of 9 runs at 56–83 ms (x86_64) and 108 µs with one at 31.9 ms (arm64) to 130 and 148 µs (BENCHMARKS,
+>     "Windows' own window"). Every idle spin now also ends by a ceiling a beat under the watchdog's least window
+>     (`config::IDLE_SPIN_CEILING`, A-361), so no window, estimate or hold can bring a spinning verdict on a live shard.
 >   - **Fixed (A-326, 2026-11-18, goal g234): a closed loop's other shards parked at R9's floor alone.** The plan's
 >     step 6 (2026-11-12, diag-liveness-42 to -45 and adacachy2; every N in the A-223 plan's notes) found the rule
 >     fails a quiet single client over three shards: p99 116.4 µs against main's 27.1 on ubuntu-24.04-arm, 144–331
@@ -985,6 +994,18 @@
 >   none (`diag-liveness-client-4`, 10 runs a tree); the parked bench form's client estimate read 17–33 µs before and
 >   after. Seen on the way: `presentation.rs` failed on Windows (`Unsupported { feature: "landing" }`, no Windows
 >   landing writer, A-262), on main's code too, where CI never ran it; it now builds on Unix only, as the verb does.
+
+> **A parked Windows shard in a job that fixes its priority class still waits out its neighbours' turns (2026-11-18,
+> A-361's open item; OPEN).** A-361 raises a shard one priority level while it is blocked in its completion port, since a
+> completion port's waiter gets none of the wake boost an event's waiter gets. A job with
+> `JOB_OBJECT_LIMIT_PRIORITY_CLASS` keeps a thread's level where it was: on jupiter, under the job kiln's agent runs
+> commands in (flags 0x2020, BelowNormal), `SetThreadPriority(ABOVE_NORMAL)` answered success and the level stayed
+> normal, so beside 64 spinners a kicked shard still woke 30.75 ms late at the median against a parked thread's 12.5 µs
+> (`wake_load` probe, 2026-11-18). The window stays R9's floor there, so the wait costs latency and never a spin or a
+> kill; `a_parked_shard_wakes_beside_spinners_as_soon_as_a_parked_thread_does` skips loudly in such a job. A user
+> APC as the kick carried no boost either (jupiter, loaded median 252 ms). **Owed:** a shard with no I/O outstanding
+> parks where Windows boosts the wake (WaitOnAddress on its parking word), its kickers signalling the object its park
+> names, with the parking protocol's loom model extended to the two objects.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
@@ -4402,11 +4423,9 @@ are retained with their scope; no documentation edit is an implementation accept
   cost is measured (§4.3), which `RuntimeConfig::from_profile` says in its formula string.
 - "10 × broadcast RTT p99" for election timeouts is Raft's published rule; ratified as a shape
   constant with the citation.
-- The idle window's multiple of the wake estimate on Windows (100, `config::loaded_wake_ratio` on Windows, a `derived!` naming
-  this entry): the ratio every platform had before A-223, kept on Windows by the supervisor's decision (2026-11-11)
-  because R9's floor alone cost a loaded single-client p99 of 48–100 ms there. It stands until Windows' own window is
-  measured (A-223's open item (C)). Linux and macOS take none: their window is R9's floor, F
-  (`config::PROVISION_FLOOR`, 50 µs), which is the requirement itself.
+- ~~The idle window's multiple of the wake estimate on Windows (100)~~ **removed 2026-11-18 by A-361**: the window is
+  R9's floor, F (`config::PROVISION_FLOOR`, 50 µs), on every platform, the requirement itself; the idle spin's ceiling,
+  the liveness budget less one beat (`config::IDLE_SPIN_CEILING`), is derived from the watchdog's window.
 - The format floor for compression (savings must exceed the chunk's metadata overhead) is
   derived from the format, not a literal.
 - The racy-window timestamp granularity per base filesystem (§4.15) is a cited table keyed by

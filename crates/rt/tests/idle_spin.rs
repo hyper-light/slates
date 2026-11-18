@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use slates_rt::futures::sleep;
 use slates_rt::registry;
-use slates_rt::runtime::{Runtime, RuntimeConfig};
+use slates_rt::runtime::{NO_IDLE_FLOOR_NS, Runtime, RuntimeConfig, WakeTracking};
 use slates_rt::shard::{Counters, ShardId};
 
 /// Shape: the idle window — long against the timer period, so the window holds dozens of idle moments,
@@ -40,8 +40,31 @@ const HOLD_NS: u64 = WINDOW_NS;
 /// shard's own window covers, so a run whose timers came late still tells a held window from an unheld one.
 const LEAST_HELD_SPINS: u64 = HOLD_NS / TICK_NS / 2;
 
+/// Shape: the capped test's idle ceiling: ten timer periods, so a spin under it still covers several idle moments.
+const CEILING_NS: u64 = 10 * TICK_NS;
+/// Shape: the wake estimate the capped test seeds its shard with, a hundred quiet stretches: a window priced on it, or a
+/// hold as long, would spin through the whole test.
+const INFLATED_WAKE_NS: u64 = 100 * WINDOW_NS;
+/// Shape: the capped test's estimate weighting, sixteen wakes (the shard is never kicked, so the estimate stays seeded).
+const CAPPED_SHIFT: u32 = 4;
+
 fn config() -> RuntimeConfig {
   config_with_window(WINDOW_NS)
+}
+
+/// A one-shard configuration that tracks a wake estimate seeded at [`INFLATED_WAKE_NS`] and prices its idle window on
+/// it, as the runtime's own spin-then-park does (a ratio of one, no floor), under a ceiling of [`CEILING_NS`] (A-361).
+fn capped_config() -> RuntimeConfig {
+  RuntimeConfig {
+    wake_tracking: Some(WakeTracking {
+      prior_ns: INFLATED_WAKE_NS,
+      shift: CAPPED_SHIFT,
+      idle_ratio: 1,
+      idle_floor_ns: NO_IDLE_FLOOR_NS,
+      idle_ceiling_ns: CEILING_NS,
+    }),
+    ..config_with_window(CEILING_NS)
+  }
 }
 
 /// A one-shard configuration whose idle window is `window_ns` and tracks no wake estimate.
@@ -170,5 +193,63 @@ fn a_held_window_keeps_the_shard_polling_past_its_own_window_until_the_hold_ends
     spins(&held),
     "the shard spun after its hold had ended: {later:?}"
   );
+  rt.shutdown().unwrap();
+}
+
+/// Opens the shard's idle window from a task, by `open` (a client's activity or a hold), and counts the shard's spins:
+/// those two ceilings after, then those a quiet stretch after that.
+fn spins_after(rt: &Runtime, shard: ShardId, open: fn()) -> (Counters, Counters) {
+  rt.spawn_on(shard, async move { open() }).unwrap();
+  wait(Duration::from_nanos(CEILING_NS).saturating_mul(2));
+  let within = counters_of(rt, shard);
+  wait(QUIET);
+  (within, counters_of(rt, shard))
+}
+
+/// A-361 by use (§4.3, §4.7: an idle shard polling for work is not a wedged one). Do: on a one-shard runtime that prices
+/// its idle window on a wake estimate seeded a hundred quiet stretches long, under a ceiling of ten timer periods, run a
+/// periodic timer task; note one client activity, wait two ceilings, then a quiet stretch; then hold the window for the
+/// inflated length and do the same. Expect: the window the shard reports is the ceiling; it spins at the idle moments
+/// inside the ceiling after each (the non-vacuity count) and not once in the quiet stretch after it. No idle spin outlives
+/// its ceiling, however far an estimate or a hold would take it, which is what keeps a daemon's idle spin under its
+/// watchdog's window: without the ceiling a Windows daemon's window, a hundred times an estimate that counted loaded
+/// wakes, spun past it and the anchor killed the live daemon (g258's now-x86 lane, 3 of 3 runs, 2026-11-18).
+#[test]
+fn an_inflated_estimate_or_hold_spins_no_longer_than_the_ceiling() {
+  let rt = Runtime::start(&capped_config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  rt.spawn_on(shard, async {
+    loop {
+      sleep(TICK_NS).await.unwrap();
+    }
+  })
+  .unwrap();
+  let start = counters_of(&rt, shard);
+  assert_eq!(
+    start.idle_window_ns, CEILING_NS,
+    "the window priced on the inflated estimate is held to the ceiling: {start:?}"
+  );
+  let opens: [(&str, fn()); 2] = [
+    ("a client's activity", || {
+      registry::with_current(|ctx| ctx.note_activity());
+    }),
+    ("a hold as long as the inflated estimate", || {
+      registry::with_current(|ctx| ctx.hold_idle_window(INFLATED_WAKE_NS));
+    }),
+  ];
+  let mut before = start;
+  for (opened_by, open) in opens {
+    let (within, after) = spins_after(&rt, shard, open);
+    assert!(
+      spins(&within) > spins(&before),
+      "{opened_by} opened no spin: {within:?}"
+    );
+    assert_eq!(
+      spins(&after),
+      spins(&within),
+      "{opened_by}: the shard spun past its ceiling: {after:?}"
+    );
+    before = after;
+  }
   rt.shutdown().unwrap();
 }

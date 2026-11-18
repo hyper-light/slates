@@ -1304,6 +1304,92 @@ mod tests {
     assert_eq!(window_ns, spin_window, "the verdict names the spin window");
   }
 
+  /// The verdicts of a shard that steps at the first look, then spins at a whole CPU with no step for `spin_ns`, then
+  /// parks, judged at the daemon's own cadence (a look a beat) against `spin_window_ns`; and how much CPU a look saw run
+  /// without a step at most (the spin's whole length: the look before the park lands as it ends).
+  fn an_idle_spin(spin_ns: u64, spin_window_ns: u64) -> (Vec<Verdict>, u64) {
+    let beat = crate::daemon::HEARTBEAT_NS;
+    let budget = LIVENESS_BUDGET_NS;
+    // The step lands on the look's instant, so the whole spin counts against the window: the worst case for the verdict.
+    let (_, mut watch) =
+      ShardWatch::default().judge(look(1, false, Some((0, 0)), beat), budget, spin_window_ns);
+    let mut verdicts = Vec::new();
+    let mut most = 0;
+    let mut spun = 0;
+    let mut now = beat;
+    loop {
+      now += beat;
+      // A look the beat after the spin used its whole length finds the shard parked; the look before saw all of it.
+      let parked = spun == spin_ns;
+      spun = (spun + beat).min(spin_ns);
+      let (verdict, next) = watch.judge(
+        look(1, parked, Some((spun, spun)), now),
+        budget,
+        spin_window_ns,
+      );
+      if !parked {
+        most = most.max(spun);
+      }
+      verdicts.push(verdict);
+      watch = next;
+      if parked {
+        return (verdicts, most);
+      }
+    }
+  }
+
+  /// A-361, §4.7, §4.14: an idle shard polling for work is not a wedged one. Do: judge, at the watchdog's own cadence, a
+  /// shard that steps and then spins at a whole CPU for the idle spin's ceiling before it parks, against the spin window
+  /// of a build as fast as the machine (the least window), of one ten times slower, and of an unmeasured build; then the
+  /// same shard spinning two windows. Expect: the ceiling's spin alive at every look in every build, and under each
+  /// window by at least a beat; the long spin judged spinning (the judge is live). The daemon holds every idle spin to the
+  /// ceiling (`config::IDLE_SPIN_CEILING_NS`, a beat under the budget, asserted at compile time), so no window, estimate
+  /// or hold can bring the verdict; a Windows daemon's window, a hundred times a loaded estimate, once did (g258).
+  #[test]
+  fn an_idle_spin_held_to_its_ceiling_is_never_judged_spinning() {
+    use slates_machine::build_cost::{BuildCost, BuildCostRefused};
+    /// Shape: a build ten times slower than machine code, a sanitizer's or an unoptimized one.
+    const SLOW_BUILD: u64 = 10;
+    let builds = [
+      Ok(BuildCost {
+        compiled_ns: 1,
+        machine_ns: 1,
+        batch: 1,
+      }),
+      Ok(BuildCost {
+        compiled_ns: SLOW_BUILD,
+        machine_ns: 1,
+        batch: 1,
+      }),
+      Err(BuildCostRefused::NoMachineCode),
+    ];
+    let ceiling = crate::config::IDLE_SPIN_CEILING_NS;
+    for build in builds {
+      let window = spin_window_ns(build);
+      let (verdicts, most) = an_idle_spin(ceiling, window);
+      assert!(
+        verdicts.iter().all(|verdict| *verdict == Verdict::Alive),
+        "a spin of the ceiling ({ceiling} ns) against a {window} ns window: {verdicts:?}"
+      );
+      assert_eq!(
+        most, ceiling,
+        "the last look before the park saw the whole spin"
+      );
+      assert!(
+        most + crate::daemon::HEARTBEAT_NS <= window,
+        "a look saw {most} ns of CPU without a step against a {window} ns window: under it by less than a beat"
+      );
+    }
+    let least = spin_window_ns(Err(BuildCostRefused::NoMachineCode));
+    let (verdicts, _) = an_idle_spin(2 * least, least);
+    assert!(
+      verdicts
+        .iter()
+        .any(|verdict| matches!(verdict, Verdict::Spinning { .. })),
+      "a spin of two windows was never judged spinning: {verdicts:?}"
+    );
+  }
+
   /// A-318. Do: derive the spin window from a measured build cost twice the machine's, one equal to it, one cheaper,
   /// and a refused measure. Expect: two budgets, the budget, the budget, the budget.
   #[test]
