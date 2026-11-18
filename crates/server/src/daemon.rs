@@ -2706,6 +2706,16 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `withhold` is set, every shard's Shards streams make their replies, publishing those that
+  /// wait for a barrier with their effect as always, and write none, as when a daemon dies between a barrier and its
+  /// reply (A-316). `Ok` once every shard has it, else the first typed refusal.
+  pub fn withhold_shards_replies(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.shards_withhold_replies = withhold)?;
+    }
+    Ok(())
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
@@ -4048,6 +4058,8 @@ async fn init_shard(
     inherited_copies,
     #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
+    #[cfg(target_os = "linux")]
+    adopt_shards: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
@@ -4121,6 +4133,7 @@ async fn init_shard(
     record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,
+    shards_withhold_replies: false,
     live_state_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
@@ -4239,6 +4252,9 @@ async fn init_shard(
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
   crate::fuse::adopt_held();
+  // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316).
+  #[cfg(target_os = "linux")]
+  crate::shards::adopt_held();
   #[cfg(windows)]
   crate::winfsp::adopt_held();
   #[cfg(target_os = "linux")]

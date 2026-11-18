@@ -694,6 +694,7 @@ const VALUES: &[&str] = &[
   "--account",
   "--uid",
   "--fd",
+  "--resync-fd",
   "--tag",
   "--dax-window",
 ];

@@ -4273,9 +4273,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the successor
   answers a request the dead daemon published and never answered from that reply, never by running it again;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
-  attachment one way: its references swept, its record removed, its resync channel released. Nothing survives a
-  restart yet: the successor's resync is owed (A-316's status), so recovery removes a Shards attachment's record and
-  releases its held channel, and the device reads that channel's end.
+  attachment one way: its references swept, its record removed, its resync channel released. A daemon's death ends
+  nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux; A-316) and serves it on
+  a fresh stream, its owner view and token from the hold, its references and opens from the image, the reply the dead
+  daemon published and never wrote answering the request the device resends, and the writes it acknowledged after its
+  last publication replayed from the write log (A-63) as a mount's are; it removes any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -4356,6 +4358,15 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > same (`crates/bridge-fuse/tests/shards_fs.rs`; the rules' unit tests in `crates/bridge-core/src/posix_acl.rs`). Owed:
 > a real guest's run (a Shards guest over a stream, a VM over slates' own virtio-fs device), and Shards' own server
 > enforcing them too (Shards' side, after its v0.8.0 tag).
+
+> **Status (2026-11-18, A-316, the successor's half).** Built and proven by use on Linux, with a test that plays the
+> anchor and the device across a daemon's death (`crates/server/tests/shards_resync_restart.rs`): each of two streams'
+> devices is handed a fresh stream in a `Resync` naming its token; an exclusive CREATE whose reply the dead daemon
+> published and never wrote is answered with that reply when resent, not run again (`EEXIST`), counted
+> `shards.replayed`; a write acknowledged after the last publication reads back (a stream's writes are now logged as a
+> mount's are, A-63, which also keeps them for the volume when the stream is not resynced); and the file exists once.
+> Owed: macOS (the channel's hand-off and the write log), the anchor holding a stream's DAX objects, Windows on Shards'
+> handle path, and Shards' device half.
 
 > **Status (2026-11-18, A-316, the resync channel, the attach's half).** Built and proven by use on Linux. A Shards
 > attach makes the channel, writes `Attached` first, holds the daemon's end at the anchor with the token and the owner
@@ -22628,7 +22639,7 @@ Applied in the same change to:
   once. Owed to the integrator: the round trips a guest's non-owner `stat`-and-open costs over a stream, before and
   after.
 
-### A-316 — A Shards stream's resync channel: made at the attach, its token told to the device and held with the daemon's end by the anchor, so a successor can hand the device a fresh stream (2026-11-18, built for goal g268, what Shards needs from slates; the attach's half)
+### A-316 — A Shards stream outlives its daemon: a resync channel made at the attach, its token held with the daemon's end by the anchor, and a successor that serves the attachment on a fresh stream and hands the device its end (2026-11-18, built for goal g268, what Shards needs from slates; Linux)
 
 Applied in the same change to:
 - §4.6, the Shards form: the resync channel's bullet, the teardown bullet (the channel released; nothing survives a
@@ -22653,6 +22664,13 @@ Applied in the same change to:
 - `crates/client`: `ShardsStream::resync`, taken after the stream's delivery when it says one follows.
 - `crates/cli`: `slates shards ... --resync-fd M` (Unix; refused on Windows), handing an ended channel where the daemon
   made none. `crates/api`: `ShardsStream::resync` reaches consumers through `serve_shards`; the simulator hands none.
+- The successor's half (`crates/server`): `fuse_hold::HeldDevice::raw_session`; `verbs::reconcile_lost` keeps a Shards
+  record whose resync end was held (`ShardState::adopt_shards`); `shards::adopt_held` and `adopt_one` (run after
+  recovery, beside `fuse::adopt_held`), `ShardsStream::new` (one constructor for the attach and the adoption),
+  `ShardsStream::replay` with `replayed`, `keep_pending_reply`, `sent_whole`, `log_write` and `written`; the counters
+  `shards.resynced`, `shards.resync_refused`, `shards.replayed`; `resync::send_resync`; and the test support
+  `Daemon::withhold_shards_replies` (`shards.reply_withheld`). The test: `crates/server/tests/shards_resync_restart.rs`,
+  a binary of its own in which the test plays the anchor and the devices across a daemon's death.
 
 - **What was there.** A Shards stream ended with its daemon: the device read the stream's end and the share ended,
   and recovery removed the guest's record (counted in `attachments_dropped`). Shards' coordinator accepted a resync
@@ -22684,9 +22702,20 @@ Applied in the same change to:
   each `Attached` first), the holds and sessions the anchor receives, the owner word's session, the held end being the
   device's own channel, and the release at a detach followed by the device reading the end; with no anchor, `Attached`
   then the end. Unit runs: see the commit.
-- **Owed** (GAPS): the successor's half on Linux (re-serve a held attachment on a fresh stream with its owner view,
-  `restorable` false and no `INIT`; send `Resync`; answer a resent request the dead daemon published from its record,
-  which needs a stream's barrier replies kept as FUSE's are, `pending_replies`; log a stream's writes as FUSE's are,
-  A-63); macOS (the channel's hand-off on the socket route, and the write log, which a resync there needs so no write
-  acknowledged after the last barrier is lost); the anchor holding a stream's DAX objects; and Windows on Shards'
-  handle path.
+- **The successor's half** (built the same day, Linux; `shards::adopt_held`, `shards::adopt_one`,
+  `shards/resync.rs` `send_resync`). Recovery keeps a Shards record whose resync end the anchor handed back
+  (`verbs::reconcile_lost`, beside the FUSE rule), and the successor serves it on a fresh stream as the same
+  attachment: the registry re-admits the record's rights under the record as owner, so the references and opens the
+  image carried are its own (A-152 gives back an open at the release of a handle the dead daemon issued); its
+  directory from the record; its owner view and token from the hold's session; no `INIT` and no restore. It then sends
+  the device a `Resync` over the held end with the fresh stream's end riding it; a refusal anywhere ends the attachment
+  and releases the hold (`shards.resync_refused`). A stream a successor may resync keeps each barrier reply in the
+  shard's pending replies before the publication, as a mount does (`keep_pending_reply`), released once the reply is
+  written whole or refused; the successor answers a first request whose unique is that reply's from it
+  (`shards.replayed`), and drops it at any other first request. And a stream's successful `WRITE` is logged before its
+  reply (`log_write`, as `fuse`'s), so a write acknowledged after the last publication survives the death, whether or
+  not the stream is resynced: before, such a write was lost with the daemon (a sibling of A-63's finding, found here).
+  The parse test also found `--resync-fd` missing from the CLI's table of value flags.
+- **Owed** (GAPS): macOS (the channel's hand-off on the socket route, and the write log, which a resync there needs so
+  no write acknowledged after the last barrier is lost); the anchor holding a stream's DAX objects; Windows on Shards'
+  handle path; and Shards' device half (ROOT, after its v0.8.0 tag).

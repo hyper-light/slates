@@ -21,7 +21,9 @@ use slates_anchor::held::{self, Incoming};
 use slates_bridge_fuse::shards_resync::{
   RESYNC_MESSAGE_BYTES, ResyncKind, ResyncMessage, TOKEN_BYTES,
 };
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass};
+use slates_client::{
+  Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, ShardsStream, SizeClass,
+};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -118,6 +120,84 @@ fn reply_errno(stream: &mut UnixStream) -> i32 {
   -i32::from_le_bytes(reply[OUT_LEN_BYTES..OUT_LEN_BYTES + 4].try_into().unwrap())
 }
 
+/// One Shards attach as the anchor sees it: the device's resync end of `shards` reads `Attached` naming its attachment
+/// and a token, with no descriptor; the anchor is given the daemon's end by a hold for that attachment, then a session
+/// of the same token and the identity view. Returns the token and the anchor's held end.
+fn held_with_its_token(anchor: &OwnedFd, shards: &ShardsStream) -> ([u8; TOKEN_BYTES], OwnedFd) {
+  let attachment = shards.attachment.attachment;
+  let resync = shards.resync.as_ref().expect("Linux hands a resync end");
+  let (attached, carried) = next_resync(resync);
+  assert_eq!(
+    (attached.kind, attached.attachment, carried),
+    (ResyncKind::Attached, attachment, 0),
+    "the device first reads its attachment's token, with no descriptor"
+  );
+  assert_ne!(attached.token, [0; TOKEN_BYTES], "a token is minted");
+  let Incoming::Hold {
+    attachment: held,
+    device,
+  } = next_held(anchor)
+  else {
+    panic!("the daemon's end was not held first");
+  };
+  assert_eq!(held, attachment, "the hold names its attachment");
+  let Incoming::Session {
+    attachment: told,
+    session,
+  } = next_held(anchor)
+  else {
+    panic!("the hold's session did not follow it");
+  };
+  assert_eq!(told, attachment);
+  assert_eq!(
+    session[..TOKEN_BYTES],
+    attached.token,
+    "the anchor keeps the token the device was told"
+  );
+  assert_eq!(
+    session[TOKEN_BYTES..],
+    [0u8; 16],
+    "and the identity view, until the guest names its owner"
+  );
+  (attached.token, device)
+}
+
+/// The guest's root names its run's owner `1000:1001` on `stream` (Shards' owner word, A-281): the reply succeeds, and
+/// the anchor is told a session for `attachment` that keeps its `token` and carries the swap, the root's owner shown
+/// as the run's 1000:1001.
+fn owner_word_updates_the_session(
+  anchor: &OwnedFd,
+  stream: &mut UnixStream,
+  attachment: u64,
+  token: [u8; TOKEN_BYTES],
+) {
+  stream.write_all(&frame(&owner_word(b"1000:1001"))).unwrap();
+  assert_eq!(
+    reply_errno(stream),
+    0,
+    "the guest's root names its run's owner"
+  );
+  let Incoming::Session {
+    attachment: told,
+    session,
+  } = next_held(anchor)
+  else {
+    panic!("the owner word told the anchor nothing");
+  };
+  assert_eq!(told, attachment);
+  assert_eq!(session[..TOKEN_BYTES], token, "the token stays");
+  let word = |at: usize| u32::from_le_bytes(session[at..at + 4].try_into().unwrap());
+  assert_eq!(
+    (
+      word(TOKEN_BYTES),
+      word(TOKEN_BYTES + 8),
+      word(TOKEN_BYTES + 12)
+    ),
+    (rustix::process::getuid().as_raw(), 1000, 1001),
+    "the swap: the root's owner shown as the run's 1000:1001"
+  );
+}
+
 /// A-316 (the coordinator's condition 4a, slates' half). Do: as the anchor, hand a daemon the hold channel; attach a
 /// volume twice in the Shards form through the client; read each stream's resync end and what the daemon sent the
 /// anchor; have the first stream's guest root name its run's owner; write on the anchor's held end; then detach the
@@ -161,76 +241,17 @@ fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_rele
     .unwrap();
   let first = client.attach_shards(volume, Intent::Write, None).unwrap();
   let second = client.attach_shards(volume, Intent::Write, None).unwrap();
-  let mut tokens = Vec::new();
-  let mut held_end = None;
-  for shards in [&first, &second] {
-    let attachment = shards.attachment.attachment;
-    let resync = shards.resync.as_ref().expect("Linux hands a resync end");
-    let (attached, carried) = next_resync(resync);
-    assert_eq!(
-      (attached.kind, attached.attachment, carried),
-      (ResyncKind::Attached, attachment, 0),
-      "the device first reads its attachment's token, with no descriptor"
-    );
-    assert_ne!(attached.token, [0; TOKEN_BYTES], "a token is minted");
-    let Incoming::Hold {
-      attachment: held,
-      device,
-    } = next_held(&anchor)
-    else {
-      panic!("the daemon's end was not held first");
-    };
-    assert_eq!(held, attachment, "the hold names its attachment");
-    let Incoming::Session {
-      attachment: told,
-      session,
-    } = next_held(&anchor)
-    else {
-      panic!("the hold's session did not follow it");
-    };
-    assert_eq!(told, attachment);
-    assert_eq!(
-      session[..TOKEN_BYTES],
-      attached.token,
-      "the anchor keeps the token the device was told"
-    );
-    assert_eq!(
-      session[TOKEN_BYTES..],
-      [0u8; 16],
-      "and the identity view, until the guest names its owner"
-    );
-    tokens.push(attached.token);
-    held_end.get_or_insert(device);
-  }
-  assert_ne!(tokens[0], tokens[1], "each attachment has its own token");
-  let held_end = held_end.unwrap();
+  let (first_token, held_end) = held_with_its_token(&anchor, &first);
+  let (second_token, _) = held_with_its_token(&anchor, &second);
+  assert_ne!(first_token, second_token, "each attachment has its own token");
 
   let mut stream = UnixStream::from(first.stream);
   stream.set_read_timeout(Some(WAIT)).unwrap();
-  stream.write_all(&frame(&owner_word(b"1000:1001"))).unwrap();
-  assert_eq!(
-    reply_errno(&mut stream),
-    0,
-    "the guest's root names its run's owner"
-  );
-  let Incoming::Session {
-    attachment: told,
-    session,
-  } = next_held(&anchor)
-  else {
-    panic!("the owner word told the anchor nothing");
-  };
-  assert_eq!(told, first.attachment.attachment);
-  assert_eq!(session[..TOKEN_BYTES], tokens[0], "the token stays");
-  let word = |at: usize| u32::from_le_bytes(session[at..at + 4].try_into().unwrap());
-  assert_eq!(
-    (
-      word(TOKEN_BYTES),
-      word(TOKEN_BYTES + 8),
-      word(TOKEN_BYTES + 12)
-    ),
-    (rustix::process::getuid().as_raw(), 1000, 1001),
-    "the swap: the root's owner shown as the run's 1000:1001"
+  owner_word_updates_the_session(
+    &anchor,
+    &mut stream,
+    first.attachment.attachment,
+    first_token,
   );
 
   let first_resync = first.resync.unwrap();

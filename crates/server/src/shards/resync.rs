@@ -19,10 +19,12 @@
 //! end. Each refusal on the way gives the resync up rather than leave a hold that would carry a wrong view: a share
 //! that cannot be resynced ends at a daemon's death, as before.
 //!
-//! **Not here yet:** the successor's half (re-serving a held attachment on a fresh stream and sending `Resync`), and a
-//! macOS hand-off of the end; both are A-316's owed pieces (GAPS). Until then a successor releases every resync end the
-//! anchor hands it, as it releases any held descriptor no record of its own kind claims (`crate::fuse::adopt_held`;
-//! macOS releases every held descriptor), so the device reads the channel's end once recovery has run.
+//! **After a death** ([`send_resync`]): recovery keeps a Shards attachment whose resync end the anchor held, and the
+//! successor serves it on a fresh stream as the same attachment (its owner view from the hold's session, no `INIT`, no
+//! restore), then hands the device the fresh stream's end over the held channel in a `Resync` naming the same token.
+//! A request the dead daemon published with its effect and never answered is answered from that reply when the device
+//! resends it (A-61's rule, `crate::shards`'s replay). Not here yet: the macOS hand-off of the end (and the write log
+//! a resync there needs), DAX objects held across the death, and Windows (GAPS).
 
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -125,6 +127,28 @@ pub(super) fn tell_owners(attachment: u64, resync: &mut Resync, owners: OwnerVie
     let _released = give_up(attachment, resync);
   }
   resync.held
+}
+
+/// Sends the device, over `held` (the attachment's resync end the anchor held across the last daemon's death), a
+/// `Resync` naming `attachment` and its `token`, with `device` (the device's end of the fresh stream the successor
+/// serves the attachment on) riding it: whether it went whole. A device that has gone refuses it, and the attachment is
+/// then ended (Shards' option (a)).
+pub(super) fn send_resync(
+  held: &OwnedFd,
+  attachment: u64,
+  token: [u8; TOKEN_BYTES],
+  device: &OwnedFd,
+) -> bool {
+  let resync = ResyncMessage {
+    kind: ResyncKind::Resync,
+    attachment,
+    token,
+  }
+  .to_bytes();
+  matches!(
+    slates_ipc::stream::send_with_descriptor(held.as_fd(), &resync, device.as_fd()),
+    Ok(sent) if sent == resync.len()
+  )
 }
 
 /// What [`give_up`] did.

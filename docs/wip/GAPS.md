@@ -96,11 +96,13 @@
 >   else the stream ends typed and counted. **Built since (A-316, 2026-11-18), the attach's half, on Linux:** the
 >   resync channel beside the stream, its token told to the device first (`Attached`) and kept with the daemon's end,
 >   which the anchor holds with the owner view as its session (so the owner view needs no record of its own), handed
->   to the client after the stream (`slates shards --resync-fd`, `ShardsStream::resync`, `CONTRACT` 10). **Owed:** the
->   successor's half (a fresh stream for a held attachment, `Resync`, the stream's published reply answered once, a
->   stream's writes in the write log, A-63); macOS (the channel's hand-off and the write log); the anchor holding a
->   stream's DAX objects (until then a stream gives its resync up at its guest's first DAX map); Windows on Shards'
->   handle path. Shards owes its device's half, after its v0.8.0 tag.
+>   to the client after the stream (`slates shards --resync-fd`, `ShardsStream::resync`, `CONTRACT` 10). **And the
+>   successor's half, on Linux:** recovery keeps a stream whose resync end the anchor held and serves it on a fresh
+>   stream, sending the device a `Resync` with its end; a resent request the dead daemon published is answered from its
+>   published reply, never run twice; a stream's writes are logged as a mount's are (A-63), which also fixes their loss
+>   at a death for streams that are not resynced. **Owed:** macOS (the channel's hand-off and the write log); the anchor
+>   holding a stream's DAX objects (until then a stream gives its resync up at its guest's first DAX map); Windows on
+>   Shards' handle path. Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it

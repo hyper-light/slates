@@ -2807,6 +2807,7 @@ mod route {
         attachment,
         lease_epoch: None,
         stream,
+        resync: None,
       },
       shards: shard_holders(&daemon),
     });
@@ -2925,6 +2926,7 @@ mod route {
           attachment,
           lease_epoch: None,
           stream,
+          resync: None,
         },
         shards: shard_holders(daemon),
       });

@@ -2374,21 +2374,18 @@ pub mod platform {
       Ok(())
     }
 
-    /// A-316: a stream whose resync channel the daemon made is delivered with it. Do: send a stream end saying its
-    /// resync end follows, then that resync end, then a plain stream end; read all three, and send a message on the
-    /// daemon's end of the resync pair. Expect the first to say a resync end follows and the third not; the second to be
-    /// the resync end for the same request and attachment; and the message read whole on the delivered end, which is
-    /// the channel's other end, not a copy.
-    #[test]
-    fn a_streams_resync_end_follows_its_end_on_the_control_socket() -> Result<(), IpcError> {
-      let (control, liveness) = channel()?;
-      let (_daemon_end, handed) = crate::stream::pair()?;
-      let (daemon_resync, handed_resync) = crate::stream::message_pair()?;
-      let (_plain_daemon_end, plain_handed) = crate::stream::pair()?;
-      control.send_stream(handed.as_fd(), 9, 901, true)?;
-      control.send_resync(handed_resync.as_fd(), 9, 901)?;
-      control.send_stream(plain_handed.as_fd(), 10, 902, false)?;
-      drop(handed_resync);
+    /// The three deliveries [`a_streams_resync_end_follows_its_end_on_the_control_socket`] sends, read in order off
+    /// `liveness`: a stream end, a resync end and another stream end, each refused `Layout` if it is another kind.
+    fn stream_resync_and_plain(
+      liveness: &Liveness,
+    ) -> Result<
+      (
+        super::super::StreamDelivery,
+        super::super::ResyncDelivery,
+        super::super::StreamDelivery,
+      ),
+      IpcError,
+    > {
       let Some(super::super::ControlDelivery::Stream(stream)) = liveness.recv_delivery()? else {
         return Err(IpcError::Layout {
           reason: "the first delivery was not the stream end",
@@ -2404,6 +2401,25 @@ pub mod platform {
           reason: "the third delivery was not the plain stream end",
         });
       };
+      Ok((stream, resync, plain))
+    }
+
+    /// A-316: a stream whose resync channel the daemon made is delivered with it. Do: send a stream end saying its
+    /// resync end follows, then that resync end, then a plain stream end; read all three, and send a message on the
+    /// daemon's end of the resync pair. Expect the first to say a resync end follows and the third not; the second to be
+    /// the resync end for the same request and attachment; and the message read whole on the delivered end, which is
+    /// the channel's other end, not a copy.
+    #[test]
+    fn a_streams_resync_end_follows_its_end_on_the_control_socket() -> Result<(), IpcError> {
+      let (control, liveness) = channel()?;
+      let (_daemon_end, handed) = crate::stream::pair()?;
+      let (daemon_resync, handed_resync) = crate::stream::message_pair()?;
+      let (_plain_daemon_end, plain_handed) = crate::stream::pair()?;
+      control.send_stream(handed.as_fd(), 9, 901, true)?;
+      control.send_resync(handed_resync.as_fd(), 9, 901)?;
+      control.send_stream(plain_handed.as_fd(), 10, 902, false)?;
+      drop(handed_resync);
+      let (stream, resync, plain) = stream_resync_and_plain(&liveness)?;
       let told = (stream.resync_follows, plain.resync_follows);
       let named = (resync.request_id, resync.attachment);
       if told != (true, false) || named != (9, 901) {
