@@ -511,13 +511,18 @@
 >   at a death for streams that are not resynced. **And on macOS (A-339, 2026-11-18), the attach's half:** the channel
 >   a stream of 28-byte messages there (a datagram pair's survivor is never told its peer has gone), its device end
 >   beside the stream's in the socket route's confirmation, and the daemon keeping its own copy of its held end, since
->   macOS flushes a socket whose every copy rides a message. **Owed:** macOS's successor's half (the write log there,
->   recovery keeping the attachment, the fresh stream handed over the held end); the anchor holding a stream's DAX
->   objects (until then a stream gives its resync up at its guest's first DAX map); Windows on Shards' handle path, and
->   a write log for a Windows stream, whose acknowledged writes a death still loses whether or not it is resynced.
->   Found beside it (Linux too): a resynced stream whose dead daemon's log overflowed is not told which writes it lost
->   (a FUSE mount is, `LostWrites`); and a stream's `FORGET`s are not logged, so a resynced stream keeps the references
->   a lost one gave back until it ends. Shards owes its device's half, after its v0.8.0 tag.
+>   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
+>   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
+>   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
+>   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
+>   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
+>   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
+>   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
+>   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
+>   acknowledged, where a mount's skips it (A-63's flush rule: a FUSE request that published took 105 us p50 against
+>   15 us for a read, 2026-10-06).
+>   Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
@@ -3411,6 +3416,13 @@
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line
 >   and drops it. The failing-first test is `an_anchor_whose_log_reader_went_away_keeps_supervising`
 >   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+> - **Closed 2026-11-18 (A-357): the Windows x86_64 binary did not start in Nano Server** (found by the test tag
+>   `v0.1.0-test.3`, run 44326428333: `slates version` exited 0xC0000139, `STATUS_ENTRYPOINT_NOT_FOUND`, so `stage`
+>   could not run and no draft was made). A-223 had imported three kernel32 functions that Nano Server's kernel32
+>   lacks (`EnableThreadProfiling`, `ReadThreadProfilingData`, `DisableThreadProfiling`). `slates-machine` now finds
+>   them at run time, and where they are missing the switch count is unknown, as when the OS refuses the profiling.
+>   Only the release lane runs the Nano Server check, so no push to main showed it. Record:
+>   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
@@ -3978,13 +3990,19 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
 >     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
 >     refusal a consumer retries; and a learner fetches the configuration only over a record session
->     (`fleet::drive_learner_fetch`). The cause is a hypothesis, since the run kept no node logs: the server node, held
->     to CPU weight 1 on adacachy under a load near 100 (in g066e, at load 112.9, its control shard ran 627, 923 and
->     1,104 ms late against its 1,000 ms watchdog window), answered its record sessions late for longer than the SLO.
+>     (`fleet::drive_learner_fetch`). The run kept no node logs, so the cause is not known. Starvation of the server
+>     is ruled out as the whole of it: with the same pair and direction (run g066s2), the server node's unit held to a
+>     2% CPU quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`, cpu.max `2000 100000`) for 45 s right
+>     after the root group formed and for 30 s while the client made a work, the client held configuration version 1
+>     throughout, every forwarded `work` was answered within 0.5 to 8.6 s (the first made the work, the rest were
+>     refused `AlreadyExists` for the experiment's repeated name), the read after the lift answered in 0.7 s, and the
+>     flow landed exactly the 4 merged files. What remains is the path: the client reached adacachy over the Mac's
+>     Wi-Fi, and 15 and 17 replaced sessions are re-dials after losses, so a run of losses longer than the SLO fits.
 >     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
->     reproduce it on one box with the server node held to a CPU quota (`systemd-run --user -p CPUQuota=`) and tell
->     from its log whether the refusal is the SLO doing its job, the configuration arriving once the starvation ends,
->     or a session or learner defect, which then gets its failing test first.
+>     drive the client's first configuration fetch across a link that drops everything for longer than the SLO and
+>     then heals (the relay of `crates/cli/tests/live_chaos.rs`, a node bound apart from its advertised address,
+>     A-277), and require the configuration and a forwarded verb back within a derived bound of the heal; a miss is a
+>     learner or session defect and gets its failing test first.
 >   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
 >     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
 >     path while the flow itself passed; the program passes every `$` as `$$`.

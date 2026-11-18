@@ -60,7 +60,9 @@ mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
-#[cfg(target_os = "linux")]
+// The descriptors the anchor holds for this daemon's attachments: FUSE devices (Linux) and Shards streams' resync ends
+// (Linux, macOS; A-316, A-339).
+#[cfg(unix)]
 mod fuse_hold;
 // The macOS NFS mounts this daemon serves, recorded as its own (A-227).
 #[cfg(target_os = "macos")]
@@ -88,7 +90,9 @@ mod mirror;
 mod readmission;
 mod remote_attach;
 mod work_home;
-#[cfg(target_os = "linux")]
+// The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
+// stream's (Linux, macOS; A-316, A-339).
+#[cfg(unix)]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]

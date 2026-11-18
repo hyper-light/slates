@@ -879,13 +879,12 @@ impl Daemon {
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
-    // What the anchor held across the restart (A-61, A-113): the FUSE devices, each moved to the shard that owns its
-    // mount, and the NFS loopback connections, served again on the listener's shard below.
+    // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
+    // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
+    // connections, served again on the listener's shard below.
     let handed = crate::anchor_hold::adopt(config.held_device_bound());
-    #[cfg(target_os = "linux")]
-    let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    #[cfg(all(unix, not(target_os = "linux")))]
-    release_devices_without_fuse(handed.devices);
+    #[cfg(unix)]
+    let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
@@ -906,10 +905,12 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
-      #[cfg(target_os = "linux")]
-      let held = inherited_fuse.next().unwrap_or_default();
-      #[cfg(target_os = "linux")]
-      let copies = inherited_copies.next().unwrap_or_default();
+      #[cfg(unix)]
+      let holds = ShardHolds {
+        devices: inherited_devices.next().unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        copies: inherited_copies.next().unwrap_or_default(),
+      };
       #[cfg(windows)]
       let windows_holds = (
         inherited_winfsp.next().unwrap_or_default(),
@@ -924,7 +925,7 @@ impl Daemon {
       // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
       // macOS shard learns its kept NFS mounts from its catalog, which it reads only as it starts.
       #[cfg(target_os = "linux")]
-      let learning = (!held.is_empty()).then(|| gate.learning());
+      let learning = (!holds.devices.is_empty()).then(|| gate.learning());
       #[cfg(target_os = "macos")]
       let learning = Some(gate.learning());
       #[cfg(windows)]
@@ -948,8 +949,8 @@ impl Daemon {
           (partition, sealing, learning),
           all,
           retained,
-          #[cfg(target_os = "linux")]
-          (held, copies),
+          #[cfg(unix)]
+          holds,
           #[cfg(windows)]
           windows_holds,
         ));
@@ -3822,8 +3823,9 @@ fn image_range(
   }
 }
 
-/// This shard's content range for its recovery images (§4.8).
-#[cfg(not(target_os = "linux"))]
+/// This shard's content range for its recovery images (§4.8). Windows keeps no write log: neither a WinFsp mount nor a
+/// Shards stream there logs its writes yet (GAPS).
+#[cfg(windows)]
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -3832,11 +3834,11 @@ fn content_slice(
   image_range(config, partition, content)
 }
 
-/// This shard's content range for its recovery images (§4.8), and the FUSE write log at the slice's front with what
-/// the previous daemon left in it to replay (A-63, `crate::write_log`), opened against the generation of the
-/// committed image, before anything this daemon does can publish and clear it. No log and nothing to replay without
-/// a content object.
-#[cfg(target_os = "linux")]
+/// This shard's content range for its recovery images (§4.8), and the write log at the slice's front with what the
+/// previous daemon left in it to replay (A-63, `crate::write_log`: a FUSE mount's writes on Linux, a Shards stream's on
+/// Linux and macOS, A-316, A-339), opened against the generation of the committed image, before anything this daemon
+/// does can publish and clear it. No log and nothing to replay without a content object.
+#[cfg(unix)]
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -3899,6 +3901,18 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
+/// What the anchor handed back for one shard's partition (Unix): its held devices, FUSE devices (Linux) and Shards
+/// streams' resync ends (A-61, A-316, A-339), and on Linux its held writable copies (A-197).
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct ShardHolds {
+  /// The held devices.
+  devices: Vec<crate::fuse_hold::HeldDevice>,
+  /// The held writable copies.
+  #[cfg(target_os = "linux")]
+  copies: Vec<crate::held_copy::InheritedCopy>,
+}
+
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
 async fn start_shard(
@@ -3908,10 +3922,7 @@ async fn start_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] held: (
-    Vec<crate::fuse_hold::HeldDevice>,
-    Vec<crate::held_copy::InheritedCopy>,
-  ),
+  #[cfg(unix)] holds: ShardHolds,
   #[cfg(windows)] windows_holds: (
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
@@ -3933,8 +3944,8 @@ async fn start_shard(
     (partition, sealing, learning),
     &all,
     retained,
-    #[cfg(target_os = "linux")]
-    held,
+    #[cfg(unix)]
+    holds,
     #[cfg(windows)]
     windows_holds,
   )
@@ -4061,10 +4072,7 @@ async fn init_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] (inherited_fuse, inherited_copies): (
-    Vec<crate::fuse_hold::HeldDevice>,
-    Vec<crate::held_copy::InheritedCopy>,
-  ),
+  #[cfg(unix)] holds: ShardHolds,
   #[cfg(windows)] (inherited_winfsp, windows_channel): (
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
@@ -4182,15 +4190,15 @@ async fn init_shard(
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+  #[cfg_attr(windows, allow(unused_mut))]
   let mut content = match AnchorSegment::open_content(env) {
     Some(result) => Some(result?),
     None => None,
   };
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   let content_range = content_slice(config, partition, content.as_ref());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
@@ -4235,15 +4243,15 @@ async fn init_shard(
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
     published_held: crate::content_holder::PublishedHeld::default(),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     write_log,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     writes_lost: recovered_writes.everything_lost,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     replay: recovered_writes.records,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pending_replies: std::collections::BTreeMap::new(),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
@@ -4290,13 +4298,13 @@ async fn init_shard(
     #[cfg(windows)]
     adopt_winfsp: Vec::new(),
     stale_fuse_mounts: Vec::new(),
+    #[cfg(unix)]
+    inherited_fuse: holds.devices,
     #[cfg(target_os = "linux")]
-    inherited_fuse,
-    #[cfg(target_os = "linux")]
-    inherited_copies,
+    inherited_copies: holds.copies,
     #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     adopt_shards: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
@@ -4499,8 +4507,9 @@ async fn init_shard(
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
   crate::fuse::adopt_held();
-  // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316).
-  #[cfg(target_os = "linux")]
+  // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316, A-339), and every held
+  // device no record claimed released.
+  #[cfg(unix)]
   crate::shards::adopt_held();
   #[cfg(windows)]
   crate::winfsp::adopt_held();
@@ -4731,8 +4740,8 @@ async fn seal_idle_content() {
   purge_if_idle().await;
 }
 
-/// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).
-#[cfg(target_os = "linux")]
+/// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
+#[cfg(unix)]
 fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   let slice = give_back_slice(s);
   let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
@@ -4744,8 +4753,8 @@ fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   (purged.bytes, purged.more)
 }
 
-/// No write log off Linux (A-63 logs the FUSE mount's writes).
-#[cfg(not(target_os = "linux"))]
+/// No write log on Windows (see `content_slice`).
+#[cfg(windows)]
 fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
   (0, false)
 }
@@ -6246,30 +6255,6 @@ fn start_shards_route(
 /// Counter: the Shards stream route that did not bind its socket (macOS): the Shards form is refused while it stands.
 #[cfg(target_os = "macos")]
 const SHARDS_ROUTE_UNBOUND: &str = "shards.route_unbound";
-
-/// Releases and closes FUSE devices the anchor handed back to a daemon on a platform without FUSE: there is no mount to
-/// serve them, and an anchor that keeps them would hand them to every daemon after. Reported, since a device here means
-/// an anchor shared with another platform's daemon or a corrupted handoff.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn release_devices_without_fuse(devices: Vec<crate::anchor_hold::HandedDevice>) {
-  for crate::anchor_hold::HandedDevice {
-    attachment,
-    device,
-    session,
-  } in devices
-  {
-    slates_machine::log_line!(
-      "slates-server: the anchor handed back FUSE device {attachment:x} ({}), which this platform cannot serve; released",
-      if session.is_some() {
-        "negotiated"
-      } else {
-        "not negotiated"
-      }
-    );
-    drop(device);
-    let _ = crate::anchor_hold::send(&slates_anchor::held::Outgoing::Release { attachment });
-  }
-}
 
 /// Raises this process's soft descriptor limit to the hard one (no privilege needed); `(before, after)` when it changed.
 /// The daemon calls it at start; the anchor too, since it holds a duplicate of every FUSE device and NFS connection
