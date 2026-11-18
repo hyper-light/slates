@@ -23,8 +23,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::live::{
-  Admitted, Entry, Head, Install, LiveError, Next, Replica, Shipper, adopt, decode_reply,
-  encode_reply,
+  Admitted, Entry, Head, Install, LiveError, Next, PastTolerance, Replica, Shipper, adopt,
+  adopt_past_tolerance, decode_reply, encode_reply, past_tolerance,
 };
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
 
@@ -2211,5 +2211,62 @@ fn counting_any_candidate_lets_a_fresh_member_stand_in_for_a_holder() {
         || message.contains("Agreement")
     }),
     "a fresh member's report stood in for a holder: {broken:?}"
+  );
+}
+
+/// A head at `position` under `epoch`, its identity the position's bytes.
+fn head_at(epoch: u64, position: u64) -> Head {
+  let mut identity = [0u8; 32];
+  identity[..8].copy_from_slice(&position.to_le_bytes());
+  Head {
+    epoch: HostEpoch(epoch),
+    position,
+    identity,
+  }
+}
+
+/// A-309 piece 3, the store-destroyed takeover's live log: the recorded holders {A, old B} at `f = 1`, old B destroyed,
+/// so A-240's count of `f + 1` recorded holders can never be met (g240's finding: the takeover waited for good); the
+/// replacement B' caught up on the log through the joint transition and holds the newest head. Do: judge whether phase
+/// one is past tolerance with B' and A members and old B gone, then walk the reports in: A's, then B''s. Expect past
+/// tolerance; A-240's rule adopting nothing whatever is reported; the past-tolerance rule waiting until B' reports and
+/// then adopting B''s head, the newest any surviving holder keeps; and within tolerance (old B a member) not past it.
+#[test]
+fn a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder() {
+  let (a, old_b, fresh_b) = (HostId(1), HostId(2), HostId(3));
+  let quorum = Quorum { f: 1 };
+  let holders = [a, old_b];
+  let members = [a, fresh_b];
+  let is_member = |host: HostId| members.contains(&host);
+  assert!(past_tolerance(&holders, is_member, quorum));
+  assert!(
+    !past_tolerance(&holders, |host| host != fresh_b, quorum),
+    "both recorded holders members: within tolerance"
+  );
+  // Every surviving member that may hold the log: the recorded holders still members, and the cohorts' members.
+  let wait = [a, fresh_b];
+  let older = head_at(1, 5);
+  let newer = head_at(1, 9);
+  let from_a = [(a, Some(older))];
+  assert_eq!(adopt(&from_a, &holders, quorum), None);
+  assert_eq!(
+    adopt_past_tolerance(&from_a, &wait),
+    PastTolerance::Waiting,
+    "the replacement holding the newest head has not reported"
+  );
+  let from_both = [(a, Some(older)), (fresh_b, Some(newer))];
+  assert_eq!(
+    adopt(&from_both, &holders, quorum),
+    None,
+    "A-240's rule never counts the replacement"
+  );
+  assert_eq!(
+    adopt_past_tolerance(&from_both, &wait),
+    PastTolerance::Adopt(Some((fresh_b, newer)))
+  );
+  assert_eq!(
+    adopt_past_tolerance(&[(a, None), (fresh_b, None)], &wait),
+    PastTolerance::Adopt(None),
+    "nobody holds any of the log: nothing to adopt"
   );
 }

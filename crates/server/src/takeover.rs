@@ -1348,9 +1348,20 @@ fn record_adoption(
       crate::state::PendingTombstone::adopted(tombstone.tombstone_sequence(record.sequence)),
     );
   } else if let Some(head) = HeadValue::from_record_bytes(&record.value) {
+    // Where the retired owner placed the volume, its settled and current cohorts in this round: a live takeover past
+    // tolerance asks every surviving one of them (A-309), and the retirement may be let go before the log is fetched.
+    let regional = state.council.configuration();
+    let mut cohort_hosts: Vec<HostId> = regional
+      .recovery_cohorts(departed, object)
+      .into_iter()
+      .chain(regional.current_cohorts(departed, object))
+      .flatten()
+      .collect();
+    cohort_hosts.sort_unstable_by_key(|host| host.0);
+    cohort_hosts.dedup();
     state.pending_materializations.insert(
       object,
-      crate::state::PendingVolume::adopted(head, Some(departed)),
+      crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts),
     );
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {

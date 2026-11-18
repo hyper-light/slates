@@ -484,8 +484,8 @@
 > - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
 > - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
 > - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
-> **Open (A-272 ii), in part fixed by A-309 (g250, 2026-11-18):** an unresolved object is kept but recovered by no
-> one. Owed: kept adoption records, so Settled rests on one, and a round of the current members for unresolved objects,
+> **Fixed (A-272 ii) by A-309 (g250, 2026-11-18), with the residuals below:** an unresolved object was kept but
+> recovered by no one. Owed: kept adoption records, so Settled rests on one, and a round of the current members for unresolved objects,
 > so `f + 1` counts the members that exist now (here, the replacement that holds the live log).
 > - **Fixed (A-309 piece 1): Settled rests on a completion record** (`RegionalConfiguration::completed`, replacing
 >   `dropped_unconfirmed`), and a holder lets a copy go only for a takeover that asked it. Five histories let a holder
@@ -507,9 +507,11 @@
 >   store-destroyed case's registers: the settled cohort [owner, A, old B] with only A left, the replacement B' in the
 >   owner's current neighbourhood; A adopts once A and B' answered
 >   (`a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now`).
-> - **Open (A-309 piece 3):** the live takeover past tolerance. A-240's phase one counts only recorded holders, so at
->   `f = 1` with {A, old B} recorded it waits for good (g240's finding), and the store-destroyed volume's registers are
->   adopted but its live log is never fetched.
+> - **Fixed (A-309 piece 3): the live takeover past tolerance.** A-240's phase one counted only recorded holders, so at
+>   `f = 1` with {A, old B} recorded it waited for good (g240's finding). Past tolerance it now waits for every
+>   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
+>   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
+>   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it

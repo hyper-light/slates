@@ -4559,14 +4559,24 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   {
     let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
     let mut candidates = placed.placement.candidates.clone();
-    let current =
-      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
+    let (current, cohort_hosts) = state::with_state(|s| {
+      (
+        s.fleet.configuration().place(object).candidates,
+        // Where the retired owner placed the volume (A-309): asked, and waited for, when the recorded holders are
+        // past tolerance.
+        s.pending_materializations
+          .get(&object)
+          .map(|pending| pending.cohort_hosts.clone())
+          .unwrap_or_default(),
+      )
+    })
+    .unwrap_or_default();
     for host in current {
       if !candidates.contains(&host) {
         candidates.push(host);
       }
     }
-    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders, cohort_hosts).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
