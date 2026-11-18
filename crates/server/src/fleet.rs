@@ -4850,30 +4850,28 @@ async fn materialize_green(
   };
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
-  // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
-  // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
-  // so the successor's record plane writes the green's next versions at the promotion epoch.
-  let (target, placed) = state::with_state(|s| {
-    let target = s.shards.get(usize::from(partition)).copied()?;
-    let placed = s.placed_heads.get(&object).cloned()?;
-    Some((target, placed))
-  })
-  .flatten()
-  .ok_or(GreenWait::Placement)?;
+  let target = state::with_state(|s| s.shards.get(usize::from(partition)).copied())
+    .flatten()
+    .ok_or(GreenWait::Placement)?;
   if served_already(origin, (object, target)).await {
     return Ok(());
   }
+  // This node's replica at the adopted version (A-333), or what it waits on: its chain and inputs, judged before the
+  // adopted record's placement, as the chain was gathered before it.
+  ready_engine(object, pending, budget).await?;
+  // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
+  // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
+  // so the successor's record plane writes the green's next versions at the promotion epoch.
+  let placed = state::with_state(|s| s.placed_heads.get(&object).cloned())
+    .flatten()
+    .ok_or(GreenWait::Placement)?;
   // The promotion epoch the takeover re-committed the green's registers at: the green's records are written at it, and
   // its adoption records it, so this node writes them there after a restart too, when `placed_heads` is forgotten.
   let promotion = placed.epoch.0.max(catalog_placed.epoch.0);
-  let handed = adopted_green(
-    object,
-    pending,
-    (catalog_sequence, &catalog),
-    promotion,
-    budget,
-  )
-  .await?;
+  let handed = state::with_state(|s| {
+    handed_green(s, object, pending, (catalog_sequence, &catalog), promotion)
+  })
+  .ok_or(GreenWait::Building)??;
   let answer = call_within(
     origin,
     target,
@@ -4938,16 +4936,14 @@ fn finish_green(object: ObjectId) {
   });
 }
 
-/// The adoption of `object` this attempt hands its owner shard (A-333): this node's replica at the adopted version, with
-/// the submit completions its ledger carried and the catalog facts the adoption records; else what it waits on. Inputs
-/// of the versions the replica lacks that this node does not hold are fetched first ([`fetch_green_inputs`]).
-async fn adopted_green(
+/// Brings this node's replica of `object` to the version its takeover adopted (A-333), or says what it waits on: `Ok`
+/// once it is there with the adopted identity. Inputs of the versions the replica lacks that this node does not hold are
+/// fetched first ([`fetch_green_inputs`]).
+async fn ready_engine(
   object: ObjectId,
   pending: &crate::state::PendingGreen,
-  (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
-  promotion: u64,
   budget: CommitBudget,
-) -> Result<crate::green_adopt::AdoptedGreen, GreenWait> {
+) -> Result<(), GreenWait> {
   use crate::green_adopt::Engine;
   let adopted = &pending.merge;
   let at = (adopted.version, adopted.identity);
@@ -4961,39 +4957,51 @@ async fn adopted_green(
       .ok_or(GreenWait::Building)?;
   }
   match engine {
-    Engine::Ready => {}
-    Engine::Building => return Err(GreenWait::Building),
-    Engine::Started => return Err(GreenWait::Started),
-    Engine::Unheld(_) => return Err(GreenWait::Inputs),
-    Engine::RecordsShort(_) => return Err(GreenWait::Chain),
-    Engine::Refused => return Err(GreenWait::Refused),
+    Engine::Ready => Ok(()),
+    Engine::Building => Err(GreenWait::Building),
+    Engine::Started => Err(GreenWait::Started),
+    Engine::Unheld(_) => Err(GreenWait::Inputs),
+    Engine::RecordsShort(_) => Err(GreenWait::Chain),
+    Engine::Refused => Err(GreenWait::Refused),
   }
-  state::with_state(|s| {
-    let completions = match crate::green_adopt::gathered_completions(s, object, adopted.version) {
-      crate::green_adopt::Gathered::Done(completions) => completions,
-      crate::green_adopt::Gathered::Began => return Err(GreenWait::Started),
-      crate::green_adopt::Gathered::Running => return Err(GreenWait::Building),
-    };
-    // Version 0's inputs manifest, as the ledger names it: what the adoption records of the origin.
-    let origin = crate::merge_origin::ledger_value(s, object, 0).map(|zero| zero.inputs);
-    let (Some(origin), Some(engine)) = (origin, crate::green_adopt::take_engine(s, object)) else {
-      return Err(GreenWait::Chain);
-    };
-    Ok(crate::green_adopt::AdoptedGreen {
-      name: adopted.name.clone(),
-      require_evidence: adopted.require_evidence,
-      owner: adopted.owner.clone(),
-      access: catalog.access.clone(),
-      catalog_sequence,
-      head: adopted.version,
-      identity: adopted.identity,
-      origin,
-      epoch: promotion,
-      engine,
-      completions,
-    })
+}
+
+/// The adoption of `object` this attempt hands its owner shard (A-333), once its replica is at the adopted version
+/// ([`ready_engine`]): the replica taken out of this node's replicas, the submit completions its ledger carried, the
+/// catalog facts the adoption records and the takeover's `promotion` epoch; else what it waits on (the completions
+/// still being gathered).
+fn handed_green(
+  state: &mut ShardState,
+  object: ObjectId,
+  pending: &crate::state::PendingGreen,
+  (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
+  promotion: u64,
+) -> Result<crate::green_adopt::AdoptedGreen, GreenWait> {
+  let adopted = &pending.merge;
+  let completions = match crate::green_adopt::gathered_completions(state, object, adopted.version) {
+    crate::green_adopt::Gathered::Done(completions) => completions,
+    crate::green_adopt::Gathered::Began => return Err(GreenWait::Started),
+    crate::green_adopt::Gathered::Running => return Err(GreenWait::Building),
+  };
+  // Version 0's inputs manifest, as the ledger names it: what the adoption records of the origin.
+  let origin = crate::merge_origin::ledger_value(state, object, 0).map(|zero| zero.inputs);
+  let (Some(origin), Some(engine)) = (origin, crate::green_adopt::take_engine(state, object))
+  else {
+    return Err(GreenWait::Chain);
+  };
+  Ok(crate::green_adopt::AdoptedGreen {
+    name: adopted.name.clone(),
+    require_evidence: adopted.require_evidence,
+    owner: adopted.owner.clone(),
+    access: catalog.access.clone(),
+    catalog_sequence,
+    head: adopted.version,
+    identity: adopted.identity,
+    origin,
+    epoch: promotion,
+    engine,
+    completions,
   })
-  .ok_or(GreenWait::Building)?
 }
 
 /// Fetches the inputs the taken-over green `object`'s ledger names for the versions its replica lacks and this node does
