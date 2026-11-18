@@ -1954,6 +1954,32 @@
 > - StaleNeverCommits: writes through a superseded owner refused, survivors fenced at the takeover's epoch;
 > - Convergence: every candidate at the owner's head, durable, nothing owed.
 >
+> - **Built, first runs owed (g229, 2026-11-17): loss, a running node cut off, and ReadSafety and Continuity across
+>   real processes.** SIGSTOP stops a whole process and drops nothing, so until now no flow here injected loss, kept an
+>   isolated owner running (its lease lapsing, its peers judged dead from its side), or cut one direction only; only
+>   KIND's netem injected loss (`cargo xtask kind live`, which no lane runs).
+>   - A node may bind elsewhere than it advertises (A-277, the manifest's `bind`), so the fault relay
+>     (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to their bind blocks, with
+>     no privilege. Each datagram meets its path's rule: a one-way cut, a loss rate, a hold of `delay ± jitter` (so
+>     datagrams reorder) and a duplication rate, every draw from one printed seed (`SLATES_CHAOS_SEED` replays it). A
+>     record link's ephemeral source is attributed to its node by the process holding the port (`/proc` on Linux,
+>     `netstat` and `ps` on macOS); a datagram no census attributes is dropped and counted, never forwarded, since
+>     forwarding it could carry a cut-off node's traffic across.
+>   - Three flows run behind it (`Fleet::start_relayed`): writes streamed while every path holds 20 ms ± 5 ms and loses
+>     1 %, then 5 %, then 1 % with 2 % duplicated, then a takeover over the lossy paths; an owner cut off both ways
+>     while it runs; and an owner that still speaks to its peers but hears none.
+>   - Two invariants are judged from outside in them. ReadSafety: a latest-state read sent through the partitioned
+>     owner after its successor acknowledged a write answers that write or a refusal, never other bytes and never
+>     missing. Continuity: the successor's first head is past every position an owner reported durable under an
+>     earlier epoch, since its log goes on from the head it adopted (`slates_db::live::Shipper::new`).
+>   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln run r71, Adas-MacBook-Pro-3,
+>     2026-11-17): forwarding and the answer's way back, a one-way cut, loss, delay and duplication, attribution by
+>     process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
+>     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
+>     Linux's census has run nowhere yet.
+>   - Owed: ReadSafety and Continuity in the SIGSTOP and SIGKILL takeover flows, so every flow ends with every register
+>     invariant.
+>
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
 >   - With both candidates stopped, a live volume's destroy was answered done; the owner was SIGKILLed, and a survivor
