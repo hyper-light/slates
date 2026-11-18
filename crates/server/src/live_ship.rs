@@ -1965,7 +1965,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
 }
 
 /// The install to send `holder`, and whether the image is too old for it. `None` and not stale while a fresh image is on
-/// its way ([`send_to_reached`]): one sent now would land the holder behind the tail. `None` and stale when there is no
+/// its way ([`reached_volume`]): one sent now would land the holder behind the tail. `None` and stale when there is no
 /// image, or the holder already holds what it carries.
 fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<Send>, bool) {
   if live.owes_image {
@@ -2104,51 +2104,118 @@ fn lane_ended(state: &mut ShardState, holder: HostId, objects: Vec<ObjectId>, an
 
 /// `holder`'s record session is established again (on the control shard): every shard sends it what it lacks at once,
 /// not at the next record period, so a resumed holder's catch-up does not wait on the period. An install it is owed waits
-/// for a fresh image ([`send_to_reached`]).
+/// for a fresh image ([`reached_volume`]). Each shard's live volumes are walked in turns of its step quantum
+/// ([`reached_slice`]) by a task of this shard, one a shard, as the period walks them (A-324): until 2026-11-18 one turn
+/// of each shard visited every live volume it owns and built every message the holder lacked, an install a copy of the
+/// whole volume, however many volumes that was.
 pub(crate) fn holder_reached(holder: HostId) {
   let Some((origin, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
     return;
   };
   for shard in shards {
-    crate::xshard::run_on_counted(origin, shard, move |s| send_to_reached(s, holder));
+    let walk = slates_rt::futures::spawn(reached_walk(origin, shard, holder))
+      .and_then(slates_rt::futures::detach);
+    if walk.is_err() {
+      let _ = state::with_state_counted(|s| s.count(LIVE_REACHED_UNWALKED, 1));
+    }
   }
 }
 
-/// Sends `holder` what this shard's live volumes that had given it up owe it ([`holder_reached`]). A holder owed an
-/// install while the image is behind the log waits for one made at the log's head: the next publication makes it, or the
-/// record period for an idle writer ([`refresh_image`]). The image a holder fell behind on was a median of 1,332 and
-/// 1,395 entries old when last built, while an install's own transit added 0 or 1, so it landed past the retained tail
-/// and took a second whole install (`live_chaos`'s rolling partition, diag-live-durability-54).
-fn send_to_reached(state: &mut ShardState, holder: HostId) {
-  let volumes: Vec<[u8; 16]> = state
-    .live
-    .shipping
-    .iter_mut()
-    .filter_map(|(volume, live)| {
-      let stale = live
-        .whole
-        .as_ref()
-        .is_some_and(|(head, _)| Some(*head) != live.shipper.head());
-      if stale && live.shipper.pending(holder) == Next::Install {
-        live.owes_image = true;
-      }
-      let was = live.unreachable.contains(&holder);
-      live
-        .unreachable
-        .retain(|unreachable| *unreachable != holder);
-      (was && live.fenced.is_none()).then_some(*volume)
-    })
-    .collect();
-  let mut sends = Vec::new();
-  for volume in volumes {
-    sends.extend(
-      pending_sends(state, volume)
-        .into_iter()
-        .filter(|send| send.holder == holder),
-    );
+/// Walks `shard`'s live volumes for `holder`'s return a turn at a time ([`reached_slice`]), from a task of the control
+/// shard (`origin`), each turn awaited within the live exchange's longest budget. Bounded: a turn always moves the walk
+/// on, the volumes are the shard's, and a turn the shard does not answer within its budget ends the walk (the record
+/// period sends the holder what it lacks then). Detached by [`holder_reached`]: nothing joins it, and its slot is reaped
+/// when it ends.
+async fn reached_walk(origin: u16, shard: u16, holder: HostId) {
+  let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut after = None;
+  loop {
+    let next = crate::xshard::call_within(
+      origin,
+      shard,
+      move |s| reached_slice(s, holder, after),
+      deadline,
+    )
+    .await;
+    match next {
+      Some(Some(last)) => after = Some(last),
+      _ => break,
+    }
   }
-  dispatch(state, sends);
 }
+
+/// One turn of [`reached_walk`]: the shard's live volumes after `after` in key order, each visited for `holder`
+/// ([`reached_volume`]) and what it lacks of those that had given it up sent, until the shard's step quantum is spent
+/// (the period's own, [`period_slice`]); the last volume visited when any remain after it, `None` once none does. The
+/// first volume is always visited, so a turn always moves the walk on.
+fn reached_slice(s: &mut ShardState, holder: HostId, after: Option<[u8; 16]>) -> Option<[u8; 16]> {
+  s.count(LIVE_REACHED_SLICES, 1);
+  let quantum = s
+    .live
+    .period_quantum_ns
+    .or_else(slates_rt::futures::step_budget_ns)
+    .unwrap_or(s.config.runtime.step_budget_ns);
+  let began = slates_rt::futures::now_ns();
+  let mut cursor = after;
+  let mut sends = Vec::new();
+  let remaining = loop {
+    let next = match cursor {
+      Some(last) => s
+        .live
+        .shipping
+        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+        .next()
+        .map(|(volume, _)| *volume),
+      None => s.live.shipping.keys().next().copied(),
+    };
+    let Some(volume) = next else {
+      break None;
+    };
+    if reached_volume(s, volume, holder) {
+      sends.extend(
+        pending_sends(s, volume)
+          .into_iter()
+          .filter(|send| send.holder == holder),
+      );
+    }
+    cursor = Some(volume);
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      break cursor;
+    }
+  };
+  dispatch(s, sends);
+  remaining
+}
+
+/// `holder`'s return to one live volume: no longer unreachable there. Whether the volume had given it up and is not
+/// fenced, so it is sent what it lacks now. A holder owed an install while the image is behind the log waits for one made
+/// at the log's head: the next publication makes it, or the record period for an idle writer ([`refresh_image`]). The
+/// image a holder fell behind on was a median of 1,332 and 1,395 entries old when last built, while an install's own
+/// transit added 0 or 1, so it landed past the retained tail and took a second whole install (`live_chaos`'s rolling
+/// partition, diag-live-durability-54).
+fn reached_volume(s: &mut ShardState, volume: [u8; 16], holder: HostId) -> bool {
+  let Some(live) = s.live.shipping.get_mut(&volume) else {
+    return false;
+  };
+  let stale = live
+    .whole
+    .as_ref()
+    .is_some_and(|(head, _)| Some(*head) != live.shipper.head());
+  if stale && live.shipper.pending(holder) == Next::Install {
+    live.owes_image = true;
+  }
+  let was = live.unreachable.contains(&holder);
+  live
+    .unreachable
+    .retain(|unreachable| *unreachable != holder);
+  was && live.fenced.is_none()
+}
+
+/// Counter: one owner-shard turn of a returned holder's walk over the shard's live volumes ([`reached_slice`], A-324).
+const LIVE_REACHED_SLICES: &str = "fleet.live.reached_slices";
+/// Counter: a returned holder's walk over one shard that could not be spawned ([`holder_reached`]); the record period
+/// sends the holder what it lacks instead.
+const LIVE_REACHED_UNWALKED: &str = "fleet.live.reached_unwalked";
 
 /// Sends each message over the control shard's session to its holder, the holders at once: one lane per holder, its
 /// messages in order on its session, every lane polled together, and each lane's replies handed to the owner shard

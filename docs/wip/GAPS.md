@@ -43,6 +43,19 @@
 > (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about
 > 4,200 on main before, 0 expected), `xshard.room_waits_peak`, and each verb's p99 against main.
 
+> **A holder's return was one turn of every live volume on each shard: in turns (2026-11-18, A-324, A-200, CLAUDE.md
+> "Bounded work everywhere"; g230, the sibling the seal walk's entry named).** `live_ship::holder_reached` ran
+> `send_to_reached` on every shard as one closure, visiting every live volume the shard owns and building every message
+> the returned holder lacked (an install a copy of the whole volume each) in one turn. It now walks each shard in turns of
+> the step quantum (`reached_slice`, counted `fleet.live.reached_slices`). Test:
+> `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`). **Owed (measurement, the
+> supervisor's):** the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
+> **Still owed (the seal walk's other sibling):** a new configuration's install on the control shard
+> (`fleet::sync_config_from_council`) raises every held record's fence and moves every held object of a retired owner
+> in one turn. Slicing it is not a cut of a loop alone: a record a stale owner sends to a held object not yet reached
+> must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
+> well as by the walk (a design change to §4.8's install, with its model).
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,

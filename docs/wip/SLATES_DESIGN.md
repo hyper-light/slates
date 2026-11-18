@@ -6870,6 +6870,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > live volumes, the quantum cut to one volume a slice, every log durable at its head after three periods). Owed
 > (measurement): the owner shard's longest step with thousands of live volumes, before and after.
 >
+> **A holder's return in turns (2026-11-18, A-324, g230).** When a holder's record session is established again, every
+> shard sends it what its live volumes owe it at once (`live_ship::holder_reached`). That ran in one turn of each shard:
+> every live volume visited, and every message the holder lacked built, an install a copy of the whole volume each. It
+> now walks each shard's live volumes in turns of the shard's step quantum, as the period does (`reached_walk` and
+> `reached_slice`, one task of the control shard a shard, each turn awaited within the live exchange's budget), each
+> turn's messages dispatched before the next; a turn the shard does not answer ends the walk, and the period sends the
+> rest. Counted `fleet.live.reached_slices`. Held by `a_holders_return_is_walked_in_turns_and_it_takes_every_log`
+> (`crates/server/tests/fleet.rs`: 12 live volumes, a holder held off its shard for two liveness budgets while each is
+> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume). Owed
+> (measurement): the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
+>
 > **The credit in bytes (2026-11-17, A-200 amended that day, AC-8.9).** The owner's credit was a fixed two entries, and
 > a publication past it shipped the whole volume next. Now the entries not yet durable and the retained tail are each
 > held to the wire bytes of the whole state an install would send (`slates_db::live::Bounds::of_whole`, set at each whole
@@ -23579,4 +23590,22 @@ Applied in the same change to:
   and never replaced. A refusal at any turn drops the seal (A-322).
 - **Cost.** A large volume's seal places later: the walk and the wrap each advance a slice a record period. The plain
   archive is kept in the job until the wrap ends, as the whole wrap kept it (and copied it once more) for its turn.
+
+### A-324 — A returned holder's walk over a shard's live volumes runs in turns of the step quantum (2026-11-18, g230, scale-out; CLAUDE.md "Bounded work everywhere")
+Applied in the same change to:
+- §4.10 live shipping (A-200): the status "A holder's return in turns".
+- `crates/server/src/live_ship.rs`: `holder_reached` spawns one walk a shard; `reached_walk`, `reached_slice` and
+  `reached_volume` (the part of the old `send_to_reached` one volume needs); counters `fleet.live.reached_slices` and
+  `fleet.live.reached_unwalked`. `crates/server/src/daemon.rs`: `inject_live_period_quantum` cuts these turns too.
+- Tests: `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** `holder_reached` ran `send_to_reached` on every shard as one closure: it visited every live volume
+  the shard owns, and for each that had given the holder up built every message it lacked, entries or an install (a copy
+  of the whole volume each), all in one turn of the shard, however many volumes it owned.
+- **The rule.** A holder's return is walked on each shard a turn of its step quantum at a time, by a task of the control
+  shard (one a shard, detached, bounded by the shard's live volumes), each turn's messages dispatched before the next.
+  A turn always visits one volume, so the walk always ends; a turn the shard does not answer within the live exchange's
+  budget ends it, and the record period, which retries every holder its lanes gave up, sends the rest.
+- **Cost.** A holder's catch-up on a shard of many live volumes is spread over turns, each a cross-shard call; the period
+  had always been its backstop.
 

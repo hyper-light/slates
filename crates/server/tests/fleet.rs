@@ -10576,6 +10576,97 @@ fn a_seals_envelope_is_wrapped_in_turns_and_places() {
   );
 }
 
+/// Shape: the live volumes whose holder the reached-walk test stops and brings back.
+const REACHED_LIVE_VOLUMES: usize = 12;
+/// Shape: how long the reached-walk test holds the holder off its control shard: two liveness budgets, past the live
+/// exchange's hard budget of one (`fleet::live_budget`), so the owner's lanes to it go unanswered and its link is dropped
+/// and dialed afresh; and within the three a starved peer is kept through (`a_starved_but_live_peer_is_not_retired`).
+const REACHED_HOLD_NS: u64 = 2 * LIVENESS_BUDGET_NS;
+/// Format: the owner's count of the owner-shard turns of a returned holder's walks (`live_ship::reached_slice`).
+const LIVE_REACHED_SLICES: &str = "fleet.live.reached_slices";
+
+/// A-324, A-200, CLAUDE.md "Bounded work everywhere": a holder's return is walked over the owner shard's live volumes in
+/// turns of its step quantum (`live_ship::reached_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 12
+/// live-shipped volumes each written once and detached; cut a's live turns to one volume
+/// (`Daemon::inject_live_period_quantum(Some(0))`); hold b off its control shard for two liveness budgets while a writes
+/// each volume again (durable on c), so a's lanes to b go unanswered and a drops b's link and dials it afresh; then wait
+/// for b to hold every volume's log at a's head. Expect every write answered, at least 12 turns of a's walks for b's
+/// return (a volume a turn), and b at a's head on every volume. Before, one turn of a's shard visited every live volume it
+/// owns for b's return and built every message b lacked, an install a copy of the whole volume each.
+#[test]
+fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let volumes: Vec<VolumeId> = (0..REACHED_LIVE_VOLUMES)
+    .map(|index| live_shipped_volume_written_once(&mut client, index))
+    .collect();
+  daemons[0].inject_live_period_quantum(Some(0)).unwrap();
+  let before = refusal_count(&daemons[0], LIVE_REACHED_SLICES).unwrap();
+  let hold = daemons[1]
+    .starve_control_shard(REACHED_HOLD_NS)
+    .expect("b's control shard is held");
+  let written: Vec<ReplyBody> = volumes
+    .iter()
+    .map(|volume| written_again(&mut client, *volume))
+    .collect();
+  let held_ns = hold.answer();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let caught_up = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(holds_every_head(&mut client, &daemons[1], &volumes))
+  });
+  let turns = refusal_count(&daemons[0], LIVE_REACHED_SLICES)
+    .unwrap()
+    .saturating_sub(before);
+  daemons[0].inject_live_period_quantum(None).unwrap();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "reached walk: b held {held_ns:?} ns, {turns} turns of a's walks for {REACHED_LIVE_VOLUMES} volumes, caught up \
+     {caught_up}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write while b was held was answered at durability: {written:?}"
+  );
+  assert!(held_ns.is_ok(), "b's control shard was held: {held_ns:?}");
+  assert!(
+    turns >= u64::try_from(REACHED_LIVE_VOLUMES).unwrap(),
+    "b's return was walked a volume a turn: {turns} turns for {REACHED_LIVE_VOLUMES} volumes"
+  );
+  assert!(caught_up, "b holds every volume's log at a's head");
+}
+
+/// Whether `holder` holds each of `volumes`' live logs at the head its owner (`client`'s node) ships.
+fn holds_every_head(client: &mut Client, holder: &Daemon, volumes: &[VolumeId]) -> bool {
+  volumes.iter().all(|volume| {
+    let head = owned_live_line(client, *volume).and_then(|(head, _, _)| head);
+    head.is_some() && held_live_head(holder, *volume) == head
+  })
+}
+
+/// One more write to `volume` through a fresh attachment, let go after: the write's reply.
+fn written_again(client: &mut Client, volume: VolumeId) -> ReplyBody {
+  let attachment = write_attachment(client, volume);
+  let written = client.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: "/again".to_owned(),
+    bytes: vec![0xA5; 64],
+    mode: 0o644,
+  });
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the attachment was let go: {detached:?}"
+  );
+  written
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.
