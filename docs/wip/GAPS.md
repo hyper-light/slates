@@ -102,16 +102,23 @@
 > up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
 > (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
-> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
->   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
->   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
->   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Fixed (A-362, g250, 2026-11-18): re-adoption.** X1's round adopts X2's objects, and its materialization met X1's
+>   own superseded copy: `verbs::materialize_taken_over` kept a volume the node already held, so the adopted state (X2's
+>   acknowledged writes) never replaced the stale copy, its fenced shipper or its kept fence. Now a takeover that names a
+>   node holding a copy it lost to a successor (`verbs::lost_to_a_successor`: fenced, A-338, or yielded, A-334)
+>   relinquishes that copy (`verbs::relinquish_superseded`: its attachments ended, its record gone with no tombstone and
+>   no key erased, `Op::VolumeRelinquished`; its slot torn down by the reaper in slices; its shipper, fence and yield
+>   forgotten; the image published without it) and makes the volume from the state it adopted. Tests:
+>   `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`) and
+>   `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key` (`crates/db/tests/model.rs`, with the step in
+>   the db model's histories). Still owed: a guest device or Shards stream serving the stale copy is ended, not waited
+>   for, since the adopted state takes the id at once.
 > - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
 >   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
 >   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
 > - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
 >   takeover's fetch), so any borrower that takes it every period starves the round the same way.
-> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
+> - **Owed (the supervisor's):** the seed on main (6876545201569229162, both Linux arches), now that re-adoption is in.
 
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were

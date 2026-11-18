@@ -7342,6 +7342,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed (GAPS): the round's
 >   adoption there meets the node's own superseded copy, which a takeover must replace (A-334's re-adoption); a lane that
 >   ends on a refusal is sent again at once.
+> - **A takeover that named a node again kept its superseded copy (fixed 2026-11-18, A-362).** With A-349 the old owner's
+>   round adopts the objects that fall to it, the volume's home among them, and its materialization found the id present
+>   and returned: the node kept its stale copy, missing the successor's acknowledged writes, its fenced shipper (so it
+>   never shipped at the new epoch) and its yield (so every verb went away from it, its new owner). Now a copy the node
+>   lost to a successor (`verbs::lost_to_a_successor`) is relinquished to the takeover that names it again
+>   (`verbs::relinquish_superseded`): its attachments end, its record goes with no tombstone and no key erased
+>   (`Op::VolumeRelinquished`), its slot leaves the tables for the reaper's destroy slices, its shipper, fence and yield
+>   are forgotten, and the shard's image is published without it before the adopted state is made under its id, so a
+>   restart in between rebuilds nothing stale. Held by `a_takeover_that_names_this_node_again_replaces_its_superseded_copy`
+>   (`crates/server/src/verbs.rs`) and `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key`
+>   (`crates/db/tests/model.rs`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -25916,3 +25927,40 @@ which holds each part of the report to the successor's own past-tolerance counts
 Applied in the same change to: §4.12 (the `CONTRACT` 21 status line), GAPS (A-272 (ii)'s entry),
 `crates/db/src/catalog.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/{takeover,state,live_ship,fleet,verbs}.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`, `crates/api/src/lib.rs`, and the tests named above.
+
+### A-362 — A takeover that names a node again relinquishes the node's superseded copy and makes the volume from the state it adopted (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", "persistence before reply"; A-334, A-338, A-343, A-349)
+
+- **What was there.** `verbs::materialize_taken_over` returned at once for a volume the node already held, so a retry
+  after a refused publication kept the copy it had made (A-343). A node can also hold a copy it lost: its log fenced at a
+  later epoch (A-338) or yielded at its re-admission (A-334). When the volume's successor departs in turn and its objects
+  fall to that node again (the volume's home ranks it first), the takeover adopted the newest registers and then kept
+  the stale copy, which lacks every write the successor acknowledged, under a fence that stops its shipper and a yield
+  that sends every verb away. A-334 recorded this as owed; the chaos nemesis (seed 6876545201569229162) meets it once
+  A-349 lets the round adopt.
+- **The rule.** A copy lost to a successor is relinquished to the takeover that names its node again, then the volume is
+  made from the adopted state as for any successor (`verbs::relinquish_superseded`):
+  - its attachments end (their clients were being sent to the successor);
+  - its record goes by `Op::VolumeRelinquished` (appended): `remove_volume`'s work and none of a destroy's, so no
+    tombstone holds the id (the volume lives on here) and no key is erased (the adopted lineage is the volume's own);
+  - its guest devices, streams and snapshot views end, and its slot leaves the tables for the reaper's destroy slices
+    (`ShardState::relinquished`, bounded by the partition's volumes), its credits given back when done;
+  - its shipper and the fence it kept are forgotten, its yield and any unrecovered mark lifted;
+  - the shard's image is published without it before the adopted state is made, so a restart between the two finds the
+    old image with no record (torn down as an orphan) or the new record with no image (answered not recovered, typed),
+    never the stale copy under the new record. A refused publication leaves the materialization pending; its next
+    attempt finds the id gone and makes the volume.
+  A copy the same takeover made is kept, as before (it is not lost to a successor).
+- **Counters.** `fleet.takeover.relinquished`, `fleet.takeover.relinquished_freed`,
+  `fleet.takeover.relinquish_unpublished`.
+- **Owed (GAPS).** A guest device or a Shards stream still serving the stale copy is ended, not waited for as a destroy
+  waits, since the adopted state takes the id at once.
+
+Held by `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`: a copy
+holding `OLD!` yielded, then a takeover at a later epoch from `NEW!`; red with the relinquish removed, the file read
+`OLD!` and the volume still lost to a successor) and `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key`
+(`crates/db/tests/model.rs`: no tombstone, the key kept, recovery agreeing; a destroyed volume's id refused), with the
+relinquish a step of the db model's histories.
+
+Applied in the same change to: §4.10 (the chaos flows' status), A-334's owed line (`crates/server/src/readmission.rs`),
+GAPS (the nemesis entry), `crates/db/src/{op,partition}.rs`, `crates/db/tests/{model.rs,wire_order.txt}`,
+`crates/server/src/{verbs,state,daemon}.rs`.

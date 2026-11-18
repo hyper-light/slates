@@ -4240,6 +4240,7 @@ async fn init_shard(
     mount_attachments: std::collections::BTreeMap::new(),
     unrecovered: std::collections::BTreeMap::new(),
     yielded: std::collections::BTreeSet::new(),
+    relinquished: Vec::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
