@@ -255,7 +255,7 @@ pub(crate) struct LiveVolume {
   /// Acknowledgements that moved this volume's durability forward: a holder's acknowledged position advancing
   /// ([`fold_into`]), or its head's or catalog's placement gaining an acknowledgement or a newer sequence
   /// (`fleet::record_acks_in`). A reply held for durability gives up only after a whole wait of
-  /// [`DURABLE_WAIT_NS`] in which this did not move ([`DurableBound`]).
+  /// [`durable_wait_ns`] in which this did not move ([`DurableBound`]).
   heard: u64,
   /// When this owner first asked a holder something on this volume's durability path since [`LiveVolume::heard`] last
   /// moved: a lane opened to send it entries or an install ([`dispatch`]), or its head's or catalog's placement asked
@@ -742,10 +742,17 @@ pub(crate) fn take_barrier(state: &mut ShardState) -> Option<(slates_db::catalog
 }
 
 /// Derived: how long a transport's reply waits for durability with nothing heard before it is answered that it is not
-/// durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`): the daemon's liveness budget, past which a holder that has not
-/// answered is not a live one to wait for. A window, not a deadline: each one in which the volume's durability moved
-/// forward starts another ([`DurableBound`]).
-const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+/// durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`), its silence judged only after the receiver has drained (A-292,
+/// [`DurableBound`]): the floor of the session plane's own judgment of a gone holder path (A-444, A-446;
+/// `fleet::live_budget`, RFC 9002 §7.6.1's persistent-congestion duration from the estimator, each probe timeout the
+/// initial one), past which a holder that has not answered may be one whose path is gone, and short of which no path is
+/// ever taken for gone. A window, not a deadline: each one in which the volume's durability moved forward starts another,
+/// and the failover delay bounds the whole wait. Until A-446 it was one liveness window, under that floor, so a reply was
+/// answered "not durable" while its holders' sessions still counted them live. Asked by the transports for their
+/// give-up records too (FUSE, virtio-fs, WinFsp), so one number names the window everywhere.
+pub(crate) fn durable_wait_ns() -> u64 {
+  crate::fleet::live_budget().deadline_ns
+}
 
 /// Format: nanoseconds in a millisecond, for the milliseconds a give-up's record reads in.
 pub(crate) const NS_PER_MS: u64 = 1_000_000;
@@ -794,12 +801,12 @@ fn note_asked(live: &mut LiveVolume, now_ns: u64) {
 /// anchor's word at (§4.14), so a control shard that runs waits in its driver at least once between two looks.
 const DURABLE_LOOK_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
-/// The spans a held reply's wait is judged in on this shard: windows of [`DURABLE_WAIT_NS`], looks [`DURABLE_LOOK_NS`]
+/// The spans a held reply's wait is judged in on this shard: windows of [`durable_wait_ns`], looks [`DURABLE_LOOK_NS`]
 /// apart while a silence is confirmed, and at most the failover delay from the hold, this node's live estimate (A-363;
 /// the operator's 10 s placeholder before; the supervisor's landing condition of 2026-11-11, banned item 8).
 fn durable_spans(state: &ShardState) -> Spans {
   Spans {
-    window_ns: DURABLE_WAIT_NS,
+    window_ns: durable_wait_ns(),
     total_ns: state.failover_ns,
     look_ns: DURABLE_LOOK_NS,
   }
@@ -856,7 +863,7 @@ fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
 }
 
 /// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or a
-/// window of [`DURABLE_WAIT_NS`] has passed with nothing heard ([`DurableBound`]): whether it became durable. The
+/// window of [`durable_wait_ns`] has passed with nothing heard ([`DurableBound`]): whether it became durable. The
 /// caller answers a stable write or `COMMIT` only then, and otherwise tells the client to try again: a barrier never
 /// claims what `f` candidates do not hold.
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
@@ -902,7 +909,7 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
       slates_machine::log_line!(
         "slates-server: a held durable reply gave up after {} windows of {} ms, {} (shard {}): {}",
         bound.windows(),
-        DURABLE_WAIT_NS / NS_PER_MS,
+        durable_wait_ns() / NS_PER_MS,
         gave_up.map_or("its wait ended", GaveUp::named),
         s.shard,
         durability_report(s, volume, target)
@@ -1026,14 +1033,6 @@ pub(crate) fn durability_report(
   )
 }
 
-/// Derived: the window a held reply's wait for durability is judged in (`slates_bridge_core::durable_bound`) before its
-/// transport answers that it is not durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`, WinFsp
-/// `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports for their give-up records, so compiled
-/// where they are.
-pub(crate) const fn durable_wait_ns() -> u64 {
-  DURABLE_WAIT_NS
-}
-
 /// A wait on this (the volume's owner) shard for `volume`'s log to be durable at `target`, or never to be ([`durability`]):
 /// ready then, or once the shard's state is out of reach (its shutdown). Parked on the volume as every held reply is, so
 /// a wait dropped early leaves at most a waker the volume's next advance wakes and drops ([`wake_parked`]). The virtio-fs
@@ -1065,12 +1064,12 @@ impl std::future::Future for DurableWait {
   }
 }
 
-/// Counter: a transport reply whose volume did not become durable within [`DURABLE_WAIT_NS`]; it was answered "try
+/// Counter: a transport reply whose volume did not become durable within [`durable_wait_ns`]; it was answered "try
 /// again".
 const LIVE_DURABLE_LATE: &str = "fleet.live.durable_late";
 
 /// Whether the wait is over (`durable`); if not, parks `waker` on the volume, within the bound on parked replies (past
-/// it the reply is not parked, so it waits out [`DURABLE_WAIT_NS`] and answers "try again").
+/// it the reply is not parked, so it waits out [`durable_wait_ns`] and answers "try again").
 fn done_or_park(
   state: &mut ShardState,
   volume: [u8; 16],
@@ -3812,26 +3811,58 @@ fn take_batch(
 /// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
 /// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
 /// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
+///
+/// The reply's part is the holder session's own persistent-congestion duration (A-444; RFC 9002 §7.6.1, three of its
+/// probe timeouts from the session plane's estimator, floored at the initial one): the session plane's judgment of a gone
+/// path, so a holder whose path is slower than a liveness window is still answered, and a silent one is given up within
+/// it, as `fleet::return_sessions` drops its session. Until A-444 the reply's part was one liveness window.
 fn exchange_budget(
   bytes: usize,
   sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
 ) -> slates_cluster::CommitBudget {
-  let live = crate::fleet::live_budget();
-  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
-    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
-    let round_trip = match endpoint.smoothed_rtt() {
-      0 => endpoint.pto(),
-      measured => measured,
-    };
-    u64::try_from(bytes)
-      .unwrap_or(u64::MAX)
-      .saturating_mul(round_trip)
-      .checked_div(endpoint.congestion_window().max(1))
-      .unwrap_or(0)
-  });
+  match sessions.first() {
+    Some((_, endpoint)) => exchange_budget_for(
+      bytes,
+      HolderPath {
+        persistent_congestion_ns: endpoint.persistent_congestion_duration(),
+        smoothed_rtt_ns: endpoint.smoothed_rtt(),
+        pto_ns: endpoint.pto(),
+        congestion_window: endpoint.congestion_window(),
+      },
+    ),
+    None => crate::fleet::live_budget(),
+  }
+}
+
+/// What the session plane measured of one holder's path, for its exchange's budget ([`exchange_budget_for`]).
+#[derive(Clone, Copy, Debug)]
+struct HolderPath {
+  /// The session's persistent-congestion duration (RFC 9002 §7.6.1).
+  persistent_congestion_ns: u64,
+  /// Its smoothed round trip; zero before any sample.
+  smoothed_rtt_ns: u64,
+  /// Its probe timeout (§6.2.1).
+  pto_ns: u64,
+  /// Its congestion window, bytes.
+  congestion_window: u64,
+}
+
+/// [`exchange_budget`] over a holder's measured path: the session's persistent-congestion duration plus `bytes`' transfer
+/// at the window-limited rate.
+fn exchange_budget_for(bytes: usize, path: HolderPath) -> slates_cluster::CommitBudget {
+  // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
+  let round_trip = match path.smoothed_rtt_ns {
+    0 => path.pto_ns,
+    measured => measured,
+  };
+  let transfer_ns = u64::try_from(bytes)
+    .unwrap_or(u64::MAX)
+    .saturating_mul(round_trip)
+    .checked_div(path.congestion_window.max(1))
+    .unwrap_or(0);
   slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
-    live.poll_interval_ns,
+    path.persistent_congestion_ns.saturating_add(transfer_ns),
+    crate::fleet::live_budget().poll_interval_ns,
   )
 }
 
@@ -7520,5 +7551,86 @@ mod tests {
         "a body of {len} bytes opens as it was sealed"
       );
     }
+  }
+
+  /// R3's class B (B-d, A-444; RFC 9002 §6.2, §7.6.1). Do: measure one holder's path with replies a liveness window and a
+  /// half apart and another's with quick ones, as the session plane's estimator does, and derive the budget a small live
+  /// exchange to each runs under. Expect: the slow holder's past its round trip, so its reply is heard where one liveness
+  /// window gave it up and dropped its link; the quick holder's its session's persistent-congestion duration and no more
+  /// than a window past it, so a silent holder is still given up within its session's own duration.
+  #[test]
+  fn a_live_exchange_waits_its_holder_path_and_a_silent_one_ends_within_its_floor() {
+    let window = crate::daemon::LIVENESS_BUDGET_NS;
+    let path = |sample_ns: u64| {
+      let mut rtt = slates_transport::rtt::RttEstimator::new();
+      for _ in 0..8 {
+        rtt.on_sample(sample_ns, 0);
+      }
+      super::HolderPath {
+        persistent_congestion_ns: rtt.persistent_congestion_duration_floored(0),
+        smoothed_rtt_ns: rtt.smoothed_rtt(),
+        pto_ns: rtt.pto(0),
+        congestion_window: 1 << 20,
+      }
+    };
+    let slow = super::exchange_budget_for(64, path(window + window / 2));
+    assert!(
+      slow.deadline_ns > window + window / 2,
+      "a holder whose replies take a window and a half is heard: {} ns",
+      slow.deadline_ns
+    );
+    let quick_path = path(1_000_000);
+    let quick = super::exchange_budget_for(64, quick_path);
+    assert!(
+      quick.deadline_ns >= quick_path.persistent_congestion_ns
+        && quick.deadline_ns < quick_path.persistent_congestion_ns + window,
+      "a silent holder is given up within its session's own duration: {} ns",
+      quick.deadline_ns
+    );
+  }
+
+  /// R3's class B (B-e, A-446; A-292's silence after a drained receiver). Do: hold a reply for durability under this
+  /// shard's window (`durable_wait_ns`) and a total of ten such windows, its holders asked at the hold and silent, the
+  /// receiver idling at every look; judge the wait at each of its looks. Expect: given up silent, not before the silence
+  /// passed a liveness window and a half (the session plane takes no holder's path for gone that soon), and within the
+  /// floor of that judgment and three looks. Before, the window was one liveness window, and the reply was told "not
+  /// durable" while its holders' sessions still counted them live.
+  #[test]
+  fn a_held_reply_is_given_up_silent_only_past_the_holder_paths_gone_floor() {
+    let window = crate::daemon::LIVENESS_BUDGET_NS;
+    let floor = crate::fleet::live_budget().deadline_ns;
+    let spans = Spans {
+      window_ns: super::durable_wait_ns(),
+      total_ns: 10 * super::durable_wait_ns(),
+      look_ns: super::DURABLE_LOOK_NS,
+    };
+    let held_at = 1_000;
+    let heard = |idles| Heard {
+      acknowledged: 0,
+      receiver_idles: idles,
+      unanswered_since_ns: Some(held_at),
+    };
+    let mut bound = DurableBound::begin(heard(0), held_at, spans);
+    let mut idles = 0;
+    let mut ended = None;
+    for _ in 0..1_000 {
+      let now = bound.next_look_ns();
+      idles += 1;
+      if let Some(why) = bound.judge(heard(idles), now) {
+        ended = Some((why, now));
+        break;
+      }
+    }
+    let (why, at) = ended.expect("the wait ended");
+    let silence = at - held_at;
+    assert_eq!(why, GaveUp::Silent);
+    assert!(
+      silence > window + window / 2,
+      "a holder silent past one liveness window, short of the gone-path floor, is still waited for: {silence} ns"
+    );
+    assert!(
+      silence <= floor + 3 * super::DURABLE_LOOK_NS,
+      "a silent holder is given up within the floor and the looks that confirm it: {silence} ns"
+    );
   }
 }

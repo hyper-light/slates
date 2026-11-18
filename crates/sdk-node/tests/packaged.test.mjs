@@ -7,14 +7,17 @@
 //
 // Run from inside the project that installed the tarballs (the import below resolves through its
 // node_modules), with the daemon named by SLATES_DAEMON; it skips loudly without one:
-//   cp crates/sdk-node/tests/packaged.test.mjs "$PROJECT/" && (cd "$PROJECT" && SLATES_DAEMON=<slates> node --test packaged.test.mjs)
+//   cp crates/sdk-node/tests/packaged.test.mjs crates/sdk-node/tests/anchor.mjs "$PROJECT/" && \
+//     (cd "$PROJECT" && SLATES_DAEMON=<slates> node --test packaged.test.mjs)
+// (`anchor.mjs`, the suites' shared anchor start and teardown, goes beside it.)
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import addon, { Client, AsyncClient } from '@hyper-light/slates';
+import { endAnchor, startAnchor } from './anchor.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -84,12 +87,7 @@ test('the packaged AsyncClient drives a live daemon end to end', async (t) => {
     return;
   }
   const instance = `slates-packaged-${process.pid}`;
-  // `detached` makes the anchor its own process-group leader, so teardown kills the whole group —
-  // the anchor and the daemon it supervises — at once.
-  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const anchor = startAnchor(daemon, instance);
   try {
     const client = await connectWhenReady(instance);
     assert.equal(typeof client.clientId(), 'number');
@@ -124,10 +122,6 @@ test('the packaged AsyncClient drives a live daemon end to end', async (t) => {
       await sleep(POLL_MS);
     }
   } finally {
-    try {
-      process.kill(-anchor.pid, 'SIGKILL');
-    } catch {
-      // The group is already gone.
-    }
+    await endAnchor(anchor);
   }
 });

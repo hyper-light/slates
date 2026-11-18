@@ -407,43 +407,61 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
     path: manifest_path.to_path_buf(),
     reason: e.to_string(),
   })?;
-  let stated = parse(&text)?;
   let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+  plan_from(
+    &text,
+    &selection.node,
+    base,
+    &mut |name| read_relative(base, name),
+    &mut read_resolver,
+  )
+}
+
+/// Plans node `node`'s deployment from the manifest `text`: each DER file it names read by `read` (by its name as the
+/// manifest states it, resolved against `base`), and the host's resolver configuration by `resolver`, asked only when
+/// a root is trusted or a node is named. [`load`] reads them from the disk; a test hands its own.
+fn plan_from(
+  text: &str,
+  node: &str,
+  base: &Path,
+  read: &mut dyn FnMut(&str) -> Result<Vec<u8>, ManifestError>,
+  resolver: &mut dyn FnMut() -> Result<Resolver, ManifestError>,
+) -> Result<FleetPlan, ManifestError> {
+  let stated = parse(text)?;
   // The host's resolver, when any node is addressed by name; a manifest of literal addresses reads nothing.
   let resolver = if !stated.enrollment_roots.is_empty()
     || stated.nodes.iter().any(|node| node.address.is_named())
   {
-    Some(read_resolver()?)
+    Some(resolver()?)
   } else {
     None
   };
   let mut nodes = Vec::with_capacity(stated.nodes.len());
   let mut key = None;
-  for node in &stated.nodes {
-    let certificate = CertificateDer::from(read_relative(base, &node.certificate)?);
-    if node.node == selection.node {
-      let key_path = base.join(&node.key);
-      let bytes = read_relative(base, &node.key)?;
+  for entry in &stated.nodes {
+    let certificate = CertificateDer::from(read(&entry.certificate)?);
+    if entry.node == node {
+      let bytes = read(&entry.key)?;
       key = Some(
         PrivateKeyDer::try_from(bytes).map_err(|reason| ManifestError::Key {
-          path: key_path,
+          path: base.join(&entry.key),
           reason: reason.to_owned(),
         })?,
       );
     }
     nodes.push(FleetNodeEntry {
-      node: node.node.clone(),
-      address: node.address.clone(),
-      bind: node.bind,
+      node: entry.node.clone(),
+      address: entry.address.clone(),
+      bind: entry.bind,
       certificate,
-      domain: node.domain,
-      region: node.region.map(RegionId),
+      domain: entry.domain,
+      region: entry.region.map(RegionId),
     });
   }
   let enrollment_roots = stated
     .enrollment_roots
     .iter()
-    .map(|path| read_relative(base, path).map(CertificateDer::from))
+    .map(|path| read(path).map(CertificateDer::from))
     .collect::<Result<Vec<_>, _>>()?;
   let manifest = FleetManifest {
     enrollment_roots,
@@ -457,12 +475,11 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
     // Not in the manifest: the plan's own refusal names it, with the same words for every caller.
     return Err(ManifestError::Plan(
       slates_server::DeployError::UnknownNode {
-        node: selection.node.clone(),
+        node: node.to_owned(),
       },
     ));
   };
-  slates_server::deploy::plan(&manifest, &selection.node, key, resolver)
-    .map_err(ManifestError::Plan)
+  slates_server::deploy::plan(&manifest, node, key, resolver).map_err(ManifestError::Plan)
 }
 
 /// This node's deployment plan from `--fleet PATH --node NAME`, or why the manifest yields none — the
@@ -472,9 +489,129 @@ pub(crate) fn load(selection: &FleetSelection) -> Result<FleetPlan, Failure> {
     .map_err(|e| Failure::Failed(format!("fleet manifest {}: {e}", selection.manifest)))
 }
 
+/// What a fleet node's anchor and daemon read of their manifest at their start ([`check_fleet`]): the fleet's TLS name,
+/// its fault tolerance, how many peers the node starts beside, and how many enrollment roots it trusts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetCheck {
+  /// The TLS name every node's certificate carries.
+  pub name: String,
+  /// The fault tolerance: a write commits at `f + 1` acknowledgements.
+  pub f: u32,
+  /// The nodes the manifest names besides this one.
+  pub peers: usize,
+  /// The enrollment roots a node the manifest does not name may enroll under.
+  pub enrollment_roots: usize,
+}
+
+impl FleetCheck {
+  fn of(plan: &FleetPlan) -> FleetCheck {
+    FleetCheck {
+      name: plan.transport.name.clone(),
+      f: plan.membership.quorum.f,
+      peers: plan.membership.peers.len(),
+      enrollment_roots: plan.transport.enrollment_roots.len(),
+    }
+  }
+}
+
+/// `selection`'s manifest read and this node's deployment planned exactly as its anchor and daemon do at their start
+/// (contract 39): for a starter that writes the manifest itself (kiln's runners, kiln goal 95101ef3, K3) to refuse a
+/// manifest before it starts an instance on it, in the words the start would end with. Reads the manifest and the
+/// files it names, and the host's resolver configuration when a root is trusted or a node is named; writes nothing.
+pub fn check_fleet(selection: &FleetSelection) -> Result<FleetCheck, Failure> {
+  load(selection).map(|plan| FleetCheck::of(&plan))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The fleet name the planning tests mint certificates for.
+  const PLANNED: &str = "slates.planned";
+
+  /// Three nodes' self-signed certificates and keys, as files a manifest names, and the manifest naming them.
+  fn minted() -> (std::collections::BTreeMap<String, Vec<u8>>, String) {
+    let mut files = std::collections::BTreeMap::new();
+    let mut nodes = Vec::new();
+    for (index, node) in ["a", "b", "c"].into_iter().enumerate() {
+      let key = rcgen::KeyPair::generate().expect("a key pair");
+      let certificate = rcgen::CertificateParams::new(vec![PLANNED.to_owned()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("a certificate");
+      files.insert(format!("{node}.crt.der"), certificate.der().to_vec());
+      files.insert(format!("{node}.key.der"), key.serialize_der());
+      nodes.push(format!(
+        r#"{{ "node": "{node}", "address": "10.0.0.{}:17300", "certificate": "{node}.crt.der", "key": "{node}.key.der" }}"#,
+        index + 1
+      ));
+    }
+    let text = format!(
+      r#"{{ "name": "{PLANNED}", "f": 1, "nodes": [{}] }}"#,
+      nodes.join(", ")
+    );
+    (files, text)
+  }
+
+  /// Contract 39 (kiln's runners write the manifest their instance starts with): do plan node `a` of a three-node
+  /// manifest from files handed in, as the start does from the disk; expect the fleet's name, its `f` and the two
+  /// peers. A node the manifest does not name, and a key that is no DER key, are refused by name; no resolver is asked
+  /// of a manifest of literal addresses and no roots.
+  #[test]
+  fn a_manifest_is_planned_from_the_files_it_names_as_a_start_plans_it() {
+    let (files, text) = minted();
+    let mut read = |name: &str| {
+      files.get(name).cloned().ok_or_else(|| ManifestError::Read {
+        path: PathBuf::from(name),
+        reason: "no such file".to_owned(),
+      })
+    };
+    let mut no_resolver = || -> Result<Resolver, ManifestError> {
+      Err(ManifestError::Read {
+        path: PathBuf::from(RESOLV_CONF),
+        reason: "asked of a manifest of literal addresses".to_owned(),
+      })
+    };
+    let plan = plan_from(&text, "a", Path::new(""), &mut read, &mut no_resolver).expect("a's plan");
+    assert_eq!(
+      FleetCheck::of(&plan),
+      FleetCheck {
+        name: PLANNED.to_owned(),
+        f: 1,
+        peers: 2,
+        enrollment_roots: 0
+      }
+    );
+    let unknown = plan_from(&text, "d", Path::new(""), &mut read, &mut no_resolver).err();
+    assert!(
+      matches!(
+        unknown,
+        Some(ManifestError::Plan(slates_server::DeployError::UnknownNode { ref node })) if node == "d"
+      ),
+      "{unknown:?}"
+    );
+    let mut garbled = files.clone();
+    garbled.insert("a.key.der".to_owned(), b"not a key".to_vec());
+    let mut read_garbled = |name: &str| {
+      garbled
+        .get(name)
+        .cloned()
+        .ok_or_else(|| ManifestError::Read {
+          path: PathBuf::from(name),
+          reason: "no such file".to_owned(),
+        })
+    };
+    assert!(matches!(
+      plan_from(
+        &text,
+        "a",
+        Path::new(""),
+        &mut read_garbled,
+        &mut no_resolver
+      ),
+      Err(ManifestError::Key { .. })
+    ));
+  }
 
   const MANIFEST: &str = r#"{
     "name": "slates-fleet",
