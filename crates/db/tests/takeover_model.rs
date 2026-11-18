@@ -336,7 +336,6 @@ struct Round {
   listed_upto: BTreeMap<HostId, usize>,
   complete: BTreeSet<HostId>,
   adopted: BTreeMap<ObjectId, Accepted>,
-  lost: BTreeSet<ObjectId>,
 }
 
 impl Round {
@@ -523,12 +522,13 @@ fn answer(
   }
 }
 
-/// Adopts every learned object the rule calls ready, with the newest record reported, and notes the lost ones.
+/// Adopts every learned object the rule calls ready, with the newest record reported. These histories keep every
+/// cohort within its tolerance (every survivor answers); past it is `the_newest_surviving_record_is_adopted_past_tolerance`'s.
 fn settle(history: &History, round: &mut Round, rule: CountingRule, gate_open: bool) {
   let empty = BTreeSet::new();
   let members: BTreeSet<HostId> = history.survivors.iter().copied().collect();
   for (object, reports) in &round.reports {
-    if round.adopted.contains_key(object) || round.lost.contains(object) {
+    if round.adopted.contains_key(object) {
       continue;
     }
     let heard = Heard {
@@ -540,21 +540,19 @@ fn settle(history: &History, round: &mut Round, rule: CountingRule, gate_open: b
     let cohorts = &history.objects[object].cohorts;
     match readiness(
       cohorts,
+      &[],
       |host| members.contains(&host),
       history.quorum,
       &heard,
       rule,
     ) {
-      Readiness::Ready => {
+      Readiness::Ready | Readiness::ReadyPastTolerance { .. } => {
         let newest = reports
           .values()
           .cloned()
           .reduce(|best, next| if next.newer_than(&best) { next } else { best })
           .unwrap();
         round.adopted.insert(*object, newest);
-      }
-      Readiness::Lost { .. } => {
-        round.lost.insert(*object);
       }
       Readiness::Waiting => {}
     }
@@ -882,4 +880,178 @@ fn the_nemesis_breaks_today_s_rule_and_each_shape_is_measured() {
     tally.named_nothing > 0,
     "holders answer by name for what they do not hold"
   );
+}
+
+/// Shape: the most hosts a past-tolerance case draws its cohorts from.
+const PAST_TOLERANCE_HOSTS: u64 = 9;
+
+/// One object of a retired host, recovered through one settled cohort and maybe a current one (A-309): which hosts are
+/// gone (no longer members), the record each surviving holder keeps, and the order the surviving members answer in.
+#[derive(Clone, Debug)]
+struct PastTolerance {
+  quorum: Quorum,
+  members: BTreeSet<HostId>,
+  cohorts: Vec<Vec<HostId>>,
+  current: Vec<Vec<HostId>>,
+  held: BTreeMap<HostId, u64>,
+  order: Vec<HostId>,
+}
+
+/// The case `seed` draws: a settled cohort of the retired host and `2f` others, `gone` of them no longer members (at
+/// least `f` past tolerance, fewer within it); sometimes a current cohort of the retired host and members; a record of
+/// sequence 1 to 4 on some of each cohort's surviving hosts; and the surviving members of the cohorts in a drawn order.
+fn past_tolerance_case(seed: u64, past: bool) -> PastTolerance {
+  let mut draw = Draw::new(seed);
+  let f = draw.within(1, 2);
+  let quorum = Quorum {
+    f: u32::try_from(f).unwrap(),
+  };
+  let mut pool: Vec<HostId> = (1..=PAST_TOLERANCE_HOSTS).map(HostId).collect();
+  let take = |draw: &mut Draw, pool: &mut Vec<HostId>| {
+    let pick = usize::try_from(draw.within(0, u64::try_from(pool.len()).unwrap() - 1)).unwrap();
+    pool.remove(pick)
+  };
+  let mut settled = vec![DEPARTED];
+  for _ in 0..2 * f {
+    settled.push(take(&mut draw, &mut pool));
+  }
+  let gone_count = if past {
+    draw.within(f, 2 * f)
+  } else {
+    draw.within(0, f - 1)
+  };
+  let gone: BTreeSet<HostId> = settled[1..]
+    .iter()
+    .copied()
+    .take(usize::try_from(gone_count).unwrap())
+    .collect();
+  let mut members: BTreeSet<HostId> = (1..=PAST_TOLERANCE_HOSTS)
+    .map(HostId)
+    .filter(|host| !gone.contains(host))
+    .collect();
+  members.remove(&DEPARTED);
+  let mut current = Vec::new();
+  if draw.chance(2, 3) {
+    let mut cohort = vec![DEPARTED];
+    let candidates: Vec<HostId> = members.iter().copied().collect();
+    for host in candidates {
+      if cohort.len() < usize::try_from(2 * f + 1).unwrap() && draw.chance(1, 2) {
+        cohort.push(host);
+      }
+    }
+    current.push(cohort);
+  }
+  let cohorts = vec![settled];
+  let surviving: BTreeSet<HostId> = cohorts
+    .iter()
+    .chain(&current)
+    .flatten()
+    .copied()
+    .filter(|host| members.contains(host))
+    .collect();
+  let mut held: BTreeMap<HostId, u64> = BTreeMap::new();
+  for host in &surviving {
+    if draw.chance(2, 3) {
+      held.insert(*host, draw.within(1, 4));
+    }
+  }
+  let mut order: Vec<HostId> = surviving.into_iter().collect();
+  for index in (1..order.len()).rev() {
+    let other = usize::try_from(draw.within(0, u64::try_from(index).unwrap())).unwrap();
+    order.swap(index, other);
+  }
+  PastTolerance {
+    quorum,
+    members,
+    cohorts,
+    current,
+    held,
+    order,
+  }
+}
+
+/// The verdict after each surviving member has answered in `case.order`, a report of its record or by name holding
+/// nothing, and the newest record reported by then.
+fn past_tolerance_walk(case: &PastTolerance) -> Vec<(Readiness, Option<u64>)> {
+  let mut reports: BTreeMap<HostId, Accepted> = BTreeMap::new();
+  let mut named: BTreeSet<HostId> = BTreeSet::new();
+  let complete = BTreeSet::new();
+  let mut verdicts = Vec::new();
+  if case.order.is_empty() {
+    // No surviving member of any cohort: nothing more can be heard, so the verdict is the one before any answer.
+    let heard = Heard {
+      reports: &reports,
+      complete: &complete,
+      named_nothing: &named,
+      local: None,
+    };
+    verdicts.push((
+      readiness(
+        &case.cohorts,
+        &case.current,
+        |host| case.members.contains(&host),
+        case.quorum,
+        &heard,
+        CountingRule::NamedAnswer,
+      ),
+      None,
+    ));
+  }
+  for host in &case.order {
+    match case.held.get(host) {
+      Some(sequence) => {
+        reports.insert(*host, record(*sequence));
+      }
+      None => {
+        named.insert(*host);
+      }
+    }
+    let heard = Heard {
+      reports: &reports,
+      complete: &complete,
+      named_nothing: &named,
+      local: None,
+    };
+    let verdict = readiness(
+      &case.cohorts,
+      &case.current,
+      |host| case.members.contains(&host),
+      case.quorum,
+      &heard,
+      CountingRule::NamedAnswer,
+    );
+    verdicts.push((
+      verdict,
+      reports.values().map(|record| record.sequence).max(),
+    ));
+  }
+  verdicts
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
+    cases: slates_test_seeds::cases(256),
+    ..ProptestConfig::default()
+  }))]
+
+  /// A-309: past tolerance an object is adopted only once every surviving member of its cohorts, settled and current,
+  /// has answered, and then with the newest record any of them holds; within tolerance the past-tolerance verdict never
+  /// comes. Do: walk the answers of a case with `f` or more of the settled cohort gone, and of one with fewer. Expect, past
+  /// tolerance, waiting until the last answer and ready past tolerance at it, the newest record reported the newest held
+  /// by any surviving member of the cohorts; within tolerance, never ready past tolerance.
+  #[test]
+  fn the_newest_surviving_record_is_adopted_past_tolerance(seed in any::<u64>()) {
+    let past = past_tolerance_case(seed, true);
+    let walk = past_tolerance_walk(&past);
+    let (last, earlier) = walk.split_last().unwrap();
+    for (verdict, _) in earlier {
+      prop_assert_eq!(*verdict, Readiness::Waiting, "adopted before every surviving holder answered: {:?}", past);
+    }
+    prop_assert!(matches!(last.0, Readiness::ReadyPastTolerance { .. }), "{:?}: {:?}", last.0, past);
+    prop_assert_eq!(last.1, past.held.values().copied().max(), "the newest surviving record: {:?}", past);
+    let within = past_tolerance_case(seed, false);
+    for (verdict, _) in past_tolerance_walk(&within) {
+      prop_assert!(!matches!(verdict, Readiness::ReadyPastTolerance { .. }), "{:?}", within);
+    }
+  }
 }

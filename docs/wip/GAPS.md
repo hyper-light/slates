@@ -500,11 +500,16 @@
 >   confirmation dropped the retirement in the same version. A move on an unresolved line is allowed (records are
 >   bounded, so an old volume's line reads unresolved once its record goes). The lineage model is
 >   `docs/wip/models/Lineage.tla`, read as text only.
-> - **Open (A-309 pieces 2 and 3):** the members that exist now recovering a cohort past its tolerance (the
->   store-destroyed case: the settled cohort [owner, A, old B] with only A left, the replacement B' holding the live
->   log outside it; until then such an object stays learned and unadopted, its share unconfirmed); the live takeover
->   past tolerance (A-240's phase one counts only recorded holders, so at `f = 1` with {A, old B} recorded it waits for
->   good, g240's finding).
+> - **Fixed (A-309 piece 2): the members that exist now recover a cohort past its tolerance.** An object one of whose
+>   settled cohorts is short of its recovery quorum is adopted once every surviving member of its cohorts, settled and
+>   current, has promised it, with the newest record any of them holds (`Readiness::ReadyPastTolerance`,
+>   `fleet.takeover.recovered_past_tolerance`); before, it was counted `fleet.takeover.lost` and never adopted. The
+>   store-destroyed case's registers: the settled cohort [owner, A, old B] with only A left, the replacement B' in the
+>   owner's current neighbourhood; A adopts once A and B' answered
+>   (`a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now`).
+> - **Open (A-309 piece 3):** the live takeover past tolerance. A-240's phase one counts only recorded holders, so at
+>   `f = 1` with {A, old B} recorded it waits for good (g240's finding), and the store-destroyed volume's registers are
+>   adopted but its live log is never fetched.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it

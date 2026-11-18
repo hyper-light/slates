@@ -2974,6 +2974,27 @@ impl RegionalConfiguration {
       .collect()
   }
 
+  /// The cohorts `object` of the retired `departed` was placed on in its recovery owners' current neighbourhoods, where
+  /// a change was in flight when they retired ([`Retirement::current`], A-309): the hosts its joint writes and
+  /// re-shipped heads reached besides the settled cohorts ([`recovery_cohorts`]). A takeover counts them only past
+  /// tolerance, when a settled cohort has fewer members than its recovery quorum (`slates_db::takeover::readiness`).
+  /// Empty when no recovery owner retired with a change in flight.
+  ///
+  /// [`recovery_cohorts`]: RegionalConfiguration::recovery_cohorts
+  pub fn current_cohorts(&self, departed: HostId, object: ObjectId) -> Vec<Vec<HostId>> {
+    self
+      .recovery_owners(departed)
+      .iter()
+      .filter_map(|owner| {
+        self
+          .retired
+          .get(owner)
+          .and_then(|retirement| retirement.current.as_ref())
+          .map(|current| current.cohort(*owner, object, self.quorum))
+      })
+      .collect()
+  }
+
   /// The member that takes `object` of the retired `departed` over: the one rendezvous ranks first among the
   /// survivors of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)), or, when no
   /// survivor is in any of them, among all the retirement's survivors (A-309): every object then ranks one, so the

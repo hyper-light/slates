@@ -12,8 +12,9 @@
 //! the retirement's recovery neighbourhoods and itself, learns every copy among them whose line falls to it
 //! ([`falls_to`]'s rule, by the copy's owner or the owner its authority moved from), judges each by [`readiness`] with
 //! every asked member having answered (the counting rule is `crates/db/tests/takeover_model.rs`'s subject, not this
-//! one's), adopts the newest reported record under its own placement, and confirms its share only when every object it
-//! learned was adopted (A-272). A holder resolves its copies at each install as `takeover::resolve_held_objects` does:
+//! one's; past tolerance it waits for every surviving member of the object's cohorts, settled and current, A-309),
+//! adopts the newest reported record under its own placement, and confirms its share only when every object it learned
+//! was adopted (A-272). A holder resolves its copies at each install as `takeover::resolve_held_objects` does:
 //! a line that names a successor moves the copy's routing to it; a line that ends at a completed takeover lets the copy
 //! go when the holder took part in that takeover ([`RegionalConfiguration::settled_for`]); and a successor's
 //! confirmation lets it go when the holder, asked in that round, is outside the successor's placement
@@ -143,10 +144,10 @@ struct Counts {
   kept_unasked: u64,
   /// Adoptions made by rounds.
   adopted: u64,
+  /// Of those, adoptions past tolerance: a cohort short of its recovery quorum, every surviving holder heard (A-309).
+  recovered_past_tolerance: u64,
   /// Takeovers completed into a record.
   completed: u64,
-  /// Shares not confirmed because the round could not adopt an object it learned.
-  unconfirmed: u64,
 }
 
 /// A violation of the oracle: the holder, the object, the copy's adoption count and the object's.
@@ -368,8 +369,10 @@ impl World {
         local: Some(successor),
       };
       let cohorts = self.regional.recovery_cohorts(departed, object);
+      let current = self.regional.current_cohorts(departed, object);
       let verdict = readiness(
         &cohorts,
+        &current,
         |host| members.contains(&host),
         self.regional.quorum,
         &heard,
@@ -377,7 +380,11 @@ impl World {
       );
       match verdict {
         Readiness::Ready => self.adopt(draw, object, successor, &reports),
-        Readiness::Waiting | Readiness::Lost { .. } => every_adopted = false,
+        Readiness::ReadyPastTolerance { .. } => {
+          self.counts.recovered_past_tolerance += 1;
+          self.adopt(draw, object, successor, &reports);
+        }
+        Readiness::Waiting => every_adopted = false,
       }
     }
     if every_adopted {
@@ -387,8 +394,6 @@ impl World {
       {
         self.counts.completed += 1;
       }
-    } else {
-      self.counts.unconfirmed += 1;
     }
   }
 
@@ -727,8 +732,7 @@ proptest! {
 /// Non-vacuity: over a fixed set of seeds the histories reach every verdict the oracle judges, so a silently dead path
 /// can never pass as a held property. Do: run the seeds and add up what they did. Expect copies let go by a settled line
 /// and by a confirmed successor, copies kept on an unresolved or lost line and on a completed takeover that never asked
-/// their holder, adoptions, completed takeovers, and shares left unconfirmed past tolerance, each at least once, and no
-/// violation.
+/// their holder, adoptions (some past tolerance, A-309) and completed takeovers, each at least once, and no violation.
 #[test]
 fn the_generated_histories_reach_every_verdict() {
   let mut total = Counts::default();
@@ -741,8 +745,8 @@ fn the_generated_histories_reach_every_verdict() {
     total.kept_unknown += counts.kept_unknown;
     total.kept_unasked += counts.kept_unasked;
     total.adopted += counts.adopted;
+    total.recovered_past_tolerance += counts.recovered_past_tolerance;
     total.completed += counts.completed;
-    total.unconfirmed += counts.unconfirmed;
   }
   println!("lineage model over {NON_VACUITY_SEEDS} seeds: {total:?}");
   assert!(total.reclaimed_settled > 0, "{total:?}");
@@ -750,6 +754,6 @@ fn the_generated_histories_reach_every_verdict() {
   assert!(total.kept_unknown > 0, "{total:?}");
   assert!(total.kept_unasked > 0, "{total:?}");
   assert!(total.adopted > 0, "{total:?}");
+  assert!(total.recovered_past_tolerance > 0, "{total:?}");
   assert!(total.completed > 0, "{total:?}");
-  assert!(total.unconfirmed > 0, "{total:?}");
 }

@@ -34,10 +34,15 @@
 (* in that round, is outside the successor's placement.  Every other       *)
 (* verdict keeps the copy.                                                 *)
 (*                                                                          *)
+(* A learned object is adoptable within tolerance (every cohort keeps its  *)
+(* recovery quorum of members) and past it (A-309 piece 2: every surviving *)
+(* member of its cohorts, settled and current, has answered; here every    *)
+(* member's copies are visible, so the round has heard them all).          *)
+(*                                                                          *)
 (* Abstractions: a cohort is a whole neighbourhood (copysets narrow it in  *)
 (* the code, which changes no rule here); rendezvous is a fixed weight per *)
-(* object and host; the counting rule within tolerance is takeover_model's *)
-(* subject, so a learned object within tolerance is adoptable here.         *)
+(* object and host; the counting rule is takeover_model's subject, so the  *)
+(* record adopted is not modelled, only that an adoption makes a newer one.*)
 (*                                                                          *)
 (* The property checked:                                                    *)
 (*   ReclaimOnlyStale  a member lets a copy go only if its object was      *)
@@ -141,7 +146,9 @@ Falls(h, o, d, s) ==
 Asked(d, s) == (RecoveryHosts(d) \cap members) \cup {s}
 Learned(d, s) == {o \in Objects : \E h \in Asked(d, s) : Falls(h, o, d, s)}
 
-\* Within tolerance every cohort keeps its recovery quorum of members (Quorum::recovery).
+\* Within tolerance every cohort keeps its recovery quorum of members (Quorum::recovery); past it the round waits
+\* for every surviving member of the object's cohorts instead (readiness). Kept for a reader's reference: the
+\* adoption below needs neither, since the model's round hears every member at once.
 RecoveryQuorum(C) == Max(Cardinality(C) - F, 1)
 WithinTolerance(d) == \A C \in Cohorts(d) : Cardinality(C \cap members) >= RecoveryQuorum(C)
 
@@ -240,12 +247,12 @@ Retire(d) ==
   /\ version' = version + 1
   /\ UNCHANGED <<joined, settled, current, done, doneBy, doneAt, owner, adopted, route, movedFrom, departed>>
 
-\* s adopts o in d's round: a newer record placed under s.
+\* s adopts o in d's round: a newer record placed under s. Within tolerance on its cohorts' quorums; past it
+\* once every surviving member of its cohorts answered, which every member's visible state stands for here.
 Adopt(d, s, o) ==
   /\ Owes(d, s)
   /\ o \in Learned(d, s)
   /\ owner[o] # s
-  /\ WithinTolerance(d)
   /\ adopted' = [adopted EXCEPT ![o] = @ + 1]
   /\ owner' = [owner EXCEPT ![o] = s]
   /\ \E acks \in SUBSET Placement(s) :

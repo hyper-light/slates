@@ -108,9 +108,11 @@ const TAKEOVER_RECLAIMED: &str = "fleet.takeover.reclaimed";
 /// of it), so nothing shows its copy adopted (A-309). Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_UNASKED: &str = "fleet.takeover.kept_unasked";
 
-/// The status count under which a successor records an object it cannot recover: one of its recovery cohorts
-/// has fewer than `f + 1` members left. Format: a refusal name in the daemon's status report.
-const TAKEOVER_LOST: &str = "fleet.takeover.lost";
+/// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
+/// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
+/// current, answered first, and the newest record any of them held was adopted. Before A-309 such an object was counted
+/// `fleet.takeover.lost` and recovered by no one. Format: a refusal name in the daemon's status report.
+const TAKEOVER_RECOVERED_PAST_TOLERANCE: &str = "fleet.takeover.recovered_past_tolerance";
 
 /// The status count under which a successor records an object it adopted and placed under itself.
 /// Format: a refusal name in the daemon's status report.
@@ -142,8 +144,6 @@ pub struct HostTakeover {
   learned: BTreeMap<ObjectId, BTreeMap<HostId, Accepted>>,
   /// The objects adopted and placed under this node.
   adopted: BTreeSet<ObjectId>,
-  /// The objects no survivor can recover.
-  lost: BTreeSet<ObjectId>,
   /// The highest fence a holder reported above the epoch; the next round runs above it.
   fenced: Option<HostEpoch>,
   /// Per learned object, the members that answered for it by name holding nothing of it (A-251 (b)): their promise of
@@ -172,7 +172,6 @@ impl HostTakeover {
       pages: BTreeMap::new(),
       learned: BTreeMap::new(),
       adopted: BTreeSet::new(),
-      lost: BTreeSet::new(),
       fenced: None,
       named_nothing: BTreeMap::new(),
       page_advances: 0,
@@ -186,7 +185,6 @@ impl HostTakeover {
     self.epoch = epoch;
     self.pages.clear();
     self.learned.clear();
-    self.lost.clear();
     self.fenced = None;
     self.named_nothing.clear();
   }
@@ -342,10 +340,6 @@ fn stale_after_confirmation(
   let Some(departed) = state.departed_owners.get(&object) else {
     return Confirmation::None;
   };
-  let outside = owner != local
-    && regional
-      .configuration_for(owner)
-      .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
   let (confirmed, asked) = match (
     regional.retired.get(&departed.owner),
     regional.completed.get(&departed.owner),
@@ -360,7 +354,16 @@ fn stale_after_confirmation(
     ),
     (None, None) => (false, false),
   };
-  match (confirmed && outside, asked) {
+  // The placement is computed only for a confirmed successor: every install resolves every held copy, and an owner's
+  // placement view is built anew each time (its domains and neighbourhood copied, its copysets laid out).
+  if !confirmed {
+    return Confirmation::None;
+  }
+  let outside = owner != local
+    && regional
+      .configuration_for(owner)
+      .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
+  match (outside, asked) {
     (true, true) => Confirmation::Stale,
     (true, false) => Confirmation::Unasked,
     (false, _) => Confirmation::None,
@@ -784,7 +787,9 @@ fn named_per_question() -> usize {
 }
 
 /// The learned objects `host`, whose pages are complete, has not answered for (A-251 (b)): those of whose recovery
-/// cohorts it is a member that it neither listed nor named as holding nothing, at most [`named_per_question`].
+/// cohorts it is a member, settled or current (the neighbourhood a change in flight reached, whose every surviving
+/// member must answer for an object past tolerance, A-309), that it neither listed nor named as holding nothing, at most
+/// [`named_per_question`].
 fn unanswered_by_name(
   take: &HostTakeover,
   regional: &RegionalConfiguration,
@@ -803,6 +808,7 @@ fn unanswered_by_name(
         && regional
           .recovery_cohorts(departed, **object)
           .iter()
+          .chain(regional.current_cohorts(departed, **object).iter())
           .any(|cohort| cohort.contains(&host))
     })
     .map(|(object, _)| *object)
@@ -1001,11 +1007,13 @@ pub(crate) fn fold_answers(
 /// The objects of `departed`'s takeover ready to adopt, each with the newest record reported for it: every
 /// one of its recovery cohorts has its recovery quorum of members that promised it — `cohort − f`, `f + 1` at
 /// the floor, at least one ([`slates_db::register::Quorum::recovery`]) — this node, a member that listed it, or one
-/// that answered for it by name. An object with a cohort left with fewer members than that quorum is lost,
-/// counted and never adopted: more of that cohort failed than the region tolerates. The rule is
-/// [`slates_db::takeover::readiness`] under [`CountingRule::NamedAnswer`] (A-251); the model in
-/// `crates/db/tests/takeover_model.rs` finds where counting a complete page instead adopts an older record than a
-/// committed one.
+/// that answered for it by name. An object with a cohort left with fewer members than that quorum (more of it failed
+/// than the region tolerates) is ready once every surviving member of its cohorts, settled and current, has promised
+/// it, and is adopted with the newest record any of them holds, counted [`TAKEOVER_RECOVERED_PAST_TOLERANCE`] (A-309):
+/// the members that exist now recover it, the replacement holding a live log among them. Before A-309 it was lost,
+/// counted and never adopted. The rule is [`slates_db::takeover::readiness`] under [`CountingRule::NamedAnswer`]
+/// (A-251); the model in `crates/db/tests/takeover_model.rs` finds where counting a complete page instead adopts an
+/// older record than a committed one, and holds the past-tolerance adoption to the newest surviving record.
 pub(crate) fn ready_objects(
   state: &mut ShardState,
   departed: HostId,
@@ -1020,7 +1028,7 @@ pub(crate) fn ready_objects(
     return Vec::new();
   };
   let mut ready = Vec::new();
-  let mut lost = Vec::new();
+  let mut past_tolerance: u64 = 0;
   let mut unpromised: u64 = 0;
   let complete: BTreeSet<HostId> = take
     .pages
@@ -1037,8 +1045,10 @@ pub(crate) fn ready_objects(
       local: local_promises.then_some(local),
     };
     let cohorts = regional.recovery_cohorts(departed, *object);
+    let current = regional.current_cohorts(departed, *object);
     match readiness(
       &cohorts,
+      &current,
       |host| regional.members.contains(&host),
       regional.quorum,
       &heard,
@@ -1049,7 +1059,12 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::Lost { .. } => lost.push(*object),
+      Readiness::ReadyPastTolerance { .. } => {
+        if let Some(newest) = reports.values().cloned().reduce(newest_of) {
+          past_tolerance = past_tolerance.saturating_add(1);
+          ready.push((*object, newest));
+        }
+      }
       Readiness::Waiting => unpromised = unpromised.saturating_add(1),
     }
   }
@@ -1057,12 +1072,8 @@ pub(crate) fn ready_objects(
     let count = state.refusals.entry(TAKEOVER_UNPROMISED).or_insert(0);
     *count = count.saturating_add(unpromised);
   }
-  for object in lost {
-    take.learned.remove(&object);
-    if take.lost.insert(object) {
-      let count = state.refusals.entry(TAKEOVER_LOST).or_insert(0);
-      *count = count.saturating_add(1);
-    }
+  if past_tolerance > 0 {
+    state.count(TAKEOVER_RECOVERED_PAST_TOLERANCE, past_tolerance);
   }
   ready
 }
@@ -1365,7 +1376,7 @@ fn record_adoption(
 }
 
 /// Whether this node's share of `departed`'s takeover is done: every member of the recovery neighbourhoods it
-/// asked has answered in full, and every object it learned is adopted or cannot be recovered.
+/// asked has answered in full, and every object it learned is adopted.
 fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   let regional = state.council.configuration();
   let Some(take) = state.host_takeovers.get(&departed) else {
@@ -1375,7 +1386,6 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
     take.generation == regional.version,
     take.fenced.is_none(),
     take.learned.is_empty(),
-    take.lost.is_empty(),
     regional
       .recovery_hosts(departed)
       .into_iter()
@@ -1385,19 +1395,13 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
 }
 
 /// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
-/// complete, and every object it learned adopted, none lost (A-272). A confirmation is what lets the retirement be
-/// pruned, and a pruned retirement settles its objects' lines, where every holder reclaims its copy. So a round that
-/// declared an object lost (its settled cohort left with fewer members than its recovery quorum) must not confirm:
-/// its retirement stays kept, and its holders keep their copies. Before, the lost object was dropped from those
-/// learned, and the round confirmed as though it had been adopted.
-fn share_done(
-  current: bool,
-  unfenced: bool,
-  nothing_learned: bool,
-  nothing_lost: bool,
-  every_page: bool,
-) -> bool {
-  current && unfenced && nothing_learned && nothing_lost && every_page
+/// complete, and every object it learned adopted (A-272). A confirmation is what lets the takeover complete, and a
+/// completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an object still
+/// learned must not confirm. Before A-272 an object declared lost was dropped from those learned and the round
+/// confirmed as though it had been adopted; since A-309 no object is declared lost (past tolerance the members that
+/// exist now recover it), so learned is the whole of it.
+fn share_done(current: bool, unfenced: bool, nothing_learned: bool, every_page: bool) -> bool {
+  current && unfenced && nothing_learned && every_page
 }
 
 #[cfg(test)]
@@ -1479,23 +1483,23 @@ mod tests {
     );
   }
 
-  /// A-272: a round that declared an object lost does not confirm its share. Do ask whether a share is done with every
-  /// page complete and nothing left learned, with and without a lost object. Expect done only with none lost. Before, a
-  /// lost object counted as done, the round confirmed, and the retirement's pruning settled the object's line, where
-  /// every holder reclaims its copy.
+  /// A-272, A-309: a round confirms its share only once every object it learned is adopted. Do ask whether a share is
+  /// done with every page complete, with and without an object still learned, and with a page missing. Expect done only
+  /// with nothing learned and every page in. Before A-272 a lost object counted as done; since A-309 none is lost, and an
+  /// object past tolerance stays learned until every surviving holder has answered and it is adopted.
   #[test]
-  fn a_round_that_lost_an_object_does_not_confirm_its_share() {
+  fn a_round_confirms_only_once_every_object_it_learned_is_adopted() {
     assert!(
-      !share_done(true, true, true, false, true),
-      "an object lost: not done, the retirement stays kept"
+      !share_done(true, true, false, true),
+      "an object still learned: not done, the takeover stays kept"
     );
     assert!(
-      share_done(true, true, true, true, true),
+      share_done(true, true, true, true),
       "every object adopted: done"
     );
     assert!(
-      !share_done(true, true, false, true, true),
-      "an object still learned: not done"
+      !share_done(true, true, true, false),
+      "a member's pages incomplete: not done"
     );
   }
   use crate::head::{HeadKey, HeadSealing};
