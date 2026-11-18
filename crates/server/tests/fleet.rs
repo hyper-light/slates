@@ -11107,10 +11107,12 @@ fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor
   taken && healed
 }
 
-/// Shape: the fleet's periods the superseded-owner test gives each step after the takeover (the successor's first
-/// shipment, a write through each node): a takeover's materialization publishes at once and a forward is a location
-/// round and one exchange, each a few periods; a hundred leave room for load, and keep a red run to seconds.
-const SUPERSEDED_PERIODS: u64 = 100;
+/// Shape: the fleet's periods the superseded-owner test gives each node's writes to be answered after the takeover. A
+/// forward is a location round and one exchange, a few periods; but the old owner's first write waits for its links to
+/// its holders, dropped while it was cut off and dialed afresh, before a holder's fence answers it, which took about
+/// ten seconds (a hundred periods) on a loaded Mac Studio. Three hundred leave room for that under load, and keep a red
+/// run to a minute or two.
+const SUPERSEDED_PERIODS: u64 = 300;
 
 /// Writes `path` through a client of `daemons[through]` until a write is answered `FsDone`, within each fleet wait judged
 /// by progress: the old owner's first write after its takeover may be the one that finds its log fenced, and is refused.
