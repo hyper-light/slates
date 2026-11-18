@@ -202,9 +202,10 @@ fn wait(span: Duration) {
 /// all three shards, the client's own among them. Expect, in the loop: holds asked of the two owners (the non-vacuity
 /// count), and at most R9's tail of parks on them past those the run's own returns explain, judged against the loop's
 /// measured period; in the paced cycles: no hold asked of any shard, though a destroy on the client's own shard leaves
-/// work running through the pause (judged by the shard's last work, 3 of 24 paced cycles looked like a loop's, 2026-11-18),
-/// and the owners parking between cycles (R9's floor alone, as A-223's window rule leaves a paced client). At R9's floor
-/// alone, before A-326, the owners parked 460 times over 200 returns (2026-11-18, the Mac Studio, a debug cycle 272 µs).
+/// work running through the pause (judged by the shard's last work, 1 to 3 of 24 paced cycles looked like a loop's,
+/// 2026-11-18), and the owners parking between cycles (R9's floor alone, as A-223's window rule leaves a paced client).
+/// At R9's floor alone, before A-326, the owners parked 460 times over 200 returns (2026-11-18, the Mac Studio, a debug
+/// cycle 272 µs).
 #[test]
 fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_client_holds_none() {
   let profile = common::machine_profile();

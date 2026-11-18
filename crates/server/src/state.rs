@@ -650,11 +650,14 @@ pub struct ShardState {
   /// The requests this shard has read in a row, each within F of its last client I/O: the length of its closed loop so
   /// far, which caps a forward's hold (`verbs::loop_hold`; A-326). 0 after a pause longer than F.
   pub loop_run: u64,
-  /// The end of this shard's last round of client I/O (requests read, replies written), one clock read a round: what
-  /// judges whether a request continues a closed loop (`verbs::loop_hold`; A-326). Unlike `last_work_ns`, the shard's
-  /// own background work (a destroy's slices, a lease's expiry, a kept forward's retry) never moves it, or a paced
-  /// client's pause would look like a loop's. 0 before the first.
+  /// The end of this shard's last round of its clients' loop I/O (their requests read, the replies to them written),
+  /// one clock read a round: what judges whether a request continues a closed loop (`verbs::loop_hold`; A-326). Unlike
+  /// `last_work_ns`, the shard's own background work (a destroy's slices, a lease's expiry, a kept forward's retry) and
+  /// a client's acknowledgement never move it, or a paced client's pause would look like a loop's. 0 before the first.
   pub last_client_io_ns: u64,
+  /// Whether the round now running read a request of a client's loop or wrote a reply to one (`verbs::serve_round`
+  /// stamps `last_client_io_ns` at its end when it did; A-326).
+  pub loop_io: bool,
   /// Where the verb now running would reply (§4.16 "Commit"; AUD-11): the shard and ring slot the
   /// reply is written to, set by the serve path or the forward task before the verb runs and cleared
   /// after it, so a verb whose acceptance must wait for a fleet commit (`submit` at `f > 0`) can hand
