@@ -13086,7 +13086,9 @@ fn yielded_holder_role() {
   let Ok(role) = std::env::var(YIELDED_HOLDER_ROLE) else {
     return;
   };
-  // The daemon is in the parent's process: this one installs its own seal before its first rendezvous.
+  // The daemon is in the parent's process: on Linux, whose rendezvous is sealed (A-187), this one installs its own seal
+  // before its first rendezvous.
+  #[cfg(target_os = "linux")]
   slates_seal::install();
   let (instance, volume) = role.split_once(' ').unwrap();
   let mut client = Client::connect(instance);
