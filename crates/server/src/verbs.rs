@@ -508,8 +508,7 @@ fn promote_region_on_root(
       } else {
         crate::xshard::send_reply_home(origin, move || {
           crate::state::deliver(client_index, request, reply, false);
-        })
-        .await;
+        });
       }
     }),
     None,
@@ -1251,7 +1250,7 @@ fn forward_to_owner(
       crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_CONTROL_STARTED, 1));
       let (replies, route) = resolve_and_forward(volume, region, cached, requests).await;
       crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_RESOLVED, 1));
-      deliver_owner_forward(origin, control, (client, request), replies, (route, plan)).await;
+      deliver_owner_forward(origin, control, (client, request), replies, (route, plan));
     }),
     None,
   );
@@ -1939,7 +1938,7 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
 /// cache or deliver a predecessor's result to the client that now occupies that slot.
 /// Carries a forwarded verb's reply from the control shard to the client's shard `origin` and finishes it there
 /// ([`finish_owner_forward`]): at once on the same shard, else as a task sent home ([`crate::xshard::send_back`]).
-async fn deliver_owner_forward(
+fn deliver_owner_forward(
   origin: u16,
   control: u16,
   (client, request): (Handle<ClientSlot>, u64),
@@ -1955,8 +1954,7 @@ async fn deliver_owner_forward(
   }
   crate::xshard::send_reply_home(origin, move || {
     finish_owner_forward(client, request, reply, after);
-  })
-  .await;
+  });
 }
 
 fn finish_owner_forward(
@@ -2724,8 +2722,7 @@ fn send_forward(
           region,
           volume,
           request_bytes,
-        )
-        .await;
+        );
         return;
       }
       // A verb that deferred its reply to a fleet commit (AUD-11) answers through the merge plane, and one whose reply
@@ -2741,8 +2738,7 @@ fn send_forward(
           let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
         }
         crate::state::deliver(client_index, request, reply, true);
-      })
-      .await;
+      });
     }),
     None,
   );
@@ -2753,7 +2749,7 @@ fn send_forward(
 /// from the control shard, and delivers the reply to the client's ring on `origin`. A control channel that refuses
 /// the task, or no control shard, answers `HomedElsewhere`, as an owner not found does. No route is cached: the
 /// client's slot lives on `origin`, and a cached route is only a hint.
-async fn forward_for_local_client(
+fn forward_for_local_client(
   origin: u16,
   control: Option<u16>,
   (client_index, request): (u32, u64),
@@ -2782,7 +2778,7 @@ async fn forward_for_local_client(
         let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
         crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_RESOLVED, 1));
         let reply = replies.first;
-        crate::xshard::send_reply_home(origin, deliver_home(reply)).await;
+        crate::xshard::send_reply_home(origin, deliver_home(reply));
       }),
       None,
     );
@@ -2794,7 +2790,7 @@ async fn forward_for_local_client(
     Some(Err((refusal, control))) => control_refusal(&refusal, control, region),
     None => Refusal::HomedElsewhere { region },
   };
-  crate::xshard::send_reply_home(origin, deliver_home(refused(refusal))).await;
+  crate::xshard::send_reply_home(origin, deliver_home(refused(refusal)));
 }
 
 /// Counts a local client's forward handed to the control shard (`handed`) or refused there.
@@ -2935,8 +2931,7 @@ fn scatter_list(
         };
         crate::xshard::send_reply_home(origin, move || {
           gather(request, part);
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -2983,8 +2978,7 @@ fn scatter_grants(
         };
         crate::xshard::send_reply_home(origin, move || {
           gather_grants(request, part);
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3042,8 +3036,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
         let part = crate::state::with_state(shard_report);
         crate::xshard::send_reply_home(origin, move || {
           gather_status(request, part);
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3256,8 +3249,7 @@ fn scatter_acknowledge(
           .unwrap_or_else(|| refused(Refusal::NotFound));
         crate::xshard::send_reply_home(origin, move || {
           crate::state::with_state_counted(|s| release_part_back(s, request, &part));
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3419,6 +3411,19 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::xshard::RUN_REFUSED_COUNTER,
             crate::xshard::run_refused(),
           ),
+          (
+            crate::xshard::ROOM_WAITS_STARTED,
+            crate::xshard::room_waits().started,
+          ),
+          (
+            crate::xshard::ROOM_WAITS_ENDED,
+            crate::xshard::room_waits().ended,
+          ),
+          (
+            crate::xshard::ROOM_WAITS_PEAK,
+            crate::xshard::room_waits().peak,
+          ),
+          (crate::xshard::KEEP_REFUSED, crate::xshard::keep_refused()),
           (
             crate::fleet::SERVE_RECEIVE_EARLIER_SEND,
             demux_sum(state, |c| c.receive_refused_earlier_send),

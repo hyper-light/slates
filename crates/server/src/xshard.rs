@@ -15,10 +15,18 @@
 //! error (banned item 9): the work runs to completion on its shard, or the spawn is refused to the caller.
 //! A call to the caller's own shard runs the closure directly, so the same code path serves one shard and
 //! many (R8).
+//!
+//! What goes back is never refused for want of room (§4.3, goal 238): a reply, a scatter part's result or a call's
+//! answer that meets the origin's full control channel is kept by the sending shard's carrier ([`carrier`]), behind
+//! anything kept for the same shard, and sent as soon as the channel has room, for as long as that shard lives. The
+//! carrier needs no task per message, so neither a full task arena nor the runtime's admission, where a task refused
+//! there answers its client, can refuse one; what it keeps answers requests in flight, which bound it
+//! (`DaemonConfig::kept_bound`), and every wait is counted ([`room_waits`]). Measured on main 80be552a before: 4,074 to
+//! 4,518 results a run of the 3,000-client load rung dropped after one coordinator period's wait.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -181,57 +189,308 @@ impl<T: 'static> Future for CrossShardCall<T> {
   }
 }
 
-/// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer), and
-/// waits for room when the origin's control channel is full, retried at [`REPLY_PACE_NS`], for as long as the origin
-/// lives (§4.3: backpressure, never a drop). A full channel drains as the origin turns. Only an origin gone (its client
-/// with it) leaves the result undelivered, counted on this shard (`xshard.reply_dropped`).
+/// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer): at
+/// once when `origin`'s control channel has room, else kept by this shard's carrier until it has ([`carry`]), for as
+/// long as `origin` lives (§4.3: backpressure, never a drop). Only an origin gone (its client with it) leaves the result
+/// undelivered, counted on this shard (`xshard.reply_dropped`). The caller holds nothing while the result waits.
 ///
-/// **What bounds the waiting (CLAUDE.md §2 item 8).** A result waits inside a task that exists for it anyway (the task
-/// that ran a forwarded verb, a scatter part, or a call), or, from a caller that cannot await, in the one task
-/// [`carry_home`] spawns for it when the channel is full. So the results waiting on a shard are at most the tasks it
-/// holds, and every one answers a request in flight: a client's (each client holds at most its region's `slots` of
-/// credit, so a shard serves at most `clients_per_shard × slots` of them at once), an acknowledgement's parts (at most
-/// `ack_scatter_bound` scatters a shard) or a call (its caller's own in-flight bound). The hard bound is the shard's task
-/// arena: a waiting task it cannot take is refused at its spawn with a typed error the caller counts
-/// (`xshard.unstarted_unanswered`, a caller's own undelivered counter), never queued. The waits are counted
-/// ([`ROOM_WAITS_STARTED`], [`ROOM_WAITS_ENDED`], [`ROOM_WAITS_PEAK`]), so the bound is seen held.
-/// Before 2026-10-07 every refusal dropped the reply at
-/// once and unseen; until 2026-11-09 one still refused after a coordinator period was dropped: about 4,300 a run of the
-/// 3,000-client rung on main, every one an acknowledgement scatter's part, whose loss refused its client
-/// `AcknowledgementOwed` until a later acknowledgement settled the release (`crates/server/tests/reply_room.rs` shows the
-/// same loss of a forwarded verb's answer).
-pub async fn send_back(origin: u16, back: SpawnRequest) {
-  if !given_room(origin, Control::Spawn(Box::new(back))).await {
+/// History: before 2026-10-07 every refusal dropped the result at once and unseen. Until 2026-11-18 one still refused
+/// after a coordinator period was dropped: about 4,300 a run of the 3,000-client rung on main, every one an
+/// acknowledgement scatter's part. The merge of agents/perf-replies that day made each wait in its own task while its
+/// origin lived, which a full arena could refuse; the carrier needs no task of its own.
+pub fn send_back(origin: u16, back: SpawnRequest) {
+  if carry(origin, Control::Spawn(Box::new(back))).is_err() {
     state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
   }
 }
 
-/// Sends `message` to `target`, waiting out a full channel for as long as `target` lives: whether it was sent; `false`
-/// only for a shard gone, or a pause the runtime refused (off a shard, a tripwire). A wait is counted from the first
-/// full channel to its end ([`RoomWait`]).
-async fn given_room(target: u16, mut message: Control) -> bool {
-  let mut waiting: Option<RoomWait> = None;
-  loop {
+/// Sends `message` to `target` at once, or keeps it for this shard's carrier ([`carrier`]) when `target`'s control
+/// channel is full, or when messages for `target` are kept already, so they reach it in the order they were sent. A kept
+/// message waits for room for as long as `target` lives. Nothing is spawned for it, so neither this shard's task arena
+/// nor a borrow of its runtime can refuse it: a task refused at admission is dropped inside the runtime's admission,
+/// where no task can be spawned, and its guard answers its client through here ([`AnswerUnstarted`]).
+///
+/// Refused, with the message dropped and every reply guard in it standing down, so the caller counts the loss: `target`
+/// gone; or a full channel while no carrier runs (before the shard's start spawns it, after its shutdown), or with the
+/// most messages kept that [`crate::config::DaemonConfig::kept_bound`] allows, which the requests in flight never reach
+/// (counted `xshard.keep_refused`).
+///
+/// **What bounds the waiting (CLAUDE.md §2 item 8).** A kept message is a reply or a result another shard waits for: a
+/// client's reply (each client holds at most its region's `slots` of credit), an acknowledgement part's result (at most
+/// `ack_scatter_bound` scatters a shard), or what a task awaits or sends (a call's result, a connection's end). So
+/// what a shard keeps is at most what the daemon has in flight, and the derived bound is that sum. Every kept message is
+/// counted as a wait for room ([`room_waits`]).
+fn carry(target: u16, message: Control) -> Result<(), RtError> {
+  let behind = KEPT.with(|kept| {
+    kept.try_borrow().is_ok_and(|kept| {
+      kept
+        .queues
+        .get(&target)
+        .is_some_and(|queue| !queue.is_empty())
+    })
+  });
+  let unsent = if behind {
+    message
+  } else {
     match registry::send_control_or_return(target, message) {
-      Ok(()) => return true,
+      Ok(()) => return Ok(()),
       Err(registry::RefusedControl {
         error: RtError::ControlFull { .. },
         message: Some(unsent),
-      }) => message = unsent,
-      Err(_) => return false,
+      }) => unsent,
+      Err(refused) => {
+        discarding_unsent(|| drop(refused.message));
+        return Err(refused.error);
+      }
     }
-    waiting.get_or_insert_with(RoomWait::begin);
-    if slates_rt::futures::sleep(REPLY_PACE_NS).await.is_err() {
-      state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
-      return false;
+  };
+  match keep(target, unsent) {
+    Ok(carrier) => {
+      if let Some(carrier) = carrier {
+        carrier.wake();
+      }
+      Ok(())
+    }
+    Err(unkept) => {
+      discarding_unsent(|| drop(unkept));
+      Err(RtError::ControlFull { shard: target })
     }
   }
 }
 
-/// [`run_on`] for work whose loss would leave state behind on `shard` (a closed connection's byte states, A-192): a
-/// channel full at once hands the message to a task of this shard that waits for room as a result carried home does
-/// ([`send_back`]), for as long as `shard` lives. Counted under `refused` on this shard when the shard is gone, or this
-/// shard could not take the waiting task.
+/// Puts `message` behind what this shard keeps for `target`, counted as a wait for room: the carrier's waker, when it
+/// waits, for the caller to wake once the keeper is let go. The message back, unkept, when no carrier runs, the bound is
+/// reached (both counted `xshard.keep_refused`), or the keeper is borrowed, which nothing allows: no code that runs
+/// while it is borrowed calls back here.
+fn keep(target: u16, message: Control) -> Result<Option<Waker>, Control> {
+  KEPT.with(|kept| {
+    let Ok(mut kept) = kept.try_borrow_mut() else {
+      return Err(message);
+    };
+    let Some(bound) = kept.bound else {
+      kept.refused = kept.refused.saturating_add(1);
+      return Err(message);
+    };
+    if kept.held >= bound {
+      kept.refused = kept.refused.saturating_add(1);
+      return Err(message);
+    }
+    kept.held = kept.held.saturating_add(1);
+    kept
+      .queues
+      .entry(target)
+      .or_default()
+      .push_back((message, RoomWait::begin()));
+    Ok(kept.carrier.take())
+  })
+}
+
+/// Sends what this shard keeps, each target's messages in order until its channel is full: how many are still kept.
+/// What was kept for a target that is gone is let go of ([`let_go_of`]): its clients went with it.
+fn flush_kept() -> usize {
+  let mut gone = Vec::new();
+  let held = KEPT.with(|kept| {
+    // Never borrowed here: nothing that runs while the keeper is borrowed calls back. Were it, the carrier would try
+    // again at its pace rather than wait for a keep that may not come.
+    let Ok(mut kept) = kept.try_borrow_mut() else {
+      return usize::MAX;
+    };
+    for (target, queue) in &mut kept.queues {
+      flush_queue(*target, queue, &mut gone);
+    }
+    kept.queues.retain(|_, queue| !queue.is_empty());
+    kept.held = kept.queues.values().map(VecDeque::len).sum();
+    kept.held
+  });
+  let_go_of(gone);
+  held
+}
+
+/// Sends `queue`'s messages to `target` in order until its channel is full (the rest stay, the first refused at the
+/// front); a target gone moves them all to `gone`. A sent message's wait ends as its [`RoomWait`] drops.
+fn flush_queue(
+  target: u16,
+  queue: &mut VecDeque<(Control, RoomWait)>,
+  gone: &mut Vec<(Option<Control>, RoomWait)>,
+) {
+  while let Some((message, wait)) = queue.pop_front() {
+    match registry::send_control_or_return(target, message) {
+      Ok(()) => {}
+      Err(registry::RefusedControl {
+        error: RtError::ControlFull { .. },
+        message: Some(unsent),
+      }) => {
+        queue.push_front((unsent, wait));
+        return;
+      }
+      Err(refused) => {
+        gone.push((refused.message, wait));
+        gone.extend(queue.drain(..).map(|(message, wait)| (Some(message), wait)));
+        return;
+      }
+    }
+  }
+}
+
+/// Lets go of messages that can no longer be carried (their shard gone, or this shard's carrier ended): each reply
+/// guard in them stands down, and they are counted (`xshard.reply_dropped`).
+fn let_go_of(gone: Vec<(Option<Control>, RoomWait)>) {
+  if gone.is_empty() {
+    return;
+  }
+  let dropped = u64::try_from(gone.len()).unwrap_or(u64::MAX);
+  discarding_unsent(|| drop(gone));
+  state::with_state_counted(|s| s.count(REPLY_DROPPED, dropped));
+}
+
+/// What this shard keeps for other shards whose control channels were full ([`carry`]), and its carrier's hold on it.
+struct Kept {
+  /// By target shard, in the order they were kept, each with its wait for room.
+  queues: BTreeMap<u16, VecDeque<(Control, RoomWait)>>,
+  /// How many are kept, in all the queues.
+  held: usize,
+  /// The most that may be kept at once (`DaemonConfig::kept_bound`), set while a carrier runs; `None` before its start
+  /// and after its end, when nothing is kept and a full channel is refused to the sender.
+  bound: Option<usize>,
+  /// The carrier's waker while it waits, taken by the next keep.
+  carrier: Option<Waker>,
+  /// Messages refused for want of a carrier or past the bound (`xshard.keep_refused`).
+  refused: u64,
+}
+
+impl Kept {
+  const fn new() -> Kept {
+    Kept {
+      queues: BTreeMap::new(),
+      held: 0,
+      bound: None,
+      carrier: None,
+      refused: 0,
+    }
+  }
+}
+
+impl Drop for Kept {
+  fn drop(&mut self) {
+    // At the thread's end, a message still kept (none once the carrier has ended, which lets go of them first) must
+    // not reach for the shard's state, which may be gone by then: every reply guard in it stands down. A flag already
+    // gone reads as standing down to the guards.
+    let _ = DISCARDING_UNSENT.try_with(|discarding| discarding.set(true));
+  }
+}
+
+thread_local! {
+  /// What this shard keeps for other shards ([`Kept`]); only this shard's thread touches it, so it needs no lock (D-7).
+  static KEPT: RefCell<Kept> = const { RefCell::new(Kept::new()) };
+}
+
+/// The carrier: sends what this shard keeps for other shards whose control channels were full ([`carry`]), each
+/// target's messages in order. While any is kept it tries again every [`REPLY_PACE_NS`], and at once whenever another
+/// is kept; while none is, it waits to be woken by the next. Each shard's start spawns it before anything else
+/// (`crate::daemon`), so nothing the shard sends is without it; `bound` is the most it keeps at once
+/// ([`crate::config::DaemonConfig::kept_bound`]). Dropped at the shard's shutdown, it lets go of what it keeps (counted
+/// `xshard.reply_dropped`: the clients go with the daemon), and the shard keeps nothing more.
+pub(crate) fn carrier(bound: usize) -> Carrier {
+  KEPT.with(|kept| {
+    if let Ok(mut kept) = kept.try_borrow_mut() {
+      kept.bound = Some(bound);
+    }
+  });
+  Carrier {
+    _running: CarrierRunning,
+    pace: None,
+  }
+}
+
+/// The carrier's future ([`carrier`]).
+pub(crate) struct Carrier {
+  /// Lets go of what is kept when the carrier is dropped.
+  _running: CarrierRunning,
+  /// The pause before the next try while something is kept.
+  pace: Option<slates_rt::futures::Sleep>,
+}
+
+impl Future for Carrier {
+  type Output = ();
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    let this = self.get_mut();
+    while flush_kept() > 0 {
+      if !this.paced(cx) {
+        // Kept still: the pause or the next keep wakes the carrier.
+        wait_for_keep(cx.waker());
+        return Poll::Pending;
+      }
+    }
+    // Nothing kept: only the next keep wakes the carrier.
+    this.pace = None;
+    wait_for_keep(cx.waker());
+    Poll::Pending
+  }
+}
+
+impl Carrier {
+  /// Polls the pause before the next try, armed at [`REPLY_PACE_NS`] if none runs: whether it has passed, so the
+  /// carrier tries again now. `false` while it runs, and when none can be armed (off a shard, a tripwire; counted), when
+  /// only the next keep wakes the carrier.
+  fn paced(&mut self, cx: &mut Context<'_>) -> bool {
+    let pace = self
+      .pace
+      .get_or_insert_with(|| slates_rt::futures::sleep(REPLY_PACE_NS));
+    match Pin::new(pace).poll(cx) {
+      Poll::Pending => false,
+      Poll::Ready(Ok(())) => {
+        self.pace = None;
+        true
+      }
+      Poll::Ready(Err(_)) => {
+        self.pace = None;
+        state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
+        false
+      }
+    }
+  }
+}
+
+/// Leaves the carrier's waker for the next keep ([`keep`]).
+fn wait_for_keep(waker: &Waker) {
+  KEPT.with(|kept| {
+    if let Ok(mut kept) = kept.try_borrow_mut() {
+      kept.carrier = Some(waker.clone());
+    }
+  });
+}
+
+/// The carrier's hold on this shard's keeper ([`carrier`]): dropped with the carrier, it lets go of what is kept, each
+/// reply guard in it standing down, and the shard keeps nothing more.
+struct CarrierRunning;
+
+impl Drop for CarrierRunning {
+  fn drop(&mut self) {
+    let kept_last: Vec<(Option<Control>, RoomWait)> = KEPT
+      .try_with(|kept| {
+        kept.try_borrow_mut().map_or_else(
+          |_| Vec::new(),
+          |mut kept| {
+            kept.bound = None;
+            kept.carrier = None;
+            kept.held = 0;
+            std::mem::take(&mut kept.queues)
+              .into_values()
+              .flatten()
+              .map(|(message, wait)| (Some(message), wait))
+              .collect()
+          },
+        )
+      })
+      .unwrap_or_default();
+    let_go_of(kept_last);
+  }
+}
+
+/// [`run_on`] for work whose loss would leave state behind on `shard` (a closed connection's byte states, A-192): sent
+/// as a result carried home is ([`carry`]), kept while `shard`'s channel is full for as long as `shard` lives. Counted
+/// under `refused` on this shard when the shard is gone, or the carrier could not keep it.
 pub fn run_on_waiting(
   origin: u16,
   shard: u16,
@@ -248,24 +507,7 @@ pub fn run_on_waiting(
     }),
     None,
   );
-  let unsent = match registry::send_control_or_return(shard, Control::Spawn(Box::new(task))) {
-    Ok(()) => return,
-    Err(registry::RefusedControl {
-      error: RtError::ControlFull { .. },
-      message: Some(unsent),
-    }) => unsent,
-    Err(_) => {
-      state::with_state_counted(|s| s.count(refused, 1));
-      return;
-    }
-  };
-  let waiting = slates_rt::futures::spawn(async move {
-    if !given_room(shard, unsent).await {
-      state::with_state_counted(|s| s.count(refused, 1));
-    }
-  })
-  .and_then(slates_rt::futures::detach);
-  if waiting.is_err() {
+  if carry(shard, Control::Spawn(Box::new(task))).is_err() {
     state::with_state_counted(|s| s.count(refused, 1));
   }
 }
@@ -305,43 +547,76 @@ pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_
   }
 }
 
-/// Counter: a scatter part's pause for room refused ([`given_room_within`]): only off a shard, so a tripwire.
+/// Counter: a scatter part's pause for room refused ([`given_room_within`]), or the carrier's ([`carrier`]): only off
+/// a shard, so a tripwire.
 pub(crate) const ROOM_PAUSE_REFUSED: &str = "xshard.room_pause_refused";
 
-/// Shape: the pace of a reply's retries for room — a tenth of a coordinator period, the collection loops' cadence
-/// (`crate::fleet::POLL_PER_PERIOD`), so a waiting reply asks about as often as the shard's loops turn.
+/// Shape: the pace of the retries for room — a tenth of a coordinator period, the collection loops' cadence
+/// (`crate::fleet::POLL_PER_PERIOD`), so a kept reply is tried about as often as the shard's loops turn.
 const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
 
-/// Format: the status counter of waits for room this shard began ([`given_room`], [`given_room_within`]).
+/// Format: the status counter of waits for room this shard began: messages its carrier kept ([`carry`]) and scatter
+/// parts that met a full channel ([`given_room_within`]).
 pub(crate) const ROOM_WAITS_STARTED: &str = "xshard.room_waits_started";
 /// Format: the status counter of waits for room this shard ended, sent or not: with [`ROOM_WAITS_STARTED`], the waits
 /// it holds now.
 pub(crate) const ROOM_WAITS_ENDED: &str = "xshard.room_waits_ended";
-/// Format: the status counter that rises each time this shard holds more waits for room at once than it ever had, by
-/// the difference: its value is the most it has held at once.
+/// Format: the status counter of the most waits for room this shard has held at once.
 pub(crate) const ROOM_WAITS_PEAK: &str = "xshard.room_waits_peak";
+/// Format: the status counter of messages this shard's carrier refused to keep: none ran, or its bound was reached
+/// ([`carry`]). Each is counted again as its sender's loss.
+pub(crate) const KEEP_REFUSED: &str = "xshard.keep_refused";
 
-thread_local! {
-  /// This shard thread's waits for room now, and the most it has held at once ([`RoomWait`]).
-  static ROOM_WAITS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+/// This shard's waits for room ([`RoomWait`]): held now, the most held at once, and begun and ended in all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomWaits {
+  /// Held now.
+  pub now: u64,
+  /// The most held at once.
+  pub peak: u64,
+  /// Begun in all.
+  pub started: u64,
+  /// Ended in all, sent or not.
+  pub ended: u64,
 }
 
-/// One wait for room in progress on this shard ([`given_room`], [`given_room_within`]): counted when it begins and,
-/// dropped, when it ends,
-/// however it ends (sent, the target gone, its task cancelled).
+thread_local! {
+  /// This shard thread's waits for room ([`RoomWait`]). Per thread, so each shard reports its own, and never through
+  /// the shard's state, which a caller that keeps a reply may be borrowing (`hand_reply_home`'s callers).
+  static ROOM_WAITS: Cell<RoomWaits> = const {
+    Cell::new(RoomWaits {
+      now: 0,
+      peak: 0,
+      started: 0,
+      ended: 0,
+    })
+  };
+}
+
+/// This shard thread's waits for room so far (in the shard's status as `xshard.room_waits_started`, `_ended` and
+/// `_peak`).
+pub fn room_waits() -> RoomWaits {
+  ROOM_WAITS.with(Cell::get)
+}
+
+/// The messages this shard thread's carrier refused to keep so far ([`KEEP_REFUSED`]).
+pub fn keep_refused() -> u64 {
+  KEPT.with(|kept| kept.try_borrow().map_or(0, |kept| kept.refused))
+}
+
+/// One wait for room in progress on this shard: a message its carrier keeps ([`carry`]) or a scatter part's
+/// ([`given_room_within`]). Counted when it begins and, dropped, when it ends, however it ends (sent, the target gone,
+/// the carrier or the part's task ended).
 struct RoomWait;
 
 impl RoomWait {
   fn begin() -> RoomWait {
-    let (now, peak) = ROOM_WAITS.with(Cell::get);
-    let now = now.saturating_add(1);
-    ROOM_WAITS.with(|waits| waits.set((now, peak.max(now))));
-    let raised = now.saturating_sub(peak);
-    state::with_state_counted(|s| {
-      s.count(ROOM_WAITS_STARTED, 1);
-      if raised > 0 {
-        s.count(ROOM_WAITS_PEAK, raised);
-      }
+    ROOM_WAITS.with(|waits| {
+      let mut counted = waits.get();
+      counted.now = counted.now.saturating_add(1);
+      counted.peak = counted.peak.max(counted.now);
+      counted.started = counted.started.saturating_add(1);
+      waits.set(counted);
     });
     RoomWait
   }
@@ -349,16 +624,18 @@ impl RoomWait {
 
 impl Drop for RoomWait {
   fn drop(&mut self) {
-    ROOM_WAITS.with(|waits| {
-      let (now, peak) = waits.get();
-      waits.set((now.saturating_sub(1), peak));
+    // Through `try_with`: a wait still kept at the thread's end drops with the keeper, after which nothing reads this.
+    let _ = ROOM_WAITS.try_with(|waits| {
+      let mut counted = waits.get();
+      counted.now = counted.now.saturating_sub(1);
+      counted.ended = counted.ended.saturating_add(1);
+      waits.set(counted);
     });
-    state::with_state_counted(|s| s.count(ROOM_WAITS_ENDED, 1));
   }
 }
 
-/// Format: the status counter of results that could not be carried home because the shard they went to is gone
-/// ([`send_back`]).
+/// Format: the status counter of results that could not be carried home: the shard they went to is gone ([`send_back`],
+/// [`flush_kept`]), or this shard stopped while its carrier kept them.
 pub(crate) const REPLY_DROPPED: &str = "xshard.reply_dropped";
 
 /// Runs `work` on `shard` and returns its result on this shard (`origin`). The closure borrows
@@ -388,7 +665,7 @@ pub fn call_on<T: Send + 'static>(
         }),
         None,
       );
-      send_back(origin, back).await;
+      send_back(origin, back);
     }),
     None,
   );
@@ -507,7 +784,7 @@ where
           }),
           None,
         );
-        send_back(origin, back).await;
+        send_back(origin, back);
       }
     }),
     None,
@@ -533,7 +810,7 @@ where
       }),
       None,
     );
-    send_back(origin, back).await;
+    send_back(origin, back);
   };
   slates_rt::futures::spawn(work)
     .and_then(slates_rt::futures::detach)
@@ -587,9 +864,9 @@ mod tests {
   const REPLY_ROOM_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
   /// A result carried home waits for room (2026-10-07). Do: on a shard, register a stand-in slot whose control channel
-  /// holds one message, fill it, and spawn a task that sends a result home to it with `send_back`; from the test
-  /// thread, wait two reply paces, then take the filler off the channel. Expect: the result's message arrives after
-  /// the filler, and nothing was counted dropped. Before, the full channel dropped it at once.
+  /// holds one message, fill it, and send a result home to it with `send_back`; from the test thread, take the filler
+  /// off the channel. Expect: the result's message arrives after the filler. Before, the full channel dropped it at
+  /// once; until 2026-11-18 it waited a coordinator period and was dropped after.
   #[test]
   // The test thread stands for the origin shard draining later: it must wait off-shard while the reply retries.
   #[allow(clippy::disallowed_methods)]
@@ -606,18 +883,14 @@ mod tests {
       let filler = SpawnRequest::new(Box::pin(async {}), None);
       registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
       let back = SpawnRequest::new(Box::pin(async {}), None);
-      let task = slates_rt::futures::spawn(send_back(home, back)).unwrap();
-      slates_rt::futures::detach(task).unwrap();
+      send_back(home, back);
       (registration, receiver)
     });
-    // The filler occupies the one slot, so the reply behind it can only land once this takes it. Wait for the
-    // filler within the same bound the reply's own wait uses, rather than assuming two pacing intervals are
-    // enough: on a loaded shared runner they are not, and this failed with the daemon behaving correctly
-    // (CI run 39073360651, macOS lane). The assertion that matters is the next one — the reply arrived once
-    // there was room — and it keeps its bound.
-    let room = std::time::Duration::from_nanos(REPLY_ROOM_NS.saturating_add(REPLY_PACE_NS));
-    assert!(receiver.recv_timeout(room).is_ok(), "the filler");
-    let carried = receiver.recv_timeout(room);
+    // The filler occupies the one slot, so the reply behind it can only land once this takes it. Both waits take the
+    // daemon's budget for a slow shard: two pacing intervals were not enough on a loaded shared runner, which failed
+    // this with the daemon behaving correctly (CI run 39073360651, macOS lane), and a reply that is lost never comes.
+    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
+    let carried = receiver.recv_timeout(MESSAGE_WAIT);
     assert!(
       carried.is_ok(),
       "the result's message arrived once there was room"
@@ -651,10 +924,9 @@ mod tests {
       (registration, receiver, handed)
     });
     assert!(handed.is_ok(), "the hand-off was refused: {handed:?}");
-    let room = std::time::Duration::from_nanos(REPLY_ROOM_NS.saturating_add(REPLY_PACE_NS));
-    assert!(receiver.recv_timeout(room).is_ok(), "the filler");
+    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
     assert!(
-      receiver.recv_timeout(room).is_ok(),
+      receiver.recv_timeout(MESSAGE_WAIT).is_ok(),
       "the reply's message arrived once there was room"
     );
     drop(registration);
@@ -1069,8 +1341,9 @@ impl AnswerUnstarted {
 
 impl Drop for AnswerUnstarted {
   fn drop(&mut self) {
-    // A send its sender saw refused: the sender answers the client on its own refusal path.
-    if DISCARDING_UNSENT.with(Cell::get) {
+    // A send its sender saw refused: the sender answers the client on its own refusal path. A flag already gone (the
+    // thread ending) reads as standing down.
+    if DISCARDING_UNSENT.try_with(Cell::get).unwrap_or(true) {
       return;
     }
     let Some(reply) = self.reply.take() else {
@@ -1086,9 +1359,10 @@ impl Drop for AnswerUnstarted {
       state::deliver(client_index, request, reply, true);
       return;
     }
-    // Carried home as [`carry_home`] carries a reply: this shard's arena refused the task the guard was in, so the
-    // reply goes to the client's shard's channel needing nothing of it, and only waits on a task here for room there.
-    if carry_home(home, move || {
+    // This shard's arena refused the task the guard was in, and the guard drops inside the runtime's admission, where
+    // no task can be spawned: the answer is carried home as any reply is ([`hand_reply_home`]), kept by the carrier
+    // while the client's shard's channel is full, which needs neither.
+    if hand_reply_home(home, move || {
       state::deliver(client_index, request, reply, true);
     })
     .is_err()
@@ -1111,24 +1385,24 @@ thread_local! {
 pub(crate) fn send_owing(target: u16, task: SpawnRequest) -> Result<(), RtError> {
   match registry::send_control_or_return(target, Control::Spawn(Box::new(task))) {
     Ok(()) => Ok(()),
-    Err(refused) => {
-      DISCARDING_UNSENT.with(|discarding| discarding.set(true));
+    Err(refused) => discarding_unsent(|| {
       drop(refused.message);
-      DISCARDING_UNSENT.with(|discarding| discarding.set(false));
       Err(refused.error)
-    }
+    }),
   }
 }
 
 /// Counter: a task owing a client its reply that was dropped before it ran (its spawn refused at admission, its shard
 /// shutting down), its client answered instead ([`AnswerUnstarted`]).
 pub(crate) const UNSTARTED_ANSWERED: &str = "xshard.unstarted_answered";
-/// Counter: such a task whose answer could not be sent home either (the client's shard's channel refused it).
+/// Counter: such a task whose answer could not be carried home either: the client's shard gone, or this shard's
+/// carrier refusing to keep it ([`hand_reply_home`]).
 pub(crate) const UNSTARTED_UNANSWERED: &str = "xshard.unstarted_unanswered";
 
 /// The synchronous end of a reply carried home ([`send_reply_home`]): run on the client's shard by its task, or, when
-/// that shard drops the task unrun (its arena full at admission), run there by the drop. Dropped anywhere else (its
-/// sender's wait for room ran out, counted `xshard.reply_dropped`), it does nothing.
+/// that shard drops the task unrun (its arena full at admission), run there by the drop. Dropped anywhere else (the
+/// client's shard gone, or the sending shard stopping while its carrier kept it; counted `xshard.reply_dropped`), it
+/// does nothing.
 struct RunUnstarted {
   at: u16,
   body: Option<Box<dyn FnOnce() + Send>>,
@@ -1145,7 +1419,7 @@ impl RunUnstarted {
 
 impl Drop for RunUnstarted {
   fn drop(&mut self) {
-    if DISCARDING_UNSENT.with(Cell::get) || self.body.is_none() {
+    if DISCARDING_UNSENT.try_with(Cell::get).unwrap_or(true) || self.body.is_none() {
       return;
     }
     if state::with_state(|s| s.shard) != Some(self.at) {
@@ -1159,78 +1433,50 @@ impl Drop for RunUnstarted {
 /// Carries a reply home to `origin`, the client's shard, as [`send_back`] carries a result: `body` is the reply's
 /// synchronous end there (writing it into the client's ring, with what goes with it). It runs on `origin` whether its
 /// arena admits the task or refuses it at admission, so a reply that reached the client's shard is never lost to a full
-/// arena there. The sibling of [`AnswerUnstarted`] the supervisor ordered fixed with it (2026-11-07).
-pub async fn send_reply_home(origin: u16, body: impl FnOnce() + Send + 'static) {
+/// arena there. The sibling of [`AnswerUnstarted`] the supervisor ordered fixed with it (2026-11-07). A reply that
+/// could not be carried (its client's shard gone) is counted `xshard.reply_dropped`.
+pub fn send_reply_home(origin: u16, body: impl FnOnce() + Send + 'static) {
+  send_back(origin, reply_task(origin, body));
+}
+
+/// The task that runs `body`, a reply's synchronous end, on `origin`, or runs it there as it is dropped unrun
+/// ([`RunUnstarted`]).
+fn reply_task(origin: u16, body: impl FnOnce() + Send + 'static) -> SpawnRequest {
   let mut guard = RunUnstarted {
     at: origin,
     body: Some(Box::new(body)),
   };
-  let back = SpawnRequest::new(
+  SpawnRequest::new(
     Box::pin(async move {
       guard.run();
     }),
     None,
-  );
-  send_back(origin, back).await;
+  )
 }
 
 /// Counter: a reply carried home whose task the client's shard refused at admission, run there by its drop instead
 /// ([`send_reply_home`]).
 pub(crate) const REPLY_RUN_UNSTARTED: &str = "xshard.reply_run_unstarted";
 
-/// [`send_reply_home`] for a caller that cannot wait for room (it holds its shard's state), as [`carry_home`] carries
-/// it: the refusal is returned for the caller to count. Until 2026-11-09 `body` was handed to `target`'s channel once
-/// and a full channel's refusal returned, so a reply met a full channel and was lost (CLAUDE.md §2 items 8 and 9).
+/// [`send_reply_home`] for a caller that holds its shard's state, or a guard dropped inside the runtime's admission
+/// ([`AnswerUnstarted`]): carried the same way ([`carry`]), with the refusal (the client's shard gone, or the carrier
+/// refusing to keep it) returned for the caller to count, the reply dropped and its guard standing down. Until
+/// 2026-11-09 `body` was handed to `target`'s channel once, so a reply that met a full channel was lost (CLAUDE.md §2
+/// items 8 and 9); until 2026-11-18 one that met a full channel waited in a task spawned here, which a full arena, or
+/// the admission a guard drops in, refused.
 pub(crate) fn hand_reply_home(
   target: u16,
   body: impl FnOnce() + Send + 'static,
 ) -> Result<(), RtError> {
-  carry_home(target, body)
-}
-
-/// Carries a reply home to `origin` from a caller that cannot await, waiting for room as [`send_reply_home`] waits,
-/// with the wait's first try made at once: `body` goes to `origin`'s control channel now, which needs nothing of this
-/// shard, and only a full channel puts the wait on a task of this shard. So a reply is not lost to this shard's arena
-/// when the channel has room (an [`AnswerUnstarted`] drops because its shard's arena is full; a task there for every
-/// reply failed `a_forward_refused_at_admission_answers_its_client` 3 of 3), nor to a full channel while this shard can
-/// run the wait. Returned: the refusal when neither could take it, `origin` gone or this shard's arena full with the
-/// channel, for the caller to count; the reply is then dropped here, its guard standing down.
-fn carry_home(origin: u16, body: impl FnOnce() + Send + 'static) -> Result<(), RtError> {
-  let mut guard = RunUnstarted {
-    at: origin,
-    body: Some(Box::new(body)),
-  };
-  let back = SpawnRequest::new(
-    Box::pin(async move {
-      guard.run();
-    }),
-    None,
-  );
-  match registry::send_control_or_return(origin, Control::Spawn(Box::new(back))) {
-    Ok(()) => Ok(()),
-    Err(registry::RefusedControl {
-      error: RtError::ControlFull { .. },
-      message: Some(unsent),
-    }) => discarding_unsent(|| {
-      slates_rt::futures::spawn(async move {
-        if !given_room(origin, unsent).await {
-          state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
-        }
-      })
-      .and_then(slates_rt::futures::detach)
-    }),
-    Err(refused) => discarding_unsent(|| {
-      drop(refused.message);
-      Err(refused.error)
-    }),
-  }
+  carry(target, Control::Spawn(Box::new(reply_task(target, body))))
 }
 
 /// Runs `drop_or_hand`, during which a reply guard dropped stands down ([`DISCARDING_UNSENT`]): the caller reports
 /// the refusal.
 fn discarding_unsent<T>(drop_or_hand: impl FnOnce() -> T) -> T {
-  DISCARDING_UNSENT.with(|discarding| discarding.set(true));
+  // The flag as it was, restored after: a stand-down inside another keeps the outer one standing down.
+  let before = DISCARDING_UNSENT.with(|discarding| discarding.replace(true));
   let result = drop_or_hand();
-  DISCARDING_UNSENT.with(|discarding| discarding.set(false));
+  DISCARDING_UNSENT.with(|discarding| discarding.set(before));
   result
 }

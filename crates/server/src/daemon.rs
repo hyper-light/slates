@@ -3745,6 +3745,12 @@ async fn init_shard(
     Option<std::os::windows::io::OwnedHandle>,
   ),
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
+  // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
+  // failure, as a refused serve loop is below.
+  futures::spawn(crate::xshard::carrier(config.kept_bound().get()))
+    .and_then(futures::detach)
+    .map_err(ServerError::Runtime)?;
   let mut slices = crate::recovery_slices::RecoverySlices::begin(config.copy_slice_ns());
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;

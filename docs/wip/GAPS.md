@@ -1,36 +1,39 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **A reply carried home past a full channel was dropped: fixed (perf's branch of 2026-11-09, landed by g238 on
-> 2026-11-18; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then dropped the result
-> (`xshard.reply_dropped`), and `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship, the merge plane's
-> deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full channel; a task refused at
-> admission answered its client once (`AnswerUnstarted`). Each lost what it carried: 4,074 to 4,518 a run of the
-> 3,000-client rung on main 80be552a. A diagnostic build of main db9c514e (2026-11-09) counted every one an
-> acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418 in two runs), not a verb's reply: no client waited out
-> a reply deadline (this entry said each did until then). A lost part's release had run on its shard; what the loss
-> left was the acknowledgement's entry on the client's shard (`ShardState::ack_scatters`), which nothing else removes,
-> so the table crept toward `ack_scatter_bound`, past which an acknowledgement's releases are not sent at all
-> (`ack.release_refused`). (This entry said until 2026-11-18 that each loss refused clients `AcknowledgementOwed`, about
+> **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, from perf's branch of
+> 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
+> dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
+> the merge plane's deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full
+> channel; and a task refused at admission answered its client once (`AnswerUnstarted`). Each lost what it carried:
+> 4,074 to 4,518 a run of the 3,000-client rung on main 80be552a. A diagnostic build of main db9c514e (2026-11-09)
+> counted every one an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418 in two runs), not a verb's
+> reply, so no client waited out a reply deadline there. A lost part's release had run on its shard; what the loss
+> left was the acknowledgement's entry on the client's shard (`ShardState::ack_scatters`), which nothing else
+> removes, so the table crept toward `ack_scatter_bound`, past which an acknowledgement's releases are not sent at all
+> (`ack.release_refused`). (Until 2026-11-18 this entry said each loss refused clients `AcknowledgementOwed`, about
 > 27,000 times a run; that does not follow, since that bound reads the completions retained, which the part had
 > released.) Since A-232 a client waits for a reply while its daemon lives, so a lost verb reply would be a call that
-> never ends. Now every one waits for room for as long as the shard it goes to lives; only a shard gone (its daemon
-> stopping) leaves a reply undelivered. A caller that cannot await (`hand_reply_home`,
-> `AnswerUnstarted`) hands the reply to the client's shard's channel at once and waits on a task of its own shard only
-> when that channel is full: a task for every reply failed main's `a_forward_refused_at_admission_answers_its_client` 3 of
-> 3, since an `AnswerUnstarted` drops because its own shard's arena is full (found on adacachy, 2 of 3 there; fixed
-> 2026-11-09, 3 of 3 pass). What bounds the waiting (CLAUDE.md §2 item 8): a result waits in a task that exists for
-> its request anyway, or in the one task `carry_home` spawns for it, so the waits on a shard are at most its requests in
-> flight (a client's, within `clients_per_shard × slots` of credit; an acknowledgement's parts, within
-> `ack_scatter_bound`; a call's) and at most its task arena, where a spawn is refused typed and counted. They are
-> counted (`xshard.room_waits_started`, `_ended`, `_peak`, the most held at once). Failing first:
-> `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`).
-> Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, and every direct `send_control` of a reply in
-> `crates/server/src`. Siblings reported, not changed (not replies, each counted where lost): a client handed to a shard
-> (`daemon.rs`, `HANDOFF_LOST`), a released client id (`RELEASE_LOST`), an NFS connection's migration (`MIGRATE_REFUSED`),
-> and a Windows DAX holder's record (`shards.rs`, `tell_holder`). Owed: a reply handed home by a caller that cannot
-> await while both the client's channel and this shard's task arena are full is still lost, counted by its caller
-> (each `*_undelivered`, `xshard.unstarted_unanswered`): the arena refuses a spawn at its hard capacity, and an
-> `AnswerUnstarted` drops because it is full. To be closed by a carrier that needs no spawn (g238's next piece).
+> never ends.
+>
+> Now each shard has a carrier (`xshard::carrier`, spawned first by the shard's start): a message that meets a full
+> channel, or finds messages for the same shard kept, is kept in order behind them and sent as soon as there is room,
+> for as long as the shard it goes to lives; only a shard gone (its daemon stopping) leaves one undelivered. The sender
+> holds nothing meanwhile, and nothing is spawned. That matters twice. perf's branch waited in a task per reply, which a
+> full arena refused. And a task refused at admission drops inside the runtime's admission, where no task can be
+> spawned at all; a wake there still marks the carrier ready. Both fail first in `crates/server/src/xshard.rs`
+> (`a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room`,
+> `a_task_refused_at_admission_answers_its_client_through_a_full_channel`), and
+> `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`)
+> failed with `send_back`'s wait bounded to a period again (perf, 2026-11-12). What bounds it (item 8): every kept message answers a request in flight or is awaited by a task, so a shard
+> keeps at most `DaemonConfig::kept_bound` (`2 × clients_per_shard × slots × shards` plus the task arenas, in the boot
+> log); past it a message is refused to its sender and counted (`xshard.keep_refused`). Counted per shard thread, not in
+> the shard's state, which a caller that keeps a reply may be borrowing: `xshard.room_waits_started`, `_ended`, `_peak`.
+> Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, `run_on_waiting` (A-192's connection ends,
+> now carried the same way), and every direct `send_control` of a reply in `crates/server/src`. Siblings reported, not
+> changed (not replies, each counted where lost): a client handed to a shard (`daemon.rs`, `HANDOFF_LOST`), a released
+> client id (`RELEASE_LOST`), an NFS connection's migration (`MIGRATE_REFUSED`), and a Windows DAX holder's record
+> (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about
+> 4,200 on main before, 0 expected), `xshard.room_waits_peak`, and each verb's p99 against main.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:

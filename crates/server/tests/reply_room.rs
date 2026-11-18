@@ -1,8 +1,9 @@
-//! A reply carried home to the client's shard is never dropped (§4.3 "admission limit": "backpressure, never a drop";
-//! CLAUDE.md §2 items 8 and 9): a forwarded verb's answer, and a cross-shard call's result, wait for room on a full
-//! channel for as long as the shard they go to lives. Until 2026-11-09 they waited one coordinator period
-//! (`xshard::REPLY_ROOM_NS`) and were dropped, counted `xshard.reply_dropped`, and the client waited out its whole reply
-//! deadline: about 4,300 a run of loadtest-scale's 3,000-client rung on main 80be552a.
+//! A reply carried home to the client's shard is never dropped (§4.3; CLAUDE.md §2 items 8 and 9): a forwarded verb's
+//! answer, and a cross-shard call's result, wait for room on a full channel for as long as the shard they go to lives,
+//! kept by the sending shard's carrier (`xshard::carrier`). Until 2026-11-18 they waited one coordinator period and were
+//! dropped, counted `xshard.reply_dropped`: 4,074 to 4,518 a run of the 3,000-client load rung on main 80be552a, every
+//! one an acknowledgement part's result there. Since A-232 a client waits for a reply while its daemon lives, so a lost
+//! verb reply would be a call that never ends.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -19,6 +20,7 @@ use slates_client::{CreateSpec, NamePolicy, SizeClass};
 use slates_ipc::protocol::{ReplyBody, RequestBody};
 use slates_server::daemon::{HEARTBEAT_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
+use slates_server::xshard::RoomWaits;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -172,7 +174,7 @@ fn attempt(n: usize) -> Attempt {
   let watching = Instant::now();
   let mut held_past_wait = false;
   while watching.elapsed() < HOLD_START_WAIT {
-    if waits_begun_on(&daemon, owner) > 0 {
+    if room_waits_on(&daemon, owner).started > 0 {
       #[allow(clippy::disallowed_methods)]
       std::thread::sleep(HELD_PAST_WAIT);
       held_past_wait = true;
@@ -191,16 +193,16 @@ fn attempt(n: usize) -> Attempt {
   }
   let waited = released.elapsed();
   let counted = daemon.refusals_on_every_shard().unwrap();
-  let count = |name: &str| counted.get(name).copied().unwrap_or(0);
+  let waits = room_waits_on_every_shard(&daemon);
   let attempt = Attempt {
     held_past_wait,
     flooded,
     answer,
     waited,
-    dropped: count("xshard.reply_dropped"),
-    started: count("xshard.room_waits_started"),
-    ended: count("xshard.room_waits_ended"),
-    peak: count("xshard.room_waits_peak"),
+    dropped: counted.get("xshard.reply_dropped").copied().unwrap_or(0),
+    started: waits.started,
+    ended: waits.ended,
+    peak: waits.peak,
   };
   drop(client);
   daemon.stop();
@@ -244,22 +246,30 @@ fn hold_until(
   waiter
 }
 
-/// The waits for room the shard at `partition` has begun, asked of that shard alone.
-fn waits_begun_on(daemon: &Daemon, partition: usize) -> u64 {
+/// The waits for room the shard at `partition` has counted, asked on that shard's thread, where they are kept
+/// (`xshard::room_waits`).
+fn room_waits_on(daemon: &Daemon, partition: usize) -> RoomWaits {
   daemon
     .observation(
       Some(daemon.shards()[partition]),
       OBSERVE_BUDGET_NS,
-      |s: &mut ShardState| {
-        s.refusals
-          .get("xshard.room_waits_started")
-          .copied()
-          .unwrap_or(0)
-      },
+      |_: &mut ShardState| slates_server::xshard::room_waits(),
     )
     .unwrap()
     .wait()
     .unwrap()
+}
+
+/// The waits for room of every shard: begun and ended summed, and the most any one shard held at once.
+fn room_waits_on_every_shard(daemon: &Daemon) -> RoomWaits {
+  (0..daemon.shards().len())
+    .map(|partition| room_waits_on(daemon, partition))
+    .fold(RoomWaits::default(), |all, shard| RoomWaits {
+      now: all.now + shard.now,
+      peak: all.peak.max(shard.peak),
+      started: all.started + shard.started,
+      ended: all.ended + shard.ended,
+    })
 }
 
 /// §4.3, CLAUDE.md §2 items 8 and 9. Do: on a two-shard daemon, create a volume the shard not serving the client owns;
