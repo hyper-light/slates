@@ -540,7 +540,7 @@ impl Instance {
           request: request.clone(),
           presentation: landing,
           manifest,
-          summary: summary_of(&summary)?,
+          summary: summary_of(&summary),
           verification: Verification::Unsigned,
         };
         if conflicts.is_empty() {
@@ -866,24 +866,28 @@ impl Instance {
   /// The audit log from record `since` (§4.15, §4.14), typed: grants, presentations, validations, entries and
   /// landings finished, in order.
   pub fn audit(&mut self, since: u64) -> Result<Vec<AuditRecord>, Error> {
-    self
-      .client
-      .audit(since)
-      .map_err(|e| self.error(e))?
-      .into_iter()
-      .map(audit_of)
-      .collect()
+    Ok(
+      self
+        .client
+        .audit(since)
+        .map_err(|e| self.error(e))?
+        .into_iter()
+        .map(audit_of)
+        .collect(),
+    )
   }
 
   /// The caller's grants (§4.13), typed: each with its volume, target, manifest, scope and state.
   pub fn grants(&mut self) -> Result<Vec<GrantRecord>, Error> {
-    self
-      .client
-      .grants()
-      .map_err(|e| self.error(e))?
-      .into_iter()
-      .map(grant_of)
-      .collect()
+    Ok(
+      self
+        .client
+        .grants()
+        .map_err(|e| self.error(e))?
+        .into_iter()
+        .map(grant_of)
+        .collect(),
+    )
   }
 
   /// One shard's telemetry drain (§4.14): the chokepoint spans its bounded ring holds, up to one reply's quota, with

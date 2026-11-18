@@ -811,6 +811,64 @@ pub async fn call_in_shard_time<T: Send + 'static>(
   within_shard_time(call, budget_ns).await
 }
 
+/// The turns of one walk cut into slices over `shard`'s state and driven by a task of shard `origin` (CLAUDE.md
+/// "Bounded work everywhere"; A-347): each [`Turns::call`] runs its slice in a turn of `shard` of its own, so the shard
+/// serves its other tasks between the slices. A call to another shard is a task of that shard, a turn of its own
+/// already. A call to the caller's own shard runs inline ([`call_on`]), so a walk that called again at once ran every
+/// slice in the one poll of its task: until 2026-11-18 the sliced walks over the control shard's own volumes (the live
+/// record period, a returned holder's walk, the seal walk, a takeover's envelope open), and every walk of a one-shard
+/// daemon, were one turn however many slices they counted. A call to this shard therefore yields first. Two slices of
+/// one walk that still ran in one poll of `shard` are counted [`TURNS_SHARED`], a bug signal the walks' tests hold at
+/// zero.
+pub(crate) struct Turns {
+  /// The shard whose task drives the walk.
+  origin: u16,
+  /// The shard whose state the slices run on.
+  shard: u16,
+  /// The poll of `shard` the walk's last slice ran in (`slates_rt::futures::polls_so_far`); `None` before the first.
+  last_poll: Option<u64>,
+}
+
+impl Turns {
+  /// A walk over `shard`'s state driven from a task of shard `origin`.
+  pub(crate) fn new(origin: u16, shard: u16) -> Turns {
+    Turns {
+      origin,
+      shard,
+      last_poll: None,
+    }
+  }
+
+  /// Runs the walk's next slice, `work`, on its shard in a turn of its own and awaits its result for at most
+  /// `deadline_ns` of wall time; `None` as [`call_within`] answers.
+  pub(crate) async fn call<T: Send + 'static>(
+    &mut self,
+    work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
+    deadline_ns: u64,
+  ) -> Option<T> {
+    if self.shard == self.origin {
+      slates_rt::futures::yield_now().await;
+    }
+    let (answer, poll) = call_within(
+      self.origin,
+      self.shard,
+      move |s| (work(s), slates_rt::futures::polls_so_far()),
+      deadline_ns,
+    )
+    .await?;
+    if poll.is_some() && poll == self.last_poll {
+      let _ = state::with_state_counted(|s| s.count(TURNS_SHARED, 1));
+    }
+    self.last_poll = poll;
+    Some(answer)
+  }
+}
+
+/// Counter: a slice of a walk driven through [`Turns`] that ran in the same poll of its shard as the walk's slice before
+/// it, a turn not given back (a bug signal: zero by construction).
+/// Format: a counter name in the daemon's status report.
+pub(crate) const TURNS_SHARED: &str = "xshard.turns_shared";
+
 /// Runs the future `start` makes as a task on `shard`, and awaits its result on this shard (`origin`) for at most
 /// `deadline_ns` of wall time: the call for work that must yield on its shard as it goes (a write-back a copy slice a
 /// turn, §4.3's bounded work, A-188), which [`call_within`]'s closure, run in one turn, cannot be. The future is made on

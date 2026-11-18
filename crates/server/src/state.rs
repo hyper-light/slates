@@ -794,8 +794,9 @@ pub struct ShardState {
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
-  /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum the record period's seal
-  /// walk turns are cut by in place of the shard's step quantum (`fleet::seal_walk_slice`).
+  /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum a seal's turns are cut by in
+  /// place of the shard's step quantum: the record period's seal walk and envelope wrap (`fleet::seal_walk_slice`), and a
+  /// takeover's envelope open (`fleet::open_slice`, A-347).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —

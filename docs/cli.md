@@ -30,9 +30,14 @@ slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
 segment in RAM, publishes the profile into it, and supervises `slates daemon` as a child with
 the segment handed over in its environment. It restarts a daemon that exits, kills one whose
-heartbeat lapses, and gives up on a crash loop (the bound is derived from the recovery budget
-and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
+heartbeat lapses because a shard is stuck (never one whose shards are only starved: kept off their
+CPUs, or waiting on memory while the host reports a memory stall), and gives up on a crash loop
+(the bound is derived from the recovery budget and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
 an anonymous shared segment alone does not establish locked residency or no swapping.
+
+`--shards N` overrides the derived shard count (tests). One process runs at most 1,024 shards (the
+runtime's registry of shards); a larger count is refused as a usage error before anything starts, since
+the daemon could never register its shards and the anchor would restart it for good.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
@@ -480,11 +485,13 @@ the copy at `N` goes into the command, so the attachment lasts exactly as long a
 command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
 The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
 command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
-With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux): a message socket
-whose first message names the attachment and a secret token, and over which, if the daemon dies and its successor
-recovers the attachment, the successor hands a fresh stream end naming the same token. Reading the channel's end means
-no such stream will come (the attachment ended, or the daemon could not keep it); a platform that makes no channel yet
-hands one already ended.
+With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux and macOS): a
+socket whose first message, 28 bytes, names the attachment and a secret token, and over which, if the daemon dies and
+its successor recovers the attachment, the successor hands a fresh stream end naming the same token. On Linux each
+message is one packet; on macOS the channel is a stream, so read each message whole by its 28 bytes. Reading the
+channel's end means no such stream will come (the attachment ended, or the daemon could not keep it); a platform that
+makes no channel yet hands one already ended. On macOS today the daemon's successor cannot yet recover the attachment,
+so the end comes at the daemon's death.
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.

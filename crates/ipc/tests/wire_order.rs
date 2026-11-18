@@ -25,13 +25,13 @@
 mod order;
 
 use slates_ipc::protocol::{
-  AttachRequest, AttachTransport, BaseReport, CauseRecord, ConflictClass, Conformance,
-  DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established, GrantScope, HostAnswer,
-  HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation, MoveRefusal, NamePolicy,
-  OwnMountUse, PlannedAction, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
-  Refusal, ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass,
-  SnapshotBoundary, TargetPathConstraint, UnsupportedReason, Verification, VolumeRefusal,
-  WatcherState, WorkOp, WriteAct, WriteMode,
+  AttachRequest, AttachTransport, AuditKind, BaseReport, CauseRecord, ConflictClass, Conformance,
+  DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established, GrantScope,
+  GrantState, HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation,
+  LandingStage, MoveRefusal, NamePolicy, OwnMountUse, PlannedAction, PolicySubject, Principal,
+  ReadAt, ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope,
+  SignatureFault, SignerKey, SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal,
+  UnsupportedReason, Verification, VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -43,9 +43,11 @@ fn schemas() -> Vec<&'static str> {
   vec![
     <AttachRequest as Wire>::SCHEMA,
     <AttachTransport as Wire>::SCHEMA,
+    <AuditKind as Wire>::SCHEMA,
     <BaseReport as Wire>::SCHEMA,
     <CauseRecord as Wire>::SCHEMA,
     <ConflictClass as Wire>::SCHEMA,
+    <DatabaseRefusal as Wire>::SCHEMA,
     <Conformance as Wire>::SCHEMA,
     <DeleteWhileOpen as Wire>::SCHEMA,
     <DriftKind as Wire>::SCHEMA,
@@ -53,12 +55,14 @@ fn schemas() -> Vec<&'static str> {
     <EntryKind as Wire>::SCHEMA,
     <Established as Wire>::SCHEMA,
     <GrantScope as Wire>::SCHEMA,
+    <GrantState as Wire>::SCHEMA,
     <HostAnswer as Wire>::SCHEMA,
     <HostPathReason as Wire>::SCHEMA,
     <Intent as Wire>::SCHEMA,
     <IpcNodeKind as Wire>::SCHEMA,
     <KernelCache as Wire>::SCHEMA,
     <LandingDegradation as Wire>::SCHEMA,
+    <LandingStage as Wire>::SCHEMA,
     <MoveRefusal as Wire>::SCHEMA,
     <NamePolicy as Wire>::SCHEMA,
     <OwnMountUse as Wire>::SCHEMA,
@@ -77,6 +81,7 @@ fn schemas() -> Vec<&'static str> {
     <SignerKey as Wire>::SCHEMA,
     <SizeClass as Wire>::SCHEMA,
     <SnapshotBoundary as Wire>::SCHEMA,
+    <TargetRefusal as Wire>::SCHEMA,
     <TargetPathConstraint as Wire>::SCHEMA,
     <UnsupportedReason as Wire>::SCHEMA,
     <Verification as Wire>::SCHEMA,

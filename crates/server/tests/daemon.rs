@@ -1440,7 +1440,9 @@ fn landing_refusal_scenario() {
       grant: None,
     }),
     ReplyBody::Refused {
-      refusal: Refusal::TargetUnavailable { .. }
+      refusal: Refusal::Target {
+        refusal: slates_ipc::protocol::TargetRefusal::Missing
+      }
     }
   ));
   // The caller has no grants and the audit log is empty (the refused landing recorded nothing).

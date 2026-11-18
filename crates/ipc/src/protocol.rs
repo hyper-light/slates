@@ -2990,12 +2990,35 @@ pub struct ActionCount {
 /// A landing manifest's summary (§4.15 step 2).
 #[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
 pub struct LandingSummary {
-  /// Entries per action name.
+  /// Entries per action name, for people (a consumer reads [`LandingSummary::actions`]).
   pub by_action: Vec<ActionCount>,
   /// Bytes the landing writes.
   pub bytes: u64,
   /// Entries the filter left out.
   pub filtered_out: u64,
+  /// Entries per action, typed (A-299, 2026-11-18: until then a consumer read `by_action`'s names). Appended.
+  pub actions: ActionTally,
+}
+
+/// A landing manifest's entries per action (§4.15 "Plan"), each [`PlannedAction`]'s count. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ActionTally {
+  /// Files the disk did not have, written.
+  pub create: u64,
+  /// Files the disk had, replaced.
+  pub replace: u64,
+  /// Files the disk had, removed.
+  pub delete: u64,
+  /// Directories moved whole from their origins.
+  pub rename: u64,
+  /// Directories made.
+  pub mkdir: u64,
+  /// Directories removed with everything beneath them.
+  pub rmdir: u64,
+  /// Symlinks made or replaced.
+  pub symlink: u64,
+  /// Directories emptied and kept.
+  pub clear: u64,
 }
 
 /// One entry of a presented landing's manifest (§4.15 step 2, "the full entry list on demand"): what the landing would
@@ -3113,6 +3136,34 @@ pub struct LandingOutcome {
   /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
   /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: u64,
+  /// The terminal state, typed (A-299, 2026-11-18: until then a consumer read `state`'s name). Appended.
+  pub stage: LandingStage,
+}
+
+/// A landing's stage (§4.15 "State machines"): the four terminal states a finished landing reports and the stages
+/// before them. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandingStage {
+  /// Its manifest is being planned.
+  Planning,
+  /// Presented, awaiting an approval.
+  AwaitingGrant,
+  /// Its entries are being validated against the disk.
+  Validating,
+  /// Its entries are being written.
+  Writing,
+  /// Its written entries are being made durable.
+  Syncing,
+  /// The volume is advancing past what landed.
+  Advancing,
+  /// Every entry landed.
+  Done,
+  /// Some entries were undone; the rest landed.
+  Partial,
+  /// Validation refused it; nothing was written.
+  Refused,
+  /// Cancelled or crashed; a resume continues it.
+  Aborted,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -3211,8 +3262,23 @@ pub struct GrantSummary {
   pub manifest: [u8; 32],
   /// The scope.
   pub scope: GrantScope,
-  /// The state name (`issued`, `consumed`, `expired`, `revoked`).
+  /// The state name (`issued`, `consumed`, `expired`, `revoked`), for people.
   pub state: String,
+  /// The state, typed (A-299, 2026-11-18: until then a consumer read `state`'s name). Appended.
+  pub grant_state: GrantState,
+}
+
+/// Where a grant stands (§4.15 "State machines"). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantState {
+  /// Issued and not yet used up.
+  Issued,
+  /// A single-use grant's landing finished.
+  Consumed,
+  /// Its term passed, or its session ended.
+  Expired,
+  /// Revoked.
+  Revoked,
 }
 
 /// An audit record on the wire (§4.15).
@@ -3230,8 +3296,31 @@ pub struct AuditEntry {
   pub landing: Option<u64>,
   /// The manifest, when bound.
   pub manifest: Option<[u8; 32]>,
-  /// The terminal state, for a finished landing.
+  /// The terminal state, for a finished landing, for people.
   pub outcome: Option<String>,
+  /// The record's kind, typed (A-299, 2026-11-18: until then a consumer read `kind`'s name). Appended.
+  pub audit_kind: AuditKind,
+  /// The terminal state, typed, for a finished landing. Appended with `audit_kind`.
+  pub stage: Option<LandingStage>,
+}
+
+/// What an audit record records (§4.15). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditKind {
+  /// A grant was issued (by the launcher's approval, or by a bypass policy).
+  GrantIssued,
+  /// A grant was revoked.
+  GrantRevoked,
+  /// A landing was presented.
+  LandingPlanned,
+  /// A landing's entries were validated against the disk.
+  LandingValidated,
+  /// An entry was written.
+  EntryWritten,
+  /// An entry was refused.
+  EntryRefused,
+  /// A landing finished.
+  LandingFinished,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability
@@ -3316,7 +3405,9 @@ pub enum Refusal {
     /// What stopped the publication.
     reason: String,
   },
-  /// The landing target directory cannot be opened, or escapes containment (§4.15 step 4).
+  /// The landing target directory cannot be opened, or escapes containment (§4.15 step 4). Superseded by
+  /// [`Refusal::Target`], which types the reason (A-299, 2026-11-18): no daemon of this build sends it; kept for the
+  /// wire's append-only rule.
   TargetUnavailable {
     /// What was wrong.
     reason: String,
@@ -3605,6 +3696,18 @@ pub enum Refusal {
     /// Why, typed.
     refusal: VolumeRefusal,
   },
+  /// The daemon's own records could not serve the verb, for a reason the variants before this one do not name (A-299):
+  /// until 2026-11-18 each reached a client as `BadRequest` carrying the database error's words. Appended.
+  Database {
+    /// Why, typed.
+    refusal: DatabaseRefusal,
+  },
+  /// A target the verb needs cannot be used: a landing's directory, a mount point, or the mount the daemon made there
+  /// (§4.15 step 4, §4.6). Until 2026-11-18 its reason was words (`TargetUnavailable`). Appended.
+  Target {
+    /// Why, typed.
+    refusal: TargetRefusal,
+  },
   /// A planned move of a volume to another fleet member (`Move`, §4.10 "Ownership follows the writer", A-291) was
   /// refused, for a reason a caller can act on by its kind. Nothing moved, and the volume is served where it was.
   /// Appended.
@@ -3612,6 +3715,88 @@ pub enum Refusal {
     /// Why.
     reason: MoveRefusal,
   },
+}
+
+/// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
+/// mount's refusal. The path is the caller's own, so none carries it. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRefusal {
+  /// The path is not absolute.
+  NotAbsolute,
+  /// A component escapes the landing's target directory.
+  Escapes,
+  /// The entry does not exist.
+  Missing,
+  /// Not a directory where one is needed.
+  NotDirectory,
+  /// Not a file where one is needed.
+  NotFile,
+  /// A handle the host no longer holds.
+  Stale,
+  /// Owned by another user than the one the verb runs for: the owner's uid, where the host named it.
+  OwnedByAnother {
+    /// The owner's uid.
+    owner: Option<u32>,
+  },
+  /// The host refused the path: its OS error number.
+  Host {
+    /// The OS error number.
+    errno: i32,
+  },
+  /// The kernel's mount table names no mount of this daemon's there.
+  NotMounted,
+  /// This daemon already records as many of its own mounts as it can: the bound.
+  RecordsFull {
+    /// The most mounts the daemon records.
+    capacity: u64,
+  },
+  /// This daemon has no tag to name its own mounts by, so it cannot record one (A-227).
+  NoOwnMountTag,
+  /// The OS's mount helper or kernel refused the mount: the OS error number, when one was given (the helper's own
+  /// words, and how it exited, are in the daemon's log).
+  MountRefused {
+    /// The OS error number.
+    errno: Option<i32>,
+  },
+  /// The mount point is not a drive letter (`S:`).
+  NotADriveLetter,
+  /// The anchor's hold on the drive did not answer within its bound (A-206): the mount, or its release, waits on it.
+  AnchorHold,
+  /// A detach of this drive already waits for the anchor's release.
+  DetachPending,
+}
+
+/// What the daemon's database refused, where the refusals before [`Refusal::Database`] name nothing closer (A-299):
+/// each the class of a database error (`slates_db::DbError`) by the same name. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatabaseRefusal {
+  /// A record in the log did not verify (a torn tail, or a hostile byte): the sequence expected there.
+  Corrupt {
+    /// The sequence expected.
+    seq: u64,
+  },
+  /// An NFSv4 instance advance named an instance at or below the current one (§4.6 A-37).
+  NfsInstanceRegressed {
+    /// The partition's current instance.
+    current: u32,
+  },
+  /// A green's checkpoint at a version it cannot stand for (W3; §4.16): not past the checkpoint the green holds, or
+  /// past its head.
+  CheckpointOutOfRange {
+    /// The version the checkpoint named.
+    version: u64,
+    /// The version of the checkpoint the green holds (0: none).
+    held: u64,
+    /// The green's head.
+    head: u64,
+  },
+  /// A sealing key record of other than its fixed length (A-92).
+  SealKeyMalformed {
+    /// The record's length.
+    len: u64,
+  },
+  /// A record's encoding was refused.
+  Encoding,
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
@@ -3668,6 +3853,10 @@ pub enum VolumeRefusal {
     /// The version this build reads.
     expected: u16,
   },
+  /// What a snapshot pins could not be kept (§4.2 `RetentionBudgetExceeded`): no unpromised capacity is left for a
+  /// retained version or bytes, or the volume is at its retention allowance. Not the volume's quota: destroying a
+  /// snapshot frees it. Appended (2026-11-18; until then it reached a client as `NoSpace`).
+  RetentionExceeded,
 }
 
 /// Why a planned move was refused ([`Refusal::MoveRefused`], A-291): each names what the caller can change. Append-only.

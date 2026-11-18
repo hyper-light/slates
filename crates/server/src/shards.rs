@@ -99,8 +99,9 @@ mod dax;
 mod end;
 // A stream's tables for a VM's save and restore (A-303).
 mod tables;
-// A stream's resync channel, the daemon's half (A-316): Linux hands the device its end with the stream's.
-#[cfg(target_os = "linux")]
+// A stream's resync channel, the daemon's half (A-316): Linux hands the device its end with the stream's on the control
+// socket, macOS beside it on the socket route (A-339).
+#[cfg(unix)]
 mod resync;
 
 pub use end::HandedEnd;
@@ -187,16 +188,16 @@ const HOLDER_ADDED: &str = "shards.holder_added";
 const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
 /// Format: the refusal-ledger name of a stream served with no resync channel (A-316): the secure random gave no token,
 /// or the OS refused the pair or its first message. The stream ends at a daemon's death, as before.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RESYNC_UNMADE: &str = "shards.resync_unmade";
 /// Counter: a stream whose resync end the anchor does not hold (A-316): the daemon has no anchor (a test, a standalone
 /// start), or the anchor refused the hold or its session. The device reads the channel's end; the stream ends at a
 /// daemon's death, as before.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RESYNC_UNHELD: &str = "shards.resync_unheld";
 /// Counter: a stream that gave its resync up while it lived (A-316): its guest mapped a file with DAX, or the anchor
 /// refused the owner view's update.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RESYNC_GIVEN_UP: &str = "shards.resync_given_up";
 /// Counter: a stream served again on a fresh stream after its daemon's death, its device handed the fresh end over the
 /// resync channel the anchor held (A-316); the successor's non-vacuity counter.
@@ -216,7 +217,7 @@ const REPLY_WITHHELD: &str = "shards.reply_withheld";
 /// Format: the refusal-ledger name of a resync end's release the anchor's channel refused (A-316): the anchor keeps the
 /// end until the next daemon releases it as one no record of its kind claims, so the device reads the channel's end
 /// only then.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RESYNC_RELEASE_REFUSED: &str = "shards.resync_release_refused";
 /// Counter: an owner word taken (A-281): a guest's root named its run's owner on the stream's root, which the stream
 /// shows its guest as the owner of what the volume keeps as its root's owner's, and the reverse.
@@ -333,9 +334,9 @@ pub(crate) struct ShardsStream {
   /// ask byte, the bound on a fresh stream's first control frame, past which it is refused before anything is allocated
   /// for it.
   restore_most: usize,
-  /// The stream's resync channel (A-316): its token, and whether the anchor holds the daemon's end so a successor can
-  /// hand the device a fresh stream. None where the channel was not made.
-  #[cfg(target_os = "linux")]
+  /// The stream's resync channel (A-316): its token, and the daemon's own copy of its end while the anchor holds one, so
+  /// a successor can hand the device a fresh stream. None where the channel was not made (or the platform makes none).
+  #[cfg(unix)]
   resync: Option<resync::Resync>,
   /// On a stream served again after its daemon's death (A-316): the reply the dead daemon published with its effect and
   /// never wrote, by the request's unique, answered when the device resends that request as its first, and dropped at
@@ -382,7 +383,7 @@ impl ShardsStream {
       owners: OwnerView::IDENTITY,
       restorable: true,
       restore_most,
-      #[cfg(target_os = "linux")]
+      #[cfg(unix)]
       resync: None,
       #[cfg(target_os = "linux")]
       replay: None,
@@ -451,8 +452,8 @@ pub struct ShardsAttached {
   pub lease_epoch: Option<u64>,
   /// The other end of the stream the daemon serves the attachment on, for the VMM.
   pub stream: HandedEnd,
-  /// The device's end of the stream's resync channel (A-316), for the VMM beside the stream's: none where the platform
-  /// hands none yet (macOS, Windows) or the channel was not made.
+  /// The device's end of the stream's resync channel (A-316, A-339), for the VMM beside the stream's: none where the
+  /// platform hands none yet (Windows) or the channel was not made.
   pub resync: Option<HandedEnd>,
 }
 
@@ -540,13 +541,13 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
   };
   s.attachments.set_owner(registry, attachment);
   // The resync channel before the record, so a committed record never names a channel the anchor was not given.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   let mut established = establish_resync(s, attachment);
   let op = Op::AttachmentAdded {
     record: attachment_record.clone(),
   };
   if let Err(e) = s.db.mutate(&mut s.segment, &op, now) {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if let Some(established) = established.as_mut()
       && resync::give_up(attachment, &mut established.resync) == resync::GivenUp::Refused
     {
@@ -565,12 +566,21 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
     scope,
     tables::most_bytes(s.config.store.max_inodes),
   );
-  // The stream keeps its channel's token and whether the anchor holds its end (A-316).
-  #[cfg(target_os = "linux")]
-  let fresh = ShardsStream {
-    resync: established.as_ref().map(|established| established.resync),
-    ..fresh
+  // The stream keeps its channel's token and its own copy of its end while the anchor holds one (A-316, A-339); the
+  // device's end goes out with the stream's.
+  #[cfg(unix)]
+  let (fresh, resync) = match established {
+    Some(resync::Established { end, resync }) => (
+      ShardsStream {
+        resync: Some(resync),
+        ..fresh
+      },
+      Some(end),
+    ),
+    None => (fresh, None),
   };
+  #[cfg(windows)]
+  let resync = None;
   s.shards_streams.insert(attachment, fresh);
   if futures::spawn(serve(attachment))
     .and_then(futures::detach)
@@ -579,10 +589,6 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
     ended(s, attachment);
     return Err(Refusal::Overloaded { shard: s.shard });
   }
-  #[cfg(target_os = "linux")]
-  let resync = established.map(|established| established.end);
-  #[cfg(not(target_os = "linux"))]
-  let resync = None;
   Ok(ShardsAttached {
     attachment,
     lease_epoch,
@@ -593,7 +599,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
 
 /// Gives `stream`'s resync up once its guest maps a file with DAX (A-316; `dax::answer`), counted: the device reads its
 /// resync channel's end and knows its share ends at a daemon's death.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn give_up_resync_for_dax(s: &mut ShardState, stream: &mut ShardsStream) {
   let Some(resync) = stream.resync.as_mut() else {
     return;
@@ -610,11 +616,11 @@ fn give_up_resync_for_dax(s: &mut ShardState, stream: &mut ShardsStream) {
 
 /// Makes `attachment`'s resync channel (A-316; [`resync::establish`]), counting a channel not made (the stream is then
 /// served without one, ending at a daemon's death as before) and one the anchor was not given.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn establish_resync(s: &mut ShardState, attachment: u64) -> Option<resync::Established> {
   match resync::establish(attachment, OwnerView::IDENTITY) {
     Ok(established) => {
-      if !established.resync.held {
+      if !established.resync.held() {
         s.count(RESYNC_UNHELD, 1);
       }
       Some(established)
@@ -765,9 +771,10 @@ fn hand_out(
   }
 }
 
-/// macOS: the end is offered on the socket route under `secret` (`crate::shards_route`), and the reply carries the
-/// secret. An offer whose expiry could not be armed is dropped at once, closing the end, so the stream ends its
-/// attachment, and the attach is refused `Overloaded`.
+/// macOS: the end is offered on the socket route under `secret` (`crate::shards_route`), the device's end of its resync
+/// channel beside it when one was made (A-339), and the reply carries the secret. An offer whose expiry could not be
+/// armed is dropped at once, closing the ends, so the stream ends its attachment, and the attach is refused
+/// `Overloaded`.
 #[cfg(target_os = "macos")]
 fn hand_out(
   s: &mut ShardState,
@@ -780,13 +787,13 @@ fn hand_out(
     attachment,
     lease_epoch,
     stream,
-    resync: _,
+    resync,
   } = attached;
   if !crate::shards_route::offer(
     s,
     (slates_ipc::route::OfferKind::Stream, attachment),
     secret,
-    stream,
+    (stream, resync),
   ) {
     return slates_ipc::protocol::ReplyBody::Refused {
       refusal: Refusal::Overloaded { shard: s.shard },
@@ -1706,9 +1713,9 @@ fn take_owner_word(s: &mut ShardState, stream: &mut ShardsStream, word: OwnerWor
       Some(Ok(kept)) => {
         stream.owners = OwnerView::swapping(kept, (uid, gid));
         s.count(OWNER_NAMED, 1);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let Some(resync) = stream.resync.as_mut()
-          && resync.held
+          && resync.held()
           && !resync::tell_owners(stream.attachment, resync, stream.owners)
         {
           s.count(RESYNC_GIVEN_UP, 1);
@@ -1909,7 +1916,7 @@ fn serve_request(
 /// mount): only for a stream a successor may resync (A-316), whose device would resend the request.
 #[cfg(target_os = "linux")]
 fn keep_pending_reply(s: &mut ShardState, stream: &ShardsStream, answered: &Answered) {
-  if !stream.resync.is_some_and(|resync| resync.held) {
+  if !stream.resync.as_ref().is_some_and(resync::Resync::held) {
     return;
   }
   s.pending_replies.insert(
@@ -2086,7 +2093,7 @@ fn ended(s: &mut ShardState, attachment: u64) {
   withdraw_offer(s, attachment);
   if let Some(mut stream) = s.shards_streams.remove(&attachment) {
     // The device reads its resync channel's end: no daemon will resync an attachment that ended (A-316).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if let Some(resync) = stream.resync.as_mut()
       && resync::give_up(attachment, resync) == resync::GivenUp::Refused
     {
@@ -2236,7 +2243,11 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
   );
   stream.owners = owners;
   stream.restorable = false;
-  stream.resync = Some(resync::Resync { token, held: true });
+  // The successor's copy of the held end is kept as the attach's daemon kept its own (`resync`'s module notes).
+  stream.resync = Some(resync::Resync {
+    token,
+    end: Some(held.device),
+  });
   stream.replay = s.recovered_replies.remove(&attachment);
   s.shards_streams.insert(attachment, stream);
   if futures::spawn(serve(attachment))
@@ -2247,7 +2258,13 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     ended(s, attachment);
     return;
   }
-  if !resync::send_resync(&held.device, attachment, token, &device_end) {
+  let sent = s
+    .shards_streams
+    .get(&attachment)
+    .and_then(|stream| stream.resync.as_ref())
+    .and_then(|resync| resync.end.as_ref())
+    .is_some_and(|held| resync::send_resync(held, attachment, token, &device_end));
+  if !sent {
     s.count(RESYNC_REFUSED, 1);
     end_stream(s, attachment);
     return;

@@ -1159,13 +1159,15 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
   Ok(taken)
 }
 
+/// `--shards N`, read as the roles read it (`slates_api::role::shard_count`): a count past the runtime's registry is
+/// refused as usage before anything starts.
 fn shards_of(taken: &Taken) -> Result<Option<u16>, ParseError> {
   taken
     .value("--shards")
     .map(|s| {
-      s.parse::<u16>().map_err(|e| ParseError::BadValue {
+      slates_api::role::shard_count(s).map_err(|reason| ParseError::BadValue {
         what: "--shards",
-        reason: e.to_string(),
+        reason,
       })
     })
     .transpose()
@@ -3123,6 +3125,27 @@ mod tests {
     ] {
       let refused = refusal(&line);
       assert!(refused.contains(mentions), "{line}: {refused}");
+    }
+  }
+
+  /// The integrator's report of 2026-11-18 (CI runs 44298844583 and 44310013691). Do: parse `anchor` and `daemon` with
+  /// the runtime registry's most shards, and with one more. Expect: the most parses; one more is refused as a bad
+  /// `--shards` naming the bound, as the roles refuse it (`slates_api::role`), so no anchor starts a daemon its runtime
+  /// refuses at registration and restarts it for good.
+  #[test]
+  fn a_shard_count_past_the_runtimes_registry_is_refused_as_usage() {
+    let most = slates_rt::registry::MAX_SHARDS;
+    for role in ["anchor", "daemon"] {
+      let fits = parse(&args(&format!("{role} --shards {most} --instance z")));
+      assert!(
+        matches!(&fits, Ok(Command::Anchor(options) | Command::Daemon(options)) if options.shards.map(usize::from) == Some(most)),
+        "{role}: {fits:?}"
+      );
+      let past = parse(&args(&format!("{role} --shards {} --instance z", most + 1)));
+      assert!(
+        matches!(&past, Err(ParseError::BadValue { what: "--shards", reason }) if reason.contains(&most.to_string())),
+        "{role}: {past:?}"
+      );
     }
   }
 
