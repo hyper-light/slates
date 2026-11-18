@@ -157,17 +157,16 @@ jobs:
           --binary ${{ matrix.copy == 'rebuild' && 'rebuild' || 'dist' }}/${{ matrix.asset }} --target ${{ matrix.target }}
           --record records/${{ matrix.asset }}${{ matrix.copy == 'rebuild' && '.rebuild' || '' }}.record.json
       # Nano Server has no Visual C++ runtime, so a binary that starts there carries its C runtime (GAPS, "The Windows
-      # binary needs the Visual C++ runtime"). Process isolation needs a host of the image's own build: windows-2025.
+      # binary needs the Visual C++ runtime"), and imports nothing Nano Server's DLLs lack (A-357). The action starts
+      # Docker's engine when a runner left it stopped, and names a Docker failure apart from the binary's.
+      # Shape: the step took 22-45 s on 2026-11-18 (runs 44326428333, 44332283768, 44338576506); ten minutes is over ten
+      # times its longest, so only a runner whose Docker cannot start or pull meets the bound.
       - name: The Windows binary starts in Nano Server
         if: ${{ matrix.nasm && matrix.copy == 'build' }}
-        shell: pwsh
-        run: |
-          docker pull --quiet mcr.microsoft.com/windows/nanoserver:ltsc2025
-          $dist = (Resolve-Path dist).Path
-          $answer = docker run --rm --isolation=process -v "${dist}:C:\dist:ro" mcr.microsoft.com/windows/nanoserver:ltsc2025 "C:\dist\${{ matrix.asset }}" version
-          if ($LASTEXITCODE -ne 0) { throw "slates version exited $LASTEXITCODE in Nano Server" }
-          Write-Output "Nano Server: $answer"
-          if (-not ("$answer" -like "slates *")) { throw "unexpected answer: $answer" }
+        timeout-minutes: 10
+        uses: ./.github/actions/nano-server-start
+        with:
+          binary: dist/${{ matrix.asset }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.copy == 'rebuild' && 'rebuild-' || '' }}${{ matrix.asset }}

@@ -420,8 +420,9 @@ fn look_in(lane: &mut Lane, tickets: &[u64]) -> Look {
   }
 }
 
-/// A forward's failover bound (A-315, A-352): the operator's failover SLO (`DaemonConfig::failover_slo_ns`, the takeover
-/// bound `verbs::resolve_and_forward` resends within) from its first send, held longer while the path to its owner
+/// A forward's failover bound (A-315, A-352): the failover delay this node estimates (`ShardState::failover_ns`, A-363:
+/// the takeover bound `verbs::resolve_and_forward` resends within; the operator's 10 s placeholder before) from its first
+/// send, held longer while the path to its owner
 /// measures a longer floor ([`path_floor_ns`]), the longest it has measured in the forward's life. So a forward is never
 /// given up or refused below the floor of the path it waits on: where that floor is past the SLO, the SLO cannot be met
 /// on that path, and the forward runs at the floor, counted ([`HELD_PAST_SLO`]) and said in the log by the lane
@@ -435,7 +436,7 @@ fn look_in(lane: &mut Lane, tickets: &[u64]) -> Look {
 pub(crate) struct FailoverBound {
   /// The forward's first send, on the wall.
   first_send_ns: u64,
-  /// The operator's failover SLO.
+  /// The failover delay this node estimated as the forward was first sent (A-363).
   slo_ns: u64,
   /// The longest floor the forward's path has measured; 0 before any.
   floor_ns: u64,
@@ -451,12 +452,12 @@ impl FailoverBound {
     }
   }
 
-  /// The bound of a forward first sent now, under this shard's failover SLO, or one liveness budget where the shard's
-  /// state is out of reach.
+  /// The bound of a forward first sent now, under this shard's failover delay (A-363), or one liveness budget where the
+  /// shard's state is out of reach.
   pub(crate) fn from_now() -> FailoverBound {
     FailoverBound::new(
       futures::now_ns(),
-      state::with_state(|s| s.config.failover_slo_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS),
+      state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS),
     )
   }
 
@@ -507,7 +508,7 @@ fn note_floor(peer: HostId, endpoint: &Endpoint) {
   let pto_ns = endpoint.pto();
   let floor_ns = path_floor_ns(congestion_ns, pto_ns);
   let crossed = state::with_state(|s| {
-    let slo_ns = s.config.failover_slo_ns;
+    let slo_ns = s.failover_ns;
     let lane = s.forward_lanes.lanes.get_mut(&peer)?;
     let was_past = lane.floor_ns > slo_ns;
     lane.floor_ns = floor_ns;

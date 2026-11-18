@@ -3289,6 +3289,27 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `Some(ns)`, this node's control shard publishes `ns` as its failover delay in place of its
+  /// estimate, and fans it to every shard with the next period (A-363): the bound of every wait that bounds a failover
+  /// (a forward, the location round, a held reply, a takeover's attempts) for a test whose subject is that bound's
+  /// rule. `None` returns to the estimate.
+  pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_failover_ns = ns;
+      // In force on the control shard at once; the period's fan carries it to the others.
+      if let Some(ns) = ns {
+        s.failover_ns = ns;
+      }
+    })
+  }
+
+  /// The failover delay this node's waits read now, nanoseconds (A-363): the control shard's estimate in whole
+  /// coordinator periods, or a test's injection. A one-shot control-shard question; an observation the daemon could not
+  /// make is its typed refusal.
+  pub fn failover_ns(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.failover_ns)
+  }
+
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
   /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
   pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
@@ -4500,6 +4521,12 @@ async fn init_shard(
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     failover: slates_cluster::failover::Failover::new(),
+    failover_ns: crate::fleet::failover_in_periods(
+      slates_cluster::failover::Failover::new()
+        .estimate()
+        .total_ns(),
+    ),
+    injected_failover_ns: None,
     council,
     consensus_ready: false,
     consensus_generation: 0,
@@ -5431,8 +5458,8 @@ impl Drop for EndStreams {
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
 /// any client has activity within the window), and idles past it. The window is the shard's own
-/// (`ShardContext::idle_window_ns`): R9's floor, or the platform's multiple of its online wake estimate where a
-/// loaded wake costs more than parking saves (`config::idle_window_ns`; A-223).
+/// (`ShardContext::idle_window_ns`): R9's floor on every platform, no estimate pricing it, and never past the idle spin's
+/// ceiling (`config::NO_ESTIMATE_MULTIPLE`, `config::IDLE_SPIN_CEILING`; A-223, A-361).
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
@@ -5447,7 +5474,7 @@ async fn serve_loop() {
   loop {
     let idle_window_ns = derived!(
       futures::idle_window_ns().unwrap_or(crate::config::PROVISION_FLOOR_NS),
-      "the shard's idle window: max(provision_floor_ns, wake estimate × loaded_wake_ratio)",
+      "the shard's idle window: provision_floor_ns, no estimate's multiple, under idle_spin_ceiling_ns",
       ["rt.idle_window_ns"]
     )
     .get();
@@ -7192,6 +7219,74 @@ mod tests {
       .install_configuration(configuration, &regional.members);
   }
 
+  /// Shape: the content puts the content-delta test holds, one publication each: enough that a delta carrying the whole
+  /// hold's image would carry tens of times what one put is.
+  const CONTENT_PUTS: u64 = 64;
+
+  /// §4.8 "persistence before reply", A-376: a holder publishes before it acknowledges each content put, and what that
+  /// publication carries must be the content it put, never the hold it already carries. Do: on a shard, hold
+  /// [`CONTENT_PUTS`] inputs of one green, each placed for its own version and of one size, building after each the delta
+  /// a publication would carry and committing it. Expect every delta to carry the same bytes (the put's manifest and its
+  /// one new chunk), and the pieces every delta carried, folded in order, to be the hold's whole image. Before: the hold's
+  /// image was one piece, re-encoded at every publication and re-put whenever it changed, so the n-th put carried every
+  /// input held before it.
+  #[test]
+  fn a_holders_publication_carries_the_content_it_puts_not_the_whole_hold() {
+    let (carried, folded_whole) = audit_on_shard(|state| {
+      use slates_db::register::{HostId, ObjectId};
+      let green = ObjectId::new(HostId(9), 1);
+      state.published_held = crate::content_holder::PublishedHeld::default();
+      crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
+      let mut folded: std::collections::BTreeMap<
+        [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+        Vec<u8>,
+      > = crate::content_holder::held_image(state)
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      let mut carried = std::collections::BTreeSet::new();
+      for version in 1..=CONTENT_PUTS {
+        let archive =
+          crate::merge_origin::InputsBuilder::whole(&version.to_le_bytes()).finish(version, 4096);
+        state
+          .held_content
+          .hold(
+            &mut crate::content_holder::hold_space(&mut state.store),
+            green,
+            slates_cluster::content::Placed { sequence: version },
+            archive,
+          )
+          .unwrap();
+        let changes = crate::content_holder::held_changes(state);
+        carried.insert(
+          changes
+            .put
+            .iter()
+            .map(|piece| piece.bytes.len())
+            .sum::<usize>(),
+        );
+        for piece in &changes.put {
+          folded.insert(piece.key, piece.bytes.clone());
+        }
+        for key in &changes.removed {
+          folded.remove(key);
+        }
+        crate::content_holder::held_committed(state, changes.whole, false);
+      }
+      let whole: std::collections::BTreeMap<_, _> = crate::content_holder::held_image(state)
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      (carried, folded == whole)
+    });
+    assert_eq!(
+      carried.len(),
+      1,
+      "every put's delta carries its manifest and its chunk, whatever the hold holds: {carried:?}"
+    );
+    assert!(folded_whole, "the folded deltas are the hold's whole image");
+  }
+
   /// One step of the held-pieces oracle's history (A-270): a change to what the shard holds, or a publication.
   #[derive(Clone, Copy, Debug)]
   enum HeldStep {
@@ -7215,6 +7310,10 @@ mod tests {
     /// A fresh acceptor that keeps its changes put in place of object `object`'s, holding one position (A-367): its
     /// changes do not account for the published positions it replaced.
     Renew(u8),
+    /// Content held for object `object`, placed for the step's index (A-376).
+    Put(u8),
+    /// Everything held for object `object` released, as a tombstone releases it (A-376).
+    Release(u8),
     /// A delta published: what `held_changes` carries, folded over the model.
     Delta,
     /// A checkpoint published: everything held.
@@ -7272,7 +7371,7 @@ mod tests {
       type Model =
         std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
       let local = state.fleet.host();
-      let step = (0u8..12, 0u8..3).prop_map(|(kind, which)| match kind {
+      let step = (0u8..14, 0u8..3).prop_map(|(kind, which)| match kind {
         0 | 1 => HeldStep::Push(which),
         2 => HeldStep::Clear(which),
         3 => HeldStep::Drop(which),
@@ -7282,6 +7381,8 @@ mod tests {
         8 => HeldStep::Again(which),
         9 => HeldStep::Compact(which),
         10 => HeldStep::Renew(which),
+        12 => HeldStep::Put(which),
+        13 => HeldStep::Release(which),
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
@@ -7298,6 +7399,9 @@ mod tests {
         let state: &mut crate::state::ShardState = &mut borrowed;
         state.holder_records.clear();
         state.live.held.clear();
+        state
+          .held_content
+          .forget_all(&mut crate::content_holder::hold_space(&mut state.store));
         state.published_held = crate::content_holder::PublishedHeld::default();
         crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
         let mut model: Model = Model::new();
@@ -7364,6 +7468,23 @@ mod tests {
               {
                 acceptor.compact_below(object(which), sequence);
               }
+            }
+            HeldStep::Put(which) => {
+              let index = u64::try_from(at).unwrap();
+              let archive =
+                crate::merge_origin::InputsBuilder::whole(&index.to_le_bytes()).finish(index, 4096);
+              let _ = state.held_content.hold(
+                &mut crate::content_holder::hold_space(&mut state.store),
+                object(which),
+                slates_cluster::content::Placed { sequence: index },
+                archive,
+              );
+            }
+            HeldStep::Release(which) => {
+              state.held_content.forget_object(
+                &mut crate::content_holder::hold_space(&mut state.store),
+                object(which),
+              );
             }
             HeldStep::Renew(which) => {
               let mut fresh = Acceptor::new(
