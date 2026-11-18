@@ -4225,10 +4225,15 @@ fn rebuild(
     None
   };
   keys_for_rebuild(sealed, keys.is_some())?;
+  let diag_t0 = std::time::Instant::now();
   let mut publications = Vec::new();
   for payload in &fetched.payloads {
     publications.push(open_payload(keys.as_ref(), payload).ok_or(REFUSED_OPEN)?);
   }
+  let diag_open = diag_t0.elapsed();
+  let diag_payload_bytes: usize = fetched.payloads.iter().map(Vec::len).sum();
+  let diag_wholes = std::cell::Cell::new(0u64);
+  let diag_deltas = std::cell::Cell::new(0u64);
   let mut image = None;
   let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
   for publication in publications {
@@ -4236,10 +4241,12 @@ fn rebuild(
       <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
     match (record, image.as_mut()) {
       (VolumeRecord::Full { image: whole }, _) => {
+        diag_wholes.set(diag_wholes.get() + 1);
         image = Some(whole);
         runs.clear();
       }
       (VolumeRecord::Delta { delta }, Some(image)) => {
+        diag_deltas.set(diag_deltas.get() + 1);
         slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
       }
       (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
@@ -4249,7 +4256,19 @@ fn rebuild(
     }
   }
   let image = image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
-  archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
+  let diag_applied = diag_t0.elapsed();
+  let diag_runs = runs.len();
+  let diag_run_bytes: usize = runs.values().map(Vec::len).sum();
+  let archived = archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page);
+  eprintln!(
+    "DIAG rebuild: {} payloads ({diag_payload_bytes} bytes, sealed {sealed}) opened in {diag_open:?}; {} wholes and {} deltas applied in {:?}; {diag_runs} runs ({diag_run_bytes} bytes) archived in {:?}",
+    fetched.payloads.len(),
+    diag_wholes.get(),
+    diag_deltas.get(),
+    diag_applied.saturating_sub(diag_open),
+    diag_t0.elapsed().saturating_sub(diag_applied)
+  );
+  archived
 }
 
 /// A publication's body sealed under the volume's lineage key, in pieces of at most an archive chunk's bytes

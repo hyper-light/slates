@@ -5359,11 +5359,14 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       }
       // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
       if let Some(fetched) = &live {
+        let diag_t0 = std::time::Instant::now();
         let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
+        let diag_t1 = diag_t0.elapsed();
         past_the_pressure_hold(s, |s| {
           verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
         })
         .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        let diag_t2 = diag_t0.elapsed();
         // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
         crate::live_ship::adopt_head(s, id, fetched.head);
         s.placed_heads.insert(object, placed);
@@ -5371,6 +5374,15 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
         // from the adopted head at once.
         published_before_served(s)?;
+        let diag_t3 = diag_t0.elapsed();
+        eprintln!(
+          "DIAG materialize live: payloads {}, rebuild {:?}, materialize {:?}, publish {:?}, total {:?}",
+          fetched.payloads.len(),
+          diag_t1,
+          diag_t2.saturating_sub(diag_t1),
+          diag_t3.saturating_sub(diag_t2),
+          diag_t3
+        );
         return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
