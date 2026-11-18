@@ -1873,8 +1873,10 @@ landing constants are in §4.15.
 > `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` SWIM's count of its
 > detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
-> (`FleetReport::failover`). The operator's SLO above is still the 10 s placeholder its consumers read until each moves
-> to the estimate or to a term of its own (A-363's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
+> (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
+> round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; the
+> lease terms still read the operator's 10 s placeholder above until each takes a term of its own (A-363's owed list;
+> GAPS, the `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -26808,3 +26810,40 @@ Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (t
 `LIVENESS_BUDGET_NS` entry), `crates/cluster/src/{failover,lib,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,verbs}.rs`,
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.
+
+### A-375 — The waits that bound a failover read the live estimate: a forward's bound, the location round's cap, a held reply's total and a takeover's attempts follow each node's failover delay, fanned to every shard in whole periods (2026-11-18, built for goal g255; A-363's owed consumers; Ada's rule of the same day that nothing sets the failover delay)
+
+- **What was there.** Each of these waits read the operator's 10 s placeholder (`DaemonConfig::failover_slo_ns`), which
+  A-363 left in place while it published the estimate.
+- **The rule.** The control shard's refresh sets `ShardState::failover_ns` each coordinator period: the estimate's total
+  rounded up to whole periods (`fleet::failover_in_periods`), the granularity every one of these waits acts at, so the
+  configuration fan (AUD-29-29's change-only `fleet::Fan`) carries it to the other shards only when it crosses a period.
+  Read by: `forward_lane::FailoverBound` and `note_floor` (A-315, A-352: the longer of the failover delay and the path's
+  measured floor, from the forward's first send); the location round's cap (`verbs`, A-317); a held reply's total
+  (`live_ship::durable_spans`, A-354); `fleet::takeover_attempts` for a taken-over volume's, green's and tombstone's
+  materialization, and the takeover round's promise wait and retirement bound (`takeover`, A-304).
+- **Not moved, each owed a term of its own:** the lease terms (a landing's target lease, a CLI attachment's term, the
+  NFSv4 and delegation leases), the telemetry horizon (its `LeaseExpiring` follows the lease terms), FUSE's mount and
+  unmount helper bounds (a helper process's wait, not a failover) and the anchor's restart cap.
+- **Test support.** `Daemon::inject_failover(Some(ns))` holds a node's published delay (its control shard at once, the
+  others at the next fan) for a test whose subject is a bound's rule, not the estimate; `Daemon::failover_ns` reads what
+  the waits read. The settings that shaped these waits in the tests moved to it: A-352's floor test (one liveness
+  budget, below the path's floor), A-317's ceiling test (one nanosecond), A-304's lone-node fixture (one second, ten
+  attempts) and A-354's held reply (pinned at the node's own estimate, so the assertion cannot move under it); the
+  dead-session watches, the promise wait and the serve-delay test read the live value.
+- **What changes.** On a quiet three-node loopback fleet these bounds fall from 10 s to the estimate, about 4-5 s
+  (A-363's measurements): a forward to a dead owner is refused about 5 s after its first send instead of 10 (never below
+  its path's floor), a takeover gives an object up after about 45 periods without progress instead of 100, a held reply
+  is refused `DurabilityPending` after about 5 s. Under starvation the estimate grows with the stretched periods. The
+  A/B against the boot sum (a build of its own) under the starved and chaos profiles is owed to main.
+- **Evidence.** The fan's unit test (`fleet::tests::a_shard_is_fanned_the_failover_delay_when_it_moves`: the first fan
+  carries the delay, a moved delay is owed alone, nothing once it is delivered, and the receiver reads it). On the Mac
+  Studio (2026-11-18, load 11-14, debug build) the server's fan, forward-lane, takeover, live-ship and owner-location unit
+  tests pass, and eleven focused fleet tests pass in 44 s: A-352's floor test, A-317's two location tests, A-354's held
+  reply, A-304's lone-node volume and green give-ups, the serve-delay retry, the two dead-session tests, A-351's
+  readmission and A-363's estimate. Red-checked with each consumer read back from the configuration: the fan without the
+  delay fails its unit test, the location cap fails the ceiling test, the attempts fail the lone-node give-up, the held
+  reply's total fails A-354's test, and the forward's bound fails the floor test.
+
+Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/server/src/{state,daemon,fleet,forward_lane,verbs,live_ship,takeover}.rs`, `crates/server/tests/fleet.rs`.

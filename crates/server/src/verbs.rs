@@ -1976,7 +1976,7 @@ async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<Ho
   let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let began = slates_rt::futures::now_ns();
   let horizon = crate::lease::horizon_ns();
-  let ceiling = crate::state::with_state(|state| state.config.failover_slo_ns).unwrap_or(horizon);
+  let ceiling = crate::state::with_state(|state| state.failover_ns).unwrap_or(horizon);
   let known = || crate::state::with_state(|state| query.known_owner(state, None)).flatten();
   loop {
     let look_began = slates_rt::futures::now_ns().saturating_sub(began);

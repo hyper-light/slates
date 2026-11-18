@@ -3278,6 +3278,27 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `Some(ns)`, this node's control shard publishes `ns` as its failover delay in place of its
+  /// estimate, and fans it to every shard with the next period (A-363): the bound of every wait that bounds a failover
+  /// (a forward, the location round, a held reply, a takeover's attempts) for a test whose subject is that bound's
+  /// rule. `None` returns to the estimate.
+  pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_failover_ns = ns;
+      // In force on the control shard at once; the period's fan carries it to the others.
+      if let Some(ns) = ns {
+        s.failover_ns = ns;
+      }
+    })
+  }
+
+  /// The failover delay this node's waits read now, nanoseconds (A-363): the control shard's estimate in whole
+  /// coordinator periods, or a test's injection. A one-shot control-shard question; an observation the daemon could not
+  /// make is its typed refusal.
+  pub fn failover_ns(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.failover_ns)
+  }
+
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
   /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
   pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
@@ -4471,6 +4492,12 @@ async fn init_shard(
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     failover: slates_cluster::failover::Failover::new(),
+    failover_ns: crate::fleet::failover_in_periods(
+      slates_cluster::failover::Failover::new()
+        .estimate()
+        .total_ns(),
+    ),
+    injected_failover_ns: None,
     council,
     consensus_ready: false,
     consensus_generation: 0,
