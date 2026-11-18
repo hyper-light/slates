@@ -2490,6 +2490,20 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
+> one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
+> compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+> re-wrote the holder's whole ledger, and a commit at `f > 0` grew by a position a version (Mac Studio, debug build:
+> `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`'s late medians 4.3 to 7.1 ms against early
+> 1.9 to 3.6 ms over 300 versions; at the goal's 300,000 versions about 60 MB a version on each replica). Now a register
+> is a head piece and a piece per accepted position, and a delta carries the positions a holder's acceptor accepted or
+> dropped since its last committed publication (`Acceptor::tracking_changes`; image version 29). Test:
+> `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger` (`crates/server/tests/recovery.rs`):
+> on main's code a delta carried 2,165 bytes at the second of 64 positions and 67,885 at the last; now one size each
+> (kiln r3432, Mac Studio). The timing test's late medians stayed 4.4 to 6.4 ms against early 2.0 to 2.4 ms, so the rest
+> of the growth is elsewhere; still open, the same growth in the content's bytes: the content hold's image is one piece, every manifest and chunk a
+> holder keeps, recomputed and compared at each publication and re-put whole when it changed, which is every version.
+>
 > **Fixed 2026-11-18 (g232, A-333): losing the primary of a kernel-sized green lost the green.** The takeover successor
 > rebuilt the green beside the ledger it holds as one of the green's holders: version 0's inputs and every increment's
 > restored whole and every accepted record decoded in one poll, then the origin's bytes and every increment recorded

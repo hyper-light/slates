@@ -7208,6 +7208,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > that main's own spread can show at the median: 65–79 µs, against main's 65–76 µs and the whole image's 207–225 µs
 > (BENCHMARKS). Still carried whole when changed: the content hold's image and the mirror records.
 >
+> **A held register is a head and its positions (2026-11-18, A-367; image version 29).** A held register was one piece
+> holding every position its acceptor kept, and a green's register on its holders is a ledger, never compacted: each
+> version's acknowledgement re-encoded and re-wrote every version the holder kept, so a commit at `f > 0` grew by a
+> position's bytes a version. Now a register is a head piece (its authority, fence and moved-from owner) and a piece per
+> accepted position, keyed by its sequence; a holder's acceptor keeps which positions it accepted or dropped since its
+> last committed publication (`Acceptor::tracking_changes`), and a delta carries the head and those positions only. An
+> acceptor whose changes do not account for its positions against what was published (one put in place of another) is
+> carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
+> chunk, at each publication that changed it) and the mirror records.
+>
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
 > - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
@@ -26476,3 +26486,38 @@ nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`
 `crates/server/src/takeover.rs`, the tests in `crates/server/src/daemon.rs`, `crates/server/src/lease.rs`,
 `crates/server/src/takeover.rs` and `crates/server/tests/fleet.rs`, and the bug record
 `docs/bugs/2026-11-18-a-retired-owner-heard-again-was-never-readmitted-and-the-fleet-stayed-split.md`.
+
+### A-367 — A holder publishes each register position once: a held register is a head piece and a piece per accepted position, and a delta carries the head and the positions accepted or dropped since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 29)
+Applied in the same change to: §4.8 (A-270's status: "A held register is a head and its positions"), GAPS (the load
+test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::tracking_changes`, `changes`,
+`clear_changes`, `position`, `positions`, `position_count`, `persisted_head`), `crates/server/src/content_holder.rs`
+(`HeldPosition`, `KIND_REGISTER_POSITION`, `register_head_piece`, `position_piece`, `register_changes`, `changes_cover`,
+`registers_committed`, `join_positions`, `PublishedHeld::registers`, `HeldRefused::PositionWithoutHead`),
+`crates/server/src/fleet.rs` (`hold_checked_record` makes a tracking acceptor), `crates/vfs/src/recover.rs`
+(`IMAGE_VERSION` 29), `Daemon::fleet_held_positions` (test support), and the tests below.
+- **What was there.** A-270 made what a shard holds for other owners keyed pieces, one per held register, so a delta
+  carried the registers marked changed. A register's piece was its acceptor's whole persisted state, every accepted
+  position. A green's merge register on its holders is a ledger (`Acceptor::compact_below` keeps a successor's every
+  version), and a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+  re-wrote every version the holder kept. On the Mac Studio, a debug build, three nodes at `f = 1`, the median submit of
+  the last 50 of 300 was 4.3 to 7.1 ms against 1.9 to 3.6 ms for the first 50 (about 10 µs a version), and at the goal's
+  300,000 versions a version's publication would be about 60 MB of positions on each replica.
+- **The rule.** A held register is a head piece, its object's authority, fence and moved-from owner, and a piece per
+  accepted position, keyed by the position's object and sequence. A holder's acceptor keeps which positions it accepted
+  (new, or again at a newer epoch) and which it dropped (compacted, forgotten) since its last committed publication; a
+  delta carries the head of every register the tracked map marked and those positions; a register dropped whole has its
+  head and every published position removed, from the positions the shard knows it published. A position held but
+  neither written since nor published cannot be, since tracking counts what an acceptor holds as written when it begins
+  and a recovery clears it only because the image it was rebuilt from carries every position; so an acceptor whose
+  changes do not account for its positions against what was published (one put in place of another under the same
+  object) is carried whole, as its pieces.
+- **Tests.** `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger`
+  (`crates/server/tests/recovery.rs`: 64 positions of one ledger held through the production path, then a warm
+  restart). Kiln r3432 on the Mac Studio, 2026-11-18, debug build: on main's code each delta carried every position held,
+  2,165 bytes at the second position and 67,885 at the sixty-fourth (32 deltas, 32 sizes); with this change every delta
+  carried one size, and all 64 positions were held after the restart. The held-pieces oracle (`folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`,
+  `daemon.rs`) now grows registers a position at a time, accepts again at a newer epoch, compacts and replaces them;
+  `a_tracking_acceptor_names_every_position_written_or_dropped_since_its_last_clear` (`slates-db`).
+- **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
+  compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
+  growth, in the content's bytes.
