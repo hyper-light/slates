@@ -3575,14 +3575,20 @@ enum ScatterKind {
   Acknowledge,
 }
 
-/// How long a scatter's part waits for room in a full control channel before it is refused (A-216's sibling sweep).
-/// Derived: half the client's reply deadline (the liveness budget, which `slates_client::Deadlines` waits a reply for),
-/// so the typed `Overloaded` reaches the client before it gives the reply up; a burst, such as the resends after a
-/// daemon's restart, drains well within it.
-const PART_ROOM_BUDGET_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
+/// Derived: a scatter's part's wait for room in a full control channel (A-216's sibling sweep), its first window and the
+/// CPU its target may run without draining (`xshard::given_room_in_shard_time`, A-65's rule, A-426):
+/// `LIVENESS_BUDGET_NS / LATE_BEAT_SHARE`, the gap in which the daemon logs one of its own shards as a near miss. A
+/// target that works through a window, on the CPU or waiting for one, drains its channel at its next turn and is waited
+/// for; one that does neither is refused at the window's end, typed (`Overloaded { shard }`), inside the watchdog's
+/// window, so the answer comes before the watchdog's own judgment would end the daemon (A-232). Until A-426 the wait was
+/// this span on the wall, as half the client's reply deadline; since 2026-11-13 a client waits for a live daemon's answer
+/// however long, and the wall bound refused the part of a target that was alive and working.
+pub(crate) const PART_ROOM_BUDGET_NS: u64 =
+  crate::daemon::LIVENESS_BUDGET_NS / crate::daemon::LATE_BEAT_SHARE;
 
 /// Sends a scatter's part, `task`, to `shard`. A control channel full at once hands the part to a task of this shard
-/// that waits for room for [`PART_ROOM_BUDGET_NS`] (`xshard::given_room_within`). Past that wait, or at once for a shard
+/// that waits for room in `shard`'s own time ([`PART_ROOM_BUDGET_NS`], `xshard::given_room_in_shard_time`). Past that
+/// wait, or at once for a shard
 /// gone or a waiting task that cannot be spawned, the part is settled as refused ([`settle_refused`]): the scatter then
 /// answers `Overloaded { shard }`, typed, when its last part is in. Before 2026-11-05 a refused part was settled through
 /// a nested state borrow that never ran, and the scatter was never answered
@@ -3615,7 +3621,7 @@ fn send_part(
       Err(_) => return settle_refused(state, kind, request, shard).map(|(_, reply, _)| reply),
     };
   let waiting = slates_rt::futures::spawn(async move {
-    if !crate::xshard::given_room_within(shard, unsent, PART_ROOM_BUDGET_NS).await {
+    if !crate::xshard::given_room_in_shard_time(shard, unsent, PART_ROOM_BUDGET_NS).await {
       // Settled in its own borrow, and delivered after it: `deliver` borrows the state itself.
       if let Some(Some((client_index, reply, paged))) =
         crate::state::with_state_counted(|s| settle_refused(s, kind, request, shard))

@@ -3646,7 +3646,14 @@
 >   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
->   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
+>   client whose shard was starved at its hand-off read by copy, now mapped directly); a scatter's part waiting for room
+>   in a full control channel and a batch of asks to a green's owner (A-426, 2026-11-18, goal g255: half a liveness
+>   window on the wall, then `Overloaded`, or the asks answered unanswered, with the target alive and stepping; now the
+>   room wait goes on while the target steps or starves, judged by its step count, since a shard drains its channel at
+>   every step, and the owner's answer by `within_shard_time`: `xshard::given_room_in_shard_time`,
+>   `call_in_shard_time_given_room`, `a_part_waits_for_room_while_its_target_steps`). Owed in class A: AC-3.3's told
+>   wait (`told::TOLD_WAIT_NS`, half a window on the wall while a FUSE mount's notifier and its kernel are told) and the
+>   park bound of a verb waiting on a green's owner (`work_home`, the lease bound on the wall). Class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies

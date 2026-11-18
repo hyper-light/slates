@@ -30145,3 +30145,38 @@ Applied in the same change to: `crates/vfs/src/{captured,lib,volume}.rs` (`captu
 `Volume::head_tree`, `read_frozen_body`), `crates/land/src/{manifest,verdict,engine,lib,captured_tests}.rs`
 (`Judged`, `Manifest::basis`, `PlanWalk::against_capture`, `content_verdict`, `Beginning::against_capture`,
 `begin_landing_from`), `crates/server/src/landing.rs` (`capture_of`, `landing_beginning`), §4.15's status, GAPS (g267).
+
+### A-426 — A scatter's part waits for room, and a batch of asks for its green owner's answer, in the target's own time (2026-11-18, built for goal g255; R3's class A; A-65, A-216, A-228, A-232, A-247, A-388)
+- **What was there.** A scatter's part (a listing's, the grants', the daemon's status, an acknowledgement's) that met
+  its target shard's control channel full waited for room half a liveness window on the wall, then settled the scatter
+  `Overloaded { shard }` (`verbs::PART_ROOM_BUDGET_NS`, "so the typed `Overloaded` reaches the client before it gives
+  the reply up"). A batch of asks to a green's owner (`work_home`, A-388) waited for room and for the owner's answer
+  within the lease bound on the wall, then answered its asks unanswered. Since 2026-11-13 a client waits for a live
+  daemon's answer however long (A-232), so the first reason was gone, and both bounds refused a target that was alive
+  and working, starved or slow to drain: the wall judgment class A's other waits gave up (A-65, A-403, A-408).
+- **The rule.** One room wait (`xshard::given_room_in_shard_time`), judged at each window's end in the target's own
+  time (`RoomRule`): a shard drains its control channel at every step, so its step count says whether room will come,
+  not its CPU clock (a shard inside one poll runs, or wakes now and then, and drains nothing until the poll ends). A
+  target that stepped in the window is draining and is waited for another whole window; one that took no step but
+  waits for a CPU is starved, not stuck (A-228), and is waited for while it has run less than the budget of CPU since
+  the wait began (A-318's rule for one poll, the budget held to this build); one that took no step and waits on nothing
+  else, or ran its budget in one poll, or cannot be read, ends the wait, and the part is refused typed. The steps are
+  read twice around the scheduler's look, as `observe::ShardTime` reads its clock, so a target that stepped between
+  the reads is read as draining. The scatter's part's window is `LIVENESS_BUDGET_NS / LATE_BEAT_SHARE`, the gap in
+  which the daemon logs one of its own shards as a near miss, so a stuck target is refused typed before the watchdog's
+  own judgment would end the daemon (A-232). A batch of asks to a green's owner waits for room the same way and for the
+  owner's answer by `within_shard_time` (A-65), both with the lease bound as their window and budget, as before its
+  wall deadline (`xshard::call_in_shard_time_given_room`).
+- **Tests.** `a_part_waits_for_room_while_its_target_steps` (`crates/server/src/xshard.rs`): a stand-in shard stepped
+  once each look's span from a thread of its own, its one-slot channel full, is drained a quarter of a window after the
+  room wait's first window; the part is sent and its message is next on the channel. And
+  `a_room_wait_goes_on_while_its_target_steps_or_starves_and_ends_when_it_does_neither` (the rule over scripted
+  readings: a step, a starved target with CPU left and past its budget, a blocked one, a step between the reads, no
+  reading, the mark's move). The four scatter tests of `crates/server/tests/ack_release.rs` hold their target inside one
+  poll that sleeps, which takes no step and reads blocked, so each is still refused `Overloaded` at the first window, as
+  they assert; the stand-in of `a_bounded_wait_for_room_waits_its_period_in_time_on_a_starved_shard` never steps and has
+  no thread to read, so it is given up at its first window too.
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{verbs,xshard,
+work_home,observe}.rs` (`observe::held_to_this_build` shared with the room rule).
