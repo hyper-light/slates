@@ -398,7 +398,11 @@ slates-vfs = 0
 #   thread under a copy of the process token with the privilege enabled: the token opened and owned (1), duplicated for
 #   impersonation and owned (1), the privilege enabled in the copy (`AdjustTokenPrivileges`, 1), the thread's token set
 #   (`SetThreadToken`, 1) and reverted (`RevertToSelf`, 1). None has a safe wrapper.
-slates-land = 29
+# 2026-11-18 (+4, A-445, a reflink in a Windows landing, `os_windows.rs` only; 29 -> 33): ReFS's block cloning has no
+#   safe wrapper: the volume's word on sharing clusters (`GetVolumeInformationByHandleW`, 1), its cluster
+#   (`NtQueryVolumeInformationFile(FileFsSizeInformation)`, 1), a file's end set (`FileEndOfFileInfo`, 1) and a region
+#   cloned (`DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`, 1).
+slates-land = 33
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.

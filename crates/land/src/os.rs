@@ -702,6 +702,19 @@ impl LandFs for OsLand {
     })
   }
 
+  /// No reflink here yet (`capabilities` says so, so the engine never asks): Linux's `FICLONE` and macOS's
+  /// `clonefile` are owed (A-445); refused `ENOTSUP`, nothing made.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    _name: &str,
+    _from: HostFile,
+    _len: u64,
+  ) -> Result<HostFile, HostError> {
+    self.dir(dir)?;
+    Err(refusal(rustix::io::Errno::NOTSUP))
+  }
+
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
     if let Some(file) = self.create_unnamed(dir)? {
       return Ok(file);

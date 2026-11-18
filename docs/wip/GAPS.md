@@ -3757,7 +3757,9 @@
 >   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`), a live exchange to a
 >   holder (A-444: one liveness window, hard; now its session's persistent-congestion duration, RFC 9002 §7.6.1 from the
 >   session plane's estimator, plus the transfer, and that duration's floor where no session is at hand,
->   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout)
+>   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout),
+>   a held reply's durability window (A-446: one liveness window; now that same floor of a gone holder path, its
+>   silence still judged after a drained receiver, `live_ship::durable_wait_ns`)
 >   and the forward
 >   lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
@@ -18628,8 +18630,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
   owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
   `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
-  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute
-  bits); and
+  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
+  own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
+  under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:
+  Linux's `FICLONE` and macOS's `clonefile`, duplicates across batches, and the measured gain); A-262's landing half
+  (the volume's other attribute bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
