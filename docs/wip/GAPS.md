@@ -2264,10 +2264,20 @@
 > boot before admitting clients (`crates/server/src/green_adopt.rs`). Test:
 > `a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`
 > (`crates/server/tests/fleet.rs`: three nodes at `f = 1`, each partition's merge budget a quarter of the 4 MiB base the
-> green's origin is walked from; owner a stopped for good, then the successor restarted warm). Found and fixed
-> beside it: a destroyed green's tombstone was one past its chain's length, short after a checkpoint (A-238), so it could
-> be older than versions its holders had accepted (`a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds`,
-> `crates/db/tests/model.rs`: 3 and 2 before, 6 and 5 now). Still open:
+> green's origin is walked from; owner a stopped for good, then the successor restarted warm): green in 4.92 s on the Mac
+> Studio (kiln r2370, debug build), five versions committed across the takeover and the restart, the replica rebuilt
+> through version 2 in 325 slices at the restart's re-adoption; red on main's code, the takeover refused 100 times and
+> given up (`NotRecovered { TakeoverIncomplete { waited_on: "refused" } }`). Found and fixed beside it:
+> - a restarted successor of any taken-over green wrote its merge and catalog records at its own host's epoch, below the
+>   fence its takeover raised at every holder, since only `placed_heads` named the promotion epoch and a restart forgets
+>   it: the green never advanced again. The green's record now keeps its takeover (`VolumeRecord::taken_over`) and
+>   `merge_service::record_epoch` falls back to it (red without it: version 3 never placed again, version 4 unanswered at
+>   60 s; `docs/bugs/2026-11-18-a-restarted-greens-successor-wrote-below-its-takeovers-fence.md`);
+> - a destroyed green's tombstone was one past its chain's length, short after a checkpoint (A-238), so it could be older
+>   than versions its holders had accepted (`a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds`,
+>   `crates/db/tests/model.rs`: 3 and 2 before, 6 and 5 now).
+>
+> Still open:
 > - a successor whose ledger ends two or more versions below the adopted one (the ledger-prefix transfer of records,
 >   GAP-A9-7), and a new candidate that holds nothing of the green (AUD-14's transfer to a new candidate set);
 > - the adoption records the gathered completions in one call on the owner shard, up to each client's bound per client:

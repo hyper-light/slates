@@ -9198,14 +9198,28 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > - a restarted successor re-adopts it at boot, after every partition has recovered and before any client is admitted:
 >   the engine rebuilt from the ledger through the adopted version (version 0 alone when a checkpoint past the adoption
 >   stands, which applies onto it), then the owner shard's own chain applied a slice a call; every verb on it answers
->   `Overloaded` meanwhile, and the works over it are replayed after it. A green the ledger cannot rebuild is fenced.
+>   `Overloaded` meanwhile, and the works over it are replayed after it. A green the ledger cannot rebuild is fenced;
+> - the green's record keeps the takeover that made this node its owner (`VolumeRecord::taken_over`: the promotion epoch
+>   and the adopted version), and a green's records are written at that epoch after a restart forgets `placed_heads`
+>   (`merge_service::record_epoch`, as `fleet::promotion_epoch` serves a volume's, A-344). A taken-over green recorded
+>   none before, so a restarted successor wrote its merge and catalog records at its own host's epoch, below the fence
+>   the takeover raised at every holder, and the green's next version never committed
+>   (`docs/bugs/2026-11-18-a-restarted-greens-successor-wrote-below-its-takeovers-fence.md`).
 >
 > A checkout of an adopted green compares its base by the manifest of the inputs its walked origin makes. Test:
 > `a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`
-> (`crates/server/tests/fleet.rs`). Owed: a successor whose ledger lacks
-> records two or more versions below the adopted one (the ledger-prefix transfer of records, GAP-A9-7); a new candidate
-> holder that holds nothing of the green (AUD-14's transfer to a new candidate set); the adoption's completions recorded
-> in one call on the owner shard, up to each client's bound per client.
+> (`crates/server/tests/fleet.rs`: three nodes at `f = 1`, each partition's merge budget 1 MiB, a quarter of the 4 MiB
+> base the green's origin is walked from). Kiln r2370 on the Mac Studio, 2026-11-18, debug build: green in 4.92 s, the
+> successor adopting the green (`merge.takeover.adopted` 1, the ledger's completions gathered in 2 slices) and serving
+> version 0's base file, the head and a third version, then after its restart re-adopting it (`awaiting_adoption` 1, the
+> replica rebuilt through version 2 in 325 seed slices, `readopted` 1) and serving a fourth version and the edit of a work
+> made before the restart as the fifth; red on main's code, the takeover refused 100 times and given up
+> (`NotRecovered { TakeoverIncomplete { waited_on: "refused" } }`, 880 s); red without the takeover in the green's record,
+> version 3 never placed again after the restart and version 4 unanswered at the test's 60 s deadline (531 s); red with
+> the works over an awaiting green rebuilt at once, the kept work answered `NotFound` (5.5 s). Owed: a successor whose
+> ledger lacks records two or more versions below the adopted one (the ledger-prefix transfer of records, GAP-A9-7); a
+> new candidate holder that holds nothing of the green (AUD-14's transfer to a new candidate set); the adoption's
+> completions recorded in one call on the owner shard, up to each client's bound per client.
 
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
@@ -25236,27 +25250,34 @@ Applied in the same change to:
   re-adoption (`readopt_at_boot`).
 - `crates/server/src/merge_origin.rs`: `advance_replica` (`ReplicaSeed::advance`, counted `merge.replica.advanced`),
   `rebuild_replica_through`, `ledger_unheld`, `ledger_value`, `inputs_manifest_identity`.
-- `crates/server/src/fleet.rs`: `materialize_green` adopts (`served_already`, `adopted_green`, `finish_green`), the
-  waits `Started` and `Building` (the latter, a build or a gathering still running, not counted against the bound),
-  `fetch_green_inputs` given what to fetch. `crates/server/src/merge_service.rs`: `recover_green_inputs`,
+- `crates/server/src/fleet.rs`: `materialize_green` adopts (`served_already`, `ready_engine` before the placement as the
+  gather was, `handed_green` with the takeover's promotion epoch, `finish_green`), the waits `Started` and `Building`
+  (the latter, a build or a gathering still running, not counted against the bound), `fetch_green_inputs` given what to
+  fetch. `crates/server/src/merge_service.rs`: `recover_green_inputs`,
   `GreenRecovery`, `green_ledger_values` and
   `unheld_green_inputs` removed; `inputs_of` and the checkpoint from the green's floor; `GreenFence::LedgerUnavailable`;
   the state `adoption_completions` and `awaiting_adoption`.
-- `crates/server/src/verbs.rs`: `adopt_taken_over_green` (replacing `materialize_taken_over_green`),
-  `record_taken_over_completions` by version; at recovery `await_adoption`, works over an awaiting green deferred;
-  `begin_readoption`, `step_readoption`, `fence_awaiting_adoption`; `chain_phase` from the floor; a verb on an awaiting
-  green answered `Overloaded`. `crates/server/src/daemon.rs`: the boot's re-adoption before the works' recovery;
+- `crates/server/src/verbs.rs`: `adopt_taken_over_green` (replacing `materialize_taken_over_green`; the green's record
+  keeps its takeover, `VolumeRecord::taken_over`), `record_taken_over_completions` by version; at recovery
+  `await_adoption`, works over an awaiting green deferred; `begin_readoption`, `step_readoption`,
+  `fence_awaiting_adoption`; `chain_phase` from the floor; a verb on an awaiting green answered `Overloaded`
+  (`green_recovery_gate`). `crates/server/src/merge_service.rs`: `record_epoch` falls back to the takeover the green's
+  record keeps. `crates/server/src/daemon.rs`: the boot's re-adoption before the works' recovery;
   `merge_chain_identities` of an adopted green. `crates/server/src/checkout.rs`: an adopted green's origin compared by
   its inputs' manifest. `crates/server/src/tombstone.rs`: a tombstone drops gathered completions.
 - Tests: `an_adopted_greens_chain_begins_after_its_adoption_and_recovery_holds_it`,
   `a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds` and the generated adoptions
   (`crates/db/tests/model.rs`); `a_taken_over_green_is_recorded_by_its_adoption_and_served` and
-  `a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed` (`verbs.rs`);
-  `an_inputs_manifest_identity_is_the_built_archives` (`merge_origin.rs`);
-  `a_ledgers_completions_keep_each_clients_newest_within_its_bound` (`green_adopt.rs`);
+  `a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed` and
+  `a_green_awaiting_its_readoption_answers_overloaded_then_serves_the_engine_handed_to_it` (`verbs.rs`);
+  `an_inputs_manifest_identity_is_the_built_archives` and
+  `a_successor_behind_names_the_inputs_it_lacks_then_advances_to_the_adopted_version` (`merge_origin.rs`);
+  `a_ledgers_completions_keep_each_clients_newest_within_its_bound` and
+  `a_replica_off_the_adopted_identity_is_never_adopted` (`green_adopt.rs`);
   `a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`
   (`crates/server/tests/fleet.rs`).
-- GAPS: the load test's ledger, after A-313's entry.
+- GAPS: the load test's ledger, after A-313's entry, and the signed-work sibling's function name. The bug record
+  `docs/bugs/2026-11-18-a-restarted-greens-successor-wrote-below-its-takeovers-fence.md`.
 - **What was there.** A green's successor is one of its holders: it keeps the green's ledger (the merge records it
   accepted, durable across a warm restart, and the inputs they name, retained while named) and a replica of the green.
   The takeover rebuilt the green beside all that: `recover_green_inputs` restored version 0's inputs and every
@@ -25274,11 +25295,21 @@ Applied in the same change to:
   checkpoint past the adoption stands), handed to the owner shard, which applies its own chain after it a slice a call.
   The ledger stays for as long as the green lives here: a green's holder records are never compacted, and its inputs are
   retained while named.
+  The adoption keeps the takeover in the green's record (`VolumeRecord::taken_over`: the promotion epoch and the adopted
+  version), and the green's merge and catalog records are written at that epoch after a restart forgets
+  `placed_heads`; before, a restarted successor of any taken-over green wrote them at its own host's epoch, below the
+  holders' fence, and the green never advanced again (found by this change's test).
 - **Why.** The goal runs one primary and two replicas over the kernel; a takeover of its green must succeed whatever the
   origin's size, and a successor's restart must keep the green. Copying what the ledger already holds into the
   partition both doubled the bytes and could not fit them. Rejected: a local origin snapshot on the successor plus a
   checkpoint at the adopted version (it doubles the origin's memory, and a checkpoint at the adopted version strands the
   works based below it after the successor's next restart).
+- **Measured.** Kiln r2370, the Mac Studio, 2026-11-18, debug build (`a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`,
+  each partition's merge budget 1 MiB against a 4 MiB base): green in 4.92 s, adopted, re-adopted at boot after the
+  replica's rebuild through version 2 in 325 slices, five versions committed; red on main's code, the takeover refused
+  100 times and given up (880 s); red with no takeover in the green's record, the restarted successor never placed
+  version 3 again (531 s); red with the awaiting green's works rebuilt at once, the kept work `NotFound` (5.5 s); red with
+  the tombstone at the chain's length, 3 and 2 where 6 and 5 are owed.
 - **Cost.** No copy, record or replay at the takeover beyond the catalog record; a successor one version behind
   recomputes one version, and one with no replica rebuilds it from the ledger as A-313's rebuild does. A restart rebuilds
   the engine from the ledger at boot, as an owner's restart replays its own origin and chain. Found and fixed beside it:
