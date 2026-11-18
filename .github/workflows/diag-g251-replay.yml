@@ -1,0 +1,65 @@
+# Diagnostics only, never merged (g251): the write-log replay routing fix on Linux, where the write log and its replay
+# are compiled (cfg(target_os = "linux")). Green, the red with the prefix routing put back, then slates-vfs and
+# slates-server whole, then the lint wall over the two crates.
+name: diag-g251-replay
+
+on:
+  push:
+    branches: [diag-g251-replay]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  replay:
+    name: replay routing on Linux (g251)
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Green (the write log's tests and the clone's replay)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p slates-server --lib -- write_log \
+            verbs::tests::a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone 2>&1 | tee green.log
+          grep -q 'a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone ... ok' green.log
+      - name: Red (the prefix routing put back)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          F=crates/server/src/verbs.rs
+          cp "$F" verbs.orig
+          perl -0pi -e 's/let handle = slot_of_volume\(state, record\.volume\)\?;/let prefix = u16::try_from(record.inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX); let handle = state.volumes.iter().find(|(_, slot)| slot.volume.prefix() == prefix).map(|(handle, _)| handle)?;/' "$F"
+          echo "mutant sites: $(grep -c 'slot.volume.prefix() == prefix' "$F")"
+          cargo test --locked -p slates-server --lib -- \
+            verbs::tests::a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone > red.log 2>&1
+          code=$?
+          cp verbs.orig "$F"
+          grep -E '^error|panicked at|^test result|left|right|clone' red.log | head -30
+          echo "red exit $code; restored mutant sites: $(grep -c 'slot.volume.prefix() == prefix' "$F")"
+          # The red must fail by the test's own assertion, never by a compile error.
+          test "$code" -ne 0 && grep -q 'panicked at' red.log && ! grep -q '^error\[' red.log
+      - name: slates-vfs
+        if: success() || failure()
+        run: cargo test --locked -p slates-vfs
+      - name: slates-server
+        if: success() || failure()
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: cargo test --locked -p slates-server --no-fail-fast
+      - name: The lint wall over the two crates
+        if: success() || failure()
+        run: cargo clippy --locked -p slates-server -p slates-vfs --all-targets -- -D warnings
