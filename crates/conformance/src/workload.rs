@@ -214,11 +214,15 @@ hg -R ../shared status --all
 /// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
 /// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
 /// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
-/// carriage return there, which the revision loop's count must not carry. The repository's representation cache
-/// (`db/rep-cache.db`) is compared by what it holds, its rows, printed where `sqlite3` is on the `PATH`, never by its
-/// bytes: it is an SQLite file, whose page layout two runs of the same commits did not share (CI run 44247840584,
-/// ubuntu, 2026-11-18); the revisions it caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared, and
-/// `svnadmin verify` and the dump's checksum print the repository whole.
+/// carriage return there, which the revision loop's count must not carry. A revision's files are compared by what
+/// Subversion promises of them, never by their layout: FSFS numbers a revision's items in the order its commit wrote
+/// them, and the client sends a commit's file contents in an order two runs do not share (the rep-cache's item index
+/// of `d/b.txt`'s content in revision 2 was 3 in one run and 4 in the next, host and host on ubuntu, host and mount on
+/// macOS: CI run 44252249999, 2026-11-18). So `db/revs` and the representation cache (`db/rep-cache.db`, an SQLite file,
+/// whose pages two runs did not share either: run 44247840584) are left out of the byte comparison; the dump's checksum,
+/// `svnlook tree`, `svn log -v` and `svnadmin verify` print every revision's content, and the cache's rows print, where
+/// `sqlite3` is on the `PATH`, each content's hash, the revision that first stored it and its size. The revisions'
+/// properties (`db/revprops`) and the youngest revision (`db/current`) stay byte-compared.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -280,7 +284,7 @@ svn list -R '^/'
 cd ..
 svnadmin verify repo
 if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, offset, size, expanded_size FROM rep_cache ORDER BY hash'
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, expanded_size FROM rep_cache ORDER BY hash'
 fi
 svnlook tree repo
 # Format: revision 6, the merge, as the repository records it.
@@ -456,7 +460,10 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 ///   in the cache, would be the one line that differs between runs);
 /// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
 ///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
-///   whether the drive makes links (A-275). Every other shell ignores the variable.
+///   whether the drive makes links (A-275). Every other shell ignores the variable;
+/// - cargo's output uncolored: CI sets `CARGO_TERM_COLOR=always` for its own logs, under which the cargo workload's
+///   second build printed its `Fresh` line inside colour codes, so its count read 0 and the script failed alike on both
+///   sides of every leg (CI run 44252249999, macOS, 2026-11-18).
 pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("GIT_AUTHOR_NAME", "slates"),
   ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
@@ -478,6 +485,7 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("npm_config_audit", "false"),
   ("npm_config_logs_max", "0"),
   ("MSYS", "winsymlinks:nativestrict"),
+  ("CARGO_TERM_COLOR", "never"),
 ];
 
 /// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live
@@ -623,9 +631,14 @@ pub const ROSTER: &[Workload] = &[
       ),
       (
         "repo/db/rep-cache.db",
-        "FSFS's representation cache is an SQLite file, whose pages SQLite lays out as it goes, so two runs of the \
-         same commits differ in its bytes; its rows are printed where sqlite3 is on the PATH, and the revisions it \
-         caches are compared byte for byte",
+        "FSFS's representation cache is an SQLite file, whose pages SQLite lays out as it goes, and its rows name \
+         each content's place by the item number its revision gave it; each content's hash, first revision and size \
+         are printed where sqlite3 is on the PATH",
+      ),
+      (
+        "repo/db/revs/",
+        "FSFS numbers a revision's items in the order its commit wrote them, which two runs of the same commits do \
+         not share; every revision's content is printed (the dump's checksum, svnlook tree, svn log -v) and verified",
       ),
     ],
     runs_on_windows: true,
