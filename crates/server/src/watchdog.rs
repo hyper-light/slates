@@ -35,7 +35,14 @@
 //! A stopped thread never reads as runnable, so a frozen process is still killed.
 //!
 //! The window is the existing liveness budget ([`crate::daemon::LIVENESS_BUDGET_NS`]), a fixed number recorded as R3
-//! debt in GAPS. A-228 adds no number to it. While every shard is alive and the control loop lives, the thread beats; once
+//! debt in GAPS. A-228 adds no number to it. A poll's CPU is held to the build the daemon runs in (A-318,
+//! [`spin_window_ns`]): the spinning window is the budget scaled by how much slower this build runs compiled code than
+//! the machine runs the same work in machine code, measured once a process ([`slates_machine::build_cost`]), never below
+//! the budget. The window of CPU is no poll's only where code runs at the speed the budget was set for: under
+//! ThreadSanitizer, whose runtime is called at every memory access and every function's entry and exit, a poll of 1,054
+//! ms and one of 1,060 ms of CPU were judged spinning and ended in-process daemons' whole test binaries on CI (runs
+//! 44238377555 and diag-b13-2, 2026-11-18). The wedged and starved judgments are on the wall and stay on the budget: a
+//! slower build stretches no wait. While every shard is alive and the control loop lives, the thread beats; once
 //! a shard is stuck it logs what it saw and withholds the beat, and the anchor, which judges the beat's age by its own
 //! measured lateness, kills the daemon. Every look is marked in the segment too, beating or not (`SUP_LOOKED`,
 //! A-232 step 5), so the anchor tells a withheld beat (the looks go on) from a watchdog that was itself kept off its CPU
@@ -74,6 +81,8 @@ pub struct Watchdog {
   handle: Option<JoinHandle<()>>,
   /// What the thread did, for whoever asks ([`Watchdog::turns`]).
   turns: &'static Turns,
+  /// The CPU a poll may run before the shard is judged spinning ([`spin_window_ns`]).
+  spin_window_ns: u64,
 }
 
 /// What the watchdog thread did, counted as it goes: how many times it looked at the shards, and at how many of those it
@@ -122,12 +131,17 @@ impl Watchdog {
     supervision: Supervision,
   ) -> std::io::Result<Watchdog> {
     let (stop, stop_signal) = channel();
+    let cost = slates_machine::build_cost::build_cost();
+    let spin_window_ns = spin_window_ns(cost);
     slates_machine::log_line!(
       "slates daemon: the watchdog beats every {} ms and finds a shard stuck after a {} ms window without a step, with \
-       no CPU progress and no wait for a CPU, or with a window's CPU run (the window is the liveness budget); a shard \
-       waiting for a CPU is starved, not stuck, and the beat goes on; {}",
+       no CPU progress and no wait for a CPU, or after {} ms of CPU without a step (the window is the liveness budget, \
+       and a poll's CPU is held to this build: {}); a shard waiting for a CPU is starved, not stuck, and the beat goes \
+       on; {}",
       HEARTBEAT_NS / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS,
+      spin_window_ns / NS_PER_MS,
+      describe_cost(cost),
       match supervision {
         Supervision::Anchored => "an anchor reads the beat, so a stuck shard withholds it",
         Supervision::Alone =>
@@ -143,19 +157,26 @@ impl Watchdog {
           &holders,
           (&control, &stop_signal),
           supervision,
-          turns,
+          (turns, spin_window_ns),
         )
       })?;
     Ok(Watchdog {
       stop: Some(stop),
       handle: Some(handle),
       turns,
+      spin_window_ns,
     })
   }
 
   /// What the thread has done so far ([`Turns`]).
   pub fn turns(&self) -> &'static Turns {
     self.turns
+  }
+
+  /// The CPU a poll may run without a step before its shard is judged spinning: the liveness budget held to this build
+  /// ([`spin_window_ns`], A-318).
+  pub fn spin_window_ns(&self) -> u64 {
+    self.spin_window_ns
   }
 
   /// Tells the thread the daemon is stopping, before the shutdown ends the control loop, so that end is not announced
@@ -180,6 +201,43 @@ impl Watchdog {
 impl Drop for Watchdog {
   fn drop(&mut self) {
     self.stop();
+  }
+}
+
+/// The CPU a poll may run without a step before its shard is judged spinning (A-318): the liveness budget held to the
+/// build the daemon runs in, scaled by how much slower it runs compiled code than the machine runs the same work in
+/// machine code ([`slates_machine::build_cost`]), never below the budget. A cooperative task yields within the shard's
+/// step budget, so a window of CPU is no poll's in the build the budget was set for; a build that runs every poll
+/// slower (ThreadSanitizer's, an unoptimized one) runs a window of CPU in a poll that is no spin. Where the cost was not
+/// measured (Miri, which has no thread clock and judges by the wall; a refused measure, logged) the budget stands.
+pub fn spin_window_ns(
+  cost: Result<slates_machine::build_cost::BuildCost, slates_machine::build_cost::BuildCostRefused>,
+) -> u64 {
+  cost.map_or(LIVENESS_BUDGET_NS, |cost| cost.scale(LIVENESS_BUDGET_NS))
+}
+
+/// The build's measured cost in the banner's words.
+fn describe_cost(
+  cost: Result<slates_machine::build_cost::BuildCost, slates_machine::build_cost::BuildCostRefused>,
+) -> String {
+  /// Format: tenths in one.
+  const TENTHS: u64 = 10;
+  match cost {
+    Ok(cost) => {
+      let tenths = cost.tenths();
+      format!(
+        "this build runs compiled code {}.{} times as slowly as the machine runs it in machine code, {} ns against {} \
+         ns for a batch of {} chains",
+        tenths / TENTHS,
+        tenths % TENTHS,
+        cost.compiled_ns,
+        cost.machine_ns,
+        cost.batch
+      )
+    }
+    Err(refused) => {
+      format!("this build's cost was not measured ({refused:?}), so the budget stands")
+    }
   }
 }
 
@@ -267,10 +325,12 @@ pub enum Verdict {
     /// How long the shard has not moved at all.
     for_ns: u64,
   },
-  /// No step while it ran `cpu_ns` of CPU (at least a window).
+  /// No step while it ran `cpu_ns` of CPU (at least the spin window, `window_ns`).
   Spinning {
     /// The CPU the shard ran since its last step.
     cpu_ns: u64,
+    /// The spin window it was judged against: the liveness budget held to this build ([`spin_window_ns`], A-318).
+    window_ns: u64,
   },
 }
 
@@ -384,9 +444,10 @@ impl ShardWatch {
     }
   }
 
-  /// Judges one look against the history (A-65's rule; `window_ns` is the liveness budget) and returns the verdict
-  /// and the history for the next look. Pure, so the rule is tested on every host with no thread under it.
-  pub fn judge(self, look: Look, window_ns: u64) -> (Verdict, ShardWatch) {
+  /// Judges one look against the history (A-65's rule; `window_ns` is the liveness budget, `spin_window_ns` the budget of
+  /// CPU a poll may run, the liveness budget held to this build, [`spin_window_ns`]) and returns the verdict and the
+  /// history for the next look. Pure, so the rule is tested on every host with no thread under it.
+  pub fn judge(self, look: Look, window_ns: u64, spin_window_ns: u64) -> (Verdict, ShardWatch) {
     let (spent, progress) = look.cpu.map_or((None, None), |(spent, progress)| {
       (Some(spent), Some(progress))
     });
@@ -438,10 +499,14 @@ impl ShardWatch {
       (Some(at_step), Some(now)) => now.saturating_sub(at_step),
       _ => 0,
     };
-    if cpu_since_step >= window_ns {
+    // A poll is judged in this build's CPU: a build that runs compiled code slower runs every poll slower, so its window
+    // of CPU is the budget scaled by that slowdown, measured (A-318). Before, ThreadSanitizer's polls of 1,054 and 1,060
+    // ms ended in-process daemons' test binaries on CI.
+    if cpu_since_step >= spin_window_ns {
       return (
         Verdict::Spinning {
           cpu_ns: cpu_since_step,
+          window_ns: spin_window_ns,
         },
         next,
       );
@@ -461,7 +526,7 @@ fn run(
   holders: &[SlotHolder],
   (control, stop): (&Receiver<()>, &Receiver<()>),
   supervision: Supervision,
-  turns: &Turns,
+  (turns, spin_window_ns): (&Turns, u64),
 ) {
   let mut clock = HostClock::new();
   let mut watches = vec![ShardWatch::begun_at(clock.monotonic_ns().max(1)); holders.len()];
@@ -490,7 +555,7 @@ fn run(
       .zip(looks)
       .zip(watches.iter_mut())
       .map(|((holder, look), watch)| {
-        let (verdict, next) = watch.judge(look?, LIVENESS_BUDGET_NS);
+        let (verdict, next) = watch.judge(look?, LIVENESS_BUDGET_NS, spin_window_ns);
         *watch = next;
         Some((holder.shard(), verdict))
       })
@@ -684,10 +749,10 @@ fn describe(verdict: Verdict) -> String {
       for_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     ),
-    Verdict::Spinning { cpu_ns } => format!(
+    Verdict::Spinning { cpu_ns, window_ns } => format!(
       "spinning, {} ms of CPU without a step against the {} ms window",
       cpu_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      window_ns / NS_PER_MS
     ),
     Verdict::Alive | Verdict::Starved { .. } => "not stuck".to_owned(),
   }
@@ -776,10 +841,10 @@ fn log_verdict(shard: u16, verdict: Verdict, turn: Turn, late: impl FnOnce() -> 
       consequence(turn),
       late()
     ),
-    Verdict::Spinning { cpu_ns } => slates_machine::log_line!(
+    Verdict::Spinning { cpu_ns, window_ns } => slates_machine::log_line!(
       "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past the {} ms window; {}; {}",
       cpu_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS,
+      window_ns / NS_PER_MS,
       consequence(turn),
       late()
     ),
@@ -825,7 +890,8 @@ mod tests {
   /// Replays `readings`, one a turn from the second turn on, over a shard that took its last step at the first turn and
   /// whose CPU clock never moves again; the verdicts in order, the first of them the second turn's.
   fn replay(readings: &[Option<RunReading>]) -> Vec<Verdict> {
-    let (_, mut watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let (_, mut watch) =
+      ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW, WINDOW);
     let mut verdicts = Vec::new();
     for (turn, run) in (2_u64..).zip(readings) {
       let (verdict, next) = watch.judge(
@@ -833,6 +899,7 @@ mod tests {
           run: *run,
           ..look(5, false, Some((10, 10)), turn * TURN)
         },
+        WINDOW,
         WINDOW,
       );
       watch = next;
@@ -859,11 +926,74 @@ mod tests {
       let (verdict, next) = watch.judge(
         look(turn * steps_per_turn, parked, Some((cpu, cpu)), turn * TURN),
         WINDOW,
+        WINDOW,
       );
       watch = next;
       verdicts.push(verdict);
     }
     verdicts
+  }
+
+  /// A-318, §4.14. Do: watch a shard on a whole CPU inside one poll, judged with a spin window three budgets long (a build
+  /// measured three times as slow as machine code, as an unoptimized or ThreadSanitizer's build is), turn by turn for
+  /// four budgets. Expect: alive while its CPU is under the spin window, though past one budget (a poll this build runs
+  /// slower, no spin); spinning once it reaches the spin window, the verdict naming it. Before A-318 the budget alone was
+  /// the window, and the poll was spinning at one budget of CPU, as ThreadSanitizer's 1,054 ms poll was on CI.
+  #[test]
+  fn a_poll_is_judged_spinning_only_past_the_window_held_to_its_build() {
+    let spin_window = 3 * WINDOW;
+    let mut watch = ShardWatch::default();
+    let mut first_spinning = None;
+    for turn in 1..=40_u64 {
+      let cpu = turn * TURN;
+      let (verdict, next) = watch.judge(
+        look(1, false, Some((cpu, cpu)), turn * TURN),
+        WINDOW,
+        spin_window,
+      );
+      watch = next;
+      if let Verdict::Spinning { cpu_ns, window_ns } = verdict {
+        first_spinning.get_or_insert((turn, cpu_ns, window_ns));
+      } else {
+        assert_eq!(
+          verdict,
+          Verdict::Alive,
+          "turn {turn}: on the CPU, so alive until the spin window"
+        );
+      }
+    }
+    let (turn, cpu_ns, window_ns) =
+      first_spinning.expect("the poll was judged spinning past the spin window");
+    assert!(
+      cpu_ns >= spin_window && cpu_ns < spin_window + TURN,
+      "turn {turn}: {cpu_ns} ns of CPU"
+    );
+    assert!(
+      turn * TURN > WINDOW,
+      "not spinning at one budget of CPU (turn {turn})"
+    );
+    assert_eq!(window_ns, spin_window, "the verdict names the spin window");
+  }
+
+  /// A-318. Do: derive the spin window from a measured build cost twice the machine's, one equal to it, one cheaper,
+  /// and a refused measure. Expect: two budgets, the budget, the budget, the budget.
+  #[test]
+  fn the_spin_window_is_the_budget_held_to_the_builds_measured_cost() {
+    use slates_machine::build_cost::{BuildCost, BuildCostRefused};
+    let cost = |compiled_ns, machine_ns| {
+      Ok(BuildCost {
+        compiled_ns,
+        machine_ns,
+        batch: 1,
+      })
+    };
+    assert_eq!(spin_window_ns(cost(200, 100)), 2 * LIVENESS_BUDGET_NS);
+    assert_eq!(spin_window_ns(cost(100, 100)), LIVENESS_BUDGET_NS);
+    assert_eq!(spin_window_ns(cost(50, 100)), LIVENESS_BUDGET_NS);
+    assert_eq!(
+      spin_window_ns(Err(BuildCostRefused::NoMachineCode)),
+      LIVENESS_BUDGET_NS
+    );
   }
 
   /// A-228, §4.14. Do: watch a shard that steps every turn, one parked every turn, and one starved (no step for
@@ -890,11 +1020,12 @@ mod tests {
   #[test]
   fn a_shard_with_no_cpu_for_a_window_is_wedged_and_a_shorter_block_is_not() {
     let mut watch = ShardWatch::default();
-    let (_, next) = watch.judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let (_, next) = watch.judge(look(5, false, Some((10, 10)), TURN), WINDOW, WINDOW);
     watch = next;
     let mut first_wedged = None;
     for turn in 2..=30 {
-      let (verdict, next) = watch.judge(look(5, false, Some((10, 10)), turn * TURN), WINDOW);
+      let (verdict, next) =
+        watch.judge(look(5, false, Some((10, 10)), turn * TURN), WINDOW, WINDOW);
       watch = next;
       if matches!(verdict, Verdict::Wedged { .. }) && first_wedged.is_none() {
         first_wedged = Some(turn);
@@ -907,10 +1038,11 @@ mod tests {
     );
     // Blocked for 0.9 of a window, then a step.
     let mut watch = ShardWatch::default();
-    let (_, next) = watch.judge(look(1, false, Some((10, 10)), TURN), WINDOW);
+    let (_, next) = watch.judge(look(1, false, Some((10, 10)), TURN), WINDOW, WINDOW);
     watch = next;
     for turn in 2..=10 {
-      let (verdict, next) = watch.judge(look(1, false, Some((10, 10)), turn * TURN), WINDOW);
+      let (verdict, next) =
+        watch.judge(look(1, false, Some((10, 10)), turn * TURN), WINDOW, WINDOW);
       watch = next;
       assert_eq!(
         verdict,
@@ -918,7 +1050,7 @@ mod tests {
         "a block shorter than the window at turn {turn}"
       );
     }
-    let (verdict, _) = watch.judge(look(2, false, Some((10, 10)), 11 * TURN), WINDOW);
+    let (verdict, _) = watch.judge(look(2, false, Some((10, 10)), 11 * TURN), WINDOW, WINDOW);
     assert_eq!(verdict, Verdict::Alive);
   }
 
@@ -928,16 +1060,17 @@ mod tests {
   /// later, so a stuck shard is still judged. Before, the look after the gap judged it wedged for the gap's length.
   #[test]
   fn a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge() {
-    let (_, mut watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let (_, mut watch) =
+      ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW, WINDOW);
     let still = |now_ns: u64| Look {
       run: blocked(None),
       ..look(5, false, Some((10, 10)), now_ns)
     };
-    let (verdict, next) = watch.judge(still(2 * TURN), WINDOW);
+    let (verdict, next) = watch.judge(still(2 * TURN), WINDOW, WINDOW);
     watch = next;
     assert_eq!(verdict, Verdict::Alive);
     let after_gap = 2 * TURN + WINDOW + WINDOW / 2;
-    let (verdict, next) = watch.judge(still(after_gap), WINDOW);
+    let (verdict, next) = watch.judge(still(after_gap), WINDOW, WINDOW);
     watch = next;
     assert_eq!(
       verdict,
@@ -946,7 +1079,7 @@ mod tests {
     );
     let mut first_wedged = None;
     for turn in 1..=20 {
-      let (verdict, next) = watch.judge(still(after_gap + turn * TURN), WINDOW);
+      let (verdict, next) = watch.judge(still(after_gap + turn * TURN), WINDOW, WINDOW);
       watch = next;
       if matches!(verdict, Verdict::Wedged { .. }) && first_wedged.is_none() {
         first_wedged = Some(turn);
@@ -985,7 +1118,8 @@ mod tests {
       !ShardWatch::default().suspects(&look(5, false, Some((10, 10)), TURN)),
       "no history yet"
     );
-    let (_, watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let (_, watch) =
+      ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW, WINDOW);
     let at = 2 * TURN;
     assert!(
       !watch.suspects(&look(6, false, Some((10, 10)), at)),
@@ -1041,7 +1175,10 @@ mod tests {
   fn each_kind_of_verdict_is_logged_once_an_episode_and_only_a_stuck_shard_stops_the_beat() {
     let starved = Verdict::Starved { for_ns: WINDOW };
     let wedged = Verdict::Wedged { for_ns: WINDOW };
-    let spinning = Verdict::Spinning { cpu_ns: WINDOW };
+    let spinning = Verdict::Spinning {
+      cpu_ns: WINDOW,
+      window_ns: WINDOW,
+    };
     assert!(Verdict::Alive.beats() && starved.beats());
     assert!(!wedged.beats() && !spinning.beats());
     let mut said = None;
@@ -1149,7 +1286,10 @@ mod tests {
   fn a_stuck_shard_or_an_ended_loop_does_not(supervision: Supervision, stopping: bool) {
     for verdict in [
       Verdict::Wedged { for_ns: WINDOW },
-      Verdict::Spinning { cpu_ns: WINDOW },
+      Verdict::Spinning {
+        cpu_ns: WINDOW,
+        window_ns: WINDOW,
+      },
     ] {
       let want = expected(supervision, stopping, Cause::Stuck { shard: 3, verdict });
       for control_ended in [false, true] {
@@ -1177,8 +1317,11 @@ mod tests {
     let first_end = |readings: &[Option<RunReading>], cpu_after_wedge: u64| {
       let mut watch = ShardWatch::default();
       for turn in 1..=2_u64 {
-        let (verdict, next) =
-          watch.judge(look(turn, false, Some((turn, turn)), turn * TURN), WINDOW);
+        let (verdict, next) = watch.judge(
+          look(turn, false, Some((turn, turn)), turn * TURN),
+          WINDOW,
+          WINDOW,
+        );
         watch = next;
         assert_eq!(
           decide(Supervision::Alone, None, false, false),
@@ -1198,6 +1341,7 @@ mod tests {
               turn * TURN,
             )
           },
+          WINDOW,
           WINDOW,
         );
         watch = next;
@@ -1221,7 +1365,11 @@ mod tests {
     let mut watch = ShardWatch::default();
     for turn in 1..=2_u64 {
       watch = watch
-        .judge(look(turn, false, Some((turn, turn)), turn * TURN), WINDOW)
+        .judge(
+          look(turn, false, Some((turn, turn)), turn * TURN),
+          WINDOW,
+          WINDOW,
+        )
         .1;
     }
     let mut wedged_at = None;
@@ -1231,6 +1379,7 @@ mod tests {
           run: blocked(None),
           ..look(2, false, Some((3, 3)), turn * TURN)
         },
+        WINDOW,
         WINDOW,
       );
       watch = next;
@@ -1273,7 +1422,7 @@ mod tests {
         steps += 1;
       }
       let cpu = now.min(wedge_ns);
-      let (verdict, next) = watch.judge(look(steps, false, Some((cpu, cpu)), now), WINDOW);
+      let (verdict, next) = watch.judge(look(steps, false, Some((cpu, cpu)), now), WINDOW, WINDOW);
       watch = next;
       if matches!(verdict, Verdict::Wedged { .. }) {
         return (now, last_beat, watch);
@@ -1352,6 +1501,7 @@ mod tests {
             run: blocked(None),
             ..look(24, false, Some((7, 7)), turn * TURN)
           },
+          WINDOW,
           WINDOW,
         )
         .1;

@@ -370,9 +370,15 @@
 >   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
 >   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
 >   without the guard: granted) and `fs_server.rs`'s server-node agent
->   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
->   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
->   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Built the same day, its
+>   siblings:** `Enroll` and `Revoke` verified the proof alone, so a consumer-bound channel holding a genuine proof
+>   could enroll a fresh consumer (binding a channel that escapes its own consumer policy) or revoke another agent's.
+>   Both now refuse `Forbidden` before the proof (`enroll_by_consumer`, `revoke_by_consumer`):
+>   `an_agent_cannot_enroll_or_revoke_a_consumer`, each guard red-checked alone (GitHub run 44274679371, Linux x86_64:
+>   without the enroll guard the agent's channel was handed consumer 11; without the revoke guard its revocation
+>   answered `Ok`; with both, `write_policy.rs` 11 of 11, `consumers.rs` 1 of 1, the server's unit tests 311 passed,
+>   clippy clean). The sweep of every launcher-proof check (the six callers of `landing::proven_by_launcher`, and
+>   consensus control) found no other: consensus control already refuses any principal but an OS account.
 
 > **W1 would have let a work off its green's shard merge under one volume's write policy: fixed before W1 landed
 > (2026-11-18, g231; A-307, §4.16).** A-285 judges a merge's policy from the work's and the green's records on one
@@ -991,7 +997,11 @@
 > "RTCF") and a layout version (1); a decoder refuses another kind or an unversioned layout `ForeignLayout`, another
 > version `LayoutVersion`, before reading any field, and a retained council or root of another build's layout refuses
 > recovery by name (`retention::configuration_refused`). Tests: `a_configuration_of_another_layout_is_refused_by_name`,
-> `a_retained_council_of_another_layout_refuses_recovery_by_name`. A-272's "The encoding" status. **Open (the sweep):**
+> `a_retained_council_of_another_layout_refuses_recovery_by_name`. A-272's "The encoding" status. The regional layout
+> is 2 since A-309 (g250, 2026-11-18: completion records where layout 1 carried `dropped_unconfirmed`, and each
+> retirement's current neighbourhood), so a layout-1 build and a layout-2 build refuse each other's configurations by
+> name; without the version, a layout-1 entry with nothing dropped and no retirement kept would have parsed as layout 2.
+> **Open (the sweep):**
 > the configuration group's commands (`config_group::ConfigCommand`) carry a tag byte but no layout version, so a
 > change to an existing command's fields would be read by position.
 >
@@ -1026,7 +1036,8 @@
 > reclaimed yet. Now a round with a lost object does not confirm (`takeover::share_done`). A ranked successor that is
 > neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
 > retired with nothing to recover through all read `Lineage::Unresolved`
-> (`RegionalConfiguration::dropped_unconfirmed`), and `Unresolved` never reclaims. The sweep for the same inference
+> (`RegionalConfiguration::dropped_unconfirmed`, replaced by A-309's completion records), and `Unresolved` never
+> reclaims. The sweep for the same inference
 > from absence, every path that frees a held record, held content, a merge replica or a live log:
 > - `takeover::resolve_held_objects` on `Settled`: the defect, fixed.
 > - `takeover::resolve_held_objects` on `stale_after_confirmation` (a holder outside the successor's placement once
@@ -1038,9 +1049,42 @@
 > - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
 > - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
 > - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
-> **Open (A-272 ii):** an unresolved object is kept but recovered by no one. Owed: kept adoption records, so Settled
-> rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
-> now (here, the replacement that holds the live log).
+> **Fixed (A-272 ii) by A-309 (g250, 2026-11-18), with the residuals below:** an unresolved object was kept but
+> recovered by no one. Owed: kept adoption records, so Settled rests on one, and a round of the current members for unresolved objects,
+> so `f + 1` counts the members that exist now (here, the replacement that holds the live log).
+> - **Fixed (A-309 piece 1): Settled rests on a completion record** (`RegionalConfiguration::completed`, replacing
+>   `dropped_unconfirmed`), and a holder lets a copy go only for a takeover that asked it. Five histories let a holder
+>   let go of a copy nobody adopted, each red before its fix: a takeover with no survivor (a region formed on one node,
+>   taken over before it reports its grown neighbourhood placed) and one carried into such a takeover, each dropped at
+>   once and read settled (read from the code); and, found by the lineage model (`crates/db/tests/lineage_model.rs`),
+>   an object no survivor of its cohorts was ranked for (no round learned it, the takeover completed), a carried
+>   retirement the bound dropped while its carrier was kept (the carrier's objects ranked anew, a survivor confirmed
+>   without one), and a holder the round never asked reading a confirmation as an adoption. The retirement now records
+>   the neighbourhood a change in flight reached; every object ranks a survivor; the bound drops a carrier with what it
+>   carries. Sibling fixed: a holder outside the successor's placement kept its stale copy for good when the last
+>   confirmation dropped the retirement in the same version. A move on an unresolved line is allowed (records are
+>   bounded, so an old volume's line reads unresolved once its record goes). The lineage model is
+>   `docs/wip/models/Lineage.tla`, read as text only.
+> - **Fixed (A-309 piece 2): the members that exist now recover a cohort past its tolerance.** An object one of whose
+>   settled cohorts is short of its recovery quorum is adopted once every surviving member of its cohorts, settled and
+>   current, has promised it, with the newest record any of them holds (`Readiness::ReadyPastTolerance`,
+>   `fleet.takeover.recovered_past_tolerance`); before, it was counted `fleet.takeover.lost` and never adopted. The
+>   store-destroyed case's registers: the settled cohort [owner, A, old B] with only A left, the replacement B' in the
+>   owner's current neighbourhood; A adopts once A and B' answered
+>   (`a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now`).
+> - **Fixed (A-309 piece 3): the live takeover past tolerance.** A-240's phase one counted only recorded holders, so at
+>   `f = 1` with {A, old B} recorded it waited for good (g240's finding). Past tolerance it now waits for every
+>   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
+>   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
+>   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
+> - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
+>   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
+>   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
+>   owns is placed on the new neighbourhood.
+> - **Residual, recorded:** a line through a retirement the bound let go before it completed stays unresolved and
+>   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
+>   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
+>   there is neither learned nor let go.
 
 > **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
 > predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
@@ -1051,7 +1095,10 @@
 > alone, was recovered jointly with old b's {old b, owner, c}, of which only c was left; the survivor counted 8 objects
 > lost (A-272 keeps the copies; none is served). Owed, model first: whether the joint cohort may apply only to objects
 > whose line passes through the unconfirmed host, in §4.8's model text, with A-272 (ii)'s lineage model; a wrong
-> narrowing would lose data, so no change before it.
+> narrowing would lose data, so no change before it. Since A-309 (g250, 2026-11-18) such an object is no longer lost:
+> the joint cohort short of its quorum puts it past tolerance, and it is adopted once every surviving member of its
+> cohorts has promised (here the replacement and c, whose own cohort still holds its quorum), with the newest record
+> any holds (`fleet.takeover.recovered_past_tolerance`). The narrowing would spare only that wait for every survivor.
 
 > **Fixed (live-durability, 2026-11-09): the store-destroyed flow's mode B was the flow's own wait.** No survivor took
 > the volume over and every takeover counter read zero: 11 of 12 runs on A-271's tree (diag-live-durability-77) and 11
@@ -1518,6 +1565,24 @@
 > bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
 > loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
 > the loop now runs to the call's bound after the exit.
+
+> **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
+> Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
+> SIGABRT when an in-process daemon's watchdog judged "shard 4 is spinning, 1054 ms of CPU without a step against the
+> 1000 ms window", and in diag-b13-2 the server's library tests the same way at 1,060 ms. A lone daemon's stuck verdict
+> ends its process (A-232), and an in-process daemon's process is the test binary. A window of CPU is no poll's only in
+> a build that runs code at the speed the budget was set for; ThreadSanitizer's runtime is called at every memory
+> access and every function's entry and exit. The spin window is now the budget held to the build: scaled by compiled ÷
+> machine-code time for one chain of work, measured once a process (`slates_machine::build_cost`), never below the
+> budget; the watchdog's start line names both. Measured: ThreadSanitizer's builds 17.9 to 35.3 times machine code on
+> CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
+> (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
+> (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
+> (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest
+> thread to a window of CPU too (`crates/api/src/role/anchor.rs`, `process_clock`), and an observation's budget is counted
+> in the observed shard's CPU (`crate::observe::ShardTime`); neither is held to the build yet, and neither has been seen
+> to fail under ThreadSanitizer. The release-build spinning kills of the A-228 entry ("A kill the rule does not touch")
+> are untouched: a release build's window is the budget.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
@@ -3034,7 +3099,36 @@
 >     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
 >     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
->     Linux's census has run nowhere yet.
+>   - **First runs (2026-11-18), 11 of 35 flows failed on macOS arm64 (main bfc34cace) and the same on Linux x86_64 and
+>     arm64 (69cd38b22).** Linux's census ran there for the first time and attributed every socket but two datagrams.
+>     - **Fixed (A-330): the relay never carried the record plane.** The three owner-partition flows failed
+>       StaleNeverCommits: their cut-off owners acknowledged 2,086, 3,528 and 2,412 writes after the cut, each durable on
+>       a candidate, over record links that went around the relay, since a node announced its record plane at its bound
+>       port and formation's redial dialed it. Every relayed flow was vacuous on that plane; each now requires a
+>       record-plane datagram per acknowledged write from its relay (`judge_relayed`). Red first:
+>       `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+>       (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+>     - **Open (g229): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
+>       resumed, answered `NotFound` for the successor's acknowledged writes (2.29 s and 3.00 s into the run, 70 to 780
+>       ms after their acknowledgements), where it must refuse or answer them. The flow now notes the reader's state when
+>       a read answers missing (`note_missing`), and its first run with it (Mac Studio, 2026-11-18) showed the cause: the
+>       old owner was retired and re-admitted under its own id (`fleet_host_epoch` 2), its catalog still held the volume
+>       with its epoch-1 shipper, and its lease confirmed again (`lease.refused.superseded` 1, `lease.wait.parked` 1,
+>       `lease.wait.served` 1), so it served its stale copy. A re-admission yields an owner's objects only in its
+>       routing table (`FleetNode::install_configuration`), and `verbs::owned_by_another_host` serves every volume its
+>       node created or still catalogues.
+>     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
+>       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
+>       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
+>       back, yet `first_head` was none. The flow now takes the survivor that took the volume over (`took_over`, the
+>       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
+>       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
+>       (g230's).
+>     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
+>       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
+>       it as a live holder.
+>     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
@@ -10738,12 +10832,14 @@ new process. In simulation the session ended one round trip after its first pack
   this node's own routing, which the give-up claims, and answered `Overloaded` for good: on a fleet of more than one node
   no client saw the materialization's `NotRecovered` either, whose tests ran on a lone node, which never forwards. It is
   answered on its owner shard now; the three-node regression above holds both.
-- **Sibling, open (g250's A-309 takes it):** an object the round declared lost (a cohort with fewer members than its
-  recovery quorum, counted `fleet.takeover.lost`) is never recorded unrecovered either, so every verb on it answers a
-  retryable `Overloaded` for as long as the daemon runs. A record naming the short cohort (`waited_on: "quorum"`) was
+- **Sibling, fixed by A-309 (g250, 2026-11-18):** an object the round declared lost (a cohort with fewer members than
+  its recovery quorum, counted `fleet.takeover.lost`) was never recorded unrecovered either, so every verb on it answered
+  a retryable `Overloaded` for as long as the daemon ran. A record naming the short cohort (`waited_on: "quorum"`) was
   built and proven on 2026-11-18 (red with the record removed: `Overloaded` to the 60 s deadline) and withdrawn before it
-  landed, at g250's request: A-309 recovers such an object instead (the round adopts once every surviving member of its
-  cohorts has promised, and `Readiness::Lost` goes away), so a refusal would only be undone.
+  landed, at g250's request: A-309 recovers such an object instead. `Readiness::Lost` is gone; the round adopts it once
+  every surviving member of its cohorts, settled and current, has promised (`Readiness::ReadyPastTolerance`,
+  `fleet.takeover.recovered_past_tolerance`), and a member that never promises leaves it to A-304's bound, which gives
+  it up by name as any other wait.
 
 ### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
 
@@ -10756,6 +10852,10 @@ new process. In simulation the session ended one round trip after its first pack
   24 logged it, each with the object's creator the crashed owner and the short cohort the replaced member's old one
   (`has 1 of 2 needed`, `retired [replaced, crashed owner]`). How much of that the report fix removes is not yet
   measured. Each lost verdict in the re-measure is to be classified by whether the failures stayed within f.
+- **Since A-309 (g250, 2026-11-18)** the verdict is no longer a loss: the cohort short of its quorum puts the object past
+  tolerance, and it is adopted once every surviving member of its cohorts has promised, with the newest record any holds
+  (`fleet.takeover.recovered_past_tolerance`). The sound rule below would spare only that wait for every survivor (and
+  the past-tolerance count it adds), so it stays a question for the model, not a loss.
 - **Ruling (2026-11-08).** Such a cohort cannot constrain an object it never held, so the verdict is false, but a false
   "lost" that needs a second failure inside the takeover window is beyond f at f = 1 and stays a recorded limit. One in a
   run whose failures stayed within f is a defect against §4.8, however rare, and then the sound rule below is built with
@@ -16394,8 +16494,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
   or zeros, so those pages could reach a guest's map.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
-  - write-log replay (`verbs::replay_one`) routes a logged FUSE write by its inode number's prefix, which for a clone's
-    inherited file is its origin's: a replayed write would land in the origin;
+  - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
+    prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost
+    it (proven by `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone`, red with the prefix routing put
+    back). Every write-log record now names the volume it was written through and is replayed there, the `FORGET`s too;
+    the log's header carries a layout word, and a log of the layout before that holds records is reported as lost writes,
+    never misread (`docs/bugs/2026-11-18-a-replayed-write-to-a-clones-inherited-file-landed-in-its-origin.md`);
   - the in-process DAX gate's recall (`has_writable_of_prefix`, `writable_of_prefix`, `recalling(no.prefix())`) counts
     a clone's writable windows on inherited files under the origin, so the clone's snapshot could freeze under one
     (harness-only exposure: `writable_dax`, DAX unadvertised);
