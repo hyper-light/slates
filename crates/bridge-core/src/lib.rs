@@ -850,12 +850,7 @@ mod tests {
       (20, 501),
       "uid and gid swap apart"
     );
-    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
-      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
-      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
-      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
-      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
-    }
+    expect_each_id_back_the_way_it_came(view);
     let same = OwnerView::swapping((1000, 1000), (1000, 1000));
     assert_eq!(
       (same.shown_uid(1000), same.kept_gid(1000)),
@@ -879,27 +874,19 @@ mod tests {
       assert!(host.reaches(name) && guest.reaches(name), "{name:?}");
       assert!(!guest_only(name), "{name:?}");
     }
-    for name in [
+    expect_a_guests_own(&[
       &b"trusted.overlay.opaque"[..],
       b"security.capability",
       b"security.selinux",
-    ] {
-      assert!(!host.reaches(name), "{name:?}");
-      assert!(guest.reaches(name), "{name:?}");
-      assert!(guest_only(name), "{name:?}");
-    }
+    ]);
     for name in [&b"user."[..], b"trusted.", b"security."] {
       assert!(
         !host.reaches(name) && !guest.reaches(name),
         "a bare prefix: {name:?}"
       );
     }
-    for name in [&b"system.posix_acl_access"[..], b"system.posix_acl_default"] {
-      assert!(!host.reaches(name), "{name:?}");
-      assert!(guest.reaches(name), "{name:?}");
-      assert!(guest_only(name), "{name:?}");
-    }
-    for name in [
+    expect_a_guests_own(&[&b"system.posix_acl_access"[..], b"system.posix_acl_default"]);
+    expect_reached_by_neither_and_no_guests_own(&[
       &b"system.posix_acl_accessx"[..],
       b"system.sockprotoname",
       b"system.",
@@ -907,10 +894,39 @@ mod tests {
       b"securityx",
       b"com.apple.FinderInfo",
       b"",
-    ] {
+    ]);
+    assert_eq!(AttributeNamespaces::default(), host);
+  }
+
+  /// The round trips of `an_owner_view_swaps_the_hosts_owner_with_the_runs_and_leaves_every_other_id`: expect every id,
+  /// the swapped pair's and others, read back through `view` the way it came, and the identity changing none.
+  fn expect_each_id_back_the_way_it_came(view: OwnerView) {
+    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
+      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
+      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
+      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
+      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
+    }
+  }
+
+  /// A guest's own names in `a_guests_namespaces_are_reached_by_its_route_alone`: expect each of `names` reached by the
+  /// guest's route alone, never by a host's mount, and marked a guest's own.
+  fn expect_a_guests_own(names: &[&[u8]]) {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for &name in names {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+  }
+
+  /// The names no route reaches in `a_guests_namespaces_are_reached_by_its_route_alone`: expect each of `names` reached
+  /// by neither a host's mount nor a guest's route, and no guest's own.
+  fn expect_reached_by_neither_and_no_guests_own(names: &[&[u8]]) {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for &name in names {
       assert!(!host.reaches(name) && !guest.reaches(name), "{name:?}");
       assert!(!guest_only(name), "{name:?}");
     }
-    assert_eq!(AttributeNamespaces::default(), host);
   }
 }

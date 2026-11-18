@@ -113,11 +113,12 @@ impl Acl {
       return Err(AclRefusal::Version);
     }
     let body = value.get(HEADER_BYTES..).unwrap_or_default();
-    if body.len() % ENTRY_BYTES != 0 {
+    let (whole, rest) = body.as_chunks::<ENTRY_BYTES>();
+    if !rest.is_empty() {
       return Err(AclRefusal::Invalid);
     }
-    let entries = body
-      .chunks_exact(ENTRY_BYTES)
+    let entries = whole
+      .iter()
       .map(entry_of)
       .collect::<Result<Vec<Entry>, AclRefusal>>()?;
     valid(&entries)?;
@@ -252,7 +253,7 @@ pub fn translated(value: &[u8], view: OwnerView, toward: Toward) -> Result<Vec<u
 
 /// One entry from its eight bytes, refused for an unknown tag, a permission outside `rwx` or a named entry's id that
 /// names no one.
-fn entry_of(bytes: &[u8]) -> Result<Entry, AclRefusal> {
+fn entry_of(bytes: &[u8; ENTRY_BYTES]) -> Result<Entry, AclRefusal> {
   let word = |at: usize| -> Result<u16, AclRefusal> {
     let pair = bytes
       .get(at..at.saturating_add(2))
