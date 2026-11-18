@@ -38,6 +38,12 @@ const DIR_MODE: u32 = 0o040_755;
 const TERM_NS: u64 = 1_000_000_000_000;
 /// Shape: the large-file class boundary, one chunk window.
 const LARGE: u64 = 65_536;
+/// Shape: the test store's cache line, a common CPU's: the store's layout is under test, not its speed.
+const CACHE_LINE: usize = 64;
+/// Shape: the entries past which a test directory splits into blocks, few so the tests' directories cross it.
+const DIR_CUTOVER: usize = 4;
+/// Shape: the simulated clock's first instant (ns), never zero, which a host reports for "none recorded".
+const CLOCK_START_NS: u64 = 1_000;
 /// Shape: a file made executable (`chmod +x` of `FILE_MODE`).
 const EXECUTABLE_MODE: u32 = 0o100_755;
 /// Format: a mode's permission bits.
@@ -51,12 +57,12 @@ fn store() -> Store {
   Store::new(
     &StoreConfig {
       page: PAGE,
-      cache_line: 64,
+      cache_line: CACHE_LINE,
       max_dirs: CAP,
       max_inodes: CAP,
       max_chunks: CAP,
       max_dir_blocks: CAP,
-      dir_cutover: 4,
+      dir_cutover: DIR_CUTOVER,
     },
     arena,
     0,
@@ -69,7 +75,7 @@ fn config(prefix: u16) -> VolumeConfig {
     names: NameEquivalence::Exact,
     quota: Quota::Bounded { limit: 1 << 24 },
     journal_bytes: 1 << 16,
-    clock: Box::new(StepClock::new(1_000, 1)),
+    clock: Box::new(StepClock::new(CLOCK_START_NS, 1)),
   }
 }
 
