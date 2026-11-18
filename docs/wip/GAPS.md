@@ -79,6 +79,22 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
+> §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
+> gated by its lease alone: once it confirmed again, an NFS mount on the old owner answered reads from the copy the
+> successor's writes had passed and its stable writes retry-later for good, and a FUSE mount the same. Now a volume
+> whose log is fenced at a later epoch (`live_ship::superseded`, kept across a restart since A-344) answers NFS
+> `NFS3ERR_STALE` (no root at a mount), and its FUSE mounts are fenced as revoked ones (kernel cache dropped,
+> `ENOTCONN`, the mount ended) the moment the owner learns its fence. Tests: `a_superseded_owners_nfs_mount_answers_stale`
+> (`crates/server/tests/fleet.rs`), `a_superseded_volumes_fuse_mount_ends` (`crates/server/tests/fuse_mount.rs`, Linux,
+> through `Daemon::inject_superseded`).
+> - **Open (waits for g229's A-334):** an idle volume's mount learns of the takeover only once the old owner knows its
+>   fence, which takes a write to meet a holder's; the re-admission's yield (A-334, g229's, not on main yet) is the
+>   signal for an idle one, and joins `live_ship::superseded` when it lands (told in g229's inbox).
+> - **Owed (siblings):** the guest device (`crate::virtiofs`), the Shards stream (`crate::shards`) and the WinFsp mount
+>   (`crate::winfsp`) still apply only the lease gate (`verbs::live_tree_fenced`) to such a volume, so each holds its
+>   requests or, its lease confirmed, serves the copy; each needs its own form of this answer.
+
 > **A live log forked at its owner's warm restart: kept and resumed past every position it may have shipped (2026-11-18,
 > A-344, §4.10, §4.8 "Recovery"; g230; found by A-343's probes).** The shipper lived in the owner shard's memory alone.
 > An owner restarted warm (a Mac Studio, three nodes at `f = 1`) took a write (`FsDone`, 410 ms) on a new chain from
@@ -124,7 +140,8 @@
 > reached the successor, which shipped nothing, and the only line shipping the volume was the old owner's fenced one.
 > Now a superseded volume is routed to its current owner, and a holder asks its own routing before the creator. Test:
 > `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`).
-> - **Owed (g230, next):** a mount on the old owner (NFS, FUSE) still answers `StaleEpoch` for the volume it lost.
+> - **Closed for a fence the old owner learned (2026-11-18, A-346, the entry above):** its NFS mount answers
+>   `NFS3ERR_STALE` and its FUSE mount ends as a revoked one; the idle case waits for A-334's yield.
 > - **Owed:** a node that lost its own volume and holds no routing entry for it takes itself as the creator route, its
 >   forward then served by its own fenced copy; and a node that holds no copy of an object takes a live creator for its
 >   owner however the council retired it. Neither is reached in a three-node fleet at `f = 1`, where every node holds

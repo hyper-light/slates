@@ -7187,9 +7187,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   and a node asks its own routing for an object it holds before taking the creator for its owner
 >   (`owner_location`'s `known_owner`). The old owner's own first write after its loss may be the one that finds the
 >   fence, and is refused `StaleEpoch`; the next reaches the successor. Held by
->   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed (GAPS): a mount on the old
->   owner (NFS, FUSE) still answers `StaleEpoch`; and a node with no routing entry for its own lost object takes itself
->   as the creator route. A successor ships a live volume from its takeover since A-343.
+>   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed (GAPS): a node with no
+>   routing entry for its own lost object takes itself as the creator route. A successor ships a live volume from its
+>   takeover since A-343, and the old owner's mounts learn of the takeover since A-346 (below).
 > - **A live log forked at its owner's warm restart (fixed 2026-11-18, A-344).** The shipper lived in the owner shard's
 >   memory alone, and a restarted owner made a new one at its next publication, from nothing, at the greater of its
 >   host's epoch and `placed_heads`' (memory too). An owner restarted warm shipped a second chain from position 0 under
@@ -7214,6 +7214,19 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
 >   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
 >   until a write, its holders keep the old chain, which holds every write acknowledged before the restart.
+> - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
+>   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
+>   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
+>   writes retry-later for good, and a FUSE mount the same through the kernel. Now a volume whose log is fenced at a
+>   later epoch (`live_ship::superseded`, kept across a restart since A-344) is answered on an NFS mount as a volume the
+>   node does not hold, `NFS3ERR_STALE` (no root given at a mount), before the lease gate; and its FUSE mounts end as a
+>   revoked mount ends (AUD-29-84): fenced the moment the owner learns its fence (`fuse::superseded`) and at any turn
+>   after, the kernel drops what it cached of the volume, every request meanwhile is refused `ENOTCONN`, and the mount
+>   ends. Held by `a_superseded_owners_nfs_mount_answers_stale` (`crates/server/tests/fleet.rs`) and, on Linux,
+>   `a_superseded_volumes_fuse_mount_ends` (`crates/server/tests/fuse_mount.rs`, the supersession injected as a holder's
+>   fence answer brings it, `Daemon::inject_superseded`). An idle volume's mount learns of the takeover only once the
+>   owner knows it: with no write to meet a holder's fence, that waits for the re-admission's yield (A-334, owed); and
+>   the guest device, the Shards stream and the WinFsp mount still hold or serve such a volume (GAPS).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -25157,3 +25170,22 @@ Applied in the same change to:
     raises on its own copy before its own report counts, as a remote candidate publishes its own before it answers.
   - A restarted owner ships its log again at its next publication; until then its holders keep the old chain, which
     holds every write acknowledged before the restart.
+
+### A-346 — A superseded owner's mounts learn of the takeover: NFS answers `NFS3ERR_STALE`, a FUSE mount ends as a revoked one (2026-11-18, g230, scale-out; §4.8 "Leases and reads", §4.6, AUD-29-84; A-338, A-344)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status (A-338's owed mount line closed, "A superseded owner's mounts went on
+  serving its copy").
+- `crates/server/src/nfs.rs`: `serve` answers a superseded volume `NFS3ERR_STALE` before the lease gate, and
+  `root_object` gives it no root. `crates/server/src/fuse.rs`: `superseded` fences every mount of the volume, and a turn
+  fences one it finds superseded. `crates/server/src/live_ship.rs`: `learn_superseded` (the fence learned, kept, the
+  mounts told), `inject_superseded`. `crates/server/src/daemon.rs`: `Daemon::inject_superseded` (test support).
+- Tests: `a_superseded_owners_nfs_mount_answers_stale` (`crates/server/tests/fleet.rs`),
+  `a_superseded_volumes_fuse_mount_ends` (`crates/server/tests/fuse_mount.rs`, Linux).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** A volume's mounts are gated by the owner's lease alone (AUD-08): a lapse answers retry-later on
+  NFS and holds a FUSE request in the kernel, both right for a lapse a confirmation ends. A takeover's fence never ends,
+  and once the old owner's lease confirmed again its mounts served the copy its successor's writes had passed.
+- **The rule.** A node that knows it lost a volume to a takeover (its log fenced at a later epoch) answers that volume's
+  mounts as a node that does not hold it: an NFS request `NFS3ERR_STALE` and no root at a mount, as the router answers a
+  handle of a volume outside the node's set; a FUSE mount fenced as a revoked one is, its kernel's cache dropped, its
+  requests refused `ENOTCONN`, and the mount ended. The client mounts the volume through its successor's node.
