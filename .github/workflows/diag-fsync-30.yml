@@ -1,0 +1,36 @@
+name: diag-fsync-30
+on:
+  push:
+    branches: [diag-fsync-30]
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  fsync:
+    name: answers_only_once_a_candidate_holds_it x15 under load (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Grant user_allow_other
+        run: grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Build
+        run: cargo test --release --locked -p slates-cli --test live_fleet --no-run 2>&1 | tail -2
+      - name: Fifteen rounds with every core busy
+        shell: bash
+        run: |
+          git log -1 --format='%h %s' | cut -c1-100
+          n=$(nproc); for i in $(seq 1 "$n"); do ( while :; do :; done ) & done; hogs=$(jobs -p)
+          pass=0; fail=0
+          for round in $(seq 1 15); do
+            if SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_fleet -- --nocapture --test-threads=1 --exact \
+                 a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it > r$round.log 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); grep -E "panicked at|held fsync gave up" r$round.log | head -4; fi
+          done
+          kill $hogs 2>/dev/null || true
+          echo "ROUNDS passed=$pass failed=$fail"
+          test "$fail" -eq 0
