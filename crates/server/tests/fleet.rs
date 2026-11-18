@@ -10858,6 +10858,139 @@ fn a_successors_live_log_goes_on_past_every_position_durable_before_it() {
   );
 }
 
+/// Every live line `daemon` reports for `volume`: (holding, head, durable, epoch, fence).
+fn diag_live_lines(
+  daemon: &Daemon,
+  volume: VolumeId,
+) -> Vec<(bool, Option<u64>, Option<u64>, Option<u64>, u64)> {
+  let ReplyBody::DaemonStatus { report } =
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+  else {
+    return Vec::new();
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .filter(|live| live.volume == volume)
+    .map(|live| {
+      (
+        live.holding,
+        live.head,
+        live.durable,
+        live.head_epoch,
+        live.fence,
+      )
+    })
+    .collect()
+}
+
+/// The fleet's counters on `daemon` whose names hold any of `parts`, non-zero.
+fn diag_counts(daemon: &Daemon, parts: &[&str]) -> Vec<(String, u64)> {
+  daemon
+    .fleet_refusals()
+    .map(|counts| {
+      counts
+        .into_iter()
+        .filter(|(name, count)| *count > 0 && parts.iter().any(|part| name.contains(part)))
+        .map(|(name, count)| (name.to_owned(), count))
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Diagnostic (g230, the nemesis stall; never for main): the owner of a live volume isolated on the probe plane alone,
+/// its record plane whole (the relay's shape before A-330), until the others retire it; then its probe plane back.
+#[test]
+fn diag_a_retired_owner_whose_record_plane_stayed_up() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "stranded");
+  eprintln!("diag: written {written:?}");
+  let show = |label: &str| {
+    for (index, daemon) in daemons.iter().enumerate() {
+      eprintln!(
+        "diag {label}: node {index} members {:?} lines {:?} counts {:?}",
+        daemon.fleet_members().map(|members| members.len()),
+        diag_live_lines(daemon, id),
+        diag_counts(
+          daemon,
+          &[
+            "live.fenced",
+            "hold_refused",
+            "taken_over",
+            "takeover.adopted",
+            "materialize",
+            "owner_location.declined",
+            "live.refused",
+            "stale"
+          ]
+        )
+      );
+    }
+  };
+  show("before");
+  daemons[0]
+    .inject_probe_deafness(&[hosts[1], hosts[2]])
+    .unwrap();
+  daemons[1].inject_probe_deafness(&[hosts[0]]).unwrap();
+  daemons[2].inject_probe_deafness(&[hosts[0]]).unwrap();
+  // Writes through a while it is cut off on the probe plane, as the nemesis wrote through its front node.
+  let mut isolated_writes = Vec::new();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let retired = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let gone = |daemon: &Daemon| {
+      daemon
+        .fleet_members()
+        .map(|members| !members.contains(&hosts[0]))
+    };
+    Ok(gone(&daemons[1])? && gone(&daemons[2])?)
+  });
+  for file in 0..3 {
+    let attachment = write_attachment(&mut client, id);
+    isolated_writes.push(client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/isolated-{file}"),
+      bytes: b"written on a while it was cut off".to_vec(),
+      mode: 0o644,
+    }));
+  }
+  eprintln!("diag: retired {retired}; writes on a while cut off {isolated_writes:?}");
+  show("retired");
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).unwrap();
+  let successor_index = if successor == hosts[1] { 1 } else { 2 };
+  let served = poll_status_answers(&observed, daemons[successor_index].instance(), id);
+  eprintln!("diag: successor node {successor_index} serves {served}");
+  show("taken");
+  for daemon in &daemons {
+    daemon.inject_probe_deafness(&[]).unwrap();
+  }
+  let settle = poll_for_periods(&observed, PLACEMENT_DEADLINE, 30, || Ok(false));
+  eprintln!("diag: settled {settle}");
+  show("back");
+  for (index, daemon) in daemons.iter().enumerate() {
+    let mut writer = Client::connect(daemon.instance());
+    let attachment = write_attachment(&mut writer, id);
+    let reply = writer.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/after-{index}"),
+      bytes: b"written after a came back".to_vec(),
+      mode: 0o644,
+    });
+    eprintln!("diag: write through node {index}: {reply:?}");
+  }
+  let settle = poll_for_periods(&observed, PLACEMENT_DEADLINE, 30, || Ok(false));
+  eprintln!("diag: settled again {settle}");
+  show("end");
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.
