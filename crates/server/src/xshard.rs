@@ -777,7 +777,7 @@ pub async fn call_within_room<T: Send + 'static>(
         }),
         None,
       );
-      send_back(origin, back).await;
+      send_back(origin, back);
     }),
     None,
   );

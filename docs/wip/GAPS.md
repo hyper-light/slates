@@ -34,7 +34,10 @@
 > does (`Registration::tell_room`), and a carrier that does not ask is never woken. Counted per shard thread, not in
 > the shard's state, which a caller that keeps a reply may be borrowing: `xshard.room_waits_started`, `_ended`, `_peak`.
 > Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, `run_on_waiting` (A-192's connection ends,
-> now carried the same way), and every direct `send_control` of a reply in `crates/server/src`. Siblings reported, not
+> now carried the same way), and every direct `send_control` of a reply in `crates/server/src`; and, from main as this
+> landed, a resumed verb's reply (`lease_wait::reply_home`, which b49360733 had sent from a task that waited for room,
+> refused by a full arena) now carried the same way, and `call_within_room`'s result, which comes home through
+> `send_back` while its request waits with `given_room_within`'s bounded, told wait. Siblings reported, not
 > changed (not replies, each counted where lost): a client handed to a shard (`daemon.rs`, `HANDOFF_LOST`), a released
 > client id (`RELEASE_LOST`), an NFS connection's migration (`MIGRATE_REFUSED`), and a Windows DAX holder's record
 > (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about

@@ -23113,6 +23113,8 @@ Applied in the same change to:
   the boot log. `crates/server/src/daemon.rs`: each shard's start spawns the carrier first. `crates/rt/src/registry.rs`:
   `Registration::tell_room`, a stand-in's drain telling as a shard's does. The tests: `crates/server/tests/reply_room.rs`
   and five in `xshard.rs`. `crates/client/examples/load_bench.rs` prints the daemon's losses and waits at a run's end.
+  `crates/server/src/lease_wait.rs`: a resumed verb's reply (`reply_home`) is handed home through the carrier, where a
+  task that waited for room (b49360733, main's form as this landed) could be refused by a full arena.
 - GAPS: the 2026-11-18 entry, and the kept-forward entry's open item on polling.
 - **What was there.** A result carried home to another shard's full control channel waited one coordinator period
   and was then dropped (`xshard.reply_dropped`); a reply handed home by a shard holding its state (FUSE, WinFsp,

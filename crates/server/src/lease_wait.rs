@@ -226,22 +226,20 @@ pub(crate) fn send_reply(state: &mut ShardState, route: ReplyRoute, reply: Reply
   reply_home(state, route, reply);
 }
 
-/// Carries a resumed verb's reply to the client's shard by a task of this shard that waits for room on that shard's
-/// channel (`crate::xshard::send_reply_home`), as a forwarded verb's reply goes. Handed over once with no wait, a burst
-/// of resumed verbs (a green's works answered together, A-247) met full channels and lost their replies, so their
-/// clients waited out their whole reply deadline: 5 a shard on every shard at 3,000 clients.
+/// Carries a resumed verb's reply to the client's shard as a forwarded verb's reply goes
+/// (`crate::xshard::hand_reply_home`, §4.3, A-296): kept by this shard's carrier while that shard's channel is full, for
+/// as long as it lives, and refused only for that shard gone or the carrier at its bound, counted. Handed over once with
+/// no wait, a burst of resumed verbs (a green's works answered together, A-247) met full channels and lost their
+/// replies, so their clients waited out their whole reply deadline: 5 a shard on every shard at 3,000 clients. A task
+/// of this shard that waited for room fixed that (b49360733) until the carrier, but a full task arena refused the task,
+/// and the reply with it.
 fn reply_home(state: &mut ShardState, route: ReplyRoute, reply: ReplyBody) {
-  let carried = slates_rt::futures::spawn(async move {
-    crate::xshard::send_reply_home(route.shard, move || {
-      crate::state::deliver(route.client_index, route.request, reply, true);
-    })
-    .await;
-  });
-  match carried {
-    Ok(task) => {
-      let _ = slates_rt::futures::detach(task);
-    }
-    Err(_) => state.count(UNDELIVERED, 1),
+  if crate::xshard::hand_reply_home(route.shard, move || {
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  })
+  .is_err()
+  {
+    state.count(UNDELIVERED, 1);
   }
 }
 
