@@ -30951,3 +30951,22 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), 
   at 1.3 s, short of a window and a half. The live-ship flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/live_ship.rs`.
+
+### A-449 — `sweep_departed`'s wait stated, and the test support's session wait derived as the product waits for a lent session (2026-11-18, built for goal g255; R3's class B, item B-f, closing class B; A-65, A-222, A-408, A-437; the supervisor's ruling of 2026-11-07)
+- **`remote_attach::sweep_departed`.** The reap loop's look at departed hosts ends their attachments on every shard,
+  each through `xshard::call_in_shard_time` with a liveness window as its budget (A-408): a wall window, then more while
+  the shard runs or waits for a CPU, as every cross-shard wait judged in its target's own time takes (A-65). The
+  departure itself is decided by the fleet's membership and its own estimators (A-363). Its derivation is now stated
+  where it is made; no change.
+- **`daemon::SESSION_WAIT_NS` → `daemon::session_wait_ns()`.** Test support (`Daemon::hold_record_session`,
+  `Daemon::ask_live_reports`) waited one liveness window for a record session out of its link. It now waits as the
+  product does for a lent session (A-437's location round): one record-plane exchange's span
+  (`fleet::record_exchange_budget_ns`, the record plane's round budget over the slowest measured path), the bound every
+  borrower of a record session runs its exchange under, as the supervisor ruled on 2026-11-07. Test support only: no
+  product behaviour changes, so no failing test; the fleet tests that hold a session (`hold_record_session`'s four
+  callers) are filed for main's run.
+- With A-437, A-439, A-442, A-444 and A-446 this closes class B of `LIVENESS_BUDGET_NS`'s R3 debt.
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B line), `crates/server/src/{daemon,
+remote_attach}.rs`.

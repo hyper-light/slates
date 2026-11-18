@@ -3791,8 +3791,10 @@
 >   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
 >   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
 >   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
->   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
->   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
+>   Class B since closed (goal g255, 2026-11-18): the location round's own wait for silent peers (A-437), the leader
+>   forward (A-439), the NFS callback probe and recall (A-442), `fleet::live_budget` and a holder's live exchange (A-444),
+>   a held reply's durability window (A-446), and `sweep_departed`'s shard-time window stated with the test support's
+>   session wait derived from one record-plane exchange's span (A-449, `daemon::session_wait_ns`).
 >   Class C siblings found by A-352's starved runs, each a wait on a live daemon's answer on the wall: the rendezvous
 >   claim wait (`slates_ipc::rendezvous::CLAIM_WAIT_NS`, a second; a starved burst's connect met it in 1 of 20 runs) and
 >   the fleet tests' `CREDIT_WAIT` (5 s), which every fleet test's `Client::connect` and `send_burst` keep; the two
