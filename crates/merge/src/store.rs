@@ -209,14 +209,6 @@ impl Store {
     reading.reader.pass(changes).ok()
   }
 
-  /// The replicas registered with the owner's blocks, evicted ones that have not left among them (none on a replica).
-  pub(crate) fn replicas(&self) -> usize {
-    match self {
-      Store::Own(blocks, _) => blocks.readers(),
-      Store::Read(_) => 0,
-    }
-  }
-
   /// The bytes kept on the owner only for its replicas (none on a replica).
   pub(crate) fn held_bytes(&self) -> usize {
     match self {

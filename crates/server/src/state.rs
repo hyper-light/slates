@@ -722,9 +722,6 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
-  /// The replicas of greens this shard owns or holds (A-457, A-273 step 5a; `crate::green_replicas`): as an owner, the
-  /// shards it fed and the engines it is retiring; as a replica's shard, the replicas it holds and what they charged.
-  pub(crate) green_replicas: crate::green_replicas::GreenReplicas,
   /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
   /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
   /// replaced, dropped or its client goes.

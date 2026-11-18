@@ -230,11 +230,6 @@ impl Chunks {
     self.store.finish(changes)
   }
 
-  /// The replicas registered with these chunks' blocks (A-273), evicted ones that have not left among them.
-  pub(crate) fn replicas(&self) -> usize {
-    self.store.replicas()
-  }
-
   /// The bytes of chunks and values kept on the owner only for its replicas (A-273): its memory, charged with its own.
   pub(crate) fn held_bytes(&self) -> usize {
     self.store.held_bytes()

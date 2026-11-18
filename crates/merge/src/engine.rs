@@ -3633,13 +3633,6 @@ impl Green {
     self.chunks.held_bytes()
   }
 
-  /// The replicas registered with this owner's content now, evicted ones that have not left among them (A-273): none
-  /// once each has left, which its holder waits for before it gives the owner up (`slates_mem::sealed`, "Lifetimes").
-  /// None on a replica.
-  pub fn replicas_registered(&self) -> usize {
-    self.chunks.replicas()
-  }
-
   /// The bytes of content this owner keeps for its replicas past which the slowest is evicted (A-273 step 4): the room
   /// its per-green budget leaves beyond its own retention, derived by its holder ([`crate::replica::held_limit`]).
   pub fn set_replica_held_limit(&mut self, bytes: usize) {

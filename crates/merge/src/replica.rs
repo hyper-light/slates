@@ -930,11 +930,6 @@ mod tests {
     let mut fresh = owner.replica(limit).unwrap();
     assert_eq!(fresh.replica(limit).err(), Some(ReplicaRefusal::NotAnOwner));
     assert_eq!(
-      (owner.replicas_registered(), fresh.replicas_registered()),
-      (2, 0),
-      "the owner counts both registrations; a replica holds none"
-    );
-    assert_eq!(
       owner.replica(limit).err(),
       Some(ReplicaRefusal::Full {
         readers: 2,
@@ -945,7 +940,6 @@ mod tests {
     let another = owner.replica(limit).unwrap();
     owner.leave_replica(another.into_left().unwrap());
     owner.leave_replica(replica.leave().unwrap());
-    assert_eq!(owner.replicas_registered(), 0, "every one left");
   }
 
   /// A-273 step 4: a change made before the last was sent evicts every replica, which could not be fed in order: the
