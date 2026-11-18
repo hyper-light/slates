@@ -5754,6 +5754,25 @@ refinement and revalidation before those results can be applied to the corrected
 > takeover questions unanswered, `Daemon::inject_takeover_silence`; the owner stops) and
 > `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`.
 
+> **Status (2026-11-18, A-351; a fleet settles on one configuration once its faults stop).** A round that gave objects
+> up kept its share unconfirmed and started over only on a new configuration or a fence, while a kept retirement refuses
+> its host's re-admission (`RegionalConfiguration::admits`). So a host retired on a false death whose takeover gave
+> anything up was never re-admitted when it was heard again: the leader proposed its admission each period and it
+> changed nothing, no configuration came, and the round never started over. The chaos nemesis ended split for good that
+> way (seeds 6876545201569229162 on both Linux arches and 7236833171758868842 on x86_64, CI diag 44311638654: the
+> survivors at two members, the retired owner at three). Now a round that gave objects up starts over once its retired
+> host is held alive at an incarnation newer than the one the round was last judged under
+> (`takeover::HostTakeover::heard_since`, counted `fleet.takeover.judged_afresh`), once a refutation: what held the
+> promises back (a partition that cut the host off, or the host's own probes holding the holders' gates, above) may
+> have ended with it. A round that gives up again waits for the next refutation, and an object it adopts clears its
+> record as on any restart. Held by `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` (three
+> nodes; the survivors silence each other's takeover questions while the owner is cut off on the probe plane until the
+> volume is given up; then they answer and the owner is healed; every node must hold one configuration of all three),
+> `a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retired_in_turn` (the nemesis's shape: the
+> volume's creator taken over and re-admitted, then the adopter deafened, its takeover resolved, healed) in
+> `crates/server/tests/fleet.rs`, and `a_round_that_gave_objects_up_starts_over_once_its_retired_host_is_heard_alive_again`
+> (`crates/server/src/takeover.rs`).
+
 > **Status (2026-11-18, A-309 piece 1; A-272 (ii)).** "A retirement is dropped once all have" now leaves a record: a
 > takeover whose every survivor confirmed its share, or left owing it and carried it into a takeover of its own that
 > completed, becomes a completion record (`RegionalConfiguration::completed`), and only such a record lets a line read
@@ -5949,6 +5968,20 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > says (`LeaseVerdict::LostToSuccessor`). Regression
 > `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
 > (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`).
+>
+> **Status (2026-11-18, A-351: the holder's gate counts only answers that can confirm).** A holder defers a promotion
+> while an answer it gave the departed owner may still feed that owner's lease, and only an answer that names the owner
+> a standing can (an owner is confirmed by a standing it recognizes and superseded by none). So an answer counts toward
+> the gate only when it names one (`AnswersGiven::answered`), and an answer to a host the configuration retired names
+> none. A former member's last counted answer is kept until its horizon passes (`AnswersGiven::retain_members`), where
+> the per-period prune had dropped it the period the member left, opening the gate while a lease built on it could still
+> hold. Before, a retired owner deaf to every answer, whose probes still reached the fleet (a member that hears nobody
+> condemns nobody, so it probes its suspects every period), was answered each period, and every holder deferred every
+> page for as long as it probed until A-304's bound gave its objects up (the chaos nemesis's deafened owner). Now the
+> gate opens a horizon after the holder's last answer to it as a member. Regressions
+> `a_holder_answering_a_retired_owners_probes_still_promises_its_objects` (`crates/server/src/daemon.rs`),
+> `an_answer_that_names_no_standing_never_holds_a_promotion_back` and
+> `a_former_members_last_answer_holds_its_promotion_until_its_horizon` (`crates/server/src/lease.rs`).
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the
@@ -26059,3 +26092,45 @@ Applied in the same change to: §4.14 (A-318's note), GAPS (A-318's entry: its s
 - **What it does not change.** A release build (its chain runs at machine code's speed), the wedged and starved
   judgments on the wall, the anchor's lapse bound and the beat.
 
+### A-351 — A takeover the retired owner cannot lease against completes, and one that gave objects up starts over once its retired owner is heard again, so a fleet settles on one configuration once its faults stop (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 "Leases and reads", "Promotion and takeover", "Membership fed by SWIM"; the chaos nemesis, seeds 6876545201569229162 and 7236833171758868842; AUD-08, A-15, A-304)
+
+- **What was there.** Three rules met in a cycle. A holder defers a promotion of a departed owner's objects while an
+  answer it gave the owner may still feed the owner's lease (AUD-08), and it counted every answer to the owner's
+  probes, though an answer to a host the configuration retired names no standing and confirms no lease. A takeover round
+  gives an object up once its promises stop coming for the failover SLO's worth of periods, keeps the share unconfirmed
+  while it does, and starts over only on a new configuration or a fence (A-304). A kept retirement refuses its host's
+  re-admission (`RegionalConfiguration::admits`, A-309). In the nemesis the volume's creator was cut off and its volume
+  adopted by a survivor, the creator re-admitted, and then the adopter cut off (`Superseded(Deafened)`,
+  `Superseded(Stopped)`); its takeover gave the adopted volume and its catalog up, and once the adopter was heard again
+  the leader proposed its admission every period and nothing changed: no configuration came, so the round never started
+  over, so the retirement never completed. The fleet stayed split for good (CI diag 44311638654: the survivors at two
+  members, the adopter at three). In-process a deafened adopter reproduced it in 1 of 3 runs (Mac Studio, kiln r2219:
+  the holder deferred 103 pages, the successor gave 2 objects up, the survivors at configuration version 16 with two
+  members and the adopter at 12 with three); a deaf member condemns nobody and so probes every suspect every period, and
+  whether a holder's gate stayed shut turned on the phase between its per-period prune of non-members' answers and the
+  page's arrival. A-349 (g250) removed the other cause the nemesis's logs show: the superseded creator's own shipper held
+  the round's sessions.
+- **The rules.** (1) Only an answer that names the prober a standing counts toward the holder's gate
+  (`AnswersGiven::answered`), and a former member's last counted answer is kept until its horizon passes
+  (`AnswersGiven::retain_members`), so the gate opens a horizon after the holder last answered the owner as a member,
+  whatever the owner does since, and never earlier. (2) A round that gave objects up starts over once its retired host is
+  held alive at an incarnation newer than the one the round was last judged under (`takeover::HostTakeover::heard_since`,
+  counted `fleet.takeover.judged_afresh`), once a refutation.
+- **Why these and not others.** Dropping the gate for a retired owner would let a holder promise while a lease built on
+  its last answer as a member could still hold, the stale read AUD-08 exists to stop. Letting a retired host back in
+  under its id while its retirement is kept would let a line through that retirement name it the owner of objects its
+  successors adopted (A-309's reason for `admits`). A periodic retry of a given-up round would be a retry loop with no
+  bound (banned item 8); the host's refutation is the event that can end what held the promises back, and it comes once
+  per death the fleet declares.
+- **What it costs.** A holder that installs a retirement less than a horizon after it last answered the owner as a
+  member waits out the rest of that horizon before it promises (at most one horizon, `lease::horizon_ns`: 900 ms at the
+  100 ms beat), where the prune had let it promise at once. A round that gave objects up runs once more per refutation
+  of its host.
+- **What it does not change.** The lease's own rule (a standing recognized confirms it); A-304's bound and its typed
+  give-up; the admission rule; re-admission by refutation (A-15).
+
+Applied in the same change to: §4.8 "Leases and reads" (status) and "Promotion and takeover" (status), GAPS (the
+nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`, `crates/server/src/fleet.rs`,
+`crates/server/src/takeover.rs`, the tests in `crates/server/src/daemon.rs`, `crates/server/src/lease.rs`,
+`crates/server/src/takeover.rs` and `crates/server/tests/fleet.rs`, and the bug record
+`docs/bugs/2026-11-18-a-retired-owner-heard-again-was-never-readmitted-and-the-fleet-stayed-split.md`.

@@ -7253,11 +7253,28 @@ mod tests {
     object: slates_db::register::ObjectId,
     sequence: u64,
   ) -> (slates_db::HostId, slates_db::HostId) {
-    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
-    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
     let local = state.fleet.host();
-    let departed = HostId(local.0 ^ 1);
-    let third = HostId(local.0 ^ 2);
+    retire_a_named_owner_of_a_held_record(
+      state,
+      object,
+      sequence,
+      (
+        slates_db::HostId(local.0 ^ 1),
+        slates_db::HostId(local.0 ^ 2),
+      ),
+    )
+  }
+
+  /// [`retire_the_owner_of_a_held_record`] with the other two members named: `departed`, the owner retired, and `third`.
+  fn retire_a_named_owner_of_a_held_record(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+    (departed, third): (slates_db::HostId, slates_db::HostId),
+  ) -> (slates_db::HostId, slates_db::HostId) {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Quorum, Record};
+    let local = state.fleet.host();
     state.council = RegionalCouncil::new(
       local,
       vec![local, departed, third],
@@ -7378,6 +7395,62 @@ mod tests {
     assert!(
       HostPromise::decode(&lapsed).is_ok(),
       "once its answers can no longer feed the owner's lease, the holder promises"
+    );
+  }
+
+  /// A-351 (§4.8 "Leases and reads", AUD-08; the chaos nemesis's deafened owner, seed 6876545201569229162): a holder that
+  /// keeps answering a retired owner's probes still promises the owner's objects once its last answer under the owner's
+  /// membership is past the horizon. Do: learn a peer on contact; make it the owner of a record this node holds, this
+  /// node's last answer to it while it was a member past the horizon; retire it; answer its probe, announcing an older
+  /// configuration, as the probes of an owner deaf to every answer keep coming; then answer the successor's takeover
+  /// page. Expect: the probe answered with no standing, and the page promising the record. Before, every answer to the
+  /// retired owner closed the gate again, so a holder deferred every page for as long as the owner probed, and the
+  /// takeover gave the owner's objects up.
+  #[test]
+  fn a_holder_answering_a_retired_owners_probes_still_promises_its_objects() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let (answered, page) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let anchor = slates_db::HostId(local.0 ^ 0x40);
+      let owner = crate::deploy::member_id(anchor, 1);
+      crate::fleet::learn_member(state, anchor, 1, owner);
+      let object = ObjectId([31; 16]);
+      let (departed, successor) = retire_a_named_owner_of_a_held_record(
+        state,
+        object,
+        0,
+        (owner, slates_db::HostId(local.0 ^ 2)),
+      );
+      let now = slates_machine::clock::monotonic_ns();
+      state
+        .answers_given
+        .alive_answers
+        .insert(departed, now - crate::lease::horizon_ns() - 1);
+      let older = state.council.configuration().version.saturating_sub(1);
+      let answered = crate::member_task::answer_probe(state, departed, 1, older);
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      }
+      .encode();
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare);
+      (answered, page)
+    });
+    assert_eq!(
+      answered.map(|(_, standing)| standing),
+      Some(None),
+      "the retired owner is answered, with no standing"
+    );
+    let promise = HostPromise::decode(&page);
+    assert!(
+      promise
+        .as_ref()
+        .is_ok_and(|promise| promise.entries.len() == 1),
+      "the holder promises the retired owner's record: {promise:?}"
     );
   }
 
