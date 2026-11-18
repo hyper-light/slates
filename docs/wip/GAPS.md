@@ -2570,7 +2570,9 @@
 > versions (`sample`, Mac Studio, debug), and deltas big enough that the journal checkpointed about as often as it
 > logged. Now the hold is a piece per chunk, per held manifest and per stage, it notes each piece it changes, and a delta
 > carries those (image version 30). Test: `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold`
-> (`daemon.rs`).
+> (`daemon.rs`): on main's code a put's delta grew 158 bytes a put, now one size. With A-367, A-372 and this, the
+> late-submit test's late median at 300 versions is 2.28 to 2.37 ms against early 2.31 to 2.49, and at 1,000 versions
+> 3.76 against 6.00 (kiln r3543, Mac Studio, debug): no growth with a green's history left at `f = 1` on the commit path.
 >
 > **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
 > retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the

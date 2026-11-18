@@ -26937,3 +26937,8 @@ ledger), `crates/cluster/src/content.rs` (`HoldPiece`, `ManifestPiece`, `Content
   one size, the folded deltas the whole image); the held-pieces oracle (`daemon.rs`) puts and releases content between
   deltas and checkpoints; the hold's model tests (`slates-cluster`) fold every step's changed pieces and hold them to
   the hold's pieces, and the folded pieces to the hold's image, byte for byte.
+- **Measured.** Kiln r3543, the Mac Studio, 2026-11-18, debug build: on main's code a put's delta carried the whole hold,
+  170 bytes at the first of 64 puts and 158 more at each after (64 sizes); with this change one size each. The
+  late-submit test's late median at 300 versions 2.28 to 2.37 ms against the early 2.31 to 2.49 (after A-372, 2.92 to
+  3.28 against 1.87 to 1.96), and at 1,000 versions 3.76 ms against 6.00 (after A-372, 8.49 against 2.28; before A-367,
+  18.2 against 2.16): a version late in a green's history now costs what an early one does.
