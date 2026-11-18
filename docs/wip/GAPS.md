@@ -1,5 +1,74 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (g267, 2026-11-18): the wire's append-only rule (D-15) is kept by review alone, and a persisted reply is read
+> outside every schema check.** A variant's wire tag is its index in its enum (`crates/wire-derive/src/lib.rs`,
+> `expand_enum`). 04d7ea465 (A-285) inserted `RequestBody::SubmitHeld` and `EditSubmitHeld` before `SubmitApproved`, so
+> `SubmitApproved`'s tag moved from 69 to 71 (`CONTRACT` 6 had published it). Nothing was misread: a ring or fleet frame
+> carries its body's schema hash (`protocol::frame`), so a client and a daemon of different builds refuse each other
+> whole, and no request body is kept. A reply is: a completion record keeps `ReplyBody` unframed
+> (`CompletionRecord::result`, recorded by `Op::CompletionRecorded` and read back by `ReplyBody::from_bytes` in
+> `crates/server/src/verbs.rs`), and the log's own schema hash covers that field only as bytes. So the same insertion in
+> `ReplyBody`, or in any type it carries (`Refusal`, `MoveRefusal`, ...), would have a daemon restarted on a newer build
+> over the anchor's segment answer a retried request with another reply than the one it recorded, or `DuplicateRequest`.
+> Owed: a structural check that every enum the wire or a record carries only grows at its end (a golden of its variants
+> in order, its regeneration behind `--ignored`), and the completion record framed with its reply's schema hash, so a
+> record of another schema is refused typed rather than read as another reply. g262 (the contract's owner) told.
+
+> **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
+> g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
+> fresh-member flow (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`) kills the bootstrap voter of five
+> nodes at f = 1 and starts a fresh process in its place. Its second formation wait never ended in 2 of 48 runs at one
+> CPU on main 84d1f59a (diag-live-fixes-70), in 1 of 48 with learner-3 (diag-raft-chaos-ab-66), and in both of main's
+> first gated runs on 2026-11-18 (the integrator's macOS run at bfc34cace; Linux, CI run 44269183565, ubuntu-latest):
+> one node, the fresh member, stayed at in contact 0 and unmeshed 0 while the others read (4, 0). Its status every 5 s
+> for 48 s (diag-raft-chaos-ab-68b-2): five members held alive, configuration version 0, its council at version 8 with
+> the replaced bootstrapper its only voter, its last fetch asking one peer at the start of the wait, and
+> `fleet.learner.no_session` 113; on Linux, `fleet.link.out_of_contact` 4. **Cause:** its join was answered with a
+> configuration committed before it existed, which does not name it, and a learner's join state, whose voters are the
+> bootstrapper alone. `direct_contact`'s member rule then judged every live peer `OutsideNeighbourhood`: it is no one's
+> neighbour, holds nothing, and knows no live voter. Every record link idled, and its learner, which fetches only over
+> record sessions, never learned version 12, which admits it.
+> **Fixed:** a node the council configuration it holds does not name keeps contact with every member it holds alive
+> (`DirectContact::Unadmitted`, judged with `Forming` in `fleet::joining_contact`) until it holds one that names it; then
+> the member rule applies. Test, failing first:
+> `a_fresh_member_joined_before_its_admission_keeps_contact_with_every_live_member` (`crates/server/src/consensus.rs`:
+> the real join path, `serve_fetch` as a learner donor and `adopt_fetch` as the fresh member, then a later answer that
+> admits it). On the Mac Studio (kiln r1379): red on main's `fleet.rs` (all four `OutsideNeighbourhood`, the mesh at
+> 0, as in CI), green with the change, red again with only the `Unadmitted` arm taken out. Bug record:
+> `docs/bugs/2026-11-18-a-fresh-member-joined-before-its-admission-kept-contact-with-no-one.md`.
+> - **To measure (the supervisor's):** live_chaos's fresh-member flow at one CPU (diag-60's harness), N of 48 runs that
+>   form: main before A-331 against main with it. Before: 46 of 48 on 84d1f59a, 47 of 48 with learner-3 (2 and 1 at the
+>   formation wait).
+> - **Siblings, reported, not changed:** a learner's known voters can go back through another learner's answer
+>   (`serve_fetch` answers with the answerer's known voters); `drive_root_learner_fetch` filters on the root's voters
+>   (2026-11-08 entry below, still open); live_chaos's `diagnosis` leaves out `fleet.learner.*` and `fleet_learner`, so
+>   this stall's own counters never printed on main (told to g229, which owns that harness).
+
+> **Signed work: merges are signed work (2026-11-17, §4.16, §4.12 "The consumer contract"; A-321, goal g090, Ada's
+> rule of 2026-11-18 that a signature is provenance and never the permission gate).** A merge may carry an SSH
+> signature (`PROTOCOL.sshsig`, namespace `slates-work`, Ed25519 or FIDO Ed25519) over its statement — the work, its
+> green, its base and the increment's identity, which a held submit hands the signer. The green's owner judges it under
+> the work's and the green's trusted signers (set only by the launcher, `SetSigners`), and records the verdict
+> (verified with its signer, unsigned, invalid with its reason) with the version: in its chain entry, then in the
+> green's accepted record and the checkpoint that folds the entry. It is answered on the merge and read back with
+> `MergeRecord`. A green or a work can require signed merges (`WritePolicy::require_signed_merges`, launcher-set); an
+> unsigned or invalid merge is refused `SignatureRequired` when it would merge, in every mode. A consumer's policy
+> cannot require it. The contract carries all of it (`CONTRACT` 13). Proven by `crates/server/tests/signed_work.rs`
+> (8 of 8, macOS arm64, 2026-11-17; each red with its guard removed), the verifier's 11 unit tests over new
+> `ssh-keygen -Y sign` vectors, the chain and checkpoint codecs' tests and the contract's by-use test. **Owed, in
+> order:**
+> - a landing's signature: the statement is defined (`signed_work::landing_statement`: the volume, the target with its
+>   length, the manifest); the verdict on `Land` and `Present` under the volume's signers, recorded with the landing's
+>   record and read back in the audit, and the contract's `land` with a signature (today `Unsupported(SignedWork)`);
+> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
+>   records none today, so a green taken over reads its merged versions unsigned;
+> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
+>   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
+>   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
+>   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
+
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
@@ -158,10 +227,13 @@
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
-> supervisor, 2026-11-17, by A-64 and D-7). Owed, in order: W1 on main; the engine's content in sealed blocks that
-> never move; the owner's frees held until every replica has acknowledged a version past them; the tests first (the
-> replica equals the owner at every version, the lifetime red with the acknowledgement ignored); the code; the
-> supervisor's A/B.
+> supervisor, 2026-11-17, by A-64 and D-7). W1 is on main (3c0af9399). **Built (step 1):** the owner's frees held until
+> every replica has acknowledged the feed position that released them (positions, since a fold releases with no new
+> version), charged to the green's retained bytes and counted (`Green::hold_content`, `acknowledge_content`,
+> `leave_content`, `content_frees_held`; tests in `crates/merge/src/history.rs`). **Owed, in order:** the replica
+> (the green's metadata built from the owner's, the feed of versions and folds, the replica equal to the owner at every
+> version); the engine's content in sealed blocks another shard may read; the lag bound that drops a replica
+> holding too much; the code on the shards; the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -257,7 +329,7 @@
 > typed landing and merge conflicts; typed provisioning (`VolumeSpec` over each source), status and drift; one closed
 > `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 2
 > (2 adds `Denied::Policy`, where A-285's `Refusal::PolicyForbids` maps outside a landing or a merge).
-> **Built (goal g247, A-263 to A-267, `CONTRACT` = 13):** every list a page at a time — `Page { items, next }` from
+> **Built (goal g247, A-263 to A-267, `CONTRACT` = 16):** every list a page at a time — `Page { items, next }` from
 > `list_page`, `grants_page` and `audit_page` (typed records, piece 6) and `changed_since_page`, an overlay's typed
 > `DriftPage` from `drift_page`; `drift` reads every entry, and `DriftReport::elided` counts what a status could not
 > carry.
@@ -272,8 +344,10 @@
 >   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3), and merges under a mode with
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
->   statement a signer signs and the trusted signers a launcher registers;
-> - typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+>   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
+>   13), a signed landing owed;
+> - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
+>   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
@@ -310,7 +384,10 @@
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
 > privilege is ever required, R10); (b) mount through the Mount Manager (`\\.\X:`), which works and needs an
-> Administrator, so only as a choice the person makes when elevated; (c) mount as a WinFsp network file system, whose
+> Administrator, so only as a choice the person makes when elevated; (b') the same with WinFsp's machine-wide setting
+> `MountUseMountmgrFromFSD=1`, which an Administrator sets once (as WinFsp itself is installed once) and which then lets
+> an unprivileged mount use the Mount Manager from WinFsp's kernel driver, its drives global to the machine (WinFsp's
+> registry-settings page: "not recommended for general use"); (c) mount as a WinFsp network file system, whose
 > final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
 > cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
 > first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
@@ -372,7 +449,8 @@
 > - **built (2026-11-18):** the MCP and SDK land verb follows the policy (it already sent `Land`; its promises now
 >   say so); `assert_materialize_lands_under_a_bypass_policy` over MCP;
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
->   unsigned, invalid with its reason), and a volume may require signed merges;
+>   unsigned, invalid with its reason), and a volume may require signed merges — **built for merges (2026-11-17,
+>   A-321)**, a landing's owed (A-321's entry);
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
 >   signed merge verified and an invalid signature reported. **The landing half ran on Linux (2026-11-18):**
 >   `write_policy.rs` 9 of 9 on Linux x86_64 and arm64, a real daemon and client over a real target directory (GitHub
@@ -691,7 +769,8 @@
 >   windows. The work keeps its last conflicting verdict, the reply carries what fits with `conflicts_elided` and its
 >   `verdict` id, `Conflicts` reads the rest, and the client hands back every window, sync and async; a replaced or
 >   forgotten verdict is refused `VerdictReplaced`. Under A-247 the green's owner judges and answers every window, and
->   the work's shard, which serves the work's reads, keeps them (`kept_conflict`). **Open:** a verdict is kept in memory
+>   the work's shard, which serves the work's reads, keeps them (`kept_conflict`); a signed submit's verdict
+>   (`SubmittedSigned`, A-321) is carried and kept the same way. **Open:** a verdict is kept in memory
 >   alone, so a restart between a conflicting submit and its walk answers `VerdictReplaced`, and the caller submits
 >   again; and the owner's completion record of a conflict off the work's shard holds every window (bounded, as the
 >   verdict is, by the work's journal), the one durable record of a reply that is not cut to one reply.
@@ -2196,10 +2275,20 @@
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
->   does not have the shard runnable (`ShardTime::runnable`, the watchdog's source). Red first:
+>   does not have the shard runnable (`shard_run_readings`, the watchdog's source). Red first:
 >   `an_observation_of_a_starved_shard_is_answered` (`crates/server/tests/liveness.rs`) ended `Deadline` at its
 >   one-window budget 3 of 3 on adacachy2 while the shard's clock stood still 3.0 s; after, answered 6 of 6 (3 at nice 0,
->   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. The anchor's start judgment
+>   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. **The rule's two readings, taken across a
+>   release: found 2026-11-09 on CI's Windows runner (diag run 42671057142), fixed 2026-11-18 (g243).** The rule read the
+>   shard's clock and then asked the scheduler, so a starved shard released between the two ran, answered and parked
+>   before the scheduler looked, and was judged wedged: the same test ended `Deadline { stage: Admission }` 3.019 s after
+>   it asked, its answer already sent (1 of 32 runs of the failing tree on windows-latest, diag-g243-2, where a look at the
+>   scheduler is a 3 ms snapshot). It now reads the clock again after the scheduler answers (`OwnTime::next_window_ns`);
+>   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Open, reported:** the
+>   watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment (`judge_start_of`) read in the same
+>   order; their whole-window rule leaves the gap one look wide, at the end of a window the shard sat still through; and
+>   no `ci.yml` lane runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw
+>   this. The anchor's start judgment
 >   (`crates/api/src/role/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's
@@ -2295,6 +2384,20 @@
 >   budget (R3 debt). Found on the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation`
 >   takes a uid only), and two server unit tests of landing fail on Windows, where CI does not run them. Record:
 >   `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+> - **Class B, the location budget: done (2026-11-18, A-317, goal g255; clients' `3c072f490` of 2026-11-09).** A
+>   forward with no known owner looked for it for one liveness budget of wall time, which a starved control shard spent
+>   before reading the gossip that refutes a false death (clients' runs at nice 19 beside two spinners a CPU: 1 or 2
+>   calls refused in every false death), and which a single round waiting on silent peers spent whole. It now looks for
+>   the membership horizon on the wall and ends only with a look begun after it, the direct route asked again after
+>   each round, within the failover SLO (`fleet.owner_location.gave_up`, `.budget_spent`, `.slo_ended`;
+>   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget`,
+>   `the_failover_slo_ends_a_forwards_location_budget`). Two longer budgets did not land: clients' polls and the horizon
+>   followed by the control shard's two driver waits each run a forward's location to the failover SLO, the polls when
+>   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
+>   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
+>   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
+>   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
+>   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a

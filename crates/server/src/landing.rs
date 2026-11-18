@@ -3028,6 +3028,86 @@ pub fn policy_verb(state: &mut ShardState, subject: PolicySubject) -> ReplyBody 
   ReplyBody::Policy {
     policy: record.policy.write.map(wire_policy),
     version: record.policy.write_version,
+    signers: record.policy.signers,
+  }
+}
+
+/// Format: the domain tag of a signer set's proof (A-321).
+const SIGNERS_DOMAIN: &[u8] = b"slates.signers";
+
+/// The proof a `SetSigners` request carries (A-321): the keyed hash, under the launcher's secret, of the signers domain
+/// tag, the volume, the number of keys and each key with its length, and the policy version the setter read, so a
+/// captured proof sets that one set once.
+pub fn signers_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  volume: VolumeId,
+  keys: &[Vec<u8>],
+  version: u64,
+) -> [u8; 32] {
+  let length = |count: usize| u64::try_from(count).unwrap_or(u64::MAX).to_le_bytes();
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(SIGNERS_DOMAIN);
+  hasher.update(&volume.bytes);
+  hasher.update(&length(keys.len()));
+  for key in keys {
+    hasher.update(&length(key.len()));
+    hasher.update(key);
+  }
+  hasher.update(&version.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves `SetSigners` (A-321): refused as `SetPolicy` is (`Forbidden` on a consumer-bound channel whatever its proof,
+/// counted `signers_set_by_consumer`; `GrantIssuerUnverified` without the launcher's proof; `PolicyChanged` from a
+/// version the policy has moved past), and `BadRequest` for a key slates does not verify; otherwise the set recorded
+/// durably in the volume's record, a key named twice kept once, and the policy's version moved.
+pub fn set_signers_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, keys, version): (VolumeId, Vec<Vec<u8>>, u64),
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("signers_set_by_consumer", 1);
+    return crate::verbs::forbidden("set_signers");
+  }
+  if !proven_by_launcher(
+    state,
+    |secret| signers_proof(secret, volume, &keys, version),
+    &proof,
+  ) {
+    state.count("grant_issuer_unverified", 1);
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  let mut set: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+  for key in keys {
+    if crate::signed_work::TrustedKey::from_wire(key.clone()).is_err() {
+      return crate::verbs::refused(Refusal::BadRequest {
+        reason:
+          "a trusted signer is an ssh-ed25519 or sk-ssh-ed25519@openssh.com key in SSH wire form"
+            .to_owned(),
+      });
+    }
+    if !set.contains(&key) {
+      set.push(key);
+    }
+  }
+  let current = match policy_record(state, volume) {
+    Ok(record) => record.policy.write_version,
+    Err(reply) => return *reply,
+  };
+  if version != current {
+    state.count("policy_changed", 1);
+    return crate::verbs::refused(Refusal::PolicyChanged { current });
+  }
+  let now = state.clock.monotonic_ns();
+  let op = Op::VolumeSignersSet {
+    id: crate::verbs::to_db_volume(volume),
+    keys: set,
+  };
+  match state.db.mutate(&mut state.segment, &op, now) {
+    Ok(_) => ReplyBody::SignersSet,
+    Err(e) => crate::verbs::refused(crate::error::refusal_of_db(&e)),
   }
 }
 
@@ -3066,6 +3146,7 @@ pub(crate) fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy 
   slates_db::catalog::WritePolicy {
     merge: db_mode(policy.merge),
     land: db_mode(policy.land),
+    require_signed_merges: policy.require_signed_merges,
   }
 }
 
@@ -3088,6 +3169,7 @@ pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolic
   WritePolicy {
     merge: mode(policy.merge),
     land: mode(policy.land),
+    require_signed_merges: policy.require_signed_merges,
   }
 }
 

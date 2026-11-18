@@ -2170,7 +2170,11 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
-      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_ipc::protocol::VolumeRefusal::Pinned
+        }
+      ))
     ),
     "the recovered snapshot is still pinned by the recovered clone (a lost pin would let it be destroyed): {:?}",
     client.destroy_snapshot(kept, snapshot)
@@ -2252,7 +2256,11 @@ fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
-      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_ipc::protocol::VolumeRefusal::Pinned
+        }
+      ))
     ),
     "the recovered snapshot is still pinned by the recovered image volume: {:?}",
     client.destroy_snapshot(kept, snapshot)

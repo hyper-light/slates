@@ -6,7 +6,7 @@ use std::fmt;
 use slates_anchor::AnchorError;
 use slates_db::DbError;
 use slates_ipc::IpcError;
-use slates_ipc::protocol::Refusal;
+use slates_ipc::protocol::{Refusal, VolumeRefusal};
 use slates_mem::MemError;
 use slates_rt::RtError;
 use slates_vfs::error::VfsError;
@@ -153,10 +153,47 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
       feature: format!("archiving a tree deeper than {limit} path components"),
     },
-    other => Refusal::BadRequest {
-      reason: format!("{other:?}"),
+    VfsError::BarrierIncomplete {
+      attachment,
+      generation,
+    } => Refusal::BarrierIncomplete {
+      attachment: *attachment,
+      generation: *generation,
     },
+    // Every other refusal of the volume core, typed by its class (A-299): until 2026-11-18 each reached a client as
+    // `BadRequest` carrying its name. No catch-all: a new volume-core refusal does not compile until it is named.
+    VfsError::Memory(_) => volume(VolumeRefusal::Memory),
+    VfsError::NotDirectory => volume(VolumeRefusal::NotDirectory),
+    VfsError::IsDirectory => volume(VolumeRefusal::IsDirectory),
+    VfsError::NotEmpty => volume(VolumeRefusal::NotEmpty),
+    VfsError::Invalid => volume(VolumeRefusal::Invalid),
+    VfsError::NoAttribute => volume(VolumeRefusal::NoAttribute),
+    VfsError::NotPermitted => volume(VolumeRefusal::NotPermitted),
+    VfsError::LinkProtected => volume(VolumeRefusal::LinkProtected),
+    VfsError::SpecialFileOperation => volume(VolumeRefusal::SpecialFileOperation),
+    VfsError::TooManyLinks => volume(VolumeRefusal::TooManyLinks),
+    VfsError::FileTooLarge => volume(VolumeRefusal::FileTooLarge),
+    VfsError::CrossVolumeMove => volume(VolumeRefusal::CrossVolumeMove),
+    VfsError::StaleHandle => volume(VolumeRefusal::StaleHandle),
+    VfsError::Pinned => volume(VolumeRefusal::Pinned),
+    VfsError::DaxMapped => volume(VolumeRefusal::DaxMapped),
+    VfsError::BaseDrift => volume(VolumeRefusal::BaseDrift),
+    VfsError::NotOverlay => volume(VolumeRefusal::NotOverlay),
+    VfsError::DigestCacheFull => volume(VolumeRefusal::DigestCacheFull),
+    VfsError::JournalIncomplete { needed, oldest } => volume(VolumeRefusal::JournalIncomplete {
+      needed: *needed,
+      oldest: *oldest,
+    }),
+    VfsError::RecoveryVersion { found, expected } => volume(VolumeRefusal::RecoveryVersion {
+      found: *found,
+      expected: *expected,
+    }),
   }
+}
+
+/// A volume-core refusal no other variant names, typed (A-299).
+fn volume(refusal: VolumeRefusal) -> Refusal {
+  Refusal::Volume { refusal }
 }
 
 /// The wire refusal for a database refusal.

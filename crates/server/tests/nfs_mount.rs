@@ -375,15 +375,31 @@ fn mkdir_args(directory: &[u8], name: &str) -> Vec<u8> {
   args
 }
 
-/// A Unix caller owns its new directory, can populate it, and excludes other callers.
+/// The group a directory made over the export by a caller whose credential names `caller_gid` takes in a plain parent
+/// of group `parent_gid`, by this host's own rule (A-328): BSD's on macOS, the parent's group, as APFS gives it.
+#[cfg(target_os = "macos")]
+fn group_made_in(parent_gid: u32, _caller_gid: u32) -> u32 {
+  parent_gid
+}
+
+/// The group a directory made over the export by a caller whose credential names `caller_gid` takes in a plain parent
+/// of group `parent_gid`, by this host's own rule (A-328): System V's elsewhere, the caller's group, as Linux gives it.
+#[cfg(not(target_os = "macos"))]
+fn group_made_in(_parent_gid: u32, caller_gid: u32) -> u32 {
+  caller_gid
+}
+
+/// A Unix caller owns its new directory, which takes its group by this host's rule (A-328), can populate it, and
+/// excludes other callers. `call_as` names the uid as the credential's gid too.
 fn assert_creation_as(stream: &mut TcpStream, root: &[u8], uid: u32) {
   use common::nfs::{NFS_PROGRAM, owner_and_mode, read_opaque};
+  let (_, _, root_gid) = owner_and_mode(stream, root, 7);
   let args = mkdir_args(root, &format!("user-{uid}"));
   let reply = call_as(stream, NFS_PROGRAM, 9, &args, 3, uid);
   assert_eq!(status(&reply), 0, "first MKDIR by uid {uid}");
   let directory = read_opaque(&reply, 8).0;
   let ownership = owner_and_mode(stream, &directory, 4);
-  assert_eq!(ownership, (0o700, uid, uid));
+  assert_eq!(ownership, (0o700, uid, group_made_in(root_gid, uid)));
   let nested = mkdir_args(&directory, "child");
   assert_eq!(status(&call_as(stream, NFS_PROGRAM, 9, &nested, 5, uid)), 0);
   assert_eq!(
@@ -401,7 +417,8 @@ fn assert_creation_as(stream: &mut TcpStream, root: &[u8], uid: u32) {
 }
 
 /// AC-3.10 / §4.6: each creation takes the requesting Unix user's ownership, even when MOUNT
-/// admitted the shared attachment under another identity. The same mount serves multiple users;
+/// admitted the shared attachment under another identity, and its group by this host's rule (A-328: the caller's
+/// on Linux, the parent's on macOS, as each host's own file system gives it). The same mount serves multiple users;
 /// nested creation must work and another user must still be refused by its directory's mode.
 #[test]
 fn a_mount_preserves_each_requests_unix_owner_across_shards() {

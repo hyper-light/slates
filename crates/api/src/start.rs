@@ -20,7 +20,7 @@
 //! on every platform (owed, the A-299 row of GAPS): today it holds the issuer only where the anchor's handoff reaches it
 //! (the anchor's own children on Linux, the exported pairs elsewhere, [`crate::Issuer`]).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -93,7 +93,22 @@ impl StartSpec {
   /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused [`StartFault::Launcher`] when the pipe cannot
   /// be made.
   pub fn anchor_command(&self) -> Result<Command, Error> {
-    let mut command = Command::new(&self.program);
+    self.anchor_command_under(&[])
+  }
+
+  /// [`StartSpec::anchor_command`] run under `wrapper`, a command that execs what follows it in the same process
+  /// (`systemd-run --user --scope --unit=NAME --`, so the instance outlives the host's process): `WRAPPER... PROGRAM
+  /// PREFIX... --instance NAME anchor ...`, with the same standard input — the launcher's record, which an exec keeps —
+  /// the same environment and the same process group. An empty `wrapper` is [`StartSpec::anchor_command`] itself.
+  pub fn anchor_command_under(&self, wrapper: &[&OsStr]) -> Result<Command, Error> {
+    let mut command = match wrapper.split_first() {
+      Some((first, rest)) => {
+        let mut command = Command::new(first);
+        command.args(rest).arg(&self.program);
+        command
+      }
+      None => Command::new(&self.program),
+    };
     command
       .args(self.prefix.iter().map(OsString::from))
       .args(self.role().args());

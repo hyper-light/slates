@@ -5306,6 +5306,13 @@ to ask once that voter left (2026-11-08). Any member can answer, since what it s
 adoption only moves forward.
 A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
 voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
+A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
+forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
+council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
+all: it is no one's neighbour, holds nothing, and may know as a voter only the member it replaced, since a learner's join
+state names the voters of its own join. So it held no record session and its learner, which fetches over those, never
+learned the configuration that admits it (live_chaos's fresh-member flow, 2 of 48 runs at one CPU, 2026-11-09; both of
+main's first gated runs, 2026-11-18). A retired member kept only its old neighbours, by the placement it last installed.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -5882,6 +5889,16 @@ routable by id; the CLI resolves `namespace/name` through that owner, defaulting
 context. A name is not a host pathname or a bearer capability. Fleet-wide enumeration is a scatter-gather over
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
+
+> **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
+> forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
+> again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
+> detector condemns a member, so a false death is refuted within it), on the wall from its first look, and gives up
+> only once a look begun after the horizon has found no owner: a round waiting on silent peers no longer spends the
+> whole budget, and a refutation the shard read while a round waited is seen before it gives up (clients' runs, nice 19
+> beside two spinners a CPU: 1 or 2 calls refused in every false death under one liveness budget of wall time). The
+> operator's failover SLO caps the whole on the wall. Counted: `fleet.owner_location.gave_up`, and the budget's two
+> ends, `budget_spent` and `slo_ended`.
 
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
@@ -7570,12 +7587,15 @@ it builds against the contract and adds to it rather than around it.
   file, its window in base coordinates and its class (§4.16's `MergeConflictClass`), with the
   green's head the work must rebase onto. Nothing is inferred and nothing is written for a conflict;
   the consumer resolves (`read_base`, a rewrite, `rewitness`; a rebase) and lands or merges again.
-- *Signed work (Ada, 2026-11-18).* A merge or a landing may carry a signature by its author's key
-  (an SSH signature, `PROTOCOL.sshsig`, the format of A-285's verifier: Ed25519 and FIDO Ed25519
-  keys), and its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
-  `Invalid { reason }`, the verifier's closed reasons. A volume's policy may require signed merges;
-  an unsigned or invalid merge into it is refused `SignatureRequired` even in bypass. Signatures
-  never gate permission: the mode does.
+- *Signed work (Ada, 2026-11-18; A-321).* A merge or a landing may carry a signature by its author's
+  key (an SSH signature, `PROTOCOL.sshsig`, under the namespace `slates-work`: Ed25519 and FIDO
+  Ed25519 keys) over the act's statement, which the daemon states (`Instance::merge_statement`), and
+  its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
+  `Invalid { reason }`, the verifier's closed reasons, under the volume's trusted signers, which the
+  launcher sets (`Instance::set_signers`). The verdict is recorded with the version and read back
+  (`Instance::merge_record`). A volume's policy may require signed merges; an unsigned or invalid
+  merge into it is refused `SignatureRequired` even in bypass, when it would merge. Signatures never
+  gate permission: the mode does. Merges are signed work now; a landing's signature is owed (A-321).
 - *Volumes.* One typed create, `Instance::provision(&VolumeSpec)`, for every source: an overlay
   over a host folder, an empty volume, a clone of a snapshot, a green (empty or over a complete
   immutable snapshot), a work volume over a green, which answers its green and its base version.
@@ -7628,7 +7648,7 @@ it builds against the contract and adds to it rather than around it.
 > on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
 > versions (the work's base beside the head), replacing what the crate reads from text or asks
 > again (typed audit and grant states are built, piece 6). **Lists a page at a time (A-263 to A-267, goal g247,
-> `CONTRACT` = 13):** every
+> `CONTRACT` = 16):** every
 > list the daemon answers a reply at a time is read through the contract a page at a time — `Page { items, next }`
 > from `Instance::{list_page, grants_page, audit_page, changed_since_page}`, an overlay's `DriftPage` from
 > `drift_page` — or whole (`list`, `grants`, `audit`, `changed_since`, `drift`); a status's `DriftReport` counts what
@@ -7681,6 +7701,26 @@ it builds against the contract and adds to it rather than around it.
 > that ends a daemon on purpose waits for it first.
 > **`CONTRACT` = 12 (A-316):** `ShardsStream::resync`, the device's end of a Shards stream's resync channel, which
 > `serve_shards` hands beside the stream's where the daemon makes one (Linux); none elsewhere and from the simulator.
+> **`CONTRACT` = 13 (A-321, signed merges):** `merge` sends its signature and answers how the daemon
+> judged it; `merge_statement` hands a signer the statement the daemon states; `approve_merge` carries
+> the merge's signature again (`MergeApproval::signature`); `merge_record` reads a version's verdict
+> back (`MergeRecord`, `Missing::Version`); `set_signers` and `signers` (`TrustedSigner`) under the
+> launcher's authority; a volume's policy may require signed merges (refused as
+> `PolicyReason::SignatureRequired`), a consumer's that does `Invalid::SignedMergesNotAVolume`;
+> `SignatureFault::Expired` gone, since no statement expires. A signed landing is still
+> `Unsupported(SignedWork)`, its verdict owed. Proven by use
+> (`a_signed_merge_is_judged_and_read_back_through_the_contract`: a requiring green refuses an
+> unsigned merge, the statement signed by the trusted key merges at 1 verified, its record reads back
+> verified and the origin's unsigned).
+> **`CONTRACT` = 14** (10 to 13 landed beside it): `StartSpec::anchor_command_under(wrapper)`, the anchor's command under a
+> wrapper that execs it (`systemd-run --user --scope -- ...`, kiln's Linux start), the launcher's
+> record kept on its standard input; proven under `/usr/bin/env`, an exec wrapper, by a policy set
+> under the launcher's secret.
+> **`CONTRACT` = 15:** the volume core's refusals typed on the wire (`Refusal::Volume { refusal:
+> VolumeRefusal }`, appended; `refusal_of_vfs` exhaustive, its catch-all gone): until then each
+> reached a client as `BadRequest` carrying its name, a pinned snapshot's destroy among them (A-310's
+> seam found it). The contract puts each in the class a consumer acts on (`Busy::Volume` for `Pinned`
+> and `DaxMapped`, `Stale`, `Denied`, `Exhausted`, `Unusable` or `Invalid` `::Volume` for the rest).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -8087,6 +8127,11 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
 > shard it has runnable is starved and waited for another window, so an observation or a cross-shard call no longer
 > gives up on one (`an_observation_of_a_starved_shard_is_answered`, red 3 of 3 before on adacachy2).
+> **2026-11-18:** it reads the shard's clock again after the scheduler answers. A thread leaves the run queue for a block
+> only by running first, so only a clock read after that answer shows a shard released between the two reads, which
+> ran, answered and parked before the scheduler looked; read only before it, such a shard was judged wedged and an
+> observation already answered was given up (once on CI's Windows runner, where a look at the scheduler is a 3 ms
+> snapshot; 1 of 32 runs of the failing tree, `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`).
 > **2026-11-08, the transitive wait:** a shard blocked joining another thread of the process (the FUSE notify thread,
 > the landing barrier thread, the WinFsp mount thread; `slates_rt::registry::spawn_waited`) is read as that thread while
 > it is runnable, so a shard waiting on a starved thread is starved, not stuck; one waiting on a blocked thread is still
@@ -9120,7 +9165,9 @@ anchor segment; in a fleet a record sent to green's 2f+1 candidate holders under
 epoch, committed at f+1 acknowledgements, refused by any holder that has seen a higher epoch for
 that host, and issued only when every identity the version references is placed. The reply is `Accepted{version}` or `Conflict{windows}`. An
 increment id already in `seen` returns its original result (the completion record holds the
-reply); retries are always safe.
+reply); retries are always safe. A signed submit's verdict rides the version's chain entry and the green's accepted
+record, a checkpoint keeping it once it folds the entry (A-321): the version's provenance, read back by `MergeRecord`
+and answering every later reply that names the version.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -9141,7 +9188,12 @@ shard a cross-shard message, another host the wire, routed by the green's id to 
 owner with the piggyback rule (a refusal from a non-owner names the current owner and epoch;
 placement refresh is single-flight per green). The caller parks and resumes with the verdict. A work volume with
 `stream = true` submits at every auto-seal; an agent that wants a review boundary submits
-explicitly. A green with `require_evidence` refuses increments without evidence references.
+explicitly. A green with `require_evidence` refuses increments without evidence references. A submit may be signed
+work (A-321): it carries an SSH signature over the merge's statement (the work, its green, its base and the increment's
+identity, which a held submit hands the signer), judged on the green's owner under the work's and the green's trusted
+signers once the increment is built, recorded with the version and answered; a work or a green whose policy requires
+signed merges refuses one that did not verify when it would merge (`SignatureRequired`). A signature never permits a
+merge: the write modes do (A-285).
 
 **Edit and submit in one request (A-225).** `edit_and_submit(work_volume, path, at, delete_len, bytes, evidence?)` is
 `edit` and then `submit`, in one request: the work's owner applies the edit exactly as `edit` does and, when the edit
@@ -9184,7 +9236,8 @@ unavailable: Refused (`ContentUnavailable`), retryable. Increment above the deri
 Refused (`IncrementTooLarge{limit}`); the SDK splits by path. Evidence required and absent:
 Refused (`EvidenceRequired`).
 
-**Refusals.** The merge entries of §4.4's taxonomy plus `StaleEpoch` and `ContentUnavailable`.
+**Refusals.** The merge entries of §4.4's taxonomy plus `StaleEpoch`, `ContentUnavailable` and, for a volume that
+requires signed merges, `SignatureRequired` (A-321).
 
 **Derived constants.**
 
@@ -22589,8 +22642,10 @@ channel before anything else, whatever its proof (`landing::grant_verb`, counter
 setting and a merge's approval already were, so an agent never approves its own landing
 (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). Built the same day, its siblings:
 `Enroll` and `Revoke` refuse `Forbidden` on a consumer-bound channel before the proof (`enroll_by_consumer`,
-`revoke_by_consumer`), so no launcher-class verb answers an agent's own channel (GAPS). Owed: signed work. The
-SSH-signature verifier built first (below) stays, for signed work.
+`revoke_by_consumer`), so no launcher-class verb answers an agent's own channel (GAPS); `SetSigners` refuses it
+alike (A-321). Signed merges built 2026-11-17 (A-321): the statement, the verdict recorded with the version, the
+trusted signers and a volume's requirement; owed, a landing's signature (A-321's next piece). The SSH-signature
+verifier built first (below) is signed work's, its grant statement removed.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
   prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
@@ -22602,7 +22657,7 @@ SSH-signature verifier built first (below) stays, for signed work.
 - **Signed work (Ada: "we can (and should) support signed work").** A merge or a landing may carry an SSH signature
   (OpenSSH `PROTOCOL.sshsig`); slates verifies it, records it as provenance and answers a typed check (verified with
   its signer, unsigned, or invalid with its reason), and a volume can require signed merges. It never decides whether
-  a write is permitted.
+  a write is permitted. Built for merges by A-321 (its statement, its trusted signers, its record).
 - **Withdrawn.** The same morning A-285 read R10 as a human-only proof: fs-server's options of 2026-11-05 (A, a prompt
   on the anchor's terminal; B, a same-user socket; C, a separate operator account; D, a signature by a key only the
   human holds; E, standing grants in a file the human writes), of which Ada first chose D with A as the fallback. Ada
@@ -22720,6 +22775,23 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
   `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
   `tests/api.rs`.
+- **`CONTRACT` 14, the same day (g263's ask; 9 to 13 landed beside it):** `StartSpec::anchor_command_under(wrapper)`, since a host cannot take
+  a `Command`'s standard input out to hand its wrapper's: the wrapper's words, then the anchor's program, prefix and
+  role, with the launcher's record on standard input, the marker and the process group. Proven by
+  `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret` (`/usr/bin/env` execs the anchor; a policy set
+  under the launcher's secret verifies; the anchor stops at `SIGTERM`, exit 0).
+- **`CONTRACT` 15, the same day: the volume core's refusals typed.** `refusal_of_vfs` (`crates/server/src/error.rs`)
+  ended in a catch-all that sent every volume-core error it did not name as `BadRequest { reason: "<its name>" }`, an
+  uncategorized refusal (CLAUDE.md §3): `Pinned` (a snapshot a clone holds, a green's origin), `DaxMapped`,
+  `NotDirectory`, `NotEmpty`, `StaleHandle` and fifteen more reached every consumer as words. A-310's seam found it
+  (its simulator had to answer `Invalid::Request("Pinned")`). The wire appends `Refusal::Volume { refusal:
+  VolumeRefusal }`, one variant per volume-core error, with the journal's and the recovery image's numbers; the mapping
+  is exhaustive, so a new volume-core error does not compile until it is classified, and `BarrierIncomplete` now
+  reaches the wire's own variant. The contract classes each: `Pinned` and `DaxMapped` a holder (`Busy::Volume`), a stale
+  handle and a drifted base a moved view (`Stale::Volume`), the volume's rules a denial, its bounds exhaustion, an
+  unreadable journal or image unusable, the operations an entry does not take invalid. Applied to
+  `crates/ipc/src/protocol.rs`, `crates/server/src/{error,verbs}.rs`, `crates/server/tests/{recovery,fuse_mount}.rs`,
+  `crates/api/src/{error,sim,lib}.rs`, `tests/api.rs` (the seam's suite asserts the typed `Pinned`).
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
@@ -23249,12 +23321,58 @@ Applied in the same change to:
 - **Owed.** The supervisor's runs of the fleet suite under load and on Windows, and the load test's count of batches
   given up behind a burst (A-306's 17,000 to 52,000 a run), which this should bring near none.
 
+### A-317 — A forward's owner location is given the membership horizon, ended by a look begun after it, within the failover SLO (2026-11-18, built for goal g255; clients' class B, `3c072f490`, with the supervisor's derivation)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-317).
+- `crates/server/src/verbs.rs`: `locate_within_budget` (the give-up counted on the caller's side of the loop) and
+  `locate_within_horizon`, and the counts `fleet.owner_location.gave_up`, `.budget_spent` and `.slo_ended`.
+- Tests (`crates/server/tests/fleet.rs`): `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` and
+  `the_failover_slo_ends_a_forwards_location_budget` (new), and
+  `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, judged by the location's own counts
+  (clients' rewrite).
+- GAPS: the R3 debt of `LIVENESS_BUDGET_NS` (class B, the location budget).
+- **What was there.** A forward with no known owner gave its location one liveness budget of wall time, a fixed
+  second: the direct route, then a round, again every poll interval until the second ran out. A control shard kept off
+  its CPU ran out of it while the gossip that refutes a false death waited to be read, and its client was refused for
+  the machine's load (clients' runs at nice 19 beside two spinners a CPU, 1 or 2 calls in every false death); and with
+  silent peers the first round's own wait spent the whole second, so the location never looked again.
+- **The rule.** The location looks (the direct route, a round, and the direct route again) every poll interval. It
+  gives up once a look begun after the membership horizon, on the wall from its first look, has found no owner, or once
+  the operator's failover SLO has passed.
+- **Why.** An owner is unfindable while live for the time a false death takes to be gossiped and refuted, which the
+  detector's own horizon bounds (the supervisor's derivation of 2026-11-07: the location budget is the membership
+  horizon), not for a liveness budget. Ending only with a look begun after it means a round that outlasted the horizon
+  is followed by one more look, and the direct route asked after each round sees what the shard read while the round
+  waited on its peers.
+- **The forms that did not land.** Clients' polls (a liveness budget's worth at the poll interval, capped by the
+  failover SLO): a round that waits a liveness budget on a silent peer makes each poll a second, so a forward's
+  location runs to the SLO, ten times main's second. And the horizon followed by two waits of the control shard in its
+  driver (A-292's receiver rule): a busy shard rarely waits, so it too runs to the SLO (A-315 found the same on the
+  forward lane). Built first on main as of `9addf53ef`, each rewrite, this one included, made the five-node takeover test
+  `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` fail there (2 of 6, 4 of 15
+  and 8 of 24 GitHub runs, against 0 of 9 on that base's own budget). On main as of `bfc34cace` this form passes it 16
+  of 16 on ubuntu-latest and windows-latest, as main does (`diag-g255-a255-green-1`, `-red-1`); what changed between
+  the two bases to make the difference was not traced.
+- **Evidence.** On GitHub's ubuntu-latest, macos-latest and windows-latest runners (2026-11-18):
+  `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` failed 3 of 3 on each over main's budget,
+  the location never looking again (`diag-g255-loc-red-1`, `-red-3`), and passed 3 of 3 on each with this form, as did
+  `the_failover_slo_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
+  (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 over main as of `bfc34cace` (above). Over
+  A-315 and main as of `1e8f4a49e` (`diag-g255-land2-1`, run 44273659893), on each of the three runners the four
+  location tests 3 of 3 each, the five-node takeover test and the left-out-head takeover test 6 of 6 each, and the
+  held-origin test 3 of 3; and fmt, clippy and the whole `slates-server` suite pass on ubuntu-latest, `fleet` 157 of
+  157.
+- **Cost.** None at the location's steady state: one more look at the direct route a round. A location that cannot find
+  its owner ends one look past the horizon: about a poll interval when its rounds are answered, and one round's wait
+  when they wait on a silent peer.
+
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
-Status: designed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the content
-question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). Code waits on W1 (A-247),
-whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-loadtest-w1`.
+Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below); the replica itself, the feed and
+the sealed blocks owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
+works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
 - **Why (measured).** W1 (A-247) moves a work's edits and composition to the work's shard; the verdict and the rebase
   still run on the green's owner.
@@ -23269,8 +23387,10 @@ whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-l
   own replay (`Green::apply_recorded`, the chain entry's `Applied` over its increment). One code path: a replica at
   version v is the owner's green at v by construction, the property replay already holds for recovery.
   - *The feed.* After a version is committed (A-252: after its quorum), the owner sends its chain entry to each shard
-    holding a replica, over the existing bounded control channel, in version order. A replica that sees a gap (a
-    version it lacks before the one it is sent) is rebuilt from the owner, counted.
+    holding a replica, over the existing bounded control channel, in version order. A fold of the owner's history
+    (retention, `Green::fold_history_before`) is a feed message too, in the same order, so a replica keeps no value
+    the owner has dropped. Each message has a feed position, one more than the last. A replica that sees a gap (a
+    position it lacks before the one it is sent) is rebuilt from the owner, counted.
   - *Served from the replica.* A rebase of a work on that shard, at the replica's head (never below the work's base;
     the work's next submit is judged by the owner against its own head, as every stale base is). A read of the green
     at a named version the replica holds (the 60% of A-247's reads). Everything else is unchanged: the verdict, the
@@ -23291,12 +23411,19 @@ whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-l
     does.
   - *Frees deferred until every replica has passed them.* A-64's deferral holds a block only until the owner's next
     publication commits, and knows nothing of readers on other shards; alone it would let a replica read a block freed
-    and reused under it. So the owner frees a chunk whose last reference version v dropped only when every replica has
-    acknowledged a version at or past v. A replica acknowledges on the feed's own channel, after its turn has applied
-    the version and dropped every reference the version removed; the acknowledgement is per version (batched to the
-    latest), never per chunk, so the cost is one message a version a replica and no atomic on any per-item path (D-7's
-    quiescent-state rule, made by message). A replica dropped, rebuilt or ended acknowledges by leaving: its shard's
-    acknowledgement is removed, so a dead replica never holds a free.
+    and reused under it. So a chunk the owner's last piece leaves is stamped with the feed position of the message
+    that carries the change (`Green::feed_position`; the owner moves to the next as it sends one,
+    `Green::advance_feed`), and freed only when every replica has acknowledged that position. Positions, not
+    versions: a fold releases chunks with no new version, and a replica that had not folded would still read them (the
+    text of the same day said versions, and was wrong). A replica acknowledges on the feed's own channel, after its
+    turn has applied the message and dropped every piece it released; the acknowledgement is per message (batched to
+    the latest), never per chunk, so the cost is one message a feed message a replica and no atomic on any per-item
+    path (D-7's quiescent-state rule, made by message). A replica joins at the owner's position then
+    (`Green::hold_content`), naming only live chunks. A replica dropped, rebuilt or ended leaves
+    (`Green::leave_content`), so a dead replica never holds a free. Built 2026-11-17 in `crates/merge/src/history.rs`
+    (`Chunks::hold`, `acknowledge`, `leave`): a held chunk's room is not reused, its bytes are charged to the green's
+    retained history (`Green::retained_bytes`) and recounted from the held list, and the frees held are counted
+    (`Green::content_frees_held`). With no replica the owner frees at once, as before.
   - *Bounds.* The deferred bytes are charged to the owner's memory class, and they are bounded by the slowest
     replica's lag. A replica more than the derived lag behind (owed: its derivation, from the class's headroom against
     the bytes a version frees) is dropped, counted (`merge.replica.dropped_lagging`), and its rebases and reads go to
@@ -23335,9 +23462,11 @@ whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-l
   - A lagging replica's rebase is answered exactly as the owner would answer it at the replica's head, and a rebase whose
     base is above the replica's head is forwarded and answered by the owner.
   - A read at a version the replica lacks is forwarded, and its answer equals the owner's.
-  - Lifetime: a replica holding a piece of a chunk whose last reference the owner has dropped reads the chunk's bytes
-    unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before; a replica
-    dropped mid-read releases its hold. Red with the acknowledgement ignored (the owner frees at once).
+  - Lifetime (built): a replica holding a piece of a chunk whose last reference the owner has dropped reads the
+    chunk's bytes unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before;
+    a replica that leaves releases its hold (`a_chunk_released_while_a_replica_reads_it_stays_until_the_replica_passes_its_release`,
+    `a_replica_that_leaves_holds_no_free`, and the generated `no_replica_reads_a_chunk_freed_before_it_passed_the_release`
+    in `crates/merge/src/history.rs`). Red with the hold ignored (the owner frees at once).
   - Non-vacuity: counters of rebases and reads served off the owner and of those forwarded, and of frees deferred for
     a replica (`merge.replica.frees_deferred`).
   - Then the A/B the supervisor runs: the anchor recipe, every round, with the owner's utilization before and after.
@@ -24105,6 +24234,10 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   and the decision's own two unit tests. By use over the export:
   `an_object_made_over_the_export_takes_its_group_by_this_hosts_rule` (`crates/bridge-nfs/tests/procedures.rs`), which
   holds macOS's CI run to BSD's rule and every other host to System V's. The FUSE creation test of AUD-29-81 stands.
+  The daemon's AC-3.10 test over its NFS port (`a_mount_preserves_each_requests_unix_owner_across_shards`,
+  `crates/server/tests/nfs_mount.rs`) expected System V's group on every host and failed on macOS once A-328 landed
+  (MKDIR's group 20, the root's, where it expected the caller's 1001; found by g251, 2026-11-18): it now states the
+  rule per host, the parent's group on macOS and the caller's elsewhere, each owner still the caller.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
@@ -24377,6 +24510,136 @@ Applied in the same change to:
   no write acknowledged after the last barrier is lost); the anchor holding a stream's DAX objects; Windows on Shards'
   handle path; and Shards' device half (ROOT, after its v0.8.0 tag).
 
+### A-321 — Signed work: a merge may carry an SSH signature over its statement, judged under the volume's trusted signers, recorded with the version as its provenance and answered typed; a volume can require signed merges; a signature never permits a write (2026-11-17, goal g090 "Signed work", Ada's rule of 2026-11-18)
+Applied in the same change to: §4.16 ("Submission", "Commit", "Refusals"), §4.12 ("The consumer contract": its
+signed-work bullet and status, `CONTRACT` 13), A-285's status, GAPS (the A-285 and A-299 entries, and a head entry of
+its own), `docs/library.md`, and:
+- `crates/server/src/signed_work.rs` (was `grant_signature.rs`): the statements (`merge_statement`,
+  `landing_statement`), the verifier under the namespace `slates-work` (`verify`, `judge`), trusted keys
+  (`TrustedKey`: kind, fingerprint, wire form), the verdict as a chain entry records it (`to_entry`, `of_entry`), its
+  counters; A-285's withdrawn grant statement, nonce and expiry removed. Golden vectors re-made with `ssh-keygen -Y sign`
+  over both statements (OpenSSH 10.2p1, 2026-11-17), each checked with `ssh-keygen -Y verify`.
+- `crates/ipc/src/protocol.rs`: `WritePolicy::require_signed_merges`; `SignerKey`, `Signer`, `SignatureFault`,
+  `Verification`; `SubmitSigned`, `SetSigners`, `MergeRecord` requests; `SubmitHeld` and `SubmitApproved` carry a
+  signature; `SubmittedSigned`, `SignersSet`, `MergeRecord` replies; `MergeApprovalRequired` carries the statement and
+  the verdict; `Policy` carries the signers; `Refusal::SignatureRequired`.
+- `crates/db`: `PolicyRecord::signers`, `WritePolicy::require_signed_merges`, `Op::VolumeSignersSet` (moves the policy
+  version, as a policy setting does).
+- `crates/merge`: the chain entry's version 4 (the verdict, `chain_entry::Signature`), the checkpoint's version 3 (the
+  signed versions' verdicts beside the accepted identities), `Green::record_signature` and `Green::signature`.
+- `crates/server`: `verbs.rs` (`judge_signature`, `refused_unsigned`, `SignedRules`, `SubmitPolicy` carries the
+  signature and the work's rules, `record_accepted` records the verdict, replay records it, `accepted_version`),
+  `work_home.rs` (the signature and the work's rules travel with the ask, A-247), `merge_service.rs`
+  (`recorded_verification`, `accepted_reply`, `merge_record_verb`), `landing.rs` (`signers_proof`, `set_signers_verb`,
+  the policy's requirement and its signers on the wire), the consumer gate (a signed submit held as an unsigned one is),
+  a consumer's policy refused the requirement.
+- `crates/client`: `submit_with_signature`, `merge_statement`, `submit_approved_signed`, `set_signers`, `signers`,
+  `merge_record`.
+- `crates/api`: `Instance::merge` sends its signature, `merge_statement`, `approve_merge` carries it again,
+  `merge_record`, `set_signers`, `signers`; `TrustedSigner`, `MergeStatement`, `MergeRecord`,
+  `MergeApproval::signature`, `Missing::Version`, `Invalid::SignedMergesNotAVolume`; `SignatureFault::Expired` gone;
+  `CONTRACT` 13.
+- Tests: `crates/server/tests/signed_work.rs` (new, below), `crates/merge/tests/{chain_replay,checkpoint}.rs`, the
+  verifier's unit tests, `crates/api/tests/api.rs` (`a_signed_merge_is_judged_and_read_back_through_the_contract`).
+
+- **Why.** Ada (2026-11-18): "we can (and should) support signed work (signed merges, etc.)", with the rule of the same
+  day that write permission follows the mode the user gave the agent, never a key or a person-only proof (A-285). So a
+  signature is provenance: who made the work. It is verified, recorded and answered; the one rule it feeds is a volume's
+  own requirement that what merges into it (or from it) be signed, a property of the volume the launcher sets as it sets
+  the write policy.
+- **What is signed: the statement.** Plain text, one field a line, so `ssh-keygen -Y sign -n slates-work -f KEY FILE`
+  signs it as a file and a person reads what they sign. A merge's: `slates merge v1`, the work, its green, the base
+  version and the increment's identity (`blake3` of the work, its base, its ops document and its post-state, §4.16), so
+  the signature binds every byte merged and verifies for that increment alone. A landing's (defined now, verified in the
+  next piece): `slates landing v1`, the volume, the target as the request names it with its length in bytes before it
+  (no path can forge a later line), and the manifest hash. The SSH namespace `slates-work` separates slates work from
+  every other signature (a git commit signs under `git`); the first line separates a merge from a landing. A statement
+  names one act exactly, so it carries no expiry: once the work changes, its signature no longer verifies.
+- **How a signer gets the statement.** From a held submit (`SubmitHeld`, the client's `merge_statement`): the
+  increment is built and nothing is merged, whatever the modes short of forbidding the merge, and the answer
+  (`MergeApprovalRequired`) carries the identity and the statement. The daemon states it, so the format lives in one
+  place.
+- **Trusted signers.** A volume's signers are public keys (`ssh-ed25519`, or FIDO `sk-ssh-ed25519@openssh.com`, whose
+  signature must carry the holder's touch) the launcher sets with `SetSigners`: the whole set, so a key is removed by
+  setting the set without it, proven by the launcher's secret over the volume, the keys and the policy version it
+  replaces (a captured proof sets nothing once the policy moved), refused `Forbidden` on an agent's own channel whatever
+  its proof. A merge verifies under its work's and its green's signers together. A valid signature by any other key is
+  `Invalid { UnregisteredKey }`.
+- **The verdict.** `Verified { signer }` (the key's type and its SHA-256 fingerprint, `ssh-keygen -l -E sha256`'s),
+  `Unsigned`, or `Invalid { reason }` (malformed, another namespace, an unsupported key or hash, an unregistered key, a
+  signature that does not verify, a security key not touched). Judged on the green's owner once the increment is built,
+  where the green's record is; the work's signers and requirement travel with a submit from a work on another shard
+  (A-247), as its merge mode does (A-307).
+- **Recorded, durably, as provenance.** An accepted version's chain entry carries its verdict (format version 4); the
+  green's accepted record keeps it (`Green::record_signature`) as it keeps the version's increment identity, and a
+  checkpoint that folds the entry keeps it too (format version 3). So the verdict is recorded once, at the merge, and
+  read back unchanged after a restart or a fold, under whatever signers are trusted by then: provenance is how the
+  merge was judged when it merged. It is bounded as the accepted record is, one entry at most per committed version. A
+  consumer reads it back with `MergeRecord { green, version }`. An accepted submit is answered from the version's record
+  (`SubmittedSigned` when the version records a verdict), so a submit's first answer, its deferred one at `f > 0` and a
+  resend's after a restart agree; a conflict records nothing and answers the submit's own verdict.
+- **A volume can require signed merges.** `WritePolicy::require_signed_merges` on a green holds every merge into it to
+  a verified signature, on a work every merge from it; either requiring decides. It is met when the merge would happen:
+  a bypass merge at once, an asked merge at its approval (`SubmitApproved` carries the signature again), refused
+  `SignatureRequired { by, verification }` with nothing merged. An asked merge answers with its verdict first, so the
+  approver sees it and a signer gets the statement whatever the requirement. A consumer's policy cannot set it (refused
+  `BadRequest`, and `Invalid::SignedMergesNotAVolume` in the contract before anything is sent): it is a volume's rule,
+  judged where the verdict runs, which holds both volumes' records and no session's; a launcher holds an agent to it by
+  setting it on the agent's work.
+- **Never a permission.** A signature changes nothing a mode decides: a forbidden merge is refused signed or not, an
+  asked one waits for its approval signed or not, a bypass one merges with a signature that did not verify (recorded
+  invalid) unless a volume requires signed merges.
+- **Rejected.** Keeping the verdict only in the chain entry: a checkpoint folds a version's entry as soon as no live
+  work is based below it, which with one work is the merge's own answer, so the first run read version 1 back
+  `NotFound` (`a_signed_merge_is_judged_recorded_and_read_back`); it is kept with the accepted record instead. Keeping
+  the signature's bytes beside the verdict: the verdict is what slates judged under the signers trusted at the merge,
+  and a later re-verification would judge under another set. A requirement checked before the approval request: a
+  signer could not get the statement from a volume that requires signatures, so the requirement is met at the merge. A
+  separate statement verb: a held submit already builds the increment and merges nothing, on every route.
+- **Proven** by `crates/server/tests/signed_work.rs` (8 tests, macOS arm64, Mac Studio, 2026-11-17): a signed merge
+  verified, a stranger's `UnregisteredKey`, a stale statement's `BadSignature`, an unsigned one, each merged and read
+  back, with the checkpoint counter and the verifier's counters as non-vacuity; a requiring green refusing an unsigned,
+  a stranger's and a `git`-namespace signature with nothing merged and a work's own requirement naming the work; an
+  asked signed merge held with its verdict, its unsigned approval refused and its signed one merged; the launcher's
+  signer set refused for a forged proof, a stale version and a non-key, kept once each in order, and a consumer's
+  requirement refused; an agent's channel refused the signers (Unix); eight works over four shards, signed and judged
+  on the green's owner; the verdicts read back after a restart from the replayed chain entries and after a second from
+  the checkpoint that folded them; a forbidden merge giving no statement. Each red with its guard removed (the
+  requirement, the work's rules travelling, the replay's record, the checkpoint's table, the green's signers, the
+  consumer refusal), the restored build green. The verifier's 11 unit tests over the new `ssh-keygen` vectors, the
+  chain and checkpoint codecs' tests, and the contract's `a_signed_merge_is_judged_and_read_back_through_the_contract`.
+- **Owed** (GAPS): a landing's signature (the statement is defined; the verdict on `Land` and `Present`, recorded with
+  the landing's record and read back in the audit, and the contract's `land` with a signature); the verdict carried by
+  a version's merge record to holders and a takeover successor (a successor records none today); a real FIDO key's
+  signature end to end.
+
+### A-331 — A node the council configuration it holds does not name keeps direct contact with every member it holds alive, until it holds one that names it (2026-11-18, goal g225: a forming fleet reaches every candidate at start)
+Applied in the same change to: §4.8 "Consensus lifetime" (the learner paragraph), GAPS (the entry for this stall),
+`crates/server/src/fleet.rs` (`DirectContact::Unadmitted`, `joining_contact`), `crates/server/src/consensus.rs` (the
+test), and the bug record `docs/bugs/2026-11-18-a-fresh-member-joined-before-its-admission-kept-contact-with-no-one.md`.
+- **Why.** The direct-contact rule (§4.8, amended 2026-10-10) keeps a record session and a probe of its own only with
+  a node's neighbours, the members it holds for, the voters, and a member being staged; everyone is contacted only
+  while the consensus groups form. It assumes the node is a member of the configuration it judges by. A fresh member
+  whose first fetch was answered before the council admitted it holds a configuration that does not name it: it is
+  no one's neighbour, holds nothing, and the voters it knows are its join donor's, which on a learner donor are the
+  voters of that learner's own join, so the bootstrapper alone when the bootstrapper is the member it replaced. The
+  rule then kept no peer: every record link idled, the learner (which fetches over record sessions) found none, and
+  the node never learned the configuration that admits it. live_chaos's fresh-member flow hit it in 2 of 48 runs at
+  one CPU on 2026-11-09 and in both of main's first gated runs on 2026-11-18; diag-raft-chaos-ab-68b-2 showed the
+  node at council version 8, in contact with none of the four members it held alive, `fleet.learner.no_session` 113 in
+  48 s.
+- **The rule.** Before the member rule, `joining_contact` judges this node alone: `Forming` while either group is
+  uninitialized (as before), `Unadmitted` while the council configuration it holds does not name it. Either keeps
+  contact with every member it holds alive; a member it holds dead is still dropped, as before. Once it holds a
+  configuration that names it, the member rule applies.
+- **Cost.** An unadmitted node keeps O(N) sessions and probes for the periods until it learns its admission, as a
+  forming node does; the others contact it already (`NotInCouncilConfiguration`), so the pair is kept from both sides,
+  which the 2026-10-10 amendment found keying needs. A node the council never admits keeps them for as long as it
+  runs, bounded by the members it holds alive.
+- **What it does not change.** Who the council admits, who votes, and what a learner adopts. A learner's known voters
+  can still go back through another learner's answer (the bug record's sibling); an admitted member has its
+  neighbourhood to fetch through, so that no longer strands anyone.
+
 ### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
 Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,
 `Listed { volumes, next }`), `crates/server/src/verbs.rs` (`list_part`, `list_page`, `longest_listable_name`,
@@ -24503,8 +24766,8 @@ Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/prot
 dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`; and
 since 2026-11-17 to `crates/server/src/{verbs,landing,merge_service,state,snapshot_view,transports}.rs` (the carried
 lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base.rs` (`drift_page`,
-`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 13 to
-16), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
+`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 16 to
+19), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
 `docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`.
 - **Status stays one reply:** it carries the first drifted entries that fit beside its other fields and counts the rest.
 - **A paged read:** `Drifted` from a position, an entry too long for any page passed over and counted. Since the drift
@@ -24524,7 +24787,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   page together. Held to `status` over the simulated host by an oracle (pages of 1, 3 and 64 inodes, the slice spent
   after every visit, every second, or never; replaced, removed and refused entries)
   (`a_drift_walk_a_page_at_a_time_lists_what_a_status_lists`). `slates-api`'s `drift_page` reads past an inode and
-  `drift` answers its lists in path order (`CONTRACT` = 16).
+  `drift` answers its lists in path order (`CONTRACT` = 19).
 - **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
   the count. Both SDKs read the whole drift with `drifted(volume)` (2026-11-17, goal g247): typed entries (`path`,
   `kind`), the unverified paths and the oversized count.
@@ -24542,7 +24805,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   budget, which counted each mount's path and not its whole encoding (twelve bytes more). The mounts were never a
   refusal: a partition holds a bounded number of attachments (`PartitionCaps::attachments`), and the 400-mount test met
   that bound before any status (corrected 2026-11-18). The client, the CLI, MCP, both SDKs and `slates-api` carry the
-  counts (`CONTRACT` = 14:
+  counts (`CONTRACT` = 17:
   `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
   and counts no conflict).
 - **A merge verdict's windows (2026-11-17, goal g247):** `Submitted` and `Rebased` carried every conflict window and
@@ -24555,11 +24818,12 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   work's own operations' conflicts, bounded by the journal the merge budget charges. Since A-247 the verdict is judged
   on the green's owner, which holds no work on another shard, so its answer names every window and the work's shard
   keeps them and carries what fits (`kept_conflict`, in the settle of the submit or the rebase); the owner's completion
-  record of that answer, from which a retry after a crash on the work's shard is answered, holds every window too. The
-  client walks them,
+  record of that answer, from which a retry after a crash on the work's shard is answered, holds every window too. A
+  signed submit's verdict (`SubmittedSigned`, A-321) carries its windows the same way, with its own count and verdict
+  id (2026-11-18). The client walks them,
   synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
   `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
-  `Stale::Verdict` (`CONTRACT` = 15).
+  `Stale::Verdict` (`CONTRACT` = 18).
 - **A name every reply holds (2026-11-18, goal g247):** A-263 bounded a new volume's name by the listing alone (4,012
   bytes). A status names the volume beside its transports, journal, loss window and mounts, so a volume under such a
   name was listed and its status refused "reply too large for the bulk area" (reproduced by use,

@@ -260,9 +260,10 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     return false;
   };
   match body {
-    RequestBody::Submit { .. } | RequestBody::SubmitHeld { .. } | RequestBody::Rebase { .. } => {
-      require_work(state, principal, volume, false, "ask").is_ok()
-    }
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::SubmitHeld { .. }
+    | RequestBody::Rebase { .. } => require_work(state, principal, volume, false, "ask").is_ok(),
     // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
     // or a forged approval runs here, where `verbs::submit_approved` refuses it, and nothing reaches the green.
     RequestBody::SubmitApproved {
@@ -320,22 +321,19 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
     }
     | RequestBody::Status { .. } => (!fetched).then_some(Need::Sizes),
     RequestBody::Declare { op, .. } => declare_need(fetched, op),
-    RequestBody::Submit { evidence, .. }
-    | RequestBody::SubmitHeld { evidence, .. }
-    | RequestBody::SubmitApproved { evidence, .. } => {
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::SubmitHeld { .. }
+    | RequestBody::SubmitApproved { .. } => {
       if home.verdict.is_some() {
         return None;
       }
-      let approval = match body {
-        RequestBody::SubmitApproved { identity, .. } => crate::verbs::Approval::Of(*identity),
-        RequestBody::SubmitHeld { .. } => crate::verbs::Approval::Held,
-        _ => crate::verbs::Approval::None,
-      };
+      let (evidence, approval, signature) = submitted(body)?;
       Some(verdict_need(
         state,
         work,
         seal(state, work),
-        (evidence, approval),
+        (evidence, approval, signature),
       ))
     }
     RequestBody::Rebase { .. } => {
@@ -377,20 +375,49 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         crate::verbs::Approval::None
       };
       sealed_with_edit(state, work, (path, *at, *delete_len, insert))
-        .map(|sealed| verdict_need(state, work, sealed, (evidence, approval)))
+        .map(|sealed| verdict_need(state, work, sealed, (evidence, approval, None)))
     }
     _ => None,
   }
 }
 
+/// What a submit verb brings its verdict (A-285, A-321): the evidence it names, its approval and its signature's bytes.
+type Submitted<'body> = (&'body [[u8; 32]], crate::verbs::Approval, Option<Vec<u8>>);
+
+/// What a submit verb brings its verdict: its evidence, its approval and its signature (A-285, A-321); `None` for a
+/// verb that is not a submit.
+fn submitted(body: &RequestBody) -> Option<Submitted<'_>> {
+  use crate::verbs::Approval;
+  match body {
+    RequestBody::Submit { evidence, .. } => Some((evidence, Approval::None, None)),
+    RequestBody::SubmitSigned {
+      evidence,
+      signature,
+      ..
+    } => Some((evidence, Approval::None, Some(signature.clone()))),
+    RequestBody::SubmitHeld {
+      evidence,
+      signature,
+      ..
+    } => Some((evidence, Approval::Held, signature.clone())),
+    RequestBody::SubmitApproved {
+      evidence,
+      identity,
+      signature,
+      ..
+    } => Some((evidence, Approval::Of(*identity), signature.clone())),
+    _ => None,
+  }
+}
+
 /// What a submit of `sealed` needs of the owner, once it has what it reads: its work's route first (A-298), then the
-/// base entries its composition lacks, then the verdict, carrying the work's merge mode, read here where the work's
-/// record is, and the approval the submit carries (A-285).
+/// base entries its composition lacks, then the verdict, carrying the work's merge mode and signed-work rules, read here
+/// where the work's record is, and the approval and the signature the submit carries (A-285, A-321).
 fn verdict_need(
   state: &ShardState,
   work: DbVolumeId,
   sealed: SealedWork,
-  (evidence, approval): (&[[u8; 32]], crate::verbs::Approval),
+  (evidence, approval, signature): (&[[u8; 32]], crate::verbs::Approval, Option<Vec<u8>>),
 ) -> Need {
   if !route_committed(state, work) {
     return Need::Route;
@@ -398,10 +425,7 @@ fn verdict_need(
   base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
     evidence: evidence.to_vec(),
     sealed: composed(state, sealed, evidence.to_vec()),
-    policy: crate::verbs::SubmitPolicy {
-      work_mode: crate::verbs::merge_mode_of(state, work),
-      approval,
-    },
+    policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature)),
   })
 }
 
@@ -585,6 +609,7 @@ fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -
   if !matches!(
     body,
     RequestBody::Submit { .. }
+      | RequestBody::SubmitSigned { .. }
       | RequestBody::SubmitHeld { .. }
       | RequestBody::SubmitApproved { .. }
       | RequestBody::EditSubmit { .. }

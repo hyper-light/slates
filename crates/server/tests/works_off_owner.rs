@@ -1203,6 +1203,7 @@ fn merging(client: &mut Client, secret: &[u8; 32], subject: PolicySubject, merge
   let policy = WritePolicy {
     merge,
     land: WriteMode::Ask,
+    require_signed_merges: false,
   };
   let (_, version) = client.policy(subject).unwrap();
   client
