@@ -1,5 +1,19 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
+> holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
+> register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
+> replica had not reached them held their records and could not apply them: it answered every later version
+> `merge.out_of_order` for good, and at `f = 1` with the old owner gone the successor's next version never placed. Now a
+> record ahead of the replica finds the versions between in the holder's own ledger: their inputs held, the replica
+> advances through them and the record is served as its next; an input not held is fetched by identity from the
+> record's owner (`fleet::fetch_ledger_inputs`, `merge.catch_up.begun`, `merge.catch_up.fetched`). Test:
+> `a_holder_behind_its_own_records_after_a_takeover_fetches_their_inputs_and_takes_the_next_version`
+> (`crates/server/tests/fleet.rs`): green in 4.4 s (kiln r355, Mac Studio, debug); red without the catch-up, version 4
+> answered out of order 4,865 times in 405 s and never placed.
+> - **Open (sibling):** a holder restarted warm with no replica, holding a record whose input it lacks, rebuilds nothing
+>   (the A-313 rebuild meets the missing input) and nothing fetches the input.
+
 > **A takeover's successor answered a forwarded read `NotFound` before it had made the volume: fixed (2026-11-18, A-394,
 > ReadSafety, §4.8 "Lookup"; g250; the chaos nemesis, seed 6876545201569229162 on macOS).** With A-382 in, the seed's
 > fourteen faults all recovered on the Mac Studio, and the verdict failed ReadSafety alone, 3 of 3 runs: during the first

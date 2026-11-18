@@ -5326,6 +5326,54 @@ async fn fetch_green_inputs(
   }
 }
 
+/// Counter (A-412): fetches a holder began of the inputs of versions its own ledger holds without them, its replica behind
+/// that ledger ([`fetch_ledger_inputs`]). Format: a refusal name in the daemon's status report.
+const CATCH_UP_BEGUN: &str = "merge.catch_up.begun";
+/// Counter (A-412): inputs such a fetch brought in whole, one a version. Format: a refusal name in the daemon's status
+/// report.
+const CATCH_UP_FETCHED: &str = "merge.catch_up.fetched";
+/// Counter (A-412): such a fetch whose task the shard's arena refused; the record's next shipment begins it again. Format:
+/// a refusal name in the daemon's status report.
+const CATCH_UP_UNSPAWNED: &str = "merge.catch_up.unspawned";
+
+/// Fetches by identity from `sender`, a merge record's owner, the inputs of the versions of the green `object` this holder's
+/// ledger holds without them (`unheld`, each version and manifest, lowest first), its replica behind that ledger (A-412,
+/// `merge_service::catch_up`): a takeover committed those versions again here through the register path, which carries no
+/// inputs. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
+/// ([`fetch_manifest_into_hold`]); the record's next shipment finds them held and advances the replica. One fetch a green
+/// at a time (`MergeShardState::catching_up`), in a detached task of this shard, each manifest within one live exchange's
+/// budget; it ends at the first manifest not fetched, and the next shipment begins another.
+pub(crate) fn fetch_ledger_inputs(
+  state: &mut ShardState,
+  object: ObjectId,
+  sender: HostId,
+  unheld: Vec<(u64, [u8; 32])>,
+) {
+  if !state.merge.catching_up.insert(object) {
+    return;
+  }
+  state.count(CATCH_UP_BEGUN, 1);
+  let fetching = async move {
+    let budget = live_budget();
+    for (version, manifest) in unheld {
+      if !fetch_manifest_into_hold(object, &[sender], move |_| version, manifest, budget).await {
+        break;
+      }
+      count_refusal(CATCH_UP_FETCHED);
+    }
+    let _ = state::with_state_counted(|s| s.merge.catching_up.remove(&object));
+  };
+  match futures::spawn(fetching) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => {
+      state.merge.catching_up.remove(&object);
+      state.count(CATCH_UP_UNSPAWNED, 1);
+    }
+  }
+}
+
 /// Which kind of taken-over object a give-up ends ([`give_up_taken_over`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TakenOver {

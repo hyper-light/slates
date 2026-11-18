@@ -29650,3 +29650,23 @@ Applied in the same change to: §4.8 (learners), A-380's entry, GAPS (A-380's op
 `crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/root_group.rs`,
 `crates/server/src/fleet.rs`, their tests, and the bug record
 `docs/bugs/2026-11-18-a-root-learner-named-the-root-voters-of-its-join.md`.
+
+### A-412 — A holder behind its own records catches up from them, fetching their inputs from the record's owner (2026-11-18, kiln goal g250; §4.16 "Apply on holders"; A-313, A-333, A-364, A-373)
+Applied in the same change to: GAPS (the entry at its head), the bug record of 2026-11-18 on a holder behind its own
+records, `crates/server/src/merge_service.rs` (`record_standing`, `catch_up`, `MergeShardState::catching_up`) and
+`crates/server/src/fleet.rs` (`fetch_ledger_inputs`, `merge.catch_up.*`).
+- **What was there.** A takeover commits the versions it adopted again through the register path, which carries no
+  inputs, and the record plane ships a placed version no more, so a holder whose replica had not reached them held their
+  records with nothing to apply them by. A record ahead of the replica was out of order, for good.
+- **The rule.** A record ahead of the replica's next version looks for the versions between in the holder's own ledger
+  (`merge_origin::ledger_unheld`). Held whole, with their inputs, the replica is advanced through them (A-333's
+  `advance_replica`) and the record served as the next version, recomputed before it is acknowledged. An input not
+  held is fetched by identity from the record's sender, the green's owner, which holds every version's inputs while its
+  records name them (A-244), staged as placed for its version, one fetch a green at a time in a detached task of the
+  shard, and the owner's next shipment of the record finds it held. A version between whose record the holder lacks is
+  out of order, as before.
+- **Tests.** `a_holder_behind_its_own_records_after_a_takeover_fetches_their_inputs_and_takes_the_next_version`
+  (`crates/server/tests/fleet.rs`): three nodes at `f = 1`, the holder withholding version 3 when the owner dies, the
+  successor's version 4 committed with it and recomputed there, version 3's input fetched. Kiln r355, the Mac Studio,
+  2026-11-18, debug build: green in 4.4 s; red without the catch-up, version 4 answered out of order 4,865 times in
+  405 s. The merge unit tests (`merge_origin`, `merge_service`) 27 of 27.
