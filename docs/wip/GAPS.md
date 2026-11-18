@@ -159,10 +159,13 @@
 >   were dropped, and nothing recorded its end. Now every attempt, from the moment its id is decided, records in its
 >   completion's atom the ring's records of it and a `landing_finished`. That record names `refused` (`aborted` once
 >   the attempt wrote an entry), the manifest it planned (its grant's when it planned none) and its verdict. The
->   server's own refusals count too: the lease, the volume, the snapshot, the host and the target. Proven by three
->   tests in `crates/server/tests/presentations.rs` (a conflict in the run, a grant mismatch in the plan, a lease held
->   before it), each red on main 79aee2a17 (Mac Studio, r3614), a fourth for an end that names no manifest, and the
->   unit test of the `aborted` rule (`docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`);
+>   server's own refusals count too: the lease, the volume, the snapshot, the host and the target. Since a later change
+>   the same day the landing's record reaches the same terminal state in the same atom, so the record and the audit
+>   cannot disagree. Only a landing whose grant the shard held as it began leaves the trail; one under a grant it does
+>   not hold is a refused request (`CONTRACT` = 35). Proven by three tests in `crates/server/tests/presentations.rs`
+>   (a conflict in the run, a grant mismatch in the plan, a lease held before it), each red on main 79aee2a17 (Mac
+>   Studio, r3614) and each reading the record's state; a fourth for a grant the shard does not hold; and the unit test
+>   of the `aborted` rule (`docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`);
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
 >   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
 >   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
