@@ -60,7 +60,10 @@ each holder, which refused it: about 760 MB over the run.
   for one (no candidates followed, no whole record, no image). Every other path that ships was already gated.
 - `crates/server/tests/fleet.rs`: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (the owner cut off on
   the probe plane until its volume is taken over, healed, one write through it to meet the fence, then 20 record
-  periods watched): red before (each holder refused the owner's fenced entry again every period), green after.
+  periods watched): red with the fix reverted (each holder refused the owner's fenced entry again every period: 19 in
+  the 20, 102 before the window), green with it (each holder's one refusal is the write that met the fence; kiln r2346,
+  Mac Studio). The holders refuse an owner the configuration does not name before they read the epoch
+  (`not_a_member`, then `not_the_acting_owner` once the old owner is admitted again), so the test counts every refusal.
 - Design (§4.10 chaos flows' status, A-349) and GAPS.
 
 ## Siblings found, not changed here

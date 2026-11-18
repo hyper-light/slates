@@ -25418,7 +25418,9 @@ the bug record.
 
 Held by `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`: the owner cut off
 on the probe plane until its volume is taken over, healed, one write through it to meet the fence, then 20 record
-periods watched): red before, each holder refusing the old owner's fenced entry again every period.
+periods watched): red with the fix reverted, each holder refusing the old owner's fenced entry again every period (19
+in the 20, and 102 before the window, `not_the_acting_owner` once the old owner was admitted again), and with it each
+holder's one refusal is the write that met the fence (kiln r2346, Mac Studio).
 
 Applied in the same change to: §4.10 (the chaos flows' status), GAPS (the nemesis entry), `crates/server/src/live_ship.rs`,
 `crates/server/tests/fleet.rs` and the bug record
