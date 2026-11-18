@@ -11252,7 +11252,7 @@ fn a_takeovers_envelope_is_opened_in_turns_and_served() {
   let read: Vec<bool> = (0..OPENED_CHUNKS)
     .map(|file| {
       let reply = read_at_head(&mut reader, id, &format!("/opened-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == opened_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == opened_body(file))
     })
     .collect();
   drop(reader);
@@ -11716,7 +11716,7 @@ fn after_the_restart(daemons: &[Daemon], instance: &str, volume: VolumeId) -> Af
   let read = (0..CONTINUITY_FILES)
     .map(|file| {
       let reply = read_at_head(&mut client, volume, &format!("/continuity-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect();
   AfterTheRestart {
@@ -13040,13 +13040,15 @@ fn reads_through(daemon: &Daemon, volume: VolumeId) -> Vec<ReplyBody> {
   let began = Instant::now();
   let mut answers = Vec::new();
   while began.elapsed() < READMITTED_READS {
-    let answer = client.call(&RequestBody::Read {
+    let answer = client.call(&RequestBody::ReadRange {
       volume,
       path: "/second".to_owned(),
       at: ReadAt::Head,
+      offset: 0,
+      max: u64::MAX,
     });
     let served =
-      matches!(&answer, ReplyBody::ReadBytes { bytes } if *bytes == written_by_the_successor());
+      matches!(&answer, ReplyBody::ReadPage { bytes, .. } if *bytes == written_by_the_successor());
     answers.push(answer);
     if served {
       break;
@@ -13096,7 +13098,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   let stale: Vec<&ReplyBody> = answers
     .iter()
     .filter(|answer| match answer {
-      ReplyBody::ReadBytes { bytes } => *bytes != written_by_the_successor(),
+      ReplyBody::ReadPage { bytes, .. } => *bytes != written_by_the_successor(),
       ReplyBody::Refused { refusal } => matches!(refusal, Refusal::NotFound),
       _ => false,
     })
@@ -13108,7 +13110,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   assert!(
     answers
       .last()
-      .is_some_and(|answer| matches!(answer, ReplyBody::ReadBytes { .. })),
+      .is_some_and(|answer| matches!(answer, ReplyBody::ReadPage { .. })),
     "a read through the owner admitted again reached the successor's write: {answers:?}"
   );
   assert!(
