@@ -1009,6 +1009,13 @@ fn target_words(refusal: TargetRefusal) -> String {
       "the anchor's hold on the drive did not answer within its bound; the mount or its release waits on it".to_owned()
     }
     TargetRefusal::DetachPending => "a detach of this drive already waits for the anchor's release".to_owned(),
+    TargetRefusal::MountManagerNotAllowed => "this machine does not let WinFsp's driver make a Mount Manager drive: an \
+      Administrator allows it once with `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t \
+      REG_DWORD /d 1 /f`"
+      .to_owned(),
+    TargetRefusal::DriveLetterTaken => {
+      "the drive letter names another volume, on this machine or in the daemon's session".to_owned()
+    }
     TargetRefusal::TooLong { longest } => {
       format!("the path is longer than the {longest} bytes the daemon takes there")
     }

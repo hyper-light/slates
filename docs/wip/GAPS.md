@@ -759,7 +759,15 @@
 > the account the daemon runs as, which every client of a Windows daemon is, for owner and its primary group for group,
 > and the drive answers security queries with it, as NTFS reports a file its account made
 > (`what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`); three winfstest cases that ask for exactly
-> its access list pass and are struck (382 to 379). **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> its access list pass and are struck (382 to 379). **Then A-368 (the same day):** that access list granted Everyone,
+> and any account of any session could open the volume through its kernel name (`\\?\GLOBALROOT\Device\Volume{…}`)
+> with the mounting account's rights; it now grants the account, SYSTEM and the Administrators alone, and the mount's
+> purge marker (`another_account_cannot_open_a_file_on_the_drive`), and the three cases are listed again (382).
+> **Resolved 2026-11-18 by A-369, so no longer for Ada:** the drive is a Mount Manager drive WinFsp's driver makes for
+> the unprivileged daemon once the machine allows it (`MountUseMountmgrFromFSD`, set once by an Administrator), and
+> Windows resolves every file's final path on it, so git with its symbolic links on works there (WinFsp's memfs as a
+> standard account, diagnostics run 44344103821; option (b') below). What A-327 stated: on the drive, git with its
+> symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
