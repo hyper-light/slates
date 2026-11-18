@@ -468,8 +468,12 @@
 >   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
 >   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
 >   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
->   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
->   owner-shard task follow (g251's next change).
+>   piece). **Used by both takeover paths (A-397, the same day):** one owner-shard task makes a live log's or a placed
+>   seal's volume, its archive copied out (on the control shard), restored and its tree laid each a slice a turn, the
+>   volume being made held in `ShardState::making_volumes` and discarded on any end but its making; later attempts join
+>   it. Still owed: a live volume's layout as an archive (`live_ship::archive_of`, a turn: 0.05 to 0.16 s at 300 MB), the
+>   held manifest's decode and chunk list (a turn of the control shard, metadata-sized), and the first publication's
+>   whole entry (the item above).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
