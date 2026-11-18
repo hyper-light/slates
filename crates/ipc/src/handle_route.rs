@@ -393,6 +393,36 @@ fn denied_or_refused(call: &'static str) -> Result<bool, IpcError> {
   })
 }
 
+/// The creation time of the process `pid` (`GetProcessTimes`' 100-nanosecond count since 1601): with its id, it names one
+/// process for its whole life, since an id is given again only after its process has ended. What a Shards stream's
+/// held session keeps of the process a successor hands a fresh stream to (A-418, A-427), so a later process given the
+/// same id is never taken for it. Refused `OsRefused` where the process is gone or not this user's to query.
+pub fn process_started(pid: u32) -> Result<u64, IpcError> {
+  use windows_sys::Win32::Foundation::FILETIME;
+  use windows_sys::Win32::System::Threading::GetProcessTimes;
+  let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+  let unset = FILETIME {
+    dwLowDateTime: 0,
+    dwHighDateTime: 0,
+  };
+  let (mut created, mut exited, mut kernel, mut user) = (unset, unset, unset, unset);
+  // SAFETY: a live process handle opened with the limited query right, which `GetProcessTimes` accepts, and four of this
+  // frame's own values for the call to write; the status is checked before any is read.
+  let timed = unsafe {
+    GetProcessTimes(
+      process.as_raw_handle(),
+      &mut created,
+      &mut exited,
+      &mut kernel,
+      &mut user,
+    )
+  };
+  if timed == 0 {
+    return Err(os("GetProcessTimes"));
+  }
+  Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
 /// The process `pid`, opened with `access`. Refused `OsRefused` where it is gone or not this user's to open.
 fn open_process(pid: u32, access: u32) -> Result<OwnedHandle, IpcError> {
   // SAFETY: opens a process by id; a null handle is refused, and a granted one is owned below.
@@ -471,4 +501,23 @@ fn token_user(process: BorrowedHandle<'_>) -> Result<Vec<u64>, IpcError> {
     return Err(os("GetTokenInformation"));
   }
   Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A-427. Do: read this process's creation time twice, and that of process id zero, the idle process, which no one
+  /// opens. Expect: the same nonzero time both times, and zero refused `OsRefused`.
+  #[test]
+  fn a_processs_creation_time_names_it_for_its_life() {
+    let pid = std::process::id();
+    let first = process_started(pid).unwrap();
+    assert_ne!(first, 0);
+    assert_eq!(process_started(pid).unwrap(), first);
+    assert!(matches!(
+      process_started(0),
+      Err(IpcError::OsRefused { .. })
+    ));
+  }
 }

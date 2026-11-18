@@ -777,9 +777,11 @@
 >   `Resync` names the fresh end's handle in the stream's holder's process, where a successor duplicates it (A-175's
 >   route), since no descriptor rides a message there; and the Windows anchor's hold formats for it (A-423, the same
 >   day): a resync end is a kind of held entry of one handle, and a daemon replaces a held entry's record as the
->   stream's session moves; owed after them, the attach's half (the message-mode resync pipe, the anchor holding its
->   end with the session and the holder) and the successor's half (adopting the held end, the duplicate into the
->   holder, the replies kept for a resend). **Built since (A-402, 2026-11-18):** the write log on
+>   stream's session moves; and the attach's half (A-427, the same day): the message-mode resync pipe made at the
+>   attach, held by the anchor before the stream serves anything, its session and holder told before any reply that
+>   rests on them, its device end handed to the client beside the stream's. Owed after them: the successor's half
+>   (adopting the held end, the duplicate into the holder, the replies kept for a resend) and `slates shards`
+>   handing the resync end to its command. **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:

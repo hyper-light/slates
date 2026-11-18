@@ -143,7 +143,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
 /// took, so its exit is no failed start (A-311) (the same day). 12: `ShardsStream::resync`, the device's end of a Shards
 /// stream's resync channel, which `serve_shards` hands beside the stream's where the daemon makes one (Linux; macOS too
-/// since A-339, the type unchanged), none elsewhere and from the simulator (A-316; the same day). 13: signed merges
+/// since A-339, and Windows since A-427, the type unchanged), none from the simulator (A-316; the same day). 13: signed merges
 /// (A-321): `merge` sends its signature and answers how the daemon judged it, `merge_statement` (a
 /// [`MergeStatement`]), `approve_merge` carries the signature again (`MergeApproval::signature`), `merge_record` (a
 /// [`MergeRecord`], `Missing::Version`), `set_signers` and `signers` ([`TrustedSigner`]); a volume's policy may require
