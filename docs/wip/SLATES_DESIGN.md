@@ -31253,7 +31253,17 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   `green_chain_bytes` less the owner's own retention, none at boot, each settle taking its own retention then.
 - **Counters.** `merge.replica.sent`, `.full`, `.held`, `.over_budget`, `.applied`, `.refused`, `.left`, `.retired`,
   `.unheld`, `.not_carried`, `.stray` (`crates/server/src/green_replicas.rs`).
-- **Checks.** CHECKS_RESULT
+- **Checks.** On the Mac Studio (debug, r354, 2026-11-18): `cargo test --locked -p slates-server --lib green_replicas`
+  3 of 3 (`a_two_shard_daemons_green_gets_one_replica_on_the_other_shard_fed_to_its_owners_head`,
+  `a_one_shard_daemon_makes_no_replica`, `giving_the_owner_up_drops_no_reader`) and `cargo test --locked -p
+  slates-merge --lib` 16 of 16; `cargo clippy --locked -p slates-merge --all-targets -- -D warnings` clean; the same
+  for `slates-server` finds nothing in this change and fails at six sites of main's own (`fleet.rs` `make_in_turns`,
+  `verbs.rs` `attach`, a type in `verbs.rs` beside `publish_delta_into`, `publish_delta_into`, a `live_ship.rs` test
+  closure, a `verbs.rs` test's `unwrap`), filed for main; rustfmt's layout taken. The first run held no replica: the
+  shard's budget alone names no room before its arena grows from its pool (A-98), so every replica was refused for its
+  budget; the room is the store's (`Store::admittable`), and a charge grows the arena first. Red with a given-up engine
+  dropped at once: `giving_the_owner_up_drops_no_reader` fails (the engine never retires), and the process-wide
+  `dropped_with_readers` reads 1 in the other two-shard test.
 - **Owed.** Step 5b: a work's rebases and named-version reads served from its shard's replica, and a refused or
   evicted replica's routed to the owner, counted; then an idle replica's give-back; then the supervisor's A/B at 1,000
   clients and more. Main's runs: the server's green suites and the merge crate whole.

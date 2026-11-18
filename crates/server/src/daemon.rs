@@ -3863,7 +3863,10 @@ impl Daemon {
   fn give_back_replicas(&self) {
     for shard in &self.shards {
       if let Err(error) = self.observe(Some(*shard), crate::green_replicas::close) {
-        slates_machine::log_line!("slates-server: stopping: shard {} gives back no replica: {error}", shard.0);
+        slates_machine::log_line!(
+          "slates-server: stopping: shard {} gives back no replica: {error}",
+          shard.0
+        );
       }
     }
     let started = slates_machine::clock::monotonic_ns();

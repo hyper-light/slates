@@ -47,7 +47,9 @@ use slates_db::catalog::VolumeId;
 use slates_mem::sealed::{Left, Passed};
 use slates_merge::chain_entry::{Applied, Signature};
 use slates_merge::engine::{Green, Increment};
-use slates_merge::replica::{Fed, FeedMessage, Replica, ReplicaRefusal, held_limit, replica_budget};
+use slates_merge::replica::{
+  Fed, FeedMessage, Replica, ReplicaRefusal, held_limit, replica_budget,
+};
 
 use crate::state::{self, ShardState};
 
@@ -210,7 +212,11 @@ fn send(state: &mut ShardState, target: u16, message: Message) {
 /// a message for this shard is handled here, and the rest are sent again.
 fn settle_owed(state: &mut ShardState) {
   let owed = OWED
-    .try_with(|owed| owed.try_borrow_mut().map(|mut owed| std::mem::take(&mut *owed)))
+    .try_with(|owed| {
+      owed
+        .try_borrow_mut()
+        .map(|mut owed| std::mem::take(&mut *owed))
+    })
     .ok()
     .and_then(Result::ok)
     .unwrap_or_default();
@@ -480,7 +486,12 @@ fn charge(state: &mut ShardState, bytes: u64) -> bool {
 }
 
 /// Sends `left`, a replica's registration, home to its owner.
-fn give_home(state: &mut ShardState, (green, install): (VolumeId, u64), owner: u16, left: Option<Left>) {
+fn give_home(
+  state: &mut ShardState,
+  (green, install): (VolumeId, u64),
+  owner: u16,
+  left: Option<Left>,
+) {
   if let Some(left) = left {
     let from = state.shard;
     send(
@@ -546,7 +557,10 @@ fn recharge(state: &mut ShardState, green: VolumeId) -> bool {
   let (bytes, charged) = (metadata_charge(&held.replica), held.charged);
   held.charged = bytes;
   if bytes <= charged {
-    state.store.budget.credit_replicated(charged.saturating_sub(bytes));
+    state
+      .store
+      .budget
+      .credit_replicated(charged.saturating_sub(bytes));
     return true;
   }
   if charge(state, bytes.saturating_sub(charged)) {
@@ -566,7 +580,12 @@ fn give_back(state: &mut ShardState, green: VolumeId) {
     return;
   };
   state.store.budget.credit_replicated(held.charged);
-  give_home(state, (green, held.install), held.owner, held.replica.leave());
+  give_home(
+    state,
+    (green, held.install),
+    held.owner,
+    held.replica.leave(),
+  );
 }
 
 /// A replica's shard gives back the replica of `green` its owner asks to leave.
@@ -594,7 +613,11 @@ fn acknowledged(state: &mut ShardState, (green, install): (VolumeId, u64), passe
 fn left_home(state: &mut ShardState, (green, install): (VolumeId, u64), from: u16, left: Left) {
   state.count(LEFT, 1);
   let replicas = &mut state.green_replicas;
-  if let Some(fed) = replicas.fed.get_mut(&green).filter(|fed| fed.install == install) {
+  if let Some(fed) = replicas
+    .fed
+    .get_mut(&green)
+    .filter(|fed| fed.install == install)
+  {
     fed.shards.remove(&from);
     if let Some(engine) = state.greens.get_mut(&green) {
       engine.leave_replica(left);
@@ -691,7 +714,8 @@ mod tests {
       green: id,
       name: local_name(state, &format!("{name}-work")),
     };
-    let ReplyBody::WorkCreated { id: work, .. } = crate::verbs::dispatch(state, 1, &owner, work) else {
+    let ReplyBody::WorkCreated { id: work, .. } = crate::verbs::dispatch(state, 1, &owner, work)
+    else {
       panic!("the work was not created");
     };
     for version in 0..versions {
@@ -746,8 +770,17 @@ mod tests {
   }
 
   /// The replica of `green` held on `state`, its head and identity, when it is at `head`.
-  fn held_at(state: &mut ShardState, green: VolumeId, head: (u64, [u8; 32])) -> Option<(u64, [u8; 32])> {
-    let replica = state.green_replicas.held.get_mut(&green)?.replica.green_mut();
+  fn held_at(
+    state: &mut ShardState,
+    green: VolumeId,
+    head: (u64, [u8; 32]),
+  ) -> Option<(u64, [u8; 32])> {
+    let replica = state
+      .green_replicas
+      .held
+      .get_mut(&green)?
+      .replica
+      .green_mut();
     let at = (replica.head(), replica.head_identity());
     (at == head).then_some(at)
   }
@@ -772,7 +805,11 @@ mod tests {
       (green, head, engine.replicas_registered(), fed)
     });
     let other = crate::daemon::observe_at(&daemon, 1, |state| state.shard);
-    assert_eq!((registered, fed), (1, vec![other]), "one replica, on the other shard");
+    assert_eq!(
+      (registered, fed),
+      (1, vec![other]),
+      "one replica, on the other shard"
+    );
     let held = eventually(&daemon, 1, move |state| held_at(state, green, head));
     assert_eq!(held, Some(head), "the replica is fed to the owner's head");
     let counted = crate::daemon::observe_at(&daemon, 1, |state| {
@@ -784,7 +821,11 @@ mod tests {
     assert_eq!(counted.0, Some(1), "held once");
     assert!(counted.1 >= 2, "both versions applied: {counted:?}");
     daemon.stop();
-    assert_eq!(slates_mem::sealed::dropped_with_readers(), 0, "no owner dropped with a replica registered");
+    assert_eq!(
+      slates_mem::sealed::dropped_with_readers(),
+      0,
+      "no owner dropped with a replica registered"
+    );
   }
 
   /// A-457, R8. Do: on a one-shard daemon, create a green and submit a version. Expect: no replica: the owner fed no
@@ -794,7 +835,11 @@ mod tests {
     let seen = crate::daemon::audit_on_shard(|state| {
       let green = green_with_versions(state, "alone", 1);
       (
-        state.green_replicas.fed.get(&green).map(|fed| fed.shards.len()),
+        state
+          .green_replicas
+          .fed
+          .get(&green)
+          .map(|fed| fed.shards.len()),
         state.greens.get(&green).map(Green::replicas_registered),
         state.refusals.get(SENT).copied(),
       )
@@ -835,6 +880,10 @@ mod tests {
     });
     assert!(!still_held, "the destroyed green's replica was given back");
     daemon.stop();
-    assert_eq!(slates_mem::sealed::dropped_with_readers(), 0, "no owner dropped with a replica registered");
+    assert_eq!(
+      slates_mem::sealed::dropped_with_readers(),
+      0,
+      "no owner dropped with a replica registered"
+    );
   }
 }
