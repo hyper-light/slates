@@ -2128,6 +2128,19 @@
 >     node, the non-vacuity count (a read is judged once it was sent after its write's acknowledgement, which the
 >     stream publishes as it goes, `NewestAcknowledged`). Agreement is named for what it is, the models' TotalOrder
 >     judged over every copy that answers rather than the committed ones alone.
+>   - A seeded nemesis (2026-11-17, `a_seeded_nemesis_of_single_faults_keeps_every_register_invariant`): fourteen
+>     single faults drawn from the flow's seed (`SLATES_CHAOS_SEED` replays it), each of seven kinds as likely: every
+>     path lossy (one of the lossy profiles), one node slowed 200 ms ± 50 ms, one link severed both ways (a partition
+>     that is not transitive: its two ends each still hear the third node), or one node stopped, cut off, deafened or
+>     muted. The struck node is the owner as often as either candidate, each fault is held 200 ms to 4 s (a blip under
+>     the 900 ms horizon up to past detection and confirmation, so a takeover may finish, or still run, as it ends), and
+>     once a run the owner is partitioned until it is taken over. Reads go through every node while each fault lasts,
+>     and the fleet must recover whole before the next (members seated, no voter change in flight, neighbourhoods
+>     settled, one node shipping, every copy caught up past the owner's durable head), so no cohort loses two members,
+>     and the stream, forwarded once another node owns the volume, must make more writes durable meanwhile.
+>     It ends with Agreement, NoLoss on the last owner, every copy fenced at its epoch, ReadSafety, Convergence and a
+>     write through the last owner, and with Continuity judged from the samples (no head shipped under a fence below
+>     what an earlier fence made durable), since its takeovers are unscheduled. Its first runs are the supervisor's.
 >   - The client side of StaleNeverCommits in the owner-partition flows is now every write sent to the old owner while
 >     it was partitioned refused. Until 2026-11-17 the SIGSTOP flow refused every write sent after the resume instead,
 >     but a re-admitted old node forwards a write to the volume's owner (§4.8 "Lookup"), so an acknowledgement through
