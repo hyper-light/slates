@@ -42,7 +42,16 @@ fn main() -> ExitCode {
   (`anchor_command_under(&wrapper)`, with `wrapper` the `OsStr` words of `systemd-run --user --scope
   --`, runs it under a wrapper that execs it, keeping the launcher's secret on its standard input),
   for example under its service manager so the instance outlives the host's process. Such a host
-  waits with `Instance::wait_for(name, None, Some(deadline))`.
+  waits with `Instance::wait_for(name, None, Some(deadline))`; one that holds the anchor's child
+  waits with `Instance::wait_for(name, Some(&mut child), None)` and needs no deadline: the wait lasts
+  while the anchor lives, and the anchor judges its starting daemon by its progress, never by a
+  second (A-366).
+- `StartSpec::until_served()` asks the anchor to stop when its daemons crash-loop before any of
+  them has served: the instance never answered, so no client can be waiting on it, and the wait ends
+  `StartFault::NeverServed` (the anchor exits `role::EXIT_NEVER_SERVED`, 5) instead of lasting while
+  the anchor loops on them. For a host that has attached nothing yet, as kiln's own start of its
+  machine's instance. Once a daemon has served, an anchor never gives its instance up (A-119), asked
+  or not.
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
   on Windows. The instance's volumes live in its memory, so they go with it.
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can

@@ -1413,6 +1413,84 @@ fn a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_ho
   );
 }
 
+/// Shape: the positions of one ledger the per-position test holds, one publication each: enough that a delta carrying
+/// the whole ledger would carry tens of times what one position is.
+const LEDGER_POSITIONS: u64 = 64;
+
+/// §4.8 "persistence before reply", A-367: a holder of a green keeps every version's merge record, a ledger that is
+/// never compacted, and publishes before it acknowledges each; what that publication carries must be the record it
+/// acknowledges, never the ledger it already carries. Do: hold [`LEDGER_POSITIONS`] records of one ledger register (a
+/// merge record's class byte, so no position is compacted) at its next sequence each, through the holder's production
+/// path, reading after each the held bytes its publication's delta carried; then restart the daemon warm over the same
+/// anchor. Expect every delta after the first to carry the same bytes (the register's head and the one position; a hold
+/// a checkpoint published carries none in a delta), and every position held after the restart at its sequence. Before:
+/// the register was one piece, so each delta carried every position held, and a green's commit at `f > 0` grew by a
+/// position's bytes a version (about 10 µs a version in a debug build, `a_submit_late_in_a_greens_history_...`).
+#[test]
+fn a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-held-ledger-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("held-ledger", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let owner = first.member_identity().unwrap();
+  let ledger = ObjectId::new(HostId(owner.0), 1);
+  let carried = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("publish.delta_held_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut per_hold = Vec::new();
+  for sequence in 1..=LEDGER_POSITIONS {
+    let before = carried(&first);
+    let mut value = vec![slates_server::catalog::MERGE_CLASS];
+    value.resize(HELD_VALUE_BYTES, u8::try_from(sequence % 251).unwrap());
+    let record = Record {
+      owner,
+      object: ledger,
+      sequence,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value,
+    };
+    let reply = first.hold_record_as_authorized(owner, record).unwrap();
+    assert!(!reply.is_empty(), "position {sequence} acknowledged");
+    per_hold.push(carried(&first).saturating_sub(before));
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let held_after = second.fleet_held_positions(ledger);
+  second.stop();
+  let deltas: std::collections::BTreeSet<u64> = per_hold
+    .iter()
+    .skip(1)
+    .copied()
+    .filter(|bytes| *bytes > 0)
+    .collect();
+  assert_eq!(
+    deltas.len(),
+    1,
+    "every delta after the first carries the register's head and one position, whatever the ledger holds: {per_hold:?}"
+  );
+  assert_eq!(
+    held_after.map(|positions| positions
+      .into_iter()
+      .map(|(sequence, _)| sequence)
+      .collect::<Vec<_>>()),
+    Ok((1..=LEDGER_POSITIONS).collect::<Vec<_>>()),
+    "every acknowledged position is held after a warm restart"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two

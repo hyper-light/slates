@@ -5422,6 +5422,14 @@ all: it is no one's neighbour, holds nothing, and may know as a voter only the m
 state names the voters of its own join. So it held no record session and its learner, which fetches over those, never
 learned the configuration that admits it (live_chaos's fresh-member flow, 2 of 48 runs at one CPU, 2026-11-09; both of
 main's first gated runs, 2026-11-18). A retired member kept only its old neighbours, by the placement it last installed.
+A pair's canonical dialer, its lower anchor, also keeps contact with a peer that holds a record session it dialed to it
+(A-337): a peer dials and keeps one only while its own rule keeps this node, and the pair's plane is keyed only from the
+lower anchor's side, so that side follows the peer's demand whatever its own view says. Each role rule is kept from both
+sides only while both hold the same view, and a learner's voters can be stale (a seat change moves no configuration
+version, so no learner fetches on it, and a learner answered by another learner takes that one's voters): a learner, the
+pair's lower anchor, dropped a voter that kept it, and the pair was never keyed (fleet test
+`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, 2026-11-18).
+Only the lower anchor follows a session, so no two nodes keep each other by their sessions alone.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -7224,6 +7232,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > that main's own spread can show at the median: 65–79 µs, against main's 65–76 µs and the whole image's 207–225 µs
 > (BENCHMARKS). Still carried whole when changed: the content hold's image and the mirror records.
 >
+> **A held register is a head and its positions (2026-11-18, A-367; image version 29).** A held register was one piece
+> holding every position its acceptor kept, and a green's register on its holders is a ledger, never compacted: each
+> version's acknowledgement re-encoded and re-wrote every version the holder kept, so a commit at `f > 0` grew by a
+> position's bytes a version. Now a register is a head piece (its authority, fence and moved-from owner) and a piece per
+> accepted position, keyed by its sequence; a holder's acceptor keeps which positions it accepted or dropped since its
+> last committed publication (`Acceptor::tracking_changes`), and a delta carries the head and those positions only. An
+> acceptor whose changes do not account for its positions against what was published (one put in place of another) is
+> carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
+> chunk, at each publication that changed it) and the mirror records.
+>
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
 > - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
@@ -7310,7 +7328,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > turn's messages dispatched before the next; a turn the shard does not answer ends the walk, and the period sends the
 > rest. Counted `fleet.live.reached_slices`. Held by `a_holders_return_is_walked_in_turns_and_it_takes_every_log`
 > (`crates/server/tests/fleet.rs`: 12 live volumes, a holder held off its shard for two liveness budgets while each is
-> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume). Owed
+> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume; held again,
+> up to four times, until the owner has dialed the holder afresh, since an owner judging its lanes in its own time under
+> load need not end the link in one hold: "0 turns for 12 volumes" under a full suite, 2026-11-18). Owed
 > (measurement): the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
 > Until A-347 the turns over the control shard's own volumes ran in one poll (an inline call; `xshard::Turns`, §4.10's
 > A-347 status): the measurer's longest steps of at most 12.0 and 42.0 ms over 1,000 and 4,000 volumes grew with the
@@ -7425,10 +7445,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
 >   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
 >   until a write, its holders keep the old chain, which holds every write acknowledged before the restart. Across real
->   processes (2026-11-18): `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
->   (`crates/cli/tests/live_fleet.rs`, three anchored daemons: the owner killed and replaced by its anchor, a write
->   through it, then the owner killed whole; a survivor serves every file, and the owner's head after the restart's
->   write is past its head before it). Owed: its first run (the integrator's lanes).
+>   processes the owner's case is held by `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
+>   (`crates/cli/tests/live_fleet.rs`; written twice on 2026-11-18 and kept as one flow): five writes, the owner's
+>   daemon killed and replaced by its anchor, five more through it, each given the fleet wait, the owner killed whole
+>   (its anchor stopped first); the restarted log ends past the head shipped before plus the writes since, and a
+>   survivor serves all ten files (4 of 4 on a Mac Studio, heads 4 then 10 or 11). With the restarted log begun again
+>   at genesis the first write through it is never answered, its log at head 0 with nothing durable.
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
@@ -7911,7 +7933,14 @@ command and every host start, mount and grant through one implementation.
   prefix and `--instance NAME`, and a host finds exactly its own instance's processes. The start
   waits for the first answer at the anchor's heartbeat cadence while the anchor lives, and makes
   the group of an instance run alone; a host that launches the anchor under its service manager
-  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
+  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`, while the
+  anchor lives when it holds the anchor's child and by a deadline of its own when it does not. A
+  starter that has attached nothing yet asks `StartSpec::until_served` (A-366): an anchor whose
+  daemons crash-loop before any of them has served (none reached its serving mark,
+  `Supervisor::ever_served`) stops, exit 5, and the wait ends `StartFault::NeverServed`, since no
+  client could be waiting on an instance that never answered; an anchor that has served once never
+  gives its instance up (A-119), asked or not. So no host bounds its wait by a second it picked,
+  which a slow start under load outlasts (kiln's 30 s at load 28, 2026-11-18). The starter
   is the launcher: under Ada's rule of 2026-11-18 (A-285 as revised, A-299) write permission
   follows each agent's mode and the launcher's authority is the instance's issuer, which the start
   is to hand its starter on every platform (owed; today the starter holds it where the anchor's
@@ -8079,7 +8108,7 @@ it builds against the contract and adds to it rather than around it.
 > on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
 > versions (the work's base beside the head), replacing what the crate reads from text or asks
 > again (typed audit and grant states are built, piece 6). **Lists a page at a time (A-263 to A-267, goal g247,
-> `CONTRACT` = 23):** every
+> `CONTRACT` = 24):** every
 > list the daemon answers a reply at a time is read through the contract a page at a time — `Page { items, next }`
 > from `Instance::{list_page, grants_page, audit_page, changed_since_page}`, an overlay's `DriftPage` from
 > `drift_page` — or whole (`list`, `grants`, `audit`, `changed_since`, `drift`); a status's `DriftReport` counts what
@@ -26606,6 +26635,98 @@ the SID a token buffer points at, the drive's SDDL), `host.rs` (`drive_security_
   form) and hostile bytes (empty, a cut header, another revision, sixteen sub-authorities, a cut sub-authority), on
   every host.
 
+### A-337 — A pair's canonical dialer keeps direct contact with a peer that holds a record session it dialed to it (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 direct contact and learners; amends the 2026-10-10 rule that contact is kept from both sides)
+
+- **What was there.** A pair's probe plane is keyed by an epoch only its lower anchor announces, over the record session
+  it dials, so a pair forms its probe mesh only if the lower anchor keeps direct contact with the higher. The role rule
+  keeps contact from both sides (`Neighbour` and `Holder`, `Voter` and `AsVoter`) only while both sides read the same
+  configuration and voters. A learner's voters can be stale: a seat change is a Raft configuration entry that moves no
+  configuration version, so no learner fetches on it, and a learner answered by another learner takes that one's known
+  voters. In g251's diag run 44262759484 (ubuntu, 2026-11-18) the fixture of
+  `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` failed its formation wait at 49 to 50
+  periods: voter c held learner e `AsVoter keyed=None canonical=Some(false)`, and e, the pair's lower anchor, held c
+  `OutsideNeighbourhood keyed=None canonical=Some(true)`. c dialed e and kept that session; e never dialed c; the pair
+  was never keyed.
+- **The rule.** A node keeps direct contact with a peer whose anchor is above its own (it is the pair's canonical dialer)
+  while it serves a record session that peer dialed to it (`fleet::direct_contact`'s `Dialed`; `ShardState::dialed_in`,
+  counted by a guard in `fleet::serve_peer_records` for the session's life). A peer dials and keeps a session only while
+  its own rule keeps this node, so the pair is keyed whenever either side's rule keeps it.
+- **Why only one side.** If both sides followed each other's sessions, two nodes whose rules both dropped the pair would
+  keep each other for good, each on the other's session. Only the lower anchor follows, and the higher anchor's contact
+  never rests on the lower's dial, so contact ends once the higher side's rule drops the pair.
+- **What it costs.** At most one record session and one probe pair more per peer whose rule keeps a node its own rule
+  drops: the mesh stays within the O(N·k) sessions and O(N·v) voter sessions of the 2026-10-10 rule.
+- **Not done here (open, GAPS).** The learner's stale voters themselves: the voters are not part of the versioned
+  configuration a learner fetches, so a learner can report to, and stay away from, the wrong council for as long as no
+  configuration commits.
+
+Applied in the same change to: §4.8 (learners and direct contact), GAPS, `crates/server/src/fleet.rs`,
+`crates/server/src/state.rs`, `crates/server/src/daemon.rs` (the state's initializer and the test
+`the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it`) and the bug record
+`docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
+
+### A-366 — A host waits on its anchor while it lives; an anchor its starter asked stops when none of its daemons ever served (2026-11-18, kiln goal g264; §4.12 "Embedding", §2.6 step 1, A-119, A-232, A-278)
+
+- **What was wrong.** A starter that held the anchor's child still bounded its wait by a second it picked: kiln's
+  start of its machine's instance waited 30 s (`UP_WAIT`), and a slow start under load outlasted it (kiln's
+  `slates_roles` test, Mac Studio at load average 28 during a parallel build, 2026-11-18: "the anchor didn't answer
+  within 30s"; passed at load 16-18 in 24-27 s). Without a deadline the wait could last for good: an anchor never gives
+  its instance up (A-119), so a daemon that cannot start is restarted after a backoff forever, and the starter sees
+  nothing but "no rendezvous yet".
+- **The rule.** The anchor already judges its starting daemon by the daemon's own CPU progress, never a second (A-232),
+  so a host that holds the anchor's child waits while the anchor lives (`Instance::wait_for(name, Some(child), None)`).
+  A starter that has attached nothing yet asks `StartSpec::until_served` (handed to the anchor as the environment word
+  `SLATES_UNTIL_SERVED`, as the launcher's record is): an anchor none of whose daemons has reached its serving mark
+  (`layout::SUP_SERVING`; `Supervisor::ever_served`, which also sees a daemon that marked and died at its exit step)
+  stops at their crash loop (two failed starts in a row, A-311), exit `role::EXIT_NEVER_SERVED` (5), and the wait ends
+  `StartFault::NeverServed`. No client can hold a mount on an instance that never answered, which is what A-119
+  protects; an anchor that has served once never gives its instance up, asked or not. CONTRACT 23.
+- **What remains.** The serving mark comes right after the daemon's start returns, so a client that attached during
+  the start of a daemon that then died before marking is the one case the rule cannot see; a starter that asks makes
+  no mount before its own wait and first call succeed, as kiln does.
+- **Applied in the same change to** `crates/anchor/src/supervise.rs` (`ever_served`), `crates/api/src/start.rs`
+  (`StartSpec::until_served`, the wait's mapping, the module doc), `crates/api/src/error.rs`
+  (`StartFault::NeverServed`), `crates/api/src/role/{mod,anchor}.rs` (`EXIT_NEVER_SERVED`, `Failure::NeverServed`, the
+  stop), `crates/api/src/lib.rs` (CONTRACT 23), `crates/cli/src/main.rs` (the command's mapping, exit 5), §4.12
+  "Embedding", `docs/library.md`; tests `crates/anchor/tests/anchor.rs` (the two crash-loop tests say whether a
+  daemon served) and `crates/api/tests/start.rs`
+  (`an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves`).
+
+### A-367 — A holder publishes each register position once: a held register is a head piece and a piece per accepted position, and a delta carries the head and the positions accepted or dropped since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 29)
+Applied in the same change to: §4.8 (A-270's status: "A held register is a head and its positions"), GAPS (the load
+test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::tracking_changes`, `changes`,
+`clear_changes`, `position`, `positions`, `position_count`, `persisted_head`), `crates/server/src/content_holder.rs`
+(`HeldPosition`, `KIND_REGISTER_POSITION`, `register_head_piece`, `position_piece`, `register_changes`, `changes_cover`,
+`registers_committed`, `join_positions`, `PublishedHeld::registers`, `HeldRefused::PositionWithoutHead`),
+`crates/server/src/fleet.rs` (`hold_checked_record` makes a tracking acceptor), `crates/vfs/src/recover.rs`
+(`IMAGE_VERSION` 29), `Daemon::fleet_held_positions` (test support), and the tests below.
+- **What was there.** A-270 made what a shard holds for other owners keyed pieces, one per held register, so a delta
+  carried the registers marked changed. A register's piece was its acceptor's whole persisted state, every accepted
+  position. A green's merge register on its holders is a ledger (`Acceptor::compact_below` keeps a successor's every
+  version), and a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+  re-wrote every version the holder kept. On the Mac Studio, a debug build, three nodes at `f = 1`, the median submit of
+  the last 50 of 300 was 4.3 to 7.1 ms against 1.9 to 3.6 ms for the first 50 (about 10 µs a version), and at the goal's
+  300,000 versions a version's publication would be about 60 MB of positions on each replica.
+- **The rule.** A held register is a head piece, its object's authority, fence and moved-from owner, and a piece per
+  accepted position, keyed by the position's object and sequence. A holder's acceptor keeps which positions it accepted
+  (new, or again at a newer epoch) and which it dropped (compacted, forgotten) since its last committed publication; a
+  delta carries the head of every register the tracked map marked and those positions; a register dropped whole has its
+  head and every published position removed, from the positions the shard knows it published. A position held but
+  neither written since nor published cannot be, since tracking counts what an acceptor holds as written when it begins
+  and a recovery clears it only because the image it was rebuilt from carries every position; so an acceptor whose
+  changes do not account for its positions against what was published (one put in place of another under the same
+  object) is carried whole, as its pieces.
+- **Tests.** `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger`
+  (`crates/server/tests/recovery.rs`: 64 positions of one ledger held through the production path, then a warm
+  restart). Kiln r3432 on the Mac Studio, 2026-11-18, debug build: on main's code each delta carried every position held,
+  2,165 bytes at the second position and 67,885 at the sixty-fourth (32 deltas, 32 sizes); with this change every delta
+  carried one size, and all 64 positions were held after the restart. The held-pieces oracle (`folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`,
+  `daemon.rs`) now grows registers a position at a time, accepts again at a newer epoch, compacts and replaces them;
+  `a_tracking_acceptor_names_every_position_written_or_dropped_since_its_last_clear` (`slates-db`).
+- **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
+  compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
+  growth, in the content's bytes.
+
 ### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
 Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,
 `Listed { volumes, next }`), `crates/server/src/verbs.rs` (`list_part`, `list_page`, `longest_listable_name`,
@@ -26736,8 +26857,8 @@ Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/prot
 dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`; and
 since 2026-11-17 to `crates/server/src/{verbs,landing,merge_service,state,snapshot_view,transports}.rs` (the carried
 lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base.rs` (`drift_page`,
-`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 23 to
-26), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
+`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 24 to
+27), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
 `docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`.
 - **Status stays one reply:** it carries the first drifted entries that fit beside its other fields and counts the rest.
 - **A paged read:** `Drifted` from a position, an entry too long for any page passed over and counted. Since the drift
@@ -26757,7 +26878,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   page together. Held to `status` over the simulated host by an oracle (pages of 1, 3 and 64 inodes, the slice spent
   after every visit, every second, or never; replaced, removed and refused entries)
   (`a_drift_walk_a_page_at_a_time_lists_what_a_status_lists`). `slates-api`'s `drift_page` reads past an inode and
-  `drift` answers its lists in path order (`CONTRACT` = 26).
+  `drift` answers its lists in path order (`CONTRACT` = 27).
 - **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
   the count. Both SDKs read the whole drift with `drifted(volume)` (2026-11-17, goal g247): typed entries (`path`,
   `kind`), the unverified paths and the oversized count.
@@ -26775,7 +26896,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   budget, which counted each mount's path and not its whole encoding (twelve bytes more). The mounts were never a
   refusal: a partition holds a bounded number of attachments (`PartitionCaps::attachments`), and the 400-mount test met
   that bound before any status (corrected 2026-11-18). The client, the CLI, MCP, both SDKs and `slates-api` carry the
-  counts (`CONTRACT` = 24:
+  counts (`CONTRACT` = 25:
   `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
   and counts no conflict).
 - **A merge verdict's windows (2026-11-17, goal g247):** `Submitted` and `Rebased` carried every conflict window and
@@ -26793,7 +26914,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   id (2026-11-18). The client walks them,
   synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
   `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
-  `Stale::Verdict` (`CONTRACT` = 25).
+  `Stale::Verdict` (`CONTRACT` = 26).
 - **A name every reply holds (2026-11-18, goal g247):** A-263 bounded a new volume's name by the listing alone (4,012
   bytes). A status names the volume beside its transports, journal, loss window and mounts, so a volume under such a
   name was listed and its status refused "reply too large for the bulk area" (reproduced by use,

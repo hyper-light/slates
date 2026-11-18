@@ -24,6 +24,25 @@
 > in order, its regeneration behind `--ignored`), and the completion record framed with its reply's schema hash, so a
 > record of another schema is refused typed rather than read as another reply. g262 (the contract's owner) told.
 
+> **A learner, the pair's lower anchor, dropped a voter that kept it, and the pair's probe mesh never formed: fixed
+> (2026-11-18, A-337, §4.8; goal g225).** `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`
+> failed its fixture's formation wait once in g251's diag run 44262759484 (ubuntu, 2026-11-18; 49 to 50 periods after the
+> initial consensus settled in 0.83 s): voter c kept learner e (`AsVoter`), e dropped c (`OutsideNeighbourhood`), and e
+> was the pair's lower anchor, the only side whose dial keys the pair's plane. The role rule is kept from both sides
+> only while both read the same voters, and a learner's can be stale. Fixed: the pair's canonical dialer keeps a peer
+> that holds a record session it dialed to it (`DirectContact::Dialed`, `ShardState::dialed_in`). Test:
+> `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it` (`crates/server/src/daemon.rs`). Bug record:
+> `docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
+> - **Open: a learner's voters are not versioned.** A seat change is a Raft configuration entry that moves no
+>   configuration version, so a learner never fetches on it, and a learner answered by another learner takes that one's
+>   known voters. A learner whose stale voters omit the leader sends its reports (which only the leader proposes) to
+>   members that are not it, and the reports are answered `NotLeader` until a configuration commits. The principled fix
+>   carries the voter set inside the versioned configuration a learner fetches (a format change of the regional
+>   configuration's encoding; for Ada's design review).
+> - **Owed (the supervisor's):** the learner tests' rate on the diag lanes once this lands
+>   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
+>   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
+
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
 > fresh-member flow (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`) kills the bootstrap voter of five
@@ -184,8 +203,17 @@
 > `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart`,
 > `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`). Bug
 > record `docs/bugs/2026-11-18-a-live-log-forked-at-its-owners-warm-restart.md`.
-> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix, and an owner-restart flow across real
->   processes (`kill -9` under the anchor, writes before and after, then the owner's loss).
+> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix.
+> - **Written (2026-11-18): the owner-restart flow across real processes**,
+>   `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor` (`crates/cli/tests/live_fleet.rs`, gated
+>   on `SLATES_TEST_CLI=1`; landed first with one write after the restart, 63b31d5b3, then made one flow with g229's). Three anchored processes; five files written through the owner; its daemon `kill -9`ed and
+>   replaced by its anchor; five more through the restarted owner, each given the fleet wait to be answered; then the
+>   owner killed whole. The flow requires the daemon replaced, the restarted log's head past the head shipped before
+>   plus the writes made since (each write is its own entry, so a log begun again at genesis ends at their count), and a
+>   survivor serving all ten files. On a Mac Studio (release, 2026-11-18) it passed 4 of 4, heads 4 then 10 or 11, 3.9
+>   to 6.1 s a run. Red with a restarted owner's log begun again at genesis (`Start::Resumed` taken for `Start::New`): the
+>   first write through the restarted owner was never answered, the log at head 0 with nothing durable and owed (with
+>   no bound on that write, the run held 23 minutes until killed; the flow now fails it at the fleet wait).
 > - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
 >   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
 >   on the owner alone until then.
@@ -355,6 +383,21 @@
 >   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+>   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
+>     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
+>     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
+>     steps (which function, owed: the trace asked of the measurer). g251 slices the takeover's rebuild and restore.
+>   - **Plan (g230's item 3, not built):** capture the whole body in the publication's turn (`whole_record` and
+>     `content_runs`, a memcpy, about a tenth of the seal), then seal its pieces (`seal_body` already seals
+>     MAX_CHUNK_BYTES pieces independently) on a task of the owner shard driven through `xshard::Turns`, a quantum a
+>     turn, yielding between; queue the publications made meanwhile behind it, bounded by the credit; append the whole
+>     entry, then the queue in order, positions assigned at append as today (no Shipper or model change). Durability
+>     targets (`durable_target`, `owed_position`) count the pending whole (head + 1) and each queued publication after
+>     it; a fence or a destroy drops the build and refuses its waiters as today; A-344's kept position is unchanged (no
+>     entry ships before it is appended, so a restart mid-build resumes past it and owes a whole entry). Install images
+>     (`refresh_image`) the same way. Test: a live volume whose whole entry is sealed a piece a turn under an injected
+>     quantum, writes made during the build answered in order and served whole after a takeover; red with the seal in
+>     one turn (one turn counted).
 > - **Owed (found by the measurer, 2026-11-18, Mac Studio, main 1eca77263):** at a GiB seal the owner's longest step,
 >   230 to 272 ms in 4 runs, is one step after the wrap ends (the envelope's completion or the first content round's put,
 >   not yet told apart), about a quarter of a millisecond a MiB: a seal of about 4 GiB would reach the watchdog's
@@ -595,7 +638,7 @@
 > typed landing and merge conflicts; typed provisioning (`VolumeSpec` over each source), status and drift; one closed
 > `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 2
 > (2 adds `Denied::Policy`, where A-285's `Refusal::PolicyForbids` maps outside a landing or a merge).
-> **Built (goal g247, A-263 to A-267, `CONTRACT` = 23 to 26):** every list a page at a time — `Page { items, next }` from
+> **Built (goal g247, A-263 to A-267, `CONTRACT` = 24 to 27):** every list a page at a time — `Page { items, next }` from
 > `list_page`, `grants_page` and `audit_page` (typed records, piece 6) and `changed_since_page`, an overlay's typed
 > `DriftPage` from `drift_page`; `drift` reads every entry, and `DriftReport::elided` counts what a status could not
 > carry.
@@ -2590,6 +2633,20 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
+> one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
+> compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+> re-wrote the holder's whole ledger, and a commit at `f > 0` grew by a position a version (Mac Studio, debug build:
+> `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`'s late medians 4.3 to 7.1 ms against early
+> 1.9 to 3.6 ms over 300 versions; at the goal's 300,000 versions about 60 MB a version on each replica). Now a register
+> is a head piece and a piece per accepted position, and a delta carries the positions a holder's acceptor accepted or
+> dropped since its last committed publication (`Acceptor::tracking_changes`; image version 29). Test:
+> `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger` (`crates/server/tests/recovery.rs`):
+> on main's code a delta carried 2,165 bytes at the second of 64 positions and 67,885 at the last; now one size each
+> (kiln r3432, Mac Studio). The timing test's late medians stayed 4.4 to 6.4 ms against early 2.0 to 2.4 ms, so the rest
+> of the growth is elsewhere; still open, the same growth in the content's bytes: the content hold's image is one piece, every manifest and chunk a
+> holder keeps, recomputed and compared at each publication and re-put whole when it changed, which is every version.
+>
 > **Fixed 2026-11-18 (g232, A-333): losing the primary of a kernel-sized green lost the green.** The takeover successor
 > rebuilt the green beside the ledger it holds as one of the green's holders: version 0's inputs and every increment's
 > restored whole and every accepted record decoded in one poll, then the origin's bytes and every increment recorded
@@ -3830,10 +3887,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       table. Now each shard yields its catalogued volumes when its own host's epoch advances (`crate::readmission`): a
 >       verb on one is forwarded to the successor, its latest state refused here (`LeaseVerdict::LostToSuccessor`). Red first:
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
->       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). **Owed:** a later
->       takeover naming the host a yielded volume's successor again keeps the copy (`verbs::materialize_taken_over`
->       returns early for an id it has), so the volume stays yielded there until a rebuild replaces it; releasing a
->       yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the client's shard,
+>       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
+>       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
+>       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
+>       client's shard,
 >       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
 >       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
 >       term).
@@ -3844,10 +3901,11 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
 >       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
 >       (g230's).
->     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>     - **Fixed (A-331, g225): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
 >       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
 >       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
->       it as a live holder.
+>       it as a live holder: a node its council configuration does not name now keeps contact with every member it holds
+>       alive.
 >     - **Fixed in the flow (g229): the long-log flow's last step asked past the stream's end.** Its step read the owner's
 >       durable position once to size the step and again inside the wait to start it, so the wait's target could pass the
 >       head a stream of `LONG_LOG` writes ever makes (from 962, then from 965, 40 more, against a log that ended at
@@ -3868,7 +3926,16 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       holder held. Kept: NoLoss is a register invariant the design proves (§4.8), and a typed final refusal is
 >       recoverable by the operator where a silent loss of an acknowledged write is not (R4). **Owed:** A-309 piece 2's
 >       register takeover passes over a falsely retired holder of the newest register record the same way.
->     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
+>     - **Held in the flows (g229): a partitioned owner is taken over, and every write sent to it answered, within the
+>       failover bound.** The four partition flows let the deafened owner be taken over after 22.7 and 34.8 s and hold its
+>       in-flight write 41 to 85 s, and the cut-off and muted owners' about 20.5 s, each until the relay healed (CI diag
+>       runs 44302631709 and 44315314779). They now require the takeover within the failover SLO (`FAILOVER_BOUND`) and
+>       every write to the old owner answered within the SLO and a liveness budget (`HELD_WRITE_BOUND`). On main with
+>       A-351 (g225, the promotion gate) and A-354 (g230, `DurabilityPending` at the SLO), all four pass on a Mac Studio
+>       (2026-11-18): taken over in 2.23 to 2.67 s; held writes refused after 10.03 to 10.09 s, the stopped owner's
+>       answered after 2.57 s.
+>     - g230's: Continuity in five flows (A-329: a successor's positions no longer start again at 1) and the nemesis's
+>       fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
@@ -4105,33 +4172,45 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >     step is its own kiln command with 1-2 s of dispatch, so on a quiet pair most of a phase is kiln's: g066b and
 >     g066c took 47 and 45 s in all. The record sessions' smoothed round trip ran from 17 ms (adacachy at load 34) to
 >     724 ms (at load 122.6), with probe timeouts up to 3.3 s.
->   - **Open: one forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on
->     adacachy at 1750).** The client's `work` was refused about 125 s after the root group formed, after the client's
->     first read of the same green had answered. At the refusal the client node held configuration version 0 with no
->     members while the server held version 1 with both, each node had replaced its record session after a loss 15
->     (client) and 17 (server) times, and both had a probe session. Its identities phase took 27.7 s (2.8 to 20.6 s in
->     the other runs), so a machine or the path was slow then. It did not recur in the 8 runs after it, 5 of them in
->     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
->     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
->     refusal a consumer retries; and a learner fetches the configuration only over a record session
->     (`fleet::drive_learner_fetch`). The run kept no node logs, so the cause is not known. Starvation of the server
->     is ruled out as the whole of it: with the same pair and direction (run g066s2), the server node's unit held to a
->     2% CPU quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`, cpu.max `2000 100000`) for 45 s right
->     after the root group formed and for 30 s while the client made a work, the client held configuration version 1
->     throughout, every forwarded `work` was answered within 0.5 to 8.6 s (the first made the work, the rest were
->     refused `AlreadyExists` for the experiment's repeated name), the read after the lift answered in 0.7 s, and the
->     flow landed exactly the 4 merged files. What remains is the path: the client reached adacachy over the Mac's
->     Wi-Fi, and 15 and 17 replaced sessions are re-dials after losses, so a run of losses longer than the SLO fits.
->     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
->     drive the client's first configuration fetch across a link that drops everything for longer than the SLO and
->     then heals (the relay of `crates/cli/tests/live_chaos.rs`, a node bound apart from its advertised address,
->     A-277), and require the configuration and a forwarded verb back within a derived bound of the heal; a miss is a
->     learner or session defect and gets its failing test first.
+>   - **One forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on adacachy at
+>     1750): not reproduced, and the recovery it put in doubt is now a test.** The client's `work` was refused about
+>     125 s after the root group formed, after the client's first read of the same green had answered. At the refusal
+>     the client node held configuration version 0 with no members while the server held version 1 with both, each node
+>     had replaced its record session after a loss 15 (client) and 17 (server) times, and both had a probe session. Its
+>     identities phase took 27.7 s (2.8 to 20.6 s in the other runs). It did not recur in the 8 runs after it, 5 of
+>     them in the same direction on the same ports, and the run kept no node logs (the program now keeps each node's
+>     last 400 lines and its whole status on a failure), so its cause is not known; the refusal itself is the designed
+>     one (`verbs::resolve_and_forward` resends to a live owner until the failover SLO, `FAILOVER_SLO_NS`, 10 s, then
+>     refuses `OwnerUnreachable`, which a consumer retries). Two causes are ruled out:
+>     - Starvation of the server (run g066s2, the same pair and direction): the server node's unit held to a 2% CPU
+>       quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`) for 45 s right after the root group formed
+>       and for 30 s while the client made a work; the client held configuration version 1 throughout, every forwarded
+>       `work` was answered within 0.5 to 8.6 s, the read after the lift in 0.7 s, and the flow landed exactly the 4
+>       merged files.
+>     - A link down past the failover delay as the root forms:
+>       `a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its_bound_once_the_link_heals`
+>       (`crates/cli/tests/fs_server.rs`) puts every datagram between the two nodes through `live_chaos.rs`'s relay
+>       (A-277), cuts it both ways before the server bootstraps the root alone, makes and shares the green while cut,
+>       holds the cut 10.9 s (the failover SLO plus a membership horizon) and heals it. The client then held a
+>       configuration naming both nodes and answered a forwarded read within a bound derived from its own estimates
+>       before the cut (the handshake's initial probe timeout, RFC 9002 §6.2.2; four of the session's probe timeouts;
+>       the detector's verdict for the pair, expected arrival plus margin; two coordinator periods; a membership
+>       horizon). Forwarded read answered 0.25 to 1.53 s after the heal against bounds of 1.82 to 3.37 s: 13 of 13 on
+>       Adas-Mac-Studio (macOS arm64, load 9 to 18) and 18 of 18 on GitHub's ubuntu x86_64 and arm64 runners (diag
+>       runs 44342202455, 44342920360 and, merged with main, 44344637800), with 53 to 11,611 datagrams dropped each
+>       way at the relay.
+>     What remains for g066d is the path itself: the client reached adacachy over the Mac's Wi-Fi. Seen in 2 of those
+>     runs and passed to g255 (forward-lane budgets): right after the heal a forward lane's floor read 175 s, past the
+>     10 s SLO, from a probe timeout of 24.9 s, about 64 times the session's live one, as if still backed off by the
+>     outage (a hypothesis; no log of the backoff count).
 >   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
 >     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
 >     path while the flow itself passed; the program passes every `$` as `$$`.
-> - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
->   pushes through a green, never through a write attachment.
+> - **Remote attach for writing is done (§4.10; A-222, 2026-11-05).** Another node's `slates attach ID --write`
+>   attaches the owner's volume in the record form and `slates write` writes through it
+>   (`a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it` in `fs_server.rs`, and the A-222
+>   entry above); the two-machine flow still pushes through a green, as an agent's work does. Open, as A-222 records:
+>   ownership migration to a writer that stays, and the read-only remote attach of a snapshot.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
 >   `CaUsedAsEndEntity`; the manifest's documentation does not say so.
 
