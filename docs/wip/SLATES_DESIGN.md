@@ -5406,6 +5406,14 @@ all: it is no one's neighbour, holds nothing, and may know as a voter only the m
 state names the voters of its own join. So it held no record session and its learner, which fetches over those, never
 learned the configuration that admits it (live_chaos's fresh-member flow, 2 of 48 runs at one CPU, 2026-11-09; both of
 main's first gated runs, 2026-11-18). A retired member kept only its old neighbours, by the placement it last installed.
+A pair's canonical dialer, its lower anchor, also keeps contact with a peer that holds a record session it dialed to it
+(A-337): a peer dials and keeps one only while its own rule keeps this node, and the pair's plane is keyed only from the
+lower anchor's side, so that side follows the peer's demand whatever its own view says. Each role rule is kept from both
+sides only while both hold the same view, and a learner's voters can be stale (a seat change moves no configuration
+version, so no learner fetches on it, and a learner answered by another learner takes that one's voters): a learner, the
+pair's lower anchor, dropped a voter that kept it, and the pair was never keyed (fleet test
+`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, 2026-11-18).
+Only the lower anchor follows a session, so no two nodes keep each other by their sessions alone.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
 counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
 cannot make a newly bootstrapped group appear protected.
@@ -7411,10 +7419,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
 >   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
 >   until a write, its holders keep the old chain, which holds every write acknowledged before the restart. Across real
->   processes (2026-11-18): `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
->   (`crates/cli/tests/live_fleet.rs`, three anchored daemons: the owner killed and replaced by its anchor, a write
->   through it, then the owner killed whole; a survivor serves every file, and the owner's head after the restart's
->   write is past its head before it). Owed: its first run (the integrator's lanes).
+>   processes the owner's case is held by `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor`
+>   (`crates/cli/tests/live_fleet.rs`; written twice on 2026-11-18 and kept as one flow): five writes, the owner's
+>   daemon killed and replaced by its anchor, five more through it, each given the fleet wait, the owner killed whole
+>   (its anchor stopped first); the restarted log ends past the head shipped before plus the writes since, and a
+>   survivor serves all ten files (4 of 4 on a Mac Studio, heads 4 then 10 or 11). With the restarted log begun again
+>   at genesis the first write through it is never answered, its log at head 0 with nothing durable.
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
@@ -26584,3 +26594,33 @@ the SID a token buffer points at, the drive's SDDL), `host.rs` (`drive_security_
   runner's account as git printed it, Everyone, the Administrators group, an authority past 2^32 in its hexadecimal
   form) and hostile bytes (empty, a cut header, another revision, sixteen sub-authorities, a cut sub-authority), on
   every host.
+
+### A-337 — A pair's canonical dialer keeps direct contact with a peer that holds a record session it dialed to it (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 direct contact and learners; amends the 2026-10-10 rule that contact is kept from both sides)
+
+- **What was there.** A pair's probe plane is keyed by an epoch only its lower anchor announces, over the record session
+  it dials, so a pair forms its probe mesh only if the lower anchor keeps direct contact with the higher. The role rule
+  keeps contact from both sides (`Neighbour` and `Holder`, `Voter` and `AsVoter`) only while both sides read the same
+  configuration and voters. A learner's voters can be stale: a seat change is a Raft configuration entry that moves no
+  configuration version, so no learner fetches on it, and a learner answered by another learner takes that one's known
+  voters. In g251's diag run 44262759484 (ubuntu, 2026-11-18) the fixture of
+  `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` failed its formation wait at 49 to 50
+  periods: voter c held learner e `AsVoter keyed=None canonical=Some(false)`, and e, the pair's lower anchor, held c
+  `OutsideNeighbourhood keyed=None canonical=Some(true)`. c dialed e and kept that session; e never dialed c; the pair
+  was never keyed.
+- **The rule.** A node keeps direct contact with a peer whose anchor is above its own (it is the pair's canonical dialer)
+  while it serves a record session that peer dialed to it (`fleet::direct_contact`'s `Dialed`; `ShardState::dialed_in`,
+  counted by a guard in `fleet::serve_peer_records` for the session's life). A peer dials and keeps a session only while
+  its own rule keeps this node, so the pair is keyed whenever either side's rule keeps it.
+- **Why only one side.** If both sides followed each other's sessions, two nodes whose rules both dropped the pair would
+  keep each other for good, each on the other's session. Only the lower anchor follows, and the higher anchor's contact
+  never rests on the lower's dial, so contact ends once the higher side's rule drops the pair.
+- **What it costs.** At most one record session and one probe pair more per peer whose rule keeps a node its own rule
+  drops: the mesh stays within the O(N·k) sessions and O(N·v) voter sessions of the 2026-10-10 rule.
+- **Not done here (open, GAPS).** The learner's stale voters themselves: the voters are not part of the versioned
+  configuration a learner fetches, so a learner can report to, and stay away from, the wrong council for as long as no
+  configuration commits.
+
+Applied in the same change to: §4.8 (learners and direct contact), GAPS, `crates/server/src/fleet.rs`,
+`crates/server/src/state.rs`, `crates/server/src/daemon.rs` (the state's initializer and the test
+`the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it`) and the bug record
+`docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.

@@ -24,6 +24,25 @@
 > in order, its regeneration behind `--ignored`), and the completion record framed with its reply's schema hash, so a
 > record of another schema is refused typed rather than read as another reply. g262 (the contract's owner) told.
 
+> **A learner, the pair's lower anchor, dropped a voter that kept it, and the pair's probe mesh never formed: fixed
+> (2026-11-18, A-337, §4.8; goal g225).** `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`
+> failed its fixture's formation wait once in g251's diag run 44262759484 (ubuntu, 2026-11-18; 49 to 50 periods after the
+> initial consensus settled in 0.83 s): voter c kept learner e (`AsVoter`), e dropped c (`OutsideNeighbourhood`), and e
+> was the pair's lower anchor, the only side whose dial keys the pair's plane. The role rule is kept from both sides
+> only while both read the same voters, and a learner's can be stale. Fixed: the pair's canonical dialer keeps a peer
+> that holds a record session it dialed to it (`DirectContact::Dialed`, `ShardState::dialed_in`). Test:
+> `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it` (`crates/server/src/daemon.rs`). Bug record:
+> `docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
+> - **Open: a learner's voters are not versioned.** A seat change is a Raft configuration entry that moves no
+>   configuration version, so a learner never fetches on it, and a learner answered by another learner takes that one's
+>   known voters. A learner whose stale voters omit the leader sends its reports (which only the leader proposes) to
+>   members that are not it, and the reports are answered `NotLeader` until a configuration commits. The principled fix
+>   carries the voter set inside the versioned configuration a learner fetches (a format change of the regional
+>   configuration's encoding; for Ada's design review).
+> - **Owed (the supervisor's):** the learner tests' rate on the diag lanes once this lands
+>   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
+>   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
+
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
 > fresh-member flow (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`) kills the bootstrap voter of five
@@ -184,8 +203,17 @@
 > `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart`,
 > `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`). Bug
 > record `docs/bugs/2026-11-18-a-live-log-forked-at-its-owners-warm-restart.md`.
-> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix, and an owner-restart flow across real
->   processes (`kill -9` under the anchor, writes before and after, then the owner's loss).
+> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix.
+> - **Written (2026-11-18): the owner-restart flow across real processes**,
+>   `a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor` (`crates/cli/tests/live_fleet.rs`, gated
+>   on `SLATES_TEST_CLI=1`; landed first with one write after the restart, 63b31d5b3, then made one flow with g229's). Three anchored processes; five files written through the owner; its daemon `kill -9`ed and
+>   replaced by its anchor; five more through the restarted owner, each given the fleet wait to be answered; then the
+>   owner killed whole. The flow requires the daemon replaced, the restarted log's head past the head shipped before
+>   plus the writes made since (each write is its own entry, so a log begun again at genesis ends at their count), and a
+>   survivor serving all ten files. On a Mac Studio (release, 2026-11-18) it passed 4 of 4, heads 4 then 10 or 11, 3.9
+>   to 6.1 s a run. Red with a restarted owner's log begun again at genesis (`Start::Resumed` taken for `Start::New`): the
+>   first write through the restarted owner was never answered, the log at head 0 with nothing durable and owed (with
+>   no bound on that write, the run held 23 minutes until killed; the flow now fails it at the fleet wait).
 > - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
 >   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
 >   on the owner alone until then.
@@ -3742,10 +3770,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       table. Now each shard yields its catalogued volumes when its own host's epoch advances (`crate::readmission`): a
 >       verb on one is forwarded to the successor, its latest state refused here (`LeaseVerdict::LostToSuccessor`). Red first:
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
->       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). **Owed:** a later
->       takeover naming the host a yielded volume's successor again keeps the copy (`verbs::materialize_taken_over`
->       returns early for an id it has), so the volume stays yielded there until a rebuild replaces it; releasing a
->       yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the client's shard,
+>       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
+>       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
+>       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
+>       client's shard,
 >       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
 >       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
 >       term).
@@ -3756,10 +3784,11 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
 >       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
 >       (g230's).
->     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>     - **Fixed (A-331, g225): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
 >       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
 >       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
->       it as a live holder.
+>       it as a live holder: a node its council configuration does not name now keeps contact with every member it holds
+>       alive.
 >     - **Fixed in the flow (g229): the long-log flow's last step asked past the stream's end.** Its step read the owner's
 >       durable position once to size the step and again inside the wait to start it, so the wait's target could pass the
 >       head a stream of `LONG_LOG` writes ever makes (from 962, then from 965, 40 more, against a log that ended at
@@ -3780,7 +3809,16 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       holder held. Kept: NoLoss is a register invariant the design proves (§4.8), and a typed final refusal is
 >       recoverable by the operator where a silent loss of an acknowledged write is not (R4). **Owed:** A-309 piece 2's
 >       register takeover passes over a falsely retired holder of the newest register record the same way.
->     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
+>     - **Held in the flows (g229): a partitioned owner is taken over, and every write sent to it answered, within the
+>       failover bound.** The four partition flows let the deafened owner be taken over after 22.7 and 34.8 s and hold its
+>       in-flight write 41 to 85 s, and the cut-off and muted owners' about 20.5 s, each until the relay healed (CI diag
+>       runs 44302631709 and 44315314779). They now require the takeover within the failover SLO (`FAILOVER_BOUND`) and
+>       every write to the old owner answered within the SLO and a liveness budget (`HELD_WRITE_BOUND`). On main with
+>       A-351 (g225, the promotion gate) and A-354 (g230, `DurabilityPending` at the SLO), all four pass on a Mac Studio
+>       (2026-11-18): taken over in 2.23 to 2.67 s; held writes refused after 10.03 to 10.09 s, the stopped owner's
+>       answered after 2.57 s.
+>     - g230's: Continuity in five flows (A-329: a successor's positions no longer start again at 1) and the nemesis's
+>       fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
