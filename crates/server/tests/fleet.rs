@@ -14232,6 +14232,224 @@ fn council_snapshot(daemons: &[Daemon]) -> String {
     .join("\n")
 }
 
+/// Format: a holder's count of register records it refused because a test told it to refuse that owner's records
+/// (`fleet::RECORD_REFUSED_BY_FAULT`).
+const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
+
+/// §4.8 "Recovery" and Phase 8 task 4 (the owner's `put_wal`: "the anchor segment replays the local log and `put_wal`
+/// into fresh indexes"): a seal its owner had not placed when the owner restarted warm places after the restart, from
+/// what the owner's anchor kept. The put WAL is no structure of its own: the snapshot's record stays `Local` in the
+/// owner's partition, durable in its anchor, and each record period's seal walk starts a seal for a head not placed, so
+/// the restart only loses the walk's progress. Do: three nodes at `f = 1`, each over an anchor segment that outlives its
+/// daemon; on a, a volume written and its creation head held by both others; b and c refuse a's records, so a
+/// snapshot's head cannot commit, until both have refused it at least once; restart a's daemon over its anchor; b and c
+/// take a's records again. Expect the snapshot unplaced before the restart and placed after it, both survivors holding
+/// its head, the file read back, and a's member id unchanged by the restart (no takeover moved the volume).
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it() {
+  let _serial = serialize_fleet_tests();
+  let names = ["seal-wal-a", "seal-wal-b", "seal-wal-c"];
+  let profiles: Vec<_> = names.into_iter().map(profile).collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &common::fixture_object("seal-wal", &node.to_string()),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let segments: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      // The content object too, so the volume's content lives in anchor-owned RAM across the owner's restart (§4.8;
+      // without one a daemon over a handed-off segment has no content arena and refuses a create
+      // `ContentUnavailable`).
+      slates_anchor::AnchorSegment::create(
+        &common::fixture_object("seal-wal", &node.to_string()),
+        &profile.facts.identity,
+        configs[node].geometry,
+      )
+      .unwrap()
+      .with_content(
+        &common::fixture_object("seal-wal-con", &node.to_string()),
+        configs[node].content_bytes(),
+      )
+      .unwrap()
+    })
+    .collect();
+  let rendezvous: Vec<_> = configs
+    .iter()
+    .map(|config| HeldRendezvous::hold(&config.instance).unwrap())
+    .collect();
+  let source = |node: usize| {
+    let (handoff, len) = segments[node].handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content: segments[node].content_handoff().unwrap(),
+      rendezvous: rendezvous[node].adoption(),
+    }
+  };
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let created = client.call(&scratch("seal-wal"));
+  let ReplyBody::Created { id } = created else {
+    panic!("the volume was created: {created:?}");
+  };
+  let object = ObjectId(id.bytes);
+  let attachment = write_attachment(&mut client, id);
+  let written = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/kept".to_owned(),
+    bytes: b"kept across a warm restart".to_vec(),
+    mode: 0o644,
+  });
+  let detached = client.call(&RequestBody::Detach { attachment });
+  let created_held = poll_all_hold(&[&daemons[1], &daemons[2]], object);
+  let refused_before = [&daemons[1], &daemons[2]]
+    .map(|holder| refusal_count(holder, RECORD_REFUSED_BY_FAULT).unwrap());
+  let refusing = daemons[1]
+    .inject_record_refusal(&[hosts[0]])
+    .and_then(|()| daemons[2].inject_record_refusal(&[hosts[0]]));
+  let snapshot = match client.call(&RequestBody::Snapshot { volume: id }) {
+    ReplyBody::Snapshotted { id, .. } => Some(id),
+    _ => None,
+  };
+  // Non-vacuity: the seal's head was shipped and refused by both, so it was ready to place but for them.
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let head_refused = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(
+      [&daemons[1], &daemons[2]]
+        .iter()
+        .zip(refused_before)
+        .all(|(holder, before)| {
+          refusal_count(holder, RECORD_REFUSED_BY_FAULT).is_ok_and(|after| after > before)
+        }),
+    )
+  });
+  drop(observed);
+  let placed_before = snapshot.map(|snapshot| {
+    client.call(&RequestBody::AwaitPlaced {
+      volume: id,
+      snapshot: Some(snapshot),
+      scope: Scope::Region,
+    })
+  });
+  drop(client);
+  daemons.remove(0).stop();
+  daemons.insert(
+    0,
+    start_fleet_node(
+      &profiles[0],
+      configs[0].clone(),
+      identities[0].pop().unwrap(),
+      ports[0],
+      peers(0),
+      source(0),
+    ),
+  );
+  let member_after = daemons[0].member_identity();
+  let lifted = daemons[1]
+    .inject_record_refusal(&[])
+    .and_then(|()| daemons[2].inject_record_refusal(&[]));
+  let mut client = Client::connect(daemons[0].instance());
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed_after =
+    snapshot.is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, id, snapshot));
+  let survivors_hold = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(daemons[1].held_position(object)? >= Some(1) && daemons[2].held_position(object)? >= Some(1))
+  });
+  drop(observed);
+  let read = client.call(&RequestBody::Read {
+    volume: id,
+    path: "/kept".to_owned(),
+    at: ReadAt::Head,
+  });
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "seal across a warm restart: before {placed_before:?}, after {placed_after}, survivors hold {survivors_hold}, \
+     member {:?} -> {member_after:?}",
+    hosts[0]
+  );
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }) && matches!(detached, ReplyBody::Detached),
+    "the volume was written and let go: {written:?} {detached:?}"
+  );
+  assert!(created_held, "both others held the volume's creation head");
+  assert!(
+    refusing.is_ok() && lifted.is_ok(),
+    "b and c refused a's records, then took them again: {refusing:?} {lifted:?}"
+  );
+  assert!(snapshot.is_some(), "the volume was snapshotted");
+  assert!(
+    head_refused,
+    "both survivors refused the seal's head before the restart"
+  );
+  assert!(
+    matches!(placed_before, Some(ReplyBody::Placed { placed: false, .. })),
+    "the seal was not placed before the restart: {placed_before:?}"
+  );
+  assert_eq!(
+    member_after,
+    Ok(hosts[0]),
+    "a warm restart keeps the owner's member id, so nothing took the volume over"
+  );
+  assert!(placed_after, "the seal placed after the warm restart");
+  assert!(survivors_hold, "both survivors hold the seal's head");
+  assert!(
+    matches!(&read, ReplyBody::ReadBytes { bytes } if bytes == b"kept across a warm restart"),
+    "the file reads back after the restart: {read:?}"
+  );
+}
+
 /// AC-8.1 / T-2.14, §4.8: restart every process while its anchor retains RAM. Both groups
 /// must recover without bootstrap, then commit another retirement after one voter is lost.
 #[test]
