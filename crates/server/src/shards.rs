@@ -2308,11 +2308,11 @@ fn keep_pending_reply(s: &mut ShardState, stream: &ShardsStream, answered: &Answ
   );
 }
 
-/// Logs the `WRITE` at the head of `stream` (`total` bytes), when `answered` says it succeeded, in the shard's write log
-/// before its reply, under the stream's volume, where a replay puts it (A-63, A-316; an inode number alone names the
-/// origin of a clone's inherited file): as `fuse`'s `log_write` does for a mount, a log with no room forces a publication
-/// that carries the write, and only a refused publication leaves it unlogged, marked as an overflow so the next daemon
-/// reports the loss rather than replaying around it.
+/// Logs the `WRITE` at the head of `stream` (`total` bytes), when `answered` says it succeeded, in the shard's write
+/// log before its reply, under the stream's volume, where a replay puts it (A-63, A-316; an inode number alone names
+/// the origin of a clone's inherited file), as `fuse`'s `log_write` does for a mount
+/// (`crate::write_log::log_acknowledged_write`: a full log forces a publication that settles the write by its own
+/// volume, A-436, and only a write nothing keeps marks the overflow, so the next daemon reports the loss).
 fn log_write(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: &Answered) {
   if answered.opcode != Some(Opcode::Write) || answered.error != 0 {
     return;
@@ -2321,25 +2321,7 @@ fn log_write(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: 
   let Some((nodeid, offset, data)) = written(request) else {
     return;
   };
-  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => log.append(object, (stream.volume.bytes, nodeid), offset, data),
-    _ => return,
-  };
-  let logged = match appended {
-    Ok(()) => true,
-    Err(crate::write_log::Refused::Full) => {
-      crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
-    }
-    Err(crate::write_log::Refused::Unwritten) => false,
-  };
-  if !logged {
-    s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
-    if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut())
-      && log.overflow(object).is_err()
-    {
-      s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
-    }
-  }
+  crate::write_log::log_acknowledged_write(s, stream.volume, (nodeid, offset), data);
 }
 
 /// Logs the lookups the `FORGET` or `BATCH_FORGET` at the head of `stream` (`total` bytes) gave back, where the anchor

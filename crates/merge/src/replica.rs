@@ -1,9 +1,10 @@
-//! A replica of a green on a shard that holds its works (A-273 step 2; §4.16 "Rebase, the only corrective path"): the
-//! green's engine built from its owner's at a version, then kept equal to it, version by version, by the owner's feed.
-//! The feed carries each accepted version's increment with what its verdict resolved it to, replayed through the engine's
-//! own replay (`Green::apply_recorded`, the property recovery already holds), and each fold of the owner's history, in
-//! the order the owner sent them. So a replica at version `v` is the owner's green at `v` by construction, and a rebase or
-//! a read at a version it holds can be answered there instead of on the owner's one thread.
+//! A replica of a green on a shard that holds its works (A-273 steps 2 and 3; §4.16 "Rebase, the only corrective path"):
+//! the green's engine made from its owner's at the owner's head, then kept equal to it, version by version, by the
+//! owner's feed. The feed carries each accepted version's increment with what its verdict resolved it to, replayed
+//! through the engine's own replay (`Green::apply_recorded`, the property recovery already holds), and each fold of the
+//! owner's history, in the order the owner sent them. So a replica at version `v` is the owner's green at `v` by
+//! construction, and a rebase or a read at a version it holds can be answered there instead of on the owner's one
+//! thread.
 //!
 //! **Why (A-273, measured).** W1 (A-247) moved a work's edits and composition to the work's shard; the verdict and the
 //! rebase still ran on the green's owner. At the 3,000-client rung over `kernel/` of linux 7.4-rc1 the owner spent 51 to
@@ -11,29 +12,34 @@
 //! larger share: 71,000 to 72,000 a run against 49,000 verdicts. A rebase changes nothing on the green, so nothing but
 //! the engine's state ties it to the owner.
 //!
-//! **The feed.** The owner stamps each message with its feed position ([`Green::feed_position`]) and moves past it, so
-//! each message is one past the one before; the content a version or a fold released is stamped with the same position
-//! (step 1, `crate::history`), which a replica acknowledges once it has applied the message. A replica applies the
-//! message at its next position. One below it is already in what the replica was built from: a message in flight while
-//! the replica was rebuilt, passed over. One above it means a message never came: the replica changes nothing and
-//! refuses it ([`FeedRefusal::Gap`]), and its holder rebuilds it from the owner, counted. A version that would replay as
-//! another is refused the same way ([`FeedRefusal::Diverged`]), before anything changes, since a replica that is not the
-//! owner's green must not answer for it.
+//! **Content once, in place (step 3).** A replica holds no byte of content of its own: the owner's content is in sealed
+//! blocks (`crate::store`, `slates_mem::sealed`), and the replica names them as the owner does and reads them where
+//! they are. It is made by [`Green::replica`]: every index, history and delta cloned, the content named by the same
+//! blocks, and the replica registered with the owner's blocks, so the owner keeps every block the replica may read
+//! until the replica has passed the message that released it ([`Fed::Applied`]'s `Passed`, which its holder sends back
+//! to the owner's [`Green::acknowledge_replica`]). A replay's own seals adopt the blocks the owner sealed in the same
+//! message, in the owner's order, each checked to hold exactly the bytes the replay made; at the replica's end its
+//! registration is given back ([`Replica::leave`], for the owner's [`Green::leave_replica`]). Measured by A-273 at the
+//! 3,000-client rung: about 14.2 MB of metadata a replica, where a copy of the content as well would have been about
+//! 49.5 MB, and about 1.3 GB for a whole kernel tree.
 //!
-//! **Built from the owner at a version.** A replica starts from the owner's checkpoint at its head, the form recovery
-//! restores a green from, over the green's origin, joined at the owner's feed position then
-//! ([`Green::replica_seed`]). Its history starts there: a rebase whose base is below the version it was built at, or a
-//! read below it, is not its to answer (`Outcome::BaseUnavailable` names its floor), and goes to the owner.
+//! **The feed.** The owner stamps each message with its feed position and moves past it ([`Green::feed_position`]), so
+//! each message is one past the one before; it carries the blocks the owner sealed and released in it. A replica
+//! applies the message at its next position. One below it is already in what the replica was made from: a message in
+//! flight while the replica was rebuilt, passed over. One above it means a message never came: the replica changes
+//! nothing and refuses it ([`FeedRefusal::Gap`]), and its holder rebuilds it from the owner, counted. A version that
+//! would replay as another is refused the same way before anything changes ([`FeedRefusal::Diverged`]), and a replay
+//! that seals other bytes than the owner did after it ([`FeedRefusal::NotTheOwners`]): a replica that is not the owner's
+//! green must not answer for it.
 //!
-//! **Not yet.** Here the replica's content is its own (the origin's and the checkpoint's bytes, and each version's
-//! post-state). Reading the owner's content in place instead (A-64, D-7; content once) is step 3, the replica's bounds
-//! are step 4, and serving a work's rebase and its named-version reads from it on the shards is step 5 (A-273's "Owed,
-//! in order"). Laptop degenerate (R8): with one shard there is no other shard and no replica.
+//! **Its history is the owner's.** A replica made from the owner holds every version the owner holds, so it answers a
+//! rebase over any base the owner can (`Outcome::BaseUnavailable` below the owner's own floor, as the owner does), and
+//! folds where the owner folds. Its bounds (step 4) and its use on the shards (step 5) are owed (A-273's "Owed, in
+//! order"). Laptop degenerate (R8): with one shard there is no other shard and no replica.
 
 use crate::chain_entry::{Applied, Signature};
-use crate::checkpoint::Checkpoint;
 use crate::engine::{Green, Increment};
-use crate::origin::Origin;
+use slates_mem::sealed::{Changes, Left, Passed};
 
 /// One message of a green's feed to its replicas (A-273).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +48,8 @@ pub struct FeedMessage {
   pub position: u64,
   /// What it carries.
   pub body: FeedBody,
+  /// The blocks the owner sealed and released in it, which a replica adopts and lets go of (step 3).
+  pub changes: Changes,
 }
 
 /// What a feed message carries.
@@ -67,27 +75,18 @@ pub enum FeedBody {
   },
 }
 
-/// What a shard needs to build a replica of a green (A-273): the owner's checkpoint at its head and the feed position
-/// of the first message the checkpoint does not hold. The green's origin comes from its base, as recovery's does.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplicaSeed {
-  /// The owner's checkpoint at its head.
-  pub checkpoint: Checkpoint,
-  /// The feed position of the next message the owner sends.
-  pub position: u64,
-}
-
 impl Green {
   /// The message that carries `version`, just committed from `increment` as `applied` resolved it, to the green's
   /// replicas, at the feed's position, which it then moves past (A-273). Made in the same step as the commit, so the
-  /// content the commit released was stamped with this message's position, and no seed is ever taken between the two.
+  /// content the commit sealed and released is this message's, and no replica is made between the two. `None` on a
+  /// replica, which feeds nothing.
   pub fn feed_version(
     &mut self,
     version: u64,
     increment: Increment,
     applied: Vec<Applied>,
     signature: Option<Signature>,
-  ) -> FeedMessage {
+  ) -> Option<FeedMessage> {
     self.feed(FeedBody::Version {
       version,
       increment,
@@ -116,37 +115,33 @@ impl Green {
     (released, self.feed_fold_since(before))
   }
 
-  /// The seed of a replica of this green now (A-273): its checkpoint at the head, and the feed position of the next
-  /// message, so the replica holds every message before it. `None` when the head is below the green's fold floor, where
-  /// no checkpoint exists.
-  pub fn replica_seed(&self) -> Option<ReplicaSeed> {
-    Some(ReplicaSeed {
-      checkpoint: self.checkpoint(self.head())?,
-      position: self.feed_position(),
-    })
-  }
-
   /// The message of a fold whose floor moved past `before`, or none.
   fn feed_fold_since(&mut self, before: u64) -> Option<FeedMessage> {
     let floor = self.folded_below();
-    (floor > before).then(|| self.feed(FeedBody::Fold { floor }))
+    if floor > before {
+      self.feed(FeedBody::Fold { floor })
+    } else {
+      None
+    }
   }
 
-  /// `body` at the feed's position, which then moves past it.
-  fn feed(&mut self, body: FeedBody) -> FeedMessage {
-    let message = FeedMessage {
-      position: self.feed_position(),
+  /// `body` at the feed's position, with the blocks sealed and released since the last message; the position then
+  /// moves past it.
+  fn feed(&mut self, body: FeedBody) -> Option<FeedMessage> {
+    let changes = self.take_changes()?;
+    Some(FeedMessage {
+      position: changes.position(),
       body,
-    };
-    self.advance_feed();
-    message
+      changes,
+    })
   }
 }
 
-/// Why a replica refused a feed message (A-273): it changed nothing, and its holder rebuilds it from the owner.
+/// Why a replica refused a feed message (A-273): its holder rebuilds it from the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedRefusal {
-  /// A message before this one never came: the replica's next position was `expected`, and it was sent `sent`.
+  /// A message before this one never came: the replica's next position was `expected`, and it was sent `sent`. Nothing
+  /// changed.
   Gap {
     /// The position the replica applies next.
     expected: u64,
@@ -154,31 +149,42 @@ pub enum FeedRefusal {
     sent: u64,
   },
   /// A version the owner committed as `version` would replay here as `replayed`: the replica is not the owner's green.
+  /// Nothing changed.
   Diverged {
     /// The version the owner committed.
     version: u64,
     /// The version it would replay as here.
     replayed: u64,
   },
+  /// The message at `position` replayed here to other content than the owner sealed (step 3): the replica is not the
+  /// owner's green, and its state is no longer to be answered from.
+  NotTheOwners {
+    /// The message's position.
+    position: u64,
+  },
 }
 
 /// What a replica did with a feed message it took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fed {
-  /// Applied: the replica is at the owner's state after the message.
-  Applied,
-  /// Passed over: what the replica was built from already holds it.
+  /// Applied: the replica is at the owner's state after the message, and has passed it; its holder sends the owner
+  /// `passed` ([`Green::acknowledge_replica`]), so the owner may free what the message released.
+  Applied {
+    /// What the owner frees by.
+    passed: Passed,
+  },
+  /// Passed over: what the replica was made from already holds it.
   PassedOver,
 }
 
 /// A replica of a green, kept equal to its owner by the owner's feed (module docs).
 #[derive(Debug)]
 pub struct Replica {
-  /// The green as the owner's feed has made it.
+  /// The green as the owner's feed has made it, its content the owner's, read in place.
   green: Green,
   /// The feed position of the next message it applies.
   next: u64,
-  /// Messages applied since it was first built.
+  /// Messages applied since it was first made.
   applied: u64,
   /// Messages passed over as already held.
   passed_over: u64,
@@ -189,27 +195,38 @@ pub struct Replica {
 }
 
 impl Replica {
-  /// A replica built from the owner's `seed` over the green's `origin` ([`Green::replica_seed`]).
-  pub fn build(origin: Origin, seed: &ReplicaSeed) -> Replica {
-    Replica {
-      green: Green::restore(origin, &seed.checkpoint),
-      next: seed.position,
+  /// The replica `green` is: a green its owner made with [`Green::replica`]. `None` for an owner's own green, which is no
+  /// replica.
+  pub fn new(green: Green) -> Option<Replica> {
+    green.is_replica().then(|| Replica {
+      next: green.feed_position(),
+      green,
       applied: 0,
       passed_over: 0,
       refused: 0,
       rebuilds: 0,
-    }
+    })
   }
 
-  /// Rebuilds this replica from a fresh `seed` of the owner's after a refusal, counted; its counters carry on.
-  pub fn rebuild(&mut self, origin: Origin, seed: &ReplicaSeed) {
-    self.green = Green::restore(origin, &seed.checkpoint);
-    self.next = seed.position;
+  /// Rebuilt after a refusal from `fresh`, a green its owner made now ([`Green::replica`]), counted; its counters carry on.
+  /// Returns the old registration for the owner's [`Green::leave_replica`]. `fresh` that is no replica changes nothing.
+  pub fn rebuild(&mut self, fresh: Green) -> Option<Left> {
+    if !fresh.is_replica() {
+      return None;
+    }
+    self.next = fresh.feed_position();
     self.rebuilds = self.rebuilds.saturating_add(1);
+    std::mem::replace(&mut self.green, fresh).into_left()
+  }
+
+  /// The replica is done: its registration, for the owner's [`Green::leave_replica`].
+  pub fn leave(self) -> Option<Left> {
+    self.green.into_left()
   }
 
   /// Takes `message` from the owner's feed (module docs): applies it at the replica's next position, passes over one
-  /// below it, and refuses one above it, or a version that would replay as another, changing nothing.
+  /// below it, and refuses one above it, or a version that would replay as another, changing nothing; a replay that seals
+  /// other content than the owner did is refused after it.
   pub fn apply(&mut self, message: &FeedMessage) -> Result<Fed, FeedRefusal> {
     if message.position < self.next {
       self.passed_over = self.passed_over.saturating_add(1);
@@ -221,31 +238,45 @@ impl Replica {
         sent: message.position,
       }));
     }
+    if let FeedBody::Version {
+      version, increment, ..
+    } = &message.body
+    {
+      self.check_version(*version, increment)?;
+    }
+    let not_the_owners = FeedRefusal::NotTheOwners {
+      position: message.position,
+    };
+    if !self.green.begin_replay(&message.changes) {
+      return Err(self.refuse(not_the_owners));
+    }
     match &message.body {
       FeedBody::Version {
-        version,
         increment,
         applied,
         signature,
-      } => self.apply_version(*version, increment, applied, *signature)?,
+        ..
+      } => {
+        let replayed = self.green.apply_recorded(increment, applied);
+        if let Some(signature) = signature {
+          self.green.record_signature(replayed, *signature);
+        }
+      }
       FeedBody::Fold { floor } => {
         self.green.fold_history_before(*floor);
       }
     }
+    let Some(passed) = self.green.finish_replay(&message.changes) else {
+      return Err(self.refuse(not_the_owners));
+    };
     self.next = self.next.saturating_add(1);
     self.applied = self.applied.saturating_add(1);
-    Ok(Fed::Applied)
+    Ok(Fed::Applied { passed })
   }
 
-  /// Replays `version` from `increment` as `applied` resolved it, or refuses it unchanged when it is not the version
-  /// after the replica's head or its increment was accepted here before.
-  fn apply_version(
-    &mut self,
-    version: u64,
-    increment: &Increment,
-    applied: &[Applied],
-    signature: Option<Signature>,
-  ) -> Result<(), FeedRefusal> {
+  /// Refuses, unchanged, a `version` that is not the one after the replica's head, or whose increment the replica
+  /// accepted before.
+  fn check_version(&mut self, version: u64, increment: &Increment) -> Result<(), FeedRefusal> {
     let next_version = self.green.head().saturating_add(1);
     let held = self.green.accepted_version(&increment.id);
     if version != next_version || held.is_some() {
@@ -253,10 +284,6 @@ impl Replica {
         version,
         replayed: held.unwrap_or(next_version),
       }));
-    }
-    let replayed = self.green.apply_recorded(increment, applied);
-    if let Some(signature) = signature {
-      self.green.record_signature(replayed, signature);
     }
     Ok(())
   }
@@ -277,8 +304,7 @@ impl Replica {
     &mut self.green
   }
 
-  /// The feed position of the next message it applies; every message before it is applied or held, which is what it
-  /// acknowledges to the owner (step 1's content holds).
+  /// The feed position of the next message it applies.
   pub fn position(&self) -> u64 {
     self.next
   }
@@ -352,31 +378,50 @@ mod tests {
     let Outcome::Accepted { version } = outcome else {
       panic!("{outcome:?}");
     };
-    owner.feed_version(version, increment, applied.unwrap(), None)
+    owner
+      .feed_version(version, increment, applied.unwrap(), None)
+      .unwrap()
   }
 
-  /// A-273: a replica built from its owner's seed and fed the owner's messages in order is the owner's green after each:
-  /// its head, its identity, and a file's bytes at every version it holds.
+  /// A replica of `owner` made now.
+  fn replica_of(owner: &mut Green) -> Replica {
+    Replica::new(owner.replica().unwrap()).unwrap()
+  }
+
+  /// Applies `message` to `replica` and hands the owner what it passed; returns what the replica did.
+  fn feed(
+    owner: &mut Green,
+    replica: &mut Replica,
+    message: &FeedMessage,
+  ) -> Result<Fed, FeedRefusal> {
+    let fed = replica.apply(message);
+    if let Ok(Fed::Applied { passed }) = fed {
+      owner.acknowledge_replica(passed);
+    }
+    fed
+  }
+
+  /// A-273: a replica made from its owner and fed the owner's messages in order is the owner's green after each: its
+  /// head, its identity, and a file's bytes at every version; and those bytes are the owner's own, read in place, never
+  /// a copy (step 3).
   #[test]
-  fn a_replica_fed_in_order_is_its_owners_green() {
+  fn a_replica_fed_in_order_is_its_owners_green_and_reads_its_bytes_in_place() {
     let mut owner = Green::new();
     let first = commit(&mut owner, create(1, 0, "a", b"one"));
-    let seed = owner.replica_seed().unwrap();
+    let mut replica = replica_of(&mut owner);
     assert_eq!(
-      seed.position,
+      replica.position(),
       first.position + 1,
-      "the seed holds the first message"
+      "made after the first message"
     );
-    let mut replica = Replica::build(Origin::default(), &seed);
-    assert_eq!(
-      replica.apply(&first),
-      Ok(Fed::PassedOver),
-      "a message the seed holds"
-    );
+    assert_eq!(feed(&mut owner, &mut replica, &first), Ok(Fed::PassedOver));
     for (tag, name) in [(2, "b"), (3, "c")] {
       let base = owner.head();
       let message = commit(&mut owner, create(tag, base, name, b"more"));
-      assert_eq!(replica.apply(&message), Ok(Fed::Applied));
+      assert!(matches!(
+        feed(&mut owner, &mut replica, &message),
+        Ok(Fed::Applied { .. })
+      ));
       assert_eq!(replica.green().head(), owner.head());
       assert_eq!(replica.green_mut().head_identity(), owner.head_identity());
     }
@@ -386,6 +431,18 @@ mod tests {
         owner.content_at("b", version)
       );
     }
+    for name in ["a", "b", "c"] {
+      let (mine, theirs) = (
+        replica.green().content(name).unwrap(),
+        owner.content(name).unwrap(),
+      );
+      assert_eq!(mine, theirs);
+      assert!(
+        std::ptr::eq(mine.as_ptr(), theirs.as_ptr()),
+        "{name} is read in place, not copied"
+      );
+    }
+    assert_eq!(replica.green().content_reads_refused(), 0);
     assert_eq!(
       replica.counts(),
       FeedCounts {
@@ -395,19 +452,20 @@ mod tests {
         rebuilds: 0
       }
     );
+    owner.leave_replica(replica.leave().unwrap());
   }
 
-  /// A-273: a message after one that never came is refused with nothing changed, and a rebuild from a fresh seed joins
-  /// the feed again; a message the rebuild already holds is passed over.
+  /// A-273: a message after one that never came is refused with nothing changed, and a rebuild from the owner joins the
+  /// feed again; a message the rebuild already holds is passed over, and the old registration is given back.
   #[test]
   fn a_gap_is_refused_unchanged_and_a_rebuild_joins_again() {
     let mut owner = Green::new();
-    let mut replica = Replica::build(Origin::default(), &owner.replica_seed().unwrap());
+    let mut replica = replica_of(&mut owner);
     let lost = commit(&mut owner, create(1, 0, "a", b"one"));
     let after = commit(&mut owner, create(2, 1, "b", b"two"));
     let head = replica.green().head();
     assert_eq!(
-      replica.apply(&after),
+      feed(&mut owner, &mut replica, &after),
       Err(FeedRefusal::Gap {
         expected: lost.position,
         sent: after.position
@@ -418,17 +476,22 @@ mod tests {
       head,
       "a refused message changes nothing"
     );
-    replica.rebuild(Origin::default(), &owner.replica_seed().unwrap());
-    assert_eq!(replica.apply(&lost), Ok(Fed::PassedOver));
-    assert_eq!(replica.apply(&after), Ok(Fed::PassedOver));
+    let left = replica.rebuild(owner.replica().unwrap()).unwrap();
+    owner.leave_replica(left);
+    assert_eq!(feed(&mut owner, &mut replica, &lost), Ok(Fed::PassedOver));
+    assert_eq!(feed(&mut owner, &mut replica, &after), Ok(Fed::PassedOver));
     let next = commit(&mut owner, create(3, 2, "c", b"three"));
-    assert_eq!(replica.apply(&next), Ok(Fed::Applied));
+    assert!(matches!(
+      feed(&mut owner, &mut replica, &next),
+      Ok(Fed::Applied { .. })
+    ));
     assert_eq!(replica.green_mut().head_identity(), owner.head_identity());
     let counts = replica.counts();
     assert_eq!(
       (counts.refused, counts.rebuilds, counts.passed_over),
       (1, 1, 2)
     );
+    owner.leave_replica(replica.leave().unwrap());
   }
 
   /// A-273: a version message that would replay as another version is refused before anything changes: one whose
@@ -436,29 +499,31 @@ mod tests {
   #[test]
   fn a_version_that_would_replay_as_another_is_refused_unchanged() {
     let mut owner = Green::new();
-    let seed = owner.replica_seed().unwrap();
+    let mut replica = replica_of(&mut owner);
     let message = commit(&mut owner, create(1, 0, "a", b"one"));
     let mut skewed = message.clone();
     if let FeedBody::Version { version, .. } = &mut skewed.body {
       *version = 7;
     }
-    let mut replica = Replica::build(Origin::default(), &seed);
     assert_eq!(
-      replica.apply(&skewed),
+      feed(&mut owner, &mut replica, &skewed),
       Err(FeedRefusal::Diverged {
         version: 7,
         replayed: 1
       })
     );
     assert_eq!(replica.green().head(), 0);
-    assert_eq!(replica.apply(&message), Ok(Fed::Applied));
+    assert!(matches!(
+      feed(&mut owner, &mut replica, &message),
+      Ok(Fed::Applied { .. })
+    ));
     let mut again = message;
     again.position = replica.position();
     if let FeedBody::Version { version, .. } = &mut again.body {
       *version = 2;
     }
     assert_eq!(
-      replica.apply(&again),
+      feed(&mut owner, &mut replica, &again),
       Err(FeedRefusal::Diverged {
         version: 2,
         replayed: 1
@@ -466,25 +531,74 @@ mod tests {
       "an increment already replayed here"
     );
     assert_eq!(replica.green().head(), 1);
+    owner.leave_replica(replica.leave().unwrap());
+  }
+
+  /// A-273 step 3: a replay whose content is not the owner's is refused: one whose increment makes other bytes than the
+  /// owner sealed in the message, after its replay, and one carrying another message's blocks, at their admission.
+  #[test]
+  fn a_replay_to_other_content_than_the_owners_is_refused() {
+    let mut owner = Green::new();
+    let mut forged_to = replica_of(&mut owner);
+    let mut swapped_to = replica_of(&mut owner);
+    let first = commit(&mut owner, create(1, 0, "a", b"one"));
+    let second = commit(&mut owner, create(2, 1, "b", b"two"));
+    let other = create(9, 0, "a", b"xyz");
+    let (_, applied) = Green::new().submit_resolved(&other);
+    let mut forged = first.clone();
+    forged.body = FeedBody::Version {
+      version: 1,
+      increment: other,
+      applied: applied.unwrap(),
+      signature: None,
+    };
+    assert_eq!(
+      feed(&mut owner, &mut forged_to, &forged),
+      Err(FeedRefusal::NotTheOwners { position: 0 }),
+      "its replay sealed other bytes"
+    );
+    let mut swapped = first;
+    swapped.changes = second.changes.clone();
+    assert_eq!(
+      feed(&mut owner, &mut swapped_to, &swapped),
+      Err(FeedRefusal::NotTheOwners { position: 0 }),
+      "another message's blocks"
+    );
+    assert_eq!(
+      swapped_to.green().head(),
+      0,
+      "refused at admission, unchanged"
+    );
+    owner.leave_replica(forged_to.leave().unwrap());
+    owner.leave_replica(swapped_to.leave().unwrap());
   }
 
   /// A-273: a fold of the owner's history is a feed message in order with the versions, so the replica keeps no value
-  /// the owner dropped; a fold that moves no floor sends nothing and moves no position.
+  /// the owner dropped, and the owner frees what the fold released once the replica passes it; a fold that moves no
+  /// floor sends nothing and moves no position.
   #[test]
   fn a_fold_is_fed_in_order_and_a_fold_that_moves_nothing_sends_nothing() {
     let mut owner = Green::new();
-    let mut replica = Replica::build(Origin::default(), &owner.replica_seed().unwrap());
+    let mut replica = replica_of(&mut owner);
     for tag in 1..=3u8 {
       let base = u64::from(tag) - 1;
       let message = commit(&mut owner, increment(tag, base, "a", &[tag; 4], tag == 1));
-      assert_eq!(replica.apply(&message), Ok(Fed::Applied));
+      assert!(matches!(
+        feed(&mut owner, &mut replica, &message),
+        Ok(Fed::Applied { .. })
+      ));
     }
     let position = owner.feed_position();
     let (_, fold) = owner.fold_and_feed(2);
     let fold = fold.unwrap();
     assert_eq!(fold.position, position);
     assert_eq!(fold.body, FeedBody::Fold { floor: 2 });
-    assert_eq!(replica.apply(&fold), Ok(Fed::Applied));
+    let held = owner.content_frees_held();
+    assert!(held >= 1, "the fold's release kept for the replica: {held}");
+    assert!(matches!(
+      feed(&mut owner, &mut replica, &fold),
+      Ok(Fed::Applied { .. })
+    ));
     assert_eq!(replica.green().folded_below(), 2);
     assert_eq!(replica.green().content_at("a", 1), None, "folded on both");
     assert_eq!(owner.content_at("a", 1), None);
@@ -492,5 +606,6 @@ mod tests {
     let (released, none) = owner.fold_and_feed(2);
     assert_eq!((released, none), (0, None));
     assert_eq!(owner.feed_position(), position + 1);
+    owner.leave_replica(replica.leave().unwrap());
   }
 }
