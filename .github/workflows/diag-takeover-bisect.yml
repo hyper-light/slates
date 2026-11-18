@@ -1,0 +1,31 @@
+name: diag-takeover-bisect
+on:
+  push:
+    branches: [diag-takeover-bisect]
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  flows:
+    name: takeover flows at ${{ matrix.sha }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sha: ["7fe9266975ce8aca4b162a0c8c510b180dd41b38", "0b9627fcee7e8e4592479915d783fe93149a03ba", "4145e3d337b2fa228a8e7ddbef15e3c65b71ac2b", "6b2fd3cbf1ebc872e890e2d35b7c720e714c6b02", "3cc5a9a51b8a7c9f9a2e1750006725e26a394902", "8636d851009abca636fd4840713172d9bf89ae9f", "ba78159a63aba33005380c5671e4cb9056cb61b3"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: live_chaos's two takeover flows, twice
+        shell: bash
+        run: |
+          git log -1 --format='%h %s' | cut -c1-120
+          cargo test --release --locked -p slates-cli --test live_chaos --no-run 2>&1 | tail -2
+          for round in 1 2; do
+            SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture --test-threads=1 serves_a_takeover > round$round.log 2>&1 || true
+            grep -E "^test result:|Continuity|panicked at" round$round.log | head -6
+          done
+          ! grep -q "Continuity" round1.log round2.log
