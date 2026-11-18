@@ -311,7 +311,7 @@ pub(crate) struct Outgoing {
 fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
-  let bound = state.config.failover_slo_ns;
+  let bound = state.failover_ns;
   let begun: Vec<(DbVolumeId, MoveOut)> = state
     .moves_out
     .iter()

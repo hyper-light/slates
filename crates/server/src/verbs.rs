@@ -2882,7 +2882,7 @@ fn status_on_channel(
     let expires = state
       .clock
       .monotonic_ns()
-      .saturating_add(state.config.failover_slo_ns);
+      .saturating_add(state.failover_ns);
     slot
       .status_pages
       .begin(request, expires, &mut state.store.metadata);
@@ -3831,7 +3831,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         .unwrap_or(0)
     })
     .sum();
-  let term = state.config.failover_slo_ns;
+  let term = state.failover_ns;
   let expiring = state
     .db
     .partition()
@@ -7725,7 +7725,7 @@ fn stage_begin(
   };
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
-  let expires = now.saturating_add(state.config.failover_slo_ns);
+  let expires = now.saturating_add(state.failover_ns);
   match state.staging.begin(
     (work_id, principal),
     len,
@@ -7751,7 +7751,7 @@ fn stage_put(
   };
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
-  let expires = now.saturating_add(state.config.failover_slo_ns);
+  let expires = now.saturating_add(state.failover_ns);
   match state
     .staging
     .put((work_id, principal, token), offset, bytes, expires)
@@ -10927,6 +10927,9 @@ fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> Repl
     if let Err(e) = state.db.mutate(&mut state.segment, &renewal, now) {
       return refused(refusal_of_db(&e));
     }
+    if let Err(e) = renew_write_lease(state, &record, expires_ns, now) {
+      return refused(refusal_of_db(&e));
+    }
   }
   ReplyBody::Renewed {
     term_ns: term,
@@ -11090,7 +11093,8 @@ fn guest_over_the_ring(
 }
 
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
-/// epoch, an expired lease passes to the next epoch, and the term is the operator's failover SLO.
+/// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363). The
+/// principal's attachments of the volume renew it while they live (`renew_write_lease`, A-414).
 fn take_write_lease(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -11111,9 +11115,10 @@ fn take_write_lease(
     None => 1,
   };
   let term = derived!(
-    state.config.failover_slo_ns,
-    "the operator's failover SLO (the renewal round trip is microseconds, so one term is the SLO)",
-    ["failover_slo_ns"]
+    state.failover_ns,
+    "the node's failover delay (A-363): an abandoned holder keeps the write lease no longer than a failover would leave \
+     the volume unserved (A-230), and its holding attachment renews it while it lives (A-414)",
+    ["failover_ns"]
   );
   let lease = LeaseRecord {
     holder: principal.clone(),
@@ -11349,8 +11354,41 @@ pub(crate) fn use_attachment(
       .db
       .mutate(&mut state.segment, &renewal, now)
       .map_err(|e| refusal_of_db(&e))?;
+    renew_write_lease(state, &record, now.saturating_add(term), now).map_err(|e| refusal_of_db(&e))?;
   }
   Ok(())
+}
+
+/// Renews the volume's write lease with the CLI attachment that holds it (D-16, A-230, A-414): the lease is its holder's,
+/// so a renewal of the attachment is a renewal of the lease, to the same expiry at the same epoch. Before, the lease was
+/// taken at the attach and released at its term while the attachment lived on, renewed by verbs or a hold, so another
+/// principal could take the volume's write lease from a live holder. A lease another principal holds, none, or one that
+/// already runs as long, is left as it is.
+fn renew_write_lease(
+  state: &mut ShardState,
+  record: &AttachmentRecord,
+  expires_ns: u64,
+  now: u64,
+) -> Result<(), DbError> {
+  let Some(lease) = state
+    .db
+    .partition()
+    .volume(record.volume)
+    .and_then(|volume| volume.lease.clone())
+  else {
+    return Ok(());
+  };
+  if lease.holder != record.principal || lease.expires_ns >= expires_ns {
+    return Ok(());
+  }
+  state.db.mutate(
+    &mut state.segment,
+    &Op::LeaseTaken {
+      volume: record.volume,
+      lease: LeaseRecord { expires_ns, ..lease },
+    },
+    now,
+  )
 }
 
 /// Ends every CLI attachment of this partition whose term has lapsed (A-230): as a detach would, releasing the write

@@ -3388,13 +3388,16 @@ impl Daemon {
   /// (a forward, the location round, a held reply, a takeover's attempts) for a test whose subject is that bound's
   /// rule. `None` returns to the estimate.
   pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
-    self.observe(self.shards.first().copied(), move |s| {
-      s.injected_failover_ns = ns;
-      // In force on the control shard at once; the period's fan carries it to the others.
-      if let Some(ns) = ns {
-        s.failover_ns = ns;
-      }
-    })
+    // On every shard at once: a laptop runs no coordinator to fan it, and a fleet's fan carries the same value.
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.injected_failover_ns = ns;
+        if let Some(ns) = ns {
+          s.failover_ns = ns;
+        }
+      })?;
+    }
+    Ok(())
   }
 
   /// The failover delay this node's waits read now, nanoseconds (A-363): the control shard's estimate in whole
