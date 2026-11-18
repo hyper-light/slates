@@ -3947,6 +3947,8 @@ async fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    // The anchor's launcher-secret region is being built (A-285, g262's steps 1-4); until it reads, none.
+    launcher_secret: None,
     session_secret,
     seal_root,
     seal_state: sealing,
