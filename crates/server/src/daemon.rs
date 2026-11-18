@@ -202,6 +202,27 @@ pub struct HeldRecordView {
   pub fence: u64,
 }
 
+/// One peer's record dial at the read ([`Daemon::fleet_record_dials`], `crate::state::RecordDial`): how long the link has
+/// been dialing for the session it lacks, how long its current handshake call and its fresh session's first discovery
+/// page have run, the handshake budgets its dialer has spent and why its last ended, and the calls made since boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordDialReport {
+  /// The peer the link addresses.
+  pub peer: slates_db::HostId,
+  /// How long the link has been dialing, while it lacks a session.
+  pub dialing_for_ns: Option<u64>,
+  /// How long its current handshake call has run, while one runs.
+  pub call_for_ns: Option<u64>,
+  /// How long its fresh session's first discovery page has waited, while it does.
+  pub enroll_for_ns: Option<u64>,
+  /// Handshake budgets its dialer has spent without establishing.
+  pub budgets_spent: u32,
+  /// Why its dialer's last budget ended, while that dialer is kept for another call.
+  pub stall: Option<slates_transport::endpoint::HandshakeStall>,
+  /// Handshake calls made since boot.
+  pub calls: u64,
+}
+
 /// The daemon.
 pub struct Daemon {
   runtime: Option<Runtime>,
@@ -3225,6 +3246,28 @@ impl Daemon {
     })
   }
 
+  /// This node's record dials at the read ([`RecordDialReport`], `ShardState::record_dials`): what a fleet test whose
+  /// formation failed prints, so a link that never came up names whether its dialer sits inside one handshake call, waits
+  /// on its first discovery page, keeps failing, or idles. Empty on a laptop; the typed refusal when the control shard
+  /// could not be observed.
+  pub fn fleet_record_dials(&self) -> Result<Vec<RecordDialReport>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let now = slates_rt::futures::now_ns();
+      s.record_dials
+        .iter()
+        .map(|(peer, dial)| RecordDialReport {
+          peer: *peer,
+          dialing_for_ns: dial.dialing_since_ns.map(|since| now.saturating_sub(since)),
+          call_for_ns: dial.call_since_ns.map(|since| now.saturating_sub(since)),
+          enroll_for_ns: dial.enroll_since_ns.map(|since| now.saturating_sub(since)),
+          budgets_spent: dial.budgets_spent,
+          stall: dial.stall,
+          calls: dial.calls,
+        })
+        .collect()
+    })
+  }
+
   /// How many placed snapshots the shard owning `object` has **repaired** (§4.10 "the healer"): re-put to
   /// a recorded holder that answered the healer's offer with chunks it lacked. The non-vacuity counter a
   /// test reads — a holder shown to hold content again proves the repair only together with this count
@@ -3911,7 +3954,6 @@ async fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
-    grant_keys: Vec::new(),
     session_secret,
     seal_root,
     seal_state: sealing,
@@ -4061,6 +4103,7 @@ async fn init_shard(
     learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
     record_sessions: std::collections::BTreeMap::new(),
+    record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,
     live_state_withhold_replies: false,

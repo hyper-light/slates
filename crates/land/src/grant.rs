@@ -23,6 +23,8 @@ pub enum Surface {
   Cli,
   /// A confirmation surface of a harness.
   Confirmation,
+  /// The volume's write policy (A-285): issued by the daemon itself under a bypass policy.
+  Policy,
 }
 
 /// What a grant covers.
