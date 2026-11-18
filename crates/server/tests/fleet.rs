@@ -10995,11 +10995,13 @@ fn shared_live_volume(daemons: &[Daemon]) -> VolumeId {
   id
 }
 
-/// Has both survivors (`daemons[1..]`) judge `daemons[0]`, `owner`, dead though it lives, and waits for one of them to
-/// take its live volume over: that survivor's index.
-fn falsely_taken_over(daemons: &[Daemon], owner: HostId) -> usize {
+/// Cuts `daemons[0]`, the live volume's owner (`hosts[0]`), off the probe plane both ways while it runs on, so the
+/// survivors stop answering it and judge it dead, and their promotion opens once they have not answered it for the
+/// horizon; waits for one of them to take its live volume over. That survivor's index. A false death injected alone is
+/// refuted while the owner still probes, and its objects are never taken over (the holders kept answering it).
+fn falsely_taken_over(daemons: &[Daemon], hosts: &[HostId]) -> usize {
+  isolate_owner_on_the_probe_plane(daemons, hosts);
   let survivors: Vec<&Daemon> = daemons.iter().skip(1).collect();
-  inject_death_into(survivors.iter().copied(), owner);
   let mut successor = None;
   let took = poll_until(&survivors, RETIREMENT_DEADLINE + SERVE_DEADLINE, || {
     successor = (1..daemons.len())
@@ -11008,9 +11010,19 @@ fn falsely_taken_over(daemons: &[Daemon], owner: HostId) -> usize {
   });
   assert!(
     took,
-    "a survivor took the live volume over from its falsely dead owner"
+    "a survivor took the live volume over from its owner cut off the probe plane"
   );
   successor.unwrap()
+}
+
+/// Ends [`falsely_taken_over`]'s cut: every node hears every other on the probe plane again, so the owner, still alive,
+/// refutes its death and is admitted again under its id.
+fn heal_the_probe_plane(daemons: &[Daemon]) {
+  for daemon in daemons {
+    daemon
+      .inject_probe_deafness(&[])
+      .expect("the probe plane is whole again");
+  }
 }
 
 /// This node's host epoch, from its status, through a client of `daemon`.
@@ -11045,10 +11057,10 @@ fn reads_through(daemon: &Daemon, volume: VolumeId) -> Vec<ReplyBody> {
   answers
 }
 
-/// A-334, §4.8 "Authority scope" and "Leases and reads" (ReadSafety through an owner admitted again; T-8.7's false
-/// death). Do: on a three-node fleet, make a live volume on a, share it and write a first file; have both survivors
-/// judge a dead though it lives, so the council retires a and a survivor takes the volume over; write a second file
-/// through the successor; wait until a, refuting its death, is admitted again at a newer host epoch; read the second file
+/// A-334, §4.8 "Authority scope" and "Leases and reads" (ReadSafety through an owner admitted again; T-8.7's partition).
+/// Do: on a three-node fleet, make a live volume on a, share it and write a first file; cut a off the probe plane both
+/// ways while it runs, so the council retires it and a survivor takes the volume over; write a second file through the
+/// successor; heal, and wait until a, refuting its death, is admitted again at a newer host epoch; read the second file
 /// through a. Expect: every read answers the file's bytes or a refusal, never `NotFound` or other bytes, and one answers
 /// its bytes (a forwards it to the successor); and a counted the volume yielded. Before A-334, a served the copy its
 /// catalog kept, once its lease confirmed again, and answered the second file `NotFound`: what the SIGSTOP owner flow of
@@ -11059,7 +11071,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let id = shared_live_volume(&daemons);
-  let successor = falsely_taken_over(&daemons, hosts[0]);
+  let successor = falsely_taken_over(&daemons, &hosts);
   let mut writer = Client::connect(daemons[successor].instance());
   let attachment = write_attachment(&mut writer, id);
   let second = writer.call(&RequestBody::FsWrite {
@@ -11073,6 +11085,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
     matches!(second, ReplyBody::FsDone { .. }),
     "the successor's write is answered at durability: {second:?}"
   );
+  heal_the_probe_plane(&daemons);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
     Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
