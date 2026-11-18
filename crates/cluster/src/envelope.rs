@@ -24,6 +24,9 @@
 //! archive was wrapped in one turn: 98 ms for 64 MiB of 64 KiB chunks (`envelope_bench`, 2026-10-05), so at about a GiB
 //! one turn ran past the daemon's watchdog window of a second, and a volume that large crash-looped its owner at every
 //! seal. [`wrap`] is one whole advance and makes the very same envelope.
+//!
+//! An open is made a slice at a time the same way ([`Opening`], A-347): a takeover's successor opens a sealed volume's
+//! envelope in turns of its owner shard's clock, a chunk at least a turn, and [`open`] is one whole advance.
 
 use hyper_seal::keys::WrappingKey;
 use hyper_seal::name::{NAME, Namer};
@@ -240,57 +243,165 @@ impl Wrapping {
 
 /// Opens `envelope` (the module doc): the real archive, every chunk its manifest references opened under `lineage`
 /// and checked against its keyed name under `namer`, in the order the manifest first references them. Its creation
-/// time is zero (the module doc). An archive that is not an envelope is refused [`EnvelopeError::Shape`].
+/// time is zero (the module doc). An archive that is not an envelope is refused [`EnvelopeError::Shape`]. One whole
+/// advance of an [`Opening`], so an open made in slices is this very archive.
 pub fn open(
   envelope: &Archive,
   lineage: &WrappingKey,
   namer: &Namer,
 ) -> Result<Archive, EnvelopeError> {
-  let Node::Directory(entries) = &envelope.manifest else {
-    return Err(EnvelopeError::Shape);
-  };
-  if !is_envelope(envelope) {
-    return Err(EnvelopeError::Shape);
-  }
-  let mut manifests = entries
-    .iter()
-    .filter(|entry| entry.name.starts_with(MANIFEST_PREFIX));
-  let manifest_entry = manifests.next().ok_or(EnvelopeError::Manifest)?;
-  if manifests.next().is_some() {
-    return Err(EnvelopeError::Manifest);
-  }
-  // The envelope's chunks by identity, so each entry finds its chunk in log time: a scan per entry made opening `n`
-  // chunks cost `n²` identity comparisons, about 1.3e8 at 1 GiB of 64 KiB chunks, on the takeover's path.
-  let stored: std::collections::BTreeMap<&[u8; 32], &Chunk> = envelope
-    .chunks
-    .iter()
-    .map(|chunk| (&chunk.identity, chunk))
-    .collect();
-  let manifest_chunk = open_entry(&stored, manifest_entry, lineage, namer)?;
-  let bytes = Archive::content(&manifest_chunk).map_err(|_| EnvelopeError::Malformed)?;
-  let mut archive = Archive::decode(&bytes).map_err(|_| EnvelopeError::Malformed)?;
-  let wanted = archive.referenced_chunks();
-  let mut chunks = Vec::with_capacity(wanted.len());
-  for identity in wanted.iter().filter(|identity| **identity != [0u8; 32]) {
-    let name = entry_name(
-      CHUNK_PREFIX,
-      &namer
-        .name(identity)
-        .map_err(|e| EnvelopeError::Sealed(SealedError::Seal(e)))?,
-    );
-    let entry = entries
-      .binary_search_by(|entry| entry.name.as_str().cmp(&name))
-      .ok()
-      .and_then(|at| entries.get(at))
-      .ok_or(EnvelopeError::Missing)?;
-    let chunk = open_entry(&stored, entry, lineage, namer)?;
-    if chunk.identity != *identity {
-      return Err(EnvelopeError::Sealed(SealedError::Name));
+  let mut opening = Opening::new(envelope.clone(), lineage, namer)?;
+  // Each advance opens at least one chunk, or returns the archive, so the loop ends: at once with the whole budget.
+  loop {
+    if let Some(archive) = opening.advance(lineage, namer, u64::MAX)? {
+      return Ok(archive);
     }
-    chunks.push(chunk);
   }
-  archive.chunks = chunks;
-  Ok(archive)
+}
+
+/// An envelope opened a slice at a time (A-347; the module doc): its sealed manifest at [`Opening::new`], then the chunks
+/// the real manifest references, in the order it first references them, at least a byte budget's worth a slice
+/// ([`Opening::advance`]), each checked against its keyed name; the archive once every one is open. The order and every
+/// opened byte are [`open`]'s, so the archive is the same however the slices fall. A refusal ends the open
+/// ([`EnvelopeError::Spent`] after it). Until 2026-11-18 a takeover opened a sealed volume's whole envelope in one turn
+/// of the successor's owner shard, a seal's open and a BLAKE3 pass a byte: about a second a GiB, the watchdog's window.
+pub struct Opening {
+  /// The envelope: its entries name the sealed chunks, and its chunks hold them.
+  envelope: Archive,
+  /// Each of the envelope's chunks by identity, as its index in the envelope's chunk list, so an entry finds its chunk
+  /// in log time (a scan per entry made opening `n` chunks cost `n²` comparisons).
+  stored: std::collections::BTreeMap<[u8; 32], usize>,
+  /// The real archive, its manifest opened; its chunks are set when the last is open, and it is handed back then.
+  archive: Option<Archive>,
+  /// The identities of the chunks the real manifest references, in the order it first references them.
+  wanted: Vec<[u8; 32]>,
+  /// The index in `wanted` of the next chunk to open.
+  next: usize,
+  /// The chunks opened so far, in `wanted`'s order.
+  chunks: Vec<Chunk>,
+  /// Whether the open has ended: its archive returned, or a refusal met.
+  spent: bool,
+}
+
+impl Opening {
+  /// Begins opening `envelope` under `lineage` and `namer`: checks it is an envelope of one sealed manifest and opens
+  /// that manifest (the real archive without its chunks: its tree and metadata, never its content); nothing else is
+  /// opened until the first [`Self::advance`]. Refused as [`open`] refuses.
+  pub fn new(
+    envelope: Archive,
+    lineage: &WrappingKey,
+    namer: &Namer,
+  ) -> Result<Opening, EnvelopeError> {
+    let Node::Directory(entries) = &envelope.manifest else {
+      return Err(EnvelopeError::Shape);
+    };
+    if !is_envelope(&envelope) {
+      return Err(EnvelopeError::Shape);
+    }
+    let mut manifests = entries
+      .iter()
+      .filter(|entry| entry.name.starts_with(MANIFEST_PREFIX));
+    let manifest_entry = manifests.next().ok_or(EnvelopeError::Manifest)?;
+    if manifests.next().is_some() {
+      return Err(EnvelopeError::Manifest);
+    }
+    let stored: std::collections::BTreeMap<[u8; 32], usize> = envelope
+      .chunks
+      .iter()
+      .enumerate()
+      .map(|(at, chunk)| (chunk.identity, at))
+      .collect();
+    let manifest_chunk = open_entry(&envelope.chunks, &stored, manifest_entry, lineage, namer)?;
+    let bytes = Archive::content(&manifest_chunk).map_err(|_| EnvelopeError::Malformed)?;
+    let archive = Archive::decode(&bytes).map_err(|_| EnvelopeError::Malformed)?;
+    let wanted: Vec<[u8; 32]> = archive
+      .referenced_chunks()
+      .into_iter()
+      .filter(|identity| *identity != [0u8; 32])
+      .collect();
+    Ok(Opening {
+      chunks: Vec::with_capacity(wanted.len()),
+      envelope,
+      stored,
+      archive: Some(archive),
+      wanted,
+      next: 0,
+      spent: false,
+    })
+  }
+
+  /// The chunks not yet opened.
+  pub fn chunks_left(&self) -> usize {
+    self.wanted.len().saturating_sub(self.next)
+  }
+
+  /// Opens the next chunks under `lineage`, each checked against its keyed name under `namer`, until this call has
+  /// opened at least `byte_budget` of their bytes (one chunk at least, so an open always moves on); once none is left,
+  /// the archive is returned. `None` while chunks remain. Every call passes the keys [`Self::new`] did. A refusal ends
+  /// the open, and every call after an end is refused [`EnvelopeError::Spent`].
+  pub fn advance(
+    &mut self,
+    lineage: &WrappingKey,
+    namer: &Namer,
+    byte_budget: u64,
+  ) -> Result<Option<Archive>, EnvelopeError> {
+    if self.spent {
+      return Err(EnvelopeError::Spent);
+    }
+    match self.open_chunks(lineage, namer, byte_budget) {
+      Ok(false) => Ok(None),
+      Ok(true) => {
+        self.spent = true;
+        let mut archive = self.archive.take().ok_or(EnvelopeError::Spent)?;
+        archive.chunks = std::mem::take(&mut self.chunks);
+        Ok(Some(archive))
+      }
+      Err(error) => {
+        self.spent = true;
+        Err(error)
+      }
+    }
+  }
+
+  /// Opens the next chunks until `byte_budget` of their bytes are open, one at least: whether none is left.
+  fn open_chunks(
+    &mut self,
+    lineage: &WrappingKey,
+    namer: &Namer,
+    byte_budget: u64,
+  ) -> Result<bool, EnvelopeError> {
+    let Node::Directory(entries) = &self.envelope.manifest else {
+      return Err(EnvelopeError::Shape);
+    };
+    let mut opened_bytes: u64 = 0;
+    let mut opened_one = false;
+    while let Some(identity) = self.wanted.get(self.next) {
+      if opened_one && opened_bytes >= byte_budget {
+        return Ok(false);
+      }
+      let name = entry_name(
+        CHUNK_PREFIX,
+        &namer
+          .name(identity)
+          .map_err(|e| EnvelopeError::Sealed(SealedError::Seal(e)))?,
+      );
+      let entry = entries
+        .binary_search_by(|entry| entry.name.as_str().cmp(&name))
+        .ok()
+        .and_then(|at| entries.get(at))
+        .ok_or(EnvelopeError::Missing)?;
+      let chunk = open_entry(&self.envelope.chunks, &self.stored, entry, lineage, namer)?;
+      if chunk.identity != *identity {
+        return Err(EnvelopeError::Sealed(SealedError::Name));
+      }
+      let len = u64::try_from(chunk.payload.len()).map_err(|_| EnvelopeError::TooLarge)?;
+      opened_bytes = opened_bytes.saturating_add(len);
+      opened_one = true;
+      self.chunks.push(chunk);
+      self.next = self.next.saturating_add(1);
+    }
+    Ok(true)
+  }
 }
 
 /// An envelope being made ([`Wrapping`]): its entries, its chunks, the identities of the chunks it already stores, and
@@ -339,7 +450,8 @@ impl Sealing {
 /// The sealed chunk `entry` names, opened: the entry must be a file of one whole extent over one of the envelope's
 /// chunks, and its name must carry the keyed name the opened chunk is checked against.
 fn open_entry(
-  stored: &std::collections::BTreeMap<&[u8; 32], &Chunk>,
+  chunks: &[Chunk],
+  stored: &std::collections::BTreeMap<[u8; 32], usize>,
   entry: &Entry,
   lineage: &WrappingKey,
   namer: &Namer,
@@ -353,7 +465,7 @@ fn open_entry(
   let name = keyed_name(&entry.name).ok_or(EnvelopeError::Shape)?;
   let stored = stored
     .get(&extent.chunk)
-    .copied()
+    .and_then(|at| chunks.get(*at))
     .ok_or(EnvelopeError::Missing)?;
   let bytes = Archive::content(stored).map_err(|_| EnvelopeError::Shape)?;
   if extent.offset != 0

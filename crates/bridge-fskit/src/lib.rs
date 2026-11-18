@@ -217,7 +217,7 @@ impl ShimError {
       VfsError::NameTooLong => ShimError::InvalidName,
       VfsError::InvalidName => ShimError::Invalid,
       VfsError::TooManyLinks => ShimError::TooManyLinks,
-      VfsError::NoSpace => ShimError::NoSpace,
+      VfsError::NoSpace | VfsError::RetentionExceeded => ShimError::NoSpace,
       VfsError::FileTooLarge => ShimError::FileTooLarge,
       VfsError::CrossVolumeMove => ShimError::CrossVolumeMove,
       VfsError::StaleHandle => ShimError::StaleHandle,

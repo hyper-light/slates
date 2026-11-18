@@ -24,7 +24,7 @@
 //!
 //! **What is never answered "none".** Only the green's shard answers, and only once its count is final: once it serves
 //! the green, since the takeover recorded every adopted completion in the same turn the green began to be served
-//! (`verbs::materialize_taken_over_green`), or once the green is `unrecovered`: a takeover given up after the failover
+//! (`verbs::adopt_taken_over_green`), or once the green is `unrecovered`: a takeover given up after the failover
 //! SLO's attempts (`fleet::give_up_taken_over`) recorded none and never will, and a recovery that could not rebuild the
 //! green left its partition's records as they were. A green pending materialization, owned elsewhere or not found gives
 //! no answer, and the route stays to be asked again the next period; so does a question refused or unanswered.

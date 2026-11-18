@@ -35,9 +35,14 @@ const WEDGE_BUDGETS: u64 = 5;
 /// the shard ran the task's start there), the window that shows no CPU, and one more for the deadline's lateness under
 /// a loaded runner; still two budgets short of the wedge.
 const ENDED_WITHIN_BUDGETS: u64 = 3;
-/// Derived: how much of its shard's own CPU time a deliberately slow question spins ([`spin_shard_time`]) — twice the short budget, so its
-/// answer is late by construction.
-const SLOW_QUESTION_NS: u64 = 2 * SHORT_BUDGET_NS;
+/// Derived: how much of its shard's own CPU time a deliberately slow question spins ([`spin_shard_time`]) — twice the short
+/// budget held to this build, the CPU an observation gives its shard in any build (A-356: the budget scaled by how much
+/// slower the build runs compiled code than machine code, `slates_machine::build_cost`), so its answer is late by
+/// construction. Twice the bare budget was not, once a slower build's budget grew: an unoptimized build gives 3.4 of them.
+fn slow_question_ns() -> u64 {
+  2 * slates_machine::build_cost::build_cost()
+    .map_or(SHORT_BUDGET_NS, |cost| cost.scale(SHORT_BUDGET_NS))
+}
 /// Spins on the calling shard until it has run `ns` of its own CPU time — the clock an observation's budget is
 /// counted in (A-65) — so a question is late by construction however little CPU a loaded machine gives the shard.
 /// Spinning by the wall clock was not: a shard given under half a core finished a two-budget wall spin having run
@@ -330,7 +335,7 @@ fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_coun
   // Admitted at once on the idle shard, the slow question is still running at the deadline.
   let slow = daemon
     .observation_on_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
-      spin_shard_time(SLOW_QUESTION_NS);
+      spin_shard_time(slow_question_ns());
       9u8
     })
     .expect("the slow observation begins")

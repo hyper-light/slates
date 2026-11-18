@@ -4,15 +4,18 @@
 //! reply cut short cannot be told from payload. A successor instead hands the device a fresh stream over a second,
 //! message-oriented channel made at the attach beside the stream, and the device resends its outstanding request on it.
 //!
-//! **The channel.** A connected pair of Unix sockets that keep message boundaries and carry descriptors: sequenced
-//! packets on Linux, datagrams on macOS (which has no sequenced-packet Unix sockets; a connected Unix datagram pair is
-//! reliable and ordered there). One way, slates to the device. The daemon's end is held by the anchor across daemon
-//! restarts, so it never closes with a daemon: the device reads its end-of-file only when no resync will ever come
-//! (the attachment ended, the anchor itself went, or the stream gave up its resync).
+//! **The channel.** A connected pair of Unix sockets that carry descriptors: sequenced packets on Linux, each message
+//! one packet; a stream on macOS (A-339), each message read whole by its fixed length, [`RESYNC_MESSAGE_BYTES`], a
+//! `Resync`'s descriptor arriving with its bytes. macOS has no sequenced-packet Unix sockets, and its datagram pairs,
+//! which keep messages whole, never tell a survivor that its peer has gone (measured 2026-11-18: a blocked read, a
+//! `select` and a kqueue waited out their 5 s), which a device needs. One way, slates to the device. The daemon's end
+//! is held by the anchor across daemon restarts, so it never closes with a daemon: the device reads its end-of-file
+//! only when no resync will ever come (the attachment ended, the anchor itself went, or the stream gave up its
+//! resync). A device that ends its share closes its end of the channel with its stream's.
 //!
-//! **The messages** ([`ResyncMessage`]), each one packet of [`RESYNC_MESSAGE_BYTES`], little-endian: a kind byte, the
-//! version byte ([`RESYNC_VERSION`]), two reserved zero bytes, the attachment id (`u64`) and the attachment's resync
-//! token (16 bytes).
+//! **The messages** ([`ResyncMessage`]), each [`RESYNC_MESSAGE_BYTES`] long, little-endian: a kind byte, the version
+//! byte ([`RESYNC_VERSION`]), two reserved zero bytes, the attachment id (`u64`) and the attachment's resync token (16
+//! bytes).
 //! - [`ResyncKind::Attached`], queued at the attach before the device has its end, carries no descriptor: it tells
 //!   the device the token.
 //! - [`ResyncKind::Resync`], sent by a successor daemon once its recovery kept the attachment, carries exactly one
@@ -29,7 +32,9 @@
 //! unique unchanged) as the new stream's first frame, and asks again for each DAX mapping's descriptor. The successor
 //! serves the new stream as the same attachment, with no `INIT`, and answers a resent request the dead daemon applied
 //! and published but never answered from the reply it published with the effect (A-61's rule), never by applying it
-//! twice.
+//! twice. The successor keeps its own copy of the fresh end until the device's first bytes on it, or until the device's
+//! end of the channel closes (A-339: macOS flushes a socket whose every copy rides a message), so a device that takes a
+//! resync and then ends its share closes both ends, the channel's too.
 //!
 //! These are functions over bytes, holding no socket, so they run on every platform; the device's half lives in
 //! Shards, and this module's parse is its reference, which slates' own tests run as the device.

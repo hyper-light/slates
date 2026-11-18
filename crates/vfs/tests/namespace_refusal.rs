@@ -361,7 +361,10 @@ fn unchanged(after: &Observed, before: &Observed, context: &str) {
 }
 
 fn typed_capacity_refusal(refusal: &VfsError) -> bool {
-  matches!(refusal, VfsError::NoSpace | VfsError::Memory(_))
+  matches!(
+    refusal,
+    VfsError::NoSpace | VfsError::RetentionExceeded | VfsError::Memory(_)
+  )
 }
 
 /// One verb against one tight dimension, at every step: the cap starts at the scenario's own use and

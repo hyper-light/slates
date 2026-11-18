@@ -222,7 +222,12 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 81
+slates-machine = 85
+# 2026-11-18 (+4, A-357, Windows only; 81 -> 85): the thread-profiling calls of A-223 (`switches.rs`) are found in kernel32
+#   at run time, never imported: three typed function-pointer aliases (`Enable`, `Read`, `Disable`) and the block that
+#   looks them up with `GetModuleHandleW` and `GetProcAddress`; the three calls' blocks were counted already. Nano Server's
+#   kernel32 exports none of the three, and the binary that imported them exited 0xC0000139 there before any of its code
+#   ran (release run 44326428333; docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md).
 # 2026-11-18 (+2, A-336, Windows only; 79 -> 81): the host's memory stall (`memory_stall.rs`), Windows' low-memory resource
 #   notification: `CreateMemoryResourceNotification` once a process and `QueryMemoryResourceNotification` at each look
 #   that suspects a shard, Win32 FFI with no safe wrapper. The watchdog and the anchor tell a shard waiting on memory

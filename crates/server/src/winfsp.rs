@@ -203,12 +203,8 @@ struct OwnVolumeRecord(u64);
 impl OwnVolumeRecord {
   fn of(volume: &[u16]) -> Result<Self, Refusal> {
     let id = slates_base::own_mounts::volume_id(volume);
-    slates_base::own_mounts::record(id).map_err(|full| Refusal::TargetUnavailable {
-      reason: format!(
-        "the WinFsp volume is past the {} mounts this daemon records as its own",
-        full.capacity
-      ),
-    })?;
+    slates_base::own_mounts::record(id)
+      .map_err(|full| crate::error::target(crate::error::records_full(full)))?;
     Ok(Self(id))
   }
 }
@@ -269,9 +265,9 @@ pub(crate) fn check_mount_point(path: &str) -> Result<(), Refusal> {
   let mut chars = path.chars();
   match (chars.next(), chars.next(), chars.next()) {
     (Some(letter), Some(':'), None) if letter.is_ascii_alphabetic() => Ok(()),
-    _ => Err(Refusal::TargetUnavailable {
-      reason: format!("the WinFsp mount point {path} is not a drive letter (`S:`)"),
-    }),
+    _ => Err(crate::error::target(
+      slates_ipc::protocol::TargetRefusal::NotADriveLetter,
+    )),
   }
 }
 
@@ -308,25 +304,32 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       Err(error) => Err((error.to_string(), None)),
     };
     // A hold the anchor may yet read names this process's objects, so a refused one keeps them until it is released.
+    // Each refusal is typed for the reply (A-299) and keeps its words for the log.
+    let refused_mount = slates_ipc::protocol::TargetRefusal::MountRefused { errno: None };
     let mut _unheld = None;
     let mounted = match mounted {
       Ok((thread, ready)) => {
         let held = match (ready.handle_values(), ready.offer.record.encode()) {
           (Ok(values), Ok(record)) => crate::anchor_hold::hold_mount(attachment, values, record)
             .await
-            .map_err(|error| format!("the anchor's hold: {error}")),
-          (Err(error), _) => Err(error.to_string()),
-          (_, Err(error)) => Err(format!("held mount record: {error:?}")),
+            .map_err(|error| {
+              (
+                slates_ipc::protocol::TargetRefusal::AnchorHold,
+                format!("the anchor's hold: {error}"),
+              )
+            }),
+          (Err(error), _) => Err((refused_mount, error.to_string())),
+          (_, Err(error)) => Err((refused_mount, format!("held mount record: {error:?}"))),
         };
         match held {
           Ok(()) => Ok((thread, ready)),
-          Err(error) => {
+          Err((refusal, why)) => {
             _unheld = Some(ready);
-            Err((error, Some(thread)))
+            Err((refusal, why, Some(thread)))
           }
         }
       }
-      Err(error) => Err(error),
+      Err((why, thread)) => Err((refused_mount, why, thread)),
     };
     let served = state::with_state_counted(|s| {
       let mut reaped = None;
@@ -336,13 +339,14 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
           reaped = refused_thread;
           reply
         }
-        Err((why, thread)) => {
+        Err((refusal, why, thread)) => {
           s.count(MOUNT_REFUSED, 1);
           crate::verbs::release_unrecorded_lease(s, &pending.record);
           reaped = thread;
-          crate::verbs::refused(Refusal::TargetUnavailable {
-            reason: format!("the WinFsp mount at {mount_point} was refused: {why}"),
-          })
+          slates_machine::log_line!(
+            "slates-server: the WinFsp mount at {mount_point} was refused: {why}"
+          );
+          crate::verbs::refused(crate::error::target(refusal))
         }
       });
       deliver(s, reply, route);
@@ -371,12 +375,9 @@ pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) ->
   let request = state.current_request?;
   let mount = state.winfsp_mounts.get_mut(&attachment)?;
   if mount.detaching {
-    return Some(crate::verbs::refused(Refusal::TargetUnavailable {
-      reason: format!(
-        "the drive {} waits for the anchor to release its hold; a detach already asked for this",
-        mount.mount_point
-      ),
-    }));
+    return Some(crate::verbs::refused(crate::error::target(
+      slates_ipc::protocol::TargetRefusal::DetachPending,
+    )));
   }
   mount.detaching = true;
   let route = state.reply_route.take();
@@ -391,11 +392,13 @@ pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) ->
         Ok(()) => end_released(s, &record),
         Err(error) => {
           s.count(DETACH_REFUSED, 1);
-          crate::verbs::refused(Refusal::TargetUnavailable {
-            reason: format!(
-              "the anchor has not released the drive it holds, so the file system still serves it: {error}"
-            ),
-          })
+          slates_machine::log_line!(
+            "slates-server: the anchor has not released the drive it holds, so the file system still serves it: \
+             {error}"
+          );
+          crate::verbs::refused(crate::error::target(
+            slates_ipc::protocol::TargetRefusal::AnchorHold,
+          ))
         }
       });
       deliver(s, reply, route);

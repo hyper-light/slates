@@ -226,11 +226,11 @@ impl OwnMountRecord {
   }
 }
 
-/// The refusal of a FUSE mount at `mount_point` this daemon could not record as its own.
+/// The refusal of a FUSE mount at `mount_point` this daemon could not record as its own, typed (A-299); the point and
+/// why are logged.
 fn own_refusal(why: Unrecorded, mount_point: &str) -> Refusal {
-  Refusal::TargetUnavailable {
-    reason: format!("the FUSE mount at {mount_point} {why}"),
-  }
+  slates_machine::log_line!("slates-server: the FUSE mount at {mount_point} {why}");
+  crate::error::target(crate::error::target_of_unrecorded(why))
 }
 
 /// Learns the FUSE mounts a predecessor kept that this shard's catalog names and the kernel's table still holds,
@@ -315,19 +315,31 @@ pub(crate) struct PendingAttach {
   pub(crate) token: [u8; 16],
 }
 
+/// The OS error number a refused FUSE mount names, when one was given: the helper's own words, and how it exited, go
+/// to the daemon's log (A-299).
+fn mount_errno(error: &MountError) -> Option<i32> {
+  match error {
+    MountError::Socketpair { code } | MountError::Spawn { code } | MountError::Recv { code } => {
+      *code
+    }
+    MountError::Helper { .. }
+    | MountError::NoDevice { .. }
+    | MountError::Timeout { .. }
+    | MountError::Channel(_)
+    | MountError::AllowOtherNotGranted => None,
+  }
+}
+
 /// Checks a FUSE mount point before any effect (§4.6 A-9's `UserOwnedExistingDirectory`): an absolute path
 /// to an existing directory — not followed through a final symbolic link — owned by the daemon's user and,
 /// for a Unix-user principal, by that user. `fusermount3` alone would mount over a regular file the user
 /// owns, so the transport's stated constraint is the daemon's to hold. A read-only query of the path the
 /// caller named; nothing is created.
 pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(), Refusal> {
-  let refuse = |why: String| {
-    Err(Refusal::TargetUnavailable {
-      reason: format!("the FUSE mount point {path} {why}"),
-    })
-  };
+  use slates_ipc::protocol::TargetRefusal as Typed;
+  let refuse = |why: Typed| Err(crate::error::target(why));
   if !path.starts_with('/') {
-    return refuse("is not an absolute path".to_owned());
+    return refuse(Typed::NotAbsolute);
   }
   // Every component is walked first, and none on a mount this daemon serves is entered (A-227): a mount point inside
   // another of its FUSE mounts would make the shard ask its own mount.
@@ -343,7 +355,7 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
         used_as: slates_ipc::protocol::OwnMountUse::MountPoint,
       });
     }
-    Err(e) => return refuse(format!("cannot be read ({e})")),
+    Err(e) => return refuse(crate::error::target_of_host(&e)),
   };
   let stat = match rustix::fs::statat(
     &point,
@@ -351,21 +363,21 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
     rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
   ) {
     Ok(stat) => stat,
-    Err(e) => return refuse(format!("cannot be read (code {})", e.raw_os_error())),
+    Err(e) => {
+      return refuse(Typed::Host {
+        errno: e.raw_os_error(),
+      });
+    }
   };
   if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
-    return refuse("is not a directory".to_owned());
+    return refuse(Typed::NotDirectory);
   }
   let owner = stat.st_uid;
-  if owner != rustix::process::geteuid().as_raw() {
-    return refuse(format!("belongs to uid {owner}, not the daemon's user"));
-  }
-  if let Principal::Uid { uid, .. } = principal
-    && *uid != owner
-  {
-    return refuse(format!(
-      "belongs to uid {owner}, not the requesting uid {uid}"
-    ));
+  // Not the daemon's user's, or not the requesting user's.
+  let owned_by_another = owner != rustix::process::geteuid().as_raw()
+    || matches!(principal, Principal::Uid { uid, .. } if *uid != owner);
+  if owned_by_another {
+    return refuse(Typed::OwnedByAnother { owner: Some(owner) });
   }
   Ok(())
 }
@@ -380,9 +392,9 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
   };
   // The mount's source is this daemon's tag (A-227), never its attachment: the kernel's table is world-readable.
   let Some(fsname) = slates_base::own_mounts::fsname() else {
-    return crate::verbs::refused(Refusal::TargetUnavailable {
-      reason: "this daemon has no record of its own mounts".to_owned(),
-    });
+    return crate::verbs::refused(crate::error::target(
+      slates_ipc::protocol::TargetRefusal::NoOwnMountTag,
+    ));
   };
   let route = state.reply_route.take();
   let cause = state.current_span;
@@ -416,9 +428,14 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
         Err(error) => {
           s.count(MOUNT_REFUSED, 1);
           release_unmounted_lease(s, &pending.record);
-          crate::verbs::refused(Refusal::TargetUnavailable {
-            reason: format!("the FUSE mount at {mount_point} was refused: {error}"),
-          })
+          slates_machine::log_line!(
+            "slates-server: the FUSE mount at {mount_point} was refused: {error}"
+          );
+          crate::verbs::refused(crate::error::target(
+            slates_ipc::protocol::TargetRefusal::MountRefused {
+              errno: mount_errno(&error),
+            },
+          ))
         }
       });
       deliver(s, reply, route);
@@ -838,10 +855,12 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     return Turned::Ended;
   };
   let told_before = mount.serve.told_through();
-  // A volume this node lost to a takeover ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too,
-  // for a mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a
-  // restart (A-344).
-  if crate::live_ship::superseded(s, mount.volume) && s.attachments.context(mount.registry).is_ok()
+  // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced, A-338, or yielded at this
+  // host's re-admission, A-334) ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too, for a
+  // mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a restart
+  // (A-344).
+  if crate::verbs::lost_to_a_successor(s, mount.volume)
+    && s.attachments.context(mount.registry).is_ok()
   {
     s.attachments.revoke(mount.registry);
     s.count(SUPERSEDED_ENDED, 1);
@@ -1338,22 +1357,13 @@ fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount)
   }
 }
 
-/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61), and closes every held
-/// device recovery found no record for. Each kept mount gets a registry attachment from its record (its rights,
-/// its durable owner, so the references recovery gave back are its own), the serve state its session restored,
-/// and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and never answered come back; then its
-/// serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61). Each kept mount gets a
+/// registry attachment from its record (its rights, its durable owner, so the references recovery gave back are its
+/// own), the serve state its session restored, and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and
+/// never answered come back; then its serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// A held device recovery found no record for is closed by `crate::shards::adopt_held`, which runs next on every Unix.
 pub(crate) fn adopt_held() {
-  let (kept, orphaned) = state::with_state(|s| {
-    (
-      std::mem::take(&mut s.adopt_fuse),
-      std::mem::take(&mut s.inherited_fuse),
-    )
-  })
-  .unwrap_or_default();
-  for held in orphaned {
-    let _ = crate::fuse_hold::release(held.attachment);
-  }
+  let kept = state::with_state(|s| std::mem::take(&mut s.adopt_fuse)).unwrap_or_default();
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
@@ -1499,11 +1509,12 @@ pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
   }
 }
 
-/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a takeover (A-346; its log
-/// fenced at a later epoch, A-338): each is fenced as a revoked mount is ([`fence_if_mounted`]), so its kernel drops what
-/// it cached of the volume, every request meanwhile is refused `ENOTCONN`, and the mount ends: FUSE's form of the
-/// `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a mount went on answering from this node's copy,
-/// which the successor's writes had passed, or, behind the lease gate, held its requests in the kernel for good.
+/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a successor (A-346; its log
+/// fenced at a later epoch, A-338, or yielded at this host's re-admission, A-334): each is fenced as a revoked mount is
+/// ([`fence_if_mounted`]), so its kernel drops what it cached of the volume, every request meanwhile is refused
+/// `ENOTCONN`, and the mount ends: FUSE's form of the `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a
+/// mount went on answering from this node's copy, which the successor's writes had passed, or, behind the lease gate,
+/// held its requests in the kernel for good.
 pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
   let mounts: Vec<u64> = s
     .fuse_mounts
