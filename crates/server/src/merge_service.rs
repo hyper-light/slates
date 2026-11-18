@@ -2536,8 +2536,9 @@ pub(crate) async fn run_merge_period(
         let dispatch =
           crate::fleet::ship_owed_catalog(origin, owner_acceptor, local, &catalog, budget).await;
         // The catalog's placement is recorded on its owner shard ahead of the next pass's question there, which
-        // this wakes, so the version that waited for it ships at once.
-        let _ = crate::state::with_state(nudge_record_plane);
+        // this wakes, so the version that waited for it ships at once. A refused borrow loses this wake and is
+        // counted; the coordinator's next period still ships the version.
+        let _ = crate::state::with_state_counted(nudge_record_plane);
         dispatch
       }
     };
