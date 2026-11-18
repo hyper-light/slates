@@ -6125,6 +6125,12 @@ measured class by read rate, Phase 8) may be held as k+m fragments across k+m ca
 of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) and the
 reconstruction budget are derived, never fixed (D-O6).
 
+> **Status (2026-11-17, A-276: the healer).** Restore, replace and the bound are built, and each is red on the old
+> code and green on the fix with its fleet test; the original healer test's failure under load was reproduced naturally
+> on the old code (2 of 54 runs under bursting contention) and not on the fix (0 of 30, two of them taking the late path
+> and counting it). Owed: probation of a repeatedly late candidate; the mirror's healer (AC-8.15); a named holder that
+> stays a member outside the candidates (GAPS).
+
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
 attachment flush barriers, hashing and puts have separately measured costs. An auto-seal
@@ -21531,8 +21537,22 @@ Applied in the same change to:
   for good, and since every holder the new placement names is a member, later heals restore rather than replace, so the
   head stays naming the departed holder. Found by reading; no test stops a daemon between two records, and
   `Db::begin`…`commit` is the database's tested all-or-none (`crates/db/tests/model.rs`).
-- **Evidence.** MEASURE: the red and green arms' table (machine, load, runs) for each test, and the original test
-  under CPU contention.
+- **Evidence** (adas-mac-studio.local-2, Apple M3 Ultra, macOS 26.4, debug, 2026-11-17; red is `e7c031aa1`'s healer
+  with the same test support and the new tests, green2 is a68704497; the full table is in the bug record).
+  - Each new test is red on the old code and green on the fix: the late repair FAILED 135 s (`repairs Ok(0) → Ok(0)`,
+    the holder holding the content) and passed 4 of 4 in 11–12 s; the restore FAILED 63 s (the named holder empty, the
+    candidate without the head holding the content) and passed 3 of 3 in 2 s; the departed holder FAILED 452 s and
+    446 s, live (the survivors' heads naming it, `republished` 0) and passed 3 of 3 each in 13–14 s, the survivor taking
+    the volume over and reading the file back after the owner's death, so the replace that puts at the next sequence
+    and then republishes is shown end to end; the bound FAILED 66 s (`fleet.heal.unfinished` 0) and passed 3 of 3 in
+    12–13 s. This change's first cut failed the late repair too ("One clock" above), 93 s, and the f = 0
+    unit test fails with live-fixes' rule put back.
+  - The original test's failure reproduced naturally on the old code, under 64 spinners bursting 300 ms each second on
+    the efficiency cores with the test clamped there too: 23 runs ok, then `repairs Ok(0) → Ok(0)` with the holder
+    holding the content, its refill's acknowledgement 128 ms after the round's dispatch, folded as a straggler.
+    Interleaved under the same load, 30 pairs: red failed 1 of 30 the same way and green2 passed 30 of 30, two of
+    them taking the late path naturally and counting it (`fleet.heal.repaired_late` 1). Red failed 2 of 54 runs under
+    that load, green2 none of 30.
 - **What it does not change.** The head's value at any sequence it was placed at, the snapshot, its manifest and what a
   client sees: the status's head, snapshot and attachment counts, bytes and lease epoch, and the file's bytes are
   checked equal across a republish. A named holder that is a member but outside the object's current candidates is

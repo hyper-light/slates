@@ -9675,8 +9675,11 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   54 (head 92dcd16c, `repairs Ok(0) → Ok(0)`, `~/.cache/slates-scratch/fanout/l37-gates.log`). live-fixes' account of
   2026-11-08 (two losses, the first-ranked candidate offered first) was retracted on 2026-11-09: on three nodes every
   member holds the head, so the door (`content_retention::admits`) refuses that candidate's put. Goal g248 found the
-  cause and two siblings, and took over live-fixes' unlanded replace (A-276, 6ec41144a).
-- **Causes**, each red on the old code (MEASURE: arms and counts):
+  cause and three siblings, and took over live-fixes' unlanded replace (A-276, 6ec41144a).
+- **Causes**, each red on the old code with its test (the Studio, 2026-11-17; the table is in the bug record), and the
+  first reproduced there naturally under contention: 64 bursting spinners on the efficiency cores, 23 runs ok, then the
+  original failure (`repairs Ok(0) → Ok(0)`, the holder holding the content), its DIAG lines showing the refill's
+  acknowledgement arriving 128 ms after the round's dispatch, as a straggler:
   - **A late repair was never counted.** A content round stops collecting about one hedge delay after a holder's
     transfer starts (`DispatchWait::judge` sees the owner's own hold as the round's only progress, so the round is
     judged stalled once its deadline passes), and the refill's acknowledgement then arrives as a straggler's.

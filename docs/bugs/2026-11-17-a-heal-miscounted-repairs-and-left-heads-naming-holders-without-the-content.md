@@ -74,8 +74,57 @@ Three faults in the healer, and a fourth under it.
 
 ## Evidence
 
-MEASURE: the red arm (main e7c031aa1's healer with the test support and DIAG counts, `diag-g248-red`) and the green arm,
-on one machine, for each test; and the original test under CPU contention.
+Machine: adas-mac-studio.local-2, Apple M3 Ultra (24 performance and 8 efficiency cores), 96 GiB, macOS 26.4, rustc
+1.98.1, debug test binaries, 2026-11-17. Each arm is `e7c031aa1` with its patch, built into its own target directory:
+- **red**: `e7c031aa1`'s healer with the test support (`Daemon::inject_content_ack_delay`, the same code as the green
+  arms'), DIAG counts and prints of each heal round and late acknowledgement, and the green arms' tests
+  (`diag-g248-red`, ad4eb1e85, never for main);
+- **green**: be7fc2a5e, this change's first cut;
+- **green2**: a68704497, with the first round stamped on the owner's clock and the bound derived (root cause 4).
+
+Each test ran alone (`fleet --exact NAME --test-threads 1`), the arms interleaved, the machine's other users at load 7 to
+17:
+
+| Test | red | green (be7fc2a5e) | green2 (a68704497) |
+|---|---|---|---|
+| `a_repair_whose_acknowledgement_outlasts_its_round_is_counted` | FAILED 135 s: holds `Ok(true)`, repairs 0 → 0 | FAILED 93 s: repairs 0 → 0, `fleet.heal.unfinished` 4, `refill_outlasted_round` 1 | ok 4 of 4, 11–12 s |
+| `a_heal_restores_the_named_holder_and_not_a_candidate_without_the_head` | FAILED 63 s: the named holder holds `Ok(false)`, the candidate without the head `Ok(true)`, repairs 0 → 1 | ok 2 s | ok 3 of 3, 2 s |
+| `a_heal_republishes_the_head_once_a_named_holder_has_left` | FAILED 452 s: the survivors' heads name the departed holder, `republished` 0 | ok 13 s | ok 3 of 3, 13–14 s |
+| `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left` | FAILED 446 s: the same | ok 13 s | ok 3 of 3, 13–14 s |
+| `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later` | FAILED 66 s: `fleet.heal.unfinished` 0 | ok 12 s | ok 3 of 3, 12–13 s |
+| `a_holder_that_lost_placed_content_is_repaired_by_the_healer` (quiet) | ok 11 s | ok 11 s | ok 3 of 3, 11 s |
+
+The red late-repair run's own record: round 0 refilled the holder and collected only the owner's hold; the holder's
+acknowledgement came 531 ms after the dispatch as a straggler and was folded with no repair; every later heal found the
+holder whole.
+
+The original test under contention, the test clamped to background QoS (`taskpolicy -c background`, so it runs on the
+efficiency cores) with spinners clamped the same way, so the contention is the test's alone:
+- no spinners, 4 pairs: red 4 of 4 ok, green2 4 of 4 ok;
+- 24 steady spinners (three to each efficiency core), 4 pairs: red 4 of 4 ok, green2 4 of 4 ok; the seal measured its
+  p95 under the same load (11–40 ms), and every refill fit the round;
+- 24 spinners in bursts of 300 ms each second, 8 pairs: red 8 of 8 ok, green2 8 of 8 ok (p95 2–5 ms);
+- 64 spinners in bursts of 300 ms each second, red alone until it failed: 23 ok, then **the original failure, naturally**:
+  `the healer re-put the lost content and the holder holds it whole again (repairs Ok(0) → Ok(0); the holder holds it
+  Ok(true) …)` after 500 s. Its DIAG lines name the cause: the seal measured a p95 of 8.1 ms; heal round 2 refilled
+  the holder and collected only the owner's hold; the holder held the content again 7.39 s after the loss; its
+  acknowledgement came 128 ms after the round's dispatch, as a straggler, folded with no repair; every later round
+  found the holder whole (`refilled []`, placed).
+- the same 64 bursting spinners, 30 pairs interleaved (load 22 to 49): red failed 1 of 30 the same way (482 s,
+  `repairs Ok(0) → Ok(0)`, the holder holding the content, nine late acknowledgements in its DIAG lines), and green2
+  passed 30 of 30, two of them taking the late path naturally and counting it (`fleet.heal.refill_outlasted_round` 1,
+  `fleet.heal.repaired_late` 1, repairs 0 → 1). Over the hunt and the pairs, red failed 2 of 54 runs, every failure a
+  refill acknowledged as a straggler; green2 failed none of 30. Every spinner was killed and counted gone after each run
+  (`spinners: started 64, alive after kill: 0`).
+
+The f = 0 rule: the unit test fails with live-fixes' rule put back (`assertion failed: f = 0: the owner's own copy is
+the whole placement; nothing to heal`) and passes with `heal_decision`.
+
+The merged tree (8c2b38739, origin/main 2b4c22d90 merged in), `cargo test --locked -p slates-server` on the Studio: the
+library's 268 tests and every test binary ok, the fleet binary 137 of 138. Its one failure,
+`a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round`, is main's recorded flake (GAPS,
+2026-11-17: it fails whenever the node the test deafens is the green's successor, and on main alone); run alone it failed
+once (476 s, `OwnerUnreachable`) and passed once (4.1 s). It runs no seal job.
 
 ## Exact edits
 
