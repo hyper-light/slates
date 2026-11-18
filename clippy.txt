@@ -1,0 +1,2 @@
+# fmt at 5fbbdf7736222463bba9959a53b3ff4406ae5511 on windows-latest
+## fmt, exit 0
