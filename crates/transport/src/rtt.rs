@@ -194,6 +194,18 @@ impl RttEstimator {
     self.rttvar
   }
 
+  /// The time an answer is expected within, nanoseconds: `smoothed_rtt + 4 · rttvar`, the probe timeout's terms
+  /// (RFC 9002 §6.2.1) without its timer granularity or its ack delay, which bound a timer's arming and a peer's ack
+  /// pacing and not the wait itself; `None` before any sample. What a waiter that spins rather than arms a timer may
+  /// expect to wait at most (`slates-server`'s live holds, A-396).
+  pub fn expected_within(&self) -> Option<u64> {
+    self.have_sample.then(|| {
+      self
+        .smoothed_rtt
+        .saturating_add(PTO_RTTVAR_MULTIPLIER.saturating_mul(self.rttvar))
+    })
+  }
+
   /// The minimum RTT seen (nanoseconds).
   pub fn min_rtt(&self) -> u64 {
     self.min_rtt
@@ -227,6 +239,29 @@ mod tests {
       3 * 2_400 * MS,
       "a slow path's sample: three of its own probe timeouts"
     );
+  }
+
+  /// A-396: do fold samples of microseconds; expect the bound an answer is expected within to be the smoothed time plus
+  /// four variations, below the millisecond the probe timeout's granularity would floor it at, and none before a sample.
+  #[test]
+  fn an_answer_is_expected_within_the_smoothed_time_and_four_variations_below_the_timer_granularity()
+   {
+    let mut rtt = RttEstimator::new();
+    assert_eq!(
+      rtt.expected_within(),
+      None,
+      "nothing is expected before a sample"
+    );
+    rtt.on_sample(40_000, 0);
+    // The first sample seeds smoothed = 40 µs and variation = 20 µs: 40 + 4 × 20 = 120 µs.
+    assert_eq!(rtt.expected_within(), Some(120_000));
+    assert!(
+      rtt.pto(0) >= GRANULARITY_NS,
+      "the probe timeout stays floored at the timer granularity"
+    );
+    rtt.on_sample(40_000, 0);
+    // smoothed stays 40 µs; variation 3/4 × 20 + 1/4 × 0 = 15 µs: 40 + 60 = 100 µs.
+    assert_eq!(rtt.expected_within(), Some(100_000));
   }
 
   /// Before any sample the PTO is twice the initial RTT (RFC 9002 §6.2.2), so the connection has a

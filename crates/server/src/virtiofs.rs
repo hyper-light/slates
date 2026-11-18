@@ -29,6 +29,13 @@
 //!
 //! A device is a guest kernel's route (A-290): its guest reads and writes its own attribute namespaces, `trusted.` and
 //! `security.`, besides `user.`, kept in the volume as its data and shown to no host's mount.
+//!
+//! A write the guest is told succeeded outlives the daemon (A-358's rule, A-410): the bridge hands each `WRITE` to the
+//! shard's write log in the anchor's content object before the used element is published, as a FUSE mount and a Shards
+//! stream do (A-63, A-316), and a successor replays it. A write the log cannot keep (no room, a span the object
+//! refused) makes the bridge owe a publication, so the device holds the reply for the owner's barrier, which answers
+//! `EIO` if it does not capture the volume. Before A-410 a plain `WRITE` was answered with neither, so a write
+//! acknowledged after the last publication was lost at a daemon's death even where the volume outlived it.
 
 use std::future::Future;
 
@@ -174,8 +181,21 @@ impl BridgeAccess for ShardBridge {
         volumes,
         attachments,
         snapshot_views,
+        write_log,
+        content,
         ..
       } = s;
+      // Each write the guest is told succeeded is kept in the shard's write log before its used element is published,
+      // as a FUSE mount's and a Shards stream's are (A-63, A-410): a log with no room for it, or a span the content
+      // object refused, leaves it to the publication the device then runs before the reply (A-358's rule). Without a
+      // log (no anchor's content object) nothing outlives the daemon, and nothing is owed.
+      let mut log_write =
+        |inode: u64, offset: u64, bytes: &[u8]| match (write_log.as_mut(), content.as_mut()) {
+          (Some(log), Some(object)) => log
+            .append(object, (volume.bytes, inode), offset, bytes)
+            .is_ok(),
+          _ => true,
+        };
       // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
       let bridge = if presents_snapshot {
         let view = snapshot_views.get_mut(&attachment)?;
@@ -194,7 +214,10 @@ impl BridgeAccess for ShardBridge {
         )
       };
       // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
-      let mut bridge = bridge.offering_dax(offer).serving_a_guest();
+      let mut bridge = bridge
+        .offering_dax(offer)
+        .serving_a_guest()
+        .logging_writes(&mut log_write);
       let mut scoped;
       let served: &mut dyn Bridge = match scope {
         Some(scope) => {

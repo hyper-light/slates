@@ -1354,23 +1354,8 @@ impl Device {
     cx: &OpContext,
     #[cfg(unix)] ingested: Option<Ingested>,
   ) -> Result<ChainOutcome, DeviceError> {
+    chain_has_room(queue, chain)?;
     let hiprio = queue == HIPRIO_QUEUE;
-    let header_len = u64::try_from(IN_HEADER_LEN).unwrap_or(u64::MAX);
-    if chain.readable_bytes < header_len {
-      return Err(DeviceError::RequestTooShort {
-        queue,
-        readable: chain.readable_bytes,
-        need: header_len,
-      });
-    }
-    let reply_header_len = u64::try_from(OUT_HEADER_LEN).unwrap_or(u64::MAX);
-    if !hiprio && chain.writable_bytes < reply_header_len {
-      return Err(DeviceError::ReplyBufferTooSmall {
-        queue,
-        writable: chain.writable_bytes,
-        need: reply_header_len,
-      });
-    }
     gather(
       memory,
       &chain.readable,
@@ -2175,6 +2160,28 @@ impl Device {
 /// Whether a request of this header expects a reply: every opcode but the forgets ([`takes_reply`]).
 fn expects_reply(header: Option<&InHeader>) -> bool {
   takes_reply(header.and_then(|h| Opcode::from_wire(h.opcode)))
+}
+
+/// Whether a chain can hold its request's header and, unless it is the high-priority queue's (whose requests take no
+/// reply), its reply's header: a chain that cannot is refused before anything is gathered from it.
+fn chain_has_room(queue: u16, chain: &DescriptorChain) -> Result<(), DeviceError> {
+  let header_len = u64::try_from(IN_HEADER_LEN).unwrap_or(u64::MAX);
+  if chain.readable_bytes < header_len {
+    return Err(DeviceError::RequestTooShort {
+      queue,
+      readable: chain.readable_bytes,
+      need: header_len,
+    });
+  }
+  let reply_header_len = u64::try_from(OUT_HEADER_LEN).unwrap_or(u64::MAX);
+  if queue != HIPRIO_QUEUE && chain.writable_bytes < reply_header_len {
+    return Err(DeviceError::ReplyBufferTooSmall {
+      queue,
+      writable: chain.writable_bytes,
+      need: reply_header_len,
+    });
+  }
+  Ok(())
 }
 
 /// Copies the chain's readable ranges, in order, into one contiguous request buffer of `total`

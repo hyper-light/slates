@@ -144,6 +144,9 @@ pub struct RecordLink {
   /// The session's congestion state when it was last returned or established, so status reports it while a borrower
   /// has it out (a cross-region read keeps it borrowed for the whole transfer).
   pub last_seen: Option<slates_ipc::protocol::SessionReport>,
+  /// How long this peer takes to answer a live exchange as a holder (A-396): the window the control shard holds its idle
+  /// window for through the next one (`live_ship::hold_for_exchange`). Learned again with a new session.
+  pub(crate) live_answers: crate::live_hold::AnswerWindow,
 }
 
 impl RecordLink {
@@ -154,6 +157,7 @@ impl RecordLink {
       borrowed: None,
       lent_to: None,
       last_seen: None,
+      live_answers: crate::live_hold::AnswerWindow::default(),
     }
   }
 

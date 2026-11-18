@@ -5310,10 +5310,11 @@ mod ownership_oracle {
     Ok(())
   }
 
+  /// A recovery's pieces by kind: the chunks', the manifests' and the stages' bytes.
+  type PiecesByKind = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
   /// The published pieces' bytes by kind, as a recovery reads them.
-  fn split_pieces(
-    published: &BTreeMap<HoldPiece, Vec<u8>>,
-  ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+  fn split_pieces(published: &BTreeMap<HoldPiece, Vec<u8>>) -> PiecesByKind {
     let (mut chunks, mut manifests, mut stages) = (Vec::new(), Vec::new(), Vec::new());
     for (piece, bytes) in published {
       match piece {

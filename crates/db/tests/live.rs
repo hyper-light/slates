@@ -2897,10 +2897,22 @@ fn hostile_fetched_replies_are_refused() {
   huge.extend_from_slice(&[0; 16]);
   let (_, mut huge) = FetchedLog::decode(huge, CAP).unwrap();
   assert_eq!(read_all(&mut huge), vec![Err(LiveError::Malformed)]);
+  assert_no_cut_reads_whole(&reply, payloads.len());
+}
+
+/// Every cut of a fetched `reply` short of its end: none that decodes reads all of its `payloads` whole.
+fn assert_no_cut_reads_whole(reply: &[u8], payloads: usize) {
+  use slates_db::live::FetchedLog;
   for length in 0..reply.len() {
     if let Ok((_, mut cut)) = FetchedLog::decode(reply[..length].to_vec(), CAP) {
-      let whole = read_all(&mut cut).into_iter().filter(Result::is_ok).count();
-      assert!(whole < payloads.len(), "a cut reply never reads whole");
+      let whole = std::iter::from_fn(|| {
+        cut
+          .next_payload()
+          .map(|payload| payload.map(<[u8]>::to_vec))
+      })
+      .filter(Result::is_ok)
+      .count();
+      assert!(whole < payloads, "a cut reply never reads whole");
     }
   }
 }

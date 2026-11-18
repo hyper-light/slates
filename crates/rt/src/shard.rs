@@ -675,9 +675,10 @@ impl ShardContext {
   /// asked for stands; a later, shorter hold or a plain activity never cuts it short. No hold runs past the shard's
   /// idle ceiling from now (A-361). The shard holds only while the idle turn a request would land in, as it has
   /// measured its own, is shorter than its wake estimate, the kicked park the hold would save; otherwise it declines,
-  /// counted, and parks once its own window ends (A-387, [`crate::held_turn::hold_pays`]). Called on the shard's own
+  /// counted, and parks once its own window ends (A-387, [`crate::held_turn::hold_pays`]). Whether the hold was kept, so
+  /// a caller counting its own holds counts the ones made (the daemon's live holds, A-396). Called on the shard's own
   /// thread.
-  pub fn hold_idle_window(&self, window_ns: u64) {
+  pub fn hold_idle_window(&self, window_ns: u64) -> bool {
     let now = self.now_ns();
     self.activity_ns.set(Some(now));
     let met_turn = self.held_turn.get().and_then(|turns| turns.met_ns());
@@ -685,13 +686,14 @@ impl ShardContext {
       self
         .idle_holds_declined
         .set(self.idle_holds_declined.get().saturating_add(1));
-      return;
+      return false;
     }
     let until = now.saturating_add(window_ns.min(self.idle_ceiling_ns));
     if until > self.held_until_ns.get() {
       self.held_until_ns.set(until);
     }
     self.idle_holds.set(self.idle_holds.get().saturating_add(1));
+    true
   }
 
   /// Whether any inbound ring holds a word (a check without a syscall).
