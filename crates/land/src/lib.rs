@@ -27,6 +27,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+#[cfg(test)]
+mod captured_tests;
 pub mod engine;
 pub mod grant;
 pub mod manifest;

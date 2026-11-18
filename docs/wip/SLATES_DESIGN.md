@@ -9421,9 +9421,20 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > reserve the capture's cost ahead (the volume's quota charges each file as it is made the volume's own, and a refusal
 > part-way leaves what was captured as copied-up entries, which change nothing a reader sees); a large file is read
 > whole in one slice (its bytes held once more while it is checked), where its windows could be read across slices;
-> the report of bytes read and retained and of the elapsed cost; and a landing of a captured clone judged against its
-> capture: it lands as a scratch volume does today, every entry a create (no witness survives the capture), so a file
-> its agent changed meets the target's copy as `CreateCreate` (GAPS, g267).
+> the report of bytes read and retained and of the elapsed cost. **A landing of a captured clone is judged against its
+> capture (A-424, stage 1, 2026-11-18):** its manifest is the change of its source since the captured snapshot, found
+> where the two trees part (`slates_vfs::captured::ChangedPaths`: the inode tables' changed records, each changed
+> directory's entries by name, a made, removed or moved subtree walked whole, a changed file named through its home),
+> and every entry is judged by content (`Judged::Content`, `slates_land::verdict::content_verdict`): its witness is the
+> BLAKE3 of the bytes the capture held, the disk is hashed, a file is written or removed only where the disk still
+> holds those bytes (accepted by identity where it already holds the volume's), and a directory is removed only once
+> emptied; a write is bound to the object its validation found (`Landing::observed`). An outsider's change to a file
+> the agent never touched is in no manifest, so it is never a conflict and never overwritten. The landing leaves the
+> clone a scratch volume (no base is taken from the target), so it still moves. Owed: a later landing judged against
+> what the last one landed rather than the capture (an outsider's edit of a file the agent landed and did not touch
+> again is a conflict until then); a moved captured clone, whose capture stays behind, still lands as a scratch volume
+> (stage 2); a name whose kind changed lands as a removal and a making that the class order meets as `TypeChanged`;
+> a symlink pointed elsewhere does not land over the old one, as an overlay's does not (GAPS, g267).
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -29501,3 +29512,36 @@ code below.
   checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
   server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
   2026-11-18, debug).
+
+### A-424 — A captured clone lands against its capture, judged by content (2026-11-18, g267, stage 1 of the captured clone's landing; §4.15 `capture_base` and "Plan", A-291)
+
+- **What was there.** A clone of a captured base (A-291) has no base plane: its record is `Scratch` and the capture made
+  every body the volume's own, so its landing planned every file as a create. A file its agent changed met the
+  target's copy as `CreateCreate`, an outsider's change to a file the agent never touched was a conflict too, a
+  removal was never carried, and a landing that did succeed took the target as the clone's base, after which the clone
+  no longer moved (GAPS g267, found reading `crates/land/src/verdict.rs`).
+- **The rule.** A scratch clone of a snapshot recorded captured lands against that snapshot (`landing::capture_of`, the
+  capture on the clone's own shard since a clone shares its origin's store): the manifest is the change of the source
+  since the capture (`slates_vfs::captured::ChangedPaths`, stepped a record or a directory a unit, its cost the change
+  rather than the tree; `PlanWalk::against_capture`), each entry judged by content (`Judged::Content`): the witness is the
+  identity of the captured bytes, a content manifest has its own encoding version so no grant of one binds the other,
+  the disk is hashed for every replacement and removal, and `content_verdict` writes or removes only over the captured
+  bytes. A removed directory goes only once emptied (`Landing::remove_emptied_dir`, never recursive) and only when it
+  held nothing but what the manifest removes at validation (`Ours::removed`). The write is bound to the object the
+  validation found (`Landing::observed`, the witness's fingerprint for the write path), so an outsider's change between
+  validation and write is a conflict. The finish leaves the clone as it was: a scratch volume that still moves.
+- **Tests.** `the_candidates_hold_every_change_and_nothing_untouched`, `a_clone_nothing_changed_has_no_candidates`,
+  `held_at_reads_each_kind_and_nothing_beneath_a_file` (`crates/vfs/src/captured.rs`: a full walk of both trees as the
+  oracle; an untouched file in a touched directory is no candidate); `the_content_table` (`crates/land/src/verdict.rs`);
+  `a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`,
+  `an_outsiders_change_under_the_agents_is_a_conflict_and_nothing_is_written`,
+  `a_target_already_holding_the_change_is_accepted_and_written_over_nothing` (`crates/land/src/captured_tests.rs`,
+  over the simulated host).
+- **Owed.** The advance (a second landing judged against what the first landed); stage 2, a moved captured clone landed
+  against its capture (it keeps no lineage on its new node and still lands as a scratch volume); a kind change as one
+  entry; the server's own test landing a captured clone into a real directory (filed for main).
+
+Applied in the same change to: `crates/vfs/src/{captured,lib,volume}.rs` (`captured`, `Volume::frozen_tree`,
+`Volume::head_tree`, `read_frozen_body`), `crates/land/src/{manifest,verdict,engine,lib,captured_tests}.rs`
+(`Judged`, `Manifest::basis`, `PlanWalk::against_capture`, `content_verdict`, `Beginning::against_capture`,
+`begin_landing_from`), `crates/server/src/landing.rs` (`capture_of`, `landing_beginning`), §4.15's status, GAPS (g267).

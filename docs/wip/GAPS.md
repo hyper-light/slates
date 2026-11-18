@@ -848,25 +848,30 @@
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
 >   still writable, its later changes then a small incremental seal); not measured yet.
-> - **Owed before kiln's workspaces switch (found 2026-11-18 reading `crates/land/src/verdict.rs`, not yet by a
->   test):** a clone of a captured base lands as a scratch volume does. Its record names no base and its files hold no
->   witness (a capture makes each body the volume's own, and the witness lived in the base body), so every entry of
->   its landing is a create: a file its agent changed meets the target's copy as `CreateCreate`, and so does an
->   outsider's change to a file the agent never touched. Kiln lands an agent's workspace into the repository (W6), so
->   the switch needs a landing judged against the captured snapshot: the manifest of what changed since it, each entry
->   compared by content with what the capture read (the target is another folder, so fingerprints cannot match).
->   Until then a captured clone moves and serves whole but does not land as an overlay does. The plan (g267,
->   2026-11-18, read from the code, nothing built): the clone shares its captured snapshot's tree, so what changed
->   since the capture is the clone's tree against that snapshot's, a walk that skips every directory node the two still
->   share (bounded by the change, as a destroy's is by its slices); each changed entry is judged by content alone
->   against the captured bytes' identity (`slates_land::verdict`: the disk hashed and compared with the capture's
->   identity, its fingerprint ignored, since the target is another folder), so an outsider's change to a file the
->   agent never touched is passed by, a file the agent changed over an untouched target is written, and a deletion is
->   carried. Stage 1 is a clone landed on the node that captured it (the snapshot is there). Stage 2 is a moved clone,
->   whose captured snapshot stays behind: the move carries it with the clone (the owed "move carrying snapshots"), or
->   the clone keeps the capture's identities; to be decided by measuring both on a kiln-sized tree. Rejected: keeping
->   the overlay's base plane as a witness-only base in the clone, since the capture copied every file up and every
->   file would read as diverged.
+> - **Built (stage 1, A-424, 2026-11-18): a captured clone lands against its capture, judged by content.** Before, a
+>   clone of a captured base landed as a scratch volume does: its record names no base and its files hold no witness,
+>   so every entry was a create, a file its agent changed met the target's copy as `CreateCreate` (so did an
+>   outsider's change to a file the agent never touched), no removal was carried, and a landing that succeeded took the
+>   target as the clone's base, after which it no longer moved. Now the landing's manifest is the change of the source
+>   since the captured snapshot (`slates_vfs::captured::ChangedPaths`: the inode tables' changed records, each changed
+>   directory's entries by name, a made, removed or moved subtree walked whole, a changed file named through its home;
+>   skipping the directory nodes the two share is not enough alone, as this entry's plan first said, since a file
+>   written in place keeps its directory's node), each entry judged by content against the captured bytes' identity
+>   (`content_verdict`): written or removed only over the captured bytes, accepted where the target already holds the
+>   volume's, a removed directory removed only once emptied and only when it held nothing else; the write is bound to
+>   the object its validation found. An outsider's change to a file the agent never touched is in no manifest. The clone
+>   stays a scratch volume (it still moves). Held by the vfs oracle (a whole-tree walk of both trees) and three landings
+>   over the simulated host (`crates/land/src/captured_tests.rs`). **Owed, in order:** (1) the advance: a second
+>   landing is judged against the capture again, so an outsider's later edit of a file the agent landed and did not
+>   touch since is a `ModifyModify` conflict (a refusal, never a loss) until the clone keeps what it landed as its base
+>   (a mark snapshot plus the per-path bases of what a filter left out); (2) stage 2, a moved clone: its capture stays on
+>   the node that made it and the moved clone keeps no lineage, so it still lands as a scratch volume (every entry a
+>   create, no removal carried) until the move carries its base (the plan: the old owner computes, at the move, the
+>   captured identity of every path the clone changed, and the new owner keeps the moved head as the mark); (3) a kind
+>   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
+>   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a
+>   captured clone into a real directory (run request filed). Kiln's W6 may land captured clones once (1) is built, or
+>   now where each workspace lands once.
 > - **Decided (the supervisor, 2026-11-18, A-291):** a kiln workspace moves as a clone of a captured base. An overlay
 >   keeps its typed refusal (`NotPlain`: its base stays on its source host, §4.10); kiln captures the repository's base
 >   once into a complete immutable snapshot (`capture_base`; a git commit's tree checked out where nothing else writes is

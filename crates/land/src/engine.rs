@@ -52,9 +52,9 @@ use crate::grant::{
   GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLease,
   LandingLeaseHeld, TargetIdentity, lease_key,
 };
-use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary};
+use crate::manifest::{Action, Filter, Judged, LandingEntry, Manifest, OverlayIdentity, Summary};
 pub use crate::source::Source;
-use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
+use crate::verdict::{ConflictClass, DiskState, Verdict, content_verdict, verdict};
 
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
 /// landing id follows, then a per-landing counter, so a sweep recognizes its own names.
@@ -570,6 +570,11 @@ struct Landing<'a, H: LandFs> {
   /// put-back for an outsider's edit and reported `ModifyModify` on every entry a no-exchange crash had
   /// set aside — hidden by a simulated clock that never moved.
   restored: BTreeMap<Box<str>, Fingerprint>,
+  /// Each entry judged by content (a captured clone's, A-291) whose validation found the disk still holding what the
+  /// capture held, by path, with the fingerprint of the object found there: its write is bound to that object, as an
+  /// overlay's is to its witness ([`Landing::witness_of`]), so an outsider's change between the validation and the
+  /// write is a conflict, never overwritten or removed.
+  observed: BTreeMap<Box<str>, Fingerprint>,
 }
 
 /// What the writer needs besides the host: the volume, the grant, the observer, the audit log.
@@ -924,6 +929,18 @@ impl<H: LandFs> Landing<'_, H> {
   /// ([`Landing::restored`]).
   fn witness_of(&self, entry: &LandingEntry) -> Option<Witness> {
     let witness = entry.witnessed?;
+    if entry.judged == Judged::Content {
+      // Judged by content: the write is bound to the object the validation found holding the captured bytes; with
+      // none found the witness's fingerprint names nothing on this disk, and the write is refused.
+      return Some(Witness {
+        fingerprint: self
+          .observed
+          .get(&entry.path)
+          .copied()
+          .unwrap_or(witness.fingerprint),
+        ..witness
+      });
+    }
     let restored = self
       .restored
       .get(&entry.path)
@@ -939,6 +956,10 @@ impl<H: LandFs> Landing<'_, H> {
   }
 
   fn needs_hash(&mut self, entry: &LandingEntry) -> Result<bool, HostError> {
+    // An entry judged by content compares the disk's bytes with what the capture held, whatever its fingerprint.
+    if entry.judged == Judged::Content && matches!(entry.action, Action::Replace | Action::Delete) {
+      return Ok(true);
+    }
     let witness = self.witness_of(entry);
     match (&entry.action, witness.as_ref()) {
       (Action::Create, _) | (Action::Replace, None) => Ok(true),
@@ -967,14 +988,20 @@ impl<H: LandFs> Landing<'_, H> {
   fn validate_entry(
     &mut self,
     entry: &LandingEntry,
-    ours: &BTreeSet<String>,
+    ours: &Ours,
   ) -> Result<EntryReport, HostError> {
     {
       let hash = self.needs_hash(entry)?;
       // Every entry's directory is synced at the end, written or not, so a resumed landing
       // makes the previous attempt's entries durable too.
       self.touched.insert(split(&entry.path).0.into());
-      let check_ours = matches!(entry.action, Action::Clear).then_some(ours);
+      // A clear's own fresh directory holds only what the manifest makes beneath it; a directory a content manifest
+      // removes may hold only what the manifest removes beneath it.
+      let check_ours = match (&entry.action, entry.judged) {
+        (Action::Clear, _) => Some(&ours.created),
+        (Action::Rmdir, Judged::Content) => Some(&ours.removed),
+        _ => None,
+      };
       let disk = match &entry.action {
         Action::Rename { from } => {
           self.touched.insert(split(from).0.into());
@@ -982,13 +1009,18 @@ impl<H: LandFs> Landing<'_, H> {
         }
         _ => self.disk_state(&entry.path, hash, check_ours)?,
       };
-      let witness = self.witness_of(entry);
-      let v = verdict(
-        &entry.action,
-        witness.as_ref(),
-        disk,
-        entry.overlay.as_ref(),
-      );
+      let v = match entry.judged {
+        Judged::Witness => {
+          let witness = self.witness_of(entry);
+          verdict(
+            &entry.action,
+            witness.as_ref(),
+            disk,
+            entry.overlay.as_ref(),
+          )
+        }
+        Judged::Content => self.judge_by_content(entry, disk)?,
+      };
       Ok(EntryReport {
         path: entry.path.clone(),
         action: entry.action.clone(),
@@ -997,6 +1029,41 @@ impl<H: LandFs> Landing<'_, H> {
         window_ns: None,
       })
     }
+  }
+
+  /// An entry judged by content (A-291): its verdict, and, where it is written over or removes what the capture held,
+  /// the object found there now, which binds the write ([`Landing::observed`]).
+  fn judge_by_content(
+    &mut self,
+    entry: &LandingEntry,
+    disk: DiskState,
+  ) -> Result<Verdict, HostError> {
+    let v = content_verdict(
+      &entry.action,
+      entry.witnessed.as_ref(),
+      disk,
+      entry.overlay.as_ref(),
+    );
+    self.observed.remove(&entry.path);
+    if v == Verdict::Apply && matches!(entry.action, Action::Replace | Action::Delete) {
+      let found = match (&entry.action, disk) {
+        (Action::Replace, DiskState::File { fingerprint, .. }) => Some(fingerprint),
+        (Action::Delete, _) => {
+          let (dir_path, name) = split(&entry.path);
+          let dir = self.open_dir_path(dir_path)?;
+          match self.host.entry_fingerprint(dir, name) {
+            Ok(found) => Some(found),
+            Err(HostError::NotFound) => None,
+            Err(e) => return Err(e),
+          }
+        }
+        _ => None,
+      };
+      if let Some(found) = found {
+        self.observed.insert(entry.path.clone(), found);
+      }
+    }
+    Ok(v)
   }
 
   // ------------------------------------------------------------- writing
@@ -1512,7 +1579,17 @@ impl<H: LandFs> Landing<'_, H> {
       }
       // A file is staged for its batch's barrier by `write_one` (A-130), never written here.
       Action::Create | Action::Replace => return Err(WriteFailure::Volume(VfsError::Invalid)),
-      Action::Delete => self.delete(dir_path, name, entry.witnessed.as_ref())?,
+      Action::Delete => {
+        // An entry judged by content is removed as the object its validation found (A-291).
+        let witness = match entry.judged {
+          Judged::Witness => entry.witnessed,
+          Judged::Content => self.witness_of(entry),
+        };
+        self.delete(dir_path, name, witness.as_ref())?
+      }
+      Action::Rmdir if entry.judged == Judged::Content => {
+        self.remove_emptied_dir(dir_path, name)?
+      }
       Action::Rmdir => self.remove_tree_entry(dir_path, name, entry.witnessed.as_ref())?,
       Action::Clear => return self.clear_entry(dir_path, name, entry),
       Action::Rename { from } => self.rename_dir(from, dir_path, name, entry.witnessed.as_ref())?,
@@ -2042,6 +2119,22 @@ impl<H: LandFs> Landing<'_, H> {
         Ok(Outcome::Written)
       }
       Err(outcome) => Ok(outcome),
+    }
+  }
+
+  /// A directory a content manifest removes (A-291): by then the landing removed what it held, so it goes only while
+  /// empty, and one an outsider wrote into since its validation stays with what it holds (`TargetInUse`). Never a
+  /// recursive removal: what the capture never held is not this landing's to remove.
+  fn remove_emptied_dir(&mut self, dir_path: &str, name: &str) -> Result<Outcome, WriteFailure> {
+    let dir = self.open_dir_path(dir_path)?;
+    self.touched.insert(dir_path.into());
+    // The handles this landing holds beneath it are closed first: a host may refuse to remove a directory held open.
+    self.forget_dirs_under(&join(dir_path, name));
+    match self.host.rmdir(dir, name) {
+      Ok(()) => Ok(Outcome::Written),
+      Err(HostError::NotFound) => Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
+      Err(HostError::Unavailable(_)) => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      Err(e) => Err(e.into()),
     }
   }
 
@@ -2659,19 +2752,33 @@ fn sweep_parents(manifest: &Manifest) -> Vec<Box<str>> {
   parents.into_iter().collect()
 }
 
-/// The paths a manifest creates, for a resumed clear to recognize its own directory.
-fn owned_paths(manifest: &Manifest) -> BTreeSet<String> {
-  manifest
-    .entries
-    .iter()
-    .filter(|e| {
-      matches!(
-        e.action,
-        Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear
-      )
-    })
-    .map(|e| e.path.to_string())
-    .collect()
+/// The paths a manifest makes and removes: what a resumed clear recognizes as its own directory's, and what a directory
+/// a content manifest removes may still hold at its validation (A-291).
+struct Ours {
+  /// The paths the manifest creates.
+  created: BTreeSet<String>,
+  /// The paths the manifest removes.
+  removed: BTreeSet<String>,
+}
+
+/// The paths a manifest makes and removes.
+fn owned_paths(manifest: &Manifest) -> Ours {
+  let paths = |made: bool| {
+    manifest
+      .entries
+      .iter()
+      .filter(|e| match e.action {
+        Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear => made,
+        Action::Delete | Action::Rmdir => !made,
+        Action::Replace | Action::Rename { .. } => false,
+      })
+      .map(|e| e.path.to_string())
+      .collect()
+  };
+  Ours {
+    created: paths(true),
+    removed: paths(false),
+  }
 }
 
 /// The reason an entry with verdict `Skip` was skipped.
@@ -2857,7 +2964,7 @@ pub fn settle_grant(
 /// volume's or the target's. [`Beginning`] run to its end in one call, then [`begin_planned`].
 #[allow(clippy::too_many_arguments)]
 pub fn begin_landing<'h, H: LandFs>(
-  mut host: HostSlot<'h, H>,
+  host: HostSlot<'h, H>,
   target: &LandingTarget,
   vol: &mut Volume,
   store: &mut Store,
@@ -2866,10 +2973,23 @@ pub fn begin_landing<'h, H: LandFs>(
   audit: &mut Audit,
   request: &LandingRequest,
 ) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
-  let mut beginning = match Beginning::new(vol, target, request) {
+  let beginning = match Beginning::new(vol, target, request) {
     Ok(beginning) => beginning,
     Err(refusal) => return Err((host, refusal)),
   };
+  begin_landing_from(beginning, host, vol, store, grants, lease, audit)
+}
+
+/// [`begin_landing`] from a [`Beginning`] its caller made: a captured clone's ([`Beginning::against_capture`]).
+pub fn begin_landing_from<'h, H: LandFs>(
+  mut beginning: Beginning,
+  mut host: HostSlot<'h, H>,
+  vol: &mut Volume,
+  store: &mut Store,
+  grants: &mut Grants,
+  lease: Option<&LandingLease>,
+  audit: &mut Audit,
+) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
   let planned = loop {
     let stepped = match host.get() {
       Some(lent) => beginning.unit(lent, vol, store, grants, audit),
@@ -2915,7 +3035,7 @@ struct Verdicting {
   manifest: Manifest,
   binding: GrantBinding,
   saved: Saved,
-  ours: BTreeSet<String>,
+  ours: Ours,
   reports: Vec<EntryReport>,
 }
 
@@ -2950,6 +3070,27 @@ impl Beginning {
     let began = Instant::now();
     let walk =
       crate::manifest::PlanWalk::new(vol, request.source).map_err(LandingRefusal::Volume)?;
+    Ok(Beginning {
+      target: target.clone(),
+      request: request.clone(),
+      began,
+      stage: BeginStage::Plan(walk),
+    })
+  }
+
+  /// [`Beginning::new`] for a clone of a captured base (§4.15 `capture_base`, A-291's landing): its manifest is the
+  /// change of `request.source` since the capture `base` (a snapshot's tree in the same store, pinned while the clone
+  /// lives), every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the
+  /// volume as it was.
+  pub fn against_capture(
+    vol: &Volume,
+    target: &LandingTarget,
+    request: &LandingRequest,
+    base: slates_vfs::captured::FrozenTree,
+  ) -> Result<Beginning, LandingRefusal> {
+    let began = Instant::now();
+    let walk = crate::manifest::PlanWalk::against_capture(vol, request.source, base)
+      .map_err(LandingRefusal::Volume)?;
     Ok(Beginning {
       target: target.clone(),
       request: request.clone(),
@@ -3139,6 +3280,7 @@ struct Saved {
   media_failed: bool,
   placed: BTreeMap<Box<str>, Fingerprint>,
   restored: BTreeMap<Box<str>, Fingerprint>,
+  observed: BTreeMap<Box<str>, Fingerprint>,
 }
 
 impl Saved {
@@ -3161,6 +3303,7 @@ impl Saved {
       media_failed: false,
       placed: BTreeMap::new(),
       restored: BTreeMap::new(),
+      observed: BTreeMap::new(),
     }
   }
 }
@@ -3187,6 +3330,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       media_failed: saved.media_failed,
       placed: saved.placed,
       restored: saved.restored,
+      observed: saved.observed,
     }
   }
 
@@ -3209,6 +3353,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       media_failed: self.media_failed,
       placed: self.placed,
       restored: self.restored,
+      observed: self.observed,
     }
   }
 }
@@ -3240,7 +3385,7 @@ enum Phase {
   /// Settling a crashed earlier attempt's hidden siblings, one directory per unit.
   Sweep { parents: Vec<Box<str>>, next: usize },
   /// Taking each entry's verdict against the disk, one entry per unit.
-  Validate { ours: BTreeSet<String>, next: usize },
+  Validate { ours: Ours, next: usize },
   /// Writing: per unit, one entry, one window of a large file, one batch's barrier or one staged file placed (A-130).
   Write {
     next: usize,
@@ -3816,6 +3961,13 @@ fn advance_step<H: LandFs>(
   store: &mut Store,
   request: &LandingRequest,
 ) -> Option<Result<(), LandingRefusal>> {
+  // A captured clone's landing (judged by content, A-291) takes no base from the target and forgets nothing: the clone
+  // stays the movable scratch volume it was, and its next landing is judged against its capture again.
+  let keeps_volume = manifest.basis == Judged::Content;
+  if !advance.begun && keeps_volume {
+    advance.begun = true;
+    return None;
+  }
   if !advance.begun {
     return match vol
       .with_host(landing.host)
@@ -3829,7 +3981,9 @@ fn advance_step<H: LandFs>(
     };
   }
   let Some(report) = reports.get(advance.next) else {
-    vol.with_host(landing.host).land_advance_end();
+    if !keeps_volume {
+      vol.with_host(landing.host).land_advance_end();
+    }
     return Some(Ok(()));
   };
   advance.next = advance.next.saturating_add(1);
@@ -3855,8 +4009,8 @@ fn advance_step<H: LandFs>(
     advance.held = advance.held.saturating_add(1);
   }
   // Only a completed landing advances (`Aborted` iff it crashed, §4.15), and only an entry that left the overlay and
-  // reached the durability boundary.
-  if advance.crashed || !takes_out || !durable {
+  // reached the durability boundary; a captured clone's entries leave nothing (above).
+  if advance.crashed || !takes_out || !durable || keeps_volume {
     return None;
   }
   // The landing's own write left a fresh ctime, so its witness is racy by the design's rule (A-49): a later verdict
