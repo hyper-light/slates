@@ -32385,6 +32385,14 @@ and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api
   two refuses the start by name rather than retrying. The walk reads a link or an address only once it lies wholly
   inside the buffer, aligned, and walks no more steps than entries fit in the buffer.
 - **Test.** `a_windows_hosts_adapters_give_its_resolver` (`crates/api/src/role/fleet.rs`, on every host).
+- **Evidence (the Mac Studio, kiln, 2026-11-18, debug).** Red once, on a copy where no adapter counts (Windows with no
+  source, as before): the test failed at its first assertion. Green: `cargo test --locked -p slates-api --lib
+  role::fleet` 11 of 11. `cargo xwin check -p slates-api` (lib and all targets) and `cargo xwin clippy -p slates-api --lib
+  --no-deps -- -D warnings` for `x86_64-pc-windows-msvc`: clean, so the Windows half compiles and lints. Clippy found
+  nothing in A-490's lines on macOS (slates-server clean; slates-api's two findings are `crates/api/tests/api.rs` 1324
+  and 1630, another change's), and Windows clippy with dependencies stops first on `crates/server/src/shards.rs:1371`,
+  also another change's. `cargo xtask unsafe`: slates-api 9 of 9; structural ok; the literal check's 45 findings are
+  none of A-490's files. The live start on Windows and the Linux check are filed for main.
 
 Applied in the same change to: §4.8 "Deployment", GAPS (the kiln runners' entry), `docs/bugs/` (a record), `docs/cli.md`,
 `docs/deploy.md`, `crates/api/src/role/fleet.rs`, `crates/api/src/role/fleet/windows_dns.rs` (new),

@@ -49,6 +49,18 @@ peer. Nothing was lost or written: the refusal came before the instance started,
   the default timeout and attempts. A host none of whose adapters counts, and a host with no adapter, give no resolver.
 - The Windows half runs only on Windows: its live check is filed for main's Windows lanes.
 
+## Evidence (2026-11-18, the Mac Studio, kiln, debug)
+
+- Red once, on a copy of a8ad21db9 where no adapter counts (Windows with no source, as before A-490):
+  `a_windows_hosts_adapters_give_its_resolver` failed at its first assertion (`fleet.rs:974`).
+- Green at 963a93999: `cargo test --locked -p slates-api --lib role::fleet`, 11 of 11.
+- Windows, cross-built: `cargo xwin check -p slates-api` (the library, and all targets) and `cargo xwin clippy -p
+  slates-api --lib --no-deps -- -D warnings` for `x86_64-pc-windows-msvc`, clean.
+- `cargo xtask unsafe`: slates-api 9 of 9. `cargo clippy -p slates-server --all-targets`: clean; `-p slates-api`:
+  nothing in this change's lines (its two findings, `crates/api/tests/api.rs` 1324 and 1630, are another change's).
+- Owed to main's lanes: the Windows half run live (a Windows node started on a manifest with a root), the binary's start
+  in Nano Server with its new `iphlpapi.dll` import, and the Linux check (no Linux runner had room).
+
 ## Siblings
 
 A sweep of every hard-coded host path in shipped code (`/etc`, `/proc`, `/sys`, `/dev`, `/run`, `/var`) found none
