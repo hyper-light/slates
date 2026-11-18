@@ -354,6 +354,7 @@ fn present_and_wait(
       target,
       filter: Filter::default(),
       grant: None,
+      signature: None,
     })
     .unwrap()
     .word();

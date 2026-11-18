@@ -2385,6 +2385,10 @@ fn restart_flow(take_over: bool) {
     "a survivor served every write X acknowledged before its restart: {counters:?}"
   );
 }
+/// A live line's head position, `None` while the log has none.
+fn head_position(line: Option<&LiveLine>) -> Option<u64> {
+  line.and_then(|(head, _, _)| head.parse().ok())
+}
 
 /// A-344 across real processes (§4.10 live shipping, §4.8 "Recovery"; goal g229, the supervisor's request of
 /// 2026-11-18): do write [`FILES`] files to a live volume through its owner, restart the owner's daemon as a crash does,
@@ -2396,9 +2400,11 @@ fn restart_flow(take_over: bool) {
 /// those writes, where one begun again at position 0 (a second chain under the same epoch, which a takeover's phase one
 /// loses to the first) ends at their count. Before A-344 a restarted owner answered no write within the client's
 /// deadline and began its log again at genesis; this flow is the real-process leg of the in-process
-/// `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover` (`crates/server/tests/fleet.rs`).
+/// `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover` (`crates/server/tests/fleet.rs`). Two
+/// versions were written the same day (63b31d5b3, one write after the restart, and goal g229's); this is the one flow,
+/// with g229's bounded writes, which fail where a log begun at genesis left the first version's run waiting for good.
 #[test]
-fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
+fn a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
     eprintln!(
       "skipping the live-shipping owner-restart flow: set SLATES_TEST_CLI=1 to run it (three anchored daemons)"
@@ -2433,7 +2439,9 @@ fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
   }
   let refusals = write_files_through_transient(&owner, &id, FILES..2 * FILES);
   let after = live_line(&owner, "shipping", &id);
-  // The owner dies whole: its daemon, then its anchor.
+  // The owner dies whole: its anchor stopped first, so the daemon's death starts no replacement, then its daemon, then
+  // the anchor.
+  signal(&fleet.daemons[owner_index], rustix::process::Signal::STOP);
   signal_pid(&daemon_after, "-KILL");
   drop(fleet.daemons.remove(owner_index));
   let served = std::panic::catch_unwind(|| wait_served_whole(&other_refs, &id, 2 * FILES).0).ok();
@@ -2451,15 +2459,10 @@ fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
     daemon_before, daemon_after,
     "the anchor replaced the owner's daemon"
   );
-  let head_of = |line: &Option<LiveLine>| {
-    line
-      .as_ref()
-      .and_then(|(head, _, _)| head.parse::<u64>().ok())
-  };
   let written_after = u64::try_from(FILES).unwrap();
   assert!(
     matches!(
-      (head_of(&before), head_of(&after)),
+      (head_position(before.as_ref()), head_position(after.as_ref())),
       (Some(shipped), Some(resumed)) if resumed > shipped + written_after
     ),
     "the restarted owner's log went on past the head it shipped before the restart, {written_after} writes on: \

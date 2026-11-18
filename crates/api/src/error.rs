@@ -396,6 +396,13 @@ pub enum RetryCause {
   },
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
+  /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
+  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): its effects stay on the
+  /// owner, never claimed durable, and the call made again runs the verb again.
+  DurabilityPending {
+    /// How long the reply was held, nanoseconds.
+    held_ns: u64,
+  },
   /// The command ring is full: nothing was sent.
   RingFull,
   /// The daemon left this channel, or a reconnected one is still being bound: nothing was sent.
@@ -441,9 +448,6 @@ pub enum Unsupported {
     /// The form.
     feature: &'static str,
   },
-  /// A landing that carries a signature: the daemon verifies signed merges (A-321) and not yet a landing's signature
-  /// ([`crate::signed`]). Nothing was sent.
-  SignedWork,
   /// The TLS provider's secure random refused, so no launcher secret could be made ([`crate::LauncherSecret::generate`]).
   SecureRandom,
 }
@@ -801,6 +805,9 @@ impl Error {
       Refusal::ContentUnavailable => retry(RetryCause::ContentUnavailable, pause_ns),
       Refusal::DigestUnverified => retry(RetryCause::ChangedWhileRead { path: None }, pause_ns),
       Refusal::HolderPending => retry(RetryCause::HolderPending, pause_ns),
+      Refusal::DurabilityPending { held_ns } => {
+        retry(RetryCause::DurabilityPending { held_ns }, pause_ns)
+      }
       Refusal::Unsupported { feature } => {
         Error::Unsupported(Unsupported::Feature(Note::new(feature)))
       }
@@ -1652,6 +1659,19 @@ mod tests {
     assert!(
       rights.contains("Forbidden") && rights.contains("status"),
       "{rights}"
+    );
+  }
+
+  /// A-354 (2026-11-18): do type the daemon's refusal of a reply held past the failover SLO for durability. Expect a
+  /// retry carrying how long it was held, after the pause.
+  #[test]
+  fn a_reply_held_past_its_durable_bound_is_a_retry() {
+    assert_eq!(
+      Error::of_refusal(Refusal::DurabilityPending { held_ns: 7 }, None, PAUSE_NS),
+      Error::Retry {
+        cause: RetryCause::DurabilityPending { held_ns: 7 },
+        pause_ns: PAUSE_NS,
+      }
     );
   }
 
