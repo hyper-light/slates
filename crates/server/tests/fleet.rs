@@ -10667,6 +10667,159 @@ fn written_again(client: &mut Client, volume: VolumeId) -> ReplyBody {
   written
 }
 
+/// Shape: the files the Continuity test writes on the owner before it is lost, each answered at durability.
+const CONTINUITY_FILES: usize = 6;
+
+/// The epoch and position of the head of `volume`'s live log on `client`'s node, as the owner it ships from (its own
+/// log, not a candidate's copy).
+fn owned_live_head(client: &mut Client, volume: VolumeId) -> Option<(u64, u64)> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && !live.holding)
+    .and_then(|live| Some((live.head_epoch?, live.head?)))
+}
+
+/// The bytes the Continuity test writes into its file `file`.
+fn continuity_body(file: usize) -> Vec<u8> {
+  format!("file {file}, durable before the owner was lost\n").into_bytes()
+}
+
+/// A live-shipped volume named `name` on `client`'s node, shared with `fleet`, written [`CONTINUITY_FILES`] files: the
+/// volume and every write's reply.
+fn live_volume_written(
+  client: &mut Client,
+  fleet: &[Daemon],
+  name: &str,
+) -> (VolumeId, Vec<ReplyBody>) {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(client, id, fleet);
+  let attachment = write_attachment(client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let written = (0..CONTINUITY_FILES)
+    .map(|file| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/continuity-{file}"),
+        bytes: continuity_body(file),
+        mode: 0o644,
+      })
+    })
+    .collect();
+  (id, written)
+}
+
+/// What the Continuity test saw through the successor: whether it served the volume, its first write's reply, its log's
+/// head (epoch, position) after that write, and whether each file written on the owner read back.
+struct ThroughTheSuccessor {
+  served: bool,
+  written: ReplyBody,
+  head: Option<(u64, u64)>,
+  read: Vec<bool>,
+}
+
+/// The Continuity test's successor side: once the node serving `instance` answers `status` for `volume` (polled over
+/// `daemons`), one write through it, its log's head, and each of the owner's files read back.
+fn through_the_successor(
+  daemons: &[Daemon],
+  instance: &str,
+  volume: VolumeId,
+) -> ThroughTheSuccessor {
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), instance, volume);
+  let mut reader = Client::connect(instance);
+  let attachment = write_attachment(&mut reader, volume);
+  let written = reader.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: "/after".to_owned(),
+    bytes: b"written on the successor".to_vec(),
+    mode: 0o644,
+  });
+  let head = owned_live_head(&mut reader, volume);
+  let read = (0..CONTINUITY_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, volume, &format!("/continuity-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+    })
+    .collect();
+  ThroughTheSuccessor {
+    served,
+    written,
+    head,
+    read,
+  }
+}
+
+/// A-329, Continuity (T-8.6: "the successor's first head is past every position durable under an earlier epoch";
+/// §4.10 live shipping): a successor's live log goes on past every position its dead owner made durable. Do: three nodes
+/// at `f = 1`; on a, a live-shipped volume written six files, each answered at durability; read a's log's durable
+/// position; stop a; once the survivor the volume ranks first serves it, write one file through it and read its log's
+/// head; read every file back through it. Expect every write answered at durability, the successor's head under a
+/// higher epoch and past a's durable position, and every file read back. Before, the successor's log began again at
+/// position 0.
+#[test]
+fn a_successors_live_log_goes_on_past_every_position_durable_before_it() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "continuity");
+  let durable = owned_live_line(&mut client, id).and_then(|(_, durable, _)| durable);
+  let before_epoch = owned_live_head(&mut client, id).map(|(epoch, _)| epoch);
+  drop(client);
+  daemons.remove(0).stop();
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let instance = daemons[usize::from(successor != hosts[1])]
+    .instance()
+    .to_owned();
+  let after = through_the_successor(&daemons, &instance, id);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "continuity: a durable at {durable:?} under epoch {before_epoch:?}; the successor's head after its first write {:?}; \
+     read {:?}",
+    after.head, after.read
+  );
+  assert!(
+    written
+      .iter()
+      .chain(std::iter::once(&after.written))
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered at durability: {written:?} {:?}",
+    after.written
+  );
+  assert!(after.served, "the successor serves the volume");
+  let (durable, before_epoch) = (
+    durable.expect("a's log was durable"),
+    before_epoch.expect("a's log showed its epoch"),
+  );
+  let (epoch, head) = after.head.expect("the successor's log shows its head");
+  assert!(
+    head > durable && epoch > before_epoch,
+    "the successor's head {head} at epoch {epoch} is past a's durable position {durable} at epoch {before_epoch}"
+  );
+  assert!(
+    after.read.iter().all(|read| *read),
+    "every file reads back through the successor: {:?}",
+    after.read
+  );
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.

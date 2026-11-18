@@ -1,5 +1,23 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A successor's live log began again at position 0: it goes on from the head its takeover adopted (2026-11-18, A-329,
+> Continuity, T-8.6; g230).** `live_ship::published` made every shipper with no start, so a successor's first entry was
+> position 0 at genesis under its higher epoch: holders took it by rank and NoLoss held, but the chaos flows' Continuity
+> failed in five takeover flows (macOS, main bfc34cace, kiln r1246: position 1 against 72 to 1,000 durable before).
+> The live takeover now records the adopted head on the owner shard (`live_ship::adopt_head`), and the volume's shipper
+> starts from it. Tests: `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (live_ship) and
+> `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
+> - **Owed (the supervisor's):** the five chaos flows' Continuity on the fix (they failed alike on both Linux arches,
+>   diag 44269183565).
+> - **Open, not numbering (read from that run's log, seed 6876545201569229162, and the macOS one's):** the nemesis's
+>   "a fence-2 copy behind the fence-1 owner's durable head". Both holders' fences stand at 2, raised by a takeover's
+>   phase one that never completed, while the owner b, still the owner at fence 1, ships epoch-1 entries neither takes
+>   (its head 6,810, durable 6,808, c at 6,808 and a at 6,588): a fence an abandoned takeover raised strands its owner.
+>   No successor shipped, so no position was renumbered; A-329 does not touch it.
+> - **Owed:** the adopted head lives in the successor shard's memory until the volume's first publication, as the
+>   volume's own image does for a live-shipped takeover (A-325's owed item): a successor restarted before then loses
+>   both.
+
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
