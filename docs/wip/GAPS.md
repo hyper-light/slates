@@ -15327,7 +15327,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (on main 2026-11-17)
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (A-292; on main 2026-11-17)
 
 `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
 running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
@@ -15377,6 +15377,16 @@ Open:
 - The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
   period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
   silence.
+- Hypothesis, not yet seen in a give-up record: a window can be silent through the owner's own delay in asking. A fresh
+  volume's log is shipped to a holder only once the coordinator has placed its catalog there (`pending_sends`'
+  `catalogued` gate), and its head waits for the coordinator's period behind that period's other commits, each awaited
+  in turn (`ship_shard_heads`); a coordinator kept past a window that way leaves a window with nothing asked, so nothing
+  heard, through no holder's fault. The receiver's two waits (A-292) prove the owner has read what came, not that it
+  asked. A give-up record from a run under load that shows the head or catalog unplaced with no lane in flight would
+  confirm it.
+- The virtio-fs serve loop times only the oldest held `FSYNC`'s next look (`serve_round`, `durable_oldest`); under
+  windows a younger reply's look can come first, so its verdict waits for the oldest's look, at most a window late. Never
+  a refusal, only a late one; the FUSE mount and WinFsp take the soonest look over every held reply.
 
 ### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (open, instrumented)
 

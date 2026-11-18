@@ -1,9 +1,9 @@
 //! When a reply held for a live-shipped volume's durability gives up (§4.10 status "FUSE `fsync` at durability" and
-//! "The wait is judged by what it hears"; A-200): the one rule every transport that holds such a reply judges by — the
-//! FUSE `fsync`, an NFS stable write or `COMMIT`, a Shards `FSYNC` and a WinFsp flush in the daemon (`slates-server`'s
-//! `live_ship`), and the virtio-fs device's `FSYNC` (`slates-bridge-virtiofs`). Pure: the caller hands it what the
-//! volume has heard ([`Heard`]) and the clock, so its judgment is tested on every host and no transport keeps a second
-//! mechanism.
+//! "The wait is judged by what it hears"; A-200, A-292): the one rule every transport that holds such a reply judges
+//! by — the FUSE `fsync`, an NFS stable write or `COMMIT`, a Shards `FSYNC` and a WinFsp flush in the daemon
+//! (`slates-server`'s `live_ship`), and the virtio-fs device's `FSYNC` (`slates-bridge-virtiofs`). Pure: the caller
+//! hands it what the volume has heard ([`Heard`]) and the clock, so its judgment is tested on every host and no
+//! transport keeps a second mechanism.
 //!
 //! **The rule.** A wait runs in windows of a fixed length (the daemon's liveness budget). A window that ends with
 //! something heard (a holder's acknowledged position advancing, the volume's head or catalog placement gaining an

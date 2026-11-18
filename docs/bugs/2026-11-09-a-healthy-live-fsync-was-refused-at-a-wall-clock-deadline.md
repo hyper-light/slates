@@ -3,7 +3,7 @@
 - **Date:** 2026-11-09; on main 2026-11-17. **Status:** fixed (the FUSE `fsync`, an NFS stable write or `COMMIT`, a
   Shards `FSYNC`, the virtio-fs device's `FSYNC`, WinFsp's held flush), and its sibling, an owner starved past a
   window's end (GAPS). **Design:** §4.10
-  status "FUSE `fsync` at durability" and "The wait is judged by what it hears", A-200, AC-8.3. **Found by:** raft-7's
+  status "FUSE `fsync` at durability" and "The wait is judged by what it hears", A-200, A-292, AC-8.3. **Found by:** raft-7's
   run of the live fleet suite; ordered by the supervisor ahead of older items, since a spurious `EIO` on `fsync` tells an
   application its data is lost. Diagnosed and built by bug-sweep (`agents/bug-sweep-2` 50fa8c56, and the total bound
   and the shared module after it); landed by g244-healthy-fsync-live.
