@@ -2973,21 +2973,60 @@ fn retry_forwards(state: &mut ShardState) -> bool {
         break;
       }
       Err(_) => {
-        // A forward that never reached its owner: refused here, its `ring.request` span ending with the
-        // refusal's write like any deferred reply's.
-        let ring = state.forwarded_rings.remove(&pending.request);
-        state.deferred.push(Deferred {
-          client_index: pending.client_index,
-          request: pending.request,
-          reply: refused(Refusal::NotFound),
-          recorded: false,
-          ring,
-        });
+        refuse_unsent_forward(state, pending);
         any = true;
       }
     }
   }
   any
+}
+
+/// Refuses a kept forward that will never reach its owner: answered `NotFound` here, its `ring.request` span ending with
+/// the refusal's write like any deferred reply's.
+fn refuse_unsent_forward(state: &mut ShardState, pending: PendingForward) {
+  let ring = state.forwarded_rings.remove(&pending.request);
+  state.deferred.push(Deferred {
+    client_index: pending.client_index,
+    request: pending.request,
+    reply: refused(Refusal::NotFound),
+    recorded: false,
+    ring,
+  });
+}
+
+/// Counter: the serve loop could not ask a kept forward's owner for room because it was not running as a task on its
+/// shard, which it always is. A bug signal: such a forward waits for the loop's next round instead of the owner's word.
+const FORWARD_ROOM_UNASKED: &str = "forward.kept.room_unasked";
+
+/// The asking half of the room wake (`slates_rt::room`) for the forwards a full control channel refused, run by the serve
+/// loop as it is about to idle (§4.3 "admission limit": backpressure, never a drop). It asks the owner of the first kept
+/// forward to tell this shard when its control channel next has room, then tries the kept forwards once more. The loop
+/// idles only if that try is refused too, and then the owner's next drain that takes a message wakes it: either the try
+/// finds the room a drain made meanwhile, or that drain finds the ask. So a kept forward waits for no timer and for no
+/// other request. An owner that has left its loop will never drain again, so its kept forwards are refused typed now.
+/// Whether the loop should serve a round instead of idling (a forward went out or was refused); false with none kept.
+pub fn ask_room_for_kept_forwards(state: &mut ShardState) -> bool {
+  let Some(owner) = state.pending_forwards.front().map(|pending| pending.owner) else {
+    return false;
+  };
+  match slates_rt::futures::want_room(owner) {
+    Ok(()) => retry_forwards(state),
+    Err(slates_rt::RtError::ShardGone { .. }) => {
+      let kept = std::mem::take(&mut state.pending_forwards);
+      for pending in kept {
+        if pending.owner == owner {
+          refuse_unsent_forward(state, pending);
+        } else {
+          state.pending_forwards.push_back(pending);
+        }
+      }
+      true
+    }
+    Err(_) => {
+      state.count(FORWARD_ROOM_UNASKED, 1);
+      retry_forwards(state)
+    }
+  }
 }
 
 /// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
