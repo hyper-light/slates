@@ -383,6 +383,21 @@
 >   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+>   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
+>     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
+>     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
+>     steps (which function, owed: the trace asked of the measurer). g251 slices the takeover's rebuild and restore.
+>   - **Plan (g230's item 3, not built):** capture the whole body in the publication's turn (`whole_record` and
+>     `content_runs`, a memcpy, about a tenth of the seal), then seal its pieces (`seal_body` already seals
+>     MAX_CHUNK_BYTES pieces independently) on a task of the owner shard driven through `xshard::Turns`, a quantum a
+>     turn, yielding between; queue the publications made meanwhile behind it, bounded by the credit; append the whole
+>     entry, then the queue in order, positions assigned at append as today (no Shipper or model change). Durability
+>     targets (`durable_target`, `owed_position`) count the pending whole (head + 1) and each queued publication after
+>     it; a fence or a destroy drops the build and refuses its waiters as today; A-344's kept position is unchanged (no
+>     entry ships before it is appended, so a restart mid-build resumes past it and owes a whole entry). Install images
+>     (`refresh_image`) the same way. Test: a live volume whose whole entry is sealed a piece a turn under an injected
+>     quantum, writes made during the build answered in order and served whole after a takeover; red with the seal in
+>     one turn (one turn counted).
 > - **Owed (found by the measurer, 2026-11-18, Mac Studio, main 1eca77263):** at a GiB seal the owner's longest step,
 >   230 to 272 ms in 4 runs, is one step after the wrap ends (the envelope's completion or the first content round's put,
 >   not yet told apart), about a quarter of a millisecond a MiB: a seal of about 4 GiB would reach the watchdog's
