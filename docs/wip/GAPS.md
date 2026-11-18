@@ -68,11 +68,17 @@
 > its own. Signed work is provenance, not permission. This closes, once built, "No grant can be issued on Linux from
 > the CLI" (A-201's entry): under bypass the daemon grants its own landing. The first reading (a human-only proof,
 > fs-server's options A–E) is withdrawn by Ada; its piece 2 (the presentation nonce and the signed `Grant`,
-> d1a46ae9) is reverted, and the SSH verifier (1c31d1c7) is kept for signed work. **Owed, in order** (types agreed
-> with g262, slates-api's owner):
-> - `WriteAct`, `WriteMode { Bypass, Ask, Forbid }`, `WritePolicy { merge, land }`, `PolicySubject`, the issuer-proven
->   `SetPolicy` (refused on a consumer-bound channel) and `Refusal::PolicyForbids { act, by }`;
-> - a landing under the effective mode, Linux included; then merges (submit) under it;
+> d1a46ae9) is reverted, and the SSH verifier (1c31d1c7) is kept for signed work. **Built (2026-11-18): a volume's
+> policy and landing under it** — `WriteAct`, `WriteMode { Bypass, Ask, Forbid }`, `WritePolicy { merge, land }`,
+> `PolicySubject`, the issuer-proven `SetPolicy` (refused `Forbidden` on a consumer-bound channel), `Policy`,
+> `Refusal::PolicyForbids { act, by }`; bypass lands in the presenting request, ask answers the approval request,
+> forbid refuses (`crates/server/tests/write_policy.rs`, 4 of 4 on macOS arm64; the bypass test red with bypass
+> turned off). **To measure** (the supervisor's): a bypass landing plans twice, the presentation and the granted
+> landing's own plan; its cost over a granted landing of the same volume (wall time and shard time, 1, 1,000 and
+> 10,000 files) says whether the granted landing should reuse the presentation's plan. **Owed, in order** (types
+> agreed with g262, slates-api's owner):
+> - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
+> - merges (submit) under the policy;
 > - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;

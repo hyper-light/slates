@@ -460,6 +460,13 @@ pub enum Op {
     /// The version it waits for.
     version: u64,
   },
+  /// A volume's write policy was set by the launcher or the harness, through the issuer (A-285). Appended (2026-11-18).
+  VolumeWritePolicySet {
+    /// The volume.
+    id: VolumeId,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
 }
 
 impl Op {
@@ -531,6 +538,7 @@ impl Op {
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
+      Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
     }
   }
 }

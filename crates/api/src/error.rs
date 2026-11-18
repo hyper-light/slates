@@ -725,6 +725,23 @@ impl Error {
         verb: Note::new(verb),
       }),
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
+      Refusal::PolicyForbids { act, by } => {
+        Error::Denied(Denied::Policy(crate::policy::PolicyRefusal {
+          act: match act {
+            slates_ipc::protocol::WriteAct::Merge => crate::policy::WriteAct::Merge,
+            slates_ipc::protocol::WriteAct::Land => crate::policy::WriteAct::Land,
+          },
+          by: match by {
+            slates_ipc::protocol::PolicySubject::Consumer { consumer } => {
+              crate::policy::PolicySubject::Consumer(consumer)
+            }
+            slates_ipc::protocol::PolicySubject::Volume { volume } => {
+              crate::policy::PolicySubject::Volume(volume)
+            }
+          },
+          reason: crate::policy::PolicyReason::Forbidden,
+        }))
+      }
       Refusal::ConsumerNotEnrolled => Error::Denied(Denied::NotEnrolled),
       Refusal::ConsumerRevoked => Error::Denied(Denied::Revoked),
       Refusal::SessionUnproven => Error::Denied(Denied::SessionUnproven),
