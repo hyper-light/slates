@@ -8005,6 +8005,11 @@ it builds against the contract and adds to it rather than around it.
 > when it gave one); a WinFsp drive the anchor's hold did not answer, or whose detach already waits. The words go to
 > the daemon's log. The contract carries the reason as `HostFault::Target(TargetRefusal)` and renders it after the
 > daemon's `TargetUnavailable`. The superseded variant is a protocol fault, since no daemon of this build sends it.
+> The daemon's closed word tables travel typed beside their words (2026-11-18, no contract type changed): a landing's
+> terminal stage (`LandingOutcome::stage`), a summary's actions (`LandingSummary::actions`, counted from the manifest's
+> entries), a grant's state (`GrantSummary::grant_state`), and an audit record's kind and stage (`AuditEntry::audit_kind`,
+> `stage`). The contract reads only those. The words stay for people (the CLI's and MCP's JSON), and a word the contract
+> did not know is no longer a protocol fault.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
