@@ -326,6 +326,9 @@ pub(crate) async fn ship(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
+  // A wall bound, by its reason (A-440): the record period's, so a busy owner shard's shipments wait a period rather than
+  // holding the period's other work behind it; and what the call does there is kept, a shipment built once and resent
+  // unchanged ([`owed`]), so an answer given up on costs its shipments one period, never a second build.
   let owed = crate::xshard::call_within(
     origin,
     shard,

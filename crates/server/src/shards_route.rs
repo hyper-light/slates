@@ -15,9 +15,10 @@
 //!
 //! **The listener and its exchanges.** The listener is bound when the daemon starts and served by one task on the
 //! control shard, which accepts each connection without blocking and runs one exchange task for it there. Exchanges
-//! are bounded by the shard's client seats (`clients_per_shard`): past them a connection is refused `Busy`. Each runs
-//! within one liveness budget, after which a silent client is dropped, so a stranger that connects and says nothing
-//! holds a seat for at most that long. Every refusal is counted by its kind, and every claim by its success, which is
+//! are bounded by the shard's client seats (`clients_per_shard`): past them a connection is refused `Busy`. The client's
+//! part of each runs within one liveness budget, after which a silent client is dropped, so a stranger that connects and
+//! says nothing holds a seat for at most that long; the owner shard's take is waited for in that shard's own time
+//! (A-440). Every refusal is counted by its kind, and every claim by its success, which is
 //! the route's non-vacuity counter.
 
 use std::collections::BTreeMap;
@@ -238,8 +239,9 @@ enum Ended {
   Failed,
 }
 
-/// One exchange on `connection`, within one liveness budget: a refusal is sent as its kind byte, and every ending is
-/// counted; the connection closes when the task ends.
+/// One exchange on `connection`: the client's part (its hello and its proof) within one liveness budget, the owner
+/// shard's take in that shard's own time ([`take_from_owner`], A-440), and the confirmation sent with the ends; a
+/// refusal is sent as its kind byte, and every ending is counted; the connection closes when the task ends.
 ///
 /// **A sent end is kept until the client has its own.** XNU flushes a Unix socket whose every reference is inside a
 /// message in flight when its collector of such descriptors runs (`unp_gc`): the socket's receive buffer is emptied and
@@ -249,13 +251,18 @@ enum Ended {
 /// load 35-47, and in up to 40 of 48 with another thread opening and closing sockets
 /// (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`).
 async fn exchange(connection: OwnedFd) {
-  let ended = match futures::within(EXCHANGE_NS, run(connection.as_fd())).await {
-    Ok(Some(Ok(sent))) => {
-      // The client's close, or its deadline, ends the wait; the end is closed only after it.
-      let _closed = futures::within(EXCHANGE_NS, client_closes(connection.as_fd())).await;
-      drop(sent);
-      None
-    }
+  // A silent client is held to one liveness budget; the owner shard's take is not the client's silence, and is waited
+  // for apart from it.
+  let ended = match futures::within(EXCHANGE_NS, claim(connection.as_fd())).await {
+    Ok(Some(Ok(claim))) => match hand_over(connection.as_fd(), claim).await {
+      Ok(sent) => {
+        // The client's close, or its deadline, ends the wait; the end is closed only after it.
+        let _closed = futures::within(EXCHANGE_NS, client_closes(connection.as_fd())).await;
+        drop(sent);
+        None
+      }
+      Err(ended) => Some(Ok(ended)),
+    },
     Ok(Some(Err(ended))) => Some(Ok(ended)),
     Ok(None) | Err(_) => Some(Err(())),
   };
@@ -307,10 +314,16 @@ async fn client_closes(connection: BorrowedFd<'_>) {
   }
 }
 
-/// The exchange's steps (`slates_ipc::route`'s module doc): the hello, the daemon's nonce, the proof (with nothing
-/// after it), the owner shard's verdict, the confirmation with the end (and a stream's resync end beside it); the ends
-/// returned, still held, for the caller to close once the client has its own.
-async fn run(connection: BorrowedFd<'_>) -> Result<Taken, Ended> {
+/// What a client claims with: its hello, the daemon's nonce it was challenged with, and its proof.
+struct Claim {
+  hello: Hello,
+  daemon_nonce: [u8; NONCE_BYTES],
+  proof: [u8; SEALED_BYTES],
+}
+
+/// The client's part of the exchange (`slates_ipc::route`'s module doc): the hello, the daemon's nonce, the proof (with
+/// nothing after it).
+async fn claim(connection: BorrowedFd<'_>) -> Result<Claim, Ended> {
   let mut hello = [0u8; HELLO_BYTES];
   read_exact(connection, &mut hello).await?;
   let hello = Hello::decode(&hello).map_err(|_| Ended::Refused(RouteRefusal::Malformed))?;
@@ -327,6 +340,21 @@ async fn run(connection: BorrowedFd<'_>) -> Result<Taken, Ended> {
   if slates_ipc::stream::recv(connection, &mut [0u8; 1]).is_ok_and(|read| read > 0) {
     return Err(Ended::Refused(RouteRefusal::Malformed));
   }
+  Ok(Claim {
+    hello,
+    daemon_nonce,
+    proof,
+  })
+}
+
+/// The daemon's part: the owner shard's verdict ([`take_from_owner`]), then the confirmation with the end (and a
+/// stream's resync end beside it); the ends returned, still held, for the caller to close once the client has its own.
+async fn hand_over(connection: BorrowedFd<'_>, claim: Claim) -> Result<Taken, Ended> {
+  let Claim {
+    hello,
+    daemon_nonce,
+    proof,
+  } = claim;
   let route = state::with_state(|s| {
     // An attachment and a mapping alike carry their owner partition in their high 16 bits.
     let partition = crate::verbs::owner_of_attachment(hello.id);
@@ -336,18 +364,7 @@ async fn run(connection: BorrowedFd<'_>) -> Result<Taken, Ended> {
   let Some((origin, owner)) = route else {
     return Err(Ended::Refused(RouteRefusal::NoOffer));
   };
-  let taken = crate::xshard::call_within(
-    origin,
-    owner,
-    move |s| take(s, hello, daemon_nonce, proof),
-    EXCHANGE_NS,
-  )
-  .await;
-  let (confirmation, taken) = match taken {
-    Some(Ok(taken)) => taken,
-    Some(Err(refusal)) => return Err(Ended::Refused(refusal)),
-    None => return Err(Ended::Failed),
-  };
+  let (confirmation, taken) = take_from_owner(origin, owner, hello, daemon_nonce, proof).await?;
   slates_ipc::route::send_confirmation(
     connection,
     &confirmation,
@@ -356,6 +373,32 @@ async fn run(connection: BorrowedFd<'_>) -> Result<Taken, Ended> {
   )
   .map_err(|_| Ended::Failed)?;
   Ok(taken)
+}
+
+/// The owner shard's verdict on a claim ([`take`]), waited for in that shard's own time (A-440; R3's class A): a window of
+/// the exchange's budget, then on while the shard works or waits for a CPU, up to that budget of its CPU. The take
+/// retires the offer and hands its ends over, once: it was waited one window on the wall, so a busy owner shard took
+/// the offer after the exchange had given up, the ends were dropped with the late answer, and the client, its claim
+/// failed, found no offer to claim again. Only a shard that stopped, or ran its budget without answering, fails it.
+async fn take_from_owner(
+  origin: u16,
+  owner: u16,
+  hello: Hello,
+  daemon_nonce: [u8; NONCE_BYTES],
+  proof: [u8; SEALED_BYTES],
+) -> Result<([u8; SEALED_BYTES], Taken), Ended> {
+  let taken = crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |s| take(s, hello, daemon_nonce, proof),
+    EXCHANGE_NS,
+  )
+  .await;
+  match taken {
+    Some(Ok(taken)) => Ok(taken),
+    Some(Err(refusal)) => Err(Ended::Refused(refusal)),
+    None => Err(Ended::Failed),
+  }
 }
 
 /// Fills `buffer` from the non-blocking `connection`, waiting on its readiness; the client's closing before it is full
@@ -403,5 +446,106 @@ fn refuse(connection: BorrowedFd<'_>, refusal: RouteRefusal) {
   if let Some(kind) = slates_ipc::route::refusal_kind(refusal) {
     // The close after this tells the client its claim ended whether or not the byte goes out.
     let _courtesy = slates_ipc::stream::send(connection, &[kind]);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: the owner shard's one busy poll: an exchange's budget and a half of wall time, past the old wall window and
+  /// inside the offer's life (two budgets), so the offer is still there when the take runs.
+  const BUSY_NS: u64 = EXCHANGE_NS + EXCHANGE_NS / 2;
+  /// Shape: how long the test thread waits for the take's answer: four busy polls.
+  const ANSWER_WAIT_NS: u64 = 4 * BUSY_NS;
+  /// Shape: the offer's secret, a byte repeated: any value does, since the test makes the proof under it.
+  const SECRET: [u8; SECRET_BYTES] = [7; SECRET_BYTES];
+  /// Shape: the client's nonce, a byte repeated: any value does.
+  const CLIENT_NONCE: [u8; NONCE_BYTES] = [1; NONCE_BYTES];
+  /// Shape: the daemon's nonce, a byte repeated: any value does, since the test hands it to the take itself.
+  const DAEMON_NONCE: [u8; NONCE_BYTES] = [2; NONCE_BYTES];
+
+  /// R3's class A (A-440). Do: on a two-shard daemon, offer a map's descriptor on the second shard under a known secret,
+  /// hold that shard in one poll for an exchange's budget and a half of wall time on its CPU a fifth of it (a busy or
+  /// starved shard), and from the first shard take the offer with a proof made under the secret. Expect: the take
+  /// answered with the offer, after more than one budget of waiting, and the offer gone from its shard. The take waited
+  /// one budget on the wall, so the exchange failed with the owner alive and working, and the owner's late take retired
+  /// the offer and dropped its descriptor with the answer, leaving the client nothing to claim again.
+  #[test]
+  fn a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let origin = state.shard;
+      let (partition, owner) = state
+        .shards
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, shard)| *shard != origin)
+        .unwrap();
+      // An offer's id carries its owner partition in its high 16 bits.
+      let id = (u64::try_from(partition).unwrap() << 48) | 1;
+      let hello = Hello {
+        kind: OfferKind::Map,
+        id,
+        client_nonce: CLIENT_NONCE,
+      };
+      let proof = Exchange::new(&SECRET, (OfferKind::Map, id), &CLIENT_NONCE, &DAEMON_NONCE)
+        .unwrap()
+        .proof()
+        .unwrap();
+      let task = futures::spawn(async move {
+        let offered = crate::xshard::call_in_shard_time(
+          origin,
+          owner,
+          move |s| {
+            let (descriptor, _peer) = slates_ipc::stream::pair().unwrap();
+            offer(s, (OfferKind::Map, id), SECRET, (descriptor, None))
+          },
+          EXCHANGE_NS,
+        )
+        .await;
+        // The busy poll goes first on the owner shard's channel, so the take waits behind it.
+        let busy = crate::xshard::call_on(origin, owner, || {
+          crate::daemon::hold_busy(BUSY_NS);
+          Some(())
+        });
+        drop(busy);
+        let started = std::time::Instant::now();
+        let taken = match take_from_owner(origin, owner, hello, DAEMON_NONCE, proof).await {
+          Ok(_) => "taken".to_owned(),
+          Err(Ended::Refused(refusal)) => format!("refused {refusal:?}"),
+          Err(Ended::Failed) => "failed".to_owned(),
+        };
+        let waited = started.elapsed();
+        let left = crate::xshard::call_in_shard_time(
+          origin,
+          owner,
+          move |s| s.map_offers.contains_key(&id),
+          EXCHANGE_NS,
+        )
+        .await;
+        let _ = sent.send((offered, taken, waited, left));
+      })
+      .unwrap();
+      futures::detach(task).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_nanos(ANSWER_WAIT_NS));
+    daemon.stop();
+    let (offered, taken, waited, left) = answer.expect("the take answered");
+    println!(
+      "a take behind a busy poll of {BUSY_NS} ns: {taken} after {waited:?}; the offer left there: {left:?}"
+    );
+    assert_eq!(offered, Some(true), "the offer was made");
+    assert_eq!(
+      taken, "taken",
+      "the take on an owner shard alive and working was not answered with the offer (after {waited:?})"
+    );
+    assert!(
+      waited > std::time::Duration::from_nanos(EXCHANGE_NS),
+      "the take ended within one budget ({waited:?}), before its owner shard's busy poll did"
+    );
+    assert_eq!(left, Some(false), "the take retired the offer");
   }
 }

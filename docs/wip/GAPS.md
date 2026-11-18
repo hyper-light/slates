@@ -798,9 +798,11 @@
 >   day): a resync end is a kind of held entry of one handle, and a daemon replaces a held entry's record as the
 >   stream's session moves; and the attach's half (A-427, the same day): the message-mode resync pipe made at the
 >   attach, held by the anchor before the stream serves anything, its session and holder told before any reply that
->   rests on them, its device end handed to the client beside the stream's. Owed after them: the successor's half
->   (adopting the held end, the duplicate into the holder, the replies kept for a resend) and `slates shards`
->   handing the resync end to its command. **Built since (A-402, 2026-11-18):** the write log on
+>   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
+>   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
+>   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
+>   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
+>   first map). **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -3693,11 +3695,20 @@
 >   `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period`,
 >   `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period`). Kept on the wall by their reason, stated
 >   beside each: the record period's read of each shard's moves (a pure read, asked again next period) and the pressure
->   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Owed in
->   class A: five of the 25 `xshard::call_within` and `task_within` sites on the wall (`shards_route.rs`,
->   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Owed, found here:
->   an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on the
->   owner shard would make `moves::seal_adopted` idempotent. Class B (the
+>   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Then the
+>   last five (A-440, 2026-11-18, g251): the Shards route's take of an offer (macOS) and the Windows anchor's hold now
+>   wait in their owner shard's own time, since each has a side effect its caller must learn of (the take retires the
+>   offer and hands its ends over once, which a late answer dropped; the anchor's hold keeps what its caller took for
+>   unheld), the route's wall bound now held to the client's part alone
+>   (`a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget`); kept on the wall by their reason, stated
+>   beside each: a dead client's reap at remote owners (its waits are remote, the forward lane's, and the reap is
+>   idempotent there, sent again by the next sweep), the mirror's record shipping (the record period's, a shipment built
+>   once and resent unchanged) and a taken-over volume's making (the period's, A-397: the making runs on and the next
+>   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
+>   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
+>   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
+>   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
+>   the owner shard would make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -18559,9 +18570,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   Red-checked on windows-latest (run 44367207034): the `ARCHIVE` set-aside and the default owner each; the own-drive
   refusal passes on both runners (run 44376034930), its red-check filed for main's run.
   **Owed:** `crates/server/tests/audit_crossing.rs` (main's, 2026-11-18) is gated to Unix only for its landing target
-  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows
-  (refused `EPERM`: no unprivileged, handle-relative way to make one);
-  a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute bits); and
+  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows,
+  **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
+  privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
+  owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
+  `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
+  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute
+  bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

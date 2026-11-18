@@ -6050,6 +6050,8 @@ async fn begin_materializing(
       }
     });
   }
+  // A wall bound, by its reason (A-397, A-440): the period's, since the making runs on as a task of the owner shard and
+  // the next attempt joins it ([`making_of`], in that shard's own time).
   let ended = crate::xshard::task_within(
     origin,
     target,

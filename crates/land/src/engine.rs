@@ -1571,7 +1571,10 @@ impl<H: LandFs> Landing<'_, H> {
       Action::Symlink { target } => {
         let dir = self.open_dir_path(dir_path)?;
         self.touched.insert(dir_path.into());
-        match self.host.symlink(dir, name, target) {
+        // Where a writer that makes a link in two steps stages it (Windows, A-438): this landing's own hidden name,
+        // which its sweep removes after a crash between the steps.
+        let staged = self.hidden_name();
+        match self.host.symlink(dir, name, target, &staged) {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
