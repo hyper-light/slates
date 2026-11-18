@@ -901,7 +901,10 @@
 > alone, was recovered jointly with old b's {old b, owner, c}, of which only c was left; the survivor counted 8 objects
 > lost (A-272 keeps the copies; none is served). Owed, model first: whether the joint cohort may apply only to objects
 > whose line passes through the unconfirmed host, in §4.8's model text, with A-272 (ii)'s lineage model; a wrong
-> narrowing would lose data, so no change before it.
+> narrowing would lose data, so no change before it. Since A-309 (g250, 2026-11-18) such an object is no longer lost:
+> the joint cohort short of its quorum puts it past tolerance, and it is adopted once every surviving member of its
+> cohorts has promised (here the replacement and c, whose own cohort still holds its quorum), with the newest record
+> any holds (`fleet.takeover.recovered_past_tolerance`). The narrowing would spare only that wait for every survivor.
 
 > **Fixed (live-durability, 2026-11-09): the store-destroyed flow's mode B was the flow's own wait.** No survivor took
 > the volume over and every takeover counter read zero: 11 of 12 runs on A-271's tree (diag-live-durability-77) and 11
