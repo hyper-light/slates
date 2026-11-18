@@ -1,0 +1,7 @@
+
+Algorithm Hash                                                             Path
+--------- ----                                                             ----
+SHA256    F8288AF4806E7161DAA2F0245B0B79687872E355A7A66C697CACF527C9715B1D D:\a\slates\slates\winfsp-x64.sys
+SHA256    C10A33B360F613220367EBAA4F94952DE628D28956AD6C6B8582C06BA05AE8CF D:\a\slates\slates\g258-test.cer
+
+
