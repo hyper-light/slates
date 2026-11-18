@@ -27,7 +27,9 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
-use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, WritePolicy};
+use slates_ipc::protocol::{
+  ChangedCursor, EntriesCursor, PlannedEntry, PolicySubject, WritePolicy,
+};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
@@ -191,6 +193,44 @@ pub struct EntriesPage {
   pub total: u64,
   /// The manifest's hash: the one the landing's `GrantRequired` named.
   pub manifest: [u8; 32],
+}
+
+/// One page of a list the daemon answers a reply at a time (§4.3: a reply is one bulk chunk; A-263 to A-266): the
+/// items in the list's order, and the cursor the next page is asked from, `None` when this page ends the list. A list's
+/// order is a key that never changes for its items (a volume's id, a grant's id, a record's sequence, a green version
+/// and its changed paths), and a page continues past the last key the previous one held, so an item that stands for
+/// the whole walk is answered exactly once however the list changes meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page<T, C> {
+  /// This page's items.
+  pub items: Vec<T>,
+  /// The cursor the next page is asked from, or `None` when this page ends the list.
+  pub next: Option<C>,
+}
+
+/// One page of an overlay volume's drifted entries ([`Client::drifted_page`]; §4.4 `status`, A-267).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriftedPage {
+  /// This page's entries, each its path and the kind of drift, in path order, as a status names them.
+  pub entries: Vec<String>,
+  /// The position the next page is read from, or `None` when this page ends the list.
+  pub next: Option<u64>,
+  /// Entries in this page's range too long for any reply alone (a host path near the platform's maximum), passed over
+  /// and counted, never sent.
+  pub oversized: u32,
+}
+
+/// Refuses a page whose cursor does not move past the one it was asked from, so a walk always ends: a daemon that
+/// answered the same cursor again would hold its walker in a loop.
+fn forward<C: Ord>(
+  next: Option<C>,
+  after: Option<C>,
+  verb: &'static str,
+) -> Result<(), ClientError> {
+  match (next, after) {
+    (Some(next), Some(after)) if next <= after => Err(ClientError::UnexpectedReply { verb }),
+    _ => Ok(()),
+  }
 }
 
 /// What a `land` call returns: the landing ran, or it needs a grant a human must make.
@@ -447,11 +487,7 @@ impl ListChain {
     let ReplyBody::Listed { volumes, next } = resolved(body)? else {
       return Err(ClientError::UnexpectedReply { verb: "list" });
     };
-    if let Some(next) = next
-      && self.after.is_some_and(|after| next <= after)
-    {
-      return Err(ClientError::UnexpectedReply { verb: "list" });
-    }
+    forward(next, self.after, "list")?;
     self.volumes.extend(volumes);
     self.after = next;
     Ok(next)
@@ -502,16 +538,14 @@ impl ChangedChain {
         verb: "changed_since",
       });
     };
+    forward(next, self.from, "changed_since")?;
     self.paths.extend(paths);
     match next {
       None => Ok(false),
-      Some(next) if self.from.is_none_or(|from| next > from) => {
-        self.from = Some(next);
+      next => {
+        self.from = next;
         Ok(true)
       }
-      Some(_) => Err(ClientError::UnexpectedReply {
-        verb: "changed_since",
-      }),
     }
   }
 
@@ -3431,19 +3465,48 @@ impl Client {
   }
 
   /// The paths a green changed strictly after `version` in any dimension (§4.16), in path order, each once: the answer
-  /// walked a page at a time, as one reply holds one page, so an answer of any length is answered.
+  /// walked a page at a time ([`Client::changed_since_page`]), as one reply holds one page, so an answer of any length
+  /// is answered.
   pub fn changed_since(
     &mut self,
     green: VolumeId,
     version: u64,
   ) -> Result<Vec<String>, ClientError> {
-    let mut chain = ChangedChain::new(green, version);
+    let mut paths = std::collections::BTreeSet::new();
+    let mut from = None;
     loop {
-      let reply = self.call(&chain.request())?;
-      if !chain.take(reply)? {
-        return Ok(chain.into_paths());
+      let page = self.changed_since_page(green, version, from)?;
+      paths.extend(page.items);
+      match page.next {
+        None => return Ok(paths.into_iter().collect()),
+        next => from = next,
       }
     }
+  }
+
+  /// One page of the paths a green changed strictly after `version` (§4.16, A-264), from `from` (`None` begins): read
+  /// from the green's change index in version order, each page ending at a full reply or at the shard's slice of its
+  /// turn, so a page may hold no path and still carry a cursor. A path changed when the walk began is answered once,
+  /// and once more if it changes again during the walk. A page whose cursor does not move past `from` is refused
+  /// [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn changed_since_page(
+    &mut self,
+    green: VolumeId,
+    version: u64,
+    from: Option<ChangedCursor>,
+  ) -> Result<Page<String, ChangedCursor>, ClientError> {
+    let ReplyBody::ChangedSince { paths, next } = self.call(&RequestBody::ChangedSince {
+      green,
+      version,
+      from,
+    })?
+    else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    };
+    forward(next, from, "changed_since")?;
+    Ok(Page { items: paths, next })
   }
 
   /// Creates a work volume over a green (§4.16); its id and the green version it is based on.
@@ -4087,8 +4150,8 @@ impl Client {
     }
   }
 
-  /// The caller's volumes, in name order: the listing walked a page at a time, as one reply holds one page (§4.4
-  /// `list`), so a listing of any length is answered.
+  /// The caller's volumes, in name order: the listing walked a page at a time ([`Client::list_page`]), as one reply
+  /// holds one page (§4.4 `list`), so a listing of any length is answered.
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, ClientError> {
     let mut chain = ListChain::default();
     loop {
@@ -4097,6 +4160,24 @@ impl Client {
         return Ok(chain.into_listing());
       }
     }
+  }
+
+  /// One page of the caller's volumes (§4.4 `list`, A-263): in volume-id order past `after` (`None` begins), as many as
+  /// one reply holds, and the cursor the next page is asked after, `None` when this page ends the listing. A volume
+  /// that exists for the whole walk is answered exactly once. A page whose cursor does not move past `after` is refused
+  /// [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn list_page(
+    &mut self,
+    after: Option<VolumeId>,
+  ) -> Result<Page<VolumeSummary, VolumeId>, ClientError> {
+    let ReplyBody::Listed { volumes, next } = self.call(&RequestBody::List { after })? else {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    };
+    forward(next, after, "list")?;
+    Ok(Page {
+      items: volumes,
+      next,
+    })
   }
 
   /// Lands a snapshot's diverged entries onto a host directory (§4.15). Without a grant the
@@ -4320,72 +4401,112 @@ impl Client {
   }
 
   /// An overlay volume's drifted entries, each its path and the kind of drift, in path order (§4.4 `status`, A-267):
-  /// walked a page at a time from the volume's owner, since a status carries only the first that fit. Also the number
-  /// of entries too long for any reply, which no page carries.
+  /// walked a page at a time from the volume's owner ([`Client::drifted_page`]), since a status carries only the first
+  /// that fit. Also the number of entries too long for any reply, which no page carries.
   pub fn drifted(&mut self, volume: VolumeId) -> Result<(Vec<String>, u64), ClientError> {
     let mut entries = Vec::new();
     let mut oversized = 0u64;
     let mut from = 0u64;
     loop {
-      let ReplyBody::Drifted {
-        entries: page,
-        next,
-        oversized: passed,
-      } = self.call(&RequestBody::Drifted { volume, from })?
-      else {
-        return Err(ClientError::UnexpectedReply { verb: "drifted" });
-      };
-      entries.extend(page);
-      oversized = oversized.saturating_add(u64::from(passed));
-      match next {
+      let page = self.drifted_page(volume, from)?;
+      entries.extend(page.entries);
+      oversized = oversized.saturating_add(u64::from(page.oversized));
+      match page.next {
         None => return Ok((entries, oversized)),
-        // A page must move the position forward, so a walk always ends.
-        Some(next) if next > from => from = next,
-        Some(_) => return Err(ClientError::UnexpectedReply { verb: "drifted" }),
+        Some(next) => from = next,
       }
     }
   }
 
-  /// The caller's grants, in grant-id order: walked a page at a time, as one reply holds one page (§4.3).
+  /// One page of an overlay volume's drifted entries (§4.4 `status`, A-267) from position `from` (0 begins): each its
+  /// path and the kind of drift, in path order, as many as one reply holds; where the next page is read from; and the
+  /// entries in this page's range too long for any reply alone, passed over and counted. A page whose position does
+  /// not move past `from` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn drifted_page(&mut self, volume: VolumeId, from: u64) -> Result<DriftedPage, ClientError> {
+    let ReplyBody::Drifted {
+      entries,
+      next,
+      oversized,
+    } = self.call(&RequestBody::Drifted { volume, from })?
+    else {
+      return Err(ClientError::UnexpectedReply { verb: "drifted" });
+    };
+    forward(next, Some(from), "drifted")?;
+    Ok(DriftedPage {
+      entries,
+      next,
+      oversized,
+    })
+  }
+
+  /// The caller's grants, in grant-id order: walked a page at a time ([`Client::grants_page`]), as one reply holds one
+  /// page (§4.3).
   pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
     let mut grants: Vec<GrantSummary> = Vec::new();
     let mut after = None;
     loop {
-      let ReplyBody::Grants { grants: page, next } = self.call(&RequestBody::Grants { after })?
-      else {
-        return Err(ClientError::UnexpectedReply { verb: "grants" });
-      };
-      grants.extend(page);
-      match next {
+      let page = self.grants_page(after)?;
+      grants.extend(page.items);
+      match page.next {
         None => return Ok(grants),
-        // A page must move the cursor forward, so a walk always ends.
-        Some(next) if after.is_none_or(|after| next > after) => after = Some(next),
-        Some(_) => return Err(ClientError::UnexpectedReply { verb: "grants" }),
+        next => after = next,
       }
     }
   }
 
-  /// The audit log from `since`, in sequence order: walked a page at a time, as one reply holds one page (§4.3), so
-  /// an audit of any length is answered.
+  /// One page of the caller's grants (§4.13, A-266): in grant-id order past `after` (`None` begins), as many as one
+  /// reply holds, and the cursor the next page is asked after, `None` when this page ends them. A grant that stands for
+  /// the whole walk is answered exactly once. A page whose cursor does not move past `after` is refused
+  /// [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn grants_page(
+    &mut self,
+    after: Option<u64>,
+  ) -> Result<Page<GrantSummary, u64>, ClientError> {
+    let ReplyBody::Grants { grants, next } = self.call(&RequestBody::Grants { after })? else {
+      return Err(ClientError::UnexpectedReply { verb: "grants" });
+    };
+    forward(next, after, "grants")?;
+    Ok(Page {
+      items: grants,
+      next,
+    })
+  }
+
+  /// The audit log from `since`, in sequence order: walked a page at a time ([`Client::audit_page`]), as one reply holds
+  /// one page (§4.3), so an audit of any length is answered.
   pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, ClientError> {
     let mut records: Vec<AuditEntry> = Vec::new();
     let mut from = since;
     loop {
-      let ReplyBody::Audit {
-        records: page,
-        more,
-      } = self.call(&RequestBody::Audit { since: from })?
-      else {
-        return Err(ClientError::UnexpectedReply { verb: "audit" });
-      };
-      // A page that says more must bring a record, so the walk moves and always ends.
-      let next = page.last().map(|record| record.seq.saturating_add(1));
-      records.extend(page);
-      match (more, next) {
-        (false, _) => return Ok(records),
-        (true, Some(next)) => from = next,
-        (true, None) => return Err(ClientError::UnexpectedReply { verb: "audit" }),
+      let page = self.audit_page(from)?;
+      records.extend(page.items);
+      match page.next {
+        None => return Ok(records),
+        Some(next) => from = next,
       }
+    }
+  }
+
+  /// One page of the audit (§4.15, A-265) from record `since`, in sequence order, as many as one reply holds, and the
+  /// sequence the next page is asked from (one past the page's last record), `None` when this page ends the audit. One
+  /// partition numbers the daemon's audit, so a walk continues where the page stopped. A page that says more follows
+  /// but brings no record past `since` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn audit_page(&mut self, since: u64) -> Result<Page<AuditEntry, u64>, ClientError> {
+    let ReplyBody::Audit { records, more } = self.call(&RequestBody::Audit { since })? else {
+      return Err(ClientError::UnexpectedReply { verb: "audit" });
+    };
+    if !more {
+      return Ok(Page {
+        items: records,
+        next: None,
+      });
+    }
+    match records.last().map(|record| record.seq.saturating_add(1)) {
+      Some(next) if next > since => Ok(Page {
+        items: records,
+        next: Some(next),
+      }),
+      _ => Err(ClientError::UnexpectedReply { verb: "audit" }),
     }
   }
 

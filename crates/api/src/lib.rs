@@ -59,6 +59,7 @@ pub mod instance;
 pub mod issuer;
 pub mod mount;
 pub mod outcome;
+pub mod page;
 pub mod policy;
 pub mod role;
 pub mod signed;
@@ -78,11 +79,13 @@ pub use outcome::{
   ActionTally, Approval, Awaiting, LandOutcome, LandingConflict, LandingReport, LandingState,
   MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome, Summary, Work,
 };
+pub use page::Page;
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
 pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
 pub use start::{Anchor, StartSpec, Started};
 pub use volume::{
-  BaseState, Drift, DriftKind, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, Watcher,
+  BaseState, Drift, DriftKind, DriftPage, DriftReport, Provisioned, Source, VolumeSpec,
+  VolumeStatus, Watcher,
 };
 
 /// The crate's version: the workspace's one hand-edited version (§4.12 "One version"), which a host reports beside its
@@ -93,15 +96,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
 /// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
 /// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
-/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day).
-pub const CONTRACT: u32 = 3;
+/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: lists a page at a time
+/// (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page, changed_since, changed_since_page,
+/// drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`; `Instance::drift` reads every entry.
+pub const CONTRACT: u32 = 4;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary,
-  GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
+  AttachTransport, AuditEntry, ChangedCursor, ConflictClass, DaemonReport, Filter, GrantScope,
+  GrantSummary, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
   LandingDurability, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction,
   PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport,
   TransportReport, UnsupportedReason, VolumeId, VolumeSummary,

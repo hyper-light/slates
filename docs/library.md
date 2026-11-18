@@ -141,6 +141,15 @@ where you must decide; a moved contract then fails your build at the place to up
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
   depend on this crate.
 - Observation: `daemon_status`, `audit`, `grants`, `telemetry`.
+- Lists a page at a time: the daemon answers every list a reply at a time, so a host that shows a
+  list a screen at a time reads one `Page { items, next }` a screen and holds no more:
+  `list_page(after)` (volumes in id order), `grants_page(after)`, `audit_page(since)`,
+  `changed_since_page(green, version, from)` (what a green changed after a version, in every
+  dimension), and `drift_page(volume, from)` (an overlay's drift, typed). Pass a page's `next` back
+  to read the next one; `None` ends the list. An item that stands for the whole walk is read
+  exactly once. The whole-list verbs `list`, `grants`, `audit`, `changed_since` and `drift` walk the
+  pages for you. A status carries the first drifted entries that fit and counts the rest in
+  `DriftReport::elided`; `drift` reads every entry.
 
 Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
 while the daemon lives. A host on its own async runtime runs them on its blocking pool until the
@@ -193,6 +202,6 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 2. The daemon's side of the write modes, merge approvals and signed work, and the verbs that set a
    policy and hand out the statement a signer signs.
 3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-4. A paged volume listing; typed audit kinds and grant states.
+4. Typed audit kinds and grant states.
 5. An async form over the host's own reactor.
 6. A seam trait with a simulator and a conformance suite.

@@ -649,6 +649,266 @@ fn a_merge_is_accepted_or_conflicted_typed() {
   daemon.stop();
 }
 
+/// Shape: the volumes the listing test makes: three pages' worth and more of summaries at these names (a page holds
+/// what one reply chunk holds, about seventy).
+const LISTED: usize = 200;
+/// Shape: the files the drift test changes on disk under its overlay: more drifted entries at these path lengths than a
+/// status reply carries beside its other fields, and more than one paged read holds.
+const DRIFTED: usize = 100;
+/// Shape: the paths the changed-since test's work changes in its green: more than one reply's worth at these lengths.
+const CHANGED: usize = 150;
+/// Shape: the landings the audit test presents, each one audit record: more than one reply's worth of records.
+const PRESENTED: usize = 120;
+
+/// Walks `read` a page at a time from the start: every page's items, and the cursors the pages were asked from (the
+/// first `None`). Each cursor must move past the last, so the walk ends.
+fn walk<T, C: Copy + Ord + std::fmt::Debug>(
+  mut read: impl FnMut(Option<C>) -> slates_api::Page<T, C>,
+) -> (Vec<Vec<T>>, Vec<Option<C>>) {
+  let mut pages = Vec::new();
+  let mut asked = vec![None];
+  loop {
+    let page = read(*asked.last().unwrap());
+    pages.push(page.items);
+    match page.next {
+      None => return (pages, asked),
+      Some(next) => {
+        assert!(
+          asked.last().unwrap().is_none_or(|last| next > last),
+          "a page moves its cursor forward: {next:?} after {asked:?}"
+        );
+        asked.push(Some(next));
+      }
+    }
+  }
+}
+
+/// A-263 (§4.4 `list`, §4.3; the library's paged listing, A-299's owed list): do make 200 volumes, then walk the
+/// listing a page at a time through the library and read it whole. Expect: more than one page; each page in volume-id
+/// order past the volume it was asked after; every volume exactly once across the walk; and the whole listing the same
+/// volumes, in name order. Before A-263 the listing was one reply, refused past about 80 volumes.
+#[test]
+fn a_listing_is_read_a_page_at_a_time_and_whole() {
+  let (daemon, mut instance) = grouped("list-pages");
+  let made: std::collections::BTreeSet<VolumeId> = (0..LISTED)
+    .map(|n| {
+      provision(
+        &mut instance,
+        &VolumeSpec::empty(&format!("listed-volume-{n:04}"), ROOM),
+      )
+    })
+    .collect();
+  let (pages, asked) = walk(|after| instance.list_page(after).unwrap());
+  assert!(
+    pages.len() > 1,
+    "{} volumes take more than one page",
+    LISTED
+  );
+  for (page, after) in pages.iter().zip(&asked) {
+    assert!(
+      page.windows(2).all(|pair| pair[0].id < pair[1].id)
+        && after.is_none_or(|after| page.iter().all(|summary| summary.id > after)),
+      "a page is in id order past its cursor"
+    );
+  }
+  let walked: Vec<VolumeId> = pages.iter().flatten().map(|summary| summary.id).collect();
+  assert_eq!(walked.len(), made.len(), "every volume once");
+  assert_eq!(
+    walked
+      .iter()
+      .copied()
+      .collect::<std::collections::BTreeSet<_>>(),
+    made
+  );
+  let whole = instance.list().unwrap();
+  let names: Vec<&str> = whole.iter().map(|summary| summary.name.as_str()).collect();
+  assert!(
+    names.windows(2).all(|pair| pair[0] <= pair[1]),
+    "the whole listing is in name order"
+  );
+  assert_eq!(
+    whole
+      .iter()
+      .map(|summary| summary.id)
+      .collect::<std::collections::BTreeSet<_>>(),
+    made
+  );
+  daemon.stop();
+}
+
+/// A-264 (§4.16 "Attachments and versions"): do merge into a green one work that writes 150 files with long names,
+/// then read what the green changed since its first version a page at a time and whole. Expect: more than one page;
+/// every path exactly once across the walk; the whole answer the same paths, in path order; and a version past the
+/// head refused `Stale`. Before A-264 the answer was one reply, refused at 800 changed files.
+#[cfg(unix)]
+#[test]
+fn a_greens_changes_are_read_a_page_at_a_time_and_whole() {
+  let (daemon, mut instance) = grouped("changed-pages");
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let Provisioned::Work { work, base } = instance
+    .provision(&VolumeSpec::work("work", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  let written: std::collections::BTreeSet<String> = (0..CHANGED)
+    .map(|n| format!("a-path-long-enough-to-fill-a-page-sooner-{n:04}.txt"))
+    .collect();
+  for path in &written {
+    instance
+      .client()
+      .edit(work.volume, path, 0, 0, b"x")
+      .unwrap();
+  }
+  let MergeOutcome::Merged { version, .. } = instance.merge(&work, None).unwrap() else {
+    panic!("a lone work merges");
+  };
+  let (pages, _) = walk(|from| instance.changed_since_page(green, base, from).unwrap());
+  assert!(pages.len() > 1, "{} paths take more than one page", CHANGED);
+  let walked: Vec<String> = pages.into_iter().flatten().collect();
+  assert_eq!(walked.len(), written.len(), "every path once: {walked:?}");
+  assert_eq!(
+    walked
+      .iter()
+      .cloned()
+      .collect::<std::collections::BTreeSet<_>>(),
+    written
+  );
+  let whole = instance.changed_since(green, base).unwrap();
+  assert_eq!(whole, written.into_iter().collect::<Vec<_>>());
+  assert!(
+    matches!(
+      instance.changed_since(green, version + 1),
+      Err(Error::Stale(_))
+    ),
+    "a version past the head is stale"
+  );
+  daemon.stop();
+}
+
+/// A-267 (§4.15 "Drift"): do write 100 files with long names through an overlay, change each on the disk, then read the
+/// volume's status and its drift. Expect: the status carries what fits and counts the rest (`elided` above zero);
+/// `drift` names all 100 `Modified` and elides none; and the paged read, walked from position 0, names each once.
+/// Before A-267 a status with 600 drifted entries was refused, and the library read only what a status carried.
+#[test]
+fn an_overlays_drift_past_one_reply_is_read_whole() {
+  let (daemon, mut instance) = grouped("drift-pages");
+  let folder = Folder::new();
+  let paths: Vec<String> = (0..DRIFTED)
+    .map(|n| format!("a-file-whose-name-takes-room-in-every-drift-entry-{n:04}.txt"))
+    .collect();
+  for path in &paths {
+    folder.write(path, b"base\n");
+  }
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("drifting", &folder.path, ROOM),
+  );
+  for path in &paths {
+    write_file(
+      &mut instance,
+      volume,
+      &format!("/{path}"),
+      b"the volume's\n",
+    );
+    folder.write(path, b"the person's\n");
+  }
+  let Some(BaseState::Read(carried)) = instance.status(volume).unwrap().base else {
+    panic!("the base reads");
+  };
+  assert!(
+    carried.elided > 0 && carried.drifted.len() < DRIFTED,
+    "a status carries what fits and counts the rest: {} carried, {} elided",
+    carried.drifted.len(),
+    carried.elided
+  );
+  let whole = instance.drift(volume).unwrap().unwrap();
+  let expected: Vec<Drift> = paths
+    .iter()
+    .map(|path| Drift {
+      path: format!("/{path}"),
+      kind: DriftKind::Modified,
+    })
+    .collect();
+  assert_eq!((whole.drifted, whole.elided), (expected.clone(), 0));
+  let mut from = 0;
+  let mut walked = Vec::new();
+  loop {
+    let page = instance.drift_page(volume, from).unwrap();
+    walked.extend(page.drifted);
+    match page.next {
+      None => break,
+      Some(next) => from = next,
+    }
+  }
+  assert_eq!(
+    walked, expected,
+    "the pages name each entry once, in path order"
+  );
+  daemon.stop();
+}
+
+/// A-265 (§4.15, §4.14): do present 120 landings of an overlay, each one audit record, then read the audit a page at a
+/// time and whole. Expect: more than one page; the records numbered in order, each once, every page's first record the
+/// sequence it was asked from or later; and the whole audit the same records. Before A-265 every record was numbered 0
+/// and the audit was one reply, refused between 50 and 100 records.
+#[cfg(unix)]
+#[test]
+fn the_audit_is_read_a_page_at_a_time_and_whole() {
+  let (daemon, mut instance) = grouped("audit-pages");
+  let folder = Folder::new();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("audited", &folder.path, ROOM),
+  );
+  write_file(&mut instance, volume, "/n.txt", b"n\n");
+  for _ in 0..PRESENTED {
+    assert!(matches!(
+      instance
+        .plan_landing(&landing_into(volume, &folder))
+        .unwrap(),
+      LandOutcome::ApprovalRequired(_)
+    ));
+  }
+  let mut pages = Vec::new();
+  let mut since = 0;
+  loop {
+    let page = instance.audit_page(since).unwrap();
+    assert!(page.items.first().is_none_or(|record| record.seq >= since));
+    pages.push(page.items);
+    match page.next {
+      None => break,
+      Some(next) => since = next,
+    }
+  }
+  assert!(
+    pages.len() > 1,
+    "{} records take more than one page",
+    PRESENTED
+  );
+  let walked: Vec<u64> = pages.iter().flatten().map(|record| record.seq).collect();
+  assert!(walked.len() >= PRESENTED, "every presentation recorded");
+  assert_eq!(
+    walked,
+    (0..u64::try_from(walked.len()).unwrap()).collect::<Vec<_>>(),
+    "numbered in order, each once"
+  );
+  assert_eq!(
+    instance.audit(0).unwrap(),
+    pages.into_iter().flatten().collect::<Vec<_>>()
+  );
+  daemon.stop();
+}
+
 /// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the
 /// daemon's shards reported and the drain answered for the shard it has.
 #[test]

@@ -7048,7 +7048,12 @@ it builds against the contract and adds to it rather than around it.
 > policy and hand out a statement to sign (A-285's owner, agreed through g262's inbox); typed fields
 > on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
 > versions (the work's base beside the head), replacing what the crate reads from text or asks
-> again; a paged listing; typed audit and grant states.
+> again; typed audit and grant states. **Lists a page at a time (A-263 to A-267, goal g247, `CONTRACT` = 4):** every
+> list the daemon answers a reply at a time is read through the contract a page at a time — `Page { items, next }`
+> from `Instance::{list_page, grants_page, audit_page, changed_since_page}`, an overlay's `DriftPage` from
+> `drift_page` — or whole (`list`, `grants`, `audit`, `changed_since`, `drift`); a status's `DriftReport` counts what
+> it could not carry (`elided`), and `drift` reads every entry. Proven by use (`crates/api/tests/api.rs`: 200 volumes,
+> 150 changed paths, 100 drifted files and 120 audit records, each walked a page at a time and read whole).
 
 > **Status (2026-11-18, A-299, piece 5: the write modes reach the contract).** Over A-285's policy
 > wire (203ad8fa): `Instance::set_write_policy(subject, &policy, &launcher)`, proven by the

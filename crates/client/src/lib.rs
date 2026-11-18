@@ -36,9 +36,9 @@ pub mod driver;
 pub mod error;
 
 pub use client::{
-  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, EntriesPage, ImageBuilt,
-  LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
-  VhostUserDevice,
+  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, DriftedPage,
+  EntriesPage, ImageBuilt, LAST_SEQUENCE, Landing, Page, Rebased, SESSION_KEY_BYTES, Session,
+  ShardsStream, StreamEnd, Submitted, VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
@@ -50,16 +50,16 @@ pub use error::ClientError;
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
 pub use slates_ipc::protocol::{
   AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
-  CauseRecord, CheckoutReport, ChokepointReport, ConflictClass, Conformance, DaemonReport,
-  DeleteWhileOpen, DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry,
-  EntriesCursor, EntryKind, Established, Filter, FleetReport, GrantScope, GrantSummary, GreenBase,
-  GroupReport, HostAnswer, HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent,
-  JournalReport, KernelCache, LandingDegradation, LandingDurability, LandingOutcome,
-  LandingSummary, LearnerReport, NamePolicy, OciBinding, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
-  Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
-  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
-  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  CauseRecord, ChangedCursor, CheckoutReport, ChokepointReport, ConflictClass, Conformance,
+  DaemonReport, DeleteWhileOpen, DetectorPeerReport, DetectorPoolReport, DetectorRelayReport,
+  DirEntry, EntriesCursor, EntryKind, Established, Filter, FleetReport, GrantScope, GrantSummary,
+  GreenBase, GroupReport, HostAnswer, HostMountEvidence, HostPathReason, IMAGE_FILE,
+  ImageMergeReport, Intent, JournalReport, KernelCache, LandingDegradation, LandingDurability,
+  LandingOutcome, LandingSummary, LearnerReport, NamePolicy, OciBinding, PlacedState,
+  PlannedAction, PlannedContent, PlannedEntry, PolicySubject, Principal, ReadAt, ReadWritePolicy,
+  RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport,
+  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
+  SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
   UnsupportedReason, VolumeId, VolumeSummary, WorkOp, WriteAct, WriteMode, WritePolicy,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async

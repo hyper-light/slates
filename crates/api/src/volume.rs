@@ -196,6 +196,24 @@ pub struct DriftReport {
   pub unverified: Vec<String>,
   /// The watcher's state, when the base has one.
   pub watcher: Option<Watcher>,
+  /// Drifted or unverified entries this report does not carry (A-267). A status carries the first that fit beside its
+  /// other fields and counts the rest here; [`crate::Instance::drift`] reads them all, and counts here only the entries
+  /// too long for any reply (a host path near the platform's maximum), which no page can carry.
+  pub elided: u32,
+}
+
+/// One page of an overlay's drift ([`crate::Instance::drift_page`]; §4.15 "Drift", A-267): its entries in path order,
+/// typed as a status types them, and the position the next page is read from.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DriftPage {
+  /// Each entry of the page the disk changed after the volume witnessed it.
+  pub drifted: Vec<Drift>,
+  /// Each entry of the page whose re-check the host refused now.
+  pub unverified: Vec<String>,
+  /// Entries in the page's range too long for any reply alone, passed over and counted.
+  pub oversized: u32,
+  /// The position the next page is read from, or `None` when this page ends the drift.
+  pub next: Option<u64>,
 }
 
 /// One drifted entry.
@@ -253,7 +271,13 @@ const UNVERIFIED: &str = " (unverified: ";
 
 /// A volume's status reply, typed.
 pub(crate) fn status_of(report: StatusReport) -> Result<VolumeStatus, Error> {
-  let base = base_of(&report.drifted, &report.watcher)?;
+  let base = match base_of(&report.drifted, &report.watcher)? {
+    Some(BaseState::Read(drift)) => Some(BaseState::Read(DriftReport {
+      elided: report.drifted_elided,
+      ..drift
+    })),
+    other => other,
+  };
   Ok(VolumeStatus {
     id: report.id,
     name: report.name,
@@ -301,6 +325,22 @@ pub(crate) fn base_of(drifted: &[String], watcher: &str) -> Result<Option<BaseSt
   Ok(Some(BaseState::Read(report)))
 }
 
+/// One page of drifted entries from the paged read's text, typed: each entry as [`base_of`] reads a status's.
+pub(crate) fn drift_page_of(page: slates_client::DriftedPage) -> Result<DriftPage, Error> {
+  let mut typed = DriftPage {
+    oversized: page.oversized,
+    next: page.next,
+    ..DriftPage::default()
+  };
+  for entry in &page.entries {
+    match drift_line(entry)? {
+      Line::Drifted(drift) => typed.drifted.push(drift),
+      Line::Unverified(path) => typed.unverified.push(path),
+    }
+  }
+  Ok(typed)
+}
+
 /// One drift entry, read.
 enum Line {
   /// The disk changed it.
@@ -336,7 +376,9 @@ fn unknown(field: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-  use super::{BaseState, Drift, DriftKind, DriftReport, Watcher, base_of};
+  use super::{
+    BaseState, Drift, DriftKind, DriftPage, DriftReport, Watcher, base_of, drift_page_of,
+  };
   use crate::error::{Error, ProtocolFault};
 
   /// A-299, §4.15 "Drift": do read the drift list a status reply carries, with each kind, a path holding parentheses
@@ -375,8 +417,46 @@ mod tests {
         ],
         unverified: vec!["/u".to_owned()],
         watcher: Some(Watcher::Overflowed),
+        elided: 0,
       }
     );
+  }
+
+  /// A-267, §4.15 "Drift": do type a page of the paged drift read: a changed entry, a refused re-check, the oversized
+  /// count and the next position; then a page whose last one ends the drift, and a page with a form the daemon does not
+  /// write. Expect each entry typed as a status's is, the count and the position carried as the page gave them, no
+  /// next position on the last page, and a protocol fault for the stranger.
+  #[test]
+  fn a_drift_page_is_typed_as_a_status_is() {
+    let page = |entries: &[&str], next, oversized| slates_client::DriftedPage {
+      entries: entries.iter().map(|entry| (*entry).to_owned()).collect(),
+      next,
+      oversized,
+    };
+    assert_eq!(
+      drift_page_of(page(
+        &["/a (Modified)", "/b (unverified: EIO (the disk))"],
+        Some(2),
+        1
+      )),
+      Ok(DriftPage {
+        drifted: vec![Drift {
+          path: "/a".to_owned(),
+          kind: DriftKind::Modified,
+        }],
+        unverified: vec!["/b".to_owned()],
+        oversized: 1,
+        next: Some(2),
+      })
+    );
+    assert_eq!(
+      drift_page_of(page(&["/c (Deleted)"], None, 0)).map(|typed| typed.next),
+      Ok(None)
+    );
+    assert!(matches!(
+      drift_page_of(page(&["/a (Renamed)"], None, 0)),
+      Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
+    ));
   }
 
   /// A-299: do read a volume with no base, one whose base could not be read, a watcher state and an entry the daemon

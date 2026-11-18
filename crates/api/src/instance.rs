@@ -262,7 +262,8 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
-  /// The caller's volumes. The daemon answers them in one reply today; a paged listing is owed (GAPS, A-299).
+  /// The caller's volumes, in name order: every one, walked a page at a time (A-263; [`Instance::list_page`] reads one
+  /// page, for a consumer that shows them a screen at a time).
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, Error> {
     self.client.list().map_err(|e| self.error(e))
   }
@@ -279,12 +280,34 @@ impl Instance {
 
   /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
   /// happened — landing it would conflict — and each whose re-check the host refused now. `None` for a volume with no
-  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now.
+  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now. Every entry: what a status
+  /// could not carry is read a page at a time (A-267, [`Instance::drift_page`]), and [`DriftReport::elided`] then
+  /// counts only the entries too long for any reply.
   pub fn drift(&mut self, volume: VolumeId) -> Result<Option<DriftReport>, Error> {
-    match self.status(volume)?.base {
-      None => Ok(None),
-      Some(BaseState::Read(report)) => Ok(Some(report)),
-      Some(BaseState::Unreadable) => Err(Error::Host(crate::error::HostFault::BaseUnreadable)),
+    let report = match self.status(volume)?.base {
+      None => return Ok(None),
+      Some(BaseState::Read(report)) => report,
+      Some(BaseState::Unreadable) => {
+        return Err(Error::Host(crate::error::HostFault::BaseUnreadable));
+      }
+    };
+    if report.elided == 0 {
+      return Ok(Some(report));
+    }
+    let mut whole = DriftReport {
+      watcher: report.watcher,
+      ..DriftReport::default()
+    };
+    let mut from = 0;
+    loop {
+      let page = self.drift_page(volume, from)?;
+      whole.drifted.extend(page.drifted);
+      whole.unverified.extend(page.unverified);
+      whole.elided = whole.elided.saturating_add(page.oversized);
+      match page.next {
+        None => return Ok(Some(whole)),
+        Some(next) => from = next,
+      }
     }
   }
 
