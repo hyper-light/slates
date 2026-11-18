@@ -1,5 +1,31 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
+> Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
+> merge, rebase, gc or repack, no mapped packs, no worktree, and no Mercurial or Subversion at all. The roster now runs
+> `git-history` (a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full
+> repack, verify-pack, fsck), `mercurial` (a named branch and merge, tag, bookmark, a hard-linked clone and its first
+> commit, rebase, push, a shared store, verify) and `subversion` (an FSFS repository and SQLite working copies:
+> checkout, commit, branch, switch, update back and forward, merge, tag, cleanup, verify, dump) on every leg that runs
+> the roster: macOS's NFS loopback mount, the Linux lane's NFSv3 adapter and NFSv4.2, Linux FUSE inside containers
+> (`oci-linux`) and the live virtio-fs guest. Each clone prints how many of its files have two names, so a mount that
+> cannot link or reports a wrong link count differs. All legs share one environment
+> (`slates_conformance::workload::ENVIRONMENT`), and the host determinism gate
+> (`the_version_control_workloads_run_byte_identically_twice_on_the_host`) runs each twice in two directories a second
+> apart and holds them identical: its first run (2026-11-17, macOS 26, git 2.50.1, Mercurial 7.2) found Mercurial's
+> `fncache` written in a different order by each process (a Python set; now one hash seed), and a clone's reflog and
+> `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
+> workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
+> be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from every
+> machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides under
+> one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
+> **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
+> to fix failing-test-first; (2) the Windows WinFsp roster: WinFsp's driver has no hard links (winfsp.dev's NTFS
+> compatibility page), so Mercurial and git copy where NTFS links, and git's symbolic-link probe needs reparse points,
+> which the drive does not serve yet; (3) a Linux FUSE leg outside a container; (4) git's fsmonitor (a daemon that
+> refuses network mounts by default) and submodules (their configuration names the source by absolute path) are not in
+> the roster.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
@@ -1968,17 +1994,23 @@
 >   - Three flows run behind it (`Fleet::start_relayed`): writes streamed while every path holds 20 ms ± 5 ms and loses
 >     1 %, then 5 %, then 1 % with 2 % duplicated, then a takeover over the lossy paths; an owner cut off both ways
 >     while it runs; and an owner that still speaks to its peers but hears none.
->   - Two invariants are judged from outside in them. ReadSafety: a latest-state read sent through the partitioned
->     owner after its successor acknowledged a write answers that write or a refusal, never other bytes and never
->     missing. Continuity: the successor's first head is past every position an owner reported durable under an
->     earlier epoch, since its log goes on from the head it adopted (`slates_db::live::Shipper::new`).
->   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln run r71, Adas-MacBook-Pro-3,
->     2026-11-17): forwarding and the answer's way back, a one-way cut, loss, delay and duplication, attribution by
->     process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
+>   - Two invariants are judged from outside, in every flow that takes a live volume over (the relayed ones, the
+>     SIGSTOP owner and the SIGKILL takeovers: `judge_takeover`, `an_owner_partitioned`). ReadSafety: a latest-state
+>     read sent through any node after a write's acknowledgement answers that write or a refusal, never other bytes and
+>     never missing; read through every survivor after a takeover, and through a partitioned owner while it runs cut off
+>     or the moment its stopped process resumes (its lease lapsed by the clock while it was stopped, before it has heard
+>     of its successor). Continuity: the successor's first head is past every position an owner reported durable under
+>     an earlier epoch, in the samples or a last look at the owner before its loss, since its log goes on from the head
+>     it adopted (`slates_db::live::Shipper::new`).
+>   - The client side of StaleNeverCommits in the owner-partition flows is now every write sent to the old owner while
+>     it was partitioned refused. Until 2026-11-17 the SIGSTOP flow refused every write sent after the resume instead,
+>     but a re-admitted old node forwards a write to the volume's owner (§4.8 "Lookup"), so an acknowledgement through
+>     it after the heal can be right; such writes are held to NoLoss on the successor with every other acknowledged one.
+>   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln on Adas-MacBook-Pro-3, 2026-11-17,
+>     run r71 and again with the takeover checks): forwarding and the answer's way back, a one-way cut, loss, delay and
+>     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
 >     Linux's census has run nowhere yet.
->   - Owed: ReadSafety and Continuity in the SIGSTOP and SIGKILL takeover flows, so every flow ends with every register
->     invariant.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
@@ -5336,7 +5368,11 @@ durably, the engine rebuilt and its head identity verified against the adopted r
 version reads, new work submits and retries meet their records through the public client on the
 successor. A successor whose accepted prefix is shorter than the adopted head stays pending and
 counted until the ledger-prefix transfer (GAP-A9-7):
-`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`.
+`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`. **Since 2026-11-18** its input half is built: a
+successor that knows every record up to the adopted one but lacks some version's inputs (one version behind the quorum
+when the owner died) fetches them by identity from the members that reported the adopted version
+(`fleet::fetch_green_inputs`, GAPS 2026-11-09). A successor whose own records end further below the adopted one still
+lacks the records themselves (the record half, owed) and is given up at the takeover's bound, named `chain`.
 
 **Implementation follow-up (2026-09-18, AUD-11 closed):** at `f > 0` a submit's acceptance
 waits for its version's merge record to commit at the quorum — the verb commits its effects but
@@ -15365,7 +15401,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (open, instrumented)
+### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (cause found; fixed for a successor one version behind, 2026-11-18; the record half open)
 
 `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`crates/server/tests/fleet.rs`, 73797a42,
 AUD-29-17) failed "the successor materialized the taken-over green at version 3" in 1 of 2 runs of main 1ed67337's fleet
@@ -15403,6 +15439,28 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   the protocol, and names it `TakeoverIncomplete`).
 - **Sibling, open:** a taken-over **volume**'s materialization (`fleet::materialize`, the `fleet.materialize.waits.*`
   counters: content, placement, catalog, catalog placement, shard) waits each period the same way, with no bound.
+- **The cause, named by the bound (diag-clients-green-1, 98c5a166 with the failure print, CI 2026-11-09):** the share
+  test 10 times per lane at nice 19 beside two spinners a CPU; ubuntu-24.04-arm 2 of 10 red (load 13.7-14.0),
+  ubuntu-latest 0 of 10. Both reds waited on the `chain`: the successor's holder state at version 2 and the other
+  survivor's at 3, `merge.takeover_incomplete` 97 and 100, then `merge.takeover_given_up` 1, in 1,403 s and 1,388 s
+  against 165-258 s for the passes. Version 3 had committed at the owner and the other holder (`f + 1`); the successor
+  adopted its record, which the other holder reported, and never received its inputs, which only the dead owner ships.
+- **Fixed for a successor one version behind (2026-11-18):** the adoption keeps the members that reported the adopted
+  version (`PendingGreen::sources`; each accepted it holding its inputs, A-244), and the materialization fetches each
+  input the ledger names and this node lacks (`merge_service::unheld_green_inputs`) by identity from them
+  (`fleet::fetch_green_inputs`, the volume takeover's own hedged, verified fetch), staged at its version so the
+  retention rule keeps it, counted `merge.takeover_inputs_fetched`. An input still not held after an attempt is its own
+  wait (`merge.takeover_waits_inputs`, named `inputs` at the bound); an attempt that leaves fewer inputs unheld than ever
+  before starts the bound's count again, at most once per input. Red first,
+  `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` (three nodes at `f = 1`, the
+  successor-to-be refusing content puts from version 3 on, the owner killed): with the fetch cut out the successor gave
+  the green up after 100 attempts waiting on its inputs, fetched 0; with it, the green placed at version 3 with the
+  owner's chain, 2 of 2, and the nine green takeover tests beside it 10 of 10 (macOS arm64, load 32-60). The share
+  test's rerun under diag-clients-green-1's load is owed to the supervisor's lanes.
+  `docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`.
+- **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
+  lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
+  identity can fill; it is still given up `chain` at the bound.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

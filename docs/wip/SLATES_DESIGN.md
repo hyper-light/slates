@@ -6396,9 +6396,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
 >   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
 >   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
->   lossy paths through a takeover, cut a running owner off, and deafen one, and also judge ReadSafety (a read through
->   the partitioned owner never answers less than its successor acknowledged) and Continuity (the successor's first
->   head is past every position durable under an earlier epoch) from outside the processes.
+>   lossy paths through a takeover, cut a running owner off, and deafen one. Every flow that takes a live volume over,
+>   these and the SIGSTOP and SIGKILL ones, now also judges ReadSafety (a read through any survivor, or through the
+>   partitioned owner while it is cut off or the moment its stopped process resumes, never answers less than was
+>   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
+>   from outside the processes.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -7974,13 +7976,16 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > green takeover and a late holder's catch-up.
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** Green takeover materializes a taken-over green from the successor's
-> accepted records (40aa3de7, AUD-14); a successor with a short prefix waits for GAP-A9-7's ledger-prefix transfer. A
+> accepted records (40aa3de7, AUD-14); a successor with a short prefix waits for GAP-A9-7's ledger-prefix transfer
+> (since 2026-11-18 its input half is built, see the status of that date below; the record half is still owed). A
 > late holder's catch-up is built (AUD-13, below). Still owed: mounted work and green volumes, the extent-backed green
 > chain, pipelined and hedged merge records.
 
-> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. **Since 2026-11-09 the wait is bounded:** each pending green counts its attempts, one a period, and past the failover SLO's worth of periods it is given up on, every verb on it answering `NotRecovered { cause: TakeoverIncomplete { waited_on } }` with the branch it waited on (`catalog`, `chain`, `placement`, `refused`), counted `merge.takeover_given_up`; before, each branch retried without end (GAPS 2026-11-09). Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. **Since 2026-11-09 the wait is bounded:** each pending green counts its attempts, one a period, and past the failover SLO's worth of periods it is given up on, every verb on it answering `NotRecovered { cause: TakeoverIncomplete { waited_on } }` with the branch it waited on (`catalog`, `chain`, `inputs` since 2026-11-18, `placement`, `refused`), counted `merge.takeover_given_up`; before, each branch retried without end (GAPS 2026-11-09). Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
 >
 > **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
+>
+> **Status (2026-11-18, a successor one version behind fetches the inputs it lacks; GAP-A9-7's input half).** A version commits at `f + 1`, so when a green's owner dies one holder may hold the newest version and the other not yet. When the one behind was the successor, it adopted the newest record (the other holder reports it) but held none of that version's inputs, and nothing fetched them: the green waited on its chain each period until the bound gave it up (`TakeoverIncomplete { waited_on: "chain" }`; 2 of 10 arm64 runs of the share test under spinners, diag-clients-green-1). Now the adoption keeps the members that reported the adopted version (each accepted it holding its inputs, A-244), and the materialization fetches each input the ledger names and this node lacks (`merge_service::unheld_green_inputs`) by identity from them (`fleet::fetch_green_inputs`, through the volume takeover's own hedged, verified fetch), staged at its version so the retention rule keeps it, counted `merge.takeover_inputs_fetched`. An input still not held after an attempt is its own wait, named `inputs` if the bound gives the green up; an attempt that leaves fewer inputs unheld than ever before is progress and starts the bound's count again, at most once per input. A successor whose own records end two or more versions below the adopted one lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by identity can fill: it is still given up at the bound, named `chain`, the record half owed. Regression: `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` (`docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`).
 
 > **Status (2026-09-18, AUD-11: acceptance waits for the commit).** `submit` returned `Submitted{version}` on the owner's local append, with the version's merge record still pending on the record plane at `f > 0` — a version a surviving quorum might not hold, and a completion record saying otherwise. Now the acceptance **waits for the commit**: when `placed_version` has not reached the version, the verb registers the request as awaiting (`MergeShardState::awaiting`: the reply route and the completion key, bounded by the clients' credit) and `run_recorded` commits its effects with no completion and no reply; when `record_merge_acks` places the version at the quorum, `resolve_accepted` records the acceptance as each waiting request's completion on the owner partition (one durable step) and delivers the reply by a task on the request's shard. A retry while waiting joins the wait; a cross-node forward polls the completion within the liveness budget, else is refused retryable. At `f = 0` the append is the commit and nothing changes (R8). Regression: two-node `f = 1`, the holder withholding content puts, then acknowledgements (`MergeFault::refuse_records`) — no acceptance under either, the wait resolving once both lift, the retry answered from the record (`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`). The retry after the owner's loss belongs to AUD-14's takeover recovery.
 
@@ -9509,6 +9514,15 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > baseline and enforced instruction regression policy are still owed; printed counts alone
 > do not meet this gate. See the dated Callgrind report and GAPS/TBD_FIXES.
 
+> **Version-control workloads (2026-11-17, A-289; Ada's goal of 2026-11-18).** The roster runs git's history and
+> maintenance (`git-history`), Mercurial (`mercurial`) and Subversion (`subversion`) beside the basic `git`
+> workload, on every leg that runs it: the macOS NFS loopback mount, the Linux lane's NFSv3 adapter and NFSv4.2, the
+> Linux FUSE mount inside containers (`oci-linux`), and the live virtio-fs guest. Every leg sets one shared
+> environment (`slates_conformance::workload::ENVIRONMENT`), and a host determinism gate runs each of the four twice in
+> two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
+> that exits nonzero on both sides is a failed workload, never an identical one. Owed: the Windows WinFsp roster, and
+> a Linux FUSE leg outside a container.
+
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
 > clears `backupskip` and compares the backup's bytes as output. Its real-save regression checks
@@ -9527,7 +9541,7 @@ field.
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
 | Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
-| Real workloads | Prove tools work | vendored git, cargo, npm, python, rg, rsync, sqlite, editors, watchers | Exit codes 0; outputs byte-identical to the host run; `git status` clean; incremental builds reuse artifacts | nightly, release |
+| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host; incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
 | Concurrency | Prove lock-free cores and schedules | loom (cores), shuttle (schedules), TSan, Miri | All explored interleavings keep invariants; no data race; no UB | CI (loom, Miri), nightly (shuttle, TSan) |
@@ -20703,3 +20717,56 @@ Applied in the same change to:
   2026-11-17); a landed presentation's files hash to what its list named, and its list then is `NotFound`. The pager
   against its oracle: generated lists and page sizes join to the encodings in order with every page but the last
   full; every cursor outside the list refused.
+
+### A-289 — The workload roster runs git's history and maintenance, Mercurial and Subversion on every leg, and a workload that fails alike on both sides fails (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on slates volumes on every route, byte-identical to the host, covered by workload tests in CI)
+Applied in the same change to: Part 6 ("Real workloads" and its status), GAPS, `crates/conformance/src/workload.rs`
+(the three workloads, `ENVIRONMENT`, `environment_exports`, `compare`), `crates/conformance/src/record.rs`
+(`WorkloadStatus::Failed`, `fails_the_suite`, `failure_note`) and `matrix.rs` (the `FAILED` part of a summary),
+`xtask/src/conformance/workloads.rs` and `container.rs` (the shared environment; the host determinism gate; each leg
+judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's environment), and CI's `conformance` and
+`live-guest` jobs.
+- **The decision.** "Byte-identical to the host" is judged as the roster always has been: one script run twice under
+  one environment, on the host and over the mount, compared by exit code, output with the two directories as one
+  token, and a manifest of the tree under reviewed exclusions. Three workloads join `git`:
+  - `git-history`: a bare upstream, a seed that pushes to it, and a local clone whose objects are hard links to the
+    upstream's; a branch, a merge, a rebase, a stash, a second worktree made and removed, a tag, a push and a pull;
+    then `gc`, a full `repack` and the upstream's `gc` (with its reachability bitmap), `verify-pack` and `fsck`.
+  - `mercurial`: a named branch and its merge, a tag and a bookmark; a local clone whose store files are hard links to
+    the source's, then a commit in the clone, before which Mercurial copies each store file it appends to and still
+    shares, judged by the file's link count; a rebase, a push back, a share of the store, and `verify` of all three.
+  - `subversion`: an FSFS repository with a fixed UUID; working copies whose state is SQLite; a commit, a branch by a
+    server-side copy, a switch and a commit there, an update back and forward, Subversion's merge into trunk, a tag, a
+    cleanup, a second working copy, then `svnadmin verify` and a checksum of the dump.
+- **A workload that fails alike on both sides fails.** Part 6 asks exit codes 0 before byte-identity, but `compare`
+  asked only that the host's and the mount's exit codes be equal, so a script stopped early on both sides (a tool
+  refusing an option, a missing extension) was recorded `Identical` and proved nothing about the mount. A nonzero
+  code on both sides is now `WorkloadStatus::Failed`, with the code and the host output's tail; the native,
+  container and guest legs all judge through `compare`, and both xtask legs fail their suite by one rule
+  (`fails_the_suite`). Red before the change: `a_workload_that_fails_alike_on_both_sides_is_failed_not_identical`
+  read `Identical` for two runs that each exited 129.
+- **Hard links are counted in the output.** Both clones print how many object or store files have two names, after
+  the clone and (Mercurial) after the clone's commit. A mount that cannot link, or that reports a stale or wrong link
+  count, differs there; and one that let Mercurial append into a store file it still shared would fail the source's
+  `verify`.
+- **One environment for every leg.** The host, the container and the guest set `ENVIRONMENT`: the fixed git identity
+  and date, Mercurial reading no configuration but a repository's (`HGRCPATH` empty), its plain output and committer,
+  and one Python hash seed. Measured on the host gate's first run (2026-11-17, macOS 26, git 2.50.1, Mercurial 7.2):
+  Mercurial wrote its store's file list (`fncache`, a set) in a different order in each process until the seed was
+  fixed. Commits carry fixed dates; Subversion's revision dates are set to one instant by `svnadmin setrevprop`, which
+  runs no hook, before its history is printed; the clones' origins are written back as relative paths.
+- **The exclusions, each a file the tool fills with stat data or an absolute path by design.** git's index and
+  reflogs (a clone's first reflog entry names its source by absolute path, and gc expires entries by age against the
+  clock); Mercurial's dirstate and its transaction copies, and the clone's `undo.desc` (it names the repository a push
+  answered by absolute URL); Subversion's `wc.db` and its journal (sizes, modification times and commit times), and
+  FSFS's `db/uuid` (a random instance id beside the UUID, which is printed).
+- **Locks.** Subversion's working copy and repository take POSIX record locks (SQLite's, and FSFS's `write-lock`),
+  and Mercurial's locks are symbolic links made atomically. Every leg runs both sides of a workload under one kernel,
+  where the kernel's own locks (macOS `locallocks`, the Linux adapter's `nolock`, FUSE and virtio-fs without served
+  locks) bind every process. Served locks (NFSv4.2's) are needed only between kernels.
+- **Tools.** The conformance job installs Mercurial and Subversion (Ubuntu's image has Mercurial only and macOS's
+  neither); the container and guest images (`rust:1.98.1`, built on `buildpack-deps`'s `scm` layer) carry git,
+  Mercurial and Subversion already. The live-guest job requires each new workload's `Identical` line.
+- **Owed.** The Windows WinFsp roster: WinFsp's driver has no hard links (its NTFS compatibility page lists them
+  unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
+  WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
+  lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).

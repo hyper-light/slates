@@ -1270,7 +1270,44 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
 pub struct PendingGreen {
   /// Its newest merge record, as adopted.
   pub merge: crate::merge_service::MergeRecordValue,
-  /// The materializations attempted so far, one a fleet period: past the failover SLO's worth the green is given up
-  /// on, every verb on it answering `Refusal::NotRecovered` (`fleet::materialize_pending_greens`).
+  /// The survivors other than this node that reported the adopted version in the takeover's round: each accepted it,
+  /// and a holder accepts a merge record only once it holds the inputs it names (A-244), so these hold every input
+  /// this node may lack (`fleet::fetch_green_inputs`). Bounded by the fleet's members.
+  pub sources: Vec<slates_db::register::HostId>,
+  /// The materializations attempted since the last that made progress, one a fleet period: past the failover SLO's
+  /// worth the green is given up on, every verb on it answering `Refusal::NotRecovered`
+  /// (`fleet::materialize_pending_greens`).
   pub attempts: u32,
+  /// The fewest of its inputs found not held here so far (`fleet::fetch_green_inputs`), `None` before the first look.
+  /// Progress is a new low: only then do the attempts start again, so an input fetched, released and fetched again
+  /// cannot hold the green pending without end; the attempts start again at most once per input the ledger names.
+  pub fewest_unheld: Option<usize>,
+}
+
+impl PendingGreen {
+  /// A green just adopted with its newest merge record `merge`, whose version `sources` reported: no attempt made yet.
+  pub fn adopted(
+    merge: crate::merge_service::MergeRecordValue,
+    sources: Vec<slates_db::register::HostId>,
+  ) -> PendingGreen {
+    PendingGreen {
+      merge,
+      sources,
+      attempts: 0,
+      fewest_unheld: None,
+    }
+  }
+
+  /// Records that `unheld` of its inputs are still not held here after an attempt's fetches; whether that is progress
+  /// (a new low, after a first look), which starts its attempts again.
+  pub fn record_unheld(&mut self, unheld: usize) -> bool {
+    let progress = self.fewest_unheld.is_some_and(|fewest| unheld < fewest);
+    if progress {
+      self.attempts = 0;
+    }
+    if self.fewest_unheld.is_none_or(|fewest| unheld < fewest) {
+      self.fewest_unheld = Some(unheld);
+    }
+    progress
+  }
 }

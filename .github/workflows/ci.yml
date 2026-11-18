@@ -311,6 +311,9 @@ jobs:
           # A skipped live guest is a vacuous pass here: the image provides its environment, so a skip fails.
           if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
           grep -q "guest workload git: Identical" live-guest.log
+          grep -q "guest workload git-history: Identical" live-guest.log
+          grep -q "guest workload mercurial: Identical" live-guest.log
+          grep -q "guest workload subversion: Identical" live-guest.log
           grep -q "guest suite fsx: ok" live-guest.log
           grep -q "guest suite fsstress: ok" live-guest.log
           grep -q "guest suite pjdfstest: ok" live-guest.log
@@ -1440,10 +1443,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # strace for the tracer; the NFS client for the root-mount adapter; fuse3 (fusermount3) for the FUSE
       # and container (`oci-linux`) transports; the workload tools the design names that the image lacks
-      # (inotify-tools for the watcher, ripgrep, sqlite3, vim). Docker Engine ships with the image.
+      # (inotify-tools for the watcher, ripgrep, sqlite3, vim), and Mercurial and Subversion for the
+      # version-control workloads (Ada's goal of 2026-11-18: git, Mercurial and Subversion covered by workload
+      # tests in CI; the image has Mercurial and no Subversion). Docker Engine ships with the image.
       - name: Suite tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim mercurial subversion
       # The container transport binds a FUSE mount shared with Docker's processes (`slates mount --shared`,
       # allow_other), which the host's operator grants (Ada authorized it on the CI runner, 2026-10-01;
       # AUD-29-67/74/78). Its hermeticity leg's tracer runs as root (`sudo strace -u runner`), because an
@@ -1452,10 +1457,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
-      # ripgrep for the rg workload and fswatch for the watcher; the rest ships with the image.
+      # ripgrep for the rg workload, fswatch for the watcher, and Mercurial and Subversion for the version-control
+      # workloads (the image has neither); the rest ships with the image.
       - name: Suite tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install ripgrep fswatch
+        run: brew install ripgrep fswatch mercurial subversion
       - name: Linux mount authority and traced startup regressions
         if: runner.os == 'Linux'
         run: |
