@@ -13507,8 +13507,13 @@ struct AnchoredFleet {
 const ANCHORED_STARTS: usize = 2;
 
 impl AnchoredFleet {
-  /// The fleet `names` under fixture objects named from `prefix`, at `f = 1`; nothing started.
+  /// The fleet `names` under fixture objects named from `prefix`, at `f = 1`, one shard a node; nothing started.
   fn new(prefix: &str, names: &[&str]) -> AnchoredFleet {
+    AnchoredFleet::sharded(prefix, names, 1)
+  }
+
+  /// [`AnchoredFleet::new`] with `shards` shards a node.
+  fn sharded(prefix: &str, names: &[&str], shards: u16) -> AnchoredFleet {
     let profiles: Vec<_> = names.iter().copied().map(profile).collect();
     let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
     let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
@@ -13534,14 +13539,21 @@ impl AnchoredFleet {
       rendezvous: Vec::new(),
     };
     for node in 0..names.len() {
-      let config = fleet_config(
+      let config = DaemonConfig::derive(
         &fleet.profiles[node],
         &common::fixture_object(prefix, &node.to_string()),
-        fleet.anchors[node],
-        fleet.seeds[node],
-        &fleet.peers(node),
-        &Default::default(),
-      );
+        Some(shards),
+      )
+      .with_fleet(FleetMembership {
+        quorum: Quorum { f: 1 },
+        peers: fleet.peers(node).iter().map(|peer| peer.host).collect(),
+        host: fleet.seeds[node],
+        origin_anchor: fleet.anchors[node],
+        domains: std::collections::BTreeMap::new(),
+        regions: std::collections::BTreeMap::new(),
+        durability: None,
+        region_mirrors: std::collections::BTreeMap::new(),
+      });
       let segment = AnchorSegment::create(
         &common::fixture_object(prefix, &node.to_string()),
         &fleet.profiles[node].facts.identity,
@@ -13719,6 +13731,145 @@ fn a_successors_takeover_report_survives_its_warm_restart() {
   assert!(
     matches!(&read, ReplyBody::ReadBytes { bytes } if bytes == b"/taken"),
     "the file reads back after the restart: {read:?}"
+  );
+}
+
+/// Shape: the shards each node of the live takeover restart test runs: two, so the volume lives on a shard other than the
+/// control shard, and nothing the control shard publishes for what it holds (a holder's acknowledgement publishes its
+/// shard: `live_ship::acknowledged`) can carry the volume by the way, whatever the timing.
+const LIVE_RESTART_SHARDS: u16 = 2;
+
+/// A live-shipped volume through `client` on its node's shard `partition`, shared with `fleet` and written
+/// [`CONTINUITY_FILES`] files: the volume and every write's reply.
+fn live_volume_on(
+  client: &mut Client,
+  fleet: &[Daemon],
+  partition: usize,
+  tag: &str,
+) -> (VolumeId, Vec<ReplyBody>) {
+  let id = volume_owned_by(client, partition, tag, fleet);
+  let attachment = write_attachment(client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let written = (0..CONTINUITY_FILES)
+    .map(|file| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/continuity-{file}"),
+        bytes: continuity_body(file),
+        mode: 0o644,
+      })
+    })
+    .collect();
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the attachment was let go: {detached:?}"
+  );
+  (id, written)
+}
+
+/// The anchored three-node fleet the live takeover restart test runs on, two shards a node, formed at `f = 1`, with a
+/// live-shipped volume on a's non-control shard written six files: the fleet, its daemons, their member ids, the volume
+/// and its writes' replies.
+fn anchored_fleet_with_a_live_volume(
+  names: &[&str],
+  prefix: &str,
+) -> (
+  AnchoredFleet,
+  Vec<Daemon>,
+  Vec<HostId>,
+  (VolumeId, Vec<ReplyBody>),
+) {
+  let mut fleet = AnchoredFleet::sharded(prefix, names, LIVE_RESTART_SHARDS);
+  let daemons: Vec<Daemon> = (0..names.len()).map(|node| fleet.start(node)).collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &fleet.seeds, &Default::default(), Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, names);
+  let mut client = Client::connect(daemons[0].instance());
+  let volume = live_volume_on(&mut client, &daemons, 1, prefix);
+  (fleet, daemons, hosts, volume)
+}
+
+/// A-343, A-325's live item (§4.8 "persistence before reply"): a live-shipped volume taken over is published at its
+/// takeover, so a successor restarted warm before any write to it keeps it. Do: three nodes at `f = 1` over anchors that
+/// outlive their daemons, two shards each; on a, a live-shipped volume on a's non-control shard, written six files; a
+/// stops for good; once the survivor the volume ranks first counts its takeover from the live log, restart it warm at
+/// once, before any write reaches the volume; then read every file through it. Expect the takeover counted, the
+/// successor serving the volume after its restart and every file read back. Before, nothing published the volume's shard
+/// after the takeover until its first write, so the restart found no image for it (`NoImage`) and never served it again,
+/// at two shards a node and at one alike. A-338's test could not tell this guard's absence: it writes through the
+/// successor right after the takeover, and that write's barrier publishes the volume.
+#[test]
+fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, hosts, (id, written)) = anchored_fleet_with_a_live_volume(
+    &["live-taken-a", "live-taken-b", "live-taken-c"],
+    "live-taken",
+  );
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let before = summed_counters(&daemons[index + 1])
+    .get(LIVE_TAKEN_OVER)
+    .copied()
+    .unwrap_or(0);
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let taken = poll_until(&observed, SERVE_DEADLINE, || {
+    Ok(
+      summed_counters(&daemons[index])
+        .get(LIVE_TAKEN_OVER)
+        .copied()
+        .unwrap_or(0)
+        > before,
+    )
+  });
+  drop(observed);
+  daemons.remove(index).stop();
+  daemons.insert(index, fleet.start(index + 1));
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..CONTINUITY_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/continuity-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+    })
+    .collect();
+  drop(reader);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("live takeover across a warm restart: taken {taken}, served {served}, read {read:?}");
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    taken,
+    "the successor took the volume over from its live log"
+  );
+  assert!(
+    served,
+    "the successor serves the volume after its warm restart"
+  );
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the restarted successor: {read:?}"
   );
 }
 

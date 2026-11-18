@@ -79,6 +79,30 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A live-shipped volume taken over was lost by a restart before its first write: published at its takeover
+> (2026-11-18, A-343, §4.8 "persistence before reply"; g230, A-325's live item).** A-325 published a volume taken over
+> from its seal before serving it and left a live-shipped one to its first write's barrier, so a successor restarted
+> warm before that write rebuilt its shard without the volume (`NoImage`) and never served it again, though its records
+> named it the owner. Every takeover now publishes before it serves, and a live volume's publication makes its shipper
+> from the head the takeover adopted (A-329), so the successor's log starts at the takeover. Test:
+> `a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over` (`crates/server/tests/fleet.rs`; two
+> shards a node, the volume on a non-control shard; red on main's code, `NoImage`, at two shards a node and at one).
+> A-338's test could not show this guard missing: it writes through the successor right after the takeover, and that
+> write's barrier publishes the volume.
+> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix: the successor now ships a whole entry
+>   at the takeover, not at the first write.
+> - **Open (found by this test's probes, 2026-11-18, Mac Studio; g230 takes it next): a live log does not survive its
+>   owner's warm restart.** The shipper lives in the owner shard's memory, and a restarted owner makes a new one at its
+>   first publication, from nothing, at `max(placed head's epoch, host epoch)`, both of which a restart forgets
+>   (`placed_heads` and `LiveState::adopted` are memory). An owner restarted warm at once took one write (`FsDone` in
+>   410 ms) on a new chain from position 0 at its own epoch 1: the holder that had held nothing took it (head 2,
+>   durable 2 at `f = 1`), the holder at the old chain's position 5 refused it 893 times `behind`. Two chains at one
+>   epoch; a takeover's phase one adopts the greatest rank, (1, 5), so it would lose the write acknowledged after the
+>   restart (read from `slates_db::live::adopt`; the run that shows it is the next piece's failing test). A successor
+>   restarted warm after its takeover shipped at epoch 1 under the holders' fence 2, `refused.no_credit`, and its write
+>   was not answered within the client's 30 s deadline. And the successor's own copy of the log, fenced at 2 by its
+>   takeover, came back from the restart at fence 1.
+
 > **A superseded owner stranded its clients: it steps down (2026-11-18, A-338, §4.8, R8; g230, the chaos nemesis's
 > "fence-2 copy behind the fence-1 owner's durable head").** After a takeover the old owner kept its volume fenced and
 > answered every verb `StaleEpoch` for good, since a node forwarded only a volume it had not created; and a third node
@@ -91,8 +115,8 @@
 >   forward then served by its own fenced copy; and a node that holds no copy of an object takes a live creator for its
 >   owner however the council retired it. Neither is reached in a three-node fleet at `f = 1`, where every node holds
 >   every object and the old owner's routing names the successor.
-> - **Owed:** a successor ships a live volume only from its first publication (A-325's live item): a takeover that no
->   write reaches leaves the superseded owner's fenced line the only one shipping.
+> - **Closed (2026-11-18, A-343, the entry above):** a successor ships a live volume from its takeover, which publishes
+>   it; before, a takeover that no write reached left the superseded owner's fenced line the only one shipping.
 > - **Owed (the supervisor's):** the nemesis seeds on the fix (6876545201569229162 Linux x86_64, 10695597685579409771
 >   arm64, 12136749566337968553 macOS).
 
@@ -109,9 +133,8 @@
 > - **Not numbering, and since fixed (A-338, above):** the nemesis's "a fence-2 copy behind the fence-1 owner's durable
 >   head" (seed 6876545201569229162, and the macOS one's). The takeover completed and the old owner was fenced, but its
 >   clients were stranded and the successor had not shipped, so the old owner's fenced line was the only one shipping.
-> - **Owed:** the adopted head lives in the successor shard's memory until the volume's first publication, as the
->   volume's own image does for a live-shipped takeover (A-325's owed item): a successor restarted before then loses
->   both.
+> - **Closed (2026-11-18, A-343):** the volume's first publication is now its takeover's own, so the adopted head no
+>   longer waits in the successor shard's memory for a write, nor the volume's image with it.
 
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
@@ -209,9 +232,8 @@
 >   image after a takeover until the volume's first write, so a successor restarted before then refused it `NoImage`
 >   and never served it again. A volume taken over from its seal is now published before it is served. Test:
 >   `a_successors_takeover_report_survives_its_warm_restart`.
-> - **Owed:** a live-shipped volume taken over is still published first by its first write's barrier, so a successor
->   restarted before that write loses it the same way; publishing it at the takeover starts the successor's live log
->   there (`live_ship::published`), a change to the live takeover's shape that needs its own piece and its chaos runs.
+> - **Closed (2026-11-18, A-343):** a live-shipped volume taken over is published at its takeover too, so a successor
+>   restarted before its first write keeps it. Test: `a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over`.
 
 > **A sealed envelope's wrap and open were quadratic in its chunks: linear (2026-11-17, A-92 piece 3b; g230).** The
 > wrap (`slates_cluster::envelope::wrap`) checked each sealed chunk against every chunk already stored, and the open

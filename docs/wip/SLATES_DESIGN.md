@@ -6653,9 +6653,21 @@ so an agent that needs durability can `await placed(scope)`.
 > now published before it is served (`fleet::published_before_served`; a refused publication keeps the takeover
 > pending, counted `fleet.materialize.unpublished`). Held by `a_successors_takeover_report_survives_its_warm_restart`
 > (`crates/server/tests/fleet.rs`: a successor restarted warm serves the volume, reports the very takeover it reported
-> before, its member id unchanged, the file read back). **Owed:** a live-shipped volume taken over is still published
-> first by its first write's barrier; publishing it at the takeover starts the successor's live log there
-> (`live_ship::published`), a change to the live takeover's shape left to its own piece (GAPS).
+> before, its member id unchanged, the file read back). A live-shipped volume taken over is published at its takeover
+> too since A-343 (the next status).
+>
+> **Status (2026-11-18, A-343: a live-shipped volume taken over is published at its takeover; g230).** A-325 left a
+> live-shipped volume to its first write's barrier, so a successor restarted warm before that write found no image for
+> it (`NoImage`) and never served it again: the loss A-325 closed for a volume taken from its seal, still open for one
+> taken from its live log. Every takeover now publishes before it serves (`fleet::published_before_served`, on both
+> paths of `fleet::materialize`). A live volume's publication also makes its shipper, from the head its takeover
+> adopted (A-329), so the successor's log starts at the takeover with a whole entry past every durable position, not at
+> the first write; before, a takeover that no write reached left the superseded owner's fenced line the only one
+> shipping. Held by `a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over`
+> (`crates/server/tests/fleet.rs`: two shards a node, the volume on a non-control shard, the successor restarted warm
+> the moment its takeover is counted, before any write; every file reads back; on main's code `NoImage` at two shards a
+> node and at one). A-338's test could not show this guard missing: it writes through the successor right after the
+> takeover, and that write's barrier publishes the volume, its image and its shipper both.
 
 > **Status (2026-11-05, A-222: another host's write attachment).** A client on another node attaches a volume in the
 > record form, through the fleet's forward, and writes it through the file verbs; the owner records it under the
@@ -7158,9 +7170,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   shard now keeps the adopted head from its takeover (`live_ship::adopt_head`) until the volume's shipper is made,
 >   which starts there: its first entry is numbered one past the adopted head, which is at or past every durable position.
 >   Held by `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (`live_ship`'s unit tests) and
->   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Owed: the
->   adopted head lives in the successor shard's memory until the volume's first publication, as the volume's own image
->   does (GAPS, A-325's live-shipped item).
+>   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Since A-343
+>   that first publication is the takeover's own, so the adopted head no longer waits in the shard's memory for a write.
 > - **A superseded owner stranded its clients (fixed 2026-11-18, A-338).** The nemesis (seeds 6876545201569229162,
 >   10695597685579409771 and 12136749566337968553) failed with "a fence-2 copy behind the fence-1 owner's durable head".
 >   Reproduced in-process (the owner cut off on the probe plane alone, its record plane whole, as the relay left it
@@ -7176,8 +7187,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   (`owner_location`'s `known_owner`). The old owner's own first write after its loss may be the one that finds the
 >   fence, and is refused `StaleEpoch`; the next reaches the successor. Held by
 >   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed (GAPS): a mount on the old
->   owner (NFS, FUSE) still answers `StaleEpoch`; a node with no routing entry for its own lost object takes itself as
->   the creator route; and a successor ships a live volume only from its first write.
+>   owner (NFS, FUSE) still answers `StaleEpoch`; and a node with no routing entry for its own lost object takes itself
+>   as the creator route. A successor ships a live volume from its takeover since A-343.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -25067,3 +25078,24 @@ Status: built 2026-11-18.
   the unpromised slots and is then refused `NoSpace` while the claim makes every file its allowance holds; a destroyed
   volume's hold comes back whole. The daemon suite's capped-slab scenarios now fill the slab with a bounded claim and a
   dynamic volume grown into the rest.
+
+### A-343 — A live-shipped volume taken over is published at its takeover, so a successor restarted before its first write keeps it (2026-11-18, g230, scale-out; §4.8 "persistence before reply", "Promotion and takeover"; A-325's live item)
+Applied in the same change to:
+- §4.8 Recovery: the status of A-325 (its owed live item closed) and A-343's own status; §4.10 live shipping: the chaos
+  flows' status (A-329's and A-338's owed lines).
+- `crates/server/src/fleet.rs`: `materialize` publishes before it serves on both paths (`published_before_served`).
+- Tests: `a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over` (`crates/server/tests/fleet.rs`),
+  red on main's code (`NoImage`) at two shards a node and at one; the fixture `AnchoredFleet::sharded` runs a fleet test
+  on more than one shard.
+- GAPS: the entry of 2026-11-18.
+- **What was there.** A-325 published a volume taken over from its seal before serving it and left a live-shipped one
+  to its first write's barrier, because that publication also makes the volume's shipper and so starts the successor's
+  live log. Nothing else published the successor's shard after the takeover, so a successor restarted warm before the
+  volume's first write rebuilt the shard without it (`NoImage`) and never served it again, though its records named it
+  the owner. No test restarted a successor between a live takeover and its first write: A-338's writes through the
+  successor right after the takeover, and that write's barrier publishes the volume.
+- **The rule.** A takeover publishes the successor shard's image before it serves the volume, from its seal or from its
+  live log alike. For a live volume that publication makes the shipper, from the head the takeover adopted (A-329): the
+  successor's log starts at the takeover, with a whole entry past every position durable before it, and ships to the
+  holder set the dead owner recorded. A refused publication keeps the takeover pending
+  (`fleet.materialize.unpublished`), as A-325 said.

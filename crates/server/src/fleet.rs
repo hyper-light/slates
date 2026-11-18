@@ -5298,6 +5298,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         crate::live_ship::adopt_head(s, id, fetched.head);
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
+        // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
+        // from the adopted head at once.
+        published_before_served(s)?;
         return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
@@ -5319,9 +5322,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       // object's next records at the promotion epoch and ships only to holders still missing these.
       s.placed_heads.insert(object, placed);
       s.placed_heads.insert(object.catalog(), catalog_placed);
-      if !catalog.live_shipped {
-        published_before_served(s)?;
-      }
+      published_before_served(s)?;
       Ok(())
     },
     HEARTBEAT_NS,
@@ -5440,14 +5441,13 @@ const MATERIALIZE_UNANSWERED: &str = "fleet.materialize.unanswered";
 /// Format: a counter name in the daemon's status report.
 const MATERIALIZE_UNPUBLISHED: &str = "fleet.materialize.unpublished";
 
-/// Publishes the owner shard's image once a volume taken over from its seal is materialized there, before it is served
-/// (§4.8 "persistence before reply"; A-325): the image in the anchor is what a restart of this node rebuilds the volume
+/// Publishes the owner shard's image once a taken-over volume is materialized there, before it is served (§4.8
+/// "persistence before reply"; A-325, A-343): the image in the anchor is what a restart of this node rebuilds the volume
 /// from. Until 2026-11-18 nothing published it until the volume's first write, and a successor restarted before then
-/// found no image for it (`NoImage`) and never served it again, though its records named it the owner. A refused
-/// publication is [`MATERIALIZE_UNPUBLISHED`]: the materialization stays pending, and its next attempt finds the volume
-/// made (`verbs::materialize_taken_over` keeps it) and publishes again. A live-shipped volume is left to its first
-/// write's barrier, as before: a publication there starts the successor's live log (`live_ship::published`), a change
-/// to the live takeover's shape that is its own piece (GAPS).
+/// found no image for it (`NoImage`) and never served it again, though its records named it the owner. A live volume's
+/// publication also makes its shipper, from the head its takeover adopted (A-329), so the successor ships its log from
+/// the takeover on. A refused publication is [`MATERIALIZE_UNPUBLISHED`]: the materialization stays pending, and its next
+/// attempt finds the volume made (`verbs::materialize_taken_over` keeps it) and publishes again.
 fn published_before_served(s: &mut crate::state::ShardState) -> Result<(), &'static str> {
   crate::verbs::publish_shard(s)
     .map(|_| ())
