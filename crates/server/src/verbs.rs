@@ -2675,6 +2675,17 @@ pub fn record_completion(
   id: RequestId,
   reply: ReplyBody,
 ) -> ReplyBody {
+  record_completion_routed(state, (origin, id), reply, None)
+}
+
+/// [`record_completion`], for a completion a green's successor adopted with `work`, the work whose submit it completes
+/// (A-288): the partition keeps the completion counted under the work while it retains it, which keeps the work's route.
+fn record_completion_routed(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  reply: ReplyBody,
+  work: Option<DbVolumeId>,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   let record = Op::CompletionRecorded {
     record: CompletionRecord {
@@ -2682,6 +2693,7 @@ pub fn record_completion(
       client: id.client,
       sequence: id.sequence,
       result: reply.to_bytes(),
+      work,
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
@@ -3560,6 +3572,39 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::fleet::SERVE_RECEIVE_OTHER,
             demux_sum(state, |c| c.receive_refused_other),
           ),
+          (crate::fleet::SERVE_OPENED, demux_sum(state, |c| c.opened)),
+          (
+            crate::fleet::SERVE_SETUP_REFUSED,
+            demux_sum(state, |c| c.setup_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEER_SESSIONS_REFUSED,
+            demux_sum(state, |c| c.peer_sessions_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEERS_REFUSED,
+            demux_sum(state, |c| c.peers_refused),
+          ),
+          (
+            crate::fleet::SERVE_HIGH_WATER,
+            demux_sum(state, |c| c.high_water),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_DIALING,
+            crate::fleet::record_dials_dialing(state),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_CALL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.call_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_ENROLL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.enroll_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_CALLS,
+            crate::fleet::record_dials_calls(state),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -3973,6 +4018,8 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
+    Refusal::PolicyForbids { .. } => "policy_forbids",
+    Refusal::PolicyChanged { .. } => "policy_changed",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4016,6 +4063,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::Submit { .. }
+      | RequestBody::SubmitApproved { .. }
       | RequestBody::EditSubmit { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
@@ -4187,7 +4235,13 @@ fn dispatch_inner(
       bytes,
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
-    RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence),
+    RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence, None),
+    RequestBody::SubmitApproved {
+      work,
+      evidence,
+      identity,
+      proof,
+    } => submit_approved(state, principal, (work, evidence), identity, proof),
     RequestBody::EditSubmit {
       work,
       path,
@@ -4361,6 +4415,25 @@ fn dispatch_inner(
         target: &target,
         filter: &filter,
         grant,
+        present_only: false,
+      },
+    ),
+    RequestBody::Present {
+      volume,
+      snapshot,
+      target,
+      filter,
+    } => crate::landing::land_verb(
+      state,
+      client_id,
+      principal,
+      crate::landing::LandCall {
+        volume,
+        snapshot,
+        target: &target,
+        filter: &filter,
+        grant: None,
+        present_only: true,
       },
     ),
     RequestBody::FsWrite {
@@ -4438,6 +4511,13 @@ fn dispatch_inner(
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
     RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::SetPolicy {
+      subject,
+      policy,
+      version,
+      proof,
+    } => crate::landing::set_policy_verb(state, principal, (subject, policy, version), proof),
+    RequestBody::Policy { subject } => crate::landing::policy_verb(state, principal, subject),
     RequestBody::Share {
       volume,
       principal: subject,
@@ -4460,8 +4540,11 @@ fn dispatch_inner(
 /// workload through the trusted harness. Refused `GrantIssuerUnverified` — counted — when the proof does
 /// not verify: an agent cannot enroll itself.
 fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody {
-  let expected = crate::landing::enroll_proof(&state.issuer_secret, account);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::enroll_proof(secret, account),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return refused(Refusal::GrantIssuerUnverified);
   }
@@ -4508,8 +4591,11 @@ fn revoke_on_channel(
   consumer: u64,
   proof: Capability,
 ) -> Served {
-  let expected = crate::landing::revoke_proof(&state.issuer_secret, consumer);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::revoke_proof(secret, consumer),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return Served::Reply(refused(Refusal::GrantIssuerUnverified));
   }
@@ -5113,6 +5199,8 @@ fn create(
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5498,29 +5586,60 @@ pub(crate) fn reserve_metadata(
   }
 }
 
+/// Why the base directory at `path` could not be opened, as a create (and a clone of an overlay) is refused for it.
+fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal {
+  match error {
+    // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
+    slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
+      path: path.to_owned(),
+      used_as: slates_ipc::protocol::OwnMountUse::Base,
+    },
+    slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: code,
+    },
+    _ => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: 0,
+    },
+  }
+}
+
+/// The host a clone of `record`'s overlay (in slot `origin`) reads its base through (§4.4 clone, AC-1.16): a duplicate of
+/// every directory handle the origin's host keeps, under the same handles (`OsHost::try_clone_dirs`), so each base
+/// directory the clone's plane names is the very directory the origin's names, whatever an outsider has since put at
+/// its path. `None` for a volume with no base directory (scratch, image). Before 2026-11-18 every clone was given no
+/// host, so an overlay's clone could not image its base and the clone verb was refused `ContentUnavailable` (GAPS
+/// 2026-11-05, "The daemon cannot clone an overlay volume").
+fn clone_base_host(
+  state: &ShardState,
+  origin: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+) -> Result<Option<OsHost>, Refusal> {
+  let BaseRecord::Path { path } = &record.base else {
+    return Ok(None);
+  };
+  let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
+  let Some(host) = slot.host.as_ref() else {
+    return Err(Refusal::BaseUnavailable {
+      path: path.clone(),
+      errno: 0,
+    });
+  };
+  host
+    .try_clone_dirs()
+    .map(Some)
+    .map_err(|error| base_open_refusal(path, error))
+}
+
 /// Opens a base directory (read-only, `O_NOFOLLOW`) and creates the overlay over it.
 fn open_base(
   state: &mut ShardState,
   path: &str,
   config: VolumeConfig,
 ) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
-  let (mut host, root) = OsHost::open_root(std::path::Path::new(path)).map_err(|e| {
-    Box::new(refused(match e {
-      // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
-      slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
-        path: path.to_owned(),
-        used_as: slates_ipc::protocol::OwnMountUse::Base,
-      },
-      slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
-        path: path.to_owned(),
-        errno: code,
-      },
-      _ => Refusal::BaseUnavailable {
-        path: path.to_owned(),
-        errno: 0,
-      },
-    }))
-  })?;
+  let (mut host, root) = OsHost::open_root(std::path::Path::new(path))
+    .map_err(|e| Box::new(refused(base_open_refusal(path, e))))?;
   let facts = host.facts(root).map_err(|_| {
     Box::new(refused(Refusal::BaseUnavailable {
       path: path.to_owned(),
@@ -5789,6 +5908,8 @@ fn found_green(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6082,6 +6203,8 @@ fn create_work(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6277,7 +6400,7 @@ fn edit_and_submit(
     ),
   };
   match edited {
-    ReplyBody::Edited => submit(state, principal, work, evidence),
+    ReplyBody::Edited => submit(state, principal, work, evidence, None),
     refused_edit => refused_edit,
   }
 }
@@ -6732,17 +6855,84 @@ fn merge_windows(
 /// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
 /// declared operations into the canonical document, seal the post-state, hash the identity, and run
 /// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
+/// Serves `SubmitApproved` (A-285): the launcher's approval of exactly one increment, proven under the issuer secret,
+/// then the submit with that approval. Refused `Forbidden` for a consumer principal, whatever its proof (an agent never
+/// approves its own merge), and `GrantIssuerUnverified` when the proof does not verify.
+fn submit_approved(
+  state: &mut ShardState,
+  principal: &Principal,
+  (work, evidence): (VolumeId, Vec<[u8; 32]>),
+  identity: [u8; 32],
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("merge_approved_by_consumer", 1);
+    return forbidden("submit_approved");
+  }
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::merge_approval_proof(secret, work, &identity),
+    &proof,
+  ) {
+    state.count("grant_issuer_unverified", 1);
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  submit(state, principal, work, evidence, Some(identity))
+}
+
+/// The merge mode a submit of `work` into `green` follows (A-285): the stricter of the two volumes' merge modes, and
+/// the volume whose mode it is. A volume with no policy set merges at once, as every merge did before write policies.
+fn merge_mode(
+  state: &ShardState,
+  work: DbVolumeId,
+  green: DbVolumeId,
+) -> (slates_db::catalog::WriteMode, DbVolumeId) {
+  use slates_db::catalog::WriteMode;
+  let mode_of = |id: DbVolumeId| {
+    state
+      .db
+      .partition()
+      .volume(id)
+      .and_then(|record| record.policy.write)
+      .map_or(WriteMode::Bypass, |policy| policy.merge)
+  };
+  let rank = |mode: WriteMode| match mode {
+    WriteMode::Forbid => 0u8,
+    WriteMode::Ask => 1,
+    WriteMode::Bypass => 2,
+  };
+  let (work_mode, green_mode) = (mode_of(work), mode_of(green));
+  if rank(green_mode) < rank(work_mode) {
+    (green_mode, green)
+  } else {
+    (work_mode, work)
+  }
+}
+
 fn submit(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
   evidence: Vec<[u8; 32]>,
+  approved: Option<[u8; 32]>,
 ) -> ReplyBody {
   let (work_id, green_id) =
     match crate::merge_service::require_work(state, principal, work, false, "submit") {
       Ok((record, green)) => (record.id, green),
       Err(refusal) => return refused(refusal),
     };
+  // The write policy (A-285): a forbidding mode refuses before the seal; an asking one is answered below, once the
+  // increment it would approve is known.
+  let (mode, by) = merge_mode(state, work_id, green_id);
+  if mode == slates_db::catalog::WriteMode::Forbid {
+    state.count("policy_forbids.merge", 1);
+    return refused(Refusal::PolicyForbids {
+      act: slates_ipc::protocol::WriteAct::Merge,
+      by: slates_ipc::protocol::PolicySubject::Volume {
+        volume: to_wire_volume(by),
+      },
+    });
+  }
   // A green that requires evidence refuses an increment without any (§4.16 `EvidenceRequired`),
   // before the seal: nothing is composed for a submit that cannot be accepted.
   if evidence.is_empty()
@@ -6763,6 +6953,21 @@ fn submit(
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
+  // An asking policy merges only the increment an approval names: none yet is answered with what to approve, and an
+  // approval of another (the work changed since) is refused. Building the increment changed nothing.
+  if mode == slates_db::catalog::WriteMode::Ask {
+    match approved {
+      None => {
+        return ReplyBody::MergeApprovalRequired {
+          work,
+          identity: inc.id,
+          paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
+        };
+      }
+      Some(identity) if identity != inc.id => return refused(Refusal::GrantMismatch),
+      Some(_) => {}
+    }
+  }
   // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
   // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
   // recorded — otherwise a full-chain refusal after an in-memory commit would strand the green ahead
@@ -6845,7 +7050,7 @@ fn submit(
       // The durable head is the checkpoint's version and the increments after it (W3).
       if let Err(refusal) = record_accepted(
         state,
-        green_id,
+        (green_id, work_id),
         version,
         (&increment_bytes, &inc),
         applied.as_deref(),
@@ -6862,7 +7067,7 @@ fn submit(
       reset_accepted_work(state, work_id, version);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
-      let completion = crate::merge_service::SubmitCompletion::of_current(state);
+      let completion = crate::merge_service::SubmitCompletion::of_current(state, work_id);
       crate::merge_service::enqueue_record(
         state,
         green_id,
@@ -6918,12 +7123,12 @@ fn submit(
 /// last accept (a work destroyed or rebased), and a full chain refuses every submit whose accept would take the
 /// checkpoint, so without it the green stayed full for good. What is still full is refused `TableAtCapacity`.
 /// Appends accepted `version`'s entry to `green`'s durable chain, unless an idempotent accept already holds it (A-257): the
-/// increment as submitted and what its verdict resolved it to. At a version whose record goes to holders the head's identity
-/// is read anyway, and goes beside it for a replay to compare; at `f = 0` the entries after the last checkpoint are checked
-/// by their digest alone.
+/// increment as submitted and what its verdict resolved it to, with the completion key of the submit from `work` that made
+/// it (A-255, A-288). At a version whose record goes to holders the head's identity is read anyway, and goes beside it for
+/// a replay to compare; at `f = 0` the entries after the last checkpoint are checked by their digest alone.
 fn record_accepted(
   state: &mut ShardState,
-  green: DbVolumeId,
+  (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
   (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
   applied: Option<&[slates_merge::chain_entry::Applied]>,
@@ -6945,7 +7150,7 @@ fn record_accepted(
       increment_bytes,
       increment,
       applied.unwrap_or_default(),
-      crate::merge_service::SubmitCompletion::of_current(state)
+      crate::merge_service::SubmitCompletion::of_current(state, work)
         .map(crate::merge_service::SubmitCompletion::to_entry),
       identity,
     ),
@@ -7394,6 +7599,20 @@ pub(crate) fn admit_clone(
       )));
     }
   };
+  // An overlay's clone reads the same base directories through a host of its own, made before the clone pins the
+  // snapshot so a refusal here has nothing to unpin.
+  let host = match clone_base_host(state, handle, record) {
+    Ok(host) => host,
+    Err(refusal) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal,
+      )));
+    }
+  };
   let cloned = match state.volumes.get_mut(handle) {
     Ok(slot) => Volume::clone_of(
       &state.store,
@@ -7430,7 +7649,7 @@ pub(crate) fn admit_clone(
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
   Ok(Admitted {
     volume: volume_core,
-    host: None,
+    host,
     credits: Credits {
       reservation,
       version: version_credit,
@@ -7524,15 +7743,16 @@ pub(crate) fn publish_clone_as(
   }
   let Admitted {
     volume: mut volume_core,
+    host,
     credits,
-    ..
   } = admitted;
   crate::content_cipher::key_volume(&mut state.store, &mut volume_core, id.bytes);
   let slot = VolumeSlot {
     id,
     name: name.to_owned(),
     volume: volume_core,
-    host: None,
+    // An overlay's clone keeps the host its admission duplicated from its origin's (AC-1.16).
+    host,
     reservation: credits.reservation,
     version_credit: credits.version,
     metadata_credit: credits.metadata,
@@ -9506,7 +9726,7 @@ fn await_placed(
 
 /// Format: the head register's sequence at a volume's creation — the "epoch-one head record" that names
 /// no content yet (§4.4 create); each snapshot's placement then writes the next sequence.
-const CREATION_HEAD_SEQUENCE: u64 = 0;
+pub(crate) const CREATION_HEAD_SEQUENCE: u64 = 0;
 
 /// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
 /// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
@@ -9560,6 +9780,8 @@ pub(crate) fn materialize_taken_over_green(
         },
         live_shipped: false,
         live_holders: None,
+        write: None,
+        write_version: 0,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -9581,10 +9803,18 @@ pub(crate) fn materialize_taken_over_green(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  debug_assert!(matches!(
+  // The id must name a green here. A volume of another role already recorded under it is not this green, and replaying
+  // the green's chain onto its record would serve one object as another: refused typed (a `debug_assert!` before
+  // 2026-11-18, which panicked a debug build's shard and let a release build go on). The takeover counts the refusal and
+  // gives the green up at its bound, naming `refused` (`fleet::materialize_pending_greens`).
+  if !matches!(
     crate::merge_service::merge_role(state, id),
     Some(MergeRole::Green { .. })
-  ));
+  ) {
+    return Err(Box::new(refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(id),
+    })));
+  }
   // The chain, durably, in order — each entry guarded before it is applied.
   let now = state.clock.monotonic_ns();
   // What this node holds durably already: its checkpoint's version and the increments after it (W3).
@@ -9685,7 +9915,10 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 
 /// Records, on a taken-over green's partition, the completions its merge records carried (A-255; RIFL §3, "If the
 /// object migrates, then the completion record must move with it"): each submit's resend after the takeover is then
-/// answered its version here, the request's key the one it was accepted under, and never run again.
+/// answered its version here, the request's key the one it was accepted under, and never run again. Each a resend can
+/// reach only through its work's route (a client of another node than the work's owner) is recorded under that work
+/// (A-288), so the partition counts what the route still leads to, and the route's adopter retires it once nothing is
+/// left to answer.
 ///
 /// Bounded per client as any client's records are ([`completion_bound`]): a client holds at most that many unacknowledged
 /// at once, so its newest that many submits are the ones it may still resend. Older ones it had acknowledged (the
@@ -9696,7 +9929,7 @@ fn record_taken_over_completions(
   completions: &[Option<crate::merge_service::SubmitCompletion>],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
-  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64)>> =
+  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64, Option<DbVolumeId>)>> =
     std::collections::BTreeMap::new();
   for (index, key) in completions.iter().enumerate() {
     let Some(key) = key else {
@@ -9706,7 +9939,7 @@ fn record_taken_over_completions(
     by_client
       .entry((key.origin, key.client))
       .or_default()
-      .push((key.sequence, version));
+      .push((key.sequence, version, key.work));
   }
   for ((origin, client), mut submits) in by_client {
     submits.sort_unstable();
@@ -9715,15 +9948,15 @@ fn record_taken_over_completions(
       TAKEN_OVER_COMPLETION_PAST_BOUND,
       u64::try_from(past).unwrap_or(u64::MAX),
     );
-    for (sequence, version) in submits.into_iter().skip(past) {
-      let reply = record_completion(
+    for (sequence, version, work) in submits.into_iter().skip(past) {
+      let reply = record_completion_routed(
         state,
-        origin,
-        RequestId { client, sequence },
+        (origin, RequestId { client, sequence }),
         ReplyBody::Submitted {
           version: Some(version),
           conflicts: Vec::new(),
         },
+        work,
       );
       let counter = if matches!(reply, ReplyBody::Refused { .. }) {
         TAKEN_OVER_COMPLETION_UNRECORDED
@@ -9927,6 +10160,8 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
+      write: None,
+      write_version: 0,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -13159,6 +13394,8 @@ mod tests {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
+        write_version: 0,
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),
@@ -14602,6 +14839,68 @@ mod tests {
       panic!("{reply:?}")
     };
     *state.by_id.get(&super::to_db_volume(id)).unwrap()
+  }
+
+  /// §4.16 owner-loss recovery, CLAUDE.md §2 item 6 (no panics in non-test code, ever): a taken-over green whose id
+  /// names a volume of another role on its owner shard is refused typed, and nothing is rebuilt over it. Do: create a
+  /// plain volume, then materialize a taken-over green under its id and another name. Expect `AlreadyExists` naming
+  /// the id, no green engine, and the plain volume still plain and served. Before (2026-11-18), a `debug_assert!` on the
+  /// volume's role panicked the shard in a debug build, and a release build went on to replay the green's chain against
+  /// the plain volume's record.
+  #[test]
+  fn a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed() {
+    let (wire, answer, engine, role, served) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "plain".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id: wire } = reply else {
+        panic!("{reply:?}")
+      };
+      let id = super::to_db_volume(wire);
+      let recovery = crate::merge_service::GreenRecovery {
+        name: "green".to_owned(),
+        require_evidence: false,
+        owner,
+        access: Vec::new(),
+        catalog_sequence: 1,
+        origin: None,
+        chain: Vec::new(),
+        completions: Vec::new(),
+        head: 0,
+        identity: [0; 32],
+      };
+      let answer = super::materialize_taken_over_green(state, id, recovery).map_err(|reply| *reply);
+      (
+        wire,
+        answer,
+        state.greens.contains_key(&id),
+        crate::merge_service::merge_role(state, id).is_none(),
+        state.by_id.contains_key(&id),
+      )
+    });
+    assert_eq!(
+      answer,
+      Err(ReplyBody::Refused {
+        refusal: Refusal::AlreadyExists { existing: wire }
+      }),
+      "a green is never materialized over a plain volume"
+    );
+    assert!(!engine, "no green engine over the plain volume");
+    assert!(role, "the volume under the id is still plain");
+    assert!(served, "the plain volume is still served");
   }
 
   /// What a client observes of the node at `path`: its kind and permission bits, owner, link count, four

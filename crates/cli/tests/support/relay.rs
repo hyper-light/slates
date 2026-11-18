@@ -315,6 +315,18 @@ impl Relay {
     let _ = self.report();
   }
 
+  /// Cuts what leaves `node` only: it still hears every peer and none hears it.
+  pub(crate) fn mute(&self, node: usize) {
+    for other in (0..self.nodes).filter(|other| *other != node) {
+      self.send(Command::Rule {
+        from: node,
+        to: other,
+        rule: PathRule::CUT,
+      });
+    }
+    let _ = self.report();
+  }
+
   /// Every path back to the default: every datagram forwarded at once.
   pub(crate) fn heal(&self) {
     self.shape_all(PathRule::default());
@@ -725,8 +737,9 @@ impl RelayState {
 }
 
 /// SplitMix64 (Steele, Lea and Flood, "Fast splittable pseudorandom number generators", OOPSLA 2014; the constants and
-/// shifts as Vigna's reference publishes them): a reproducible sequence of draws from one seed.
-struct Draws(u64);
+/// shifts as Vigna's reference publishes them): a reproducible sequence of draws from one seed. The relay draws its
+/// rules' outcomes from one; a flow's own schedule (the nemesis of `live_chaos.rs`) draws from another.
+pub(crate) struct Draws(u64);
 
 impl Draws {
   /// Format: SplitMix64's increment, the 64-bit fraction of the golden ratio.
@@ -735,6 +748,23 @@ impl Draws {
   const MIX_FIRST: u64 = 0xBF58_476D_1CE4_E5B9;
   /// Format: SplitMix64's second mixing multiplier.
   const MIX_SECOND: u64 = 0x94D0_49BB_1331_11EB;
+
+  /// The sequence `seed` names.
+  pub(crate) fn seeded(seed: u64) -> Draws {
+    Draws(seed)
+  }
+
+  /// A draw in `0..bound` (zero for a bound of zero). The modulo's bias is below `bound / 2^64`, nothing at the bounds
+  /// a schedule draws.
+  pub(crate) fn below(&mut self, bound: u64) -> u64 {
+    self.next() % bound.max(1)
+  }
+
+  /// A span uniform within `low..=high` (`low` when `high` is not above it).
+  pub(crate) fn within(&mut self, low: Duration, high: Duration) -> Duration {
+    let span_ns = u64::try_from(high.saturating_sub(low).as_nanos()).unwrap_or(u64::MAX);
+    low.saturating_add(Duration::from_nanos(self.below(span_ns.saturating_add(1))))
+  }
 
   fn next(&mut self) -> u64 {
     self.0 = self.0.wrapping_add(Self::GAMMA);
@@ -1085,6 +1115,63 @@ fn a_cut_drops_its_direction_only_until_healed() {
   assert_eq!(bytes, b"healed");
 }
 
+/// Goal g229, the one-way partitions a flow applies to a whole node. Do: mute node 0 and send each way; heal; deafen node
+/// 0 and send each way. Expect: muted, node 0's datagram is cut and node 1's arrives; deafened, the reverse; each cut
+/// counted on its own direction.
+#[test]
+fn mute_and_deafen_each_cut_one_direction_of_a_node() {
+  let (relay, nodes) = relayed_pair(5);
+  relay.mute(0);
+  nodes[0]
+    .dialer
+    .send_to(b"unheard", nodes[1].advertised_record)
+    .unwrap();
+  nodes[1]
+    .dialer
+    .send_to(b"heard", nodes[0].advertised_record)
+    .unwrap();
+  let (bytes, _) =
+    receive_within(&nodes[0].bound[1], ARRIVAL_WAIT).expect("a muted node still hears");
+  assert_eq!(bytes, b"heard");
+  assert_eq!(
+    receive_within(&nodes[1].bound[1], ABSENCE_WAIT),
+    None,
+    "nobody hears a muted node"
+  );
+  let report = relay.report();
+  assert_eq!(
+    (report.cut(0, 1), report.cut(1, 0)),
+    (1, 0),
+    "{}",
+    report.summary()
+  );
+  relay.heal();
+  relay.deafen(0);
+  nodes[0]
+    .dialer
+    .send_to(b"spoken", nodes[1].advertised_record)
+    .unwrap();
+  nodes[1]
+    .dialer
+    .send_to(b"lost", nodes[0].advertised_record)
+    .unwrap();
+  let (bytes, _) =
+    receive_within(&nodes[1].bound[1], ARRIVAL_WAIT).expect("a deafened node still speaks");
+  assert_eq!(bytes, b"spoken");
+  assert_eq!(
+    receive_within(&nodes[0].bound[1], ABSENCE_WAIT),
+    None,
+    "a deafened node hears nothing"
+  );
+  let report = relay.report();
+  assert_eq!(
+    (report.cut(0, 1), report.cut(1, 0)),
+    (1, 1),
+    "{}",
+    report.summary()
+  );
+}
+
 /// Goal g229, the rates and the hold. Do: send node 0 -> 1 under all-loss, then under a fixed delay, then under
 /// all-duplication. Expect: nothing arrives and the loss is counted; the delayed datagram arrives no sooner than the
 /// delay; the duplicated one arrives twice.
@@ -1188,8 +1275,9 @@ fn a_census_attributes_a_socket_to_its_process() {
 }
 
 /// Goal g229: the draws are SplitMix64's, so a seed names a schedule. Do: draw holds and chances from two relays'
-/// generators seeded alike and one seeded otherwise. Expect: equal seeds, equal draws; every hold within `delay ±
-/// jitter`; a zero rate never fires and a whole one always does.
+/// generators seeded alike and one seeded otherwise; then a schedule's spans and picks. Expect: equal seeds, equal
+/// draws; every hold within `delay ± jitter`; a zero rate never fires and a whole one always does; every span within
+/// its bounds, every pick below its bound and each of a small bound's values drawn.
 #[test]
 fn the_draws_are_reproducible_and_within_their_bounds() {
   let (mut first, mut second, mut other) = (Draws(7), Draws(7), Draws(8));
@@ -1207,4 +1295,23 @@ fn the_draws_are_reproducible_and_within_their_bounds() {
   );
   assert!((0..1000).all(|_| !first.chance(0)));
   assert!((0..1000).all(|_| first.chance(PARTS_PER_MILLION)));
+  // The schedule's draws: within their bounds, every value of a small bound met, and one seed one sequence.
+  let (low, high) = (Duration::from_millis(200), Duration::from_secs(4));
+  let (mut schedule, mut again) = (Draws::seeded(11), Draws::seeded(11));
+  let spans: Vec<Duration> = (0..1000).map(|_| schedule.within(low, high)).collect();
+  assert!(spans.iter().all(|span| *span >= low && *span <= high));
+  assert_eq!(
+    spans,
+    (0..1000)
+      .map(|_| again.within(low, high))
+      .collect::<Vec<_>>()
+  );
+  let picks: std::collections::BTreeSet<u64> = (0..1000).map(|_| schedule.below(3)).collect();
+  assert_eq!(picks, (0..3).collect());
+  assert_eq!(schedule.below(0), 0, "a bound of zero draws zero");
+  assert_eq!(
+    schedule.within(high, low),
+    high,
+    "a span whose upper bound is not above its lower is the lower"
+  );
 }

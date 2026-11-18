@@ -68,7 +68,7 @@ their numbers.
 | R7 | Plain English. A human implementer must be able to act on every sentence. | Terms of art are defined once in the glossary (0.4) and used consistently. Each algorithm is written as numbered steps. Each test case is written as "do X, expect Y". |
 | R8 | Both laptop and EdenFS scale, one code path. | Every subsystem carries a "laptop degenerate" section: the laptop is the derived N=1 case of one formula family, never a mode switch. A named differential test asserts that the N=1 configuration has the same observable semantics as the fleet configuration. |
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
-| R10 | Disk is written only on a user permission grant. | A grant is a database record created only by the CLI or a confirmation surface a human operates; the MCP server and the SDKs have no verb that creates one; the landing engine refuses without a grant bound to the exact manifest it is about to write; every grant, manifest, and outcome is in the audit log (§4.15). |
+| R10 | Disk is written only on a user permission grant, and the grant follows the mode the user gave the agent (A-285). | A grant is a database record bound to the exact manifest it is about to write; the launcher's write policy decides whether the daemon issues it at once (bypass), answers an approval request that the harness presents (ask) or refuses (a forbidding mode); an agent can never raise its own policy; every grant, manifest, and outcome is in the audit log (§4.15). |
 
 **R1's access and residency contract (A-50, 2026-09-30; audit §9; decided by Ada, 2026-09-30).** slates is
 pure in memory: literal zero disk access is the baseline requirement — the entire point of the product —
@@ -860,10 +860,10 @@ plan schedules.
   distinguishes workloads within it. A channel label supplied by a caller cannot establish
   human authority. A trusted confirmation surface binds its approval to the exact manifest;
   transport checks supplement that authority check (§4.13).
-- A-285 (Ada, 2026-11-18): the human's authority is a signature by a key only the human holds (an ssh-agent key that
-  asks for confirmation on every use, or a FIDO key that needs a touch), over the exact landing and a nonce the daemon
-  issued; the anchor's own terminal is the fallback where no key is registered. No secret a process of the user can
-  read is authority any more.
+- A-285 (Ada, 2026-11-18): write permission follows the mode the user gave the agent's harness. Bypass merges and
+  lands; ask answers a typed approval request bound to the manifest, which the harness presents; a forbidding mode is
+  refused. The launcher or the harness sets the policy and an agent never raises its own. The earlier reading of a
+  human-only proof is withdrawn; signatures are signed-work provenance, not permission.
 - Evidence: `SO_PEERCRED`, `getpeereid`/`LOCAL_PEERTOKEN`, named-pipe client checks [B]; hecate's "an id is never a bearer capability" [C: survey-hecate.md §8.4]; vorpal's MCP enrollment rule [C: survey-vorpal.md §6.1].
 - Grants are created only through the CLI or a confirmation surface a human operates, for the same reason vorpal enrols servable roots by hand: a confirmation delivered through the agent's channel would be answered by the agent. A landing opens the target beneath its own directory descriptor (`openat2` with `RESOLVE_BENEATH` on Linux, `O_NOFOLLOW` chains elsewhere) so it can never write outside the granted directory [B: openat2(2)]; the target must be owned by the calling user and must not lie inside a slates mount.
 
@@ -1632,6 +1632,18 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   handles; add the claim and lineage record. Root cloning is O(1). A remote clone retains the
   base service dependency or uses an already complete immutable base. It never turns into an
   empty scratch volume merely because its source directory is remote.
+  > Status (2026-11-18, a local clone of an overlay): the daemon gives each volume a host of its own, so an
+  > overlay's clone gets one holding every directory of its origin's host under the same handle, each a duplicate
+  > descriptor of the very directory the origin reads (`slates_base::OsHost::try_clone_dirs`, `verbs::clone_base_host`):
+  > the clone's base reference is the origin's, never a pathname looked up again. Its base plane keys the root listing
+  > by the root number the clone's root directory keeps (its origin's) and takes each of the origin's listings with its
+  > entries dropped, to be read afresh from the live base (`BasePlane::for_clone`). A recovery reopens the clone's base
+  > from its record and checks its fingerprints, as it does the origin's. Before, every clone was admitted with no
+  > host, its first image could not fingerprint its base, and `volume clone` of an overlay was refused
+  > `ContentUnavailable`, pinned or not. Held by
+  > `an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart` (`crates/server/tests/recovery.rs`)
+  > and `a_clones_base_subdirectory_reads_as_the_disk_holds_it` (`crates/vfs/tests/base.rs`). A clone on another host
+  > (remote attach, below) is still owed.
 - attach(volume|snapshot, consumer, transport, chosen_path?) → Attachment: authenticate the
   consumer and requested access, reserve all costs, pin the view and generation, establish
   the path or device, then publish `Bound`. Refusal rolls back owned resources. A metadata
@@ -1849,7 +1861,8 @@ struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, 
                body: Body, identity: Option<Blake3>, born: Epoch, flags,
                windows: WindowsAttributes /* A-262: HIDDEN, SYSTEM, ARCHIVE, OFFLINE, NOT_CONTENT_INDEXED, and a
                                              directory's READONLY (a file's is its mode), at Windows' values, in the
-                                             two bytes of tail padding, so no inode grows */ }
+                                             two bytes of tail padding, so no inode grows; A-275: a symlink's
+                                             DIRECTORY, which makes it a Windows directory link */ }
 enum Body { Inline(SmallBytes), Extents(ExtentList), Open(OpenExtent, ExtentList), Symlink(NameRef),
             Base { witness: Option<Handle<Witness>>, pinned: ExtentList, fd: Option<BaseFd>, lost: bool } }
 struct Extent { off: u64, len: u64, src: ExtentSrc } enum ExtentSrc { Chunk{chunk: ChunkHandle, off: u32}, Zero, Base{fd: BaseFd} }
@@ -3078,13 +3091,16 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 
 > **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
-> list with one of three stated differences (security descriptors, reparse points and symbolic links, named streams;
+> list with one of the stated differences (security descriptors, generic reparse data, named streams, a link's own data;
 > a settable creation time was built in A-259, `t/base/06.t` case 5 off the list, and the attribute bits in A-262, its
-> 18 cases off, leaving 355). Four Win32 bugs it found are fixed with failing tests first
+> 18 cases off, leaving 355; symbolic links in A-275, which lets 105 cases behind three script-level entries run, 78
+> passing and 30 listed case by case, leaving 382). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
-> failure (`fsx-seed-1-unfinished:10000`) until fixed.
+> failure (`fsx-seed-1-unfinished:10000`) until fixed. Since A-300 (2026-11-17) the lanes also run the workload
+> roster's version-control workloads over the drive (git, Mercurial and Subversion, through Git for Windows' shell),
+> judged against NTFS with the drive's one stated difference: no hard links.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -5539,6 +5555,27 @@ placement records bind both scopes; cached configuration/attachment generations 
 ordinary writes. A region-home move also carries root-group authority. The id still routes by
 creator plus these exceptions; this adds no global lookup catalog or per-write coordination.
 
+> **Status (2026-11-18, the moved-object exceptions; the configuration's half of an explicit move).**
+> `RegionalConfiguration::moved` holds, for each moved object only, its owner and the configuration version its move
+> committed at, its ownership generation (`slates_db::register::Moved`). An object's line starts at its exception's
+> owner, else at its creator, and a retired host hands it on along the takeover's lineage
+> (`RegionalConfiguration::owner_of`). A member reports a move through the council's report stream
+> (`ConfigCommand::Move`, `MovedForgotten` once the object is destroyed); the leader proposes it only when the
+> configuration names the reporter as the owner, or names no owner because the object's line runs through a takeover
+> that is done (the configuration no longer keeps that successor, and a host that lost its authority never reports
+> again under its id), and never for a lost or unresolved line. A move that would add an exception past the bound the
+> leader derives is answered `ReportOutcome::Full` and not proposed (`fleet::moved_bound`: the members times one
+> member's volume slots, at the leader's size). A move back to the creator drops the exception. An exception follows
+> its owner's takeover at the successor's confirmation, through a takeover carried into another's too, so no line
+> starts at a retirement the configuration dropped. The encoding carries the exceptions last (the encoding itself is
+> still unversioned; GAPS). Held by four tests in `crates/db/src/register.rs` (`a_move_names_the_objects_owner_and_only_its_owner_moves_it`,
+> `a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy`,
+> `a_moved_objects_exception_follows_a_takeover_carried_into_another`,
+> `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`), the council's
+> `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` and the encoding's round trip and lying-count tests.
+> Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
+> old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
+
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
 among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its
@@ -5650,6 +5687,29 @@ version.
 > `NotFound` in the settle window before the successor processes the retirement was fixed in the same pass: `find`
 > answers a retryable `Overloaded` for an object this node holds a copy of (a recovery candidate), never `NotFound`
 > for an object that exists. `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`.
+
+> **Status (2026-11-18, a taken-over volume's materialization is bounded).** Each wait of a taken-over volume's
+> materialization (`fleet.materialize.waits.*`: its content, placement, catalog, catalog placement or shard; its live
+> log; a refused or unanswered materialization) retried every period without end. Now each pending volume counts its
+> attempts, one a period, and past the failover SLO's worth without progress (`failover_slo_ns / HEARTBEAT_NS`, the
+> bound a taken-over green has had since 2026-11-09) it is given up on: its owner shard records it unrecovered, every
+> verb on it answers `NotRecovered { cause: TakeoverIncomplete { waited_on } }` naming the wait (`content`, `placement`,
+> `catalog`, `catalog_placement`, `shard`, `live`, `refused`), and `fleet.materialize.given_up` counts it. Progress is
+> more of the head's content staged than ever before, so a large volume whose fetch is cut by its deadline each period
+> is given up only once the fetch stops advancing. For a wait on its catalog register (or that register's placement)
+> while the takeover round that adopted it still pages, progress is an advance of that round's pages, for a green as
+> for a volume (`takeover::rounds_still_paging`, `fleet::paging_round`): a catalog register sorts after every head of
+> its creator's partition and a round reads a page (about 55 objects) a member a period, so on a host with more than
+> the bound's worth of pages of heads in one partition every catalog arrives after the bound, and the green bound of
+> 2026-11-09 counted those waits. The wait counts only while the round stands still, so a round that never finishes
+> paging cannot hold the object pending without end. A mirror-seeded volume given up is reported adopted to the
+> council, unrecovered on its successor. Regressions: `a_taken_over_volume_whose_catalog_never_comes_is_refused_by_name`,
+> `a_taken_over_volume_whose_content_never_comes_is_refused_by_name` (GAPS 2026-11-09, the sibling bullet), and the
+> counting rule's unit tests (`a_catalog_wait_reads_its_round_only_while_the_round_pages`,
+> `a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count`,
+> `a_wait_on_a_paging_round_is_progress_only_while_the_round_advances`,
+> `a_round_pages_until_every_asked_member_has_answered_every_page`,
+> `a_volumes_attempts_start_again_only_at_a_new_high_of_staged_content`).
 
 > **Owner location (2026-09-17).** A foreign node cannot reconstruct a historic copyset from
 > present membership. After its creator route stops being usable, it asks authenticated
@@ -5991,6 +6051,13 @@ failure.
 > catalog record, which names the green: held, or learned from a location round. A version's record ships only once
 > that catalog is committed, and the record plane ships the catalog at the work's creation. A merge record carries
 > format version 1; another version is refused typed.
+
+> **Status (2026-11-17, A-288: a work's route ends).** The route is kept only while the green's owner holds a completion
+> it can reach: a submit forwarded from another node than the work's owner, not yet acknowledged. The merge record
+> (format 2) and chain entry (version 3) name such a submit's work. The successor records the completion under it, and
+> the route's adopter asks the green's owner each period and retires the route through the destroy's tombstone stages
+> once none is held, or once the green is given up. Still held: a route to a green destroyed or lost while it is kept,
+> one whose completion is never acknowledged, and one its adopter kept across a warm restart (GAPS).
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -6480,11 +6547,19 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
 >   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
 >   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
->   lossy paths through a takeover, cut a running owner off, and deafen one. Every flow that takes a live volume over,
+>   lossy paths through a takeover; cut a running owner off, deafen it or mute it, each taken over; cut off, deafen or
+>   mute each candidate in turn, where no write may be refused and no candidate may depose the owner (one voter's view
+>   retires no one, A-250); and hold one candidate's every datagram 200 ms ± 50 ms (T-8.3's slow candidate, AC-8.12),
+>   where no write may wait for it. Every flow that takes a live volume over,
 >   these and the SIGSTOP and SIGKILL ones, now also judges ReadSafety (a read through any survivor, or through the
 >   partitioned owner while it is cut off or the moment its stopped process resumes, never answers less than was
 >   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
->   from outside the processes.
+>   from outside the processes. The flows that take nothing over (candidates partitioned, stalled or slowed, and the
+>   lossy phases) read through every node mid-fault and after it, held to ReadSafety too, with the owner answering every
+>   read: its lease needs one healthy candidate's confirmation of two. A seeded nemesis draws fourteen single faults of
+>   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
+>   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
+>   invariant is judged across whatever takeovers they cause, Continuity from the samples.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -6599,7 +6674,14 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   holder that accepts it drops the volume's and its catalog's records. Waiting for every candidate is what
 >   keeps a later takeover from meeting a lone live head.
 > - **A takeover adopts the tombstone** and never materializes the volume. Before this a successor served a
->   destroyed volume again.
+>   destroyed volume again. The successor records the adopted tombstone on the shard the id routes to once a period,
+>   and since 2026-11-18 past the failover SLO's worth of attempts (`failover_slo_ns / HEARTBEAT_NS`, as for a
+>   taken-over volume or green) it gives that record up, counted `fleet.tombstone.given_up` with its last reason (no
+>   shard for the partition, refused, unanswered): the adoption already placed the tombstone under the successor at the
+>   quorum, so the volume is never served again, and what is lost is the retirement, which leaves the candidates
+>   holding the tombstone, the safe state. The successor keeps it marked, so the volume stays known destroyed there.
+>   Before, a tombstone whose partition had no shard was skipped every period, uncounted, and a refused one retried
+>   every period without end.
 > - **On a laptop** the tombstone retires with the destroy: there is no remote candidate to ship to.
 > - **Single-value registers** (head, catalog, tombstone) keep only their newest accepted position. A
 >   green's chain is a ledger and is kept whole.
@@ -6923,30 +7005,29 @@ command and every host start, mount and grant through one implementation.
   waits for the first answer at the anchor's heartbeat cadence while the anchor lives, and makes
   the group of an instance run alone; a host that launches the anchor under its service manager
   takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
-  is given no grant authority: under Ada's decision of 2026-11-18 a grant is proved by a key only
-  the human holds (A-285), presented through the crate's proof-agnostic grant call.
+  is the launcher: under Ada's rule of 2026-11-18 (A-285 as revised, A-299) write permission
+  follows each agent's mode and the launcher's authority is the instance's issuer, which the start
+  is to hand its starter on every platform (owed; today the starter holds it where the anchor's
+  handoff reaches it).
 - *What a host holds.* An `Instance`: one held client of one running instance. A landing's
-  presentation lives as long as the client that made it (A-46), so a plan a person is shown is
-  granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
-  the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
+  presentation lives as long as the client that made it (A-46), so a plan an approver is shown is
+  approved and landed on the same client. An `Issuer`: the launcher's authority (§4.13, A-299), the
+  anchor segment's handoff, attached for the length of one proof and never kept as a secret.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
   without a daemon whether the machine can mount and what is missing, and `mount::unmount_lazy` lets
   go of a mount a leftover process still holds, Linux) or as a descriptor a VMM takes (the Shards
-  stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
-  `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
-  the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
-  whole typed client for the rest (the merge verbs of §4.16, the file verbs).
-- *Refusals.* One closed `Error`: the daemon's `Refusal`, `Unavailable` (no daemon at the instance),
-  the channel's own, and the crate's (`MountFault` with the OS's error number, `IssuerFault`,
-  `PathFault`, `StartFault`). None is prose alone; the enums are `#[non_exhaustive]`, so a host
-  matches them with a wildcard arm as the crate grows.
+  stream, A-161; the vhost-user socket); landing and merging under the caller's write mode, and
+  approving exactly the manifest shown (the consumer contract below, A-299, which replaced A-278's
+  `land_approved`); observation (daemon status, audit, grants, telemetry). `Instance::client` lends
+  the whole typed client for the rest (a work volume's declared edits, the file verbs).
+- *Refusals.* One closed `Error` whose variant is what a consumer does about it (the consumer
+  contract below, A-299). None is prose alone.
 - *Grant exclusion.* The SDKs and the MCP server depend on `slates-client`, not on this crate, so
   no grant verb reaches them (the structural exclusion this section asks of the registry); the
   daemon still refuses a grant kind on their channels whatever they claim.
-- *Versioning.* The workspace's one version. The report types it re-exports are the wire's, which
-  grow append-only (D-15), so a host matches their enums with a wildcard arm.
+- *Versioning.* The workspace's one version (`VERSION`), and the contract's own (`CONTRACT`, below).
 
 > **Status (2026-11-18, A-278, pieces 1 and 2).** Built: the crate with attach, the group, the
 > volume lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
@@ -6962,6 +7043,129 @@ command and every host start, mount and grant through one implementation.
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
 > an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
 > a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
+
+**The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
+2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
+permission errors, and every other interaction. Answers are typed outcomes and failures typed
+errors — closed enums a consumer matches and acts on, never strings. Kiln is the first consumer:
+it builds against the contract and adds to it rather than around it.
+- *Write permission.* Merging a work volume into its green (§4.16) and landing a volume onto a
+  host directory (§4.15) follow the permission the user gave the harness or agent asking to write,
+  a `WriteMode` per act (`WritePolicy { merge, land, require_signed_merges }`): **bypass** merges
+  and writes at once; **ask** answers a typed approval request (`ApprovalRequired`) the harness
+  presents, and writes once it is approved; **forbid** answers a typed refusal (`Refused`). The
+  launcher (kiln passes each agent's mode) or the harness sets a policy per enrolled consumer (an
+  agent's session, §4.13 "Principals") or per volume; an act follows the stricter of its caller's
+  and its volume's (`WritePolicy::meet`); a subject with no policy keeps what every subject did
+  before (`WritePolicy::UNSET`): its merges run at once (a change in memory) and its landings ask (a
+  write to disk waits for an approval, R10). No key, signature or person-only proof decides it. An agent never raises
+  its own mode: setting a policy and approving need the launcher's authority — the instance's
+  issuer, handed to whoever starts the instance — which the daemon refuses on a consumer's channel,
+  and an agent holds only its consumer's capability. The daemon keeps and enforces the policies
+  (A-285, the owner of §4.13's grant path).
+- *Outcomes.* A landing answers `LandOutcome::{Written(report), ApprovalRequired(approval),
+  Conflicted(conflicts), Refused(policy refusal)}`; a merge `MergeOutcome::{Merged { version,
+  verification }, ApprovalRequired, Conflicted { windows, head }, Refused}`; a rebase
+  `RebaseOutcome::{Rebased { version }, Conflicted}`. A `LandingApproval` names the request, the
+  presentation's id, the manifest hash it binds and a typed summary of what it writes (entries per
+  action, bytes, what the filter left out); `Instance::approval_entries` lists it path by path
+  (A-287). A `MergeApproval` names the work and its green, the increment's identity it binds and
+  the paths it changes. `Instance::approve_landing` presents again and approves only when the
+  manifest is still the one shown, and `Instance::approve_merge` merges only while the increment is
+  still the one shown; otherwise each answers what holds now. Both work from any client: an
+  approval is bound to what it shows, never to the client that first presented it.
+  `Instance::plan_landing` presents without writing whatever the mode (the daemon's present-only
+  verb), for a reviewer.
+- *Conflicts are verdicts (D-26, D-27).* A landing conflict names its path, its class (§4.15 step 4's
+  table: both changed, changed against deleted, deleted against changed, both renamed, both created,
+  a type change, the target in use) and the bytes the volume would land there; a merge conflict its
+  file, its window in base coordinates and its class (§4.16's `MergeConflictClass`), with the
+  green's head the work must rebase onto. Nothing is inferred and nothing is written for a conflict;
+  the consumer resolves (`read_base`, a rewrite, `rewitness`; a rebase) and lands or merges again.
+- *Signed work (Ada, 2026-11-18).* A merge or a landing may carry a signature by its author's key
+  (an SSH signature, `PROTOCOL.sshsig`, the format of A-285's verifier: Ed25519 and FIDO Ed25519
+  keys), and its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
+  `Invalid { reason }`, the verifier's closed reasons. A volume's policy may require signed merges;
+  an unsigned or invalid merge into it is refused `SignatureRequired` even in bypass. Signatures
+  never gate permission: the mode does.
+- *Volumes.* One typed create, `Instance::provision(&VolumeSpec)`, for every source: an overlay
+  over a host folder, an empty volume, a clone of a snapshot, a green (empty or over a complete
+  immutable snapshot), a work volume over a green, which answers its green and its base version.
+  Snapshot, destroy, list, a typed status (`VolumeStatus`, an overlay's base `Read` or
+  `Unreadable`), an overlay's drift as typed entries (`Drift { path, kind }`, `Modified`,
+  `Deleted`, `Replaced`, `TypeChanged`, apart from the entries whose re-check the host refused),
+  `read` at a head, a version or an attachment's view, and serving: a host mount on bare metal, or
+  a descriptor a VMM takes.
+- *Errors.* `Error`'s variant is the class of thing a consumer does: `NotFound` (naming the subject
+  the call named: a volume, a snapshot, a presentation, an attachment, an entry, a shard),
+  `AlreadyExists`, `Denied`, `Exhausted`, `Busy`, `Stale`, `Retry { cause, pause_ns }` (the
+  derived first pause; `Instance::retry_pause_ns` gives each later one), `Unavailable` (no daemon:
+  start it, or report), `Unsupported`, `Invalid`, `Unusable` (destroying, not recovered, no group),
+  `Elsewhere`, `Host` (with the OS's error number), `Mount`, `Start`, and `Protocol` (a fault in
+  slates: report it). Every refusal on the wire maps to exactly one of them in one exhaustive table,
+  so a refusal added to the wire does not compile until it is given its class. Words the daemon or
+  the OS said only in prose travel as a `Note`, which is displayed and never matched.
+- *Versioning a consumer pins.* No contract enum is `#[non_exhaustive]`. `slates_api::CONTRACT` is
+  raised by one with every change to a type or a verb of the contract; a consumer pinning slates at
+  a commit asserts the version it was written against and matches exhaustively, so at its next
+  vendoring a moved contract is a failed assertion beside the compile errors of the matches it must
+  extend — never a variant falling silently through a wildcard. The wire types the contract
+  re-exports grow append-only (D-15) and count as the contract's where it returns them.
+- *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
+  laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
+  not confirmed) are variants a laptop never sends.
+
+> **Status (2026-11-18, A-299, piece 4: the contract published).** Built in `slates-api`: the write
+> modes, the policy and its typed refusal (`policy`), signed work's types (`signed`), the outcomes,
+> approvals and typed conflicts (`outcome`), typed provisioning, status and drift (`volume`), the
+> closed taxonomy with one exhaustive table over the wire's refusals, the channel's and this
+> process's own faults (`error`), and `Instance::{provision, read, land, plan_landing,
+> approval_entries, approve, merge, rebase, retry_pause_ns}` over today's daemon, on which every
+> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1,
+> then 2 the same day (`Denied::Policy`, the class a policy refusal takes outside a landing or a merge,
+> agreed with A-285's owner before its `Refusal::PolicyForbids` reaches the wire).
+> The CLI's mount, grant, enroll, revoke, run and recover map the taxonomy to its exit codes.
+> Proven by use over an in-process daemon (`crates/api/tests/api.rs`: the group missing is
+> `Unusable(NoGroup)`; provisioning from each source, `AlreadyExists` naming the holder, a destroyed
+> volume `NotFound` naming it; an overlay's landing answered `ApprovalRequired` with its typed
+> summary, a stale approval writing nothing and answering the fresh presentation, the shown one
+> `Written` and `Done`; a file changed on disk typed drift and a typed `ModifyModify` conflict with
+> the volume's bytes; a merge `Merged`, a rewrite of the same bytes `Conflicted` with its window and
+> the green's head, a clean work rebased and merged; signed work refused `Unsupported(SignedWork)`)
+> and by unit tests of the pure parts (each refusal's class, the drift text's grammar, the summary's
+> actions, the merge classes' discriminants, the policy meet). **Owed, in order:** the starter handed
+> the launcher's authority on every platform (the anchor passes the segment's descriptor back on
+> Linux); the daemon's side of the modes, merge approvals and signed work, with the verbs that set a
+> policy and hand out a statement to sign (A-285's owner, agreed through g262's inbox); typed fields
+> on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
+> versions (the work's base beside the head), replacing what the crate reads from text or asks
+> again; a paged listing; typed audit and grant states.
+
+> **Status (2026-11-18, A-299, piece 5: the write modes reach the contract).** Over A-285's policy
+> wire (203ad8fa): `Instance::set_write_policy(subject, &policy, &launcher)`, proven by the
+> launcher's issuer, and `Instance::write_policy(subject)` (`None` while unset: merges at once,
+> landings ask); a
+> landing or a merge a policy forbids answers its `Refused` outcome (`PolicyRefusal { act, by,
+> reason }`), any other call `Denied::Policy`; a policy that requires signed merges is refused
+> `Unsupported(SignedWork)` before anything is sent, since the daemon keeps no such requirement yet;
+> `CONTRACT` = 3. `plan_landing` reads the volume's mode first and refuses a bypass volume
+> `Unsupported(WritePolicies)` rather than write it: the daemon presents and lands a bypass volume
+> in one request, and a present-only verb is owed (asked of A-285's owner). Proven by use
+> (`a_landing_follows_its_volumes_write_mode`: unset reads back as none; a bypass volume lands in
+> the one call, `Done`, its file on the disk, while its plan is refused and writes nothing; a
+> forbidding one answers `Refused` by its own policy, nothing written; the signed requirement
+> refused before the daemon is asked). **Piece 6:** the audit log and the grant listing typed
+> (`AuditRecord` with `AuditKind` and a `LandingStage` outcome; `GrantRecord` with `GrantState`), each
+> word of the daemon's closed tables read in one place and a stranger a protocol fault; `CONTRACT` = 4.
+> `CONTRACT` = 5: `WritePolicy::UNSET` merges at once and asks for landings, as the daemon applies an
+> unset policy (agreed with A-285's owner; R10 asks for a disk write, a merge changes memory).
+> **`CONTRACT` = 6:** over A-285's present-only verb and merge approvals (1242c7d9): `plan_landing`
+> presents through `Present`, so a bypass volume's plan writes nothing; an ask merge answers a
+> `MergeApproval` (identity, paths) that `approve_merge` merges under the launcher's proof, an
+> approval of another increment merging nothing and asking again; the landing's approval is a
+> `LandingApproval`, approved by `approve_landing`; `merge` takes evidence. Proven by use
+> (`a_merge_follows_its_greens_write_mode`: an ask green holds the merge, nothing merged; a stranger's
+> approval asks again; the shown one merges at 1; a forbidding green refuses).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -7123,11 +7327,11 @@ server, not inferred from command names.
 > every grant and a session grant was recorded spent at its first landing. Record:
 > `docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`.
 
-> **Status (2026-11-18, A-285).** Ada chose the grant's proof: a signature by a key only the human holds, an SSH
-> signature under the namespace `slates-grant` (an ssh-agent key added with `ssh-add -c`, or a FIDO key) or a WebAuthn
-> assertion over the same statement; the anchor's own terminal where no key is registered. The statement and the SSH
-> verifier are built (`crates/server/src/grant_signature.rs`); the wire, the nonce, key registration and the CLI are
-> owed, and the issuer secret still proves grants until they land. Record: A-285, GAPS (2026-11-18).
+> **Status (2026-11-18, A-285).** Ada's rule: a grant follows the write mode the user gave the agent (bypass lands at
+> once, ask answers an approval request the harness presents, a forbidding mode refuses), set by the launcher or the
+> harness and never raised by the agent. The confirmation surface is whoever holds the launcher's authority, the
+> instance's issuer. The write policy is owed; until it lands, grants are made as before, by the issuer's keyed hash.
+> Record: A-285, GAPS (2026-11-18).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -8087,7 +8291,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > late holder's catch-up is built (AUD-13, below). Still owed: mounted work and green volumes, the extent-backed green
 > chain, pipelined and hedged merge records.
 
-> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. **Since 2026-11-09 the wait is bounded:** each pending green counts its attempts, one a period, and past the failover SLO's worth of periods it is given up on, every verb on it answering `NotRecovered { cause: TakeoverIncomplete { waited_on } }` with the branch it waited on (`catalog`, `chain`, `inputs` since 2026-11-18, `placement`, `refused`), counted `merge.takeover_given_up`; before, each branch retried without end (GAPS 2026-11-09). Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A volume of another role already recorded under the green's id is refused `AlreadyExists`, never rebuilt over (a `debug_assert!` before 2026-11-18). A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. **Since 2026-11-09 the wait is bounded:** each pending green counts its attempts, one a period, and past the failover SLO's worth of periods it is given up on, every verb on it answering `NotRecovered { cause: TakeoverIncomplete { waited_on } }` with the branch it waited on (`catalog`, `chain`, `inputs` since 2026-11-18, `placement`, `refused`), counted `merge.takeover_given_up`; before, each branch retried without end (GAPS 2026-11-09). Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
 >
 > **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
 >
@@ -9628,7 +9832,10 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
 > that exits nonzero on both sides is a failed workload, never an identical one. Since A-293 the Linux lane runs the
 > roster over the daemon's own FUSE mount (`slates mount`, unprivileged), the route an agent's tools take, rather than
-> through the root NFS adapter. Owed: the Windows WinFsp roster.
+> through the root NFS adapter. Since A-300 the Windows lanes run the four over the WinFsp drive through Git for
+> Windows' shell, judged against NTFS with the drive's one stated difference: it makes no hard link (WinFsp's driver
+> refuses one), so a local clone copies there where NTFS links, and the three lines that count a clone's links are
+> recorded with both sides. Owed: the roster's other workloads on Windows.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -9648,7 +9855,7 @@ field.
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
 | Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
-| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host; incremental builds reuse artifacts | nightly, release |
+| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host (on the WinFsp drive, which makes none, a stated difference: A-300); incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
 | Concurrency | Prove lock-free cores and schedules | loom (cores), shuttle (schedules), TSan, Miri | All explored interleavings keep invariants; no data race; no UB | CI (loom, Miri), nightly (shuttle, TSan) |
@@ -14690,7 +14897,15 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
   - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
-    (`ERROR_INVALID_FUNCTION`).
+    (`ERROR_INVALID_FUNCTION`). **Amended by A-275 (2026-11-09):** a volume symlink is the Windows symbolic link, so
+    the reason stands for generic reparse data (REPARSE) and no longer for symbolic links, with three differences a
+    POSIX link brings, each stated in A-275: a link holds no data stream of its own (SYMLINK-DATA); a link POSIX made is
+    a file link, whatever its target; and a link relative to the drive's root (`\x\y`) is kept relative to its own
+    directory, so moved, it reaches what that path names from its new directory, where NTFS keeps it naming `\x\y`.
+    And who may make one is NTFS's rule judged by the drive, with one deviation: under Developer Mode it allows a
+    program without the privilege that writes a link's reparse buffer itself without
+    `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, since that flag never reaches a file system (`CreateSymbolicLinkW`
+    refuses such a caller itself, so its callers get NTFS's answers).
   - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
 - **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
   `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
@@ -16033,6 +16248,8 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   overlay's base names its directories by its own host's handles, so the clone of the server's overlay was refused
   `ContentUnavailable`, pinned or not, on a fleet node and on a standalone daemon alike (the volume core's own overlay
   clone, `a_clone_of_an_overlay_snapshot_reads_the_same_base`, is not reachable through the daemon). Recorded in GAPS.
+  (Since 2026-11-18 the daemon clones an overlay, §4.4 clone's status; this alternative stays rejected for the
+  reasons below.)
 - **Rejected: `land GREEN TARGET` building a hidden view.** A grant binds a presented manifest, and the presentation
   and the granted landing are two calls; a view rebuilt for each would need its manifest proven stable, and a kept one
   would be state the user never named.
@@ -16535,9 +16752,78 @@ Applied in the same change to:
 - **Open.**
   - A second loss of the green's owner needs the ledger-prefix transfer (GAP-A9-7).
   - The cross-region case is owed a test.
-  - The route has no end for a work whose owner died. Only a volume's owner writes its tombstone, and a work never
-    comes back, so its adopted catalog record is kept placed for as long as the fleet runs: a store with no bound,
-    which CLAUDE.md §2 bans. How it should end is reserved for Ada (GAPS, A-255's entry, 2026-11-17).
+  - ~~The route has no end for a work whose owner died~~: ended by A-288 (2026-11-17). A route is kept while the
+    green's owner holds a completion only the route can reach, then its adopter retires it.
+
+### A-288 — A work's route ends once its green's owner holds no completion the route can reach (accepted and built 2026-11-17; amends A-255; the supervisor's option A)
+
+Applied in the same change to:
+- `crates/merge`: `chain_entry` version 3: a completion names its submitting work when the client was on another node.
+- `crates/db`: `CompletionRecord::work` (appended); `Partition::completions_routed_by`, kept beside the windows and
+  released by the acknowledgement that releases the completion.
+- `crates/anchor`: `LAYOUT_VERSION` 8.
+- `crates/server`:
+  - `MergeRecordValue` format 2 (`SubmitCompletion::work`); `record_taken_over_completions` records the work;
+  - `work_route` (the keeper, its question on fleet stream 25, and the retirement);
+  - `takeover::record_adoption` wakes the keeper, and `forget_owner_on_every_shard`;
+  - `fleet::retire_shard_tombstones` drops the owner's own copies of a retired object's registers.
+- The test `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` (red on main 7c6faee27 and
+  dbf53afa2: retired false, counted 0; green with the fix, both routes retired, counted 2), §4.16's status, GAPS, and
+  `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
+- The second piece, the same day: `work_route::held_completions` answers for a green its shard holds `unrecovered`, and
+  `work_route::nudge` is public for a test that plants a route. The test
+  `a_route_to_a_green_its_successor_gave_up_on_is_retired` (red: the route kept, all 111 questions refused).
+
+- **What was there.** A-255 made a work's catalog record, which names its green, the route a resend of its submit
+  takes after the work's owner is taken over. Its adopter keeps it placed (`fleet::owed_adopted_work_catalogs`). Nothing
+  ever retired it: only a volume's owner writes its tombstone, and a work never comes back to have one. Every work alive
+  at an owner's death was held by its adopter and every holder for as long as the fleet ran, a store with no bound
+  (CLAUDE.md §2 item 8).
+- **The rule.**
+  - A route is kept exactly while the green's owner retains a completion that a resend can reach only through it.
+    RIFL keeps a completion until its client acknowledges it, and moves it with its object (Lee et al., SOSP 2015, §3),
+    so the route lives as long as those records.
+  - Only a client on another node than the work's owner reaches its completion through the route. A client of the
+    owner's own node resends to that node, which answers from the records it made, since its partition still holds the
+    work. If the node is gone, so is the client. So a merge record names the submit's work only for a forwarded submit.
+    This is what ends the commonest route, a work its own owner's clients submitted from.
+  - The green's successor records each such completion under its work, durably (`CompletionRecord::work`). Its
+    partition counts what each work still has (`Partition::completions_routed_by`), and the acknowledgement that
+    releases the last ends the count.
+  - The route's adopter asks the green's owner every record period, for the works whose routes it keeps, whether any is
+    still held (`work_route::Question`, fleet stream 25). Only the green's shard answers, and only once its count is
+    final: once it serves the green, or holds it `unrecovered`, since a takeover given up after the failover SLO's
+    attempts recorded no adopted completion and never will. A green pending materialization, owned elsewhere or not
+    found gives no answer, and the route stays.
+  - A work answered "none" moves from the adopter's pending catalogs to its pending tombstones, at sequence 1, where the
+    work's own destroy would have closed its registers. AUD-29-43's two stages then drop every holder's copy. When the
+    tombstone retires, the owner drops its own copies of both registers too: a successor had kept its takeover's
+    acceptors and its placement of an adopted catalog for good, for a destroyed taken-over volume as well.
+  - The keeper is its own task, parked while its node keeps no route, so a slow question never holds the record
+    plane's coordinator and an idle node takes no wakeup for it. A question names at most as many works as fit one
+    fleet frame (71). An owner that leaves one question unanswered is not asked its green's others that period, so a
+    pass spends at most one liveness budget on it, however many routes lead there.
+- **Rejected.**
+  - (B) A cap per adopter, the oldest route retired first. It refuses a resend that could have been answered.
+  - (C) Leaving the store unbounded.
+  - Counting every adopted completion, a local client's too. That is the literal "holds no completion", but a local
+    client's completion of a dead owner is never acknowledged. Its route would never end, for the commonest work.
+  - Judging a completion by whether the council still holds its client's node as a member. A restarted node is a new
+    member, and its old id is retired before the new one is admitted (`fleet::LearnedOutcome::Restarted`, from
+    reading). A route retired in that gap refuses a resend its surviving client is owed.
+- **Open.**
+  - A green destroyed (a given-up one too, which is then neither served nor `unrecovered`), or lost to a second
+    takeover it cannot survive (GAP-A9-7), while a route to it is kept leaves that route held: the green has no owner
+    to answer.
+  - ~~A green its successor gave up on keeps a route to it~~: ended the same day. Its shard answers for a green it
+    holds `unrecovered`, from its partition's count (`a_route_to_a_green_its_successor_gave_up_on_is_retired`).
+  - A completion its client never acknowledges keeps its route, as it keeps the record itself. This covers a client of
+    another node that died, and one that never writes to the green again. Only an acknowledgement or a client lease
+    ends either, and RIFL's client leases are not built.
+  - An adopter that restarts warm gets its holder copies back but not the routes it kept (`pending_catalogs`), so it
+    neither re-places nor retires them. This is A-255's own gap, found by reading; no test shows it yet.
+- **Wire.** A merge record of format 1 and a chain entry of version 2 are refused typed. An older segment is refused at
+  layout 8. A peer of an older build does not answer the route's question, which it does not know, so the route stays.
 
 ### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
 Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
@@ -16557,6 +16843,150 @@ Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cl
 - **Proven** on this Mac by two tests that failed on the old order: `a_refused_second_anchor_leaves_the_live_instance_its_segment_and_its_bytes`
   (across processes: a live anchor and its daemon, a second anchor refused, the daemon killed, its successor adopting the
   segment by name and reading the file back) and `a_refused_second_daemon_leaves_the_live_ones_segment_in_place`.
+
+### A-275 — A volume symlink is a Windows symbolic link: the WinFsp drive serves reparse points (accepted 2026-11-09, the supervisor's pick)
+Applied in the same change to: A-209 (amended: REPARSE and SYMLINK), §4.5 (the inode's kept Windows bits), §4.6 (the
+Windows conformance status), §4.8 (image version 26, delta version 9: 27 and 10 when built on 2026-11-09, which left
+26 and 9 to A-270; A-275 landed first, on 2026-11-17, so it took them), GAPS, `docs/wip/conformance.md`, the winfstest
+list (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`, 355 to 382 entries) and its record,
+`crates/vfs` (`inode::WindowsAttributes::LINK_DIRECTORY`, `kept`, `from_image`; `IMAGE_VERSION`, `DELTA_VERSION`),
+and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`'s walk and `file_info`'s tag in
+`host.rs`; the slots and exports in `ffi.rs`).
+- **What was missing.** The drive served no reparse point, so every `CreateSymbolicLinkW` answered
+  `ERROR_INVALID_FUNCTION`, a link made on Linux showed on Windows as a reparse point Windows could not follow, and
+  winfstest's `t/reparse/02.t`, `03.t` and `t/streams/04.t` stopped at their first link. Git for Windows
+  (`core.symlinks`) and npm make links this way.
+- **The rule.** A volume symlink is the Windows symbolic link; there is no second kind of link. The drive sets WinFsp's
+  `ReparsePoints` (bit 4 of `VolumeParams`, `fsctl.h` v2.1) and fills its four reparse slots. Windows follows a link
+  through WinFsp's own resolver (`FspFileSystemResolveReparsePoints`, and `FspFileSystemFindReparsePoint` when a path's
+  walk fails, as memfs's `GetSecurityByName` does), which asks the shard for each component's link by name without
+  following it. `FSCTL_GET_REPARSE_POINT` is answered with an `IO_REPARSE_TAG_SYMLINK` buffer made from the volume's
+  target. `FSCTL_SET_REPARSE_POINT` with a symbolic link's buffer, on the empty file or directory `CreateSymbolicLinkW`
+  has just made, replaces it with a volume link at its name, keeping its attribute bits; `FSCTL_DELETE_REPARSE_POINT`
+  turns a link back into an empty file or directory. Generic reparse data (every other tag) is its own change, owed
+  after named streams; it still answers `STATUS_INVALID_DEVICE_REQUEST`, as every reparse request did before.
+- **1. A link's type.** A Windows link is typed: a directory link carries `FILE_ATTRIBUTE_DIRECTORY` and is removed by
+  `RemoveDirectory`, a file link by `DeleteFile`. A volume symlink is untyped.
+  - A link Windows made keeps the type it was created with: the empty object `CreateSymbolicLinkW` made is a directory
+    for `SYMBOLIC_LINK_FLAG_DIRECTORY`, and the link that replaces it keeps `FILE_ATTRIBUTE_DIRECTORY` in A-262's
+    `Inode::windows`, whose kept set admits that bit for a symlink alone (`WindowsAttributes::LINK_DIRECTORY`). It
+    reports `DIRECTORY | REPARSE_POINT` (0x410), a file link `ARCHIVE | REPARSE_POINT` (0x420), as `t/reparse/03.t` and
+    `02.t` expect.
+  - A link POSIX made has no type and is presented as a file link, whatever its target is, and stays one when its target
+    changes type. This is how Samba presents a link opened as itself (`fdos_mode` reports `FILE_ATTRIBUTE_REPARSE_POINT`
+    for `S_IFLNK`, never `DIRECTORY`; samba master 9ae24f2f, `source3/smbd/dosmode.c` 729-746). WSL types a link by its
+    target only when it makes the NT link itself, and only for a target that exists (release notes, build 17046;
+    microsoft/WSL 2183822c, `test/windows/wsl/DrvFsTests.cpp` 160-191); Git for Windows makes a typeless link a file link
+    and recreates it as a directory link once its target exists as one (`compat/mingw.c`, `create_phantom_symlink`,
+    `process_phantom_symlink`), which on this drive sets the bit as any directory link does. The type decides only how
+    the link is removed and listed: WinFsp follows a file link into a directory, "contrary to NTFS" (its traverse check
+    in `src/dll/security.c`, and its resolver, which reads no link's type), so nothing a POSIX link names fails to
+    resolve on the drive. Deriving the type from the target at each lookup was rejected: it costs a resolution per link
+    in every listing, and Windows keeps a name's information until told (`FileInfoTimeout` infinite), so a target's
+    change of type would leave the link's reported type stale with no notification to correct it. Promoting a link the
+    drive finds pointing at a directory, as Git for Windows promotes its own, was rejected too: the drive would write the
+    volume on a lookup, which a read-only attachment refuses and which a publication would then carry; Git for Windows
+    promotes by recreating the link with `SYMBOLIC_LINK_FLAG_DIRECTORY`, which the drive keeps. When a target later
+    changes type, no link's type follows it: a POSIX link stays a file link, and a Windows link keeps the type it was made
+    with, as on NTFS.
+- **2. Separators (R8: one volume, one meaning).** A relative target is stored with `/` and presented to Windows with
+  `\`, as Git for Windows writes a link (`mingw_create_symlink`) and reads one (`normalize_ntpath`), and as WSL's DrvFs
+  does both ways (`drvfs.c` 3524-3570). A Windows link relative to the drive's root (`\x\y`) is stored as the path to the
+  same object from the link's own directory (`../../x/y` for a link at `\a\b\link`), which resolves to that object on
+  every platform; Windows reads it back in that form. This is a stated difference: POSIX has no form relative to a
+  volume's root, so a moved link of this form reaches what its path names from its new directory, where NTFS keeps it
+  naming `\x\y` (`a_link_relative_to_the_drives_root_follows_its_directory_when_moved`: moved one directory deeper, the
+  link reaches `\a\x\y`). `CreateSymbolicLinkW` never makes this form (it makes a rooted target absolute); only a
+  program that writes the reparse buffer itself does. Every other target is presented as given and resolves only where
+  it means something: a POSIX-absolute one (`/usr/bin`) is shown to Windows unchanged with flags 0 and resolves to
+  nothing on the drive; a Windows-absolute one keeps the Win32 path of its `\??\` substitute (`C:\x`, or `\\srv\share\x`
+  for `\??\UNC\srv\share\x`), which Linux and macOS read unchanged and do not resolve. Any other absolute NT form
+  (`\??\Volume{…}\`, `\Device\…`) has no Win32 path and is refused `STATUS_IO_REPARSE_DATA_INVALID`. The lossy case: a
+  POSIX name holding `\`, which Windows takes for a separator, so `a\b` reads on Windows as two components and `C:\x` as
+  a drive path; neither reaches what Linux meant, and Windows cannot name such a file in any case. Samba sends a
+  relative target's `/` unchanged (`read_symlink_reparse`, `source3/smbd/files.c` 859-922); slates converts, since its
+  drive is followed by WinFsp's resolver, which splits at `\` alone.
+- **3. Privilege: NTFS's rule.** Making or removing a symbolic link asks for `SeCreateSymbolicLinkPrivilege`, unless
+  Developer Mode is on (Microsoft Learn, CreateSymbolicLinkW, `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, which Git
+  for Windows passes, `adjust_symlink_flags`). WinFsp's own check (`ReparsePointsAccessCheck`, `SeSinglePrivilegeCheck`
+  in `src/sys/fsctl.c` 231-240, v2.1) was measured refusing Developer Mode's unprivileged create: a token with no
+  privilege, the flag passed and Developer Mode on (`AllowDevelopmentWithoutDevLicense` 1), answered
+  `ERROR_PRIVILEGE_NOT_HELD` (diagnostics run 42712321599). memfs, airfs and WinFsp's FUSE layer leave the check off, which
+  would make the drive looser than NTFS. So the drive judges it:
+  - WinFsp passes the caller's token only on a Create or Open (`Req.Create.AccessToken`; no FSCTL carries one). Only for
+    one that could become a link does the receiver read it: from user mode, opening a reparse point itself
+    (`FILE_OPEN_REPARSE_POINT`, as `CreateSymbolicLinkW` opens the object it makes a link) and asking an access a link's
+    set needs (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_ATTRIBUTES`, or a generic or maximum right granting
+    one; `Request::could_become_a_link`). Every other open costs no token query. The receiver reads the token's
+    privileges while WinFsp keeps it live, and keeps the open as one that may make a link if the token holds the
+    privilege enabled, as NTFS's check asks (`crate::dispatcher::may_link`). That table is bounded by the drive's open table, since each entry is one
+    of its live opens, and an entry is dropped at its Close; an open a successor restored after a takeover has none, and
+    is judged unprivileged unless Developer Mode is on.
+  - A symbolic link's set or delete is allowed if its open was kept so, or if Developer Mode is on, read from the registry
+    at the set. Otherwise it answers `STATUS_PRIVILEGE_NOT_HELD`, which Windows reports as `ERROR_PRIVILEGE_NOT_HELD`,
+    NTFS's answer.
+  - Stated deviations from NTFS. (a) WinFsp never passes `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` to a file
+    system, so under Developer Mode the drive allows a program without the privilege that sets a link's buffer itself
+    (`FSCTL_SET_REPARSE_POINT`) without that flag, where NTFS may refuse it. A `CreateSymbolicLinkW` caller never meets
+    this: `CreateSymbolicLinkW` itself refuses a caller without the privilege that did not pass the flag, before any file
+    system is asked, so on its path the drive answers as NTFS in every case measured (a token with no privilege, the
+    flag and Developer Mode each off and on: `ERROR_PRIVILEGE_NOT_HELD` three times and the link made once, on the
+    drive and on the runner's NTFS alike, diagnostics run 42715955734). (b) The privilege
+    must be enabled in the token at the open, where NTFS asks it enabled at the set. `CreateSymbolicLinkW` enables it
+    around its whole operation, before its create, so on that path the two agree; a program that never enables it is
+    refused, as on NTFS. Only a program that enables it after its open and before its `FSCTL_SET_REPARSE_POINT` is
+    refused where NTFS allows it: stricter, and safe (`a_raw_link_set_needs_the_privilege_enabled_at_its_open`).
+    (c) A link set through an open made without `FILE_OPEN_REPARSE_POINT` or a write access, or through one a
+    successor restored after a takeover (which kept no token), is judged as one without the privilege: allowed under
+    Developer Mode alone.
+  - Measured on the runner by `a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused` (`ERROR_PRIVILEGE_NOT_HELD`,
+    no link left), `a_link_is_made_by_a_caller_holding_the_symlink_privilege`, and
+    `a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag` and
+    `a_raw_link_set_needs_the_privilege_enabled_at_its_open`, on the final build (diagnostics run 42720006662), with
+    Developer Mode on and then off: `CreateSymbolicLinkW` without the privilege and without the flag, 1314 and 1314;
+    with the flag, made and 1314; with the privilege, made; a raw set with the privilege held but disabled, made (the
+    deviation (a)) and 1314; enabled before its open, made and made. The NTFS control (the same token and
+    flags on the runner's own disk, Developer Mode off and on) gave the same four answers as the drive. The daemon holds no privilege (R10).
+- **4. Absolute targets and SymlinkEvaluation.** The daemon never follows a link. WinFsp's driver completes every link
+  its resolver returns by rewriting the file object's name and answering `STATUS_REPARSE` with `IO_REPARSE`, for a
+  relative link (prefixed with the volume's name) and an absolute one alike (`src/sys/create.c` 893-996, v2.1), so the
+  I/O manager reopens the new name under the caller's token and is never handed an `IO_REPARSE_TAG_SYMLINK` to evaluate.
+  The drive is a local disk file system (`FILE_DEVICE_DISK_FILE_SYSTEM` without `FILE_REMOTE_DEVICE`,
+  `src/sys/volume.c`); Windows reports it a "Fixed Drive" (`fsutil fsinfo drivetype`). Measured on the runner (diagnostics
+  run 42712321599): the evaluation classes are L2L and L2R enabled, R2L and R2R disabled; a drive link to
+  `\\localhost\C$\Windows\win.ini` is followed. With `fsutil behavior set SymlinkEvaluation L2R:0` (which `fsutil behavior
+  query` then reports DISABLED) the drive link was still followed, but so was the same link on the runner's NTFS, so the
+  setting did not take effect on the running system and the run cannot tell the drive from NTFS there; the reason the
+  drive would not apply it either is WinFsp's rewrite, read in its source above.
+- **The stored form's cost, and the format bump.** The directory bit lives in the inode's existing `u16`: no inode,
+  wire, archive or layout change. But an earlier reader would drop the bit without a word and show a directory link as
+  a file link, so the image (version 26) and the delta (version 9) are bumped, and a reader of another version refuses
+  them typed rather than read them as its own (the version-refusal tests in `crates/vfs/tests/checkpoint_log.rs`). FUSE,
+  NFS and FSKit read and make links as before and never see the bit.
+- **Crash behaviour.** A set or delete is one shard request that removes the object and makes its replacement, then
+  publishes once (§4.8, D-18): no publication shows the name missing or holding both, so a crash leaves the old object or
+  the link, never neither.
+- **Limits, each answered by its status.** The print name is derived, not kept. A file with bytes cannot become a link
+  (`STATUS_DIRECTORY_NOT_EMPTY`). A link holds no bytes of its own: a write or read through a handle opened on the link
+  itself is refused (`ERROR_INVALID_PARAMETER`; NTFS and memfs keep a data stream beside a reparse point;
+  `t/reparse/02.t` cases 15 and 16, listed SYMLINK-DATA). The open that set the link keeps the object it opened, now
+  unlinked, as a POSIX open of an unlinked file does; WinFsp drops what Windows cached of the name after the set
+  (`FspFsvolFileSystemControlReparsePointComplete` invalidates the node's information), so the next open finds the link.
+- **What winfstest says** (diagnostics run 42695804063, windows-latest, 733 cases): the links let 105 cases run that
+  never ran. With the 3 listed cases they unlocked (02.t:1, 03.t:1, streams/04.t:9), 78 pass and 30 are listed, none a
+  defect: 02.t 39 of 41 (15 and 16, SYMLINK-DATA), 03.t 26 of 26, streams/04.t 13 of its cases 9 to 49 (28 listed
+  STREAMS, each through a `name:stream` path). The list goes from 355 to 382, recorded from diagnostics run 42720006662 on the final build (733 cases, 382
+  expected, 0 unexpected, 0 listed-now-passing).
+- **Proven** by `symbolic_links_made_through_the_drive_are_followed_and_read_back` and
+  the three privilege tests and `a_link_relative_to_the_drives_root_follows_its_directory_when_moved`
+  (`crates/cli/tests/winfsp_semantics.rs`, on CI's Windows
+  runner; the first red on main, `ERROR_INVALID_FUNCTION` at the first `CreateSymbolicLinkW`, and red with the four
+  reparse callbacks removed, `Incorrect function.` at the first `CreateSymbolicLinkW`, diagnostics run 42712321599), `a_symlink_keeps_the_directory_bit_that_makes_it_a_windows_directory_link`
+  (`crates/bridge-core/tests/volume_bridge.rs`; on main the reply read 2 where 18 was set),
+  `windows_attributes_survive_an_image_and_a_rebuild` (`crates/vfs/tests/recover.rs`; with the old image mask the
+  rebuilt volume read 2, not 18), the version-refusal tests, the buffer's ten tests in `crates/bridge-winfsp/src/symlink.rs`
+  (its layout built field by field from MS-FSCC 2.1.2.4; hostile buffers refused; the separator rule and its lossy case),
+  and winfstest judged against the 382-entry list.
 
 ### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
 Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
@@ -20782,6 +21212,8 @@ Applied in the same change to:
   Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
   prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
   could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+  (A-285 was revised the same day: write permission follows the agent's mode, and the launcher, the issuer's holder,
+  approves.)
 - **Piece 3, the same day** (kiln's asks, g263): `mount::available() -> Result<MountKind, MountFault>`, the machine's
   mount mechanism with no daemon (macOS: `mount(2)`, always; the BSDs: `mount_nfs` on the `PATH`; Linux:
   `fusermount3` on the `PATH` and a `/dev/fuse` the user may read and write; Windows: WinFsp's library loads), each
@@ -20902,7 +21334,8 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   Mercurial and Subversion already. The live-guest job requires each new workload's `Identical` line.
 - **Owed.** The Windows WinFsp roster: WinFsp's driver has no hard links (its NTFS compatibility page lists them
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
-  WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
+  WinFsp reparse points, which the drive does not serve yet. **Built by A-300 (2026-11-17)**, the drive serving
+  reparse points since A-275, and the missing hard links a stated difference of the route. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
 
 ### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
@@ -20966,48 +21399,197 @@ Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip
   mount and a file's second name to two links (gated on a built CLI, run in CI's Linux conformance step). The roster's
   runs over the mount are the supervisor's (CLAUDE.md §8).
 
-### A-285 — A grant is signed by a key only the human holds; the anchor's own terminal is the fallback, on every OS (accepted 2026-11-18, Ada's decision; piece 1 built 2026-11-18)
-Applied in the same change to: D-22 (A-285 line), §4.13 "Grants" (status), GAPS (2026-11-18 entry),
-`crates/server/src/grant_signature.rs`.
-Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested). Owed, in order: the presentation's
-nonce, the signed `Grant` on the wire and the nonce spent once (replay); durable key registration (the first key only
-through A or kiln's person path, later keys signed by a registered key); `slates grant` signing through `ssh-keygen -Y
-sign` and A's terminal prompt; the exported-variables issuer surface removed on macOS and Windows (which closes
-GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use path recorded; the WebAuthn form verified.
-- Why: before, the anchor held the grant-issuer secret. On Linux it sat in a descriptor only the anchor's children
-  inherit, so no `slates grant` could be issued and a Linux server's landing stopped at its presentation (GAPS, A-201);
-  on macOS and Windows the anchor printed `export` variables, and any process of the user that held them could grant,
-  agents included. fs-server's options (2026-11-05):
-  - A. The anchor asks on its own controlling terminal, naming the exact manifest. Small and on every OS, but R10 rests
-    on who owns that terminal: an agent that started the anchor in its own shell can answer.
-  - B. A same-user socket to the anchor checked by `SO_PEERCRED`. Any process of the user, agents included, can
-    grant; it breaks D-22. Rejected.
-  - C. A separate operator account owns issuance (the peer's uid is checked). Strong and unprivileged, but a setup per
-    machine and the human switching accounts for each grant.
-  - **D. A grant signed by a key only the human holds**: an ssh-agent key added with `ssh-add -c` (the agent asks the
-    human through askpass on every use) or a FIDO key (`sk-ssh-ed25519`, a touch per signature). An agent with a shell
-    cannot make the signature unseen.
-  - E. Standing grants in a file the human writes. It weakens R10 to a policy, and agents must not be able to write
-    the file.
+### A-285 — Write permission follows the mode the user gave the agent; signed work is provenance, never the permission gate (accepted 2026-11-18, Ada's decisions; revised the same day)
+Applied in the same change to: R10 (CLAUDE.md §1 and Part 1's rule table), D-22 (A-285 line), §4.13 "Grants" (status),
+GAPS (2026-11-18 entry), `crates/server/src/grant_signature.rs` (module docs).
+Status: a volume's write policy and landing under it are built (2026-11-18): the wire (`WriteAct`, `WriteMode`,
+`WritePolicy`, `PolicySubject`, `SetPolicy`, `Policy`, `Refusal::PolicyForbids`), the policy an appended field of the
+volume's record (`PolicyRecord.write`, op `VolumeWritePolicySet`), set only under the issuer and never from a
+consumer-bound channel; a landing under it, on every Unix host: forbid refuses before any host access, ask answers the
+approval request a launcher's grant approves, bypass grants the planned presentation itself (`GrantSurface::Policy`)
+and lands it in the same request (`landing::land_under_policy`). Built the same day: `Present`, a landing presented and
+never landed whatever the mode (a reviewer's read of a bypass volume's changes writes nothing); merges under the policy,
+the stricter of the work's and the green's merge mode, forbid refused before the seal, ask answered
+`MergeApprovalRequired` with the increment's identity and its path count and merged by `SubmitApproved` under the
+launcher's proof of exactly that identity (`landing::merge_approval_proof`), a volume with no merge mode set merging at
+once as every merge did before policies. Built the same day: every launcher-class proof (grant, policy, merge
+approval, enroll, revoke) verifies under the daemon's issuer secret or the launcher secret its starter handed the anchor
+(`landing::proven_by_launcher`), so a launcher keeps its authority across its own restarts and the daemon's; and a
+`SetPolicy` names the policy version it replaces (`PolicyRecord.write_version`, covered by the proof), so a captured
+proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Owed, in order: a consumer's own policy, the
+MCP and SDK land verb gated by the policy, then signed work. The
+SSH-signature verifier built first (below) stays, for signed work.
+- **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
+  agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
+  prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
+  (its own prompt, an MCP elicitation, kiln's presentation), and writes once the approval comes back bound to that
+  manifest; a changed manifest is refused. A mode that forbids writing (plan): a typed refusal. The policy is carried
+  by the session's consumer or the volume and set by the launcher (kiln passes each agent's mode when it creates the
+  workspace) or the harness; the effective mode is the stricter of the two, unset is ask, and an agent can never raise
+  its own. The launcher's authority is the instance's issuer, which an agent's consumer channel never holds.
+- **Signed work (Ada: "we can (and should) support signed work").** A merge or a landing may carry an SSH signature
+  (OpenSSH `PROTOCOL.sshsig`); slates verifies it, records it as provenance and answers a typed check (verified with
+  its signer, unsigned, or invalid with its reason), and a volume can require signed merges. It never decides whether
+  a write is permitted.
+- **Withdrawn.** The same morning A-285 read R10 as a human-only proof: fs-server's options of 2026-11-05 (A, a prompt
+  on the anchor's terminal; B, a same-user socket; C, a separate operator account; D, a signature by a key only the
+  human holds; E, standing grants in a file the human writes), of which Ada first chose D with A as the fallback. Ada
+  withdrew that reading and the options (2026-11-18): agents can approve merges and landings within the mode their user
+  gave them. What was built for it and is withdrawn: the presentation's nonce and the signed `Grant` proof (piece 2,
+  d1a46ae9, reverted); never built: key registration and the terminal prompt.
+- **Kept.** The verifier (piece 1, 1c31d1c7): an SSH signature under a namespace, `ssh-ed25519` and `sk-ssh-ed25519`
+  (the user-presence flag required), `sha512` or `sha256`, Ed25519 and SHA-2 from AWS-LC (A-66), against a set of
+  keys; every failure a typed `SignatureRefusal`. Proven by 10 unit tests over a real `ssh-keygen -Y sign` vector
+  (OpenSSH 10.0p2): every single-bit flip, an unregistered key, a changed field, another namespace, an expired
+  statement, an untouched security key and hostile bytes are refused. Signed work reuses it over its own statement.
 
-  Ada chose D, with A only where no key is registered, the same on macOS, Windows and Linux (2026-11-18).
-- The proof: an SSH signature (OpenSSH `PROTOCOL.sshsig`) under the namespace `slates-grant`, over a plain-text
-  statement, one field a line: the landing, the manifest hash, the target (prefixed by its byte length), the scope and
-  term, a nonce the daemon issues with the presentation, and an expiry in Unix seconds. It covers all that the old
-  keyed proof bound. The nonce makes a signature usable once and only after the presentation. Keys: `ssh-ed25519` and
-  `sk-ssh-ed25519@openssh.com`, whose signature must carry the authenticator's user-presence flag; hashes `sha512` or
-  `sha256`; Ed25519 and SHA-2 from AWS-LC (A-66). A second form is accepted over the same bytes: a WebAuthn assertion
-  whose challenge is the statement's SHA-256, made in kiln's person session (a passkey or a security-key touch).
-- Registration is itself a grant-class act. A standalone anchor accepts its first key only through A's terminal
-  prompt. A kiln-managed anchor has no terminal; it registers and confirms through kiln's person session, a WebAuthn
-  ceremony whose public key reaches the anchor over kiln's authenticated person path, which agents cannot use (kiln
-  already refuses an agent a manifest-bearing land). This last route is the supervisor's direction, put to Ada as a
-  recommendation (2026-11-18). Each later key must be signed by a registered key. No agent channel can add a key.
-- Proven (piece 1): a real `ssh-keygen -Y sign` signature (OpenSSH 10.0p2) verifies; every single-bit flip of it is
-  refused; an unregistered key, a changed manifest or any other changed field, another namespace, a statement past its
-  expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
-  panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
-  the exact encoding, since the first vector was signed before the target gained its length prefix.
+### A-299 — The consumer contract: write modes per act, typed outcomes, typed conflicts and drift, signed work, one closed error taxonomy, a contract version a consumer pins (accepted 2026-11-18, Ada's widening of goal g262; piece 4, the contract published, built 2026-11-18)
+Applied in the same change to: §4.12 ("Embedding": what a host holds, its refusals and its versioning; "The consumer
+contract", new, with its status), GAPS (the A-299 entry and the Embedding library row), `docs/library.md`.
+- `crates/api`: `policy.rs` (new: `WriteMode`, `WriteAct`, `WritePolicy`, `PolicySubject`, `PolicyRefusal`,
+  `PolicyReason`), `signed.rs` (new: `WorkSignature`, `Verification`, `Signer`, `SignerKey`, `SignatureFault`),
+  `outcome.rs` (new: `LandOutcome`, `MergeOutcome`, `RebaseOutcome`, `Approval`, `Awaiting`, `Work`, `Summary`,
+  `ActionTally`, `LandingReport`, `LandingState`, `LandingConflict`, `MergeConflict`, `MergeConflicts`), `volume.rs`
+  (new: `VolumeSpec`, `Source`, `Provisioned`, `VolumeStatus`, `BaseState`, `DriftReport`, `Drift`, `DriftKind`,
+  `Watcher`), `error.rs` (rewritten: the classes and their details, `Note`, `MountMissing`, `Unreported`; every enum
+  closed), `instance.rs` (`provision`, `read`, `land`, `plan_landing`, `approval_entries`, `approve`, `merge`,
+  `rebase`, `retry_pause_ns`; `create`, `clone_snapshot`, `land` under a grant id, `land_approved`, `LandingPlan`,
+  `Planned` and `Approved` removed, replaced), `lib.rs` (`CONTRACT`; `overlay` and `scratch` replaced by
+  `VolumeSpec::overlay`, `VolumeSpec::empty`), `grant.rs`, `issuer.rs`, `start.rs` (the launcher's authority),
+  `mount.rs` (typed missing pieces), `Cargo.toml` (`slates-merge`), `tests/api.rs`, `tests/start.rs`.
+- `crates/cli/src/verbs.rs`: `failure_of_api` maps the taxonomy's classes to the command's exit codes; the Windows
+  unmount names each unreported volume from its typed refusal.
+
+- **Why.** Ada (2026-11-18): "merge and write to disk permissions need to reflect those granted by the user to the
+  harness/agent seeking to merge their write to disk. Part of your work is figuring out and building a correct, robust,
+  performant API with typed responses and errors that consumers can consume (Kiln is a consumer) to act upon this. This
+  also applies to handling merge conflicts, permission errors, provisioning/managing volumes, and other interactions."
+  And the rule of the same day: agents can approve merges and landings; bypass writes, ask returns a typed approval
+  request, forbid a typed refusal; no keys, no signatures, no person-only proofs; the launcher or the harness sets a
+  session's or a volume's policy, and an agent can never raise its own. And, later the same day: "we can (and should)
+  support signed work (signed merges, etc.)": a merge or a landing may carry a signature, its outcome a typed
+  verification, and a volume's policy may require signed merges; signatures never gate permission.
+- **Before.** `slates-api` answered the wire's `Refusal` (with free text in a dozen variants), the client's own
+  `ClientError`, a landing's plan with its conflicts as `"path (Class)"` strings, a summary counting actions by name,
+  an outcome's state as a word, a drift list of `"path (Kind)"` strings with an unreadable base reported as a drift
+  entry `"status refused: ..."`, a merge window's class as a byte, and enums a consumer had to match with a wildcard.
+  A consumer acting on any of it parsed text.
+- **The shape.** One class per thing a consumer does (the table in `error.rs`), with the refusal's own data typed in
+  its detail; where the daemon or the OS spoke in prose only, a `Note`, displayed and never matched. The mapping from
+  the wire is one exhaustive match, so a refusal added to the wire cannot compile until it has a class. `NotFound`
+  names the subject the call named, which the bare wire refusal does not. Outcomes are enums of what happened —
+  written, awaiting approval, conflicted, refused — and the refusal a policy makes is an outcome, not an error: in a
+  forbid mode it is the expected answer. A landing whose presentation found conflicts answers them typed, read from
+  the presentation's own entries (A-287), never parsed. An unreadable base is a state of the status, never a failure of
+  it, so a mount still reads the daemon's port.
+- **Closed, and versioned for a pinning consumer.** The A-278 crate's enums were `#[non_exhaustive]`, which forces a
+  wildcard and lets a new variant fall through it unhandled. Kiln vendors slates at a commit; a new variant should stop
+  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` is raised with every change: 1 as
+  first published, 2 the same day for `Denied::Policy` (the class `Refusal::PolicyForbids` maps to outside a landing or a
+  merge, defined before A-285's owner appends that refusal, so its arm in the exhaustive table is mechanical).
+- **Write permission, split between the crate and the daemon.** The modes are enforced where agents reach slates — the
+  daemon, through the MCP server, the SDKs and the mounts as much as this crate — so the daemon keeps them (A-285's
+  owner). The crate publishes the types now so kiln's agents (g263–g266) build against them. Until the daemon's side
+  lands, every landing with something to write asks (today's behaviour, a grant per landing) and `approve` grants it
+  with the launcher's issuer, binding exactly the manifest shown; a signed act is refused `Unsupported(SignedWork)`
+  before anything is sent, and every outcome reports `Unsigned`, which is true.
+- **Rejected.** A merge's conflicts carrying the work's base from the handle a consumer holds: the daemon knows the
+  base, a handle can be stale, and the wire carries it next (owed). A paged listing faked over the one-reply list: the
+  daemon answers every volume in one reply today, and a page the daemon did not cut would hide that cost; the paged
+  verb is owed. Policy verbs that could only refuse until the daemon keeps policies: left out until they work.
+- **Piece 5, the same day** (over A-285's policy wire, 203ad8fa): `Instance::set_write_policy` (the launcher's
+  `Issuer` proves `slates_server::landing::policy_proof` over the subject and policy) and `Instance::write_policy`;
+  `PolicyForbids` answered as a landing's or a merge's `Refused` outcome and as `Denied::Policy` elsewhere (A-285's
+  owner added the variant's arm the same hour, and the two definitions were one); the API's policy converted to and
+  from the wire's, its signed-merge requirement refused before sending; `plan_landing` refusing a bypass volume until a
+  present-only verb exists; `CONTRACT` 3. Applied to `crates/api/src/{policy,issuer,instance,error,lib}.rs`,
+  `tests/api.rs` (`a_landing_follows_its_volumes_write_mode`), §4.12's status, GAPS, `docs/library.md`.
+- **Piece 6, the same day:** the audit log and the grant listing typed (`observe.rs`: `AuditRecord`, `AuditKind`,
+  `LandingStage`, `GrantRecord`, `GrantState`), read from the daemon's closed name tables in one place; `CONTRACT` 4.
+  Checked by unit tests over every word and a stranger, and by use: after a landing the audit holds the presentation,
+  the issued grant and the landing finished `Done`, and the single-use grant is listed `Consumed`.
+- **`CONTRACT` 5, the same day:** `WritePolicy::UNSET` merges at once and asks for landings (it read ask for both).
+  The daemon applies an unset policy so (A-285's owner raised it): R10 asks for a write to disk, while a merge changes
+  memory, and every submit merged at once before write modes existed, kiln's included.
+- **`CONTRACT` 6, the same day** (over A-285's present-only verb and merge approvals, 1242c7d9, whose placeholder in
+  `merge` it replaces): `Approval` split into `LandingApproval` and `MergeApproval`, so no outcome can hold an approval
+  of the other act; `approve` into `approve_landing` and `approve_merge` (the authority proves the merge with
+  `merge_approval_proof`; a changed increment merges nothing and is asked again); `merge` takes evidence;
+  `plan_landing` presents through the daemon's `Present`, whatever the mode, and its bypass refusal and
+  `Unsupported::WritePolicies` are gone.
+- **The launcher secret, piece 1 (the segment's field), the same day.** The launcher's authority must outlive the
+  launcher's own restart: handing kiln the anchor segment's descriptor (Linux keeps the segment as a memfd) would die
+  with kiln's process, after which no approval or policy could be proven without restarting the instance and losing its
+  volumes. So the launcher provides a secret of its own at every start and keeps it; the anchor publishes it into the
+  supervision block (`SUP_LAUNCHER_PRESENT` 320, `SUP_LAUNCHER_SECRET` 328, 32 bytes, beside the issuer and session
+  secrets; zero in an older anchor's segment, read as none), and the daemon verifies launcher-class proofs under it as
+  under the issuer secret (A-285's owner, agreed 2026-11-18). The issuer secret stays minted per boot: the client
+  regions' names and the boot incarnation derive from it (A-176). Built here: `AnchorSegment::publish_launcher_secret`
+  and `launcher_secret` (`crates/anchor`), with `a_published_launcher_secret_is_read_by_a_later_attachment`. Next: the
+  starter's delivery on the anchor's standard input and `Issuer::from_launcher_secret`.
+- **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
+  macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
+  CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
+
+### A-300 — The Windows lanes run git, Mercurial and Subversion over the WinFsp drive, judged against NTFS with the drive's one stated difference: it makes no hard link (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route, WinFsp among them)
+Applied in the same change to: Part 6 ("Real workloads": its row and status), §4.6 (the Windows conformance status),
+A-289 (its owed Windows roster), GAPS, `docs/wip/conformance.md`, `crates/conformance/src/workload.rs`
+(`Workload::runs_on_windows`, the Windows spellings of `normalize_output`, `StatedDifference`, `stated_differences`,
+`compare_with`, the Subversion script, `MSYS` in `ENVIRONMENT`), `crates/conformance/src/record.rs`
+(`WorkloadStatus::Stated`, `stated_note`), `matrix.rs` (a summary's stated part), `capability.rs` (the Windows
+workloads cell runnable), `xtask/src/conformance/workloads.rs` (which workloads a lane runs, the directory's plain
+form, the judgment under the route's stated differences), and CI's `windows-lint` and `windows-arm64` jobs.
+- **The decision.** The Windows lanes run the roster's version-control workloads (`git`, `git-history`, `mercurial`,
+  `subversion`) over the drive (`slates mount ID E:`): each script once in an NTFS folder of the scratch and once on
+  the drive, under the shared environment, judged by exit code, output and tree as every leg is. Git for Windows' `sh`
+  runs the scripts. The lanes install Mercurial (7.2.4, PyPI's wheel for each architecture) and Subversion (1.15.0,
+  VisualSVN's command-line zip, its SHA-256 pinned). The roster's other workloads are owed a Windows form
+  (`Workload::runs_on_windows` false): their scripts lean on tools a Windows runner lacks (rsync, rg, sqlite3, vim, a
+  watcher's inotify or FSEvents) or have not run there (cargo, npm, python).
+- **What Windows needed of the harness**, each a pure function with unit tests:
+  - Windows tools print a directory in several spellings: Python's and Mercurial's `D:\a`, git's and a Subversion file
+    URL's `D:/a`, the shell's `/d/a`, a lowercase drive letter, and a canonical path's verbatim `\\?\D:\a`. Each
+    becomes the root token (`normalize_output`), the longest first. A POSIX directory gains no Windows spelling, and
+    neither does a drive's root, whose shell spelling (`/d`) would match unrelated text. The harness starts each script
+    in the directory's plain form (`plain_path`), the one the tools print.
+  - A Subversion file URL names a Windows directory as `file:///D:/a`, so the script takes the directory from `pwd -W`
+    where the shell has it (other shells refuse the option, and `pwd` answers). Windows' `svnlook youngest` ends its
+    line with a carriage return, which the revision loop drops.
+  - Git for Windows' shell copies the target for `ln -s` by default. `MSYS=winsymlinks:nativestrict` in the shared
+    environment makes it a Windows symbolic link, and a failure where it cannot make one, as POSIX's `ln -s` does. So
+    the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
+    Every other shell ignores the variable.
+- **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
+  `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
+  parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
+  page lists hard links as unsupported. So a local git or Mercurial clone copies on the drive where NTFS links it.
+  `git-history`'s "objects with two names after the clone" line and `mercurial`'s two "store files with two names"
+  lines count links on NTFS and none on the drive; every byte the clones hold is the same.
+  - The harness states these three lines for the WinFsp route alone (`stated_differences`), each matched by the start
+    both lines share. A pair of lines that differ and both carry one stated start is recorded with both sides
+    (`WorkloadStatus::Stated`) and does not fail the suite. Any other difference fails it, and so does a stated start
+    none of whose lines differed, so the list only shrinks, as an expected-failure list does.
+  - Rejected: printing the counts only where the file system can link (it would hide the very difference the goal
+    names); and a list kept outside the code (the lines are three and fixed, and their reason belongs beside the
+    comparison that applies it).
+  - Mercurial on the drive trusts a link count only after its `checknlink` probe makes a link, so there it copies each
+    store file before appending to it. The bytes are the same, and `verify` of all three repositories holds them.
+  - Hard-linked clones and stores on the WinFsp route need WinFsp's driver to pass hard links to its file system
+    (`FileLinkInformation` and the link queries): a change upstream to a signed kernel driver, outward-facing, so it is
+    a decision for Ada. Until then the route states the difference.
+- **Proven** on this Mac (2026-11-17; the Windows lanes' first run is the supervisor's):
+  `a_windows_directory_is_the_root_token_in_every_spelling_its_tools_print`,
+  `the_drives_link_count_is_a_stated_difference_on_its_route_alone`, `a_stated_line_excuses_nothing_else` and
+  `a_stated_difference_that_no_longer_differs_fails` (`crates/conformance/src/workload.rs`);
+  `the_workload_summary_names_a_routes_stated_differences_apart` (`matrix.rs`);
+  `windows_runs_fsx_winfstest_and_the_workloads` (`capability.rs`); `the_windows_lane_runs_the_version_control_workloads`;
+  and by use `the_drives_stated_differences_name_the_lines_the_real_clones_print` (`xtask/src/conformance/workloads.rs`).
+  That last test runs the real `git-history` and `mercurial` scripts on a host whose clones link (git: 5 of 5 objects;
+  Mercurial: 7 of 9 store files, 4 after the clone's commit). It judges each against the same run as a copying clone
+  prints it: identical but for exactly one and two stated lines; a difference on a route that states nothing; and,
+  against itself, refused because no stated line differed.
+- **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
+  run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.
 
 ### A-292 — A held durable reply gives up when its holders are silent, not at a deadline (2026-11-17, built for goal g244; found 2026-11-09 by bug-sweep)
 

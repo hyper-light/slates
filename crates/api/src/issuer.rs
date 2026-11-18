@@ -1,20 +1,21 @@
-//! The issuer authority (§4.13 "Grants", R10): what lets a confirmation surface grant a landing, enroll or revoke a
-//! consumer, and confirm a consensus recovery.
+//! The issuer authority (§4.13 "Grants", R10; A-299): what lets the launcher approve a landing an agent's write mode
+//! asks about, enroll or revoke a consumer, and confirm a consensus recovery.
 //!
-//! Only an authenticated human confirmation surface holds grant-issuer authority. The daemon mints an issuer secret at
-//! every start and publishes it into the anchor's segment; a proof is a keyed hash under it of exactly what is granted
-//! (the landing, its manifest, the scope and the term), which the daemon verifies before it accepts the grant, and a
-//! secret minted by a previous daemon proves nothing to this one. So the authority is holding the segment: the anchor's
-//! own tree holds it (on Linux the segment is a descriptor only the anchor's children inherit), and on macOS and
-//! Windows a process the anchor's user gave its name to (the anchor prints the variables to export). The ring, the SDKs
-//! and the MCP server never hold it, and the daemon refuses a grant kind on their channels whatever they claim.
+//! The daemon mints an issuer secret at every start and publishes it into the anchor's segment; a proof is a keyed hash
+//! under it of exactly what is granted (the landing, its manifest, the scope and the term), which the daemon verifies
+//! before it accepts the grant, and a secret minted by a previous daemon proves nothing to this one. So the authority is
+//! holding the segment: the anchor's own tree holds it (on Linux the segment is a descriptor only the anchor's children
+//! inherit), and on macOS and Windows a process the anchor's user gave its name to. Under Ada's rule of 2026-11-18
+//! (A-299) that holder is the launcher — the host that started the instance and passes each agent its write mode — and
+//! never an agent: an agent holds only its consumer's capability, and the daemon refuses a grant kind on the ring, the
+//! SDKs' and the MCP server's channels whatever they claim.
 //!
 //! An [`Issuer`] keeps the handoff, never the secret: each proof attaches the segment, reads the secret the running
 //! daemon published, proves, and lets the mapping go, so a daemon restart between two grants is met with its own
 //! secret and the secret is held in this process only for the length of one proof.
 //!
 //! Moved here from the CLI on 2026-11-18 (A-278): `slates grant`, `enroll`, `revoke`, `run` and `recover` use it, as an
-//! embedding host's confirmation surface does.
+//! embedding host's launcher does.
 
 use slates_anchor::AnchorSegment;
 use slates_anchor::layout::ISSUER_SECRET_BYTES;
@@ -23,7 +24,7 @@ use slates_ipc::delivery::Capability;
 use slates_machine::facts::{Facts, Identity};
 use slates_mem::Handoff;
 
-use crate::error::{Error, IssuerFault};
+use crate::error::{Denied, Error, IssuerFault};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::instance::Instance;
 
@@ -65,14 +66,16 @@ impl Issuer {
         .find(|(name, _)| name == key)
         .map(|(_, value)| value.as_str())
     };
-    let handoff = value(ENV_HANDOFF).ok_or(Error::Issuer(IssuerFault::NoHandoff))?;
+    let handoff = value(ENV_HANDOFF).ok_or_else(|| no_authority(IssuerFault::NoHandoff))?;
     let len = value(ENV_LEN)
-      .ok_or(Error::Issuer(IssuerFault::Malformed {
-        reason: "no segment length (SLATES_ANCHOR_LEN)",
-      }))?
+      .ok_or_else(|| {
+        no_authority(IssuerFault::Malformed {
+          reason: "no segment length (SLATES_ANCHOR_LEN)",
+        })
+      })?
       .parse::<usize>()
       .map_err(|_| {
-        Error::Issuer(IssuerFault::Malformed {
+        no_authority(IssuerFault::Malformed {
           reason: "the segment length (SLATES_ANCHOR_LEN) is not a number",
         })
       })?;
@@ -91,12 +94,12 @@ impl Issuer {
   /// [`IssuerFault::NotPublished`] while the daemon has published none (an all-zero secret is no authority).
   fn secret(&self) -> Result<[u8; ISSUER_SECRET_BYTES], Error> {
     let segment = AnchorSegment::attach(&self.handoff, self.len, &self.identity)
-      .map_err(|e| Error::Issuer(IssuerFault::Attach(e)))?;
+      .map_err(|e| no_authority(IssuerFault::Attach(e)))?;
     let secret = segment
       .issuer_secret()
-      .map_err(|e| Error::Issuer(IssuerFault::Attach(e)))?;
+      .map_err(|e| no_authority(IssuerFault::Attach(e)))?;
     if secret.iter().all(|byte| *byte == 0) {
-      return Err(Error::Issuer(IssuerFault::NotPublished));
+      return Err(no_authority(IssuerFault::NotPublished));
     }
     Ok(secret)
   }
@@ -124,11 +127,32 @@ impl Issuer {
       .map_err(|e| instance.error(e))
   }
 
+  /// The proof a `SetPolicy` request carries (A-285, A-299): the keyed hash of exactly `subject` and `policy` under the
+  /// secret the running daemon published, with the policy domain's own tag, so it proves nothing else.
+  pub(crate) fn policy_proof(
+    &self,
+    subject: &slates_ipc::protocol::PolicySubject,
+    policy: &slates_ipc::protocol::WritePolicy,
+    version: u64,
+  ) -> Result<[u8; 32], Error> {
+    Ok(slates_server::landing::policy_proof(
+      &self.secret()?,
+      subject,
+      policy,
+      version,
+    ))
+  }
+
   /// The proof that confirms the consensus recovery plan `plan` (§4.8, A-19), for an instance whose operator holds no
   /// recovery key of their own.
   pub fn recovery_proof(&self, plan: &[u8; 32]) -> Result<[u8; 32], Error> {
     Ok(slates_server::recovery_proof(&self.secret()?, plan))
   }
+}
+
+/// This process holds no usable issuer authority: why, as the contract's denial.
+fn no_authority(fault: IssuerFault) -> Error {
+  Error::Denied(Denied::NoAuthority(fault))
 }
 
 impl GrantAuthority for Issuer {
@@ -143,5 +167,17 @@ impl GrantAuthority for Issuer {
       claim.scope,
       claim.term_ns,
     )))
+  }
+
+  /// The keyed hash of exactly `work` and its increment `identity`, under the merge approval's own domain (A-285).
+  fn prove_merge(
+    &self,
+    work: slates_ipc::protocol::VolumeId,
+    identity: &[u8; 32],
+  ) -> Result<GrantProof, Error> {
+    let secret = self.secret()?;
+    Ok(GrantProof::IssuerHash(
+      slates_server::landing::merge_approval_proof(&secret, work, identity),
+    ))
   }
 }

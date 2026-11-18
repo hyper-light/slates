@@ -16,10 +16,12 @@
 //!    later takeover meet that live head alone.
 //!
 //! When every candidate holds the retirement the owner records `Op::TombstoneRetired` and the tombstone gives
-//! back the volume slot it kept (the tombstone table is bounded by the volume capacity). A successor that
-//! adopts either stage records `Op::TombstoneAdopted` and continues from that stage. On a laptop there are no
-//! remote candidates, so both stages are complete at once and the tombstone retires with the destroy — the
-//! same code with nothing to ship (R8).
+//! back the volume slot it kept (the tombstone table is bounded by the volume capacity), and drops its own copies of
+//! both registers: a successor kept its takeover's acceptor of each and its placement of an adopted catalog (A-288). A
+//! successor that adopts either stage records `Op::TombstoneAdopted` and continues from that stage, and so does the
+//! adopter of a work's route once nothing can use the route (A-288, `crate::work_route`): a work never comes back, so
+//! its route closes as its own destroy would have closed it. On a laptop there are no remote candidates, so both
+//! stages are complete at once and the tombstone retires with the destroy — the same code with nothing to ship (R8).
 
 use slates_db::register::ObjectId;
 use slates_wire::Wire;
