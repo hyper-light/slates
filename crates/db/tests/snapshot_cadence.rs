@@ -354,8 +354,10 @@ const FIRST_SMALL_RECORDS: u64 = 64;
 /// Shape: the replay each later chunk of small records adds, as a share of the budget: an eighth, so the checks step
 /// through the tail finely enough to see it pass the budget.
 const CHUNKS_PER_BUDGET: u64 = 8;
-/// Shape: the timed recoveries of each check of the mix test, the median judged (raft).
-const CHECK_RECOVERIES: usize = 3;
+/// Shape: the timed recoveries of each check of the mix test, the median judged (raft), the spread of their inner
+/// quartiles the check's own noise: five, as [`RECOVERIES`], so the quartiles are the second and the fourth cost and
+/// the fastest and the slowest recovery stand outside the spread.
+const CHECK_RECOVERIES: usize = RECOVERIES;
 
 /// Appends one large record that does not grow the partition: a green increment, then the checkpoint that folds it.
 fn advance_and_fold(db: &mut slates_db::replay::Db, seg: &mut AnchorSegment, id: VolumeId, n: u64) {
@@ -383,9 +385,18 @@ fn advance_and_fold(db: &mut slates_db::replay::Db, seg: &mut AnchorSegment, id:
   .unwrap();
 }
 
-/// The median cost of `CHECK_RECOVERIES` recoveries of the segment's tail as it stands ([`recovery_cost_ns`]), and the
-/// bytes it replayed.
-fn timed_tail(seg: &mut AnchorSegment) -> (u64, u64) {
+/// `CHECK_RECOVERIES` recoveries of the segment's tail as it stands ([`recovery_cost_ns`]): their median cost and their
+/// spread, and the bytes replayed. The spread is the inner quartiles' (the middle half of the costs, the machine's own
+/// noise at that moment), which one recovery preempted does not widen: the most less the least let one such recovery
+/// cover a trigger three times late (13.9 ms past the baseline against an 8.2 ms range, load 37 on the Mac Studio).
+#[derive(Clone, Copy, Debug)]
+struct Timed {
+  median_ns: u64,
+  spread_ns: u64,
+  replayed: u64,
+}
+
+fn timed_tail(seg: &mut AnchorSegment) -> Timed {
   let mut replay_ns = Vec::with_capacity(CHECK_RECOVERIES);
   let mut replayed = 0u64;
   for _ in 0..CHECK_RECOVERIES {
@@ -395,10 +406,12 @@ fn timed_tail(seg: &mut AnchorSegment) -> (u64, u64) {
     replay_ns.push(cost_ns);
   }
   replay_ns.sort_unstable();
-  (
-    replay_ns.get(CHECK_RECOVERIES / 2).copied().unwrap(),
+  let quartile = CHECK_RECOVERIES / 4;
+  Timed {
+    median_ns: replay_ns.get(CHECK_RECOVERIES / 2).copied().unwrap(),
+    spread_ns: replay_ns[CHECK_RECOVERIES - 1 - quartile] - replay_ns[quartile],
     replayed,
-  )
+  }
 }
 
 /// A recovery and what it cost, as the calling thread's CPU time: the work the replay did, which a loaded machine does
@@ -426,11 +439,16 @@ fn recovery_cost_ns(recovery: impl FnOnce() -> Recovered) -> (Recovered, u64) {
 }
 
 /// A-243, §4.8 (the record mix). Do: on a fresh segment with a 10 ms recovery budget, append large records (64 KiB
-/// green increments, each folded at once) until the cadence has settled on them, then switch to small records and time
-/// a recovery of the tail (median of three) after every eighth of a budget's replay, until the next snapshot. Expect:
-/// every tail replays within the budget. A cadence extrapolated from the large records' bytes a microsecond allowed
+/// green increments, each folded at once) until the cadence has settled on them, and time a recovery of what that leaves
+/// (the snapshot's decode, the baseline); then switch to small records and time a recovery of the tail (median of five)
+/// after every eighth of a budget's replay, until the next snapshot. Expect: every tail replays within the budget, the
+/// tail's replay being a recovery's cost past the baseline, within the check's own spread. The design bounds a recovery
+/// by "the snapshot's decode plus the larger of the budget and the replay of a snapshot's size of tail"
+/// (`slates_db::replay::snapshot_due`); held to the budget with the decode in it, a macOS CI runner failed the eighth
+/// check, 11.6 ms against 10 ms where the first, a near-empty tail, had cost 1.7 ms, and the check's three recoveries
+/// spread wide (run 44260193629, 2026-11-18). A cadence extrapolated from the large records' bytes a microsecond allowed
 /// hundreds of times the small records' replay: in the cadence test above, 442 MB at 12 bytes a microsecond, about
-/// 37 s against a 1 s budget.
+/// 37 s against a 1 s budget, which this still fails.
 #[test]
 fn a_tail_whose_records_change_size_still_replays_within_its_recovery_budget() {
   let mut seg = segment(BUDGET_LOG_BYTES);
@@ -446,17 +464,31 @@ fn a_tail_whose_records_change_size_still_replays_within_its_recovery_budget() {
     advance_and_fold(&mut db, &mut seg, id, n);
   }
   let settled = db.stats();
+  // What a recovery costs before any of the small records: the snapshot's decode and a recovery's fixed work, which the
+  // design's bound holds apart from the budget.
+  let baseline = timed_tail(&mut seg);
+  println!(
+    "baseline: a recovery of the settled segment ({} bytes of tail) cost {} ns at the median, spread {} ns",
+    baseline.replayed, baseline.median_ns, baseline.spread_ns
+  );
   for _ in 0..FIRST_SMALL_RECORDS {
     n += 1;
     account(&mut db, &mut seg, id, n);
   }
   let mut checks = Vec::new();
   if db.stats().snapshots == settled.snapshots {
-    let (first_ns, first_bytes) = timed_tail(&mut seg);
-    checks.push((first_bytes, first_ns));
-    println!("check 1: a tail of {first_bytes} bytes replayed in {first_ns} ns at the median");
+    let first = timed_tail(&mut seg);
+    let first_ns = first.median_ns.saturating_sub(baseline.median_ns);
+    checks.push((first.replayed, first_ns));
+    println!(
+      "check 1: a tail of {} bytes replayed in {first_ns} ns past the baseline at the median",
+      first.replayed
+    );
     let mut chunk_bytes = 0u64;
-    let mut chunk = (first_bytes * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / first_ns.max(1)).max(1);
+    // Paced by the whole recovery's cost, the decode in it, so the checks step at most an eighth of the budget apart
+    // however small the tail's own share reads.
+    let mut chunk =
+      (first.replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / first.median_ns.max(1)).max(1);
     while db.stats().snapshots == settled.snapshots {
       n += 1;
       chunk_bytes += account(&mut db, &mut seg, id, n);
@@ -464,25 +496,34 @@ fn a_tail_whose_records_change_size_still_replays_within_its_recovery_budget() {
         continue;
       }
       chunk_bytes = 0;
-      let (replay_ns, replayed) = timed_tail(&mut seg);
+      let timed = timed_tail(&mut seg);
+      let (replay_ns, replayed) = (
+        timed.median_ns.saturating_sub(baseline.median_ns),
+        timed.replayed,
+      );
       checks.push((replayed, replay_ns));
       let tail = db.stats().tail;
+      // The check's own noise: its recoveries' spread and the baseline's, each the machine's at its moment.
+      let noise_ns = timed.spread_ns + baseline.spread_ns;
       println!(
-        "check {}: a tail of {replayed} bytes replayed in {replay_ns} ns at the median; the commits measured {} ns",
+        "check {}: a tail of {replayed} bytes replayed in {replay_ns} ns past the baseline at the median (spread {} \
+         ns); the commits measured {} ns",
         checks.len(),
+        timed.spread_ns,
         tail.replay_ns
       );
       assert!(
-        replay_ns <= SMALL_BUDGET_NS,
-        "a tail of {replayed} bytes replayed in {replay_ns} ns at the median, past the {SMALL_BUDGET_NS} ns budget, \
-         with no snapshot yet (the commits measured {} ns of its work); the checks (bytes, ns): {checks:?}",
+        replay_ns <= SMALL_BUDGET_NS + noise_ns,
+        "a tail of {replayed} bytes replayed in {replay_ns} ns past the baseline at the median, past the \
+         {SMALL_BUDGET_NS} ns budget and the {noise_ns} ns of noise its recoveries and the baseline's spread, with no \
+         snapshot yet (the commits measured {} ns of its work); the checks (bytes, ns): {checks:?}",
         tail.replay_ns
       );
       assert!(
         replayed < BUDGET_LOG_BYTES / 2,
         "the tail reached {replayed} bytes with no snapshot"
       );
-      chunk = (replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / replay_ns.max(1)).max(1);
+      chunk = (replayed * SMALL_BUDGET_NS / CHUNKS_PER_BUDGET / timed.median_ns.max(1)).max(1);
     }
   }
   println!(

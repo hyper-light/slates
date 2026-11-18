@@ -2316,6 +2316,15 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some(record) = state.db.partition().volume(slot.id) else {
       continue;
     };
+    // A volume this node lost to a successor (yielded at its re-admission, A-334, or its log fenced, A-338) ships no
+    // record (A-382): its successor owns its registers, so each record here is stale, and a holder's copy made afresh
+    // (a re-admitted holder lets its own go, `readmission::let_go_own_registers`) takes the first member's record it
+    // meets as its owner's. Shipped, a re-admitted creator's stale catalog could reach such a copy before the
+    // successor's, and every holder refused the rest of them each period (`fleet.record.refused.unauthorized`, 218 in
+    // one nemesis run).
+    if crate::verbs::lost_to_a_successor(state, slot.id) {
+      continue;
+    }
     let object = ObjectId(slot.id.bytes);
     // A volume being destroyed ships its tombstone, never its catalog or a head (AUD-29-43): its registers
     // close at the sequence the destroy's record will keep, so the tombstone is continuous with it.

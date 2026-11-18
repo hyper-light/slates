@@ -6236,6 +6236,24 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
 > old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
 
+> **Status (2026-11-18, A-382: a host admitted again gives up its own authority on its copies).** The host-epoch bump
+> fences every object the host owned, and its re-admission yields its catalogued volumes (A-334). The same install now
+> lets go every register copy the host held, as a candidate, under its own authority: the copies of the objects it took
+> over before it was retired (`readmission::let_go_own_registers`, counted `fleet.readmission.registers_let_go`). Its
+> takeover completed before the re-admission (`RegionalConfiguration::admits`), so each such object is its successor's.
+> The configuration no longer names that successor, and the re-admission forgot the host's own routes, so nothing else
+> moves those copies: kept, each refused the successor's every record `ForeignGeneration`. A live log ships only to a
+> holder that holds its catalog, so the host's live copy never caught up (the chaos nemesis, CI diag 44345243646: 660
+> to 796 such refusals a run). Let go, the successor's next record makes the copy afresh, as it makes any new
+> candidate's, and its live log follows. The host keeps the content it holds for those objects (A-335). A volume a node
+> lost to a successor, yielded or with its log fenced, ships no catalog or head record (`fleet::unplaced_heads`), since
+> a copy made afresh takes the first member's record it meets as its owner's. Held by
+> `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
+> `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed: the
+> let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
+> yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
+
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
 among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its
@@ -28078,6 +28096,47 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/client/src/client.rs`,
 `crates/server/src/{verbs,state,daemon}.rs`, `crates/server/tests/attachment_term.rs`.
+
+### A-382 — A host admitted again lets go its own register copies, and a volume it lost ships no record: the superseded adopter's copy catches up (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Promotion and takeover"; the chaos nemesis's convergence, seeds 6876545201569229162 and 7236833171758868842; A-334's holder side)
+Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the entry of 2026-11-18), the bug record
+`docs/bugs/2026-11-18-a-readmitted-adopters-own-register-copies-refused-its-successor-for-good.md`, and the code below.
+- **What was there.** A host the council retired while it was away, admitted again under its id, yields the volumes it
+  catalogues (A-334), and its re-admission forgets its own routes (`FleetNode::install_configuration`). It also held
+  register copies, as a candidate, of the objects it had taken over before it was retired, and they still named it as
+  their owner, at the generation of its own takeover. The install moves a held copy's authority only to the owner its
+  route names (`fleet::reconcile_held_authority`), and nothing routed those objects any more, so the copies kept their
+  authority for good.
+- **What it broke.** Convergence. The object's next owner shipped its catalog and head to every candidate, and the
+  re-admitted host refused each `ForeignGeneration` (660 to 796 a run in the nemesis's four dumps, CI diag 44345243646).
+  A live log ships only to a holder that holds its volume's catalog (`live_ship::pending_sends`), so the host's live
+  copy, at the fence of its own takeover, was never sent the successor's log and stayed behind it for a whole fleet
+  wait. Reproduced in process on both Linux arches (CI diag 44354746021): the creator at fence 3 (head 9), the third
+  node at its head, the adopter still at fence 2 (head 5), and the creator never sent it anything.
+- **The rule.** At the install that re-admits the host (its own host epoch advanced), the control shard lets go every
+  held register copy whose authority names the host (`readmission::let_go_own_registers`, counted
+  `fleet.readmission.registers_let_go`): its takeover completed before it could be admitted again
+  (`RegionalConfiguration::admits`), so each such object is its successor's, and the successor adopted every position of
+  it that ever committed. The successor's next record makes the copy afresh, as a new candidate's
+  (`fleet::check_held_record`), and its live log follows. The content held for those objects stays (A-335). A volume
+  this node lost to a successor (yielded, A-334, or its log fenced, A-338) ships no catalog or head record
+  (`fleet::unplaced_heads`): its successor owns its registers, every holder refuses them, and a copy made afresh takes
+  the first member's record it meets as its owner's, so a stale catalog stamped at the sender's current host epoch could
+  have taken it before the successor's.
+- **Tests.** `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter` and
+  `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` (`crates/server/tests/fleet.rs`: the
+  A-351 scene, a volume taken back from the adopter that took it first, ending in the nemesis's `wait_caught_up`):
+  green 2 of 2 each on both Linux arches (CI diag 44358084443), and red without the let-go (the adopter's copy stays at
+  fence 2). `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (same file: A-344's scene, the
+  superseded owner restarted warm so its placed acknowledgements are gone): green 2 of 2 on arm64, neither other
+  node refusing any record of the old owner's in 20 periods, and red without the record half's guard, 19 refused by
+  each in 20 periods (CI diag 44360107160); the convergence scene alone never ships a stale record (red without the
+  guard, 3 of 3 runs passed there).
+- **Not this amendment.** The x86_64 runs of the same seeds ended two daemons each by their watchdogs (a shard spinning
+  1000 ms of CPU in one poll) right after the supersession: the live takeover's materialization in one turn, g251's.
+- **Owed.** The let-go is kept by the control shard's next publication, so a warm restart before it restores the
+  copies; the yield is memory-only (`ShardState::yielded`). A yielded volume's own live shipper still does period work
+  and ships (A-349's rule covers a fenced one): in 2 of 12 runs of the third node's case the superseded adopter built
+  119 and 1,714 installs for the creator, each refused `not_the_acting_owner`.
 
 ### A-383 — A holder reads a version's inputs extent by extent, charged to its shard's budget, never refused for good by a cap of distinct chunks (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders")
 

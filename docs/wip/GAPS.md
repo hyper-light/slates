@@ -1,5 +1,35 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A host admitted again refused its successor's records for good, so its live copy never caught up: fixed
+> (2026-11-18, A-382, §4.8 "Authority scope"; g230; the chaos nemesis's convergence, seeds 6876545201569229162 and
+> 7236833171758868842 on arm64, CI diag 44345243646).** The superseded adopter, admitted again under its id, kept its
+> register copies of the objects it had adopted under its own authority, at their old generation: its re-admission
+> forgot its own routes, and the install moves a copy only along its route. So it refused the creator's catalog and
+> head `ForeignGeneration` every period (660 to 796 a run), and the creator, which ships a live log only to a holder
+> holding its catalog, never sent it the log: its live copy stayed at fence 2 behind the creator's fence 3 for a whole
+> fleet wait. Fixed: the re-admission lets those copies go (`readmission::let_go_own_registers`,
+> `fleet.readmission.registers_let_go`), so the successor's next record makes them afresh, and a volume a node lost to
+> a successor ships no catalog or head record (`fleet::unplaced_heads`). Tests:
+> `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
+> `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Bug
+> record: `docs/bugs/2026-11-18-a-readmitted-adopters-own-register-copies-refused-its-successor-for-good.md`.
+> - **Not this entry: the x86_64 runs of the same seeds** ended two daemons each by their watchdogs ("shard N is
+>   spinning, 1000 ms of CPU without a step") right after the supersession, so the dead nodes' copies read none: the
+>   live takeover's materialization in one turn, g251's item, as seed 17036665960917068132.
+> - **Open: a superseded owner's shipper that is never told its fence ships on.** In 2 of 12 runs of the third node's
+>   case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but never fenced, built 119 and
+>   1,714 installs for the creator, which refused each `not_the_acting_owner`; the adopter never learned its fence from
+>   those answers, though the creator's copy was fenced above it. A-349 stops a fenced log only. Next: why that answer
+>   does not fence the sender (`live_ship::not_served`, `Shipper::on_reply`), and whether a yielded log should stop
+>   as a fenced one does (its waiting writers then need a refusal of their own).
+> - **Owed: the let-go and the yield survive a warm restart only once published.** The let-go rides the control shard's
+>   next publication; a warm restart before it restores the copies and routes them to this host again; and the yield
+>   is memory-only (`ShardState::yielded`), so a warm restart forgets that the node lost the volume at all (A-334).
+> - **Owed: a copy made afresh takes the first member's record at the current generation as its owner's,** as a new
+>   candidate's does. A node that knows it lost a volume (yielded or fenced) ships it no record; a stale owner that
+>   does not know yet was retired, so it is no member until its re-admission yields.
+
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
 > `crates/ipc/tests/wire_order.rs` (43 enums, 410 tags) and `crates/db/tests/wire_order.rs` (17 enums, 152 tags, `Op`
@@ -2382,6 +2412,14 @@
 >   after one record (`docs/bugs/2026-11-09-the-cadence-tests-approach-predicted-the-next-record-from-the-last.md`).
 >   Open, raft's: the trigger times replay work on the wall, so preemption counts as work; the thread's CPU time would
 >   remove the spikes from the trigger and the test alike.
+>   **The record-mix test (2026-11-18, g251):** it held a whole recovery, the snapshot's decode in it, to the tail's
+>   budget, which the design's bound does not (the decode plus the larger of the budget and a snapshot's size of tail),
+>   and a macOS CI runner failed its eighth check at 11.6 ms where a near-empty tail cost 1.7 ms (run 44260193629). It
+>   now judges each check past a baseline recovery of the settled segment, within the inner-quartile spread of five
+>   recoveries (`docs/bugs/2026-11-18-the-cadence-mix-test-held-the-snapshot-decode-to-the-budget.md`). **Open:** the
+>   commits' measure of the tail's replay and the replay itself diverge by machine and moment (the commits about 1.7x
+>   over on a Mac Studio, 0.4x to 1.25x on the CI runner), so where they under-measure the tail replays past the budget
+>   before the trigger fires.
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
