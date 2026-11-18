@@ -374,6 +374,36 @@ pub struct Base {
 }
 
 impl Base {
+  /// The restricted base of the paths `named` (`Green::base_for`), assembled from each path's own entries as
+  /// `Green::path_base` gives them (A-247: a work's shard keeps the entries of the paths it touched, so it composes its
+  /// increment without the green). In `base_for`'s order: each named path's entries in path order, then the hard links
+  /// whose link or target is named, by link. `None` when a named path's entries are not in `per_path`: a base not
+  /// known, never a smaller one.
+  pub fn for_names(
+    named: &std::collections::BTreeSet<&str>,
+    per_path: &std::collections::BTreeMap<String, Base>,
+  ) -> Option<Base> {
+    let mut base = Base::of_files(Vec::new());
+    let mut links: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for path in named {
+      let entries = per_path.get(*path)?;
+      base.files.extend(entries.files.iter().cloned());
+      base.specials.extend(entries.specials.iter().cloned());
+      base.dirs.extend(entries.dirs.iter().cloned());
+      base.modes.extend(entries.modes.iter().cloned());
+      base.symlinks.extend(entries.symlinks.iter().cloned());
+      base.xattrs.extend(entries.xattrs.iter().cloned());
+      for (link, target) in &entries.hardlinks {
+        links.insert(link.as_str(), target.as_str());
+      }
+    }
+    base.hardlinks = links
+      .into_iter()
+      .map(|(link, target)| (link.to_owned(), target.to_owned()))
+      .collect();
+    Some(base)
+  }
+
   /// A base with the given files and no directories or recorded modes (the common file-only case).
   pub fn of_files(files: Vec<(String, u64)>) -> Base {
     Base {

@@ -143,18 +143,15 @@ pub(crate) fn rejected_cache_budget(state: &ShardState) -> usize {
 /// Never past the head.
 pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   let head = state.greens.get(&green).map_or(0, Green::head);
-  let work_bases = state
-    .works
-    .values()
-    .filter(|work| work.green == green)
-    .map(|work| work.base_version);
   let pins = state
     .merge
     .attachments
     .values()
     .filter(|pin| pin.green == green)
     .map(|pin| pin.version);
-  work_bases.chain(pins).min().unwrap_or(head).min(head)
+  // Every work's base is held in the partition wherever the work lives (A-247).
+  let oldest_work = state.db.partition().oldest_work_floor(green);
+  pins.chain(oldest_work).min().unwrap_or(head).min(head)
 }
 
 /// The version a green's durable chain may be checkpointed at (W3; §4.16): the reachable floor, kept below the
@@ -275,6 +272,7 @@ pub(crate) fn work_base<'a>(
 ) -> crate::work_files::Base<'a> {
   crate::work_files::Base {
     green: state.greens.get(&work.green),
+    fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
   }
 }
@@ -320,6 +318,9 @@ pub(crate) fn settle_green_retention_leaving(
   let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
+    // Capacity is claimed as it is needed (A-98), and a green's works, which claim it by their charges, live on other
+    // shards (A-247): the green's own retention claims what it charges.
+    state.store.make_room(wanted.saturating_sub(charged));
     state
       .store
       .budget
@@ -358,6 +359,7 @@ pub(crate) fn secure_green_retention(
   if charged.saturating_add(bytes) > cap {
     return Err(cap.saturating_sub(charged));
   }
+  state.store.make_room(bytes);
   state
     .store
     .budget
@@ -1408,6 +1410,8 @@ pub(crate) fn destroy_merge_volume(
   // destroyed green credits everything it charged as retention.
   if let Some(work) = state.works.remove(&id) {
     crate::work_charge::release(state, work.charged);
+    // The floor goes with it: on this shard in this transaction, elsewhere by a message once it has committed (A-247).
+    crate::work_home::tell_floor(state, work.green, id, None);
     let _ = settle_green_retention(state, work.green);
   }
   crate::verbs::release_origin_snapshot(state, held.as_ref());
@@ -1496,6 +1500,10 @@ pub(crate) fn status_merge_volume(
       takeover_kept: 0,
       // A green or a work volume has no base folder (A-299).
       base: None,
+      // A green's state is its versions, each committed by its merge record before it is answered (§4.16 "Commit"),
+      // not owner-local edits a seal would place; the volume loss window (AC-8.3) does not describe it, so none is
+      // reported rather than a zero it was not measured to be.
+      loss: slates_ipc::protocol::LossReport::default(),
     }),
   })
 }
@@ -2444,6 +2452,9 @@ pub(crate) fn next_merge_work(
   let mut work = Vec::new();
   let mut catalogs_owed = std::collections::BTreeSet::new();
   ship_new_works_catalogs(state, local, &mut catalogs_owed, &mut work);
+  // A submit off its green's shard waits here, on its work's shard, for the work's route (A-298): a catalog committed
+  // since the last pass runs it again.
+  crate::work_home::routes_placed(state);
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
     // The green's catalog register first (AUD-29-17): a successor that adopted a merge record and no catalog could
@@ -2512,7 +2523,8 @@ fn ship_version(
   };
   // The submitting work's catalog record before the record that carries its completion (A-255): a successor
   // answers a resend only through the work's catalog, which names the green, so no holder takes the completion
-  // before the route is committed. A destroyed work's catalog owes nothing.
+  // before the route is committed. A destroyed work's catalog owes nothing. A work on another shard has no record
+  // here, so this passes: its shard asked for the verdict only once its catalog was committed (A-298).
   if let Some(submitting) =
     submitting.filter(|submitting| !crate::fleet::catalog_committed(state, *submitting, local))
   {
@@ -2776,6 +2788,10 @@ pub(crate) async fn run_merge_period(
   }
 }
 
+/// The inputs a version's record travels with, while its targets lack them (A-286): the shipment, and the identity the
+/// record names its inputs by, so the targets' answers about them are read against it.
+type VersionInputs = (Option<ShipInputs>, Option<[u8; 32]>);
+
 /// Ships a version's record to its targets over [`MERGE_RECORD_STREAM`] through the owner's own
 /// acceptor at `f + 1` — with its inputs (the content exchange's offer and at most a shipment's bound of the chunks the
 /// targets lack, A-286) in the same message while the targets lack them, so a version commits in one exchange — and
@@ -2789,12 +2805,7 @@ async fn ship_record(
   shard: u16,
   local: HostId,
   owner_acceptor: &mut Acceptor,
-  (object, version, record, (inputs, manifest)): (
-    ObjectId,
-    u64,
-    Record,
-    (Option<ShipInputs>, Option<[u8; 32]>),
-  ),
+  (object, version, record, (inputs, manifest)): (ObjectId, u64, Record, VersionInputs),
   targets: Vec<HostId>,
   shape: Placement,
   quorum: Quorum,
@@ -3077,6 +3088,9 @@ pub struct ReplyRoute {
   pub client_index: u32,
   /// The request word (the request id).
   pub request: u64,
+  /// The reply goes to the work's shard, which settles it before the client is answered (A-247), not to a client's
+  /// ring: `shard` is the work's, and `client_index` is unused.
+  pub through_work: bool,
 }
 
 /// One submit whose acceptance waits for its version's merge record to commit at the quorum
@@ -3256,7 +3270,14 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
       let Some(route) = entry.route else {
         continue;
       };
+      let (origin, id) = (entry.origin, entry.id);
       if crate::xshard::hand_reply_home(route.shard, move || {
+        if route.through_work {
+          let _ = crate::state::with_state_counted(|s| {
+            crate::work_home::answered_late(s, origin, id, recorded);
+          });
+          return;
+        }
         crate::state::deliver(route.client_index, route.request, recorded, true);
       })
       .is_err()
@@ -3289,8 +3310,9 @@ const ACCEPTANCE_REJOINED: &str = "merge.acceptance_rejoined";
 /// A resolved acceptance whose completion record could not be made durable (rolled back); the
 /// client's retry re-executes and meets the idempotent accept.
 const ACCEPTANCE_UNRECORDED: &str = "merge.acceptance_unrecorded";
-/// A resolved acceptance whose delivery task the client's shard refused at its admission bound; the
-/// completion record answers the client's retry.
+/// A resolved acceptance whose reply could not be carried to its client's shard (`xshard::hand_reply_home`): that
+/// shard gone, as its daemon stops, or this shard's carrier at its bound. The completion record answers the client's
+/// resend. (Until goal 238, 2026-11-18, a full channel there lost it too.)
 const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
 /// A holder withheld a merge record's acknowledgement (the injected fault).
 const RECORD_WITHHELD: &str = "merge.record_withheld";
