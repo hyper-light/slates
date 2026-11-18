@@ -85,8 +85,11 @@
 >   records the voters in force once no change is in flight (`ConfigCommand::Seat`), and a learner reads them from the
 >   configuration it holds. Tests: `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
 >   (`crates/cluster/src/config_group.rs`), `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`
->   (`crates/db/src/register.rs`), the round trip in `crates/cluster/src/raft_wire.rs`. The root group's learners still
->   name the root voters of their join (the open sibling of the 2026-11-08 entry).
+>   (`crates/db/src/register.rs`), the round trip in `crates/cluster/src/raft_wire.rs`. The root group's learners named
+>   the root voters of their join (the open sibling of the 2026-11-08 entry) until A-406 recorded the root voters the
+>   same way (`RootCommand::Seat`; a root learner also fetches once a root voter it knows is no longer alive). Test:
+>   `a_root_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+>   (`crates/cluster/src/root_group.rs`).
 > - **Owed (the supervisor's):** the learner tests' rate on the diag lanes once this lands
 >   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
 >   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
