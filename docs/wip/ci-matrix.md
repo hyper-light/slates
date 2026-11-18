@@ -30,13 +30,21 @@ drift (CLAUDE.md §4, doc-truth tests).
 | ubuntu x64 | 299 | 0 | 5 | 0 | 15 |
 | ubuntu arm64 | 1 | 4 | 0 | 299 | 15 |
 | macOS arm64 | 282 | 0 | 5 | 0 | 32 |
-| Windows x64 | 41 | 1 | 0 | 216 | 61 |
-| Windows arm64 | 42 | 1 | 0 | 215 | 61 |
+| Windows x64 | 58 | 1 | 0 | 206 | 54 |
+| Windows arm64 | 59 | 1 | 0 | 205 | 54 |
 
 With this change both Windows lanes run `crates/server/tests/fleet.rs` (85 passed, 3 ignored on the runners:
-diagnostics run 42340483175). `slates-server`'s unit tests join them with the Windows landing writer: two landing tests
-fail on Windows until it lands, since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`, so that
-step lands with the writer (`agents/release-wincov-lib`).
+diagnostics run 42340483175). `slates-server`'s unit tests joined them with the Windows landing writer (below): two
+landing tests failed on Windows until it landed, since `landing.rs`'s Windows arm refused
+`Unsupported { feature: "landing" }`.
+
+Since 2026-11-18 (A-185, the Windows landing writer) both Windows lanes also run `slates-land` whole, `slates-server`'s
+unit tests one test at a time (368 passed, 3 ignored, in 9.68 s on windows-latest and 16.64 s on windows-11-arm), the
+landing suites through the daemon one test at a time (`presentations`, `checkout`, `landing_fairness`, `lease`,
+`presentation_fairness`, `signed_work`, `snapshot_landing` and `write_policy`), the client's `presentation` and the MCP
+surface (`slates-mcp`'s `mcp`), all passing on both runners (diagnostics run 44371955995, on main 53353e5e8 with the
+change merged). The table's rows for those targets read `all` on Windows; `presentations`, `presentation_fairness`,
+`signed_work` and `write_policy` postdate the table and have no rows.
 
 Since 2026-11-18 both Windows lanes also run `crates/server/tests/liveness.rs` (the daemon's liveness beat, A-228), one test
 at a time: 12 tests pass, the 6 child roles ignored, in 51-52 s on windows-latest and 57-58 s on windows-11-arm, three runs
@@ -198,7 +206,7 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-cli | bin `slates` | — | 0 (0, 0) | all | — | all | — | — |
 | slates-cli | test `start_judgment` | windows | 2 (0, 2) | n/b | n/b | n/b | all | all |
 | slates-cli | test `vm_harness` | target_os = "linux" | 2 (1, 0) | all | — | n/b | n/b | n/b |
-| slates-cli | test `winfsp` | windows | 16 (1, 15) | n/b | n/b | n/b | all | all |
+| slates-cli | test `winfsp` | windows | 20 (1, 19) | n/b | n/b | n/b | all | all |
 | slates-cli | test `winfsp_semantics` | windows | 7 (0, 7) | n/b | n/b | n/b | all | all |
 | slates-client | test `acknowledge` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-client | test `async_core` | unix | 2 (0, 0) | all | — | all | n/b | n/b |
@@ -211,7 +219,7 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-client | test `merge_identity` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-client | test `merge_post_state` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-client | test `netns` | target_os = "linux" | 1 (0, 0) | all | part | n/b | n/b | n/b |
-| slates-client | test `presentation` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-client | test `presentation` | — | 1 (0, 0) | all | — | all | all | all |
 | slates-client | test `reap` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-client | test `reap_map` | any(target_os = "linux", target_os = "macos") | 4 (0, 0) | all | all | all | n/b | n/b |
 | slates-client | test `shards` | — | 16 (2, 0) | all | — | all | all | all |
@@ -268,18 +276,18 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-ipc | test `status` | — | 3 (0, 0) | all | — | all | — | — |
 | slates-ipc | test `stream_exec` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-ipc | test `stream_spawn` | windows | 1 (0, 0) | n/b | n/b | n/b | all | all |
-| slates-land | test `durability` | — | 9 (0, 0) | all | — | all | — | — |
-| slates-land | test `grant_binding` | — | 4 (0, 0) | all | — | all | — | — |
-| slates-land | test `lease` | — | 2 (0, 0) | all | — | all | — | — |
-| slates-land | test `oracle` | — | 29 (0, 0) | all | — | all | — | — |
-| slates-land | test `os` | unix | 10 (0, 0) | all | — | all | n/b | n/b |
-| slates-land | test `os_escape` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
-| slates-land | test `os_removal` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
-| slates-land | test `removal` | — | 2 (0, 0) | all | — | all | — | — |
-| slates-land | lib | — | 0 (0, 0) | all | — | all | — | — |
-| slates-land | test `source` | — | 4 (0, 0) | all | — | all | — | — |
+| slates-land | test `durability` | — | 9 (0, 0) | all | — | all | all | all |
+| slates-land | test `grant_binding` | — | 4 (0, 0) | all | — | all | all | all |
+| slates-land | test `lease` | — | 2 (0, 0) | all | — | all | all | all |
+| slates-land | test `oracle` | — | 29 (0, 0) | all | — | all | all | all |
+| slates-land | test `os` | — | 13 (0, 0) | all | — | all | all | all |
+| slates-land | test `os_escape` | — | 1 (0, 0) | all | — | all | all | all |
+| slates-land | test `os_removal` | — | 1 (0, 0) | all | — | all | all | all |
+| slates-land | test `removal` | — | 2 (0, 0) | all | — | all | all | all |
+| slates-land | lib | — | 0 (0, 0) | all | — | all | all | all |
+| slates-land | test `source` | — | 4 (0, 0) | all | — | all | all | all |
 | slates-machine | lib | — | 0 (0, 0) | all | — | all | — | — |
-| slates-mcp | test `mcp` | — | 1 (0, 0) | all | — | all | — | — |
+| slates-mcp | test `mcp` | — | 1 (0, 0) | all | — | all | all | all |
 | slates-mcp | lib | — | 4 (0, 0) | all | — | all | — | — |
 | slates-mem | test `capacity` | — | 2 (0, 0) | all | — | all | all | all |
 | slates-mem | test `dax_layout` | — | 5 (0, 0) | all | — | all | all | all |
@@ -339,7 +347,7 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-server | test `ack_release` | unix | 6 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `attach_forms` | unix | 9 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `attachment_term` | — | 1 (0, 0) | all | — | all | — | — |
-| slates-server | test `checkout` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `checkout` | — | 3 (0, 0) | all | — | all | all | all |
 | slates-server | test `consumers` | — | 1 (0, 0) | all | — | all | — | — |
 | slates-server | test `cross_shard_wait` | — | 7 (0, 0) | all | — | all | — | — |
 | slates-server | test `daemon` | unix | 25 (0, 0) | all | — | all | n/b | n/b |
@@ -352,8 +360,8 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-server | test `green_checkpoint` | unix | 4 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `green_post_state` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `green_retention` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
-| slates-server | test `landing_fairness` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
-| slates-server | test `lease` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | test `landing_fairness` | — | 3 (0, 0) | all | — | all | all | all |
+| slates-server | test `lease` | — | 1 (0, 0) | all | — | all | all | all |
 | slates-server | test `live_ship` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `liveness` | — | 7 (1, 0) | all | — | all | all | all |
 | slates-server | test `merge_load` | — | 5 (0, 0) | all | — | all | — | — |
@@ -367,8 +375,8 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-server | test `recovery` | unix | 48 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `seal` | — | 2 (0, 0) | all | — | all | — | — |
 | slates-server | test `shards` | unix | 28 (1, 0) | all | — | all | n/b | n/b |
-| slates-server | lib | — | 0 (0, 0) | all | — | all | — | — |
-| slates-server | test `snapshot_landing` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
+| slates-server | lib | — | 0 (0, 0) | all | — | all | all | all |
+| slates-server | test `snapshot_landing` | — | 3 (0, 0) | all | — | all | all | all |
 | slates-server | test `virtiofs` | unix | 30 (1, 0) | all | — | all | n/b | n/b |
 | slates-test-seeds | lib | — | 4 (0, 0) | all | — | all | — | — |
 | slates-transport | test `admission` | — | 3 (0, 0) | all | — | all | — | — |

@@ -335,12 +335,24 @@ pub(crate) fn write_file<H: HostFs>(
   path: &str,
   bytes: &[u8],
 ) {
+  write_file_with_mode(vol, host, store, path, bytes, FILE_MODE);
+}
+
+/// [`write_file`] with the mode a file it creates is given (an existing file keeps its own).
+pub(crate) fn write_file_with_mode<H: HostFs>(
+  vol: &mut Volume,
+  host: &mut H,
+  store: &mut Store,
+  path: &str,
+  bytes: &[u8],
+  mode: u32,
+) {
   let (dir, name) = split(path);
   let d = dir_of(vol, host, store, dir);
   let mut o = vol.with_host(host);
   let no = match o.lookup(store, d, name) {
     Ok(l) => l.inode,
-    Err(_) => o.create_file(store, d, name, FILE_MODE).unwrap(),
+    Err(_) => o.create_file(store, d, name, mode).unwrap(),
   };
   o.truncate(store, no, 0).unwrap();
   if !bytes.is_empty() {

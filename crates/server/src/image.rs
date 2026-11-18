@@ -218,9 +218,7 @@ pub(crate) fn complete_once_durable(
 }
 
 /// Where the reply of in-flight `request` goes, taken, for a task that hands the request on to another deferral (a
-/// bypass presentation's granted landing, A-285) rather than completing it here. Unix's, where a landing is presented
-/// (the Windows writer is owed, `crate::landing::land_verb`).
-#[cfg(unix)]
+/// bypass presentation's granted landing, A-285) rather than completing it here.
 pub(crate) fn take_in_flight(
   state: &mut ShardState,
   request: (u64, RequestId),

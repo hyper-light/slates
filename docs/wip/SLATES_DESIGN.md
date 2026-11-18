@@ -9350,6 +9350,20 @@ stays in the overlay.
 > holding only what the manifest creates beneath it; a rename whose destination holds the
 > witnessed directory), so the re-run is idempotent for directories as it is for files.
 
+> **Status (2026-11-18, A-185: landing on Windows).** The landing writer runs on Windows: `crates/land/src/os_windows.rs`
+> has the Unix seam's surface, so the engine, the server's wiring (`crates/server/src/landing.rs`, no longer gated on
+> Unix) and the oracle run unchanged over it. Each verb is relative to a handle the base host holds: creates by
+> `NtCreateFile` with `FILE_CREATE`, the rename that never replaces by `NtSetInformationFile(FileRenameInformationEx)`
+> with POSIX semantics, removals by `FileDispositionInfoEx` with POSIX semantics, a batch's barrier as each file's
+> `FlushFileBuffers` on ⌈√n⌉ threads, a directory's sync through the directory opened again to write. NTFS has no
+> atomic exchange, so the engine moves the old entry aside, as on a Unix filesystem without one. The target is walked
+> from its drive's root one component at a time, refusing a link, a junction or a mount point; a target on one of this
+> daemon's own WinFsp drives is refused before any open (A-227); and it must be owned by this user. A file's mode sets
+> or clears its `READONLY` bit alone (A-262: a file's read-only state is its mode), every other attribute bit kept.
+> Not built: a symbolic link, which Windows makes only with a privilege slates never asks for (R10), so such an entry
+> fails, typed; and the volume's other Windows attribute bits, which a landing carries and does not yet apply (A-262's
+> landing half). Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's.
+
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
 > table keyed by the target's path, the engine never fenced by the term, no path wrote the durable
@@ -19010,9 +19024,10 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
     It also fixes what stage 1 would have exposed: the Windows base had reported the attribute word itself as the mode, so
     an ordinary file (`ARCHIVE`, `0x20`) read as `0o040`, which the drive would have reported read-only and refused to
     delete (`docs/bugs/2026-11-08-a-windows-base-files-mode-was-its-attribute-word.md`).
-  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). It waits on a Windows
-    landing writer, which does not exist yet (`crates/land`'s writer is `cfg(unix)`). Linux and macOS landings carry
-    the bits in the volume and apply none.
+  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). The Windows landing
+    writer exists since A-185 (2026-11-18): it sets a file's `READONLY` from its mode and keeps every other bit the file
+    holds (NTFS's `ARCHIVE` on a file it writes), and applies none of the volume's. Linux and macOS landings carry the
+    bits in the volume and apply none.
   - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
     identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
 - **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
@@ -20346,6 +20361,14 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
   `crates/base/src/windows.rs`, with `crates/base/tests/host.rs`
   `a_files_times_are_unix_nanoseconds_and_an_in_place_edit_moves_them`, which failed on jupiter before the fix and runs
   on every host.
+- **The last check, closed with A-185 (2026-10-26).** The step asked for a write through another slates attachment
+  to show in a mapping after the compare-back's refill. Within a volume such a write reaches every map by write-through
+  before it returns (tested). Across volumes it reaches the disk only by a landing, and a landing places a new file
+  rather than writing in place, so an existing map keeps the replaced file as POSIX does; Ada chose to prove the fresh
+  map: `a_write_through_another_attachment_landed_on_the_disk_reaches_a_fresh_map` lands overlay B onto the directory
+  overlay A maps, A's old node answers `ESTALE` and keeps the old bytes, and A's name, looked up again, maps the landed
+  bytes. The refill itself is proven by an in-place edit (`a_section_of_an_untouched_base_file_is_refilled_with_an_
+  outsiders_edit`). Built for it: landing on Windows (A-185).
 - **Rejected: the pipe's name, as the goal stated it** (above: it lets an asker hold the shard). **Rejected: the
   daemon keeping a duplicate of the client end as the reference.** Any handle keeps the pipe's client open, so the
   stream would never end when its VM did.
@@ -20377,6 +20400,110 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
     592 to 837 µs (the descriptor's conversion), which the first ask's shard pays (GAPS).
   - macOS: the Unix DAX suites pass unchanged (`slates-server --test shards` 26 of 26, `slates-vfs --test
     shards_backing`, `slates-mem --test dax_object`, `slates-bridge-core`, `slates-bridge-fuse`).
+
+### A-185 — Landing runs on Windows: a handle-relative NTFS writer, and NTFS's renames in the engine's move check (accepted 2026-10-26; landed 2026-11-18)
+Applied in the same change to: §4.15 (a status), A-180 (its last check), A-262 (its landing half's status), GAPS,
+`docs/wip/ci-matrix.md`, `.github/workflows/ci.yml` (both Windows lanes), the bug record of 2026-11-08 (the earlier
+finding), `crates/land` (`src/os_windows.rs`, new: the Windows seam; `src/lib.rs`; `Cargo.toml`, `windows-sys`;
+`src/engine.rs`, `same_object_after_a_move`; `tests/os.rs`, `tests/os_escape.rs` and `tests/os_removal.rs` on Windows,
+their symbolic-link cases on Unix, and three new tests in `tests/os.rs`; `tests/common`, `write_file_with_mode`;
+`examples/land_bench.rs`, its OS rows on every platform), `crates/base` (`src/windows.rs`: `walk_dir` with the
+own-drive refusal, `WalkRefusal`, `drive_of`, the handle accessors and adoption, `entry_fingerprint`; `tests/host.rs`: the
+junction helper's backslashes), `crates/server` (`src/landing.rs`, `src/image.rs` and `src/landing_entries.rs` without
+a Unix gate; the landing and lease fixtures, `common::client::channel_account`, and `presentations.rs`, `lease.rs`,
+`snapshot_landing.rs`, `landing_fairness.rs`, `presentation_fairness.rs`, `write_policy.rs`, `checkout.rs` and
+`signed_work.rs` on every platform, a channel's account read from the daemon where they asked `getuid`), `crates/client`
+(`tests/presentation.rs` on every platform; `tests/shards.rs`, the landing-to-fresh-map test), `crates/cli`
+(`tests/winfsp.rs`, a landing target on the daemon's own drive), and `unsafe-budget.toml` (`slates-land` 4 → 22).
+- **What was there.** `slates-land`'s write seam was Unix-only and the server refused every landing on Windows
+  (`Unsupported { feature: "landing" }`), so no landing test ran there and no Windows lane ran the daemon's unit tests,
+  two of which asked for a landing until they moved to `crates/server/tests/presentations.rs`. Ada's rule (2026-10-26):
+  every function works on every platform. Another session built the writer on 2026-10-26 on jupiter (Windows
+  10.0.26200) and left it uncommitted (`agents/windows-land-wip`, `dcd74474`); on 2026-11-18 it was ported onto main,
+  1,985 commits on, and finished.
+- **The writer.** Every verb is relative to a handle the base host holds, never a path, as on Unix:
+  - creates by `NtCreateFile` with `FILE_CREATE` and the parent's handle as `RootDirectory`, so a name, link or
+    junction already there refuses the create;
+  - the rename that never replaces by `NtSetInformationFile(FileRenameInformationEx)`, POSIX semantics and never
+    `REPLACE_IF_EXISTS`. Win32's `SetFileInformationByHandle(FileRenameInfoEx)` refused a name relative to
+    `RootDirectory` with `ERROR_INVALID_PARAMETER` (measured on jupiter, Windows 10.0.26200);
+  - removals by `FileDispositionInfoEx`, POSIX semantics, the read-only attribute ignored;
+  - writes through the temporary's own file (`seek_write`), never a duplicated handle per write;
+  - a file's mode as its `READONLY` bit alone, set where the mode has no write bit and cleared where it has one
+    (A-262), every other attribute bit kept (`attributes_for_mode`);
+  - a batch's barrier as each file's `FlushFileBuffers` on ⌈√n⌉ threads, off the shard (A-132). A directory's sync
+    goes through the directory opened again, an empty name relative to its own handle, with `FILE_ADD_FILE`:
+    `ReOpenFile` with `GENERIC_WRITE` was refused `ERROR_ACCESS_DENIED`.
+
+  NTFS has no atomic exchange of two names, so the capabilities say so and the engine moves the old entry aside
+  first. A symbolic link is refused `EPERM`: Windows makes one only through a path (`CreateSymbolicLinkW`) or with a
+  privilege, and slates writes through handles and asks for no privilege (R10).
+- **Containment.** The target is walked from its drive's root one component at a time with `FILE_OPEN_REPARSE_POINT`,
+  refusing `..`, a link, a junction or a mount point (`slates_base::walk_dir`), and must be owned by this process's
+  user, compared by security identifier. A target on one of this daemon's own WinFsp drives is refused `OwnMount`
+  before any open (A-227), as the Unix walk refuses a component on one of its mounts: the walk refuses every name
+  surrogate, so the drive the path names is the only volume it can reach, and its DOS device is asked of the object
+  manager, never of the volume.
+- **What the engine met on NTFS** (each measured, then fixed):
+  - The base host's fingerprint carried the raw attribute word as the mode, so the engine read a witnessed directory
+    as a file (`Conflict(TypeChanged)` on the worked example's tree removal; jupiter, 2026-10-26). A-262 fixed the same
+    bug for the base plane on 2026-11-08 (`windows_mode_and_bits`), before this landed, and the writer reads its
+    mapping; its bug record now carries this finding.
+  - NTFS gives a file renamed onto a name another file left moments before that file's creation time (tunneling),
+    and the engine's fallback does exactly that, so every replacement was undone `TargetInUse`, the birth time the
+    only other difference (jupiter, 2026-10-26). A moved object is now judged on the device, the file index, the size,
+    the mtime, the mode and its attribute bits, the birth time set aside with the ctime and owner
+    (`same_object_after_a_move`, one check where three sites had their own).
+  - A rename sets `ARCHIVE` on the file it moves, and a backup clears it from every file it has copied, so a witnessed
+    file without it could never be moved aside and found the same: with the bit compared, such a file's replacement was
+    undone `TargetInUse` and the landing ended `Partial` (red-check on CI's windows-latest, run 44367207034). The move
+    check sets the bit aside with the birth time, and a moved file that differs from its witness in any field still has
+    its bytes compared (`a_file_whose_archive_bit_a_backup_cleared_is_replaced_by_a_landing`).
+  - The writer gave each file its mode by writing the attribute word whole (`NORMAL` or `READONLY`). The rename that
+    places the file sets `ARCHIVE` again, so a landed file held it either way (red-check: the word written whole lands
+    the same, run 44367207034); the writer now sets or clears `READONLY` alone, A-262's rule, every other bit kept
+    (`attributes_for_mode`; `a_landed_file_keeps_its_archive_bit_and_takes_read_only_from_its_mode` holds the mapping).
+  - An elevated process owns nothing it makes by its user: Windows makes the token's default owner the owner of a
+    process's new objects, and an elevated administrator's is the Administrators group (the owner CI's runner gave a
+    directory it made: `BUILTIN\Administrators`). The writer compared a target's owner with the token's user alone, so
+    on CI's runners every landing into a directory the test made was refused `TargetNotOwned`
+    (`OwnedByAnother`; presentations 0 of 6 on windows-11-arm, run 44364587413). The owner may now be the token's user
+    or its default owner (`TokenOwner`): a directory this process made is its own however it ran, as a root daemon's
+    is its own on Unix.
+- **What a landing means for a DAX map** (A-180's last check, decided with Ada). A landing never writes a file in
+  place (R1's old-or-new): it places a new file at the name. So a guest holding the old file open keeps its bytes,
+  as POSIX does (measured: its `READ` returned them), and a node with no descriptor held answers `ESTALE` (A-151);
+  the guest looks the name up again and maps the new file, which holds the landed bytes. A refill follows a change
+  made in place on the disk only.
+- **Still owed.** A symbolic link in a Windows landing (no unprivileged, handle-relative way to make one); a reflink
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half, applying the volume's other attribute bits. And
+  the seam's numbering: it reports the refusals the engine tells apart by POSIX numbers (`EEXIST`, `ENOSPC`,
+  `EOPNOTSUPP`, `EPERM`) and every other one by its Win32 code, so a Win32 code equal to one of the engine's numbers
+  (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_BAD_COMMAND` 22, `ERROR_OUT_OF_PAPER` 28, `ERROR_TOO_MANY_SESS` 69,
+  `ERROR_INSUFFICIENT_BUFFER` 122) would read as that POSIX refusal. None of the writer's calls is known to answer one;
+  a typed refusal at the seam, rather than a number, would close it on every host.
+- **Proven** (2026-11-18) on CI's windows-latest and windows-11-arm, on main 53353e5e8 with this change merged (run
+  44371955995):
+  - `slates-land` whole on NTFS: the oracle 30 of 30, `os.rs` 9 of 9 (the real kill test, T-1.15, and the three new
+    tests among them), the escape oracle with junction and hard-link swaps before every seam call, and the removal
+    oracle with real outsider saves; 62 s and 87 s with the build;
+  - `slates-server`'s unit tests one test at a time, 368 passed and 3 ignored, in 9.68 s and 16.64 s;
+  - the landing suites through the daemon, one test at a time: `presentations.rs` 10 of 10 (the two landing tests the
+    unit tests once held among them), `checkout`, `landing_fairness`, `lease`, `presentation_fairness`, `signed_work`,
+    `snapshot_landing` and `write_policy`, all passing;
+  - the client's `presentation.rs` (the presenter killed by `TerminateProcess`), the landing-to-fresh-map DAX test
+    (`crates/client/tests/shards.rs`), and the MCP surface with `slates.land.materialize`;
+  - a landing target and a base on the daemon's own WinFsp drive refused `OwnMount` before any open (run 44376034930).
+
+  macOS (the Mac Studio) and ubuntu-latest: the land suite whole (71 tests), the daemon's landing unit tests,
+  `presentations.rs`, `write_policy.rs` and `signed_work.rs` (runs 44367197015 and 44371955995). Red-checked on
+  windows-latest (run 44367207034), each mutation alone: the move check comparing `ARCHIVE` undid the backup-cleared
+  file's replacement (`Undone(TargetInUse)`, the landing `Partial`); the owner compared with the token's user alone
+  refused all three new tests' targets (`TargetNotOwned`); and the attribute word written whole changed nothing a test
+  sees (the placing rename sets `ARCHIVE`). The own-drive refusal's red-check (the walk without its drive check) is
+  filed for main's run, not yet read. The 2026-10-26 red-checks on jupiter stand: a rename that may
+  replace failed the removal oracle; a walk that follows a junction failed the escape test; a placement made a no-op
+  failed the fresh-map test.
 
 ### A-181 — `slates shards` on Windows starts its command holding the stream end as a named handle, and waits for it (accepted 2026-10-26)
 Applied in the same change to: §4.6 (the Shards form's Windows status), GAPS, `crates/ipc` (`win_spawn.rs`, new: the
