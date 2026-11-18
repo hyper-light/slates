@@ -30427,6 +30427,8 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A
 - **Test.** `a_verb_held_for_its_quorum_commit_waits_the_failover_delay` (`crates/server/src/work_home.rs`): on a shard
   whose failover delay is held at three lease bounds, a verb deferred for its quorum commit is still held a lease bound
   after its deferral and released at the failover delay.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-7, debug build, `cargo test --locked -p slates-server --lib --
+  work_home lease_wait`): 1 of 1. Red-checked once: with the bound back at the lease's, the test fails at its first
+  look, the verb released. The green owner's flows and the load rungs that park verbs are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/work_home.rs`.
