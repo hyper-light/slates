@@ -3470,7 +3470,7 @@ fn serve_taken(
       let publishing = slates_rt::futures::now_ns();
       let answer = acknowledged(state, encode_reply(&reply));
       // DIAG (g076b prototype): the holder keeps polling after a live entry, so the next one finds it awake.
-      if let Some(hold) = std::env::var("SLATES_DIAG_HOLD_NS")
+      if let Some(hold) = std::env::var("SLATES_DIAG_HOLDER_HOLD_NS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
       {
