@@ -24161,6 +24161,10 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   and the decision's own two unit tests. By use over the export:
   `an_object_made_over_the_export_takes_its_group_by_this_hosts_rule` (`crates/bridge-nfs/tests/procedures.rs`), which
   holds macOS's CI run to BSD's rule and every other host to System V's. The FUSE creation test of AUD-29-81 stands.
+  The daemon's AC-3.10 test over its NFS port (`a_mount_preserves_each_requests_unix_owner_across_shards`,
+  `crates/server/tests/nfs_mount.rs`) expected System V's group on every host and failed on macOS once A-328 landed
+  (MKDIR's group 20, the root's, where it expected the caller's 1001; found by g251, 2026-11-18): it now states the
+  rule per host, the parent's group on macOS and the caller's elsewhere, each owner still the caller.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
