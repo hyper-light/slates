@@ -2982,6 +2982,16 @@
 >     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
 >       still cross to the green's owner and queue there (A-273's replicas would take the reads and rebases off it).
 >
+>     **The rung's starved clients were the harness's hot set, and the round is reported, not judged (2026-11-18, g083,
+>     A-416).** Every 1,000-client run had 16 to 29 clients starved, and the bound requires none: the harness drew its
+>     `--hot-files 800` with replacement over `kernel/`'s 700-odd eligible files, so every file was hot and some three
+>     to five times hotter than the rest. The hot set is now that many distinct files and at most half the files long
+>     enough to edit, refused (`refused`, exit 1) otherwise, so the rung's 800 need a larger tree (`fs/`, 2,365 files).
+>     And the bound judges every request kind and the cycle, a whole edit and merge, as §1.4's status names them; a
+>     round, as many edits and merges as its conflicts make, stays in the `latency` row (191 ms at its p99 with every
+>     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
+>     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
