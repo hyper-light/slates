@@ -1,0 +1,24 @@
+# DIAG (not for main): g230's A-371 db tests on Linux x86_64 -- the credit test green, then red on the old Shipper.
+name: diag-g230-db
+on:
+  push:
+    branches: ['diag-g230-db-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The db live tests (green)
+        run: |
+          set +e
+          cargo test --locked -p slates-db --test live > green.log 2>&1; echo "== green live exit $?"
+          grep -E "^test result|FAILED|panicked" green.log | head -20
+          cargo test --locked -p slates-db --lib live > greenlib.log 2>&1; echo "== green lib live exit $?"
+          grep -E "^test result|FAILED|panicked" greenlib.log | head -20
