@@ -2174,7 +2174,7 @@ fn fill_with_empty_files(client: &mut Client, volume: VolumeId) -> (u64, Refusal
       }
       _ => made += 1,
     }
-    if made % u64::try_from(ACK_EVERY).unwrap() == 0 {
+    if made.is_multiple_of(u64::try_from(ACK_EVERY).unwrap()) {
       acknowledge(client);
     }
   }
