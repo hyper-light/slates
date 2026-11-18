@@ -5331,6 +5331,28 @@ fn let_its_frozen_copy_go(fleet: &[&Daemon], daemon: &Daemon) -> bool {
   })
 }
 
+/// Silences each of `holders`' answers to `asker`'s takeover questions, so `asker` cannot adopt what is moved to it.
+fn silence_takeover_answers_to(holders: &[&Daemon], asker: HostId) {
+  for holder in holders {
+    holder.inject_takeover_silence(&[asker]).unwrap();
+  }
+}
+
+/// The move test's read-back once the survivors `retired` the dead target ([`read_back`] of `files` in `volume`):
+/// nothing is read, and nothing served, when they did not.
+fn read_back_once_retired(
+  retired: bool,
+  fleet: &[&Daemon],
+  client: &mut Client,
+  (volume, files): (VolumeId, &[(&str, &[u8])]),
+) -> (bool, Option<ReplyBody>) {
+  if retired {
+    read_back(fleet, client, volume, files)
+  } else {
+    (false, None)
+  }
+}
+
 /// A-291 (§4.10, the failure matrix's "migration in flight when the new host dies"): the new owner dies at the switch,
 /// never having adopted the volume. Three daemons at `f = 1`. Do: on a, write two files into a volume and seal its head
 /// while c refuses every content put, so the head is held by a and b alone (the shape a seal leaves when the target
@@ -5365,20 +5387,14 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
     .collect();
   let mut client_a = Client::connect(&instances[0]);
   let (id, files) = sealed_on_owner_and_target(&daemons, &mut client_a, "stranded-move");
-  for holder in [&daemons[0], &daemons[2]] {
-    holder.inject_takeover_silence(&[hosts[1]]).unwrap();
-  }
+  silence_takeover_answers_to(&[&daemons[0], &daemons[2]], hosts[1]);
   let everyone: Vec<&Daemon> = daemons.iter().collect();
   let (moved, answers) = move_until_done(&everyone, &mut client_a, id, hosts[1]);
   let target = daemons.remove(1);
   target.stop();
   let retired = moved && poll_survivors_retire(&daemons, hosts[1]);
   let fleet: Vec<&Daemon> = daemons.iter().collect();
-  let (served, last) = if retired {
-    read_back(&fleet, &mut client_a, id, &files)
-  } else {
-    (false, None)
-  };
+  let (served, last) = read_back_once_retired(retired, &fleet, &mut client_a, (id, &files));
   let let_go = let_its_frozen_copy_go(&fleet, &daemons[0]);
   let handed_off = daemons[0]
     .refusals_on_every_shard()
@@ -7499,15 +7515,26 @@ fn a_forward_is_never_refused_below_its_paths_floor() {
     "the probe through b's deaf session under a {slo:?} failover SLO: answered after {took:?} and {periods} of b's \
      periods with {answer:?}; b's counters {counters:?}"
   );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert!(held, "b's discovery to a was held");
+  assert!(marked, "the deafness was installed on b");
+  assert_answered_at_the_paths_floor(&answer, (took, slo), &counters);
+}
+
+/// The probe through b's deaf session: answered on the replacement session, never refused below its path's floor;
+/// answered past its failover SLO `slo`, so the floor is what held it; and b's `counters` show the deaf session dropped
+/// and the probe's bound held at the path's measured floor.
+fn assert_answered_at_the_paths_floor(
+  answer: &Result<ReplyBody, IpcError>,
+  (took, slo): (Duration, Duration),
+  counters: &[(&'static str, u64)],
+) {
   let count = |wanted: &str| {
     counters
       .iter()
       .find(|(name, _)| *name == wanted)
       .map_or(0, |(_, count)| *count)
   };
-  assert!(routed, "b routed the volume to a: {last:?}");
-  assert!(held, "b's discovery to a was held");
-  assert!(marked, "the deafness was installed on b");
   assert!(
     matches!(answer, Ok(ReplyBody::Status { .. })),
     "the probe was answered on the replacement, never refused below its path's floor: {answer:?} after {took:?}"
@@ -24014,13 +24041,14 @@ fn green_or_stop(created: Option<VolumeId>, daemons: &mut Vec<Daemon>, what: &st
   panic!("{what}");
 }
 
+/// The late-submit test's measured pairs: each pair's two waits (the old green's, the fresh green's), and each pair's
+/// index with its two answers.
+type MeasuredPairs = (Vec<(Duration, Duration)>, Vec<(u64, ReplyBody, ReplyBody)>);
+
 /// The late-submit test's measured pairs: [`MEASURED_PAIRS`] submits each on the `old` green and the `fresh` one, the
 /// order alternating so neither green is always the one measured just after the other. Each pair's two waits, and each
 /// pair's index with its two answers.
-fn measured_submit_pairs(
-  client: &mut Client,
-  (old, fresh): (VolumeId, VolumeId),
-) -> (Vec<(Duration, Duration)>, Vec<(u64, ReplyBody, ReplyBody)>) {
+fn measured_submit_pairs(client: &mut Client, (old, fresh): (VolumeId, VolumeId)) -> MeasuredPairs {
   let mut pairs = Vec::new();
   let mut answers = Vec::new();
   for index in 0..MEASURED_PAIRS {
@@ -24053,6 +24081,12 @@ fn assert_each_submit_its_greens_next_version(
   history: &[ReplyBody],
   answers: &[(u64, ReplyBody, ReplyBody)],
 ) {
+  assert_history_accepted_in_order(history);
+  assert_measured_submits_accepted(answers);
+}
+
+/// Each history submit accepted as the next version, in order from 1.
+fn assert_history_accepted_in_order(history: &[ReplyBody]) {
   for (index, submitted) in history.iter().enumerate() {
     let version = u64::try_from(index).unwrap() + 1;
     assert!(
@@ -24060,6 +24094,11 @@ fn assert_each_submit_its_greens_next_version(
       "history submit {index} is accepted as version {version}: {submitted:?}"
     );
   }
+}
+
+/// Each measured pair's submits accepted as their greens' next versions: the old green's after its history, the fresh
+/// green's from 1.
+fn assert_measured_submits_accepted(answers: &[(u64, ReplyBody, ReplyBody)]) {
   for (index, older, newer) in answers {
     assert!(
       matches!(older, ReplyBody::Submitted { version: Some(at), .. } if *at == HISTORY_SUBMITS + index + 1),
@@ -25621,6 +25660,31 @@ fn takeover_given_up(daemon: &Daemon) -> Result<bool, ObserveError> {
   })
 }
 
+/// The successor placed the taken-over green at version 4 (`placed`), never gave it up, and adopted the version between
+/// its own and the adopted one, by its `counted` counters.
+fn assert_placed_at_four_by_adoption(
+  placed: &Result<bool, ObserveError>,
+  counted: &std::collections::BTreeMap<&'static str, u64>,
+) {
+  assert_eq!(
+    placed,
+    &Ok(true),
+    "the successor placed the taken-over green at version 4 (given up {}, positions adopted {}, waited on its chain {})",
+    count_of(counted, "merge.takeover_given_up"),
+    count_of(counted, "fleet.takeover.ledger_positions_adopted"),
+    count_of(counted, "merge.takeover_incomplete"),
+  );
+  assert_eq!(
+    count_of(counted, "merge.takeover_given_up"),
+    0,
+    "the green was never given up"
+  );
+  assert!(
+    count_of(counted, "fleet.takeover.ledger_positions_adopted") >= 1,
+    "the successor adopted the version between its own and the adopted one"
+  );
+}
+
 /// GAP-A9-7's record half (A-364; §4.8 "For each ledger position ... adopts the highest accepted proposal consistent
 /// with the committed prefix", §4.16): a successor two versions behind the quorum takes the green over. Do: three nodes
 /// at `f = 1`; on a, a green advanced to version 2 and recomputed by both holders; the survivor rendezvous ranks first
@@ -25693,7 +25757,6 @@ fn a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_gr
     daemon.stop();
   }
   let counted = counted.expect("the successor's counters are read");
-  let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
   assert!(both_at_two, "both holders recomputed version 2");
   assert!(unowned, "before the death neither holder owned the green");
   assert!(other_at_four, "the other holder recomputed version 4");
@@ -25702,23 +25765,7 @@ fn a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_gr
     Ok(Some(2)),
     "the successor was two versions behind when the owner died"
   );
-  assert_eq!(
-    placed,
-    Ok(true),
-    "the successor placed the taken-over green at version 4 (given up {}, positions adopted {}, waited on its chain {})",
-    count_of("merge.takeover_given_up"),
-    count_of("fleet.takeover.ledger_positions_adopted"),
-    count_of("merge.takeover_incomplete"),
-  );
-  assert_eq!(
-    count_of("merge.takeover_given_up"),
-    0,
-    "the green was never given up"
-  );
-  assert!(
-    count_of("fleet.takeover.ledger_positions_adopted") >= 1,
-    "the successor adopted the version between its own and the adopted one"
-  );
+  assert_placed_at_four_by_adoption(&placed, &counted);
   assert_eq!(
     successor_chain,
     Ok(owner_chain),
