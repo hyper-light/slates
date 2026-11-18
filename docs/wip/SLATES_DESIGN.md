@@ -4809,6 +4809,19 @@ and hands it to one client; the client writes only `cmd` slots and the `parked` 
 writes only `cpl` slots and the wake word; large payloads (archive streams, big reads through the
 SDK) travel through a per-client bulk region referenced by offset from a slot.
 
+> **Status (2026-11-18, A-381): a client's ring wakes only its own shard.** On macOS and Windows a client of a shard
+> that has announced itself idle rings the bootstrap object's daemon-wide doorbell, and the daemon's doorbell thread
+> kicks shards. It kicked every shard at every ring: at 1,000 clients over 23 shards on a Mac Studio each shard parked
+> and woke about 7,500 times a second, alike on shards serving one connection and two, and the control shard ran a
+> claim round for every request. A ring now marks the shard its region names (a bit a shard id in the bootstrap
+> object, with a summary bit a word, so the thread reads only the words a ring touched) and a claim marks the claim
+> (the header's word beside the doorbell), and the thread kicks the shards marked: the control shard only for a
+> claim. The bootstrap object's magic is `SLB2`, so a client or an object of the layout before is refused as another
+> layout, never served with its rings unheard. Linux clients write their shard's own kick descriptor, as before.
+> Tests: `a_ring_marks_only_the_shard_it_names_and_a_claim_marks_the_claim` (`slates-ipc`) and
+> `a_clients_ring_wakes_only_the_shard_that_serves_it` (`crates/server/tests/doorbell.rs`), red with the thread
+> kicking every shard.
+
 > **Status (2026-09-19, Linux rendezvous):** the control shard drains the listener and
 > awaits its next one-shot driver readiness. Connections already queued or arriving during
 > registration remain readable. No Linux doorbell thread polls a pending connection and
@@ -27220,3 +27233,39 @@ ledger), `crates/cluster/src/content.rs` (`HoldPiece`, `ManifestPiece`, `Content
   late-submit test's late median at 300 versions 2.28 to 2.37 ms against the early 2.31 to 2.49 (after A-372, 2.92 to
   3.28 against 1.87 to 1.96), and at 1,000 versions 3.76 ms against 6.00 (after A-372, 8.49 against 2.28; before A-367,
   18.2 against 2.16): a version late in a green's history now costs what an early one does.
+
+### A-381 — A client's ring wakes only the shard that serves it: the doorbell thread kicks the shards the rings marked (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; §4.7, D-10)
+Applied in the same change to: §4.7 (the status of 2026-11-18), GAPS (the load test's entry),
+`crates/ipc/src/rendezvous.rs` (the macOS and Windows bootstrap object: `MAGIC` `SLB2`, `AT_CLAIM_RUNG`, the summary
+and pending mark words, `Bell::ring_for`, `Bell::ring_claim`, `Bell::take_pending`; `Doorbell::ring` names the shard;
+`DoorbellWaiter::take_pending`; `Pending`), `crates/ipc/src/endpoint.rs` (`ClientEnd::send` rings for its region's
+shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked, `kick_pending`),
+`crates/server/src/daemon.rs` (each kick paired with its shard's id), and the tests below.
+- **What was wrong.** On macOS and Windows a client rings the bootstrap object's daemon-wide word when its shard has
+  announced itself idle, and the daemon's one doorbell thread, woken, kicked every shard and flagged the control shard's
+  claim poller. A shard serves the clients whose regions name it and no other, so every kick but one was a wake for
+  nothing, and every request its client sent to a parked shard woke every other shard as well. Measured on the Mac
+  Studio at 1,000 clients over 23 shards (the g083 trace diagnostic, 2026-11-18, load 14 to 17, 14,476 replies a
+  second): each shard parked and woke 344,631 to 379,811 times in 49.3 s, about 7,500 times a second, alike on shards
+  serving one connection and two, while it served about 600 of its own clients' requests a second.
+- **The rule.** A ring marks the shard its client's region names, a bit a shard id (a region's shard is a `u16`, so
+  every id has one), and its word in a summary of a bit a word, before it moves the doorbell word and wakes the thread;
+  a claim marks the claim's word instead. The thread, woken by the word's move, takes the claim's mark and the summary,
+  then each pending word the summary names, and kicks the control shard for a claim (and flags its claim poller) and
+  each shard marked. A mark is taken by a swap, so a ring landing while the thread takes is either taken now or moves
+  the word again and is taken at the next wait. A mark naming no shard of this daemon (a client of the daemon before a
+  restart) kicks nothing. The kick stays unconditional for a shard marked: its park does not look at its clients'
+  rings, so a kick skipped because it was not parked yet could be lost.
+- **Format.** The bootstrap object grows by the summary (16 words) and the pending words (1,024): 8,320 bytes. Its
+  magic is `SLB2`: an object or a client of the layout before (`SLBT`) is refused by the other as another layout.
+  Pre-release; no shim.
+- **Tests.** `a_ring_marks_only_the_shard_it_names_and_a_claim_marks_the_claim` (`slates-ipc`): rings for shards 3, 64,
+  3 again and 65,535 and a claim are taken as the claim and those three shards, each once, and a second take is empty.
+  `a_clients_ring_wakes_only_the_shard_that_serves_it` (`crates/server/tests/doorbell.rs`): one client's 200 paced
+  cycles, each a create and a destroy on its own shard of a three-shard daemon, wake that shard at least once a cycle and
+  a shard neither it nor the control shard fewer than half as often; red with the thread kicking every shard (at 100
+  cycles on the Mac Studio such a shard woke 114 times against the client's shard's 100 with every shard kicked, and 14
+  times with A-381).
+- **Measured (owed, the supervisor's):** the 1,000-client rung on the Mac Studio, main before against this, interleaved:
+  every shard's parks a second, its CPU, and each kind's latency and floor.
+

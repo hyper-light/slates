@@ -26,8 +26,8 @@ mod common;
 /// one shard that is neither and that nothing of the client's touches, the one the rings must leave asleep.
 const TEST_SHARDS: u16 = 3;
 /// Shape: the client's paced cycles, each a create and a destroy of a volume its own shard owns: a ring a cycle, enough
-/// that one shard woken by every ring stands far above one woken only by its own timers.
-const CYCLES: usize = 100;
+/// that a shard woken by every ring stands far above one woken only by its own timers.
+const CYCLES: usize = 200;
 /// Shape: the pause before each cycle, a millisecond: twenty times R9's floor F, the idle window, so the client's shard
 /// has announced itself idle and the cycle's create rings the doorbell.
 const PACE: Duration = Duration::from_millis(1);
@@ -36,8 +36,9 @@ const VOLUME_BYTES: u64 = 1 << 20;
 /// Shape: names tried for the ones the client's shard owns: about a third of names land on each of three partitions.
 const NAME_TRIES: usize = 8 * CYCLES;
 /// Shape: the share of the client's own shard's wakes past which a shard nothing asked is counted woken by the rings:
-/// one tenth. Woken by every ring it gains as many as the client's shard, and by its own timers alone a handful.
-const ASLEEP_SHARE: u64 = 10;
+/// one half. Woken by every ring it gains about as many as the client's shard (114 against 100 at 100 cycles, the herd
+/// put back, 2026-11-18), and by its own timers alone a few a second (14 against 100 in the same run's 1.2 s).
+const ASLEEP_SHARE: u64 = 2;
 
 /// The shard (by position, its partition) that serves the client `client_id`.
 fn serving(daemon: &Daemon, client_id: u32) -> usize {
@@ -121,7 +122,7 @@ fn run_cycle(client: &mut Client, name: String) {
 /// A-381 (§4.7, D-10; AC-2.6's wake strategy). Do: on a three-shard daemon, one client runs [`CYCLES`] cycles a
 /// millisecond apart, each a create and a destroy of a volume its own shard owns, so its shard idles between cycles and
 /// each cycle's create rings the doorbell. Expect: the client's shard parked and was woken at least once a cycle (the
-/// rings happened); and every shard that is neither the client's nor the control shard woke fewer times than a tenth of
+/// rings happened); and every shard that is neither the client's nor the control shard woke fewer times than half of
 /// that. Before A-381, on macOS and Windows, every ring kicked every shard, and such a shard woke once a ring.
 #[test]
 fn a_clients_ring_wakes_only_the_shard_that_serves_it() {
