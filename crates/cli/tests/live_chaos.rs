@@ -2189,24 +2189,34 @@ fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds, &NewestAcknowledged
   })
 }
 
-/// Lets the stream run until `count` writes have been acknowledged since `from`, within the fleet wait (the chaos
-/// thread's way to put an event mid-stream). Polls the owner's log head, which every acknowledged write moves.
+/// Lets the stream run until `count` more positions of the owner's live log are durable than at the call, within the
+/// fleet wait ([`until_durable`]; the chaos thread's way to put an event mid-stream): every acknowledged write moves the
+/// owner's durable position by one at least.
 fn after_writes(owner: &str, volume: &str, count: u64) {
-  let head_now = || {
-    live_states(owner, volume)
-      .unwrap_or_default()
-      .into_iter()
-      .find(|state| !state.holding)
-      .and_then(|state| state.durable)
-  };
-  let from = head_now().unwrap_or(0);
+  let from = owned_durable(owner, volume).unwrap_or(0);
+  until_durable(owner, volume, from.saturating_add(count));
+}
+
+/// `owner`'s durable position of `volume`'s live log as its own line reports it, `None` while it shows none.
+fn owned_durable(owner: &str, volume: &str) -> Option<u64> {
+  live_states(owner, volume)
+    .unwrap_or_default()
+    .into_iter()
+    .find(|state| !state.holding)
+    .and_then(|state| state.durable)
+}
+
+/// Waits until `owner`'s live log of `volume` is durable at `target` or past it, within the fleet wait from the call;
+/// the stall guard: a write the daemon never answers fails the flow with the fleet printed.
+fn until_durable(owner: &str, volume: &str, target: u64) {
+  let from = owned_durable(owner, volume);
   let deadline = Instant::now() + FLEET_WAIT;
-  while head_now().unwrap_or(0) < from + count {
+  while owned_durable(owner, volume).unwrap_or(0) < target {
     if Instant::now() >= deadline {
       let instances = DIAGNOSED.with(|instances| instances.borrow().clone());
       panic!(
-        "the stream made {count} writes durable on {owner} (from {from}, now {:?}):\n{}",
-        head_now(),
+        "the stream made {owner}'s log durable at {target} (from {from:?}, now {:?}):\n{}",
+        owned_durable(owner, volume),
         diagnosis(&instances, volume)
       );
     }
@@ -3461,6 +3471,10 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         "StaleNeverCommits (fences)",
         fenced_at_or_above(&survivors, &volume, epoch),
       );
+      verdict.check(
+        "the loss report names a takeover past tolerance exactly when it went past (A-332)",
+        past_tolerance_reported(successor, &volume),
+      );
       judge_takeover(
         &mut verdict,
         &fleet,
@@ -3490,6 +3504,51 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   }
   drop(fleet);
   verdict.judge();
+}
+
+/// A-332: where `successor`'s loss report for `volume` and its counts disagree on whether its takeover went past
+/// tolerance: its registers (`fleet.takeover.recovered_past_tolerance`) and its live log
+/// (`fleet.live.taken_over_past_tolerance`), each part named in the report exactly when the successor counted it. Each
+/// disagreement in words; empty when they agree. The flow's fleet serves this one volume, so a count is its own.
+fn past_tolerance_reported(successor: &str, volume: &str) -> Vec<String> {
+  let counted = [
+    counter(successor, "fleet.takeover.recovered_past_tolerance") > 0,
+    counter(successor, "fleet.live.taken_over_past_tolerance") > 0,
+  ];
+  let report = Client::connect(successor, deadlines())
+    .map_err(|e| format!("{e:?}"))
+    .and_then(|mut client| {
+      client
+        .status(volume_id_of(volume))
+        .map_err(|e| format!("{e:?}"))
+    });
+  let taken = match report {
+    Ok(report) => report.loss.taken_over,
+    Err(why) => return vec![format!("{successor} answered no status of {volume}: {why}")],
+  };
+  let Some(taken) = taken else {
+    return vec![format!(
+      "{successor}'s loss report names no takeover of {volume}"
+    )];
+  };
+  let named = [
+    taken
+      .past_tolerance
+      .is_some_and(|past| past.registers.is_some()),
+    taken
+      .past_tolerance
+      .is_some_and(|past| past.live_log.is_some()),
+  ];
+  ["registers", "live log"]
+    .iter()
+    .zip(counted.iter().zip(named))
+    .filter(|(_, (counted, named))| **counted != *named)
+    .map(|(part, (counted, named))| {
+      format!(
+        "{successor}: its {part} past tolerance counted {counted}, reported {named} ({taken:?})"
+      )
+    })
+    .collect()
 }
 
 /// The control for every chaos flow's latency: do stream writes to a live volume on a fleet nothing disturbs, for
@@ -3825,17 +3884,17 @@ fn a_long_live_log_is_taken_over_whole() {
   let target = u64::try_from(LONG_LOG).unwrap();
   let (outcomes, samples) = stream_through(&fleet.instances, &owner, &volume, 0..LONG_LOG, |_| {
     loop {
-      let durable = live_states(&owner, &volume)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|state| !state.holding)
-        .and_then(|state| state.durable)
-        .unwrap_or(0);
-      let left = target.saturating_sub(durable);
-      if left == 0 {
+      let durable = owned_durable(&owner, &volume).unwrap_or(0);
+      if durable >= target {
         break;
       }
-      after_writes(&owner, &volume, left.min(BETWEEN_EVENTS));
+      // Each step's target is absolute, from this one reading: a step re-read later asked past the stream's end
+      // (from 962, 40 more, against a log that ended at 1,001: CI diag run 44274378785, Linux x86_64, 2026-11-18).
+      until_durable(
+        &owner,
+        &volume,
+        target.min(durable.saturating_add(BETWEEN_EVENTS)),
+      );
     }
   });
   verdict.note(latency_line(&outcomes));

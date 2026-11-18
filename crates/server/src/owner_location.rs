@@ -93,10 +93,12 @@ impl Query {
     CachedRoute { query: self, owner }
   }
 
-  /// Reuse this client's most recent route, or the owner this node's own routing names (A-338), or the id's live first
-  /// owner when it is still in the object's home: the owner a moved object's exception names (A-291; §4.8 "Lookup": "an
-  /// ownership or home move is a configuration exception naming the affected volume"), else its creator. A dead one
-  /// never turns into a rendezvous guess over unrelated members. Asked on the control shard, where the council's
+  /// Reuse this client's most recent route, else the owner this node's own routing names (A-338), else the id's live
+  /// first owner when it is still in the object's home: the owner a moved object's exception names (A-291; §4.8
+  /// "Lookup": "an ownership or home move is a configuration exception naming the affected volume"), else its creator. A
+  /// dead one never turns into a rendezvous guess over unrelated members. Never this node: a verb is forwarded only when
+  /// this node does not serve the object, and the first owner is this node itself only for an object it lost to a
+  /// successor (A-334, A-338), which only the location round can find. Asked on the control shard, where the council's
   /// configuration is. A holder of a moved object's copy follows the exception in its routing
   /// (`crate::moves::follow_moved_objects`), so the two agree wherever both are known.
   pub(crate) fn known_owner(
@@ -106,7 +108,9 @@ impl Query {
   ) -> Option<HostId> {
     // This node's own routing names the owner of an object it holds a copy of, from the records it accepted and the
     // retirements it installed, so it is asked before the creator, which a takeover may have succeeded (A-338): routed
-    // to a creator its routing knew had lost the volume, every forward was redirected there again, for good.
+    // to a creator its routing knew had lost the volume, every forward was redirected there again, for good. And never
+    // this node (A-334): a verb is forwarded only when this node does not serve the object, so a creator or a route that
+    // names this node leaves the owner to the location round.
     let local = state.fleet.host();
     let object = ObjectId(self.object);
     cached
@@ -127,6 +131,7 @@ impl Query {
           .map_or_else(|| object.creator(), |moved| moved.owner);
         eligible(state, first, RegionId(self.region)).then_some(first)
       })
+      .filter(|owner| *owner != local)
   }
 }
 

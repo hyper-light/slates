@@ -212,6 +212,10 @@ pub struct HostTakeover {
   /// for ([`give_up_unpromised`]). Never adopted or learned again in this round, and the share is not confirmed while
   /// any is here, so their holders keep their copies (A-272's rule). Bounded by the retired host's objects.
   given_up: BTreeSet<ObjectId>,
+  /// Per learned object judged ready past tolerance ([`ready_objects`]), the first of its cohorts short of the recovery
+  /// quorum: its adoption records it with a volume's head, whose loss report names it once served (A-332). Bounded by
+  /// `learned`: an entry leaves with its object.
+  past_tolerance: BTreeMap<ObjectId, slates_db::catalog::RecoveryShortfall>,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -267,6 +271,7 @@ impl HostTakeover {
       page_advances: 0,
       waits: BTreeMap::new(),
       given_up: BTreeSet::new(),
+      past_tolerance: BTreeMap::new(),
     }
   }
 
@@ -283,6 +288,7 @@ impl HostTakeover {
     self.named_nothing.clear();
     self.waits.clear();
     self.given_up.clear();
+    self.past_tolerance.clear();
   }
 
   /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
@@ -1199,11 +1205,17 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::ReadyPastTolerance { .. } => {
-        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted.
+      Readiness::ReadyPastTolerance {
+        needed, members, ..
+      } => {
+        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted, and the cohort
+        // it fell short in kept for the volume's loss report (A-332).
         take.waits.remove(object);
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
           past_tolerance = past_tolerance.saturating_add(1);
+          take
+            .past_tolerance
+            .insert(*object, shortfall(needed, members));
           ready.push((*object, newest));
         }
       }
@@ -1236,10 +1248,22 @@ pub(crate) fn ready_objects(
   take
     .waits
     .retain(|object, _| take.learned.contains_key(object));
+  take
+    .past_tolerance
+    .retain(|object, _| take.learned.contains_key(object));
   if past_tolerance > 0 {
     state.count(TAKEOVER_RECOVERED_PAST_TOLERANCE, past_tolerance);
   }
   ready
+}
+
+/// The shortfall a readiness past tolerance judged (A-332): a cohort's recovery quorum `needed` and the `members` of it
+/// left, as the loss report counts them.
+fn shortfall(needed: usize, members: usize) -> slates_db::catalog::RecoveryShortfall {
+  slates_db::catalog::RecoveryShortfall {
+    needed: u64::try_from(needed).unwrap_or(u64::MAX),
+    remaining: u64::try_from(members).unwrap_or(u64::MAX),
+  }
 }
 
 /// The members that promised one learned object: those that listed it, with the highest record each holds, and those
@@ -1710,7 +1734,9 @@ fn record_adoption(
   // The members other than this node that reported the adopted position: a green's successor fetches any input it
   // lacks from them (`fleet::fetch_green_inputs`), since each accepted that version holding its inputs.
   let mut reported_adopted = Vec::new();
+  let mut registers_short = None;
   if let Some(take) = state.host_takeovers.get_mut(&departed) {
+    registers_short = take.past_tolerance.remove(&object);
     if let Some(reports) = take.learned.remove(&object) {
       reported_adopted = reports
         .into_iter()
@@ -1758,10 +1784,9 @@ fn record_adoption(
       .collect();
     cohort_hosts.sort_unstable_by_key(|host| host.0);
     cohort_hosts.dedup();
-    state.pending_materializations.insert(
-      object,
-      crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts),
-    );
+    let mut pending = crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts);
+    pending.registers_short = registers_short;
+    state.pending_materializations.insert(object, pending);
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
@@ -1786,7 +1811,7 @@ fn record_adoption(
 }
 
 /// Whether this node's share of `departed`'s takeover is done: every member of the recovery neighbourhoods it
-/// asked has answered in full, and every object it learned is adopted, none given up ([`share_done`]).
+/// asked has answered in full, and every object it learned is adopted and held here, none given up ([`share_done`]).
 fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   let regional = state.council.configuration();
   let Some(take) = state.host_takeovers.get(&departed) else {
@@ -1797,6 +1822,7 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
     take.fenced.is_none(),
     take.learned.is_empty(),
     take.given_up.is_empty(),
+    !materializing(state, departed),
     regional
       .recovery_hosts(departed)
       .into_iter()
@@ -1805,8 +1831,27 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   )
 }
 
+/// Whether an object `departed`'s round adopted is still being materialized on this node (A-345): its volume's content,
+/// or its live log, not yet held, or a green not yet rebuilt. Its share is not done until it is, since until then this
+/// node still reads from the holders, and a holder that keeps no record of the object authorizes that read through the
+/// departed owner's kept retirement (`fleet::content_authority`'s `successor`). Confirmed with the registers alone, the
+/// share let the retirement complete and go while a live takeover still waited for a falsely retired holder of the
+/// newest entries, and the other holder then refused the successor every report (the fresh-member flow, 2026-11-18:
+/// `fleet.live.hold_refused.fetch_unauthorized` 82, the volume given up). A retirement kept a little longer only delays
+/// the re-admission of the hosts it names, which still answer a report meanwhile.
+fn materializing(state: &ShardState, departed: HostId) -> bool {
+  state
+    .pending_materializations
+    .values()
+    .any(|pending| pending.departed == Some(departed))
+    || state
+      .pending_green_materializations
+      .values()
+      .any(|pending| pending.departed == Some(departed))
+}
+
 /// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
-/// complete, and every object it learned adopted, none given up (A-272, A-304). A confirmation is what lets the takeover
+/// complete, and every object it learned adopted and held here, none given up (A-272, A-304, A-345). A confirmation is what lets the takeover
 /// complete, and a completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an
 /// object still learned or given up must not confirm: its retirement stays kept, and its holders keep their copies.
 /// Before A-272 an object declared lost was dropped from those learned and the round confirmed as though it had been
@@ -1817,9 +1862,10 @@ fn share_done(
   unfenced: bool,
   nothing_learned: bool,
   nothing_given_up: bool,
+  nothing_materializing: bool,
   every_page: bool,
 ) -> bool {
-  current && unfenced && nothing_learned && nothing_given_up && every_page
+  current && unfenced && nothing_learned && nothing_given_up && nothing_materializing && every_page
 }
 
 #[cfg(test)]
@@ -1940,27 +1986,34 @@ mod tests {
     );
   }
 
-  /// A-272, A-304, A-309: a round confirms its share only once every object it learned is adopted, none given up. Do ask
-  /// whether a share is done with every page complete, with and without an object still learned or given up, and with a
-  /// page missing. Expect done only with nothing learned, nothing given up and every page in. Before A-272 a lost object
+  /// A-272, A-304, A-309, A-345: a round confirms its share only once every object it learned is adopted and held here,
+  /// none given up. Do ask whether a share is done with every page complete, with and without an object still learned,
+  /// given up or still materializing, and with a page missing. Expect done only with nothing learned, nothing given up,
+  /// nothing materializing and every page in. A-345: confirmed with an adopted volume's live log still unfetched, the
+  /// retirement completed and went while the successor waited for a falsely retired holder, and the other holder then
+  /// refused the successor every report. Before A-272 a lost object
   /// counted as done; since A-309 none is lost, and an object past tolerance stays learned until every surviving holder
   /// has answered and it is adopted, or is given up at A-304's bound.
   #[test]
   fn a_round_confirms_only_once_every_object_it_learned_is_adopted() {
     assert!(
-      !share_done(true, true, false, true, true),
+      !share_done(true, true, false, true, true, true),
       "an object still learned: not done, the takeover stays kept"
     );
     assert!(
-      !share_done(true, true, true, false, true),
+      !share_done(true, true, true, false, true, true),
       "an object given up: not done, the takeover stays kept"
     );
     assert!(
-      share_done(true, true, true, true, true),
-      "every object adopted: done"
+      !share_done(true, true, true, true, false, true),
+      "an object adopted but still materializing here: not done, the takeover stays kept (A-345)"
     );
     assert!(
-      !share_done(true, true, true, true, false),
+      share_done(true, true, true, true, true, true),
+      "every object adopted and held: done"
+    );
+    assert!(
+      !share_done(true, true, true, true, true, false),
       "a member's pages incomplete: not done"
     );
   }
@@ -2076,6 +2129,52 @@ mod tests {
       promise_object(&mut holding, object, &prepare, false),
       Ok(Some(_))
     ));
+  }
+
+  /// A-345: what keeps a round's share open while its adoptions are not yet held here is exactly the pending objects that
+  /// round adopted. Do: in an audit shard, adopt a volume for departed owner 7 and a green for owner 8, then ask, for each
+  /// owner and for an owner 9 that adopted nothing, whether its round is still materializing; then hold both (take them
+  /// off the pending maps) and ask again. Expect owner 7 and owner 8 materializing while theirs are pending, owner 9
+  /// never, and neither once its object is held.
+  #[test]
+  fn a_round_is_materializing_only_while_an_object_it_adopted_is_pending_here() {
+    crate::daemon::audit_on_shard(|state| {
+      let (seven, eight, nine) = (RegisterHost(7), RegisterHost(8), RegisterHost(9));
+      let volume = ObjectId::new(seven, 1);
+      let green = ObjectId::new(eight, 2);
+      state.pending_materializations.insert(
+        volume,
+        crate::state::PendingVolume::adopted(sealed(&[1], 3), Some(seven), Vec::new()),
+      );
+      let merge = crate::merge_service::MergeRecordValue {
+        version: 1,
+        increment: [3; 32],
+        base: 0,
+        inputs: None,
+        identity: [4; 32],
+        evidence: Vec::new(),
+        name: "pending-green".to_owned(),
+        require_evidence: false,
+        owner: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        completion: None,
+      };
+      state.pending_green_materializations.insert(
+        green,
+        crate::state::PendingGreen::adopted(merge, Some(eight), Vec::new()),
+      );
+      assert!(materializing(state, seven), "owner 7's volume is pending");
+      assert!(materializing(state, eight), "owner 8's green is pending");
+      assert!(!materializing(state, nine), "owner 9 adopted nothing");
+      state.pending_materializations.remove(&volume);
+      state.pending_green_materializations.remove(&green);
+      assert!(
+        !materializing(state, seven) && !materializing(state, eight),
+        "held, neither round is materializing"
+      );
+    });
   }
 
   fn sealed(keys: &[u64], manifest: u8) -> HeadValue {
