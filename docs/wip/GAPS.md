@@ -9912,6 +9912,54 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
 
+### 2026-11-17: the healer missed late repairs, could place where the head names no holder, and left a departed holder named (A-276; fixed)
+
+- **Found.** `a_holder_that_lost_placed_content_is_repaired_by_the_healer` failed once under a whole-suite gate at load
+  54 (head 92dcd16c, `repairs Ok(0) → Ok(0)`, `~/.cache/slates-scratch/fanout/l37-gates.log`). live-fixes' account of
+  2026-11-08 (two losses, the first-ranked candidate offered first) was retracted on 2026-11-09: on three nodes every
+  member holds the head, so the door (`content_retention::admits`) refuses that candidate's put. Goal g248 found the
+  cause and three siblings, and took over live-fixes' unlanded replace (A-276, 6ec41144a).
+- **Causes**, each red on the old code with its test (the Studio, 2026-11-17; the table is in the bug record), and the
+  first reproduced there naturally under contention: 64 bursting spinners on the efficiency cores, 23 runs ok, then the
+  original failure (`repairs Ok(0) → Ok(0)`, the holder holding the content), its DIAG lines showing the refill's
+  acknowledgement arriving 128 ms after the round's dispatch, as a straggler:
+  - **A late repair was never counted.** A content round stops collecting about one hedge delay after a holder's
+    transfer starts (`DispatchWait::judge` sees the owner's own hold as the round's only progress, so the round is
+    judged stalled once its deadline passes), and the refill's acknowledgement then arrives as a straggler's.
+    `fold_late_content` folded it into the placement but counted no repair, the job recorded and dropped, and every
+    later heal found the holder whole. Under load the refill outlasts the round more often.
+  - **A restore could place where the head names no holder.** A cohort member holding no head for the object admits a
+    put at the head's sequence as ahead of its records; the heal placed there, re-recorded that set at the head's
+    sequence, and the named holder stayed empty while the head named it.
+  - **A departed holder stayed named** (live-fixes, 2026-11-09): a head is never rewritten at its sequence, and a
+    replacement put there is refused by the cohort members holding the head; a heal had no bound.
+  - **The first round's dispatch was stamped on another clock** (on main since the p95 hedge trigger; found by this
+    change's first green run): `first_round_at_ns` came from the dispatching shard's runtime-driver clock, which counts
+    from that shard's start, and the owner judged it by its host clock since boot. The hedge round was never held for
+    the measured p95, and with the heal's bound every heal unfinished after its first round ended at the next period.
+- **Fixed (A-276).** A heal restores exactly the named holders, all at once, and records nothing; a repair counts when
+  its acknowledgement is folded, in its round or late (`fleet.heal.repaired_late`,
+  `fleet.heal.refill_outlasted_round`); a named holder that left, or a placement naming fewer than `f + 1`, is replaced
+  on the current cohort at the next sequence, its placement and the republished head one transaction
+  (`record_replacement`), and at `f = 0` nothing is healed (`heal_decision`); every heal ends once its content round's
+  whole span and a period have passed since its first round (`heal_bound_ns`, `fleet.heal.unfinished`), the first
+  round's dispatch stamped on the owner's clock; a round's and a straggler's acknowledgements fold only into the job put
+  at their sequence. Test support `Daemon::inject_content_ack_delay` makes the late acknowledgement deterministic. Bug record:
+  `docs/bugs/2026-11-17-a-heal-miscounted-repairs-and-left-heads-naming-holders-without-the-content.md`.
+- **Open, reported and not changed:**
+  - A named holder that is still a member but outside the object's current candidates (a neighbourhood change moved
+    the cohort) refuses a placement from the owner (`content_authority`), so it can be neither re-offered to nor
+    verified: the heal leaves it named and counts `fleet.heal.named_outside_candidates`. If it loses its copy, the head
+    names a holder without the content. Recommended: replace it as a departed holder is (one republish per volume per
+    such change), so every holder a head names is one the owner can restore.
+  - A departure is healed at the healer's cadence, one placed snapshot per hundred periods at rest, so a node owning
+    many volumes leaves the last of them naming the departed holder for a long walk; a second failure inside that walk
+    loses them at `f = 1`. Recommended: on a retirement, heal first the volumes whose placement names the retired host.
+  - The mirror has no healer (AC-8.15): a mirror holder that loses its copy is never re-shipped to, and the mirror head
+    keeps naming it (live-fixes, 2026-11-08, from reading; its GAPS note never landed).
+  - A takeover's re-commit and a neighbourhood change re-place content under a new holder set; each is owed a test of
+    this shape (live-fixes, 2026-11-09).
+
 ### 2026-11-08: a restarted node's peers kept their sessions to its old process (A-261, stateless reset)
 
 **Fixed in the transport.** On loadtest-scale's primary-kill rung, the client node forwarded into its record session
