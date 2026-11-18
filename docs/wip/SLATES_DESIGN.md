@@ -6902,9 +6902,27 @@ reconstruction budget are derived, never fixed (D-O6).
 > with its turns, made, or refused) is what a later attempt reads before it fetches anything: it joins one running
 > (`fleet.materialize.waits.making`, its turns counted as progress against the give-up bound) and reads one ended; the
 > log is rebuilt once a takeover (`fleet.live.rebuilds_begun`). Held by
-> `a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`). Owed: the archive's
-> layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first publication's
-> live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
+> `a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`). Owed: the
+> archive's layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first
+> publication's live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
+>
+> **Status (2026-11-18, A-386, g251: a takeover's fetch of a live log in turns).** The fetch the rebuild starts from was
+> still one turn on each end: the candidate the successor adopted cloned every entry it held and copied them all into
+> one answer grown as it went, in a turn of its control shard, and the successor copied every payload back out of the
+> answer in a turn of its own (a nemesis run held 34,814 entries, 406 MB appended, beside a control shard's single
+> 557 ms poll, seed 18189587465523915115). Now the candidate lays its answer out on a task of its serve loop
+> (`live_ship::serve_fetch`, `FetchAnswer`): the fence raised and published in the first turn, then the entries a copy
+> slice a turn (`DaemonConfig::copy_slice_bytes_within` of the takeover's quantum, an entry at least, counted
+> `fleet.live.fetch_slices`), into a buffer reserved whole, which the transport takes as it is (`Endpoint::reply` by
+> value, `StreamSender::write` keeping it as the stream's buffer). The successor reads the answer's reply and leaves the
+> payloads in place (`slates_db::live::FetchedLog`): each is read and checked against the hold's cap when the rebuild
+> applies it, and a payload whose framing broke in transit stops the rebuild `fleet.live.takeover_refused.fetched`, which
+> is not kept as the log's refusal, so the log is fetched again. A successor that holds the adopted head itself lays its
+> own copy out the same way. A copy that moved while its answer was laid out (a later successor's fence, another head,
+> entries gone, the copy let go) answers as a fetch arriving then would. The wire is unchanged. Held by the same fleet
+> test (the answer an entry a turn under a cut quantum, both survivors' longest steps under the window, the successor's
+> failover estimate timing the volume) and `a_fetch_answered_an_entry_a_turn_is_the_answer_laid_out_at_once`
+> (`crates/server/src/live_ship.rs`).
 >
 > The same change gives every sliced walk its turns on the shard that drives it (`xshard::Turns`). A walk is driven by a
 > task of the control shard, one `xshard::call_within` a slice; a call to another shard is a task there, a turn of its
@@ -27545,3 +27563,41 @@ typed mount refusal) and `anchor_hold_windows.rs`, `crates/anchor/src/handles.rs
   the held drive touches pass beside them: the CLI's WinFsp mount tests (18, the twenty killed daemons, the held and
   released drives, the refused hold among them), the bridge's live oracles, the anchor's hold tests, and Win32 semantics
   (19).
+
+### A-386 — A takeover's fetch of a live log is answered in turns, and read in place
+
+*2026-11-18, g251 (the coordinator's order after seed 18189587465523915115).* §4.10 live shipping's takeover fetch
+(A-200, A-240) is answered and read in bounded turns. **Before:** the candidate phase one adopted answered the fetch in
+one turn of its control shard: every held entry cloned, then copied into one answer grown as it went (`encode_fetched`),
+then the shard published; the successor copied every payload back out of the answer (`decode_fetched`) in one turn of
+its own control shard, or cloned its own copy whole when it held the adopted head; and the transport copied the whole
+answer once more into the stream's buffer. In a nemesis run (seed 18189587465523915115, x86_64) the candidate held
+34,814 entries of a log of which 406 MB had been appended, and a control shard logged a single 557 ms poll before a
+successor's watchdog ended it. **Now:** the candidate's serve loop answers a fetch on a task of its own
+(`live_ship::serve_fetch`): its first turn authorizes, fences the copy at the successor's epoch and publishes the fence;
+then `FetchAnswer` lays the entries out a copy slice a turn (half the takeover's quantum at the measured memcpy rate,
+`DaemonConfig::copy_slice_bytes_within(fleet::seal_quantum_ns)`, an entry at least), into a buffer reserved for all of
+them (`slates_db::live::fetched_reply`, `push_fetched`). The transport takes a reply by value and keeps it as the
+stream's buffer (`Endpoint::reply`, `Connection::reply`, `StreamSender::write`), so no reply is copied whole. The
+successor decodes the answer's reply and keeps the payloads in place (`slates_db::live::FetchedLog`); the rebuild takes
+each as it applies it (`Rebuilding::advance`), checked against the hold's cap then. A broken framing stops the rebuild
+`fleet.live.takeover_refused.fetched`, which `note_rebuild` does not keep, so the next attempt fetches again, as an
+answer that did not decode always was. A successor that holds the adopted head lays its own copy out the same way
+(`own_log`). Under the fence nothing ships to the copy, so its entries hold still between the turns; a copy that moved
+anyway answers what a fetch arriving then would: a raised fence its stale-epoch refusal, otherwise the head it holds
+now without entries, which the successor does not take. The wire is unchanged: the answer's bytes are the ones
+`encode_fetched` wrote.
+
+Tests: `a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs` (renamed from A-374's; it now also
+counts the answer's turns on both survivors, at least one an entry under the cut quantum, holds both survivors' longest
+steps under the window, and reads the successor's failover estimate timing the volume) and
+`a_fetch_answered_an_entry_a_turn_is_the_answer_laid_out_at_once` (an entry a turn and all at once give the same bytes;
+a raised fence and a let-go copy answer as a fetch arriving then would); `hostile_fetched_replies_are_refused`
+(`crates/db/tests/live.rs`) reads the payloads in place: a payload over the cap and a length of `u32::MAX` are refused
+when reached, and no cut of the answer reads whole.
+
+Applied in the same change to: §4.10's status (A-386), GAPS (A-347's "one-turn walks of a whole volume": the live
+takeover's fetch), the bug record `docs/bugs/2026-11-18-a-takeover-fetch-copied-the-whole-log-in-one-turn.md`,
+`crates/db/src/live.rs`, `crates/db/tests/live.rs`, `crates/transport/src/{stream,connection,endpoint,conn,flow}.rs`,
+`crates/transport/tests/{session,stateless_reset}.rs`, `crates/transport/examples/{congestion_bench,path_mtu_bench}.rs`,
+`crates/server/src/{live_ship,fleet,config}.rs`, `crates/server/tests/fleet.rs`.

@@ -2064,8 +2064,9 @@ impl Endpoint {
   /// Replies to request `id` with `reply`, in the class the request came in. The reply is sent while the
   /// caller goes on to the next request — it keeps flowing on every later turn until acknowledged; a
   /// server that stops serving [`settle`](Endpoint::settle)s first. A reply to a request the peer has
-  /// since abandoned is dropped (`Ok`); one to a stream the peer never opened is refused typed.
-  pub fn reply(&mut self, id: u64, reply: &[u8]) -> Result<(), EndpointError> {
+  /// since abandoned is dropped (`Ok`); one to a stream the peer never opened is refused typed. The reply is taken as
+  /// it is, never copied whole ([`crate::stream::StreamSender::write`]).
+  pub fn reply(&mut self, id: u64, reply: Vec<u8>) -> Result<(), EndpointError> {
     self.conn.reply(id, reply).map_err(EndpointError::Stream)?;
     self.flush()
   }
@@ -2078,7 +2079,7 @@ impl Endpoint {
   {
     let (id, kind, request) = self.next_request().await?;
     let reply = handler(kind, request);
-    self.reply(id, &reply)
+    self.reply(id, reply)
   }
 
   /// Serves one request whose reply is produced asynchronously — a forwarded verb whose reply comes from
@@ -2091,7 +2092,7 @@ impl Endpoint {
   {
     let (id, kind, request) = self.next_request().await?;
     let reply = handler(kind, request).await;
-    self.reply(id, &reply)
+    self.reply(id, reply)
   }
 
   /// Drives the session until everything it has sent — every reply and request byte, every reset and
