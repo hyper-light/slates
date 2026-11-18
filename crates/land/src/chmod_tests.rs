@@ -3,16 +3,11 @@
 //! against a disk that kept the file as the volume witnessed it, already holds the volume's change, or changed it
 //! another way. Its bytes are never rewritten: the same file keeps its inode.
 
-use slates_mem::arena::ChunkArena;
-use slates_mem::region::Region;
 use slates_vfs::base::BaseConfig;
-use slates_vfs::clock::StepClock;
 use slates_vfs::host::HostFs;
 use slates_vfs::host::sim::SimHost;
 use slates_vfs::inode::{Kind, WindowsAttributes};
-use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
-use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+use slates_vfs::volume::{Store, Volume};
 
 use crate::engine::{
   Audit, LandingRefusal, LandingReport, LandingRequest, LandingState, LandingTarget, Outcome,
@@ -21,14 +16,11 @@ use crate::engine::{
 use crate::grant::{GrantScope, Grants, Leases, Surface, TargetIdentity, lease_key};
 use crate::manifest::Filter;
 use crate::source::Source;
+use crate::test_store::{config, store};
 use crate::verdict::{ConflictClass, Verdict};
 
-/// Shape: the test store's page.
-const PAGE: usize = 4096;
-/// Shape: pages of content the test store maps (4 MiB).
-const REGION_PAGES: usize = 1024;
-/// Shape: slots per slab in the test store.
-const CAP: usize = 1 << 14;
+/// Shape: the inode-number prefix of these tests' volumes.
+const PREFIX: u16 = 3;
 /// Shape: the lease and grant terms (monotonic ns); no test crosses them.
 const TERM_NS: u64 = 1_000_000_000_000;
 /// Shape: the large-file class boundary, one chunk window.
@@ -49,36 +41,6 @@ const PRIVATE_MODE: u32 = 0o100_600;
 /// Shape: the script's bytes.
 const SCRIPT: &[u8] = b"#!/bin/sh\necho landed\n";
 
-fn store() -> Store {
-  let mut arena = ChunkArena::new(PAGE);
-  arena
-    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
-    .unwrap();
-  Store::new(
-    &StoreConfig {
-      page: PAGE,
-      cache_line: 64,
-      max_dirs: CAP,
-      max_inodes: CAP,
-      max_chunks: CAP,
-      max_dir_blocks: CAP,
-      dir_cutover: 4,
-    },
-    arena,
-    0,
-  )
-}
-
-fn config() -> VolumeConfig {
-  VolumeConfig {
-    prefix: 3,
-    names: NameEquivalence::Exact,
-    quota: Quota::Bounded { limit: 1 << 24 },
-    journal_bytes: 1 << 16,
-    clock: Box::new(StepClock::new(1_000, 1)),
-  }
-}
-
 /// A disk holding `/run.sh` (the script, at `SCRIPT_MODE`) and an overlay of it, the disk settled before the mount.
 fn overlay_of_a_script(store: &mut Store) -> (SimHost, Volume) {
   let mut host = SimHost::new();
@@ -90,7 +52,7 @@ fn overlay_of_a_script(store: &mut Store) -> (SimHost, Volume) {
   let facts = host.facts(root).unwrap();
   let vol = Volume::create_overlay(
     store,
-    config(),
+    config(PREFIX),
     BaseConfig {
       root,
       facts,
@@ -121,16 +83,15 @@ fn request(grant: Option<crate::grant::GrantId>) -> LandingRequest {
   }
 }
 
-/// Presents the overlay's landing into the disk's root, grants what was presented, and lands it: the presentation's
-/// preliminary verdicts by path, and the granted landing's result.
-fn land_granted(
-  host: &mut SimHost,
-  vol: &mut Volume,
-  store: &mut Store,
-) -> (
+/// A landing's presentation and its granted run: the presentation's preliminary verdicts by path, and the granted
+/// landing's result.
+type Landed = (
   Vec<(Box<str>, Option<Verdict>)>,
   Result<LandingReport, LandingRefusal>,
-) {
+);
+
+/// Presents the overlay's landing into the disk's root, grants what was presented, and lands it.
+fn land_granted(host: &mut SimHost, vol: &mut Volume, store: &mut Store) -> Landed {
   let target = LandingTarget {
     dir: host.root(),
     key: "/".into(),
@@ -220,6 +181,31 @@ fn a_base_files_mode_changed_alone_lands_and_no_byte_is_rewritten() {
   );
   assert_eq!(host.bytes("/run.sh").as_deref(), Some(SCRIPT));
   assert_eq!(report.bytes_written, 0, "{report:?}");
+}
+
+/// A-472 (a landed mode is durable before it is reported). Do: `chmod` `/run.sh` through the overlay and land it over the
+/// simulated host, whose sync model holds a mode set in place unsynced until a barrier names its file. Expect the entry
+/// written in a batch whose one barrier synced the file: no mode a power loss could take back, the file still the one it
+/// was. Before A-472 the mode was set and reported with no sync of the file, its directory's sync the only one, which
+/// fsync(2) does not say covers another inode's metadata.
+#[test]
+fn a_metadata_entry_is_synced_by_its_batchs_barrier_before_it_is_reported() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, no, EXECUTABLE_MODE)
+    .unwrap();
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
+  assert_eq!(report.barriers, 1, "the batch's barrier: {report:?}");
+  assert!(
+    !host.holds_unsynced_metadata("/run.sh"),
+    "the mode a power loss could take back"
+  );
 }
 
 /// A-458 (a field the volume kept is the disk's, as bytes are). Do: mark `/run.sh` hidden through the overlay (its Windows
