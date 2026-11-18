@@ -2652,7 +2652,9 @@ pub enum Lineage {
   /// of its own that completed, and a survivor confirms only once every object it learned was adopted (A-272). Positive
   /// evidence, never inferred from a retirement no longer kept (A-309). A holder that took part in that takeover holds a
   /// stale copy: its answers taught the successors every copy it held, so each was adopted
-  /// ([`RegionalConfiguration::settled_for`]); a holder outside it was never asked, and nothing shows its copy adopted.
+  /// ([`RegionalConfiguration::settled_for`]); a holder outside it was never asked, and nothing shows its copy adopted:
+  /// the completion record keeps no neighbourhood to judge the object's recovery by (A-341,
+  /// [`RegionalConfiguration::within_tolerance`]).
   Settled {
     /// The retired host whose completed takeover the line ends at.
     takeover: HostId,
@@ -3335,6 +3337,28 @@ impl RegionalConfiguration {
       .collect()
   }
 
+  /// Whether `object` of the retired `departed` is recovered within tolerance (A-341): `departed`'s retirement is kept and
+  /// each of the object's settled recovery cohorts ([`recovery_cohorts`]) keeps at least its recovery quorum of members.
+  /// Every record committed for the object is on `f + 1` of each settled cohort, or on all of a smaller one: the owner's
+  /// settle report placed it there, or its joint write did. So a round that adopted the object heard a recovery quorum of
+  /// each and learned a record at least as new as any committed one, and a copy held anywhere else is stale. False once
+  /// the retirement is no longer kept, since a completion record keeps no neighbourhood to judge by, and false past
+  /// tolerance, where a copy outside the cohorts may be the only one of a record no round learned (a joiner holding a
+  /// bootstrap owner's joint write, its settled cohort the owner alone: `crates/db/tests/lineage_model.rs`).
+  ///
+  /// [`recovery_cohorts`]: RegionalConfiguration::recovery_cohorts
+  pub fn within_tolerance(&self, departed: HostId, object: ObjectId) -> bool {
+    let cohorts = self.recovery_cohorts(departed, object);
+    !cohorts.is_empty()
+      && cohorts.iter().all(|cohort| {
+        cohort
+          .iter()
+          .filter(|host| self.members.contains(host))
+          .count()
+          >= self.quorum.recovery(cohort.len())
+      })
+  }
+
   /// The member that takes `object` of the retired `departed` over: the one rendezvous ranks first among the
   /// survivors of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)), or, when no
   /// survivor is in any of them, among all the retirement's survivors (A-309): every object then ranks one, so the
@@ -3409,7 +3433,9 @@ impl RegionalConfiguration {
   /// confirmed its own share of that completed takeover, so it was a member of its recovery neighbourhoods throughout its
   /// round and answered every successor in full before any confirmed, and every copy it held that fell to a successor
   /// was learned and adopted. A holder outside those neighbourhoods was never asked: its copy may be the only one of an
-  /// object no successor learned (a neighbourhood the owner wrote to before it settled elsewhere), so it keeps it.
+  /// object no successor learned (a neighbourhood the owner wrote to before it settled elsewhere), so it keeps it, unless
+  /// a successor's confirmation in the kept retirement shows the object recovered within tolerance
+  /// ([`RegionalConfiguration::within_tolerance`], A-341).
   pub fn settled_for(&self, takeover: HostId, holder: HostId) -> bool {
     self
       .completed

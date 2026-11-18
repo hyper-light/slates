@@ -25224,7 +25224,9 @@ model below; each red before its fix):
   one, and nothing in the configuration tells which. Owed (GAPS): a holder an owner's neighbourhood settled away from
   lets its copies go at that settle, on the owner's report, so these do not stay. (Wrong as stated, A-335: the settle
   report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
-  its holder still keeps is kept whole since A-335.)
+  its holder still keeps is kept whole since A-335.) Since A-341 the kept retirement does tell, at a successor's
+  confirmation: an unasked copy goes as a stale one where the object's settled cohorts are within tolerance
+  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance or when judged on a completion record.
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -27413,3 +27415,37 @@ record before its inputs) and `crates/server/src/takeover.rs` (`commit_adopted`)
   answers the next version out of order until it fetches those inputs and advances; the green goes on at `f + 1` while
   its other holders answer. The successor's own replacement is not driven end to end by a test: that wants two
   takeovers with divergent uncommitted values; its rewind is the register path's, which the tests drive.
+
+### A-341 — A holder the takeover never asked lets its copy go where the kept retirement shows the object recovered within tolerance (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover"; A-309's owed rule, its safe part; A-335)
+Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::within_tolerance`; `Lineage::Settled` and `settled_for` documented),
+`crates/db/tests/lineage_model.rs` (the holder rule, the never-placed copy's exemption from the oracle, the counts) and
+`crates/server/src/takeover.rs` (`Confirmation::Covered`, `fleet.takeover.unasked_covered`).
+- **What was there.** A-309 kept every copy of a holder the takeover never asked (`fleet.takeover.kept_unasked`): its
+  copy is one a neighbourhood the retired owner left still holds, which within tolerance is stale and past it may be
+  the only one. Nothing let it go, so it stayed for good.
+- **The first rule, rejected by the model before it was built.** Let every unasked copy go at the successor's
+  confirmation or the completion record, the oracle relaxed to accept a release where a placement had certified a
+  record at least as new on a cohort without the holder. The lineage model's A-309 oracle (an adoption after every copy
+  let go) failed it at seed 44: a region formed on host 1 alone admitted host 102, host 1 wrote an object jointly to
+  {1} and {1, 102}, placed at `f + 1`, then moved its neighbourhood to later joiners without settling and died. Its
+  takeover asked the joiners, learned nothing of the object, its successor confirmed, and 102 let go the last copy
+  after one failure at `f = 1`. The relaxed oracle had passed it: the "certification" was the dead owner's own cohort.
+- **The rule.** An unasked copy goes as a stale one goes (`let_go_stale`: its content kept while its retention rule
+  keeps it) only when its successor's confirmation is read from the kept retirement and each of the object's settled
+  recovery cohorts keeps its recovery quorum of members (`RegionalConfiguration::within_tolerance`). Every record
+  committed for the object is on `f + 1` of each settled cohort, or on all of a smaller one (the owner's settle report
+  placed it there, or its joint write did), so the round heard a recovery quorum of each and learned a record at least
+  as new. Past tolerance, or judged on a completion record (which keeps no neighbourhood), the copy is kept, counted as
+  before.
+- **Tests.** The lineage model, its oracle A-309's with never-placed copies exempt (a record never placed was never
+  acknowledged): no violation over its 400 seeds and 256 generated histories, `reclaimed_unasked` and `kept_unasked`
+  each reached; red with the tolerance unjudged, seed 44. `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance`
+  (`crates/server/src/daemon.rs`): within tolerance at the first confirmation a plain register goes and a head naming
+  this holder's content stays for it; on the completion record both remaining copies stay. Kiln r41 on the Mac Studio,
+  2026-11-18, debug build: the model over 400 seeds `reclaimed_unasked` 10 and `kept_unasked` 214, no violation; with
+  the tolerance unjudged, seed 44's violation (102's copy of host 1's object, never adopted). The server test passes,
+  with every unasked copy covered the completion record's copy goes ((false, true, false)), and with none covered (A-309)
+  the plain register stays ((true, true, true)); `takeover::` and the holder tests 21 of 21, the register tests 76 of 76.
+- **Still owed (GAPS).** A copy first judged on a completion record (every object of the last successor to confirm)
+  or past tolerance stays; the completion record would need the retired host's settled neighbourhood to judge it.
