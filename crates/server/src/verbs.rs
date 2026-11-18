@@ -16919,7 +16919,13 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
   // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
   let mut skipped: Vec<(DbVolumeId, slates_vfs::VfsError)> = Vec::new();
+  // An attempt that leaves a volume out owes the write log its restamp before it can commit (A-422).
+  let mut restamp_owed = false;
   let outcome = loop {
+    if !skipped.is_empty() && !restamp_owed {
+      owe_write_log_restamp(state);
+      restamp_owed = true;
+    }
     match stream_checkpoint(
       state,
       &handles,
@@ -16938,6 +16944,9 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // of rebuilding empty (§4.8, AUD-05).
   for (id, e) in &skipped {
     count_skipped(state, *id, e);
+  }
+  if outcome.is_err() && restamp_owed {
+    forgive_write_log_restamp(state);
   }
   let mut published = outcome?;
   published.skipped = skipped.into_iter().map(|(id, _)| id).collect();
@@ -16962,12 +16971,8 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
-  // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-  clear_write_log(
-    state,
-    published.skipped.is_empty(),
-    state.journal.generation(),
-  );
+  // generation (A-63). A volume left out keeps its records, restamped, so its writes stay replayable (A-422).
+  settle_write_log(state, &published.skipped, state.journal.generation());
   Ok(published)
 }
 
@@ -17199,18 +17204,38 @@ fn publish_delta_into(
     (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
   )?;
   let (start, end) = state.delta_range;
-  let Some(object) = state.content.as_mut() else {
-    return Err(slates_vfs::VfsError::RecoveryIncomplete);
-  };
-  if end <= start || end > object.len() {
-    return Err(slates_vfs::VfsError::NoSpace);
+  match state.content.as_ref() {
+    None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
+    Some(object) if end <= start || end > object.len() => {
+      return Err(slates_vfs::VfsError::NoSpace);
+    }
+    Some(_) => {}
   }
-  let mut log = ContentSlots {
-    object,
-    start,
-    len: end.saturating_sub(start),
+  // A delta that leaves a volume out owes the write log its restamp before it commits (A-422).
+  let restamp_owed = !published.skipped.is_empty();
+  if restamp_owed {
+    owe_write_log_restamp(state);
+  }
+  let appended = match state.content.as_mut() {
+    Some(object) => {
+      let mut log = ContentSlots {
+        object,
+        start,
+        len: end.saturating_sub(start),
+      };
+      state.journal.append_encoded(&mut log, encoded)
+    }
+    None => Err(slates_vfs::VfsError::RecoveryIncomplete),
   };
-  published.frame_bytes = state.journal.append_encoded(&mut log, encoded)?;
+  published.frame_bytes = match appended {
+    Ok(frame_bytes) => frame_bytes,
+    Err(e) => {
+      if restamp_owed {
+        forgive_write_log_restamp(state);
+      }
+      return Err(e);
+    }
+  };
   for handle in recorded {
     if let Ok(slot) = state.volumes.get_mut(handle) {
       slot.volume.mark_published(&state.store);
@@ -17228,11 +17253,7 @@ fn publish_delta_into(
   crate::content_holder::held_committed(state, held.whole, false);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
-  clear_write_log(
-    state,
-    published.skipped.is_empty(),
-    state.journal.generation(),
-  );
+  settle_write_log(state, &published.skipped, state.journal.generation());
   Ok(published)
 }
 
@@ -17721,19 +17742,50 @@ const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
 pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 
-/// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
-/// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
-/// writes stay owed to the next daemon.
-fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
-  if !captured_every_volume {
-    return;
-  }
-  let Some(object) = state.content.as_mut() else {
+/// Settles the shard's write log after a publication of `generation` committed (A-63, A-422). One that captured every
+/// volume holds every logged write in its image: the log empties, stamped with that generation. One that left out the
+/// volumes `skipped` (an overlay whose base host a landing holds) holds none of their writes since their last capture:
+/// the log keeps exactly their records under that generation and drops the rest, which the image carries
+/// (`WriteLog::retain`). Before A-422 such a log was left under its older stamp, which a restarted daemon found older
+/// than the committed image, so it replayed nothing and the left-out volume lost every write acknowledged since its
+/// last capture. A log the content object refuses is counted; a refused retain also leaves the log marked overflowed,
+/// so the loss is reported.
+fn settle_write_log(state: &mut ShardState, skipped: &[DbVolumeId], generation: u64) {
+  let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
     return;
   };
-  if let Some(log) = state.write_log.as_mut()
-    && log.clear(object, generation).is_err()
-  {
+  let settled = if skipped.is_empty() {
+    log.clear(object, generation)
+  } else {
+    let left_out: std::collections::BTreeSet<[u8; 16]> =
+      skipped.iter().map(|id| id.bytes).collect();
+    log.retain(object, generation, |volume| left_out.contains(volume))
+  };
+  if settled.is_err() {
+    state.count(WRITE_LOG_UNWRITTEN, 1);
+  }
+}
+
+/// Owes the shard's write log its restamp before a publication that leaves a volume out commits (A-422,
+/// `WriteLog::owe_restamp`): a daemon that dies between the commit and [`settle_write_log`] leaves its successor a
+/// stamp older than the committed image with the restamp owed, and the successor reports the left-out volume's writes
+/// lost rather than drop them in silence. Refused by the content object, counted.
+fn owe_write_log_restamp(state: &mut ShardState) {
+  let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
+    return;
+  };
+  if log.owe_restamp(object).is_err() {
+    state.count(WRITE_LOG_UNWRITTEN, 1);
+  }
+}
+
+/// The publication that owed the write log its restamp was refused (A-422): nothing committed, so the log stands as
+/// it was. Refused by the content object, counted.
+fn forgive_write_log_restamp(state: &mut ShardState) {
+  let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
+    return;
+  };
+  if log.forgive_restamp(object).is_err() {
     state.count(WRITE_LOG_UNWRITTEN, 1);
   }
 }
@@ -17806,7 +17858,11 @@ fn replay_forget(
 }
 
 /// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
-/// not rebuild that volume.
+/// not rebuild that volume. An overlay's write goes through its host, as the bridge's write did (A-429): a base file
+/// the image holds uncopied is copied up first, its windows read from the disk, so the bytes around the write stay the
+/// disk's. Written through the volume alone, the write opened its window from the window's start with nothing of the
+/// disk in it, and the bytes before it read as zeros. An overlay whose host is away is refused `BaseUnavailable`, as
+/// the bridge refuses it.
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
@@ -17814,9 +17870,21 @@ fn replay_one(
   let handle = slot_of_volume(state, record.volume)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   let inode = slates_vfs::ids::InodeNo(record.inode);
-  let written = slot
-    .volume
-    .write(&mut state.store, inode, record.offset, &record.bytes);
+  let written = if slot.volume.is_overlay() {
+    match slot.host.as_mut() {
+      Some(host) => {
+        slot
+          .volume
+          .with_host(host)
+          .write(&mut state.store, inode, record.offset, &record.bytes)
+      }
+      None => Err(slates_vfs::VfsError::BaseUnavailable(0)),
+    }
+  } else {
+    slot
+      .volume
+      .write(&mut state.store, inode, record.offset, &record.bytes)
+  };
   // A mount taken over by this daemon may hold pages of this inode that differ from the volume with no reference of it
   // recorded, so its takeover round names it (A-158): older ones when the write landed, and the refused write's own
   // bytes, which its writer's kernel cached, when it did not.
@@ -18388,6 +18456,91 @@ mod tests {
     assert_eq!(origin_reads, b"origin", "the origin is untouched");
   }
 
+  /// Shape: where the replayed write lands in the overlay's base file: past the file's start, inside its first window,
+  /// so the disk's bytes lie on both sides of it.
+  const REPLAYED_AT: usize = 10;
+  /// Shape: the replayed write's bytes.
+  const REPLAYED: &[u8] = b"REPLAYED";
+
+  /// A-429 (A-63's replay; found by reading in A-422's sibling sweep, 2026-11-18): a logged write into an overlay's
+  /// base file is replayed through the overlay's host, as the bridge wrote it. Do: on a shard holding an overlay of
+  /// this crate's sources, replay a logged write of "REPLAYED" at byte 10 of its `lib.rs`, which nothing has copied up,
+  /// as a successor replays a write its dead daemon acknowledged after its last publication; read the file back through
+  /// the overlay. Expect: the replay succeeds, and the file reads as the disk's `lib.rs` with those eight bytes in
+  /// place.
+  /// Before, the replay wrote through the volume alone and never copied the file up, so the write opened its window
+  /// from the window's start with nothing of the disk in it: the ten bytes before it read as zeros where the disk's
+  /// showed.
+  #[test]
+  fn a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it() {
+    const DISK: &[u8] = include_bytes!("lib.rs");
+    let (replayed, read) = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+      let (overlay, handle) = dynamic_volume(state, &principal, "replayed-overlay", Some(base));
+      let file = {
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(handle).unwrap();
+        let root = slot.volume.root_inode(store).unwrap();
+        let host = slot.host.as_mut().unwrap();
+        slot
+          .volume
+          .with_host(host)
+          .lookup_no(store, root, "lib.rs")
+          .unwrap()
+          .inode
+      };
+      let record = crate::write_log::Record {
+        volume: overlay.bytes,
+        inode: file.0,
+        offset: u64::try_from(REPLAYED_AT).unwrap(),
+        bytes: REPLAYED.to_vec(),
+      };
+      let replayed =
+        super::replay_one(state, &record).map(|written| written.map_err(|e| e.to_string()));
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(handle).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      let mut overlay_fs = slot.volume.with_host(host);
+      let mut read = Vec::new();
+      let mut piece = vec![0u8; 4096];
+      loop {
+        let at = u64::try_from(read.len()).unwrap();
+        let got = overlay_fs.read(store, file, at, &mut piece).unwrap();
+        if got == 0 {
+          break;
+        }
+        read.extend_from_slice(&piece[..got]);
+      }
+      (replayed, read)
+    });
+    assert_eq!(
+      replayed,
+      Some(Ok(REPLAYED.len())),
+      "the logged write was replayed"
+    );
+    let mut expected = DISK.to_vec();
+    expected[REPLAYED_AT..REPLAYED_AT + REPLAYED.len()].copy_from_slice(REPLAYED);
+    assert_eq!(
+      read.len(),
+      expected.len(),
+      "the file keeps the disk's length"
+    );
+    let first_difference = read
+      .iter()
+      .zip(&expected)
+      .position(|(got, want)| got != want);
+    assert_eq!(
+      first_difference,
+      None,
+      "the file reads as the disk's with the replayed bytes in place (the first ten bytes: {:?})",
+      &read[..REPLAYED_AT]
+    );
+  }
+
   /// A-64 (the relief). Do: on a shard with a reduced reserve, write a file large enough that rewriting it leaves the
   /// arena below the operation headroom; publish (the image names its blocks); rewrite it whole, so every old block's
   /// free is deferred; then relieve. Expect: before, deferred bytes and free bytes below the headroom; after, a
@@ -18812,6 +18965,140 @@ mod tests {
       assert_eq!(published.volumes, vec![plain, overlay], "{published:?}");
       assert!(published.skipped.is_empty(), "{published:?}");
     });
+  }
+
+  /// Shape: the bytes of the overlay's acknowledged write in the left-out volume's test.
+  const LEFT_OUT_WRITE: &[u8] = b"the overlay's write its writer was told succeeded";
+  /// Shape: the bytes of the plain volume's write in the same test, which the delta carries.
+  const CARRIED_WRITE: &[u8] = b"the plain volume's write, in the delta's image";
+
+  /// A-422 (A-63's write log; found by reading, 2026-11-18): a volume a publication leaves out keeps its logged writes
+  /// for the next daemon. Do: on a shard holding a plain volume and an overlay of this crate's sources, create a file
+  /// in each and publish (both captured, the log emptied); copy one of the overlay's base files up, so its next
+  /// publication is its whole image; write into each new file and log both writes, as a FUSE mount and a Shards stream
+  /// log a write before its reply; take the overlay's base host away (as a landing holds it), so its image cannot be
+  /// taken; publish a delta; then open the log as a restarted daemon does, against the generation its journal
+  /// committed. Expect: the delta carried the plain volume and left out the overlay (non-vacuity), and the restarted
+  /// daemon is handed the overlay's write, whole, and not the plain volume's, which the delta carries and whose replay
+  /// over it could undo a later change. Before A-422 the log kept the stamp of the publication before, the restarted
+  /// daemon found it older than the committed image and replayed nothing, and the overlay lost the write.
+  #[test]
+  fn a_volume_a_publication_leaves_out_keeps_its_logged_writes_for_the_next_daemon() {
+    let (plain, overlay, overlay_file, published, recovered) =
+      crate::daemon::audit_on_shard(|state| {
+        let principal = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+        let (plain, plain_handle) = dynamic_volume(state, &principal, "left-out-plain", None);
+        let (overlay, overlay_handle) =
+          dynamic_volume(state, &principal, "left-out-overlay", Some(base));
+        let plain_file = {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get_mut(plain_handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          slot
+            .volume
+            .create_file_no(store, root, "kept", 0o644)
+            .unwrap()
+        };
+        let overlay_file = {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get_mut(overlay_handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          let host = slot.host.as_mut().unwrap();
+          slot
+            .volume
+            .with_host(host)
+            .create_file_no(store, root, "kept", 0o644)
+            .unwrap()
+        };
+        super::publish_shard(state).expect("the shard publishes both files");
+        {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get_mut(overlay_handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          let host = slot.host.as_mut().unwrap();
+          let mut overlay_fs = slot.volume.with_host(host);
+          let copied = overlay_fs.lookup_no(store, root, "lib.rs").unwrap().inode;
+          overlay_fs.write(store, copied, 0, b"copied up").unwrap();
+          overlay_fs
+            .write(store, overlay_file, 0, LEFT_OUT_WRITE)
+            .unwrap();
+          // The overlay borrow ends here: it closes what it reclaimed when dropped, so it holds the slot till then.
+          drop(overlay_fs);
+          let plain_slot = volumes.get_mut(plain_handle).unwrap();
+          plain_slot
+            .volume
+            .write(store, plain_file, 0, CARRIED_WRITE)
+            .unwrap();
+        }
+        {
+          let super::ShardState {
+            write_log, content, ..
+          } = &mut *state;
+          let log = write_log.as_mut().unwrap();
+          let object = content.as_mut().unwrap();
+          log
+            .append(object, (overlay.bytes, overlay_file.0), 0, LEFT_OUT_WRITE)
+            .unwrap();
+          log
+            .append(object, (plain.bytes, plain_file.0), 0, CARRIED_WRITE)
+            .unwrap();
+        }
+        let host = state.volumes.get_mut(overlay_handle).unwrap().host.take();
+        assert!(host.is_some(), "the overlay had a base host");
+        let published = super::publish_delta(state).expect("the delta publishes");
+        let generation = {
+          let object = state.content.as_ref().unwrap();
+          let (images, deltas) = (state.content_range, state.delta_range);
+          slates_vfs::checkpoint_log::committed_generation(
+            &super::ContentView {
+              object,
+              start: images.0,
+              len: images.1.saturating_sub(images.0),
+            },
+            &super::ContentView {
+              object,
+              start: deltas.0,
+              len: deltas.1.saturating_sub(deltas.0),
+            },
+          )
+        };
+        let super::ShardState {
+          write_log, content, ..
+        } = &mut *state;
+        let recovered = write_log
+          .as_ref()
+          .unwrap()
+          .reopened(content.as_mut().unwrap(), generation);
+        (plain, overlay, overlay_file, published, recovered)
+      });
+    assert_eq!(
+      published.skipped,
+      vec![overlay],
+      "the delta left the overlay out: {published:?}"
+    );
+    assert!(
+      published.volumes.contains(&plain),
+      "and carried the plain volume: {published:?}"
+    );
+    let recovered = recovered.expect("the restarted daemon opens the log");
+    assert!(
+      !recovered.everything_lost,
+      "nothing is reported lost: {recovered:?}"
+    );
+    assert_eq!(
+      recovered.records,
+      vec![crate::write_log::Logged::Write(crate::write_log::Record {
+        volume: overlay.bytes,
+        inode: overlay_file.0,
+        offset: 0,
+        bytes: LEFT_OUT_WRITE.to_vec(),
+      })],
+      "the restarted daemon replays the left-out overlay's write, and not the plain volume's, which the delta carries"
+    );
   }
 
   /// A dynamic volume named `name` (over `base` when given), created through the verb: its id and its slot.

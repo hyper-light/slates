@@ -699,17 +699,14 @@ mod tests {
 
   const SLATES: &str = "/usr/local/bin/slates";
 
-  /// A-370, the flag's judgement. Do: judge a refused map write on every host the launcher meets, with the option off
-  /// and on. Expect: off and under no profile, the AppArmor refusal word for word as before A-370; off after leaving a
-  /// loaded profile, a refusal naming the option; on with no profile, the commands that load it for this executable;
-  /// on under the profile, the call itself (the restriction cannot explain it); and on an unrestricted host the call,
-  /// whatever the option.
+  /// A-370, the flag's judgement with the option off. Do: judge a refused map write on a restricted host, under no
+  /// profile and after leaving a loaded one. Expect: under no profile, the AppArmor refusal word for word as before
+  /// A-370; after leaving a loaded profile, a refusal naming the option.
   #[test]
   fn a_refused_map_write_is_judged_by_the_restriction_the_option_and_the_profile() {
     let step = MapStep::OpenSetgroups;
     let restricted_bare = host(Some(true), "unconfined", SLATES);
     let restricted_loaded = host(Some(true), SLATES, SLATES);
-    let unrestricted = host(Some(false), "unconfined", SLATES);
 
     let before = judge_map_refusal(step, 13, AppArmor::Off, &restricted_bare, false);
     assert_eq!(before, ExecFault::ConfinedByAppArmor);
@@ -732,7 +729,18 @@ mod tests {
       not_chosen.to_string().contains("--apparmor-profile"),
       "{not_chosen}"
     );
+  }
 
+  /// A-370, the flag's judgement with the option on, and on any host. Do: judge a refused map write with the option on
+  /// and no profile loaded, under the profile, and on an unrestricted host with the option off and on. Expect: with no
+  /// profile, the commands that load it for this executable; under the profile, the call itself (the restriction cannot
+  /// explain it); on an unrestricted host, the call, whatever the option.
+  #[test]
+  fn a_refused_map_write_with_the_option_on_names_the_profile_or_the_call() {
+    let step = MapStep::OpenSetgroups;
+    let restricted_bare = host(Some(true), "unconfined", SLATES);
+    let restricted_loaded = host(Some(true), SLATES, SLATES);
+    let unrestricted = host(Some(false), "unconfined", SLATES);
     let not_loaded = judge_map_refusal(step, 13, AppArmor::Profile, &restricted_bare, false);
     assert_eq!(
       not_loaded,

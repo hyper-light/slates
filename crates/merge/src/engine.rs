@@ -3185,6 +3185,12 @@ impl Green {
     self.signatures.get(&version).copied()
   }
 
+  /// The version the increment of identity `id` was accepted as, if this green accepted it: its idempotency record, read
+  /// without judging anything (a replica checks a fed version against it, A-273).
+  pub fn accepted_version(&self, id: &[u8; 32]) -> Option<u64> {
+    self.accepted.get(id).copied()
+  }
+
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
   fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
     use crate::chain_entry::Applied;
