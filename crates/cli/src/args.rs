@@ -2290,6 +2290,14 @@ mod tests {
     text.split_whitespace().map(str::to_owned).collect()
   }
 
+  /// The client request a command line parses to; a test fails if it parses to anything else.
+  fn client_request(text: &str) -> ClientRequest {
+    let Command::Client(request) = parse(&args(text)).unwrap() else {
+      panic!("not a client verb: {text}");
+    };
+    request
+  }
+
   /// AC-8.1, §4.8: recovery requires an exact plan and both explicit acknowledgements;
   /// a read-only plan needs neither, and a join always names its replacement group.
   #[test]
@@ -2419,12 +2427,7 @@ mod tests {
   /// the verb, the process verbs' options.
   #[test]
   fn the_grammar_parses_the_documented_forms() {
-    let Command::Client(request) = parse(&args(
-      "volume create scratch --bounded 4GiB --fold --instance x",
-    ))
-    .unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("volume create scratch --bounded 4GiB --fold --instance x");
     assert_eq!(request.instance, "x");
     assert_eq!(
       request.verb,
@@ -2436,17 +2439,10 @@ mod tests {
         base: None,
       }
     );
-    let Command::Client(request) = parse(&args("--instance y volume list")).unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("--instance y volume list");
     assert_eq!(request.instance, "y");
     assert_eq!(request.verb, Verb::List);
-    let Command::Client(request) = parse(&args(
-      "attach 00000000000000000000000000000001 --write --snapshot 3",
-    ))
-    .unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("attach 00000000000000000000000000000001 --write --snapshot 3");
     assert_eq!(
       request.verb,
       Verb::Attach {
@@ -2457,12 +2453,7 @@ mod tests {
       }
     );
     // `--hold` keeps the CLI attachment alive from this process (A-384); a container bind is not held.
-    let Command::Client(request) = parse(&args(
-      "attach 00000000000000000000000000000001 --write --hold",
-    ))
-    .unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("attach 00000000000000000000000000000001 --write --hold");
     assert_eq!(
       request.verb,
       Verb::Hold {

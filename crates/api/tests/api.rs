@@ -15,24 +15,19 @@
   clippy::disallowed_methods
 )]
 
-#[cfg(unix)]
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AttachTransport, Denied, Error, Exhausted, Existing, Instance, Intent, Invalid, IssuerFault,
-  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget,
-  PathFault, PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes,
-  SnapshotId, Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
-  WorkSignature, WriteAct, WriteMode, WritePolicy,
-};
-// What only the Unix-gated tests (the overlay and landing tests) name.
-#[cfg(unix)]
-use slates_api::{
-  AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, LandOutcome, LandingApproval,
-  LandingConflict, LandingStage, LandingState, Unsupported,
+  AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Exhausted,
+  Existing, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch, LandOutcome,
+  LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome,
+  MergeRecord, Missing, MountOptions, MoveTarget, PathFault, PolicyReason, PolicyRefusal,
+  PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source, TrustedSigner,
+  Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work, WorkSignature,
+  WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -132,7 +127,6 @@ fn grouped(tag: &str) -> (Daemon, Instance) {
 }
 
 /// [`grouped`] on the shards of the daemon kiln starts ([`KILN_SHARDS`]).
-#[cfg(unix)]
 fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
   let (daemon, mut instance) = daemon_on(tag, KILN_SHARDS);
   instance.ensure_group().unwrap();
@@ -140,13 +134,12 @@ fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
 }
 
 /// A real directory for an overlay's base and a landing's target (A-50: never `/tmp`, never a RAM directory): in the
-/// build output, named with the process id and a counter, canonical, removed on drop.
-#[cfg(unix)]
+/// build output, named with the process id and a counter, canonical, removed on drop. The daemon reads and lands into
+/// it on every platform (Windows since A-185).
 struct Folder {
   path: String,
 }
 
-#[cfg(unix)]
 impl Folder {
   fn new() -> Folder {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -157,10 +150,7 @@ impl Folder {
     ));
     std::fs::create_dir_all(&made).unwrap();
     Folder {
-      path: std::fs::canonicalize(&made)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned(),
+      path: as_a_host_names_it(&std::fs::canonicalize(&made).unwrap()),
     }
   }
 
@@ -177,11 +167,25 @@ impl Folder {
   }
 }
 
-#[cfg(unix)]
 impl Drop for Folder {
   fn drop(&mut self) {
     let _removed = std::fs::remove_dir_all(&self.path);
   }
+}
+
+/// A canonical folder as a host names it, the plain path it passes an overlay or a landing (kiln passes its workspace's
+/// own). Windows' `canonicalize` answers the verbatim form (`\\?\C:\...`), under which `/` is a name's character rather
+/// than a separator, so a name such as `.git/HEAD` joined to it is no path at all; the drive's plain form is the same
+/// folder.
+fn as_a_host_names_it(canonical: &Path) -> String {
+  let text = canonical.to_string_lossy().into_owned();
+  #[cfg(windows)]
+  if let Some(plain) = text.strip_prefix(r"\\?\")
+    && plain.get(1..3) == Some(r":\")
+  {
+    return plain.to_owned();
+  }
+  text
 }
 
 /// Writes `bytes` as the whole of `path` in `volume` through the typed file channel, under a write attachment held for
@@ -208,7 +212,6 @@ fn provision(instance: &mut Instance, spec: &VolumeSpec) -> VolumeId {
 }
 
 /// The landing of `volume`'s head into `folder`, `.git` left out as kiln's landings leave it.
-#[cfg(unix)]
 fn landing_into(volume: VolumeId, folder: &Folder) -> slates_api::LandingRequest {
   slates_api::LandingRequest {
     volume,
@@ -348,15 +351,14 @@ fn the_launchers_authority_needs_the_anchors_handoff() {
   ));
 }
 
-/// AC-5.10 / T-5.12 and AC-5.12 / T-5.14 (A-278, A-299; §4.15, D-25, D-26) on the landing a host drives (Unix: the
-/// daemon lands on Unix). Do: lay an overlay over a folder holding a file and a `.git`, change the file, add one and
+/// AC-5.10 / T-5.12 and AC-5.12 / T-5.14 (A-278, A-299; §4.15, D-25, D-26) on the landing a host drives, on every
+/// platform (Windows since A-185). Do: lay an overlay over a folder holding a file and a `.git`, change the file, add one and
 /// change `.git/HEAD` in the volume; land it with `/.git` left out under the ask mode every landing has today; approve
 /// an approval of another manifest; approve the one shown. Expect: the folder untouched until the approval; the
 /// landing answered `ApprovalRequired` with a typed summary (one create, one replace, `.git` filtered out), unsigned,
 /// listing exactly the two files as they read; the stale approval writing nothing and answering the fresh
 /// presentation; the shown one `Written`, `Done`, two entries, and the folder then holding exactly the volume's two
 /// files with `.git/HEAD` as it was.
-#[cfg(unix)]
 #[test]
 fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   let (daemon, mut instance) = grouped("landing");
@@ -406,7 +408,6 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
 /// The ask of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: land `request`, unsigned. Expect it
 /// answered `ApprovalRequired`, unsigned and carrying no signature, for `request`, with the landing's statement and a
 /// typed summary of one create and one replace, `.git` filtered out. Returns the approval.
-#[cfg(unix)]
 fn expect_an_approval_asked(
   instance: &mut Instance,
   request: &slates_api::LandingRequest,
@@ -441,7 +442,6 @@ fn expect_an_approval_asked(
 
 /// The entry list of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-287). Expect `approval`'s list to
 /// be what it writes, path by path, `/.git` left out, each file as it reads in `volume`.
-#[cfg(unix)]
 fn expect_the_entries_listed_as_they_read(
   instance: &mut Instance,
   volume: VolumeId,
@@ -479,7 +479,6 @@ fn expect_the_entries_listed_as_they_read(
 /// The approved landing of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: approve `approval` with
 /// `issuer`. Expect it `Written` and `Done`, unsigned, two entries written, and `folder` holding exactly the volume's
 /// two files with `.git/HEAD` as it was.
-#[cfg(unix)]
 fn expect_the_approved_manifest_written(
   instance: &mut Instance,
   approval: &LandingApproval,
@@ -506,7 +505,6 @@ fn expect_the_approved_manifest_written(
 /// landing audited, typed: the presentation, the grant the launcher issued and the landing finished `Done`; and the
 /// single-use grant of `approval`, consumed by it, gone from the grant table (A-266: a principal's grants are its live
 /// ones, and a used grant's history is the audit's).
-#[cfg(unix)]
 fn expect_the_landing_audited_and_its_grant_consumed(
   instance: &mut Instance,
   approval: &LandingApproval,
@@ -535,9 +533,8 @@ fn expect_the_landing_audited_and_its_grant_consumed(
 
 /// AC-5.12 / T-5.14 (A-278, A-299; §4.15 "Drift", step 4): do change a file in an overlay, then change the same file on
 /// the disk; expect no drift before and, after, the drift typed — the file `Modified` at its whole path, the base read
-/// with a watcher — and the landing answered `Conflicted` with the file's class `ModifyModify` and the bytes the volume
-/// would land there, nothing written.
-#[cfg(unix)]
+/// (helped by a watcher where the host has one; Windows' base host reads by fingerprints alone) — and the landing
+/// answered `Conflicted` with the file's class `ModifyModify` and the bytes the volume would land there, nothing written.
 #[test]
 fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict() {
   let (daemon, mut instance) = grouped("drift");
@@ -586,7 +583,6 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
 /// call, `Written` and `Done`, its file on the disk; its plan presented and nothing written (the daemon's present-only
 /// verb); the forbid volume's landing answered `Refused` by its own policy and nothing written; and the signed-merge
 /// requirement set and read back on the volume, a consumer's refused (A-321).
-#[cfg(unix)]
 #[test]
 fn a_landing_follows_its_volumes_write_mode() {
   let (daemon, mut instance) = grouped("modes");
@@ -642,7 +638,6 @@ fn a_landing_follows_its_volumes_write_mode() {
 /// signed merges on it, and one on a consumer. Expect the landing answered `Refused` by the volume's own policy, nothing
 /// written; the volume's requirement set and read back (A-321); and the consumer's refused
 /// `Invalid::SignedMergesNotAVolume` before anything is sent, since the requirement is a volume's rule.
-#[cfg(unix)]
 fn expect_a_forbidding_volume_never_lands(
   instance: &mut Instance,
   shut: VolumeId,
@@ -873,13 +868,12 @@ fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
   daemon.stop();
 }
 
-/// AC-5.10 / AC-5.12 (A-321; §4.15, §4.12 "The consumer contract") on the landing a host drives (Unix: the daemon lands
-/// on Unix): do trust a key on an overlay with the launcher's authority; plan its landing; sign the statement the plan
+/// AC-5.10 / AC-5.12 (A-321; §4.15, §4.12 "The consumer contract") on the landing a host drives, on every platform
+/// (Windows since A-185): do trust a key on an overlay with the launcher's authority; plan its landing; sign the statement the plan
 /// states with the trusted key and land with the signature under the ask an unset volume has; approve the approval it
 /// answers; read the audit. Expect the plan unsigned, stating the landing for a signer; the signed landing asked again
 /// over the same manifest, verified naming the key and carrying the signature, nothing written; the approval `Written`
 /// and verified, the file on the disk; and the landing's planned and finished audit records verified.
-#[cfg(unix)]
 #[test]
 fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
   let (daemon, mut instance) = grouped("signed-landing");
@@ -897,7 +891,6 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
 /// Shape: the instances that read the audit in the cross-shard test beside the one that landed. A client's shard is its
 /// id's residue over the shards and fresh ids are handed out in turn, so the four sit on both of kiln's shards
 /// whichever the first took.
-#[cfg(unix)]
 const AUDIT_READERS: usize = 3;
 
 /// AC-5.10 / AC-5.12 (A-321, A-265; §4.15 "Ownership facts": the audit log is written through the control shard;
@@ -907,7 +900,6 @@ const AUDIT_READERS: usize = 3;
 /// Expect every reader to read the landing's planned and finished records, verified. Before A-265 `Audit` read only the
 /// partition of the reader's own shard while a landing's records were written on its volume's, so a reader on the
 /// control shard read none of them and the landing's verdict with them (GAPS, found by g90).
-#[cfg(unix)]
 #[test]
 fn a_signed_landings_audit_reads_back_on_every_shard_kiln_starts() {
   let (daemon, mut instance) = kiln_grouped("audit-shards");
@@ -937,7 +929,6 @@ fn a_signed_landings_audit_reads_back_on_every_shard_kiln_starts() {
 /// `volume` with the `launcher`'s authority, write a file into it, plan its landing into `folder`, sign the statement
 /// the plan states and land with the signature, and approve what that asks. Expect what that test names; the landing
 /// and the verdict it was answered with.
-#[cfg(unix)]
 fn land_signed(
   instance: &mut Instance,
   launcher: &slates_api::Issuer,
@@ -982,7 +973,6 @@ fn land_signed(
 
 /// The audit of `a_signed_landing_is_judged_and_read_back_through_the_contract`. Expect every record of `landing` that
 /// judges its signature `verified`, a planned and a finished one among them, and no other kind of record judging one.
-#[cfg(unix)]
 fn expect_the_signed_landing_audited(
   instance: &mut Instance,
   landing: u64,
@@ -1108,7 +1098,6 @@ fn a_merge_follows_its_greens_write_mode() {
 
 /// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in
 /// whole GiB, at least one and at most 64.
-#[cfg(unix)]
 fn kiln_volume_max() -> u64 {
   /// Format: kiln's `MAX_VOLUME_GIB`.
   const MAX_VOLUME_GIB: u64 = 64;
@@ -1117,7 +1106,6 @@ fn kiln_volume_max() -> u64 {
 
 /// The daemon's own count of each shard's inode-version slab (§4.2 inode dimension), printed beside a test's verdict
 /// as its evidence: the slots, those committed to volumes' allowances, and those snapshots retain.
-#[cfg(unix)]
 fn print_version_slabs(instance: &mut Instance, when: &str) {
   for shard in instance.daemon_status().unwrap().shards {
     eprintln!(
@@ -1139,7 +1127,6 @@ fn print_version_slabs(instance: &mut Instance, when: &str) {
 /// that snapshot's landing without writing and list its entries, read `.gitignore` at the head as kiln's ignore rules
 /// do, and a base file nothing looked up before the snapshot. Expect: each file's bytes as the disk holds them — a read
 /// of a file nobody changed is never refused for space.
-#[cfg(unix)]
 #[test]
 fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() {
   let (daemon, mut instance) = kiln_grouped("review-read");
@@ -1191,7 +1178,6 @@ fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() 
 /// spec, a quarter of the machine's memory each) than the daemon kiln starts has shards, through one instance, as kiln
 /// does for its agents' sessions. Expect every one made: a workspace that may grow to a quarter of the machine holds
 /// none of its shard's room before it grows (§4.2: dynamic growth consumes only unpromised capacity).
-#[cfg(unix)]
 #[test]
 fn kilns_workspaces_are_provisioned_side_by_side() {
   let (daemon, mut instance) = kiln_grouped("side-by-side");
@@ -1253,7 +1239,6 @@ fn a_lone_instance_names_itself_and_refuses_a_move_typed() {
 /// read it; capture a scratch volume. Expect the clone to read the captured bytes, never the folder's later ones, and to
 /// report no base (it reads no folder); and the scratch volume's capture refused `Unsupported`, there being no base to
 /// capture.
-#[cfg(unix)]
 #[test]
 fn a_captured_bases_clone_reads_the_capture_with_no_base_directory() {
   let (daemon, mut instance) = grouped("capture");
@@ -1298,10 +1283,8 @@ fn a_captured_bases_clone_reads_the_capture_with_no_base_directory() {
 }
 
 /// Shape: a capped daemon's version slab: room for a handful of files, so a test can spend every unpromised slot.
-#[cfg(unix)]
 const CAPPED_SLAB: usize = 64;
 /// Shape: the capped daemon's arena, sized with its slab so a slot is about 1 MiB of quota (A-109).
-#[cfg(unix)]
 const CAPPED_RESERVE: u64 = 64 << 20;
 
 /// The retention sibling of P1 (2026-11-18; A-342's record): a snapshot's retention refused reached kiln as
@@ -1310,7 +1293,6 @@ const CAPPED_RESERVE: u64 = 64 << 20;
 /// the growth, snapshot it, and change a file the snapshot holds. Expect: the growth refused `NoSpace`, the volume's
 /// own bound, and the change refused `Volume { RetentionExceeded }` on the wire, typed apart from it (the contract
 /// classes it `Exhausted::Volume`, `error.rs`'s unit test), the file as it was.
-#[cfg(unix)]
 #[test]
 fn a_snapshots_retention_refused_is_not_the_quota() {
   let (daemon, mut instance) = daemon_with("retention", TEST_SHARDS, |config| {
@@ -1364,13 +1346,10 @@ fn a_snapshots_retention_refused_is_not_the_quota() {
 const LISTED: usize = 200;
 /// Shape: the files the drift test changes on disk under its overlay: more drifted entries at these path lengths than a
 /// status reply carries beside its other fields, and more than one paged read holds.
-#[cfg(unix)]
 const DRIFTED: usize = 100;
 /// Shape: the paths the changed-since test's work changes in its green: more than one reply's worth at these lengths.
-#[cfg(unix)]
 const CHANGED: usize = 150;
 /// Shape: the landings the audit test presents, each one audit record: more than one reply's worth of records.
-#[cfg(unix)]
 const PRESENTED: usize = 120;
 
 /// Walks `read` a page at a time from the start: every page's items, and the cursors the pages were asked from (the
@@ -1453,7 +1432,6 @@ fn a_listing_is_read_a_page_at_a_time_and_whole() {
 /// then read what the green changed since its first version a page at a time and whole. Expect: more than one page;
 /// every path exactly once across the walk; the whole answer the same paths, in path order; and a version past the
 /// head refused `Stale`. Before A-264 the answer was one reply, refused at 800 changed files.
-#[cfg(unix)]
 #[test]
 fn a_greens_changes_are_read_a_page_at_a_time_and_whole() {
   let (daemon, mut instance) = grouped("changed-pages");
@@ -1513,7 +1491,6 @@ fn a_greens_changes_are_read_a_page_at_a_time_and_whole() {
 /// `drift` names all 100 `Modified`, in path order, and elides none; and the paged read, walked from the start, names
 /// each once.
 /// Before A-267 a status with 600 drifted entries was refused, and the library read only what a status carried.
-#[cfg(unix)]
 #[test]
 fn an_overlays_drift_past_one_reply_is_read_whole() {
   let (daemon, mut instance) = grouped("drift-pages");
@@ -1574,7 +1551,6 @@ fn an_overlays_drift_past_one_reply_is_read_whole() {
 /// time and whole. Expect: more than one page; the records numbered in order, each once, every page's first record the
 /// sequence it was asked from or later; and the whole audit the same records. Before A-265 every record was numbered 0
 /// and the audit was one reply, refused between 50 and 100 records.
-#[cfg(unix)]
 #[test]
 fn the_audit_is_read_a_page_at_a_time_and_whole() {
   let (daemon, mut instance) = grouped("audit-pages");
@@ -1635,11 +1611,11 @@ fn the_daemon_is_observed_through_the_library() {
 }
 
 /// The Shards route by use (§4.6, A-161): the stream end the library hands a VMM serves the volume, and offers its guest
-/// DAX.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// DAX. On every platform whose daemon serves the Shards form: a Unix socket on Linux and macOS, the client end of the
+/// attachment's named pipe on Windows (the handle route, A-179). slates ships no other platform.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod shards {
   use std::io::{Read, Write};
-  use std::os::unix::net::UnixStream;
 
   use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 
@@ -1672,10 +1648,54 @@ mod shards {
   /// Shape: a file of a DAX range and a half (`FUSE_DAX_SZ`, the range a guest maps a file in): one the stream marks.
   const LARGE_BYTES: u64 = slates_mem::DAX_RANGE_BYTES + slates_mem::DAX_RANGE_BYTES / 2;
 
+  /// The end the library handed, as Shards' device reads and writes it: a Unix socket with the suite's read bound.
+  #[cfg(unix)]
+  type Wire = std::os::unix::net::UnixStream;
+
+  /// The end the library handed on Windows: the client end of the attachment's pipe, opened for overlapped I/O, so each
+  /// read and write waits on an `OVERLAPPED` of its own (`slates_ipc::stream::read_waiting`, `write_waiting`), as the
+  /// client's own Shards suite speaks it (`crates/client/tests/shards.rs`).
+  #[cfg(windows)]
+  struct Wire(slates_api::StreamEnd);
+
+  #[cfg(windows)]
+  impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::read_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+  }
+
+  #[cfg(windows)]
+  impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::write_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// The handed end as a [`Wire`].
+  #[cfg(unix)]
+  fn wire(end: slates_api::StreamEnd) -> Wire {
+    let stream = std::os::unix::net::UnixStream::from(end);
+    stream.set_read_timeout(Some(START_WAIT)).unwrap();
+    stream
+  }
+
+  /// The handed end as a [`Wire`].
+  #[cfg(windows)]
+  fn wire(end: slates_api::StreamEnd) -> Wire {
+    Wire(end)
+  }
+
   /// Shards' fs device as the end's holder speaks it: a little-endian length, then the FUSE request; one reply frame
   /// back.
   struct Device {
-    stream: UnixStream,
+    stream: Wire,
     unique: u64,
   }
 
@@ -1730,9 +1750,10 @@ mod shards {
     write_file(&mut instance, volume, "/present", b"through the stream\n");
     write_file(&mut instance, volume, "/large", &large);
     let served = instance.serve_shards(volume, Intent::Write, None).unwrap();
-    let stream = UnixStream::from(served.stream);
-    stream.set_read_timeout(Some(START_WAIT)).unwrap();
-    let mut device = Device { stream, unique: 0 };
+    let mut device = Device {
+      stream: wire(served.stream),
+      unique: 0,
+    };
     let mut init = Vec::new();
     for word in [
       MAJOR,
@@ -1763,7 +1784,8 @@ mod shards {
       0,
       "FUSE_HAS_INODE_DAX kept"
     );
-    let page = u32::try_from(rustix::param::page_size()).unwrap();
+    // The host's page, which the daemon names as the alignment on every platform (Windows' is 4 KiB, as its INIT's).
+    let page = u32::try_from(slates_machine::facts::Facts::page_bytes()).unwrap();
     assert_eq!(
       word(INIT_OUT_ALIGNMENT_AT) >> 16,
       page.trailing_zeros(),
@@ -1785,11 +1807,11 @@ mod shards {
   }
 }
 
-/// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop.
-#[cfg(unix)]
+/// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop, on every platform:
+/// the completion signal is a descriptor on Unix and a socket on Windows (`slates_api::Completion`), and only the
+/// reactor's one wait on it is the platform's own ([`readable_within`]).
 mod asynchronous_form {
   use std::cell::Cell;
-  use std::os::fd::BorrowedFd;
   use std::pin::pin;
   use std::task::{Context, Poll, Waker};
 
@@ -1805,8 +1827,50 @@ mod asynchronous_form {
   /// its first poll (the daemon replied before the call reached its wait) drops nothing and runs again.
   const ROUNDS_PER_DROP: usize = 4;
 
-  /// A host's reactor in miniature: its wait blocks this thread in `poll(2)` until the completion signal is readable
-  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A call
+  /// Whether `completion` became readable within `bound`, this thread blocked in `poll(2)` until it did or the bound
+  /// passed. The instance's client keeps the descriptor open while the call that waits here borrows the instance.
+  #[cfg(unix)]
+  fn readable_within(completion: Completion, bound: Duration) -> std::io::Result<bool> {
+    // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
+    // as the instance lives, and the call that waits here borrows the instance.
+    let descriptor = unsafe { std::os::fd::BorrowedFd::borrow_raw(completion) };
+    let timeout = rustix::event::Timespec::try_from(bound).ok();
+    let mut interest = [rustix::event::PollFd::new(
+      &descriptor,
+      rustix::event::PollFlags::IN,
+    )];
+    rustix::event::poll(&mut interest, timeout.as_ref())
+      .map(|ready| ready > 0)
+      .map_err(std::io::Error::from)
+  }
+
+  /// Whether `completion` became readable within `bound`, this thread blocked in `WSAPoll` (Winsock's `poll`) until it
+  /// did or the bound passed, in whole milliseconds rounded up so a short bound never spins. The instance's client
+  /// keeps the socket open while the call that waits here borrows the instance.
+  #[cfg(windows)]
+  fn readable_within(completion: Completion, bound: Duration) -> std::io::Result<bool> {
+    use windows_sys::Win32::Networking::WinSock::{
+      POLLRDNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
+    };
+    /// Format: the nanoseconds of the millisecond `WSAPoll` counts its timeout in.
+    const NANOS_PER_MILLI: u128 = 1_000_000;
+    let millis = i32::try_from(bound.as_nanos().div_ceil(NANOS_PER_MILLI)).unwrap_or(i32::MAX);
+    let mut interest = [WSAPOLLFD {
+      fd: SOCKET::try_from(completion).unwrap(),
+      events: POLLRDNORM,
+      revents: 0,
+    }];
+    // SAFETY: `interest` is one live, initialized entry for the call's length, naming the waiting instance's completion
+    // socket, which its client keeps open while the call that waits here borrows the instance.
+    let ready = unsafe { WSAPoll(interest.as_mut_ptr(), 1, millis) };
+    if ready == SOCKET_ERROR {
+      return Err(std::io::Error::last_os_error());
+    }
+    Ok(ready > 0)
+  }
+
+  /// A host's reactor in miniature: its wait blocks this thread ([`readable_within`]) until the completion signal is
+  /// readable or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A call
   /// that would wait for good fails the test instead of hanging it: a wait with no timeout is bounded by the suite's
   /// wait, and so are the waits a call times out one after another with no signal between them (a live daemon's call
   /// goes on waiting through its deadlines, A-232, so only the host bounds it). It counts how its waits ended, the
@@ -1823,23 +1887,15 @@ mod asynchronous_form {
 
   impl Reactor for Blocking {
     fn wait(&self, completion: Completion, timeout_ns: Option<u64>) -> Waiting<'_> {
-      // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
-      // as the instance lives, and the call that waits here borrows the instance.
-      let descriptor = unsafe { BorrowedFd::borrow_raw(completion) };
       let bound = timeout_ns.map_or(START_WAIT, Duration::from_nanos);
-      let timeout = rustix::event::Timespec::try_from(bound).ok();
-      let mut interest = [rustix::event::PollFd::new(
-        &descriptor,
-        rustix::event::PollFlags::IN,
-      )];
-      let woke = match rustix::event::poll(&mut interest, timeout.as_ref()) {
-        Ok(0) if timeout_ns.is_none() => Err(std::io::Error::new(
+      let woke = match readable_within(completion, bound) {
+        Ok(false) if timeout_ns.is_none() => Err(std::io::Error::new(
           std::io::ErrorKind::TimedOut,
           "nothing landed within the suite's wait",
         )),
-        Ok(0) => Ok(Woke::TimedOut),
-        Ok(_) => Ok(Woke::Readable),
-        Err(errno) => Err(std::io::Error::from(errno)),
+        Ok(false) => Ok(Woke::TimedOut),
+        Ok(true) => Ok(Woke::Readable),
+        Err(error) => Err(error),
       };
       let counted = match woke {
         Ok(Woke::Readable) => {
@@ -2020,7 +2076,9 @@ mod asynchronous_form {
 }
 
 /// Shape: the environment variable that opts into a test making a kernel mount, which main runs; a unit run skips it
-/// loudly.
+/// loudly. Unix's alone, as the busy unmount is: `mount::unmount_busy` is Linux's lazy detach and the forced unmount of
+/// macOS and the BSDs, and a Windows drive is the WinFsp host's to end, whose own tests are the CLI's
+/// (`crates/cli/tests/winfsp.rs`).
 #[cfg(unix)]
 const MOUNT_TESTS: &str = "SLATES_TEST_MOUNT";
 
@@ -2105,16 +2163,32 @@ fn reads_its_end(socket: &std::os::unix::net::UnixStream) -> bool {
   matches!(std::io::Read::read(&mut &*socket, &mut byte), Ok(0))
 }
 
-/// A stream end as it is where it is a pipe handle (Windows): [`reads_its_end`] does not judge it.
-#[cfg(not(unix))]
+/// A stream end made ready for [`reads_its_end`] on Windows: the client end of the attachment's pipe, as it came.
+#[cfg(windows)]
 fn awaiting(end: slates_api::StreamEnd) -> slates_api::StreamEnd {
   end
 }
 
-/// Whether the peer of a stream end reads its end: not judged where the end is a pipe handle (Windows).
-#[cfg(not(unix))]
-fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
-  true
+/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended. A
+/// Windows end is an overlapped pipe handle whose waited read (`slates_ipc::stream::read_waiting`, zero once the peer
+/// has gone) takes no bound of its own, so a duplicate of the handle is read on a thread of the test's and its answer
+/// waited for within the suite's wait: an end that never comes fails the check instead of hanging the suite. Until
+/// 2026-11-18 this answered `true` without reading.
+#[cfg(windows)]
+fn reads_its_end(end: &slates_api::StreamEnd) -> bool {
+  use std::os::windows::io::AsHandle;
+  let reader = end.try_clone().unwrap();
+  let (answer, answered) = std::sync::mpsc::channel();
+  let reading = std::thread::spawn(move || {
+    let mut byte = [0u8; 1];
+    let read = slates_ipc::stream::read_waiting(reader.as_handle(), &mut byte).ok();
+    let _ = answer.send(read);
+  });
+  let ended = matches!(answered.recv_timeout(START_WAIT), Ok(Some(0)));
+  if ended {
+    reading.join().unwrap();
+  }
+  ended
 }
 
 /// A-310's conformance suite: one flow of the seam's verbs, each outcome and each refusal asserted as its typed value,

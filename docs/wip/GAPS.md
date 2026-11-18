@@ -343,6 +343,19 @@
 > - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
 >   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
 >   on the owner alone until then.
+> - **Fixed 2026-11-18 (g232, A-428): after the warm restart nothing shipped once the holders came back.** Main bisected
+>   the fleet test's red to A-376, whose cheaper holder publications changed the order of the restart's steps; the
+>   cause is the live log's. The resumed log's first whole entry (6) covered no candidate's key, a write followed (7),
+>   and the returning holders, owed installs, waited for an image at the head; none is made while a whole record is
+>   owed for the keys, and that record waited for credit only their installs could free (`owes whole true; holders
+>   [..@None, ..@None]; lanes []; covers candidates false` for the whole 20 s bound). Now the last whole state is
+>   installed while the retained tail reaches past it. Red-checked by
+>   `a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it`; the fleet test
+>   is main's to run. Still open, beside it: with the tail cut past the last whole state (an owner writing past the
+>   retain bound), a whole record owed for the keys or for a refused publication and a full credit could still meet
+>   the same wait: the image waits for the record (`refresh_image`), the record for credit. Owed: an owed whole record
+>   admitted when every holder it waits on is owed an install, or an image made at the head when the record is owed
+>   only for the keys (the volume's state is then the head's).
 
 > **A live-shipped volume taken over was lost by a restart before its first write: published at its takeover
 > (2026-11-18, A-343, §4.8 "persistence before reply"; g230, A-325's live item).** A-325 published a volume taken over
@@ -693,17 +706,20 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed, not built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 and 2 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
 > supervisor, 2026-11-17, by A-64 and D-7). W1 is on main (3c0af9399). **Built (step 1):** the owner's frees held until
 > every replica has acknowledged the feed position that released them (positions, since a fold releases with no new
 > version), charged to the green's retained bytes and counted (`Green::hold_content`, `acknowledge_content`,
-> `leave_content`, `content_frees_held`; tests in `crates/merge/src/history.rs`). **Owed, in order:** the replica
-> (the green's metadata built from the owner's, the feed of versions and folds, the replica equal to the owner at every
-> version); the engine's content in sealed blocks another shard may read; the lag bound that drops a replica
-> holding too much; the code on the shards; the supervisor's A/B.
+> `leave_content`, `content_frees_held`; tests in `crates/merge/src/history.rs`). **Built (step 2, 2026-11-18,
+> g083):** the replica and its feed (`crates/merge/src/replica.rs`): built from the owner's checkpoint at its head and
+> its feed position, fed each committed version and each fold in order, a gap or a version that would replay as
+> another refused unchanged and the replica rebuilt, counted; equal to the owner at every version over generated
+> histories with messages late, lost or in flight across a rebuild (`crates/merge/tests/replica.rs`). Its content is
+> its own until step 3. **Owed, in order:** the engine's content in sealed blocks another shard may read; the lag
+> bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -999,21 +1015,21 @@
 > |---|---|---|
 > | Instance start | `start.rs`: `an_instance_starts_from_the_hosts_own_executable_serves_and_stops`, `a_second_start_of_a_running_instance_is_refused_already_running`, `a_program_that_cannot_run_is_refused_spawn`, `an_anchor_whose_host_refuses_the_role_is_refused_anchor_exited`, `an_instance_started_with_a_launcher_secret_takes_it_and_serves`, `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret`, `an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves` | the start binary (the test binary is the host, `harness = false`); the wrapper test Unix |
 > | Instance attach | `api.rs`: `attaching_where_no_daemon_serves_is_refused_unavailable`; `start.rs`: `a_wait_for_an_instance_nobody_starts_ends_unavailable_at_its_deadline`; every `api.rs` test attaches, and the first `start.rs` test attaches again after its stop | every platform |
-> | Volume create | `api.rs`: `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (empty; `AlreadyExists` naming the holder; a relative overlay folder `Invalid(Path)`), `a_group_is_made_once_and_made_again_harmlessly_before_any_volume` (`Unusable(NoGroup)`), `a_merge_is_accepted_or_conflicted_typed` (green, work), `kilns_workspaces_are_provisioned_side_by_side` (kiln's overlay spec, Unix), `an_instance_answers_the_seams_conformance_suite` | every platform; the overlay tests Unix |
-> | Clone | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (the clone reads the snapshot's bytes), `a_captured_bases_clone_reads_the_capture_with_no_base_directory` (Unix), the seam suite | every platform |
-> | Snapshot | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed`; the seam suite (a pinned snapshot's destroy `Busy(Volume(Pinned))`, an unpinned one's done); `a_snapshots_retention_refused_is_not_the_quota` (Unix) | every platform |
+> | Volume create | `api.rs`: `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (empty; `AlreadyExists` naming the holder; a relative overlay folder `Invalid(Path)`), `a_group_is_made_once_and_made_again_harmlessly_before_any_volume` (`Unusable(NoGroup)`), `a_merge_is_accepted_or_conflicted_typed` (green, work), `kilns_workspaces_are_provisioned_side_by_side` (kiln's overlay spec), `an_instance_answers_the_seams_conformance_suite` | every platform; the overlay tests on Windows since 2026-11-18 (run filed) |
+> | Clone | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (the clone reads the snapshot's bytes), `a_captured_bases_clone_reads_the_capture_with_no_base_directory`, the seam suite | every platform |
+> | Snapshot | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed`; the seam suite (a pinned snapshot's destroy `Busy(Volume(Pinned))`, an unpinned one's done); `a_snapshots_retention_refused_is_not_the_quota` | every platform |
 > | Destroy | `a_volume_is_provisioned_snapshotted_cloned_and_destroyed` (gone from the list, then `NotFound` naming it); the seam suite | every platform |
 > | Serving: a mount on bare metal | `api.rs`: `a_busy_mount_is_let_go_of_the_oss_way` (mounts through the library; a plain unmount refused busy; `unmount_busy` answers `Detached` or `Forced`); the CLI mounts through `Instance::mount`: `slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it`, `slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it` (`crates/cli/tests/cli.rs`), the WinFsp drive (`crates/cli/tests/winfsp.rs`); `mount.rs`'s nine unit tests (what a mount needs on each OS, the mount's arguments) | kernel mounts only where asked: `SLATES_TEST_MOUNT=1` (Unix), `SLATES_TEST_CLI=1`, CI's Windows lanes |
-> | Serving: a virtio-fs/DAX descriptor to a VMM | `api.rs`: `a_shards_stream_end_serves_the_volume_it_was_made_for` (FUSE through the end the library hands; `INIT` keeps a `dax=inode` guest's DAX flags; a file of a DAX range or more marked `FUSE_ATTR_DAX`); the seam suite (a served stream's peer reads its end at the detach); the CLI's `slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it` (gated); the map's data path, below the library over the same stream: `the_stream_offers_per_inode_dax_for_files_of_a_range_or_more`, `a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart` (`crates/server/tests/shards.rs`). **Missing:** the Windows stream through the library (the `api.rs` test is Linux and macOS only; the route is held below it by `crates/client/tests/shards.rs`); and `Instance::serve_vhost_user` (Linux), which no `slates-api` test drives (the route is held by the server's vhost-user tests and `crates/cli/tests/guest_vhost.rs`, a real VM, gated) | Linux, macOS |
-> | Changes | `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (`approval_entries`: exactly the two files, each read back and hashed against its entry), `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot` (kiln's review: a snapshot presented, its entries listed, each read at the head), `a_greens_changes_are_read_a_page_at_a_time_and_whole` (a green's `changed_since`) | Unix |
-> | Drift | `a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict`, `an_overlays_drift_past_one_reply_is_read_whole`; unit: `a_base_report_is_typed_entry_by_entry`, `a_drift_page_is_typed_as_a_status_is` | Unix; the units everywhere |
-> | Landing plans | `a_landing_follows_its_volumes_write_mode` (a plan presents and writes nothing), `a_signed_landing_is_judged_and_read_back_through_the_contract` (a plan states what a signer signs), `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot` (a snapshot's plan) | Unix |
-> | Grant-bound landing | `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (ask: nothing written until approved; another manifest's approval writes nothing and answers the fresh presentation; the shown one writes exactly its manifest; the grant consumed, the landing audited), `a_landing_follows_its_volumes_write_mode` (bypass `Written` in one call; forbid `Refused`, nothing written), `a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict` (`Conflicted`, nothing written), `the_launchers_authority_needs_the_anchors_handoff`; `start.rs`: `the_launchers_secret_proves_its_policy_across_a_daemon_restart` | Unix |
-> | Changes, drift, plans and landing on Windows | **Missing:** the daemon lands on Windows since A-185, and the overlay's drift is read there (`crates/base/src/windows.rs`), but every `api.rs` test of changes, drift, plans and landing is `cfg(unix)`, as are the paged audit's and the async form's | none |
-> | Observation | `the_daemon_is_observed_through_the_library` (the daemon's status, a shard's telemetry), `a_listing_is_read_a_page_at_a_time_and_whole`, `the_audit_is_read_a_page_at_a_time_and_whole` (Unix), `a_signed_landings_audit_reads_back_on_every_shard_kiln_starts` (Unix), the landing test's audit and grant reads; unit: `each_grant_state_is_read_from_its_typed_field`, `each_audit_kind_and_stage_is_read_from_its_typed_field` | every platform; the audit's Unix |
-> | Typed refusals | `crates/api/src/error.rs`'s eleven unit tests (every wire refusal through one exhaustive table, `each_refusal_is_typed_into_the_class_a_consumer_acts_on` first); by use: `Unavailable` (attach, a wait), `Unusable(NoGroup)`, `NotFound` and `AlreadyExists` naming their subject, `Invalid(Path)`, `Busy(Volume(Pinned))`, `Exhausted::Volume(RetentionExceeded)`, `Stale` (a version past the head), `Invalid::MoveTarget` (`a_lone_instance_names_itself_and_refuses_a_move_typed`), `Denied(NoAuthority)`, and the start's `AlreadyRunning`, `Spawn`, `AnchorExited`, `NeverServed` | every platform; some Unix |
+> | Serving: a virtio-fs/DAX descriptor to a VMM | `api.rs`: `a_shards_stream_end_serves_the_volume_it_was_made_for` (FUSE through the end the library hands; `INIT` keeps a `dax=inode` guest's DAX flags; a file of a DAX range or more marked `FUSE_ATTR_DAX`); the seam suite (a served stream's peer reads its end at the detach); the CLI's `slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it` (gated); the map's data path, below the library over the same stream: `the_stream_offers_per_inode_dax_for_files_of_a_range_or_more`, `a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart` (`crates/server/tests/shards.rs`). On Windows since 2026-11-18 (gap b): the same test speaks through the client end of the attachment's named pipe (the handle route, A-179), and the seam's check reads the end on a duplicate of the handle within the suite's wait, where it answered `true` unread. **Missing:** `Instance::serve_vhost_user` (Linux), which no `slates-api` test drives (the route is held by the server's vhost-user tests and `crates/cli/tests/guest_vhost.rs`, a real VM, gated) | Linux, macOS; Windows compiled clean (`cargo xwin check --tests`), its run filed for main |
+> | Changes | `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (`approval_entries`: exactly the two files, each read back and hashed against its entry), `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot` (kiln's review: a snapshot presented, its entries listed, each read at the head), `a_greens_changes_are_read_a_page_at_a_time_and_whole` (a green's `changed_since`) | every platform (Windows since 2026-11-18: compiled, its run filed for main) |
+> | Drift | `a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict`, `an_overlays_drift_past_one_reply_is_read_whole`; unit: `a_base_report_is_typed_entry_by_entry`, `a_drift_page_is_typed_as_a_status_is` | every platform (Windows since 2026-11-18: compiled, its run filed for main); the units everywhere |
+> | Landing plans | `a_landing_follows_its_volumes_write_mode` (a plan presents and writes nothing), `a_signed_landing_is_judged_and_read_back_through_the_contract` (a plan states what a signer signs), `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot` (a snapshot's plan) | every platform (Windows since 2026-11-18: compiled, its run filed for main) |
+> | Grant-bound landing | `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (ask: nothing written until approved; another manifest's approval writes nothing and answers the fresh presentation; the shown one writes exactly its manifest; the grant consumed, the landing audited), `a_landing_follows_its_volumes_write_mode` (bypass `Written` in one call; forbid `Refused`, nothing written), `a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict` (`Conflicted`, nothing written), `the_launchers_authority_needs_the_anchors_handoff`; `start.rs`: `the_launchers_secret_proves_its_policy_across_a_daemon_restart` | every platform (Windows since 2026-11-18: compiled, its run filed for main) |
+> | Changes, drift, plans and landing on Windows | Closed 2026-11-18: the daemon lands on Windows since A-185 and reads an overlay's base there by fingerprints alone, so every `api.rs` test of changes, drift, plans and landing runs there too, with the paged audit's and the async form's (its reactor waits in `WSAPoll` there, `poll(2)` on Unix); a folder is named in the plain form a host passes, never `canonicalize`'s `\\?\` form. Gates kept, each with its reason: the busy unmount (Unix's alone) and the Shards stream (gap b) | Windows: compiled clean (`cargo xwin check --tests`), its run filed for main |
+> | Observation | `the_daemon_is_observed_through_the_library` (the daemon's status, a shard's telemetry), `a_listing_is_read_a_page_at_a_time_and_whole`, `the_audit_is_read_a_page_at_a_time_and_whole`, `a_signed_landings_audit_reads_back_on_every_shard_kiln_starts`, the landing test's audit and grant reads; unit: `each_grant_state_is_read_from_its_typed_field`, `each_audit_kind_and_stage_is_read_from_its_typed_field` | every platform; the audit's on Windows since 2026-11-18 (run filed) |
+> | Typed refusals | `crates/api/src/error.rs`'s eleven unit tests (every wire refusal through one exhaustive table, `each_refusal_is_typed_into_the_class_a_consumer_acts_on` first); by use: `Unavailable` (attach, a wait), `Unusable(NoGroup)`, `NotFound` and `AlreadyExists` naming their subject, `Invalid(Path)`, `Busy(Volume(Pinned))`, `Exhausted::Volume(RetentionExceeded)`, `Stale` (a version past the head), `Invalid::MoveTarget` (`a_lone_instance_names_itself_and_refuses_a_move_typed`), `Denied(NoAuthority)`, and the start's `AlreadyRunning`, `Spawn`, `AnchorExited`, `NeverServed` | every platform |
 > | By-use tests | `api.rs` over an in-process daemon; `start.rs`, the test binary as the embedding host; the seam suite over an instance and over the simulator (`an_instance_answers_the_seams_conformance_suite`, `the_simulator_answers_the_seams_conformance_suite`) | every platform |
-> | Documented | `docs/library.md`, §4.12 "Embedding" and "The consumer contract", every module's doc; `role::main`'s example compiles as a doctest. **Missing:** the guide's workspace-flow example (`docs/library.md`) is compiled by no test, so it can drift from the API unseen | the doctest everywhere |
+> | Documented | `docs/library.md`, §4.12 "Embedding" and "The consumer contract", every module's doc; `role::main`'s example compiles as a doctest, and since 2026-11-18 (gap d) so does every Rust example of the guide: `docs/library.md` is the doc of a `cfg(doctest)` item (`slates_api::Guide`, never built otherwise), so `cargo test -p slates-api --doc` compiles its start and workspace-flow examples against the crate | the doctests everywhere |
 > | Versioned | `VERSION` and `CONTRACT`; `the_contract_history_names_every_version_in_order` (unit); the wire's tags, `crates/ipc/tests/wire_order.rs` and `crates/db/tests/wire_order.rs` | every platform |
 >
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
@@ -3648,7 +3664,14 @@
 >   `NFS4ERR_DELAY` after 1.296 s with a starved shard; now listed after 1.59–1.80 s and answered by the owner after
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
->   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
+>   client whose shard was starved at its hand-off read by copy, now mapped directly); a scatter's part waiting for room
+>   in a full control channel and a batch of asks to a green's owner (A-426, 2026-11-18, goal g255: half a liveness
+>   window on the wall, then `Overloaded`, or the asks answered unanswered, with the target alive and stepping; now the
+>   room wait goes on while the target steps or starves, judged by its step count, since a shard drains its channel at
+>   every step, and the owner's answer by `within_shard_time`: `xshard::given_room_in_shard_time`,
+>   `call_in_shard_time_given_room`, `a_part_waits_for_room_while_its_target_steps`). Owed in class A: AC-3.3's told
+>   wait (`told::TOLD_WAIT_NS`, half a window on the wall while a FUSE mount's notifier and its kernel are told) and the
+>   park bound of a verb waiting on a green's owner (`work_home`, the lease bound on the wall). Class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
@@ -11177,6 +11200,37 @@ Owed:
 
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
+
+### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
+
+> - **Found.** By reading (g268, the write log's sibling sweep after A-410). `verbs::clear_write_log` stamped the write
+>   log again only after a publication that captured every volume. A publication can leave a volume out: an overlay it
+>   cannot image because its base host is away or its base cannot be read. Such a publication committed a newer
+>   generation for the other volumes and left the log under its older stamp. If the daemon died before the next
+>   publication that captured every volume, its successor read that stamp as older than its image and replayed nothing.
+>   The left-out volume lost every write acknowledged since its last capture, closed files included (a close's flush
+>   skips its barrier while the log holds every write), and nothing was reported.
+> - **Fixed.** A publication that leaves volumes out keeps exactly their records under its stamp and drops the rest
+>   (`WriteLog::retain`). It owes that restamp from before its commit (the overflow word's second bit), so a death
+>   between the commit and the restamp is reported as lost writes, never dropped in silence.
+> - **Proven.**
+>   - `a_volume_a_publication_leaves_out_keeps_its_logged_writes_for_the_next_daemon`: red without the fix, the
+>     restarted daemon handed no record.
+>   - The write log's own tests: `a_log_keeps_the_left_out_volumes_records_in_order_under_the_new_stamp`,
+>     `a_restamp_owed_at_a_death_reports_the_left_out_writes_lost_never_drops_them_in_silence` and
+>     `an_overflow_marked_before_a_restamp_stays_reported`.
+>   - The run through a real daemon restart is main's (`run-requests.md`, 2026-11-18).
+> - **Open (siblings, from reading).**
+>   1. A checkpoint leaves a volume it cannot image out entirely, where a delta keeps its committed record. Recovery
+>      then refuses that volume until a later publication captures it whole.
+>   2. **Fixed 2026-11-18 (A-429):** the replay wrote an overlay's logged write without the overlay's host, so a base
+>      file the image held uncopied had the bytes of its window before the write read as zeros. The replay now writes
+>      through the host, copying the file up first, as the bridge did
+>      (`a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`, red once without the fix: byte 0
+>      differed; `docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
+>   3. When the log is full, its forced publication counts the write as logged only if it left nothing out. A captured
+>      volume's write is then reported lost, though the image holds it.
+> - **Record.** `docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 

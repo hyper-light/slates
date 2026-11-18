@@ -290,7 +290,7 @@ struct OwnTime {
 /// gives the shard its budget of work, and a build that runs every poll slower needs more CPU for the same work: under
 /// ThreadSanitizer (17.9 to 35.3 times machine code on CI's runners) a shard busy with a second's worth of native work
 /// runs tens of seconds of CPU, and a bare budget gave up on it as a busy shard that would never answer.
-fn held_to_this_build(ns: u64) -> u64 {
+pub(crate) fn held_to_this_build(ns: u64) -> u64 {
   slates_machine::build_cost::build_cost().map_or(ns, |cost| cost.scale(ns))
 }
 

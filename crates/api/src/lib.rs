@@ -270,6 +270,15 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
   })
 }
 
+/// The user guide, `docs/library.md`, as rustdoc collects doctests: each of its Rust examples compiles against this
+/// crate (`cargo test -p slates-api --doc`), so the guide cannot drift from the API it shows (a doc-truth test,
+/// CLAUDE.md §4; the library audit's gap d, 2026-11-18). Nothing else ever sees it: `cfg(doctest)` holds only while
+/// rustdoc collects doctests, so no build compiles it, no rendered page shows it, and a vendored copy without `docs/`
+/// builds as before.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/library.md")]
+pub struct Guide;
+
 #[cfg(test)]
 mod contract_history {
   /// §4.12 "Versioning" (A-299; a doc-truth test, CLAUDE.md §4): the contract's version list names every version up to

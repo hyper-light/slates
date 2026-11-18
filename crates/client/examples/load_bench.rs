@@ -1101,7 +1101,7 @@ fn park(completions: &[Completion], timeout_ns: u64) -> Vec<bool> {
   let wait = Duration::from_nanos(timeout_ns);
   let timeout = Timespec {
     tv_sec: Secs::try_from(wait.as_secs()).unwrap_or(Secs::MAX),
-    tv_nsec: Nsecs::try_from(wait.subsec_nanos()).unwrap_or(0),
+    tv_nsec: Nsecs::from(wait.subsec_nanos()),
   };
   match rustix::event::poll(&mut fds, Some(&timeout)) {
     Ok(_) => fds

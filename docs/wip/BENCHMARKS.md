@@ -14105,6 +14105,35 @@ to 1,978 and 4,206 to 4,737. Every run's oracle had 0 failures.
 p99 in five (the sixth, 20 ms round 3, went the other way with every kind, at the same load), and 20 to 25% off the
 shards' CPU. A-400 builds it; its own A/B against main is filed with the supervisor.
 
+## A work on its client's shard, the A/B: an edit's p50 lower in six of six pairs and its p99 in four, the bound still not met (A-400; goals 231 and 257; 2026-11-18)
+
+**What it is.** The supervisor's A/B of A-400 (a work lives on the shard that serves its creation, its client's own):
+main just before it (`1a1e6627c`, branch `agents/g083-a400-before`) against that commit with A-400 alone (`4765813fe`,
+`agents/g083-w1-under-1ms-placement`). Both builds predate A-416, so their hot sets were drawn with replacement, and
+the given-up clients below are largely that (GAPS, A-416).
+
+**Environment and command.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO),
+the daemon in the harness's process (23 shards), `kernel/` of linux v7.4-rc1, kiln run r77, 2026-11-18, load 8 to 27:
+`ROUNDS_PER_LEVEL=20 bash ~/.cache/g083-scripts/ab.sh a400before agents/g083-a400-before a400
+agents/g083-w1-under-1ms-placement 3 50000 20000` (1,000 clients, `--hot-files 800 --per-connection 32 --rounds 20
+--reply-patience 60 --think-us <Z>`, the arms back to back, the order alternating by round). p50 / p99 in µs.
+
+| Z µs, round | Edit before | Edit after | Accepted before | Accepted after | given up before / after |
+|---|---|---|---|---|---|
+| 50,000, 1 | 119 / 7,292 | 60 / 262 | 230 / 9,366 | 209 / 414 | 14 / 22 |
+| 20,000, 1 | 160 / 2,775 | 100 / 1,460 | 321 / 6,684 | 295 / 2,274 | 26 / 20 |
+| 50,000, 2 | 118 / 6,456 | 82 / 3,694 | 219 / 8,929 | 210 / 7,451 | 14 / 21 |
+| 20,000, 2 | 507 / 17,804 | 94 / 857 | 1,397 / 20,390 | 300 / 4,306 | 25 / 22 |
+| 50,000, 3 | 128 / 10,912 | 91 / 12,091 | 239 / 14,171 | 226 / 17,951 | 30 / 19 |
+| 20,000, 3 | 161 / 651 | 125 / 1,791 | 321 / 921 | 390 / 2,611 | 20 / 22 |
+
+Every one of the 12 runs had 0 oracle failures and exited 0.
+
+**What it means.** A-400 stays: its edit p50 was lower in all six pairs and its p99 in four, as the pricing said. The
+1,000-client bound was not met by either arm: the edit's and the accepted submit's p99 were both under 1 ms in 2 of
+the 12 runs (after, 50,000 round 1; before, 20,000 round 3), and 14 to 30 clients gave up in every run. The given-up clients are the next point to read (the fs/ rung under A-416's set rule is filed); the owner's
+one thread for verdicts and rebases is the next wall (A-273).
+
 ## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
 
 **What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
