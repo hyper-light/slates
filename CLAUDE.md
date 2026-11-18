@@ -30,7 +30,7 @@ gap, slates does not inherit it.
 | **R7 Plain English.** A human implementer can act on every sentence. | Module docs and comments are written for the next engineer, in prose, citing the design section. |
 | **R8 Laptop ≡ fleet, one code path.** | Every subsystem has a laptop-degenerate section; the N=1 differential test in CI asserts identical semantics with one node and with the simulated fleet. No mode switches, ever. |
 | **R9 Sub-50 µs provisioning.** | The provisioning histogram (p50/p99/p999/max, spinning and parked) is a permanent, ratcheted CI gate. |
-| **R10 Disk writes happen only on a user permission grant; no privilege is ever required.** | Grants exist only through the CLI or a confirmation surface; the MCP and SDK channels have no grant verb (refused by kind). The daemon never requests `CAP_SYS_ADMIN` or root; the only privileged pieces are OS-shipped brokers installed once. |
+| **R10 Disk writes happen only on a user permission grant, which follows the mode the user gave the agent; no privilege is ever required.** | The launcher or the harness sets a session's or volume's write policy and an agent can never raise its own (A-285): bypass merges and lands at once; ask answers a typed approval request bound to the manifest, which the harness presents; a forbidding mode is refused. Signatures are signed-work provenance, never the permission gate. The daemon never requests `CAP_SYS_ADMIN` or root; the only privileged pieces are OS-shipped brokers installed once. |
 
 ## 2. Banned (explicit authorization required, per item, in the conversation)
 
@@ -297,3 +297,16 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
 - Answer the question asked; when challenged, give the maximal solution with evidence, not a hedge. Say "wrong" about your own earlier answer when it was.
 - Every claim carries a number, a date, and a command or a citation. "From memory" is flagged as such and listed for verification.
 - Plain English in every document and comment; no jargon that a careful engineer new to the project cannot act on.
+
+## 8. Every agent: implement, unit-test, merge (Ada, 2026-11-18, binding on every agent and subagent, forever)
+
+1. **Implement** the change, with its unit tests (a bug's failing test first) and the design, GAPS and docs lines it makes true, in one commit in the style above.
+2. **Test** with `cargo test -p <crate>` for each crate you touched, plus `cargo fmt`. Nothing else: no cross-platform builds, lint matrices, `xtask`, doc builds, integration or e2e suites, CI waits or benchmarks.
+3. **Merge it yourself:**
+   - `git fetch origin && git merge origin/main` into your branch;
+   - rerun those unit tests if the merge changed your crates;
+   - `git push origin HEAD:main`.
+
+   If the push is refused because main moved, fetch, merge and push again. Never force-push or rewrite main.
+
+The supervisor and its integrator handle build, integration, e2e, cross-platform runs, CI and measurement on main after merges. They bisect any breakage to its commit and send it back to that commit's author, who fixes it the same way. This section overrides older instructions in this file about gates before landing and about who lands.

@@ -22,8 +22,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use super::slates::{Session, SlatesBinary};
-use super::{Failure, HostOs, Options, Readiness, Run, Scratch, Suite, Transport};
+use super::slates::{Reach, Session, SlatesBinary};
+use super::{Failure, HostOs, Options, Run, Scratch, Transport};
 
 /// Shape: small files per round — enough that the per-file cost dominates the phase's fixed cost.
 const SMALL_FILES: usize = 256;
@@ -82,22 +82,27 @@ fn one_round(
   transport: Transport,
   binary: &SlatesBinary,
 ) -> Result<Vec<Duration>, Failure> {
-  let root_available = match super::readiness(os, transport, Suite::Workloads) {
-    Readiness::Ready { root } => root,
-    Readiness::Skip(reason) => {
-      return Err(Failure(format!(
-        "conformance bench: {} is not runnable here: {}",
-        transport.slug(),
-        reason.text()
-      )));
-    }
+  // The bench measures the kernel's NFS clients side by side: NFSv3, which the FUSE transport's cells reach through as
+  // their adapter, beside NFSv4.2. Both mount as root, and the cache drops between phases are root's too, so it asks
+  // for root itself rather than borrow a suite's cell, whose reach may be FUSE (the workloads', A-293).
+  if !(super::is_root() || super::sudo_without_prompt()) {
+    return Err(Failure(format!(
+      "conformance bench: {} is not runnable here: the kernel's NFS mount and drop_caches need root, and this host \
+       has no passwordless sudo (`sudo -n true` was refused)",
+      transport.slug()
+    )));
+  }
+  let reach = match transport {
+    Transport::NativeLinuxFuse => Reach::LinuxNfsAdapter,
+    _ => Reach::Own,
   };
   let run = Run {
     root,
     options,
     os,
     transport,
-    root_available,
+    root_available: true,
+    reach,
     scratch: Scratch::open(options, transport)?,
   };
   let session = Session::open_with(&run, binary.clone(), ("bench", VOLUME_SIZE, false), None)?;

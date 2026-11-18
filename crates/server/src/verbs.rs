@@ -1701,7 +1701,26 @@ pub(crate) async fn resolve_and_forward(
       });
       Some(owner)
     }
-    None => locate_within_budget(query).await,
+    None => match locate_within_budget(query).await {
+      Some(owner) => Some(owner),
+      None => match locate_work_green(volume, region).await {
+        WorkGreen::Remote(owner) => Some(owner),
+        WorkGreen::Here => {
+          // The work's green is this node's own, and the request missed its completion window on the way here (a
+          // local request is answered from it first): no completion is recorded under its key, and the work is
+          // gone with its owner, so nothing runs (§4.16's failure matrix: the work's loss window).
+          crate::state::with_state(|state| state.count(WORK_GONE_HERE, 1));
+          return (
+            OwnerReplies {
+              first: refused(Refusal::NotFound),
+              later: Vec::new(),
+            },
+            None,
+          );
+        }
+        WorkGreen::Unknown => None,
+      },
+    },
   };
   let (decoded, later) = loop {
     let (decoded, later) = forward_once(owner, &requests).await;
@@ -1833,6 +1852,75 @@ async fn await_materialization(object: ObjectId) {
     }
   }
 }
+
+/// The status count of a request for a work no member owns, sent to its green's owner by the work's catalog record this
+/// node holds (A-255).
+const ROUTED_BY_WORK_GREEN: &str = "fleet.owner_location.routed_by_work_green";
+
+/// The owner of the green that `volume` is a work of, for a request no member owns the work for (A-255): after its
+/// owner's takeover a work has no owner (its head is never placed, so a successor never takes it over), but every holder
+/// of its catalog record knows its green (`CatalogValue::work_of`), whose owner holds the work's submits' completions
+/// (their merge records). This node's own held copy of that record is a hint and grants nothing (§4.8 "Lookup"): the
+/// green's owner answers only a completion recorded under the request's own key, and refuses anything else typed
+/// without running it. `None` when this node holds no catalog record naming a green for `volume`, or the green's owner is
+/// not found within the location budget.
+async fn locate_work_green(volume: VolumeId, region: u64) -> WorkGreen {
+  // This node's own held copy of the work's catalog record first; else one bounded location round asks the peers that
+  // hold one (`owner_location::locate_work_of`, the round's own bound and counters).
+  let held = crate::state::with_state(|state| {
+    crate::owner_location::held_work_of(state, ObjectId(volume.bytes))
+  })
+  .flatten();
+  let green = match held {
+    Some(green) => green,
+    None => {
+      let Some(query) = crate::state::with_state(|state| {
+        crate::owner_location::Query::new(state, ObjectId(volume.bytes), region)
+      }) else {
+        return WorkGreen::Unknown;
+      };
+      match crate::owner_location::locate_work_of(query).await {
+        Some(green) => green,
+        None => return WorkGreen::Unknown,
+      }
+    }
+  };
+  let green = ObjectId(green);
+  let found = crate::state::with_state(|state| {
+    let here = state.fleet.object_owner(green) == Some(state.fleet.host());
+    (
+      here,
+      crate::owner_location::Query::new(state, green, region),
+    )
+  });
+  let Some((here, query)) = found else {
+    return WorkGreen::Unknown;
+  };
+  if here {
+    return WorkGreen::Here;
+  }
+  match locate_within_budget(query).await {
+    Some(owner) => {
+      crate::state::with_state(|state| state.count(ROUTED_BY_WORK_GREEN, 1));
+      WorkGreen::Remote(owner)
+    }
+    None => WorkGreen::Unknown,
+  }
+}
+
+/// Where the green of a work no member owns is ([`locate_work_green`]).
+enum WorkGreen {
+  /// Owned by this node.
+  Here,
+  /// Owned by this member.
+  Remote(HostId),
+  /// Not known: this node holds no catalog record naming one, or its owner was not found within the budget.
+  Unknown,
+}
+
+/// The status count of a request for a work no member owns, whose green this node owns and whose completion it does not
+/// hold: refused `NotFound`, run nowhere (A-255).
+const WORK_GONE_HERE: &str = "fleet.owner_location.work_gone_here";
 
 /// The owner of `query`'s object, resolved again within the one liveness budget a forward allows for finding its owner:
 /// the direct route (the volume's creator while eligible) and then a location round, asked again every tenth of a
@@ -2231,8 +2319,10 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     | RequestBody::Advance { attachment, .. }
     | RequestBody::BindMount { attachment, .. } => Some(owner_of_attachment(*attachment)),
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
-    // names — not the client's shard, where nothing is awaiting.
-    RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
+    // names — not the client's shard, where nothing is awaiting. So is a presentation's entry list.
+    RequestBody::Grant { landing, .. } | RequestBody::LandingEntries { landing, .. } => {
+      Some(owner_of_landing(*landing))
+    }
     // A telemetry drain names its shard: it runs there, on that shard's own ring (§4.14).
     RequestBody::Telemetry { partition } => Some(*partition),
     other => volume_of(other).map(owner_of),
@@ -2889,21 +2979,60 @@ fn retry_forwards(state: &mut ShardState) -> bool {
         break;
       }
       Err(_) => {
-        // A forward that never reached its owner: refused here, its `ring.request` span ending with the
-        // refusal's write like any deferred reply's.
-        let ring = state.forwarded_rings.remove(&pending.request);
-        state.deferred.push(Deferred {
-          client_index: pending.client_index,
-          request: pending.request,
-          reply: refused(Refusal::NotFound),
-          recorded: false,
-          ring,
-        });
+        refuse_unsent_forward(state, pending);
         any = true;
       }
     }
   }
   any
+}
+
+/// Refuses a kept forward that will never reach its owner: answered `NotFound` here, its `ring.request` span ending with
+/// the refusal's write like any deferred reply's.
+fn refuse_unsent_forward(state: &mut ShardState, pending: PendingForward) {
+  let ring = state.forwarded_rings.remove(&pending.request);
+  state.deferred.push(Deferred {
+    client_index: pending.client_index,
+    request: pending.request,
+    reply: refused(Refusal::NotFound),
+    recorded: false,
+    ring,
+  });
+}
+
+/// Counter: the serve loop could not ask a kept forward's owner for room because it was not running as a task on its
+/// shard, which it always is. A bug signal: such a forward waits for the loop's next round instead of the owner's word.
+const FORWARD_ROOM_UNASKED: &str = "forward.kept.room_unasked";
+
+/// The asking half of the room wake (`slates_rt::room`) for the forwards a full control channel refused, run by the serve
+/// loop as it is about to idle (§4.3 "admission limit": backpressure, never a drop). It asks the owner of the first kept
+/// forward to tell this shard when its control channel next has room, then tries the kept forwards once more. The loop
+/// idles only if that try is refused too, and then the owner's next drain that takes a message wakes it: either the try
+/// finds the room a drain made meanwhile, or that drain finds the ask. So a kept forward waits for no timer and for no
+/// other request. An owner that has left its loop will never drain again, so its kept forwards are refused typed now.
+/// Whether the loop should serve a round instead of idling (a forward went out or was refused); false with none kept.
+pub fn ask_room_for_kept_forwards(state: &mut ShardState) -> bool {
+  let Some(owner) = state.pending_forwards.front().map(|pending| pending.owner) else {
+    return false;
+  };
+  match slates_rt::futures::want_room(owner) {
+    Ok(()) => retry_forwards(state),
+    Err(slates_rt::RtError::ShardGone { .. }) => {
+      let kept = std::mem::take(&mut state.pending_forwards);
+      for pending in kept {
+        if pending.owner == owner {
+          refuse_unsent_forward(state, pending);
+        } else {
+          state.pending_forwards.push_back(pending);
+        }
+      }
+      true
+    }
+    Err(_) => {
+      state.count(FORWARD_ROOM_UNASKED, 1);
+      retry_forwards(state)
+    }
+  }
 }
 
 /// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
@@ -3437,6 +3566,39 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::fleet::SERVE_RECEIVE_OTHER,
             demux_sum(state, |c| c.receive_refused_other),
           ),
+          (crate::fleet::SERVE_OPENED, demux_sum(state, |c| c.opened)),
+          (
+            crate::fleet::SERVE_SETUP_REFUSED,
+            demux_sum(state, |c| c.setup_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEER_SESSIONS_REFUSED,
+            demux_sum(state, |c| c.peer_sessions_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEERS_REFUSED,
+            demux_sum(state, |c| c.peers_refused),
+          ),
+          (
+            crate::fleet::SERVE_HIGH_WATER,
+            demux_sum(state, |c| c.high_water),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_DIALING,
+            crate::fleet::record_dials_dialing(state),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_CALL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.call_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_ENROLL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.enroll_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_CALLS,
+            crate::fleet::record_dials_calls(state),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -3850,6 +4012,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
+    Refusal::PolicyForbids { .. } => "policy_forbids",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4193,6 +4356,9 @@ fn dispatch_inner(
     RequestBody::DetachOf { volume, attachment } => {
       detach_of(state, principal, Some(volume), attachment)
     }
+    RequestBody::LandingEntries { landing, from } => {
+      crate::landing_entries::landing_entries_verb(state, principal, landing, from)
+    }
     // A peer's reap is served in `serve_forward`, under the peer's authenticated id; no client sends one.
     RequestBody::RemoteReap { .. } => refused(Refusal::BadRequest {
       reason: "a remote reap is a fleet peer's, never a client's".to_owned(),
@@ -4312,6 +4478,12 @@ fn dispatch_inner(
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
     RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::SetPolicy {
+      subject,
+      policy,
+      proof,
+    } => crate::landing::set_policy_verb(state, principal, subject, policy, proof),
+    RequestBody::Policy { subject } => crate::landing::policy_verb(state, principal, subject),
     RequestBody::Share {
       volume,
       principal: subject,
@@ -4987,6 +5159,7 @@ fn create(
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5663,6 +5836,7 @@ fn found_green(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -5704,7 +5878,7 @@ fn found_green(
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   state.greens.insert(id, engine);
   // Version 0's merge record — the origin, placed before the record names it (§4.16 "Commit").
-  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new());
+  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new(), (None, None));
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
@@ -5956,6 +6130,7 @@ fn create_work(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -5989,6 +6164,10 @@ fn create_work(
       charged,
     },
   );
+  // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
+  // version's merge record waits for it (A-255): shipped by the record plane now, not at the coordinator's period.
+  state.merge.works_owing_catalog.insert(id);
+  crate::merge_service::nudge_record_plane(state);
   ReplyBody::WorkCreated {
     id: to_wire_volume(id),
     base,
@@ -6732,6 +6911,7 @@ fn submit(
       reset_accepted_work(state, work_id, version);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
+      let completion = crate::merge_service::SubmitCompletion::of_current(state);
       crate::merge_service::enqueue_record(
         state,
         green_id,
@@ -6739,6 +6919,7 @@ fn submit(
         inc.id,
         inc.base,
         inc.evidence,
+        (completion, Some(work_id)),
       );
       // The work's base moved to the version, so the reachable floor may have risen: fold the histories
       // to it and true the retention charge up to what the commit retained (the secured surplus credited).
@@ -6813,6 +6994,8 @@ fn record_accepted(
       increment_bytes,
       increment,
       applied.unwrap_or_default(),
+      crate::merge_service::SubmitCompletion::of_current(state)
+        .map(crate::merge_service::SubmitCompletion::to_entry),
       identity,
     ),
   };
@@ -8307,7 +8490,7 @@ fn detach_of(
   attachment: u64,
 ) -> ReplyBody {
   // A CLI attachment past its term is refused as expired, never as unknown (A-230).
-  if let Err(refusal) = use_attachment(state, attachment) {
+  if let Err(refusal) = use_attachment(state, principal, attachment) {
     return refused(refusal);
   }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
@@ -8352,7 +8535,7 @@ fn bind_mount(
   path: &str,
 ) -> ReplyBody {
   // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
-  if let Err(refusal) = use_attachment(state, attachment) {
+  if let Err(refusal) = use_attachment(state, principal, attachment) {
     return refused(refusal);
   }
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
@@ -8445,12 +8628,18 @@ pub(crate) enum Ending {
   Expired,
 }
 
-/// A verb's use of attachment `attachment` against its term (A-230, §4.7). A CLI attachment within its term is renewed
-/// when less than half of the term is left, so a user at work keeps it with one durable record per half term, never one
-/// a verb; one past its term is ended now, as its lapse would end it, and refused. An id the partition recorded as
-/// expired is refused `AttachmentExpired`, never `NotFound`. Any other attachment, or none, passes, for the verb's own
-/// lookup to answer.
-pub(crate) fn use_attachment(state: &mut ShardState, attachment: u64) -> Result<(), Refusal> {
+/// `principal`'s use of attachment `attachment` against its term (A-230, §4.7). A CLI attachment within its term is
+/// renewed when less than half of the term is left, so a user at work keeps it with one durable record per half term,
+/// never one a verb; one past its term is ended now, as its lapse would end it, and refused. An id the partition
+/// recorded as expired is refused `AttachmentExpired`, never `NotFound`. Only the attachment's own principal's use
+/// renews or ends it: another's passes untouched, for the verb's own check to refuse `Forbidden` (before 2026-11-09 a
+/// use renewed the attachment ahead of that check, so any channel that named the id kept another account's attachment
+/// alive; fixtures' sweep after A-255). Any other attachment, or none, passes, for the verb's own lookup to answer.
+pub(crate) fn use_attachment(
+  state: &mut ShardState,
+  principal: &Principal,
+  attachment: u64,
+) -> Result<(), Refusal> {
   let expired = Refusal::AttachmentExpired { attachment };
   let Some(record) = state.db.partition().attachment(attachment).cloned() else {
     return if state.db.partition().attachment_expired(attachment) {
@@ -8459,6 +8648,9 @@ pub(crate) fn use_attachment(state: &mut ShardState, attachment: u64) -> Result<
       Ok(())
     };
   };
+  if &record.principal != principal {
+    return Ok(());
+  }
   let Consumer::Termed { expires_ns } = record.consumer else {
     return Ok(());
   };
@@ -9417,6 +9609,7 @@ pub(crate) fn materialize_taken_over_green(
         },
         live_shipped: false,
         live_holders: None,
+        write: None,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -9438,10 +9631,18 @@ pub(crate) fn materialize_taken_over_green(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  debug_assert!(matches!(
+  // The id must name a green here. A volume of another role already recorded under it is not this green, and replaying
+  // the green's chain onto its record would serve one object as another: refused typed (a `debug_assert!` before
+  // 2026-11-18, which panicked a debug build's shard and let a release build go on). The takeover counts the refusal and
+  // gives the green up at its bound, naming `refused` (`fleet::materialize_pending_greens`).
+  if !matches!(
     crate::merge_service::merge_role(state, id),
     Some(MergeRole::Green { .. })
-  ));
+  ) {
+    return Err(Box::new(refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(id),
+    })));
+  }
   // The chain, durably, in order — each entry guarded before it is applied.
   let now = state.clock.monotonic_ns();
   // What this node holds durably already: its checkpoint's version and the increments after it (W3).
@@ -9468,7 +9669,12 @@ pub(crate) fn materialize_taken_over_green(
       })));
     }
   };
-  for increment_bytes in recovery.chain.iter().skip(already) {
+  for (increment_bytes, completion) in recovery
+    .chain
+    .iter()
+    .zip(&recovery.completions)
+    .skip(already)
+  {
     let judged = slates_merge::engine::Increment::decode(increment_bytes)
       .ok()
       .map(|increment| {
@@ -9483,7 +9689,13 @@ pub(crate) fn materialize_taken_over_green(
     };
     let op = Op::GreenAdvanced {
       green: id,
-      increment: slates_merge::chain_entry::encode(increment_bytes, &increment, &applied, None),
+      increment: slates_merge::chain_entry::encode(
+        increment_bytes,
+        &increment,
+        &applied,
+        completion.map(crate::merge_service::SubmitCompletion::to_entry),
+        None,
+      ),
     };
     if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
       return Err(Box::new(refused(refusal_of_db(&e))));
@@ -9514,10 +9726,71 @@ pub(crate) fn materialize_taken_over_green(
       reason: "taken-over green does not reproduce its adopted head".to_owned(),
     })));
   }
+  record_taken_over_completions(state, &recovery.completions);
   let object = ObjectId(id.bytes);
   let placed = state.merge.placed.entry(object).or_insert(recovery.head);
   *placed = (*placed).max(recovery.head);
   Ok(())
+}
+
+/// The status count of a taken-over submit's completion recorded on its green's successor (A-255).
+const TAKEN_OVER_COMPLETION_RECORDED: &str = "merge.takeover.completion_recorded";
+/// The status count of a taken-over submit's completion left out because its client's newer completions filled the
+/// client's bound ([`completion_bound`]): its resend is refused typed and runs nothing.
+const TAKEN_OVER_COMPLETION_PAST_BOUND: &str = "merge.takeover.completion_past_bound";
+/// The status count of a taken-over submit's completion the partition could not make durable.
+const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unrecorded";
+
+/// Records, on a taken-over green's partition, the completions its merge records carried (A-255; RIFL §3, "If the
+/// object migrates, then the completion record must move with it"): each submit's resend after the takeover is then
+/// answered its version here, the request's key the one it was accepted under, and never run again.
+///
+/// Bounded per client as any client's records are ([`completion_bound`]): a client holds at most that many unacknowledged
+/// at once, so its newest that many submits are the ones it may still resend. Older ones it had acknowledged (the
+/// acknowledgements stayed with the departed owner), and their resend, which a conforming client never sends, is refused
+/// typed and runs nothing (the work is gone with its owner). Counted.
+fn record_taken_over_completions(
+  state: &mut ShardState,
+  completions: &[Option<crate::merge_service::SubmitCompletion>],
+) {
+  let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
+  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64)>> =
+    std::collections::BTreeMap::new();
+  for (index, key) in completions.iter().enumerate() {
+    let Some(key) = key else {
+      continue;
+    };
+    let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+    by_client
+      .entry((key.origin, key.client))
+      .or_default()
+      .push((key.sequence, version));
+  }
+  for ((origin, client), mut submits) in by_client {
+    submits.sort_unstable();
+    let past = submits.len().saturating_sub(bound);
+    state.count(
+      TAKEN_OVER_COMPLETION_PAST_BOUND,
+      u64::try_from(past).unwrap_or(u64::MAX),
+    );
+    for (sequence, version) in submits.into_iter().skip(past) {
+      let reply = record_completion(
+        state,
+        origin,
+        RequestId { client, sequence },
+        ReplyBody::Submitted {
+          version: Some(version),
+          conflicts: Vec::new(),
+        },
+      );
+      let counter = if matches!(reply, ReplyBody::Refused { .. }) {
+        TAKEN_OVER_COMPLETION_UNRECORDED
+      } else {
+        TAKEN_OVER_COMPLETION_RECORDED
+      };
+      state.count(counter, 1);
+    }
+  }
 }
 
 /// A taken-over green whose recovered chain did not reproduce the adopted head's identity: refused on
@@ -9712,6 +9985,7 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
+      write: None,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -11323,6 +11597,9 @@ fn replay_chain_entry(
     base: entry.increment.base,
     evidence: entry.increment.evidence,
     identity,
+    completion: entry
+      .completion
+      .map(crate::merge_service::SubmitCompletion::of_entry),
   });
   *next = next.saturating_add(1);
   Ok(false)
@@ -11374,6 +11651,7 @@ fn chain_phase(
       base: 0,
       evidence: Vec::new(),
       identity: green.head_identity(),
+      completion: None,
     });
   }
   Ok(GreenReplayPhase::Chain {
@@ -11386,7 +11664,7 @@ fn chain_phase(
 }
 
 /// A volume id's bytes in hexadecimal, as the CLI prints a volume id.
-fn hex_of(bytes: &[u8]) -> String {
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -12940,6 +13218,7 @@ mod tests {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),
@@ -14007,6 +14286,7 @@ mod tests {
       access: Vec::new(),
       live_shipped: false,
       live_holders: None,
+      work_of: None,
     }
   }
 
@@ -14382,6 +14662,68 @@ mod tests {
       panic!("{reply:?}")
     };
     *state.by_id.get(&super::to_db_volume(id)).unwrap()
+  }
+
+  /// §4.16 owner-loss recovery, CLAUDE.md §2 item 6 (no panics in non-test code, ever): a taken-over green whose id
+  /// names a volume of another role on its owner shard is refused typed, and nothing is rebuilt over it. Do: create a
+  /// plain volume, then materialize a taken-over green under its id and another name. Expect `AlreadyExists` naming
+  /// the id, no green engine, and the plain volume still plain and served. Before (2026-11-18), a `debug_assert!` on the
+  /// volume's role panicked the shard in a debug build, and a release build went on to replay the green's chain against
+  /// the plain volume's record.
+  #[test]
+  fn a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed() {
+    let (wire, answer, engine, role, served) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "plain".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id: wire } = reply else {
+        panic!("{reply:?}")
+      };
+      let id = super::to_db_volume(wire);
+      let recovery = crate::merge_service::GreenRecovery {
+        name: "green".to_owned(),
+        require_evidence: false,
+        owner,
+        access: Vec::new(),
+        catalog_sequence: 1,
+        origin: None,
+        chain: Vec::new(),
+        completions: Vec::new(),
+        head: 0,
+        identity: [0; 32],
+      };
+      let answer = super::materialize_taken_over_green(state, id, recovery).map_err(|reply| *reply);
+      (
+        wire,
+        answer,
+        state.greens.contains_key(&id),
+        crate::merge_service::merge_role(state, id).is_none(),
+        state.by_id.contains_key(&id),
+      )
+    });
+    assert_eq!(
+      answer,
+      Err(ReplyBody::Refused {
+        refusal: Refusal::AlreadyExists { existing: wire }
+      }),
+      "a green is never materialized over a plain volume"
+    );
+    assert!(!engine, "no green engine over the plain volume");
+    assert!(role, "the volume under the id is still plain");
+    assert!(served, "the plain volume is still served");
   }
 
   /// What a client observes of the node at `path`: its kind and permission bits, owner, link count, four
