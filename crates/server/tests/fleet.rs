@@ -17916,3 +17916,34 @@ fn a_forwarded_read_by_the_same_uid_on_another_host_is_forbidden_without_a_share
     "node b's read was served once the named share was made (last: {after_share:?})"
   );
 }
+
+/// Diagnostics only (a diag branch, never on main): `SLATES_DIAG_FORMATIONS` three-node formations in a row, each as
+/// the fleet suite forms one (`start_mesh`, whose settle panics with the formation-failure message), stopped after each.
+#[test]
+#[ignore = "diagnostics only"]
+fn diag_formation_loop() {
+  let formations = std::env::var("SLATES_DIAG_FORMATIONS")
+    .ok()
+    .and_then(|count| count.parse::<u64>().ok())
+    .unwrap_or(1);
+  for formation in 1..=formations {
+    let _serial = serialize_fleet_tests();
+    let names = ["a", "b", "c"];
+    let nodes: Vec<(MachineProfile, HostId, Identity)> =
+      names.iter().map(|name| fleet_node(name)).collect();
+    let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+      nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+    let (_serve_lease, serve) = mesh_serve_ports(names.len());
+    let began = Instant::now();
+    let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+    let formed = began.elapsed();
+    for daemon in daemons {
+      daemon.stop();
+    }
+    eprintln!(
+      "diag: formation {formation} formed in {} ms",
+      formed.as_millis()
+    );
+  }
+}
