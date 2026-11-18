@@ -972,6 +972,33 @@
 >   discovery refresh catches a session sitting unborrowed in its slot, and a peer's stateless reset (A-261) ends one
 >   sooner where it is heard
 >   (`docs/bugs/2026-11-09-a-dead-record-session-was-lent-on-for-want-of-anyone-judging-it.md`).
+>   - **Its test made deterministic (2026-11-18, goal g245).** The test's 256-client burst made its recovery bound
+>     (1.1 s) depend on load: missed at 1.33 s (loadtest-scale, adacachy2, load 41), 1.339 s (the supervisor's r423,
+>     load ~52) and 1.384 s (a diagnostic run on a Mac, load 28 to 47). That run's timeline: the link redialed 89 ms
+>     after the drop, its handshake took 665 ms (its cause not measured apart), the lane's first turn on the replacement
+>     came at 853 ms with 8,031 forwards queued, a sent its first reply at 896 ms, and b's lane took it at 1,384 ms
+>     while the burst's resends cycled through b's control shard (37,000 to 62,000 batches given up a run); the
+>     judgment and the redial were not the cost. The
+>     test now keeps b's lane borrowing the session with four readers, a read each in flight, discovery held: green 5 of
+>     5 (dropped 2,002 to 2,644 ms into the silence against its 1,998 ms window, answered on the replacement 21 to 112 ms
+>     later) and red 5 of 5 with the return's judgment removed, on a Mac at load 33 to 56 beside 8 spinners. The burst
+>     went to A-306's test, below.
+>   - **Finding (b), fixed (2026-11-18, A-306): a resend keeps its place in the lane.** A read through b during the dead
+>     session missed its failover bound behind the burst's resends: each resend took fresh tickets at the back of the
+>     lane and was given up again before it was begun. With the probe read sent just after the burst's first round,
+>     main refused it `OwnerUnreachable` at 10.5 s in 1 of 10 runs and answered it after 9.2 and 9.5 s in two more
+>     (2.3 to 10.5 s; load 37 to 46). A forward's place is now its first send's ticket and its resends are queued there
+>     (`forward_lane::Place`, `fleet.forward.resent_in_place`): 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+>     `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` sends the probe before the burst, so its place is
+>     the lane's first: answered in 2.19 to 2.50 s, 5 of 5; with the place ignored it was refused at its bound in 2 of
+>     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
+>     and a model test, both red with the place ignored
+>     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
+>   - **Open (2026-11-18, goal g245): a forward still queued is given up at its stall budget while its lane moves.**
+>     Nothing of it was sent, and with its place kept its resend loses nothing, but each one costs its forwarder a give-up
+>     and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the most in
+>     the runs that starved. Owed: a queued forward's quiet counts its lane's progress (a forward begun or a reply taken),
+>     so it is given up only when the lane does not move for a stall budget, the failover bound still capping it.
 >
 > - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
 >   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with

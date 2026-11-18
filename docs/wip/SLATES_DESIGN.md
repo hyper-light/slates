@@ -5610,6 +5610,19 @@ version.
 > read now takes 1.8 to 2.4 ms (`crate::forward_lane`; `forwards_to_one_owner_never_wait_behind_each_other`;
 > `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`).
 
+> **Status (2026-11-18, A-306: a resend keeps its place in the lane).** A forward given up at its stall budget, or cut
+> off by its session's replacement, is sent again by its caller under its own ids (`verbs::resolve_and_forward`). Each
+> send took fresh tickets at the back of the peer's lane, so behind a backlog the lane begins more slowly than a stall
+> budget a resend was given up again before it was begun, while forwards first queued after it went ahead: a read
+> through a client node whose session to its owner died was refused `OwnerUnreachable` at its failover bound in 1 of 10
+> runs behind a 256-client burst, and answered after 9.2 and 9.5 s in two more (load 37 to 46). A forward's place is
+> now its first send's ticket, and its resends are queued there (`forward_lane::Place`): the lane begins forwards in
+> the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+> `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
+> `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
+> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -21519,3 +21532,32 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   against itself, refused because no stated line differed.
 - **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
   run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.
+
+### A-306 — A resent forward keeps the place its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18.
+- `crates/server/src/forward_lane.rs`: `Place`; each ticket's place, and the lane's queue ordered by place, then
+  ticket; `ForwardLanes::queue` and `leave` (the queue's discipline apart from the shard's state) and
+  `begin_queued_with` (apart from the session); the count `fleet.forward.resent_in_place`; the module doc.
+  `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes the place) and `crates/server/src/verbs.rs`
+  (`resolve_and_forward` keeps one place across its resends; `forward_once` passes it).
+- Tests: `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and the model test
+  `a_lanes_forwards_are_begun_in_the_order_they_were_first_queued` (`forward_lane.rs`), and
+  `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's "dead record session" entry. The bug record:
+  `docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`.
+- **What was there.** A forwarder gives its batch up once none of its forwards has progressed for its stall budget,
+  queued or begun, and its caller sends the same requests again under their own ids while the owner is not confirmed
+  dead and the failover bound allows. Every send was a new batch with fresh tickets, and a lane begins its queue in
+  ticket order, so every resend went to the back.
+- **The rule.** A forward's place is the ticket its first send was given; a resend is queued at it, each request of a
+  batch at its own first ticket. A lane begins its queued forwards in the order of their places: the order of first
+  sends, whatever has been given up and sent again since. Its wait is bounded by the forwards first sent before it.
+- **Why.** Goal g245, finding (b): behind a 256-client burst a read through a client node whose session to its owner
+  died was refused at its failover bound in 1 of 10 runs and answered after 9.2 and 9.5 s in two more (2.3 to 10.5 s
+  in all), its every resend given up again behind forwards first sent after it. With its place kept: 4.1 to 6.5 s in
+  10 of 10.
+- **Cost.** None new: a queued forward's key in the same ordered set is a pair, and a resend's insert and a leave's
+  remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
+  with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
+  owed apart (GAPS).
