@@ -182,21 +182,50 @@ impl<T: 'static> Future for CrossShardCall<T> {
 }
 
 /// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer), and
-/// waits for room when the origin's control channel is full: retried at [`REPLY_PACE_NS`] for at most
-/// [`REPLY_ROOM_NS`] of time, one coordinator period. A full channel drains as the origin turns, so a burst no
-/// longer costs the reply; a reply still refused after the period, or whose origin is gone, is counted on this shard
-/// (`xshard.reply_dropped`) and its waiter's own deadline answers it (the client's reply deadline; `call_within`'s).
-/// Before 2026-10-07 every refusal dropped the reply at once and unseen.
+/// waits for room when the origin's control channel is full, retried at [`REPLY_PACE_NS`], for as long as the origin
+/// lives (§4.3: backpressure, never a drop). A full channel drains as the origin turns. Only an origin gone (its client
+/// with it) leaves the result undelivered, counted on this shard (`xshard.reply_dropped`).
+///
+/// **What bounds the waiting (CLAUDE.md §2 item 8).** A result waits inside a task that exists for it anyway (the task
+/// that ran a forwarded verb, a scatter part, or a call), or, from a caller that cannot await, in the one task
+/// [`carry_home`] spawns for it when the channel is full. So the results waiting on a shard are at most the tasks it
+/// holds, and every one answers a request in flight: a client's (each client holds at most its region's `slots` of
+/// credit, so a shard serves at most `clients_per_shard × slots` of them at once), an acknowledgement's parts (at most
+/// `ack_scatter_bound` scatters a shard) or a call (its caller's own in-flight bound). The hard bound is the shard's task
+/// arena: a waiting task it cannot take is refused at its spawn with a typed error the caller counts
+/// (`xshard.unstarted_unanswered`, a caller's own undelivered counter), never queued. The waits are counted
+/// ([`ROOM_WAITS_STARTED`], [`ROOM_WAITS_ENDED`], [`ROOM_WAITS_PEAK`]), so the bound is seen held.
+/// Before 2026-10-07 every refusal dropped the reply at
+/// once and unseen; until 2026-11-09 one still refused after a coordinator period was dropped: about 4,300 a run of the
+/// 3,000-client rung on main, every one an acknowledgement scatter's part, whose loss refused its client
+/// `AcknowledgementOwed` until a later acknowledgement settled the release (`crates/server/tests/reply_room.rs` shows the
+/// same loss of a forwarded verb's answer).
 pub async fn send_back(origin: u16, back: SpawnRequest) {
   if !given_room(origin, Control::Spawn(Box::new(back))).await {
     state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
   }
 }
 
-/// Sends `message` to `target`, waiting out a full channel for one coordinator period of time ([`REPLY_ROOM_NS`]), as
-/// [`given_room_within`] waits: whether it was sent; `false` past that, or at once for a shard gone.
-async fn given_room(target: u16, message: Control) -> bool {
-  given_room_within(target, message, REPLY_ROOM_NS).await
+/// Sends `message` to `target`, waiting out a full channel for as long as `target` lives: whether it was sent; `false`
+/// only for a shard gone, or a pause the runtime refused (off a shard, a tripwire). A wait is counted from the first
+/// full channel to its end ([`RoomWait`]).
+async fn given_room(target: u16, mut message: Control) -> bool {
+  let mut waiting: Option<RoomWait> = None;
+  loop {
+    match registry::send_control_or_return(target, message) {
+      Ok(()) => return true,
+      Err(registry::RefusedControl {
+        error: RtError::ControlFull { .. },
+        message: Some(unsent),
+      }) => message = unsent,
+      Err(_) => return false,
+    }
+    waiting.get_or_insert_with(RoomWait::begin);
+    if slates_rt::futures::sleep(REPLY_PACE_NS).await.is_err() {
+      state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
+      return false;
+    }
+  }
 }
 
 /// [`run_on`] for work whose loss would leave state behind on `shard` (a closed connection's byte states, A-192): a
@@ -251,6 +280,7 @@ pub fn run_on_waiting(
 /// in `crates/server/tests/ack_release.rs`).
 pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
   let deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
+  let mut waiting: Option<RoomWait> = None;
   loop {
     match registry::send_control_or_return(target, message) {
       Ok(()) => return true,
@@ -260,6 +290,7 @@ pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_
       }) => message = unsent,
       Err(_) => return false,
     }
+    waiting.get_or_insert_with(RoomWait::begin);
     let left = deadline.saturating_sub(slates_rt::futures::now_ns());
     if left == 0 {
       return false;
@@ -281,12 +312,53 @@ pub(crate) const ROOM_PAUSE_REFUSED: &str = "xshard.room_pause_refused";
 /// (`crate::fleet::POLL_PER_PERIOD`), so a waiting reply asks about as often as the shard's loops turn.
 const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
 
-/// Derived: how long a result carried home waits for room: one coordinator period (`HEARTBEAT_NS`), the period the
-/// daemon's own loops tolerate a stall for before acting. A span of the shard's clock, not a count of tries (until
-/// 2026-11-06 it was `POLL_PER_PERIOD + 1` tries of [`REPLY_PACE_NS`], which a starved shard stretched).
-const REPLY_ROOM_NS: u64 = crate::daemon::HEARTBEAT_NS;
+/// Format: the status counter of waits for room this shard began ([`given_room`], [`given_room_within`]).
+pub(crate) const ROOM_WAITS_STARTED: &str = "xshard.room_waits_started";
+/// Format: the status counter of waits for room this shard ended, sent or not: with [`ROOM_WAITS_STARTED`], the waits
+/// it holds now.
+pub(crate) const ROOM_WAITS_ENDED: &str = "xshard.room_waits_ended";
+/// Format: the status counter that rises each time this shard holds more waits for room at once than it ever had, by
+/// the difference: its value is the most it has held at once.
+pub(crate) const ROOM_WAITS_PEAK: &str = "xshard.room_waits_peak";
 
-/// Format: the status counter of results that could not be carried home ([`send_back`]).
+thread_local! {
+  /// This shard thread's waits for room now, and the most it has held at once ([`RoomWait`]).
+  static ROOM_WAITS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// One wait for room in progress on this shard ([`given_room`], [`given_room_within`]): counted when it begins and,
+/// dropped, when it ends,
+/// however it ends (sent, the target gone, its task cancelled).
+struct RoomWait;
+
+impl RoomWait {
+  fn begin() -> RoomWait {
+    let (now, peak) = ROOM_WAITS.with(Cell::get);
+    let now = now.saturating_add(1);
+    ROOM_WAITS.with(|waits| waits.set((now, peak.max(now))));
+    let raised = now.saturating_sub(peak);
+    state::with_state_counted(|s| {
+      s.count(ROOM_WAITS_STARTED, 1);
+      if raised > 0 {
+        s.count(ROOM_WAITS_PEAK, raised);
+      }
+    });
+    RoomWait
+  }
+}
+
+impl Drop for RoomWait {
+  fn drop(&mut self) {
+    ROOM_WAITS.with(|waits| {
+      let (now, peak) = waits.get();
+      waits.set((now.saturating_sub(1), peak));
+    });
+    state::with_state_counted(|s| s.count(ROOM_WAITS_ENDED, 1));
+  }
+}
+
+/// Format: the status counter of results that could not be carried home because the shard they went to is gone
+/// ([`send_back`]).
 pub(crate) const REPLY_DROPPED: &str = "xshard.reply_dropped";
 
 /// Runs `work` on `shard` and returns its result on this shard (`origin`). The closure borrows
@@ -511,6 +583,9 @@ pub async fn within_shard_time<T: 'static>(
 mod tests {
   use super::*;
 
+  /// Shape: the bounded wait the starved-shard test gives a scatter part's room: one coordinator period.
+  const REPLY_ROOM_NS: u64 = crate::daemon::HEARTBEAT_NS;
+
   /// A result carried home waits for room (2026-10-07). Do: on a shard, register a stand-in slot whose control channel
   /// holds one message, fill it, and spawn a task that sends a result home to it with `send_back`; from the test
   /// thread, wait two reply paces, then take the filler off the channel. Expect: the result's message arrives after
@@ -546,6 +621,41 @@ mod tests {
     assert!(
       carried.is_ok(),
       "the result's message arrived once there was room"
+    );
+    drop(registration);
+    daemon.stop();
+  }
+
+  /// A reply handed home by a caller that cannot await waits for room too (§4.3 "backpressure, never a drop";
+  /// [`hand_reply_home`], [`AnswerUnstarted`]). Do: on a shard, register a stand-in slot whose control channel holds one
+  /// message, fill it, and hand a reply home to it with `hand_reply_home`, from the shard's state as its callers do; from
+  /// the test thread, take the filler off the channel. Expect: the hand-off reported no refusal, and the reply's message
+  /// arrives after the filler. Handed to the channel once, as until 2026-11-07, or dropped on a full channel, nothing
+  /// arrives.
+  #[test]
+  // The test thread stands for the client's shard draining later: it must wait off-shard while the reply waits.
+  #[allow(clippy::disallowed_methods)]
+  fn a_reply_handed_home_to_a_full_channel_waits_for_room() {
+    let daemon = crate::daemon::audit_daemon();
+    let (registration, receiver, handed) = crate::daemon::observe_first(&daemon, |_state| {
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let home = registration.shard();
+      let filler = SpawnRequest::new(Box::pin(async {}), None);
+      registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+      let handed = hand_reply_home(home, || {});
+      (registration, receiver, handed)
+    });
+    assert!(handed.is_ok(), "the hand-off was refused: {handed:?}");
+    let room = std::time::Duration::from_nanos(REPLY_ROOM_NS.saturating_add(REPLY_PACE_NS));
+    assert!(receiver.recv_timeout(room).is_ok(), "the filler");
+    assert!(
+      receiver.recv_timeout(room).is_ok(),
+      "the reply's message arrived once there was room"
     );
     drop(registration);
     daemon.stop();
@@ -601,15 +711,15 @@ mod tests {
     daemon.stop();
   }
 
-  /// The wait for room is a span of time on a busy shard too (2026-11-06). Do: on a shard, fill a stand-in slot's
-  /// one-message channel and never drain it; keep the shard busy 20 ms at a time back to back with a task that spins and
-  /// yields; and wait for room for a result carried home there. Expect: the wait gives up about one
+  /// A bounded wait for room (`given_room_within`, a scatter part's) is a span of time on a busy shard too (2026-11-06).
+  /// Do: on a shard, fill a stand-in slot's one-message channel and never drain it; keep the shard busy 20 ms at a time
+  /// back to back with a task that spins and yields; and wait for room there within one coordinator period. Expect: the wait gives up about one
   /// coordinator period after it began, not much more. Before, it was a count of tries of one pause each, and each try
   /// lasted a pause plus the shard's busy poll.
   #[test]
   // The test thread waits for the result off the shard.
   #[allow(clippy::disallowed_methods)]
-  fn a_result_sent_home_to_a_full_channel_waits_its_period_in_time_on_a_starved_shard() {
+  fn a_bounded_wait_for_room_waits_its_period_in_time_on_a_starved_shard() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     /// Shape: how long the starver keeps the shard busy at a time: twice the room wait's pause.
     const STARVED_FOR_NS: u64 = 2 * REPLY_PACE_NS;
@@ -649,9 +759,10 @@ mod tests {
       slates_rt::futures::detach(starver).unwrap();
       let waiter = slates_rt::futures::spawn(async move {
         let began = slates_rt::futures::now_ns();
-        let sent = given_room(
+        let sent = given_room_within(
           home,
           Control::Spawn(Box::new(SpawnRequest::new(Box::pin(async {}), None))),
+          REPLY_ROOM_NS,
         )
         .await;
         WAITED_NS.store(
@@ -793,15 +904,13 @@ impl Drop for AnswerUnstarted {
       state::deliver(client_index, request, reply, true);
       return;
     }
-    let mut guard = AnswerUnstarted::new(home, home, client_index, request, reply.clone());
-    let back = SpawnRequest::new(
-      Box::pin(async move {
-        guard.started();
-        state::deliver(client_index, request, reply, true);
-      }),
-      None,
-    );
-    if registry::send_control(home, Control::Spawn(Box::new(back))).is_err() {
+    // Carried home as [`carry_home`] carries a reply: this shard's arena refused the task the guard was in, so the
+    // reply goes to the client's shard's channel needing nothing of it, and only waits on a task here for room there.
+    if carry_home(home, move || {
+      state::deliver(client_index, request, reply, true);
+    })
+    .is_err()
+    {
       state::with_state_counted(|s| s.count(UNSTARTED_UNANSWERED, 1));
     }
   }
@@ -887,24 +996,60 @@ pub async fn send_reply_home(origin: u16, body: impl FnOnce() + Send + 'static) 
 /// ([`send_reply_home`]).
 pub(crate) const REPLY_RUN_UNSTARTED: &str = "xshard.reply_run_unstarted";
 
-/// [`send_reply_home`] for a caller that cannot wait for room (it holds its shard's state): `body` is handed to
-/// `target`'s control channel once, and the channel's refusal is returned for the caller to count, as before. Once
-/// the channel takes it, `body` runs on `target` whether its arena admits the task or refuses it at admission.
+/// [`send_reply_home`] for a caller that cannot wait for room (it holds its shard's state), as [`carry_home`] carries
+/// it: the refusal is returned for the caller to count. Until 2026-11-09 `body` was handed to `target`'s channel once
+/// and a full channel's refusal returned, so a reply met a full channel and was lost (CLAUDE.md §2 items 8 and 9).
 pub(crate) fn hand_reply_home(
   target: u16,
   body: impl FnOnce() + Send + 'static,
 ) -> Result<(), RtError> {
+  carry_home(target, body)
+}
+
+/// Carries a reply home to `origin` from a caller that cannot await, waiting for room as [`send_reply_home`] waits,
+/// with the wait's first try made at once: `body` goes to `origin`'s control channel now, which needs nothing of this
+/// shard, and only a full channel puts the wait on a task of this shard. So a reply is not lost to this shard's arena
+/// when the channel has room (an [`AnswerUnstarted`] drops because its shard's arena is full; a task there for every
+/// reply failed `a_forward_refused_at_admission_answers_its_client` 3 of 3), nor to a full channel while this shard can
+/// run the wait. Returned: the refusal when neither could take it, `origin` gone or this shard's arena full with the
+/// channel, for the caller to count; the reply is then dropped here, its guard standing down.
+fn carry_home(origin: u16, body: impl FnOnce() + Send + 'static) -> Result<(), RtError> {
   let mut guard = RunUnstarted {
-    at: target,
+    at: origin,
     body: Some(Box::new(body)),
   };
-  send_owing(
-    target,
-    SpawnRequest::new(
-      Box::pin(async move {
-        guard.run();
-      }),
-      None,
-    ),
-  )
+  let back = SpawnRequest::new(
+    Box::pin(async move {
+      guard.run();
+    }),
+    None,
+  );
+  match registry::send_control_or_return(origin, Control::Spawn(Box::new(back))) {
+    Ok(()) => Ok(()),
+    Err(registry::RefusedControl {
+      error: RtError::ControlFull { .. },
+      message: Some(unsent),
+    }) => discarding_unsent(|| {
+      let waiting = slates_rt::futures::spawn(async move {
+        if !given_room(origin, unsent).await {
+          state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
+        }
+      })?;
+      let _ = slates_rt::futures::detach(waiting);
+      Ok(())
+    }),
+    Err(refused) => discarding_unsent(|| {
+      drop(refused.message);
+      Err(refused.error)
+    }),
+  }
+}
+
+/// Runs `drop_or_hand`, during which a reply guard dropped stands down ([`DISCARDING_UNSENT`]): the caller reports
+/// the refusal.
+fn discarding_unsent<T>(drop_or_hand: impl FnOnce() -> T) -> T {
+  DISCARDING_UNSENT.with(|discarding| discarding.set(true));
+  let result = drop_or_hand();
+  DISCARDING_UNSENT.with(|discarding| discarding.set(false));
+  result
 }
