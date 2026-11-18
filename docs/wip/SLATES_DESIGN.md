@@ -10804,7 +10804,9 @@ shard of its node before the green's first change, feeds it each change over the
 own shard, and makes every replica leave before it gives the engine up. A work's shard answers from its replica
 (step 5b, A-465) what the work asks of its green, its base at its version and its rebase, by the owner's own functions
 over the replica's engine, with no hop; what the replica does not hold is asked of the owner, counted by why, and a
-replica that left after a refusal or an eviction is made again before the owner's next change.
+replica that left after a refusal or an eviction is made again before the owner's next change. A replica no work on its
+shard has used for its idle window, the longest gap it has known between two uses, is given back (A-473), and made again
+when work there asks for it.
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25318,9 +25320,11 @@ own shard; and every replica leaving before its owner is given up. Step 5b built
 work's base reads (its files, a page, every file's length, at its base version) and its rebase answered by its shard's
 replica with no hop, by the owner's functions over the replica's engine (byte for byte the owner's, the oracle test);
 what the replica cannot serve asked of the owner, counted by why; a replica that left after a refusal or an eviction
-made again, counted, never one that left for its budget. Owed: an idle replica's give-back (its idle period derived from
-the feed's cost per version against the rebases it served); the supervisor's A/B at 1,000 clients and more. The text and
-its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+made again, counted, never one that left for its budget. The idle give-back built 2026-11-18 (g083, A-473, below): a
+replica no work on its shard has used for its idle window, the longest gap it has known between two uses, leaves, its
+charge credited, counted; only a recorded use arms the check; work that returns asks for it again, and the owner's next
+change remakes it. Owed: the supervisor's A/B at 1,000 clients and more (running). The text and its measurements are
+perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -32239,3 +32243,36 @@ a field test; `src/manifest_vectors.txt`, new: the published vectors; `src/lib.r
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry), `crates/server/src/daemon.rs`, and
 `docs/bugs/2026-11-18-the-anchor-never-found-a-wedged-daemon-once-its-own-waits-ran-a-window-late.md` (A-467's bug,
 recorded).
+
+### A-473 — A replica no work on its shard has used for its idle window is given back, and made again when work there asks for it; the window is the green's own use there, and only a recorded use arms the check (2026-11-18, goal 87 via g083; A-273's idle give-back; §4.16 "Rebase off the owner"; A-457, A-465)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and
+`crates/server/src/green_replicas.rs` (`Held`'s use history and `idle_at`; `note_use`, `idle_check`,
+`next_idle_wait`, `give_back_idle`; `Gone::Idle`, `Tomb`, `want_again`, `Message::Wanted`, `wanted`; the test).
+
+- **What was there.** A replica made on every other shard at its green's first change (A-457) stayed until its owner
+  gave the engine up, fed every version and charged to its shard whether or not any work there used it.
+- **The window.** A held replica keeps when a work on its shard last used it (a base read or a rebase it served,
+  A-465) and the longest gap it has known between two uses, the first measured from its holding: its gap tail, the
+  green's own use on that shard. A replica unused for longer than its gap tail is idle: its works have paused longer
+  than they ever have. No literal enters the window.
+- **The check, by event.** Recording a use arms the shard's idle check if it does not run: one task a shard, which
+  sleeps to the moment the first held replica has gone unused for its window, gives back every one that has, counted
+  (`merge.replica.idle_given_back`), its charge credited and its registration sent home, and goes on while a used
+  replica is held; it ends when none is. Nothing sweeps on a period.
+- **Work returns.** The first base read or rebase a given-back replica would have served is asked of the owner,
+  counted (`merge.replica.route_idle`), and asks the owner, once, to make it again (`Message::Wanted`); the owner's
+  next change does, through A-465's remake path, counted (`merge.replica.remade`). A replica given back for idleness
+  is not made again until a work asks for it, so an idle green costs nothing on that shard.
+- **Not judged.** A replica never used on its shard has no use to derive a window from, so it is not judged idle: it
+  costs its feed and its charge until its owner gives the engine up. Making replicas only where works ask for them
+  would end that; it is owed, the A/B's evidence first.
+- **Checks.** On the Mac Studio (debug, r417, 2026-11-18): `cargo test --locked -p slates-server --lib green_replicas`
+  7 of 7 (the new `an_unused_replica_is_given_back_after_its_idle_window_and_made_again_when_work_returns`: given back
+  once idle, its 155 bytes of charge credited, the next request asked of the owner as idle, made again at the owner's
+  next change and held again) and `cargo test --locked -p slates-merge --lib` 16 of 16; the one-crate clippy of
+  `slates-merge` clean, and of `slates-server` clean in this change's code (it fails at main's own sites in `fleet.rs`,
+  `verbs.rs`, `watchdog.rs` and `live_ship.rs`); `cargo xtask check` structural clean and the literal check clean in
+  this change (it counts 52 literals in other crates' files); rustfmt's layout taken. Red with an idle replica never
+  given back: the new test fails, nothing given back within an observation's budget.
+- **Owed.** The supervisor's A/B at 1,000 clients and more (running).

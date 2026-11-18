@@ -744,7 +744,12 @@
 > replica cannot serve asked of the owner, counted by why (`merge.replica.route_absent`, `_behind`, `_refused`,
 > `_evicted`, `_over_budget`); `merge.replica.served` the non-vacuity counter; a replica that left after a refusal or an
 > eviction made again before the owner's next change (`merge.replica.remade`), never one that left for its budget.
-> **Owed, in order:** an idle replica's give-back; the supervisor's A/B at 1,000 clients and more.
+> **Built (idle give-back, 2026-11-18, g083, A-473):** a replica no work on its shard has used for its idle window (the
+> longest gap it has known between two uses, the first from its holding) is given back, its charge credited
+> (`merge.replica.idle_given_back`); only a recorded use arms the shard's one idle check, never a sweep; the first
+> request after asks the owner, once, to make it again (`merge.replica.route_idle`), and its next change does
+> (`merge.replica.remade`). A replica never used on its shard is not judged idle (no use to derive a window from).
+> **Owed:** the supervisor's A/B at 1,000 clients and more (running).
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
