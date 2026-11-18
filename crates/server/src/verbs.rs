@@ -2063,11 +2063,25 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   }
   let host = state.fleet.host();
   let creator = ObjectId(volume.bytes).creator();
+  let id = to_db_volume(volume);
+  let held = state.db.partition().volume(id).is_some();
+  // A volume a planned move took to another member (A-291) is that member's from the switch on, the routing following
+  // the configuration: its verbs go there, whether this node has let its copy go or still keeps it frozen until the
+  // move is adopted. A volume held here and not moving is served here, whatever the routing says.
+  // The move's own verb on a copy this node froze for it is answered here, from the move's own state (`Moved` once the
+  // routing follows the configuration to its target), whatever the target does after the switch: forwarded to a target
+  // that died before adopting, it was never answered at all.
+  let asks_its_own_move =
+    matches!(body, RequestBody::Move { .. }) && state.moves_out.contains_key(&id);
+  let moved_away = !asks_its_own_move
+    && state
+      .fleet
+      .object_owner(ObjectId(volume.bytes))
+      .is_some_and(|owner| owner != host)
+    && (!held || state.moves_out.contains_key(&id));
   // A volume this node lost to a successor is the successor's, whoever created it and whatever this catalog still holds
   // of it: its verbs go there, as any other node's do (`lost_to_a_successor`: A-338's fenced log, A-334's yield).
-  if !lost_to_a_successor(state, to_db_volume(volume))
-    && (creator == host || state.db.partition().volume(to_db_volume(volume)).is_some())
-  {
+  if !moved_away && !lost_to_a_successor(state, id) && (creator == host || held) {
     return None;
   }
   // Only another member can own it. A node alone (a laptop: the fleet of one) answers the verb here, `NotFound` for an
@@ -4372,6 +4386,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::Target { .. } => "target",
     Refusal::DurabilityPending { .. } => "durability_pending",
     Refusal::VerdictReplaced { .. } => "verdict_replaced",
+    Refusal::MoveRefused { .. } => "move_refused",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4463,15 +4478,37 @@ fn lease_gate(
   LeaseGate::Answer(refused(Refusal::LeaseUnconfirmed { version }))
 }
 
-/// The gates a verb passes before it runs: the owner's lease, and for a work whose green lives on another shard its
-/// owner for a base or a verdict (A-247): the verb is parked until the answer comes, and its later verbs park behind
-/// it (`crate::work_home`).
+/// Counter: verbs refused `Overloaded` because their volume is frozen for a planned move (A-291).
+/// Format: a counter name in the daemon's status report.
+const MOVE_FROZEN: &str = "fleet.move.frozen_refused";
+
+/// The answer to a verb on a volume frozen for a planned move (A-291), or none for any other: a frozen volume answers
+/// only its status and the move itself until it leaves or thaws; every other verb is told to come back (retryable,
+/// counted), and once the volume has left it forwards to its new owner.
+fn frozen_for_a_move(state: &mut ShardState, body: &RequestBody) -> Option<ReplyBody> {
+  let volume = volume_of(body)?;
+  if !crate::moves::frozen(state, volume)
+    || matches!(body, RequestBody::Status { .. } | RequestBody::Move { .. })
+  {
+    return None;
+  }
+  state.count(MOVE_FROZEN, 1);
+  Some(refused(Refusal::Overloaded { shard: state.shard }))
+}
+
+/// The gates a verb passes before it runs: its volume not frozen for a planned move (A-291), the owner's lease, and for
+/// a work whose green lives on another shard its owner for a base or a verdict (A-247): the verb is parked until the
+/// answer comes, and its later verbs park behind it (`crate::work_home`).
 fn gates(
   state: &mut ShardState,
   client_id: u32,
   principal: &Principal,
   body: RequestBody,
 ) -> LeaseGate {
+  // A volume frozen for a planned move answers only its status and the move itself (A-291).
+  if let Some(come_back) = frozen_for_a_move(state, &body) {
+    return LeaseGate::Answer(come_back);
+  }
   let body = match lease_gate(state, client_id, principal, body) {
     LeaseGate::Run(body) => body,
     answered @ LeaseGate::Answer(_) => return answered,
@@ -4608,6 +4645,8 @@ fn dispatch_inner(
       base.as_deref(),
     ),
     RequestBody::Snapshot { volume } => snapshot(state, principal, volume),
+    RequestBody::Move { volume, to } => crate::moves::move_verb(state, principal, volume, to),
+    RequestBody::CaptureBase { volume } => capture_base(state, principal, volume),
     RequestBody::DestroySnapshot { volume, snapshot } => {
       destroy_snapshot_verb(state, principal, volume, snapshot)
     }
@@ -6477,6 +6516,18 @@ pub(crate) fn take_snapshot(
   if !rights_of(&record, principal).write {
     return Err(Box::new(forbidden("snapshot")));
   }
+  snapshot_effect(state, handle, &record).map(|(id, coverage, _)| (id, coverage))
+}
+
+/// The `Snapshot` verb's effect on `record`'s volume (in slot `handle`), its rights already checked: the barrier, the
+/// core's snapshot, and its records (`SnapshotTaken`, `VolumeHeadAdvanced`). Returns the snapshot, what its barrier lets
+/// it claim and the volume's new head epoch, or the refusal. A planned move's hand-over and its new owner's seal take
+/// theirs here too (A-291), their caller the system.
+fn snapshot_effect(
+  state: &mut ShardState,
+  handle: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+) -> Result<(SnapshotId, slates_ipc::protocol::SnapshotCoverage, u64), Box<ReplyBody>> {
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
   // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).
   let Some(next_epoch) = record.epoch.checked_add(1) else {
@@ -6533,7 +6584,79 @@ pub(crate) fn take_snapshot(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  Ok((id, coverage))
+  Ok((id, coverage, next_epoch))
+}
+
+/// The head a planned move hands over (A-291, `crate::moves`), its caller having checked the volume's `admin`: the
+/// volume's head epoch when its live tree is exactly its head snapshot (nothing changed since, so no snapshot is
+/// taken and none is left behind), else the epoch of a snapshot taken now, as the `Snapshot` verb takes one.
+pub(crate) fn head_for_move(
+  state: &mut ShardState,
+  volume: VolumeId,
+) -> Result<u64, Box<ReplyBody>> {
+  let (handle, record) = find(state, volume)?;
+  let unchanged = record.epoch > 0
+    && state.volumes.get(handle).is_ok_and(|slot| {
+      slot
+        .volume
+        .unchanged_since(core_snapshot(SnapshotId {
+          value: record.head.value,
+        }))
+        .unwrap_or(false)
+    });
+  if unchanged {
+    return Ok(record.epoch);
+  }
+  snapshot_effect(state, handle, &record).map(|(_, _, epoch)| epoch)
+}
+
+/// The seal a moved volume's new owner takes once it serves the volume (A-291): a snapshot of `id` taken as the
+/// `Snapshot` verb takes one, which the record plane seals and places under this node's own placement. Returns the
+/// snapshot it superseded (the adopted head) and the new head epoch, or the refusal (the volume gone, an incomplete
+/// barrier while a writer's request is in flight), retried next period.
+pub(crate) fn seal_adopted_head(
+  state: &mut ShardState,
+  id: DbVolumeId,
+) -> Result<(DbSnapshotId, u64), Box<ReplyBody>> {
+  let (handle, record) = find(state, VolumeId { bytes: id.bytes })?;
+  let superseded = record.head;
+  snapshot_effect(state, handle, &record).map(|(_, _, epoch)| (superseded, epoch))
+}
+
+/// Destroys `id`'s snapshot `snapshot` as the `DestroySnapshot` verb does, its caller the system (A-291: the adopted
+/// head a moved volume's new owner superseded with its own seal). A snapshot a clone still pins is refused, as the verb
+/// refuses it, and kept.
+pub(crate) fn drop_snapshot(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  snapshot: DbSnapshotId,
+) -> Result<(), Box<ReplyBody>> {
+  let Some(&handle) = state.by_id.get(&id) else {
+    return Err(Box::new(refused(Refusal::NotFound)));
+  };
+  let wire = SnapshotId {
+    value: snapshot.value,
+  };
+  match state.volumes.get_mut(handle) {
+    Ok(slot) => slot
+      .volume
+      .destroy_snapshot(&mut state.store, core_snapshot(wire))
+      .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?,
+    Err(_) => return Err(Box::new(refused(Refusal::NotFound))),
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &Op::SnapshotDestroyed {
+        volume: id,
+        id: snapshot,
+      },
+      now,
+    )
+    .map(|_| ())
+    .map_err(|e| Box::new(refused(refusal_of_db(&e))))
 }
 
 /// What a closed barrier lets the snapshot claim (§4.6): the attachments closed, and the narrowest
@@ -9451,9 +9574,18 @@ pub(crate) fn admit_clone(
       )));
     }
   };
-  // An overlay's clone reads the same base directories through a host of its own, made before the clone pins the
-  // snapshot so a refusal here has nothing to unpin.
-  let host = match clone_base_host(state, handle, record) {
+  // A clone of a captured base holds its whole tree and has no base directory (A-291); any other overlay's clone reads
+  // the same base directories through a host of its own, made before the clone pins the snapshot so a refusal here has
+  // nothing to unpin.
+  let captured = state
+    .db
+    .partition()
+    .is_captured(record.id, to_db_snapshot(snapshot));
+  let host = match if captured {
+    Ok(None)
+  } else {
+    clone_base_host(state, handle, record)
+  } {
     Ok(host) => host,
     Err(refusal) => {
       return Err(Box::new(give_back(
@@ -9466,6 +9598,12 @@ pub(crate) fn admit_clone(
     }
   };
   let cloned = match state.volumes.get_mut(handle) {
+    Ok(slot) if captured => Volume::clone_without_base(
+      &state.store,
+      &mut slot.volume,
+      core_snapshot(snapshot),
+      config,
+    ),
     Ok(slot) => Volume::clone_of(
       &state.store,
       &mut slot.volume,
@@ -9575,6 +9713,14 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
+  // A clone of a captured base holds its whole tree and reads no base directory (A-291).
+  if state
+    .db
+    .partition()
+    .is_captured(record.id, to_db_snapshot(snapshot))
+  {
+    new_record.base = BaseRecord::Scratch;
+  }
   let ops = [
     Op::VolumeCreated { record: new_record },
     Op::LineageAdded {
@@ -11294,6 +11440,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     .step_quantum_ns()
     .saturating_mul(DESTROY_SLICE_PERMILLE)
     / PERMILLE;
+  let releasing = step_releases(state, budget.max(1));
   let mut any = step_relinquished(state, budget);
   let destroying: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
@@ -11358,9 +11505,49 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       retire_local_tombstones(state);
     }
   }
+  any || releasing
+}
+
+/// One cooperative slice of each volume released to the member a move named (A-291, `crate::moves`): its record left
+/// already, so only its memory goes, a slice at a time as a destroy's does, and its slot with its credits once done.
+/// Whether any release is still unfinished.
+fn step_releases(state: &mut ShardState, budget: u64) -> bool {
+  let mut unfinished = Vec::new();
+  for (handle, origin_pin) in std::mem::take(&mut state.releasing) {
+    let mut begun = Ok(());
+    let done = match state.volumes.get_mut(handle) {
+      Ok(slot) => {
+        if !slot.volume.is_destroying() {
+          begun = slot.volume.destroy(&mut state.store);
+        }
+        matches!(
+          slot.volume.destroy_step(&mut state.store, budget),
+          Ok(DestroyProgress::Done) | Err(_)
+        )
+      }
+      Err(_) => true,
+    };
+    if let Err(e) = begun {
+      state.count(refusal_name(&refusal_of_vfs(&e)), 1);
+    }
+    if done {
+      if let Ok(slot) = state.volumes.remove(handle) {
+        release_slot_credits(state, &slot);
+      }
+      // A released clone's pin on its origin's snapshot goes once nothing of it is left (A-291).
+      release_origin_pin(state, origin_pin);
+    } else {
+      unfinished.push((handle, origin_pin));
+    }
+  }
+  let any = !unfinished.is_empty();
+  state.releasing = unfinished;
   any
 }
 
+/// A volume's pin on its origin's snapshot, by the origin volume and the snapshot, or none (§4.5): a clone's origin, or
+/// the snapshot an image volume was built from (A-160).
+pub(crate) type OriginPin = Option<(DbVolumeId, DbSnapshotId)>;
 /// One destroy slice of each stale copy relinquished to a re-adoption ([`relinquish_superseded`], A-362), within `budget`
 /// each; a finished one gives its credits back and leaves. Whether any has more to tear down.
 fn step_relinquished(state: &mut ShardState, budget: u64) -> bool {
@@ -11383,7 +11570,7 @@ fn step_relinquished(state: &mut ShardState, budget: u64) -> bool {
 
 /// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
 /// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
-fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSnapshotId)> {
+pub(crate) fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> OriginPin {
   state
     .db
     .partition()
@@ -11399,7 +11586,7 @@ fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSn
 
 /// Gives back a destroyed volume's pin on its origin's snapshot ([`origin_pin_of`]), when the origin is served here.
 /// Best-effort: the origin may be gone or on another shard.
-fn release_origin_pin(state: &mut ShardState, origin_pin: Option<(DbVolumeId, DbSnapshotId)>) {
+pub(crate) fn release_origin_pin(state: &mut ShardState, origin_pin: OriginPin) {
   if let Some((origin_volume, origin_snapshot)) = origin_pin
     && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
   {
@@ -12533,10 +12720,21 @@ pub(crate) fn made_already(
   catalog: &crate::catalog::CatalogValue,
 ) -> Result<bool, Box<ReplyBody>> {
   if state.by_id.contains_key(&id) {
-    if !lost_to_a_successor(state, id) {
+    // A copy this node froze for a move it made (A-291) is superseded by what its takeover adopted: the member it moved
+    // the volume to died, this node is its successor, and that member may have taken writes since. The fleet's
+    // materialization lets it go before the volume's keys are adopted (`fleet::let_frozen_go`); one still here whose
+    // release the database refused is not made: the attempt is refused, retryable, and made again next period.
+    if state.moves_out.contains_key(&id) {
+      if !crate::moves::supersede_frozen(state, id) {
+        return Err(Box::new(refused(Refusal::Overloaded {
+          shard: state.shard,
+        })));
+      }
+    } else if !lost_to_a_successor(state, id) {
       return Ok(true);
+    } else {
+      relinquish_superseded(state, id)?;
     }
-    relinquish_superseded(state, id)?;
   }
   if let Some(existing) = state.db.partition().volume_by_name(&catalog.name) {
     return Err(Box::new(refused(Refusal::AlreadyExists {
@@ -13717,6 +13915,34 @@ fn pin(
     handle,
     volume: to_db_volume(volume),
     walk: slates_vfs::base::PinWalk::new(paths),
+    capture: false,
+  };
+  crate::image::defer(state, run_pin(job))
+}
+
+/// `CaptureBase` (§4.15 `capture_base`, A-291): captures an overlay's whole base into a complete immutable snapshot. The
+/// caller asserts its source is quiesced (kiln: a commit's tree checked out where nothing else writes); the capture walks
+/// the base a slice at a time as a pin does, making every file's bytes and every link's target the volume's own
+/// (`PinWalk::capture`), then takes a snapshot, judges it complete with the host, and records it captured
+/// (`Op::BaseCaptured`), so a clone of it is made with no base directory and moves between fleet members as a plain volume
+/// does. A source that changed under the walk, or a snapshot that still leans on the disk, is refused
+/// `ConsistentBaseUnavailable`; the reply waits for the walk (`BaseCaptured { snapshot }`).
+fn capture_base(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
+  let handle = match base_of(state, principal, volume, "capture_base", true) {
+    Ok(h) => h,
+    Err(r) => return *r,
+  };
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a capture outside a recorded request".to_owned(),
+    });
+  };
+  let job = PinJob {
+    request,
+    handle,
+    volume: to_db_volume(volume),
+    walk: slates_vfs::base::PinWalk::capture(),
+    capture: true,
   };
   crate::image::defer(state, run_pin(job))
 }
@@ -13727,6 +13953,8 @@ struct PinJob {
   handle: Handle<crate::state::VolumeSlot>,
   volume: DbVolumeId,
   walk: slates_vfs::base::PinWalk,
+  /// Whether it is a capture (§4.15 `capture_base`, A-291), which ends in a recorded complete snapshot.
+  capture: bool,
 }
 
 impl PinJob {
@@ -13747,8 +13975,18 @@ impl PinJob {
   }
 
   /// Publishes the volume so its pinned state precedes the completion (a client told it is pinned never meets a
-  /// restart that lost the pin); the reply.
+  /// restart that lost the pin); the reply. A capture first takes its snapshot and records it captured.
   fn finish(&self, state: &mut ShardState, pinned: usize) -> Result<ReplyBody, Refusal> {
+    if self.capture {
+      let snapshot = self.capture_snapshot(state)?;
+      return match publish_shard(state) {
+        Ok(published) if published.captured(self.volume) => {
+          Ok(ReplyBody::BaseCaptured { snapshot })
+        }
+        Ok(_) => Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete)),
+        Err(error) => Err(refusal_of_vfs(&error)),
+      };
+    }
     match publish_shard(state) {
       Ok(published) if published.captured(self.volume) => Ok(ReplyBody::Pinned {
         entries: u64::try_from(pinned).unwrap_or(u64::MAX),
@@ -13756,6 +13994,70 @@ impl PinJob {
       Ok(_) => Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete)),
       Err(error) => Err(refusal_of_vfs(&error)),
     }
+  }
+}
+
+impl PinJob {
+  /// A capture's snapshot (A-291): taken once the walk made every byte the volume's own, judged complete with the host
+  /// (no file left on the disk, every merged directory's base names in its frozen node, nothing drifted), and recorded
+  /// captured. A snapshot that is not complete is destroyed again and refused `ConsistentBaseUnavailable`: the source
+  /// changed under the capture, so it was not quiesced.
+  fn capture_snapshot(&self, state: &mut ShardState) -> Result<SnapshotId, Refusal> {
+    let record = state
+      .db
+      .partition()
+      .volume(self.volume)
+      .cloned()
+      .ok_or(Refusal::NotFound)?;
+    let (snapshot, _, _) =
+      snapshot_effect(state, self.handle, &record).map_err(|reply| match *reply {
+        ReplyBody::Refused { refusal } => refusal,
+        _ => Refusal::NotFound,
+      })?;
+    let complete = {
+      let slot = state
+        .volumes
+        .get_mut(self.handle)
+        .map_err(|_| Refusal::NotFound)?;
+      let core = core_snapshot(snapshot);
+      match slot.host.as_mut() {
+        Some(host) => {
+          let mut overlay = slot.volume.with_host(host);
+          let complete = overlay.snapshot_is_complete(&state.store, core);
+          let drifted = overlay
+            .status(&mut state.store)
+            .map(|status| !status.drift.is_empty() || !status.unverified.is_empty());
+          match (complete, drifted) {
+            (Ok(complete), Ok(drifted)) => Ok(complete && !drifted),
+            (Err(e), _) | (_, Err(e)) => Err(refusal_of_vfs(&e)),
+          }
+        }
+        None => Ok(false),
+      }
+    }?;
+    if !complete {
+      // The incomplete snapshot goes again; a refusal to drop it is the answer, since the snapshot stays.
+      drop_snapshot(state, self.volume, to_db_snapshot(snapshot)).map_err(
+        |reply| match *reply {
+          ReplyBody::Refused { refusal } => refusal,
+          _ => Refusal::NotFound,
+        },
+      )?;
+      return Err(Refusal::ConsistentBaseUnavailable);
+    }
+    let now = state.clock.monotonic_ns();
+    state
+      .db
+      .mutate(
+        &mut state.segment,
+        &Op::BaseCaptured {
+          volume: self.volume,
+          snapshot: to_db_snapshot(snapshot),
+        },
+        now,
+      )
+      .map_err(|e| refusal_of_db(&e))?;
+    Ok(snapshot)
   }
 }
 

@@ -6238,8 +6238,16 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > `a_moved_objects_exception_follows_a_takeover_carried_into_another`,
 > `a_member_moves_an_object_whose_line_names_no_owner` and `no_member_moves_a_lost_object`, both A-309's), the council's
 > `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` and the encoding's round trip and lying-count tests.
-> Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
-> old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
+>
+> **Amended the same day (A-291, the planned handoff in the daemon, §4.10 "Ownership follows the writer").** An
+> exception also names the member the move took the object from (`Moved::from`) and the cohort its records sit in
+> (`Moved::cohort`, carried by `ConfigCommand::Move`), until the new owner reports the move adopted
+> (`ConfigCommand::MoveAdopted`, tag 10; `RegionalConfiguration::adopt_move` clears both, the ownership generation
+> kept). A move back to the creator keeps an exception naming the creator, since the creator let its copy go when the
+> object left and adopts it back by the same round any member does; only a takeover's successor that is the creator
+> drops one. The holders' side is built: at each install a holder of a moved object's copies routes it to the
+> exception's owner, so its acceptors take that owner's authority at the reconcile and a record from the old owner is
+> refused; once the move is adopted, a copy outside the owner's placement is dropped (`crate::moves`).
 
 > **Status (2026-11-18, A-382: a host admitted again gives up its own authority on its copies).** The host-epoch bump
 > fences every object the host owned, and its re-admission yields its catalogued volumes (A-334). The same install now
@@ -7777,6 +7785,48 @@ advances that object's ownership generation and names the new owner, the new own
 one, and the old owner's later writes are refused `StaleEpoch`. Load never moves ownership;
 holder duty is balanced by neighbourhood changes; operators keep an explicit move.
 
+> **Status (2026-11-18, A-291: the explicit move is built for plain volumes; the automatic migration is not).**
+> `slates move ID --to HOST` (`RequestBody::Move`; `slates_client::Client::move_volume`) runs the planned handoff
+> as place, switch, adopt, release (`crates/server/src/moves.rs`):
+> - **Place.** The owner refuses, each by its own `MoveRefusal`, a volume that is not a plain live one, one with an
+>   attachment or lease, clones or a green that depends on it, or a snapshot other than its head, and a target that is
+>   not another member of its neighbourhood (which holds the volume's sealing keys). A clone that reads no base
+>   directory moves (a clone of a captured base, §4.15, or of a plain volume): its tree is archived whole, and its pin
+>   on its origin's snapshot is given back when its old owner lets it go. It hands over its head (a snapshot
+>   only if the volume changed since), freezes the volume (every other verb answers `Overloaded`, retryable), waits
+>   until the head and catalog are placed at `f + 1` of its cohort (a live log durable at its head) and the head's
+>   content is held by `f + 1` members other than itself, captures its own newest records of both registers and
+>   reports `Move` with that cohort. The target's neighbourhood must cover the cohort, so the target's takeover could
+>   recover the volume. An owner's own copy counts toward its content's placement only while it owns the volume (a
+>   seal leaves the head held by the owner and `f` others): from the switch on, a successor of the new owner fetches
+>   by identity from the hosts the head names, and a frozen copy serves no fetch. So a head short of `f + 1` others is
+>   placed again first, at the next sequence on the cohort without the owner, and republished there naming the hosts
+>   that took it (the handoff, `Heal::Handoff`, the healer's replace with the owner left out; `fleet.move.handoff_begun`).
+>   The healer passes a frozen copy by.
+> - **Switch.** The committed exception names the new owner; every node routes the volume there (a lookup asks the
+>   exception's owner first), every holder takes the new owner's authority, and the old owner's records are refused.
+> - **Adopt.** The new owner runs phase one by name over the recorded cohort (`MOVE_STREAM`, 29): the old owner
+>   answers from its captured records, every other member from its copy; the newest of each register is re-committed
+>   under the new owner's placement at the round's epoch, the volume is materialized as a takeover's successor
+>   materializes it, sealed under the new owner's placement, and once that seal is placed the move is reported
+>   adopted.
+> - **Release.** Only then does the old owner let its frozen copy go (`Op::VolumeReleased`, no tombstone), so the
+>   volume is held by `f + 1` throughout.
+>
+> A move's verb answers `Moving` until the switch and `Moved` from it; the old owner thaws only a move whose target
+> left before any switch, or an unreported one whose records or handoff were not placed within the failover SLO
+> (`MoveRefusal::Unplaced`). `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`
+> (`crates/server/tests/fleet.rs`) moves a volume between three daemons and back to its creator;
+> `a_move_completes_when_its_old_owner_dies_at_the_switch` and
+> `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` stop either side at the switch. The second was red
+> 3 of 3 before the handoff (2026-11-18, the Mac Studio): the old owner was the target's successor, the head named it
+> and the target alone, and its takeover fetched only from the dead target until it gave the volume up.
+> An overlay does not move (its base stays on its source host, "Overlay volumes in a fleet"): a workspace that must move
+> is a clone of a captured base (§4.15 `capture_base`), which `a_clone_of_a_captured_base_moves_and_gives_its_pin_back`
+> moves between three daemons.
+> Owed: the automatic migration by the origin of the last N writes (AC-8.16's other half: N is to be derived from a
+> measured migration against the measured cross-host write), and a move carrying snapshots other than the head.
+
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
 its owner before the increment is sent (the put runs at `submit` if the auto-seal has not already
@@ -8535,6 +8585,11 @@ it builds against the contract and adds to it rather than around it.
 > cancel. Owed: the paged verbs (list, read, a landing's entries), landings and merges, and the policy and observation
 > verbs, awaited the same way.
 
+> **`CONTRACT` = 33 and 34** (A-291): a volume's move to another fleet member (`Instance::move_volume`,
+> `Instance::member`, `MoveProgress`, and the move's refusals' details: `Busy::Attached`, `Busy::Moving`,
+> `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`), then an overlay's base captured whole so
+> its clones move (`Instance::capture_base`).
+
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
 to=None)` moves the base to the head (or a named version) or raises with windows;
@@ -9217,6 +9272,28 @@ facility refuses `ConsistentBaseUnavailable`; repeated stats alone cannot prove 
 arbitrary multi-file scan corresponds to one instant. Ordinary `pin` can stabilize named
 entries as observed, but is not relabelled atomic whole-tree capture. Report source identity,
 coverage, dependencies, bytes read/retained and elapsed cost.
+
+> **Status (2026-11-18, A-291: `capture_base` is built for a source its caller quiesces).** `RequestBody::CaptureBase`
+> (`slates_client::Client::capture_base`, `slates_api::Instance::capture_base`) runs the pin's sliced walk with every
+> file's bytes made the volume's own whatever their size, each large file read whole and checked against its witness
+> (`DigestUnverified` when it changed under the read), and every link's target owned (`PinWalk::capture`,
+> `Overlay::capture_file` in `crates/vfs/src/base.rs`). It then takes a snapshot, judges it complete with the host (no
+> file left on the disk, every merged directory's base names frozen, nothing drifted or unverified), and records it
+> captured (`Op::BaseCaptured`, kept in the partition's snapshot with its snapshot and dropped with it); an incomplete
+> one is destroyed again and refused `ConsistentBaseUnavailable`. A clone of a captured snapshot has no base plane and
+> no host (`Volume::clone_without_base`, its record `BaseRecord::Scratch`), so it serves with the folder gone and moves
+> between fleet members as a plain volume does (§4.10's status). The quiescence is the caller's: kiln captures a
+> commit's tree checked out where nothing else writes. Evidence: `a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory`
+> (`crates/vfs/tests/base.rs`: a pin of the same tree refuses a whole archive, the capture's archives whole),
+> `a_captured_base_is_kept_with_its_snapshot_and_goes_with_it` (`crates/db/tests/model.rs`),
+> `a_captured_bases_clone_reads_the_capture_with_no_base_directory` (`crates/api/tests/api.rs`) and
+> `a_clone_of_a_captured_base_moves_and_gives_its_pin_back` (`crates/server/tests/fleet.rs`). Owed: admission does not
+> reserve the capture's cost ahead (the volume's quota charges each file as it is made the volume's own, and a refusal
+> part-way leaves what was captured as copied-up entries, which change nothing a reader sees); a large file is read
+> whole in one slice (its bytes held once more while it is checked), where its windows could be read across slices;
+> the report of bytes read and retained and of the elapsed cost; and a landing of a captured clone judged against its
+> capture: it lands as a scratch volume does today, every entry a create (no witness survives the capture), so a file
+> its agent changed meets the target's copy as `CreateCreate` (GAPS, g267).
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -28500,6 +28577,115 @@ Applied in the same change to:
   the flush after it or a handle opened since. Each guard removed alone fails it, the flush answered 0 where `EIO`
   belongs: the stream's bridge given no record of its losses (both platforms), and a resynced stream given none
   (Linux).
+
+### A-291 — A volume moves to another fleet member by place, switch, adopt and release (accepted and built 2026-11-18, kiln goal g267: the slates server federates across kiln runners, an agent moved between runners carries on with its volume)
+Applied in the same change to: §4.8 "Authority scope" (its status, amended), §4.10 "Ownership follows the writer" (its
+status), GAPS (the g267 entry), `docs/cli.md` (`slates move`); `crates/db` (`register.rs`: `Moved::from`,
+`Moved::cohort`, `move_object` with a cohort and a kept exception for a move back to the creator, `adopts_move`,
+`adopt_move`, `Acceptor::highest_accepted`; `takeover.rs`: `answer_move`; `op.rs`: `Op::VolumeReleased`;
+`partition.rs`: its guard and apply, `has_clones`; `error.rs`: `DbError::Attached`), `crates/cluster`
+(`config_group.rs`: `ConfigCommand::Move { cohort }`, `ConfigCommand::MoveAdopted` (tag 10, after A-380's seat record took 9); `raft_wire.rs`: the
+exception's `from` and cohort), `crates/ipc` (`RequestBody::Move`, `ReplyBody::Moving`/`Moved`,
+`Refusal::MoveRefused`, `MoveRefusal`), `crates/server` (`moves.rs` new; `verbs.rs`: the frozen gate, the forward of a
+moved-away volume, `head_for_move`, `seal_adopted_head`, `drop_snapshot`, the release's slices; `fleet.rs`: the
+stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `adopt_at`, `drop_copy`;
+`owner_location.rs`: the exception's owner first), `crates/client` (`Client::move_volume`, `MoveState`),
+`crates/cli` (`slates move ID --to HOST`), `crates/api` (`Instance::move_volume`, `Instance::member`,
+`MoveProgress`, the typed refusals `Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`, `Invalid::MoveTarget`,
+`RetryCause::MoveUnplaced`, `CONTRACT` 33; `tests/api.rs`), `docs/library.md`.
+- **Why.** Kiln moves an agent between runners only without a workspace volume (`harness/relocate.rs` refuses one),
+  since nothing moved a volume: the design named the planned handoff (§4.10) and its configuration exception (§4.8
+  "Authority scope"), and neither was built. A volume is mounted only on its owner (every attachment form but the
+  record form hands the client something of the owner's host), so an agent that goes on on another runner needs its
+  volume owned there.
+- **The protocol, and why each step is where it is.**
+  - *Place before the switch.* The owner freezes the volume and waits until its head and catalog are placed at
+    `f + 1` of its cohort before it reports, so the records the new owner adopts are the newest there will be and are
+    already where a takeover would find them.
+  - *The old owner answers, from its own records.* An owner keeps its records in its owner's acceptor, not as a
+    holder's copy, so the first cut's old owner answered the new owner's phase one "nothing" and counted toward the
+    recovery quorum, which could settle a register as empty while another holder had the record. It now captures its
+    newest records when it reports and answers from them; and a register no answer reports a record of is never
+    adopted as empty (the records were placed before the report, so such a quorum is a cohort that lost them).
+  - *The cohort travels with the move.* The first cut required the target's cohort for the volume to be the owner's,
+    which in a fleet larger than `2f + 1` almost never holds. The `Move` command carries the cohort the records sit
+    in and the new owner asks that cohort, whatever its own placement; the target must be in the owner's
+    neighbourhood (it holds the sealing keys) and its neighbourhood must cover the cohort (its takeover would recover
+    the volume from there if it died before adopting).
+  - *Release after adoption.* The first cut released the old owner's copy at the switch, leaving `f` copies until the
+    new owner adopted. The old owner now keeps its frozen copy until the new owner has materialized the volume,
+    sealed it under its own placement at `f + 1` and reported `MoveAdopted`; holders outside the new owner's placement
+    drop their copies only then.
+  - *An exception for a move back to the creator.* The first cut dropped the exception, so nothing adopted the volume
+    back and its holder never let go; the exception now names the creator like any member.
+  - *A thaw only where no switch can come.* A reported move can commit later, so the old owner thaws only when the
+    configuration shows the target gone and no exception moving the volume away (no entry can then apply it: a move's
+    target must be a member, and a retired id never returns), or refuses an unreported move whose records were not
+    placed within the failover SLO. A move once seen switched never thaws.
+  - *The target's takeover may hand the volume back.* When the target dies after the switch and the old owner is its
+    takeover's successor (the creator, so the takeover drops the exception), the old owner's frozen copy would shadow
+    what the takeover adopted, writes the target took included: `materialize_taken_over` returned early on the held id.
+    The adoption now supersedes the frozen copy (`moves::supersede_frozen`), and a switched move whose exception is gone
+    lets its copy go. The supersede comes before the takeover adopts the volume's keys (`fleet::materialize`): a
+    release erases a volume's keys with its record, so a release after the adoption erased the keys it had just
+    adopted.
+  - *A head held off the old owner (the handoff).* A seal leaves a head held by its owner and `f` others: the owner
+    counts its own live copy. From the switch on that copy is no owner's: a successor fetches by identity only from the
+    hosts the head names, and a frozen copy answers no fetch. So at `f = 1` a move handed over a head held by the old
+    owner and one other host, often the target, and a target that died at the switch left the content in the frozen
+    copy alone: `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` was red 3 of 3 (the Mac Studio,
+    2026-11-18; the old owner was the successor and its takeover fetched only from the dead target until it gave the
+    volume up, `fleet.fetch.no_holder_session` 100, `fleet.materialize.given_up` 1), and a successor other than the
+    old owner would have failed the same way while the old owner let its copy go at that successor's confirmation.
+    The move now reports only a head held by `f + 1` members other than the old owner: a head short of them is placed
+    again at the next sequence on the cohort without the old owner and republished there (`Heal::Handoff`, the
+    healer's replace with the owner neither a candidate nor counted; `fleet.move.handoff_begun`), and the healer
+    passes a frozen copy by (a frozen copy's heal had republished its head once its target died). The test forces the
+    shape: c refuses every content put while a seals the head, and b's move questions go unanswered, so b never adopts;
+    the move's own verb on the old owner's frozen copy is answered there (`Moved` once its routing follows the switch),
+    since forwarded to a target that never adopted it was never answered. Red-checked in one tree (the Mac Studio,
+    r3358): without the handoff the test fails as before (`fleet.fetch.no_holder_session` 100,
+    `fleet.materialize.given_up` 1), with it it passes (7.85 s and 5.87 s). Rejected: reusing
+    the frozen copy in the old owner's own takeover (it serves only the case where the old owner is the successor) and
+    the old owner holding its own content as a holder (its hold outlives no event that would release it when it is
+    outside the new owner's placement). The cost is one more content copy before the switch, the copy the new owner's
+    own seal makes after it in a fleet whose cohorts coincide, and a frozen phase as long as that copy takes: a volume
+    whose handoff outlasts the failover SLO is refused `Unplaced` and thaws (GAPS).
+  - *A typed refusal.* Every refusal is `Refusal::MoveRefused { reason }`, a closed `MoveRefusal` a consumer matches
+    (Ada, 2026-11-18: responses and errors are closed, typed enums, never strings).
+- **Evidence.** Unit: `a_moves_adoption_is_reported_by_its_new_owner_and_lets_the_member_it_left_go`,
+  `a_move_names_the_objects_owner_and_only_its_owner_moves_it` (`crates/db/src/register.rs`);
+  `a_holder_promises_a_moved_object_only_to_the_owner_the_configuration_moved_it_to` (`crates/db/src/takeover.rs`);
+  `a_moved_volume_is_released_whole_and_leaves_no_tombstone` (`crates/db/tests/model.rs`, with recovery);
+  `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` (`crates/cluster/src/config_group.rs`); the
+  configuration's round trip and its lying-count and forged-flag tests (`crates/cluster/src/raft_wire.rs`);
+  `the_old_owner_reports_until_the_switch_keeps_its_copy_until_adopted_and_thaws_only_without_a_switch` and
+  `a_move_hands_over_a_head_held_by_f_plus_one_members_besides_its_owner` (`crates/server/src/moves.rs`). By use: `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`,
+  `a_move_completes_when_its_old_owner_dies_at_the_switch` and
+  `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` (`crates/server/tests/fleet.rs`); the contract's `a_lone_instance_names_itself_and_refuses_a_move_typed`
+  (`crates/api/tests/api.rs`).
+- **Decided (the supervisor, 2026-11-18, the design's own preferred form, so no ruling of Ada's was needed): how a kiln
+  agent's workspace moves.** Kiln made each agent an unpinned overlay of its runner's repository folder (kiln's
+  `docs/agentic.md` W3), and an overlay's base stays on its source host (§4.10 "Overlay volumes in a fleet"), so an
+  overlay keeps its typed refusal (`MoveRefusal::NotPlain`). The workspace instead becomes a clone of a captured base:
+  kiln captures the repository's base once into a complete immutable snapshot (§4.15 `capture_base`; a git commit's
+  tree, checked out where nothing else writes, is a quiesced source), and each agent gets an O(1) clone of it, which
+  moves like a plain volume and survives its runner's loss ("the preferred delta-plus-base design", §4.10). Rejected:
+  a remote base service (the source runner must stay up; asynchronous base reads in the volume core) and re-binding a
+  moved overlay to the target's own copy of the folder (an equal path on another host is not evidence of an equal
+  source).
+- **Built the same day: the capture, and the move of a clone.** `capture_base` (§4.15's status) and the move of a clone
+  that reads no base directory, its pin on its origin's snapshot given back when its old owner lets it go (§4.10's
+  status). Applied in `crates/db` (`op.rs`: `Op::BaseCaptured`; `partition.rs`: `CapturedBase`, `is_captured`, kept in
+  the snapshot), `crates/vfs` (`base.rs`: `PinWalk::capture`, `Overlay::capture_file`, `Overlay::own_whole`;
+  `volume.rs`: `Volume::clone_without_base`), `crates/ipc` (`RequestBody::CaptureBase`, `ReplyBody::BaseCaptured`),
+  `crates/server` (`verbs.rs`: `capture_base` and its snapshot judged complete and recorded, a captured snapshot's
+  clone made with no host and a scratch base record, a released clone's pin given back; `moves.rs`: a clone moves;
+  `state.rs`: `releasing` carries the pin), `crates/client` (`Client::capture_base`), `crates/api`
+  (`Instance::capture_base`, `CONTRACT` 34), `docs/library.md`. Evidence: the four tests §4.15's status names.
+- **Owed.** Kiln's switch from per-agent overlays to clones of a captured base; the automatic migration by the
+  origin of the last N writes (AC-8.16's other half); a move that carries snapshots other than the head; the
+  multi-runner test with injected faults (GAPS).
 
 ### A-377 — A live whole entry of more than one piece is sealed in turns of its owner shard, and the publications made meanwhile follow it in order (2026-11-18, g230, scale-out; §4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere"; AC-8.9; A-323's and A-347's sibling)
 Applied in the same change to: §4.10 "Live shipping" (its status), GAPS (the one-turn walks entry: the whole entry's

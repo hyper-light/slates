@@ -738,15 +738,75 @@
 > **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
 > agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
 > planned handoff ("Ownership follows the writer", Phase 8 task 9, AC-8.16, T-8.14), then kiln as the fleet's operator.
-> - **Built:** a local clone of an overlay (below, 2026-11-05's list) and the configuration's moved-object exceptions
->   (§4.8 "Authority scope", its status of this date): a move is reported, bounded, committed, followed through
->   takeovers and dropped at a destroy.
-> - **Owed, in order:** the holders' side of a committed move (the object's copies take the new owner's authority and
->   refuse the old owner); the handoff in the daemon (drain, the head or live log durable, the report, the new owner's
->   phase one for the one object, materialize, serve; routing follows the exception; a `slates volume move` verb); an
->   overlay's move (its base stays on its source host, §4.10 "Overlay volumes in a fleet", so it is refused typed
->   until a remote base service or a captured base exists); kiln's runners as members (certificates under kiln's CA,
->   seeds from kiln's runner directory); a multi-runner test with injected faults.
+> - **Built:** a local clone of an overlay (below, 2026-11-05's list); the configuration's moved-object exceptions
+>   (§4.8 "Authority scope"); and the planned move of a plain volume (A-291, §4.10's status): place, switch, adopt
+>   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
+>   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 33), every refusal typed, a move back
+>   to the creator, a destroyed moved volume's exception dropped; held in process by three-daemon tests of the move,
+>   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields);
+>   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 34) with the move of a clone of a captured
+>   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
+>   on its new owner and destroys the captured snapshot once the old owner let the clone go.
+> - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
+>   seeds from kiln's runner directory); kiln's relocation of an agent with its volume (detach, move, attach on the
+>   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
+>   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
+>   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
+>   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
+> - **Kiln's runners as members: the network each needs (written 2026-11-18, `docs/deploy.md` "What a node's firewall
+>   must let through").** Each runner's node takes inbound UDP at its manifest's base port (probes) and the next
+>   (records) from the other runners; TCP at the base port only for the network export, which kiln does not use (its
+>   agents mount their volumes on their own runner). As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
+>   inbound UDP but kiln's own ports and adacachy2's passes LAN UDP 17202 and 17212 alone, so neither passes a slates
+>   block yet: each needs `ufw allow proto udp from <the LAN> to any port <base>:<base+1>` once, an operator's (root)
+>   step slates never takes (R10). The Macs' firewalls were not checked.
+> - **Fixed (2026-11-18): a move whose target dies at the switch is served by its successor.**
+>   `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` was red 3 of 3 on the Mac Studio after main
+>   ef7f0915a was merged, and again on a07bc2587 (the merge of main 3915879e3). Its log put the cause elsewhere than
+>   first written here: the old owner a was the dead target's successor (`fleet.takeover.adopted` 2), and its
+>   materialization gave the volume up waiting on content (`fleet.fetch.no_holder_session` 100,
+>   `fleet.materialize.given_up` 1) before it released its frozen copy (the give-up logged first, then the release),
+>   so the release race named here before was not the cause. A seal leaves a head held by its owner and `f` others,
+>   the owner counting its own live copy; at `f = 1` the moved head named a and b alone, and after the switch a's
+>   frozen copy answers no fetch, so b's death left no copy any successor could fetch (a successor c would have failed
+>   the same way while a let its copy go at c's confirmation). Now a move reports only a head held by `f + 1` members
+>   other than the old owner, placing it again on the cohort without the owner at the next sequence and republishing
+>   it there when short (A-291's handoff, `Heal::Handoff`, counted `fleet.move.handoff_begun`, which the test now
+>   requires); the healer passes a frozen copy by (it had republished the frozen copy's head after b died,
+>   `fleet.heal.named_gone` 1, `fleet.heal.republished` 1); and a takeover lets a frozen copy go before it adopts the
+>   volume's keys, which the release erases. The test forces the shape it guards: c refuses every content put while a
+>   seals the head (so a and b alone hold it), and a and c leave b's move questions unanswered, so b never adopts
+>   (`inject_takeover_silence` covers a move's questions by name). Doing so found the operator's own move verb
+>   forwarded from the old owner to the target, which never answered it: the move's verb on a frozen copy is now
+>   answered there, `Moved` once its routing follows the switch. Red-checked in one tree on the Mac Studio (r3358,
+>   0b4ae1111): with the handoff turned off the test fails as it did (`fleet.fetch.no_holder_session` 100,
+>   `fleet.materialize.given_up` 1, every read `NotRecovered`), with it on it passes before and after (7.85 s, 5.87 s).
+>   An earlier red-check in a second worktree had passed 7 of 7 only because its build shared the green tree's target
+>   directory and ran the green binary; a red-check mutates the tree the green run built.
+> - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
+>   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
+>   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
+>   still writable, its later changes then a small incremental seal); not measured yet.
+> - **Owed before kiln's workspaces switch (found 2026-11-18 reading `crates/land/src/verdict.rs`, not yet by a
+>   test):** a clone of a captured base lands as a scratch volume does. Its record names no base and its files hold no
+>   witness (a capture makes each body the volume's own, and the witness lived in the base body), so every entry of
+>   its landing is a create: a file its agent changed meets the target's copy as `CreateCreate`, and so does an
+>   outsider's change to a file the agent never touched. Kiln lands an agent's workspace into the repository (W6), so
+>   the switch needs a landing judged against the captured snapshot: the manifest of what changed since it, each entry
+>   compared by content with what the capture read (the target is another folder, so fingerprints cannot match).
+>   Until then a captured clone moves and serves whole but does not land as an overlay does. The plan, as read on
+>   2026-11-18 (g267): the capture already records a witness (fingerprint and identity) for every file it copies up
+>   (`Overlay::capture_file`), and a clone made with `CloneBase::Drop` drops them with the base plane. The clone keeps
+>   them instead, as a witness-only base that never reads a host, so its diverged walk (`PlanWalk`) names exactly
+>   what changed since the capture; the verdict judges such an entry by content alone (`slates_land::verdict`: the
+>   disk's identity against the witness's, every file hashed, its fingerprint ignored); and the witnesses travel with
+>   the clone through a move (the archive and the takeover's restore carry them), since a moved clone's origin snapshot
+>   stays on the node that captured it.
+> - **Decided (the supervisor, 2026-11-18, A-291):** a kiln workspace moves as a clone of a captured base. An overlay
+>   keeps its typed refusal (`NotPlain`: its base stays on its source host, §4.10); kiln captures the repository's base
+>   once into a complete immutable snapshot (`capture_base`; a git commit's tree checked out where nothing else writes is
+>   a quiesced source) and gives each agent an O(1) clone, which moves like a plain volume and survives its runner's
+>   loss, the design's preferred delta-plus-base form. Kiln's W3 changes shape (g263, g264 told).
 > - **Decided (Ada, 2026-11-18):** the persistent disks Hex gives microVMs stay on their own machine (Hex's D281,
 >   "volumes stay per machine", stands); only slates workspaces replicate across kiln runners, so the moves and copies
 >   this entry owes are of slates volumes alone.
@@ -1707,9 +1767,14 @@
 > is 2 since A-309 (g250, 2026-11-18: completion records where layout 1 carried `dropped_unconfirmed`, and each
 > retirement's current neighbourhood), so a layout-1 build and a layout-2 build refuse each other's configurations by
 > name; without the version, a layout-1 entry with nothing dropped and no retirement kept would have parsed as layout 2.
+> It is 4 since A-291 (g267, 2026-11-18: each moved-object exception carries the member the move took it from and the
+> cohort its records sit in), after A-380 took 3 for the council's recorded voters; a configuration with no moved
+> object would also have parsed as layout 3.
 > **Open (the sweep):**
 > the configuration group's commands (`config_group::ConfigCommand`) carry a tag byte but no layout version, so a
-> change to an existing command's fields would be read by position.
+> change to an existing command's fields would be read by position. A-291 changed one: `Move` carries the cohort its
+> records sit in. No build before it proposed a `Move` (piece 2 had no proposer), and a build of either side refuses
+> the other's form by its length (`decode_move` requires its bytes used up), which is the accident this item names.
 >
 > **Was open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
 > `raft_wire::encode_regional_configuration` is a fixed sequence of fields with no version byte. A-272 appended a
