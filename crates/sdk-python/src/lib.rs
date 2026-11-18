@@ -159,6 +159,7 @@ fn landing_dict(py: Python<'_>, landing: Landing) -> PyResult<Py<PyDict>> {
     Landing::GrantRequired {
       landing,
       manifest,
+      nonce: _,
       summary,
       conflicts,
     } => {
