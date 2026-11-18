@@ -5521,6 +5521,29 @@ refinement and revalidation before those results can be applied to the corrected
 > - Regression `a_takeover_completes_when_one_survivor_never_received_the_head` covers both successors in
 >   one run: the one holding the head, and the one holding nothing.
 
+> **Status (2026-11-18, A-304; a learned object's wait for its cohorts' promises is bounded).** An object waits in the
+> round until each of its recovery cohorts has promised it, and a dead member's silence ends when the council retires
+> it. A member cut off from its successor alone is never retired, since every other member hears it, so the object
+> waited every period for as long as the daemon ran (`fleet.takeover.unpromised`), and every verb on it answered a
+> retryable `Overloaded`. Now each learned object counts the periods it waits with no member promising it anew and no
+> page of the round advancing (`takeover::PromiseWait`: a page still to come may list it, and a member answers by name
+> only once its pages are complete, so a round that still pages or still hears promises never gives an object up). Past
+> the failover SLO's worth of such periods (`failover_slo_ns / HEARTBEAT_NS`, the bound a taken-over volume's and
+> green's materialization has) the object is given up by name: its owner shard records it unrecovered, every verb on it
+> answers `NotRecovered { cause: TakeoverIncomplete { waited_on: "promises" } }`, this node claims it to lookups, and
+> the round neither learns it again nor asks about it, counted `fleet.takeover.given_up` (the periods past the bound
+> `fleet.takeover.unpromised.past_bound`). Safety is unchanged: an object is still adopted only on its cohorts'
+> recovery quorums. A given-up object keeps the share unconfirmed as a lost one does (A-272), so its holders keep their
+> copies; a new configuration starts the round over and judges it afresh, and an adoption then clears its record
+> (`verbs::materialize_taken_over`, the green's, and an adopted tombstone's record). A catalog register given up records nothing of its own: its volume waits for it in
+> the materialization and is given up there, naming `catalog`. A given-up volume is answered on its owner shard and never
+> forwarded (`verbs::owned_by_another_host`): forwarded, it met this node's own routing and answered `Overloaded` for good
+> on any fleet of more than one node, the materialization's give-ups too (proven on a lone node, which never forwards).
+> Regressions:
+> `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name` (three nodes; each survivor leaves the other's
+> takeover questions unanswered, `Daemon::inject_takeover_silence`; the owner stops) and
+> `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -23057,3 +23080,32 @@ their reset checked first), the test below, GAPS.
   merged, and accepts the launcher's; the green's ask holds an edit-and-submit, keeping its edit, until approved; an
   agent's session that asks holds its merge of its own off-shard work; the owner was asked for the verdicts. A-285's
   own tests run one shard, where every work shares its green's partition.
+
+### A-304 — A takeover round gives up a learned object whose cohorts' promises stop coming, by name, after the failover SLO's worth of periods (2026-11-18, goal g251: every open slates bug fixed)
+Applied in the same change to: §4.8 "Promotion and takeover" (status), GAPS (2026-11-18 entry),
+`crates/server/src/takeover.rs` (`PromiseWait`, `give_up_unpromised`, `share_done`), `crates/server/src/fleet.rs`
+(`takeover_attempts`; an adopted tombstone clears a stale unrecovered record), `crates/server/src/verbs.rs` (so does a
+materialization; an unrecovered volume is answered on its owner shard, never forwarded), `crates/ipc/src/protocol.rs` (`RecoveryCause::TakeoverIncomplete`'s names), `Daemon::inject_takeover_silence`
+(test support).
+- **Why.** CLAUDE.md §2 item 8 forbids a retry without a bound, whatever its cause, and every branch of a taken-over
+  object's materialization was bounded on 2026-11-09 and 2026-11-18 by that rule. Phase one's own wait was not: a
+  learned object waits until each recovery cohort has given its recovery quorum of promises (`cohort − f`), and a
+  member that never answers the successor while every other member hears it is never retired, so the wait had no end.
+  Found by g242 (reported unverified), proven by `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name`,
+  which answered `Overloaded` until its deadline before the bound.
+- **The rule.** Each learned object counts the periods judged waiting with no member promising it anew and no page of
+  the round advancing; either is progress and starts the count again. Past `takeover_attempts(failover_slo_ns)` such
+  periods the object is given up by name (`waited_on: "promises"`), recorded unrecovered on its owner shard and claimed
+  to lookups; the round learns it no more and asks no more about it. The bound is counted in periods, not wall time, as
+  the materialization's is, so a loaded node keeps its attempts.
+- **Answered where it is recorded.** A given-up volume's refusal is recorded on its owner shard, and a forwardable verb
+  there went to the location round, met this node's own routing (the give-up claims the object) and answered
+  `Overloaded` for good, so on a fleet of more than one node no client ever saw the materialization's `NotRecovered`
+  either; its tests ran on a lone node, which never forwards. A volume its shard records unrecovered is now answered
+  there (`verbs::owned_by_another_host`).
+- **Not here: a lost object.** An object whose cohort is left short of its recovery quorum still answers `Overloaded`
+  (GAPS); A-309 (g250) recovers it rather than refusing it, so no refusal of it is recorded here.
+- **What it does not change.** Adoption still needs every cohort's recovery quorum (Flexible Paxos, A-251's counting
+  rule); a given-up object keeps the share unconfirmed (A-272), so the retirement stays kept and its holders keep their
+  copies; a new configuration judges it afresh, so a member retired late (detection past the SLO under load) costs a
+  refusal, never the object.

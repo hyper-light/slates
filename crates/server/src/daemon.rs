@@ -3121,6 +3121,18 @@ impl Daemon {
     })
   }
 
+  /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
+  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), while it answers everything else on the same
+  /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
+  /// it. Replaces any earlier set; an empty `askers` restores full service. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_takeover_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_takeover_silence = askers;
+    })
+  }
+
   /// The owner's sealed manifest for `object` once its content has placed on its holders (§4.10), read on the shard
   /// that owns it; `Ok(None)` before then or when this node does not own it. A test or an operator reads it to follow
   /// a seal before its head ships.
@@ -4149,6 +4161,7 @@ async fn init_shard(
     injected_serve_delay_ns: None,
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
+    injected_takeover_silence: std::collections::BTreeSet::new(),
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),

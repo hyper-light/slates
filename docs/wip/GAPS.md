@@ -10364,6 +10364,35 @@ new process. In simulation the session ended one round trip after its first pack
   beside their definitions, which the check reads, as it already does for the reap-tick constants, or it reports them
   apart from refusals in status. Then the check cannot fall behind a new counter. Owner: live-fixes.
 
+### 2026-11-18: a takeover round's learned object waited without end for a member cut off from its successor alone (fixed, A-304)
+
+- **The wait.** A successor adopts a learned object once each recovery cohort has given its recovery quorum of promises
+  (§4.8 phase one). A dead member's silence ends when the council retires it; a member that never answers the successor
+  while every other member hears it is never retired, so the object waited every period for as long as the daemon ran
+  (`fleet.takeover.unpromised`), and every verb on it answered a retryable `Overloaded`. Reported unverified by g242
+  (2026-11-18); CLAUDE.md §2 item 8 forbids the unbounded retry whatever its cause, as the materialization's bounds of
+  2026-11-09 and 2026-11-18 did.
+- **Proven:** `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name` (`crates/server/tests/fleet.rs`): three
+  nodes at f = 1, the head held by both survivors, each survivor leaving the other's takeover questions unanswered
+  (`Daemon::inject_takeover_silence`), the owner stopped. With the bound cut out the successor answered `Overloaded`
+  until the serve deadline.
+- **Fixed (A-304):** each learned object counts the periods it waits with no member promising it anew and no page of the
+  round advancing (`takeover::PromiseWait`), and past the failover SLO's worth of them it is given up by name: recorded
+  unrecovered on its owner shard (`NotRecovered { TakeoverIncomplete { waited_on: "promises" } }`), claimed to lookups,
+  learned and asked about no more, counted `fleet.takeover.given_up`; the share stays unconfirmed (A-272), so its holders
+  keep their copies; a new configuration judges it afresh, and an adoption clears its record.
+- **Sibling, fixed in the same change:** a volume recorded unrecovered on its owner shard (a give-up, here or in the
+  materialization's bounds) was still forwarded by a forwardable verb (`verbs::owned_by_another_host` never looked), met
+  this node's own routing, which the give-up claims, and answered `Overloaded` for good: on a fleet of more than one node
+  no client saw the materialization's `NotRecovered` either, whose tests ran on a lone node, which never forwards. It is
+  answered on its owner shard now; the three-node regression above holds both.
+- **Sibling, open (g250's A-309 takes it):** an object the round declared lost (a cohort with fewer members than its
+  recovery quorum, counted `fleet.takeover.lost`) is never recorded unrecovered either, so every verb on it answers a
+  retryable `Overloaded` for as long as the daemon runs. A record naming the short cohort (`waited_on: "quorum"`) was
+  built and proven on 2026-11-18 (red with the record removed: `Overloaded` to the 60 s deadline) and withdrawn before it
+  landed, at g250's request: A-309 recovers such an object instead (the round adopts once every surviving member of its
+  cohorts has promised, and `Readiness::Lost` goes away), so a refusal would only be undone.
+
 ### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
 
 - **The window.** A successor needs a recovery quorum in every cohort of `recovery_cohorts(departed, object)`. When the

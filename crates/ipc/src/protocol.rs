@@ -3449,15 +3449,17 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
-  /// A green this node took over from a departed owner (§4.16 owner-loss recovery) could not be materialized within the
-  /// takeover's bound: the failover SLO's worth of the fleet's periods, each one attempt. Every verb on it answers this
-  /// rather than waiting without end. Appended.
+  /// A volume or green this node took over from a departed owner (§4.8, §4.16 owner-loss recovery) could not be adopted
+  /// or materialized within the takeover's bound: the failover SLO's worth of the fleet's periods without progress, each
+  /// one attempt. Every verb on it answers this rather than waiting without end. Appended.
   TakeoverIncomplete {
-    /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
-    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
-    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
-    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
-    /// owner shard refused the rebuilt green).
+    /// What the last attempt waited on: `promises` (a recovery cohort never gave its quorum of promises in the takeover
+    /// round, A-304), `catalog` (its catalog register or that register's placement never adopted), `catalog_placement`,
+    /// `content` (a volume's content not held here, and not served whole by a recorded holder), `live` (a live-shipped
+    /// volume's log), `shard` (no shard here for its partition), `chain` (a version's record not known here: the adopted
+    /// version beyond this node's accepted records), `inputs` (an input its ledger names not held here, and not served
+    /// whole by the survivors that reported the adopted version), `placement` (no placement of the adopted record, or no
+    /// shard for its partition), or `refused` (the owner shard refused the rebuilt volume or green).
     waited_on: String,
   },
 }
