@@ -793,6 +793,14 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
     return false;
   };
   let mut gave_up = None;
+  // DIAG (g076b prototype): the owner keeps polling while it holds a live reply, so the acknowledgement finds it awake.
+  if std::env::var_os("SLATES_DIAG_HOLD_NS").is_some() {
+    let hold = std::env::var("SLATES_DIAG_HOLD_NS")
+      .ok()
+      .and_then(|value| value.parse::<u64>().ok())
+      .unwrap_or(0);
+    slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(hold));
+  }
   // A window at a time ([`DurableBound`]): one that ends with the volume's durability moved forward is followed by
   // another, one that ends with nothing heard gives up.
   loop {
@@ -3450,6 +3458,13 @@ fn serve_taken(
       state.count(LIVE_HELD, taken);
       let publishing = slates_rt::futures::now_ns();
       let answer = acknowledged(state, encode_reply(&reply));
+      // DIAG (g076b prototype): the holder keeps polling after a live entry, so the next one finds it awake.
+      if let Some(hold) = std::env::var("SLATES_DIAG_HOLD_NS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+      {
+        slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(hold));
+      }
       let now = slates_rt::futures::now_ns();
       hop_diag::record(
         state,
