@@ -20107,7 +20107,7 @@ Applied in the same change to: §4.7 (the rendezvous's status), A-114 (adoption 
 ### A-177 — The daemon serves a WinFsp volume at a drive letter and tells Windows of every other path's change (accepted 2026-10-26)
 Applied in the same change to: §4.6 ("Windows (own thin WinFsp binding)" and its status; the DAX matrix's A-164 status), the DAX matrix (`docs/wip/virtiofs.md` §8, the Windows x86_64 mount-route cell), GAPS, README (the Windows capability row), `crates/bridge-winfsp` (`host.rs` rewritten: requests to the owner shard, `MountThread`; `ffi.rs`: the exports found at run time; `notify.rs`, new; `build.rs` and `tests/mount.rs` removed), `crates/bridge-core` (`delivery.rs`: `Coherence` and `Delivered` moved from `slates-bridge-fuse`), `crates/server` (`winfsp.rs`, new; `transports.rs`: WinFsp offered where its library loads; `verbs.rs`: the WinFsp form's establishment, deferral, end and recovery; `daemon.rs`: `EndWinFspMounts`), `crates/ipc` (`AttachRequest::WinFspMount`, `UnsupportedReason::WinFspNotInstalled`, appended), `crates/db` (`AttachForm::WinFspMount`, appended; `daemon_mount_point`), `crates/client` (`attach_winfsp`), `crates/cli` (`mount`/`unmount` on Windows; `tests/winfsp.rs`, new), `.github/workflows/ci.yml` (both x86_64 Windows lanes), `unsafe-budget.toml` (`slates-bridge-winfsp` 86 → 104), `xtask/src/capabilities.rs`, and two bug records.
 - **What was there.** The WinFsp host served only a volume it built and owned itself (its live test's scratch volume), `slates mount` refused on Windows, and the daemon reported the transport `BridgeNotWired` (research f17). Nothing else could change a file under a Windows mount, so there was nothing to tell Windows.
-- **Built: the owner shard serves the mount.** `attach` with the WinFsp form defers its reply to the mount's task on the volume's owner shard. An owned mount thread creates the file system, defines the drive and starts WinFsp's two dispatcher threads, off the shard. Each callback sends its request over a bounded channel to the task and wakes it (§4.3: "WinFsp requests arrive on WinFsp's threads and are routed to the owning shard"). The task serves one request a turn through the shared operation layer, under a registry attachment, behind the live-tree fence. A namespace or size change, a flush, or the close of a handle that changed its file publishes before its reply. The attachment is recorded with the reply once the drive is mounted. A drive letter has nothing beneath it, so every end of the attachment removes the drive.
+- **Built: the owner shard serves the mount.** `attach` with the WinFsp form defers its reply to the mount's task on the volume's owner shard. An owned mount thread creates the file system, defines the drive and starts WinFsp's two dispatcher threads, off the shard. Each callback sends its request over a bounded channel to the task and wakes it (§4.3: "WinFsp requests arrive on WinFsp's threads and are routed to the owning shard"). The task serves one request a turn through the shared operation layer, under a registry attachment, behind the live-tree fence. A namespace or size change, a write (A-379), a flush, or the close of a handle that changed its file publishes before its reply. The attachment is recorded with the reply once the drive is mounted. A drive letter has nothing beneath it, so every end of the attachment removes the drive.
 - **Built: Windows is told.** `FileInfoTimeout` is infinite (§4.6, as designed), and the volume's free space has a zero timeout: no notification names it. Before each request, and whenever the volume's generation moves, the task runs the FUSE mount's coherence rounds (now `slates_bridge_core::delivery`). It hands Windows one `FspFileSystemNotify` round naming what Windows holds open: Windows caches only what hangs off an open file node (WinFsp `src/sys/file.c`). A round a rename's lock defers (`STATUS_CANT_WAIT` at a zero-timeout begin) or WinFsp refuses puts the cursor back. WinFsp processes a round in a work item of its own (`FspVolumeNotify`, `src/sys/volume.c`), so the shard never waits on a kernel lock.
 - **Decided: the library is found at run time, not linked.** Linked, a daemon could not start on a Windows host without WinFsp. Loaded as WinFsp's own `FspLoad` loads it, the daemon starts everywhere, and the form is refused `WinFspNotInstalled` where the library is absent (run on jupiter, which has no WinFsp, 2026-10-25).
 - **Two defects found on the runner by a request log, both fixed** (run 40251802164). A paging write (`ConstrainedIo`) was applied whole, so a 62-byte file grew to its 4096-byte page; it is now clipped to the file's size, as WinFsp's `memfs` clips it (`docs/bugs/2026-10-26-a-paging-write-through-winfsp-grew-a-file-to-its-page.md`). And since the host was first written, every open of a file was handed the first open's context, so a second open freed that context twice (`docs/bugs/2026-10-26-a-winfsp-file-opened-twice-freed-its-first-context-twice.md`); the mount now takes per-handle contexts (`UmFileContextIsUserContext2`). A file's last close now writes its pages back before its publication (`FlushAndPurgeOnCleanup`): before, a Windows program's write reached the shard only at the cache manager's lazy write-back.
@@ -26968,3 +26968,33 @@ Applied in the same change to:
 - **The rule.** The credit holds the deltas in flight; a whole state rides one past it, admitted only while everything in
   flight is within the credit, and is never counted against the deltas behind it.
 
+
+### A-379 — A WinFsp write is published before its reply: A-358's rule on Windows, where no write log keeps an answered write and a drive outlives its daemon (2026-11-18, goal g079, fsync'd files never come back empty after daemon kills, the sibling sweep; §4.6 "Windows", §4.8 barrier, D-18; A-198, A-200, A-358)
+
+Applied in the same change to:
+- `crates/bridge-winfsp/src/host.rs`: `Op::needs_barrier` names `Op::Write`; a purge's own write is barrier-free, as a
+  purge's close was.
+- `crates/server/src/winfsp.rs` (the module doc); §4.6 "Windows" (the built-mount paragraph).
+- `crates/cli/tests/winfsp.rs`: `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused`.
+- GAPS (the 2026-11-18 entry, and the virtio-fs owed line of Phase 8 step 4);
+  `docs/bugs/2026-11-18-a-winfsp-write-answered-before-its-publication-was-lost-across-a-daemon-kill.md`.
+
+- **What was there.** A WinFsp write was answered before any publication. Its handle's flush or close carried the
+  barrier, "as a FUSE close's `flush` does".
+- **Why it changed.** FUSE can wait for the close because its write log keeps every answered write in anchor-owned
+  memory for a successor (A-63). Windows has no write log, and since A-198 a WinFsp drive outlives a killed daemon. So a
+  write answered before a publication died with its daemon, and the successor's flush then answered success over the
+  loss.
+  - On CI's two Windows runners, each of five rounds wrote a new file's first page, killed the daemon, then flushed. On
+    main every write was lost on both runners: 5 of 5 each, every file read back empty behind a successful flush. With
+    the change every write was kept.
+  - An overwrite inside a published length is not exposed: it lands in place in the file's open extent (§4.8). The test's
+    first draft kept 5 of 5 on main that way.
+- **The rule.** A-358's: every write is published before its reply. The reply claims no durability past the daemon: on
+  a live-shipped volume a flush still waits for the candidates, and a write does not (A-200).
+- **Siblings.**
+  - NFS publishes (A-358).
+  - FUSE and Shards streams log (A-63; Unix).
+  - virtio-fs does neither. It is safe only while a VM dies with its device's daemon, and the work that lets a VM outlive
+    it must bring this rule (GAPS).
+- **Cost.** A publication per paging write, owed a measurement through a drive.

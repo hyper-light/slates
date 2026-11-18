@@ -10223,7 +10223,30 @@ whose verifier disagrees written again — with a kill per round and a final kil
 kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
 client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
 
-### 2026-11-18: a WinFsp write answered before its publication may be lost across a daemon kill (A-358's sibling; open, unproven)
+### 2026-11-18: a WinFsp write answered before its publication was lost across a daemon kill (A-358's sibling; fixed, A-379)
+
+> **2026-11-18 (g079): proven and fixed (A-379).**
+> - **The test.** `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused` (`crates/cli/tests/winfsp.rs`)
+>   runs on CI's two Windows runners through diagnostics branches. Each of five rounds:
+>   - creates a new file through a writable drive, opened unbuffered;
+>   - writes its first page;
+>   - kills the daemon before any flush or close;
+>   - waits for the successor on the same drive, then flushes and reads the page back uncached.
+> - **Results.**
+>   - On main (run 44360312582) all 5 rounds lost their write on each runner: every flush succeeded, and every new file
+>     then read back empty, 0 of its 4,096 bytes.
+>   - With the fix (run 44360313388) every write was kept: 5 of 5 on each runner.
+> - **Why the first draft passed.** It overwrote one page of an existing file and kept 5 of 5 on main (run 44354915582).
+>   An overwrite inside a published length lands in place in the file's open extent in anchor-owned memory (§4.8). A new
+>   file's bytes run past every published length.
+> - **The fix.** `Op::needs_barrier` names `Op::Write`: every WinFsp write is published before its reply, apart from a
+>   purge's own write, which changes nothing. A write's reply claims no durability past the daemon, so on a live-shipped
+>   volume only a flush waits for the candidates (A-200).
+> - **Regressions.** With the fix the WinFsp bridge's library tests (107), the WinFsp CLI suite (19, A-198's twenty kills
+>   with no drive lost) and the WinFsp semantics suite (16) pass on both runners (runs 44356053019 and 44360313388).
+> - **Owed.** The cost: a publication per paging write, measured through a WinFsp drive before and after.
+> - **Record.** `docs/bugs/2026-11-18-a-winfsp-write-answered-before-its-publication-was-lost-across-a-daemon-kill.md`.
+
 
 A-358 found that an NFS write answered before any publication is lost when the daemon dies, if the client never sends
 it again (Apple's never does). WinFsp has the same shape:
@@ -17305,6 +17328,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     as in step 3; `guest_dax.rs` 3 of 3 beside them. **Found:** the A-170 bug below, in 2 rounds of 3 before the fix.
   - **Owed, a later goal:** a VM that outlives its device's daemon. The anchor would have to hold the device's socket
     end and its state (vrings, memory table, back-end channel, windows) across the restart, as A-61 holds a FUSE device.
+    The device's writes would then need A-358's rule as well (A-379's sibling note, 2026-11-18). They are answered before
+    any publication and are not logged, so today they are safe only because the VM dies with the daemon. They must be
+    published before their reply, or logged, before a VM may outlive its daemon.
 - **Fixed 2026-10-25 (A-170), found by step 4: a clone's copy-up sealed its origin's open extent behind the origin's
   image, so a crash lost the shard.** `docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`.
   - **Symptom:** the daemon-kill test failed 2 rounds of 3, then 3 of 4, always the fastest rounds. The successor logged
