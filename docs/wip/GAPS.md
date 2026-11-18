@@ -3062,6 +3062,11 @@
 >       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
 >       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
 >       it as a live holder.
+>     - **Fixed in the flow (g229): the long-log flow's last step asked past the stream's end.** Its step read the owner's
+>       durable position once to size the step and again inside the wait to start it, so the wait's target could pass the
+>       head a stream of `LONG_LOG` writes ever makes (from 962, then from 965, 40 more, against a log that ended at
+>       1,001: CI diag runs 44274378785 and 44288273676, Linux x86_64). Each step's target is now absolute, from one
+>       reading (`until_durable`).
 >     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
