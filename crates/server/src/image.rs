@@ -213,7 +213,12 @@ pub(crate) fn complete_once_durable(
       crate::live_ship::defer(state, (volume, target), request, route, reply)
         .map(|refusal| (refusal, route))
     }
-    (reply, None) => Some((reply, route)),
+    (reply, None) => {
+      // Answered without waiting for durability: the seat its task took, if any, is given back
+      // (`crate::live_ship::take_seat`).
+      crate::live_ship::release_seat(state, request);
+      Some((reply, route))
+    }
   }
 }
 

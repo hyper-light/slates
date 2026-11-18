@@ -7199,8 +7199,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
 > twice (g232's finding). Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
-> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
-> in `defer`, after its commit (GAPS, OPEN).
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome that may wait so (a mapped file's write-back, a checkout)
+> takes a seat among the held replies as its task begins (`live_ship::take_seat`), refused `Overloaded` at the bound
+> before it writes anything; its wait fills the seat (`defer`, which no longer refuses for room), or it gives the seat
+> back when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back
+> answers, so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no
+> seat (that release, or one whose volume turned live-shipped while it ran) is held past the bound, counted
+> (`fleet.live.held_past_bound`), rather than refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`: before, the sync was
+> refused `Overloaded` with its stores already in the file.
 >
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
@@ -27602,6 +27608,19 @@ Applied in the same change to:
   that name sharing only reads was refused (`ERROR_SHARING_VIOLATION`) while the purge lasted. A reader of another
   name still can be, while that name's purge lasts, as after any change A-190 purges for (once in the VM's check,
   against none in 51 reads of the writer's own name).
+- **A delete a purge's handle carried was dropped (found by this entry's live test on the VM, 2026-11-18; bug record
+  `docs/bugs/2026-11-18-a-delete-a-purges-last-handle-carried-was-dropped.md`).** WinFsp hands a pending delete to
+  the cleanup of the file node's last handle, whoever's (v2.1 `src/sys/file.c` `FspFileNodeCleanup`; this volume
+  takes no POSIX delete). When a program deletes a file while A-190's purge holds it open, the purge's cleanup
+  carries the delete, and the shard answered a purge's cleanup without making it: Windows was told the name was
+  gone, and the volume kept it. One live run of three saw the other name count two links for good. The delete is
+  now made whoever's cleanup carries it, behind the publication barrier, and it owes the other names their count
+  (`a_delete_a_purges_last_handle_carries_is_made`, red at the reversed change and green with it on both Windows
+  runners, diagnostics run 44359955657). The window predates hard links (A-190, any purged file); hard links widen it,
+  since a write through one name purges the others. On the VM a race of a write through one name and the other
+  name's delete lost 21 of 28 and 2 of 16 deletes before the change, 0 of 59 after it. The same race also hangs the
+  deleter in its cleanup, before the change and after it: open, GAPS ("A delete racing a coherent purge can hang its
+  caller").
 - **Proven.** The request decoding, the replay rule, the shard's rules and the owed words by the tests above, green on
   both Windows runners (diagnostics run 44350120133 at `28ad74fcd`; the notification and decoding tests also on the
   Mac Studio, kiln r3516). End to end on a Windows Server 2025 evaluation under KVM on adacachy, test signing on,

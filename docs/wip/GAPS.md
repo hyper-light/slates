@@ -954,6 +954,27 @@
 > re-recorded from the x86_64 run. **Open:** the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor,
 > watcher) are owed a Windows form.
 
+> **A delete racing a coherent purge can hang its caller in the WinFsp drive (found 2026-11-18 by A-360's race on the
+> test-signing VM; open, Windows; the dropped delete found beside it is fixed, docs/bugs/2026-11-18-a-delete-a-purges-last-handle-carried-was-dropped.md).**
+> The race: `a<n>` linked to `b<n>`, `a<n>` held open so the mount's next round purges it (A-190), a write through
+> `b<n>`, then `a<n>` closed and deleted at once (`vm-delete-race.ps1`). In 4 of 4 runs, the deleter hung within 60
+> rounds: at rounds 28 and 17 before the fix, and at 60 and 1 after it. Its thread waits in `NtClose` (`IopCloseFile`) for its
+> cleanup IRP. Local kernel debugging at round 1 (`kd -kl`, 2026-11-18 18:52 UTC) showed:
+> - one file node's Main and Paging resources held shared by an owner pointer, which is a WinFsp request;
+> - one exclusive waiter, a system worker thread;
+> - the daemon's receive worker idle, waiting for the next request through FltMgr;
+> - the purge client idle on its pipe.
+> So the stuck request is not in user mode.
+> - **Impact when unrecovered.** The process cannot exit while the daemon lives, and on the first run the daemon did not
+>   exit when its anchor was killed. Windows' restart then hung past 15 minutes, and a reset was needed.
+> - **Not known yet:** which request holds the node (the owner pointer's `Kind` and IRP), and whether WinFsp as released
+>   reaches the hang. There, a purge follows a change from outside a file's open names (A-190) rather than a hard link's.
+> - **Also open:** 3 of 59 deletes were refused `ERROR_ACCESS_DENIED` in that race with the fix in place, where NTFS
+>   deletes.
+> - **Owed** (filed to main, run-requests 2026-11-18): `vm-hang-probe2.ps1` on the VM, which dumps the owner request
+>   and its IRP when the race stops, and the same race on WinFsp's own driver with an outside writer in place of the
+>   link.
+
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
 > every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`
@@ -3499,8 +3520,8 @@
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
 
-> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
-> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; CLOSED: recorded
+> verbs, and asynchronous outcomes the same day, below).** `live_ship::defer` judged the shard's bound on replies held for
 > durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
 > which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
 > directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
@@ -3508,10 +3529,17 @@
 > `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
 > (`crates/server/tests/fleet.rs`).
-> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
->   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
->   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
->   such a reply from the task's start, refused `Overloaded` before the task runs.
+> - **CLOSED 2026-11-18 (g076a), the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and
+>   of a checkout (`image::complete_once_durable`) reached `defer` after their commit and could be refused there: a
+>   sync refused `Overloaded` had already written the map's stores into the file. Their held count changes across their
+>   awaits, so the bound cannot be judged when they end. Each now takes a seat among the held replies as its task begins
+>   (`live_ship::take_seat`: `direct_map::sync_then`, `checkout::checkout_verb`), refused `Overloaded` at the bound
+>   before it writes anything. Its wait fills the seat (`defer` no longer refuses for room), or it gives the seat back
+>   when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back answers,
+>   so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no seat
+>   (that release, or one whose volume turned live-shipped while it ran) is held past the bound and counted
+>   (`fleet.live.held_past_bound`), never refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`
+>   (`crates/server/tests/fleet.rs`): red before, with the file holding the store the refused sync had written.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; CLOSED 2026-11-18 on
 > macOS and Linux, below; Windows OPEN, raft).**
