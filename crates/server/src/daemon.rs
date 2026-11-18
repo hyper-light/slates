@@ -843,14 +843,15 @@ impl Daemon {
       slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
-    let supervision = segment.supervision()?;
-    start_beat.beat(&supervision);
+    // The block the start beats, held across the runtime's start (`supervision` above says who reads the beat).
+    let beat_block = segment.supervision()?;
+    start_beat.beat(&beat_block);
     // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits. The start
     // beats after each unit of the runtime's work, its pair rings above all, N(N-1) of them (`slates_rt::runtime`).
     let runtime = Runtime::start_sized(
       &config.runtime,
       &[config.control_shard_capacity().get()],
-      &mut || start_beat.beat(&supervision),
+      &mut || start_beat.beat(&beat_block),
     )?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
@@ -931,7 +932,7 @@ impl Daemon {
           );
         }
       })?;
-      start_beat.beat(&supervision);
+      start_beat.beat(&beat_block);
     }
     // The doorbell, on the rendezvous opened above.
     let kicks: Vec<slates_rt::driver::Kick> = shards
@@ -958,7 +959,7 @@ impl Daemon {
       .filter_map(|shard| registry::holder_of(shard.0))
       .collect();
     // The start's last beat, then the watchdog's thread takes the beat over: one writer at a time.
-    start_beat.beat(&supervision);
+    start_beat.beat(&beat_block);
     slates_machine::log_line!(
       "slates-server: the start beat {} times over {} shards before the watchdog took the beat over",
       start_beat.beats,
