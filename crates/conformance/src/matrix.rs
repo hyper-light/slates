@@ -206,12 +206,19 @@ fn disabled(operations: &[String]) -> String {
 
 fn workloads(tools: &[crate::record::WorkloadResult]) -> String {
   let mut identical = Vec::new();
+  let mut stated = Vec::new();
   let mut differing = Vec::new();
   let mut failed = Vec::new();
   let mut skipped = Vec::new();
   for tool in tools {
     match &tool.status {
       WorkloadStatus::Identical => identical.push(tool.name.as_str()),
+      WorkloadStatus::Stated { lines } => stated.push(format!(
+        "{} ({} line{})",
+        tool.name,
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" }
+      )),
       WorkloadStatus::Differs { .. } => differing.push(tool.name.as_str()),
       WorkloadStatus::Failed { exit_code, .. } => {
         failed.push(format!("{} (exit {exit_code})", tool.name))
@@ -222,6 +229,12 @@ fn workloads(tools: &[crate::record::WorkloadResult]) -> String {
     }
   }
   let mut parts = vec![format!("identical: {}", list(&identical))];
+  if !stated.is_empty() {
+    parts.push(format!(
+      "identical but for the route's stated differences: {}",
+      stated.join(", ")
+    ));
+  }
   if !differing.is_empty() {
     parts.push(format!("DIFFERS: {}", differing.join(", ")));
   }
@@ -395,5 +408,37 @@ mod tests {
       summary(&Counts::Workloads { tools }),
       "identical: git; DIFFERS: npm; FAILED: mercurial (exit 255); skipped: watcher (fswatch absent)"
     );
+  }
+
+  /// A-300. Do: summarize a Windows run whose clones were identical but for the drive's stated difference (its link
+  /// counts: one line of git's history, two of Mercurial's), beside a plain identical one. Expect each named with its
+  /// count of stated lines, apart from the identical tools, and nothing called a difference.
+  #[test]
+  fn the_workload_summary_names_a_routes_stated_differences_apart() {
+    use crate::record::WorkloadResult;
+    let tools = vec![
+      WorkloadResult {
+        name: "git".to_owned(),
+        status: WorkloadStatus::Identical,
+      },
+      WorkloadResult {
+        name: "git-history".to_owned(),
+        status: WorkloadStatus::Stated {
+          lines: vec!["output line 1: host \"9 of 9\", mount \"0 of 9\"".to_owned()],
+        },
+      },
+      WorkloadResult {
+        name: "mercurial".to_owned(),
+        status: WorkloadStatus::Stated {
+          lines: vec!["a".to_owned(), "b".to_owned()],
+        },
+      },
+    ];
+    let summarized = summary(&Counts::Workloads { tools });
+    assert_eq!(
+      summarized,
+      "identical: git; identical but for the route's stated differences: git-history (1 line), mercurial (2 lines)"
+    );
+    assert!(!summarized.contains("DIFFERS"), "{summarized}");
   }
 }

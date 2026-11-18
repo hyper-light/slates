@@ -23,7 +23,7 @@ use std::process::Command;
 
 use slates_ipc::protocol::{Intent, VolumeId};
 
-use crate::error::{Error, MountFault};
+use crate::error::{Error, Missing, MountFault, MountMissing};
 use crate::instance::Instance;
 
 /// How a volume is mounted.
@@ -98,15 +98,19 @@ impl Instance {
     // runtime profile's identity rule), so nothing need be shared with other local users.
     if options.shared {
       return Err(Error::Mount(MountFault::Unsupported {
-        reason: "a shared mount is the Linux FUSE mount's allow_other; a macOS host mount reaches a container \
-                 through Docker Desktop's file sharing as the mounting user",
+        missing: MountMissing::SharedMount,
       }));
     }
     available().map_err(Error::Mount)?;
     // The mount point as the kernel records it (a read, never a write): the daemon finds the mount it binds and the
     // mounts it keeps across a restart in the kernel's table by exactly this path (A-227).
     let real = real_path(path)?;
-    let report = self.status(volume)?;
+    // The raw status: a mount needs only the volume's name and the daemon's port, so a base the status could not read
+    // now does not stop it.
+    let report = self
+      .client
+      .status(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     let port = report
       .nfs_port
       .ok_or(Error::Mount(MountFault::NoNfsListener))?;
@@ -114,7 +118,7 @@ impl Instance {
       Some(subtree) => self.client.attach_scoped_mount(volume, intent, subtree),
       None => self.client.attach_mount(volume, intent),
     }
-    .map_err(|e| Error::of(&self.name, e))?;
+    .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     let token = attachment
       .token
       .ok_or(Error::Mount(MountFault::NoCapability))?;
@@ -129,7 +133,12 @@ impl Instance {
     // shows it; a bind the daemon refuses takes the mount down again rather than leave a mount whose record says it
     // is bound nowhere.
     if let Err(error) = self.client.bind_mount(attachment.attachment, &real) {
-      let bind = Error::of(&self.name, error);
+      let bind = self.fail(
+        error,
+        Some(Missing::Attachment {
+          attachment: attachment.attachment,
+        }),
+      );
       return Err(match unmount(&real) {
         Ok(()) => bind,
         Err(fault) => Error::Mount(MountFault::Unbound {
@@ -165,7 +174,7 @@ impl Instance {
         .attach_scoped_fuse(volume, intent, &real, subtree),
       (None, false) => self.client.attach_fuse(volume, intent, &real),
     }
-    .map_err(|e| Error::of(&self.name, e))?;
+    .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(Mounted {
       attachment: attachment.attachment,
       path: attachment.path.unwrap_or(real),
@@ -184,14 +193,13 @@ impl Instance {
   ) -> Result<Mounted, Error> {
     if options.subtree.is_some() || options.shared {
       return Err(Error::Mount(MountFault::Unsupported {
-        reason: "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive \
-                 letter",
+        missing: MountMissing::WindowsSubtreeOrShared,
       }));
     }
     let attachment = self
       .client
       .attach_winfsp(volume, intent, path)
-      .map_err(|e| Error::of(&self.name, e))?;
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(Mounted {
       attachment: attachment.attachment,
       path: attachment.path.unwrap_or_else(|| path.to_owned()),
@@ -225,12 +233,18 @@ impl Instance {
               .map(|mount| mount.attachment);
           }
         }
-        Err(slates_client::ClientError::Refused(refusal)) => unreported.push(format!(
-          "volume {} ({}) refused {refusal:?}",
-          summary.name,
-          crate::volume_id_text(summary.id)
-        )),
-        Err(other) => return Err(Error::of(&self.name, other)),
+        Err(slates_client::ClientError::Refused(refusal)) => {
+          unreported.push(crate::error::Unreported {
+            volume: summary.id,
+            name: summary.name,
+            refusal: Box::new(Error::of_refusal(
+              refusal,
+              Some(Missing::Volume(summary.id)),
+              self.client.retry_pause_ns(0),
+            )),
+          })
+        }
+        Err(other) => return Err(self.error(other)),
       }
     }
     match found {
@@ -330,7 +344,6 @@ pub(crate) fn backend() -> MountBackend {
 
 /// The host-mount mechanism a machine offers (§4.6), as [`available`] finds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum MountKind {
   /// The loopback NFS bridge: `mount(2)` on macOS (A-34), `mount_nfs` on the other BSDs.
   NfsLoopback,
@@ -340,18 +353,6 @@ pub enum MountKind {
   WinFsp,
 }
 
-/// Format: why a BSD other than macOS cannot mount: the program its loopback mount runs is missing.
-#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "linux")), test))]
-const NO_MOUNT_NFS: &str = "`mount_nfs` is not on the PATH — slates's loopback mount needs it (it is built into macOS \
-                            and the BSDs); no kernel extension, FUSE library, or Apple entitlement is required";
-/// Format: why a Linux machine cannot mount: the unprivileged mount helper is missing.
-#[cfg(any(target_os = "linux", test))]
-const NO_FUSERMOUNT: &str = "`fusermount3` is not on the PATH — the daemon mounts FUSE through it, unprivileged (R10); \
-                             the OS's fuse3 package ships it";
-/// Format: why a Linux machine cannot mount: the FUSE device is absent or not this user's to open.
-#[cfg(any(target_os = "linux", test))]
-const NO_FUSE_DEVICE: &str = "/dev/fuse is missing, or this user cannot read and write it — load the fuse module, or \
-                              pass the device into the container";
 /// Format: the FUSE device `fusermount3` opens for the daemon (Linux).
 #[cfg(target_os = "linux")]
 const FUSE_DEVICE: &str = "/dev/fuse";
@@ -389,8 +390,7 @@ pub fn available() -> Result<MountKind, MountFault> {
     Ok(MountKind::WinFsp)
   } else {
     Err(MountFault::Unsupported {
-      reason: "WinFsp is not installed: its library (winfsp-x64.dll, or winfsp-a64.dll on arm64) did not load; \
-               install WinFsp from winfsp.dev",
+      missing: MountMissing::WinFsp,
     })
   }
 }
@@ -401,7 +401,7 @@ fn nfs_available(backend: MountBackend) -> Result<MountKind, MountFault> {
   match backend {
     MountBackend::NfsLoopback => Ok(MountKind::NfsLoopback),
     MountBackend::Unsupported => Err(MountFault::Unsupported {
-      reason: NO_MOUNT_NFS,
+      missing: MountMissing::MountNfs,
     }),
   }
 }
@@ -413,10 +413,10 @@ fn fuse_available(helper_found: bool, device_usable: bool) -> Result<MountKind, 
   match (helper_found, device_usable) {
     (true, true) => Ok(MountKind::Fuse),
     (false, _) => Err(MountFault::Unsupported {
-      reason: NO_FUSERMOUNT,
+      missing: MountMissing::Fusermount3,
     }),
     (true, false) => Err(MountFault::Unsupported {
-      reason: NO_FUSE_DEVICE,
+      missing: MountMissing::FuseDevice,
     }),
   }
 }
@@ -597,7 +597,7 @@ pub fn unmount_lazy(path: &str) -> Result<(), MountFault> {
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn unmount_lazy(_path: &str) -> Result<(), MountFault> {
   Err(MountFault::Unsupported {
-    reason: "a lazy unmount is Linux's (`fusermount3 -u -z`); here unmount the path once its users have closed it",
+    missing: MountMissing::LazyUnmount,
   })
 }
 
@@ -644,10 +644,9 @@ const UNMOUNT_ARGS: &[&str] = &[];
 #[cfg(test)]
 mod tests {
   use super::{
-    MountBackend, MountKind, NO_FUSE_DEVICE, NO_FUSERMOUNT, NO_MOUNT_NFS, classify, export_path,
-    fuse_available, mount_args, nfs_available,
+    MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
   };
-  use crate::error::MountFault;
+  use crate::error::{MountFault, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.
@@ -756,20 +755,20 @@ mod tests {
     assert_eq!(
       fuse_available(false, true),
       Err(MountFault::Unsupported {
-        reason: NO_FUSERMOUNT
+        missing: MountMissing::Fusermount3
       })
     );
     assert_eq!(
       fuse_available(false, false),
       Err(MountFault::Unsupported {
-        reason: NO_FUSERMOUNT
+        missing: MountMissing::Fusermount3
       }),
       "the helper is named first: without it the device is never opened"
     );
     assert_eq!(
       fuse_available(true, false),
       Err(MountFault::Unsupported {
-        reason: NO_FUSE_DEVICE
+        missing: MountMissing::FuseDevice
       })
     );
     assert_eq!(
@@ -779,7 +778,7 @@ mod tests {
     assert_eq!(
       nfs_available(MountBackend::Unsupported),
       Err(MountFault::Unsupported {
-        reason: NO_MOUNT_NFS
+        missing: MountMissing::MountNfs
       })
     );
   }
