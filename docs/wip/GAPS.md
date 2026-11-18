@@ -3741,11 +3741,14 @@
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
 >   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
 >   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
->   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Owed in C-a: Windows, where opening the owner's
->   named Event to probe it would keep the name and refuse a successor its ownership, so its claim still waits the claim
->   wait (a daemon's pid in the bootstrap header with an exit watch, or an open-only probe that cannot block a successor,
->   is the next step); the fleet tests' `CREDIT_WAIT` in daemon time; and the macOS region fetch's own wait for the
->   owner's turn (the Mach reply's send-once notification would end it at the owner's death). Class B (the
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Windows since A-447 (2026-11-18, g251): the
+>   daemon writes its process id and creation time into the bootstrap header (layout `SLB3`), and a claim with no live
+>   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
+>   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
+>   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
+>   daemon and no successor's takeover is refused (A-176). Owed in C-a: the fleet tests' `CREDIT_WAIT` in daemon time,
+>   and the macOS region fetch's own wait for the owner's turn (the Mach reply's send-once notification would end it at
+>   the owner's death); Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root

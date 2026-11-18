@@ -414,7 +414,11 @@ slates-db = 0
 # 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
 # held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
 # these Win32 security calls have no safe wrapper and add no file or privilege requirement.
-slates-ipc = 141
+# 2026-11-18 (+5, A-447): a Windows claim waits on its daemon's exit. The claimant opens the daemon's process for
+# SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
+# (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
+# after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
+slates-ipc = 146
 # 2026-11-18 (+1, §4.6 A-433, a Windows Shards stream's resync, `stream_pipe.rs` compiled only for Windows): `write_now`
 #   cancels a pipe write the reader has no room for (`CancelIoEx`, 1), so a successor's `Resync` to a device that
 #   reads nothing never holds its shard; the write and its settling are the waited write's sites.

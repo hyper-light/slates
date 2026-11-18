@@ -30931,3 +30931,31 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/rendezvous.rs`,
 `crates/ipc/tests/rendezvous.rs`.
+
+### A-447 — A Windows claim waits while its daemon lives: the daemon's process mark in the bootstrap header, its exit waited on beside the claim (2026-11-18, goal 85 via g251; R3's class C, C-a's Windows half; §4.7 "Rendezvous"; A-143, A-159, A-176, A-443)
+
+- **What was there.** A-443 made a claim on Linux and macOS wait while its rendezvous's owner lives; a Windows claim still
+  gave up at the claim wait, a second, with its daemon alive, since opening the owner's named Event to probe it would
+  keep its name and refuse a successor its ownership while the probe held it (A-176).
+- **The rule.** The daemon writes its process mark into the bootstrap header before it publishes the header: its process
+  id (the slot A-159 had emptied) and its creation time (`GetProcessTimes`, 100 ns intervals since 1601), at 24 and 32,
+  in the layout `SLB3` (a claimant of `SLB2` would read no mark, so each refuses the other as another layout). A claim
+  with no live anchor reads the mark, opens the process for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` alone,
+  the least that reads its creation time, and judges it by that time: a process given the pid after the daemon's exit
+  is never taken for the daemon, and the claim reads it exited at once. The claim then waits on its Event and the
+  process together (`WaitForMultipleObjects`, any) and ends at the daemon's exit, the slot taken back if the daemon had
+  not taken it. A process handle keeps the process object, and so its pid, but none of the objects the process named:
+  the bootstrap section's and the owner token's names die with the daemon, and a successor's takeover is never refused
+  for it. Under a live anchor the restart bound still bounds the claim (a restarted daemon is another process). A
+  header of this layout with no mark refuses the claim typed.
+- **Read first.** Microsoft's documentation of `OpenProcess` (the access rights it grants), `GetProcessTimes` (which
+  needs `PROCESS_QUERY_INFORMATION` or `PROCESS_QUERY_LIMITED_INFORMATION`), `WaitForMultipleObjects` (a process handle
+  is signaled at the process's exit) and "Process Handles and Identifiers" (a pid is not reused while a handle to its
+  process is open).
+- **Tests.** `the_daemons_mark_is_little_endian_at_its_offsets_and_none_is_read_where_none_was_written` (the golden
+  vector at both offsets, the magic `SLB3`, and hostile images: unwritten, a zero pid or time, short, every bit set).
+  The waits are Windows' (`cargo xwin check` clean); the cross-process rendezvous file's Windows run, a claim served
+  past a second and one ended at its daemon's exit, is filed for main.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{rendezvous,exit_watch,
+wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).

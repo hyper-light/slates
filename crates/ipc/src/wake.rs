@@ -184,9 +184,11 @@ pub use win_event::Event;
 #[cfg(windows)]
 mod win_event {
   use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
   };
-  use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+  use windows_sys::Win32::System::Threading::{
+    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+  };
 
   use crate::error::IpcError;
 
@@ -263,6 +265,25 @@ mod win_event {
       // SAFETY: the handle is a live Event this struct owns.
       if unsafe { SetEvent(self.handle()) } == 0 {
         return Err(os("SetEvent"));
+      }
+      Ok(())
+    }
+
+    /// Waits until the Event is signaled or the process `process` exits (`None`: forever), the first of either; both
+    /// are kernel objects one wait takes (`WaitForMultipleObjects`, any of them): a claim waits for its answer beside
+    /// its daemon's exit (A-447).
+    pub fn wait_or_exit(
+      &self,
+      process: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> Result<(), IpcError> {
+      use std::os::windows::io::AsRawHandle;
+      let objects: [HANDLE; 2] = [self.handle(), process.as_raw_handle()];
+      let count = u32::try_from(objects.len()).unwrap_or(u32::MAX);
+      // SAFETY: both handles are live for the call (the Event this struct owns, the process handle the caller borrows),
+      // the array outlives the call and `count` is its length.
+      let rc = unsafe { WaitForMultipleObjects(count, objects.as_ptr(), 0, INFINITE) };
+      if rc == WAIT_FAILED {
+        return Err(os("WaitForMultipleObjects"));
       }
       Ok(())
     }
