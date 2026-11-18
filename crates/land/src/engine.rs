@@ -2763,7 +2763,7 @@ struct Ours {
 
 /// The paths a manifest makes and removes.
 fn owned_paths(manifest: &Manifest) -> Ours {
-  let paths = |made: bool| {
+  let paths = |made: bool| -> BTreeSet<String> {
     manifest
       .entries
       .iter()
@@ -2779,6 +2779,42 @@ fn owned_paths(manifest: &Manifest) -> Ours {
     created: paths(true),
     removed: paths(false),
   }
+}
+
+/// The touched directories the sync phase syncs: every one but those a removal of this landing took away or found gone,
+/// whose removal the sync of its parent (touched too) makes durable. A content manifest (A-424) deletes a directory's
+/// files and then the directory, so the directory was touched by its files' entries and is gone by the sync: syncing it
+/// could only fail, and would hold every entry in it as unsynced.
+fn directories_to_sync(
+  touched: &BTreeSet<Box<str>>,
+  manifest: &Manifest,
+  reports: &[EntryReport],
+) -> Vec<Box<str>> {
+  let gone: Vec<&str> = manifest
+    .entries
+    .iter()
+    .zip(reports)
+    .filter(|(entry, report)| {
+      entry.action == Action::Rmdir
+        && matches!(
+          report.outcome,
+          Some(Outcome::Written | Outcome::Skipped(SkipReason::AlreadyThere))
+        )
+    })
+    .map(|(entry, _)| entry.path.as_ref())
+    .collect();
+  touched
+    .iter()
+    .filter(|dir| {
+      !gone.iter().any(|removed| {
+        dir.as_ref() == *removed
+          || dir
+            .strip_prefix(*removed)
+            .is_some_and(|rest| rest.starts_with('/'))
+      })
+    })
+    .cloned()
+    .collect()
 }
 
 /// The reason an entry with verdict `Skip` was skipped.
@@ -3814,7 +3850,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
         );
         if done {
           next_phase = Some(Phase::Sync {
-            touched: landing.touched.iter().cloned().collect(),
+            touched: directories_to_sync(&landing.touched, manifest, reports),
             next: 0,
             progress: SyncProgress::default(),
           });
