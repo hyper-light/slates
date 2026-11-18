@@ -26,7 +26,14 @@ The failing tests:
 - `a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time` (`crates/server/tests/recovery.rs`): a green over a pinned
   overlay's snapshot of four files of a hashing share each, the daemon restarted over its segment.
 
-The runs, red and green, follow.
+Run r1017 (kiln, 2026-11-18, the Mac Studio `d1323898`, debug build, a clone of
+`agents/g232-100-000-clients-recovery-load` at 9ac30eb67; logs `~/.cache/g232-logs/recovery-load-2/` there):
+- **Red** (in a copy, the decode and the seeding each given an unbounded share, so each is one step, as before): the
+  unit test failed "the origin decoded over 1 units", and the recovery test failed "the recovery seeded the origin over
+  1 shares" (`merge.recovery.origin_load_steps` 1).
+- **Green**: the unit test passed in 0.75 s and the recovery test in 1.90 s, each seeing more than one unit; slates-merge's
+  checkpoint tests passed 4 of 4, the new property (`a_green_seeded_in_shares_then_given_its_checkpoint_is_the_restored_green`)
+  among them.
 
 ## Root cause
 
