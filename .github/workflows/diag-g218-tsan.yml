@@ -4,7 +4,7 @@ on:
     branches: ['diag-g218-tsan-*']
 jobs:
   lone:
-    name: lone_daemon under TSan on ubuntu-latest, three runs
+    name: lone_daemon under TSan on ubuntu-latest, with its end waited out, three TSan option sets
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,9 +23,9 @@ jobs:
           SLATES_TEST_RESTART_SLOWDOWN: "25"
         run: |
           nproc; uptime
-          for run in 1 2 3; do
-            echo "### run $run"
-            cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-client --test lone_daemon -- --nocapture 2>&1 | tail -150
+          for opts in "halt_on_error=0" "halt_on_error=0 atexit_sleep_ms=0" "halt_on_error=0 report_thread_leaks=0 atexit_sleep_ms=0"; do
+            echo "### TSAN_OPTIONS=$opts"
+            TSAN_OPTIONS="$opts" cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-client --test lone_daemon -- --nocapture --test-threads=1 a_lone_daemons 2>&1 | grep -E 'A232|DIAG|ThreadSanitizer|SUMMARY|panicked|test result|FAILED|still running|  #[0-9]' | cut -c1-400 | tail -120
           done
       - name: lone_daemon uninstrumented, the control
         run: |

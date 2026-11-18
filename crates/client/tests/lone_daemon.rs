@@ -61,7 +61,7 @@ const BEAT: Duration = Duration::from_nanos(HEARTBEAT_NS);
 const START_WAIT: Duration = Duration::from_nanos(100 * LIVENESS_BUDGET_NS);
 /// Shape: the test's own bound on the whole exchange once the hold has begun: ten windows, far past the rule's bound and
 /// the reconnect budget after it, so a daemon that never ends itself fails here with the call still pending.
-const GIVE_UP: Duration = Duration::from_nanos(10 * LIVENESS_BUDGET_NS);
+const GIVE_UP: Duration = Duration::from_nanos(120 * LIVENESS_BUDGET_NS); // DIAG: let the child end by itself
 /// Shape: the loop's pause between steps: a hundredth of a beat, so the exit is seen within it.
 const STEP_PAUSE: Duration = Duration::from_nanos(HEARTBEAT_NS / 100);
 
@@ -469,6 +469,7 @@ fn said_so_far(stderr: &Receiver<(u64, String)>) -> String {
 fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64, String)> {
   let mut found = None;
   while let Ok((read_at_ns, line)) = stderr.recv_timeout(BEAT) {
+    eprintln!("DIAG child stderr at {read_at_ns}: {line}");
     if line.contains(END_WORDS) {
       found = Some((
         micros_after(&line, VERDICT_LATE_WORDS),
