@@ -1,0 +1,157 @@
+name: DIAG g258 -- a delete a purge's last handle carries (A-360, A-190), merged with main's A-368 and A-369, the focused tests and the VM's binaries (not for main)
+
+# Goal g258, WinFsp hard links. On both Windows runners, at this tree (agents/g258-step-continued-ada-hardlinks):
+# the bridge's link tests (the forwarded request's decoding, a saved link's replay, the shard's link rules) and the
+# semantics suite's live CreateHardLinkW test, which must skip loudly on WinFsp as released (its driver refuses the link
+# itself) while the drive, now declaring HardLinks, still mounts and serves. On windows-latest it then builds, for adacachy's
+# test-signing VM, this tree's release slates.exe and semantics test (under C:\g258t, the path the test binary names)
+# and main's release slates.exe (the red check: the patched driver without the drive's half), as one artifact.
+# The tree is the fix merged with main (A-368, A-369 touched the bridge and the server): the focused tests again; the
+# red at the reversed fix ran in diag-g258-22 (run 44359955657) on both runners.
+# Derived: the bounds are CI's own for the same suites (ci.yml).
+
+on:
+  push:
+    branches: ['diag-g258-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: links on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: diag-results/g258-${{ github.run_id }}-links-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUBLISH'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n' "$ab" "$lint" "$live" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUBLISH
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: fmt, the touched crates
+        shell: bash
+        run: |
+          set +e
+          { echo "# fmt at $(git rev-parse HEAD) on ${{ matrix.runner }}"
+            cargo fmt -p slates-bridge-winfsp -p slates-cli -- --check
+            echo "## fmt, exit $?"
+          } 2>&1 | tee clippy.txt
+          "$RUNNER_TEMP/publish.sh"
+          # informational: the touched files were formatted before the push
+          true
+      - name: The focused tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 55
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "# hard-link focused tests at $(git rev-parse HEAD) on ${{ matrix.runner }}"
+            WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-bridge-winfsp --lib link -- --test-threads=1
+            echo "## bridge link tests, exit $?"
+            WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-bridge-winfsp --lib -- a_change_to_a_file_with_another_name a_change_through_one_name two_changes_owed_one_word a_directory_takes_no_second_name a_delete_a_purges_last_handle_carries_is_made a_replayed_cleanup_cannot_unlink --test-threads=1
+            echo "## bridge shared-change test, exit $?"
+            SLATES_TEST_CLI=1 WINFSP_TEST_MOUNT=1 cargo test --locked -p slates-cli --test winfsp_semantics a_hard_link_made_through_the_drive -- --nocapture --test-threads=1
+            echo "## cli hard-link test, exit $?"
+          } 2>&1 | tee live.txt
+          "$RUNNER_TEMP/publish.sh"
+          grep -q '^## bridge link tests, exit 0$' live.txt \
+            && grep -q '^## bridge shared-change test, exit 0$' live.txt \
+            && grep -q '^## cli hard-link test, exit 0$' live.txt \
+            && grep -q 'a_forwarded_link_gives_the_open_file_a_second_name ... ok' live.txt \
+            && grep -q 'a_hostile_link_request_names_nothing ... ok' live.txt \
+            && grep -q 'a_change_to_a_file_with_another_name_is_kept_for_the_other_names ... ok' live.txt \
+            && grep -q 'a_change_through_one_name_tells_only_the_files_other_names ... ok' live.txt \
+            && grep -q 'two_changes_owed_one_word_span_every_byte_either_changed ... ok' live.txt \
+            && grep -q 'a_directory_takes_no_second_name ... ok' live.txt \
+            && grep -q 'a_delete_a_purges_last_handle_carries_is_made ... ok' live.txt \
+            && grep -q 'a_replayed_cleanup_cannot_unlink_the_file_that_replaced_its_open ... ok' live.txt \
+            && grep -q 'SKIP: this WinFsp' live.txt
+      - name: The VM's binaries (windows-latest)
+        if: ${{ !cancelled() && matrix.runner == 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR='C:\g258t'
+          cargo test --release --locked -p slates-cli --test winfsp_semantics --no-run 2>&1 | tee vm-build.txt
+          git fetch -q --depth 1 origin main
+          git worktree add -q --detach "$RUNNER_TEMP/main" FETCH_HEAD
+          (cd "$RUNNER_TEMP/main" && git log --oneline -1 && CARGO_TARGET_DIR='C:\g258m' cargo build --release --locked -p slates-cli --bin slates) 2>&1 | tee -a vm-build.txt
+          mkdir -p vm
+          cp 'C:\g258t\release\slates.exe' vm/slates.exe
+          cp 'C:\g258m\release\slates.exe' vm/slates-main.exe
+          test_exe=$(ls -t 'C:\g258t\release\deps'/winfsp_semantics-*.exe | head -1)
+          cp "$test_exe" vm/winfsp_semantics.exe
+          { echo "tree $(git rev-parse HEAD^) main $(git -C "$RUNNER_TEMP/main" rev-parse HEAD)"
+            echo "test exe $test_exe (CARGO_BIN_EXE_slates = C:\g258t\release\slates.exe)"
+            sha256sum vm/*.exe; } | tee vm/manifest.txt
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && matrix.runner == 'windows-latest' }}
+        with:
+          name: g258-vm-binaries
+          path: vm/
