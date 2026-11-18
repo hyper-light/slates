@@ -1294,6 +1294,163 @@ fn a_captured_bases_clone_reads_the_capture_with_no_base_directory() {
   daemon.stop();
 }
 
+/// Shape: the length of the archive export test's file that spans several chunks (a chunk is sixteen pages).
+const SPANNING_BYTES: usize = 300 * 1024;
+/// Shape: the permission bits of a directory the archive export test makes.
+const DIRECTORY_MODE: u32 = 0o755;
+/// Format: POSIX `S_IFMT` and `S_IFREG`, a regular file's type bits as an archive's metadata carries them.
+const FILE_TYPE: (u32, u32) = (0o170_000, 0o100_000);
+
+/// The bytes a restored file holds: its pieces laid at their offsets over its length's zeros.
+fn assembled(file: &slates_archive::RestoredFile) -> Vec<u8> {
+  let mut bytes = vec![0u8; usize::try_from(file.len).unwrap()];
+  for (offset, piece) in &file.pieces {
+    let at = usize::try_from(*offset).unwrap();
+    bytes[at..at + piece.len()].copy_from_slice(piece);
+  }
+  bytes
+}
+
+/// A-441 (§4.11 "Archive"; Mantle's CP-T10.4): a snapshot exported as its archive carries every file's bytes and every
+/// entry's metadata, read back as a consumer streams it out. Do: a volume holding a small file, a file spanning several
+/// chunks and an empty one, in nested directories; snapshot it, then write over the small file; export the snapshot
+/// into a new volume; read the archive file back through `read`, a page at a time as a consumer would; decode it and
+/// restore it in memory (`slates_archive`: every chunk and the whole archive verified by identity). Expect: the archive
+/// is as long as the export said and names the manifest it said; the restored tree holds exactly the snapshot's files,
+/// each with its bytes, its length and a regular file's mode as written, and its two directories, never the write made
+/// after the snapshot; a second export of the snapshot names the same manifest. And by kind: a snapshot the volume
+/// never took is `NotFound` naming it, and an archive volume's name already held is `AlreadyExists`.
+#[test]
+fn a_snapshot_exported_as_its_archive_carries_every_file_and_entry() {
+  let (daemon, mut instance) = grouped("archive-export");
+  let volume = provision(&mut instance, &VolumeSpec::empty("exported", ROOM));
+  let spanning: Vec<u8> = (0..SPANNING_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let files: [(&str, &[u8]); 3] = [
+    ("top.txt", b"before the snapshot"),
+    ("dir/spanning.bin", &spanning),
+    ("dir/deeper/empty", b""),
+  ];
+  let attached = instance.attach_volume(volume, Intent::Write).unwrap();
+  for directory in ["/dir", "/dir/deeper"] {
+    instance
+      .client()
+      .fs_mkdir((volume, attached.attachment), directory, DIRECTORY_MODE)
+      .unwrap();
+  }
+  for (path, bytes) in files {
+    instance
+      .client()
+      .fs_write(
+        (volume, attached.attachment),
+        &format!("/{path}"),
+        bytes,
+        MODE,
+      )
+      .unwrap();
+  }
+  instance.detach(attached.attachment).unwrap();
+  let snapshot = instance.snapshot(volume).unwrap();
+  write_file(
+    &mut instance,
+    volume,
+    "/top.txt",
+    b"written after the snapshot",
+  );
+
+  let exported = instance
+    .export_archive(volume, snapshot, "exported-archive")
+    .unwrap();
+  let bytes = read_file(
+    &mut instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  assert_eq!(
+    u64::try_from(bytes.len()).unwrap(),
+    exported.archive_bytes,
+    "the archive file is as long as the export said"
+  );
+  let archive = slates_archive::Archive::decode(&bytes)
+    .expect("the archive decodes, every chunk and its whole verified by identity");
+  assert_eq!(
+    archive.manifest_identity(),
+    exported.manifest,
+    "the archive names the manifest the export said"
+  );
+  let restored = slates_archive::restore(&archive, u64::MAX).unwrap();
+  let trimmed = |path: &str| path.trim_start_matches('/').to_owned();
+  let restored_files: std::collections::BTreeMap<String, Vec<u8>> = restored
+    .files
+    .iter()
+    .map(|(path, file)| (trimmed(path), assembled(file)))
+    .collect();
+  let expected: std::collections::BTreeMap<String, Vec<u8>> = files
+    .iter()
+    .map(|(path, bytes)| ((*path).to_owned(), bytes.to_vec()))
+    .collect();
+  assert_eq!(
+    restored_files, expected,
+    "every file of the snapshot, with its bytes, and none written after it"
+  );
+  for (path, bytes) in files {
+    let meta = restored
+      .metadata
+      .iter()
+      .find(|(named, _)| trimmed(named) == path)
+      .map(|(_, meta)| meta)
+      .unwrap_or_else(|| panic!("{path} has its metadata"));
+    assert_eq!(
+      meta.mode & FILE_TYPE.0,
+      FILE_TYPE.1,
+      "{path} is a regular file"
+    );
+    assert_eq!(meta.mode & 0o7777, MODE, "{path} keeps its mode");
+    assert_eq!(
+      meta.size,
+      u64::try_from(bytes.len()).unwrap(),
+      "{path}'s length"
+    );
+  }
+  let directories: std::collections::BTreeSet<String> = restored
+    .directories
+    .iter()
+    .map(|path| trimmed(path))
+    .collect();
+  assert!(
+    directories.contains("dir") && directories.contains("dir/deeper"),
+    "both directories: {directories:?}"
+  );
+  let again = instance
+    .export_archive(volume, snapshot, "exported-again")
+    .unwrap();
+  assert_eq!(
+    again.manifest, exported.manifest,
+    "the same snapshot names the same manifest"
+  );
+
+  let never = SnapshotId {
+    value: snapshot.value.saturating_add(1_000),
+  };
+  assert!(
+    matches!(
+      instance.export_archive(volume, never, "never-archive"),
+      Err(Error::NotFound(Missing::Snapshot { .. }))
+    ),
+    "a snapshot the volume never took"
+  );
+  assert!(
+    matches!(
+      instance.export_archive(volume, snapshot, "exported-archive"),
+      Err(Error::AlreadyExists(_))
+    ),
+    "an archive volume's name already held"
+  );
+  drop(instance);
+  daemon.stop();
+}
+
 /// Shape: a capped daemon's version slab: room for a handful of files, so a test can spend every unpromised slot.
 const CAPPED_SLAB: usize = 64;
 /// Shape: the capped daemon's arena, sized with its slab so a slot is about 1 MiB of quota (A-109).
