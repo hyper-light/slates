@@ -1,14 +1,20 @@
 //! The shared-memory doorbell watcher (§4.7): on macOS and Windows a client rings
 //! the bootstrap object's word (and, on Windows, signals the named doorbell Event, since the word's
-//! wake is process-local there, D-10). This owned thread waits on it and kicks each shard; shutdown
-//! wakes and joins it. Linux clients write eventfds directly, and the control shard
+//! wake is process-local there, D-10). This owned thread waits on it and kicks the shards the rings
+//! marked: a client's ring marks the shard its region names, a claim marks the control shard (A-381).
+//! Shutdown wakes and joins it. Linux clients write eventfds directly, and the control shard
 //! awaits rendezvous readiness through its driver, so Linux starts no watcher thread.
+//!
+//! **Only the shard rung is kicked (A-381).** Until 2026-11-18 each ring kicked every shard: at 1,000 clients over 23
+//! shards on a Mac Studio each shard parked and woke about 7,500 times a second whatever its own clients asked (a
+//! shard's parks were alike on shards serving one connection and two), so each request a client sent to a parked shard
+//! woke the 22 others too, and the control shard ran an accept round for every request.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 
-use slates_ipc::rendezvous::DoorbellWaiter;
+use slates_ipc::rendezvous::{DoorbellWaiter, Pending};
 use slates_rt::driver::Kick;
 
 /// The daemon's doorbell thread.
@@ -30,13 +36,13 @@ impl std::fmt::Debug for DoorbellThread {
 }
 
 impl DoorbellThread {
-  /// Starts the thread: it waits on `waiter`, sets `rang`, and kicks `kicks` (every shard, the
-  /// control shard first) each time the doorbell rings. `waker` is a second handle on the same
-  /// doorbell, rung by [`Self::stop`].
+  /// Starts the thread: it waits on `waiter` and, each time the doorbell rings, kicks the shards the rings marked, each
+  /// found in `kicks` by its id (the control shard first); a claim's ring sets `rang` and kicks the control shard.
+  /// `waker` is a second handle on the same doorbell, rung by [`Self::stop`].
   pub fn start(
     waiter: DoorbellWaiter,
     waker: DoorbellWaiter,
-    kicks: Vec<Kick>,
+    kicks: Vec<(u16, Kick)>,
     rang: &'static AtomicBool,
   ) -> Result<DoorbellThread, slates_ipc::IpcError> {
     let (stop, stop_signal) = channel();
@@ -85,7 +91,7 @@ fn stopped(stop: &Receiver<()>) -> bool {
 
 fn run(
   waiter: &DoorbellWaiter,
-  kicks: &[Kick],
+  kicks: &[(u16, Kick)],
   stop: &Receiver<()>,
   rang_flag: &'static AtomicBool,
 ) {
@@ -119,10 +125,34 @@ fn run(
       break;
     }
     if rang {
-      rang_flag.store(true, Ordering::Release);
-      for kick in kicks {
-        kick.kick();
-      }
+      let pending = match waiter.take_pending() {
+        Ok(pending) => pending,
+        Err(error) => {
+          slates_machine::log_line!(
+            "slates-server: the doorbell thread stopped: its rings' marks could not be read: {error}"
+          );
+          return;
+        }
+      };
+      kick_pending(&pending, kicks, rang_flag);
+    }
+  }
+}
+
+/// Kicks what `pending` asked for: the control shard (`kicks`' first) for a claim, with `rang_flag` set for its claim
+/// poller, and each shard a client rang for, found in `kicks` by its id. A mark naming no shard of this daemon (a
+/// client of the daemon before a restart rang into the object the anchor held over it) kicks nothing: that client's
+/// next request is on the shard its reconnect names.
+fn kick_pending(pending: &Pending, kicks: &[(u16, Kick)], rang_flag: &'static AtomicBool) {
+  if pending.claim {
+    rang_flag.store(true, Ordering::Release);
+    if let Some((_, control)) = kicks.first() {
+      control.kick();
+    }
+  }
+  for shard in &pending.shards {
+    if let Some((_, kick)) = kicks.iter().find(|(id, _)| id == shard) {
+      kick.kick();
     }
   }
 }
