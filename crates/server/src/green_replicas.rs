@@ -857,7 +857,10 @@ mod tests {
   }
 
   /// On `state`, its owner's shard: a green and one work over it; their ids.
-  fn green_and_work(state: &mut ShardState, prefix: &str) -> (VolumeId, slates_ipc::protocol::VolumeId) {
+  fn green_and_work(
+    state: &mut ShardState,
+    prefix: &str,
+  ) -> (VolumeId, slates_ipc::protocol::VolumeId) {
     let owner = principal();
     let name = local_name(state, prefix);
     let created = RequestBody::CreateGreen {
@@ -1088,7 +1091,10 @@ mod tests {
 
   /// A work of `green` based at version 1 whose increment, composed on its shard, is `increment`: what its shard moves
   /// to be rebased.
-  fn sealed(green: VolumeId, increment: slates_merge::engine::Increment) -> crate::work_home::SealedWork {
+  fn sealed(
+    green: VolumeId,
+    increment: slates_merge::engine::Increment,
+  ) -> crate::work_home::SealedWork {
     crate::work_home::SealedWork {
       work: VolumeId { bytes: [0x5e; 16] },
       green,
@@ -1110,7 +1116,10 @@ mod tests {
     if on_owner {
       return vec![
         format!("{:?}", crate::verbs::owner_files(state, green, 1, &paths)),
-        format!("{:?}", crate::verbs::owner_page(state, green, 1, path, (2, 4))),
+        format!(
+          "{:?}",
+          crate::verbs::owner_page(state, green, 1, path, (2, 4))
+        ),
         format!("{:?}", crate::verbs::owner_sizes(state, green, 1)),
         format!("{:?}", crate::verbs::owner_rebase(state, clean)),
         format!("{:?}", crate::verbs::owner_rebase(state, conflict)),
@@ -1123,8 +1132,14 @@ mod tests {
       format!("{files:?}"),
       format!("{page:?}"),
       format!("{sizes:?}"),
-      format!("{:?}", crate::verbs::rebase_on(serving(state, green, 1), &clean)),
-      format!("{:?}", crate::verbs::rebase_on(serving(state, green, 1), &conflict)),
+      format!(
+        "{:?}",
+        crate::verbs::rebase_on(serving(state, green, 1), &clean)
+      ),
+      format!(
+        "{:?}",
+        crate::verbs::rebase_on(serving(state, green, 1), &conflict)
+      ),
     ]
   }
 
@@ -1154,7 +1169,9 @@ mod tests {
       "a clean rebase among them: {owner:?}"
     );
     assert!(
-      owner.iter().any(|answer| answer.starts_with("Reply(Rebased {")),
+      owner
+        .iter()
+        .any(|answer| answer.starts_with("Reply(Rebased {")),
       "and a conflict: {owner:?}"
     );
     daemon.stop();
@@ -1293,7 +1310,11 @@ mod tests {
       [ROUTE_BEHIND, ROUTE_ABSENT, ROUTE_EVICTED, ROUTE_OVER_BUDGET]
         .map(|route| state.refusals.get(route).copied().unwrap_or(0))
     });
-    assert_eq!((remade, held_again.is_some()), (Some(1), true), "remade once, held again");
+    assert_eq!(
+      (remade, held_again.is_some()),
+      (Some(1), true),
+      "remade once, held again"
+    );
     assert!(over, "its budget's leave routes to the owner");
     assert_eq!(not_remade, Some(1), "never remade for its budget");
     assert_eq!(counted, [1, 1, 1, 1], "each route counted by why");

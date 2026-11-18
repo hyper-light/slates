@@ -31776,7 +31776,15 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   its shard costs one making.
 - **Non-vacuity.** `merge.replica.served`, moved by every answer a replica gives, which the gate test asserts moved by
   two (a base read and a rebase) with `merge.work.asked_owner` unchanged.
-- **Checks.** CHECKS_RESULT
+- **Checks.** On the Mac Studio (debug, r398, 2026-11-18): `cargo test --locked -p slates-server --lib green_replicas`
+  6 of 6 (the oracle `what_a_replica_answers_is_the_owners_answer_whole`,
+  `a_works_base_read_and_rebase_on_its_replicas_shard_are_served_there_with_no_hop`,
+  `a_replica_that_left_is_remade_unless_for_its_budget_and_each_route_is_counted_by_why`, and A-457's three) and
+  `cargo test --locked -p slates-merge --lib` 16 of 16; the one-crate clippy of `slates-merge` clean (r390); rustfmt's
+  layout taken. The first run found the oracle's two rebases both clean (its second version had inserted before the
+  first's bytes; it now replaces them) and the gate test waiting for one journal entry where an edit that makes a file
+  records more. Red with the work's shard never asking its replica: the gate test fails, its counters of what was
+  served and what was asked of the owner (0, 3) where (2, 1) was due.
 - **Owed.** An idle replica's give-back; the supervisor's A/B at 1,000 clients and more (the arms filed with this
   change); main's runs of the green suites and `works_off_owner`, whose one-shard and many-shard replies must still be
   the same.
