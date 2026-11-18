@@ -7715,7 +7715,9 @@ follows a symlink when removing; no code is loaded after start; every refusal is
 at rendezvous using a capability delivered and retained outside other agents' reach, for
 example an inherited endpoint from the trusted harness. Per-request identity strings and
 peer uid alone cannot establish consumer identity. Between hosts, authenticated transport
-also binds the delegated consumer scope. Rights are checked before resource admission,
+also binds the delegated consumer scope. A consumer channel never carries the launcher's authority: an enrollment, a
+revocation, a policy setting, a merge's approval or a grant sent on one is refused `Forbidden` whatever proof it carries
+(A-285). Rights are checked before resource admission,
 namespace lookup that reveals protected content, queue creation or any VFS/device effect.
 Replay/session resumption preserves that binding; it cannot change the authenticated consumer.
 
@@ -22503,8 +22505,9 @@ volume's mode to decide), so the stricter of consumer and volume governs; and th
 (`crates/cli/tests/fs_server.rs`, which found it): a landing's grant is refused `Forbidden` on a consumer-bound
 channel before anything else, whatever its proof (`landing::grant_verb`, counter `grant_by_consumer`), as a policy
 setting and a merge's approval already were, so an agent never approves its own landing
-(`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). Open, its siblings: `Enroll` and
-`Revoke` still verify the proof alone (GAPS). Owed: signed work. The
+(`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). Built the same day, its siblings:
+`Enroll` and `Revoke` refuse `Forbidden` on a consumer-bound channel before the proof (`enroll_by_consumer`,
+`revoke_by_consumer`), so no launcher-class verb answers an agent's own channel (GAPS). Owed: signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
