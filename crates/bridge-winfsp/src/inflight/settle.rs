@@ -122,7 +122,8 @@ fn settle<E: Edges>(
 }
 
 /// Answers one request a dead owner had taken. Only Create's saved result is needed to preserve a possibly issued
-/// context, and a successful rename's to finish its names; read completion can reference an old process mapping
+/// context, a successful rename's to finish its names, and a successful hard link's because the volume holds the name
+/// (A-360); read completion can reference an old process mapping
 /// (sys/read.c), so every other buffer-bearing operation cancels without dereferencing it. A captured Cleanup or Close
 /// runs again. Answers whether the file system refused a replayed Cleanup or Close.
 fn replay<E: Edges>(
@@ -139,6 +140,11 @@ fn replay<E: Edges>(
     }
     if let Some((from, to)) = request.successful_rename(saved)? {
       edges.rename_open_names(&from, &to)?;
+      edges.send(saved)?;
+      return Ok(false);
+    }
+    // A hard link the volume holds is answered as made (A-360); it moves no open's name.
+    if request.successful_link(saved)? {
       edges.send(saved)?;
       return Ok(false);
     }

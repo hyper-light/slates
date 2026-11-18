@@ -722,7 +722,15 @@
 > both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
 > the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
-> keep the stated difference and offer the change upstream. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> keep the stated difference and offer the change upstream. **2026-11-18, A-360 (goal g258):** the driver change is
+> written, two commits on WinFsp v2.1 that apply to v2.2 (`docs/wip/winfsp-patches`, never sent to WinFsp), and the
+> drive declares `HardLinks` and serves a forwarded link (its focused tests on both Windows runners). Proven end to end
+> on a test-signing Windows Server 2025 VM under KVM (adacachy) with the patched driver: the live `CreateHardLinkW`
+> test passes (one file index, two links, the other name reads a write 0.9 ms after the writer's close) and `git clone
+> --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
+> create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
+> (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
+> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
@@ -3048,6 +3056,20 @@
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
 
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
+> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
+> which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
+> directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
+> supervisor. A recorded verb now meets the bound before it runs (`live_ship::refuse_over_bound` in
+> `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`).
+> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
+>   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
+>   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
+>   such a reply from the task's start, refused `Overloaded` before the task runs.
+
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
 > live-shipped volume waits at most the daemon's liveness budget (1 s, `live_ship::DURABLE_WAIT_NS`) and is then answered
@@ -5318,7 +5340,58 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
-### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20, OPEN — a defect, not a runner setting)
+### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20; re-diagnosed 2026-11-05: Ubuntu's AppArmor restriction; CLOSED 2026-11-18 by A-370: slates' profile, used when asked)
+
+> **Closed 2026-11-18 by A-370 (goal g078, kiln 7d8d1280): `slates exec` runs unprivileged on a restricted host, with
+> slates' AppArmor profile loaded and the option on.** Ada's decision the same day: "Ship the profile but feature flag
+> it so whether via SDK (Node/Python), API, or CLI it is user enabled." Design §4.6 "The launcher on a restricted
+> host".
+> - **The profile:** `abi <abi/4.0>,` then `profile <executable> flags=(unconfined) { userns, }`, named by the
+>   executable's real path. It is rendered by the binary for its own path (`slates apparmor profile`) and by the SDKs
+>   and slates-api for any path. `slates apparmor check` says whether the host restricts user namespaces and prints the
+>   root commands that load the profile. slates never loads it (R10) and never writes `/etc/apparmor.d` (R1).
+> - **The flag:** `slates exec --apparmor-profile`, slates-api's `ExecSpec::apparmor` (`AppArmor::Profile`), the Python
+>   SDK's `exec_command(..., apparmor_profile=True)`, the Node SDK's `execCommand(..., { apparmorProfile: true })`; off
+>   unless set.
+>   - Off: a launcher running under its loaded profile leaves it first (`changeprofile unconfined`), so the host's
+>     restriction refuses it as with no profile loaded, and the refusal names the switch; with no profile loaded, the
+>     refusal is word for word the one of 2026-11-05.
+>   - On: the namespace is made under the profile and the command is exec'd unconfined (`exec unconfined`), so it holds
+>     no user-namespace grant.
+> - **Measured** (diagnostics run 44344947954, the launcher's sequence by a probe, 2026-11-18): on `ubuntu-24.04`
+>   (AppArmor 4.0.1, Linux 7.0.0-1017-azure) and `ubuntu-latest`, now Ubuntu 26.04.1 (AppArmor 5.0.2, Linux
+>   7.0.0-1016-aws, `apparmor_restrict_unprivileged_unconfined=1`):
+>   - the profile loaded, the maps, the private tree and the bind succeed, and the command reads the volume;
+>   - the step-out restores the refusal;
+>   - with `exec unconfined` the command runs `unconfined`, and its own `unshare -Ur` is refused (inherited, it
+>     succeeded);
+>   - a copy of the binary at another path is not covered.
+> - **Through the real binary** (diagnostics run 44350784102, 2026-11-18, on `ubuntu-24.04` x86_64 and arm64 and Ubuntu
+>   26.04.1 x86_64, each restricting unprivileged user namespaces):
+>   - the focused unit tests passed (`slates-client` 5, `slates-api` 4, the CLI's grammar 6);
+>   - with no profile loaded, `the_launcher_uses_slates_apparmor_profile_only_when_asked`,
+>     `apparmor_prints_the_profile_and_checks_the_host` and `the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`
+>     passed, 3 of 3; without the option the refusal is word for word the one of 2026-11-05;
+>   - the same test demanding the loaded regime with none loaded failed (the red check);
+>   - with the binary's profile loaded by `apparmor_parser -r`, the three passed again. By hand, with
+>     `--apparmor-profile` the command read the volume as the runner's uid 1001, ran `unconfined`, and its own
+>     `unshare -Ur` was refused; without it the launcher was refused naming the switch (exit 4);
+>   - the SDKs' plumbing tests passed against the built wheel (3 of 3) and addon (1 of 1).
+>
+>   CI's `gates` job runs both regimes on every push since (`The slates exec AppArmor profile, opted into (Linux)`).
+> - **Red-checked** (diagnostics run 44353311142, `ubuntu-24.04`), each guard removed in turn:
+>   - the switch dropped from the launcher's arguments failed the shared grammar's test and the CLI's round trip;
+>   - with the step-out removed, the launcher ran without the option under the loaded profile (exit 0, where 4 is
+>     owed);
+>   - with the exec-time drop removed, the command ran labelled `/home/runner/work/slates/slates/target/debug/slates
+>     (unconfined)` and held the grant (`grant-held`).
+> - **macOS** (diagnostics run 44352021341, `macos-latest`): the focused tests pass there too (5, 4, 6 and the CLI's
+>   `apparmor_prints_the_profile_and_checks_the_host`); `slates apparmor check` answers `readiness: unsupported` (exit 1)
+>   and `exec` the refusal it always gave off Linux (exit 4).
+> - The launcher moved from `crates/cli/src/exec.rs` to `crates/api/src/exec.rs`, so an embedding host's executable
+>   serves it (`role::main`'s `exec`), and the profile can name that executable.
+>
+> The entry as it stood on 2026-11-05:
 
 > **Re-diagnosed 2026-11-05 (bug-sweep): the refusal is fixed; the rest is a host setting after all, which slates
 > cannot lift unprivileged.** The entry below drew its conclusion from a probe that execs a shell, and an exec'd process
@@ -7144,8 +7217,9 @@ namespace. An unsatisfiable path is refused with the exact missing directory, ne
 budgeted `unsafe` (`unshare_unsafe`, sound in the single-threaded pre-exec launcher). The `--`
 splits the flags from the command; the parsing is unit-tested on every host, and the launcher
 runs against a real daemon mount in the CI Linux lane. Owed: the daemon publishing its root
-mount so `SLATES_ROOT` need not be set by hand, and the AppArmor-profile detection with the exact
-remedy message (a generic hint is given now).
+mount so `SLATES_ROOT` need not be set by hand. (The AppArmor detection with the exact remedy message landed
+2026-11-05; slates' AppArmor profile, used when the caller asks, with A-370 on 2026-11-18, when the launcher moved to
+`crates/api/src/exec.rs`: GAPS `8a-launcher-ci`.)
 
 The xtask unsafe counter was made word-boundary aware in the same change: it counted the
 substring `unsafe` inside identifiers like `unshare_unsafe`; it now counts the `unsafe` keyword
