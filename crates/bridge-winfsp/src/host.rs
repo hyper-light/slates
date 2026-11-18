@@ -457,6 +457,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        shared: false,
         flush: false,
       };
     }
@@ -468,6 +469,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
+        shared: false,
         flush: false,
       };
     }
@@ -502,6 +504,9 @@ impl Request {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
+    let change = bound
+      .as_ref()
+      .map_or(Change::None, |op| change_of(op, bridge, cx));
     let flush = matches!(&bound, Ok(Op::Flush { .. } | Op::FlushVolume));
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
@@ -523,6 +528,7 @@ impl Request {
     };
     reply = record_open_reply(reply, opened, self.hint, bridge, cx, names, ledger);
     reply = finish_context_effects(reply, closed, names, ledger);
+    let shared = change.left_other_names(&reply);
     Served {
       reply,
       sender: self.reply,
@@ -530,7 +536,60 @@ impl Request {
       echo,
       restored_read,
       flush,
+      shared,
     }
+  }
+}
+
+/// What a request does to a file that may have other names (A-360), decided before it runs.
+#[derive(Clone, Copy)]
+enum Change {
+  /// No change to a file's bytes, size, times or names.
+  None,
+  /// A change whose reply carries the file's information, its link count with it.
+  Reported,
+  /// A link: the file has another name once it succeeds.
+  Link,
+  /// A delete of one name of a file that had this many.
+  Delete { names: u32 },
+}
+
+impl Change {
+  /// Whether the served request changed a file that has, or had, another name: each other name Windows holds open has
+  /// its own file node and caches, which only a notification reaches (A-360).
+  fn left_other_names(self, reply: &Reply) -> bool {
+    match (self, reply) {
+      (_, Reply::Err(_)) | (Change::None, _) => false,
+      (Change::Reported, Reply::Wrote { info, .. } | Reply::Object { info, .. }) => {
+        info.hard_links > 1
+      }
+      (Change::Reported, _) => false,
+      (Change::Link, _) => true,
+      (Change::Delete { names }, _) => names > 1,
+    }
+  }
+}
+
+/// The [`Change`] `op` makes. A delete reads the file's link count first, since its reply carries none; a write's,
+/// a size's, an overwrite's, an allocation's and a time's reply carries the count. A purge's own echo is no change.
+fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Change {
+  match op {
+    Op::Write { object, .. } if object.purge => Change::None,
+    Op::Write { .. }
+    | Op::SetSize { .. }
+    | Op::Truncate { .. }
+    | Op::SetAllocation { .. }
+    | Op::SetTimes { .. } => Change::Reported,
+    Op::Link { .. } => Change::Link,
+    Op::Cleanup {
+      object,
+      delete: Some(_),
+    } if !object.purge => bridge
+      .getattr(object.object, cx)
+      .ok()
+      .filter(|attr| attr.kind != Kind::Dir)
+      .map_or(Change::None, |attr| Change::Delete { names: attr.nlink }),
+    _ => Change::None,
   }
 }
 
@@ -775,6 +834,8 @@ pub struct Served {
   barrier: bool,
   echo: bool,
   restored_read: bool,
+  /// The request changed a file that has, or had, another name (A-360): see [`Served::changed_a_file_with_other_names`].
+  shared: bool,
   /// The request was a flush (of a handle, or of the volume): its success tells the caller its data is durable.
   flush: bool,
 }
@@ -790,6 +851,14 @@ impl Served {
   /// host (`crate::purge`).
   pub fn is_purge_echo(&self) -> bool {
     self.echo
+  }
+
+  /// Whether the request changed a file that has, or had, another name (A-360). The mount's own requests are its
+  /// kernel's doing for the name they came through, so their journal records are passed over; but each other name
+  /// Windows holds open has a file node and caches of its own, so these records stay owed, and the mount's next round
+  /// tells every name the file is open under.
+  pub fn changed_a_file_with_other_names(&self) -> bool {
+    self.shared
   }
 
   /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.

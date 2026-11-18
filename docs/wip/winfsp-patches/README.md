@@ -41,6 +41,8 @@ half, and git's `clone --local` on the drive.
 - WinFsp's DLL (`src/dll/fsop.c`) has no case for the link class, so a file system on the DLL's dispatcher would answer
   `STATUS_INVALID_PARAMETER`; slates' receive worker serves the request itself. An upstream change would add an interface
   callback, a link in `memfs`, and `winfsp-tests` cases.
-- Each name of a file has a file node of its own in the driver, so a byte one name's cache holds is not the other's: the
-  file system must notify the other names when it changes a file, as slates' drive notifies every name an inode is open
-  under (`crates/bridge-winfsp/src/notify.rs`, `an_inodes_change_names_every_path_it_is_open_under`).
+- Each name of a file has a file node of its own in the driver, and a node outlives its last handle while the cache
+  manager holds the file, so the bytes and size one name's node caches are not the other's: the file system must
+  notify the other names when it changes the file, its own changes through one name included. slates' drive keeps
+  such a request's journal records for its next notification round (A-360); on the VM, before it did, a write through
+  one name read back through the other as the bytes before it.

@@ -924,6 +924,76 @@ fn a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was() {
   assert_eq!(names["file"], before["file"]);
 }
 
+/// A-360. Do: through an open of `file`, serve a write while it has one name, a link to `\second`, a write once it has
+/// two, the delete of `\second`, and a write once one name is left. Expect: the link, the write to a file with two names
+/// and the delete of one of two names each changed a file with another name, so the mount keeps their records for its
+/// next round; the writes to a file with one name do not (their records are the kernel's own doing).
+#[test]
+fn a_change_to_a_file_with_another_name_is_kept_for_the_other_names() {
+  let mut store = fixed_store();
+  let (mut volume, cx) = fixed_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  let file = bridge.lookup(root, &cx, "file").unwrap();
+  let object = ObjectId::new(file.ino, file.generation);
+  let fh = bridge.open(object, &cx, 0).unwrap();
+  let memory =
+    SparseObject::unnamed(crate::opens::bytes(2).unwrap(), slates_mem::Words::new()).unwrap();
+  let mut ledger = Ledger::create(memory, 2).unwrap();
+  let context = ledger
+    .opened(
+      Open {
+        object,
+        fh,
+        purge: false,
+      },
+      "\\file",
+    )
+    .unwrap();
+  let mut names = OpenNames::new();
+  names.opened(context, file.ino, "\\file");
+  let write = || Op::Write {
+    object: context,
+    offset: 0,
+    data: b"x".to_vec(),
+    append: false,
+    constrained: false,
+  };
+  let cases = [
+    (write(), false, "a write to a file with one name"),
+    (
+      Op::Link {
+        object: context,
+        path: "\\second".to_owned(),
+        replace: false,
+      },
+      true,
+      "a link",
+    ),
+    (write(), true, "a write to a file with two names"),
+    (
+      Op::Cleanup {
+        object: context,
+        delete: Some("\\second".to_owned()),
+      },
+      true,
+      "the delete of one of two names",
+    ),
+    (write(), false, "a write once one name is left"),
+  ];
+  for (op, expected, what) in cases {
+    let (reply, _answer) = sync_channel(1);
+    let served = Request {
+      op,
+      reply,
+      hint: 0,
+      replayed: false,
+    }
+    .serve(&mut bridge, &cx, &mut names, &mut ledger);
+    assert_eq!(served.changed_a_file_with_other_names(), expected, "{what}");
+  }
+}
+
 /// A-198. Do: replay an open's delete cleanup after its first cleanup unlinked the name and an SDK created a new file
 /// there. Expect: the replacement still has its name and bytes; cleanup belongs to the old file's identity.
 #[test]

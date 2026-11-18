@@ -1073,7 +1073,14 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
       );
       let served = request.map(|request| {
         let served = request.serve(&mut bridge, &cx, names, ledger);
-        coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
+        if served.changed_a_file_with_other_names() {
+          // Its other names' file nodes cache what this changed (A-360): the records stay owed, and the next round
+          // tells every name the file is open under. Telling them before this reply would make the receive worker
+          // wait on a notification whose purge may need that worker.
+          *owed = true;
+        } else {
+          coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
+        }
         served
       });
       (served, delivered)

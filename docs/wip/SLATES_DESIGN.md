@@ -26086,7 +26086,9 @@ Applied in the same change to:
   (`tests/support/host.rs`) `a_forwarded_link_gives_the_open_file_a_second_name`,
   `a_link_to_a_taken_name_replaces_it_only_when_asked`, `a_link_never_replaces_a_directory_or_a_read_only_file`,
   `a_link_onto_a_name_of_the_file_itself_changes_nothing`, `a_directory_takes_no_second_name`,
-  `a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was`.
+  `a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was`,
+  `a_change_to_a_file_with_another_name_is_kept_for_the_other_names`.
+- `crates/server/src/winfsp.rs`: a served request that changed a file with another name keeps its records owed.
 - `crates/cli/tests/winfsp_semantics.rs`: `a_hard_link_made_through_the_drive_names_the_same_file`, the live
   `CreateHardLinkW` test, which skips loudly where the driver refuses the link itself.
 - A-300: its stated difference holds on WinFsp as released.
@@ -26126,6 +26128,19 @@ Applied in the same change to:
   link count reaches `FileInfo.HardLinks` (0 for a directory). A saved successful link is answered as made on recovery,
   as a saved rename is, since the volume holds the name; a cancellation would tell the caller a visible name was not
   made, and the copy it fell back to would find the name taken.
+- **Two names, two caches.** WinFsp's driver keeps a file node per name, and a node outlives its last handle while the
+  cache manager holds the file, with its data and information cached (this drive's `FileInfoTimeout` is infinite, A-177).
+  So a change through one name left another name's node stale: on the test-signing VM a write through `b.txt` read back
+  through `a.txt` as the bytes before it, size and all, while the volume held the new bytes under both. A request the
+  mount serves is its kernel's own doing for the name it came through, so the mount passes over its journal records
+  (`served_own_request`); a request that changes a file with another name (a write, a size, an overwrite, an allocation
+  or a time whose reply counts more than one link; a link; the delete of one of several names) keeps its records owed
+  instead (`Served::changed_a_file_with_other_names`), and the mount's next round tells every name the file is open
+  under, the one it came through a redundant word. That round follows the reply, at the mount's next turn: a reader
+  through the other name sees the change once the notification is applied, milliseconds after the writer's reply, not
+  with it. Telling the names before the reply would make the receive worker wait on a notification whose purge may
+  need that worker (a dirty page of the other name is written back through it), which WinFsp's rule against notifying
+  from the answering thread forbids.
 - **Proven so far.** The request decoding, the replay rule and the shard's rules by the tests above (diag lane, both
   Windows runners). End to end on a test-signing Windows VM: owed in this entry's next record.
 - **What remains, and whose.** The patch reaches users only in a WinFsp release: upstream, which needs WinFsp's

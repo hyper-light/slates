@@ -365,10 +365,26 @@ fn links_and_index(path: &str) -> (u32, u64) {
   )
 }
 
+/// Polls `seen` until it holds, within [`WAIT_FOR`]; answers how long that took. A change through one name of a file
+/// reaches the file nodes of its other names at the mount's next round, not before the change's own reply (A-360): each
+/// name has its own node in WinFsp's driver, and the mount tells them by notification.
+fn eventually(what: &str, mut seen: impl FnMut() -> bool) -> Duration {
+  let started = Instant::now();
+  while !seen() {
+    assert!(
+      started.elapsed() < WAIT_FOR,
+      "{what}: not seen within {WAIT_FOR:?}"
+    );
+    pause();
+  }
+  started.elapsed()
+}
+
 /// A-360. Do: make a file on the drive and give it a second name with `CreateHardLinkW`, as git's local clone links its
 /// objects; write through the second name, read through the first and through slates; delete the first name; link onto
-/// a taken name. Expect: one file under two names (one file index, two links), the write seen through both, the second
-/// name keeping the bytes with one link once the first is gone, and the taken name refused `ERROR_ALREADY_EXISTS`. Skips
+/// a taken name. Expect: one file under two names (one file index, two links), the write seen through slates at once
+/// and through the first name within [`WAIT_FOR`] (the mount's next round), the second name keeping the bytes with one
+/// link (within the same bound) once the first is gone, and the taken name refused `ERROR_ALREADY_EXISTS`. Skips
 /// loudly where WinFsp's driver refuses the link itself (`ERROR_NOT_SUPPORTED`): only a driver carrying
 /// `docs/wip/winfsp-patches` forwards it. With [`EXPECT_HARD_LINKS`] set (a machine with that driver), a refusal fails.
 #[test]
@@ -405,22 +421,22 @@ fn a_hard_link_made_through_the_drive_names_the_same_file() {
   );
   std::fs::write(drive.path("second.txt"), b"written through the second name").unwrap();
   assert_eq!(
-    std::fs::read(drive.path("first.txt")).unwrap(),
-    b"written through the second name"
-  );
-  assert_eq!(
     drive.read_through_slates("first.txt").as_deref(),
     Some("written through the second name")
   );
+  let told = eventually("the second name's write through the first name", || {
+    std::fs::read(drive.path("first.txt")).unwrap() == b"written through the second name"
+  });
+  eprintln!("the first name read the second name's write {told:?} after its close");
   std::fs::remove_file(drive.path("first.txt")).unwrap();
   assert_eq!(
     std::fs::read(drive.path("second.txt")).unwrap(),
     b"written through the second name"
   );
-  assert_eq!(
-    links_and_index(&drive.path("second.txt")),
-    (1, second_index)
-  );
+  let told = eventually("one link left after the first name's delete", || {
+    links_and_index(&drive.path("second.txt")) == (1, second_index)
+  });
+  eprintln!("the second name counted one link {told:?} after the first name's delete");
   std::fs::write(drive.path("third.txt"), b"another file").unwrap();
   assert_eq!(
     create_hard_link(&drive.path("third.txt"), &drive.path("second.txt")),
