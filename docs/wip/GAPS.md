@@ -2067,6 +2067,25 @@
 >   itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+> - **Class B, the location budget: open (2026-11-18, goal g255; clients' `3c072f490` of 2026-11-09 did not land).** A
+>   forward with no known owner still looks for it for one liveness budget of wall time (`verbs::locate_within_budget`),
+>   which a starved control shard spends before reading the gossip that refutes a false death (clients' runs at nice 19
+>   beside two spinners a CPU: 1 or 2 calls refused in every false death), and which one round waiting on a silent peer
+>   spends whole, so the location never looks again. Three rewrites were built and run on GitHub's runners (branch
+>   `agents/g255-cross-shard-remote-location`, never on main), each with the counts `fleet.owner_location.gave_up`,
+>   `.budget_spent` and `.slo_ended`, and the tests `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget`
+>   (red on main 9 of 9: never looked again) and `the_failover_slo_ends_a_forwards_location_budget`: clients' polls (a
+>   liveness budget's worth at the poll interval, capped by the failover SLO); the membership horizon followed by two
+>   driver waits of the control shard; and the horizon ended by a look begun after it. All three passed their own tests
+>   and the false-death test, and all three broke the five-node takeover test
+>   `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round`: 2 of 6, 4 of 15 and 1 of 8
+>   runs failed (`diag-g255-loc-green-1`, `-green-3`, `-green-4`), each running its 60 s resend and 410 s placement
+>   deadlines out (the resend refused `OwnerUnreachable` or `NotFound`, the green never served again), against 0 of at
+>   least 19 on main's budget (`-red-1`, `-red-3`). Not measured apart; the likely mechanism is the location rounds
+>   themselves, which borrow every eligible peer's record session for up to a liveness budget while a dead peer stays
+>   eligible, so a budget that runs longer or rounds more often holds sessions the takeover's own exchanges need. Owed:
+>   that test's trace (`SLATES_FLEET_TRACE`) under a rewrite, then the round's own wait (the supervisor's derivation of
+>   2026-11-07: the slowest asked peer's tail plus `fleet::record_exchange_budget_ns`) before or with the budget.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
