@@ -2723,10 +2723,14 @@
 >   budget, which the design's bound does not (the decode plus the larger of the budget and a snapshot's size of tail),
 >   and a macOS CI runner failed its eighth check at 11.6 ms where a near-empty tail cost 1.7 ms (run 44260193629). It
 >   now judges each check past a baseline recovery of the settled segment, within the inner-quartile spread of five
->   recoveries (`docs/bugs/2026-11-18-the-cadence-mix-test-held-the-snapshot-decode-to-the-budget.md`). **Open:** the
->   commits' measure of the tail's replay and the replay itself diverge by machine and moment (the commits about 1.7x
->   over on a Mac Studio, 0.4x to 1.25x on the CI runner), so where they under-measure the tail replays past the budget
->   before the trigger fires.
+>   recoveries (`docs/bugs/2026-11-18-the-cadence-mix-test-held-the-snapshot-decode-to-the-budget.md`). **Fixed by
+>   A-420 (2026-11-18, g251):** the commits' measure of the tail's replay and the replay itself diverged by machine and
+>   moment (the commits about 1.7x over on a Mac Studio, 0.4x to 1.25x on the CI runner), since the commits timed each
+>   record's encode in place of the replay's decode and the replay held its whole tail decoded; a record of 1,024
+>   one-byte keys replayed in 1.49x what its commits measured (8.49 ms against 5.71 ms, the Mac Studio, debug). A commit
+>   now decodes its record as the replay will and times it with the encode, write and apply, and recovery replays a
+>   record at a time (`a_tails_measured_replay_work_covers_its_replay_when_its_records_decode_dearer_than_they_encode`;
+>   `docs/bugs/2026-11-18-the-snapshot-trigger-timed-the-encode-in-place-of-the-replays-decode.md`).
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
@@ -16058,7 +16062,8 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
 - A fill that fails part-way unmarks its range but leaves the bytes it stored. A later fill copies only the volume's data
   runs and pages that are not zero, so where the file has since become a hole or zeros, those stale bytes would stay in
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
-  fill finishes.
+  fill finishes. **Fixed 2026-11-18 (A-419):** the range is left uncleared and counted, and cleared before its next
+  fill; three unit tests reach a fill failing part-way (the 2026-10-25 G-vhost entry says which).
 
 ### 2026-11-01: the Linux arm64 KVM cells, with no Docker on the Mac (Step 7 of the VFS and DAX plan) — closed
 
@@ -18292,9 +18297,19 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   file's size, so a guest whose size was stale (another path cut the file) mapped a range write-through never reached,
   and read zeros there after a later extension. `covered` now covers every range an ask touches;
   `a_range_asked_past_the_files_end_takes_a_later_write_into_it` failed before and passes after.
-- **Open, observed while reading (owed a test with an injected refusal):** a fill refused part-way unmarks its range
-  but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
-  or zeros, so those pages could reach a guest's map.
+- **Fixed 2026-11-18 (A-419, goal 83 B7, g079): a fill refused part-way unmarked its range but left the pages it
+  stored in the object, and a later fill of the range skipped what the volume then held as holes or zeros, so those
+  pages reached a guest's map.** A fill refused or given up part-way now leaves its range uncleared: no write reaches
+  it, it stays counted against the fill budget, and its next fill clears it before storing anything
+  (`docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`). Tests, with an
+  injected refusal (`crates/bridge-core/src/dax_backing.rs`): `a_fill_refused_part_way_leaves_nothing_a_later_fill_shows`,
+  `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows` and
+  `a_part_way_fill_stays_counted_until_its_range_is_filled_again`; red without the fix 3 of 3 (the first slice still
+  read `A` after the file was zeroed; one range counted where two held bytes), green with it, on the Mac Studio.
+  - **Open, the siblings it found (each from reading, each owed a failing test):** a successor's adopted DAX object
+    (A-365) may hold a fill's bytes in a range its range table does not name (a range the dead daemon was filling, or
+    one that failed there), which the successor's next fill skips as before A-419; and on Windows a range is committed
+    before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
     prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost

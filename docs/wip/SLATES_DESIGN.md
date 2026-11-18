@@ -4428,7 +4428,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   once to `2^63 − 2 MiB` and never resized. Every range an ask touches is kept equal from then on, past the file's end
   too, since a guest maps by a size another path may have cut (A-167). It is filled from the volume a
   range at a time as asked, every change of the file through any path written into it before the change returns, and
-  the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. So there is no revoke
+  the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. A range whose fill is
+  refused or given up part-way is left uncleared: no change reaches it, it stays counted against the fill budget, and
+  its next fill clears it before storing anything, since a fill skips holes and pages of zeros (A-419). So there is no revoke
   and no message to the device; the stream offers per-inode DAX (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX` on files of a
   range or more) while the shard's fill budget has room. On Windows (A-180) the object is a section under A-175's
   confining descriptor, reserved at the machine's memory and committed a range at a time. It is duplicated into the
@@ -6678,6 +6680,12 @@ window is the mirror lag at that moment, zero for every operation that awaited t
 > the floor.
 > Recovery's bound changes with it (the paragraph below). The snapshot still runs whole on the committing shard's
 > turn; slicing it is owed. (`docs/bugs/2026-11-07-a-partitions-snapshot-cadence-never-left-its-boot-guess.md`.)
+> **A-420 (2026-11-18):** the commits timed each record's encode in place of the decode a replay does, and a replay
+> held every decoded record of its tail before applying the first, so a record that decodes dearer than it encodes
+> (a thousand one-byte keys, one allocation each) replayed in more than its commits measured and the tail ran past its
+> budget before the trigger fired. A commit now decodes its record as the replay will before writing it, and times
+> that decode with the encode, the write and the apply; recovery decodes, applies and drops one record at a time.
+> (`docs/bugs/2026-11-18-the-snapshot-trigger-timed-the-encode-in-place-of-the-replays-decode.md`.)
 
 **Recovery.** Node restart: the anchor segment replays the local log and `put_wal` into fresh
 indexes; the node rejoins with a new ephemeral id (a restart is a join); its owned objects are
@@ -6691,9 +6699,10 @@ need content fetch and a confirmed lease; measure that complete recovery boundar
 its last snapshot and replaying the log after it. A snapshot comes once that log has taken the budget's worth of
 replay work, as its commits measured it, and is at least the last snapshot's size (A-243). So a partition's recovery is
 at most decode(P) + max(budget, the replay of P bytes of log), where P is its snapshot's size: the budget while the
-partition is small enough, about twice its own snapshot's cost once it outgrows it. The commits' measure errs early,
-since it is slower per byte than the replay (17 against 24 to 27 bytes a microsecond on CI's x86_64, debug) and counts
-a preempted commit's stall.
+partition is small enough, about twice its own snapshot's cost once it outgrows it. The commits' measure covers the
+replay's work: each commit times its record's encode, its decode as the replay will decode it, its checksum and copy
+into the ring, and its apply, where a replay reads, checksums, decodes and applies a record at a time (A-420). It errs
+early by the encode, which bounds the replay's read, and by a preempted commit's stall.
 
 > **Status (2026-11-17, g230: the owner's `put_wal` is its `Local` records).** No structure of its own is needed: a
 > seal's snapshot record stays `Local` in the owner's partition, durable in its anchor with the rest of the log, until
@@ -29857,3 +29866,80 @@ module's channel and message paragraphs).
   a resend and the `FORGET`s logged as on Unix. The anchor's Windows hold needs a kind for the resync end and a
   message that replaces a held entry's record (the session moves as the guest names its owner, its `INIT` is answered,
   a restore runs and its holder changes). And Shards' device half.
+
+### A-420 — A commit times the decode a replay of its record does, and recovery replays a record at a time (2026-11-18, goal 83, g251; A-243's open line)
+
+Applied in the same change to:
+- §4.8: the A-243 status blockquote and the Recovery paragraph's account of the measure.
+- GAPS: the load-test entry's open line (the commits' measure against the replay's).
+- `crates/db/src/record.rs`: `LogRing::encode`, `Encoded::decode_as_replayed` and `LogRing::write` in place of
+  `append`; `LogRing::replay` hands each record to its caller's apply before reading the next (`Replayed::records` in
+  place of the collected `ops`).
+- `crates/db/src/replay.rs`: `append_record` and `timed`; `derive_partition` applies as it walks; the unit test.
+- `crates/ipc` (`DbSnapshotReport::tail_replay_ns`'s doc).
+- **What was there.** A-243's trigger fires once the tail's replay work, as its commits measured it, reaches the
+  recovery budget, so a recovery keeps to the budget only while that measure is at least the replay's own work. The
+  commits timed each record's encode, checksum, copy and apply; a replay reads, checksums, decodes and applies, and it
+  decoded the whole tail into one list before applying any of it. Where a record's decode costs more than its encode
+  the measure fell short: CI's macOS runner measured 0.4x to 1.25x of the replay (run 44260193629's mix test), and a
+  record of a thousand one-byte keys (its decode allocates each key, its encode copies five bytes a key) replays in
+  more than its commits measured on any machine.
+- **The rule.** The measure covers the replay's work, step for step. A commit encodes its record, decodes the body as
+  the replay will, writes it (the checksum and the copy) and applies it, and charges all four: the decode is the
+  replay's own, the write's checksum and copy are the replay's checksum and copy out of the ring, and the encode (an
+  allocation and a write of every byte) bounds the replay's read (an allocation, a zeroing and a copy). So the measure
+  errs early only by the encode and a preempted commit's stall. A body that does not decode is refused `Corrupt`
+  before anything is written: a replay would cut the record there, and every record after it with it. Recovery
+  decodes, applies and drops one record at a time, so it holds one decoded record, never a tail's worth, and repeats
+  per record what the commit timed.
+- **Rejected.** A per-class model of replay cost learned from recoveries: it learns nothing before a daemon's first
+  recovery, which is the one the bound must hold for, and a model by class and bytes misjudges records of one class
+  and size with different shapes (a thousand small keys against one large one), the extrapolation A-243 removed.
+- **Cost.** One decode a commit, the allocations of the record's decoded fields, beside the clone, encode, checksum,
+  copy and apply it already made; the replay saves a tail-sized list.
+- **Tests.** `a_tails_measured_replay_work_covers_its_replay_when_its_records_decode_dearer_than_they_encode`
+  (`replay.rs`'s unit tests): 64 records of 1,024 one-byte keys, their replay in a recovery past a baseline held to
+  what the commits measured. The cadence and cost tests (`snapshot_cadence.rs`, `snapshot_cost.rs`, the model) are
+  filed for main.
+
+### A-419 — A DAX fill that fails part-way leaves its range uncleared and counted, cleared before its next fill begins (2026-11-18, goal 83 item B7, g079; §4.6 the backed route; A-163, A-193)
+Applied in the same change to: §4.6 (the Shards route's DAX line), GAPS (the 2026-10-25 G-vhost entry's open line and
+the backed L1 entry's twin), `crates/vfs/src/shards_backing.rs` (`ShardsBacking::mark_uncleared`, `uncleared`,
+`cleared`), `crates/bridge-core/src/dax_backing.rs` (a range's fill begins by clearing an uncleared one; a failure and
+`abandon_fill` leave it uncleared; `charge_of`; the fill's `range_charge` removed) with three unit tests, and the bug
+record `docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`.
+- **What was there.** A range is marked filled when its fill begins, so write-through reaches it. A fill refused
+  part-way (the volume refusing a slice's seek or read, the OS a store or a placement) or given up (the attachment's
+  bridge gone) unmarked the range and gave its charge back, while the pages its slices stored stayed in the object. No
+  change of the file reached the range from then on, and its next fill copies only the volume's data runs and pages
+  that are not zeros, since a range never filled reads zero. So where the file had since become a hole or zeros, the
+  guest's map showed the old bytes, and the backings held those pages uncounted. A-193's "placed after the fill"
+  reasoned from the old rule.
+- **The rule.** A fill that fails or is given up part-way leaves its range uncleared: no longer filled, so no write
+  reaches it, and still counted, since its slices may have stored bytes. The next fill of the range clears it before
+  it stores anything (`DaxObject::zero`: Linux gives the pages back; macOS and Windows store zeros over what holds
+  bytes, within the range's charge), then fills it as a range never filled. A clear the OS refuses refuses that fill,
+  and the range stays uncleared and counted. A backing's charge counts its filled and uncleared ranges together, so a
+  range moving between them changes no count, and letting the backing go gives both back.
+- **Why this and not another.**
+  - Clearing at the failure would need a second path for a clear refused there, and on macOS and Windows zeroing gives
+    no memory back, so the range would stay counted anyway.
+  - Clearing every range as its fill begins costs nothing on Linux, but on Windows a zeroing is stores over the whole
+    2 MiB (a section tells no holes), which would make every hole's pages resident. Only a range a fill left part-way
+    can hold bytes.
+  - Comparing every page with the volume, as a refill does, reads every page of the range, which on Windows faults
+    its committed pages in.
+- **What it costs.** Nothing on a fill that does not fail. A failed range stays counted until it is filled again or its
+  backing goes: at most a range for each fill that failed, within the budget.
+- **Tests** (`crates/bridge-core/src/dax_backing.rs`, the lib's unit tests; the refusal injected by a context of
+  another volume, which the bridge refuses as any read it cannot serve):
+  `a_fill_refused_part_way_leaves_nothing_a_later_fill_shows`, `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows`
+  and `a_part_way_fill_stays_counted_until_its_range_is_filled_again`. The Mac Studio (d1323898, macOS arm64), debug
+  build, 2026-11-18: red without the fix, 3 of 3 failing (kiln r97: the refused and abandoned fills' first slice still
+  read `A` after the file was zeroed; 2,097,152 bytes counted where two ranges held bytes); green with it, the module's
+  5 of 5.
+- **Siblings, reported, not changed here** (each from reading, each owed a failing test; GAPS):
+  - a successor's adopted DAX object (A-365) may hold a fill's bytes in a range its range table does not name, since
+    a range is recorded only once answered: the one the dead daemon was filling, or one that failed there;
+  - on Windows a range is committed (`prepare_range`) before its charge is asked, so a `Budget` refusal leaves a
+    committed range uncounted, and Windows gives no committed page of a section back.
