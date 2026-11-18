@@ -523,7 +523,11 @@
 > Subversion failed on both sides: Git for Windows' shell rewrote the argument `^/trunk` as a path,
 > `^C:\Program Files\Git\trunk` (svn `E020024`). Fixed: the variable is set on the git workload's `ln -s` alone, so git
 > runs as Git for Windows ships it, its symbolic links off; and `MSYS_NO_PATHCONV=1` hands every argument on as
-> written. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> written. **Corrected the same day (CI run 44271637767, both architectures; A-327):** Subversion ran identical, and
+> every `hg` exited 2 on both sides, Python handed `/c/hostedtoolcache/…/Scripts/hg` unconverted (pip's `hg` is a `#!`
+> script naming `python.exe`, started with the script's path as its argument) and reading it on drive `D:`. The shared
+> environment now leaves only Subversion's `^/` URLs unconverted (`MSYS2_ARG_CONV_EXCL=^/`), red-tested by
+> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
@@ -734,7 +738,12 @@
 > 44252296495), and Subversion with only the item order A-319 fixed. In 44260193629 the macOS leg ran git, git's history,
 > Mercurial and cargo identical, and Subversion differed at `repo/db/revprops`, `755` on the host and `2755` over the
 > mount: slates gave a directory made in a set-group-ID parent the bit, System V's rule, where APFS gives none; fixed
-> by A-328 (the NFS export gives its host's rule, BSD's on macOS), failing test first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> by A-328 (the NFS export gives its host's rule, BSD's on macOS), failing test first. In the next run with A-328
+> (44271637767, main 7d760c4e) macOS ran all twelve workloads identical, Subversion's included; and pjdfstest there failed
+> 63 cases of `chown/00.t` unlisted (`expected 0,0, got 0,20`): an object root makes takes the group of the directory
+> the run starts in under BSD's rule, and that directory was the harness's own user's (staff). pjdfstest assumes root's
+> directory, as the file system under test's is, so a root run now starts in a directory handed to root, owner and
+> group 0 (A-328's entry); (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
