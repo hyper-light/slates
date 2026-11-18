@@ -411,8 +411,19 @@ struct Ended {
   gone_at_ns: Option<u64>,
 }
 
+/// The longest a call outstanding at its daemon's exit may take to end after it, by the client's own rule: its next reply
+/// deadline after the exit, past the reconnect budget, and one of the reconnect's paced attempts (`reconnect / 10`, the
+/// driver's pacing).
+fn call_after_exit() -> Duration {
+  let deadlines = deadlines();
+  Duration::from_nanos(deadlines.reply_ns + deadlines.reconnect_ns + deadlines.reconnect_ns / 10)
+}
+
 /// Drives `driver` as an SDK's loop does until the call `ticket` ends or `give_up` passes from `held_at`, watching
-/// `daemon`'s process.
+/// `daemon`'s process. Once the process has exited, the loop runs on until the call's own bound after the exit
+/// ([`call_after_exit`]) and a beat, past `give_up` if need be: a busy machine stretches the verdict's window of a spinning
+/// shard's CPU over many windows of wall time (8.49 s at loads 62 to 131 on a 15-CPU Mac, 2026-11-17), and a loop that
+/// ended at `give_up` read a call still within its bound as never ended.
 fn drive(
   client: &mut Client,
   driver: &mut Driver,
@@ -427,7 +438,12 @@ fn drive(
     gone_at_ns: None,
   };
   let mut next_tick = Instant::now();
-  while ended.call.is_none() && held_at.elapsed() < give_up {
+  let until = |ended: &Ended| {
+    ended.exit.map_or(give_up, |(_, exited_after)| {
+      give_up.max(exited_after + call_after_exit() + BEAT)
+    })
+  };
+  while ended.call.is_none() && held_at.elapsed() < until(&ended) {
     let mut events = driver.pump(client);
     if Instant::now() >= next_tick {
       events.extend(driver.tick(client));
@@ -576,11 +592,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let line_after = Duration::from_nanos(line_read_ns.saturating_sub(t0_ns));
   let gone_after = Duration::from_nanos(gone_ns.saturating_sub(t0_ns));
   let end = Duration::from_nanos(gone_ns.saturating_sub(line_read_ns));
-  let deadlines = deadlines();
-  let call_bound = exited_after
-    + Duration::from_nanos(
-      deadlines.reply_ns + deadlines.reconnect_ns + deadlines.reconnect_ns / 10,
-    );
+  let call_bound = exited_after + call_after_exit();
   let signed_ns = |after: Duration, bound: Duration| -> i128 {
     i128::try_from(after.as_nanos()).unwrap() - i128::try_from(bound.as_nanos()).unwrap()
   };
