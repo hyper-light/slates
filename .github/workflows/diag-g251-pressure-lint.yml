@@ -1,0 +1,35 @@
+# Diagnostics only, never merged (g251, A-336): the lint wall over the touched crates and their downstream on Linux,
+# where the Linux-only code compiles, x86_64 and arm64.
+name: diag-g251-pressure-lint
+
+on:
+  push:
+    branches: ['diag-g251-pressure-lint-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  lint:
+    name: lint on Linux (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: The lint wall over the touched crates and their downstream
+        if: success() || failure()
+        run: cargo clippy --locked -p slates-machine -p slates-rt -p slates-server -p slates-api -p slates-cli --all-targets -- -D warnings
+      - name: The kernel-held thread test again
+        if: success() || failure()
+        run: cargo test --locked -p slates-rt --lib thread_clock
