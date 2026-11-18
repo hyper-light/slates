@@ -195,6 +195,26 @@ impl RecordLink {
   }
 }
 
+/// One peer's record dial as its link task (`crate::fleet::establish_record_link`) last left it (§4.8, §4.14): what
+/// status and a fleet whose formation failed read to tell a dial still inside one handshake call, one waiting on its
+/// first discovery page, and one that keeps failing. A dialer that nobody answers spends a whole handshake budget
+/// inside one call, and counts nothing until the call ends; this says so while it runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordDial {
+  /// When the link began dialing for the session it lacks (the runtime clock), while it lacks one.
+  pub dialing_since_ns: Option<u64>,
+  /// When its current handshake call began, while one runs.
+  pub call_since_ns: Option<u64>,
+  /// When its fresh session's first discovery page was sent, while the link waits on it to install the session.
+  pub enroll_since_ns: Option<u64>,
+  /// Handshake budgets its dialer has spent without establishing (`Endpoint::handshake_budgets_spent`).
+  pub budgets_spent: u32,
+  /// Why its dialer's last budget ended (`Endpoint::handshake_stall`), while that dialer is kept for another call.
+  pub stall: Option<slates_transport::endpoint::HandshakeStall>,
+  /// Handshake calls made for this peer since boot: a dial that keeps calling is one that keeps failing.
+  pub calls: u64,
+}
+
 /// A mount capability's place in the shard's attachment registry (GAP-A9-4).
 #[derive(Clone, Copy, Debug)]
 pub struct MountAttachment {
@@ -512,6 +532,9 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The keys the human registered to sign grants with (A-285; `crate::grant_signature`). A signed `Grant` verifies
+  /// only under one of them; none are registered until the human's surface registers the first.
+  pub grant_keys: Vec<crate::grant_signature::RegisteredKey>,
   /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
   /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
   pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
@@ -769,6 +792,9 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, RecordLink>,
+  /// Each peer's record dial ([`RecordDial`]), as its link task last left it: read by status and by a fleet whose
+  /// formation failed. One entry a peer, bounded by the fleet's peer capacity as `pairs_delivered` is.
+  pub record_dials: BTreeMap<slates_db::HostId, RecordDial>,
   /// The congestion state of each session a peer dialed to this node, as its serve loop last saw it after a request,
   /// keyed by the peer's stable anchor: the connections a peer's forwards and reads ride, whose sender here is this
   /// node. One a peer, replaced on a re-dial, so bounded by the roster. Empty on a laptop.
@@ -964,9 +990,9 @@ pub struct ShardState {
   /// Taken-over objects whose head this node adopted and placed but whose **content** it has not yet
   /// materialized into a served volume (§4.10 "Promotion and takeover" → serve): the adopted head
   /// value, kept until the manifest's archive is held (already, as a content candidate, or fetched
-  /// from a recorded holder) and the volume is created under its original id. Empty once every
-  /// takeover serves.
-  pub pending_materializations: BTreeMap<ObjectId, crate::head::HeadValue>,
+  /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
+  /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
+  pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
   /// The catalog register this node adopted for each taken-over volume (keyed by the volume's object), with
   /// the adopted record's sequence (AUD-29-17): a pending materialization waits for it, and the successor's
   /// record continues the register from that sequence. Bounded by the objects this node owns.
@@ -1270,6 +1296,10 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
 pub struct PendingGreen {
   /// Its newest merge record, as adopted.
   pub merge: crate::merge_service::MergeRecordValue,
+  /// The retired owner whose takeover round adopted it, `None` for one no round adopted. While that round still pages,
+  /// a wait for the green's catalog register counts against the bound only when the round has not advanced since the
+  /// previous attempt: the register may come on a later page (`takeover::rounds_still_paging`, [`round_advanced`]).
+  pub departed: Option<slates_db::register::HostId>,
   /// The survivors other than this node that reported the adopted version in the takeover's round: each accepted it,
   /// and a holder accepts a merge record only once it holds the inputs it names (A-244), so these hold every input
   /// this node may lack (`fleet::fetch_green_inputs`). Bounded by the fleet's members.
@@ -1282,19 +1312,26 @@ pub struct PendingGreen {
   /// Progress is a new low: only then do the attempts start again, so an input fetched, released and fetched again
   /// cannot hold the green pending without end; the attempts start again at most once per input the ledger names.
   pub fewest_unheld: Option<usize>,
+  /// The page advances of its still-paging takeover round at the last attempt that waited on its catalog register,
+  /// `None` before the first ([`PendingGreen::record_round`]).
+  pub round_seen: Option<u64>,
 }
 
 impl PendingGreen {
-  /// A green just adopted with its newest merge record `merge`, whose version `sources` reported: no attempt made yet.
+  /// A green just adopted with its newest merge record `merge` by `departed`'s takeover round, whose version `sources`
+  /// reported: no attempt made yet.
   pub fn adopted(
     merge: crate::merge_service::MergeRecordValue,
+    departed: Option<slates_db::register::HostId>,
     sources: Vec<slates_db::register::HostId>,
   ) -> PendingGreen {
     PendingGreen {
       merge,
+      departed,
       sources,
       attempts: 0,
       fewest_unheld: None,
+      round_seen: None,
     }
   }
 
@@ -1309,5 +1346,220 @@ impl PendingGreen {
       self.fewest_unheld = Some(unheld);
     }
     progress
+  }
+
+  /// Records, after an attempt that waited on its catalog register, that the still-paging takeover round which adopted
+  /// it has advanced `advances` pages so far; whether the round advanced since the previous such attempt (after a
+  /// first), which is progress and starts its attempts again ([`round_advanced`]).
+  pub fn record_round(&mut self, advances: u64) -> bool {
+    let progress = round_advanced(&mut self.round_seen, advances);
+    if progress {
+      self.attempts = 0;
+    }
+    progress
+  }
+}
+
+/// A taken-over volume awaiting materialization (§4.8 "Promotion and takeover", §4.10;
+/// `ShardState::pending_materializations`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingVolume {
+  /// Its adopted head.
+  pub head: crate::head::HeadValue,
+  /// The retired owner whose takeover round adopted it, `None` for one no round adopted (a mirror's promotion seeds
+  /// its catalog with its head). While that round still pages, a wait for the volume's catalog register or that
+  /// register's placement counts against the bound only when the round has not advanced since the previous attempt:
+  /// the register may come on a later page (`takeover::rounds_still_paging`, [`round_advanced`]).
+  pub departed: Option<slates_db::register::HostId>,
+  /// The materializations attempted since the last that made progress, one a fleet period: past the failover SLO's
+  /// worth the volume is given up on, every verb on it answering `Refusal::NotRecovered`
+  /// (`fleet::materialize_pending`).
+  pub attempts: u32,
+  /// The most chunks of its head's content found staged here after an attempt's fetch so far, `None` before the first
+  /// look. Progress is a new high: only then do the attempts start again, so a fetch cut by its deadline each period
+  /// is given up only once it stops advancing, and the count starts again at most once per chunk the content names.
+  pub most_staged: Option<usize>,
+  /// The page advances of its still-paging takeover round at the last attempt that waited on its catalog register,
+  /// `None` before the first ([`PendingVolume::record_round`]).
+  pub round_seen: Option<u64>,
+}
+
+impl PendingVolume {
+  /// A volume just adopted with its head `head` by `departed`'s takeover round: no attempt made yet.
+  pub fn adopted(
+    head: crate::head::HeadValue,
+    departed: Option<slates_db::register::HostId>,
+  ) -> PendingVolume {
+    PendingVolume {
+      head,
+      departed,
+      attempts: 0,
+      most_staged: None,
+      round_seen: None,
+    }
+  }
+
+  /// Records that `staged` chunks of its content are staged here after an attempt's fetch; whether that is progress (a
+  /// new high, after a first look), which starts its attempts again.
+  pub fn record_staged(&mut self, staged: usize) -> bool {
+    let progress = self.most_staged.is_some_and(|most| staged > most);
+    if progress {
+      self.attempts = 0;
+    }
+    if self.most_staged.is_none_or(|most| staged > most) {
+      self.most_staged = Some(staged);
+    }
+    progress
+  }
+
+  /// Records, after an attempt that waited on its catalog register or that register's placement, that the
+  /// still-paging takeover round which adopted it has advanced `advances` pages so far; whether the round advanced
+  /// since the previous such attempt (after a first), which is progress and starts its attempts again
+  /// ([`round_advanced`]).
+  pub fn record_round(&mut self, advances: u64) -> bool {
+    let progress = round_advanced(&mut self.round_seen, advances);
+    if progress {
+      self.attempts = 0;
+    }
+    progress
+  }
+}
+
+/// Whether a still-paging takeover round, read at `advances` page advances (`takeover::rounds_still_paging`), advanced
+/// since an object waiting on it last read it at `seen`, which it then reads. A first look is no advance. A round's
+/// count only grows, but a round begun anew counts from zero, so any change is an advance. An object waits on its round
+/// only for a register the round's later pages may bring (its catalog register sorts after every head of its creator's
+/// partition, and a round reads a page a member a period): while the round advances, the wait is progress and its
+/// attempts start again; while the round stands still (a member that never answers, or answers without moving on), the
+/// wait counts toward the bound like any other.
+fn round_advanced(seen: &mut Option<u64>, advances: u64) -> bool {
+  let advanced = seen.is_some_and(|seen| seen != advances);
+  *seen = Some(advances);
+  advanced
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A green's adopted merge record, for a pending green.
+  fn adopted_record() -> crate::merge_service::MergeRecordValue {
+    crate::merge_service::MergeRecordValue {
+      version: 3,
+      increment: [5u8; 32],
+      base: 2,
+      inputs: Some([9u8; 32]),
+      identity: [7u8; 32],
+      evidence: Vec::new(),
+      name: "green".to_owned(),
+      require_evidence: false,
+      owner: slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1000,
+      },
+      completion: None,
+    }
+  }
+
+  /// §4.8 takeover, CLAUDE.md §2 item 8 (no unbounded retry): a taken-over green's attempts start again only when an
+  /// attempt leaves fewer of its inputs unheld than ever before. Do: record 3 unheld at the first look, make attempts,
+  /// then record 3, 2, 3 (an input released and fetched again), 2 and 0. Expect progress only at 2 and at 0, each
+  /// starting the attempts again, and none at the first look or at a count already reached, so an input that keeps
+  /// being lost cannot keep the green pending without end.
+  #[test]
+  fn a_greens_attempts_start_again_only_at_a_new_low_of_unheld_inputs() {
+    let mut pending = PendingGreen::adopted(adopted_record(), None, Vec::new());
+    let mut seen = Vec::new();
+    for unheld in [3, 3, 2, 3, 2, 0] {
+      pending.attempts = 5;
+      let progress = pending.record_unheld(unheld);
+      seen.push((unheld, progress, pending.attempts));
+    }
+    assert_eq!(
+      seen,
+      vec![
+        (3, false, 5),
+        (3, false, 5),
+        (2, true, 0),
+        (3, false, 5),
+        (2, false, 5),
+        (0, true, 0),
+      ]
+    );
+  }
+
+  /// §4.8 takeover, CLAUDE.md §2 item 8: a taken-over volume's attempts start again only when its staged content
+  /// reaches a new high. Do: record 4 chunks staged at the first look, make attempts, then record 4, 9, 2 (the stage
+  /// dropped and fetched again), 9 and 10. Expect progress only at 9 and at 10, so a fetch cut by its deadline each
+  /// period is given up only once it stops advancing, and a stage that keeps being lost cannot keep the volume pending
+  /// without end.
+  #[test]
+  fn a_volumes_attempts_start_again_only_at_a_new_high_of_staged_content() {
+    let mut pending = PendingVolume::adopted(
+      crate::head::HeadValue {
+        manifest: Some([9u8; 32]),
+        content_holders: vec![7],
+        sealing: None,
+      },
+      None,
+    );
+    let mut seen = Vec::new();
+    for staged in [4, 4, 9, 2, 9, 10] {
+      pending.attempts = 7;
+      let progress = pending.record_staged(staged);
+      seen.push((staged, progress, pending.attempts));
+    }
+    assert_eq!(
+      seen,
+      vec![
+        (4, false, 7),
+        (4, false, 7),
+        (9, true, 0),
+        (2, false, 7),
+        (9, false, 7),
+        (10, true, 0),
+      ]
+    );
+  }
+
+  /// §4.8 takeover, CLAUDE.md §2 item 8: a taken-over object waiting on its catalog register while the round that
+  /// adopted it pages starts its attempts again only when the round has advanced since its previous look, for a volume
+  /// and a green alike. Do: read the round at 3 page advances at the first look, then 3, 4, 4, 9 and, the round begun
+  /// anew, 0. Expect progress at 4, 9 and 0 and nowhere else, so a round that stands still lets the attempts count, and
+  /// one that keeps paging keeps the object pending only while it moves on.
+  #[test]
+  fn a_wait_on_a_paging_round_is_progress_only_while_the_round_advances() {
+    let mut volume = PendingVolume::adopted(
+      crate::head::HeadValue {
+        manifest: None,
+        content_holders: Vec::new(),
+        sealing: None,
+      },
+      Some(slates_db::register::HostId(5)),
+    );
+    let mut green = PendingGreen::adopted(
+      adopted_record(),
+      Some(slates_db::register::HostId(5)),
+      Vec::new(),
+    );
+    let (mut volume_seen, mut green_seen) = (Vec::new(), Vec::new());
+    for advances in [3, 3, 4, 4, 9, 0] {
+      volume.attempts = 6;
+      green.attempts = 6;
+      let progress = volume.record_round(advances);
+      volume_seen.push((advances, progress, volume.attempts));
+      let progress = green.record_round(advances);
+      green_seen.push((advances, progress, green.attempts));
+    }
+    let expected = vec![
+      (3, false, 6),
+      (3, false, 6),
+      (4, true, 0),
+      (4, false, 6),
+      (9, true, 0),
+      (0, true, 0),
+    ];
+    assert_eq!(volume_seen, expected, "a volume");
+    assert_eq!(green_seen, expected, "a green");
   }
 }

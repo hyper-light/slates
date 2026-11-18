@@ -3560,6 +3560,39 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::fleet::SERVE_RECEIVE_OTHER,
             demux_sum(state, |c| c.receive_refused_other),
           ),
+          (crate::fleet::SERVE_OPENED, demux_sum(state, |c| c.opened)),
+          (
+            crate::fleet::SERVE_SETUP_REFUSED,
+            demux_sum(state, |c| c.setup_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEER_SESSIONS_REFUSED,
+            demux_sum(state, |c| c.peer_sessions_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEERS_REFUSED,
+            demux_sum(state, |c| c.peers_refused),
+          ),
+          (
+            crate::fleet::SERVE_HIGH_WATER,
+            demux_sum(state, |c| c.high_water),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_DIALING,
+            crate::fleet::record_dials_dialing(state),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_CALL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.call_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_ENROLL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.enroll_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_CALLS,
+            crate::fleet::record_dials_calls(state),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -9581,10 +9614,18 @@ pub(crate) fn materialize_taken_over_green(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  debug_assert!(matches!(
+  // The id must name a green here. A volume of another role already recorded under it is not this green, and replaying
+  // the green's chain onto its record would serve one object as another: refused typed (a `debug_assert!` before
+  // 2026-11-18, which panicked a debug build's shard and let a release build go on). The takeover counts the refusal and
+  // gives the green up at its bound, naming `refused` (`fleet::materialize_pending_greens`).
+  if !matches!(
     crate::merge_service::merge_role(state, id),
     Some(MergeRole::Green { .. })
-  ));
+  ) {
+    return Err(Box::new(refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(id),
+    })));
+  }
   // The chain, durably, in order — each entry guarded before it is applied.
   let now = state.clock.monotonic_ns();
   // What this node holds durably already: its checkpoint's version and the increments after it (W3).
@@ -14602,6 +14643,68 @@ mod tests {
       panic!("{reply:?}")
     };
     *state.by_id.get(&super::to_db_volume(id)).unwrap()
+  }
+
+  /// §4.16 owner-loss recovery, CLAUDE.md §2 item 6 (no panics in non-test code, ever): a taken-over green whose id
+  /// names a volume of another role on its owner shard is refused typed, and nothing is rebuilt over it. Do: create a
+  /// plain volume, then materialize a taken-over green under its id and another name. Expect `AlreadyExists` naming
+  /// the id, no green engine, and the plain volume still plain and served. Before (2026-11-18), a `debug_assert!` on the
+  /// volume's role panicked the shard in a debug build, and a release build went on to replay the green's chain against
+  /// the plain volume's record.
+  #[test]
+  fn a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed() {
+    let (wire, answer, engine, role, served) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "plain".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id: wire } = reply else {
+        panic!("{reply:?}")
+      };
+      let id = super::to_db_volume(wire);
+      let recovery = crate::merge_service::GreenRecovery {
+        name: "green".to_owned(),
+        require_evidence: false,
+        owner,
+        access: Vec::new(),
+        catalog_sequence: 1,
+        origin: None,
+        chain: Vec::new(),
+        completions: Vec::new(),
+        head: 0,
+        identity: [0; 32],
+      };
+      let answer = super::materialize_taken_over_green(state, id, recovery).map_err(|reply| *reply);
+      (
+        wire,
+        answer,
+        state.greens.contains_key(&id),
+        crate::merge_service::merge_role(state, id).is_none(),
+        state.by_id.contains_key(&id),
+      )
+    });
+    assert_eq!(
+      answer,
+      Err(ReplyBody::Refused {
+        refusal: Refusal::AlreadyExists { existing: wire }
+      }),
+      "a green is never materialized over a plain volume"
+    );
+    assert!(!engine, "no green engine over the plain volume");
+    assert!(role, "the volume under the id is still plain");
+    assert!(served, "the plain volume is still served");
   }
 
   /// What a client observes of the node at `path`: its kind and permission bits, owner, link count, four
