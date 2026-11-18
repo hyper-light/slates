@@ -222,7 +222,12 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 70
+slates-machine = 72
+# 2026-11-18 (+2, A-318, one compiled per target): the build-cost chain in machine code (`build_cost.rs`,
+#   `machine_chain`), an `asm!` block for x86-64 and one for AArch64, each reading a slice it is handed and writing only
+#   its own registers. Machine code is the point: it is the one form of the work no compiler flag instruments or
+#   deoptimizes, so the compiled chain's time against it is this build's slowdown, which the watchdog holds a poll's
+#   CPU to. No safe form of inline assembly exists.
 # 2026-11-08 (+7, the start judgment per thread): another process's threads, each one's CPU (`process_clock.rs`,
 #   `busiest_of` and `busiest_thread_ns`): on macOS `proc_pidinfo(PROC_PIDLISTTHREADS)` and `proc_pidinfo
 #   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
