@@ -7278,6 +7278,20 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   teardown's end and in the orphan sweep: waiting verbs refused `NotFound`, parked replies woken to "not durable").
 >   The destroy flow now holds the owner to it too (red first, 1 of 1).
 >
+> **The round, counted hop by hop (2026-11-18, g076b).** A-200's measurement placed the added median in "the
+> cross-shard dispatch round" from averages (an entry's build 13.3 µs, its round 90.7 µs, the exchange alone about
+> 25 µs) and owed the round's hops apart. The owner now times each write's round from stamps on the host's one monotonic
+> clock (`slates_machine::clock`, one origin across shards and processes; a shard's driver clock starts at its own epoch,
+> so its readings on two shards differ by a constant and a span across them is not a span): the publication reaching
+> the shipper, its message made, its lane free on the control shard, the message sent and its answer read there
+> (`live_ship::LaneStamps`), and the fold that makes the entry durable. Each pair of consecutive stamps is one hop,
+> counted with its nanoseconds once a write by that fold (`fleet.live.hop.{build,to_control,lane,exchange,to_owner,round}`
+> and each `_ns`; `count_hops`), so the five hops add up to the round exactly. A reply held for the entry times its own
+> wake from the fold (`fleet.live.hop.reply`, `wait_durable`), and a holder times its serve, the publication that keeps
+> the entry included (`fleet.live.hop.holder`). Held by `a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it`
+> (`crates/server/tests/fleet.rs`: 16 writes in a closed loop; each hop timed once a timed round; the hops' nanoseconds
+> equal to the rounds'). The breakdown under the contract command is owed (the supervisor's run).
+>
 > **FUSE `fsync` at durability (2026-11-05).** A FUSE mount answered `fsync` at the owner's own barrier, so on a
 > live-shipped volume it claimed what no candidate held: with both candidates' processes stopped it returned success in
 > 19 µs (`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`, red first). An `fsync` (or `fsyncdir`)
