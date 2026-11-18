@@ -266,10 +266,23 @@
 > - **Owed:** a seal's archive walk and its wrap each advance one slice a record period (100 ms), so a large volume takes
 >   many periods to place: at a walk slice of half a 20 µs quantum at 5 GB/s, about 50 KB a period, a GiB takes hours.
 >   The turns are bounded; their pace is not derived from the loss window a seal serves.
-> - **Owed (siblings, one-turn walks of a whole volume):** a takeover's open of a sealed envelope
->   (`fleet::opened_archive`'s `envelope::open`) and a live log's whole record (`live_ship::payload` seals the volume's
->   whole image in one turn) are each one turn of the whole volume, the first on the successor, the second at every
->   whole entry and install image.
+> - **Closed (2026-11-18, A-347):** a takeover opens a sealed envelope in turns of the successor's owner shard
+>   (`fleet::open_in_turns`, `slates_cluster::envelope::Opening`); test `a_takeovers_envelope_is_opened_in_turns_and_served`.
+> - **Closed (2026-11-18, A-347): the sliced walks were one poll on the control shard.** A walk's slices are calls from a
+>   control-shard task, and a call to the caller's own shard runs inline, so the live period, a returned holder's walk
+>   (A-324), the seal walk and the open ran every slice in one poll over the control shard's own volumes and on every
+>   shard of a one-shard daemon; their tests counted slices, not polls. They now go through `xshard::Turns` (a call to
+>   the driving shard yields first; two slices of one walk in one poll counted `xshard.turns_shared`, which the four
+>   tests hold at zero). The measurer's A-324 longest steps (at most 12.0 ms over 1,000 live volumes, 42.0 ms over 4,000,
+>   one shard, 2026-11-18) grew with the volumes as one poll would; to be measured again.
+> - **Owed (siblings, one-turn walks of a whole volume):** a live log's whole record (`live_ship::payload` seals the
+>   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
+>   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
+>   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+> - **Owed (found by the measurer, 2026-11-18, Mac Studio, main 1eca77263):** at a GiB seal the owner's longest step,
+>   230 to 272 ms in 4 runs, is one step after the wrap ends (the envelope's completion or the first content round's put,
+>   not yet told apart), about a quarter of a millisecond a MiB: a seal of about 4 GiB would reach the watchdog's
+>   one-second window (extrapolated).
 > - **Owed (sibling, a seal left with nothing to do):** a content round's archive is carried back to the owner shard by
 >   `xshard::run_on_counted` (`fleet::put_seal_content`); a full control channel drops it, counted `xshard.run_refused`,
 >   and leaves the job with no archive as A-322's did, until a newer snapshot supersedes it.
