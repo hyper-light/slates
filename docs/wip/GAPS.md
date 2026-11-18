@@ -671,7 +671,14 @@
 > every `hg` exited 2 on both sides, Python handed `/c/hostedtoolcache/…/Scripts/hg` unconverted (pip's `hg` is a `#!`
 > script naming `python.exe`, started with the script's path as its argument) and reading it on drive `D:`. The shared
 > environment now leaves only Subversion's `^/` URLs unconverted (`MSYS2_ARG_CONV_EXCL=^/`), red-tested by
-> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. In the same run
+> git and git's history failed on the drive alone, `fatal: detected dubious ownership`, git naming the owner Everyone
+> (`S-1-1-0`): the drive answered no security query (WinFsp's DLL refused each, and Windows reported its world
+> descriptor), and the one descriptor it held named the Administrators group. **Fixed by A-350:** that descriptor names
+> the account the daemon runs as, which every client of a Windows daemon is, for owner and its primary group for group,
+> and the drive answers security queries with it, as NTFS reports a file its account made
+> (`what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`); three winfstest cases that ask for exactly
+> its access list pass and are struck (382 to 379). **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
@@ -680,10 +687,12 @@
 > `MountUseMountmgrFromFSD=1`, which an Administrator sets once (as WinFsp itself is installed once) and which then lets
 > an unprivileged mount use the Mount Manager from WinFsp's kernel driver, its drives global to the machine (WinFsp's
 > registry-settings page: "not recommended for general use"); (c) mount as a WinFsp network file system, whose
-> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
-> cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
-> first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
-> Windows form.
+> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Shown
+> (2026-11-18, diagnostics run 44336880588, with A-327's correction and A-350):** on both Windows runners git and
+> Subversion ran identical over the drive, and git's history and Mercurial identical but for the drive's stated
+> hard-link lines; the cell's record (`native-windows-winfsp.workloads.json`, the owed skip of 2026-11-05 until then) is
+> re-recorded from the x86_64 run. **Open:** the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor,
+> watcher) are owed a Windows form.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
@@ -887,7 +896,10 @@
 > 63 cases of `chown/00.t` unlisted (`expected 0,0, got 0,20`): an object root makes takes the group of the directory
 > the run starts in under BSD's rule, and that directory was the harness's own user's (staff). pjdfstest assumes root's
 > directory, as the file system under test's is, so a root run now starts in a directory handed to root, owner and
-> group 0 (A-328's entry); (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> group 0 (A-328's entry): diagnostics run 44329324901 ran pjdfstest as root there with no unlisted failure (8,569 of
+> 8,686 passed, the 117 listed failed), and the macOS records are re-recorded, pjdfstest's from that run (the unprivileged
+> run of 2026-09-16 until then) and the workloads' from 44271637767 (all twelve identical); (2) ~~the Windows WinFsp
+> roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
@@ -10069,6 +10081,25 @@ whose verifier disagrees written again — with a kill per round and a final kil
 6 rewrite rounds forced by a changed verifier, 0 lost, in each of three runs. The empty files came from runs where every
 kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
 client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
+
+### 2026-11-18: a WinFsp write answered before its publication may be lost across a daemon kill (A-358's sibling; open, unproven)
+
+A-358 found that an NFS write answered before any publication is lost when the daemon dies, if the client never sends
+it again (Apple's never does). WinFsp has the same shape:
+- a plain write is answered before any publication; only a namespace or size change, a flush, and the close of a handle
+  that wrote publish first (`crates/server/src/winfsp.rs`);
+- Windows has no write log (`write_log` is `#[cfg(unix)]`);
+- a WinFsp drive outlives a killed daemon (A-198).
+
+So a kill between a paging write's reply and the next flush or close would lose that write, and the successor's flush
+would answer success over the state without it, since Windows' cache manager already counts those pages clean.
+
+Owed:
+1. The test, on CI's Windows runners: `crates/cli/tests/nfs_held.rs`'s `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite`
+   shape on a WinFsp drive: write, kill, flush, close, read back.
+2. If it is red, the fix: A-358's rule (publish every write before its reply), or the write log on Windows, A/B'd.
+
+Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 

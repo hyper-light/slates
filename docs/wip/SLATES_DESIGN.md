@@ -16461,7 +16461,12 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
     NOT_CONTENT_INDEXED and a directory's READONLY beside the mode, and a file's READONLY is its mode's write bits, so
     the reason stands for READONLY and no longer for the rest; the 18 cases are off the list.
   - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
-    volume's own rule; a DACL set or asked for at create is not kept.
+    volume's own rule; a DACL set or asked for at create is not kept. **Amended by A-350 (2026-11-18):** the one
+    descriptor names the account the daemon runs as for owner and that account's primary group for group (it named the
+    Administrators group), and a security query is answered with it (before, WinFsp's DLL refused every query, and
+    Windows reported its world descriptor: owner Everyone, no access list), so git trusts a repository on the drive. The
+    reason stands for access lists and for an owner or group set after the create; three winfstest cases that ask for
+    exactly the drive's access list pass and are off the list.
   - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
     time), and POSIX has no setter. **Amended by A-259 (2026-11-08):** the bridges' attributes carry the volume's
     birth time, the drive reports it and keeps the one `SetFileTime` sets, and `t/base/06.t` case 5 is off the list.
@@ -17595,10 +17600,10 @@ Applied in the same change to:
   - The worker posts the confirmation, wakes the mount's task, acknowledges and goes on. The FIFO channel puts the
     confirmation ahead of the worker's next request.
   - Why the post wakes the shard: without the wake, the confirmation would wait for the worker's next shard call to carry
-    it, and a request answered without the shard can come right after a Create: the host registers no GetSecurity
-    callback (`ffi.rs`, `get_security: None`), so WinFsp's own QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without
-    calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`), and QueryEa and QueryStreamInformation likewise
-    (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
+    it, and a request answered without the shard can come right after a Create: the host's GetSecurity answers
+    QuerySecurity from the mount's one descriptor on the receiving thread (A-350; before it, WinFsp's DLL refused the
+    query itself, `src/dll/fsop.c:1444-1445` of v2.1), and WinFsp answers QueryEa and QueryStreamInformation without
+    calling the host at all (`fsop.c:1208`, `1478`). Its save would then find the confirmation unapplied and wait out a whole round for it. Woken at the post, the
     shard applies it while the worker acknowledges and receives; the post costs one wake, far below the round it
     replaces.
   - The acknowledgement settles the response; nothing clears it but the next save. Before any save, the worker takes the
@@ -24917,8 +24922,9 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   the Subversion script stopped at its first `^/` there (the harness runs every script under `set -e`). Test:
   `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url`
   (`crates/conformance/src/workload.rs`, run by both Windows lanes once their tools are installed): `hg version` and
-  Python's echo of `^/trunk` under the shared environment, red under `MSYS_NO_PATHCONV` (exit 2) and under no setting
-  (`^C:\Program Files\Git\trunk`).
+  Python's echo of `^/trunk` under the shared environment. Green on both Windows runners in diagnostics run 44329324901,
+  and red there with each setting put back: under `MSYS_NO_PATHCONV`, `hg` exits 2 with CI's own message (`can't open
+  file 'D:\\c\\hostedtoolcache\\…\\Scripts\\hg'`); with no setting, Python is handed `^C:/Program Files/Git/trunk`.
 
 ### A-328 — A new object takes its group by the rule of the kernel its route serves: System V's for Linux kernels, its host's own over the NFS export, BSD's on macOS (2026-11-18, A-289's macOS run; Ada's goal of 2026-11-18)
 Applied in the same change to: §4.6 ("POSIX and transparency acceptance": the group a new object takes), GAPS (A-289's
@@ -24967,7 +24973,10 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   and its record's command says so. Linux's System V rule gave root's objects group 0 whatever the directory's group,
   so nothing changes there, and no listed case is about a group. Test:
   `what_root_makes_where_a_root_run_starts_is_in_group_0` (the same file), run by CI's macOS gates job, whose runner
-  has passwordless `sudo`; it skips loudly without it.
+  has passwordless `sudo`; it skips loudly without it. Green on macos-latest in diagnostics run 44329324901, and red
+  there with the group left out of the hand-over (`chown 0`): root's directory took group 20, its start's. In the same
+  run pjdfstest as root over the NFS loopback mount failed only its 117 listed cases (8,569 of 8,686 passed;
+  `chown/00.t` its 8 listed), and its record replaces the unprivileged run of 2026-09-16.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
@@ -26520,3 +26529,58 @@ Applied in the same change to:
     kill as soon as it is answered, a COMMIT, and no WRITE again. Before the change it lost 6 of 6 files (0 of
     52,177 bytes each); after, 0 of 6, every COMMIT having met a successor's verifier.
   - The kernel client under kills: see GAPS ("2026-10-06: two fsync-acknowledged files came back empty").
+
+### A-350 — The WinFsp drive reports the account it serves as every object's owner, and answers security queries with its one descriptor (2026-11-18, g261, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route; amends A-209's SECURITY difference)
+Applied in the same change to: §4.6 (the stated SECURITY difference; the receiver's rule for why the confirmation's
+post wakes the shard), GAPS (A-300's entry), `crates/bridge-winfsp/src/account.rs` (new: a SID's text from its bytes,
+the SID a token buffer points at, the drive's SDDL), `host.rs` (`drive_security_descriptor`, `token_information`,
+`get_security`), `ffi.rs` (the `GetSecurity` slot), `unsafe-budget.toml` (148 to 155), winfstest's reviewed list
+(three cases struck, 382 to 379) and its record, the drive's workloads record, the evidence matrix, and
+`crates/cli/tests/winfsp_semantics.rs`.
+- **What CI found.** Run 44271637767, both Windows lanes: git and git's history failed on the drive alone, `fatal:
+  detected dubious ownership in repository at 'E:/conformance-8232/workloads/git'`, git naming the owner `Everyone
+  (S-1-1-0)` and the user `runneradmin (S-1-5-21-…-500)`. Git for Windows trusts a repository whose owner is the user, or
+  the Administrators group when the user is a member (`compat/mingw.c` `is_path_owned_by_current_sid`); NTFS records a
+  new object's owner and group from its maker's token.
+- **Why Everyone.** The host registered no `GetSecurity`, so WinFsp's DLL refused every security query
+  `STATUS_INVALID_DEVICE_REQUEST` without calling it (v2.1 `src/dll/fsop.c` 1444-1445), and WinFsp's driver keeps no
+  descriptor from an open unless the volume lets opens run in kernel mode (`AllowOpenInKernelMode`, `src/sys/create.c`
+  699-700, which slates does not set). Windows' I/O manager answers a file system's refusal of a query with its world
+  descriptor: owner and group Everyone and no access list (`D:NO_ACCESS_CONTROL`, as winfstest's outputs printed it).
+  The descriptor the drive did hold, which only WinFsp's open check read, named the Administrators group.
+- **The decision.** The drive still keeps no descriptor per object, and every maker on it is one account: a Windows
+  daemon's clients are its own user (its rendezvous objects admit that user's SID alone, §4.6 "Rendezvous"; A-237
+  records the account as uid 0). So the drive's one descriptor names that account, the user of the daemon's token, as
+  owner and the token's primary group as group, which is what NTFS gives a file the account makes unelevated; and the
+  host answers `GetSecurity` with it, on the receiving thread and without the shard, since every object reports the
+  same one. The access list is unchanged (Everyone, full access), so the shard decides every request as before.
+  Rejected: the Administrators group as owner, which git trusts only for an elevated administrator's process, so an
+  unelevated user's repository stays refused; a descriptor kept per object in the volume, a format change for an owner
+  that is the same account on every object; and each object's uid mapped to a SID by WinFsp's POSIX map
+  (`FspPosixMapUidToSid`), since every Windows object's uid is 0, so all would map to one SID and not the user's.
+- **What stays stated.** No access list set or asked for at a create is kept or enforced, and no owner or group set
+  later (no `SetSecurity`; Windows answers such a set with success, as winfstest's `SetFileSecurity` calls show, none of
+  them on the reviewed list). Objects
+  made by other routes (the SDK, a base directory's files, another host) report the same account too.
+- **Cost.** None to the shard: a query is a copy of the mount's bytes on the receiving thread, where WinFsp's DLL
+  refused it before; and the driver now keeps the answered descriptor on the open file node for `SecurityTimeout`, which
+  version-1 parameters without their own take from `FileInfoTimeout`, infinite (`src/sys/volume.c` 255-256), so a second
+  query of an open file stays in the kernel. g258, which measures the receiver, was told.
+- **winfstest.** Three listed cases ask for exactly the drive's access list, `D:P(A;;FA;;;WD)`, and pass with it:
+  `t/base/10.t` cases 2 and 12, and `t/streams/03.t` case 17 (a directory's, after the stream's refusal). They are struck
+  (382 to 379 entries), and the record is re-recorded from diagnostics run 44336880588 (x86_64; arm64 gave the same
+  verdicts): 733 cases, 354 passed, 379 failed, every one listed. Every other SECURITY case reads an
+  access list set after its create, or one the open check would have to enforce, and fails as before.
+- **Tests.** `what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`
+  (`crates/cli/tests/winfsp_semantics.rs`): a directory and a file made through the drive, and the drive's root, report
+  this process's account as owner and its primary group as group, each read through Windows' own
+  `GetNamedSecurityInfoW` and `ConvertSidToStringSidW`. Green on both Windows runners in diagnostics run 44329324901
+  (each owned by the runner's account, `S-1-5-21-…-500`, in its primary group, `…-513`), and red on both with the
+  callback removed: the drive's root reported owner and group `S-1-1-0`, as git saw in CI. And by use, the roster's
+  version-control workloads over the drive (diagnostics run 44336880588, x86_64 and arm64 alike): git and Subversion
+  identical, git's history and Mercurial identical but for the drive's stated hard-link lines (A-300); the drive's
+  workloads record is re-recorded from it, where the record of 2026-11-05 was an owed skip. The SID's text
+  (`crate::account`): golden vectors (the CI
+  runner's account as git printed it, Everyone, the Administrators group, an authority past 2^32 in its hexadecimal
+  form) and hostile bytes (empty, a cut header, another revision, sixteen sub-authorities, a cut sub-authority), on
+  every host.

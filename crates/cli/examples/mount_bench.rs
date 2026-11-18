@@ -15,9 +15,10 @@
 //! - rename (within the directory);
 //! - unlink;
 //! - on Windows, create then a security query, on its own files and timed from the create's start to the query's
-//!   answer. The query reaches slates' receive worker as QuerySecurity and WinFsp answers it without calling the host,
-//!   which registers no GetSecurity callback, so it is a request no shard call precedes, right after a Create: where an
-//!   open's confirmation posted behind no wake would hold the worker (A-274). Each such call reached the worker on both
+//!   answer. The query reaches slates' receive worker as QuerySecurity, and the host's GetSecurity answers it from the
+//!   mount's one descriptor without a shard call (A-350; before it, WinFsp's DLL refused the query itself), so it is a
+//!   request no shard call precedes, right after a Create: where an open's confirmation posted behind no wake would hold
+//!   the worker (A-274). Each such call reached the worker on both
 //!   Windows runners (diag-winfsp-overlap-52, run 43148071819: 21,000 of 21,000 a daemon on arm64; on x86_64 the worker
 //!   took 273,006 more that no call of the bench's made, one for each of the 273,007 Cleanups but one); a stream query
 //!   did not (the kernel refused it, error 87, before any request), so it is not here. An error answer is counted and
@@ -180,7 +181,7 @@ impl Samples {
   }
 }
 
-/// The file's owner, asked on its handle: a QuerySecurity request WinFsp answers without calling slates' host. Its
+/// The file's owner, asked on its handle: a QuerySecurity request slates' host answers without a shard call (A-350). Its
 /// answer, or the error's Win32 code.
 #[cfg(windows)]
 fn query_security(file: &std::fs::File) -> Result<(), u32> {
