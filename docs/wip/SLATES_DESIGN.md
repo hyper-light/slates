@@ -8670,6 +8670,15 @@ would need a privilege slates never holds (R10).
 > recorded invalid. Proven by `crates/server/tests/signed_work.rs` (four landing tests, macOS arm64, Mac Studio,
 > 2026-11-18) and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`, each guard red alone.
 
+> **Status (2026-11-18, the audit trail records each step once).** A granted run's finish mirrors into the durable
+> log only the engine ring's records of that run: the ring's sequence when the run began (`Audit::next_seq`, kept as
+> the run's `audit_from`) bounds them. Before, the finish mirrored every record the ring held for the landing's id, so
+> a presented landing's plan, which its presentation records itself, was recorded twice, and a resumed landing would
+> re-record its first attempt's records. Measured on the Mac Studio: a presented-then-granted landing's trail read
+> plan, grant, plan, plan under the grant, validation, entry, finish; now each step once
+> (`a_presented_then_granted_landing_records_each_step_once` in `crates/server/tests/presentations.rs`, red on the old
+> mirror). Record: `docs/bugs/2026-11-18-a-presented-landings-plan-was-audited-twice.md`.
+
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
 > `NtCreateFile` relative to it with `FILE_OPEN_REPARSE_POINT`, and makes the reparse check on the object it
