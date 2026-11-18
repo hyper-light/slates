@@ -20301,6 +20301,20 @@ A fleet that mixes builds therefore stops with a typed refusal; it never reads a
 But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
 none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
 
+> **Status (2026-11-17, g230): the configuration's layout is versioned and refused by name.** A regional configuration
+> now begins with a magic ("RCFG") and a layout version (1), and a root configuration with its own ("RTCF", 1)
+> (`raft_wire::REGIONAL_MAGIC`, `REGIONAL_LAYOUT`, `ROOT_MAGIC`, `ROOT_LAYOUT`). A decoder reads them before any field
+> and refuses another kind or an unversioned layout `ForeignLayout { magic }` and another version
+> `LayoutVersion { layout }`, so no layout is ever read by another's positions. An unversioned configuration begins
+> with its version number, whose low word is the magic only at version 1,195,787,090 (regional) or 1,178,817,618
+> (root). A retained council or root whose configuration is another build's layout refuses recovery as a corrupt one
+> does (a vote is never forgotten), now by name ("retained council base is another build's layout",
+> `retention::configuration_refused`). Every caller above refuses as before; only the reason changed. Held by
+> `a_configuration_of_another_layout_is_refused_by_name` (`crates/cluster/src/raft_wire.rs`) and
+> `a_retained_council_of_another_layout_refuses_recovery_by_name` (`crates/server/src/retention.rs`). The
+> configuration group's commands (`config_group::ConfigCommand`) are told apart by a tag byte and carry no layout
+> version: a change to an existing command's fields would be read by position, as the configuration was (GAPS).
+
 ### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object, and a holder lists a copy by the authority it was written under (accepted 2026-11-08; steps (a) and (b) built)
 
 A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
