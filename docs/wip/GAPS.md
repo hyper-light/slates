@@ -21,11 +21,26 @@
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) the Windows WinFsp roster: WinFsp's driver has no hard links (winfsp.dev's NTFS
-> compatibility page), so Mercurial and git copy where NTFS links, and git's symbolic-link probe needs reparse points,
-> which the drive does not serve yet; (3) ~~a Linux FUSE leg outside a container~~ **closed 2026-11-17 (A-293)**: the
-> native Linux lane runs the roster over the daemon's own FUSE mount, unprivileged, recorded RAN; (4) git's fsmonitor
-> (a daemon that refuses network mounts by default) and submodules (their configuration names the source by absolute
-> path) are not in the roster.
+> compatibility page), so Mercurial and git copy where NTFS links; git's symbolic-link probe needed reparse points,
+> which the drive serves since A-275 landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
+> **closed 2026-11-17 (A-293)**: the native Linux lane runs the roster over the daemon's own FUSE mount, unprivileged,
+> recorded RAN; (4) git's fsmonitor (a daemon that refuses network mounts by default) and submodules (their
+> configuration names the source by absolute path) are not in the roster.
+
+> **Windows symbolic links through the WinFsp drive: built (2026-11-09, §4.6; A-275; landed 2026-11-17).** Every
+> `CreateSymbolicLinkW` on the drive answered `ERROR_INVALID_FUNCTION`, so git and npm could make no link there and a
+> link made on Linux showed as a reparse point Windows could not follow. Now a volume symlink is the Windows symbolic
+> link: WinFsp's resolver follows it, a relative target is stored with `/` and shown with `\`, a directory link keeps
+> its type in the inode's Windows bits (image 26, delta 9, an older reader refusing them), and making one asks for
+> `SeCreateSymbolicLinkPrivilege` as NTFS does, unless Developer Mode is on (judged by the drive from the opener's
+> token, since WinFsp's own check refuses Developer Mode; a `CreateSymbolicLinkW` caller gets NTFS's answer in all four
+> cases measured, and only a program writing the reparse buffer itself without the unprivileged flag is allowed under
+> Developer Mode, since that flag never reaches a file system). winfstest's `t/reparse/02.t`, `03.t` and
+> `t/streams/04.t` run to their ends: 78 cases newly pass, and three script-level entries become 30 case-level ones,
+> each with its reason (355 to 382 entries; finer grain, no case that passed before fails). Stated differences: a link
+> holds no data stream; a link POSIX made is a file link; a link relative to the drive's root is kept relative to its
+> directory, so moved, it reaches another object where NTFS keeps it on `\x\y`. **Still owed:** generic reparse data (39
+> entries), its own amendment after named streams.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
