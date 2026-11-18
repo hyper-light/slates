@@ -6212,10 +6212,30 @@ a reader's fetch stages the same way, one chunk per exchange, and resumes from w
 each holder's offer and transfer progress independently, with no wait on the slowest offer;
 anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`, and puts a
-repeatedly late candidate on probation for the group to replace. Cold sealed content (a
+repeatedly late candidate on probation for the group to replace. The healer keeps every head naming
+holders that hold its content (A-276). It re-offers a placed snapshot to exactly the holders its
+placement names, all at once, and ends once each of them holds it, recording nothing: the head
+already names them, and a head is never rewritten at its sequence. A holder that lacked chunks is
+put exactly those, and counts one repair whenever its acknowledgement arrives, inside its round or
+after the round stopped collecting at the hedge delay. A holder the placement names that has left
+the fleet cannot be re-offered to, so the healer places the content on the current cohort at the
+head's sequence plus one, which every holder's door admits as ahead of its records
+(`content_retention::admits`), and records that placement together with the same head snapshot
+advanced to that sequence, as one record; the next record period ships a head there naming holders
+that hold the content. A placement naming fewer than f+1 holders is replaced the same way; at f = 0
+the owner's own copy is the whole placement, and there is nothing to heal. Every heal is bounded from
+its first round by its content round's whole span and one period, so its first round's every
+acknowledgement is folded first; one that has not finished by then ends, counted, and a later step
+heals the volume again. Cold sealed content (a
 measured class by read rate, Phase 8) may be held as k+m fragments across k+m candidates instead
 of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) and the
 reconstruction budget are derived, never fixed (D-O6).
+
+> **Status (2026-11-17, A-276: the healer).** Restore, replace and the bound are built, and each is red on the old
+> code and green on the fix with its fleet test; the original healer test's failure under load was reproduced naturally
+> on the old code (2 of 54 runs under bursting contention) and not on the fix (0 of 30, two of them taking the late path
+> and counting it). Owed: probation of a repeatedly late candidate; the mirror's healer (AC-8.15); a named holder that
+> stays a member outside the candidates (GAPS).
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
@@ -22169,3 +22189,201 @@ Applied in the same change to:
   remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
   with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
   owed apart (GAPS).
+
+### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
+Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
+
+Status: designed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the content
+question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). Code waits on W1 (A-247),
+whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-loadtest-w1`.
+
+- **Why (measured).** W1 (A-247) moves a work's edits and composition to the work's shard; the verdict and the rebase
+  still run on the green's owner.
+  - At the 3,000-client load rung (`kernel/` of linux 7.4-rc1, 754 files, 16 MB) the owner spends 51–53% of its wall
+    on them (W1, the anchor recipe, 2026-11-11). A verdict is 21.4–21.7 µs of the owner's CPU and a rebase 12.3–12.4.
+  - Rebases are the larger share of the owner's merge work: 71,000–72,000 rebases a run against 49,000 verdicts.
+  - At 1,000 clients and equal offered load, W1's rebase p99 is worse than main's (rounds' medians 30.7 against 21.2 ms):
+    it crosses to the owner and waits in the ask batch, where on main it ran beside its work.
+  - A rebase changes nothing on the green. Running it on the work's shard takes it off the owner entirely.
+- **The shape.** Each shard that holds a work of a green keeps a replica of the green: the engine's own metadata, built
+  from the owner's at a version and kept current by the owner's accepted versions applied in order through the engine's
+  own replay (`Green::apply_recorded`, the chain entry's `Applied` over its increment). One code path: a replica at
+  version v is the owner's green at v by construction, the property replay already holds for recovery.
+  - *The feed.* After a version is committed (A-252: after its quorum), the owner sends its chain entry to each shard
+    holding a replica, over the existing bounded control channel, in version order. A replica that sees a gap (a
+    version it lacks before the one it is sent) is rebuilt from the owner, counted.
+  - *Served from the replica.* A rebase of a work on that shard, at the replica's head (never below the work's base;
+    the work's next submit is judged by the owner against its own head, as every stale base is). A read of the green
+    at a named version the replica holds (the 60% of A-247's reads). Everything else is unchanged: the verdict, the
+    `Head` read, the merge record, every refusal.
+  - *Behind.* A replica whose head is below a work's base (the owner accepted a version the feed has not delivered)
+    forwards that rebase to the owner, as today, counted. A read at a version the replica does not hold, above its
+    head or below its floor, is forwarded the same way.
+  - *Laptop degenerate (R8).* With one shard there is no other shard and no replica: the owner serves, as now.
+- **Content: once, in place (the supervisor's decision, 2026-11-17).** A-64 keeps content once in the anchor's RAM, and
+  D-7 lets any core read an immutable chunk. So a replica holds no bytes of its own: it names the owner's chunks, and
+  reads them where they are. It never copies them and never fetches them through the fleet for a shard of the same node.
+  Two things the code does not have today follow, and both are part of this amendment:
+  - *Chunks that never move or change.* The engine's content is its owner's heap today (`Green::content`, a map of
+    `Vec<u8>`; the history's `Chunks`, a slot vector of `Vec<u8>` reused when freed), so a reference to it from another
+    thread is not sound. The owner's current values and history chunks move into blocks of a region the owner allocates
+    and seals: a sealed block is never written, moved or reused while any shard can name it (D-6's rule for volume
+    chunks, A-64's for the image). A replica's piece names a block by handle and range, as an image's chunk reference
+    does.
+  - *Frees deferred until every replica has passed them.* A-64's deferral holds a block only until the owner's next
+    publication commits, and knows nothing of readers on other shards; alone it would let a replica read a block freed
+    and reused under it. So the owner frees a chunk whose last reference version v dropped only when every replica has
+    acknowledged a version at or past v. A replica acknowledges on the feed's own channel, after its turn has applied
+    the version and dropped every reference the version removed; the acknowledgement is per version (batched to the
+    latest), never per chunk, so the cost is one message a version a replica and no atomic on any per-item path (D-7's
+    quiescent-state rule, made by message). A replica dropped, rebuilt or ended acknowledges by leaving: its shard's
+    acknowledgement is removed, so a dead replica never holds a free.
+  - *Bounds.* The deferred bytes are charged to the owner's memory class, and they are bounded by the slowest
+    replica's lag. A replica more than the derived lag behind (owed: its derivation, from the class's headroom against
+    the bytes a version frees) is dropped, counted (`merge.replica.dropped_lagging`), and its rebases and reads go to
+    the owner. So no replica can hold the owner's memory past its class.
+  - *When this would be wrong.* If a measured fact makes it unsound (a lifetime the acknowledgement cannot hold) or
+    slower than a copy (cross-shard reads of the owner's blocks costing more than the copy saves), the numbers and the
+    alternative go to the supervisor before code is built another way.
+- **What a replica costs, measured** (perf, 2026-11-11). A diagnostic build (never committed) logged the owner's green,
+  by kind, at the 3,000-client rung's end: head 9,000, two runs alike to a few hundred bytes. Payload bytes, maps' node
+  overhead not counted, so a lower bound:
+
+  | part | bytes | a replica holds it |
+  |---|---|---|
+  | current file bytes | 16,438,721 | no: the owner's blocks, read in place |
+  | history chunks (the current values again, and earlier runs) | 18,859,529 | no: the owner's blocks, read in place |
+  | content history index (45,690 entries, their piece lists) | 8,991,756 | yes |
+  | deltas (9,000 versions, 44,997 ops) | 4,642,109 | yes |
+  | path, last-changed and kind indexes, kind histories | 613,120 | yes |
+  | idempotency and rejected-result caches | 4,183,041 | no: the owner's |
+
+  - Metadata is about 14.2 MB a replica at this rung (about 1.6 KB a version kept, until the retention floor folds it),
+    about 313 MB at 22 shards. Copying content as well would have been about 49.5 MB a replica, and about 1.3 GB for a
+    whole kernel tree, most of a 1.49 GB memory class in every replica: content in place avoids both.
+  - Against the budgets, from the measurement's own daemon log (adas-mac-studio.local-2, `effective_capacity_bytes`
+    103,079,215,104, 23 shards): a shard's metadata class, `table_bytes`, is 373,475,417 bytes (it already bounds the
+    green's chain), and a memory class, `reserve_per_shard`, is 1,493,901,668. A replica's metadata is 3.8% of one
+    shard's `table_bytes` (under 8% if the maps' node overhead doubled it), and each shard holds only its own replica.
+- **Bounds and outcomes.** A replica's metadata is charged to its shard's metadata budget. At the bound the replica is
+  dropped and its rebases and reads go to the owner, counted (`merge.replica.dropped`), never refused to the client.
+  A replica no work on its shard has used for the derived idle period (owed: its derivation, from the feed's cost per
+  version against the rebases it served) is dropped the same way. The feed rides the control channel's existing bound;
+  a full channel delays a version, never drops it (the reply rule since 2026-11-09), and a replica behind forwards.
+- **Tests first.**
+  - The replica equals the owner at every version over generated histories (files, links, modes, renames, removals),
+    the green's identity compared at each version.
+  - A lagging replica's rebase is answered exactly as the owner would answer it at the replica's head, and a rebase whose
+    base is above the replica's head is forwarded and answered by the owner.
+  - A read at a version the replica lacks is forwarded, and its answer equals the owner's.
+  - Lifetime: a replica holding a piece of a chunk whose last reference the owner has dropped reads the chunk's bytes
+    unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before; a replica
+    dropped mid-read releases its hold. Red with the acknowledgement ignored (the owner frees at once).
+  - Non-vacuity: counters of rebases and reads served off the owner and of those forwarded, and of frees deferred for
+    a replica (`merge.replica.frees_deferred`).
+  - Then the A/B the supervisor runs: the anchor recipe, every round, with the owner's utilization before and after.
+- **Tried and rejected.**
+  - *Copying content into each replica* (perf's option 1) or *for the paths a shard's works touch* (option 2): content
+    twice, against A-64, and about 1.3 GB a replica for a whole kernel tree. Rejected 2026-11-17 by the supervisor.
+  - *An epoch-published immutable root of the green's metadata* (the owner's maps shared read-only with every shard):
+    it needs a persistent map the engine does not use. Rejected 2026-11-11 for a replica fed by message. Its other
+    cost, reclaiming what readers may still hold, is paid here for content alone, by acknowledgement.
+  - *Shard-count-fixed replicas* (a replica on a literal number of shards): a tuning literal (R3), and a work's shard is
+    where its rebases are. Rejected for "every shard holding a work of the green".
+  - *Answering the owner's asks in slices of the step budget* (2026-11-09): the step budget, about 4.5 µs, is below one
+    ask's cost, so every slice was one ask and every answer a message; SubmitAccepted p99 75.3–493.0 ms against W1's
+    53.8–77.2 (BENCHMARKS). It moved no work off the owner.
+
+### A-276 — A heal restores the holders a head names and counts each repair however late its acknowledgement; a holder that left is replaced at the next sequence, recorded with the republished head as one record; every heal ends once its first round's replies have had their whole span (2026-11-17, built for goal g248; the replace is live-fixes' 2026-11-09 work; amends §4.10's healer)
+
+Applied in the same change to:
+- §4.10: the "Content replication" paragraph's healer sentences.
+- GAPS (2026-11-17 entry) and `docs/bugs/2026-11-17-a-heal-miscounted-repairs-and-left-heads-naming-holders-without-the-content.md`;
+  the content-replication record's piece 2 (`docs/wip/content-replication.md`).
+- `crates/server/src/fleet.rs`: `heal_one_placed_snapshot`, `Heal`, `heal_for`, `heal_decision`, `start_seal`,
+  `seal_complete`, `content_work`, `put_seal_content`, `fold_round`, `fold_content_ack`, `fold_late_content`,
+  `record_placed_seals`, `record_replacement`, and the test support `injected_content_ack_delay`, with the unit test
+  `the_heal_restores_named_candidates_and_replaces_only_a_departed_or_short_placement`; `crates/server/src/head.rs`
+  (`SealJob::put_sequence`, `SealJob::republish`, `SealJob::refilled`); `crates/server/src/daemon.rs`
+  (`Daemon::inject_content_ack_delay`).
+- The tests in `crates/server/tests/fleet.rs`: `a_repair_whose_acknowledgement_outlasts_its_round_is_counted`,
+  `a_heal_restores_the_named_holder_and_not_a_candidate_without_the_head`,
+  `a_heal_republishes_the_head_once_a_named_holder_has_left`,
+  `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left` and
+  `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later`; and
+  `a_holder_that_lost_placed_content_is_repaired_by_the_healer` now prints whether the holder holds the content and the
+  owner's heal counts.
+
+- **The rule amended.** §4.10 said the healer replays puts that never reached f+1 and that anti-entropy repairs only
+  differing subtrees between recorded holders. The healer re-opened a placed snapshot as an ordinary seal on the current
+  cohort, offered it in rendezvous order, re-recorded whichever holders acknowledged at the head's sequence, and counted
+  a repair only for a holder whose acknowledgement its round collected. Three things followed, each measured below:
+  - **A late repair was never counted.** A content round stops collecting at the hedge delay (the p95 of the owner's
+    put readings, rounded up to the collection poll), and a refill that outlasts it acknowledges as a straggler. The
+    straggler was folded into the placement, the job recorded and dropped, and the repair was never counted; every later
+    heal found the holder whole. This is how `a_holder_that_lost_placed_content_is_repaired_by_the_healer` failed under
+    load (`repairs Ok(0) → Ok(0)`, 2026-11-08, this Mac at load 54).
+  - **A restore could place where the head does not name.** A cohort member holding no head for the object (one that
+    refused or had not yet received the owner's records, as a restarted holder has not) admits a put at the head's
+    sequence as ahead of its records and acknowledged first. The heal placed there, re-recorded that set at the head's
+    sequence, and the named holder stayed empty while the head named it.
+  - **A departed holder stayed named.** A head is never rewritten at its sequence, so a heal's re-recorded placement
+    never reached the head when a holder it named had left the fleet (live-fixes, 2026-11-09).
+- **The rule now.**
+  - **Restore.** While every holder the placement names is a member, the heal re-offers at the head's sequence to
+    exactly the named holders that are candidates, all at once, and ends once every one of them holds the content. It
+    records nothing.
+  - **Repairs.** A holder whose offer answer named chunks it lacked is remembered on the job (`SealJob::refilled`), and
+    its first acknowledgement counts one repair, whether its round collected it or it arrived as a straggler's
+    (`fleet.heal.repaired_late`). `fleet.heal.refill_outlasted_round` counts the refills a round did not collect.
+  - **Replace.** When a holder the placement names is no longer a member (`fleet.heal.named_gone`), or the placement
+    names fewer than `f + 1` holders (`fleet.heal.named_short`, as one recorded before the fleet's `f` grew does), the
+    heal places the content on the current cohort at the head's sequence plus one, the only sequence every holder's door
+    admits (`content_retention::admits`: named by the holder's newest record there, or ahead of every record it holds).
+    Its placement and the same head snapshot advanced to that sequence (`Op::VolumeHeadAdvanced`) are one transaction,
+    every operation checked before it opens, and nothing is recorded unless the head is still that snapshot at the
+    sequence before. Counted `fleet.heal.republished`, or `fleet.heal.republish_refused`.
+  - **Nothing to heal.** When no named remote holder can be put to: at `f = 0` the owner's own copy is the whole
+    placement. The decision is one pure function (`heal_decision`), unit-tested at `f = 0` and on a fleet. live-fixes'
+    cut replaced any placement naming no remote holder, which on a one-node fleet (`f = 0`, a supported configuration)
+    would have advanced the head's sequence by one at every healer step, for good; found by reading this change.
+  - **Bound.** Every heal is bounded from its first round by its content round's whole span (the longest deadline each
+    holder task of a round waits under, derived from the measured round-trip tails) and one period, in which a reply
+    that came at the span's end is folded (`heal_bound_ns`), judged only once its content is not yet where it must be.
+    One past it ends, counted `fleet.heal.unfinished`, and a later step takes the volume up again. live-fixes' cut
+    bounded it by the membership horizon (`lease::horizon_ns`, 900 ms at the default beat), shorter than the span its own
+    rounds' replies may take (1.1 s at least), so a first round's late repair could be lost with its job.
+  - **One clock.** The first round's dispatch is stamped on the owner shard's clock (`ShardState::clock`), the one the
+    hedge delay and the bound are judged by. It was stamped from the dispatching shard's runtime-driver clock, which
+    counts from that shard's start, so the owner's clock read every first round as long past: the hedge round was never
+    held for the measured p95 (a pre-existing fault since the p95 trigger, here a sibling found and fixed), and every
+    heal that did not finish in its first round ended at the next period, unfinished, its late repair uncounted.
+  - **Folds.** A round's acknowledgements, and a straggler's, fold only into the job they were put for: the same
+    snapshot at the same put sequence.
+- **Why one record for the replace.** Recorded apart (live-fixes' cut), the placement was recorded first and the
+  advance after: a refused advance, or a process killed between the two, left the placement naming the new holders at
+  the head's old sequence. The owner's head value there then differs from the value its holders hold, which they refuse
+  for good, and since every holder the new placement names is a member, later heals restore rather than replace, so the
+  head stays naming the departed holder. Found by reading; no test stops a daemon between two records, and
+  `Db::begin`…`commit` is the database's tested all-or-none (`crates/db/tests/model.rs`).
+- **Evidence** (adas-mac-studio.local-2, Apple M3 Ultra, macOS 26.4, debug, 2026-11-17; red is `e7c031aa1`'s healer
+  with the same test support and the new tests, green2 is a68704497; the full table is in the bug record).
+  - Each new test is red on the old code and green on the fix: the late repair FAILED 135 s (`repairs Ok(0) → Ok(0)`,
+    the holder holding the content) and passed 4 of 4 in 11–12 s; the restore FAILED 63 s (the named holder empty, the
+    candidate without the head holding the content) and passed 3 of 3 in 2 s; the departed holder FAILED 452 s and
+    446 s, live (the survivors' heads naming it, `republished` 0) and passed 3 of 3 each in 13–14 s, the survivor taking
+    the volume over and reading the file back after the owner's death, so the replace that puts at the next sequence
+    and then republishes is shown end to end; the bound FAILED 66 s (`fleet.heal.unfinished` 0) and passed 3 of 3 in
+    12–13 s. This change's first cut failed the late repair too ("One clock" above), 93 s, and the f = 0
+    unit test fails with live-fixes' rule put back.
+  - The original test's failure reproduced naturally on the old code, under 64 spinners bursting 300 ms each second on
+    the efficiency cores with the test clamped there too: 23 runs ok, then `repairs Ok(0) → Ok(0)` with the holder
+    holding the content, its refill's acknowledgement 128 ms after the round's dispatch, folded as a straggler.
+    Interleaved under the same load, 30 pairs: red failed 1 of 30 the same way and green2 passed 30 of 30, two of
+    them taking the late path naturally and counting it (`fleet.heal.repaired_late` 1). Red failed 2 of 54 runs under
+    that load, green2 none of 30.
+- **What it does not change.** The head's value at any sequence it was placed at, the snapshot, its manifest and what a
+  client sees: the status's head, snapshot and attachment counts, bytes and lease epoch, and the file's bytes are
+  checked equal across a republish. A named holder that is a member but outside the object's current candidates is
+  neither restored nor replaced (`fleet.heal.named_outside_candidates`; GAPS, open). The mirror's own healer stays open
+  (GAPS, AC-8.15).

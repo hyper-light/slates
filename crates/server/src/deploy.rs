@@ -880,27 +880,7 @@ mod tests {
       "b still advertises where its peers dial it"
     );
 
-    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
-    for dialer in ["a", "c"] {
-      let theirs =
-        plan(&manifest, dialer, key_of(&keys, dialer), Some(resolver())).expect("a plan");
-      let to_b = theirs
-        .transport
-        .peers
-        .iter()
-        .find(|peer| peer.host == b_host)
-        .expect("b is a peer");
-      assert_eq!(
-        to_b.address,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
-        "{dialer} dials b's advertised probe port, never its bind"
-      );
-      assert_eq!(
-        to_b.record_address,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
-        "{dialer} dials b's advertised record port, never its bind"
-      );
-    }
+    expect_b_dialed_where_it_advertises(&manifest, &keys);
 
     let a = plan(&manifest, "a", key_of(&keys, "a"), Some(resolver())).expect("a's plan");
     assert_eq!(
@@ -932,6 +912,35 @@ mod tests {
       SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42_000),
       "a node without a bind binds where it advertises"
     );
+  }
+
+  /// The dialers of `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`. Do: plan nodes a
+  /// and c from `manifest`, in which node b binds elsewhere than it advertises. Expect each to dial b at its advertised
+  /// probe port (41000) and record port (41001), never at its bind.
+  fn expect_b_dialed_where_it_advertises(
+    manifest: &FleetManifest,
+    keys: &[PrivateKeyDer<'static>],
+  ) {
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    for dialer in ["a", "c"] {
+      let theirs = plan(manifest, dialer, key_of(keys, dialer), Some(resolver())).expect("a plan");
+      let to_b = theirs
+        .transport
+        .peers
+        .iter()
+        .find(|peer| peer.host == b_host)
+        .expect("b is a peer");
+      assert_eq!(
+        to_b.address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
+        "{dialer} dials b's advertised probe port, never its bind"
+      );
+      assert_eq!(
+        to_b.record_address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
+        "{dialer} dials b's advertised record port, never its bind"
+      );
+    }
   }
 
   /// A resolver for the named-address tests: one nameserver, the documented defaults.

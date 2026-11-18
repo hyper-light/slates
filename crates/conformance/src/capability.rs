@@ -374,13 +374,7 @@ mod tests {
       Suite::Workloads,
       Suite::Hermeticity,
     ] {
-      match availability(Transport::NativeMacosNfs, suite) {
-        Availability::Runnable { on, adapter, .. } => {
-          assert_eq!(on, HostOs::Macos);
-          assert!(adapter.is_none());
-        }
-        other => panic!("{suite:?} on macOS: {other:?}"),
-      }
+      expect_runnable_on_macos_with_no_adapter(suite);
       match (suite, availability(Transport::NativeLinuxFuse, suite)) {
         (
           Suite::Workloads,
@@ -401,6 +395,17 @@ mod tests {
         }
         (_, other) => panic!("{suite:?} on Linux: {other:?}"),
       }
+    }
+  }
+
+  /// The macOS half of `native_lanes_run_on_their_own_os`: expect `suite` runnable on macOS with no adapter.
+  fn expect_runnable_on_macos_with_no_adapter(suite: Suite) {
+    match availability(Transport::NativeMacosNfs, suite) {
+      Availability::Runnable { on, adapter, .. } => {
+        assert_eq!(on, HostOs::Macos);
+        assert!(adapter.is_none());
+      }
+      other => panic!("{suite:?} on macOS: {other:?}"),
     }
   }
 
