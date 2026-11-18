@@ -85,9 +85,11 @@
 > successor's writes had passed and its stable writes retry-later for good, and a FUSE mount the same. Now a volume
 > whose log is fenced at a later epoch (`live_ship::superseded`, kept across a restart since A-344) answers NFS
 > `NFS3ERR_STALE` (no root at a mount), and its FUSE mounts are fenced as revoked ones (kernel cache dropped,
-> `ENOTCONN`, the mount ended) the moment the owner learns its fence. Tests: `a_superseded_owners_nfs_mount_answers_stale`
-> (`crates/server/tests/fleet.rs`), `a_superseded_volumes_fuse_mount_ends` (`crates/server/tests/fuse_mount.rs`, Linux,
-> through `Daemon::inject_superseded`).
+> `ENOTCONN`, the mount ended) the moment the owner learns its fence, or at the mount's next request over a fence kept
+> across a restart. Tests: `a_superseded_owners_nfs_mount_answers_stale` (`crates/server/tests/fleet.rs`),
+> `a_held_descriptor_on_a_superseded_volume_reads_nothing_more` and
+> `a_fuse_mount_over_a_kept_fence_ends_at_its_next_request` (`crates/server/tests/fuse_mount.rs`, Linux, through
+> `Daemon::inject_superseded`).
 > - **Open (waits for g229's A-334):** an idle volume's mount learns of the takeover only once the old owner knows its
 >   fence, which takes a write to meet a holder's; the re-admission's yield (A-334, g229's, not on main yet) is the
 >   signal for an idle one, and joins `live_ship::superseded` when it lands (told in g229's inbox).

@@ -331,42 +331,105 @@ fn left_dead_until_its_user_unmounts(point: &str, what: &str) {
   );
 }
 
-/// A-346 on Linux (§4.8 "Leases and reads", A-338): a FUSE mount of a volume its node lost to a takeover ends as a revoked
-/// mount ends, FUSE's form of the `NFS3ERR_STALE` an NFS mount of it answers. Do: create a volume, mount it over FUSE,
-/// write `f` and read it back; mark the node superseded on the volume (`Daemon::inject_superseded`, as a holder's answer
-/// with a later fence marks it); read `f` afresh until refused. Expect the read before served, a read after refused
-/// `ENOTCONN` (the revoked mount's answer, and the kernel's once the mount ended), and the shards' count of mounts ended
-/// for a takeover moved. Before, the mount went on answering from the node's copy.
-#[test]
-#[allow(clippy::disallowed_methods)] // the test's own files, read and written through the slates mount: RAM, not disk
-fn a_superseded_volumes_fuse_mount_ends() {
-  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
-    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
-    return;
-  }
+/// A daemon on two shards under the fixture name `name`, its local consensus group made.
+fn superseded_fixture(name: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
-  let instance = format!("srv-fuse-superseded-{}", std::process::id());
+  let instance = format!("srv-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let daemon = Daemon::start(
     &profile,
     config,
     SegmentSource::Create {
-      name: common::fixture_object("slates-seg", "fuse-superseded"),
+      name: common::fixture_object("slates-seg", name),
     },
   )
   .unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  (daemon, instance)
+}
+
+/// Format: the daemon's count of FUSE mounts ended because their node lost the volume to a takeover (A-346).
+const SUPERSEDED_ENDED: &str = "fuse.superseded_ended";
+
+/// A-346 on Linux (§4.8 "Leases and reads", A-338, AUD-29-84), a fence learned: a descriptor opened on a volume's FUSE
+/// mount before its node learned it lost the volume to a takeover reads nothing more once the mount has dropped what its
+/// kernel cached, as a revoked consumer's descriptor reads nothing more: FUSE's form of the `NFS3ERR_STALE` an NFS mount
+/// of the volume answers. Do: write a 1 MiB file through the mount, open it and read its first page; mark the node
+/// superseded on the volume as a holder's answer with a later fence marks it (`Daemon::inject_superseded`, learned, the
+/// mounts told); wait for the mount's kernel to drop its cache; read the next page through the same descriptor. Expect
+/// that read refused, `EIO` or `ENOTCONN`, and the mount ended for the takeover counted. Before, nothing fenced the
+/// mount, and the descriptor read the page its kernel had cached from the write.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own files, read and written through the slates mount: RAM, not disk
+fn a_held_descriptor_on_a_superseded_volume_reads_nothing_more() {
+  use std::os::unix::fs::FileExt;
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let (daemon, instance) = superseded_fixture("fuse-superseded-fd");
   let mut owner = connect(&instance);
-  let volume = owner.create(&scratch("fuse-superseded")).unwrap();
+  let volume = owner.create(&scratch("fuse-superseded-fd")).unwrap();
+  let point = target_dir();
+  owner
+    .attach_fuse(volume, Intent::Write, &point.path)
+    .unwrap();
+  let bytes: Vec<u8> = (0..REVOKED_FILE_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  std::fs::write(format!("{}/big", point.path), &bytes).unwrap();
+  let held = std::fs::File::open(format!("{}/big", point.path)).unwrap();
+  let mut first = vec![0u8; READ_BEFORE];
+  held.read_exact_at(&mut first, 0).unwrap();
+  daemon.inject_superseded(volume, 2, true).unwrap();
+  let dropped = eventually(|| {
+    counter(&daemon, SUPERSEDED_ENDED) >= 1 && counter(&daemon, REVOKED_INVALIDATED) >= 2
+  });
+  let mut unread = vec![0u8; READ_BEFORE];
+  let after = held.read_exact_at(&mut unread, UNREAD_AT);
+  drop(held);
+  let _ = Command::new("fusermount3")
+    .args(["-u", "-z", &point.path])
+    .status();
+  daemon.stop();
+  assert_eq!(first, bytes[..READ_BEFORE], "the first page read before");
+  assert!(
+    dropped,
+    "the mount ended for the takeover and its kernel dropped what it cached"
+  );
+  let refused_with = after.as_ref().err().and_then(std::io::Error::raw_os_error);
+  assert!(
+    [rustix::io::Errno::IO, rustix::io::Errno::NOTCONN]
+      .iter()
+      .any(|errno| refused_with == Some(errno.raw_os_error())),
+    "a descriptor opened before the takeover read the next page: {after:?}"
+  );
+}
+
+/// A-346 on Linux, a kept fence: a FUSE mount of a volume its node knew it had lost before any mount was told (as a
+/// restart over a kept fence finds it, A-344) ends at its next request. Do: mount a volume and write `f`; mark the node
+/// superseded on the volume as such a restart finds it (`Daemon::inject_superseded`, not learned: no mount told); read
+/// `f` afresh until refused. Expect the read refused `ENOTCONN`, the revoked mount's answer and the kernel's once it
+/// ended, and the mount ended for the takeover counted. Before, the mount answered from the node's copy.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own files, read and written through the slates mount: RAM, not disk
+fn a_fuse_mount_over_a_kept_fence_ends_at_its_next_request() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let (daemon, instance) = superseded_fixture("fuse-superseded-kept");
+  let mut owner = connect(&instance);
+  let volume = owner.create(&scratch("fuse-superseded-kept")).unwrap();
   let point = target_dir();
   owner
     .attach_fuse(volume, Intent::Write, &point.path)
     .unwrap();
   std::fs::write(format!("{}/f", point.path), b"the node's copy").unwrap();
-  let before = std::fs::read(format!("{}/f", point.path));
-  daemon.inject_superseded(volume, 2).unwrap();
+  let before = std::fs::read(format!("{}/f", point.path)).map_err(|error| error.raw_os_error());
+  daemon.inject_superseded(volume, 2, false).unwrap();
   let mut after = None;
   let refused = eventually(|| {
     let read = std::fs::read(format!("{}/f", point.path));
@@ -374,16 +437,13 @@ fn a_superseded_volumes_fuse_mount_ends() {
     after = Some(read.map_err(|error| error.raw_os_error()));
     done
   });
-  let ended = daemon
-    .refusals_on_every_shard()
-    .map(|counts| counts.get("fuse.superseded_ended").copied().unwrap_or(0))
-    .unwrap_or(0);
+  let ended = counter(&daemon, SUPERSEDED_ENDED);
   let _ = Command::new("fusermount3")
     .args(["-u", "-z", &point.path])
     .status();
   daemon.stop();
   assert_eq!(
-    before.map_err(|error| error.raw_os_error()),
+    before,
     Ok(b"the node's copy".to_vec()),
     "the mount served the file before"
   );

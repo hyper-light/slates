@@ -7223,8 +7223,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   revoked mount ends (AUD-29-84): fenced the moment the owner learns its fence (`fuse::superseded`) and at any turn
 >   after, the kernel drops what it cached of the volume, every request meanwhile is refused `ENOTCONN`, and the mount
 >   ends. Held by `a_superseded_owners_nfs_mount_answers_stale` (`crates/server/tests/fleet.rs`) and, on Linux,
->   `a_superseded_volumes_fuse_mount_ends` (`crates/server/tests/fuse_mount.rs`, the supersession injected as a holder's
->   fence answer brings it, `Daemon::inject_superseded`). An idle volume's mount learns of the takeover only once the
+>   `a_held_descriptor_on_a_superseded_volume_reads_nothing_more` (the fence learned, the mount told) and
+>   `a_fuse_mount_over_a_kept_fence_ends_at_its_next_request` (a kept fence, the mount's own turn) in
+>   `crates/server/tests/fuse_mount.rs`, the supersession injected as each path brings it (`Daemon::inject_superseded`). An idle volume's mount learns of the takeover only once the
 >   owner knows it: with no write to meet a holder's fence, that waits for the re-admission's yield (A-334, owed); and
 >   the guest device, the Shards stream and the WinFsp mount still hold or serve such a volume (GAPS).
 
@@ -25180,7 +25181,8 @@ Applied in the same change to:
   fences one it finds superseded. `crates/server/src/live_ship.rs`: `learn_superseded` (the fence learned, kept, the
   mounts told), `inject_superseded`. `crates/server/src/daemon.rs`: `Daemon::inject_superseded` (test support).
 - Tests: `a_superseded_owners_nfs_mount_answers_stale` (`crates/server/tests/fleet.rs`),
-  `a_superseded_volumes_fuse_mount_ends` (`crates/server/tests/fuse_mount.rs`, Linux).
+  `a_held_descriptor_on_a_superseded_volume_reads_nothing_more` and
+  `a_fuse_mount_over_a_kept_fence_ends_at_its_next_request` (`crates/server/tests/fuse_mount.rs`, Linux).
 - GAPS: the entry of 2026-11-18.
 - **What was there.** A volume's mounts are gated by the owner's lease alone (AUD-08): a lapse answers retry-later on
   NFS and holds a FUSE request in the kernel, both right for a lapse a confirmation ends. A takeover's fence never ends,

@@ -1395,29 +1395,38 @@ fn learn_superseded(state: &mut ShardState, volume: [u8; 16], current: HostEpoch
   wake_parked(state, volume);
 }
 
-/// Test support (`Daemon::inject_superseded`, never reachable from the wire): this owner is found superseded on `id` at
-/// `epoch`, as a holder's fence answer finds it ([`learn_superseded`]); a volume this shard ships no log of is marked by
-/// a kept fence, as a restart over one would find it (A-344), and its mounts told the same way. So a mount's answer to a
-/// takeover is driven without a fleet.
+/// Test support (`Daemon::inject_superseded`, never reachable from the wire): this owner is superseded on `id` at
+/// `epoch`, `learned` now, as a holder's answer with a later fence finds it ([`learn_superseded`], its mounts told), or
+/// else as a restart over a kept fence finds it (A-344: the fence kept, no mount told, each mount's own turn finds it).
+/// A volume this shard ships no log of is marked by a kept fence either way. So a mount's answer to a takeover is driven
+/// without a fleet, each path alone.
 pub(crate) fn inject_superseded(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   epoch: u64,
+  learned: bool,
 ) {
-  if state.live.shipping.contains_key(&id.bytes) {
+  if learned && state.live.shipping.contains_key(&id.bytes) {
     learn_superseded(state, id.bytes, HostEpoch(epoch));
     return;
   }
-  state.live.resumed.insert(
-    id.bytes,
-    OwnedLive {
-      epoch,
-      next: 0,
-      fenced: Some(epoch),
-    },
-  );
+  match state.live.shipping.get_mut(&id.bytes) {
+    Some(live) => live.fenced = Some(HostEpoch(epoch)),
+    None => {
+      state.live.resumed.insert(
+        id.bytes,
+        OwnedLive {
+          epoch,
+          next: 0,
+          fenced: Some(epoch),
+        },
+      );
+    }
+  }
   #[cfg(target_os = "linux")]
-  crate::fuse::superseded(state, id);
+  if learned {
+    crate::fuse::superseded(state, id);
+  }
 }
 
 /// Counter: a superseded owner's fence that its learning could not publish at once (A-344); the next publication keeps
