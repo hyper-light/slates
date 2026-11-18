@@ -7916,8 +7916,10 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > `a_clone_of_a_captured_base_moves_and_gives_its_pin_back` (`crates/server/tests/fleet.rs`). Owed: admission does not
 > reserve the capture's cost ahead (the volume's quota charges each file as it is made the volume's own, and a refusal
 > part-way leaves what was captured as copied-up entries, which change nothing a reader sees); a large file is read
-> whole in one slice (its bytes held once more while it is checked), where its windows could be read across slices; and
-> the report of bytes read and retained and of the elapsed cost.
+> whole in one slice (its bytes held once more while it is checked), where its windows could be read across slices;
+> the report of bytes read and retained and of the elapsed cost; and a landing of a captured clone judged against its
+> capture: it lands as a scratch volume does today, every entry a create (no witness survives the capture), so a file
+> its agent changed meets the target's copy as `CreateCreate` (GAPS, g267).
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;

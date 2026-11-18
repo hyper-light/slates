@@ -78,6 +78,14 @@
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
+> - **Owed before kiln's workspaces switch (found 2026-11-18 reading `crates/land/src/verdict.rs`, not yet by a
+>   test):** a clone of a captured base lands as a scratch volume does. Its record names no base and its files hold no
+>   witness (a capture makes each body the volume's own, and the witness lived in the base body), so every entry of
+>   its landing is a create: a file its agent changed meets the target's copy as `CreateCreate`, and so does an
+>   outsider's change to a file the agent never touched. Kiln lands an agent's workspace into the repository (W6), so
+>   the switch needs a landing judged against the captured snapshot: the manifest of what changed since it, each entry
+>   compared by content with what the capture read (the target is another folder, so fingerprints cannot match).
+>   Until then a captured clone moves and serves whole but does not land as an overlay does.
 > - **Decided (the supervisor, 2026-11-18, A-291):** a kiln workspace moves as a clone of a captured base. An overlay
 >   keeps its typed refusal (`NotPlain`: its base stays on its source host, §4.10); kiln captures the repository's base
 >   once into a complete immutable snapshot (`capture_base`; a git commit's tree checked out where nothing else writes is
