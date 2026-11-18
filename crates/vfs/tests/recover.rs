@@ -1093,6 +1093,11 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
     .write(&mut src, f, 0, b"content the snapshot keeps")
     .unwrap();
   let snap = vol.snapshot(&mut src).unwrap();
+  // The head rewrites `f` after the snapshot, so the snapshot holds its own version of it; the directory is unchanged
+  // and shared with the head, as the live volume shares it (A-395).
+  vol
+    .write(&mut src, f, 0, b"content the head rewrote after it")
+    .unwrap();
 
   let image = vol.to_image(&src, None).unwrap();
   let mut fresh = common::surviving(&src);
@@ -1107,8 +1112,8 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
   )
   .unwrap();
 
-  // The recovered snapshot is an independent tree (its own root and file inode), so dropping it must
-  // free those inode slab slots. An empty deadlist (the bug) would free nothing.
+  // The recovered snapshot holds its own version of `f`, so dropping it must free that inode's slab slot. An empty
+  // deadlist (the bug) would free nothing.
   let before = fresh.inodes.len();
   recovered.destroy_snapshot(&mut fresh, snap).unwrap();
   let after = fresh.inodes.len();
@@ -1172,8 +1177,9 @@ fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
 
 /// AC (§4.2/§4.8): a recovered snapshot shares an unchanged file's inode with the head rather than
 /// rebuilding a private copy, so the store holds it once. Head = root, a, b (3 inodes); the snapshot
-/// adds its own root and its own older `b` (2), and shares `a` with the head — so five inodes, not
-/// six. With sharing disabled this would be six, which makes the test non-vacuous.
+/// adds its own older `b` (1), and shares `a` and the root directory with the head, which the head did not change
+/// (rewriting `b` changes `b` alone) — so four inodes, as the live volume holds them. With no sharing this would be six,
+/// and with the root rebuilt privately, as it was until A-395, five.
 #[test]
 fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   let mut src = store();
@@ -1200,8 +1206,69 @@ fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   .unwrap();
   assert_eq!(
     fresh.inodes.len(),
-    5,
-    "the snapshot shares the unchanged file's inode with the head (six without sharing)"
+    4,
+    "the snapshot shares the unchanged file and directory with the head (six without sharing)"
+  );
+}
+
+/// §4.2, §4.8 (A-395): a recovered snapshot shares with the head the directories the head has not changed, as the live
+/// volume does, and the head's first change to one after recovery copies it, so the snapshot never sees the change and
+/// keeps the old version, retained, exactly as the live volume would. Do: a volume holding `d/x`; snapshot it; recover
+/// it; then create `d/y` in the live volume and in the recovered one. Expect recovery to hold the inodes the live volume
+/// held (none for the snapshot's directories, which it shares); `d/y` in the recovered head and not in its snapshot,
+/// which still holds `d/x`; and the recovered volume's retained versions equal to the live volume's after the same
+/// change, and more than none. Red before A-395: recovery held a private root and `d` for the snapshot.
+#[test]
+fn a_head_change_after_recovery_copies_a_directory_the_snapshot_shares() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let d = vol.mkdir_no(&mut src, root, "d", 0o755).unwrap();
+  let x = vol.create_file_no(&mut src, d, "x", 0o644).unwrap();
+  vol.write(&mut src, x, 0, b"x").unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+  let live_inodes = src.inodes.len();
+
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  let recovered_inodes = fresh.inodes.len();
+
+  vol.create_file_no(&mut src, d, "y", 0o644).unwrap();
+  recovered.create_file_no(&mut fresh, d, "y", 0o644).unwrap();
+  assert_eq!(
+    recovered_inodes, live_inodes,
+    "recovery holds the inodes the live volume held: the snapshot's directories are the head's"
+  );
+  assert!(
+    recovered.resolve(&fresh, "/d/y").is_ok(),
+    "the recovered head holds the new file"
+  );
+  assert!(
+    recovered.resolve_in(&fresh, snap, "/d/y").is_err(),
+    "the snapshot never sees the head's change to a directory it shared"
+  );
+  assert!(
+    recovered.resolve_in(&fresh, snap, "/d/x").is_ok(),
+    "the snapshot still holds its own file"
+  );
+  assert_eq!(
+    recovered.retained_versions(),
+    vol.retained_versions(),
+    "the snapshot retains the old directories as the live volume's does"
+  );
+  assert!(
+    vol.retained_versions() > 0,
+    "the change copied directories the snapshot holds (the case meant)"
   );
 }
 
@@ -1305,9 +1372,10 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   );
   assert_eq!(
     fresh.inodes.len(),
-    5,
-    "the shared version is one inode across both snapshots (head root, head f, root a, shared f, \
-     root b); an independent copy per snapshot would be six"
+    3,
+    "the shared version is one inode across both snapshots, and the root, which the head never changed, is the \
+     head's in both (head root, head f, shared f), as the live volume holds them; a private root per snapshot made it \
+     five until A-395, and an independent copy per snapshot six"
   );
   let mut buf = vec![0u8; 16];
   let n = recovered.read_in(&fresh, snap_a, f, 0, &mut buf).unwrap();
@@ -1432,8 +1500,9 @@ fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
   .unwrap();
   assert_eq!(
     fresh.inodes.len(),
-    6,
-    "one shared version, not one per snapshot: head root, head f, three snapshot roots, one shared f"
+    3,
+    "one shared version, not one per snapshot, and the root the head never changed shared by all three: head root, \
+     head f, one shared f (a private root per snapshot made it six until A-395)"
   );
 
   let mut buf = vec![0u8; 16];
