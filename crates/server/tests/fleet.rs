@@ -11232,6 +11232,179 @@ fn a_superseded_owners_clients_reach_its_successor() {
   );
 }
 
+/// Derived: the coordinator periods a takeover round waits on a learned object's promises before it gives the object
+/// up (`takeover`'s promise-wait bound, A-304): the failover SLO's worth of the fleet's periods, at least one.
+fn promise_wait_periods() -> u64 {
+  slates_server::config::FAILOVER_SLO_NS
+    .div_ceil(HEARTBEAT_NS)
+    .max(1)
+}
+
+/// Derived: the coordinator periods a fleet takes to settle on one configuration again once a member it retired on a
+/// false death hears it again: the member's refutation (a membership horizon), a round of its takeover run whole (the
+/// promise wait, the round's own bound), the commits that complete its retirement and re-admit it, the seat changes
+/// that give it its vote back, and its probe mesh formed again.
+fn readmission_periods(daemons: &[&Daemon]) -> u64 {
+  horizon_periods()
+    .saturating_add(promise_wait_periods())
+    .saturating_add(commit_periods().saturating_mul(2))
+    .saturating_add(seats_committed_periods(daemons, Quorum { f: 1 }))
+    .saturating_add(mesh_formation_periods(daemons.len()))
+}
+
+/// The status counts a convergence wait reports for one node: its takeover rounds', its holder's deferred promotions'
+/// and its live takeovers'.
+fn convergence_counters(daemon: &Daemon) -> Vec<(&'static str, u64)> {
+  summed_counters(daemon)
+    .into_iter()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.takeover.")
+        || name.starts_with("fleet.promotion.")
+        || name.starts_with("fleet.live.taken_over")
+    })
+    .collect()
+}
+
+/// What `daemon` holds of the fleet's configuration, for a convergence wait's report: its council's members and voters,
+/// its placement's and council's versions, whether it leads and is meshed, and [`convergence_counters`].
+fn configuration_view(daemon: &Daemon) -> String {
+  format!(
+    "{:?}: members={:?} voters={:?} versions={:?} leads={:?} meshed={:?} counters={:?}",
+    daemon.member_identity(),
+    daemon.council_members(),
+    daemon.council_voters(),
+    daemon.configuration_versions(),
+    daemon.council_leads(),
+    daemon.fleet_meshed(),
+    convergence_counters(daemon)
+  )
+}
+
+/// Whether every one of `daemons` holds one configuration naming every one of `hosts`: the same council version
+/// everywhere, installed in its placement, every host a member and a voter, and its probe mesh whole.
+fn settled_on_one_configuration(
+  daemons: &[Daemon],
+  hosts: &[HostId],
+) -> Result<bool, ObserveError> {
+  let mut every = hosts.to_vec();
+  every.sort_unstable();
+  let mut versions = std::collections::BTreeSet::new();
+  let mut whole = true;
+  for daemon in daemons {
+    let (placed, council) = daemon.configuration_versions()?;
+    versions.insert(council);
+    let voting = daemon
+      .council_voters()?
+      .is_some_and(|voters| same_voters(&voters, &every));
+    whole &= placed == council
+      && daemon.council_members()? == every
+      && voting
+      && daemon.fleet_meshed()?;
+  }
+  Ok(whole && versions.len() == 1)
+}
+
+/// The live takeovers and given-up objects each of `daemons` has counted.
+fn takeover_outcomes(daemons: &[Daemon]) -> Vec<(u64, u64)> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      let counted = summed_counters(daemon);
+      (
+        counted.get(LIVE_TAKEN_OVER).copied().unwrap_or(0),
+        counted
+          .get("fleet.takeover.given_up")
+          .copied()
+          .unwrap_or(0),
+      )
+    })
+    .collect()
+}
+
+/// The fleet converges on one configuration once its faults stop (§4.8 "Membership fed by SWIM", A-15's rejoin; T-8.5's
+/// convergence and T-8.7's partitions; the chaos nemesis's deafened owner, seeds 6876545201569229162 and
+/// 7236833171758868842). Do: three nodes at `f = 1`; on a, a live-shipped volume written six files and shared with the
+/// fleet; make a deaf to b and c on the probe plane (its probes still reach them, and their answers never reach it: the
+/// nemesis's `Deafened` owner) until b and c have retired it, then keep it deaf while its takeover runs, until a
+/// survivor has taken the volume over or given an object up, or the round's bound has passed twice; heal. Expect every
+/// node to hold one configuration that names all three as members and voters, installed, and the probe mesh whole,
+/// within the periods a re-admission takes.
+#[test]
+fn a_fleet_whose_deafened_owner_was_retired_settles_on_one_configuration_once_it_hears_again() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (_id, written) = live_volume_written(&mut client, &daemons, "deafened");
+  drop(client);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let deafened = daemons[0].inject_probe_deafness(&[hosts[1], hosts[2]]);
+  let retired = deafened.is_ok()
+    && poll_until(&observed, RETIREMENT_DEADLINE, || {
+      all_hold(daemons[1..].iter().map(|survivor| {
+        survivor
+          .council_members()
+          .map(|members| !members.contains(&hosts[0]))
+      }))
+    });
+  let at_retirement: Vec<String> = daemons.iter().map(configuration_view).collect();
+  let before = takeover_outcomes(&daemons);
+  let resolved = retired
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      promise_wait_periods().saturating_mul(2),
+      || {
+        Ok(
+          takeover_outcomes(&daemons)
+            .iter()
+            .zip(&before)
+            .any(|(now, then)| now.0 > then.0 || now.1 > then.1),
+        )
+      },
+    );
+  let while_deaf = takeover_outcomes(&daemons);
+  let at_heal: Vec<String> = daemons.iter().map(configuration_view).collect();
+  let healed = daemons[0].inject_probe_deafness(&[]);
+  let settled = healed.is_ok()
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let at_end: Vec<String> = daemons.iter().map(configuration_view).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "deafened owner: retired {retired}; takeover resolved while deaf {resolved} (live takeovers, given up per node \
+     {before:?} -> {while_deaf:?}); settled {settled}\nat retirement:\n{}\nat the heal:\n{}\nat the end:\n{}",
+    at_retirement.join("\n"),
+    at_heal.join("\n"),
+    at_end.join("\n")
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    deafened.is_ok() && healed.is_ok(),
+    "a was made deaf and healed: {deafened:?} {healed:?}"
+  );
+  assert!(
+    retired,
+    "b and c retired a while it heard neither: {}",
+    at_retirement.join("; ")
+  );
+  assert!(
+    settled,
+    "every node holds one configuration naming a, b and c, all voting and meshed, once a hears again: {}",
+    at_end.join("; ")
+  );
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.
