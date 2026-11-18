@@ -159,10 +159,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`LandingApproval`] carries the landing's `statement` (what a signer signs) and the `signature` it carried, which
 /// `approve_landing` presents and lands with again; a [`LandingReport`]'s `verification` is the verdict on what was
 /// written, no longer always unsigned; an [`AuditRecord`] of a landing as a whole carries its `verification` (the same
-/// day).
+/// day). 21: a takeover past the volume's tolerance shows in its loss report (`VolumeTakeover::past_tolerance`, a
+/// [`PastTolerance`] naming the [`Shortfall`] of its registers' cohort and of its live log's recorded holders): until
+/// then a consumer could not tell a takeover that may have lost writes acknowledged only to the lost hosts from one that
+/// kept every one (A-332; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 20;
+pub const CONTRACT: u32 = 21;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
@@ -170,9 +173,10 @@ pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, 
 pub use slates_ipc::protocol::{
   AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, Filter, GrantScope, GreenBase,
   HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
-  LossReport, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent,
-  PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TargetRefusal, TelemetryReport,
-  TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
+  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
+  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
+  VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
