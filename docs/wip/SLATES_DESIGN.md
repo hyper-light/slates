@@ -6441,6 +6441,26 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
 > refusal for the bound.
 >
+> **A candidate's copy survives its own restart (2026-11-06).** A candidate's copies of live logs were not in its shard's
+> recovery image, and it acknowledged an entry before anything was published: after a warm restart (its anchor kept) it
+> held nothing it had acknowledged (`a_candidates_copy_survives_its_own_daemons_restart`, red first: head 4 before, none
+> after). Now each copy, with its owner, fence and head, rides the held image (`live_ship::HeldLive` in
+> `content_holder::HeldImage`), and an entry, an install or a fetch is answered only once the publication carrying it
+> commits (`live_ship::acknowledged`), as content and register holders answer; a warm restart holds it again
+> (`restore_copies`). The cost is that publication on each acknowledgement, and the held image is rebuilt whole at each
+> one, so it grows with what a candidate keeps (up to the volume's size of changes since the last whole entry). An
+> earlier form of this change also shipped a whole entry once the changes since the last were as large as it, which kept
+> that small (193–196 µs added at the median, p99 513–715 µs, at load 58–107); it is withdrawn, since the install image
+> kept beside the log (live-durability) means a whole entry on the log is shipped only at the holder's bound.
+>
+> **The held image is incremental (2026-11-08, A-270; on main 2026-11-18 at image version 27, delta version 10).** What
+> a shard holds for other owners is now keyed pieces: the
+> content hold and the mirror records one piece each, one per held register, and of each live copy a head piece and one
+> piece per entry, keyed by slot. A delta carries the pieces put and the keys removed since the last publication, so an
+> acknowledgement's publication carries the entry it added. Persisting every acknowledged live entry now adds nothing
+> that main's own spread can show at the median: 65–79 µs, against main's 65–76 µs and the whole image's 207–225 µs
+> (BENCHMARKS). Still carried whole when changed: the content hold's image and the mirror records.
+>
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
 > - *One lane a holder, the holders at once.* A dispatch sent a write's messages to the holders one after another, and
@@ -16102,6 +16122,70 @@ Applied in the same change to:
   holds. With routing restored a restart no longer does this, but the rule belongs in phase one, for the takeover's
   owner (the bug record's siblings).
 
+### A-270 — What a shard holds for other owners is keyed pieces, and a delta carries only those that changed (accepted and built 2026-11-08, the supervisor's checkpoint_log rules for raft-5's incremental held image)
+
+Applied in the same change to:
+- §4.8 A-200's status: the note on a candidate's copy surviving its own restart.
+- GAPS: the 2026-11-08 entry; BENCHMARKS: the three-arm measurement.
+- `crates/vfs`:
+  - `recover.rs`: `HeldPiece`, `HELD_PIECE_KEY_BYTES`, `ShardImage.held` as pieces, `IMAGE_VERSION` 26 → 27, and
+    `read_header`. Built as 25 → 26 and 8 → 9; A-275 landed first (2026-11-17) and took 26 and 9, so A-270 takes the
+    next (landed 2026-11-18).
+  - `checkpoint_log.rs`: `ShardDelta.held_put` and `held_removed`, folded by `apply` as the call records are, and
+    `DELTA_VERSION` 9 → 10.
+  - `error.rs`: `VfsError::RecoveryVersion { found, expected }`.
+- `crates/server`:
+  - `tracked.rs` (new): `Tracked`, a map that marks every key reached mutably since its owner last published, and
+    `slates_db::takeover::AcceptorStore` for it (A-251's by-name answer reaches held acceptors through `get_mut`).
+  - `content_holder.rs`: `held_image`, `held_changes`, `held_committed`, `split_held` and `HeldRefused`. A held
+    register's piece carries A-251's `HeldRegister { object, acceptor: PersistedAcceptor }` (`Acceptor::to_persisted`,
+    restored with `from_persisted`), its moved-from owner included, so a move rides the next delta like any change.
+  - `live_ship.rs`: `Held.first` and its slots, and `LiveState.slot_floor`.
+  - `state.rs`: `holder_records` and `live.held` tracked, and `published_held`.
+  - `verbs.rs`: the checkpoint and delta paths, `read_journal`, and `committed_held_agrees`.
+- The tests:
+  - `a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds` (`crates/server/tests/recovery.rs`,
+    failing first).
+  - `folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds` (`crates/server/src/daemon.rs`).
+  - `a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed` (`crates/server/src/daemon.rs`):
+    A-251's moved case reaching the journal only in a delta. Red with the piece writing `moved_from: None`, and with
+    `Tracked::get_mut` left unmarked.
+  - From `crates/vfs/tests/checkpoint_log.rs`: the journal model with held pieces,
+    `an_image_of_another_version_is_refused_by_its_version`, `a_delta_of_another_version_is_refused_not_read_as_torn`
+    and `a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new`. A-275's two version tests asserted
+    the same histories refused `RecoveryIncomplete`, main's refusal of another version before this change; they are
+    folded into these two, which cite both amendments and keep A-275's check that this build's own image is read.
+  - `a_candidates_restored_copy_serves_its_owners_takeover` (`crates/cli/tests/live_fleet.rs`), un-ignored. Since the
+    per-host principals (A-237) a survivor refused the taken-over volume's reads `NotShared`, with or without this
+    change; the test now shares the volume with every node first (b79bae7b), and the restart and takeover flows run
+    under their own fleet names (2c93f4c9): `live_fleet` 31 of 31, three runs in a row (adacachy, 2026-11-11).
+- **What was there.** Every delta carried the shard's held image whole. It was rebuilt from everything held: the
+  content hold, every register and every live copy with all its entries. Then it was compared byte for byte with the
+  last one published. So a holder's acknowledgement cost work proportional to everything it held: across 64 held
+  records a delta's held bytes grew from 2,224 to 55,216, and a live write cost 207–225 µs at the median. Its own
+  size also forced a full checkpoint every other publication.
+- **The rule.**
+  1. What a shard holds for others is keyed pieces: a kind byte, an object id and a position. vfs never reads them.
+  2. A checkpoint carries every piece. A delta carries the pieces put and the keys removed since the last committed
+     publication, never one key both, and recovery folds them in order over the checkpoint.
+  3. A piece is found changed structurally. Held registers and live copies sit in maps that mark every key reached
+     mutably, so no call site can forget to. The content hold and the mirror records are compared by their bytes.
+  4. A live copy's entries are numbered by slot. They are only pushed after the last or all cleared, and a copy made
+     again starts at or above every slot a committed publication carried, so a slot never names two entries.
+  5. Another build's image or CRC-valid delta frame is refused `RecoveryVersion` by the version it carries, before
+     anything after it is decoded. It is never read under this layout, and never taken for a torn frame, which would
+     recover the checkpoint without the acknowledged deltas after it.
+- **Measured** (adacachy, 2026-11-08, and again 2026-11-11 on the tip after B11). The failing test's late median dropped
+  from 55,216 bytes to one record's. At load 11–13, five rounds interleaved: what live shipping adds to a stable write
+  at the median, pieces 85.5–92.9 µs (median 91.6), main 70.9–99.5 µs (88.5), the whole image 225.3–325.4 µs (231.2)
+  (BENCHMARKS).
+  Interleaved at load 42–113, live shipping adds 65–79 µs to a stable write at the median with pieces, 65–76 µs on main
+  (which persists no live copy) and 207–225 µs with the whole image (BENCHMARKS).
+- **Red-checks.** The generated-history oracle fails with `get_mut` left unmarked, and with a copy made again at slot 0.
+  A crash after any byte of any write of a held delta recovers the old pieces until the journal's last write is whole.
+- **Owed.** The content hold and the mirror records are still re-encoded and compared at each publication: work
+  proportional to what they hold, though carried only when they change.
+
 ### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 
 Applied in the same change to:
@@ -20929,9 +21013,10 @@ pages left 620 committed objects unlearned. Two shapes were run against that nem
     byte. The layout without the field is refused as truncated, never read as "moved from none".
   - **The image.** The held image's register is its object and this encoding (`HeldRegister`), so a warm restart keeps
     an earlier move. The layout changed, so the image version is 25 and the delta version 8: a delta carries the held
-    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7), and raft-7 (A-270) takes the
-    numbers after. An image or delta of another version is refused by its version. A missing field is never read as
-    none: that would be the compatibility shim §2.7 forbids.
+    image whole. Both follow conformance-14 (A-262, image 23 and 24, delta 6 and 7); A-275 (image 26, delta 9) and
+    raft-7's A-270 (image 27, delta 10) take the numbers after, in landing order. An image or delta of another version
+    is refused by its version. A missing field is never read as none: that would be the compatibility shim §2.7
+    forbids.
   - **Counted.** `fleet.takeover.listed_by_moved_from` counts a copy only the moved-from owner placed in the round.
 - **(ii), measured and rejected: each host's object directory kept by its recovery cohort at `f + 1`,** as the
   configuration group keeps membership, read by the successor for every name.
@@ -21409,8 +21494,11 @@ once as every merge did before policies. Built the same day: every launcher-clas
 approval, enroll, revoke) verifies under the daemon's issuer secret or the launcher secret its starter handed the anchor
 (`landing::proven_by_launcher`), so a launcher keeps its authority across its own restarts and the daemon's; and a
 `SetPolicy` names the policy version it replaces (`PolicyRecord.write_version`, covered by the proof), so a captured
-proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Owed, in order: a consumer's own policy, the
-MCP and SDK land verb gated by the policy, then signed work. The
+proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Built the same day: a consumer's own policy,
+kept in its record and on every shard's channels bound to it, held on the agent's shard before its request is routed
+(forbid refused; ask turns a landing into `Present` and a merge into `SubmitHeld`/`EditSubmitHeld`; bypass leaves the
+volume's mode to decide), so the stricter of consumer and volume governs; and the MCP and SDK land verbs, which send
+`Land` with no grant, say what the policy does. Owed: signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
