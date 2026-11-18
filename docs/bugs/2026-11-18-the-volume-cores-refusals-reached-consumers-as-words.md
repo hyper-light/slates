@@ -65,5 +65,15 @@ Each is now `Refusal::Volume { IsDirectory }` or `{ NotDirectory }`. The tests c
 The sweep for every other spelling found no further volume-core error in words. It did find 11 arms in
 `crates/server/src/verbs.rs` (lines 5885, 5917, 6113, 6198, 8955, 8998, 9206, 10414, 10487, 11608 and 11632 on
 f64b8c33c) that send a memory error other than `BudgetExceeded`, or a registry insert's error, at admission as
-`BadRequest { e.to_string() }`. That is the same fault in another class; it is owed (GAPS, A-299).
+`BadRequest { e.to_string() }`. That is the same fault in another class, and it was fixed the same day. Each of the
+11, the two arms that answered a full registry with `BadRequest { "volume registry full at N" }`, and a database's
+memory refusal now go through `refusal_of_mem` (`crates/server/src/error.rs`). It types them as the volume core types
+`VfsError::Memory`: `BudgetExceeded` with what is available, a lock refusal with what was locked, and the rest
+`Refusal::Volume { Memory }`.
+
+No test reaches these arms by use today. Each reservation refuses only `BudgetExceeded` (`Ledger::take`), and the
+registry shares its bound, `caps.volumes`, with the database's volume table, which a create checks first. So their
+proof is the mapping's unit test, `every_memory_refusal_at_admission_is_typed`.
+Still owed: `refusal_of_db`'s last catch-all sends `Corrupt`, `NfsInstanceRegressed`, `CheckpointOutOfRange`,
+`SealKeyMalformed` and `Wire` as words.
 
