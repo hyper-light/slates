@@ -1342,6 +1342,30 @@ impl Device {
     self.queues.get_mut(index).ok_or(DeviceError::NotConfigured)
   }
 
+  /// Holds, unserved, a chain whose request asks for the guest's stores through its maps to reach the volume first,
+  /// while they are written back ([`crate::backed`]): whether it was held. A chain already through its ingest (`fresh`
+  /// false) is served, with how the ingest came out.
+  #[cfg(unix)]
+  fn held_for_ingest(
+    &mut self,
+    queue: u16,
+    chain: &DescriptorChain,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    fresh: bool,
+  ) -> bool {
+    if !(fresh && self.hold_for_ingest(bridge, queue)) {
+      return false;
+    }
+    self.backed.request = Some(crate::backed::HeldRequest {
+      queue,
+      chain: chain.clone(),
+      mark: self.journal_mark(bridge, cx),
+    });
+    self.backed.counts.ingests_held = self.backed.counts.ingests_held.saturating_add(1);
+    true
+  }
+
   /// Serves one chain: the FUSE request is gathered, dispatched and its reply scattered; returns
   /// the bytes written into the chain's writable buffers (the used element's length). With a DAX placer, a request that
   /// asks for the guest's stores first is held unless `ingested` says how their ingest came out.
@@ -1373,13 +1397,7 @@ impl Device {
     // A request that asks for the guest's stores through its maps to reach the volume first is held, unserved, while
     // they are written back ([`crate::backed`]); the turn serves it when the ingest is done, with how it came out.
     #[cfg(unix)]
-    if ingested.is_none() && self.hold_for_ingest(bridge, queue) {
-      self.backed.request = Some(crate::backed::HeldRequest {
-        queue,
-        chain: chain.clone(),
-        mark: self.journal_mark(bridge, cx),
-      });
-      self.backed.counts.ingests_held = self.backed.counts.ingests_held.saturating_add(1);
+    if self.held_for_ingest(queue, chain, bridge, cx, ingested.is_none()) {
       return Ok(ChainOutcome::IngestHeld);
     }
     self.observe(header.as_ref());
