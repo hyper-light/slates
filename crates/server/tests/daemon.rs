@@ -1487,12 +1487,7 @@ fn bulk_and_overlay_scenario() {
   }) else {
     panic!("create overlay");
   };
-  let ReplyBody::BaseBytes { bytes } = client.call(&RequestBody::ReadBase {
-    volume: overlay,
-    path: "/lib.rs".into(),
-  }) else {
-    panic!("read_base");
-  };
+  let bytes = read_base_whole(&mut client, overlay, "/lib.rs");
   assert!(
     bytes.starts_with(b"//! `slates-server`"),
     "the base is read from the disk"
@@ -1511,7 +1506,8 @@ fn bulk_and_overlay_scenario() {
   assert!(matches!(
     client.call(&RequestBody::ReadBase {
       volume: id,
-      path: "/x".into()
+      path: "/x".into(),
+      offset: 0,
     }),
     ReplyBody::Refused {
       refusal: Refusal::Unsupported { .. }
@@ -1994,12 +1990,7 @@ fn digest_scenario() {
   }) else {
     panic!("create overlay");
   };
-  let ReplyBody::BaseBytes { bytes } = client.call(&RequestBody::ReadBase {
-    volume: overlay,
-    path: "/lib.rs".into(),
-  }) else {
-    panic!("read_base");
-  };
+  let bytes = read_base_whole(&mut client, overlay, "/lib.rs");
   let digest = RequestBody::Digest {
     volume: overlay,
     path: "/lib.rs".into(),
@@ -2753,10 +2744,13 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
   }));
   assert_foreign_merge_refused(intruder.call(&RequestBody::Rebase { work }));
   // The green never advanced under the foreign calls; the owner still drives its own submit to success.
-  let ReplyBody::Submitted { version, conflicts } = owner.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = owner.call(&RequestBody::Submit {
     work,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("the owner submits its own work");
   };
   assert!(
@@ -2833,7 +2827,7 @@ fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
     ReplyBody::Versions { head: 1 }
   );
   assert_eq!(
-    read(&mut sharer, green, "f", ReadAt::Head),
+    read(sharer, green, "f", ReadAt::Head),
     Ok(b"owned".to_vec())
   );
   let ReplyBody::WorkCreated { id: own, base } = sharer.call(&RequestBody::CreateWork {
@@ -2912,10 +2906,13 @@ fn merge_submit_scenario() {
   declare(&mut client, b, b"world");
 
   // A merges on the fast path; the chain advances.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: a,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit a");
   };
   assert!(
@@ -2950,10 +2947,13 @@ fn merge_submit_scenario() {
   );
 
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: b,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit b");
   };
   assert_eq!(version, None, "B is not accepted");
@@ -3016,10 +3016,13 @@ fn merge_modify_scenario() {
   };
   assert_eq!(base, 1, "the work is based on the green's head, version 1");
   edit(&mut client, modw, 0, 5, b"world");
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: modw,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit");
   };
   assert!(
@@ -3095,10 +3098,13 @@ fn merge_lagging_scenario() {
     }
   ));
   // A, based on version 1, touched a different file — it merges past version 2 as version 3.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: a,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit a");
   };
   assert!(
@@ -3157,7 +3163,9 @@ fn green_head(client: &mut Client, green: slates_ipc::protocol::VolumeId) -> u64
 fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
   let tail = work_over(client, green, "tail");
   edit_f(client, tail, 8, 2, b"YY");
-  let ReplyBody::Rebased { version, conflicts } = client.call(&RequestBody::Rebase { work: tail })
+  let ReplyBody::Rebased {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Rebase { work: tail })
   else {
     panic!("rebase");
   };
@@ -3168,10 +3176,13 @@ fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId)
   assert_eq!(version, Some(2), "the work is rebased onto the head");
   assert_eq!(green_head(client, green), 2, "a rebase commits nothing");
 
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: tail,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit");
   };
   assert!(
@@ -3199,7 +3210,9 @@ fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::Volume
       ..
     }
   ));
-  let ReplyBody::Rebased { version, conflicts } = client.call(&RequestBody::Rebase { work: loser })
+  let ReplyBody::Rebased {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Rebase { work: loser })
   else {
     panic!("rebase loser");
   };
@@ -3302,10 +3315,13 @@ fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::Volum
       mode: 0o644,
     },
   );
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: meta,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit meta");
   };
   assert!(
@@ -3352,10 +3368,13 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   assert_eq!(version, Some(3), "the first xattr set is version 3");
 
   // The second, based on 2, sets a different value — it conflicts against the stored "AA".
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Submit {
     work: other,
     evidence: Vec::new(),
-  }) else {
+  })
+  else {
     panic!("submit xattr-c");
   };
   assert_eq!(
@@ -3477,7 +3496,7 @@ fn declared_ipc_metadata_merges_over_the_wire_and_retains_its_old_version() {
   submit_accepted(&mut client, first, 1);
   let reply = client.call(&submit_of(other));
   assert!(
-    matches!(reply, ReplyBody::Submitted { version: None, ref conflicts }
+    matches!(reply, ReplyBody::Submitted { version: None, ref conflicts, .. }
     if conflicts.iter().any(|window| window.path == "pipe")),
     "metadata differs: {reply:?}"
   );
@@ -3693,6 +3712,40 @@ fn read(
   }
 }
 
+/// A base entry's bytes as `read_base` walks them (§4.4, A-267): a page at a time to the file's size, every page of one
+/// stamp.
+fn read_base_whole(
+  client: &mut Client,
+  volume: slates_ipc::protocol::VolumeId,
+  path: &str,
+) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  let mut first_stamp = None;
+  loop {
+    let ReplyBody::BaseBytes {
+      bytes: page,
+      total,
+      stamp,
+    } = client.call(&RequestBody::ReadBase {
+      volume,
+      path: path.to_owned(),
+      offset: u64::try_from(bytes.len()).unwrap(),
+    })
+    else {
+      panic!("read_base");
+    };
+    assert_eq!(
+      *first_stamp.get_or_insert(stamp),
+      stamp,
+      "one state of {path}"
+    );
+    bytes.extend_from_slice(&page);
+    if u64::try_from(bytes.len()).unwrap() >= total || page.is_empty() {
+      return bytes;
+    }
+  }
+}
+
 /// The refusal a request gets, or a panic naming the reply that was not one.
 fn refusal_of(client: &mut Client, body: &RequestBody) -> Refusal {
   match client.call(body) {
@@ -3730,6 +3783,7 @@ fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, ve
     ReplyBody::Submitted {
       version: Some(got),
       conflicts,
+      ..
     } if got == version && conflicts.is_empty() => {}
     other => panic!("submit expected version {version}: {other:?}"),
   }
@@ -4193,7 +4247,10 @@ fn barrier_part(
     b"hello",
     "the sealed version holds only what was declared before the seal"
   );
-  let ReplyBody::Submitted { version, conflicts } = client.call(&submit_of(w)) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&submit_of(w))
+  else {
     panic!("second submit");
   };
   assert!(
@@ -4420,7 +4477,7 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
   edit_at(&mut client, lagging, "big", 0, 4, b"LAGS");
   let reply = client.call(&submit_of(lagging));
   assert!(
-    matches!(&reply, ReplyBody::Submitted { version: None, conflicts } if !conflicts.is_empty()),
+    matches!(&reply, ReplyBody::Submitted { version: None, conflicts, .. } if !conflicts.is_empty()),
     "the lagging edit conflicts with the writer's: {reply:?}"
   );
   let with_conflict = daemon.merge_retention(g).unwrap();
@@ -4531,7 +4588,6 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
 /// a volume's growth, never kept for free.
 #[test]
 fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them() {
-  use slates_ipc::protocol::ReadAt;
   let (daemon, instance) = daemon("work-charge");
   let mut client = Client::connect(&instance);
   let ReplyBody::GreenCreated { id: green, .. } = client.call(&RequestBody::CreateGreen {

@@ -3846,7 +3846,7 @@ mod tests {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+mod landed_reply_tests {
   use slates_ipc::protocol::{
     HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
   };
