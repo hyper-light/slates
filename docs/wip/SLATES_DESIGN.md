@@ -28055,3 +28055,27 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/client/src/client.rs`,
 `crates/server/src/{verbs,state,daemon}.rs`, `crates/server/tests/attachment_term.rs`.
+
+**A-384's holders (the second change, the same day).** The library's holder is `slates_client::Hold`
+(`crates/client/src/hold.rs`): made for an attachment, it renews it once before it returns (so a refusal comes back at
+once), then from a thread of its own over a client of its own, at the cadence each `Renewed` names, until it is dropped
+(the stop channel's sender dropped ends the renewer's wait at once, and the thread is joined) or the daemon refuses a
+renewal (`Hold::lost`, `Hold::wait_lost`). Its own client, because a renewal must not wait behind its holder's other
+calls on one ordered channel; it waits on a channel with a timeout, never a sleep (D-9). The CLI's holder is `slates
+attach ID --hold` (`crates/cli/src/verbs.rs`, `hold`): it attaches in the CLI's form, says so as `attach` does, and
+waits on a `Hold` until the daemon refuses it; the process ending, however it ends, ends the renewals, so no signal
+handling is needed and a killed holder behaves as an interrupted one. The SDKs (Python, Node) make no CLI-form
+attachment: their verbs ride their own client, and a library client's `attach` takes the root form, which ends with
+that client, so neither has an attachment for a term to judge; a library user who makes a CLI-form attachment holds it
+with a `Hold`. `docs/cli.md` states the term as A-384 made it (it still named the 10 s SLO). Held by
+`a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse` (`crates/client/tests/client.rs`) and
+`attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends` (`crates/cli/tests/cli.rs`, gated by
+`SLATES_TEST_CLI`). Owed beside them: a laptop's failover delay counts its anchor's supervision as its detection (the
+watchdog's window `W`, A-232: a stuck daemon is ended and restarted), so a bare attachment's ceiling there is `W` plus
+the recovery, not the recovery alone; and the volume's write lease (D-16) takes its holder's term too.
+Measured on the Mac Studio (2026-11-18, load 22-23, debug build): the library test held an attachment through three 2 s
+ceilings with no verb and saw it refused `AttachmentExpired` two ceilings after the hold's drop (10.8-10.9 s); the CLI
+flow, twice, held one through 4 s with no verb, wrote under it from another process, and saw it refused once the holding
+process was killed (11.9-12.3 s); the CLI's parse tests take `--hold` (29 of 29; its first run refused the flag, missing
+from the global switch table). Red-checked: a `Hold` whose renewer renews nothing fails the library test's held write,
+and a `--hold` that returns after attaching fails the CLI flow (its holder gone before the write).

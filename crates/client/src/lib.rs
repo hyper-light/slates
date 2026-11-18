@@ -35,6 +35,7 @@ pub mod client;
 pub mod driver;
 pub mod error;
 pub mod exec;
+pub mod hold;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, DriftedPage,
@@ -47,6 +48,8 @@ pub use client::{
 #[cfg(any(unix, windows))]
 pub use client::{MappedRead, MappedWrite, page_bytes};
 pub use error::ClientError;
+/// A CLI attachment held alive by its holder (A-384).
+pub use hold::Hold;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a
 /// workload on an inherited descriptor, and the typed faults of a delivery a consumer cannot take.
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
