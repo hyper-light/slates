@@ -139,10 +139,12 @@ const OCI_OWED: &str = "the container form exists — `attach` returns a verifie
 pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
-  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane \
-    mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), \
-    and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with \
-    `user_allow_other`)",
+  not_covered: concat!(
+    "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane ",
+    "mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), ",
+    "and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with ",
+    "`user_allow_other`)",
+  ),
 };
 
 /// Tools every mounted macOS suite needs.

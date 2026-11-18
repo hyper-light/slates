@@ -1277,9 +1277,11 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.land.materialize",
-      "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows \
-       (A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and \
-       writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      concat!(
+        "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows ",
+        "(A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and ",
+        "writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      ),
       json!({
         "volume": string,
         "target": string,

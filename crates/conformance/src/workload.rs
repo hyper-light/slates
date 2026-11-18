@@ -150,6 +150,7 @@ git status --porcelain=v2 --branch
 /// fixed date, as the git workloads' do, and the clone's `hgrc` is written back with the source's relative path,
 /// since `hg clone` records a local source by its absolute path.
 const MERCURIAL: &str = r#"
+# Format: every commit's one fixed date, as the git workloads fix theirs.
 d='2026-09-14 00:00:00 +0000'
 hg init src
 cd src
@@ -221,6 +222,7 @@ case $top in
   *) url="file:///$top/repo" ;;
 esac
 svn() { command svn --config-dir "$top/svn-config" --non-interactive --no-auth-cache "$@"; }
+# Format: every revision's one fixed date, and the repository's fixed UUID.
 printf '2026-09-14T00:00:00.000000Z' > date
 svnadmin create repo
 svnadmin setuuid repo 00000000-0000-4000-8000-00000000c0de
@@ -266,6 +268,7 @@ svn info --show-item last-changed-revision
 svn info --show-item url
 svn info --show-item repos-uuid
 svn log -v -r 1:HEAD '^/'
+# Format: revision 5 is the change on trunk, 6 the branch's merge into it.
 svn diff -c 5 '^/'
 svn propget svn:mergeinfo .
 svn cat -r 2 a.txt
@@ -273,6 +276,7 @@ svn list -R '^/'
 cd ..
 svnadmin verify repo
 svnlook tree repo
+# Format: revision 6, the merge, as the repository records it.
 svnlook changed -r 6 repo
 svnadmin dump -q repo | cksum
 "#;
@@ -854,10 +858,12 @@ pub struct StatedDifference {
 }
 
 /// Why the WinFsp drive's link counts are not NTFS's (A-300).
-const NO_HARD_LINK_ON_THE_DRIVE: &str = "the WinFsp drive makes no hard link: WinFsp's driver answers \
-  FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS \
-  compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes \
-  are the same (A-300)";
+const NO_HARD_LINK_ON_THE_DRIVE: &str = concat!(
+  "the WinFsp drive makes no hard link: WinFsp's driver answers ",
+  "FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS ",
+  "compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes ",
+  "are the same (A-300)",
+);
 
 /// The WinFsp drive's stated differences: how many files of a local clone have two names (A-300). git and Mercurial
 /// link a local clone's files where the file system can and copy them where it cannot, so these lines count links on
