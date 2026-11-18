@@ -222,6 +222,23 @@ fn daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
+/// §2.6 boot step 2 (A-312). Do: start a daemon of [`TEST_SHARDS`] shards and ask how often its start beat. Expect at least
+/// once for every ordered pair of its shards (the runtime's pair rings, the start's work that grows fastest) and once for
+/// each shard, before its watchdog took the beat over. A start beats as it goes, so the anchor, which kills a start whose
+/// one thread runs a window of CPU without a beat, never kills one that progresses, however many shards it starts.
+/// Before, nothing beat until the watchdog ran, and the anchor killed every 407-shard start on B10's Linux gate at load 70.
+#[test]
+fn a_daemons_start_beats_at_every_unit_of_its_work() {
+  let (daemon, _) = daemon("start-beats");
+  let shards = u64::from(TEST_SHARDS);
+  let least = shards * (shards - 1) + shards;
+  assert!(
+    daemon.start_beats() >= least,
+    "a start of {shards} shards beat {} times, under its {least} units",
+    daemon.start_beats()
+  );
+}
+
 /// A-254, under A-176 and A-178's rule. Do: start a daemon that creates its own segment (run alone, with no anchor); start a
 /// second daemon for the same instance and segment name. Expect the second refused and the first's segment still there
 /// to attach by its handoff: a refused start leaves a running instance untouched. Before, on macOS, the second start

@@ -131,6 +131,46 @@ proptest! {
     prop_assert_eq!(restored.submit(&further), original);
     prop_assert_eq!(restored.head_identity(), green.head_identity());
   }
+
+  /// §4.8 "Recovery", §4.3 "Bounded work everywhere": a recovery seeds a green from its origin a share at a time
+  /// (`OriginLoad`) and then applies its checkpoint (`Green::with_checkpoint`), where `Green::restore` does both in one
+  /// call. Do: build a green from a generated origin and chain, take its checkpoint at a generated `F`, and restore it
+  /// twice: in one call, and seeded in shares of a generated size before the checkpoint is applied. Expect: one head, one
+  /// head identity, the same files at every version from `F` to the head once both replay the chain past `F`, and the
+  /// same verdict on a further increment.
+  #[test]
+  fn a_green_seeded_in_shares_then_given_its_checkpoint_is_the_restored_green(
+    origin_rows in prop::collection::vec(raw(), 0..12),
+    chain in prop::collection::vec(raw(), 1..24),
+    extra in raw(),
+    pick in any::<u16>(),
+    share in 1usize..64,
+  ) {
+    let (green, accepted) = chain_of(&origin_rows, &chain);
+    let head = green.head();
+    let at = u64::from(pick) % (head + 1);
+    let checkpoint = green.checkpoint(at).expect("a checkpoint at or below the head");
+    let mut whole = Green::restore(origin_of(&origin_rows), &checkpoint);
+    let mut load = slates_merge::engine::OriginLoad::new(origin_of(&origin_rows));
+    let seeded = loop {
+      if let Some(seeded) = load.step(share) {
+        break seeded;
+      }
+    };
+    let mut in_shares = seeded.with_checkpoint(&checkpoint);
+    for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
+      prop_assert_eq!(whole.submit(increment), Outcome::Accepted { version: *version });
+      prop_assert_eq!(in_shares.submit(increment), Outcome::Accepted { version: *version });
+    }
+    prop_assert_eq!(in_shares.head(), whole.head());
+    prop_assert_eq!(in_shares.head_identity(), whole.head_identity());
+    for version in at..=head {
+      prop_assert_eq!(in_shares.files_at(version), whole.files_at(version), "files at {}", version);
+    }
+    let further = increment_of(&extra).with_id(id(0, 0xD0), head);
+    prop_assert_eq!(in_shares.submit(&further), whole.submit(&further));
+    prop_assert_eq!(in_shares.head_identity(), whole.head_identity());
+  }
 }
 
 /// A checkpoint touching every table, for the codec's tests.

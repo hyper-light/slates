@@ -31,6 +31,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/recovered.rs"]
+mod recovered;
+
 /// Shape: how long the daemon may take to come up, and to be replaced after a kill.
 const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the poll interval of the waits.
@@ -274,12 +277,15 @@ fn an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered() {
   // Kills that landed with requests still unsent, so a successor answered requests the dead daemon never read: the
   // non-vacuity evidence that a request outlived a daemon in the connection, not merely that the connection did.
   let mut kills_inside_a_burst = 0usize;
-  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  // Each daemon is killed once the anchor has judged it recovered (A-311): a daemon killed sooner is a failed start,
+  // and the second in a row is a crash loop the anchor backs off, which this flow does not test.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
   for round in 0..KILLS {
     let (waited, inside) = held.kill_inside_a_burst(round, pid);
     longest_wait = longest_wait.max(waited);
     kills_inside_a_burst += usize::from(inside);
-    pid = await_new_daemon(&instance, pid, round);
+    let killed = pid;
+    pid = recovered::await_recovered(&instance, &|next| next != killed, POLL, START_WAIT);
   }
   let whole = read_whole(&mut held.stream, &held.file, held.model.len(), held.xid);
   eprintln!(
@@ -557,7 +563,8 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
   let instance = format!("nfs-commit-{}", std::process::id());
   let _anchor = start_anchor(&instance);
   let mut held = HeldSession::open(&instance);
-  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  // Each daemon is killed once the anchor has judged it recovered (A-311), as in the held-connection flow.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
   let mut xid = 10_000u32;
   let mut committed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
   let mut rewrites = 0usize;
@@ -586,7 +593,8 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
       committed.push((file, pieces.concat()));
     }
     if killed {
-      pid = await_new_daemon(&instance, pid, round);
+      let killed = pid;
+      pid = recovered::await_recovered(&instance, &|next| next != killed, POLL, START_WAIT);
     }
   }
   // One more kill: every file is now read from what the restarted daemon recovered.
@@ -694,7 +702,8 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
     kills_inside_a_burst: 0,
     answered_from_held: 0,
   };
-  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  // Each daemon is killed once the anchor has judged it recovered (A-311), as in the held-connection flow.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
   let mut round = 0usize;
   while round < MUTATION_KILLS || (run.answered_from_held == 0 && round < MUTATION_KILLS_MAX) {
     run.kill_inside_a_mkdir_burst(round, pid);
@@ -711,6 +720,14 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
       );
     }
     run.answered_from_held += answered;
+    // The successor's counters are read as soon as it answers; it is killed in the next round once it has recovered.
+    let successor = pid;
+    recovered::await_recovered(
+      &instance,
+      &|answering| answering == successor,
+      POLL,
+      START_WAIT,
+    );
     round += 1;
   }
   run.assert_each_applied_once(round);

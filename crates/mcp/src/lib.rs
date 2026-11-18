@@ -2085,6 +2085,8 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
   // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
   if let Some(fields) = report.as_object_mut() {
     fields.insert("dumps_local_full".to_owned(), json!(r.dumps_local_full));
+    // Whether the anchor has judged the daemon recovered (A-311): what a caller that ends a daemon on purpose waits for.
+    fields.insert("recovered".to_owned(), json!(r.recovered));
   }
   report
 }

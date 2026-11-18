@@ -112,9 +112,10 @@ pub struct MergeShardState {
   /// each time. Nothing of a green ships while its inputs are not made. Bounded by the greens this shard owns; dropped
   /// with the green and once every candidate holds version 0.
   pub(crate) origin_inputs: BTreeMap<ObjectId, crate::merge_origin::OriginInputs>,
-  /// On a holder: the greens whose version 0 a task of this shard is seeding into a replica a share at a time from the
-  /// inputs it holds (`crate::merge_origin::ReplicaSeed`, A-286). Every record of such a green is answered with no
-  /// acknowledgement until the replica is seeded; the owner ships it again. Bounded by the greens this holder backs.
+  /// On a holder: the greens whose replica a task of this shard is building a share at a time from what it holds
+  /// (`crate::merge_origin::ReplicaSeed`): version 0 seeded from its inputs (A-286), and on a holder that restarted,
+  /// every version it accepted recomputed from its held increments (A-313). Every record of such a green is answered with
+  /// no acknowledgement until the replica is built; the owner ships it again. Bounded by the greens this holder backs.
   pub(crate) seeding: BTreeSet<ObjectId>,
 }
 
@@ -3197,10 +3198,49 @@ const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
 /// A holder withheld a merge record's acknowledgement (the injected fault).
 const RECORD_WITHHELD: &str = "merge.record_withheld";
 
+/// Where a merge record's version stands against this holder's replica of its green (§4.16 "Apply on holders").
+enum RecordStanding {
+  /// A version the replica already applied: the acceptor re-acknowledges it (idempotent).
+  Applied,
+  /// The replica's next version, or version 0 of a green this holder has no replica of: it is recomputed here.
+  Next,
+}
+
+/// The standing of `version` of `object`'s merge records on this holder, or `None` when nothing may be acknowledged now:
+/// the replica is still being rebuilt, or the version is out of order (counted). A holder with the green's records and
+/// no replica (a warm restart) rebuilds the replica from them first (A-313).
+fn record_standing(
+  state: &mut ShardState,
+  object: ObjectId,
+  version: u64,
+) -> Option<RecordStanding> {
+  let next = match state.merge.replicas.get(&object) {
+    Some(replica) => Some(replica.head().saturating_add(1)),
+    // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
+    // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
+    // refused out of order here, for good.
+    None => match crate::merge_origin::rebuild_replica(state, object) {
+      crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
+      crate::merge_origin::Rebuild::Later => return None,
+      crate::merge_origin::Rebuild::Nothing => None,
+    },
+  };
+  match (next, version) {
+    (Some(next), version) if version < next => Some(RecordStanding::Applied),
+    (None, 0) => Some(RecordStanding::Next),
+    (Some(next), version) if version == next => Some(RecordStanding::Next),
+    _ => {
+      state.count(OUT_OF_ORDER, 1);
+      None
+    }
+  }
+}
+
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
 /// then the record is accepted into the object's acceptor like a head record and the bound
-/// acknowledgement returned. Every other case is an empty reply the owner counts as no
+/// acknowledgement returned. A holder with the green's records and no replica (a warm restart) rebuilds the replica
+/// from them first (A-313). Every other case is an empty reply the owner counts as no
 /// acknowledgement, with the reason counted here; a mismatch is fatal for the green on this holder.
 pub(crate) fn accept_merge_record(
   state: &mut ShardState,
@@ -3231,22 +3271,13 @@ pub(crate) fn accept_merge_record(
     state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
-  let next = state
-    .merge
-    .replicas
-    .get(&object)
-    .map(|replica| replica.head().saturating_add(1));
-  match (next, value.version) {
+  match record_standing(state, object, value.version) {
+    None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
-    (Some(next), version) if version < next => {
+    Some(RecordStanding::Applied) => {
       return crate::fleet::accept_held_record(state, local, peer_host, record);
     }
-    (None, 0) => {}
-    (Some(next), version) if version == next => {}
-    _ => {
-      state.count(OUT_OF_ORDER, 1);
-      return Vec::new();
-    }
+    Some(RecordStanding::Next) => {}
   }
   // Version 0 of a green over a base: its replica is seeded from the origin a share at a time (A-286).
   if value.version == 0

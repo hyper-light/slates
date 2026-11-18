@@ -847,8 +847,12 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
     if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
       break;
     }
+    // The test's bound is the anchor's own verdict: it expects no start killed, so the first kill ends the watch and fails
+    // it with the anchor's line. Before 2026-11-11 the watch read on, and with no back-off for starts that each fail past
+    // the window it read for good: B10's Linux gate restarted the start every second for 27 minutes.
     if line.contains(START_KILL_LINE) {
       kills.push(line.trim_end().to_owned());
+      break;
     }
   }
   let served = line.contains(&serving_line);
@@ -12142,10 +12146,7 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     .publish(RegionKind::Profile, profile.to_json().unwrap().as_bytes())
     .unwrap();
   let args = ["--ignored", "--exact", "garbling_daemon", "--nocapture"].map(str::to_owned);
-  let policy = RestartPolicy::derive(
-    slates_db::replay::RECOVERY_BUDGET_NS,
-    slates_db::replay::RECOVERY_BUDGET_NS,
-  );
+  let policy = RestartPolicy::derive(config.failover_slo_ns);
   let mut anchor = SupervisingTest(Supervisor::new(segment, &args, policy.get()).unwrap());
   anchor
     .0

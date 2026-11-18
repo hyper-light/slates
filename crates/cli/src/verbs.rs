@@ -1715,6 +1715,8 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     attachment: shards.attachment.attachment,
     stream: shards.stream,
     at: request.handed,
+    resync: shards.resync,
+    resync_at: request.resync_at,
   };
   hand_to(client, OsStr::new(program), args, handed)
 }
@@ -1732,6 +1734,12 @@ struct Handed {
   stream: slates_client::StreamEnd,
   /// Where the command finds it.
   at: crate::args::HandOff,
+  /// The stream's resync end, when the daemon handed one (A-316).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync: Option<slates_client::StreamEnd>,
+  /// Where the command finds its resync end, when it asked for one (`--resync-fd`).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync_at: Option<i32>,
 }
 
 /// Replaces this process with `program`, the stream end at the descriptor number `handed` names
@@ -1752,11 +1760,31 @@ fn hand_to(
     ));
   };
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  let error = slates_ipc::stream::exec_with(program, &args, handed.stream, at);
+  let mut ends = vec![(handed.stream, at)];
+  if let Some(resync_at) = handed.resync_at {
+    ends.push((resync_end(handed.resync)?, resync_at));
+  }
+  let error = slates_ipc::stream::exec_with_ends(program, &args, ends);
   Err(Failure::Failed(format!(
     "shards: running {} with its end at descriptor {at}: {error}",
     program.to_string_lossy()
   )))
+}
+
+/// The resync end a command that asked for one is handed (A-316): the daemon's, or, where the daemon handed none (a
+/// platform with no resync yet, a stream served without one), a channel already ended, so the command reads its end at
+/// once and knows, as it would from the daemon's, that no resync will come.
+#[cfg(unix)]
+fn resync_end(
+  handed: Option<slates_client::StreamEnd>,
+) -> Result<slates_client::StreamEnd, Failure> {
+  if let Some(handed) = handed {
+    return Ok(handed);
+  }
+  let (ended, end) = slates_ipc::stream::message_pair()
+    .map_err(|e| Failure::Failed(format!("shards: an ended resync channel: {e}")))?;
+  drop(ended);
+  Ok(end)
 }
 
 /// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`
@@ -2538,6 +2566,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
   // (`slates share ID uid:N@ANCHOR`).
   out.push_str(&format!("anchor: {}\n", report.anchor));
+  // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
+  out.push_str(&format!("recovered: {}\n", report.recovered));
   let root: String = report
     .seal
     .root_id

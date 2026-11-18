@@ -129,18 +129,21 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
 /// same day). 10: a volume's loss window, `VolumeStatus::loss` (`LossReport`, `VolumeTakeover`; AC-8.3): what an owner
 /// loss would lose now, the newest seal placed on another host, and on a successor the takeover that made it the owner
-/// (the same day). 11: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page,
-/// audit_page, changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
-/// `Instance::drift` reads every entry (the same day). 12: a list a verb's own reply carries counts what one reply could
-/// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
-/// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
-/// conflict (the same day). 13: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
-/// was replaced; `merge` and `rebase` answer every window of a verdict however many (A-267) (the same day). 14:
-/// `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it passes; `drift`
-/// answers its lists in path order (A-267) (the same day).
+/// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
+/// took, so its exit is no failed start (A-311) (the same day). 12: `ShardsStream::resync`, the device's end of a Shards
+/// stream's resync channel, which `serve_shards` hands beside the stream's where the daemon makes one (Linux), none
+/// elsewhere and from the simulator (A-316; the same day). 13: lists a page at a time (A-263 to A-267): `Page`,
+/// `Instance::{list_page, grants_page, audit_page, changed_since, changed_since_page, drift_page}`, `DriftPage`,
+/// `DriftReport::elided`, `ChangedCursor`; `Instance::drift` reads every entry (the same day). 14: a list a verb's own
+/// reply carries counts what one reply could not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths,
+/// paths_elided }`, `Stale::Disk` carries `elided`, `LandingReport` carries `degraded_elided`, and a presentation is
+/// clean only when it carries and counts no conflict (the same day). 15: `Stale::Verdict`, a merge's or a rebase's
+/// conflict windows read after the work's verdict was replaced; `merge` and `rebase` answer every window of a verdict
+/// however many (A-267) (the same day). 16: `drift_page` reads past an inode (`after: Option<u64>`), in inode order,
+/// re-checking the entries it passes; `drift` answers its lists in path order (A-267) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 14;
+pub const CONTRACT: u32 = 16;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

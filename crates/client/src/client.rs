@@ -150,6 +150,10 @@ pub struct ShardsStream {
   /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it
   /// (`slates_ipc::stream::exec_with` does both, replacing the process with the VMM).
   pub stream: StreamEnd,
+  /// The device's end of the stream's resync channel (A-316; `slates_bridge_fuse::shards_resync`), close-on-exec, to
+  /// hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor daemon hands the
+  /// device a fresh stream after this one's daemon dies. None where the daemon hands none (macOS and Windows yet).
+  pub resync: Option<StreamEnd>,
 }
 
 /// What `attach_vhost_user` returns (§4.6; goal G-vhost): the attachment, and the socket end to hand the VMM as its
@@ -1549,7 +1553,9 @@ impl Client {
             ControlDelivery::Mapping(mapping) => {
               MappedRead::map(mapping.block, (volume, mapping_id), file_len, block_len)
             }
-            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_read" }),
+            ControlDelivery::Stream(_) | ControlDelivery::Resync(_) => {
+              Err(ClientError::UnexpectedReply { verb: "map_read" })
+            }
           });
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1677,7 +1683,9 @@ impl Client {
             ControlDelivery::Mapping(mapping) => {
               MappedWrite::map(mapping.block, (volume, mapping_id), file_len, block_len)
             }
-            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_write" }),
+            ControlDelivery::Stream(_) | ControlDelivery::Resync(_) => {
+              Err(ClientError::UnexpectedReply { verb: "map_write" })
+            }
           });
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1804,18 +1812,22 @@ impl Client {
         established,
         capability,
         token,
-      } => Ok(ShardsStream {
-        stream: self.delivered_stream(attachment)?,
-        attachment: Attachment {
-          attachment,
-          lease_epoch,
-          path,
-          version,
-          established,
-          capability,
-          token,
-        },
-      }),
+      } => {
+        let (stream, resync) = self.delivered_stream_and_resync(attachment)?;
+        Ok(ShardsStream {
+          stream,
+          resync,
+          attachment: Attachment {
+            attachment,
+            lease_epoch,
+            path,
+            version,
+            established,
+            capability,
+            token,
+          },
+        })
+      }
       ReplyBody::ShardsHanded {
         attachment,
         lease_epoch,
@@ -1823,6 +1835,7 @@ impl Client {
         handle,
       } => Ok(ShardsStream {
         stream: adopt_handed_stream(handle)?,
+        resync: None,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1840,6 +1853,7 @@ impl Client {
         secret,
       } => Ok(ShardsStream {
         stream: self.claim_offer(attachment, &secret)?,
+        resync: None,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1912,21 +1926,54 @@ impl Client {
   /// (Linux: a Shards stream, A-161; a vhost-user device's socket, G-vhost).
   #[cfg(unix)]
   fn delivered_stream(&self, attachment: u64) -> Result<StreamEnd, ClientError> {
-    let delivered = self.recv_delivery(|delivery| {
+    self
+      .delivered_stream_and_resync(attachment)
+      .map(|(stream, _resync)| stream)
+  }
+
+  /// [`Self::delivered_stream`], and the stream's resync end when the stream's delivery says one follows it (A-316),
+  /// which the daemon sends next, before the reply.
+  #[cfg(unix)]
+  fn delivered_stream_and_resync(
+    &self,
+    attachment: u64,
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
+    let unexpected = || ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    };
+    let ControlDelivery::Stream(delivered) = self.recv_delivery(|delivery| {
       matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == attachment)
-    })?;
-    match delivered {
-      ControlDelivery::Stream(delivered) => Ok(delivered.stream),
-      ControlDelivery::Mapping(_) => Err(ClientError::UnexpectedReply {
-        verb: "attach_shards",
-      }),
+    })?
+    else {
+      return Err(unexpected());
+    };
+    if !delivered.resync_follows {
+      return Ok((delivered.stream, None));
     }
+    let ControlDelivery::Resync(resync) = self.recv_delivery(|delivery| {
+      matches!(delivery, ControlDelivery::Resync(resync) if resync.attachment == attachment)
+    })?
+    else {
+      return Err(unexpected());
+    };
+    Ok((delivered.stream, Some(resync.end)))
   }
 
   /// No control socket carries a handle here: a Windows daemon answers the Shards form `ShardsHanded`, naming the handle
   /// in the reply, so `Attached` is not one of its answers to it.
   #[cfg(not(unix))]
   fn delivered_stream(&self, _attachment: u64) -> Result<StreamEnd, ClientError> {
+    Err(ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    })
+  }
+
+  /// See [`Self::delivered_stream`]: no control socket carries a handle here.
+  #[cfg(not(unix))]
+  fn delivered_stream_and_resync(
+    &self,
+    _attachment: u64,
+  ) -> Result<(StreamEnd, Option<StreamEnd>), ClientError> {
     Err(ClientError::UnexpectedReply {
       verb: "attach_shards",
     })

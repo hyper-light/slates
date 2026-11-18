@@ -124,9 +124,10 @@ pub const SUP_HOLD_REFUSALS: usize = 192;
 /// Format: the byte offset inside the supervision block, the word after the hold refusals.
 pub const SUP_LOG_REFUSALS: usize = 200;
 /// The current daemon's **serving** word: when, in the heartbeat's host domain, it finished its start (recovery
-/// included) and began serving; zero until then, and zeroed at every start. An exit after it is a daemon that
-/// recovered, which the restart bound does not count (`supervise.rs`). Zero in a block an older daemon wrote, so every
-/// exit under it counts, as before.
+/// included) and began serving; zero until then, and zeroed at every start. The step that first sees it ends the
+/// daemon's start for the restart bound, and a daemon that has served as long as its start took has recovered
+/// (`SUP_RECOVERED`, A-311): an exit before then is a failed start (`supervise.rs`). Zero in a block an older daemon
+/// wrote, so every exit under it counts, as before.
 /// Format: the byte offset inside the supervision block, the word after the refused log lines.
 pub const SUP_SERVING: usize = 208;
 /// The current daemon's **looked** word (A-232): when, in the heartbeat's host domain, its watchdog last looked at its
@@ -137,6 +138,14 @@ pub const SUP_SERVING: usize = 208;
 /// spares while it is starved.
 /// Format: the byte offset inside the supervision block, the word after the serving word.
 pub const SUP_LOOKED: usize = 216;
+/// The current daemon's **recovered** word (A-311): when, on the anchor's clock (the heartbeat's host domain), the
+/// anchor judged that the daemon has served as long as its start took, its start counted from the spawn to the step
+/// that first saw its serving word; zero until then, and zeroed at every start. Its exit before then is a failed start,
+/// which the restart bound counts as one before it served is; its exit after it is a recovered daemon's, restarted at
+/// once. The daemon reports it as `recovered` in `slates status`, so whoever ends a daemon on purpose (a test, an
+/// operator) can wait for the anchor's own verdict first. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the word after the looked word.
+pub const SUP_RECOVERED: usize = 224;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon
@@ -194,7 +203,8 @@ pub enum State {
   Stopped = 0,
   /// A daemon is running (its pid is in the block).
   Running = 1,
-  /// Supervision stopped restarting: the daemon failed faster than it could recover.
+  /// In a crash loop: the daemon's starts failed in a row, and its next start waits out a backoff (A-119, A-311);
+  /// supervision never stops restarting it.
   CrashLoop = 2,
 }
 

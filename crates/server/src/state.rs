@@ -495,6 +495,14 @@ pub struct ShardState {
     slates_db::catalog::AttachmentRecord,
     crate::fuse_hold::HeldDevice,
   )>,
+  /// The Shards streams recovery kept because the anchor held their resync ends (A-316), each with its record, served
+  /// again on a fresh stream once the shard runs (`shards::adopt_held`). Filled once at recovery and emptied by that
+  /// step; bounded as `inherited_fuse` is, of which these were part.
+  #[cfg(target_os = "linux")]
+  pub(crate) adopt_shards: Vec<(
+    slates_db::catalog::AttachmentRecord,
+    crate::fuse_hold::HeldDevice,
+  )>,
   /// The read-only views of snapshots presented through host mounts and guest devices, by attachment (AUD-29-76;
   /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot attachment.
   pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,
@@ -834,6 +842,10 @@ pub struct ShardState {
   /// borrowed — the interrupted-discovery restart the replacement-voter regression forces by stopping this
   /// node while it holds (`Daemon::inject_discovery_fault`).
   pub discovery_withhold_replies: bool,
+  /// Test support (never reachable from the wire): a Shards stream's replies are made, and published with their
+  /// effect where they wait for a barrier, but never written, as when a daemon dies between a barrier and its reply
+  /// (A-316's successor test); counted `shards.reply_withheld`.
+  pub shards_withhold_replies: bool,
   /// Test support (never reachable from the wire): while set, the record serve side holds every live-state reply (a
   /// takeover's report or log fetch, `slates_cluster::live::LIVE_STATE_STREAM`) after its request arrived, while every
   /// other stream and the probe plane answer as usual: a holder alive and in contact whose report misses an asker's
@@ -1478,13 +1490,21 @@ pub struct PendingVolume {
   /// The page advances of its still-paging takeover round at the last attempt that waited on its catalog register,
   /// `None` before the first ([`PendingVolume::record_round`]).
   pub round_seen: Option<u64>,
+  /// The hosts the retired owner placed this volume on, the members of its cohorts in the takeover that adopted it,
+  /// settled and current (A-309): where its live log was shipped besides the recorded holders, so a live takeover past
+  /// tolerance asks every surviving one of them (`live_ship::fetch`). Taken from the configuration when the volume is
+  /// adopted, since the retirement may complete and be let go before the log is fetched. Empty for a volume no round
+  /// adopted (a mirror's promotion).
+  pub cohort_hosts: Vec<slates_db::register::HostId>,
 }
 
 impl PendingVolume {
-  /// A volume just adopted with its head `head` by `departed`'s takeover round: no attempt made yet.
+  /// A volume just adopted with its head `head` by `departed`'s takeover round, the retired owner having placed it on
+  /// `cohort_hosts`: no attempt made yet.
   pub fn adopted(
     head: crate::head::HeadValue,
     departed: Option<slates_db::register::HostId>,
+    cohort_hosts: Vec<slates_db::register::HostId>,
   ) -> PendingVolume {
     PendingVolume {
       head,
@@ -1492,6 +1512,7 @@ impl PendingVolume {
       attempts: 0,
       most_staged: None,
       round_seen: None,
+      cohort_hosts,
     }
   }
 
@@ -1598,6 +1619,7 @@ mod tests {
         sealing: None,
       },
       None,
+      Vec::new(),
     );
     let mut seen = Vec::new();
     for staged in [4, 4, 9, 2, 9, 10] {
@@ -1650,6 +1672,7 @@ mod tests {
         sealing: None,
       },
       Some(slates_db::register::HostId(5)),
+      Vec::new(),
     );
     let mut green = PendingGreen::adopted(
       adopted_record(),
