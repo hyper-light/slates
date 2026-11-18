@@ -153,6 +153,9 @@ const REVOKED_REFUSED: &str = "fuse.revoked_refused";
 /// Format: fenced mounts whose task could not be woken to drop their kernel's cache (the change signal refused): each
 /// drops it at its next request instead. Zero is the healthy reading.
 const REVOKED_UNWOKEN: &str = "fuse.revoked_unwoken";
+/// Format: mounts ended because this node lost their volume to a takeover (A-346): each fenced as a revoked mount is, its
+/// kernel's cache dropped, then ended.
+const SUPERSEDED_ENDED: &str = "fuse.superseded_ended";
 /// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
 /// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
 /// shard's other clients (§4.3).
@@ -835,6 +838,14 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     return Turned::Ended;
   };
   let told_before = mount.serve.told_through();
+  // A volume this node lost to a takeover ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too,
+  // for a mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a
+  // restart (A-344).
+  if crate::live_ship::superseded(s, mount.volume) && s.attachments.context(mount.registry).is_ok()
+  {
+    s.attachments.revoke(mount.registry);
+    s.count(SUPERSEDED_ENDED, 1);
+  }
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
   // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
   // A mount whose attachment admits nothing more answers nothing from the volume, so it needs no lease: it refuses
@@ -1485,6 +1496,24 @@ pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
   if mount.change.signal().is_err() {
     // The task still sees the revocation at its next request; only the drop waits for one.
     s.count(REVOKED_UNWOKEN, 1);
+  }
+}
+
+/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a takeover (A-346; its log
+/// fenced at a later epoch, A-338): each is fenced as a revoked mount is ([`fence_if_mounted`]), so its kernel drops what
+/// it cached of the volume, every request meanwhile is refused `ENOTCONN`, and the mount ends: FUSE's form of the
+/// `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a mount went on answering from this node's copy,
+/// which the successor's writes had passed, or, behind the lease gate, held its requests in the kernel for good.
+pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
+  let mounts: Vec<u64> = s
+    .fuse_mounts
+    .iter()
+    .filter(|(_, mount)| mount.volume == volume)
+    .map(|(attachment, _)| *attachment)
+    .collect();
+  for attachment in mounts {
+    fence_if_mounted(s, attachment);
+    s.count(SUPERSEDED_ENDED, 1);
   }
 }
 
