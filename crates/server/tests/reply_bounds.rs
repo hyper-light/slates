@@ -205,6 +205,7 @@ fn a_presentation_with_more_conflicts_than_one_reply_holds_is_answered() {
     target: base.path.clone(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let Ok(ReplyBody::GrantRequired {
     landing,

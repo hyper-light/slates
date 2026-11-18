@@ -19334,6 +19334,8 @@ fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "once the sessions returned the catalog committed and the submit was answered"
   );
