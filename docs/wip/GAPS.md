@@ -142,7 +142,8 @@
 >   So about 110 ms per million files per shard in release, in one poll,
 >   amortized over about 0.6 small writes per file.
 > - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
->   format raft-5's incremental held image is changing, and two format changes at once would collide. Owed when that lands:
+>   format raft-5's incremental held image was changing (it is built: A-270, image version 26, delta version 9), and two
+>   format changes at once would collide. Owed when that lands:
 >   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
 >   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
 
@@ -1854,6 +1855,27 @@
 > `not_a_member` and then 21 times `no_catalog` and held nothing for the whole run: a candidate that never receives the
 > volume's catalog keeps refusing, and the log rests on the other candidate alone (with it stopped, writes cannot be
 > durable; a soak run hung on exactly that). Owner: raft, next.
+>
+> **Found 2026-11-06 (raft), fixed 2026-11-07 (A-250): a restarted council leader never condemned a member that died
+> during its restart.**
+> Under anchors, with a candidate's daemon restarted warm while the owner was stopped and then killed, no takeover
+> began in 40 s: the restarted node led the council (term 2, three voters) and still listed the owner a member, but its
+> failure detector held no entry for it (the owner was already stopped when it came back, so it never heard from it and
+> never suspected it); the other survivor had dropped the owner. The reproduction is
+> `a_candidates_restored_copy_serves_its_owners_takeover` (`crates/cli/tests/live_fleet.rs`, ignored until 2026-11-09).
+> Root cause (read from the code, 2026-11-07): a node joins a member to its failure detector only once a session keyed
+> it (`member_task::join_addressable` reads `plane.keyed`), and its detector ignores gossip about members it has not
+> joined (AUD-15: no authenticated peer can name arbitrary targets). A member already down when the node restarts is
+> never keyed, so never joined, and the survivors' gossip of its death is dropped. Proposed fix, not yet built: also
+> join every member the committed configuration names whose address resolves, keyed or not. The configuration
+> authorizes them, so AUD-15's bound holds. The peers' death gossip then reaches the restarted node, while its own
+> unsendable probes stay no misses (the KIND rule in `MemberPlane::join`).
+> Closed by A-250 (caf06d71; the 2026-11-07 entry "a member down through a voter's restart was never taken over"): a
+> death is retired at `f + 1` voters, and a restarted voter watches every configured member, the join proposed above.
+> The reproduction runs again since it shares its volume with every node first (b79bae7b, 2026-11-09): `live_fleet` 31
+> of 31, three runs in a row (adacachy, 2026-11-11, 2c93f4c9). The holder's live copies rode its recovery image rebuilt
+> whole at each acknowledgement (`live_ship::acknowledged`, about 100 µs a live write, growing with what a candidate
+> keeps); since A-270 a publication carries only the pieces that changed (the 2026-11-08 entry).
 >
 > **As found, landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
 > capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
@@ -15214,6 +15236,32 @@ because sixteen daemons share the test process, and was the second partition.
 - **What a fix has to decide.** A shard blocked in the kernel (state `D`) or runnable but starved (state `R`) is still
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
+
+### 2026-11-08: a holder's acknowledgement published everything it held — fixed (A-270)
+
+raft-4's c6e178aa made a candidate publish before it acknowledges a live entry, so its copies survive its own warm
+restart. But each publication carried the shard's whole held image (the content hold, every register, every live copy
+with all its entries), rebuilt and compared byte for byte, so an acknowledgement cost what the holder held.
+- Across 64 held records a delta's held bytes grew from 2,224 to 55,216
+  (`a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds`, red first).
+- A live write cost 207–225 µs at the median, against main's 65–76 µs.
+
+Now the held image is keyed pieces, and a delta carries only those put and removed: the same test holds the late median
+to one record's, and a live write costs 65–79 µs (BENCHMARKS, interleaved at load 42–113).
+- Held registers and live copies are tracked maps, so no change goes unmarked.
+- The format versions moved (image 26, delta 9), and another build's journal is refused `RecoveryVersion`, never
+  misread.
+- `a_candidates_restored_copy_serves_its_owners_takeover` runs again. Since main's per-host principals (A-237) a
+  survivor refused the taken-over volume's reads `NotShared`, with or without this change; the test now shares the
+  volume with every node first (b79bae7b), and `live_fleet` passed 31 of 31, three runs in a row (adacachy, 2026-11-11,
+  2c93f4c9, after giving the restart and takeover flows their own fleet names).
+
+Open:
+- The content hold and the mirror records are still compared whole at each publication.
+- `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` sometimes answers the fsync made with every
+  candidate running `EIO` (the "healthy" one). On main at 92dcd16c: once in 6 runs that reached it, at load 96. On
+  agents/raft-7: 2 in 9, once in the full suite at load over 100 and once alone at load 36 (adacachy, 2026-11-08).
+  Not this change's, so open: the counters of a failing run are kept in the agent's scratch (`fsync2-main-2.log`).
 
 ### 2026-11-07: a member down through a voter's restart was never taken over — fixed (A-250)
 
