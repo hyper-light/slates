@@ -888,15 +888,19 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
     // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
-    // connections, served again on the listener's shard below.
-    let handed = crate::anchor_hold::adopt(config.held_device_bound());
+    // connections, served again on the listener's shard below. Windows parses at most every entry its anchor may hold,
+    // of every class: the attachments' and the DAX sections' (A-448).
+    let handed = crate::anchor_hold::adopt(
+      config
+        .held_device_bound()
+        .saturating_add(config.held_dax_bound()),
+    );
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    // The held copies: the Shards streams' DAX objects (A-365), each moved to the shard that owns its attachment; and
-    // the writable direct maps' copies (A-197), each to the shard that holds its map, which Linux alone sends the anchor.
-    #[cfg(unix)]
+    // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that
+    // owns its attachment; and the writable direct maps' copies (A-197), each to the shard that holds its map, which
+    // Linux alone sends the anchor.
     let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
-    #[cfg(unix)]
     let mut inherited_dax = inherited_dax.into_iter();
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
@@ -905,8 +909,23 @@ impl Daemon {
       // No other kind of copy is held here: one is let go at once, its record no shard's.
       let _released = crate::anchor_hold::release_copy(copy.copy);
     }
+    // No other kind of copy is held on Windows: a section whose record is no DAX record is an entry no shard adopts,
+    // which the control shard releases with the refused mounts (its release is an exchange only a shard can make).
     #[cfg(windows)]
-    let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
+    let mut held_mounts = handed.mounts;
+    #[cfg(windows)]
+    held_mounts.extend(
+      other_copies
+        .into_iter()
+        .map(|copy| crate::anchor_hold::HandedMount {
+          attachment: copy.copy,
+          handles: Vec::new(),
+          record: copy.record,
+          adoptable: false,
+        }),
+    );
+    #[cfg(windows)]
+    let mut inherited_winfsp = crate::winfsp::split_held(held_mounts, shards.len()).into_iter();
     // The Shards streams' resync ends (A-433), each to the shard that owns its attachment.
     #[cfg(windows)]
     let mut inherited_resync =
@@ -934,15 +953,16 @@ impl Daemon {
         dax: inherited_dax.next().unwrap_or_default(),
       };
       #[cfg(windows)]
-      let windows_holds = (
-        inherited_winfsp.next().unwrap_or_default(),
-        if index == 0 {
+      let holds = ShardHolds {
+        winfsp: inherited_winfsp.next().unwrap_or_default(),
+        channel: if index == 0 {
           windows_channel.take()
         } else {
           None
         },
-        inherited_resync.next().unwrap_or_default(),
-      );
+        resync: inherited_resync.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
+      };
       // This shard's learning of the mounts it keeps, taken before it starts so none of the daemon's crossings is
       // judged before the shard has recorded them (A-227). A Linux shard the anchor handed no FUSE device keeps no mount
       // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
@@ -972,10 +992,7 @@ impl Daemon {
           (partition, sealing, learning),
           all,
           retained,
-          #[cfg(unix)]
           holds,
-          #[cfg(windows)]
-          windows_holds,
         ));
         if let Err(e) = start.and_then(futures::detach) {
           INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
@@ -4053,9 +4070,9 @@ fn content_slice(
   }
 }
 
-/// The DAX range table in this shard's slice of the content object (A-365), with what the previous daemon recorded in
-/// it; none without a content object holding the shard's images (`images`, [`content_slice`]'s range).
-#[cfg(unix)]
+/// The DAX range table in this shard's slice of the content object (A-365; Windows' sections, A-448), with what the
+/// previous daemon recorded in it; none without a content object holding the shard's images (`images`,
+/// [`content_slice`]'s range).
 fn dax_range_table(
   config: &DaemonConfig,
   partition: u16,
@@ -4108,6 +4125,20 @@ struct ShardHolds {
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
+/// What the anchor handed back for one shard's partition (Windows): its WinFsp mounts (A-198), the hold channel (the
+/// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
+#[cfg(windows)]
+struct ShardHolds {
+  /// The held WinFsp mounts.
+  winfsp: Vec<crate::winfsp::InheritedMount>,
+  /// The hold channel's daemon end: the control shard installs it.
+  channel: Option<std::os::windows::io::OwnedHandle>,
+  /// The held Shards streams' resync ends (A-433).
+  resync: Vec<crate::anchor_hold::HandedResync>,
+  /// The held Shards streams' DAX sections (A-448).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
+}
+
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
 async fn start_shard(
@@ -4117,12 +4148,7 @@ async fn start_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
-  #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] windows_holds: (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-    Vec<crate::anchor_hold::HandedResync>,
-  ),
+  holds: ShardHolds,
 ) {
   // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to each
   // shard queues behind it (GAPS, boot, 2026-10-05).
@@ -4140,10 +4166,7 @@ async fn start_shard(
     (partition, sealing, learning),
     &all,
     retained,
-    #[cfg(unix)]
     holds,
-    #[cfg(windows)]
-    windows_holds,
   )
   .await;
   let took_us = started.elapsed().as_micros();
@@ -4268,13 +4291,17 @@ async fn init_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] (inherited_winfsp, windows_channel, inherited_resync): (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-    Vec<crate::anchor_hold::HandedResync>,
-  ),
+  holds: ShardHolds,
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  #[cfg(windows)]
+  let ShardHolds {
+    winfsp: inherited_winfsp,
+    channel: windows_channel,
+    resync: inherited_resync,
+    dax: inherited_dax,
+  } = holds;
+  #[cfg(unix)]
+  let inherited_dax = holds.dax;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -4393,8 +4420,7 @@ async fn init_shard(
   };
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  // The DAX range table (A-365), with what the previous daemon recorded in it.
-  #[cfg(unix)]
+  // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
   let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
@@ -4445,11 +4471,8 @@ async fn init_shard(
     replay: recovered_writes.records,
     pending_replies: std::collections::BTreeMap::new(),
     recovered_replies: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     dax_ranges,
-    #[cfg(unix)]
-    inherited_dax: holds.dax,
-    #[cfg(unix)]
+    inherited_dax,
     adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,

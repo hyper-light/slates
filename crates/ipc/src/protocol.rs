@@ -1127,6 +1127,23 @@ pub enum RequestBody {
     /// The archive volume's name.
     name: String,
   },
+  /// Make a volume from an archive (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-453): a new volume `name` of `size`
+  /// holding the tree of the archive the caller's volume `archive` holds as [`ARCHIVE_FILE`] in its root, as an export
+  /// leaves it (a caller writes the bytes it kept there). The archive file's length is admitted against `archive`'s
+  /// own size class and the shard's room before a byte is read; the file is read, decoded, verified and restored in
+  /// slices on `archive`'s owner shard, and the new volume made there with the archive's name policy. The reply waits
+  /// for the import. A stream that is no archive, or one not whole, is refused [`Refusal::ArchiveRefused`] by its
+  /// kind, with nothing made. `read` on `archive` is required. Appended.
+  ArchiveImport {
+    /// The volume whose root holds the archive file.
+    archive: VolumeId,
+    /// The new volume's name.
+    name: String,
+    /// The new volume's size class.
+    size: SizeClass,
+    /// Whether unlocked memory refuses, as a create's.
+    require_locked: bool,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1901,6 +1918,7 @@ impl RequestBody {
       | RequestBody::Move { volume, .. }
       | RequestBody::CaptureBase { volume }
       | RequestBody::ArchiveExport { volume, .. } => Some(*volume),
+      RequestBody::ArchiveImport { archive, .. } => Some(*archive),
     }
   }
 
@@ -3927,6 +3945,31 @@ pub enum Refusal {
     /// Why.
     reason: MoveRefusal,
   },
+  /// The bytes an `ArchiveImport` read are not an archive this daemon can make a volume from (A-453), refused by kind
+  /// before the volume is published: nothing is made, its name stays free and its room goes back. Appended.
+  ArchiveRefused {
+    /// Why.
+    fault: ArchiveFault,
+  },
+}
+
+/// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the
+/// archive reader's refusals (`slates_archive::ArchiveError`) a caller acts on alike. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFault {
+  /// The stream does not begin with an archive's magic: another format's file, or no file at all.
+  ForeignMagic,
+  /// An archive of a format this daemon does not read: a newer major, a required flag it does not know, or a name
+  /// policy it does not hold. A newer daemon reads it.
+  Unsupported,
+  /// The stream ends before its own frame does: cut off where it was kept or copied. Copy it again whole.
+  Truncated,
+  /// The bytes are not those the archive's checksum or identities name: altered where it was kept or copied.
+  Corrupt,
+  /// Whole and matching its checksum, the archive breaks the format's rules: a declared length past its cap, a chunk
+  /// out of canonical form, a total, extent, name or path that does not hold, or a tree that does not restore. A
+  /// faulty or hostile writer made it.
+  Malformed,
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -4761,6 +4804,13 @@ pub enum ReplyBody {
     archive_bytes: u64,
     /// The archive's manifest identity: the BLAKE3 Merkle root of the snapshot's tree (D-17), the same for the same
     /// tree wherever it is exported.
+    manifest: [u8; 32],
+  },
+  /// A volume was made from an archive (`ArchiveImport`, A-453). Appended.
+  ArchiveImported {
+    /// The new volume.
+    id: VolumeId,
+    /// The manifest identity of the archive it was made from, verified against the tree: the exported snapshot's.
     manifest: [u8; 32],
   },
 }

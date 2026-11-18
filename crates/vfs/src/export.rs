@@ -85,6 +85,16 @@ const POLICY_FOLD: u32 = 1;
 /// core's names module fixes its own table and does not yet surface a version number (owed).
 const UNICODE_VERSION_UNSPECIFIED: u32 = 0;
 
+/// The name policy an archive header's name-policy id names, as the exporter writes it (A-453: a volume made from an
+/// archive takes its archive's policy), or `None` for an id the exporter never writes.
+pub fn name_equivalence_of_id(id: u32) -> Option<NameEquivalence> {
+  match id {
+    POLICY_EXACT => Some(NameEquivalence::Exact),
+    POLICY_FOLD => Some(NameEquivalence::Fold),
+    _ => None,
+  }
+}
+
 /// The kind a manifest mode's type bits name, or `None` for bits the exporter never writes.
 pub fn kind_of_mode(mode: u32) -> Option<Kind> {
   match mode & MODE_TYPE_MASK {
@@ -1044,6 +1054,31 @@ mod tests {
     );
     let restored = restore(&archive, u64::MAX).unwrap();
     assert_restored_tree(&restored, &body);
+  }
+
+  /// A-453: do export a snapshot of a byte-exact volume and of a folding one. Expect each archive's name-policy id to
+  /// name its volume's policy back (`name_equivalence_of_id`), so a volume made from the archive takes the policy its
+  /// source had; and an id the exporter never writes to name none.
+  #[test]
+  fn an_archives_name_policy_names_its_volumes_back() {
+    for names in [NameEquivalence::Exact, NameEquivalence::Fold] {
+      let mut store = store();
+      let mut volume = Volume::create(
+        &mut store,
+        VolumeConfig {
+          prefix: 1,
+          names,
+          quota: Quota::Bounded { limit: QUOTA },
+          journal_bytes: 1 << 16,
+          clock: Box::new(StepClock::new(0, 1)),
+        },
+      )
+      .unwrap();
+      let id = volume.snapshot(&mut store).unwrap();
+      let (archive, _) = archive_in_slices(&volume, &store, id, u64::MAX);
+      assert_eq!(name_equivalence_of_id(archive.name_policy_id), Some(names));
+    }
+    assert_eq!(name_equivalence_of_id(u32::MAX), None);
   }
 
   /// The tree [`populate`] built, as a restore must reproduce it: every file's bytes, the directory, the

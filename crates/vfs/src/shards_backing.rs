@@ -158,6 +158,20 @@ impl BackingObject {
     }
   }
 
+  /// What the anchor holds of a VMM's object across this daemon's death (Windows, A-448): a duplicate of its section in
+  /// this process that maps it read and write and may ask its size (`slates_mem::DaxObject::held`), for the anchor to
+  /// duplicate out and a successor to adopt. A peer's copy is never a stream's, so it is refused.
+  #[cfg(windows)]
+  pub fn held(&self) -> Result<std::os::windows::io::OwnedHandle, MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.held(),
+      BackingObject::Peer(_) => Err(MemError::OsRefused {
+        call: "the anchor's hold of a peer's copy",
+        code: None,
+      }),
+    }
+  }
+
   /// Readies range `range` of a VMM's object for the VMM's map before its ask is answered (Windows commits it; see
   /// `slates_mem::DaxObject::prepare_range`). A peer's copy is whole from its making, so nothing is done for one.
   pub fn prepare_range(&mut self, range: u64) -> Result<(), MemError> {

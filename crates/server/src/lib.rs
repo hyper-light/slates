@@ -96,8 +96,8 @@ mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
 // stream's (every platform; A-316, A-339, A-402).
 mod write_log;
-// Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365).
-#[cfg(unix)]
+// Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365; Windows'
+// sections, A-448).
 mod dax_ranges;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]

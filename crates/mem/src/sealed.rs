@@ -46,6 +46,19 @@
 //! error, counted process-wide ([`dropped_with_readers`]) so the holder's tests hold it at zero: a holder that ends its
 //! readers first never leaks. Found by Miri, 2026-11-18: a test that never made its reader leave dropped its writer
 //! with a live block, which the writer kept (`docs/bugs/2026-11-18-a-sealed-block-writer-dropped-with-a-reader-kept-its-blocks.md`).
+//!
+//! **Bounds (A-273 step 4).** Nothing here grows without a bound and a typed refusal at it:
+//! - Readers: a join past the limit its writer's holder derives (for a green's owner, one reader on each other shard
+//!   of its node and its rebuild's fresh one, A-273) is refused ([`JoinRefused`]).
+//! - The bytes kept for readers: past the limit the writer's holder derives ([`SealedBlocks::set_held_limit`]; for a
+//!   green's owner, the room its budget leaves beyond its own retention, A-273), the slowest reader is evicted, one at
+//!   a time: every later [`Changes`] names it, and it refuses each ([`ReaderRefusal::Evicted`]) until its holder makes
+//!   it leave. It keeps its frees until then, since it may still read: the bound costs a reader, never a read of freed
+//!   bytes.
+//! - The blocks recorded for the next [`Changes`]: one message's worth. A writer that records a second message's
+//!   changes before taking the first ([`SealedBlocks::evict_all`], called by its holder at the next change) evicts every
+//!   reader, which could not be fed in order, and records nothing more until a reader joins again.
+//! - A reader's live table: the writer's live blocks, its own bound.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,6 +130,14 @@ pub struct SealedBlocks {
   held_bytes: usize,
   /// The frees kept for a reader since the store was made: the non-vacuity counter of the deferral.
   frees_held: u64,
+  /// The bytes kept for readers past which the slowest is evicted (module docs, "Bounds"); unbounded until its holder
+  /// sets it.
+  held_limit: usize,
+  /// Readers evicted and not yet left: each keeps its frees (it may read until it leaves) and refuses every message.
+  evicted: std::collections::BTreeSet<u64>,
+  /// Readers evicted since the store was made, for the bytes kept and for changes left unfed: the bounds' counters.
+  evicted_lagging: u64,
+  evicted_unfed: u64,
 }
 
 impl Default for SealedBlocks {
@@ -142,6 +163,17 @@ pub struct Changes {
   position: u64,
   sealed: Vec<(Block, Place)>,
   released: Vec<Block>,
+  /// The readers evicted and not yet left, each of which refuses it.
+  evicted: Vec<u64>,
+}
+
+/// Why a writer refused a reader's join: it has `limit` readers already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinRefused {
+  /// The readers it has.
+  pub readers: usize,
+  /// The most it takes.
+  pub limit: usize,
 }
 
 /// A reader has passed every position below `position`: what it sends its writer, which frees what every reader passed.
@@ -192,6 +224,10 @@ impl SealedBlocks {
       live_bytes: 0,
       held_bytes: 0,
       frees_held: 0,
+      held_limit: usize::MAX,
+      evicted: std::collections::BTreeSet::new(),
+      evicted_lagging: 0,
+      evicted_unfed: 0,
     }
   }
 
@@ -220,7 +256,7 @@ impl SealedBlocks {
     };
     let block = Block { slot, generation };
     self.live_bytes = self.live_bytes.saturating_add(len);
-    if !self.readers.is_empty() {
+    if self.feeding() {
       self.sealed_since.push((
         block,
         Place {
@@ -257,10 +293,69 @@ impl SealedBlocks {
       self.free_slot(block);
       return;
     }
-    self.released_since.push(block);
+    if self.feeding() {
+      self.released_since.push(block);
+    }
     self.held.push_back((self.position, block));
     self.held_bytes = self.held_bytes.saturating_add(len);
     self.frees_held = self.frees_held.saturating_add(1);
+    if self.held_bytes > self.held_limit && self.evicted.is_empty() {
+      self.evict_slowest();
+    }
+  }
+
+  /// Whether a reader may still take the next [`Changes`]: one is registered and not evicted.
+  fn feeding(&self) -> bool {
+    self.readers.len() > self.evicted.len()
+  }
+
+  /// Evicts the reader that has passed the least, the one holding the most (module docs, "Bounds"); ties go to the
+  /// earliest registered.
+  fn evict_slowest(&mut self) {
+    let slowest = self
+      .readers
+      .iter()
+      .filter(|(reader, _)| !self.evicted.contains(reader))
+      .min_by_key(|(reader, passed)| (**passed, **reader))
+      .map(|(reader, _)| *reader);
+    if let Some(reader) = slowest {
+      self.evicted.insert(reader);
+      self.evicted_lagging = self.evicted_lagging.saturating_add(1);
+    }
+  }
+
+  /// The bytes kept for readers past which the slowest is evicted: the room the writer's memory class leaves for them,
+  /// derived by its holder.
+  pub fn set_held_limit(&mut self, bytes: usize) {
+    self.held_limit = bytes;
+    if self.held_bytes > self.held_limit && self.evicted.is_empty() {
+      self.evict_slowest();
+    }
+  }
+
+  /// Whether changes are recorded that no [`Changes`] has taken yet: the writer's holder takes them after every change
+  /// it makes, so one found at the next change was left unfed.
+  pub fn has_pending(&self) -> bool {
+    !self.sealed_since.is_empty() || !self.released_since.is_empty()
+  }
+
+  /// Evicts every reader, which could not be fed in order once a change went unfed, and drops what was recorded for
+  /// them (module docs, "Bounds"). Each keeps its frees until it leaves. Returns how many it evicted.
+  pub fn evict_all(&mut self) -> usize {
+    let before = self.evicted.len();
+    self.evicted.extend(self.readers.keys().copied());
+    let evicted = self.evicted.len().saturating_sub(before);
+    self.evicted_unfed = self
+      .evicted_unfed
+      .saturating_add(u64::try_from(evicted).unwrap_or(u64::MAX));
+    self.sealed_since.clear();
+    self.released_since.clear();
+    evicted
+  }
+
+  /// Readers evicted since the store was made: for the bytes kept for them, and for changes left unfed.
+  pub fn evictions(&self) -> (u64, u64) {
+    (self.evicted_lagging, self.evicted_unfed)
   }
 
   /// The blocks sealed and released since the last [`Changes`], at the writer's position, which then moves past it: what
@@ -271,6 +366,7 @@ impl SealedBlocks {
       position: self.position,
       sealed: std::mem::take(&mut self.sealed_since),
       released: std::mem::take(&mut self.released_since),
+      evicted: self.evicted.iter().copied().collect(),
     };
     self.position = self.position.saturating_add(1);
     changes
@@ -282,8 +378,15 @@ impl SealedBlocks {
   }
 
   /// Registers a reader now: it may read every block the writer names now, and has passed every position before the
-  /// writer's ([`SealedBlocks::position`]).
-  pub fn join(&mut self) -> Joined {
+  /// writer's ([`SealedBlocks::position`]). Refused when the writer has `limit` readers already, evicted ones that have
+  /// not left among them (they still hold their frees).
+  pub fn join(&mut self, limit: usize) -> Result<Joined, JoinRefused> {
+    if self.readers.len() >= limit {
+      return Err(JoinRefused {
+        readers: self.readers.len(),
+        limit,
+      });
+    }
     let reader = self.next_reader;
     self.next_reader = self.next_reader.saturating_add(1);
     self.readers.insert(reader, self.position);
@@ -309,12 +412,12 @@ impl SealedBlocks {
         ))
       })
       .collect();
-    Joined {
+    Ok(Joined {
       writer: self.writer,
       reader,
       position: self.position,
       live,
-    }
+    })
   }
 
   /// A reader passed every position below `passed`'s: blocks every reader has passed are freed. A reader never moves
@@ -335,6 +438,7 @@ impl SealedBlocks {
       return;
     }
     self.readers.remove(&left.reader);
+    self.evicted.remove(&left.reader);
     self.free_passed();
     if self.readers.is_empty() {
       self.sealed_since.clear();
@@ -445,6 +549,8 @@ impl Drop for SealedBlocks {
 pub enum ReaderRefusal {
   /// It is another writer's.
   OtherWriter,
+  /// The writer evicted this reader (module docs, "Bounds"): it takes nothing more, and its holder makes it leave.
+  Evicted,
   /// It is not the position the reader takes next: `expected`, sent `sent`.
   OutOfOrder {
     /// The position the reader admits or passes next.
@@ -511,6 +617,9 @@ impl BlockReader {
     if changes.writer != self.writer {
       return Err(ReaderRefusal::OtherWriter);
     }
+    if changes.evicted.contains(&self.reader) {
+      return Err(ReaderRefusal::Evicted);
+    }
     if self.admitted.is_some() || changes.position != self.next {
       return Err(ReaderRefusal::OutOfOrder {
         expected: self.next,
@@ -557,6 +666,11 @@ impl BlockReader {
   /// The position it admits next: it has passed every position below it.
   pub fn position(&self) -> u64 {
     self.next
+  }
+
+  /// Whether `changes` says its writer evicted this reader, read without taking it.
+  pub fn evicted_by(&self, changes: &Changes) -> bool {
+    changes.writer == self.writer && changes.evicted.contains(&self.reader)
   }
 
   /// Reads refused since it was made: a name not in its live table.
@@ -608,6 +722,9 @@ mod tests {
   #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
   use super::*;
+
+  /// Shape: the readers a test's writer takes, more than any plain test registers; the generated histories meet it.
+  const READERS: usize = 8;
 
   /// The writer's own read of `block`: `bytes`, or nothing once it is freed or its slot used again.
   fn writer_reads(store: &SealedBlocks, block: Block, bytes: Option<&[u8]>) {
@@ -664,7 +781,7 @@ mod tests {
   fn a_released_block_stays_until_every_reader_passes_its_release() {
     let mut store = SealedBlocks::new();
     let kept = store.seal(b"kept".to_vec());
-    let mut reader = BlockReader::new(store.join());
+    let mut reader = BlockReader::new(store.join(READERS).unwrap());
     let fresh = store.seal(b"fresh".to_vec());
     store.release(kept);
     let changes = store.take_changes();
@@ -703,7 +820,7 @@ mod tests {
     let mut store = SealedBlocks::new();
     let live = store.seal(vec![1; 16]);
     let kept = store.seal(vec![2; 16]);
-    let reader = BlockReader::new(store.join());
+    let reader = BlockReader::new(store.join(READERS).unwrap());
     store.release(kept);
     let Err(store) = store.end() else {
       panic!("ended under a registered reader");
@@ -722,7 +839,7 @@ mod tests {
   #[test]
   fn a_writer_dropped_with_a_reader_registered_is_counted() {
     let mut store = SealedBlocks::new();
-    let reader = BlockReader::new(store.join());
+    let reader = BlockReader::new(store.join(READERS).unwrap());
     let before = dropped_with_readers();
     drop(store);
     assert!(dropped_with_readers() > before);
@@ -735,7 +852,7 @@ mod tests {
   fn changes_out_of_order_or_of_another_writer_are_refused() {
     let mut store = SealedBlocks::new();
     let mut other = SealedBlocks::new();
-    let mut reader = BlockReader::new(store.join());
+    let mut reader = BlockReader::new(store.join(READERS).unwrap());
     let first = store.take_changes();
     let second = store.take_changes();
     assert_eq!(
@@ -769,11 +886,11 @@ mod tests {
     let mut store = SealedBlocks::new();
     let gone = store.seal(b"gone".to_vec());
     let stays = store.seal(b"stays".to_vec());
-    let early = BlockReader::new(store.join());
+    let early = BlockReader::new(store.join(READERS).unwrap());
     store.release(gone);
     let _ = store.take_changes();
     assert_eq!(store.held_bytes(), 4);
-    let late = BlockReader::new(store.join());
+    let late = BlockReader::new(store.join(READERS).unwrap());
     assert_eq!(
       late.read(gone),
       None,
@@ -798,7 +915,7 @@ mod tests {
     /// Shape: the messages the writer sends, each sealing one block and releasing the one before.
     const MESSAGES: u8 = 32;
     let mut store = SealedBlocks::new();
-    let joined = store.join();
+    let joined = store.join(READERS).unwrap();
     let (to_reader, from_writer) = channel::<(Changes, Block, u8)>();
     let (to_writer, from_reader) = channel::<Passed>();
     let reader = std::thread::spawn(move || {
@@ -841,6 +958,101 @@ mod tests {
     assert_eq!(store.held_bytes(), 0);
     assert_eq!(store.frees_held(), u64::from(MESSAGES) - 1);
     assert_eq!(store.live_bytes(), 64);
+  }
+
+  /// A-273 step 4: a join past the writer's limit is refused, its readers named; once one leaves, a reader joins again.
+  #[test]
+  fn a_join_past_the_limit_is_refused() {
+    let mut store = SealedBlocks::new();
+    let first = BlockReader::new(store.join(1).unwrap());
+    assert_eq!(
+      store.join(1).err(),
+      Some(JoinRefused {
+        readers: 1,
+        limit: 1
+      })
+    );
+    store.leave(first.leave());
+    let again = BlockReader::new(store.join(1).unwrap());
+    store.leave(again.leave());
+    assert!(store.end().is_ok(), "every reader left: the writer ends");
+  }
+
+  /// A-273 step 4: past the held limit the slowest reader is evicted, one at a time: every later message names it and it
+  /// refuses it, while it still reads what it holds; at its leave everything kept for it alone is freed, and a reader
+  /// joins again.
+  #[test]
+  fn the_slowest_reader_is_evicted_past_the_held_limit_and_keeps_its_frees_until_it_leaves() {
+    let mut store = SealedBlocks::new();
+    let (a, b, c) = (
+      store.seal(vec![1; 8]),
+      store.seal(vec![2; 8]),
+      store.seal(vec![3; 8]),
+    );
+    let mut slow = BlockReader::new(store.join(READERS).unwrap());
+    let mut fast = BlockReader::new(store.join(READERS).unwrap());
+    store.set_held_limit(8);
+    store.release(a);
+    let first = store.take_changes();
+    fast.admit(&first).unwrap();
+    store.acknowledge(fast.pass(&first).unwrap());
+    assert_eq!(store.evictions(), (0, 0), "at the limit, not past it");
+    store.release(b);
+    assert_eq!(store.evictions(), (1, 0), "past it: the slowest evicted");
+    store.release(c);
+    assert_eq!(store.evictions(), (1, 0), "one at a time, until it leaves");
+    let second = store.take_changes();
+    assert_eq!(slow.admit(&second), Err(ReaderRefusal::Evicted));
+    // It reads what it holds until it leaves.
+    reader_reads(&slow, a, Some(&[1u8; 8][..]));
+    fast.admit(&second).unwrap();
+    store.acknowledge(fast.pass(&second).unwrap());
+    writer_holds(&store, 0, 24);
+    // Kept for the evicted reader alone: freed at its leave.
+    store.leave(slow.leave());
+    writer_holds(&store, 0, 0);
+    let rebuilt = BlockReader::new(store.join(READERS).unwrap());
+    assert_eq!(rebuilt.live_blocks(), 0, "it names only what is live");
+    store.leave(rebuilt.leave());
+    store.leave(fast.leave());
+    assert!(store.end().is_ok(), "every reader left: the writer ends");
+  }
+
+  /// A-273 step 4: a change left unfed (the writer's holder made a second change before taking the first's) evicts every
+  /// reader and drops what was recorded; nothing more is recorded until a reader joins again, which is fed.
+  #[test]
+  fn a_change_left_unfed_evicts_every_reader_and_records_nothing_more() {
+    let mut store = SealedBlocks::new();
+    let mut reader = BlockReader::new(store.join(READERS).unwrap());
+    let first = store.seal(vec![3; 4]);
+    assert!(store.has_pending());
+    assert_eq!(store.evict_all(), 1);
+    assert!(
+      !store.has_pending(),
+      "what was recorded for the evicted is dropped"
+    );
+    let later = store.seal(vec![4; 4]);
+    assert!(
+      !store.has_pending(),
+      "nothing is recorded while no reader may take it"
+    );
+    assert_eq!(
+      reader.admit(&store.take_changes()),
+      Err(ReaderRefusal::Evicted)
+    );
+    assert_eq!(store.evictions(), (0, 1));
+    store.leave(reader.leave());
+    let mut again = BlockReader::new(store.join(READERS).unwrap());
+    store.release(later);
+    assert!(store.has_pending(), "fed again once a reader joined");
+    let changes = store.take_changes();
+    again.admit(&changes).unwrap();
+    store.acknowledge(again.pass(&changes).unwrap());
+    reader_reads(&again, first, Some(&[3u8; 4][..]));
+    // Released and passed: no longer in its live table.
+    reader_reads(&again, later, None);
+    store.leave(again.leave());
+    assert!(store.end().is_ok(), "every reader left: the writer ends");
   }
 
   /// One reader of the generated histories: the reader, the blocks the model says it may read, and the messages sent it
@@ -889,11 +1101,14 @@ mod tests {
               modelled.inbox.push_back(changes.clone());
             }
           }
-          3 => readers.push(Modelled {
-            reader: BlockReader::new(store.join()),
-            live: named.iter().copied().collect(),
-            inbox: VecDeque::new(),
-          }),
+          3 => match store.join(READERS) {
+            Ok(joined) => readers.push(Modelled {
+              reader: BlockReader::new(joined),
+              live: named.iter().copied().collect(),
+              inbox: VecDeque::new(),
+            }),
+            Err(refused) => proptest::prop_assert_eq!(refused.readers, READERS),
+          },
           4 if !readers.is_empty() => {
             let at = pick % readers.len();
             let modelled = &mut readers[at];

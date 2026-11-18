@@ -4,7 +4,10 @@
 //! (§4.11, A-441): a snapshot rendered as its content-addressed archive file in a new volume, for a consumer that keeps
 //! a snapshot's bytes elsewhere (Mantle, kiln's object store) and reads the file a page at a time. It runs as a build
 //! does: checked at once, walked in slices by a task of the volume's owner shard, its volume and the request's
-//! completion committed as one atom.
+//! completion committed as one atom. And its way back, `archive import` (A-453): the archive file a consumer wrote into
+//! a volume of its own, its length admitted before a byte is read, then read, decoded and verified, restored and laid
+//! into a new volume, each a slice a turn on that volume's owner shard (`slates_archive::Decoding`, `Planning`,
+//! `Restoring`, the takeover's `verbs::Populating`), the new volume and the completion one atom as an export's are.
 //!
 //! **Running.** Each verb checks what it can at once — the volume, the right, the name, the snapshot — and defers its
 //! reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the work a slice
@@ -38,20 +41,22 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
-  BaseRecord, PolicyRecord, Principal, Role, SizeClass as DbSizeClass, SnapshotId as DbSnapshotId,
-  VolumeId as DbVolumeId, VolumeRecord, VolumeState,
+  BaseRecord, NamePolicy as DbNamePolicy, PolicyRecord, Principal, Role, SizeClass as DbSizeClass,
+  SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_image::{Builder, Identity, Progress, Segments, Timestamp, Walk, Walked};
 use slates_ipc::protocol::{
-  ARCHIVE_FILE, IMAGE_FILE, ImageMergeReport, NamePolicy, Refusal, ReplyBody, SizeClass,
-  SnapshotId, VolumeId,
+  ARCHIVE_FILE, ArchiveFault, IMAGE_FILE, ImageMergeReport, NamePolicy, Refusal, ReplyBody,
+  SizeClass, SnapshotId, VolumeId,
 };
 use slates_mem::Handle;
 use slates_vfs::clock::{Clock, HostClock};
+use slates_vfs::dir::Child;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::image::{
   BuildIo, ImageContent, ImageError, Merge, MergeReport, SnapshotFile, SnapshotTree, SnapshotWalk,
 };
+use slates_vfs::names::NameEquivalence;
 use slates_wire::request::RequestId;
 
 use crate::error::{refusal_of_db, refusal_of_vfs};
@@ -1661,5 +1666,601 @@ async fn archive_steps(job: &mut ArchiveJob) -> Result<(), Refusal> {
       return Ok(());
     }
     slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Counter: one slice of an archive import (A-453): its file read, decoded, planned, restored or laid into the new
+/// volume a slice a turn, never in one long turn; how many turns the imports took.
+/// Format: a counter name in the daemon's status report.
+const IMPORT_SLICES: &str = "image.archive_import_slices";
+
+/// `ArchiveImport` (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-453): checks the archive volume, the right and the name
+/// at once, then reads the archive file, decodes and verifies it, restores its tree and lays it into a new volume in a
+/// task of this shard, and defers the reply to it, as an export does. The archive volume is only read, so `read` is the
+/// right it needs; the new volume is the caller's own.
+pub(crate) fn import_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  archive: VolumeId,
+  name: String,
+  (size, require_locked): (SizeClass, bool),
+) -> ReplyBody {
+  if !state.consensus_ready {
+    return refused(Refusal::ConsensusNotInitialized);
+  }
+  let (_, record) = match find_store_backed(state, archive, StoreVerb::ArchiveRead) {
+    Ok(found) => found,
+    Err(reply) => return *reply,
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("archive_import");
+  }
+  // The name as its own partition holds it too: a volume another partition made under an alias there (A-236).
+  if let Some(existing) = crate::verbs::name_held(state, &name) {
+    return refused(Refusal::AlreadyExists { existing });
+  }
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "an archive import outside a recorded request".to_owned(),
+    });
+  };
+  let (alias, id) = match name_alias(state, &name) {
+    Ok(minted) => minted,
+    Err(refusal) => return refused(refusal),
+  };
+  let job = ImportJob {
+    request,
+    principal: principal.clone(),
+    archive: record.id,
+    archive_cap: class_cap(crate::verbs::wire_size(record.policy.size)),
+    name,
+    size,
+    require_locked,
+    file: InodeNo(0),
+    length: 0,
+    bytes: Vec::new(),
+    manifest: [0; 32],
+    names: NamePolicy::Exact,
+    admitted: None,
+    id,
+    decoded: None,
+    restored: None,
+    shedding: Vec::new(),
+  };
+  defer(state, run_import(job, alias))
+}
+
+/// The bytes a volume of `size` may hold: its bound, or its dynamic maximum.
+fn class_cap(size: SizeClass) -> u64 {
+  match size {
+    SizeClass::Bounded { limit } => limit,
+    SizeClass::Dynamic { max } => max,
+  }
+}
+
+/// An archive import between its slices: what it holds, released by [`ImportJob::release`] on a refusal or by its drop,
+/// and shed a piece a unit after its reply ([`ImportJob::shed`]).
+struct ImportJob {
+  request: (u64, RequestId),
+  principal: Principal,
+  /// The volume whose root holds the archive file.
+  archive: DbVolumeId,
+  /// The most that volume may hold: no archive written into it is longer.
+  archive_cap: u64,
+  /// The new volume's name.
+  name: String,
+  /// The new volume's size class.
+  size: SizeClass,
+  /// Whether the new volume's memory must be locked.
+  require_locked: bool,
+  /// The archive file.
+  file: InodeNo,
+  /// The archive file's length, as it was admitted.
+  length: usize,
+  /// The archive file's bytes, read a slice a unit.
+  bytes: Vec<u8>,
+  /// The archive's manifest identity, verified against its tree.
+  manifest: [u8; 32],
+  /// The new volume's name policy: its archive's.
+  names: NamePolicy,
+  /// The new volume, admitted and not yet recorded.
+  admitted: Option<Admitted>,
+  /// The new volume's id, minted at its admission (or by its name's alias).
+  id: Option<DbVolumeId>,
+  /// The decoded archive, held while its tree is planned and restored.
+  decoded: Option<slates_archive::Archive>,
+  /// The restored tree, held while it is laid into the volume.
+  restored: Option<slates_archive::Restored>,
+  /// The manifest's nodes still to release, an entry a piece ([`ImportJob::shed`]).
+  shedding: Vec<slates_archive::Node>,
+}
+
+impl Drop for ImportJob {
+  fn drop(&mut self) {
+    if self.admitted.is_some() {
+      // A task that ended early: the volume goes back. With the state unreachable (a shutdown) nothing can be, and
+      // the process's end returns it.
+      if crate::state::with_state(|s| self.release(s)).is_none() {
+        self.admitted = None;
+      }
+    }
+  }
+}
+
+impl ImportJob {
+  /// Finds the archive file in the archive volume's root and admits its length before a byte of it is read, then makes
+  /// room for it, allocated and never zeroed whole. No longer than the archive volume's class cap: every byte an
+  /// archive's writer put there was charged to that volume, so only a file with holes is longer, and no writer of an
+  /// archive makes one (refused `Malformed`). And no longer than the room this shard could admit, since the file is
+  /// held whole while it is decoded (owed: a streamed decoder, GAPS A-453): refused `BudgetExceeded` naming the room.
+  fn open(&mut self, state: &mut ShardState) -> Result<(), Refusal> {
+    let handle = slot_of(state, self.archive)?;
+    let (file, length) = locate_archive(state, handle).map_err(|error| refusal_of_vfs(&error))?;
+    if length > self.archive_cap {
+      return Err(Refusal::ArchiveRefused {
+        fault: ArchiveFault::Malformed,
+      });
+    }
+    let room = state.store.admittable();
+    let over_room = || Refusal::BudgetExceeded { available: room };
+    if length > room {
+      return Err(over_room());
+    }
+    let length = usize::try_from(length).map_err(|_| over_room())?;
+    self
+      .bytes
+      .try_reserve_exact(length)
+      .map_err(|_| over_room())?;
+    self.file = file;
+    self.length = length;
+    Ok(())
+  }
+
+  /// One slice of the reading, a copy slice a unit; `Some` once the buffer holds the file's admitted length, or all it
+  /// held (a file cut short meanwhile reads short, and its decode refuses it as cut off).
+  fn read_step(&mut self, state: &mut ShardState) -> Result<Option<()>, Refusal> {
+    let (archive, file, length) = (self.archive, self.file, self.length);
+    let bytes = &mut self.bytes;
+    state.count(IMPORT_SLICES, 1);
+    sliced(state, |s| {
+      let at = bytes.len();
+      let piece = usize::try_from(s.config.copy_slice_bytes())
+        .unwrap_or(usize::MAX)
+        .max(1)
+        .min(length.saturating_sub(at));
+      if piece == 0 {
+        return Ok(Some(()));
+      }
+      let handle = slot_of(s, archive)?;
+      bytes.resize(at.saturating_add(piece), 0);
+      let read = match bytes.get_mut(at..) {
+        Some(into) => read_archive(s, handle, file, u64::try_from(at).unwrap_or(u64::MAX), into)
+          .map_err(|error| refusal_of_vfs(&error))?,
+        None => 0,
+      };
+      bytes.truncate(at.saturating_add(read));
+      Ok((read == 0 || bytes.len() >= length).then_some(()))
+    })
+  }
+
+  /// Admits the new volume, as a create admits one (every credit reserved, or none), under its archive's name policy:
+  /// one this daemon does not hold is refused `Unsupported`.
+  fn admit(&mut self, state: &mut ShardState, name_policy_id: u32) -> Result<(), Refusal> {
+    self.names = match slates_vfs::export::name_equivalence_of_id(name_policy_id) {
+      Some(NameEquivalence::Exact) => NamePolicy::Exact,
+      Some(NameEquivalence::Fold) => NamePolicy::Fold,
+      None => {
+        return Err(Refusal::ArchiveRefused {
+          fault: ArchiveFault::Unsupported,
+        });
+      }
+    };
+    // The id its name's alias already names (A-236), or one minted here.
+    let id = match self.id {
+      Some(id) => id,
+      None => fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?,
+    };
+    let admitted = crate::verbs::admit(
+      state,
+      &self.principal,
+      self.size,
+      self.names,
+      self.require_locked,
+      None,
+    )
+    .map_err(|reply| crate::verbs::reply_refusal(*reply))?;
+    self.admitted = Some(admitted);
+    self.id = Some(id);
+    Ok(())
+  }
+
+  /// Records the new volume — a plain scratch volume of the caller's, under its archive's name policy — moves it into
+  /// the registry and publishes it; the reply.
+  fn publish(&mut self, state: &mut ShardState) -> Result<ReplyBody, Refusal> {
+    let id = self.id.ok_or_else(unreachable)?;
+    let admitted = self.admitted.take().ok_or_else(unreachable)?;
+    let record = VolumeRecord {
+      id,
+      name: self.name.clone(),
+      owner_shard: state.partition,
+      policy: PolicyRecord {
+        size: crate::verbs::db_size(self.size),
+        names: match self.names {
+          NamePolicy::Exact => DbNamePolicy::Exact,
+          NamePolicy::Fold => DbNamePolicy::Fold,
+        },
+        require_locked: self.require_locked,
+        role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
+      },
+      base: BaseRecord::Scratch,
+      head: DbSnapshotId::default(),
+      epoch: 0,
+      referenced_bytes: 0,
+      unique_bytes: 0,
+      state: VolumeState::Live,
+      lease: None,
+      owner: self.principal.clone(),
+      access: Vec::new(),
+      created_ns: state.clock.monotonic_ns(),
+      catalog_version: 0,
+      taken_over: None,
+    };
+    let Admitted {
+      volume,
+      host,
+      credits,
+    } = admitted;
+    let reply = crate::verbs::publish_created_volume(
+      state,
+      id,
+      volume,
+      host,
+      (
+        credits.reservation,
+        credits.version,
+        credits.metadata,
+        credits.lock,
+      ),
+      record,
+    );
+    if let ReplyBody::Refused { refusal } = reply {
+      return Err(refusal);
+    }
+    publish_new_volume(state, id)?;
+    Ok(ReplyBody::ArchiveImported {
+      id: wire_id(id),
+      manifest: self.manifest,
+    })
+  }
+
+  /// Releases a piece of what the import made, `true` while more is left: its buffer (one allocation), then the
+  /// restored tree an entry a piece, then the archive a chunk a piece, then its manifest an entry a piece.
+  fn shed(&mut self) -> bool {
+    if self.bytes.capacity() > 0 {
+      self.bytes = Vec::new();
+      return true;
+    }
+    if let Some(restored) = self.restored.as_mut() {
+      let more = restored.files.pop_first().is_some()
+        || restored.metadata.pop_first().is_some()
+        || restored.directories.pop_first().is_some()
+        || restored.xattrs.pop_first().is_some();
+      if !more {
+        self.restored = None;
+      }
+      return true;
+    }
+    if let Some(archive) = self.decoded.as_mut() {
+      if archive.chunks.pop().is_none() {
+        let manifest = std::mem::replace(
+          &mut archive.manifest,
+          slates_archive::Node::Directory(Vec::new()),
+        );
+        self.shedding.push(manifest);
+        self.decoded = None;
+      }
+      return true;
+    }
+    match self.shedding.pop() {
+      Some(slates_archive::Node::Directory(mut entries)) => {
+        // One entry a piece: its name and metadata freed here, its node released after it.
+        if let Some(entry) = entries.pop() {
+          self.shedding.push(slates_archive::Node::Directory(entries));
+          self.shedding.push(entry.node);
+        }
+        true
+      }
+      Some(slates_archive::Node::File(_)) => true,
+      None => false,
+    }
+  }
+
+  /// Gives back what the import holds: the new volume, discarded with its credits.
+  fn release(&mut self, state: &mut ShardState) {
+    if let Some(admitted) = self.admitted.take() {
+      crate::verbs::discard_admitted(state, admitted);
+    }
+  }
+}
+
+/// The archive file in the root of the volume in `handle`, and its length: a regular file, read through the volume's
+/// host when it overlays one. A directory at its name is refused `IsDirectory`, a link or a special node `Invalid`.
+fn locate_archive(
+  state: &mut ShardState,
+  handle: Handle<VolumeSlot>,
+) -> Result<(InodeNo, u64), slates_vfs::VfsError> {
+  let path = format!("/{ARCHIVE_FILE}");
+  let ShardState { store, volumes, .. } = state;
+  let slot = volumes
+    .get_mut(handle)
+    .map_err(|_| slates_vfs::VfsError::NotFound)?;
+  let (located, observed) = match slot.host.as_mut() {
+    Some(host) => {
+      let mut overlay = slot.volume.with_host(host);
+      let located = overlay.resolve(store, &path)?;
+      let observed = overlay.observe(store, located.inode)?;
+      (located, observed)
+    }
+    None => {
+      let located = slot.volume.resolve(store, &path)?;
+      let observed = slot.volume.observe(store, located.inode)?;
+      (located, observed)
+    }
+  };
+  match located.child {
+    Child::File(_) => Ok((located.inode, observed.attrs.size)),
+    Child::Dir(_) => Err(slates_vfs::VfsError::IsDirectory),
+    _ => Err(slates_vfs::VfsError::Invalid),
+  }
+}
+
+/// Reads the archive file `file` from `at` into `into`, in the volume of `handle`, through its host when it overlays
+/// one; the bytes read, fewer at the file's end.
+fn read_archive(
+  state: &mut ShardState,
+  handle: Handle<VolumeSlot>,
+  file: InodeNo,
+  at: u64,
+  into: &mut [u8],
+) -> Result<usize, slates_vfs::VfsError> {
+  let ShardState { store, volumes, .. } = state;
+  let slot = volumes
+    .get_mut(handle)
+    .map_err(|_| slates_vfs::VfsError::NotFound)?;
+  match slot.host.as_mut() {
+    Some(host) => slot.volume.with_host(host).read(store, file, at, into),
+    None => slot.volume.read(store, file, at, into),
+  }
+}
+
+/// The refusal an archive the import read is answered with (A-453): the reader's refusal by its kind
+/// ([`ArchiveFault`]), each the class a caller acts on alike, and a restore over its budget `BudgetExceeded` naming the
+/// `room` the shard could admit for it. Every reader refusal is classed here by name, so a new one must be classed.
+fn refusal_of_import(error: &slates_archive::ArchiveError, room: u64) -> Refusal {
+  use slates_archive::ArchiveError;
+  let fault = match error {
+    ArchiveError::OverBudget { .. } => return Refusal::BudgetExceeded { available: room },
+    ArchiveError::BadMagic => ArchiveFault::ForeignMagic,
+    ArchiveError::UnsupportedMajor { .. } | ArchiveError::UnknownRequiredFlag { .. } => {
+      ArchiveFault::Unsupported
+    }
+    // A stream whose trailer magic is missing is not whole, as one too short for its frame is not.
+    ArchiveError::Truncated | ArchiveError::BadTrailer => ArchiveFault::Truncated,
+    ArchiveError::ArchiveHashMismatch
+    | ArchiveError::ChunkIdentityMismatch { .. }
+    | ArchiveError::ManifestHashMismatch => ArchiveFault::Corrupt,
+    ArchiveError::BadSeekTable
+    | ArchiveError::BadLength
+    | ArchiveError::BadPayload { .. }
+    | ArchiveError::MissingChunk
+    | ArchiveError::ChunkMaxTooLarge { .. }
+    | ArchiveError::ChunkTooLarge { .. }
+    | ArchiveError::NonCanonicalChunk { .. }
+    | ArchiveError::TotalsMismatch
+    | ArchiveError::BadExtents
+    | ArchiveError::BadName
+    | ArchiveError::DuplicatePath => ArchiveFault::Malformed,
+  };
+  Refusal::ArchiveRefused { fault }
+}
+
+/// The refusal laying a restored tree into the new volume is answered with: a tree that does not lay (a file against
+/// its metadata, a hard link against its first name, a name count against its link count: `Populating`'s refusals)
+/// `Malformed`, since its archive verified whole; the volume's own refusals (its room, its inodes) as it refuses them.
+fn refusal_of_laying(error: &slates_vfs::VfsError) -> Refusal {
+  match error {
+    slates_vfs::VfsError::RecoveryIncomplete | slates_vfs::VfsError::NotFound => {
+      Refusal::ArchiveRefused {
+        fault: ArchiveFault::Malformed,
+      }
+    }
+    other => refusal_of_vfs(other),
+  }
+}
+
+/// One slice of the decode, a piece a unit, no piece hashing more than an archive slice's bytes (half the live step
+/// quantum at the measured BLAKE3 rate); the archive once whole and verified.
+fn decode_step(
+  state: &mut ShardState,
+  decoding: &mut slates_archive::Decoding<'_>,
+) -> Result<Option<slates_archive::Archive>, Refusal> {
+  let slice_bytes = usize::try_from(state.config.archive_slice_bytes())
+    .unwrap_or(usize::MAX)
+    .max(1);
+  state.count(IMPORT_SLICES, 1);
+  sliced(state, |_| {
+    decoding
+      .step(slice_bytes, || true)
+      .map_err(|error| refusal_of_import(&error, 0))
+  })
+}
+
+/// One slice of the restore's plan, a piece a unit; the plan once whole.
+fn plan_step<'tree>(
+  state: &mut ShardState,
+  planning: &mut slates_archive::Planning<'tree>,
+) -> Result<Option<slates_archive::Planned<'tree>>, Refusal> {
+  state.count(IMPORT_SLICES, 1);
+  sliced(state, |_| {
+    planning
+      .step(|| true)
+      .map_err(|error| refusal_of_import(&error, 0))
+  })
+}
+
+/// One slice of the restore, a piece a unit; the restored tree once whole. An allocation refused names `room`.
+fn restore_step(
+  state: &mut ShardState,
+  restoring: &mut slates_archive::Restoring<'_>,
+  room: u64,
+) -> Result<Option<slates_archive::Restored>, Refusal> {
+  state.count(IMPORT_SLICES, 1);
+  sliced(state, |_| {
+    restoring
+      .step(|| true)
+      .map_err(|error| refusal_of_import(&error, room))
+  })
+}
+
+/// One slice of laying the restored `tree` into the new volume, a piece a unit, no piece writing or comparing more than
+/// a copy slice of a file (a page at least); `true` once every piece is laid.
+fn populate_step(
+  state: &mut ShardState,
+  populating: &mut crate::verbs::Populating,
+  tree: &slates_archive::Restored,
+  admitted: &mut Admitted,
+) -> Result<bool, Refusal> {
+  let slice_bytes = usize::try_from(state.config.copy_slice_bytes())
+    .unwrap_or(usize::MAX)
+    .max(state.config.page);
+  state.count(IMPORT_SLICES, 1);
+  sliced(state, |s| {
+    populating
+      .step(
+        tree,
+        &mut s.store,
+        &mut admitted.volume,
+        slice_bytes,
+        || true,
+      )
+      .map(|laid| laid.then_some(()))
+      .map_err(|error| refusal_of_laying(&error))
+  })
+  .map(|laid| laid.is_some())
+}
+
+/// Imports the archive a slice at a time; then commits its volume, or the refusal, as one atom and delivers the reply;
+/// then releases what the import made.
+async fn run_import(mut job: ImportJob, alias: Option<NameAlias>) {
+  let reserved = reserve(alias.as_ref()).await;
+  let outcome = match &reserved {
+    Ok(()) => import_steps(&mut job).await,
+    Err(refusal) => Err(refusal.clone()),
+  };
+  let request = job.request;
+  let completed = crate::state::with_state(|s| {
+    complete(s, request, |s| {
+      match outcome.and_then(|()| job.publish(s)) {
+        Ok(reply) => reply,
+        Err(refusal) => {
+          job.release(s);
+          refused(refusal)
+        }
+      }
+    })
+  });
+  let delivered = match completed {
+    Some((reply, route)) => {
+      settle(
+        alias,
+        reserved,
+        matches!(reply, ReplyBody::ArchiveImported { .. }),
+      )
+      .await;
+      crate::state::with_state(|s| deliver(s, reply, route))
+    }
+    None => None,
+  };
+  if delivered.is_none() {
+    // The shard's state was unreachable (its shutdown): no record committed, so the client's retry, on the shard that
+    // succeeds it, runs the verb again; the job's drop frees what it made.
+    return;
+  }
+  shed_in_slices(|| job.shed()).await;
+}
+
+/// The import's slices: the archive file's length admitted and the file read; the archive decoded and verified (the
+/// file's bytes freed at once after, since the archive holds its own); the new volume admitted under the archive's name
+/// policy; the tree planned, admitted against what the volume may hold and the shard could admit, and restored; and
+/// laid into the volume.
+async fn import_steps(job: &mut ImportJob) -> Result<(), Refusal> {
+  with(|s| job.open(s))?;
+  while with(|s| job.read_step(s))?.is_none() {
+    slates_rt::futures::yield_now().await;
+  }
+  let bytes = std::mem::take(&mut job.bytes);
+  let mut decoding =
+    slates_archive::Decoding::new(&bytes).map_err(|error| refusal_of_import(&error, 0))?;
+  let archive = loop {
+    if let Some(archive) = with(|s| decode_step(s, &mut decoding))? {
+      break archive;
+    }
+    slates_rt::futures::yield_now().await;
+  };
+  job.manifest = decoding.manifest_identity();
+  drop(decoding);
+  drop(bytes);
+  with(|s| job.admit(s, archive.name_policy_id))?;
+  let ImportJob {
+    size,
+    admitted,
+    decoded,
+    restored,
+    ..
+  } = job;
+  let archive = &*decoded.insert(archive);
+  let mut planning = slates_archive::Planning::new(archive);
+  let planned = loop {
+    slates_rt::futures::yield_now().await;
+    if let Some(planned) = with(|s| plan_step(s, &mut planning))? {
+      break planned;
+    }
+  };
+  let own = admitted
+    .as_ref()
+    .and_then(|volume| volume.credits.reservation)
+    .map_or(0, |reservation| reservation.bytes);
+  let needed = planned.needed();
+  let (budget, room) = with(|s| {
+    Ok(crate::verbs::restore_budget(
+      s,
+      class_cap(*size),
+      own,
+      needed,
+    ))
+  })?;
+  let mut restoring = planned
+    .restoring(budget)
+    .map_err(|error| refusal_of_import(&error, room))?;
+  let tree = loop {
+    slates_rt::futures::yield_now().await;
+    if let Some(tree) = with(|s| restore_step(s, &mut restoring, room))? {
+      break tree;
+    }
+  };
+  drop(restoring);
+  let tree = &*restored.insert(tree);
+  let volume = admitted.as_mut().ok_or_else(unreachable)?;
+  let mut populating = crate::verbs::Populating::new();
+  loop {
+    slates_rt::futures::yield_now().await;
+    if with(|s| populate_step(s, &mut populating, tree, &mut *volume))? {
+      return Ok(());
+    }
   }
 }
