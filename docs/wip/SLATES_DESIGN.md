@@ -26345,7 +26345,8 @@ Applied in the same change to:
   before the record half in its place (the highest record alone), and TLC must refute it.
 - **Results** (GAPS' model table): per-position adoption, no error at two epochs, 2,683,673 distinct states, depth 27;
   the register's rule, Continuity violated at depth 14. The 2026-09-04 runs of `FencedRegister_2.cfg` and `Reconfig.cfg`
-  were re-run on the same toolchain and give the same counts. The three-epoch configuration is owed its result.
+  were re-run on the same toolchain and give the same counts. The three-epoch configuration ran 34 minutes without a
+  violation (40,469,260 distinct states, depth 26) and was stopped short of completion (GAPS' model table).
 - **The build (the record half).** A green successor that does not know the records of versions below the one its
   round adopted (`green_adopt::Engine::RecordsShort`, A-333) asks every member of the green's recovery cohorts, settled
   and current, for its positions in that range under the round's epoch and generation (`LedgerPrepare` /
