@@ -1722,6 +1722,51 @@ fn read_bound() -> Duration {
     .saturating_add(lease)
 }
 
+/// One write of `file` to `volume` through `instance`, given the fleet wait to be answered (acknowledged or refused): a
+/// reply held longer than the durable wait's bound (the failover SLO, A-354) is a reply held for good. Past it the fleet
+/// is shown whole ([`diagnosis`]) and its daemons killed, so the client is told and the flow fails here with the state
+/// that held the write, where before it hung: the long-log flow waited out its 1,700 s cap after "taken over" on arm64
+/// (CI run 44331494887, main 68148152d), and the lossy flow 21 minutes on a Mac Studio.
+fn write_answered_within(
+  instance: &str,
+  volume: &str,
+  file: usize,
+  began: &Instant,
+) -> Vec<Outcome> {
+  std::thread::scope(|scope| {
+    let writer = scope.spawn(|| {
+      Stream {
+        instance,
+        volume: volume_id_of(volume),
+        began: *began,
+      }
+      .run(file..file + 1, &AtomicBool::new(false))
+    });
+    let waited = Instant::now();
+    while !writer.is_finished() {
+      if waited.elapsed() > FLEET_WAIT {
+        let instances = DIAGNOSED.with(|instances| instances.borrow().clone());
+        eprintln!(
+          "chaos: a write on {instance} was never answered within {FLEET_WAIT:?}:\n{}",
+          diagnosis(&instances, volume)
+        );
+        for node in &instances {
+          if let Some(pid) = daemon_pid(node) {
+            send_signal(pid, rustix::process::Signal::KILL);
+          }
+        }
+        let outcome = writer.join().unwrap();
+        panic!(
+          "a write on {instance} was never answered within {FLEET_WAIT:?} (the fleet's state is printed above): \
+           {outcome:?}"
+        );
+      }
+      pause();
+    }
+    writer.join().unwrap()
+  })
+}
+
 /// Writes through `successor` one file at a time from `files`, until one is acknowledged or the fleet wait passes, then
 /// reads the head it ships `volume` from: its first head, the one [`continuity`] judges (`None` if no write was
 /// acknowledged). Every outcome comes back too, for NoLoss.
@@ -1734,12 +1779,7 @@ fn first_write_through(
   let deadline = Instant::now() + FLEET_WAIT;
   let mut written = Vec::new();
   for file in files {
-    let outcome = Stream {
-      instance: successor,
-      volume: volume_id_of(volume),
-      began: *began,
-    }
-    .run(file..file + 1, &AtomicBool::new(false));
+    let outcome = write_answered_within(successor, volume, file, began);
     let acknowledged = outcome.iter().any(|outcome| outcome.refused.is_none());
     written.extend(outcome);
     if acknowledged || Instant::now() >= deadline {
@@ -4308,6 +4348,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     (&fleet, &survivors),
     (&volume, &outcomes),
     samples.iter().map(|sample| &sample.state).chain(&last_look),
+    last_look.iter().find(|state| !state.holding),
   );
   drop(fleet);
   verdict.judge();
@@ -4331,6 +4372,42 @@ fn write_set(recorded: &std::collections::BTreeSet<String>, named: &[String]) ->
 /// here again so the judge does not take its rule from the code it judges), and only an unfenced holder can accept one.
 fn stale_owner_can_commit(holders: usize, unfenced: usize, tolerated: usize) -> bool {
   unfenced > 0 && unfenced >= holders.saturating_sub(tolerated).max(tolerated)
+}
+
+/// The holder sets a superseded owner counts a write's durability from, as its own last `live` line showed them before
+/// its loss: its active holders and, while a transition is in flight, the set it is moving to (a joint transition counts
+/// both); the set its catalog records when it shows neither. Empty when the owner showed no shipping line.
+fn superseded_cohorts(superseded: Option<&LiveState>) -> Vec<Vec<String>> {
+  let Some(owner) = superseded.filter(|state| !state.holding) else {
+    return Vec::new();
+  };
+  let cohorts: Vec<Vec<String>> = [&owner.holders, &owner.moving_to]
+    .into_iter()
+    .filter(|cohort| !cohort.is_empty())
+    .cloned()
+    .collect();
+  if cohorts.is_empty() && !owner.recorded.is_empty() {
+    return vec![owner.recorded.clone()];
+  }
+  cohorts
+}
+
+/// [`stale_owner_can_commit`] over a superseded owner's `cohorts` ([`superseded_cohorts`]): it could still commit only
+/// where the holders still below the takeover's fence (`unfenced`, member ids) reach the write count in every cohort it
+/// counts, since a joint transition needs the count in each.
+fn stale_owner_can_commit_jointly(
+  cohorts: &[Vec<String>],
+  unfenced: &[String],
+  tolerated: usize,
+) -> bool {
+  !cohorts.is_empty()
+    && cohorts.iter().all(|cohort| {
+      let below = cohort
+        .iter()
+        .filter(|holder| unfenced.contains(holder))
+        .count();
+      stale_owner_can_commit(cohort.len(), below, tolerated)
+    })
 }
 
 /// StaleNeverCommits on the holders' fences: a violation only where the unfenced holders could still make a write count
@@ -4387,6 +4464,51 @@ fn a_superseded_owner_can_commit_only_where_its_unfenced_holders_reach_the_write
   );
 }
 
+/// §4.8's StaleNeverCommits judged by the superseded owner's own holder sets (goal g229). Do: judge the fresh-member
+/// flow's failing run on main 68148152d (CI run 44331494887, x86_64): the dead owner's holders d and b, the successor d
+/// adding c, whose copy from an older set was still below the fence; then the same owner with b unfenced, and an owner
+/// in a transition. Expect: c, which the dead owner never counted, no violation; b, one of its two, a violation; and in
+/// a transition from `[d, b]` to `[b, c]`, b (in both cohorts) a violation and c (in one) none. The judge read the
+/// successor's sets before, and called the first run's c a violation.
+#[test]
+fn a_superseded_owner_is_judged_by_its_own_holder_sets_not_its_successors() {
+  let owner = |holders: &[&str], moving_to: &[&str]| LiveState {
+    holding: false,
+    head: Some(3345),
+    durable: Some(3344),
+    owed: false,
+    epoch: Some(1),
+    identity: None,
+    fence: 1,
+    holders: holders.iter().map(|host| (*host).to_owned()).collect(),
+    moving_to: moving_to.iter().map(|host| (*host).to_owned()).collect(),
+    recorded: holders.iter().map(|host| (*host).to_owned()).collect(),
+  };
+  let judged = |owner: &LiveState, unfenced: &[&str]| {
+    let unfenced: Vec<String> = unfenced.iter().map(|host| (*host).to_owned()).collect();
+    stale_owner_can_commit_jointly(&superseded_cohorts(Some(owner)), &unfenced, FLEET_F)
+  };
+  let settled = owner(&["d", "b"], &[]);
+  assert!(
+    !judged(&settled, &["c"]),
+    "a holder the dead owner never counted cannot make its write"
+  );
+  assert!(judged(&settled, &["b"]), "one of its two holders can");
+  let moving = owner(&["d", "b"], &["b", "c"]);
+  assert!(
+    judged(&moving, &["b"]),
+    "a holder in both cohorts reaches the count in each"
+  );
+  assert!(
+    !judged(&moving, &["c"]),
+    "a holder in the new cohort alone leaves the old one short"
+  );
+  assert!(
+    superseded_cohorts(None).is_empty(),
+    "an owner that showed no line names no cohort"
+  );
+}
+
 /// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, and every holder the
 /// takeover counted is fenced at its epoch. Those are read from the successor: the holder set its catalog records (the
 /// set its phase one counted, which a transition may have recorded before the old owner activated it) and its own
@@ -4397,6 +4519,7 @@ fn judge_served<'a>(
   (fleet, survivors): (&Fleet, &[&str]),
   (volume, outcomes): (&str, &[Outcome]),
   observed: impl IntoIterator<Item = &'a LiveState>,
+  superseded: Option<&LiveState>,
 ) {
   match wait_serving(survivors, volume, outcomes) {
     Some((successor, took)) => {
@@ -4416,13 +4539,32 @@ fn judge_served<'a>(
         .into_iter()
         .flat_map(|state| state.recorded.into_iter().chain(state.holders))
         .collect();
+      // The holders the superseded owner could still count a write from are its own, as its last line before its loss
+      // showed them ([`superseded_cohorts`]), never the successor's: A-343 publishes the volume at its takeover, so the
+      // successor's line names its own holders at once, a transition's new member among them (a run on main 68148152d
+      // judged a holder the successor was only adding, its copy from an older set still below the fence, and called it a
+      // violation: CI run 44331494887, x86_64). The successor's sets stand in only when the owner showed no line.
+      let cohorts = superseded_cohorts(superseded);
+      let owners_holders: std::collections::BTreeSet<&String> = cohorts.iter().flatten().collect();
       let counted: Vec<&str> = hosts
         .iter()
-        .filter(|(host, survivor)| named.contains(host) && **survivor != successor)
+        .filter(|(host, survivor)| {
+          **survivor != successor
+            && if cohorts.is_empty() {
+              named.contains(host)
+            } else {
+              owners_holders.contains(host)
+            }
+        })
         .map(|(_, survivor)| *survivor)
         .collect();
       verdict.note(format!(
-        "the successor's recorded and active holders among the survivors: {counted:?}"
+        "the holders the takeover superseded among the survivors: {counted:?} (by {})",
+        if cohorts.is_empty() {
+          "the successor's recorded and active sets"
+        } else {
+          "the old owner's own sets"
+        }
       ));
       let unfenced = fenced_at_or_above(&counted, volume, epoch);
       if !unfenced.is_empty() {
@@ -4433,7 +4575,34 @@ fn judge_served<'a>(
           diagnosis(&shown, volume)
         ));
       }
-      judge_fences(verdict, write_set(&recorded, &named), unfenced);
+      if cohorts.is_empty() {
+        judge_fences(verdict, write_set(&recorded, &named), unfenced);
+      } else {
+        let unfenced_hosts: Vec<String> = hosts
+          .iter()
+          .filter(|(host, survivor)| {
+            owners_holders.contains(host)
+              && **survivor != successor
+              && !fenced_at_or_above(&[**survivor], volume, epoch).is_empty()
+          })
+          .map(|(host, _)| host.clone())
+          .collect();
+        let violations = if stale_owner_can_commit_jointly(&cohorts, &unfenced_hosts, FLEET_F) {
+          unfenced
+        } else {
+          if !unfenced.is_empty() {
+            verdict.note(format!(
+              "below the takeover's fence, fewer than a write needs of the old owner's holders {cohorts:?}: \
+               {unfenced:?}"
+            ));
+          }
+          Vec::new()
+        };
+        verdict.check(
+          "StaleNeverCommits (the counted holders' fences)",
+          violations,
+        );
+      }
       let others: Vec<&str> = survivors
         .iter()
         .copied()

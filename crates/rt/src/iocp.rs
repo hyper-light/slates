@@ -1,5 +1,20 @@
 //! The I/O completion port driver (Windows): `PostQueuedCompletionStatus` for kicks and no-ops,
 //! `GetQueuedCompletionStatusEx` with a timeout for the wait [B: Microsoft Learn].
+//!
+//! **A blocked wait sits one level above normal (A-361).** Windows raises a thread's priority a level when an event, a
+//! semaphore or an address it waits on wakes it, and none when it is dequeued from an I/O completion port, which is how a
+//! parked shard waits. Measured on CI's Windows runners (2026-11-18, diag-g234-wake-1, two spinning threads a logical CPU
+//! at the job's own BelowNormal level): a thread woken from a completion port stayed at its base priority and ran 29 ms
+//! (windows-latest) and 14 ms (windows-11-arm) after its kick at the median, 95–112 ms and 32–48 ms at the p99, as the
+//! runtime's own parked shard did, waiting out the spinners' turns of 31.6 ms; a waiter on an event or on
+//! WaitOnAddress ran one level up and took 15 µs and 6–7 µs; an event waiter with its boost disabled waited the 29 and
+//! 14 ms again; and a completion-port waiter raised one level for its wait alone took 15–17 µs and 6–7 µs. So a wait
+//! that may block raises a thread at the normal level to the next for as long as it blocks, and puts it back before it
+//! runs anything ([`RaisedForWait`]): the shard is woken as Windows wakes an event's waiter and runs, as before, at its
+//! own level. A thread at another level (a test that starves a shard at IDLE) is left as it is, and a zero-timeout
+//! harvest, which never blocks, pays nothing. A raise and its restore cost 0.77–0.88 µs a pair quiet and 1.3–5.5 µs
+//! loaded, against a parked wake of 6–15 µs. No privilege is asked: a thread may set its own level within its process's
+//! class (R10).
 
 use std::time::Instant;
 
@@ -7,6 +22,10 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, 
 use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::System::IO::{
   CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
+};
+use windows_sys::Win32::System::Threading::{
+  GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+  THREAD_PRIORITY_NORMAL,
 };
 
 use crate::afd::{Afd, Block, READABLE_EVENTS, WRITABLE_EVENTS, base_socket};
@@ -182,6 +201,37 @@ impl IocpDriver {
   }
 }
 
+/// Moves the calling thread from priority level `from` to `to` when it stands at `from`: whether it moved.
+fn move_level(from: i32, to: i32) -> bool {
+  // SAFETY: the calling thread's pseudo-handle, valid for both calls; a thread reads and sets its own level within its
+  // process's priority class without any privilege.
+  unsafe {
+    GetThreadPriority(GetCurrentThread()) == from && SetThreadPriority(GetCurrentThread(), to) != 0
+  }
+}
+
+/// The calling thread raised one level above normal for a wait that may block, and put back as this drops (A-361, the
+/// module doc). Holds nothing when the wait cannot block or the thread was not at the normal level.
+struct RaisedForWait(bool);
+
+impl RaisedForWait {
+  /// Raises the calling thread for a wait of `timeout_ns` (`None`: without bound) when that wait may block.
+  fn raise(timeout_ns: Option<u64>) -> RaisedForWait {
+    RaisedForWait(
+      timeout_ns != Some(0) && move_level(THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_ABOVE_NORMAL),
+    )
+  }
+}
+
+impl Drop for RaisedForWait {
+  fn drop(&mut self) {
+    if self.0 {
+      // A level something else set during the wait is left as it is.
+      let _ = move_level(THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL);
+    }
+  }
+}
+
 /// Posts a kick packet to `port`, a live port the caller has pinned ([`KickPort::with`]); safe from
 /// any thread. A failed post means the port is being torn down with its shard, the documented outcome
 /// of a kick to an exiting shard (`Kick::kick`).
@@ -211,6 +261,9 @@ impl Driver for IocpDriver {
     // waits out the rest, so a park never returns early, as the seam promises. Each further wait asks for at least a
     // millisecond, so the rest shrinks every time; a kick or a completion still ends the wait at once.
     let deadline = timeout_ns.map(|ns| self.now_ns().saturating_add(ns));
+    // One level up while the wait may block, back to normal before anything runs (A-361, the module doc); every return
+    // below drops it.
+    let raised = RaisedForWait::raise(timeout_ns);
     let count = loop {
       let remaining = deadline.map(|due| due.saturating_sub(self.now_ns()));
       match self.dequeue(remaining)? {
@@ -219,6 +272,7 @@ impl Driver for IocpDriver {
         None => return Ok(()),
       }
     };
+    drop(raised);
     for entry in self.entries.iter().take(count) {
       match entry.lpCompletionKey {
         KICK_KEY => {}

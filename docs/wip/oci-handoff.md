@@ -66,7 +66,7 @@
   `crates/server/src/nfs.rs`; no attachment record is made for a mount. Linux: `crates/bridge-fuse`
   has the codec, dispatch and `fusermount3` launcher (`src/mount.rs`, `fsname=slates,subtype=slates`)
   but the daemon does not serve `/dev/fuse` (`crates/server/src/lib.rs` has `nfs` and `virtiofs`
-  only; `crates/cli/src/exec.rs` calls the root mount "owed").
+  only; `crates/api/src/exec.rs` calls the root mount "owed").
 - CLI `attach ID [--read|--write] [--snapshot N]` (`crates/cli/src/args.rs:737`), `emit_attach`
   (`verbs.rs:397`); MCP `slates.attach.attach` (`crates/mcp/src/lib.rs:281`, `attachment_json:764`,
   `status_json:716`).

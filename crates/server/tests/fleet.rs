@@ -3096,35 +3096,40 @@ fn start_mesh_unbootstrapped(
     shards,
     regions,
     mirrors,
+    |_| {},
   )
+}
+
+/// [`start_mesh_with_f`] at `shards` shards per daemon, each node's derived configuration changed by `tune` before
+/// its daemon starts: for a test that needs a derived bound small enough to reach (a shard's client seats).
+fn start_mesh_tuned(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  shards: u16,
+  tune: fn(&mut DaemonConfig),
+) -> Vec<Daemon> {
+  let none = std::collections::BTreeMap::new();
+  let daemons = start_mesh_bound_and_advertised(
+    nodes,
+    hosts.len(),
+    hosts,
+    certs,
+    (serve, serve),
+    1,
+    shards,
+    &none,
+    &std::collections::BTreeMap::new(),
+    tune,
+  );
+  bootstrap_mesh(&daemons, hosts, &none);
+  settle_initial_consensus(&daemons, hosts, &none, Quorum { f: 1 });
+  daemons
 }
 
 /// Each node's (probe, record) serve port pair, in node order.
 type PortPairs = [(u16, u16)];
-
-/// The failover SLO the meshes started next are configured with in place of the derived default (0: the default),
-/// for a test whose subject is an SLO below a path's floor ([`a_forward_is_never_refused_below_its_paths_floor`]). Set
-/// and cleared by [`MeshFailoverSlo`]; the fleet tests run one at a time ([`serialize_fleet_tests`]), so no other test's
-/// mesh reads it.
-static MESH_FAILOVER_SLO_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Holds [`MESH_FAILOVER_SLO_NS`] at a value for its life, and clears it when dropped, a failed assertion's unwinding
-/// included.
-struct MeshFailoverSlo;
-
-impl MeshFailoverSlo {
-  /// The meshes started while this lives are configured with a failover SLO of `slo_ns`.
-  fn set(slo_ns: u64) -> MeshFailoverSlo {
-    MESH_FAILOVER_SLO_NS.store(slo_ns, std::sync::atomic::Ordering::Release);
-    MeshFailoverSlo
-  }
-}
-
-impl Drop for MeshFailoverSlo {
-  fn drop(&mut self) {
-    MESH_FAILOVER_SLO_NS.store(0, std::sync::atomic::Ordering::Release);
-  }
-}
 
 /// [`start_mesh_unbootstrapped`] with each node bound at its pair of `bound` and advertised at its pair of `advertised`
 /// (A-277): its peers dial it at the advertised pair and it announces that pair, so a node advertised where a port
@@ -3144,6 +3149,7 @@ fn start_mesh_bound_and_advertised(
     slates_db::register::RegionId,
     slates_db::register::RegionId,
   >,
+  tune: fn(&mut DaemonConfig),
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
@@ -3170,7 +3176,7 @@ fn start_mesh_bound_and_advertised(
         .collect();
       let member_peers: Vec<HostId> = (0..n).filter(|&j| j != i).map(|j| hosts[j]).collect();
       let instance = format!("fleet3-{}-{pid}", host.0);
-      let config =
+      let mut config =
         DaemonConfig::derive(&profile, &instance, Some(shards)).with_fleet(FleetMembership {
           quorum: Quorum { f },
           peers: member_peers,
@@ -3181,10 +3187,7 @@ fn start_mesh_bound_and_advertised(
           durability: None,
           region_mirrors: mirrors.clone(),
         });
-      let config = match MESH_FAILOVER_SLO_NS.load(std::sync::atomic::Ordering::Acquire) {
-        0 => config,
-        slo_ns => config.with_failover_slo(slo_ns),
-      };
+      tune(&mut config);
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
@@ -6162,7 +6165,7 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
 }
 
 /// Derived: the coordinator periods a dead-session test watches for, in the daemons' own time (`poll_for_periods`): the
-/// forwards' failover bound on `daemon` (`DaemonConfig::failover_slo_ns`, one period a heartbeat). Past it a forward
+/// forwards' failover bound on `daemon` (its failover delay, `Daemon::failover_ns`, A-363; one period a heartbeat). Past it a forward
 /// through the dead session is refused and sent afresh, so an answer after it is no longer the lane's recovery, and the
 /// red case (no borrower judges the session) spends the watch and fails. Counted in periods, never on the wall: a daemon
 /// kept off its CPUs runs fewer of them a wall second, so the watch stretches with it (A-228). On the wall it read 8 s,
@@ -6170,8 +6173,8 @@ fn fill_task_arena(shard: u16) -> Vec<slates_rt::shard::TaskId> {
 /// 44274886122).
 fn dead_session_watch_periods(daemon: &Daemon) -> u64 {
   daemon
-    .config()
-    .failover_slo_ns
+    .failover_ns()
+    .expect("the node's failover delay")
     .div_ceil(slates_server::daemon::HEARTBEAT_NS)
 }
 /// Derived: the coordinator periods within which b's forward lane owes its first answer on the replacement after the
@@ -6277,7 +6280,7 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   // Derived: a reader's patience for one read, in b's own periods: the failover bound its forward is resent within and a
   // liveness budget for the refusal that ends it to come back, so a read through the dead session is answered one way or
   // the other before the reader asks again.
-  let read_patience = (daemons[1].config().failover_slo_ns + LIVENESS_BUDGET_NS)
+  let read_patience = (daemons[1].failover_ns().expect("b's failover delay") + LIVENESS_BUDGET_NS)
     .div_ceil(slates_server::daemon::HEARTBEAT_NS);
   let control_b = daemons[1].shards()[0].0;
   let readers: Vec<std::thread::JoinHandle<[u64; 3]>> = (0..DEAD_SESSION_READERS)
@@ -6454,7 +6457,7 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
   // The probe: its forward takes the session first, and that turn makes it deaf.
   let probe_read = read.clone();
   let probe_through_b = daemons[1].instance().to_owned();
-  let patience = (daemons[1].config().failover_slo_ns + LIVENESS_BUDGET_NS)
+  let patience = (daemons[1].failover_ns().expect("b's failover delay") + LIVENESS_BUDGET_NS)
     .div_ceil(slates_server::daemon::HEARTBEAT_NS);
   let asking = std::thread::spawn(move || {
     let mut probe = Client::connect_for_periods(&probe_through_b, control_b, patience);
@@ -6542,7 +6545,7 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
 /// through a session gone silent can be answered only once the transport has judged the session dead, the link has
 /// dialed again and the replacement has carried it, and a failover SLO shorter than that (an operator's choice, or a
 /// path a starved process stretched) refused the forward `OwnerUnreachable` at the SLO, before the session could even be
-/// judged. Do: three nodes whose failover SLO is one liveness budget, below the transport's silence window on any path
+/// judged. Do: three nodes whose failover delay is held at one liveness budget (injected, A-363), below the transport's silence window on any path
 /// (never under a liveness budget, and floored at three initial probe timeouts, about 2 s); a volume on a; b's discovery
 /// to a held; b's session to a made deaf; a probe read through b, the first forward after the deafness. Expect: b drops
 /// the deaf session, and the probe is answered on the replacement after its SLO has passed, b counting the forward held
@@ -6550,7 +6553,6 @@ fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
 #[test]
 fn a_forward_is_never_refused_below_its_paths_floor() {
   let _serial = serialize_fleet_tests();
-  let _slo = MeshFailoverSlo::set(LIVENESS_BUDGET_NS);
   let names = ["a", "b", "c"];
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
     names.iter().map(|name| fleet_node(name)).collect();
@@ -6564,7 +6566,14 @@ fn a_forward_is_never_refused_below_its_paths_floor() {
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
   assert_fleet_forms(&daemons, &hosts, &names);
-  let slo = Duration::from_nanos(daemons[1].config().failover_slo_ns);
+  // The failover delay held at one liveness budget on every node, below the path's floor (A-363: an injection, since
+  // nothing sets the estimate).
+  for daemon in &daemons {
+    daemon
+      .inject_failover(Some(LIVENESS_BUDGET_NS))
+      .expect("the failover delay is held on each node");
+  }
+  let slo = Duration::from_nanos(LIVENESS_BUDGET_NS);
   let mut owner = Client::connect(daemons[0].instance());
   let volume = volume_owned_by(&mut owner, 0, "below-floor", &daemons);
   let mut router = Client::connect(daemons[1].instance());
@@ -11860,6 +11869,12 @@ fn live_volume_attached(client: &mut Client, fleet: &[Daemon], name: &str) -> (V
 fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  // a's failover delay held at its estimate now (A-363), so the hold's bound cannot move under the assertion; held from
+  // the start, every shard of a has it long before the write is held.
+  let slo_ns = daemons[0].failover_ns().expect("a's failover delay");
+  daemons[0]
+    .inject_failover(Some(slo_ns))
+    .expect("a's failover delay is held");
   for daemon in &daemons[1..] {
     daemon.inject_record_refusal(&[hosts[0]]).unwrap();
   }
@@ -11890,7 +11905,6 @@ fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_
   eprintln!(
     "held for good: the write {first:?}, the same request {same_id:?}, {gave_up} given up, the write again {again:?}"
   );
-  let slo_ns = slates_server::config::FAILOVER_SLO_NS;
   assert!(
     matches!(
       first,
@@ -12159,10 +12173,15 @@ fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
 }
 
 /// Derived: the coordinator periods a takeover round waits on a learned object's promises before it gives the object
-/// up (`takeover`'s promise-wait bound, A-304): the failover SLO's worth of the fleet's periods, at least one.
-fn promise_wait_periods() -> u64 {
-  slates_server::config::FAILOVER_SLO_NS
-    .div_ceil(HEARTBEAT_NS)
+/// up (`takeover`'s promise-wait bound, A-304): the failover delay's worth of the fleet's periods, the longest any of
+/// `daemons` estimates now (A-363), at least one.
+fn promise_wait_periods(daemons: &[&Daemon]) -> u64 {
+  daemons
+    .iter()
+    .filter_map(|daemon| daemon.failover_ns().ok())
+    .map(|failover_ns| failover_ns.div_ceil(HEARTBEAT_NS))
+    .max()
+    .unwrap_or(1)
     .max(1)
 }
 
@@ -12172,7 +12191,7 @@ fn promise_wait_periods() -> u64 {
 /// that give it its vote back, and its probe mesh formed again.
 fn readmission_periods(daemons: &[&Daemon]) -> u64 {
   horizon_periods()
-    .saturating_add(promise_wait_periods())
+    .saturating_add(promise_wait_periods(daemons))
     .saturating_add(commit_periods().saturating_mul(2))
     .saturating_add(seats_committed_periods(daemons, Quorum { f: 1 }))
     .saturating_add(mesh_formation_periods(daemons.len()))
@@ -12292,7 +12311,7 @@ fn deaf_until_its_takeover_resolves(
     && poll_for_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods().saturating_mul(2),
+      promise_wait_periods(&observed).saturating_mul(2),
       || {
         Ok(
           takeover_outcomes(daemons)
@@ -12817,6 +12836,7 @@ fn mesh_with_mapped_candidates() -> (PortLease, [PortMapping; 2], Vec<Daemon>) {
     1,
     &regions,
     &std::collections::BTreeMap::new(),
+    |_| {},
   );
   bootstrap_mesh(&daemons, &seeds, &regions);
   settle_initial_consensus(&daemons, &seeds, &regions, Quorum { f: 1 });
@@ -13512,7 +13532,7 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
     && poll_for_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods().saturating_mul(3),
+      promise_wait_periods(&observed).saturating_mul(3),
       || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -23259,6 +23279,141 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
   );
 }
 
+/// The sum over `client`'s daemon's shards of the counter `kind` (`slates status`'s per-shard counts).
+fn shard_count(client: &mut Client, kind: &str) -> u64 {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    panic!("the daemon reported its status");
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|count| count.kind == kind)
+    .map(|count| count.count)
+    .sum()
+}
+
+/// Shape: a failover delay no held reply of [`a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`]
+/// reaches, held on every node by injection (A-375): twice its longest wait ([`PLACEMENT_DEADLINE`]), so A-354 gives up
+/// none of the writes that fill the bound.
+const HELD_PAST_THE_TEST_NS: u64 = 2 * PLACEMENT_DEADLINE.as_secs() * 1_000_000_000;
+
+/// A-200 with the request window (§4.9): a verb refused `Overloaded` changed nothing, so its resend under the same id
+/// runs it once, as on a plain volume. Do: three nodes at `f = 1`, each shard seating one client, so the replies a
+/// shard may hold for durability are one ring of them; on a, a live-shipped volume with a file, then both candidates
+/// stopped, so nothing becomes durable; one client fills the owner shard's held replies with writes of the file; a
+/// second client makes a directory and, answered `Overloaded`, sends it again under its id. Expect both answers
+/// `Overloaded`, and never `AlreadyExists`: the shard was still at its bound. Before, the verb committed its effects and
+/// was refused after (`live_ship::defer`), so the resend made the directory a second time and was refused
+/// `AlreadyExists` for a directory its own first send made; an `O_APPEND` write appended twice (the supervisor's report
+/// of g232's finding, 2026-11-18).
+#[test]
+fn a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  // Two shards of one client seat each: the two clients sit on different shards, and the owner shard's bound on held
+  // replies (`live_ship::awaiting_bound`, seats times ring slots) is one client's ring.
+  // A-354 gives up a reply held past the failover SLO; held past this test's waits instead, so every held write stays
+  // held while the bound is filled and met.
+  let mut daemons = start_mesh_tuned(nodes, &hosts, &certs, &serve, 2, |config| {
+    config.clients_per_shard = 1;
+  });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  // Every node's failover delay held past the test's waits (A-375: injected, since nothing sets the estimate), so A-354
+  // gives up none of the held writes; held from formation, every shard has it long before a write is held.
+  for daemon in &daemons {
+    daemon
+      .inject_failover(Some(HELD_PAST_THE_TEST_NS))
+      .expect("the failover delay is held past the test");
+  }
+  let mut filler = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = filler.call(&scratch("over-bound")) else {
+    panic!("create");
+  };
+  share_with_fleet(&mut filler, id, &daemons);
+  let ReplyBody::Attached { attachment, .. } = filler.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
+  };
+  let shipped = filler.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let write = RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/file".to_owned(),
+    bytes: b"written".to_vec(),
+    mode: 0o644,
+  };
+  let first_write = filler.call(&write);
+  let mut maker = Client::connect(daemons[0].instance());
+  // Both candidates gone: nothing written from here becomes durable, so every write's reply is held.
+  for candidate in daemons.split_off(1) {
+    candidate.stop();
+  }
+  let held_before = shard_count(&mut maker, "fleet.live.awaited");
+  let ring = filler.end.region().cmd().slots();
+  filler.send_burst(&write, ring);
+  let ring_held = poll_until(&[&daemons[0]], PLACEMENT_DEADLINE, || {
+    Ok(shard_count(&mut maker, "fleet.live.awaited") >= held_before + u64::try_from(ring).unwrap())
+  });
+  let mkdir = RequestBody::FsMkdir {
+    volume: id,
+    attachment,
+    path: "/made".to_owned(),
+    mode: 0o755,
+  };
+  let made = maker.call(&mkdir);
+  let resent = maker.call_retry(&mkdir);
+  let over_bound = shard_count(&mut maker, "fleet.live.over_bound");
+  drop((filler, maker));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "live-ship {shipped:?}; first write {first_write:?}; {ring} writes held {ring_held}; mkdir {made:?}; resent \
+     {resent:?}; over_bound {over_bound}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    matches!(first_write, ReplyBody::FsDone { .. }),
+    "the write before the stop was durable and answered: {first_write:?}"
+  );
+  assert!(ring_held, "a ring of writes was held for durability");
+  assert!(over_bound >= 1, "the bound refused a verb (non-vacuous)");
+  let overloaded = |reply: &ReplyBody| {
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Overloaded { .. }
+      }
+    )
+  };
+  assert!(overloaded(&made), "the mkdir met the bound: {made:?}");
+  assert!(
+    overloaded(&resent),
+    "the resend met the bound again and ran nothing twice: {resent:?}"
+  );
+}
+
 /// Shape: how long a resend is sent again while refused retryable: five liveness budgets, past a takeover's settling.
 const RESEND_RETRY_FOR: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS);
 
@@ -25004,7 +25159,8 @@ fn location_ends(daemon: &Daemon) -> (u64, u64) {
 }
 
 /// A forward read through the one node left of a formed three-node fleet, of a volume whose owner that node holds dead
-/// with no peer left to answer a location round, `failover_slo_ns` applied to that node first when given: the reply, how
+/// with no peer left to answer a location round, its failover delay held at `failover_slo_ns` first when given
+/// (injected, A-363): the reply, how
 /// many polls the location made past its first (`fleet.owner_location.retried`), and how its budget ended (the counts
 /// `budget_spent` and `slo_ended` moved by the read).
 fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64, (u64, u64)) {
@@ -25024,14 +25180,8 @@ fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64, 
     .expect("the owner is held dead on the survivor");
   if let Some(slo) = failover_slo_ns {
     survivor
-      .observation(
-        Some(survivor.shards()[0]),
-        slates_server::daemon::OBSERVE_BUDGET_NS,
-        move |state: &mut slates_server::state::ShardState| state.config.failover_slo_ns = slo,
-      )
-      .unwrap()
-      .wait()
-      .expect("the ceiling is set on the survivor's control shard");
+      .inject_failover(Some(slo))
+      .expect("the ceiling is held on the survivor's control shard");
   }
   let counts = |daemon: &Daemon| {
     daemon.fleet_refusals().map_or((0, 0, 0), |counters| {
@@ -25083,8 +25233,8 @@ fn a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget() {
 }
 
 /// A-317, the ceiling on the same budget: a location round can wait for peers that do not answer, so the operator's
-/// failover SLO ends the location on the wall whatever its other bound says. Do: the same read with the node's failover
-/// SLO at one nanosecond. Expect: refused at its first look at the ceiling, with no look past the first, counted as
+/// failover delay ends the location on the wall whatever its other bound says. Do: the same read with the node's failover
+/// delay held at one nanosecond (injected, A-363). Expect: refused at its first look at the ceiling, with no look past the first, counted as
 /// ended by the SLO.
 #[test]
 fn the_failover_slo_ends_a_forwards_location_budget() {
@@ -25510,8 +25660,8 @@ fn issue_with(
   )
 }
 
-/// Shape: the failover SLO the bounded-green fixture runs under: a second, ten of the fleet's periods, so a green the
-/// fixture plants is given up on after ten attempts.
+/// Shape: the failover delay the bounded-green fixture holds its node at (injected, A-363): a second, ten of the fleet's
+/// periods, so a green the fixture plants is given up on after ten attempts.
 const SHORT_FAILOVER_SLO_NS: u64 = 1_000_000_000;
 /// Shape: the planted green's object id: a volume-class id (byte 10, the register-class byte, clear) whose partition
 /// (bytes 8 and 9, `verbs::owner_of`) is the node's first, so its owner shard is here.
@@ -25520,7 +25670,7 @@ const PLANTED_GREEN: [u8; 16] = [
 ];
 
 /// A one-node fleet daemon at `f = 0`, bootstrapped, admitting enrolled members under its own certificate, with the
-/// failover SLO cut to [`SHORT_FAILOVER_SLO_NS`]: its record plane, and with it the materialization of taken-over
+/// failover delay held at [`SHORT_FAILOVER_SLO_NS`]: its record plane, and with it the materialization of taken-over
 /// objects, runs each period as a fleet's does (R8).
 fn lone_fleet_node(tag: &str) -> Daemon {
   let key = rcgen::KeyPair::generate().unwrap();
@@ -25532,18 +25682,16 @@ fn lone_fleet_node(tag: &str) -> Daemon {
   let (_lease, [probe, record, _, _]) = four_free_ports();
   let profile = profile(tag);
   let instance = format!("{tag}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(1))
-    .with_fleet(FleetMembership {
-      quorum: Quorum { f: 0 },
-      peers: Vec::new(),
-      host: member_id(anchor, 0),
-      origin_anchor: anchor,
-      domains: std::collections::BTreeMap::new(),
-      regions: std::collections::BTreeMap::new(),
-      durability: None,
-      region_mirrors: std::collections::BTreeMap::new(),
-    })
-    .with_failover_slo(SHORT_FAILOVER_SLO_NS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(1)).with_fleet(FleetMembership {
+    quorum: Quorum { f: 0 },
+    peers: Vec::new(),
+    host: member_id(anchor, 0),
+    origin_anchor: anchor,
+    domains: std::collections::BTreeMap::new(),
+    regions: std::collections::BTreeMap::new(),
+    durability: None,
+    region_mirrors: std::collections::BTreeMap::new(),
+  });
   let daemon = Daemon::start_with_fleet(
     &profile,
     config,
@@ -25569,6 +25717,9 @@ fn lone_fleet_node(tag: &str) -> Daemon {
   )
   .unwrap();
   daemon.bootstrap(true).unwrap();
+  daemon
+    .inject_failover(Some(SHORT_FAILOVER_SLO_NS))
+    .expect("the failover delay is held short");
   daemon
 }
 
@@ -26778,7 +26929,12 @@ fn a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client(
   let reached = audit_wait(&daemons.iter().collect::<Vec<_>>(), || {
     Ok(status_answers(&mut warm, id))
   });
-  let bound = Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS);
+  // The foreign node's forward bound: its failover delay as it estimates it now (A-363).
+  let bound = Duration::from_nanos(
+    daemons[names.len() - 1]
+      .failover_ns()
+      .expect("the foreign node's failover delay"),
+  );
   let delayed = owner_daemon.inject_serve_delay(Some(
     u64::try_from((bound + Duration::from_secs(2)).as_nanos()).unwrap(),
   ));

@@ -34,6 +34,7 @@
 pub mod client;
 pub mod driver;
 pub mod error;
+pub mod exec;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, DriftedPage,

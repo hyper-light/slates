@@ -62,6 +62,35 @@ test('the addon loads and exposes the Client surface', (t) => {
   assert.equal(typeof slates.Client.connect, 'function', 'Client.connect factory is exported');
 });
 
+// A-370, the chosen-path launcher's AppArmor option from Node (§4.6 "The launcher"). Do: build the launcher's command
+// with no options, with `{ apparmorProfile: true }` and with it `false`, and an empty command; render slates' AppArmor
+// profile for the installed binary's path and for one it cannot name exactly. Expect: the option off unless asked and on
+// exactly when asked, in every surface's grammar (each value after `=`); the profile named by the path granting
+// `userns,`; and a JS error for the empty command and the unnamable path.
+test('execCommand carries the AppArmor option only when asked, and apparmorProfile names the executable', (t) => {
+  if (!addonPath || !existsSync(addonPath)) {
+    t.skip('SLATES_NODE_ADDON is not set to a built .node addon — skipped loudly');
+    return;
+  }
+  const slates = require(addonPath);
+  assert.deepEqual(
+    slates.execCommand('scratch', '/home/u/build', ['cargo', 'build', '--', '-x']),
+    ['slates', 'exec', '--volume=scratch', '--at=/home/u/build', '--', 'cargo', 'build', '--', '-x'],
+  );
+  assert.deepEqual(
+    slates.execCommand('scratch', '/home/u/build', ['cargo', 'build'], {
+      apparmorProfile: true,
+      program: '/usr/local/bin/slates',
+    }),
+    ['/usr/local/bin/slates', 'exec', '--volume=scratch', '--at=/home/u/build', '--apparmor-profile', '--', 'cargo', 'build'],
+  );
+  assert.ok(!slates.execCommand('v', '/p', ['true'], { apparmorProfile: false }).includes('--apparmor-profile'));
+  assert.throws(() => slates.execCommand('v', '/p', []), /exec needs a command/);
+  const profile = slates.apparmorProfile('/usr/local/bin/slates');
+  assert.ok(profile.includes('profile /usr/local/bin/slates flags=(unconfined) {\n  userns,\n}'), profile);
+  assert.throws(() => slates.apparmorProfile('/opt/my tools/slates'), /cannot name exactly/);
+});
+
 test('connecting to a missing daemon throws a typed error', (t) => {
   if (!addonPath || !existsSync(addonPath)) {
     t.skip('SLATES_NODE_ADDON is not set to a built .node addon — skipped loudly');
