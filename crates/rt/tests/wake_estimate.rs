@@ -7,7 +7,9 @@
 //! follow. A shard whose configuration carries no measured prior keeps its fixed values. A poll past the
 //! quantum by the wall clock is attributed in a window of the thread's account: the task's when it ran
 //! past the quantum on the CPU or blocked in a call, the host's when it was runnable and held off the
-//! CPU, unattributed where the platform cannot tell (the first long poll opens the first window).
+//! CPU, unattributed where the platform cannot tell (the first long poll opens the first window). And a
+//! kicked shard beside spinners at its own priority runs again as soon as the platform runs any woken
+//! thread (A-361: on Windows it had waited out the spinners' turns).
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -266,6 +268,172 @@ fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
   assert_eq!(
     counters.idle_window_ns, IDLE_FLOOR_NS,
     "the idle window is the floor however far the queued mean climbed: {counters:?}"
+  );
+}
+
+/// Shape: kicked parks of each kind the loaded-wake test times: enough that the median is the middle of many, so one
+/// lucky placement cannot carry it, and few enough that a wake which waits out the spinners' turns (about 30 ms each on
+/// CI's Windows runners before A-361) keeps the test near two seconds.
+const TIMED_WAKES: usize = 32;
+/// Shape: how many times a parked thread's median wake a parked shard's may take beside the spinners: ten. Beside two
+/// spinners a logical CPU on CI's Windows runners (2026-11-18, diag-g234-wake-1), a shard parked in its completion port
+/// took 25–30 ms at the median on windows-latest and 14 ms on windows-11-arm, a thread parked by WaitOnAddress 15 µs and
+/// 6–7 µs (a thousand times and more), and a shard raised a level while it waits 16 µs and 8 µs (about once); ten leaves
+/// room for the two waits' own costs on every platform and still fails a wake that waits for a turn.
+const LOADED_WAKE_RATIO: u32 = 10;
+
+/// Waits on this thread, yielding, until `ready` holds.
+fn yield_until(ready: impl Fn() -> bool) {
+  let began = Instant::now();
+  while !ready() {
+    assert!(began.elapsed() < PARK_WAIT, "the wait's party never came");
+    std::thread::yield_now();
+  }
+}
+
+/// Holds this thread, yielding, for [`ASLEEP_AFTER`]: the other party is asleep in its wait by then.
+fn let_it_fall_asleep() {
+  let began = Instant::now();
+  while began.elapsed() < ASLEEP_AFTER {
+    std::thread::yield_now();
+  }
+}
+
+/// Parks the shard and wakes it from another thread [`ASLEEP_AFTER`] after it announced the park: how long the kick
+/// took to run it again.
+fn timed_shard_wake(ctx: &slates_rt::shard::ShardContext, wakers: &Receiver<Waker>) -> Duration {
+  let waker = wakers.try_recv().expect("the task handed over its waker");
+  let shard = ctx.id;
+  std::thread::scope(|scope| {
+    let kicker = scope.spawn(move || {
+      yield_until(|| {
+        registry::with_entry(shard, |entry| entry.parking.parked())
+          .expect("a local shard is registered")
+      });
+      let_it_fall_asleep();
+      let kicked = Instant::now();
+      waker.wake();
+      kicked
+    });
+    ctx.park(None);
+    let ran = Instant::now();
+    ran.saturating_duration_since(kicker.join().expect("the kicker ran"))
+  })
+}
+
+/// Parks a thread in std's park and wakes it from this one [`ASLEEP_AFTER`] after it announced the park: how long the
+/// unpark took to run it again, the platform's own wake of a thread blocked in a wait.
+fn timed_thread_wake() -> Duration {
+  let parking = std::sync::atomic::AtomicBool::new(false);
+  let woken = std::sync::atomic::AtomicBool::new(false);
+  std::thread::scope(|scope| {
+    let sleeper = scope.spawn(|| {
+      parking.store(true, std::sync::atomic::Ordering::Release);
+      while !woken.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::park();
+      }
+      Instant::now()
+    });
+    yield_until(|| parking.load(std::sync::atomic::Ordering::Acquire));
+    let_it_fall_asleep();
+    let kicked = Instant::now();
+    woken.store(true, std::sync::atomic::Ordering::Release);
+    sleeper.thread().unpark();
+    let ran = sleeper.join().expect("the sleeper ran");
+    ran.saturating_duration_since(kicked)
+  })
+}
+
+/// Whether a thread of this process can raise itself one priority level, as a parked shard's wait does on Windows
+/// (A-361). A job that fixes its processes' priority class keeps a thread's level where it was: on jupiter, under the
+/// job kiln's agent runs commands in (`JOB_OBJECT_LIMIT_PRIORITY_CLASS`, BelowNormal; 2026-11-18), `SetThreadPriority`
+/// answered success and the level stayed normal.
+#[cfg(windows)]
+fn may_raise_a_level() -> bool {
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+  };
+  // A fresh thread asks, so the test's own thread keeps its level.
+  std::thread::spawn(|| {
+    // SAFETY: the calling thread's pseudo-handle, valid for both calls; a thread sets its own level within its class.
+    unsafe {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0
+        && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL
+    }
+  })
+  .join()
+  .unwrap_or(false)
+}
+
+/// Elsewhere the loaded wake asks no raise.
+#[cfg(not(windows))]
+fn may_raise_a_level() -> bool {
+  true
+}
+
+/// The middle of `times`.
+fn median(mut times: Vec<Duration>) -> Duration {
+  times.sort_unstable();
+  times.get(times.len() / 2).copied().unwrap_or_default()
+}
+
+/// A-361, the loaded wake (§4.3 "Drivers"). Do: beside two spinning threads per logical CPU, at the test's own
+/// priority, kick a parked shard and wake a thread parked in std's park [`TIMED_WAKES`] times each, in turn. Expect the
+/// shard's median wake within [`LOADED_WAKE_RATIO`] times the parked thread's: a kicked shard runs again as soon as the
+/// platform runs any woken thread. On Windows a thread dequeued from an I/O completion port gets none of the priority
+/// boost a waiter on an event or on WaitOnAddress gets, so before A-361 the kicked shard queued behind the spinners at
+/// its own level until a spinner's 31 ms turn ended, and the A-223 window's multiple was what hid it.
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue, an eventfd or a completion port, which Miri does not model
+fn a_parked_shard_wakes_beside_spinners_as_soon_as_a_parked_thread_does() {
+  if !may_raise_a_level() {
+    eprintln!(
+      "SKIP (loud): a job fixes this process's priority class, so a parked shard cannot sit a level up while it waits \
+       and waits out its neighbours' turns here (GAPS, A-361's open item)"
+    );
+    return;
+  }
+  let rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
+  let ctx = rt.context();
+  let (tx, rx) = channel::<Waker>();
+  rt.spawn(async move {
+    for _ in 0..TIMED_WAKES {
+      PendOnce {
+        wakers: tx.clone(),
+        polled: false,
+      }
+      .await;
+    }
+  })
+  .unwrap();
+  let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+  let stop = std::sync::atomic::AtomicBool::new(false);
+  let (mut shard, mut thread) = (Vec::new(), Vec::new());
+  std::thread::scope(|scope| {
+    for _ in 0..cpus * SPINNERS_PER_CPU {
+      scope.spawn(|| {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      });
+    }
+    for _ in 0..TIMED_WAKES {
+      step_until_idle(ctx);
+      shard.push(timed_shard_wake(ctx, &rx));
+      thread.push(timed_thread_wake());
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+  });
+  step_until_idle(ctx);
+  let (shard, thread) = (median(shard), median(thread));
+  eprintln!(
+    "loaded wake beside {} spinners, median of {TIMED_WAKES}: a kicked shard {shard:?}, a parked thread {thread:?}",
+    cpus * SPINNERS_PER_CPU
+  );
+  assert!(
+    shard <= thread * LOADED_WAKE_RATIO,
+    "beside {} spinners a kicked shard's median wake was {shard:?}, a parked thread's {thread:?}",
+    cpus * SPINNERS_PER_CPU
   );
 }
 

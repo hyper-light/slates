@@ -1,0 +1,50 @@
+name: diag-g234-loadedwake
+
+# Diagnostics only, never on main (A-361, goal g234): the loaded-wake test, a parked shard against a parked thread
+# beside two spinners a logical CPU, three times on each runner. The -red branch carries the test alone, the -green
+# branch the test and the raise.
+on:
+  push:
+    branches: ["diag-g234-loadedwake-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    name: loaded wake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: Build the test
+        run: |
+          cargo test --locked -p slates-rt --test wake_estimate --no-run > build.log 2>&1; status=$?
+          tail -15 build.log
+          exit $status
+      - name: The loaded-wake test, three times
+        run: |
+          set +e
+          fails=0
+          for round in 1 2 3; do
+            echo "== round $round $(date -u +%H:%M:%S)"
+            cargo test --locked -p slates-rt --test wake_estimate a_parked_shard_wakes_beside_spinners -- --nocapture > run.log 2>&1
+            status=$?
+            grep -E 'loaded wake|SKIP|panicked|test result|beside' run.log | cut -c1-300
+            [ $status -eq 0 ] || fails=$((fails+1))
+          done
+          echo "== $fails of 3 rounds failed"
+          exit $fails
