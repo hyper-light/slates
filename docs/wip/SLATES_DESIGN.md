@@ -31782,44 +31782,8 @@ new, four tests; `src/captured_tests.rs`, one; `tests/oracle.rs`, A-451's bits t
   (an execute bit) makes an entry whose set changes nothing there; the next landing finds the file as the disk keeps it.
   A check and a set are two calls on one handle, and an outsider's change to the same field between them is not seen.
   Siblings found, not fixed: a `touch` alone and a base directory's mode change alone still land nothing; a captured
-<<<<<<< HEAD
   clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14; fixed by A-466 the same
   day); and the manifest's canonical encoding, which grants bind, has no golden vector.
-
-### A-466 — A captured clone's replacement keeps an outsider's mode change it did not make: its metadata judged field by field beside its bytes (2026-11-18, g085; A-291, A-458, D-27)
-Applied in the same change to: §4.15 step 4 (the replacement's metadata rule), A-458 (its sibling, fixed), GAPS (A-185's
-owed list), `docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`, `crates/land`
-(`src/manifest.rs`: `content_witness_of`, the content witness's encoding with the captured `FileMeta`,
-`VERSION_CONTENT` 5; `src/verdict.rs`: `landed_meta`; `src/engine.rs`: `judge_replaced_meta`, `ReplacedMeta` kept across
-slices, `stage_file` staging the decided mode and bits, a replacement's metadata set alone through `Landing::chmod`;
-`src/captured_tests.rs`, three tests; `src/chmod_tests.rs`, the overlay's sibling).
-- **What was there.** A captured clone's entries are judged by content alone (A-291). A replacement was `Apply` while
-  the disk held the captured bytes, whatever had happened to the file's metadata, and was staged with the clone's mode
-  and Windows bits. So a person's `chmod` on the disk under a file the agent rewrote was overwritten without a conflict;
-  a mode changed both ways went to the clone; and where an outsider had brought the disk to the agent's bytes, the
-  entry was `AcceptIdentical` whole and a mode the agent had set never landed. The content witness held the captured
-  bytes' identity alone, so nothing could tell whose the metadata change was.
-- **The rule.** The bytes keep their content verdict. The metadata is judged beside them, each field by A-458's rule,
-  against what the capture held (now in the content witness, and encoded beside its identity, so a grant binds it): the
-  clone's value where it changed the field and the disk still holds the capture's; the disk's where the clone left the
-  field as captured, an outsider's change kept, or already holds the clone's; `ModifyModify` where a field the clone
-  changed holds a third value on the disk (`verdict::landed_meta`). Never a value made of two. Bytes to write are staged
-  with the decided mode and bits; bytes the disk already holds are kept, and the fields the file lacks are set alone
-  through its own handle, judged again there (A-458's write), no byte rewritten. An overlay's replacement is unchanged:
-  it needs its witnessed file whole before its exchange (§4.15 step 6, T-1.14), so an outsider's metadata change there
-  refuses the landing and nothing is overwritten.
-- **Tests.** Failing first on the Mac Studio (2026-11-18, kiln r375, load 2.9 to 5.6, debug), main's code with the
-  tests alone: 3 of 30 `slates-land` lib tests failed — the outsider's 0600 came back 0644, the mode both changed was
-  `Apply` where `ModifyModify` was due, and the agent's 0755 over bytes already there came back 0644 — while the
-  overlay's sibling passed, its replacement refused. With the fix (load 4.0 to 5.9): `cargo test --locked -p slates-land
-  --lib` 30 of 30. Red-checked once: with a field the clone left alone taking the clone's value instead of the disk's
-  (the overwrite this fixes), 1 of 30 failed, the outsider's-mode test. macOS `cargo check` and `cargo xwin check
-  --target x86_64-pc-windows-msvc` of slates-land and slates-server with all targets were clean; `cargo fmt` laid the
-  lines out. Filed for main: the land oracle (its captured-clone tests meet the content witness's new encoding and the
-  replacement's metadata) and the crash oracle.
-=======
-  clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the manifest's
-  canonical encoding, which grants bind, has no golden vector.
 
 ### A-461 — A start is judged by its silence until its watchdog looks, its beats its steps; the anchor's window is the liveness window raised to its own measured lateness; a graceful stop is judged in the daemon's own beating (2026-11-18, built for goal g255; R3's class D, item D-b's start and stop half; §2.5 graceful stop, §4.14 `daemon.alive`; A-228, A-232, A-312, A-318, A-455)
 - **What was there.** The anchor judged a start by the watchdog's rule (`ShardWatch`) over the bare liveness window `W`,
@@ -31918,4 +31882,35 @@ Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a sta
 Applied in the same change to: §4.7 ("Wake strategy", the A-232 status's successor), GAPS (the `LIVENESS_BUDGET_NS`
 entry's class C), `crates/ipc/src/{endpoint,rendezvous,wake,region,completion,lib}.rs`, `crates/machine/src/switches.rs`,
 `crates/client/src/client.rs`, `crates/api/src/lib.rs` (the deadlines' doc), `unsafe-budget.toml`.
->>>>>>> origin/main
+
+### A-466 — A captured clone's replacement keeps an outsider's mode change it did not make: its metadata judged field by field beside its bytes (2026-11-18, g085; A-291, A-458, D-27)
+Applied in the same change to: §4.15 step 4 (the replacement's metadata rule), A-458 (its sibling, fixed), GAPS (A-185's
+owed list), `docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`, `crates/land`
+(`src/manifest.rs`: `content_witness_of`, the content witness's encoding with the captured `FileMeta`,
+`VERSION_CONTENT` 5; `src/verdict.rs`: `landed_meta`; `src/engine.rs`: `judge_replaced_meta`, `ReplacedMeta` kept across
+slices, `stage_file` staging the decided mode and bits, a replacement's metadata set alone through `Landing::chmod`;
+`src/captured_tests.rs`, three tests; `src/chmod_tests.rs`, the overlay's sibling).
+- **What was there.** A captured clone's entries are judged by content alone (A-291). A replacement was `Apply` while
+  the disk held the captured bytes, whatever had happened to the file's metadata, and was staged with the clone's mode
+  and Windows bits. So a person's `chmod` on the disk under a file the agent rewrote was overwritten without a conflict;
+  a mode changed both ways went to the clone; and where an outsider had brought the disk to the agent's bytes, the
+  entry was `AcceptIdentical` whole and a mode the agent had set never landed. The content witness held the captured
+  bytes' identity alone, so nothing could tell whose the metadata change was.
+- **The rule.** The bytes keep their content verdict. The metadata is judged beside them, each field by A-458's rule,
+  against what the capture held (now in the content witness, and encoded beside its identity, so a grant binds it): the
+  clone's value where it changed the field and the disk still holds the capture's; the disk's where the clone left the
+  field as captured, an outsider's change kept, or already holds the clone's; `ModifyModify` where a field the clone
+  changed holds a third value on the disk (`verdict::landed_meta`). Never a value made of two. Bytes to write are staged
+  with the decided mode and bits; bytes the disk already holds are kept, and the fields the file lacks are set alone
+  through its own handle, judged again there (A-458's write), no byte rewritten. An overlay's replacement is unchanged:
+  it needs its witnessed file whole before its exchange (§4.15 step 6, T-1.14), so an outsider's metadata change there
+  refuses the landing and nothing is overwritten.
+- **Tests.** Failing first on the Mac Studio (2026-11-18, kiln r375, load 2.9 to 5.6, debug), main's code with the
+  tests alone: 3 of 30 `slates-land` lib tests failed — the outsider's 0600 came back 0644, the mode both changed was
+  `Apply` where `ModifyModify` was due, and the agent's 0755 over bytes already there came back 0644 — while the
+  overlay's sibling passed, its replacement refused. With the fix (load 4.0 to 5.9): `cargo test --locked -p slates-land
+  --lib` 30 of 30. Red-checked once: with a field the clone left alone taking the clone's value instead of the disk's
+  (the overwrite this fixes), 1 of 30 failed, the outsider's-mode test. macOS `cargo check` and `cargo xwin check
+  --target x86_64-pc-windows-msvc` of slates-land and slates-server with all targets were clean; `cargo fmt` laid the
+  lines out. Filed for main: the land oracle (its captured-clone tests meet the content witness's new encoding and the
+  replacement's metadata) and the crash oracle.
