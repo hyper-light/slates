@@ -3883,7 +3883,12 @@
 >   test daemons, an embedding) waited forever; every look asks the start stamp too, and Windows' wait takes the looks'
 >   timeout (`a_daemon_restarted_inside_its_own_process_ends_the_wait`;
 >   `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`); A-447's Windows
->   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
+>   claim had the same blind spot and now reads the start stamp it began under. A park a look ended was counted as no
+>   kind, neither a reply's wake nor an unanswered one, and the client suite's park accounting failed on macOS (32
+>   parks, 17 replies, 0 unanswered); since A-506 (2026-11-18, g251b) it is counted as its own kind
+>   (`ClientEnd::parks_ended_by_looks`) and teaches the wake estimate nothing
+>   (`a_park_a_liveness_look_ends_is_counted_as_its_own_kind_and_teaches_the_estimate_nothing`). `CLAIM_WAIT_NS` (a
+>   second, W restated
 >   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
 >   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
 >   left (twice it); and the pacing of an async connect's and a reconnect's polls (a tenth of it,

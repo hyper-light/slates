@@ -5189,7 +5189,9 @@ drops.
 > learns. While a Linux completion bridge runs (Node's adopted descriptor), the park waits on the bridge's pipe, the
 > eventfd's only reader then, and gives the pipe's level back as it ends. The synchronous round trip waits so; the
 > reply deadline still paces the waits that cannot see the departure yet (the async driver's tick, the wait for a slot
-> on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS.
+> on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS. A park a look ends (its
+> timeout the look's, the daemon then found alive) is counted as its own kind, `ClientEnd::parks_ended_by_looks`, beside
+> the replies and the unanswered wakes, and teaches the wake estimate nothing (A-506).
 
 > **Status (2026-11-18, A-468): a client whose daemon is gone reconnects while its instance's rendezvous has a holder,
 > and fails `DaemonGone` at once when it has none.** Until A-468 a reconnect was tried for the reconnect budget (`T + W`,
@@ -33009,3 +33011,22 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
 
 Applied in the same change to: Part 0 (§0.1's reading order), Part 3 (D-28), §4.17 (new), GAPS (a §4.17 entry at the
 top), `research/vcs-servers.md` (new).
+
+### A-506 — A park a liveness look ends is counted as its own kind, and teaches the wake estimate nothing (2026-11-18, UI goal 86 via g251b; A-456's accounting; §4.7 "Failure matrix", "Wake strategy"; A-223, A-456)
+
+- **What was there.** Since A-456 a departure wait on macOS, and on Windows since its fix the same day, parks until the
+  next look at the daemon's life, and a park whose timeout comes first ends neither by a reply's wake nor by an
+  unanswered one: the look finds the daemon alive and the client parks again. `ClientEnd` counted every park
+  (`park_ratio`) but such an end as no kind, so the client suite's accounting, every park ended by a reply or an
+  unanswered wake, failed on macOS: `the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed`, 32 parks, 17 replies,
+  0 unanswered (main's run r432 at 7113415eb). The bug record:
+  `docs/bugs/2026-11-18-a-park-a-liveness-look-ended-was-counted-as-no-kind.md`.
+- **The rule.** A departure park that waited until its next look and timed out is counted as ended by that look
+  (`ClientEnd::parks_ended_by_looks`, `Client::parks_ended_by_looks`), decided in `after_park` from the park's own
+  timeout, so a Linux park, which has none, is never counted so. Every park a wait makes is then a reply's, an
+  unanswered wake's, a look's, a deadline's or the departure's. Such a park teaches the wake estimate nothing: its wait
+  is kept for the estimate only when a wake ended it (`after_wake`), as before, and the test now holds that.
+- **Tests.** `endpoint::departure::a_park_a_liveness_look_ends_is_counted_as_its_own_kind_and_teaches_the_estimate_nothing`
+  (a reply held 1.5 s: every park counted; on macOS and Windows at least one park a look ended, as many as the looks
+  made or one more, on Linux none; the estimate gains at most one sample for each park a look did not end), with the
+  late-reply test's replier shared (`reply_late`). The client suite's accounting names the new kind.
