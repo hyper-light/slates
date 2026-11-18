@@ -25206,6 +25206,8 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   `Overlay::read_base_range` (the bytes from an offset, the file's size and a stamp of its fingerprint: device,
   inode, size, modification, change and birth times, folded by BLAKE3), and the client walks the pages as `read` walks
   `ReadRange`'s, refusing a mix of two states. The whole-file `Read` verb, a second read path beside the paged
-  `ReadRange` that read a whole file into memory and answered it in one reply, is removed (replaced, not kept beside:
-  no caller used it but the client's unused `read_begin`, `read_spin` and `read_poll`, removed with it, and tests,
-  which read through `ReadRange`).
+  `ReadRange` that read a whole file into memory and answered it in one reply, is retired. Nothing sends it: the
+  client's unused `read_begin`, `read_spin` and `read_poll` went with it, and tests read through `ReadRange`. It is
+  refused `Unsupported`, naming `ReadRange`, and kept with `ReplyBody::ReadBytes` in its published place, since
+  removing either moved every tag after it, which main's wire-order test (853943af0) refuses (D-15: a completion
+  record keeps its reply unframed). Retired, not kept beside: no second read path serves.

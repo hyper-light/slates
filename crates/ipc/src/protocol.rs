@@ -579,6 +579,18 @@ pub enum RequestBody {
     /// The version to pin, or the head.
     version: Option<u64>,
   },
+  /// Retired (A-267): a whole file in one reply, which past a reply chunk's bytes was refused "reply too large for the
+  /// bulk area" after the daemon had read the whole file into its memory. A file is read a page at a time with
+  /// `ReadRange`, which the client walks; this verb is refused `Unsupported` and kept only so the tags after it hold
+  /// (D-15, `tests/wire_order.rs`).
+  Read {
+    /// The volume.
+    volume: VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
+  },
   /// Explicitly create a configuration group through an authenticated local account (AUD-07).
   /// Binding the request to this start prevents a client retry from resetting a replacement.
   Bootstrap {
@@ -1775,6 +1787,8 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
+      // Retired (A-267): refused where it arrives, so routed nowhere.
+      RequestBody::Read { .. } => None,
       RequestBody::Share { volume, .. }
       | RequestBody::LiveShip { volume, .. }
       | RequestBody::DetachOf { volume, .. }
@@ -4042,6 +4056,12 @@ pub enum ReplyBody {
     /// holder of the view's reads treats every path as invalidated (a superset is always safe), or reads a green's
     /// changes a page at a time (`ChangedSince`).
     invalidated_elided: u32,
+  },
+  /// Retired with `RequestBody::Read` (A-267): never sent; kept only so the tags after it hold (D-15,
+  /// `tests/wire_order.rs`).
+  ReadBytes {
+    /// The bytes.
+    bytes: Vec<u8>,
   },
   /// The local copy and exact action proposed for operator-reviewed quorum-loss recovery.
   RecoveryPlan {

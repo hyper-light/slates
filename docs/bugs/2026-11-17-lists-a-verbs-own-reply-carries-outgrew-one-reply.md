@@ -69,7 +69,8 @@ A-267's first part bounded a status's drift; these four ride in the reply of a v
   the table's bound and found the long name a status could not hold.
 - **`read_base` and the whole-file `Read`**, fixed in a later change: each read a whole file into the daemon's memory
   and answered it in one reply, refused past about four kilobytes. `read_base` is paged with a stamp
-  (`crates/server/tests/base_read_pages.rs`); `Read`, a second path beside the paged `ReadRange`, is removed.
+  (`crates/server/tests/base_read_pages.rs`); `Read`, a second path beside the paged `ReadRange`, is retired (refused
+  `Unsupported` in its published wire place, so no tag after it moves).
 - **`Submitted` and `Rebased`**, fixed in the change after this one: a verdict's conflict windows, refused at 400
   windows by the same test's first form. A work needs every window, not a count, since it resolves each, so the work
   keeps its verdict, `Conflicts` pages it, and the client hands back every window

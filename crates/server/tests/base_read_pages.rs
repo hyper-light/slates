@@ -14,8 +14,8 @@
 // An overlay over a real host directory: macOS and Linux.
 #![cfg(unix)]
 
-use slates_client::{Client, CreateSpec, NamePolicy, SizeClass, VolumeId};
-use slates_ipc::protocol::{ReplyBody, RequestBody};
+use slates_client::{Client, ClientError, CreateSpec, NamePolicy, Refusal, SizeClass, VolumeId};
+use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -130,6 +130,32 @@ fn a_base_file_changed_between_pages_is_stamped_apart() {
   let (_, changed_total, changed) = page(&mut client, volume, u64::try_from(read).unwrap());
   assert_eq!(changed_total, u64::try_from(grown.len()).unwrap());
   assert_ne!(changed, stamp, "the changed file stamps its pages apart");
+  drop(client);
+  daemon.stop();
+}
+
+/// A-267, D-15. Do: send the retired whole-file `Read` for a base file of an overlay. Expect: refused `Unsupported`,
+/// naming the paged `ReadRange` that replaced it. The verb keeps its published wire place (`tests/wire_order.rs` in
+/// slates-ipc), so no tag after it moves, and nothing serves it.
+#[test]
+fn the_retired_whole_file_read_is_refused_naming_the_paged_read() {
+  let (daemon, instance) = daemon("retired");
+  let mut client = connect(&instance);
+  let base = target_dir();
+  base.seed("big", &patterned(BIG, 0));
+  let volume = overlay(&mut client, &base);
+  let reply = client.call(&RequestBody::Read {
+    volume,
+    path: "/big".to_owned(),
+    at: ReadAt::Head,
+  });
+  assert!(
+    matches!(
+      &reply,
+      Err(ClientError::Refused(Refusal::Unsupported { feature })) if feature.contains("ReadRange")
+    ),
+    "{reply:?}"
+  );
   drop(client);
   daemon.stop();
 }

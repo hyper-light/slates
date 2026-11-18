@@ -919,7 +919,8 @@
 > - **`read_base`: paged (A-267, 2026-11-17, goal g247).** It read the whole base file into the daemon's memory and
 >   answered it in one reply, refused past about 4 KiB; now a page at a time with the file's size and its
 >   fingerprint's stamp, the client refusing a file that changed between pages. The whole-file `Read` verb, a second
->   read path beside the paged `ReadRange`, is removed.
+>   read path beside the paged `ReadRange`, is retired: refused `Unsupported`, naming `ReadRange`, and kept with
+>   `ReadBytes` in its published place, so no wire tag after it moves (D-15, `crates/ipc/tests/wire_order.rs`).
 
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records

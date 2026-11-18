@@ -4611,6 +4611,10 @@ fn dispatch_inner(
       pid,
       handle,
     } => crate::shards::add_holder(state, to_db_volume(volume), attachment, (pid, handle)),
+    // Retired (A-267): a whole file in one reply; a file is read a page at a time.
+    RequestBody::Read { .. } => refused(Refusal::Unsupported {
+      feature: RETIRED_WHOLE_READ.to_owned(),
+    }),
     RequestBody::ReadRange {
       volume,
       path,
@@ -10424,6 +10428,10 @@ fn bind_mount(
 /// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
 /// (A-267, 2026-11-18): a long name can leave less than this.
 const MOUNTS_REPORT_BYTES: usize = 1024;
+
+/// Format: what the retired whole-file `Read` is refused as (A-267): the verb, and the paged read that replaced it.
+const RETIRED_WHOLE_READ: &str =
+  "Read, retired (A-267): a file is read a page at a time with ReadRange";
 
 /// Format: the watcher text of a status of a volume with no base (a scratch volume, a clone of one).
 const WATCHER_SCRATCH: &str = "scratch";
