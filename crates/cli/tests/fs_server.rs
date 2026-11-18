@@ -9,6 +9,11 @@
 //! a launcher secret on its standard input (A-299) and sets the policy and approves through `slates-api` with that
 //! secret's authority. No approval is a human's. The same flow ran across a Docker container and across two machines
 //! (adacachy and kiln-a094a12d) on 2026-11-05, then up to a human's grant.
+//!
+//! A client node cut off from the server at the fault relay of `support/relay.rs` as the root forms, for longer than the
+//! failover delay, must hold the configuration and forward again within a bound its own live estimates give once the
+//! link heals (fs-server plan step 4, after the two-machine run g066d; the recorded two-machine program is
+//! `docs/wip/bench/fs-two-machines/run.js`, which drives this file's roles).
 #![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
@@ -1407,6 +1412,358 @@ fn detector_lines(instance: &str) -> String {
 /// Derived: how long the retired test holds a live host's attachment before the kill: two and a half liveness budgets
 /// (1 s each, `LIVENESS_BUDGET_NS`), so the owner's departure look (one a budget) runs at least twice meanwhile.
 const LIVE_HOLD: Duration = Duration::from_millis(2_500);
+
+// ── A client node cut off as the root forms (fs-server plan step 4; the two-machine run g066d) ───────────────────────
+
+// The fault relay of `live_chaos.rs` (goal g229, A-277), put between the two nodes to cut and heal their link while both
+// processes run on. This flow uses its cut, heal and counts alone, so the rest of it may go unused in this binary.
+#[allow(dead_code)]
+#[path = "support/relay.rs"]
+mod relay;
+
+/// Shape: the server's place in [`NODES`], its node index at the relay.
+const SERVER_INDEX: usize = 0;
+/// Shape: the client's place in [`NODES`], its node index at the relay.
+const CLIENT_INDEX: usize = 1;
+
+/// [`write_manifest_at`] for a fleet behind the fault relay (A-277): each node advertised on loopback at the relay's
+/// block for it and bound at its own, so every datagram between the two passes the relay.
+#[allow(clippy::disallowed_methods)]
+fn write_relayed_manifest(dir: &str, advertised: &[u16], bound: &[u16]) -> String {
+  let nodes: Vec<serde_json::Value> = NODES
+    .iter()
+    .zip(advertised.iter().zip(bound))
+    .map(|(node, (advertised, bound))| {
+      serde_json::json!({
+        "node": node,
+        "address": format!("127.0.0.1:{advertised}"),
+        "bind": format!("127.0.0.1:{bound}"),
+        "certificate": format!("{node}.crt.der"),
+        "key": format!("{node}.key.der"),
+      })
+    })
+    .collect();
+  let manifest = serde_json::json!({ "name": FLEET_NAME, "f": 0, "nodes": nodes });
+  let path = format!("{dir}/fleet.json");
+  std::fs::write(&path, manifest.to_string()).unwrap();
+  path
+}
+
+/// The server and client nodes up behind the fault relay, the root not yet bootstrapped: (scratch, [server, client], the
+/// daemons, the relay). Each node advertises a block the relay holds and binds one of its own (the manifest's `bind`,
+/// A-277), so every datagram between the two passes the relay; it forwards everything at once until told otherwise.
+fn relayed_two_node_fleet(tag: &str) -> (Scratch, [String; 2], Vec<Daemon>, relay::Relay) {
+  let dir = scratch(&format!("fs-server-{tag}"));
+  for node in NODES {
+    mint_identity(&dir.path, node);
+  }
+  let offset = std::process::id() % u32::from(PORT_SPAN);
+  let mut from = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
+  let mut next_block = || {
+    let held = free_port_block(from);
+    from = held.base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR);
+    held
+  };
+  // The nodes' bind blocks and the relay's advertised ones, all held at once, so the two sets never share a port.
+  let bound: Vec<HeldBlock> = NODES.iter().map(|_| next_block()).collect();
+  let advertised: Vec<HeldBlock> = NODES.iter().map(|_| next_block()).collect();
+  let bound_bases: Vec<u16> = bound.iter().map(|held| held.base).collect();
+  let advertised_bases: Vec<u16> = advertised.iter().map(|held| held.base).collect();
+  let manifest = write_relayed_manifest(&dir.path, &advertised_bases, &bound_bases);
+  let seed = u64::from(std::process::id());
+  let relay = relay::Relay::start(
+    advertised
+      .into_iter()
+      .zip(&bound_bases)
+      .map(|(held, base)| relay::RelayedNode {
+        advertised: held.sockets.try_into().unwrap(),
+        bound: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, *base),
+      })
+      .collect(),
+    seed,
+  );
+  // A node's serve sockets are its bind block, known up front; only its record links' ports need the relay's census.
+  for (index, base) in bound_bases.iter().enumerate() {
+    relay.claim(*base, index);
+    relay.claim(base.checked_add(1).unwrap(), index);
+  }
+  eprintln!("fs-server: fleet {tag} behind the relay, seed {seed}");
+  let pid = std::process::id();
+  let instances: Vec<String> = NODES
+    .iter()
+    .map(|node| format!("cli-fs-{tag}-{node}-{pid}"))
+    .collect();
+  let daemons: Vec<Daemon> = NODES
+    .iter()
+    .zip(&instances)
+    .zip(&bound)
+    .enumerate()
+    .map(|(index, ((node, instance), held))| {
+      let daemon = start(instance, &manifest, (node, held), None);
+      relay.root(index, daemon.child.id());
+      daemon
+    })
+    .collect();
+  for instance in &instances {
+    eventually(instance, &["volume", "list"]);
+  }
+  let [server, client] = <[String; 2]>::try_from(instances).unwrap();
+  (dir, [server, client], daemons, relay)
+}
+
+/// The value a `slates status` report gives `key` on its `key: value` line.
+fn status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+  status
+    .lines()
+    .find_map(|line| line.strip_prefix(key)?.strip_prefix(": "))
+}
+
+/// The number a status line gives `name` in its `name=value` field.
+fn field_of(line: &str, name: &str) -> Option<u64> {
+  line
+    .split_whitespace()
+    .find_map(|part| part.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+}
+
+/// Whether a node's status holds a configuration that names both nodes (§4.8: the council's committed configuration,
+/// installed into its placement view).
+fn configured_with_both(status: &str) -> bool {
+  status_value(status, "fleet_configuration_version").is_some_and(|version| version != "0")
+    && status_value(status, "fleet_configuration_members") == Some("2")
+}
+
+/// What the client's own estimators held of its path to the server just before the cut, the live estimates its recovery
+/// bound is derived from: its failure detector's verdict for the pair (the expected arrival of a probe's answer and the
+/// margin past it before the probe counts as unanswered, hyper-swim's per-pair NFD-E) and its record session's probe
+/// timeout (RFC 9002 §6.2.1: the smoothed round trip plus four times its variation).
+#[derive(Debug)]
+struct PathEstimates {
+  expected: Duration,
+  margin: Duration,
+  pto: Duration,
+}
+
+/// [`PathEstimates`] from `client`'s status for its peer `server_host`, once its detector has a verdict for the pair and
+/// its record session to it a probe timeout; `None` before.
+fn path_estimates(client: &str, server_host: &str) -> Option<PathEstimates> {
+  let status = ok(client, &["status"]);
+  let detector_prefix = format!("fleet_detector {server_host}: ");
+  let session_prefix = format!("fleet_session {server_host}: ");
+  let detector = status
+    .lines()
+    .find_map(|line| line.strip_prefix(detector_prefix.as_str()))?;
+  let session = status
+    .lines()
+    .find_map(|line| line.strip_prefix(session_prefix.as_str()))?;
+  let expected = field_of(detector, "expected_ns").filter(|ns| *ns > 0)?;
+  let margin = field_of(detector, "margin_ns")?;
+  let pto = field_of(session, "pto_ns").filter(|ns| *ns > 0)?;
+  Some(PathEstimates {
+    expected: Duration::from_nanos(expected),
+    margin: Duration::from_nanos(margin),
+    pto: Duration::from_nanos(pto),
+  })
+}
+
+/// Derived: the bound on a client node's recovery once its link heals, its configuration held and a forwarded read
+/// answered, each step at the pace the design states and the live estimates give it (§4.8):
+/// - its record session, judged dead by the cut (RFC 9002 §7.6.1's persistent congestion), is dialed afresh, and a dial
+///   in its handshake resends its flight at most a handshake probe ceiling apart, the initial probe timeout of a
+///   connection with no round-trip sample yet (RFC 9002 §6.2.2, `slates_transport::rtt::INITIAL_PTO_NS`); its two
+///   remaining flights are each answered within the path's probe timeout;
+/// - the probe plane answers within the detector's verdict for the pair, its expected arrival plus its margin;
+/// - the server's council admits the client once it is reachable, a joint change its sole voter commits alone at f = 0,
+///   in a coordinator period for each of its two configurations (`HEARTBEAT_NS`);
+/// - an unconfigured learner asks for the configuration at least once a membership horizon (`lease::horizon_ns`, the
+///   ceiling of its pace), and is answered within the path's probe timeout;
+/// - the forwarded read is answered within the path's probe timeout.
+fn recovery_bound(path: &PathEstimates) -> Duration {
+  let handshake = Duration::from_nanos(slates_transport::rtt::INITIAL_PTO_NS) + path.pto * 2;
+  let probe = path.expected + path.margin;
+  let admission = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS) * 2;
+  let fetch = Duration::from_nanos(slates_server::lease::horizon_ns()) + path.pto;
+  let read = path.pto;
+  handshake + probe + admission + fetch + read
+}
+
+/// Polls `probe` until it gives a value or the phase's wait is spent.
+fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+  let started = Instant::now();
+  loop {
+    if let Some(value) = probe() {
+      return value;
+    }
+    assert!(started.elapsed() < FLEET_WAIT, "{what} never came");
+    pause();
+  }
+}
+
+/// A node's fleet lines, for a failure's report: its configuration, mesh, sessions, learner and fleet refusal counts.
+fn fleet_report(instance: &str) -> String {
+  let (_, out, err) = run(instance, &["status"]);
+  out
+    .lines()
+    .filter(|line| {
+      line.starts_with("fleet_configuration")
+        || line.starts_with("fleet_peers")
+        || line.starts_with("fleet_replaced")
+        || line.starts_with("fleet_learner")
+        || line.starts_with("fleet_session ")
+        || line.starts_with("fleet_detector ")
+        || line.contains(" refused fleet.")
+    })
+    .map(|line| line.chars().take(200).collect::<String>())
+    .collect::<Vec<_>>()
+    .join("\n")
+    + &err
+}
+
+/// The cut of the link-cut flow: put in at the relay before the server bootstraps the root alone (the bootstrap is the
+/// server's verb, so the root forms with the client cut off and no fetch can slip through first); while it holds, the
+/// server makes a green over its project and shares it with the client (each a verb on the server alone); held for
+/// `cut_for`. Expect: datagrams dropped both ways, and the client still unconfigured at the cut's end. The green.
+fn cut_as_the_root_forms(
+  dir: &Scratch,
+  [server, client]: [&str; 2],
+  relay: &relay::Relay,
+  cut_for: Duration,
+) -> String {
+  relay.isolate(CLIENT_INDEX);
+  eventually(server, &["bootstrap", "root"]);
+  let cut_at = Instant::now();
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let (_volume, _snapshot, green) = server_green(server, &project);
+  share_with_client(server, &green, client);
+  while cut_at.elapsed() < cut_for {
+    pause();
+  }
+  let report = relay.report();
+  assert!(
+    report.cut(CLIENT_INDEX, SERVER_INDEX) > 0 && report.cut(SERVER_INDEX, CLIENT_INDEX) > 0,
+    "the cut dropped datagrams both ways: {}",
+    report.summary()
+  );
+  assert_eq!(
+    status_value(&ok(client, &["status"]), "fleet_configuration_version"),
+    Some("0"),
+    "the client stayed unconfigured through the cut: {}",
+    fleet_report(client)
+  );
+  green
+}
+
+/// What a client node did once its link healed: when it first held a configuration naming both nodes and when a
+/// forwarded read first answered, each from the heal, and the last refusal it met.
+#[derive(Debug, Default)]
+struct Recovery {
+  configured: Option<Duration>,
+  answered: Option<Duration>,
+  last: String,
+}
+
+/// Polls `client` from `healed` until a forwarded read of `green` answers the server's bytes, or `give_up` after the
+/// heal: first its status until it holds a configuration naming both nodes, then the read.
+fn recovery_of(client: &str, green: &str, healed: Instant, give_up: Duration) -> Recovery {
+  let mut recovery = Recovery::default();
+  while recovery.answered.is_none() && healed.elapsed() < give_up {
+    if recovery.configured.is_none() {
+      recovery.configured = configured_since(client, healed);
+    } else {
+      recovery.answered = read_since(client, green, healed, &mut recovery.last);
+    }
+    if recovery.answered.is_none() {
+      pause();
+    }
+  }
+  recovery
+}
+
+/// When, from `healed`, a status read began that found `client` holding a configuration naming both nodes; `None` if it
+/// did not.
+fn configured_since(client: &str, healed: Instant) -> Option<Duration> {
+  let began = Instant::now();
+  configured_with_both(&ok(client, &["status"])).then(|| began.duration_since(healed))
+}
+
+/// When, from `healed`, a forwarded read of `green` through `client` answered the server's bytes; `None` if it did not,
+/// with its refusal kept in `last`.
+fn read_since(client: &str, green: &str, healed: Instant, last: &mut String) -> Option<Duration> {
+  let (code, out, err) = run(client, &["read", green, "src/one.txt"]);
+  if code == 0 && out == "one: original line" {
+    return Some(healed.elapsed());
+  }
+  *last = format!("exit {code}: {out}{err}");
+  None
+}
+
+/// fs-server plan step 4 (the two-machine run g066d: a client node's forwarded `work` refused `OwnerUnreachable` with the
+/// client at configuration version 0 and its record sessions re-dialed 15 times); §4.8 formation and learners, R8.
+/// Do: a server node and a client node with every datagram between them through the fault relay; cut the link both
+/// ways as the root forms ([`cut_as_the_root_forms`]) and hold the cut for longer than the failover delay (the
+/// operator's failover SLO plus a membership horizon, so each node's detector has judged the other gone and every
+/// forward's resend bound has passed); heal; then poll the client ([`recovery_of`]). Expect: the cut held; once healed,
+/// the client holds a configuration naming both nodes and a forwarded read of the server's green answers the server's
+/// bytes within [`recovery_bound`] of the heal, from the estimates its own detector and record session held before the
+/// cut, plus the harness's own cost of observing it (two CLI calls, measured before the cut, and a poll's pause). Gated
+/// like the other process flows (`SLATES_TEST_CLI=1`).
+#[test]
+fn a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its_bound_once_the_link_heals()
+ {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the link-cut flow: set SLATES_TEST_CLI=1 to run it (two daemons behind the fault relay)"
+    );
+    return;
+  }
+  let (dir, [server, client], daemons, relay) = relayed_two_node_fleet("cut");
+  let server_host = status_value(&ok(&server, &["status"]), "fleet_host")
+    .unwrap()
+    .to_owned();
+  let path = wait_for("the client's estimates of its path to the server", || {
+    path_estimates(&client, &server_host)
+  });
+  let began = Instant::now();
+  ok(&client, &["status"]);
+  let observe = began.elapsed();
+  let cut_for = Duration::from_nanos(
+    slates_server::config::FAILOVER_SLO_NS + slates_server::lease::horizon_ns(),
+  );
+  let green = cut_as_the_root_forms(&dir, [&server, &client], &relay, cut_for);
+  relay.heal();
+  let healed = Instant::now();
+  let bound = recovery_bound(&path);
+  let slack = observe * 2 + Duration::from_millis(POLL_MS);
+  let recovery = recovery_of(&client, &green, healed, cut_for + bound + slack);
+  let timeline = format!(
+    "cut held {:.1} s; after the heal: {recovery:?}; bound {bound:?} + observing {slack:?} (from the client's \
+     estimates before the cut: {path:?}); relay {}",
+    cut_for.as_secs_f64(),
+    relay.report().summary()
+  );
+  eprintln!("fs-server link cut: {timeline}");
+  let detail = || {
+    format!(
+      "{timeline}\nclient:\n{}\nserver:\n{}",
+      fleet_report(&client),
+      fleet_report(&server)
+    )
+  };
+  let answered = recovery.answered.unwrap_or_else(|| {
+    panic!(
+      "the client never read the server's green once the link healed: {}",
+      detail()
+    )
+  });
+  assert!(
+    answered <= bound + slack,
+    "the client was configured and forwarded past its bound: {}",
+    detail()
+  );
+  drop(daemons);
+  drop(relay);
+  drop(dir);
+}
 
 /// Format: the environment variable that turns this test binary, re-invoked, into one of its roles, for the lanes that
 /// put a node or its launcher where the test process is not (the container lane; the two-machine lane, driven through

@@ -2545,6 +2545,20 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
+> one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
+> compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+> re-wrote the holder's whole ledger, and a commit at `f > 0` grew by a position a version (Mac Studio, debug build:
+> `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`'s late medians 4.3 to 7.1 ms against early
+> 1.9 to 3.6 ms over 300 versions; at the goal's 300,000 versions about 60 MB a version on each replica). Now a register
+> is a head piece and a piece per accepted position, and a delta carries the positions a holder's acceptor accepted or
+> dropped since its last committed publication (`Acceptor::tracking_changes`; image version 29). Test:
+> `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger` (`crates/server/tests/recovery.rs`):
+> on main's code a delta carried 2,165 bytes at the second of 64 positions and 67,885 at the last; now one size each
+> (kiln r3432, Mac Studio). The timing test's late medians stayed 4.4 to 6.4 ms against early 2.0 to 2.4 ms, so the rest
+> of the growth is elsewhere; still open, the same growth in the content's bytes: the content hold's image is one piece, every manifest and chunk a
+> holder keeps, recomputed and compared at each publication and re-put whole when it changed, which is every version.
+>
 > **Fixed 2026-11-18 (g232, A-333): losing the primary of a kernel-sized green lost the green.** The takeover successor
 > rebuilt the green beside the ledger it holds as one of the green's holders: version 0's inputs and every increment's
 > restored whole and every accepted record decoded in one poll, then the origin's bytes and every increment recorded
@@ -2851,7 +2865,20 @@
 > is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
-> class C claim wait below.
+> class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
+> sum** (Ada, the same day: a value computed once at boot is still a constant). The control shard keeps `F = D + E + R`
+> as running estimates, refreshed each coordinator period: `D` SWIM's count of the detector's periods at their running
+> tail (NFD-E per pair with Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes
+> unavailability against the fleet's measured MTBF, φ-accrual's threshold `−log10 β`; the detector's own bound keeps the
+> longest period it ever ran and read 7-14 s on a quiet fleet, so it is not used); `E` the council's death-confirmation window at the
+> coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
+> the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
+> (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
+> behind it. Owed, each in its own change: the failover-shaped waits read it (a forward's bound, the location round's cap,
+> a live takeover's fetch, the takeover's attempts, the telemetry horizon); each lease takes its term from a φ-accrual
+> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
+> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
+> sum is kept only as the A/B baseline, a build of its own, never a mode.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -4073,33 +4100,45 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >     step is its own kiln command with 1-2 s of dispatch, so on a quiet pair most of a phase is kiln's: g066b and
 >     g066c took 47 and 45 s in all. The record sessions' smoothed round trip ran from 17 ms (adacachy at load 34) to
 >     724 ms (at load 122.6), with probe timeouts up to 3.3 s.
->   - **Open: one forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on
->     adacachy at 1750).** The client's `work` was refused about 125 s after the root group formed, after the client's
->     first read of the same green had answered. At the refusal the client node held configuration version 0 with no
->     members while the server held version 1 with both, each node had replaced its record session after a loss 15
->     (client) and 17 (server) times, and both had a probe session. Its identities phase took 27.7 s (2.8 to 20.6 s in
->     the other runs), so a machine or the path was slow then. It did not recur in the 8 runs after it, 5 of them in
->     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
->     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
->     refusal a consumer retries; and a learner fetches the configuration only over a record session
->     (`fleet::drive_learner_fetch`). The run kept no node logs, so the cause is not known. Starvation of the server
->     is ruled out as the whole of it: with the same pair and direction (run g066s2), the server node's unit held to a
->     2% CPU quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`, cpu.max `2000 100000`) for 45 s right
->     after the root group formed and for 30 s while the client made a work, the client held configuration version 1
->     throughout, every forwarded `work` was answered within 0.5 to 8.6 s (the first made the work, the rest were
->     refused `AlreadyExists` for the experiment's repeated name), the read after the lift answered in 0.7 s, and the
->     flow landed exactly the 4 merged files. What remains is the path: the client reached adacachy over the Mac's
->     Wi-Fi, and 15 and 17 replaced sessions are re-dials after losses, so a run of losses longer than the SLO fits.
->     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
->     drive the client's first configuration fetch across a link that drops everything for longer than the SLO and
->     then heals (the relay of `crates/cli/tests/live_chaos.rs`, a node bound apart from its advertised address,
->     A-277), and require the configuration and a forwarded verb back within a derived bound of the heal; a miss is a
->     learner or session defect and gets its failing test first.
+>   - **One forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on adacachy at
+>     1750): not reproduced, and the recovery it put in doubt is now a test.** The client's `work` was refused about
+>     125 s after the root group formed, after the client's first read of the same green had answered. At the refusal
+>     the client node held configuration version 0 with no members while the server held version 1 with both, each node
+>     had replaced its record session after a loss 15 (client) and 17 (server) times, and both had a probe session. Its
+>     identities phase took 27.7 s (2.8 to 20.6 s in the other runs). It did not recur in the 8 runs after it, 5 of
+>     them in the same direction on the same ports, and the run kept no node logs (the program now keeps each node's
+>     last 400 lines and its whole status on a failure), so its cause is not known; the refusal itself is the designed
+>     one (`verbs::resolve_and_forward` resends to a live owner until the failover SLO, `FAILOVER_SLO_NS`, 10 s, then
+>     refuses `OwnerUnreachable`, which a consumer retries). Two causes are ruled out:
+>     - Starvation of the server (run g066s2, the same pair and direction): the server node's unit held to a 2% CPU
+>       quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`) for 45 s right after the root group formed
+>       and for 30 s while the client made a work; the client held configuration version 1 throughout, every forwarded
+>       `work` was answered within 0.5 to 8.6 s, the read after the lift in 0.7 s, and the flow landed exactly the 4
+>       merged files.
+>     - A link down past the failover delay as the root forms:
+>       `a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its_bound_once_the_link_heals`
+>       (`crates/cli/tests/fs_server.rs`) puts every datagram between the two nodes through `live_chaos.rs`'s relay
+>       (A-277), cuts it both ways before the server bootstraps the root alone, makes and shares the green while cut,
+>       holds the cut 10.9 s (the failover SLO plus a membership horizon) and heals it. The client then held a
+>       configuration naming both nodes and answered a forwarded read within a bound derived from its own estimates
+>       before the cut (the handshake's initial probe timeout, RFC 9002 §6.2.2; four of the session's probe timeouts;
+>       the detector's verdict for the pair, expected arrival plus margin; two coordinator periods; a membership
+>       horizon). Forwarded read answered 0.25 to 1.53 s after the heal against bounds of 1.82 to 3.37 s: 13 of 13 on
+>       Adas-Mac-Studio (macOS arm64, load 9 to 18) and 18 of 18 on GitHub's ubuntu x86_64 and arm64 runners (diag
+>       runs 44342202455, 44342920360 and, merged with main, 44344637800), with 53 to 11,611 datagrams dropped each
+>       way at the relay.
+>     What remains for g066d is the path itself: the client reached adacachy over the Mac's Wi-Fi. Seen in 2 of those
+>     runs and passed to g255 (forward-lane budgets): right after the heal a forward lane's floor read 175 s, past the
+>     10 s SLO, from a probe timeout of 24.9 s, about 64 times the session's live one, as if still backed off by the
+>     outage (a hypothesis; no log of the backoff count).
 >   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
 >     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
 >     path while the flow itself passed; the program passes every `$` as `$$`.
-> - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
->   pushes through a green, never through a write attachment.
+> - **Remote attach for writing is done (§4.10; A-222, 2026-11-05).** Another node's `slates attach ID --write`
+>   attaches the owner's volume in the record form and `slates write` writes through it
+>   (`a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it` in `fs_server.rs`, and the A-222
+>   entry above); the two-machine flow still pushes through a green, as an agent's work does. Open, as A-222 records:
+>   ownership migration to a writer that stays, and the read-only remote attach of a snapshot.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
 >   `CaUsedAsEndEntity`; the manifest's documentation does not say so.
 
@@ -7464,6 +7503,7 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/Reconfig.tla` | `Reconfig.cfg`, re-run (A-364) | no error, the same as 2026-09-04 (1 s) | 20,478 distinct | 19 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger_3.cfg` (A-364): 3 epochs (two takeovers), holders symmetric | not completed: stopped after 34 min with 13,438,768 states on the queue, to give the runner's memory back (TLC at 9.6 GB beside other builds); no invariant violated in the 40,469,260 distinct states explored, every one at depth 26 or less. A complete run wants a bound on the stale owners' proposals or a larger machine | 40,469,260 distinct (partial) | 26 (partial) | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
@@ -11612,6 +11652,14 @@ new process. In simulation the session ended one round trip after its first pack
   60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+- **The departure wait's budget omitted the election, fixed 2026-11-18 (g225).** The three tests that stop the bootstrap
+  voter wait `departure_learned_periods`, which counted the detector's horizon, the death window and the commits but
+  not the election the stop leaves owed: the bootstrapper leads the council it created, and only a leader proposes the
+  retirement. At one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2) 9 of 48 runs of the two tests waiting
+  on it spent their budget (94 periods) with every survivor still at the version of the stop, or the leader still naming
+  the stopped voter. The budget now adds the election's timeout (base and span, measured as the daemons derive it) and
+  its two rounds. Still open beside it: a learner's known voters move only with a newer configuration, and a seat change
+  moves none (the A-337 entry above).
 
 ### 2026-11-09: the formation check falls behind each new event counter (open)
 
@@ -17765,20 +17813,31 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   the shard panicked ("assertion failed: matches!(crate::merge_service::merge_role(state, id), Some(MergeRole::Green {
   .. }))") and the test failed; with the refusal it answers `AlreadyExists` and the plain volume stays plain and served
   (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
-- **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
-  lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
-  identity can fill; it is still given up `chain` at the bound. **Modelled (A-364, g250, 2026-11-18):**
+- **Fixed, the record half (GAP-A9-7; A-364, g250, 2026-11-18):** a successor whose own records ended two or more
+  versions below the adopted one lacked the intermediate records themselves (phase one reports each holder's highest
+  record only), which no fetch by identity can fill, and gave the green up `chain` at the bound. Modelled first:
   `docs/wip/models/FencedLedger.tla` adopts a ledger position by position, as §4.8 states it, and TLC finds no error at
-  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety), while
-  the register's rule, the highest record alone, fails Continuity (the model table below). Owed, the build (g250): the
-  successor's green materialization, finding positions between its own highest record and the adopted version unknown
-  here (`merge_service::unheld_green_inputs` answering none), asks the members of the green's recovery cohorts for the
-  positions in that range under the round's epoch (a holder promises the object, raising its fence, and reports each
-  accepted position with its epoch), adopts at each position the record accepted under the highest epoch among a
-  recovery quorum of each cohort, re-commits each under its own epoch (phase-two acceptance at a new epoch records that
-  epoch, BUG-12), and then gathers the chain; holders already keep a ledger's every position (`Acceptor::accepted`,
-  never compacted for a merge chain). The takeover's share stays open while the green is pending (A-345's
-  `takeover::materializing`), so its holders still authorize the question.
+  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety) while
+  the register's rule, the highest record alone, fails Continuity (the model table below). Built on it: the successor's
+  green materialization, finding versions below the adopted one whose records it does not know
+  (`green_adopt::Engine::RecordsShort`, A-333), asks every member of the green's recovery cohorts for the positions in that
+  range under its round's epoch (`slates_db::register::LedgerPrepare` on stream 28; a holder answers through the checks
+  a by-name question runs, promising the object first: `slates_db::takeover::answer_ledger`), adopts at each position,
+  in order, the record accepted under the highest epoch once a recovery quorum of each cohort promised it
+  (`slates_db::takeover::ledger_positions`), commits each again under its own epoch (`takeover::commit_adopted`, shared
+  with the newest record's adoption), and then fetches the versions' inputs and gathers the chain. Holders already kept
+  a ledger's every position (`Acceptor::accepted`, never compacted for a merge chain), and the takeover's share stays
+  open while the green is pending (A-345's `takeover::materializing`), so its holders still authorize the question.
+  Test: `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`
+  (`crates/server/tests/fleet.rs`; red with the catch-up skipped: waited on its chain 100 periods, given up), with the
+  db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's round trip and hostile input, and
+  `an_acceptor_reports_a_ledgers_positions_in_a_range`.
+- **Open (A-364): a held position never yields to a higher epoch.** `Acceptor::check` refuses a record whose value
+  differs from the one a holder already accepted at that position (`ConflictingPosition`), where the model's acceptor
+  overwrites a lower-epoch value (Paxos per position). A position whose divergent value was never committed (two
+  takeovers, the first adopting without it) cannot then be re-committed on the holders that keep the stale one; with
+  the successor among them its own commit is refused and the range waits for its bound. Not reached at `f = 1` with one
+  takeover; owed: accept a higher epoch's different value at an uncommitted position, held to the model.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

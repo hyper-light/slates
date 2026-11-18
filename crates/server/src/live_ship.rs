@@ -1382,7 +1382,9 @@ fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
 fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
   let id = slates_db::catalog::VolumeId { bytes: volume };
   let now = slates_rt::futures::now_ns();
-  let bound_ns = state.config.failover_slo_ns;
+  // The rule's own total ([`durable_spans`]): the failover delay, so a held verb is bounded as the transports' held
+  // replies are and follows the failover estimate wherever it is published, never a number of its own.
+  let bound_ns = durable_spans(state).total_ns;
   let keys: Vec<([u8; 16], u64)> = state
     .live
     .awaiting
@@ -1418,7 +1420,8 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
 /// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
 fn judge_held_destroys(state: &mut ShardState) {
   let now = slates_rt::futures::now_ns();
-  let bound_ns = state.config.failover_slo_ns;
+  // The rule's own total, as [`judge_held`] reads it.
+  let bound_ns = durable_spans(state).total_ns;
   let volumes: Vec<[u8; 16]> = state.live.destroys.keys().copied().collect();
   for volume in volumes {
     let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
