@@ -2851,7 +2851,9 @@ before the report is published, so a tool never reads attributes newer than the 
 > attachment's own (`Volume::forget_for`). A `FORGET` the log cannot take forces a publication; one still refused is
 > counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
 > `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
-> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
+> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`). A Shards stream whose
+> resync end the anchor holds logs its guest's `FORGET`s the same way since A-390 (2026-11-18); before, a resynced
+> stream kept the references a lost one gave back until it ended.
 > **Every record names its volume (2026-11-18, A-166's sibling sweep).** The replay found a record's volume by its inode
 > number's prefix, and a clone keeps its origin's numbers for every file it inherits, so a write a dead daemon logged to
 > a clone's inherited file was replayed into the origin (or another clone of it), and the clone lost it. Each write and
@@ -4434,8 +4436,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux, A-316; macOS, A-339)
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
-  the writes it acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes
-  any other's record, as before.
+  the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
+  from the write log (A-63) as a mount's are; it removes any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -28087,3 +28089,24 @@ Applied in the same change to:
   `a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go`). Each guard removed alone fails the new test:
   the copy taken back awake, as before, leaves the client's map holding the replayed bytes where its store was (the
   failing test, the bug itself); a copy never woken fails at the sync after the takeover.
+
+### A-390 — A Shards stream logs its guest's FORGETs after the last publication, as a FUSE mount does, where the anchor holds its resync end (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
+Applied in the same change to:
+- §4.6, the Shards form's death bullet; the write log's status (A-154's sibling), amended; GAPS: A-281's entry.
+- `crates/server`: `write_log.rs` (`log_forgets`, moved from `fuse.rs` and shared; the module's notes), `fuse.rs` (calls
+  it), `shards.rs` (`log_forgets` of a stream whose resync end the anchor holds); the test
+  `crates/server/tests/shards_resync_restart.rs` (the nameless file its guest lets go after the last publication).
+
+- **What was there.** A FUSE mount logs the lookups its kernel gives back (`FORGET`, `BATCH_FORGET`) beside its writes
+  (A-154's sibling, 2026-11-08), since a `FORGET` takes no reply and is never resent: one served after the last
+  publication and lost with its daemon left the references the image recorded counted for good. A Shards stream's were
+  not logged. Once a stream outlived its daemon (A-316, A-339), its successor restored the lookups the image recorded,
+  and an unlinked file the guest had let go stayed referenced until the stream ended.
+- **The rule.** A stream whose resync end the anchor holds logs each `FORGET`'s lookups as its attachment's, through
+  the mount's own code, now shared (`write_log::log_forgets`); the replay gives them back in their place among the
+  writes. A stream no successor keeps is not logged: its attachment and every reference it held end at its daemon's
+  death.
+- **Evidence.** On a Mac Studio (kiln run r221) and on Linux (adacachy, kiln run r252), the restart test passes, its
+  volume's referenced bytes after the successor's recovery where the guest's `FORGET` left them, 39 bytes, the
+  surviving file's. With the stream's `FORGET`s not logged, it fails on both: 65,575 bytes, the 64 KiB the nameless
+  file kept referenced, and the 39.

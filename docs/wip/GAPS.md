@@ -654,8 +654,10 @@
 >   replay and woken after it, as A-365's DAX objects are (`crates/server/tests/held_copy_replay.rs`, Linux). Found
 >   beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
->   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
->   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
+>   `shards.resync_writes_unreported`); a stream's `FORGET`s were not logged, so a resynced stream kept the references
+>   a lost one gave back until it ended (**fixed by A-390, 2026-11-18**: logged as a mount's are, where the anchor holds
+>   the stream's resync end; `shards_resync_restart`'s nameless file stays let go across the death); and a stream's
+>   `close` publishes even when the log holds every write it
 >   acknowledged, where a mount's skips it (A-63's flush rule: a FUSE request that published took 105 us p50 against
 >   15 us for a read, 2026-10-06).
 >   Shards owes its device's half, after its v0.8.0 tag.
