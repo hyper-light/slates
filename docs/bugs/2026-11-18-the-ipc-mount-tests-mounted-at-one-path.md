@@ -36,10 +36,13 @@ lane that runs the file at once (`cargo test`'s default).
 
 ## Fix
 
-`MountPaths::new(tag)` names the root `slates-ipc-<tag>-<pid>`. The IPC test passes `"ipc"` and the device test
-`"dev"`. The tags are kept short because the IPC test binds a socket inside the mount, and that path must fit in
-`sockaddr_un` (otherwise the test skips loudly, as before). Evidence: GitHub diagnostics run 44266547416 (Linux
-x86_64, 2026-11-18):
+`MountPaths::new(tag)` names the root `slates-ipc-<tag>-<pid>`: the IPC test passes `"ipc"` and the device test
+`"devices"`. The tags are short because the IPC test binds a socket inside the mount, and that path must fit in
+`sockaddr_un` (otherwise the test skips loudly, as before). Two agents found and fixed this on the same morning: g251's
+fab67dbd9 landed first (from CI run 44260193629) and is the fix main keeps. g268's identical change (d36b9f961, tag
+`"dev"`) gave way to it at the merge, and this record keeps g268's control experiment, which main's fix did not run.
+
+Evidence: GitHub diagnostics run 44266547416 (Linux x86_64, 2026-11-18):
 
 - Main 8c9f05404 with the tests at once failed 4 of 5 runs, at lines 298, 433, 258 and 258.
 - The same binary one test at a time (`--test-threads=1`) failed 0 of 3 runs. This is the control: the old paths pass

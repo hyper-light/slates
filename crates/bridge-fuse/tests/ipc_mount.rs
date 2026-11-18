@@ -35,12 +35,13 @@ struct MountPaths {
 }
 
 impl MountPaths {
-  /// The directories of their own for the test named `tag`: the tests of this file run at once, and each one's drop
-  /// unmounts and removes its whole root, so two tests sharing one would mount over, unmount and remove each other's
-  /// (`coherence_mount`'s `scratch` is the same rule). `tag` is short: the socket's path must fit `sockaddr_un`.
-  fn new(tag: &str) -> Self {
+  /// The mount points of the test `test` in this process. A test's name is in the path because libtest runs this file's
+  /// tests at once, in one process: with the process id alone both mounted on one `original`, one over the other, each
+  /// test's paths reached the other's volume, and the first to fail unmounted and removed the other's (CI's ubuntu
+  /// runner, run 44260193629: `pipe` answered ENOENT, and `disk` stat right and then answered ENOENT, both in 0.03 s).
+  fn new(test: &str) -> Self {
     let root = format!(
-      "{}/slates-ipc-{tag}-{}",
+      "{}/slates-ipc-{test}-{}",
       env!("CARGO_TARGET_TMPDIR"),
       std::process::id()
     );
@@ -412,7 +413,7 @@ fn device_image() -> VolumeImage {
 #[test]
 fn a_device_node_reaches_the_mount_with_its_number_and_is_never_opened() {
   std::thread::scope(|scope| {
-    let paths = MountPaths::new("dev");
+    let paths = MountPaths::new("devices");
     let mounted = match mount(&paths.original, &[], MOUNT_WAIT) {
       Ok(mounted) => mounted,
       Err(MountError::NoDevice { .. } | MountError::Helper { .. } | MountError::Spawn { .. }) => {

@@ -243,7 +243,10 @@ fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_rele
   let second = client.attach_shards(volume, Intent::Write, None).unwrap();
   let (first_token, held_end) = held_with_its_token(&anchor, &first);
   let (second_token, _) = held_with_its_token(&anchor, &second);
-  assert_ne!(first_token, second_token, "each attachment has its own token");
+  assert_ne!(
+    first_token, second_token,
+    "each attachment has its own token"
+  );
 
   let mut stream = UnixStream::from(first.stream);
   stream.set_read_timeout(Some(WAIT)).unwrap();

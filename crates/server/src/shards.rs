@@ -1923,7 +1923,8 @@ fn keep_pending_reply(s: &mut ShardState, stream: &ShardsStream, answered: &Answ
 }
 
 /// Logs the `WRITE` at the head of `stream` (`total` bytes), when `answered` says it succeeded, in the shard's write log
-/// before its reply (A-63, A-316): as `fuse`'s `log_write` does for a mount, a log with no room forces a publication
+/// before its reply, under the stream's volume, where a replay puts it (A-63, A-316; an inode number alone names the
+/// origin of a clone's inherited file): as `fuse`'s `log_write` does for a mount, a log with no room forces a publication
 /// that carries the write, and only a refused publication leaves it unlogged, marked as an overflow so the next daemon
 /// reports the loss rather than replaying around it.
 #[cfg(target_os = "linux")]
@@ -1936,7 +1937,7 @@ fn log_write(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: 
     return;
   };
   let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => log.append(object, nodeid, offset, data),
+    (Some(log), Some(object)) => log.append(object, (stream.volume.bytes, nodeid), offset, data),
     _ => return,
   };
   let logged = match appended {
