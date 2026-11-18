@@ -3916,6 +3916,20 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       holder held. Kept: NoLoss is a register invariant the design proves (§4.8), and a typed final refusal is
 >       recoverable by the operator where a silent loss of an acknowledged write is not (R4). **Owed:** A-309 piece 2's
 >       register takeover passes over a falsely retired holder of the newest register record the same way.
+>     - **Fixed in the flow (g229): the fresh-member flow judged the successor's new holder as the old owner's.** It
+>       read the holders whose fences StaleNeverCommits is judged by from the successor. Since A-343 the successor
+>       publishes at its takeover, so its line names its own holders at once, including one a transition is only adding.
+>       In one run of five (CI run 44331494887, x86_64, main 68148152d) that holder's copy, from an older set, was still
+>       at fence 1, and the flow called it a violation: the dead owner's holders were d (the successor) and b, both
+>       fenced. The flow now judges the superseded owner by its own sets at its last look (active, and moving-to in a
+>       transition, each cohort needing the write count), with
+>       `a_superseded_owner_is_judged_by_its_own_holder_sets_not_its_successors` on that run's state.
+>     - **Fixed in the flow (g229): a successor's first write is given the fleet wait to be answered.** The long-log flow
+>       waited out its 1,700 s cap after "taken over" on arm64 (same run), the shape of the lossy flow's hang that A-353
+>       fixed; A-354 now refuses a held reply at the failover SLO. A write through the successor that is still unanswered
+>       after the fleet wait now fails the flow with every node's state printed and its daemons killed
+>       (`write_answered_within`). On a Mac Studio under 24 spinners (load 13 to 39), the fresh-member flow passed 6 of 6
+>       (52 to 73 s) and the long-log flow 6 of 6 (8 to 11 s).
 >     - **Held in the flows (g229): a partitioned owner is taken over, and every write sent to it answered, within the
 >       failover bound.** The four partition flows let the deafened owner be taken over after 22.7 and 34.8 s and hold its
 >       in-flight write 41 to 85 s, and the cut-off and muted owners' about 20.5 s, each until the relay healed (CI diag
