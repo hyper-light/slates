@@ -113,6 +113,9 @@
 #   the gathering `WSASend`, `WSAIoctl(SIO_TCP_INFO)` for the peer's close, `shutdown`, and the
 #   `OwnedSocket::from_raw_socket` that hands a socket over (12). The Unix stream calls moved from `tcp.rs` into the
 #   seam unchanged in number. 84 → 96.
+#   A blocked wait one level up (`iocp.rs` `move_level`, 2026-11-18, A-361): one block that reads and sets the calling
+#   thread's own priority level (`GetThreadPriority`, `SetThreadPriority`), Win32 without a safe wrapper, so a shard
+#   blocked in its completion port is woken as Windows wakes an event's waiter (1). 101 → 102.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (11): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -353,7 +356,7 @@ slates-mem = 63
 #   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
 #   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
 #   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
-slates-rt = 101
+slates-rt = 102
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
