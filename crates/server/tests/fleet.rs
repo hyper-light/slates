@@ -11394,10 +11394,8 @@ fn settled_on_one_configuration(
     let voting = daemon
       .council_voters()?
       .is_some_and(|voters| same_voters(&voters, &every));
-    whole &= placed == council
-      && daemon.council_members()? == every
-      && voting
-      && daemon.fleet_meshed()?;
+    whole &=
+      placed == council && daemon.council_members()? == every && voting && daemon.fleet_meshed()?;
   }
   Ok(whole && versions.len() == 1)
 }
@@ -11410,10 +11408,7 @@ fn takeover_outcomes(daemons: &[Daemon]) -> Vec<(u64, u64)> {
       let counted = summed_counters(daemon);
       (
         counted.get(LIVE_TAKEN_OVER).copied().unwrap_or(0),
-        counted
-          .get("fleet.takeover.given_up")
-          .copied()
-          .unwrap_or(0),
+        counted.get("fleet.takeover.given_up").copied().unwrap_or(0),
       )
     })
     .collect()
@@ -11436,7 +11431,11 @@ struct DeafSpell {
 /// never reach it: the chaos nemesis's `Deafened` partition) until the others have retired it, keeps it deaf while its
 /// takeover runs, until a survivor has taken a live volume over or given an object up, or the round's bound has passed
 /// twice, and then heals it.
-fn deaf_until_its_takeover_resolves(daemons: &[Daemon], hosts: &[HostId], deaf: usize) -> DeafSpell {
+fn deaf_until_its_takeover_resolves(
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  deaf: usize,
+) -> DeafSpell {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let others: Vec<HostId> = hosts
     .iter()
@@ -11507,8 +11506,8 @@ fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retir
   let (id, written) = live_volume_written(&mut client, &daemons, "adopted");
   drop(client);
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let successor = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes))
-    .expect("a survivor takes over");
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
   let adopter = if successor == hosts[1] { 1 } else { 2 };
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken

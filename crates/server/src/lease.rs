@@ -384,9 +384,9 @@ impl AnswersGiven {
   ///
   /// [`promotion_open`]: AnswersGiven::promotion_open
   pub fn retain_members(&mut self, members: &[HostId], now_ns: u64) {
-    self.alive_answers.retain(|peer, last| {
-      members.contains(peer) || now_ns.saturating_sub(*last) <= horizon_ns()
-    });
+    self
+      .alive_answers
+      .retain(|peer, last| members.contains(peer) || now_ns.saturating_sub(*last) <= horizon_ns());
     let answered = &self.alive_answers;
     self
       .announced_versions
