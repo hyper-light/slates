@@ -1305,6 +1305,29 @@
 > sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
 > of 2026-11-07 has the log.
 
+> **Starts that each failed past the anchor's restart window were restarted at once, for good (found 2026-11-11 on
+> B10's Linux gate; closed 2026-11-17 by A-311 and A-312; the supervisor's runs under load owed, below).** The anchor counted failed starts in a
+> window of the recovery budget, a second, so a start that took longer fell in a window of its own every time and was
+> never a crash loop. B10's gate on adacachy2 (be4985bb, load 67-73) ran `a_start_whose_shards_sum_past_a_window_comes_up`
+> for 27 minutes, the anchor killing the 407-shard start every second ("ran 1009-1037 ms of CPU on one thread without
+> beating") and restarting it at once; the goal's record (g254) has main's macOS CI meeting it at 367 shards. Now a
+> second failed start in a row is a crash loop, backed off at least its own life and doubling to the failover SLO
+> (A-311). Red on main 29ef4521 (a 400 ms start against a 200 ms window: restarted at once 4 times of 4, backed off
+> None); passes on this change, a crash loop at the second exit backed off 548 ms, its own life (an 18-core MacBook at
+> load 15; `a_crash_loop_of_starts_longer_than_the_window_is_backed_off`, the bug record of 2026-11-11). The test now ends its watch at the anchor's first start kill instead of reading on. Open:
+> - ~~**The serve-then-crash loop.**~~ **Closed 2026-11-17 (A-311's second half):** a daemon that dies before it has
+>   served as long as its start took is a failed start, and the anchor publishes its verdict that a daemon has recovered
+>   (`recovered` in `slates status`). The end-to-end flows that kill daemons in a row (`held_rendezvous.rs`,
+>   `nfs_held.rs`, `merge_kill.rs`, `winfsp.rs`, `guest_vhost.rs`) kill each once it is judged recovered; without the
+>   wait, `held_rendezvous` failed 4 of 4 under the rule at load 21-63 (the liveness agent's run of 2026-11-11). Owed:
+>   the supervisor's runs of those flows on main (gated on `SLATES_TEST_CLI=1`; WinFsp's on CI's Windows runners).
+> - ~~**A long start beats per unit of work.**~~ **Built 2026-11-17 (A-312):** the starting thread beats after each unit
+>   of its work (each shard's registration, spawn and acknowledged build, each pair ring) until the watchdog takes the
+>   beat over, so the backoff is no longer all that stands between a long start and the anchor. Owed: the supervisor's
+>   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
+>   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
+>   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
+
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
 > killed, and every restart started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only
