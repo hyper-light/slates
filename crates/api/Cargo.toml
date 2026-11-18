@@ -60,6 +60,8 @@ slates-machine = { workspace = true }
 slates-db = { workspace = true }
 # The Shards stream test speaks FUSE through the end the library hands a VMM (A-161), with the codec's ABI constants.
 slates-bridge-fuse = { workspace = true }
+# The landing test checks each listed file's bytes against the BLAKE3 its plan's entry names (A-287).
+blake3 = { workspace = true }
 
 # Instance start by use: the test binary is an embedding host whose own `main` serves the roles when its arguments
 # begin with its prefix, as kiln's does, so it runs without libtest's harness (A-278).

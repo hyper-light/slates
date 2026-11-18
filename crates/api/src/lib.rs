@@ -34,9 +34,8 @@
 //! field or a variant is added, never changed or removed, so a host reads them and matches their enums with a
 //! wildcard arm.
 //!
-//! **What is owed** (GAPS, the A-278 row): a landing's per-path entries (the daemon's `Changes` request, which g266
-//! builds); an async form over a host's reactor (R6); a seam trait with a simulator and a conformance suite for hosts
-//! whose rules ask for one (Hex's §9, kiln's `kiln-seams`).
+//! **What is owed** (GAPS, the A-278 row): an async form over a host's reactor (R6); a seam trait with a simulator and
+//! a conformance suite for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -68,9 +67,9 @@ pub use slates_client::{
 };
 /// The wire's types this crate's verbs take and return (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, NamePolicy, Refusal, SizeClass, SnapshotId, StatusReport, TelemetryReport,
-  VolumeId, VolumeSummary,
+  AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary, Intent,
+  LandingOutcome, LandingSummary, NamePolicy, PlannedAction, PlannedContent, PlannedEntry, Refusal,
+  SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary,
 };
 
 /// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
