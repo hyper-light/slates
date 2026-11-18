@@ -35,9 +35,12 @@ const WAIT: Duration = Duration::from_secs(20);
 const LOOKUP: u32 = 1;
 const FORGET: u32 = 2;
 const UNLINK: u32 = 10;
+const OPEN: u32 = 14;
 const READ: u32 = 15;
 const WRITE: u32 = 16;
 const RELEASE: u32 = 18;
+const FSYNC: u32 = 20;
+const FLUSH: u32 = 25;
 const SETXATTR: u32 = 21;
 const GETXATTR: u32 = 22;
 const INIT: u32 = 26;
@@ -50,6 +53,8 @@ const CREATE_EXCLUSIVE: u32 = 0o302;
 const FILE_MODE: u32 = 0o100_644;
 /// Format: Linux's `EEXIST`.
 const EEXIST: i32 = 17;
+/// Format: `EIO`, how Linux reports a writeback error, the lost writes of a file a handle was open on.
+const EIO: i32 = 5;
 /// Format: `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT` in `fuse_init_in.flags` (`include/uapi/linux/fuse.h`), which a Linux
 /// guest's kernel offers; and where the anchor's session of a stream keeps its form (past the token and the owner
 /// view's four words), with the form's bit for the extended SETXATTR (A-378).
@@ -449,6 +454,67 @@ fn the_guest_lets_it_go(
   }
 }
 
+/// After the death, A-393: the dead daemon's log overflowed, so every file the guest had open may have lost writes, and
+/// the guest is told as a taken-over FUSE mount's kernel is: a `FLUSH` through its handle of `data` from before the
+/// death answers `EIO`, its first `FSYNC` answers `EIO` and its second none, and a `FLUSH` then none; a handle opened
+/// after the death is told nothing. Counted, `shards.resync_writes_lost`.
+fn the_resynced_guest_is_told_its_lost_writes(
+  daemon: &Daemon,
+  writer: &mut Guest,
+  (data, fh): (u64, u64),
+) {
+  let flush = |fh: u64| {
+    let mut body = fh.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 16]);
+    body
+  };
+  let fsync = |fh: u64| {
+    let mut body = fh.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 8]);
+    body
+  };
+  let answered = |writer: &mut Guest, opcode: u32, unique: u64, body: &[u8]| {
+    writer.ask(&request(opcode, unique, data, body)).0
+  };
+  assert_eq!(
+    answered(writer, FLUSH, 31, &flush(fh)),
+    EIO,
+    "a flush through the handle from before the death reports the loss"
+  );
+  assert_eq!(
+    answered(writer, FSYNC, 32, &fsync(fh)),
+    EIO,
+    "and so does its first fsync, which takes the report"
+  );
+  assert_eq!(
+    answered(writer, FSYNC, 33, &fsync(fh)),
+    0,
+    "the second fsync reports nothing more"
+  );
+  assert_eq!(
+    answered(writer, FLUSH, 34, &flush(fh)),
+    0,
+    "nor does a flush after it"
+  );
+  let (errno, _, body) = writer.ask(&request(
+    OPEN,
+    35,
+    data,
+    &[2u32.to_le_bytes(), [0; 4]].concat(),
+  ));
+  assert_eq!(errno, 0, "the guest opens the file again");
+  let fresh = u64::from_le_bytes(body[0..8].try_into().unwrap());
+  assert_eq!(
+    answered(writer, FSYNC, 36, &fsync(fresh)),
+    0,
+    "a handle opened after the death is told nothing"
+  );
+  assert!(
+    counted(daemon, "shards.resync_writes_lost", 1) >= 1,
+    "the stream was served again with its losses told"
+  );
+}
+
 /// After the death: each device's resync end (the first of each pair) brings a `Resync` naming its attachment and the
 /// token its `Attached` (the second) named, with one descriptor, the end of the fresh stream it is served on, live (a
 /// flush in flight zeroes its receive buffer, A-339). Returns each fresh end, in the pairs' order.
@@ -549,24 +615,27 @@ fn answered_once_and_kept(
   );
 }
 
-/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too), A-378, A-390. Do: as the
+/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too), A-378, A-390, A-393. Do: as the
 /// anchor, hand a daemon the hold channel; attach a volume three times in the Shards form; the second stream's kernel
 /// sends an INIT taking the extended SETXATTR form; on the second stream create, write, close and unlink a file, its
 /// lookup still held, the unlink's barrier publishing it nameless; create a file and open it on the second stream;
 /// withhold the daemon's replies and send an exclusive CREATE on the first stream, whose barrier publishes it with its
 /// reply; then write on the second stream, acknowledged after that last publication, and give the nameless file's
-/// lookup back there (a FORGET, no publication after it), the volume's referenced bytes dropping by the file's; kill
-/// the daemon (a fenced stop: no record ended, no hold released); start a second daemon over the same segment with the
-/// held ends handed back, while another thread opens and closes sockets and the devices leave their `Resync`s unread
-/// for a while; then the third device goes without a byte on its fresh stream. Expect each device to be handed a fresh
-/// stream in a `Resync` that names its attachment and the token its `Attached` named, with one descriptor, live; the
-/// volume's referenced bytes where the FORGET left them (the successor gave the logged FORGET back; before A-390 it
-/// restored the lookup the image held, and the nameless file stayed referenced until the stream ended); the resent
-/// CREATE answered with success under its unique, from the published reply (a second application would answer
-/// `EEXIST`), counted as replayed; the acknowledged write read back on the second stream (the write log); a SETXATTR in
-/// the extended form served there and read back, parsed as before the death though no INIT repeated it; the file there
-/// once, a new exclusive CREATE of it refused `EEXIST`; each writing device counted as having taken its fresh end; and
-/// the third attachment ended, its hold released, counted as abandoned.
+/// lookup back there (a FORGET, no publication after it), the volume's referenced bytes dropping by the file's; mark
+/// the daemon's write log overflowed, as a refused publication of a full one leaves it; kill the daemon (a fenced stop:
+/// no record ended, no hold released); start a second daemon over the same segment with the held ends handed back,
+/// while another thread opens and closes sockets and the devices leave their `Resync`s unread for a while; then the
+/// third device goes without a byte on its fresh stream. Expect each device to be handed a fresh stream in a `Resync`
+/// that names its attachment and the token its `Attached` named, with one descriptor, live; the volume's referenced
+/// bytes where the FORGET left them (the successor gave the logged FORGET back; before A-390 it restored the lookup the
+/// image held, and the nameless file stayed referenced until the stream ended); the resent CREATE answered with success
+/// under its unique, from the published reply (a second application would answer `EEXIST`), counted as replayed; the
+/// acknowledged write read back on the second stream (the write log); the guest told its writes may be lost, as a
+/// taken-over mount's kernel is (a flush through its handle from before the death answers `EIO`, its first fsync too
+/// and its second none, a handle opened after it nothing); a SETXATTR in the extended form served there and read back,
+/// parsed as before the death though no INIT repeated it; the file there once, a new exclusive CREATE of it refused
+/// `EEXIST`; each writing device counted as having taken its fresh end; and the third attachment ended, its hold
+/// released, counted as abandoned.
 #[test]
 fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once() {
   let (anchor, daemon_end) = held::channel().unwrap();
@@ -605,6 +674,10 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
   let forgotten = a_nameless_file_held_by_its_lookup(&mut old_writer);
   let file = create_unanswered_then_write(&first, &mut old_creator, &mut old_writer);
   let let_go = the_guest_lets_it_go(&mut client, volume, &mut old_writer, forgotten);
+  assert!(
+    first.inject_write_log_overflow().unwrap(),
+    "every shard's log is marked overflowed, as a refused publication of a full one leaves it"
+  );
   first.inject_consensus_failure().unwrap();
   first.stop();
   drop(client);
@@ -626,6 +699,7 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
   ]);
   let (mut creator, mut writer) = (Guest::over(creator), Guest::over(writer));
   answered_once_and_kept(&second, &mut creator, &mut writer, file);
+  the_resynced_guest_is_told_its_lost_writes(&second, &mut writer, file);
   the_successor_parses_the_extended_form(&mut writer, file.0);
   a_device_gone_before_its_first_frame_ends_its_attachment(
     &second,

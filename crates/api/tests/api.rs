@@ -23,16 +23,16 @@ use std::time::{Duration, Instant};
 
 use slates_api::{
   AttachTransport, Denied, Error, Exhausted, Existing, Instance, Intent, Invalid, IssuerFault,
-  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, PathFault,
-  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId,
-  Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget,
+  PathFault, PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes,
+  SnapshotId, Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
   WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 // What only the Unix-gated tests (the overlay and landing tests) name.
 #[cfg(unix)]
 use slates_api::{
   AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, LandOutcome, LandingApproval,
-  LandingConflict, LandingStage, LandingState,
+  LandingConflict, LandingStage, LandingState, Unsupported,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -1215,6 +1215,85 @@ fn kilns_workspaces_are_provisioned_side_by_side() {
   for volume in made.into_iter().flatten() {
     instance.destroy(volume).unwrap();
   }
+  daemon.stop();
+}
+
+/// A-291 (§4.10 "Ownership follows the writer"), the contract's half: a lone instance names itself and refuses a move
+/// typed. Do: on a lone instance, read its member id, then ask to move a volume to that id, to another id, and a
+/// volume that does not exist. Expect a member id that is not zero; both moves refused
+/// `Invalid::MoveTarget(NotMember)` (a node alone has no other member: R8's degenerate fleet), the volume still
+/// served where it was; and the missing volume refused by what it named. The move itself across members is the
+/// server's fleet test (`a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`).
+#[test]
+fn a_lone_instance_names_itself_and_refuses_a_move_typed() {
+  let (daemon, mut instance) = grouped("move");
+  let member = instance.member().unwrap();
+  assert_ne!(member, 0, "an instance names its member");
+  let volume = provision(&mut instance, &VolumeSpec::empty("staying", ROOM));
+  write_file(&mut instance, volume, "/f", b"stays here");
+  let not_member = Err(Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)));
+  assert_eq!(instance.move_volume(volume, member), not_member);
+  assert_eq!(
+    instance.move_volume(volume, member.wrapping_add(1)),
+    not_member
+  );
+  assert_eq!(read_file(&mut instance, volume, "/f"), b"stays here");
+  let missing = VolumeId { bytes: [7; 16] };
+  assert_eq!(
+    instance.move_volume(missing, member.wrapping_add(1)),
+    Err(Error::NotFound(Missing::Volume(missing)))
+  );
+  drop(instance);
+  daemon.stop();
+}
+
+/// A-291 (§4.15 `capture_base`): an overlay's base captured whole, and a clone of the capture reading it with no base
+/// directory, the form a kiln workspace takes so it can move between runners. Do: write two files into a folder,
+/// overlay it, capture its base; then change one file and add another in the folder; clone the captured snapshot and
+/// read it; capture a scratch volume. Expect the clone to read the captured bytes, never the folder's later ones, and to
+/// report no base (it reads no folder); and the scratch volume's capture refused `Unsupported`, there being no base to
+/// capture.
+#[cfg(unix)]
+#[test]
+fn a_captured_bases_clone_reads_the_capture_with_no_base_directory() {
+  let (daemon, mut instance) = grouped("capture");
+  let folder = Folder::new();
+  folder.write("a.txt", b"first");
+  folder.write("sub/b.txt", b"second");
+  let overlay = provision(
+    &mut instance,
+    &VolumeSpec::overlay("captured", &folder.path, ROOM),
+  );
+  let snapshot = instance.capture_base(overlay).unwrap();
+  folder.write("a.txt", b"changed on the disk after the capture");
+  folder.write("late.txt", b"added after the capture");
+  let clone = provision(
+    &mut instance,
+    &VolumeSpec::clone_of("workspace", overlay, snapshot),
+  );
+  assert_eq!(read_file(&mut instance, clone, "/a.txt"), b"first");
+  assert_eq!(read_file(&mut instance, clone, "/sub/b.txt"), b"second");
+  assert!(
+    matches!(
+      instance.read(clone, "/late.txt", slates_api::ReadAt::Head),
+      Err(Error::NotFound(_))
+    ),
+    "the clone holds the capture, never the folder's later entries"
+  );
+  assert_eq!(
+    instance.status(clone).unwrap().base,
+    None,
+    "the clone reads no base directory"
+  );
+  let scratch = provision(&mut instance, &VolumeSpec::empty("plain", ROOM));
+  assert!(
+    matches!(
+      instance.capture_base(scratch),
+      Err(Error::Unsupported(Unsupported::Feature(_)))
+    ),
+    "a scratch volume has no base to capture"
+  );
+  drop(instance);
   daemon.stop();
 }
 
