@@ -546,6 +546,47 @@ pub enum Op {
     /// archived); `None` for a green with no origin.
     origin: Option<[u8; 32]>,
   },
+  /// An audit record this partition owes the control partition (A-265's crossing, made durable 2026-11-18): kept in the
+  /// partition's outbox, numbered by its own crossing sequence in `apply`, until the control partition acknowledges it,
+  /// so it commits with the atom that made it and a crash before its batch arrives loses nothing. Appended.
+  AuditOwed {
+    /// The record; its `seq` is set in `apply`.
+    record: AuditRecord,
+  },
+  /// The control partition appended this partition's owed records before crossing sequence `through` (A-265): they
+  /// leave the outbox. Appended.
+  AuditDelivered {
+    /// The first crossing sequence the control partition has not appended.
+    through: u64,
+  },
+  /// On the control partition: a batch of the records partition `origin` owes, the first at crossing sequence `first`
+  /// (A-265). `apply` appends only those past what `origin` already delivered, and marks `origin` delivered through the
+  /// batch's end, so a batch sent again, after a crash or a lost acknowledgement, appends nothing twice. Appended.
+  AuditBatchAppended {
+    /// The partition that owed the records.
+    origin: u16,
+    /// The crossing sequence of the batch's first record.
+    first: u64,
+    /// The records, in crossing order.
+    records: Vec<AuditRecord>,
+  },
+  /// A volume moved to another fleet member left this node (§4.10 "Ownership follows the writer", A-291): its record,
+  /// snapshots, lineage and this node's copies of its keys go, as a destroy's do, but no tombstone stays. Its registers
+  /// belong to the member the configuration's moved-object exception names, which adopted them, so nothing here may
+  /// close them. Appended (2026-11-18).
+  VolumeReleased {
+    /// The volume.
+    id: VolumeId,
+  },
+  /// A snapshot was captured as a complete immutable base (§4.15 `capture_base`, A-291): its tree holds every name,
+  /// byte and attribute, none read from the host directory, so a clone of it is made with no base directory. Kept while
+  /// the snapshot and its volume are. Appended (2026-11-18).
+  BaseCaptured {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    snapshot: crate::catalog::SnapshotId,
+  },
 }
 
 impl Op {
@@ -628,6 +669,11 @@ impl Op {
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
       Op::VolumeSignersSet { .. } => "volume_signers_set",
       Op::VolumeRelinquished { .. } => "volume_relinquished",
+      Op::AuditOwed { .. } => "audit_owed",
+      Op::AuditDelivered { .. } => "audit_delivered",
+      Op::AuditBatchAppended { .. } => "audit_batch_appended",
+      Op::VolumeReleased { .. } => "volume_released",
+      Op::BaseCaptured { .. } => "base_captured",
     }
   }
 }

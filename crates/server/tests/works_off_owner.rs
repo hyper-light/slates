@@ -453,6 +453,8 @@ fn pipelined_round(client: &mut Client, green: VolumeId, round: u8) {
     ReplyBody::Submitted {
       version: Some(accepted),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "based at {base}"
   );
@@ -556,6 +558,8 @@ fn submit_with_the_answer_lost(
 const ACCEPTED_AT_TWO: ReplyBody = ReplyBody::Submitted {
   version: Some(2),
   conflicts: Vec::new(),
+  conflicts_elided: 0,
+  verdict: 0,
 };
 
 /// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost, so the green advanced
@@ -608,7 +612,10 @@ fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
   await_overloaded(&mut client, id);
   client.edit(other, "f", 32, 4, b"BBBB").unwrap();
   assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(3));
-  let ReplyBody::Submitted { version, conflicts } = client.retry(id, &request).unwrap() else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.retry(id, &request).unwrap()
+  else {
     panic!("the retry answers a submit");
   };
   assert_eq!(version, None);
@@ -778,6 +785,8 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
     ReplyBody::Submitted {
       version: Some(2),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }
   );
   assert!(
@@ -787,6 +796,84 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
   assert_eq!(reply_of(&mut client, edit), ReplyBody::Edited);
   assert_eq!(client.read(green, "f", ReadAt::Head).unwrap(), b"AAAA");
   assert_eq!(client.read(work, "f", ReadAt::Head).unwrap(), b"BBBB");
+  drop(client);
+  daemon.stop();
+}
+
+/// Format: the status counter of the most batches of asks a shard had out to one owner at once (A-388).
+const BATCHES_OUT_PEAK: &str = "merge.work.batches_out_peak";
+
+/// Two names of `prefix` that hash to one partition, not `green`'s, and that partition.
+fn two_names_on_one_partition(green: VolumeId, prefix: &str) -> (String, String, u16) {
+  let mut seen: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+  for suffix in 0u32.. {
+    let name = format!("{prefix}-{suffix}");
+    let partition = owner_of_name(&name, usize::from(MANY_SHARDS));
+    if partition == owner_of(green) {
+      continue;
+    }
+    if let Some(first) = seen.insert(partition, name.clone()) {
+      return (first, name, partition);
+    }
+  }
+  panic!("the names run out before two share a partition")
+}
+
+/// A-388 (§4.16 "Asks are batched per owner"; A-247). Do: two works on one shard that is not their green's; hold the
+/// green's owner shard; send, without waiting, an edit of a base file from each, so each asks the owner and the first
+/// ask's batch is out, unanswered, when the second is made; then let the owner go. Expect: both edits answered, and the
+/// works' shard had two batches out to the owner at once. With one batch out at a time the second ask waited in the
+/// shard for the first batch's round trip before it left (a peak of 1).
+#[test]
+fn a_shards_second_ask_leaves_while_its_first_batch_is_still_out() {
+  static HELD: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon(MANY_SHARDS, "two-out");
+  let mut client = connect(&instance);
+  let green = client.create_green("two-out-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "two-out-seed").unwrap();
+  client.edit(seed, "first", 0, 0, b"....").unwrap();
+  client.edit(seed, "second", 0, 0, b"....").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let (one, other, partition) = two_names_on_one_partition(green, "two-out");
+  let (first_work, _) = client.create_work(green, &one).unwrap();
+  let (second_work, _) = client.create_work(green, &other).unwrap();
+  let owner = daemon.shards()[usize::from(owner_of(green))];
+  let holding = daemon
+    .observation(Some(owner), OBSERVE_BUDGET_NS, |_: &mut ShardState| {
+      HELD.store(true, Ordering::Release);
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(OWNER_HOLD);
+    })
+    .unwrap();
+  let waiter = std::thread::spawn(move || holding.wait().unwrap());
+  while !HELD.load(Ordering::Acquire) {
+    std::thread::yield_now();
+  }
+  let edit = |work: VolumeId, path: &str| RequestBody::Edit {
+    work,
+    path: path.to_owned(),
+    at: 0,
+    delete_len: 4,
+    bytes: b"AAAA".to_vec(),
+  };
+  let first = client.begin(&edit(first_work, "first")).unwrap();
+  let second = client.begin(&edit(second_work, "second")).unwrap();
+  waiter.join().unwrap();
+  assert_eq!(reply_of(&mut client, first), ReplyBody::Edited);
+  assert_eq!(reply_of(&mut client, second), ReplyBody::Edited);
+  let peak = daemon
+    .observation(
+      Some(daemon.shards()[usize::from(partition)]),
+      OBSERVE_BUDGET_NS,
+      |state: &mut ShardState| state.refusals.get(BATCHES_OUT_PEAK).copied().unwrap_or(0),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+  assert!(
+    peak >= 2,
+    "the works' shard had {peak} batch(es) out to the owner at most: the second ask waited for the first's answer"
+  );
   drop(client);
   daemon.stop();
 }

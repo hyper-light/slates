@@ -155,6 +155,49 @@ pub enum DriftKind {
   TypeChanged,
 }
 
+/// One range of a base entry as the disk holds it now ([`Overlay::read_base_range`]; §4.4 `read_base`,
+/// A-267): the bytes, the file's size, and a stamp of its fingerprint, so a reader joining ranges knows each is of one
+/// state of the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseRange {
+  /// The bytes from the range's offset: as many as asked, fewer at the file's end, none past it.
+  pub bytes: Vec<u8>,
+  /// The file's size when the range was read.
+  pub total: u64,
+  /// The file's fingerprint when the range was read, folded to a word (its device, inode number, size, times and
+  /// birth): a file changed or replaced between two ranges stamps them differently.
+  pub stamp: u64,
+}
+
+/// One entry of a page of an overlay's drift ([`Overlay::drift_page`]; §4.4 `status`, A-267): as `status` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriftPageEntry {
+  /// A witnessed entry whose disk no longer matches its witness, as recorded.
+  Drifted {
+    /// The entry, by path.
+    path: String,
+    /// What the disk did to it.
+    kind: DriftKind,
+  },
+  /// A witnessed entry whose re-check the host refused now: not known to match.
+  Unverified {
+    /// The entry, by path.
+    path: String,
+    /// The host's refusal.
+    refusal: VfsError,
+  },
+}
+
+/// A page of an overlay's drift ([`Overlay::drift_page`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriftPageRead {
+  /// The inodes found drifted or unverified, in inode order, each with its entries as `status` lists them: an entry
+  /// recorded drifted whose re-check the host refuses now is in both of `status`'s lists, so it is both here.
+  pub entries: Vec<(InodeNo, Vec<DriftPageEntry>)>,
+  /// The last inode the page visited, when inodes remain past it to visit; `None` once the walk is done.
+  pub next: Option<InodeNo>,
+}
+
 /// What `status` reports for an overlay volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseStatus {
@@ -783,6 +826,24 @@ fn untouched_merged_dir(store: &Store, dir: Handle<DirNode>) -> bool {
     .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
 }
 
+/// A fingerprint folded to a word ([`BaseRange::stamp`]): BLAKE3 over the fields a change or a replacement of the file
+/// moves (its device, inode number, size, modification, change and birth times), its first eight bytes.
+fn fingerprint_stamp(fp: &Fingerprint) -> u64 {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&fp.dev.to_le_bytes());
+  hasher.update(&fp.ino.to_le_bytes());
+  hasher.update(&fp.size.to_le_bytes());
+  hasher.update(&fp.mtime_ns.to_le_bytes());
+  hasher.update(&fp.ctime_ns.to_le_bytes());
+  hasher.update(&fp.birth_ns.to_le_bytes());
+  let digest = hasher.finalize();
+  let mut word = [0u8; 8];
+  for (to, from) in word.iter_mut().zip(digest.as_bytes()) {
+    *to = *from;
+  }
+  u64::from_le_bytes(word)
+}
+
 fn host_refusal(e: HostError) -> VfsError {
   match e {
     HostError::NotFound => VfsError::NotFound,
@@ -1104,7 +1165,11 @@ impl Volume {
 pub struct PinWalk {
   dirs: Vec<String>,
   files: Vec<InodeNo>,
+  /// A capture's base links, whose targets become the volume's own (none for a pin, which leaves links alone).
+  links: Vec<InodeNo>,
   pinned: usize,
+  /// Whether the walk captures the base (§4.15 `capture_base`, A-291) rather than pins it.
+  capture: bool,
 }
 
 impl PinWalk {
@@ -1116,7 +1181,20 @@ impl PinWalk {
     PinWalk {
       dirs,
       files: Vec::new(),
+      links: Vec::new(),
       pinned: 0,
+      capture: false,
+    }
+  }
+
+  /// A capture of the whole base (§4.15 `capture_base`, A-291): every directory listed, every file's bytes made the
+  /// volume's own whatever its size ([`Overlay::capture_file`]) and every link's target too, so a snapshot taken after
+  /// it holds no base-backed body: its archive covers the whole tree, and a clone of it needs no base directory. Where a
+  /// pin keeps a large file on its descriptor with its windows held, a capture reads it whole; that is its cost.
+  pub fn capture() -> PinWalk {
+    PinWalk {
+      capture: true,
+      ..PinWalk::new(None)
     }
   }
 
@@ -2627,27 +2705,7 @@ impl Overlay<'_> {
       // The small class: the bytes come in whole and the body becomes plain content.
       self.host.close_file(file);
       self.plane()?.descriptors.remove(&no);
-      let handle = self.vol.make_current_inode(store, no)?;
-      let charge = self.vol.write_charge(store, no, 0, fp.size)?;
-      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
-      if !self
-        .vol
-        .quota
-        .admit(self.vol.bytes.total(), charge, &mut store.budget)
-      {
-        return Err(VfsError::NoSpace);
-      }
-      // The copy lands whole or not at all (T-1.1): checked for room before the base body is replaced.
-      let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      self.vol.write_room(store, 0, len)?;
-      let before = crate::volume::content_by_epoch(store, handle);
-      store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
-      self
-        .vol
-        .reconcile(before, crate::volume::EpochContent::Empty);
-      if !bytes.is_empty() {
-        self.vol.apply_write_whole(store, handle, 0, &bytes)?;
-      }
+      self.own_whole(store, no, &bytes)?;
     } else {
       self.plane()?.descriptors.insert(no, file);
     }
@@ -2655,6 +2713,57 @@ impl Overlay<'_> {
     self
       .vol
       .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
+    Ok(())
+  }
+
+  /// A captured file's bytes become the volume's own, whatever its size (§4.15 `capture_base`, A-291): it is copied up as
+  /// a write would copy it, and a large file the copy-up kept on its descriptor (pinned or not) is then read whole,
+  /// checked against its witness and made plain content, its descriptor closed. A source that changed under the capture
+  /// is refused `DigestUnverified` (the caller captures again once it is quiesced); a file already the volume's own is
+  /// left as it is.
+  fn capture_file(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    let (base_len, identity) = match &self.vol.inode(store, no)?.body {
+      Body::Base(base) => (base.base_len, base.witness.as_ref().map(|w| w.identity)),
+      _ => return Ok(()),
+    };
+    self.check_drift(store, no)?;
+    let file = self.descriptor(store, no)?;
+    let bytes = self.read_whole(file, base_len)?;
+    if identity != Some(*blake3::hash(&bytes).as_bytes()) {
+      return Err(VfsError::DigestUnverified);
+    }
+    self.own_whole(store, no, &bytes)?;
+    if let Some(file) = self.plane()?.descriptors.remove(&no) {
+      self.host.close_file(file);
+    }
+    Ok(())
+  }
+
+  /// Makes `bytes` the whole content of the base file `no`, its body plain content from here on: charged and admitted
+  /// before the base body is replaced, so the copy lands whole or not at all (T-1.1). The small class's copy-up and a
+  /// capture's large file both end here.
+  fn own_whole(&mut self, store: &mut Store, no: InodeNo, bytes: &[u8]) -> Result<(), VfsError> {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let handle = self.vol.make_current_inode(store, no)?;
+    let charge = self.vol.write_charge(store, no, 0, len)?;
+    store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
+    if !self
+      .vol
+      .quota
+      .admit(self.vol.bytes.total(), charge, &mut store.budget)
+    {
+      return Err(VfsError::NoSpace);
+    }
+    self.vol.write_room(store, 0, len)?;
+    let before = crate::volume::content_by_epoch(store, handle);
+    store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
+    self
+      .vol
+      .reconcile(before, crate::volume::EpochContent::Empty);
+    if !bytes.is_empty() {
+      self.vol.apply_write_whole(store, handle, 0, bytes)?;
+    }
     Ok(())
   }
 
@@ -3237,6 +3346,104 @@ impl Overlay<'_> {
     Ok(())
   }
 
+  /// One page of `status`'s drift (§4.4, A-267): visits, in inode order past `after`, every inode `status` would list —
+  /// those witnessed, re-checked now as `status` re-checks them, and those with drift recorded — and answers the ones
+  /// found drifted or unverified, until `limit` are found or `spent` says the page's slice of the shard's step is used.
+  /// It always visits one inode before it asks, so a walk moves. Where inodes remain, the page names the last it
+  /// visited, which the next page starts after. A walk of the pages re-checks each witnessed entry once; reading the
+  /// whole status each page re-checked every entry once a page and held the shard for all of them each time.
+  /// The watcher's hints are `status`'s to take: a walk follows a status.
+  pub fn drift_page(
+    &mut self,
+    store: &mut Store,
+    after: Option<InodeNo>,
+    limit: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<DriftPageRead, VfsError> {
+    if self.vol.base.is_none() {
+      return Err(VfsError::NotOverlay);
+    }
+    let mut entries = Vec::new();
+    let mut cursor = after;
+    loop {
+      let Some(no) = self.next_drift_candidate(cursor) else {
+        return Ok(DriftPageRead {
+          entries,
+          next: None,
+        });
+      };
+      cursor = Some(no);
+      let mut found = Vec::new();
+      if self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|b| b.witness(no).is_some())
+      {
+        match self.check_drift(store, no) {
+          // Drift found is recorded by the check itself and listed below.
+          Ok(()) | Err(VfsError::BaseDrift) => {}
+          Err(refusal) => found.push(DriftPageEntry::Unverified {
+            path: self.path_or_inode(store, no),
+            refusal,
+          }),
+        }
+      }
+      if let Some(kind) = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.drift.get(&no).copied())
+      {
+        found.push(DriftPageEntry::Drifted {
+          path: self.path_or_inode(store, no),
+          kind,
+        });
+      }
+      if !found.is_empty() {
+        entries.push((no, found));
+      }
+      if entries.len() >= limit || spent() {
+        let more = self.next_drift_candidate(cursor).is_some();
+        return Ok(DriftPageRead {
+          entries,
+          next: cursor.filter(|_| more),
+        });
+      }
+    }
+  }
+
+  /// The next inode past `after` that `status` would list: witnessed (to re-check), or with drift recorded.
+  fn next_drift_candidate(&self, after: Option<InodeNo>) -> Option<InodeNo> {
+    let plane = self.vol.base.as_ref()?;
+    let witnessed = plane
+      .witnesses
+      .iter_head_after(after.as_ref())
+      .next()
+      .map(|(no, _)| *no);
+    let from = match after {
+      Some(no) => std::ops::Bound::Excluded(no),
+      None => std::ops::Bound::Unbounded,
+    };
+    let drifted = plane
+      .drift
+      .range((from, std::ops::Bound::Unbounded))
+      .next()
+      .map(|(no, _)| *no);
+    match (witnessed, drifted) {
+      (Some(witnessed), Some(drifted)) => Some(witnessed.min(drifted)),
+      (witnessed, drifted) => witnessed.or(drifted),
+    }
+  }
+
+  /// An inode's path, or `inode N` where none names it, as `status` names it.
+  fn path_or_inode(&self, store: &Store, no: InodeNo) -> String {
+    self
+      .vol
+      .path_of_inode(store, no)
+      .unwrap_or_else(|| format!("inode {}", no.0))
+  }
+
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
   pub fn status(&mut self, store: &mut Store) -> Result<BaseStatus, VfsError> {
     self.process_hints(store)?;
@@ -3761,8 +3968,62 @@ impl Overlay<'_> {
 
   // ---------------------------------------------------------------- verbs
 
+  /// One range of `read_base` (§4.4, A-267): up to `max` bytes of the entry at `path` from `offset`, as the disk holds
+  /// it right now, with its size and its fingerprint's stamp ([`BaseRange`]); a read, never a write. The daemon answers
+  /// `read_base` a reply at a time from it, so neither a reply nor the daemon's memory holds more than a page of a base
+  /// file however large; reading the whole file in one call held all of it and answered past a reply's room with
+  /// "reply too large for the bulk area".
+  pub fn read_base_range(
+    &mut self,
+    path: &str,
+    offset: u64,
+    max: usize,
+  ) -> Result<BaseRange, VfsError> {
+    let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((name, dirs)) = parts.split_last() else {
+      return Err(VfsError::IsDirectory);
+    };
+    let mut opened = Vec::new();
+    let mut dir = root;
+    let result = (|| {
+      for d in dirs {
+        dir = self.host.open_dir(dir, d).map_err(host_refusal)?;
+        opened.push(dir);
+      }
+      let file = self.host.open_file(dir, name).map_err(host_refusal)?;
+      let ranged = self.host.fstat(file).map_err(host_refusal).and_then(|fp| {
+        let left = fp.size.saturating_sub(offset);
+        let len = usize::try_from(left).unwrap_or(usize::MAX).min(max);
+        let mut bytes = vec![0u8; len];
+        let mut done = 0usize;
+        while let Some(unread) = bytes.get_mut(done..).filter(|unread| !unread.is_empty()) {
+          let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+          let n = self.host.read_at(file, at, unread).map_err(host_refusal)?;
+          if n == 0 {
+            break;
+          }
+          done = done.saturating_add(n);
+        }
+        bytes.truncate(done);
+        Ok(BaseRange {
+          bytes,
+          total: fp.size,
+          stamp: fingerprint_stamp(&fp),
+        })
+      });
+      self.host.close_file(file);
+      ranged
+    })();
+    for d in opened {
+      self.host.close_dir(d);
+    }
+    result
+  }
+
   /// `read_base`: the entry as the disk holds it right now, through the base's directories by
-  /// name; a read, never a write.
+  /// name; a read, never a write. The whole file in memory: the volume core's own callers and its tests; the daemon
+  /// answers `read_base` a range at a time ([`Self::read_base_range`]).
   pub fn read_base(&mut self, path: &str) -> Result<Vec<u8>, VfsError> {
     let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -3901,9 +4162,19 @@ impl Overlay<'_> {
     walk: &mut PinWalk,
   ) -> Result<Option<usize>, VfsError> {
     if let Some(no) = walk.files.pop() {
+      if walk.capture {
+        self.capture_file(store, no)?;
+      } else {
+        self.copy_up(store, no, CopyUp::Content)?;
+        let size = self.vol.inode(store, no)?.attrs.size;
+        self.pin_windows(store, no, 0, size)?;
+      }
+      walk.pinned = walk.pinned.saturating_add(1);
+      return Ok(None);
+    }
+    if let Some(no) = walk.links.pop() {
+      // A captured link's target becomes the volume's own: its copy-up reads nothing from the disk.
       self.copy_up(store, no, CopyUp::Content)?;
-      let size = self.vol.inode(store, no)?.attrs.size;
-      self.pin_windows(store, no, 0, size)?;
       walk.pinned = walk.pinned.saturating_add(1);
       return Ok(None);
     }
@@ -3921,6 +4192,7 @@ impl Overlay<'_> {
           match kind {
             Kind::Dir => walk.dirs.push(child_path(&path, &name)),
             Kind::File => walk.files.push(no),
+            Kind::Symlink if walk.capture => walk.links.push(no),
             Kind::Symlink | Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {}
           }
         }

@@ -176,8 +176,17 @@ const TAKEOVER_RECLAIMED: &str = "fleet.takeover.reclaimed";
 
 /// The status count under which a holder records a copy it kept though its line ended at a completed takeover, or its
 /// successor confirmed with this holder outside its placement: the takeover never asked this holder (it was no survivor
-/// of it), so nothing shows its copy adopted (A-309). Format: a refusal name in the daemon's status report.
+/// of it), and nothing shows the object recovered within tolerance (past it, or judged by a completion record, which
+/// keeps no neighbourhood), so its copy may be the only one of a record no round learned (A-309, A-341). Format: a
+/// refusal name in the daemon's status report.
 const TAKEOVER_KEPT_UNASKED: &str = "fleet.takeover.kept_unasked";
+
+/// The status count under which a holder records a copy the takeover never asked it for, let go as a stale one is
+/// ([`let_go_stale`]) because its successor confirmed with this holder outside its placement and the kept retirement
+/// shows the object's settled cohorts within tolerance (`RegionalConfiguration::within_tolerance`): the round heard a
+/// recovery quorum of each, and every record committed for the object is on `f + 1` of each, so it learned one at least
+/// as new as this copy (A-341). Format: a refusal name in the daemon's status report.
+const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 
 /// The status count under which a holder records a stale copy it kept because it still holds the copy's content
 /// (A-335): content its records name it for, or content placed for a sequence ahead of them, which its retention rule
@@ -462,7 +471,8 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///   took part in that takeover (`RegionalConfiguration::settled_for`), as is one whose successor has confirmed its
 ///   share while this holder, asked in that round, is outside the successor's placement (the successor's adoption never
 ///   reaches it); a stale copy is dropped unless this holder still holds its content, which the successor may still
-///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309);
+///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309), unless the
+///   kept retirement shows the object's settled cohorts within tolerance, when it goes the same way (A-341);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   let regional = state.council.configuration().clone();
@@ -474,6 +484,10 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
     if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
       match stale_after_confirmation(state, &regional, object, owner, local) {
         Confirmation::Stale => let_go_stale(state, object),
+        Confirmation::Covered => {
+          state.count(TAKEOVER_UNASKED_COVERED, 1);
+          let_go_stale(state, object);
+        }
         Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
         Confirmation::None => {}
       }
@@ -510,6 +524,8 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
       }
     }
   }
+  // A copy the configuration moved to another member (A-291) follows its move.
+  crate::moves::follow_moved_objects(state);
 }
 
 /// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
@@ -534,7 +550,10 @@ fn let_go_stale(state: &mut ShardState, object: ObjectId) {
 /// was asked in that round (one of its survivors, A-309), so `owner` learned this copy and adopted the object, and this
 /// holder is outside `owner`'s placement of it, so the adoption never reaches this copy. A holder the round never asked
 /// (one an earlier neighbourhood of the retired host reached) keeps its copy: `owner` may have confirmed without ever
-/// learning the object (`crates/db/tests/lineage_model.rs` found it). The confirmation is read from the kept retirement
+/// learning the object (`crates/db/tests/lineage_model.rs` found it), unless the kept retirement shows the object's
+/// settled cohorts within tolerance, so the round learned a record at least as new (A-341; past tolerance, or judged by
+/// a completion record alone, the model found a history that let go the last copy of a record placed at `f + 1` after
+/// one failure). The confirmation is read from the kept retirement
 /// or, once the takeover completed, from its completion record (A-309): the last confirmation drops the retirement in
 /// the very version that records it, and judged by the kept retirement alone a holder outside the placement never saw
 /// that confirmation and kept its stale copy for good.
@@ -573,6 +592,7 @@ fn stale_after_confirmation(
       .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
   match (outside, asked) {
     (true, true) => Confirmation::Stale,
+    (true, false) if regional.within_tolerance(departed.owner, object) => Confirmation::Covered,
     (true, false) => Confirmation::Unasked,
     (false, _) => Confirmation::None,
   }
@@ -582,8 +602,12 @@ fn stale_after_confirmation(
 enum Confirmation {
   /// The successor confirmed its share and this holder, outside its placement, was asked in that round: stale.
   Stale,
-  /// The successor confirmed and this holder is outside its placement, but the round never asked it: kept, counted
-  /// [`TAKEOVER_KEPT_UNASKED`] (A-309).
+  /// The successor confirmed and this holder is outside its placement, and the round never asked it, but the kept
+  /// retirement shows the object's settled cohorts within tolerance: stale too, counted [`TAKEOVER_UNASKED_COVERED`]
+  /// (A-341).
+  Covered,
+  /// The successor confirmed and this holder is outside its placement, but the round never asked it and nothing shows
+  /// the object recovered within tolerance: kept, counted [`TAKEOVER_KEPT_UNASKED`] (A-309).
   Unasked,
   /// No confirmation that judges the copy: none yet, or this holder is within the successor's placement.
   None,
@@ -607,12 +631,20 @@ pub(crate) fn forget_owner_on_every_shard(state: &mut ShardState, object: Object
   }
 }
 
+/// Drops this holder's stale copy of `object` after a takeover ([`drop_copy`]). Reached only through [`let_go_stale`],
+/// once the retention rule left no whole content for the object here (A-335). Counted [`TAKEOVER_RECLAIMED`].
+fn reclaim(state: &mut ShardState, object: ObjectId) {
+  drop_copy(state, object);
+  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
-/// reclaimed with its records, never kept for a head this holder no longer backs). Reached only through
-/// [`let_go_stale`], once the retention rule left no whole content for the object here (A-335). Counted
-/// [`TAKEOVER_RECLAIMED`].
-fn reclaim(state: &mut ShardState, object: ObjectId) {
+/// reclaimed with its records, never kept for a head this holder no longer backs). A takeover's reclaim ([`reclaim`])
+/// and a planned move's (A-291, `crate::moves::follow_moved_objects`, once the move's new owner has sealed the volume
+/// under its own placement, which leaves this holder out) both end a copy so.
+pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
   state.held_content.forget_object(
     &mut crate::content_holder::hold_space(&mut state.store),
@@ -621,8 +653,6 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
-  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
-  *count = count.saturating_add(1);
 }
 
 /// Answers one page of a successor's takeover round on [`TAKEOVER_STREAM`] (§4.8): after checking the asker is
@@ -1803,6 +1833,33 @@ async fn adopt(
   Some(dispatch)
 }
 
+/// Adopts `object` as [`adopt`] does, at `epoch`: a moved volume's adoption (A-291, `crate::moves`), whose round over
+/// the move's cohort is no takeover's, names its own epoch, and names this node as `departed` (no takeover round is kept
+/// for it). Returns the dispatch to settle and whether the record was placed.
+pub(crate) async fn adopt_at(
+  departed: HostId,
+  object: ObjectId,
+  adopted: Accepted,
+  epoch: HostEpoch,
+  local: HostId,
+  budget: CommitBudget,
+) -> (Option<Dispatch>, bool) {
+  let Some((dispatch, record, placement)) =
+    commit_adopted_at(object, adopted, epoch, local, budget).await
+  else {
+    return (None, false);
+  };
+  let placed = placement.is_ok();
+  state::with_state(|s| match placement {
+    Ok(placement) => record_adoption(s, departed, object, &record, placement, local),
+    Err(unplaced_cause) => {
+      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+      s.count(unplaced_cause, 1);
+    }
+  });
+  (Some(dispatch), placed)
+}
+
 /// Re-commits `adopted`, a record of `object` the round of `departed`'s takeover learned, under this node (`local`) at
 /// the round's epoch and the configuration's generation, on the object's placement (phase two of the takeover: the
 /// record accepted again under the new epoch, BUG-12), and keeps the acceptor that holds it. The dispatch whose
@@ -1816,7 +1873,21 @@ async fn commit_adopted(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
-  let (mut acceptor, shape, quorum, record) = state::with_state(|s| {
+  let epoch =
+    state::with_state(|s| s.host_takeovers.get(&departed).map(|take| take.epoch)).flatten()?;
+  commit_adopted_at(object, adopted, epoch, local, budget).await
+}
+
+/// [`commit_adopted`] at `epoch`, the round's: a takeover's round names its own, and a moved volume's adoption (A-291,
+/// `crate::moves`) the epoch of its round over the move's cohort, which no takeover round is kept for.
+async fn commit_adopted_at(
+  object: ObjectId,
+  adopted: Accepted,
+  epoch: HostEpoch,
+  local: HostId,
+  budget: CommitBudget,
+) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
+  let (mut acceptor, shape, quorum, record, replaces) = state::with_state(|s| {
     let config = s.fleet.configuration();
     let generation = config.version;
     let quorum = config.quorum;
@@ -1824,7 +1895,6 @@ async fn commit_adopted(
       acked: Vec::new(),
       ..config.place(object)
     };
-    let epoch = s.host_takeovers.get(&departed)?.epoch;
     let mut acceptor = s.holder_records.remove(&object).unwrap_or_else(|| {
       Acceptor::new(
         local,
@@ -1838,6 +1908,10 @@ async fn commit_adopted(
       generation,
       owner: local,
     });
+    // This node holds another value at the adopted position, a lower epoch's that never committed (A-373).
+    let replaces = acceptor
+      .value_at(object, adopted.sequence)
+      .is_some_and(|held| held != adopted.value.as_slice());
     let record = Record {
       owner: local,
       object,
@@ -1846,7 +1920,7 @@ async fn commit_adopted(
       generation,
       value: adopted.value,
     };
-    Some((acceptor, shape, quorum, record))
+    Some((acceptor, shape, quorum, record, replaces))
   })
   .flatten()?;
   let holders = take_sessions("fleet.lent_to.adopt", |host| {
@@ -1905,8 +1979,15 @@ async fn commit_adopted(
     }
     Err(_) => Err(unplaced_cause),
   };
+  // The local acceptance replaced that value: a replica of the green built over it follows (A-373), so the adoption's
+  // engine is advanced from the version before, never served from a value the ledger no longer holds.
+  let replaced =
+    replaces && acceptor.value_at(object, record.sequence) == Some(record.value.as_slice());
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
+    if replaced {
+      crate::merge_origin::rewind_past_replaced(s, &record);
+    }
   });
   Some((dispatch, record, placement))
 }
@@ -2642,6 +2723,7 @@ mod tests {
         },
         completion: None,
         signature: None,
+        folded_below: 0,
       };
       state.pending_green_materializations.insert(
         green,

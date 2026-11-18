@@ -715,15 +715,18 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 2 since A-309, which put the completion records (`completed`)
+/// Format: the regional configuration's layout version: 4 since A-291's planned move, which gave each moved-object
+/// exception the member a move took it from and the cohort its records sit in (a flag, then, when it is set, the host
+/// and the cohort's hosts), after its owner and version. Layout 3 (A-380) appended the council's recorded voters
+/// (`voters`, a host set) after the moved-object exceptions. Layout 2 (A-309) put the completion records (`completed`)
 /// where layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence
-/// byte, then its settled form, after its unconfirmed hosts); the moved-object exceptions, `moved`, stay last. Layout 1
-/// was the first versioned layout. A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than
-/// read another layout's fields by position: before the version, a field appended to the layout was refused only by the
-/// accident of a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have
-/// been read with a field defaulted (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was
-/// dropped and no retirement is kept, which only the version tells apart.
-const REGIONAL_LAYOUT: u32 = 2;
+/// byte, then its settled form, after its unconfirmed hosts). Layout 1 was the first versioned layout. A decoder
+/// refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read another layout's fields by position:
+/// before the version, a field appended to the layout was refused only by the accident of a length (`Truncated` one
+/// way, `LengthMismatch` the other), and a change that kept the length would have been read with a field defaulted
+/// (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was dropped and no retirement is
+/// kept, and A-291's when no object is moved, which only the version tells apart.
+const REGIONAL_LAYOUT: u32 = 4;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
@@ -829,11 +832,20 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     out.extend_from_slice(&object.0);
     put_u64(&mut out, moved.owner.0);
     put_u64(&mut out, moved.version);
+    // The member a move took it from and the cohort its records sit in (A-291): a flag, then, when it is set, the host
+    // and the cohort's hosts.
+    out.push(u8::from(moved.from.is_some()));
+    if let Some(from) = moved.from {
+      put_u64(&mut out, from.0);
+      encode_hosts(&mut out, &moved.cohort);
+    }
   }
+  encode_hosts(&mut out, &config.voters);
   out
 }
 
-/// Decodes the moved-object exceptions (count, then each `(object, owner, version)`), bounding the count.
+/// Decodes the moved-object exceptions (count, then each `(object, owner, version, from)`, `from` a flag and, when the
+/// flag is set, the host and the move's cohort), bounding every count.
 fn decode_moved(
   bytes: &[u8],
 ) -> Result<(std::collections::BTreeMap<ObjectId, Moved>, &[u8]), RaftWireError> {
@@ -843,11 +855,21 @@ fn decode_moved(
     let (object, tail) = take_object(rest)?;
     let (owner, tail) = take_u64(tail)?;
     let (version, tail) = take_u64(tail)?;
+    let (moved_from, tail) = take_bool(tail)?;
+    let (from, cohort, tail) = if moved_from {
+      let (from, tail) = take_u64(tail)?;
+      let (cohort, tail) = decode_hosts(tail)?;
+      (Some(HostId(from)), cohort, tail)
+    } else {
+      (None, Vec::new(), tail)
+    };
     moved.insert(
       object,
       Moved {
         owner: HostId(owner),
         version,
+        from,
+        cohort,
       },
     );
     rest = tail;
@@ -997,6 +1019,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (adoptions, rest) = decode_adoptions(rest)?;
   let (completed, rest) = decode_completed(rest)?;
   let (moved, rest) = decode_moved(rest)?;
+  let (voters, rest) = decode_hosts(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
     version,
@@ -1011,6 +1034,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     adoptions,
     completed,
     moved,
+    voters,
   })
 }
 
@@ -1891,13 +1915,16 @@ mod tests {
     ));
     expect_round_trip(&config, "round-trip is identity with an adoption in flight");
     // A moved object's exception (§4.8 "Authority scope") survives it too.
-    assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3)));
+    assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3), &[B, A, HostId(3)]));
     assert_eq!(config.moved.len(), 1);
     expect_round_trip(&config, "round-trip is identity with a moved object");
     // A completed takeover's record (A-309) survives it too: every survivor of every kept retirement confirms.
     complete_every_retirement(&mut config);
     assert!(!config.completed.is_empty());
     expect_round_trip(&config, "round-trip is identity with completion records");
+    // The council's recorded voters (A-380) survive it too.
+    assert!(config.seat(&[HostId(3), B]));
+    expect_round_trip(&config, "round-trip is identity with recorded voters");
   }
 
   /// Confirms every survivor's share of every retirement `config` keeps, so each completes into a record (A-309).
@@ -1973,8 +2000,9 @@ mod tests {
       .unwrap();
     assert!(config.moved.is_empty());
     let bytes = encode_regional_configuration(&config);
-    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count.
-    let tail = confirmed * size_of::<u64>() + size_of::<u32>();
+    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count
+    // and the recorded voters' count (none of either here, A-380).
+    let tail = confirmed * size_of::<u64>() + 2 * size_of::<u32>();
     let count_at = bytes.len() - tail - size_of::<u32>();
     let mut lying = bytes.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -2003,11 +2031,13 @@ mod tests {
       3,
       false,
     );
-    assert!(config.move_object(ObjectId::new(A, 5), A, B));
+    assert!(config.move_object(ObjectId::new(A, 5), A, B, &[A]));
     let bytes = encode_regional_configuration(&config);
-    // The exceptions are last: a count, then one entry of an object id and two words.
-    let entry = OBJECT_BYTES + 2 * size_of::<u64>();
-    let count_at = bytes.len() - entry - size_of::<u32>();
+    // The exceptions come before the recorded voters' count alone (none here, A-380): a count, then one entry of an
+    // object id, two words, the `from` flag, its word and the cohort (a count and one host).
+    let voters = size_of::<u32>();
+    let entry = OBJECT_BYTES + 4 * size_of::<u64>() + 1 + size_of::<u32>();
+    let count_at = bytes.len() - voters - entry - size_of::<u32>();
     let mut lying = bytes.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(
@@ -2015,12 +2045,21 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
-    for cut in 1..=entry {
+    for cut in 1..=voters + entry {
       assert!(
         decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
         "a configuration cut {cut} bytes short is refused"
       );
     }
+    // The `from` flag is a flag: any other byte is refused by name.
+    let flag_at = bytes.len() - voters - 2 * size_of::<u64>() - size_of::<u32>() - 1;
+    let mut forged = bytes.clone();
+    forged[flag_at] = 2;
+    assert_eq!(
+      decode_regional_configuration(&forged),
+      Err(RaftWireError::BadFlag { flag: 2 }),
+      "a forged `from` flag is refused"
+    );
   }
 
   /// A retirement whose confirmed-host count lies — more ids than the bytes back — is refused before
@@ -2039,9 +2078,9 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     // The last retirement ends with its confirmed ids (a count, none here), its unconfirmed ids (a count, none here)
     // and its current neighbourhood's presence byte (none here, A-309): make the confirmed count claim every id there
-    // is. The adoptions' count, the completion records' count and the moved objects' count (none of each here) follow
-    // the last retirement, in that order.
-    let tail = 5 * size_of::<u32>() + 1;
+    // is. The adoptions' count, the completion records' count, the moved objects' count and the recorded voters' count
+    // (none of each here, the last A-380's) follow the last retirement, in that order.
+    let tail = 6 * size_of::<u32>() + 1;
     let confirmed_count_at = bytes.len() - tail;
     let mut lying = bytes.clone();
     lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]
@@ -2131,10 +2170,10 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x02\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x04\x00\x00\x00".as_slice()),
         Some(b"RTCF\x01\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 2 since A-309"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 4 since A-291, which gave each moved object its member left and cohort (3 since A-380, 2 since A-309)"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));

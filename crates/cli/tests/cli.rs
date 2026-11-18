@@ -1324,6 +1324,55 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   drop(anchor);
 }
 
+/// Shape: the volumes the paged-listing test creates through the CLI: about five listing pages' worth, at about 50 bytes
+/// a summary (`paged-NNNNN`, its id and counters) in a 4,096-byte reply chunk; past the 100 that one reply held.
+const PAGED_VOLUMES: usize = 400;
+
+/// §4.4 `list`, by use. Do: on a real anchor (two shards) create [`PAGED_VOLUMES`] volumes with `slates volume
+/// create`, then run `slates volume list` and `slates volume list --json`. Expect: both exit 0 and hold every volume
+/// exactly once. Before 2026-11-08 both were refused "reply too large for the bulk area" at 100 volumes (2,000 tried by
+/// hand: refused at every count from 100).
+#[test]
+fn volume_list_answers_a_listing_longer_than_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the paged volume listing: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-paged-list-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let mut ids = Vec::new();
+  for n in 0..PAGED_VOLUMES {
+    let name = format!("paged-{n:05}");
+    let (code, out, err) = run(&instance, &["volume", "create", &name, "--bounded", "1MiB"]);
+    assert_eq!(code, 0, "create {name}: {err}");
+    ids.push(value_of(&out, "id"));
+  }
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "volume list: {err}");
+  for id in &ids {
+    assert_eq!(
+      out
+        .lines()
+        .filter(|line| line.starts_with(id.as_str()))
+        .count(),
+      1,
+      "volume {id} listed once"
+    );
+  }
+  let (code, out, err) = run(&instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "volume list --json: {err}");
+  for id in &ids {
+    assert_eq!(
+      out.matches(&format!("\"id\":\"{id}\"")).count(),
+      1,
+      "volume {id} in the JSON once"
+    );
+  }
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`
@@ -13055,6 +13104,167 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
 }
 
+/// A path under `root` exactly `bytes` long: components of at most 200 bytes, under the 255-byte name limit, so only
+/// the whole path's length is at stake.
+#[cfg(unix)]
+fn path_of_length(root: &str, bytes: usize) -> String {
+  let mut path = root.to_owned();
+  while path.len() < bytes {
+    let room = bytes - path.len() - 1;
+    path.push('/');
+    path.push_str(&"d".repeat(room.clamp(1, 200)));
+  }
+  assert_eq!(
+    path.len(),
+    bytes,
+    "a path of exactly {bytes} bytes under {root}"
+  );
+  path
+}
+
+/// §4.8, §4.4 `create` and `status` (A-263 on B9: the supervisor's bound on a recorded cause). A recovery cause names an
+/// overlay's base as recorded, so the base a volume records is bounded: the platform's path maximum, and no longer than
+/// the refusal every verb on an unrecovered volume answers holds whole (`slates_server::verbs::longest_recordable_base`).
+/// Do: create an overlay over a base of exactly that length, and try one a byte longer; snapshot the first, make its base
+/// unreadable to the daemon, and restart it in order. Expect: the longer base is refused `BaseUnavailable` before
+/// anything is made; the volume's `status` is refused `NotRecovered` naming `BaseUnavailable`, the whole base path and
+/// the host's refusal.
+#[cfg(unix)]
+#[test]
+fn the_longest_recorded_base_is_named_whole_by_status() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the longest recorded base: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-longbase-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-longbase"),
+  };
+  let longest = slates_server::verbs::longest_recordable_base();
+  let base = path_of_length(&scratch.path, longest);
+  shell(&format!("mkdir -p '{base}'"));
+  // Never made: it is refused before the daemon looks at the disk (on macOS no such directory can be made at all).
+  let longer = path_of_length(&scratch.path, longest + 1);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "too-long",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &longer,
+    ],
+  );
+  assert_ne!(code, 0, "a base past the bound is refused: {out}");
+  assert!(err.contains("BaseUnavailable"), "refused by kind: {err}");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "longest",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "a base of {longest} bytes is recorded: {err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("chmod 000 '{base}'"));
+  restart_in_order(&instance);
+  let (code, out, err) = run(&instance, &["status", &id]);
+  shell(&format!("chmod 755 '{base}'"));
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseUnavailable") && err.contains(&base),
+    "status names the {longest}-byte base whole, by kind: {err}"
+  );
+}
+
+/// Shape: the base files the drift test changes on disk after pinning: several replies' worth of drift.
+#[cfg(unix)]
+const CLI_DRIFTED: usize = 600;
+
+/// §4.4 `status`, A-267, by use. Do: overlay a host directory of 600 files, pin them, change every file on disk, and
+/// run `slates status ID --drift` until the drift is seen. Expect: it names all 600, once each, though the status reply
+/// carries only the first that fit; and `slates status ID` counts 600. Before, `--drift` printed the status's own list,
+/// and the text form counted only those.
+#[cfg(unix)]
+#[test]
+fn status_drift_names_every_drifted_entry_past_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping status --drift past one reply: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-drift-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-drift"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!(
+    "mkdir -p '{base}' && cd '{base}' && for n in $(seq -w 0 {}); do echo before > drifting-$n.txt; done",
+    CLI_DRIFTED - 1
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "drifting",
+      "--bounded",
+      "64MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["base", "pin", &id]);
+  assert_eq!(code, 0, "{err}");
+  shell(&format!(
+    "cd '{base}' && for f in drifting-*.txt; do echo 'after, and longer' > \"$f\"; done"
+  ));
+  let started = std::time::Instant::now();
+  let named = loop {
+    let (code, out, err) = run(&instance, &["status", &id, "--drift"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    if lines.len() >= CLI_DRIFTED || started.elapsed() > std::time::Duration::from_secs(30) {
+      break lines;
+    }
+    // A test waiting on the base's watcher between asks; the daemon is another process.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  };
+  assert_eq!(
+    named.len(),
+    CLI_DRIFTED,
+    "every drifted entry, once: {} named",
+    named.len()
+  );
+  let distinct: std::collections::BTreeSet<&String> = named.iter().collect();
+  assert_eq!(distinct.len(), CLI_DRIFTED, "each once");
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line == format!("drifted: {CLI_DRIFTED}")),
+    "the status counts every drifted entry: {out}"
+  );
+}
+
 /// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
 /// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
 /// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
@@ -13106,4 +13316,85 @@ fn assert_gone(instance: &str, id: &str) {
     err.contains("NotFound"),
     "the destroyed volume is not found: {err}"
   );
+}
+
+/// Shape: how long the hold flow leaves its held attachment with no verb: several of the bare term a laptop daemon gives a
+/// CLI attachment nothing renews (its failover delay there, the recovery budget, A-363 and A-384), so only the hold kept
+/// it, and long enough after the hold's end for any term to lapse.
+const HOLD_IDLE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A-384, the CLI's holder: `slates attach --hold` keeps a CLI attachment alive from its process, and its end lets the
+/// attachment lapse. Do: on an anchored daemon, create a volume; run `attach ID --write --hold` in the background and
+/// read the attachment it names; leave the attachment with no verb for [`HOLD_IDLE`]; write a file under it from another
+/// `slates` process; kill the holding process; wait [`HOLD_IDLE`] again; write under it once more. Expect the holding
+/// process still running before its kill, the first write accepted (the hold kept the attachment through several bare
+/// terms), and the last refused `AttachmentExpired` (exit 1: the process's end ended the renewals). Gated like the CLI
+/// flow (`SLATES_TEST_CLI=1`): an anchor, its daemon and a process per verb.
+#[test]
+fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
+  use std::io::BufRead;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the attach --hold flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-hold-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "held", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mut holder = slates()
+    .arg("--instance")
+    .arg(&instance)
+    .args(["attach", &id, "--write", "--hold"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let named = {
+    let stdout = holder.stdout.take().expect("the holder's output");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    lines.find_map(|line| {
+      line
+        .ok()
+        .and_then(|line| line.strip_prefix("attachment: ").map(str::to_owned))
+    })
+  };
+  let Some(attachment) = named else {
+    // The holder ended without naming one: what it said is the reason.
+    let output = holder.wait_with_output().unwrap();
+    panic!(
+      "the holder named no attachment: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+  };
+  #[allow(clippy::disallowed_methods)] // the held attachment with no verb, past several bare terms
+  std::thread::sleep(HOLD_IDLE);
+  let still_holding = holder.try_wait().unwrap().is_none();
+  let (written, _, written_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "held.txt"], b"held");
+  let _killed = holder.kill();
+  let _reaped = holder.wait();
+  #[allow(clippy::disallowed_methods)] // the hold ended: any term lapses
+  std::thread::sleep(HOLD_IDLE);
+  let (late, _, late_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "late.txt"], b"late");
+  drop(anchor);
+  assert!(
+    still_holding,
+    "the holding process was still running before its kill"
+  );
+  assert_eq!(
+    written, 0,
+    "the hold kept the attachment through several bare terms: {written_err}"
+  );
+  assert_eq!(
+    late, 1,
+    "the attachment lapsed once its holder ended: {late_err}"
+  );
+  assert!(late_err.contains("AttachmentExpired"), "{late_err}");
 }

@@ -410,10 +410,55 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       destination: destination.clone(),
     };
     return emit_attach(&mut client, *volume, *snapshot, *intent, form, request.json)
+      .map(|_attachment| ())
       .map_err(|e| failure_of(e, &request.instance));
+  }
+  if let Verb::Hold {
+    volume,
+    snapshot,
+    intent,
+  } = &request.verb
+  {
+    return hold(
+      &mut client,
+      &request.instance,
+      (*volume, *snapshot, *intent),
+      request.json,
+    )
+    .map_err(|e| failure_of(e, &request.instance));
   }
   let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
+}
+
+/// `slates attach VOLUME --hold` (A-384): attaches in the CLI's form and says so as `attach` does, then keeps the
+/// attachment alive from this process until it ends: a [`slates_client::Hold`] renews it at the cadence the daemon names,
+/// so other `slates` processes may name it however long they are idle. The process ending (an interrupt, a kill, any
+/// end) ends the renewals, and the attachment lapses at its holder's pace; a renewal the daemon refuses (the attachment
+/// detached elsewhere) ends the command with that refusal.
+fn hold(
+  client: &mut Client,
+  instance: &str,
+  (volume, snapshot, intent): (VolumeId, Option<SnapshotId>, Intent),
+  json: bool,
+) -> Result<(), ClientError> {
+  let attachment = emit_attach(
+    client,
+    volume,
+    snapshot,
+    intent,
+    AttachRequest::Termed,
+    json,
+  )?;
+  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?;
+  slates_machine::log_line!(
+    "slates attach --hold: holding attachment {attachment} (its term {} ms); it lapses once this process ends",
+    held.term_ns() / NANOS_PER_MILLISECOND
+  );
+  match held.wait_lost() {
+    Some(refused) => Err(refused),
+    None => Ok(()),
+  }
 }
 
 /// Serves the MCP tools (§4.12): the merge/volume/attach/base/land tools mapped onto the client SDK,
@@ -580,7 +625,8 @@ fn merge_edit(
 }
 
 /// `advance ATTACHMENT [VERSION]`: the version now pinned and the invalidated paths, as text lines or
-/// a JSON `{ "version", "invalidated" }`.
+/// a JSON `{ "version", "invalidated", "invalidated_elided" }`: past what one reply holds the paths are counted
+/// (A-267), and a line says how many more changed.
 fn merge_advance(
   client: &mut Client,
   attachment: u64,
@@ -591,12 +637,22 @@ fn merge_advance(
   if json {
     slates_machine::out_line!(
       "{}",
-      serde_json::json!({ "version": advanced.version, "invalidated": advanced.invalidated })
+      serde_json::json!({
+        "version": advanced.version,
+        "invalidated": advanced.invalidated,
+        "invalidated_elided": advanced.invalidated_elided,
+      })
     );
   } else {
     slates_machine::out_line!("version: {}", advanced.version);
     for path in advanced.invalidated {
       slates_machine::out_line!("{path}");
+    }
+    if advanced.invalidated_elided > 0 {
+      slates_machine::out_line!(
+        "and {} more paths changed: every path counts as invalidated",
+        advanced.invalidated_elided
+      );
     }
   }
   Ok(())
@@ -746,7 +802,9 @@ fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError
 }
 
 /// `status ID` / `volume stat ID`: the report as text, its drifted paths (`--drift`), or the whole
-/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form).
+/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form). `--drift` names every drifted
+/// entry: the report carries those that fit beside its other fields (A-267), so past them the paged read
+/// (`Client::drifted`) walks the rest; an entry too long for any page is counted on standard error.
 fn emit_status(
   client: &mut Client,
   volume: slates_client::VolumeId,
@@ -757,13 +815,44 @@ fn emit_status(
   if json {
     slates_machine::out_line!("{}", slates_mcp::status_json(&report));
   } else if drift {
-    for path in &report.drifted {
+    let (entries, oversized) = if report.drifted_elided > 0 {
+      let whole = client.drifted(volume)?;
+      let oversized = whole.oversized;
+      (drift_lines(whole), oversized)
+    } else {
+      (report.drifted, 0)
+    };
+    for path in &entries {
       slates_machine::out_line!("{path}");
+    }
+    if oversized > 0 {
+      slates_machine::log_line!(
+        "{oversized} drifted entries too long for a reply were passed over"
+      );
     }
   } else {
     slates_machine::out_text!("{}", status_text(&report));
   }
   Ok(())
+}
+
+/// A drift walked a page at a time, as text in path order: `PATH (KIND)` for an entry the disk changed, as a status
+/// names it, and `PATH (unverified)` for one whose re-check the host refused (a page carries no refusal's words).
+fn drift_lines(whole: slates_client::DriftedPage) -> Vec<String> {
+  let mut lines: Vec<(String, String)> = whole
+    .drifted
+    .into_iter()
+    .map(|entry| {
+      let line = format!("{} ({:?})", entry.path, entry.kind);
+      (entry.path, line)
+    })
+    .chain(whole.unverified.into_iter().map(|path| {
+      let line = format!("{path} (unverified)");
+      (path, line)
+    }))
+    .collect();
+  lines.sort();
+  lines.into_iter().map(|(_, line)| line).collect()
 }
 
 /// `volume create`: the new volume's id, as text (the id and its bridge path) or a JSON `{ "id" }`.
@@ -929,6 +1018,29 @@ fn emit_image_merge(
   Ok(())
 }
 
+/// `move ID --to HOST` (§4.10, A-291): one ask of the volume's owner to move it to the member. The move goes on between
+/// asks, so a caller asks again until it is done, as a client of the verb does. Prints `moving HOST` while it is under
+/// way and `moved HOST` once the configuration names the member, or `{ "moved": bool, "to": HOST }`.
+fn emit_moved(
+  client: &mut Client,
+  volume: VolumeId,
+  to: u64,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (moved, to) = match client.move_volume(volume, to)? {
+    slates_client::MoveState::Moving { to } => (false, to),
+    slates_client::MoveState::Moved { to } => (true, to),
+  };
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "moved": moved, "to": to }));
+  } else if moved {
+    slates_machine::out_line!("moved {to}");
+  } else {
+    slates_machine::out_line!("moving {to}");
+  }
+  Ok(())
+}
+
 /// `volume placed`: whether the scope is durable and the mirror's age, as two text lines or a JSON
 /// `{ "placed", "mirror_age_ns" }` (a null `mirror_age_ns` when there is no mirror).
 fn emit_placed(
@@ -962,8 +1074,9 @@ fn emit_attach(
   intent: Intent,
   form: AttachRequest,
   json: bool,
-) -> Result<(), ClientError> {
+) -> Result<u64, ClientError> {
   let attached = client.attach_with(volume, snapshot, intent, form)?;
+  let attachment = attached.attachment;
   if json {
     slates_machine::out_line!("{}", slates_mcp::attachment_json(&attached));
   } else {
@@ -978,7 +1091,7 @@ fn emit_attach(
     slates_machine::out_text!("{}", established_text(&attached.established));
     slates_machine::out_text!("{}", capability_text(&attached.capability));
   }
-  Ok(())
+  Ok(attachment)
 }
 
 /// What an attach established, as `key: value` lines; a container bind shows its verified source,
@@ -1086,8 +1199,8 @@ fn capability_text(c: &slates_client::AttachmentCapability) -> String {
   )
 }
 
-/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
-/// `changed-since` uses, so a script reads `.paths` from both).
+/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths", "paths_elided" }` (the key
+/// `changed-since` uses, so a script reads `.paths` from both): past what one reply holds they are counted (A-267).
 fn emit_rewitness(
   client: &mut Client,
   volume: VolumeId,
@@ -1096,10 +1209,16 @@ fn emit_rewitness(
 ) -> Result<(), ClientError> {
   let rewitnessed = client.rewitness(volume, paths)?;
   if json {
-    slates_machine::out_line!("{}", serde_json::json!({ "paths": rewitnessed }));
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "paths": rewitnessed.paths, "paths_elided": rewitnessed.paths_elided })
+    );
   } else {
-    for path in rewitnessed {
+    for path in rewitnessed.paths {
       slates_machine::out_line!("{path}");
+    }
+    if rewitnessed.paths_elided > 0 {
+      slates_machine::out_line!("and {} more paths rewitnessed", rewitnessed.paths_elided);
     }
   }
   Ok(())
@@ -1118,6 +1237,17 @@ fn emit_pin(
     slates_machine::out_line!("{}", serde_json::json!({ "pinned": pinned }));
   } else {
     slates_machine::out_line!("pinned: {pinned}");
+  }
+  Ok(())
+}
+
+/// `base capture`: the snapshot holding the overlay's whole base (A-291), as text or a JSON `{ "snapshot" }`.
+fn emit_captured(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
+  let snapshot = client.capture_base(volume)?;
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "snapshot": snapshot.value }));
+  } else {
+    slates_machine::out_line!("snapshot: {}", snapshot.value);
   }
   Ok(())
 }
@@ -1215,12 +1345,14 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => serde_json::json!({
       "grant_required": true,
       "landing": landing,
       "manifest": hex32(manifest),
       "summary": slates_mcp::landing_summary_json(summary),
       "conflicts": conflicts,
+      "conflicts_elided": conflicts_elided,
       "grant_with": format!("slates grant {landing}"),
     }),
   }
@@ -1305,8 +1437,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
-    // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
-    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } => {}
+    // `ClientError`), and `attach --hold` needs the instance for its own client, so [`run`] handles them before this
+    // dispatch; they never reach here.
+    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } | Verb::Hold { .. } => {}
     Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;
@@ -1362,7 +1495,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       snapshot,
       intent,
       form,
-    } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
+    } => {
+      emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?;
+    }
     Verb::Detach { attachment, volume } => {
       match volume {
         Some(volume) => client.detach_of(*volume, *attachment)?,
@@ -1390,6 +1525,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
     Verb::Pin { volume, paths } => emit_pin(client, *volume, paths.clone(), json)?,
+    Verb::CaptureBase { volume } => emit_captured(client, *volume, json)?,
     Verb::Land {
       volume,
       snapshot,
@@ -1421,6 +1557,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
         json,
       );
     }
+    Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }
@@ -2185,6 +2322,12 @@ fn print_landing(landing: slates_client::Landing) {
       for degradation in &outcome.degraded {
         slates_machine::out_line!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
+      if outcome.degraded_elided > 0 {
+        slates_machine::out_line!(
+          "and {} more degraded cells, past what one reply holds",
+          outcome.degraded_elided
+        );
+      }
       slates_machine::out_line!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
@@ -2192,6 +2335,7 @@ fn print_landing(landing: slates_client::Landing) {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       slates_machine::out_line!("landing: {landing}");
       slates_machine::out_line!("manifest: {}", hex32(&manifest));
@@ -2202,6 +2346,11 @@ fn print_landing(landing: slates_client::Landing) {
       slates_machine::out_line!("filtered_out: {}", summary.filtered_out);
       for path in &conflicts {
         slates_machine::out_line!("conflict: {path}");
+      }
+      if conflicts_elided > 0 {
+        slates_machine::out_line!(
+          "and {conflicts_elided} more conflicts, past what one reply holds"
+        );
       }
       slates_machine::out_line!("grant with: slates grant {landing}");
     }
@@ -2259,7 +2408,11 @@ fn status_text(report: &StatusReport) -> String {
     report.head.value,
     report.snapshots,
     report.watcher,
-    report.drifted.len()
+    // Every drifted entry, those the report carried and those it counted (A-267).
+    report
+      .drifted
+      .len()
+      .saturating_add(usize::try_from(report.drifted_elided).unwrap_or(usize::MAX))
   ) + &format!(
     "placed: {}\nmirror_age_ns: {}\nhost_epoch: {}\n",
     report.placed.region,

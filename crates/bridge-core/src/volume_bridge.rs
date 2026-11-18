@@ -94,6 +94,9 @@ pub struct VolumeBridge<'v> {
   /// Which attribute namespaces the transport reaches ([`crate::AttributeNamespaces`]): a host's mount's unless a guest
   /// kernel's route says otherwise ([`VolumeBridge::serving_a_guest`]; A-290).
   namespaces: crate::AttributeNamespaces,
+  /// Whether the transport's kernel sends the extended `fuse_setxattr_in` (A-378), as the transport last said
+  /// ([`Bridge::set_setxattr_ext`]): a guest connection that kept `FUSE_SETXATTR_EXT`.
+  setxattr_ext: bool,
 }
 
 /// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
@@ -313,6 +316,7 @@ impl<'v> VolumeBridge<'v> {
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
       namespaces: crate::AttributeNamespaces::Host,
+      setxattr_ext: false,
     }
   }
 
@@ -336,6 +340,7 @@ impl<'v> VolumeBridge<'v> {
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
       namespaces: crate::AttributeNamespaces::Host,
+      setxattr_ext: false,
     }
   }
 
@@ -365,6 +370,7 @@ impl<'v> VolumeBridge<'v> {
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
       namespaces: crate::AttributeNamespaces::Host,
+      setxattr_ext: false,
     }
   }
 
@@ -1640,6 +1646,14 @@ impl Bridge for VolumeBridge<'_> {
 
   fn attribute_namespaces(&mut self) -> crate::AttributeNamespaces {
     self.namespaces
+  }
+
+  fn setxattr_ext(&mut self) -> bool {
+    self.setxattr_ext
+  }
+
+  fn set_setxattr_ext(&mut self, extended: bool) {
+    self.setxattr_ext = extended;
   }
 
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {

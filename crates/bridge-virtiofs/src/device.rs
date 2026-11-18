@@ -564,6 +564,10 @@ pub struct Device {
   /// never applied over another path's newer write (`slates_bridge_fuse::guest_writeback`).
   writeback: slates_bridge_fuse::guest_writeback::GuestWriteback,
   negotiated: Option<InitNegotiation>,
+  /// Whether the `INIT` reply this device sent kept `FUSE_SETXATTR_EXT` (A-378): its guest's kernel then sends the
+  /// extended `fuse_setxattr_in`, which the bridge must parse. Read from the reply the shared dispatch wrote, the
+  /// connection's truth; [`Device::negotiated`] is a host's negotiation of the same request and keeps no guest flag.
+  setxattr_ext: bool,
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
   counters: DeviceCounters,
@@ -609,6 +613,7 @@ impl Device {
       reply: Vec::new(),
       writeback: slates_bridge_fuse::guest_writeback::GuestWriteback::new(),
       negotiated: None,
+      setxattr_ext: false,
       fault: None,
       awaiting: None,
       counters: DeviceCounters::default(),
@@ -858,6 +863,7 @@ impl Device {
     }
     self.queues = queues;
     self.negotiated = None;
+    self.setxattr_ext = false;
     self.fault = None;
     Ok(())
   }
@@ -865,6 +871,12 @@ impl Device {
   /// The FUSE connection the guest negotiated, once `FUSE_INIT` has been served.
   pub fn negotiated(&self) -> Option<InitNegotiation> {
     self.negotiated
+  }
+
+  /// Whether the guest's kernel sends the extended `fuse_setxattr_in` (A-378): its `INIT` reply kept
+  /// `FUSE_SETXATTR_EXT`.
+  pub fn setxattr_ext(&self) -> bool {
+    self.setxattr_ext
   }
 
   /// The fault that stopped the device, if one has.
@@ -1386,6 +1398,9 @@ impl Device {
       return Ok(ChainOutcome::IngestHeld);
     }
     self.observe(header.as_ref());
+    // The bridge parses `SETXATTR` in the form the guest's last `INIT` reply kept (A-378), told before every chain, since
+    // one pass can serve the `INIT` and a request after it.
+    bridge.set_setxattr_ext(self.setxattr_ext);
     // The guest unmounting (FUSE_DESTROY) with live DAX windows: each is unmapped and its backing let go, the guest's
     // stores through its maps ingested while the unmount was held (§4.6 terminal teardown).
     #[cfg(unix)]
@@ -1466,6 +1481,14 @@ impl Device {
         .map(|h| ReplyHeader::write_error(h.unique, EIO, &mut self.reply).unwrap_or(0))
         .unwrap_or(0);
       self.counters.replies_truncated = self.counters.replies_truncated.saturating_add(1);
+    }
+    // The form of `SETXATTR` the guest's kernel sends from now on, as the `INIT` reply it reads kept it (A-378).
+    if matches!(opcode, Some(Opcode::Init)) {
+      self.setxattr_ext = self
+        .reply
+        .get(OUT_HEADER_LEN..written)
+        .and_then(slates_bridge_fuse::init::kept_flags)
+        .is_some_and(|kept| kept & slates_bridge_fuse::abi::flags::SETXATTR_EXT != 0);
     }
     let reply = self.reply.get(..written).unwrap_or(&[]);
     if let Err(e) = scatter(memory, &chain.writable, reply) {

@@ -25,8 +25,8 @@
 //! volume's trusted signers ([`Instance::set_signers`]).
 
 use slates_client::{
-  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, SignedLanding,
-  Submitted, VhostUserDevice,
+  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, Rewitnessed, ShardsStream,
+  SignedLanding, Submitted, VhostUserDevice,
 };
 use slates_ipc::protocol::{
   DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
@@ -38,7 +38,8 @@ use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::observe::{AuditRecord, GrantRecord, audit_of, grant_of};
 use crate::outcome::{
   LandOutcome, LandingApproval, LandingConflict, MergeApproval, MergeConflict, MergeConflicts,
-  MergeOutcome, MergeRecord, RebaseOutcome, Work, merge_class_of, report_of, summary_of,
+  MergeOutcome, MergeRecord, MoveProgress, RebaseOutcome, Work, merge_class_of, report_of,
+  summary_of,
 };
 use crate::policy::{PolicyRefusal, PolicySubject, WritePolicy};
 use crate::signed::{MergeStatement, TrustedSigner, Verification, WorkSignature};
@@ -261,6 +262,21 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
+  /// Captures an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291), its id: every
+  /// file's bytes and every link's target become the volume's own, so a clone of the snapshot
+  /// (`VolumeSpec::clone_of`) needs no base directory, survives its runner's loss and moves between fleet members
+  /// ([`Instance::move_volume`]). The host asserts nothing writes the folder while the capture runs (kiln: a commit's
+  /// tree checked out where nothing else writes); a file that changed while it was read is refused `Error::Retry`
+  /// (`RetryCause::ChangedWhileRead`) and a folder that moved under the capture [`crate::Invalid::LiveBase`], and the
+  /// capture may be asked again. It reads the whole folder, so it takes as long as that does; a volume that is not an
+  /// overlay is refused [`crate::Unsupported::Feature`].
+  pub fn capture_base(&mut self, volume: VolumeId) -> Result<SnapshotId, Error> {
+    self
+      .client
+      .capture_base(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
+  }
+
   /// Destroys a snapshot, returning what only it held to the shard; refused while a clone pins it.
   pub fn destroy_snapshot(&mut self, volume: VolumeId, snapshot: SnapshotId) -> Result<(), Error> {
     self
@@ -278,7 +294,8 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
-  /// The caller's volumes. The daemon answers them in one reply today; a paged listing is owed (GAPS, A-299).
+  /// The caller's volumes, in name order: every one, walked a page at a time (A-263; [`Instance::list_page`] reads one
+  /// page, for a consumer that shows them a screen at a time).
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, Error> {
     self.client.list().map_err(|e| self.error(e))
   }
@@ -295,12 +312,41 @@ impl Instance {
 
   /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
   /// happened — landing it would conflict — and each whose re-check the host refused now. `None` for a volume with no
-  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now.
+  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now. Every entry: what a status
+  /// could not carry is read a page at a time (A-267, [`Instance::drift_page`]), and [`DriftReport::elided`] then
+  /// counts only the entries too long for any reply.
   pub fn drift(&mut self, volume: VolumeId) -> Result<Option<DriftReport>, Error> {
-    match self.status(volume)?.base {
-      None => Ok(None),
-      Some(BaseState::Read(report)) => Ok(Some(report)),
-      Some(BaseState::Unreadable) => Err(Error::Host(crate::error::HostFault::BaseUnreadable)),
+    let report = match self.status(volume)?.base {
+      None => return Ok(None),
+      Some(BaseState::Read(report)) => report,
+      Some(BaseState::Unreadable) => {
+        return Err(Error::Host(crate::error::HostFault::BaseUnreadable));
+      }
+    };
+    if report.elided == 0 {
+      return Ok(Some(report));
+    }
+    let mut whole = DriftReport {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      watcher: report.watcher,
+      elided: 0,
+    };
+    let mut after = None;
+    loop {
+      let page = self.drift_page(volume, after)?;
+      whole.drifted.extend(page.drifted);
+      whole.unverified.extend(page.unverified);
+      whole.elided = whole.elided.saturating_add(page.oversized);
+      match page.next {
+        None => {
+          // The pages come in inode order; the report names its entries in path order, as a status does.
+          whole.drifted.sort_by(|a, b| a.path.cmp(&b.path));
+          whole.unverified.sort();
+          return Ok(Some(whole));
+        }
+        next => after = next,
+      }
     }
   }
 
@@ -320,12 +366,13 @@ impl Instance {
   }
 
   /// Takes the disk's present state of drifted entries as their new base (all of them when `paths` is `None`, §4.15
-  /// `rewitness`); the paths done. The volume's own changes to them stay its own.
+  /// `rewitness`); the paths done, as many as one reply holds, and the count of the rest (A-267), which were taken
+  /// too. The volume's own changes to them stay its own.
   pub fn rewitness(
     &mut self,
     volume: VolumeId,
     paths: Option<Vec<String>>,
-  ) -> Result<Vec<String>, Error> {
+  ) -> Result<Rewitnessed, Error> {
     self
       .client
       .rewitness(volume, paths)
@@ -543,6 +590,7 @@ impl Instance {
             manifest,
             summary,
             conflicts,
+            conflicts_elided,
           },
         verification,
         statement: Some(statement),
@@ -556,7 +604,8 @@ impl Instance {
           statement,
           signature: signature.cloned(),
         };
-        if conflicts.is_empty() {
+        // A reply carries the conflicts one reply holds and counts the rest (A-267): clean only when it has neither.
+        if conflicts.is_empty() && conflicts_elided == 0 {
           Ok(Presented::Plan(approval))
         } else {
           self.conflicts_of(&approval).map(Presented::Settled)
@@ -860,6 +909,29 @@ impl Instance {
       .policy(subject.wire())
       .map(|(policy, _)| policy.map(WritePolicy::of_wire))
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
+  }
+
+  /// Asks `volume`'s owner to move it to the fleet member `to` (§4.10 "Ownership follows the writer", A-291), the
+  /// member named by its id ([`Instance::member`] on that member's own instance). One ask: the move goes on between
+  /// asks, so a consumer asks again until it is [`MoveProgress::Moved`], and the volume is then served by `to` once it
+  /// has adopted it (its verbs answer [`crate::RetryCause::Overloaded`] until then). The volume must be a plain one with
+  /// no attachment, clone or snapshot but its head, and `admin` on it is required. Each refusal is typed by what to do:
+  /// [`crate::Busy::Attached`] (detach first), [`crate::Busy::Moving`], [`crate::Unusable::Unmovable`],
+  /// [`crate::Invalid::MoveTarget`], [`crate::RetryCause::MoveUnplaced`]; a lone instance, which has no other member, is
+  /// refused [`crate::MoveTarget::NotMember`].
+  pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveProgress, Error> {
+    match self.client.move_volume(volume, to) {
+      Ok(slates_client::MoveState::Moving { to }) => Ok(MoveProgress::Moving { to }),
+      Ok(slates_client::MoveState::Moved { to }) => Ok(MoveProgress::Moved { to }),
+      Err(e) => Err(self.fail(e, Some(Missing::Volume(volume)))),
+    }
+  }
+
+  /// This instance's fleet member id: what another instance's [`Instance::move_volume`] names it by, and what its
+  /// volume ids and its peers name it by (§4.8). It is the node's certificate anchor with its boot's nonce, so a
+  /// daemon restarted under the same anchor is a new member; ask it again after a restart.
+  pub fn member(&mut self) -> Result<u64, Error> {
+    Ok(self.daemon_status()?.fleet.host)
   }
 
   /// The daemon's status (§4.14 `slates.status`): its shards, health signals with their freshness, the fleet's view,

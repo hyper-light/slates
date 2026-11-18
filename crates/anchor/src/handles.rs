@@ -17,10 +17,17 @@
 /// `#CRC32C_HEX` over the preceding text. Handles are inherited across the spawn at the values named.
 pub const ENV_HANDLES: &str = "SLATES_ANCHOR_HANDLES";
 
-/// Format: what a hold holds, its `what` byte: a WinFsp mount's volume control handle, drive link and ledger (A-198).
+/// Format: what a hold holds, its `what` byte: a WinFsp mount's volume control handle and ledger (A-198), the volume
+/// keeping its Mount Manager drive (A-369).
 pub const WHAT_WINFSP_MOUNT: u8 = 1;
 
-/// Format: the most handles one hold names: a WinFsp mount's three (A-198).
+/// Format: the handles a WinFsp mount's hold names: its volume control handle and its ledger (A-369; A-198's held a
+/// third, the drive's temporary link, which a Mount Manager drive does not have).
+pub const WINFSP_MOUNT_HANDLES: usize = 2;
+
+/// Format: the room one hold's message has for handles: three, A-198's WinFsp mount, kept since A-369 so the message's
+/// layout, which an anchor and a daemon built apart across an upgrade both read, does not move; a hold names one to
+/// this many.
 pub const MAX_HANDLES: usize = 3;
 
 /// Format: a WinFsp mount's largest handoff record: `FSP_FSCTL_VOLUME_NAME_SIZEMAX` (64 + 192 UTF-16 units), its

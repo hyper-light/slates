@@ -36,7 +36,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
-  attach ID [--read | --write] [--snapshot N]
+  attach ID [--read | --write] [--snapshot N] [--hold]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
@@ -50,6 +50,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base digest ID PATH [--json]                     a clean base file's verified content digest
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
+  base capture ID [--json]                         capture an overlay's whole base: a snapshot whose clones move
   land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
   image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
   image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
@@ -384,6 +385,17 @@ pub(crate) enum Verb {
     /// `--oci-source` to `--oci-destination` (§4.6 A-9).
     form: slates_client::AttachRequest,
   },
+  /// Attach in the CLI's form and keep the attachment alive from this process until it ends (`slates attach --hold`,
+  /// A-384): a renewer of its own renews it at the cadence the daemon names; the process ending ends the renewals, and
+  /// the attachment lapses at its holder's pace.
+  Hold {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The intent.
+    intent: Intent,
+  },
   /// Detach.
   Detach {
     /// The attachment.
@@ -419,6 +431,12 @@ pub(crate) enum Verb {
     volume: slates_client::VolumeId,
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
+  },
+  /// Capture an overlay's whole base into a complete immutable snapshot (`base capture ID`, §4.15 `capture_base`,
+  /// A-291), whose clones need no base directory and move between fleet members.
+  CaptureBase {
+    /// The overlay.
+    volume: slates_client::VolumeId,
   },
   /// Build a snapshot's disk image (`image build`, A-160).
   ImageBuild {
@@ -496,6 +514,14 @@ pub(crate) enum Verb {
     volume: slates_client::VolumeId,
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
+  },
+  /// Move a volume to another fleet member (`move ID --to HOST`, §4.10, A-291): asks its owner until the configuration
+  /// names the member.
+  Move {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The member's host id, as `status` names the members.
+    to: u64,
   },
 }
 
@@ -728,6 +754,7 @@ const SWITCHES: &[&str] = &[
   "--require-evidence",
   "--keep",
   "--apparmor-profile",
+  "--hold",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -1383,9 +1410,31 @@ fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
         },
       )))
     }
+    ["move", id] => {
+      taken.only(&Spec {
+        values: &["--to"],
+        switches: &[],
+      })?;
+      let to = taken
+        .value("--to")
+        .ok_or(ParseError::Missing("move ID --to HOST"))?
+        .parse::<u64>()
+        .map_err(|e| ParseError::BadValue {
+          what: "--to",
+          reason: e.to_string(),
+        })?;
+      Ok(Some(client(
+        taken,
+        Verb::Move {
+          volume: volume(id)?,
+          to,
+        },
+      )))
+    }
     ["revoke"] => Err(ParseError::Missing("CONSUMER")),
     ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
     ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
+    ["move", ..] => Err(ParseError::Missing("move ID --to HOST")),
     _ => Ok(None),
   }
 }
@@ -1635,7 +1684,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     ["attach", id] => {
       taken.only(&Spec {
         values: &["--snapshot", "--oci-source", "--oci-destination"],
-        switches: &["--read", "--write"],
+        switches: &["--read", "--write", "--hold"],
       })?;
       let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
       let intent = if taken.switch("--write") {
@@ -1643,6 +1692,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       } else {
         Intent::Read
       };
+      // `--hold`: this process keeps the CLI attachment alive until it ends (A-384); a container bind has its own life.
+      if taken.switch("--hold") {
+        if taken.value("--oci-source").is_some() || taken.value("--oci-destination").is_some() {
+          return Err(ParseError::Missing(
+            "no --oci-source or --oci-destination with --hold: a container bind is not held",
+          ));
+        }
+        return Ok(client(
+          &taken,
+          Verb::Hold {
+            volume: volume(id)?,
+            snapshot,
+            intent,
+          },
+        ));
+      }
       let form = match (
         taken.value("--oci-source"),
         taken.value("--oci-destination"),
@@ -2204,9 +2269,15 @@ fn parse_base(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         paths: paths(&rest.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>()),
       },
     )),
+    ["capture", id] => Ok(client(
+      taken,
+      Verb::CaptureBase {
+        volume: volume(id)?,
+      },
+    )),
     [] => Err(ParseError::Missing("base subcommand")),
     ["read" | "digest", ..] => Err(ParseError::Missing("ID PATH")),
-    ["rewitness" | "pin"] => Err(ParseError::Missing("volume ID")),
+    ["rewitness" | "pin" | "capture"] => Err(ParseError::Missing("volume ID")),
     [other, ..] => Err(ParseError::UnknownCommand(format!("base {other}"))),
   }
 }
@@ -2325,6 +2396,25 @@ mod tests {
     assert!(parse(&args("bootstrap")).is_err());
   }
 
+  /// A-291 (§4.15 `capture_base`): `base capture` names one overlay; a capture of nothing, or of paths (a capture is
+  /// always the whole base), is refused rather than guessed.
+  #[test]
+  fn base_capture_names_one_overlay_and_no_paths() {
+    let id = "ab".repeat(16);
+    let Command::Client(request) = parse(&args(&format!("base capture {id}"))).unwrap() else {
+      panic!("base capture is a client request");
+    };
+    assert!(matches!(request.verb, Verb::CaptureBase { .. }));
+    assert!(
+      parse(&args("base capture")).is_err(),
+      "an overlay is required"
+    );
+    assert!(
+      parse(&args(&format!("base capture {id} /src"))).is_err(),
+      "a capture is the whole base"
+    );
+  }
+
   /// The grammar: a create with its flags in any order, a global instance before or after
   /// the verb, the process verbs' options.
   #[test]
@@ -2365,6 +2455,28 @@ mod tests {
         intent: Intent::Write,
         form: slates_client::AttachRequest::Termed,
       }
+    );
+    // `--hold` keeps the CLI attachment alive from this process (A-384); a container bind is not held.
+    let Command::Client(request) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --hold",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Hold {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+      }
+    );
+    assert!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --hold --oci-source /a --oci-destination /b",
+      ))
+      .is_err(),
+      "a container bind is not held"
     );
     assert_eq!(
       parse(&args("anchor --quick --shards 2 --instance z")),

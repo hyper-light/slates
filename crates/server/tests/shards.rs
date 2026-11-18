@@ -2637,6 +2637,55 @@ fn ingest_cost_per_mapped_mib() {
   drop(daemon);
 }
 
+/// Measured, not a gate (A-399): what a `close`'s `FLUSH` costs a guest after writes the shard's write log holds (A-63).
+/// One file is created and kept open; each cycle writes a page at its start and sends `FLUSH`, the request every
+/// `close` sends, timing the `FLUSH`'s round trip alone; [`FLUSH_CYCLES`] cycles a round, [`FLUSH_ROUNDS`] rounds, each
+/// round's p50 and p99 printed and the best of each, with the daemon's `shards.flush_logged` count (the flushes that
+/// published nothing, A-399). Run before and after A-399 by the same command, the two binaries interleaved.
+///
+/// Run: `cargo test --release -p slates-server --test shards -- --ignored --nocapture flush_cost`.
+#[test]
+#[ignore = "a measurement, run by hand in release"]
+fn flush_cost_after_logged_writes() {
+  /// Shape: the rounds, and the cycles a round: enough of each for a p99 of its own.
+  const FLUSH_ROUNDS: usize = 5;
+  const FLUSH_CYCLES: usize = 200;
+  let (daemon, client, id) = provisioned("shards-flush-cost");
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (node, fh) = guest.create(ROOT, "flushed").unwrap();
+  let mut flush = fh.to_le_bytes().to_vec();
+  flush.extend_from_slice(&[0u8; 16]);
+  let page = vec![0x5a; 4096];
+  let mut rounds = Vec::with_capacity(FLUSH_ROUNDS);
+  for _ in 0..FLUSH_ROUNDS {
+    let mut times = Vec::with_capacity(FLUSH_CYCLES);
+    for _ in 0..FLUSH_CYCLES {
+      assert_eq!(guest.write(node, fh, 0, &page), Ok(4096));
+      let started = Instant::now();
+      assert_eq!(errno(&guest.ask(Opcode::Flush, node, &flush)), 0);
+      times.push(started.elapsed());
+    }
+    times.sort_unstable();
+    rounds.push((times[FLUSH_CYCLES / 2], times[FLUSH_CYCLES * 99 / 100]));
+  }
+  let best_p50 = rounds.iter().map(|round| round.0).min().unwrap();
+  let best_p99 = rounds.iter().map(|round| round.1).min().unwrap();
+  let logged = daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("shards.flush_logged")
+    .copied()
+    .unwrap_or(0);
+  println!(
+    "flush cost after a logged page write, {FLUSH_ROUNDS} rounds of {FLUSH_CYCLES}: best p50 {best_p50:?}, best p99 \
+     {best_p99:?}; rounds (p50, p99) {rounds:?}; shards.flush_logged {logged}"
+  );
+  assert_eq!(guest.close(node, fh), (0, 0));
+  drop(client);
+  drop(daemon);
+}
+
 /// macOS: the socket route that hands a client its stream end (A-161, part 1 step 3), driven by hand on the wire so
 /// every hostile exchange can be made.
 #[cfg(target_os = "macos")]
@@ -3752,6 +3801,138 @@ fn expect_each_wrong_restore_refused_with_its_reason(daemon: &Daemon, id: Volume
     let refused = restored(&mut stream, &bytes).unwrap_err();
     assert!(refused.contains(why), "{why}: {refused}");
   }
+}
+
+/// Format: `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT` in `fuse_init_in.flags` (`include/uapi/linux/fuse.h`), which a Linux
+/// guest's kernel offers at INIT; `FUSE_SETXATTR_ACL_KILL_SGID`, a setter's flag in the extended `fuse_setxattr_in`;
+/// `FATTR_MODE`, a SETATTR's bit for the mode; and `S_ISGID`, the set-group-ID bit of a mode.
+const INIT_POSIX_ACL: u32 = 1 << 20;
+const INIT_SETXATTR_EXT: u32 = 1 << 29;
+const SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
+const FATTR_MODE: u32 = 1 << 0;
+const S_ISGID: u32 = 0o2000;
+/// Format: where `fuse_init_out.flags` lies in an INIT reply (after major, minor and max_readahead), and `fuse_attr.mode`
+/// in a GETATTR reply (`fuse_attr_out`: 16 bytes before its `fuse_attr`, whose mode is at 60).
+const INIT_FLAGS_AT: usize = OUT_HEADER_LEN + 12;
+const ATTR_OUT_MODE_AT: usize = OUT_HEADER_LEN + 16 + 60;
+
+/// The access ACL `setfacl -m u:4242:rw` makes of a file at 0660 (version 2, then each entry's tag, permissions and
+/// id): its owner rw, 4242 rw, its group rw, the mask rw, everyone else none.
+fn named_user_acl() -> Vec<u8> {
+  let mut value = 2u32.to_le_bytes().to_vec();
+  for (tag, perm, id) in [
+    (0x01u16, 6u16, u32::MAX),
+    (0x02, 6, 4242),
+    (0x04, 6, u32::MAX),
+    (0x10, 6, u32::MAX),
+    (0x20, 0, u32::MAX),
+  ] {
+    value.extend_from_slice(&tag.to_le_bytes());
+    value.extend_from_slice(&perm.to_le_bytes());
+    value.extend_from_slice(&id.to_le_bytes());
+  }
+  value
+}
+
+/// The INIT a Linux guest's kernel sends offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT` over `guest` (protocol 7.41):
+/// whether its reply kept the extended form.
+fn init_offering_the_extended_form(guest: &mut Guest) -> bool {
+  let mut body = Vec::new();
+  for word in [MAJOR, 41, 128 << 10, INIT_POSIX_ACL | INIT_SETXATTR_EXT] {
+    body.extend_from_slice(&word.to_le_bytes());
+  }
+  let reply = guest.ask(Opcode::Init, 0, &body);
+  assert_eq!(errno(&reply), 0, "INIT answered");
+  u32::from_le_bytes(reply[INIT_FLAGS_AT..INIT_FLAGS_AT + 4].try_into().unwrap())
+    & INIT_SETXATTR_EXT
+    != 0
+}
+
+/// The mode `guest` is shown for `node`: its permission and set-id bits.
+fn shown_mode(guest: &mut Guest, node: u64) -> u32 {
+  let reply = guest.getattr_reply(node);
+  assert_eq!(errno(&reply), 0, "GETATTR answered");
+  u32::from_le_bytes(
+    reply[ATTR_OUT_MODE_AT..ATTR_OUT_MODE_AT + 4]
+      .try_into()
+      .unwrap(),
+  ) & 0o7777
+}
+
+/// A file `name` made in the root over `guest` and closed, then made set-group-ID at 02660 by a SETATTR of its mode
+/// alone (`fuse_setattr_in`, 88 bytes, its mode at 68): its node, the guest keeping its lookup.
+fn set_group_id_file(guest: &mut Guest, name: &str) -> u64 {
+  let (node, fh) = guest.create(ROOT, name).unwrap();
+  assert_eq!(guest.close(node, fh), (0, 0));
+  let mut chmod = vec![0u8; 88];
+  chmod[0..4].copy_from_slice(&FATTR_MODE.to_le_bytes());
+  chmod[68..72].copy_from_slice(&(S_ISGID | 0o660).to_le_bytes());
+  assert_eq!(errno(&guest.ask(Opcode::SetAttr, node, &chmod)), 0);
+  assert_eq!(shown_mode(guest, node), S_ISGID | 0o660);
+  node
+}
+
+/// A-378. Over `guest`, whose kernel sends the extended form, sets `node`'s access ACL in that form with
+/// `FUSE_SETXATTR_ACL_KILL_SGID`, as Linux's `fuse_set_acl` sends it for a setter outside the file's group. Expect the
+/// set served, the ACL read back as set, and the file 0660, its set-group-ID bit cleared.
+fn expect_an_acl_set_from_outside_the_group_to_clear_the_bit(guest: &mut Guest, node: u64) {
+  let acl = named_user_acl();
+  let mut set = u32::try_from(acl.len()).unwrap().to_le_bytes().to_vec();
+  for word in [0, SETXATTR_ACL_KILL_SGID, 0] {
+    set.extend_from_slice(&word.to_le_bytes());
+  }
+  set.extend_from_slice(&named("system.posix_acl_access"));
+  set.extend_from_slice(&acl);
+  assert_eq!(
+    errno(&guest.ask(Opcode::SetXattr, node, &set)),
+    0,
+    "the set is served"
+  );
+  let got = guest.ask(
+    Opcode::GetXattr,
+    node,
+    &getxattr(256, Some("system.posix_acl_access")),
+  );
+  assert_eq!(
+    (errno(&got), &got[OUT_HEADER_LEN..]),
+    (0, acl.as_slice()),
+    "the ACL reads back as set: its name and value were found past the extended head"
+  );
+  assert_eq!(
+    shown_mode(guest, node),
+    0o660,
+    "the set-group-ID bit is gone"
+  );
+}
+
+/// A-378, by use on a real daemon: a guest's kernel that kept `FUSE_SETXATTR_EXT` at its INIT sends every SETXATTR in the
+/// extended form, and a restored guest's, which sends no INIT, goes on sending it. Do: over a stream, INIT offering
+/// `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`; make two files set-group-ID at 02660; set the first's access ACL in the
+/// extended form with `FUSE_SETXATTR_ACL_KILL_SGID`; SAVE; end the stream; on a fresh stream of the volume, RESTORE with
+/// the tables and no INIT, and set the second's the same way. Expect the INIT to keep the extended form; each set
+/// served, its ACL read back and its file 0660, the set-group-ID bit cleared, on the restored stream as on the saved
+/// one; and the save and the restore counted.
+#[test]
+fn a_guests_extended_setxattr_is_parsed_from_its_init_and_after_its_restore() {
+  let (daemon, client, id) = provisioned("shards-setxattr-ext");
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  assert!(
+    init_offering_the_extended_form(&mut guest),
+    "a guest's kernel is asked for the extended form"
+  );
+  let first = set_group_id_file(&mut guest, "first.txt");
+  let second = set_group_id_file(&mut guest, "second.txt");
+  expect_an_acl_set_from_outside_the_group_to_clear_the_bit(&mut guest, first);
+  let tables = saved(&mut guest);
+  drop(guest);
+  let mut restored_guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  assert_eq!(restored(&mut restored_guest, &tables), Ok(()));
+  expect_an_acl_set_from_outside_the_group_to_clear_the_bit(&mut restored_guest, second);
+  assert_eq!(wait_for_count(&daemon, "shards.saved", 1), 1);
+  assert_eq!(wait_for_count(&daemon, "shards.restored", 1), 1);
+  drop(restored_guest);
+  drop(client);
+  drop(daemon);
 }
 
 /// Bounds `end`'s reads by `bound` where the OS lets it. XNU refuses any socket option on a socket that can neither send

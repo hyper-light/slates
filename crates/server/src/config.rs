@@ -86,9 +86,9 @@ const FLEET_LOOPS_PER_SHARD: usize = FLEET_PLANES * 2 + 1;
 /// F, R9's provisioning floor (AC-2.1, T-2.6): a create's single-client p99 is held to fifty microseconds. The idle
 /// window is at least this long, so a closed-loop client that meets R9 (its next request within F of its last reply)
 /// finds its own shard still polling (A-223), and the other shards its loop goes round are held for its return
-/// ([`closed_loop_hold`], A-326). It is the requirement itself, not a measurement, so no load moves it; the
-/// boot probe's smallest wake, the other input weighed, was measured at up to 259-346 µs on a loaded boot
-/// (BENCHMARKS, the idle window's rule). `provision_bench` gates on the same constant.
+/// ([`closed_loop_hold`], A-326; on macOS none, A-387). It is the requirement itself, not a measurement, so no load
+/// moves it; the boot probe's smallest wake, the other input weighed, was measured at up to 259-346 µs on a loaded
+/// boot (BENCHMARKS, the idle window's rule). `provision_bench` gates on the same constant.
 pub const PROVISION_FLOOR: Derived<u64> = derived!(
   50_000,
   "R9: a create's single-client p99 at most 50 µs",
@@ -117,7 +117,7 @@ pub const NO_ESTIMATE_MULTIPLE: Derived<u64> = derived!(
 /// neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a step's quantum. A
 /// spin held under the budget by a beat can therefore never reach the verdict, on any platform and in any build: an
 /// idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are R9's floor and
-/// a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is what keeps a
+/// a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`loop_return_hold`]); it is what keeps a
 /// rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did (A-361).
 pub const IDLE_SPIN_CEILING: Derived<u64> = derived!(
   crate::daemon::LIVENESS_BUDGET_NS.saturating_sub(crate::daemon::HEARTBEAT_NS),
@@ -173,20 +173,44 @@ pub fn loop_revisit_cycles(shards: u16) -> u64 {
   most
 }
 
-/// The idle window a forward holds its shards open for when it is made for a client in R9's closed loop (§4.7; A-326):
+/// How long a closed loop over `shards` shards takes to come back to one of them at R9's percentile (§4.7; A-326):
 /// `CLOSED_LOOP_CYCLE_FLOORS × F × loop_revisit_cycles(S)`. A loop that meets R9 sends its next request within F of
 /// its last reply, which F covers on the client's own shard (A-223's window rule), but over `S` shards its next request
 /// for a given shard comes only after the loop has gone round the others, as many cycles of at most `2F` as
 /// [`loop_revisit_cycles`] allows at R9's percentile. Measured (step 6 of the A-223 plan, 2026-11-12): at R9's floor
 /// alone a quiet single client's p99 on ubuntu-24.04-arm's three shards was 116.4 µs against main's 27.1, its shards
 /// parking 144 to 331 times per 1,000 creates; at `F × S`, 36.8 µs and 3 to 7 parks; at `2F × S`, 29.5 µs. Its inputs
-/// are R9's floor and percentile and the shard count, so no load moves it. A forward holds no longer than its loop had
-/// run, and a paced client, whose next request comes later than F, starts no loop (`verbs::loop_hold`).
-pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
+/// are R9's floor and percentile and the shard count, so no load moves it.
+pub fn loop_return_hold(shards: u16) -> Derived<u64> {
   derived!(
     CLOSED_LOOP_CYCLE_NS.saturating_mul(loop_revisit_cycles(shards)),
     "2 × provision_floor_ns × the least k with ((shards − 1) / shards)^k ≤ 1 / PROVISION_TAIL",
     ["provision_floor_ns", "shards", "PROVISION_TAIL (R9's p99)"]
+  )
+}
+
+/// The idle window a forward holds its shards open for when it is made for a client in R9's closed loop (§4.7; A-326),
+/// where a held shard's idle spin polls its driver without sleeping (epoll, a completion port): the loop's return at
+/// R9's percentile ([`loop_return_hold`]). A forward holds no longer than its loop had run, and a paced client, whose
+/// next request comes later than F, starts no loop (`verbs::loop_hold`).
+#[cfg(not(target_os = "macos"))]
+pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
+  loop_return_hold(shards)
+}
+
+/// The idle window a forward holds its shards open for on macOS: none (A-387). macOS's idle spin naps 12–15 µs a turn
+/// in its zero-timeout `kevent`, an involuntary switch each, which A-218 kept for its tails under load, so a held shard
+/// churns where a parked one would wait for a 3–5 µs kick. Measured on a quiet M4 Max Mac Studio (2026-11-18, nine runs
+/// an arm, BENCHMARKS "The closed-loop hold on macOS"): at its nine shards, main's hold against none, a single client's
+/// median create 51–60 against 41–43 µs at an equal p99 (92.0 against 92.3 µs), 63 against 17 involuntary switches a
+/// create and 2.9 against 1.65 cores; at three shards the p99 80.8 against 65.6 µs; beside two spinners a logical CPU at
+/// nine shards the p99 1.87 against 1.34 ms, and at three even (2.25 against 2.43 ms).
+#[cfg(target_os = "macos")]
+pub fn closed_loop_hold(_shards: u16) -> Derived<u64> {
+  derived!(
+    0,
+    "none: macOS's idle spin naps in its driver poll (A-218), so a hold costs more than the park it saves",
+    ["A-218", "A-387"]
   )
 }
 
@@ -210,9 +234,6 @@ pub(crate) const fn bulk_chunk_bytes() -> u64 {
 /// Shape: the landing slots the segment holds: landings in flight per daemon, one per shard
 /// plus one for the control shard's presentation.
 const LANDING_SLOTS_PER_SHARD: u32 = 1;
-/// Shape: the audit ring: a page per shard; the audit rate is measured from the first landings
-/// (§4.15's derived table) and the ring re-sized at the next start.
-const AUDIT_PAGES_PER_SHARD: u64 = 1;
 
 /// The store's caps per shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,7 +412,7 @@ pub struct DaemonConfig {
   /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
   pub failover_slo_ns: u64,
   /// Derived: the idle window a forward holds its shards open for when it is made for a client in R9's closed loop
-  /// ([`closed_loop_hold`], §4.7; A-326).
+  /// ([`closed_loop_hold`], §4.7; A-326), none on macOS (A-387).
   pub closed_loop_hold_ns: u64,
   /// The operator's stated per-node **re-replication bandwidth** in bytes/second, the anchor `B` of the
   /// scatter-width derivation (§4.8 "Placement", D-14): how fast this node restores a lost host's copies.
@@ -752,6 +773,24 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("volumes_per_shard", &volumes));
+    // The audit's window (§4.15's derived table; A-265): what the partition's table bytes hold of its records, the
+    // memory ceiling that bounds it whatever the landing rate. The design's `landing rate × operator audit horizon ×
+    // record size` may lower it once a landing rate is measured; none is yet, so the horizon is not applied.
+    let audit_record_bytes =
+      u64::try_from(size_of::<slates_db::catalog::AuditRecord>()).unwrap_or(1);
+    let audit_records: Derived<usize> = derived!(
+      usize::try_from(
+        tables
+          .get()
+          .checked_div(audit_record_bytes.max(1))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "table_bytes / size_of::<AuditRecord>()",
+      ["table_bytes"]
+    );
+    derivations.push(note("audit_records_per_shard", &audit_records));
     // §4.7 "Derived constants": a client ring holds what one client may have in flight — Little's law
     // on the request rate × p99 service time (`requests_in_flight_per_shard`, the admission value that
     // sizes one client's in-flight work) — rounded up to a power of two. Until 2026-09-22 it was the
@@ -870,9 +909,6 @@ impl DaemonConfig {
         .max(page),
       log_bytes: log_bytes.get(),
       snapshot_bytes: snapshot_bytes.get(),
-      audit_bytes: AUDIT_PAGES_PER_SHARD
-        .saturating_mul(page)
-        .saturating_mul(shards),
       landing_slots: LANDING_SLOTS_PER_SHARD
         .saturating_mul(runtime.shards.max(1).into())
         .saturating_add(1),
@@ -891,6 +927,7 @@ impl DaemonConfig {
       // bytes the records draw from, so a green's persisted chain is bounded by measured memory, not
       // a magic count. Checkpointing to fold old chain entries (the design's optimization) is owed.
       green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
+      audit_records: audit_records.get(),
     };
     // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
     // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
@@ -1052,7 +1089,8 @@ impl DaemonConfig {
       tracking.idle_ceiling_ns = IDLE_SPIN_CEILING_NS;
     }
     // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
-    // the loop's revisit at R9's percentile (§4.7; A-326).
+    // the loop's revisit at R9's percentile (§4.7; A-326), where a held shard polls without sleeping (none on macOS,
+    // A-387).
     let loop_hold = closed_loop_hold(runtime.shards);
     derivations.push(note("closed_loop_hold_ns", &loop_hold));
     #[cfg(unix)]
@@ -1449,7 +1487,13 @@ impl DaemonConfig {
   /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
   /// shard now: half its live step quantum at the machine's measured memcpy rate.
   pub fn copy_slice_bytes(&self) -> u64 {
-    copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+    self.copy_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// [`DaemonConfig::copy_slice_bytes`] for a turn of `quantum_ns` (a takeover's turns, whose quantum a test may cut,
+  /// `fleet::seal_quantum_ns`): half of it at the machine's measured memcpy rate.
+  pub fn copy_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
+    copy_slice_bytes(self.memcpy_bytes_per_second, quantum_ns)
   }
 
   /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
@@ -1768,7 +1812,7 @@ mod tests {
     let tail = 1.0 / f64::from(u32::try_from(PROVISION_TAIL).unwrap());
     let mut last = 0;
     for shards in 1..=MOST_SHARDS_TESTED {
-      let hold = closed_loop_hold(shards).get();
+      let hold = loop_return_hold(shards).get();
       assert_eq!(hold % CLOSED_LOOP_CYCLE_NS, 0, "{shards} shards: {hold} ns");
       let cycles = i32::try_from(hold / CLOSED_LOOP_CYCLE_NS).unwrap();
       let stay = f64::from(shards - 1) / f64::from(shards);
@@ -1784,9 +1828,9 @@ mod tests {
       assert!(hold >= last, "{shards} shards: {hold} ns after {last} ns");
       last = hold;
     }
-    assert_eq!(closed_loop_hold(1).get(), CLOSED_LOOP_CYCLE_NS);
+    assert_eq!(loop_return_hold(1).get(), CLOSED_LOOP_CYCLE_NS);
     assert!(
-      closed_loop_hold(STEP_SIX_SHARDS).get() >= CLOSED_LOOP_CYCLE_NS * u64::from(STEP_SIX_SHARDS)
+      loop_return_hold(STEP_SIX_SHARDS).get() >= CLOSED_LOOP_CYCLE_NS * u64::from(STEP_SIX_SHARDS)
     );
   }
 
@@ -2119,12 +2163,7 @@ mod tests {
         let rings: u64 = geometry
           .regions()
           .iter()
-          .filter(|region| {
-            matches!(
-              region.kind,
-              slates_anchor::RegionKind::Log(_) | slates_anchor::RegionKind::Audit
-            )
-          })
+          .filter(|region| matches!(region.kind, slates_anchor::RegionKind::Log(_)))
           .map(|region| region.len)
           .sum();
         assert!(

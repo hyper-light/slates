@@ -328,7 +328,7 @@ pub struct ShardState {
   pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
-  /// writes (A-61, A-63), and a resynced Shards stream is counted as one whose guest is not told (A-339; GAPS).
+  /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393).
   #[cfg(unix)]
   pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
@@ -510,6 +510,14 @@ pub struct ShardState {
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
   /// cap: a relinquished copy was a volume this shard held, and each leaves once its teardown is done.
   pub(crate) relinquished: Vec<VolumeSlot>,
+  /// The claims this shard holds for live volumes routed to it that this node holds the log of as a candidate (§4.2 "a
+  /// remote holder makes the same admission against its own machine before acknowledging placement"; g229): by volume,
+  /// the credits a successor's restore takes over (`verbs::CandidateClaim`, `verbs::make_restored`). Bounded by the live
+  /// copies this node holds of volumes routed to this partition, each admitted only once its catalog is held
+  /// (`live_ship::admit_claim`): a claim whose copy went is released at the control shard's next reconciliation
+  /// (`live_ship::reconcile_claims`).
+  pub(crate) candidate_claims:
+    std::collections::BTreeMap<slates_db::catalog::VolumeId, crate::verbs::CandidateClaim>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
@@ -642,13 +650,20 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
-  /// Listings in flight: by request word, the client slot, the shards still to answer, and
-  /// the summaries so far (a scatter-gather over owners, §4.8 "Lookup").
-  pub scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::VolumeSummary>)>,
+  /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
+  /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
+  pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
   /// `grants` reads in flight: the caller's grants live on the shards that presented their landings (a
   /// grant record is written where its landing was), so the read is a scatter-gather like a listing — by
   /// request word, the client slot, the shards still to answer, and the summaries so far.
-  pub grant_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::GrantSummary>)>,
+  pub(crate) grant_scatters: BTreeMap<
+    u64,
+    (
+      u32,
+      usize,
+      Vec<crate::verbs::PagePart<slates_ipc::protocol::GrantSummary>>,
+    ),
+  >,
   /// Every shard of the daemon, for the scatter.
   pub shards: Vec<u16>,
   /// What the last start's recovery found (the status reports it).
@@ -866,12 +881,35 @@ pub struct ShardState {
   /// place of the shard's step quantum: the record period's seal walk and envelope wrap (`fleet::seal_walk_slice`), and a
   /// takeover's envelope open (`fleet::open_slice`, A-347).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
+  /// Test support (`Daemon::inject_live_turn_pause`, never set in production): a wait between the turns of a live
+  /// takeover's rebuild on this owner shard (`fleet::make_live_in_turns`, g251), so a test's materialization outlasts
+  /// the control shard's periods and its later attempts meet it running.
+  pub(crate) live_turn_pause_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
   /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;
   /// bounded by the kept retirements, each entry dropped once this node no longer owes a confirmation. Empty on
   /// a laptop (no fleet loop runs) and whenever no takeover is outstanding.
   pub host_takeovers: BTreeMap<slates_db::HostId, crate::takeover::HostTakeover>,
+  /// This shard's volumes frozen for a planned move to another member (§4.10, A-291; [`crate::moves`]): each one's
+  /// target and the head its move waits to see placed. Bounded by the shard's volumes; an entry leaves when its volume
+  /// is released to the target, or thaws.
+  pub(crate) moves_out: crate::moves::MovesOut,
+  /// The adoptions of volumes the configuration moved to this node (A-291), driven on the control shard only: per
+  /// volume, its round's epoch, the records its cohort reported and its seal. Bounded by the moved-object exceptions
+  /// naming this node; an entry leaves once its move is adopted.
+  pub(crate) move_adoptions: BTreeMap<ObjectId, crate::moves::MoveAdoption>,
+  /// The newest records of each volume this node moved away and still keeps (A-291), captured from its owner's acceptor
+  /// when it reported the move, by the volume's object and then by register: what it answers the new owner's phase one
+  /// with. Kept on the control shard only, bounded by the shards' outgoing moves; an entry leaves with the release.
+  pub(crate) move_records: BTreeMap<ObjectId, BTreeMap<ObjectId, slates_db::register::Accepted>>,
+  /// Destroyed volumes this node owned under a moved-object exception, reported forgotten to the council until the
+  /// configuration drops their exceptions (A-291), on the control shard only. Bounded by the exceptions naming this node.
+  pub(crate) moves_forgotten: std::collections::BTreeSet<ObjectId>,
+  /// Slots of volumes released to the member a move named (A-291), freed in the destroy's slices
+  /// ([`crate::verbs::step_destroys`]); their records already left. Each carries a clone's pin on its origin's snapshot,
+  /// given back once the slot is gone. Bounded by the shard's volumes.
+  pub(crate) releasing: Vec<(slates_mem::Handle<VolumeSlot>, crate::verbs::OriginPin)>,
   /// A learner has evidence its configuration is behind the region and should refresh from a voter next
   /// period (§4.8 the reactive piggyback). Set when this node **received** a record naming a newer
   /// configuration generation than its own (the holder-behind case, [`crate::fleet::accept_held_record`]),
@@ -1067,6 +1105,10 @@ pub struct ShardState {
   /// test can hold a wait's bound below a path's floor, or short enough to watch a give-up (`Daemon::inject_failover`).
   /// `None` in every deployment.
   pub injected_failover_ns: Option<u64>,
+  /// Each CLI attachment's renewals as this, its owner shard, has seen them (A-384): when it was last used and the gaps
+  /// between its uses, which its term follows (`verbs::attachment_term`). In memory only: a restart starts each again,
+  /// with a fresh term. Bounded by the partition's attachments: an entry leaves when its attachment ends.
+  pub attachment_paces: BTreeMap<u64, AttachmentPace>,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
@@ -1134,6 +1176,11 @@ pub struct ShardState {
   /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
   /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
   pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
+  /// On a taken-over volume's owner shard, its materialization from a live log made in turns of this shard's clock by a
+  /// task of its own (g251, `fleet::make_live`): running, with the turns it has taken, or ended, until the control
+  /// shard's next attempt reads the end and forgets it. A later attempt joins a running one and never rebuilds the log
+  /// again. At most one a volume this shard is making, which the takeover's pending materializations bound.
+  pub making_taken_over: BTreeMap<ObjectId, Making>,
   /// The catalog register this node adopted for each taken-over volume (keyed by the volume's object), with
   /// the adopted record's sequence (AUD-29-17): a pending materialization waits for it, and the successor's
   /// record continues the register from that sequence. Bounded by the objects this node owns.
@@ -1177,6 +1224,21 @@ pub struct WorkState {
   /// version, so the work composes its increment off its green's shard (`Base::for_names`). Cleared with the base;
   /// charged with the work.
   pub entries: std::collections::BTreeMap<String, slates_merge::increment::Base>,
+  /// The work's last conflicting verdict (§4.16, A-267), kept for `Conflicts` until its next submit or rebase replaces
+  /// it, and cleared when one succeeds. Its windows are conflicts of the work's own declared operations, so their
+  /// number is bounded by the journal the merge budget charges; a restart forgets it, and a read of it is then refused
+  /// `VerdictReplaced`.
+  pub verdict: Option<KeptVerdict>,
+}
+
+/// A work's kept conflicting verdict (§4.16, A-267): its id, which the `Submitted` or `Rebased` reply named, and every
+/// window of it, in the verdict's order.
+#[derive(Clone, Debug)]
+pub struct KeptVerdict {
+  /// The verdict's id: the shard's monotonic clock when it was judged, and past the work's last.
+  pub id: u64,
+  /// Every window of the verdict.
+  pub windows: Vec<slates_ipc::protocol::MergeWindow>,
 }
 
 /// A reply waiting to be written into a client's ring.
@@ -1512,6 +1574,20 @@ impl PendingGreen {
   }
 }
 
+/// Where a taken-over volume's materialization in turns stands on its owner shard (`ShardState::making_taken_over`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Making {
+  /// Its task runs: the turns it has taken so far.
+  Running {
+    /// The turns taken, one a slice of its owner shard's clock: what tells a materialization that moves from one stuck.
+    turns: u64,
+  },
+  /// Its task made the volume and published it.
+  Made,
+  /// Its task ended refused, named by the refusal's counter.
+  Refused(&'static str),
+}
+
 /// A taken-over volume's tombstone awaiting its record on the shard the volume's id routes to (§4.4 destroy, §4.10
 /// status AUD-29-43; `ShardState::pending_tombstones`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1544,6 +1620,34 @@ impl PendingTombstone {
     self.attempts = self.attempts.saturating_add(1);
     self.given_up = self.attempts >= bound;
     self.given_up
+  }
+}
+
+/// A CLI attachment's pace (A-384): when it was last used, and the running estimate of the gaps between its uses
+/// (RFC 6298's estimator, as the failover estimate's terms are), so its term is its holder's own.
+#[derive(Debug, Default)]
+pub struct AttachmentPace {
+  /// The shard's clock at its last use, or at its making.
+  pub last_use_ns: u64,
+  /// The gaps between its uses.
+  pub gaps: slates_cluster::failover::RunningDuration,
+}
+
+impl AttachmentPace {
+  /// A pace begun by a use at `now_ns`, no gap measured yet.
+  pub fn begun(now_ns: u64) -> AttachmentPace {
+    AttachmentPace {
+      last_use_ns: now_ns,
+      gaps: slates_cluster::failover::RunningDuration::new(),
+    }
+  }
+
+  /// A use at `now_ns`: the gap since the last is a sample. A clock that read earlier is no sample.
+  pub fn used(&mut self, now_ns: u64) {
+    if let Some(gap) = now_ns.checked_sub(self.last_use_ns) {
+      self.gaps.on_sample(gap);
+    }
+    self.last_use_ns = now_ns;
   }
 }
 
@@ -1582,6 +1686,12 @@ pub struct PendingVolume {
   /// When it was adopted, on the shard's clock (zero off a shard): its recovery is timed from here to its service, into
   /// the failover estimate (A-363).
   pub adopted_ns: u64,
+  /// The turns its owner shard's materialization had taken at the last attempt that found it running, `None` before
+  /// the first ([`PendingVolume::record_turns`]).
+  pub turns_seen: Option<u64>,
+  /// The head and sealing its live log was fetched at by the attempt that began its materialization (g251), for the
+  /// end's note of a refused rebuild (`live_ship::note_rebuild`); `None` before a live materialization began.
+  pub live_adopted: Option<(slates_db::live::Head, Option<crate::head::HeadSealing>)>,
 }
 
 impl PendingVolume {
@@ -1601,7 +1711,23 @@ impl PendingVolume {
       cohort_hosts,
       registers_short: None,
       adopted_ns: slates_rt::futures::now_ns(),
+      turns_seen: None,
+      live_adopted: None,
     }
+  }
+
+  /// Records, after an attempt that found its owner shard's materialization running (g251), that it has taken `turns`
+  /// turns so far; whether it took more since the previous such attempt (after a first), which is progress and starts
+  /// its attempts again, so a long volume's materialization is never given up on while it moves.
+  pub fn record_turns(&mut self, turns: u64) -> bool {
+    let progress = self.turns_seen.is_some_and(|seen| turns > seen);
+    if progress {
+      self.attempts = 0;
+    }
+    if self.turns_seen.is_none_or(|seen| turns > seen) {
+      self.turns_seen = Some(turns);
+    }
+    progress
   }
 
   /// Records that `staged` chunks of its content are staged here after an attempt's fetch; whether that is progress (a
@@ -1664,6 +1790,7 @@ mod tests {
       },
       completion: None,
       signature: None,
+      folded_below: 0,
     }
   }
 

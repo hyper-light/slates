@@ -191,8 +191,35 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
   depend on this crate.
+- Moving a volume to another fleet member (A-291): `member()` is this instance's member id, and
+  `move_volume(volume, to)` asks the volume's owner to move it to the member `to` (another
+  instance's `member()`): one ask, answered `MoveProgress::Moving` until the switch and
+  `MoveProgress::Moved` from it, so ask again until `Moved`; detach first. The new member serves the
+  volume once it has adopted it (its verbs answer `Retry` until then), and the old one lets its copy
+  go once the new one has placed it. Refusals: `Busy(Attached)`, `Busy(Moving)`,
+  `Unusable(Unmovable(NotPlain | Lineage | Snapshots))`, `Invalid(MoveTarget(NotMember |
+  OutsideNeighbourhood))`, `Retry { cause: MoveUnplaced, .. }`. A lone instance has no other member.
+  An overlay does not move (its folder stays on its machine); a clone of a captured base does.
+- Capturing a folder once for many workspaces that move (A-291): `capture_base(overlay)` makes
+  every byte and link of the overlay's folder the volume's own and answers a snapshot holding the
+  whole tree; `VolumeSpec::clone_of(name, overlay, snapshot)` then gives each workspace an O(1)
+  clone that reads no folder at all, so it moves like an empty volume's and outlives the folder.
+  Capture only a folder nothing writes while it runs (a commit's tree checked out for it): a file
+  that changes while it is read is refused `Error::Retry { cause: ChangedWhileRead, .. }`, and a
+  capture the folder moved under `Error::Invalid(Invalid::LiveBase)`; a volume with no folder is
+  refused `Error::Unsupported`. A large file is read whole, so the capture costs its bytes in memory
+  once more while it runs.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
   `telemetry`.
+- Lists a page at a time: the daemon answers every list a reply at a time, so a host that shows a
+  list a screen at a time reads one `Page { items, next }` a screen and holds no more:
+  `list_page(after)` (volumes in id order), `grants_page(after)`, `audit_page(since)`,
+  `changed_since_page(green, version, from)` (what a green changed after a version, in every
+  dimension), and `drift_page(volume, from)` (an overlay's drift, typed). Pass a page's `next` back
+  to read the next one; `None` ends the list. An item that stands for the whole walk is read
+  exactly once. The whole-list verbs `list`, `grants`, `audit`, `changed_since` and `drift` walk the
+  pages for you. A status carries the first drifted entries that fit and counts the rest in
+  `DriftReport::elided`; `drift` reads every entry.
 - The chosen-path launcher (`slates_api::exec`, Linux, A-370): a volume shown at an existing directory
   for one command, in a namespace of its own, served by the host's own executable as `role::main`
   serves the roles. `exec::command(&spec, host_exe, &["slates-role".into()])` builds the command
@@ -254,6 +281,4 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 
 1. The starter handed the launcher's authority on every platform.
 2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-3. A paged volume listing.
-4. An async form over the host's own reactor.
-5. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.
+3. An async form over the host's own reactor.

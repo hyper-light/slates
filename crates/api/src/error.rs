@@ -38,8 +38,8 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  AttachTransport, DatabaseRefusal, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal,
-  SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
+  AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse, Principal,
+  RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -301,6 +301,10 @@ pub enum Busy {
   /// The volume core's holder: `Pinned` (a live clone, or a green's origin, holds the snapshot or the volume: end it
   /// first), `DaxMapped` (a guest maps the file: wait for the map's end) (A-299).
   Volume(VolumeRefusal),
+  /// The volume has an attachment or a lease, which a move of it waits for to end (A-291): detach, then ask again.
+  Attached,
+  /// The volume is already moving to another member (A-291): ask for that move, or wait for it to end.
+  Moving,
 }
 
 /// What has moved on.
@@ -334,8 +338,10 @@ pub enum Stale {
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
   Disk {
-    /// The entries, from the target's root.
+    /// The entries, from the target's root: as many as one reply holds (A-267).
     paths: Vec<String>,
+    /// Entries past what one reply holds (A-267): presenting again lists every one.
+    elided: u32,
   },
   /// A bootstrap naming another daemon start.
   Bootstrap,
@@ -348,6 +354,12 @@ pub enum Stale {
   Policy {
     /// The policy's version now.
     current: u64,
+  },
+  /// A merge's or a rebase's conflict windows were read after the work's verdict was replaced — by a later submit or
+  /// rebase of the work, or the daemon's restart (A-267): merge or rebase again for a new verdict.
+  Verdict {
+    /// The work volume.
+    work: VolumeId,
   },
 }
 
@@ -413,6 +425,9 @@ pub enum RetryCause {
   HandoffLost,
   /// A wait ended at its deadline.
   Deadline,
+  /// A move's records were not placed within the fleet's failover SLO, so it was not reported and the volume thawed
+  /// (A-291): ask for the move again.
+  MoveUnplaced,
 }
 
 /// Why no daemon answers.
@@ -473,7 +488,8 @@ pub enum Invalid {
   /// The green requires evidence on every increment, and the merge carried none.
   EvidenceRequired,
   /// A green's base must be a complete immutable snapshot, and this one still serves entries from a host folder: pin the
-  /// whole base and snapshot again.
+  /// whole base and snapshot again. Or a capture's folder moved under it (`Instance::capture_base`, A-291): capture it
+  /// again once nothing writes it.
   LiveBase,
   /// No clean digest exists for the entry: read and hash its bytes instead (§4.15).
   NoCleanDigest,
@@ -506,6 +522,18 @@ pub enum Invalid {
   /// The entry or the volume is the wrong one for the operation: `NotDirectory`, `IsDirectory`, `NotEmpty`, `Invalid`,
   /// `NoAttribute`, `SpecialFileOperation`, `CrossVolumeMove`, `NotOverlay` (A-299).
   Volume(VolumeRefusal),
+  /// A move's target cannot take the volume (A-291): name another member.
+  MoveTarget(MoveTarget),
+}
+
+/// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTarget {
+  /// It is not another member of the volume's region: `status` names the members.
+  NotMember,
+  /// It is outside the owner's neighbourhood (it holds no key to the volume's sealed content), or its neighbourhood does
+  /// not cover the cohort the volume's records sit in.
+  OutsideNeighbourhood,
 }
 
 /// A volume of the wrong kind for the verb.
@@ -542,6 +570,8 @@ pub enum Unusable {
   /// out of range, a malformed sealing key, a refused encoding. Each is a fault on the daemon's side to report, not a
   /// request to change.
   Database(DatabaseRefusal),
+  /// The volume cannot move to another member in its present form (A-291).
+  Unmovable(Unmovable),
   /// The fleet's configuration cannot hold the write to the operator's declared durability (§4.8 "Placement"); reads
   /// continue.
   DurabilityUnmet {
@@ -552,6 +582,17 @@ pub enum Unusable {
     /// The hosts the policy assumes fail at once.
     coincident_failures: u64,
   },
+}
+
+/// Why a volume cannot move to another member in its present form ([`Unusable::Unmovable`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmovable {
+  /// It is not a plain live volume: an overlay (its base stays on its source host), an image, a green or a work.
+  NotPlain,
+  /// It has clones, or is a green's origin, each depending on it on its owner.
+  Lineage,
+  /// It has snapshots other than its head: a move carries the head, and the others would be lost. Destroy them first.
+  Snapshots,
 }
 
 /// Where to send the call instead.
@@ -716,6 +757,23 @@ impl Error {
     }
   }
 
+  /// A move's refusal (A-291), typed by what a consumer does about it: detach or wait ([`Busy`]), change the volume
+  /// ([`Unusable::Unmovable`]), name another target ([`Invalid::MoveTarget`]), or ask again ([`RetryCause::MoveUnplaced`]).
+  fn of_move_refusal(reason: MoveRefusal, pause_ns: u64) -> Error {
+    match reason {
+      MoveRefusal::Attached => Error::Busy(Busy::Attached),
+      MoveRefusal::Pending => Error::Busy(Busy::Moving),
+      MoveRefusal::NotPlain => Error::Unusable(Unusable::Unmovable(Unmovable::NotPlain)),
+      MoveRefusal::Lineage => Error::Unusable(Unusable::Unmovable(Unmovable::Lineage)),
+      MoveRefusal::Snapshots => Error::Unusable(Unusable::Unmovable(Unmovable::Snapshots)),
+      MoveRefusal::Target => Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)),
+      MoveRefusal::Neighbourhood => {
+        Error::Invalid(Invalid::MoveTarget(MoveTarget::OutsideNeighbourhood))
+      }
+      MoveRefusal::Unplaced => retry(RetryCause::MoveUnplaced, pause_ns),
+    }
+  }
+
   /// A daemon refusal of a call that named `subject`, typed: one exhaustive table over §4.4's taxonomy as the wire
   /// carries it, so a refusal added to the wire does not compile until it is given its class here.
   pub(crate) fn of_refusal(refusal: Refusal, subject: Option<Missing>, pause_ns: u64) -> Error {
@@ -732,8 +790,15 @@ impl Error {
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
+      Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
-      Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
+      Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      } => Error::Stale(Stale::Disk {
+        paths: entries,
+        elided: entries_elided,
+      }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
       Refusal::ConsensusRecoveryStale => Error::Stale(Stale::Recovery),
       Refusal::LeaseHeld { epoch } => Error::Busy(Busy::WriteLease { epoch }),
@@ -764,6 +829,7 @@ impl Error {
         verb: Note::new(verb),
       }),
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
+      Refusal::MoveRefused { reason } => Error::of_move_refusal(reason, pause_ns),
       Refusal::PolicyForbids { act, by } => {
         Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
@@ -994,6 +1060,16 @@ fn target_words(refusal: TargetRefusal) -> String {
       "the anchor's hold on the drive did not answer within its bound; the mount or its release waits on it".to_owned()
     }
     TargetRefusal::DetachPending => "a detach of this drive already waits for the anchor's release".to_owned(),
+    TargetRefusal::MountManagerNotAllowed => "this machine does not let WinFsp's driver make a Mount Manager drive: an \
+      Administrator allows it once with `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t \
+      REG_DWORD /d 1 /f`"
+      .to_owned(),
+    TargetRefusal::DriveLetterTaken => {
+      "the drive letter names another volume, on this machine or in the daemon's session".to_owned()
+    }
+    TargetRefusal::TooLong { longest } => {
+      format!("the path is longer than the {longest} bytes the daemon takes there")
+    }
   }
 }
 

@@ -60,7 +60,6 @@ fn segment(name: &str, log_bytes: u64) -> AnchorSegment {
       profile_bytes: PAGE,
       log_bytes,
       snapshot_bytes: SNAPSHOT_BYTES,
-      audit_bytes: PAGE,
       landing_slots: 1,
       landing_slot_bytes: PAGE,
     },
@@ -77,6 +76,7 @@ fn caps() -> PartitionCaps {
     timers: 1 << 12,
     tick_ns: 1_000,
     green_chain_bytes: 1 << 20,
+    audit_records: 1 << 12,
   }
 }
 
@@ -1662,6 +1662,7 @@ const CHECKPOINT_GREEN: u64 = 1;
 fn checkpoint_caps() -> PartitionCaps {
   PartitionCaps {
     green_chain_bytes: BUDGET_INCREMENTS * INCREMENT_BYTES,
+    audit_records: 1 << 12,
     ..caps()
   }
 }
@@ -2213,6 +2214,184 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   drop(db);
   let recovered = open(&mut segment);
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}
+
+/// A-291 (§4.10 "Ownership follows the writer"): do create a volume, record a snapshot of it and an attachment, release
+/// it, end the attachment, release it again, and recover the database. Expect the first release refused `Attached`
+/// with nothing changed; the second to take the volume's record, its snapshot and its name with it and to leave no
+/// tombstone, since its registers are the member's it moved to and no holder may be told to close them; a later create
+/// under the same name admitted; and the recovered database to agree.
+#[test]
+fn a_moved_volume_is_released_whole_and_leaves_no_tombstone() {
+  let mut segment = segment("slates-db-move-release", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let moved = volume(1, "moved");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: moved.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::SnapshotTaken {
+      record: SnapshotRecord {
+        id: SnapshotId { value: 1 },
+        volume: moved.id,
+        epoch: 1,
+        identity: None,
+        placed: PlacementState::Local,
+        taken_ns: 0,
+      },
+    },
+    0,
+  )
+  .unwrap();
+  let attachment = AttachmentRecord {
+    id: 1,
+    volume: moved.id,
+    consumer: Consumer::Bridge,
+    snapshot: None,
+    form: AttachForm::Root,
+    principal: principal(0),
+    rights: Rights {
+      read: true,
+      write: true,
+      admin: false,
+    },
+    token: [1; 16],
+  };
+  db.mutate(&mut segment, &Op::AttachmentAdded { record: attachment }, 0)
+    .unwrap();
+  assert_eq!(
+    db.mutate(&mut segment, &Op::VolumeReleased { id: moved.id }, 0),
+    Err(DbError::Attached { attachments: 1 }),
+    "a volume leaves only whole"
+  );
+  assert!(db.partition().volume(moved.id).is_some());
+  db.mutate(&mut segment, &Op::AttachmentRemoved { id: 1 }, 0)
+    .unwrap();
+  db.mutate(&mut segment, &Op::VolumeReleased { id: moved.id }, 0)
+    .unwrap();
+  let released = |db: &Db| {
+    db.partition().volume(moved.id).is_none()
+      && db.partition().volume_by_name("moved").is_none()
+      && db.partition().snapshots_of(moved.id).is_empty()
+      && db.partition().tombstone(moved.id).is_none()
+      && db.partition().tombstones().next().is_none()
+  };
+  assert!(
+    released(&db),
+    "record, snapshot and name gone, no tombstone"
+  );
+  drop(db);
+  let mut recovered = open(&mut segment);
+  assert!(released(&recovered), "the recovered database agrees");
+  recovered
+    .mutate(
+      &mut segment,
+      &Op::VolumeCreated {
+        record: volume(2, "moved"),
+      },
+      0,
+    )
+    .unwrap();
+}
+
+/// A-291 (§4.15 `capture_base`): do record a volume's snapshot, capture it as a complete base, refuse a capture of a
+/// snapshot the partition does not hold, recover the database, destroy the captured snapshot, capture a second snapshot
+/// and release the volume, and recover again. Expect the captured snapshot named so before and after the first recovery
+/// and the unheld one refused `NotFound` with nothing recorded; the capture gone with its snapshot's destroy, and with
+/// its volume's release; and the second recovery to agree.
+#[test]
+fn a_captured_base_is_kept_with_its_snapshot_and_goes_with_it() {
+  let mut segment = segment("slates-db-captured-base", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let base = volume(1, "base");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: base.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  let taken = |value: u64| Op::SnapshotTaken {
+    record: SnapshotRecord {
+      id: SnapshotId { value },
+      volume: base.id,
+      epoch: value,
+      identity: None,
+      placed: PlacementState::Local,
+      taken_ns: 0,
+    },
+  };
+  let (first, second) = (SnapshotId { value: 1 }, SnapshotId { value: 2 });
+  db.mutate(&mut segment, &taken(1), 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::BaseCaptured {
+      volume: base.id,
+      snapshot: first,
+    },
+    0,
+  )
+  .unwrap();
+  assert!(db.partition().is_captured(base.id, first));
+  assert_eq!(
+    db.mutate(
+      &mut segment,
+      &Op::BaseCaptured {
+        volume: base.id,
+        snapshot: second,
+      },
+      0,
+    ),
+    Err(DbError::NotFound),
+    "a capture names a snapshot the partition holds"
+  );
+  assert!(!db.partition().is_captured(base.id, second));
+  drop(db);
+  let mut db = open(&mut segment);
+  assert!(
+    db.partition().is_captured(base.id, first),
+    "the capture survives a recovery"
+  );
+  db.mutate(
+    &mut segment,
+    &Op::SnapshotDestroyed {
+      volume: base.id,
+      id: first,
+    },
+    0,
+  )
+  .unwrap();
+  assert!(
+    !db.partition().is_captured(base.id, first),
+    "the capture goes with its snapshot"
+  );
+  db.mutate(&mut segment, &taken(2), 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::BaseCaptured {
+      volume: base.id,
+      snapshot: second,
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(&mut segment, &Op::VolumeReleased { id: base.id }, 0)
+    .unwrap();
+  assert!(
+    !db.partition().is_captured(base.id, second),
+    "the capture goes with its volume"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(!recovered.partition().is_captured(base.id, first));
+  assert!(!recovered.partition().is_captured(base.id, second));
 }
 
 /// A-362 (§4.8 "Promotion and takeover"): a volume relinquished to its re-adoption leaves no tombstone and erases no key,

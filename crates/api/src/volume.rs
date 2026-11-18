@@ -197,6 +197,24 @@ pub struct DriftReport {
   pub unverified: Vec<String>,
   /// The base's watcher.
   pub watcher: Watcher,
+  /// Drifted or unverified entries this report does not carry (A-267). A status carries the first that fit beside its
+  /// other fields and counts the rest here; [`crate::Instance::drift`] reads them all, and counts here only the entries
+  /// too long for any reply (a host path near the platform's maximum), which no page can carry.
+  pub elided: u32,
+}
+
+/// One page of an overlay's drift ([`crate::Instance::drift_page`]; §4.15 "Drift", A-267): its entries in inode order,
+/// typed as a status types them, and the inode the next page starts after.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DriftPage {
+  /// Each entry of the page the disk changed after the volume witnessed it.
+  pub drifted: Vec<Drift>,
+  /// Each entry of the page whose re-check the host refused now.
+  pub unverified: Vec<String>,
+  /// Entries in the page's range too long for any reply alone, passed over and counted.
+  pub oversized: u32,
+  /// The inode the next page starts after, or `None` when this page ends the walk.
+  pub next: Option<u64>,
 }
 
 /// One drifted entry.
@@ -250,37 +268,53 @@ pub(crate) fn status_of(report: StatusReport) -> VolumeStatus {
     mounts_elided: report.mounts_elided,
     journal: report.journal,
     takeover_kept: report.takeover_kept,
-    base: report.base.map(base_state_of),
+    base: report
+      .base
+      .map(|base| base_state_of(base, report.drifted_elided)),
     loss: report.loss,
   }
 }
 
-/// An overlay's base as the reply carries it, typed (A-299).
-fn base_state_of(base: wire::BaseReport) -> BaseState {
+/// One page of the paged drift read, typed (A-267): each entry as a status's base types it.
+pub(crate) fn drift_page_of(page: slates_client::DriftedPage) -> DriftPage {
+  DriftPage {
+    drifted: page.drifted.into_iter().map(drift_of).collect(),
+    unverified: page.unverified,
+    oversized: page.oversized,
+    next: page.next,
+  }
+}
+
+/// One drifted entry as the wire carries it, typed.
+fn drift_of(entry: wire::DriftEntry) -> Drift {
+  Drift {
+    path: entry.path,
+    kind: match entry.kind {
+      wire::DriftKind::Modified => DriftKind::Modified,
+      wire::DriftKind::Deleted => DriftKind::Deleted,
+      wire::DriftKind::Replaced => DriftKind::Replaced,
+      wire::DriftKind::TypeChanged => DriftKind::TypeChanged,
+    },
+  }
+}
+
+/// An overlay's base as the reply carries it, typed (A-299), with the count of the entries the reply could not carry
+/// (A-267).
+fn base_state_of(base: wire::BaseReport, elided: u32) -> BaseState {
   match base {
     wire::BaseReport::Read {
       drifted,
       unverified,
       watcher,
     } => BaseState::Read(DriftReport {
-      drifted: drifted
-        .into_iter()
-        .map(|entry| Drift {
-          path: entry.path,
-          kind: match entry.kind {
-            wire::DriftKind::Modified => DriftKind::Modified,
-            wire::DriftKind::Deleted => DriftKind::Deleted,
-            wire::DriftKind::Replaced => DriftKind::Replaced,
-            wire::DriftKind::TypeChanged => DriftKind::TypeChanged,
-          },
-        })
-        .collect(),
+      drifted: drifted.into_iter().map(drift_of).collect(),
       unverified,
       watcher: match watcher {
         wire::WatcherState::Live => Watcher::Live,
         wire::WatcherState::Overflowed => Watcher::Overflowed,
         wire::WatcherState::Unavailable => Watcher::Unavailable,
       },
+      elided,
     }),
     wire::BaseReport::Unreadable => BaseState::Unreadable,
   }
@@ -290,7 +324,9 @@ fn base_state_of(base: wire::BaseReport) -> BaseState {
 mod tests {
   use slates_ipc::protocol::{self as wire, DriftEntry};
 
-  use super::{BaseState, Drift, DriftKind, DriftReport, Watcher, base_state_of};
+  use super::{
+    BaseState, Drift, DriftKind, DriftPage, DriftReport, Watcher, base_state_of, drift_page_of,
+  };
 
   /// A-299, §4.15 "Drift": do type a base the status read, with an entry of each kind and one whose re-check the host
   /// refused, and one it could not read; expect each entry typed at its path, the refused one apart, the watcher, and
@@ -303,17 +339,20 @@ mod tests {
       (wire::DriftKind::Replaced, DriftKind::Replaced),
       (wire::DriftKind::TypeChanged, DriftKind::TypeChanged),
     ];
-    let read = base_state_of(wire::BaseReport::Read {
-      drifted: kinds
-        .iter()
-        .map(|(kind, _)| DriftEntry {
-          path: format!("/{kind:?} (Modified)"),
-          kind: *kind,
-        })
-        .collect(),
-      unverified: vec!["/u".to_owned()],
-      watcher: wire::WatcherState::Overflowed,
-    });
+    let read = base_state_of(
+      wire::BaseReport::Read {
+        drifted: kinds
+          .iter()
+          .map(|(kind, _)| DriftEntry {
+            path: format!("/{kind:?} (Modified)"),
+            kind: *kind,
+          })
+          .collect(),
+        unverified: vec!["/u".to_owned()],
+        watcher: wire::WatcherState::Overflowed,
+      },
+      3,
+    );
     assert_eq!(
       read,
       BaseState::Read(DriftReport {
@@ -326,11 +365,47 @@ mod tests {
           .collect(),
         unverified: vec!["/u".to_owned()],
         watcher: Watcher::Overflowed,
+        elided: 3,
       })
     );
     assert_eq!(
-      base_state_of(wire::BaseReport::Unreadable),
+      base_state_of(wire::BaseReport::Unreadable, 0),
       BaseState::Unreadable
     );
+  }
+
+  /// A-267, §4.15 "Drift": do type a page of the paged drift read: a changed entry, a refused re-check, the oversized
+  /// count and the next position, then a last page. Expect each entry typed as a status's base types it, the count and
+  /// the position carried as the page gave them, and no next position on the last page.
+  #[test]
+  fn a_drift_page_is_typed_as_a_status_is() {
+    let page = slates_client::DriftedPage {
+      drifted: vec![DriftEntry {
+        path: "/a".to_owned(),
+        kind: wire::DriftKind::Deleted,
+      }],
+      unverified: vec!["/b".to_owned()],
+      next: Some(2),
+      oversized: 1,
+    };
+    assert_eq!(
+      drift_page_of(page),
+      DriftPage {
+        drifted: vec![Drift {
+          path: "/a".to_owned(),
+          kind: DriftKind::Deleted,
+        }],
+        unverified: vec!["/b".to_owned()],
+        oversized: 1,
+        next: Some(2),
+      }
+    );
+    let last = slates_client::DriftedPage {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      next: None,
+      oversized: 0,
+    };
+    assert_eq!(drift_page_of(last).next, None);
   }
 }

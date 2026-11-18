@@ -27,6 +27,7 @@ AuditKind 3 LandingValidated
 AuditKind 4 EntryWritten
 AuditKind 5 EntryRefused
 AuditKind 6 LandingFinished
+AuditKind 7 GrantExpired
 BaseReport 0 Read
 BaseReport 1 Unreadable
 CauseRecord 0 Root
@@ -112,6 +113,14 @@ LandingStage 6 Done
 LandingStage 7 Partial
 LandingStage 8 Refused
 LandingStage 9 Aborted
+MoveRefusal 0 NotPlain
+MoveRefusal 1 Attached
+MoveRefusal 2 Lineage
+MoveRefusal 3 Snapshots
+MoveRefusal 4 Target
+MoveRefusal 5 Neighbourhood
+MoveRefusal 6 Unplaced
+MoveRefusal 7 Pending
 NamePolicy 0 Exact
 NamePolicy 1 Fold
 OwnMountUse 0 Base
@@ -215,6 +224,8 @@ Refusal 68 Volume
 Refusal 69 Database
 Refusal 70 Target
 Refusal 71 DurabilityPending
+Refusal 72 VerdictReplaced
+Refusal 73 MoveRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -281,6 +292,12 @@ ReplyBody 62 MergeApprovalRequired
 ReplyBody 63 SubmittedSigned
 ReplyBody 64 SignersSet
 ReplyBody 65 MergeRecord
+ReplyBody 66 Drifted
+ReplyBody 67 Conflicts
+ReplyBody 68 Renewed
+ReplyBody 69 Moving
+ReplyBody 70 Moved
+ReplyBody 71 BaseCaptured
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -356,6 +373,11 @@ RequestBody 71 SubmitApproved
 RequestBody 72 SubmitSigned
 RequestBody 73 SetSigners
 RequestBody 74 MergeRecord
+RequestBody 75 Drifted
+RequestBody 76 Conflicts
+RequestBody 77 Renew
+RequestBody 78 Move
+RequestBody 79 CaptureBase
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
@@ -394,6 +416,9 @@ TargetRefusal 11 MountRefused
 TargetRefusal 12 NotADriveLetter
 TargetRefusal 13 AnchorHold
 TargetRefusal 14 DetachPending
+TargetRefusal 15 MountManagerNotAllowed
+TargetRefusal 16 DriveLetterTaken
+TargetRefusal 17 TooLong
 UnsupportedReason 0 HostPlatform
 UnsupportedReason 1 ListenerNotBound
 UnsupportedReason 2 MountNeedsPrivilege

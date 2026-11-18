@@ -792,12 +792,36 @@ impl Volume {
 
   /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) (D-5). The clone's
   /// policy is the origin's; its inode counter continues from the origin's so numbers stay
-  /// unique across both.
+  /// unique across both. An overlay's clone reads the origin's base directories as the origin does.
   pub fn clone_of(
     store: &Store,
     origin: &mut Volume,
     snapshot: SnapshotId,
+    config: VolumeConfig,
+  ) -> Result<Volume, VfsError> {
+    Volume::clone_inner(store, origin, snapshot, config, CloneBase::Inherit)
+  }
+
+  /// Clones `snapshot` of `origin` as [`Volume::clone_of`] does, with no base plane: for a snapshot captured as a
+  /// complete immutable base (§4.15 `capture_base`, A-291), whose tree holds every name, byte and attribute the base
+  /// directory gave it, so the clone reads nothing from a host and needs no base directory (and moves between fleet
+  /// members as a plain volume does). The caller has judged the snapshot complete; an entry it still left to the base
+  /// would read `BaseUnavailable` in the clone.
+  pub fn clone_without_base(
+    store: &Store,
+    origin: &mut Volume,
+    snapshot: SnapshotId,
+    config: VolumeConfig,
+  ) -> Result<Volume, VfsError> {
+    Volume::clone_inner(store, origin, snapshot, config, CloneBase::Drop)
+  }
+
+  fn clone_inner(
+    store: &Store,
+    origin: &mut Volume,
+    snapshot: SnapshotId,
     mut config: VolumeConfig,
+    base: CloneBase,
   ) -> Result<Volume, VfsError> {
     if config.names != origin.policy {
       return Err(VfsError::PolicyMismatch);
@@ -840,7 +864,10 @@ impl Volume {
       last_snapshot: None,
       origin_epoch: Some(epoch),
       quota: config.quota,
-      base: origin.base.as_ref().map(|b| b.for_clone(root_no, epoch)),
+      base: match base {
+        CloneBase::Inherit => origin.base.as_ref().map(|b| b.for_clone(root_no, epoch)),
+        CloneBase::Drop => None,
+      },
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       change: ChangeWaiters::default(),
@@ -7527,4 +7554,14 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
     }
   }
   merged
+}
+
+/// Whether a clone keeps its origin's base plane ([`Volume::clone_of`]) or has none
+/// ([`Volume::clone_without_base`], a clone of a captured base).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloneBase {
+  /// The clone reads the origin's base directories as the origin does.
+  Inherit,
+  /// The clone has no base plane.
+  Drop,
 }

@@ -113,7 +113,7 @@ use crate::daemon::HEARTBEAT_NS;
 use crate::deploy::NodeAddress;
 use crate::dns::{self, Resolver};
 use crate::head::{HeadValue, PlacedHead, SealJob};
-use crate::state::{self, LearnedMember, ShardState};
+use crate::state::{self, LearnedMember, Making, ShardState};
 use crate::verbs;
 use crate::xshard::{call_within, run_on};
 
@@ -1597,7 +1597,7 @@ async fn serve_peer_records(
       };
     let (stream_id, stream, request) = match next {
       crate::forward_lane::Next::Forwarded { stream_id, reply } => {
-        if endpoint.reply(stream_id, &reply).is_err() {
+        if endpoint.reply(stream_id, reply).is_err() {
           return;
         }
         continue;
@@ -1613,7 +1613,34 @@ async fn serve_peer_records(
           verbs::serve_forward(control, peer_anchor, &request).await
         });
         if let Some(reply) = served
-          && endpoint.reply(stream_id, &reply).is_err()
+          && endpoint.reply(stream_id, reply).is_err()
+        {
+          return;
+        }
+        continue;
+      }
+      // A takeover's fetch of a live log is laid out in turns of this shard (g251), so it too runs on its own task: a
+      // long log's answer holds no other request of the peer.
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if kind == slates_cluster::live::LIVE_STATE_STREAM
+        && enrolled
+        && slates_db::live::is_fetch(&request) =>
+      {
+        let peer_host = state::with_state(|s| {
+          s.learned_members
+            .get(&peer_anchor)
+            .map_or(seed, |learned| learned.host)
+        })
+        .unwrap_or(seed);
+        let served = forwards.spawn(stream_id, async move {
+          withheld_live_state().await;
+          crate::live_ship::serve_fetch(local, peer_host, request).await
+        });
+        if let Some(reply) = served
+          && endpoint.reply(stream_id, reply).is_err()
         {
           return;
         }
@@ -1629,7 +1656,7 @@ async fn serve_peer_records(
           crate::work_route::serve(control, &request).await
         });
         if let Some(reply) = served
-          && endpoint.reply(stream_id, &reply).is_err()
+          && endpoint.reply(stream_id, reply).is_err()
         {
           return;
         }
@@ -1671,12 +1698,8 @@ async fn serve_peer_records(
           count_refusal(ACCEPT_REFUSED);
           return Vec::new();
         }
-        // Test support: a fault holds a live-state reply after its request arrived (never reachable from the wire),
-        // so a takeover's question to this node misses its budget while the probe plane still answers.
         if stream == slates_cluster::live::LIVE_STATE_STREAM {
-          while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
-            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
-          }
+          withheld_live_state().await;
         }
         match stream {
           crate::member_task::PLANE_EPOCH_STREAM => plane_secret
@@ -1706,30 +1729,51 @@ async fn serve_peer_records(
             crate::mirror::serve_promise(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
-          slates_cluster::live::LIVE_ENTRY_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_entry(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
-          slates_cluster::live::LIVE_STATE_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_state(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
-          slates_cluster::live::LIVE_ENTRIES_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_entries(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
+          // A message that puts a live log's entries in a copy first has the volume's claim admitted on this node
+          // (§4.2, g229: `live_ship::admit_claim`), answered `NoRoom` when it cannot be.
+          slates_cluster::live::LIVE_ENTRY_STREAM | slates_cluster::live::LIVE_ENTRIES_STREAM => {
+            let peer_host = state::with_state(|s| {
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host)
+            })
+            .unwrap_or(seed);
+            let object = slates_db::live::object_of(&request);
+            let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+            match admission.refusal() {
+              Some(refusal) => refusal,
+              None => state::with_state(|s| {
+                if stream == slates_cluster::live::LIVE_ENTRY_STREAM {
+                  crate::live_ship::serve_entry(s, local, peer_host, &request)
+                } else {
+                  crate::live_ship::serve_entries(s, local, peer_host, &request)
+                }
+              })
+              .unwrap_or_default(),
+            }
+          }
+          slates_cluster::live::LIVE_STATE_STREAM => {
+            let peer_host = state::with_state(|s| {
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host)
+            })
+            .unwrap_or(seed);
+            // An install puts a whole state in a copy; a report or a fetch takes nothing in.
+            let installs =
+              !slates_db::live::is_report(&request) && !slates_db::live::is_fetch(&request);
+            let object = installs
+              .then(|| slates_db::live::object_of_state(&request))
+              .flatten();
+            let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+            match admission.refusal() {
+              Some(refusal) => refusal,
+              None => {
+                state::with_state(|s| crate::live_ship::serve_state(s, local, peer_host, &request))
+                  .unwrap_or_default()
+              }
+            }
+          }
           crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -1752,6 +1796,15 @@ async fn serve_peer_records(
               .get(&peer_anchor)
               .map_or(seed, |learned| learned.host);
             crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
+          // A moved volume's new owner asks its cohort by name (A-291).
+          crate::moves::MOVE_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::moves::serve_move_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
           stream if is_content_stream(stream) => {
@@ -1854,13 +1907,22 @@ async fn serve_peer_records(
       }
     }
     .await;
-    let served = endpoint.reply(stream_id, &reply);
+    let served = endpoint.reply(stream_id, reply);
     // The sender's state on the connection the peer dialed: where its forwards and reads come back from this node.
     let seen = crate::state::RecordLink::seen(peer_anchor, &endpoint);
     state::with_state(|s| s.served_sessions.insert(peer_anchor.0, seen));
     if served.is_err() {
       return;
     }
+  }
+}
+
+/// Test support: while a fault holds this node's live-state replies (`ShardState::live_state_withhold_replies`, never
+/// reachable from the wire), a reply on that kind waits after its request arrived, so a takeover's question to this node
+/// misses its budget while the probe plane still answers.
+async fn withheld_live_state() {
+  while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
+    crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
   }
 }
 
@@ -1958,8 +2020,15 @@ fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
 /// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
 const RECORD_UNPUBLISHED: &str = "fleet.record.unpublished";
 
+/// The status count of held records accepted in place of a different value held at their position, a lower epoch's,
+/// which never committed (A-373): what a green's replica built over the replaced value follows. Format: a refusal name
+/// in the daemon's status report.
+const RECORD_REPLACED: &str = "fleet.record.replaced";
+
 /// Holds `record` from `peer_host` once its authority was checked ([`check_held_record`]): the acceptance into this
-/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply.
+/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply. A record
+/// that replaces a different value held at its position (a higher epoch's, A-373) rewinds this holder's replica of the
+/// green it belongs to past the value it replaced (`merge_origin::rewind_past_replaced`).
 pub(crate) fn hold_checked_record(
   state: &mut ShardState,
   local: HostId,
@@ -1967,6 +2036,11 @@ pub(crate) fn hold_checked_record(
   record: &Record,
 ) -> Vec<u8> {
   let generation = state.fleet.configuration().version;
+  let replaces = state
+    .holder_records
+    .get(&record.object)
+    .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
+    .is_some_and(|held| held != record.value.as_slice());
   let accepted = match state.holder_records.get_mut(&record.object) {
     Some(acceptor) => acceptor.accept(record),
     None => {
@@ -2002,6 +2076,12 @@ pub(crate) fn hold_checked_record(
       // departed owner: the object has an authorized live owner again, and the promotion gate this holder
       // kept for it has served its purpose.
       state.departed_owners.remove(&record.object);
+      // The register holds the new value from here, acknowledged or not: a replica built over the one it replaced
+      // follows it now.
+      if replaces {
+        state.count(RECORD_REPLACED, 1);
+        crate::merge_origin::rewind_past_replaced(state, record);
+      }
       match state
         .fleet
         .track_object(record.object, peer_host, state.council.configuration())
@@ -2092,8 +2172,10 @@ fn serve_content_request(
 /// inputs (A-286): a content acknowledgement bound to them when it holds them whole (`merge_service::inputs_held`), to
 /// a peer that may place them here; else the content plane's answer to the shipment's offer asked again after its
 /// chunks, the chunks it still lacks; else nothing. So inputs larger than one shipment cross in as many as they take,
-/// each carrying only what this holder lacks.
-fn serve_merge_shipment(
+/// each carrying only what this holder lacks. A record that replaces a different value held at its position (a
+/// higher epoch's, A-373) is held before its content frames, whose inputs the door admits only once a held record names
+/// them (`merge_service::hold_replacing_record`).
+pub(crate) fn serve_merge_shipment(
   s: &mut ShardState,
   local: HostId,
   peer_host: HostId,
@@ -2108,6 +2190,7 @@ fn serve_merge_shipment(
   let Ok(record) = Record::decode(record) else {
     return Vec::new();
   };
+  crate::merge_service::hold_replacing_record(s, local, peer_host, &record);
   if !content.is_empty() {
     s.count(crate::merge_service::INPUTS_CARRIED, 1);
   }
@@ -2295,6 +2378,15 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some(record) = state.db.partition().volume(slot.id) else {
       continue;
     };
+    // A volume this node lost to a successor (yielded at its re-admission, A-334, or its log fenced, A-338) ships no
+    // record (A-382): its successor owns its registers, so each record here is stale, and a holder's copy made afresh
+    // (a re-admitted holder lets its own go, `readmission::let_go_own_registers`) takes the first member's record it
+    // meets as its owner's. Shipped, a re-admitted creator's stale catalog could reach such a copy before the
+    // successor's, and every holder refused the rest of them each period (`fleet.record.refused.unauthorized`, 218 in
+    // one nemesis run).
+    if crate::verbs::lost_to_a_successor(state, slot.id) {
+      continue;
+    }
     let object = ObjectId(slot.id.bytes);
     // A volume being destroyed ships its tombstone, never its catalog or a head (AUD-29-43): its registers
     // close at the sequence the destroy's record will keep, so the tombstone is continuous with it.
@@ -3199,9 +3291,13 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     .find_map(|(id, handle)| {
       let object = ObjectId(id.bytes);
       let record = state.db.partition().volume(*id)?;
+      // A copy frozen for a move (A-291) is the move's to place: before the switch its handoff places it
+      // ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal from here would
+      // contend with (a frozen copy's heal republished its head once its target died, 2026-11-18).
       if record.epoch == 0
         || record.state == VolumeState::Destroying
         || state.seals.contains_key(&object)
+        || crate::moves::frozen(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
       {
         return None;
       }
@@ -3248,6 +3344,12 @@ enum Heal {
   Restore(Vec<HostId>),
   /// Place on the current cohort at the next sequence and republish the head there naming that set.
   Replace,
+  /// Place on the current cohort without this owner at the next sequence and republish the head there naming that set
+  /// ([`start_move_handoff`], A-291): a volume moving to another member is handed over with its head held by `f + 1`
+  /// hosts other than the member it leaves. This owner's own copy is its content only while it owns the volume: once
+  /// the configuration names the new owner, every successor fetches by identity from the holders the head names, and
+  /// this node's frozen copy serves no fetch, so the owner is neither a candidate nor counted.
+  Handoff,
 }
 
 /// The heal for an owned snapshot whose recorded placement names `region` (§4.10 "the healer"), as [`heal_decision`]
@@ -3462,9 +3564,11 @@ fn start_seal(
   created_unix: u64,
   healing: Option<Heal>,
 ) -> bool {
-  // A replace puts its content at the next sequence, ahead of every holder's records, since a holder refuses a put
-  // at the head's own sequence that the head there does not name it for (`content_retention::admits`).
-  let put_sequence = if matches!(healing, Some(Heal::Replace)) {
+  // A replace (and a move's handoff) puts its content at the next sequence, ahead of every holder's records, since a
+  // holder refuses a put at the head's own sequence that the head there does not name it for
+  // (`content_retention::admits`).
+  let republish = matches!(healing, Some(Heal::Replace | Heal::Handoff));
+  let put_sequence = if republish {
     let Some(next) = sequence.checked_add(1) else {
       state.count(HEAL_EPOCH_EXHAUSTED, 1);
       return false;
@@ -3493,6 +3597,11 @@ fn start_seal(
   // names and a successor fetches from, and a head is never rewritten at its sequence.
   let mut content = match &healing {
     Some(Heal::Restore(holders)) => Placement::of(holders),
+    Some(Heal::Handoff) => {
+      let mut cohort = state.fleet.configuration().place_content(object);
+      cohort.candidates.retain(|host| *host != local);
+      cohort
+    }
     Some(Heal::Replace) | None => state.fleet.configuration().place_content(object),
   };
   content.acked = if content.candidates.contains(&local) {
@@ -3514,13 +3623,48 @@ fn start_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing: healing.is_some(),
-      republish: matches!(healing, Some(Heal::Replace)),
+      republish,
       refilled: Vec::new(),
       records_acked: Vec::new(),
       shipment: None,
     },
   );
   true
+}
+
+/// Begins the handoff of a moving volume's head on its owner shard (A-291; [`Heal::Handoff`]): the head's content put at
+/// the next sequence on this owner's cohort without this node, and the head republished there naming the hosts that took
+/// it, so the head a move hands over is held by `f + 1` hosts other than the member it leaves (`crate::moves`). `false`,
+/// nothing begun, while a seal job for the volume is under way (a handoff begun earlier among them) or when its head
+/// cannot be walked ([`start_seal`] counts that).
+pub(crate) fn start_move_handoff(state: &mut ShardState, id: DbVolumeId) -> bool {
+  let object = ObjectId(id.bytes);
+  if state.seals.contains_key(&object) {
+    return false;
+  }
+  let Some(&handle) = state.by_id.get(&id) else {
+    return false;
+  };
+  let Some((head, sequence)) = state
+    .db
+    .partition()
+    .volume(id)
+    .map(|record| (record.head, record.epoch))
+  else {
+    return false;
+  };
+  let local = state.fleet.host();
+  let created_unix = u64::try_from(state.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
+  start_seal(
+    state,
+    local,
+    object,
+    handle,
+    head,
+    sequence,
+    created_unix,
+    Some(Heal::Handoff),
+  )
 }
 
 /// Whether `job`'s content is where the job must leave it: a restoring heal once every holder it restores holds it,
@@ -3988,12 +4132,9 @@ fn hedge_targets(hedged: bool, remote: Vec<HostId>, first_round: usize) -> Vec<H
 /// dispatch to settle.
 async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Option<Dispatch> {
   let budget = work.budget;
-  // The first round reaches `f + 1` copies: at home the owner is one of them, so `f` remote candidates; in the
-  // mirror region the owner holds none, so `f + 1`.
-  let owner_copies = match work.track {
-    Track::Home => 0,
-    Track::Mirror => 1,
-  };
+  // The first round reaches `f + 1` copies: where the owner is a candidate (a home seal) it is one of them, so `f`
+  // remote candidates; where it is not (the mirror region, a move's handoff, A-291) it holds none, so `f + 1`.
+  let owner_copies = usize::from(!work.candidates.contains(&local));
   let hedge = usize::try_from(work.quorum.f)
     .unwrap_or(0)
     .saturating_add(owner_copies);
@@ -4594,8 +4735,14 @@ async fn adopt_and_serve(
   in_flight: &mut Vec<Dispatch>,
 ) {
   in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
+  // Each volume the configuration moved to this node: phase one over its recorded cohort, adoption, then its seal and
+  // the report that it is adopted (A-291).
+  crate::moves::drive_adoptions(origin, local, budget, in_flight).await;
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
+  // The claims of the live logs this node holds (§4.2, g229), settled before anything is made from one: a copy let go
+  // releases its claim, a warm restart's copies have theirs admitted again.
+  crate::live_ship::reconcile_claims(origin).await;
   materialize_adopted_objects(origin, local, budget, in_flight).await;
 }
 
@@ -5198,6 +5345,8 @@ async fn give_up_taken_over(
             waited_on: waited.to_owned(),
           },
         );
+        // A live materialization's record is forgotten with the volume: nothing reads its end now (g251).
+        s.making_taken_over.remove(&object);
       },
       HEARTBEAT_NS,
     )
@@ -5493,6 +5642,20 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     // The control shard's state out of reach (its shutdown): nothing is attempted, nothing is counted.
     None => return Ok(()),
   };
+  // A live volume's materialization runs in turns on its owner shard, by a task of that shard ([`make_live`], g251): an
+  // attempt that finds one running joins it, one that finds one ended reads its end, and only one that finds neither
+  // fetches the log and begins one. Before, every attempt fetched the whole log and rebuilt it inside one owner-shard
+  // turn, which ran past the watchdog's spin window (the nemesis's successors, 0.3 to 2.8 s), and an attempt that turn
+  // outlasted (its call's deadline a period, 100 ms) counted as unanswered, so the next period fetched and rebuilt the
+  // whole log again.
+  if catalog.live_shipped && catalog.live_holders.is_some() {
+    match making_of(origin, target, object).await {
+      Some(Joined::None) => {}
+      Some(Joined::Running(turns)) => return making_runs(object, turns),
+      Some(Joined::Ended(ended)) => return live_ended(object, ended),
+      None => return materialize_unanswered(),
+    }
+  }
   // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
   // candidates under the takeover's epoch, the greatest head adopted, `f + 1` counted among the holders the catalog
   // records (A-240). A catalog that records none had a shipper that never shipped (it ships only once its holders are
@@ -5515,10 +5678,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     None
   };
   let region = head.content_holders.clone();
-  // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
-  // remembered at it (`live_ship::note_rebuild`).
-  let adopted_head = live.as_ref().map(|fetched| fetched.head);
-  let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
   // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
@@ -5564,6 +5723,20 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     registers_short,
     live.as_ref().and_then(|fetched| fetched.past_tolerance),
   );
+  if let Some(fetched) = live {
+    let making = MakeLive {
+      object,
+      id,
+      head,
+      catalog,
+      catalog_sequence,
+      placed,
+      catalog_placed,
+      region,
+      past_tolerance,
+    };
+    return begin_live(origin, target, making, fetched).await;
+  }
   let served = call_within(
     origin,
     target,
@@ -5578,10 +5751,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         takeover: slates_db::catalog::TakeoverRecord {
           epoch: placed.epoch.0,
           head_sequence: sequence,
-          from_live_log: live.is_some(),
+          from_live_log: false,
           past_tolerance,
         },
       };
+      // A copy this node froze for a move it made (A-291) goes before the volume's keys are adopted ([`let_frozen_go`]);
+      // an envelope's open let it go in its first turn.
+      let_frozen_go(s, id)?;
       // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c); an
       // envelope's was adopted before its open ([`open_in_turns`]). A head that carried no entry for this node (it
       // acknowledged before its pair arrived) leaves a plain archive's volume to a new key.
@@ -5589,22 +5765,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
       {
         s.count(LINEAGE_UNADOPTED, 1);
-      }
-      // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
-      if let Some(fetched) = &live {
-        let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
-        past_the_pressure_hold(s, |s| {
-          verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
-        })
-        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
-        // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
-        crate::live_ship::adopt_head(s, id, fetched.head);
-        s.placed_heads.insert(object, placed);
-        s.placed_heads.insert(object.catalog(), catalog_placed);
-        // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
-        // from the adopted head at once.
-        published_before_served(s)?;
-        return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
       // An envelope is opened before this turn ([`open_in_turns`]), so what arrives here is a plain archive.
@@ -5632,15 +5792,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     HEARTBEAT_NS,
   )
   .await;
-  if let Some(adopted) = adopted_head {
-    match &served {
-      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None, adopted_sealing),
-      Some(Err(refusal)) => {
-        crate::live_ship::note_rebuild(object, adopted, Some(refusal), adopted_sealing)
-      }
-      None => {}
-    }
-  }
   let outcome = state::with_state(|s| match served {
     Some(Ok(())) => {
       // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363).
@@ -5669,6 +5820,370 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   outcome.unwrap_or(Ok(()))
 }
 
+/// Counter: materializations of a taken-over volume whose frozen copy (a move this node made, A-291) the database would
+/// not let go this period: the volume stays pending and is attempted again next period.
+const FROZEN_UNSUPERSEDED: &str = "fleet.materialize.frozen_unsuperseded";
+
+/// Lets a copy this node froze for a move it made (A-291) go before a takeover of the same volume adopts its keys, on
+/// the volume's owner shard: the adoption serves what the move's target left, writes included
+/// (`crate::moves::supersede_frozen`), and the copy's release erases the volume's keys with its record (a destroy's
+/// cryptographic erase), so a release after the adoption erased the keys just adopted and the volume's next seal made
+/// keys of its own. Nothing when no copy is frozen here; [`FROZEN_UNSUPERSEDED`], counted, when the database refused the
+/// release (attempted again next period).
+fn let_frozen_go(state: &mut ShardState, id: DbVolumeId) -> Result<(), &'static str> {
+  if state.moves_out.contains_key(&id) && !crate::moves::supersede_frozen(state, id) {
+    state.count(FROZEN_UNSUPERSEDED, 1);
+    return Err(FROZEN_UNSUPERSEDED);
+  }
+  Ok(())
+}
+
+/// A live volume's materialization as its owner shard holds it, read by an attempt of the control shard ([`making_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Joined {
+  /// None runs or ended there: the attempt fetches the log and begins one.
+  None,
+  /// One runs: the turns it has taken.
+  Running(u64),
+  /// One ended, made or refused by the named counter: read once, and forgotten there.
+  Ended(Result<(), &'static str>),
+}
+
+/// Where `object`'s live materialization stands on its owner shard `target` ([`make_live`]), an ended one forgotten
+/// there once read; `None` when the shard did not answer in its own time.
+async fn making_of(origin: u16, target: u16, object: ObjectId) -> Option<Joined> {
+  crate::xshard::call_in_shard_time(
+    origin,
+    target,
+    move |s| match s.making_taken_over.get(&object).copied() {
+      None => Joined::None,
+      Some(Making::Running { turns }) => Joined::Running(turns),
+      Some(Making::Made) => {
+        s.making_taken_over.remove(&object);
+        Joined::Ended(Ok(()))
+      }
+      Some(Making::Refused(why)) => {
+        s.making_taken_over.remove(&object);
+        Joined::Ended(Err(why))
+      }
+    },
+    HEARTBEAT_NS,
+  )
+  .await
+}
+
+/// An attempt that found its volume's materialization running on the owner shard: the turns it has taken recorded (more
+/// than at the last look is progress, so a materialization that moves is never given up on) and the wait counted.
+fn making_runs(object: ObjectId, turns: u64) -> Result<(), VolumeWait> {
+  let counted = state::with_state(|s| {
+    if let Some(pending) = s.pending_materializations.get_mut(&object) {
+      pending.record_turns(turns);
+    }
+    s.count(MATERIALIZE_WAITS_MAKING, 1);
+  });
+  match counted {
+    Some(()) => Err(VolumeWait::Making),
+    // The control shard's state out of reach (its shutdown): nothing more is attempted.
+    None => Ok(()),
+  }
+}
+
+/// The end of a live volume's materialization where the control shard learns it: made, the takeover's pending entries
+/// are done with; refused, counted as an owner shard's refusals are, and a refusal of the log remembered at the head it
+/// was fetched at ([`crate::live_ship::note_rebuild`]), so the log is not fetched again at a head it cannot rebuild.
+fn live_ended(object: ObjectId, ended: Result<(), &'static str>) -> Result<(), VolumeWait> {
+  let adopted = state::with_state(|s| {
+    s.pending_materializations
+      .get(&object)
+      .and_then(|pending| pending.live_adopted.clone())
+  })
+  .flatten();
+  if let Some((head, sealing)) = adopted {
+    crate::live_ship::note_rebuild(object, head, ended.err(), sealing);
+  }
+  let outcome = state::with_state(|s| match ended {
+    Ok(()) => {
+      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363), as a one-turn
+      // materialization's is.
+      if let Some(pending) = s.pending_materializations.remove(&object) {
+        s.failover
+          .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
+      }
+      s.pending_catalogs.remove(&object);
+      Ok(())
+    }
+    Err(refusal) => {
+      s.count(MATERIALIZE_REFUSED, 1);
+      s.count(refusal, 1);
+      Err(VolumeWait::Refused)
+    }
+  });
+  // The control shard's state out of reach (its shutdown): nothing more is attempted.
+  outcome.unwrap_or(Ok(()))
+}
+
+/// An attempt whose question to the owner shard was not answered in that shard's own time: counted, retried next
+/// period.
+fn materialize_unanswered() -> Result<(), VolumeWait> {
+  let counted = state::with_state(|s| {
+    s.count(MATERIALIZE_REFUSED, 1);
+    s.count(MATERIALIZE_UNANSWERED, 1);
+  });
+  match counted {
+    Some(()) => Err(VolumeWait::Refused),
+    None => Ok(()),
+  }
+}
+
+/// What a live volume's materialization takes to its owner shard besides the log: the takeover's adopted registers and
+/// their placements, the content holders the head recorded and the shortfall it was adopted past (A-332).
+struct MakeLive {
+  object: ObjectId,
+  id: DbVolumeId,
+  head: HeadValue,
+  catalog: crate::catalog::CatalogValue,
+  catalog_sequence: u64,
+  placed: crate::head::PlacedHead,
+  catalog_placed: crate::head::PlacedHead,
+  region: Vec<u64>,
+  past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
+}
+
+/// Begins a live volume's materialization on its owner shard `target` as a task of that shard ([`make_live`]) and waits
+/// a period for its end: an end within that is read at once; one still running is joined by the next attempt
+/// ([`making_of`], which asks in the shard's own time), its log never fetched or rebuilt again meanwhile, so the wait
+/// needs no longer than the period it holds the control shard's coordinator for. Waited for in the owner shard's own
+/// time instead, the coordinator was held for the whole materialization (1.2 s of a test's paused turns), its council
+/// and its heads with it. The head and sealing the log was fetched at are kept with the pending volume, for its end's
+/// [`crate::live_ship::note_rebuild`].
+async fn begin_live(
+  origin: u16,
+  target: u16,
+  making: MakeLive,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(), VolumeWait> {
+  let object = making.object;
+  let _ = state::with_state_counted(|s| {
+    if let Some(pending) = s.pending_materializations.get_mut(&object) {
+      pending.live_adopted = Some((fetched.head, fetched.sealing.clone()));
+    }
+  });
+  let ended = crate::xshard::task_within(
+    origin,
+    target,
+    move || make_live(making, fetched),
+    HEARTBEAT_NS,
+  )
+  .await;
+  match ended {
+    Some(ended) => {
+      // Read here, so the owner shard forgets the record its task left for a later attempt.
+      crate::xshard::run_on_counted(origin, target, move |s| {
+        if matches!(
+          s.making_taken_over.get(&object),
+          Some(Making::Made | Making::Refused(_))
+        ) {
+          s.making_taken_over.remove(&object);
+        }
+      });
+      live_ended(object, ended)
+    }
+    // Still running on the owner shard, or not begun there: the next attempt reads which.
+    None => making_runs(object, 0),
+  }
+}
+
+/// A live volume's materialization, a task of its owner shard (g251, CLAUDE.md "Bounded work everywhere"): it claims the
+/// volume's record (`ShardState::making_taken_over`), makes the volume in turns of the shard's clock
+/// ([`make_live_in_turns`]), and leaves its end in the record for the control shard to read. Refused
+/// [`MAKING_ALREADY`] when a materialization of the volume already runs there, which the control shard joins instead.
+async fn make_live(
+  making: MakeLive,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(), &'static str> {
+  let object = making.object;
+  let claimed = state::with_state(|s| {
+    if s.making_taken_over.contains_key(&object) {
+      return false;
+    }
+    s.making_taken_over
+      .insert(object, Making::Running { turns: 0 });
+    true
+  });
+  match claimed {
+    Some(true) => {}
+    Some(false) => return Err(MAKING_ALREADY),
+    None => return Err(MATERIALIZE_UNANSWERED),
+  }
+  let ended = make_live_in_turns(making, fetched).await;
+  // Recorded only while the record is still this task's: a takeover the control shard gave up on meanwhile forgot it
+  // ([`give_up_taken_over`]), and nothing would read an end left then.
+  let recorded = state::with_state(|s| {
+    if let Some(record) = s.making_taken_over.get_mut(&object) {
+      *record = match ended {
+        Ok(()) => Making::Made,
+        Err(why) => Making::Refused(why),
+      };
+    }
+  });
+  if recorded.is_none() {
+    return Err(MATERIALIZE_UNANSWERED);
+  }
+  ended
+}
+
+/// One more turn taken by `object`'s materialization on this owner shard, counted for the control shard's progress.
+fn turned(state: &mut ShardState, object: ObjectId) {
+  if let Some(Making::Running { turns }) = state.making_taken_over.get_mut(&object) {
+    *turns = turns.saturating_add(1);
+  }
+}
+
+/// The turns of a live volume's materialization on its owner shard: the log's payloads opened and applied a slice a
+/// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a payload at least:
+/// [`crate::live_ship::Rebuilding`]), counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a
+/// turn; then the archive restored, a turn (`verbs::restore_taken_over`); then the volume made from the restore and
+/// published before it is served (A-343), its shipper made from the head the takeover adopted (A-329), a turn, so no
+/// client meets it unpublished. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68 to
+/// 1.08 s to rebuild 152 to 306 MB of log, 0.24 to 0.32 s to restore and populate the volume and up to 0.48 s to publish,
+/// past the watchdog's spin window, which ended the successor's process.
+async fn make_live_in_turns(
+  making: MakeLive,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(), &'static str> {
+  let MakeLive {
+    object,
+    id,
+    head,
+    catalog,
+    catalog_sequence,
+    placed,
+    catalog_placed,
+    region,
+    past_tolerance,
+  } = making;
+  let crate::live_ship::Fetched {
+    head: adopted,
+    log,
+    lineage,
+    naming,
+    ..
+  } = fetched;
+  let begun = state::with_state(|s| {
+    // A copy this node froze for a move it made (A-291) goes before the rebuild adopts the volume's keys
+    // ([`let_frozen_go`]).
+    let_frozen_go(s, id)?;
+    let begun = crate::live_ship::Rebuilding::begin(s, id, &catalog.owner, (lineage, naming), log);
+    begun.map_err(|why| crate::live_ship::rebuild_refused(s, why))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)?;
+  let mut rebuilding = begun?;
+  let _ = state::with_state_counted(|s| s.count(LIVE_REBUILDS_BEGUN, 1));
+  loop {
+    let slice_ns = state::with_state(|s| crate::config::wrap_slice_ns(seal_quantum_ns(s)))
+      .ok_or(MATERIALIZE_UNANSWERED)?;
+    let began = futures::now_ns();
+    let before = rebuilding.applied();
+    let advanced = rebuilding.advance(|| futures::now_ns().saturating_sub(began) >= slice_ns);
+    let applied = rebuilding.applied().saturating_sub(before);
+    let done = state::with_state(|s| {
+      s.count(LIVE_REBUILD_SLICES, 1);
+      s.count(
+        LIVE_REBUILD_PAYLOADS,
+        u64::try_from(applied).unwrap_or(u64::MAX),
+      );
+      turned(s, object);
+      advanced.map_err(|why| crate::live_ship::rebuild_refused(s, why))
+    })
+    .ok_or(MATERIALIZE_UNANSWERED)??;
+    if done {
+      break;
+    }
+    futures::yield_now().await;
+    // A test's wait between the turns (`Daemon::inject_live_turn_pause`); nothing in production.
+    if let Some(pause_ns) = state::with_state(|s| s.live_turn_pause_ns).flatten()
+      && futures::sleep(pause_ns).await.is_err()
+    {
+      count_refusal(LIVE_TURN_PAUSE_UNTIMED);
+    }
+  }
+  futures::yield_now().await;
+  let archive = rebuilding.archive();
+  let archive = state::with_state(|s| {
+    turned(s, object);
+    archive.map_err(|why| crate::live_ship::rebuild_refused(s, why))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)??;
+  futures::yield_now().await;
+  // The archive restored in a turn of its own: a volume made here already (a retry after its publication was refused)
+  // restores nothing.
+  let restored = state::with_state(|s| {
+    turned(s, object);
+    past_the_pressure_hold(s, |s| match verbs::made_already(s, id, &catalog)? {
+      true => Ok(None),
+      false => verbs::restore_taken_over(s, id, &catalog, Some(&archive)),
+    })
+    .map_err(|refusal| materialize_refusal_counter(&refusal))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)??;
+  drop(archive);
+  futures::yield_now().await;
+  state::with_state(|s| {
+    turned(s, object);
+    let sequence = placed.sequence;
+    // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
+    let taken = verbs::TakenOver {
+      head: &head,
+      catalog: &catalog,
+      catalog_sequence,
+      sequence,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: placed.epoch.0,
+        head_sequence: sequence,
+        from_live_log: true,
+        past_tolerance,
+      },
+    };
+    past_the_pressure_hold(s, |s| {
+      verbs::materialize_taken_over_restored(s, id, &taken, region, restored.as_ref())
+    })
+    .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+    // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
+    crate::live_ship::adopt_head(s, id, adopted);
+    s.placed_heads.insert(object, placed);
+    s.placed_heads.insert(object.catalog(), catalog_placed);
+    // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
+    // from the adopted head at once. Counted taken over only then, in this turn, as the one-turn materialization counted
+    // it: a test that restarts the successor once the count rises found a volume made and published.
+    published_before_served(s)?;
+    crate::live_ship::taken_over(s);
+    Ok(())
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)?
+}
+
+/// Counter: one owner-shard turn's slice of a live volume's rebuild from its log ([`make_live_in_turns`], g251).
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
+/// Counter: the payloads a live volume's rebuild applied, in all its turns (g251): with [`LIVE_REBUILD_SLICES`], how
+/// many a turn took.
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILD_PAYLOADS: &str = "fleet.live.rebuild_payloads";
+/// Counter: a live volume's rebuild from its log begun on its owner shard (g251): once a takeover, however many attempts
+/// its control shard makes while it runs.
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILDS_BEGUN: &str = "fleet.live.rebuilds_begun";
+/// Counter: a test's wait between a live rebuild's turns the runtime could not time; the next turn went at once.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TURN_PAUSE_UNTIMED: &str = "fleet.live.turn_pause_untimed";
+/// Counter: an attempt that found its volume's live materialization running on the owner shard and joined it (g251).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_MAKING: &str = "fleet.materialize.waits.making";
+/// Counter: a live materialization begun while another of the same volume ran on its owner shard, which the control
+/// shard joins instead (g251).
+/// Format: a counter name in the daemon's status report.
+const MAKING_ALREADY: &str = "fleet.materialize.making_already";
+
 /// What a taken-over volume's materialization waited on when an attempt could not finish ([`materialize_pending`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VolumeWait {
@@ -5686,6 +6201,8 @@ enum VolumeWait {
   Live,
   /// The owner shard refused the materialization, or did not answer within the period.
   Refused,
+  /// Its live materialization runs in turns on the owner shard ([`make_live`], g251).
+  Making,
 }
 
 impl VolumeWait {
@@ -5699,6 +6216,7 @@ impl VolumeWait {
       VolumeWait::CatalogPlacement => MATERIALIZE_WAITS_CATALOG_PLACEMENT,
       VolumeWait::Shard => MATERIALIZE_WAITS_SHARD,
       VolumeWait::Live | VolumeWait::Refused => MATERIALIZE_REFUSED,
+      VolumeWait::Making => MATERIALIZE_WAITS_MAKING,
     }
   }
 
@@ -5718,6 +6236,7 @@ impl VolumeWait {
       VolumeWait::Shard => "shard",
       VolumeWait::Live => "live",
       VolumeWait::Refused => "refused",
+      VolumeWait::Making => "making",
     }
   }
 }
@@ -5819,6 +6338,8 @@ async fn open_in_turns(
   let begun = turns
     .call(
       move |s| {
+        // A copy this node froze for a move it made (A-291) goes first: its release erases the volume's keys.
+        let_frozen_go(s, id)?;
         // A head that carried no entry for this node leaves the envelope unopened: its keys are not this node's.
         let adopted = lineage.is_some_and(|lineage| {
           let adopted =
@@ -5880,8 +6401,10 @@ fn recorded_keys(
 }
 
 /// The quantum a seal's turns are cut by on this shard (its archive walk's, its envelope's wrap and, on a successor, an
-/// envelope's open): the shard's step quantum, or the one a test injected (`Daemon::inject_seal_walk_quantum`).
-fn seal_quantum_ns(state: &ShardState) -> u64 {
+/// envelope's open and a live log's rebuild), a takeover fetch's answer (`live_ship::FetchAnswer`) and a live whole
+/// entry's build (`live_ship::WholeBuild`, A-377): the shard's step quantum, or the one a test injected
+/// (`Daemon::inject_seal_walk_quantum`).
+pub(crate) fn seal_quantum_ns(state: &ShardState) -> u64 {
   state
     .seal_walk_quantum_ns
     .or_else(futures::step_budget_ns)
@@ -8100,6 +8623,9 @@ fn reconcile_council_membership(s: &mut ShardState) {
   // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md).
   let voting: Vec<HostId> = alive.iter().map(|(host, _)| *host).collect();
   s.council.reconcile_voters(&voting);
+  // Once no change is in flight, the voters in force go into the configuration, so a learner learns them by its version
+  // (A-380): a seat change alone moves none.
+  s.council.record_voters();
 }
 
 /// One period as the council **leader**: reconcile the membership ([`reconcile_council_membership`]),
@@ -9280,6 +9806,10 @@ async fn follow_configuration(
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
   // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
   fan_configs_to_shards(origin, shards);
+  // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
+  // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
+  crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
+  crate::moves::report_forgotten(local, budget, in_flight).await;
   // Report this node's neighbourhood change placed once every shard holds all it owns at `f + 1` of each
   // cohort of its current placement, so the council retires the old set (§4.8 "Neighbourhood changes").
   report_settlement(origin, shards, local, budget, in_flight).await;
@@ -9867,6 +10397,8 @@ async fn retire_shard_tombstones(
   for object in retired {
     owner_acceptor.forget_object(object);
     owner_acceptor.forget_object(object.catalog());
+    // A destroyed volume this node owned under a moved-object exception: the exception goes with it (A-291).
+    let _ = state::with_state_counted(|s| crate::moves::note_destroyed(s, object, local));
     // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
     // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
     // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for
@@ -10397,7 +10929,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 27] = [
+    let kinds: [(&str, u64); 28] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -10434,6 +10966,7 @@ mod request_kind_tests {
       ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
       ("takeover ledger", crate::takeover::TAKEOVER_LEDGER_STREAM),
+      ("move", crate::moves::MOVE_STREAM),
     ];
     let mut shared = Vec::new();
     for (at, (name, kind)) in kinds.iter().enumerate() {

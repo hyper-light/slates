@@ -938,8 +938,8 @@ impl Fleet {
   }
 
   /// [`create_volume`] on `owner`, shared with every other node ([`Self::share`]).
-  fn create_volume(&self, owner: &str, name: &str, live: bool) -> String {
-    let id = create_volume(owner, name, live);
+  fn create_volume(&self, owner: &str, name: &str, live: bool, claim: Claim) -> String {
+    let id = create_volume(owner, name, live, claim);
     self.share(owner, &id);
     id
   }
@@ -1067,7 +1067,7 @@ const FILE_ROOM: usize = 2;
 /// Derived: a flow's volume holds every file a stream can write, `STREAM_FILES` × `WRITE_BYTES` × [`FILE_ROOM`], in
 /// MiB, so no flow is ever refused for space before it is stopped. A fixed 64 MiB held 16,384 writes, and a 10 s
 /// release stream with the live checkpoint fix wrote 16,404 and failed on its last 20 (live-durability, CI
-/// diag-live-durability-7, 2026-11-07). It is a quota, not memory: the daemons hold only what was written.
+/// diag-live-durability-7, 2026-11-07). As a bounded claim it is memory as well as a quota ([`Claim::Bounded`]).
 fn volume_bound_mib() -> usize {
   STREAM_FILES
     .saturating_mul(WRITE_BYTES)
@@ -1075,11 +1075,30 @@ fn volume_bound_mib() -> usize {
     .div_ceil(1 << 20)
 }
 
-/// Creates a volume on `owner` (live-shipped when `live`): its id.
-fn create_volume(owner: &str, name: &str, live: bool) -> String {
+/// How a flow's volume claims its room (§4.2), always up to [`volume_bound_mib`].
+#[derive(Clone, Copy, Debug)]
+enum Claim {
+  /// A bounded claim: its owner's shard reserves the whole bound at the create, and its successor's shard again at a
+  /// takeover (`verbs::make_restored`; §4.2 "sacred bounded claims"), so a pressure hold raised after the create
+  /// refuses none of a stream's writes. The bound is 782 MiB, 76 % of a shard's 1 GiB reserve on CI's 7 GB macOS
+  /// runner (`reserve=1073741824`), so a node there holds one such claim on each of its two shards. A flow that keeps
+  /// one volume makes it so.
+  Bounded,
+  /// A dynamic volume: it holds only what was written, on its owner and on a successor alike (A-342). A flow that
+  /// keeps several volumes on one fleet makes them so, or a successor holding one bounded claim on the shard a later
+  /// volume routes to cannot take that volume over.
+  Dynamic,
+}
+
+/// Creates a volume on `owner` under `claim` (live-shipped when `live`): its id.
+fn create_volume(owner: &str, name: &str, live: bool, claim: Claim) -> String {
   let bound = format!("{}MiB", volume_bound_mib());
+  let class = match claim {
+    Claim::Bounded => "--bounded",
+    Claim::Dynamic => "--dynamic",
+  };
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", &bound]),
+    &run_ready(owner, &["volume", "create", name, class, &bound]),
     "id",
   );
   if live {
@@ -2401,7 +2420,7 @@ fn a_candidate_killed_mid_stream_catches_up_and_its_copy_serves_a_takeover() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let killed_index = fleet.others(owner_index)[0];
-  let volume = fleet.create_volume(&owner, "killed-candidate", true);
+  let volume = fleet.create_volume(&owner, "killed-candidate", true, Claim::Bounded);
   let mut verdict = Verdict::new("a candidate killed mid-stream");
   let instances = fleet.instances.clone();
   let (outcomes, samples) = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
@@ -2590,7 +2609,7 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, tag, true);
+  let volume = fleet.create_volume(&owner, tag, true, Claim::Bounded);
   let mut verdict = Verdict::new(flow);
   let mut epoch_before = None;
   let mut probes = Vec::new();
@@ -2749,7 +2768,7 @@ fn writes_stream_through_random_candidate_stalls() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "jitter", true);
+  let volume = fleet.create_volume(&owner, "jitter", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes through random candidate stalls");
   let pids: Vec<u32> = fleet
     .others(owner_index)
@@ -2877,7 +2896,7 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "destroy-wait", true);
+  let volume = fleet.create_volume(&owner, "destroy-wait", true, Claim::Bounded);
   let mut verdict = Verdict::new("a live volume destroyed with writes waiting");
   let mut destroyed_at = Duration::ZERO;
   let (outcomes, samples) = stream_through(
@@ -3019,7 +3038,7 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "cut-waiting", true);
+  let volume = fleet.create_volume(&owner, "cut-waiting", true, Claim::Bounded);
   let mut verdict = Verdict::new("clients killed while their writes wait");
   let began = Instant::now();
   let stop_sampling = AtomicBool::new(false);
@@ -3143,7 +3162,7 @@ fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, tag, live);
+  let volume = fleet.create_volume(&owner, tag, live, Claim::Bounded);
   let mut verdict = Verdict::new(match (live, unheard) {
     (true, true) => "a live volume's unheard destroy, then its owner's loss",
     (true, false) => "a live volume's destroy, then its owner's loss",
@@ -3459,7 +3478,7 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let replaced_index = fleet.others(owner_index)[0];
-  let volume = fleet.create_volume(&owner, "replaced-candidate", true);
+  let volume = fleet.create_volume(&owner, "replaced-candidate", true, Claim::Bounded);
   let mut verdict = Verdict::new("a candidate's store destroyed mid-stream");
   let instances = fleet.instances.clone();
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
@@ -3606,7 +3625,7 @@ fn writes_stream_on_a_quiet_fleet() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "quiet", true);
+  let volume = fleet.create_volume(&owner, "quiet", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes on a quiet fleet");
   let (outcomes, samples) =
     stream_through(&fleet.instances, &owner, &volume, 0..STREAM_FILES, |_| {
@@ -3914,7 +3933,7 @@ fn a_long_live_log_is_taken_over_whole() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "long-log", true);
+  let volume = fleet.create_volume(&owner, "long-log", true, Claim::Bounded);
   let mut verdict = Verdict::new("a long live log taken over");
   // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
   // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
@@ -4000,7 +4019,7 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "big-entry", true);
+  let volume = fleet.create_volume(&owner, "big-entry", true, Claim::Bounded);
   let mut verdict = Verdict::new("a live entry past one chunk taken over");
   let id = volume_id_of(&volume);
   let big: Vec<u8> = (0..BIG).map(|at| u8::try_from(at % 251).unwrap()).collect();
@@ -4143,7 +4162,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     .min_by_key(|index| *index == fleet.bootstrap)
     .expect("a five-member fleet seats three voters, so two members hold no seat");
   let owner = instances[owner_index].clone();
-  let volume = fleet.create_volume(&owner, "fresh-member", true);
+  let volume = fleet.create_volume(&owner, "fresh-member", true, Claim::Bounded);
   let mut verdict = Verdict::new("a member that never held the log at a takeover");
   verdict.note(format!(
     "owner {owner}; council seats at {:?}",
@@ -4842,6 +4861,13 @@ fn answered_within(
 /// returns; then replace the dead node with a fresh member, which owns the next iteration's volume. Expect a survivor to
 /// serve the probe and every file before it, byte for byte, each time: a write's answer means it is durable on `f + 1`
 /// hosts, so no window between the answer and the owner's death may lose it.
+///
+/// The volumes are dynamic ([`Claim::Dynamic`]): the two survivors keep every iteration's volume they took over. As
+/// bounded claims of the stream's bound, iterations 3 and 4 failed on CI's 7 GB macOS runner (diag-supervisor-live-2,
+/// 2026-11-18): both of their successor's shards already held a taken-over claim of 782 MiB of their 1 GiB, so its
+/// restore was refused `BudgetExceeded` once a period for the failover SLO's 100 periods and the volume given up
+/// (`fleet.materialize.given_up`), while the other survivor held the whole log through the probe (head 9 of an NFS
+/// iteration's log, head 8 of a client-write iteration's, the heads the passing iterations' successors adopted).
 #[test]
 fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor() {
   /// Shape: the iterations, alternating the barrier.
@@ -4861,7 +4887,12 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
       Barrier::NfsFileSync
     };
     let owner = fleet.instances[owner_index].clone();
-    let volume = fleet.create_volume(&owner, &format!("kill-at-ack-{iteration}"), true);
+    let volume = fleet.create_volume(
+      &owner,
+      &format!("kill-at-ack-{iteration}"),
+      true,
+      Claim::Dynamic,
+    );
     let files: Vec<(String, Vec<u8>)> = (0..=BEFORE)
       .map(|file| {
         let name = format!("ack-{iteration}-{file}");
@@ -5000,7 +5031,7 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
-  let volume = fleet.create_volume(&owner, "lossy", true);
+  let volume = fleet.create_volume(&owner, "lossy", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes through lossy paths, then a takeover over them");
   let mut probes = Vec::new();
   let (outcomes, samples) = stream_through_reading(
@@ -5111,7 +5142,7 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
   let slow = fleet.others(owner_index)[0];
-  let volume = fleet.create_volume(&owner, "slow", true);
+  let volume = fleet.create_volume(&owner, "slow", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes past a slow candidate");
   let mut slowed = (Duration::ZERO, Duration::ZERO);
   let mut probes = Vec::new();
@@ -5305,7 +5336,7 @@ fn an_owner_partitioned(tag: &str, flow: &'static str, partition: Partition) {
   let fleet = partition.fleet(tag);
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
-  let volume = fleet.create_volume(&owner, tag, true);
+  let volume = fleet.create_volume(&owner, tag, true, Claim::Bounded);
   let mut verdict = Verdict::new(flow);
   let mut run = PartitionRun::default();
   let (outcomes, samples) = stream_through(
@@ -6018,7 +6049,7 @@ fn a_seeded_nemesis_of_single_faults_keeps_every_register_invariant() {
   }
   let fleet = Fleet::start_relayed("nemesis", Supervision::Bare, &FLEET_NODES);
   let front = fleet.instances[fleet.owner_index()].clone();
-  let volume = fleet.create_volume(&front, "nemesis", true);
+  let volume = fleet.create_volume(&front, "nemesis", true, Claim::Bounded);
   // The relay draws from the flow's seed; the schedule from the same seed turned half a word, so the two differ.
   let seed = chaos_seed("nemesis");
   let schedule = nemesis_schedule(
