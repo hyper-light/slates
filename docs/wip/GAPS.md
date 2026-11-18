@@ -11198,7 +11198,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 > - **Open (siblings, from reading).**
 >   1. A checkpoint leaves a volume it cannot image out entirely, where a delta keeps its committed record. Recovery
 >      then refuses that volume until a later publication captures it whole.
->   2. The replay writes an overlay's logged write without the overlay's host.
+>   2. **Fixed 2026-11-18 (A-429):** the replay wrote an overlay's logged write without the overlay's host, so a base
+>      file the image held uncopied had the bytes of its window before the write read as zeros. The replay now writes
+>      through the host, copying the file up first, as the bridge did
+>      (`a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`, red once without the fix: byte 0
+>      differed; `docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
 >   3. When the log is full, its forced publication counts the write as logged only if it left nothing out. A captured
 >      volume's write is then reported lost, though the image holds it.
 > - **Record.** `docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`.

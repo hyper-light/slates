@@ -2911,6 +2911,12 @@ before the report is published, so a tool never reads attributes newer than the 
 > leaves a stale stamp with the restamp owed, reported as lost writes rather than dropped. Proven by
 > `a_volume_a_publication_leaves_out_keeps_its_logged_writes_for_the_next_daemon`
 > (`docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`).
+> **The replay writes an overlay's file through its host (2026-11-18, A-429).** The replay wrote a logged record through
+> the volume alone, where the bridge had written it through the overlay's host. For a base file the recovered image
+> holds uncopied, the write then opened its window with nothing of the disk in it, and the bytes before it read as
+> zeros. `verbs::replay_one` now writes an overlay's record as the bridge does: the file copied up and its windows read
+> from the disk first. Proven by `a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`
+> (`docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -30198,3 +30204,30 @@ Applied in the same change to:
   of the fix removed, the restarted daemon handed nothing (`left: []`). `cargo xwin check -p slates-server
   --all-targets` for `x86_64-pc-windows-msvc` is clean of the three dead items. The restart through a real daemon
   is main's (`run-requests.md`).
+
+### A-429 — The write log's replay writes an overlay's logged write through its host (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.6 "Linux", §4.15 copy-up; amends A-63's replay)
+Applied in the same change to: `crates/server/src/verbs.rs` (`replay_one`; the test
+`a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`), §4.6 (the takeover status, after
+A-422's paragraph), GAPS (A-422's entry, its second sibling marked fixed) and the bug record
+`docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`.
+
+- **What was there.** A transport's write reaches an overlay through the overlay's host (`VolumeBridge::write`,
+  `host_for`). `Overlay::write` copies a base file up first: it reads the file and records its witness, and for the
+  large class it pins each touched window from the disk. Only then does it apply the bytes. The replay of a logged
+  write (`replay_one`) called `Volume::write` with no host. For a file the dead daemon had copied up after its last
+  publication, which the recovered image still holds as a base file, the write opened its chunk window from the
+  window's start with nothing of the disk in it. Every byte of the window before the write then read as zero, and the
+  file was left unwitnessed.
+- **The rule.** A replayed write is the write the transport made, applied the way the transport applied it. An
+  overlay's record goes through `Volume::with_host` and the slot's host, and an overlay whose host is away is refused
+  `BaseUnavailable`, as the bridge refuses it. Recovery reopens an overlay's host before it replays the log
+  (`build_recovered_volume`), so in a recovery only a volume it could not rebuild lacks one, and that volume is not
+  replayed.
+- **What remains.** A base file the disk changed between the dead daemon's copy-up and the replay is copied up as the
+  disk holds it now. The dead daemon's copy was never published, so the replayed write lands on the newer bytes;
+  logging a copy-up's bytes would cost a whole file per first write.
+- **Evidence.** The test replays a logged write of eight bytes at byte 10 of an uncopied base file (the server crate's
+  `lib.rs`) and reads the file back through the overlay: with the fix it reads as the disk's file with the eight bytes
+  in place. It was red once with the replay writing through the volume alone, the first difference at byte 0 (Mac
+  Studio, 2026-11-18T20:29Z, debug); with the fix it passes beside the clone replay test and the write log's eleven (13
+  of 13).
