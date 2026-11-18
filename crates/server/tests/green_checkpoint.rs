@@ -60,6 +60,14 @@ fn submit_versions(
     }
     match client.submit(work) {
       Ok(Submitted::Accepted(version)) => head = version,
+      Ok(Submitted::ApprovalRequired { .. }) => {
+        return (
+          head,
+          Some(format!(
+            "submit {n}: awaits approval, with no write policy set"
+          )),
+        );
+      }
       Ok(Submitted::Conflict(windows)) => {
         return (head, Some(format!("submit {n}: conflict {windows:?}")));
       }

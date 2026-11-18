@@ -27,7 +27,7 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
-use slates_ipc::protocol::{EntriesCursor, PlannedEntry};
+use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, WritePolicy};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
@@ -46,6 +46,14 @@ pub enum Submitted {
   Accepted(u64),
   /// The increment conflicts; the windows to rebase against.
   Conflict(Vec<MergeWindow>),
+  /// An ask write policy holds the merge for approval (A-285): nothing merged. [`Client::submit_approved`] with this
+  /// identity, under the launcher's proof, merges exactly this increment.
+  ApprovalRequired {
+    /// The increment's identity, which the approval binds.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
+  },
 }
 
 /// The result of a rebase (§4.16 "Rebase, the only corrective path"): the work moved onto the head
@@ -861,6 +869,9 @@ fn extract_submitted(body: ReplyBody) -> Result<Submitted, ClientError> {
       version: None,
       conflicts,
     } => Ok(Submitted::Conflict(conflicts)),
+    ReplyBody::MergeApprovalRequired {
+      identity, paths, ..
+    } => Ok(Submitted::ApprovalRequired { identity, paths }),
     _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
   }
 }
@@ -3437,8 +3448,29 @@ impl Client {
         version: None,
         conflicts,
       } => Ok(Submitted::Conflict(conflicts)),
+      ReplyBody::MergeApprovalRequired {
+        identity, paths, ..
+      } => Ok(Submitted::ApprovalRequired { identity, paths }),
       _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
     }
+  }
+
+  /// Submits a work whose merge an ask policy held (A-285), approving exactly the increment `identity` names, under
+  /// `proof`, the keyed hash under the instance's issuer secret (`slates_server::landing::merge_approval_proof`): merged
+  /// if the work still builds that increment, refused `GrantMismatch` if it changed since.
+  pub fn submit_approved(
+    &mut self,
+    work: VolumeId,
+    evidence: &[[u8; 32]],
+    identity: [u8; 32],
+    proof: [u8; 32],
+  ) -> Result<Submitted, ClientError> {
+    extract_submitted(self.call(&RequestBody::SubmitApproved {
+      work,
+      evidence: evidence.to_vec(),
+      identity,
+      proof,
+    })?)
   }
 
   /// Edits a work volume and submits it, in one request (§4.16, A-225): exactly [`Client::edit`] and then, when the
@@ -3479,6 +3511,9 @@ impl Client {
         version: None,
         conflicts,
       } => Ok(Submitted::Conflict(conflicts)),
+      ReplyBody::MergeApprovalRequired {
+        identity, paths, ..
+      } => Ok(Submitted::ApprovalRequired { identity, paths }),
       _ => Err(ClientError::UnexpectedReply {
         verb: "edit_and_submit",
       }),
@@ -3915,6 +3950,24 @@ impl Client {
     }
   }
 
+  /// Presents a landing and never lands it, whatever the volume's write policy (A-285): `Landing::GrantRequired` with
+  /// the plan, its entries readable through [`Client::landing_entries`], and nothing written. A reviewer's read of what
+  /// a landing would write, a bypass volume's included.
+  pub fn present(
+    &mut self,
+    volume: VolumeId,
+    snapshot: Option<SnapshotId>,
+    target: &str,
+    filter: Filter,
+  ) -> Result<Landing, ClientError> {
+    extract_landed(self.call(&RequestBody::Present {
+      volume,
+      snapshot,
+      target: target.to_owned(),
+      filter,
+    })?)
+  }
+
   /// Issues the grant a presented landing needs, carrying the human surface's proof of issuer authority
   /// (§4.13 "Grants"; the proof is `slates_server::landing::grant_proof` under the anchor's issuer
   /// secret — only a caller that maps the anchor segment can make one). Returns the grant id `land`
@@ -3937,6 +3990,39 @@ impl Client {
     })? {
       ReplyBody::Granted { grant } => Ok(grant),
       _ => Err(ClientError::UnexpectedReply { verb: "grant" }),
+    }
+  }
+
+  /// Sets a write policy (A-285) from the `version` the setter read: the launcher's or the harness's act, proven by
+  /// `proof`, the keyed hash under the launcher's secret (`slates_server::landing::policy_proof`); refused
+  /// `PolicyChanged` once the policy has moved past `version`. Refused `Forbidden` on a consumer-bound
+  /// channel (an agent never sets its own policy) and `GrantIssuerUnverified` without the proof.
+  pub fn set_policy(
+    &mut self,
+    subject: PolicySubject,
+    (policy, version): (WritePolicy, u64),
+    proof: [u8; 32],
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetPolicy {
+      subject,
+      policy,
+      version,
+      proof,
+    })? {
+      ReplyBody::PolicySet => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "set_policy" }),
+    }
+  }
+
+  /// A write policy (A-285) and its version, the one a [`Client::set_policy`] names: `None` while none is set, which
+  /// merges at once and lands under approval.
+  pub fn policy(
+    &mut self,
+    subject: PolicySubject,
+  ) -> Result<(Option<WritePolicy>, u64), ClientError> {
+    match self.call(&RequestBody::Policy { subject })? {
+      ReplyBody::Policy { policy, version } => Ok((policy, version)),
+      _ => Err(ClientError::UnexpectedReply { verb: "policy" }),
     }
   }
 
