@@ -28,7 +28,7 @@ use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::{InodeNo, RefOwner};
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{Kind, SpecialNode};
 
 /// Format: the set-group-ID mode bit (`<sys/stat.h>` `S_ISGID`): on a directory, what is created in it takes
 /// the directory's group, and a directory created in it takes the bit too.
@@ -617,13 +617,8 @@ impl<'v> VolumeBridge<'v> {
     parent: InodeNo,
     cx: &OpContext,
   ) -> Result<(), VfsError> {
-    let uid = match (cx.owner_uid, &cx.subject) {
-      (Some(uid), _) => uid,
-      (None, Principal::Uid { uid, .. }) => *uid,
-      // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
-      // account's, as the host filesystem will report it.
-      (None, Principal::Consumer { account, .. }) => *account,
-      (None, Principal::Sid { .. } | Principal::Certificate { .. }) => return Ok(()),
+    let Some(uid) = creating_uid(cx) else {
+      return Ok(());
     };
     let parent_attrs = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).stat(self.store, parent),
@@ -646,6 +641,20 @@ impl<'v> VolumeBridge<'v> {
   }
 }
 
+/// The uid request `cx` creates as: the transport's per-request caller (an NFS `AUTH_SYS` uid, a FUSE request
+/// header's), else the enrolled subject's own Unix account; `None` for a subject that is no Unix user (a Windows SID, a
+/// certificate — never on the POSIX mount path), whose platform's own ownership model governs.
+fn creating_uid(cx: &OpContext) -> Option<u32> {
+  match (cx.owner_uid, &cx.subject) {
+    (Some(uid), _) => Some(uid),
+    (None, Principal::Uid { uid, .. }) => Some(*uid),
+    // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
+    // account's, as the host filesystem will report it.
+    (None, Principal::Consumer { account, .. }) => Some(*account),
+    (None, Principal::Sid { .. } | Principal::Certificate { .. }) => None,
+  }
+}
+
 /// A neutral [`NodeAttr`] from what the volume observes of inode `no`. Generation is 0 until
 /// generation-tracked reuse lands (§4.6 `(no, gen)`).
 fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
@@ -665,6 +674,7 @@ fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
     btime: attrs.btime,
     windows: observed.windows.bits(),
     change: observed.change,
+    device: observed.device,
   }
 }
 
@@ -1168,18 +1178,24 @@ impl Bridge for VolumeBridge<'_> {
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
+    // A device node other than a whiteout is made for a caller acting as root alone (A-294,
+    // `crate::access::needs_superuser`): a kernel asks `CAP_MKNOD` before a FUSE or virtio-fs request reaches here, and
+    // this holds every other transport to the same rule.
+    if crate::access::needs_superuser(node) && creating_uid(cx) != Some(crate::access::ROOT_UID) {
+      return Err(VfsError::NotPermitted);
+    }
     let parent_no = InodeNo(parent.inode);
     let no = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
-        .mknod_no(self.store, parent_no, name, mode, kind),
+        .mknod_no(self.store, parent_no, name, mode, node),
       None => self
         .volume
-        .mknod_no(self.store, parent_no, name, mode, kind),
+        .mknod_no(self.store, parent_no, name, mode, node),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
     Ok(node_attr(no.0, &self.volume.observe(self.store, no)?))

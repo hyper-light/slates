@@ -1863,6 +1863,20 @@ the mounting kernel and its endpoint identity, never a distributed stream. The c
 regular-file I/O refuses these kinds. Existing host special files remain excluded from
 the live base: importing a name must not connect the volume to a host endpoint.
 
+**Device nodes (A-294).** A block or character device node is an inode whose body is its number: a major and a minor,
+each the 32 bits NFS carries (`specdata3`, `specdata4`), kept exactly as made (`Body::Device(DeviceNumber)`, eight bytes
+inside a body already larger, so no inode should grow; owed: `tree_heap`'s measurement of `Inode`, 168 bytes before).
+It has no content, so the core's regular-file I/O refuses it as it
+refuses a FIFO; it links, renames, unlinks, snapshots, clones, recovers, replicates, archives and merges with its number,
+and a whiteout as overlayfs writes one is a character device numbered 0/0 like any other. Nothing in slates opens the
+device a node names: the base plane imports none from the host, a landing refuses one, and every consumer's kernel is
+guarded (§4.6).
+
+> **A-294 status (2026-11-17).** Built in the volume core (`Kind::BlockDevice`, `Kind::CharDevice`, `SpecialNode`,
+> `Volume::mknod_no`, `observe` and `device_in` report the number), the recovery image (version 28) and delta (11), the
+> archive (manifest minor 4), the merge deriver's ops document, and the ext4 image's build and merge (a number past the
+> image's 12-bit major and 20-bit minor is refused at the build, `DeviceNumberUnencodable`).
+
 > **A-26 implementation status (2026-09-20).** The shared namespace, VFS deltas, snapshots,
 > clones, recovery and archives carry IPC metadata. The merge service also preserves it
 > through capture, creation, deletion, conflicts and replay; its inode-aware
@@ -2103,10 +2117,22 @@ the verdict that every entry beneath still matches its listing fingerprint.
 
 **Special names (A-26).** A bridge may create and report FIFO/socket inodes only with
 their real type. The kernel owns transient communication; unsupported platforms refuse
-typed rather than returning a regular file. Block and character devices remain unsupported;
-neither the server nor a mounted client is granted device activation by a volume operation.
-Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
-must exercise local communication and isolation between clones as well as namespace calls.
+typed rather than returning a regular file. Neither the server nor a mounted client is granted device activation by a
+volume operation. Mounted acceptance must exercise local communication and isolation between clones as well as
+namespace calls.
+
+**Device nodes (A-294).** A bridge creates and reports a block or character device node with its number, in its own
+encoding: NFSv3's `rdev` (`specdata3`), NFSv4's `rawdev` (`specdata4`), FUSE's `rdev` in the Linux kernel's 32-bit form
+(`new_encode_dev`; a number past it reads as 0, as Linux's own NFS client reads one, `xdr_decode_specdata3`). A device
+node other than a whiteout (a character device 0/0) is made for a caller acting as root alone, a whiteout for any caller
+who may write the directory: Linux's rule (`vfs_mknod` asks `CAP_MKNOD` of every device but a whiteout; `nfsd` drops
+`CAP_MKNOD` from every uid but root's), applied once in the shared bridge (`access::needs_superuser`) and checked over
+NFS after a taken name (`EEXIST`) and an unwritable directory (`EACCES`), the order A-268 set. Nothing opens one as a
+device: every mount slates makes is `nosuid,nodev` (macOS `MNT_NODEV`; the Linux FUSE mount's own options; the OCI
+binding), so its kernel refuses the open `EACCES` (`may_open_dev`); an export's PersistentVolume is `nodev` too, and in a
+pod, whose bind drops it (A-94), the container runtime's device cgroup refuses the open; a guest's mount of a virtio-fs
+share is the guest's, so slates asks it for `nodev`, and a guest that declines opens only its own devices. WinFsp and
+FSKit have no device kind and refuse the node unsupported, as a FIFO.
 
 **A read-only attachment is a read-only file system (decided 2026-11-08, from POSIX).** An attachment that may read but
 not write, and a snapshot's view, refuse every change as POSIX's read-only file system does: `EROFS`, at the open for
@@ -2981,8 +3007,8 @@ therefore one implementation shared by both versions.
   defines: NFSv4.2's attributes (`xattr_support`) are not offered, nor returned, in an NFSv4.1 compound.
   `change_attr_type` is not offered until the counter is monotonic across a crash (TBD_FIXES: an
   unstable write's counter can precede the recovery image).
-- **Special names and times.** CREATE makes FIFOs and socket names through the v3 MKNOD, which keeps
-  A-26's rule (block and character devices refused). `supported_attrs` names `time_access_set` and
+- **Special names and times.** CREATE makes FIFOs, socket names and device nodes through the v3 MKNOD, which keeps
+  A-294's rule (a device node other than a whiteout for root alone), and GETATTR reports a device's `rawdev`. `supported_attrs` names `time_access_set` and
   `time_modify_set`, without which the Linux client drops `utimensat`'s explicit times; a GETATTR or
   READDIR asking for either is `NFS4ERR_INVAL` (§5.6). Times have NFSv4's full range: `nfstime4`'s
   signed 64-bit seconds reach the volume's `i64` nanoseconds both ways (the dialect carries them,
@@ -4700,7 +4726,9 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 ### 4.8 Metadata database, registers and configuration (D-14, D-18)
 
 **Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
-hard links and snapshot versions. No live kernel endpoint state is part of the image.
+hard links and snapshot versions. No live kernel endpoint state is part of the image. A device node's image carries
+its number as its body (A-294, image version 28); an image giving one content or a size, or giving a FIFO or file a
+device body, is refused `RecoveryIncomplete`.
 
 > **Status (2026-10-01, AUD-29-30).** A leader admits a proposal or membership entry against its log budget
 > before its log changes, refusing it (`false`, counted `budget_refused`) instead of letting the next
@@ -6222,10 +6250,30 @@ a reader's fetch stages the same way, one chunk per exchange, and resumes from w
 each holder's offer and transfer progress independently, with no wait on the slowest offer;
 anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`, and puts a
-repeatedly late candidate on probation for the group to replace. Cold sealed content (a
+repeatedly late candidate on probation for the group to replace. The healer keeps every head naming
+holders that hold its content (A-276). It re-offers a placed snapshot to exactly the holders its
+placement names, all at once, and ends once each of them holds it, recording nothing: the head
+already names them, and a head is never rewritten at its sequence. A holder that lacked chunks is
+put exactly those, and counts one repair whenever its acknowledgement arrives, inside its round or
+after the round stopped collecting at the hedge delay. A holder the placement names that has left
+the fleet cannot be re-offered to, so the healer places the content on the current cohort at the
+head's sequence plus one, which every holder's door admits as ahead of its records
+(`content_retention::admits`), and records that placement together with the same head snapshot
+advanced to that sequence, as one record; the next record period ships a head there naming holders
+that hold the content. A placement naming fewer than f+1 holders is replaced the same way; at f = 0
+the owner's own copy is the whole placement, and there is nothing to heal. Every heal is bounded from
+its first round by its content round's whole span and one period, so its first round's every
+acknowledgement is folded first; one that has not finished by then ends, counted, and a later step
+heals the volume again. Cold sealed content (a
 measured class by read rate, Phase 8) may be held as k+m fragments across k+m candidates instead
 of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) and the
 reconstruction budget are derived, never fixed (D-O6).
+
+> **Status (2026-11-17, A-276: the healer).** Restore, replace and the bound are built, and each is red on the old
+> code and green on the fix with its fleet test; the original healer test's failure under load was reproduced naturally
+> on the old code (2 of 54 runs under bursting contention) and not on the fix (0 of 30, two of them taking the late path
+> and counting it). Owed: probation of a repeatedly late candidate; the mirror's healer (AC-8.15); a named holder that
+> stays a member outside the candidates (GAPS).
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
@@ -7774,7 +7822,9 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 **Special names (A-26).** A landing containing FIFO/socket creation refuses before its
 first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
-No copy-up, hashing, archive or landing step opens a host special file as regular content.
+No copy-up, hashing, archive or landing step opens a host special file as regular content. A landing containing a
+device node refuses the same way (A-294): a grant authorizes content, never a device on the host, and making one there
+would need a privilege slates never holds (R10).
 
 > **Containment correction (2026-09-19).** Scratch directories created by inode operations
 > belong in the diverged set even without a base. Whole-target staging is removed: its hidden
@@ -8313,7 +8363,9 @@ granted-target exception).
 
 **Special names (A-26).** FIFO/socket changes are explicit namespace/metadata operations,
 with kinds included in canonical identities and conflicts. They have no content hunks.
-Applying or replicating an increment cannot import a live endpoint from the work volume.
+Applying or replicating an increment cannot import a live endpoint from the work volume. A device node is one more
+such kind with its number (A-294): the number is part of its canonical identity, so two works making one path with two
+numbers conflict, and the same node made twice converges.
 
 > **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
 > timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
@@ -8322,8 +8374,13 @@ Applying or replicating an increment cannot import a live endpoint from the work
 > deletion clears live metadata and preserves old versions. The wire declaration is implemented.
 > IPC rename, alias metadata declarations and primary unlink with aliases remain typed refusals
 > under the existing path-based work journal; an inode-aware journal and mounted green/work
-> volumes remain owed. Device creation/activation remain refused. Evidence:
+> volumes remain owed. Device activation remains refused. Evidence:
 > `docs/bugs/2026-09-20-merge-ipc-origins-refused.md`.
+>
+> **Status (2026-11-17, A-294).** A device node's kind and number ride the special-node encoding as kinds 2 and 3,
+> its major and minor after the FIFO and socket fields, so every FIFO and socket encoding and identity is unchanged and
+> no origin, checkpoint or chain format version moved; origins capture device nodes, declared work makes them
+> (`IpcNodeKind::BlockDevice`, `CharDevice`), and the post-state carries each node at its own length.
 >
 > Retention admission reserves the values a verdict can supersede, counting each affected path
 > once and both ends of a rename. Incoming bytes are not an upper bound on retained history:
@@ -10745,6 +10802,8 @@ activation remain refused, with device-metadata preservation a separate decision
   and server archive restoration; `merge`, IPC declarations and server merge capture/sealing,
   with the dated special-file and merge IPC bug records. No new privilege
   or tool is authorized.
+- Resolved (2026-11-18, Ada, option (c); A-294): device nodes are kept as metadata in volumes, images, archives,
+  merges and bridges, with their kind and number, and nothing opens one as a device; A-268's refusal is replaced.
 
 ### A-27 — Verify displaced content across the exchange's own ctime update (2026-09-20)
 
@@ -12685,8 +12744,9 @@ Status: built 2026-10-05 (condition 4).
 - What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
-  writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
-  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268).
+  writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon kept refusing
+  device nodes (NFS4ERR_BADTYPE; `NFS3ERR_PERM`/`NFS4ERR_PERM`, a client's `EPERM`, since A-268) until A-294
+  (2026-11-17) kept them as metadata, so `nodev` is now the guard, not moot.
 - Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
   uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
   flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
@@ -17184,6 +17244,10 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
   and winfstest judged against the 382-entry list.
 
 ### A-268 — A device node is refused as a file system without device nodes refuses it: EPERM, after the name and the directory (accepted 2026-11-08)
+> **Superseded by A-294 (2026-11-17).** A device node is made; `NFS3ERR_PERM`/`NFS4ERR_PERM` now answers only a caller
+> who is not root asking for a device other than a whiteout, after the taken name and the unwritable directory this
+> amendment ordered.
+
 Applied in the same change to: A-26 (its device refusal's answer), the condition-4 status (§4.6), GAPS, the record
 `docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`, and `crates/bridge-nfs/src/procedures.rs`
 (`Export::refuse_device_node`; NFSv4's CREATE reaches it through MKNOD).
@@ -21274,6 +21338,9 @@ The steps' own records follow.
   `FAILED_EXIT_CODE` (4, the CLI's code for a failed daemon), never a panic: a stuck shard's thread cannot be joined, so
   an orderly stop would wait on it for good. The end's line is written by a thread of its own, waited for at most one
   beat, since a shard can be wedged in a write to an undrained standard error while holding the lock every log line takes.
+  A writer that says the line is written is joined before the exit, so it is owned; one still blocked after the beat is
+  ended by the exit (2026-11-18: unjoined, a finished writer was a thread leak to ThreadSanitizer, whose exit report
+  held a lone daemon's end 26 s and made its exit code 66, `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`).
 - **Decided: only `FromEnv` is supervised; `Handoff` is not** (the plan's choice, recorded here as it asked). `Handoff`
   is an anchor in the daemon's own process: it may read the beat, but it cannot end a stuck daemon without ending
   itself, so nothing would end it, and its watchdog ends the process as a lone daemon's does. Supervision is a fact
@@ -22265,3 +22332,273 @@ Applied in the same change to:
   remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
   with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
   owed apart (GAPS).
+
+### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
+Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
+
+Status: designed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the content
+question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). Code waits on W1 (A-247),
+whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-loadtest-w1`.
+
+- **Why (measured).** W1 (A-247) moves a work's edits and composition to the work's shard; the verdict and the rebase
+  still run on the green's owner.
+  - At the 3,000-client load rung (`kernel/` of linux 7.4-rc1, 754 files, 16 MB) the owner spends 51–53% of its wall
+    on them (W1, the anchor recipe, 2026-11-11). A verdict is 21.4–21.7 µs of the owner's CPU and a rebase 12.3–12.4.
+  - Rebases are the larger share of the owner's merge work: 71,000–72,000 rebases a run against 49,000 verdicts.
+  - At 1,000 clients and equal offered load, W1's rebase p99 is worse than main's (rounds' medians 30.7 against 21.2 ms):
+    it crosses to the owner and waits in the ask batch, where on main it ran beside its work.
+  - A rebase changes nothing on the green. Running it on the work's shard takes it off the owner entirely.
+- **The shape.** Each shard that holds a work of a green keeps a replica of the green: the engine's own metadata, built
+  from the owner's at a version and kept current by the owner's accepted versions applied in order through the engine's
+  own replay (`Green::apply_recorded`, the chain entry's `Applied` over its increment). One code path: a replica at
+  version v is the owner's green at v by construction, the property replay already holds for recovery.
+  - *The feed.* After a version is committed (A-252: after its quorum), the owner sends its chain entry to each shard
+    holding a replica, over the existing bounded control channel, in version order. A replica that sees a gap (a
+    version it lacks before the one it is sent) is rebuilt from the owner, counted.
+  - *Served from the replica.* A rebase of a work on that shard, at the replica's head (never below the work's base;
+    the work's next submit is judged by the owner against its own head, as every stale base is). A read of the green
+    at a named version the replica holds (the 60% of A-247's reads). Everything else is unchanged: the verdict, the
+    `Head` read, the merge record, every refusal.
+  - *Behind.* A replica whose head is below a work's base (the owner accepted a version the feed has not delivered)
+    forwards that rebase to the owner, as today, counted. A read at a version the replica does not hold, above its
+    head or below its floor, is forwarded the same way.
+  - *Laptop degenerate (R8).* With one shard there is no other shard and no replica: the owner serves, as now.
+- **Content: once, in place (the supervisor's decision, 2026-11-17).** A-64 keeps content once in the anchor's RAM, and
+  D-7 lets any core read an immutable chunk. So a replica holds no bytes of its own: it names the owner's chunks, and
+  reads them where they are. It never copies them and never fetches them through the fleet for a shard of the same node.
+  Two things the code does not have today follow, and both are part of this amendment:
+  - *Chunks that never move or change.* The engine's content is its owner's heap today (`Green::content`, a map of
+    `Vec<u8>`; the history's `Chunks`, a slot vector of `Vec<u8>` reused when freed), so a reference to it from another
+    thread is not sound. The owner's current values and history chunks move into blocks of a region the owner allocates
+    and seals: a sealed block is never written, moved or reused while any shard can name it (D-6's rule for volume
+    chunks, A-64's for the image). A replica's piece names a block by handle and range, as an image's chunk reference
+    does.
+  - *Frees deferred until every replica has passed them.* A-64's deferral holds a block only until the owner's next
+    publication commits, and knows nothing of readers on other shards; alone it would let a replica read a block freed
+    and reused under it. So the owner frees a chunk whose last reference version v dropped only when every replica has
+    acknowledged a version at or past v. A replica acknowledges on the feed's own channel, after its turn has applied
+    the version and dropped every reference the version removed; the acknowledgement is per version (batched to the
+    latest), never per chunk, so the cost is one message a version a replica and no atomic on any per-item path (D-7's
+    quiescent-state rule, made by message). A replica dropped, rebuilt or ended acknowledges by leaving: its shard's
+    acknowledgement is removed, so a dead replica never holds a free.
+  - *Bounds.* The deferred bytes are charged to the owner's memory class, and they are bounded by the slowest
+    replica's lag. A replica more than the derived lag behind (owed: its derivation, from the class's headroom against
+    the bytes a version frees) is dropped, counted (`merge.replica.dropped_lagging`), and its rebases and reads go to
+    the owner. So no replica can hold the owner's memory past its class.
+  - *When this would be wrong.* If a measured fact makes it unsound (a lifetime the acknowledgement cannot hold) or
+    slower than a copy (cross-shard reads of the owner's blocks costing more than the copy saves), the numbers and the
+    alternative go to the supervisor before code is built another way.
+- **What a replica costs, measured** (perf, 2026-11-11). A diagnostic build (never committed) logged the owner's green,
+  by kind, at the 3,000-client rung's end: head 9,000, two runs alike to a few hundred bytes. Payload bytes, maps' node
+  overhead not counted, so a lower bound:
+
+  | part | bytes | a replica holds it |
+  |---|---|---|
+  | current file bytes | 16,438,721 | no: the owner's blocks, read in place |
+  | history chunks (the current values again, and earlier runs) | 18,859,529 | no: the owner's blocks, read in place |
+  | content history index (45,690 entries, their piece lists) | 8,991,756 | yes |
+  | deltas (9,000 versions, 44,997 ops) | 4,642,109 | yes |
+  | path, last-changed and kind indexes, kind histories | 613,120 | yes |
+  | idempotency and rejected-result caches | 4,183,041 | no: the owner's |
+
+  - Metadata is about 14.2 MB a replica at this rung (about 1.6 KB a version kept, until the retention floor folds it),
+    about 313 MB at 22 shards. Copying content as well would have been about 49.5 MB a replica, and about 1.3 GB for a
+    whole kernel tree, most of a 1.49 GB memory class in every replica: content in place avoids both.
+  - Against the budgets, from the measurement's own daemon log (adas-mac-studio.local-2, `effective_capacity_bytes`
+    103,079,215,104, 23 shards): a shard's metadata class, `table_bytes`, is 373,475,417 bytes (it already bounds the
+    green's chain), and a memory class, `reserve_per_shard`, is 1,493,901,668. A replica's metadata is 3.8% of one
+    shard's `table_bytes` (under 8% if the maps' node overhead doubled it), and each shard holds only its own replica.
+- **Bounds and outcomes.** A replica's metadata is charged to its shard's metadata budget. At the bound the replica is
+  dropped and its rebases and reads go to the owner, counted (`merge.replica.dropped`), never refused to the client.
+  A replica no work on its shard has used for the derived idle period (owed: its derivation, from the feed's cost per
+  version against the rebases it served) is dropped the same way. The feed rides the control channel's existing bound;
+  a full channel delays a version, never drops it (the reply rule since 2026-11-09), and a replica behind forwards.
+- **Tests first.**
+  - The replica equals the owner at every version over generated histories (files, links, modes, renames, removals),
+    the green's identity compared at each version.
+  - A lagging replica's rebase is answered exactly as the owner would answer it at the replica's head, and a rebase whose
+    base is above the replica's head is forwarded and answered by the owner.
+  - A read at a version the replica lacks is forwarded, and its answer equals the owner's.
+  - Lifetime: a replica holding a piece of a chunk whose last reference the owner has dropped reads the chunk's bytes
+    unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before; a replica
+    dropped mid-read releases its hold. Red with the acknowledgement ignored (the owner frees at once).
+  - Non-vacuity: counters of rebases and reads served off the owner and of those forwarded, and of frees deferred for
+    a replica (`merge.replica.frees_deferred`).
+  - Then the A/B the supervisor runs: the anchor recipe, every round, with the owner's utilization before and after.
+- **Tried and rejected.**
+  - *Copying content into each replica* (perf's option 1) or *for the paths a shard's works touch* (option 2): content
+    twice, against A-64, and about 1.3 GB a replica for a whole kernel tree. Rejected 2026-11-17 by the supervisor.
+  - *An epoch-published immutable root of the green's metadata* (the owner's maps shared read-only with every shard):
+    it needs a persistent map the engine does not use. Rejected 2026-11-11 for a replica fed by message. Its other
+    cost, reclaiming what readers may still hold, is paid here for content alone, by acknowledgement.
+  - *Shard-count-fixed replicas* (a replica on a literal number of shards): a tuning literal (R3), and a work's shard is
+    where its rebases are. Rejected for "every shard holding a work of the green".
+  - *Answering the owner's asks in slices of the step budget* (2026-11-09): the step budget, about 4.5 µs, is below one
+    ask's cost, so every slice was one ask and every answer a message; SubmitAccepted p99 75.3–493.0 ms against W1's
+    53.8–77.2 (BENCHMARKS). It moved no work off the owner.
+
+### A-276 — A heal restores the holders a head names and counts each repair however late its acknowledgement; a holder that left is replaced at the next sequence, recorded with the republished head as one record; every heal ends once its first round's replies have had their whole span (2026-11-17, built for goal g248; the replace is live-fixes' 2026-11-09 work; amends §4.10's healer)
+
+Applied in the same change to:
+- §4.10: the "Content replication" paragraph's healer sentences.
+- GAPS (2026-11-17 entry) and `docs/bugs/2026-11-17-a-heal-miscounted-repairs-and-left-heads-naming-holders-without-the-content.md`;
+  the content-replication record's piece 2 (`docs/wip/content-replication.md`).
+- `crates/server/src/fleet.rs`: `heal_one_placed_snapshot`, `Heal`, `heal_for`, `heal_decision`, `start_seal`,
+  `seal_complete`, `content_work`, `put_seal_content`, `fold_round`, `fold_content_ack`, `fold_late_content`,
+  `record_placed_seals`, `record_replacement`, and the test support `injected_content_ack_delay`, with the unit test
+  `the_heal_restores_named_candidates_and_replaces_only_a_departed_or_short_placement`; `crates/server/src/head.rs`
+  (`SealJob::put_sequence`, `SealJob::republish`, `SealJob::refilled`); `crates/server/src/daemon.rs`
+  (`Daemon::inject_content_ack_delay`).
+- The tests in `crates/server/tests/fleet.rs`: `a_repair_whose_acknowledgement_outlasts_its_round_is_counted`,
+  `a_heal_restores_the_named_holder_and_not_a_candidate_without_the_head`,
+  `a_heal_republishes_the_head_once_a_named_holder_has_left`,
+  `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left` and
+  `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later`; and
+  `a_holder_that_lost_placed_content_is_repaired_by_the_healer` now prints whether the holder holds the content and the
+  owner's heal counts.
+
+- **The rule amended.** §4.10 said the healer replays puts that never reached f+1 and that anti-entropy repairs only
+  differing subtrees between recorded holders. The healer re-opened a placed snapshot as an ordinary seal on the current
+  cohort, offered it in rendezvous order, re-recorded whichever holders acknowledged at the head's sequence, and counted
+  a repair only for a holder whose acknowledgement its round collected. Three things followed, each measured below:
+  - **A late repair was never counted.** A content round stops collecting at the hedge delay (the p95 of the owner's
+    put readings, rounded up to the collection poll), and a refill that outlasts it acknowledges as a straggler. The
+    straggler was folded into the placement, the job recorded and dropped, and the repair was never counted; every later
+    heal found the holder whole. This is how `a_holder_that_lost_placed_content_is_repaired_by_the_healer` failed under
+    load (`repairs Ok(0) → Ok(0)`, 2026-11-08, this Mac at load 54).
+  - **A restore could place where the head does not name.** A cohort member holding no head for the object (one that
+    refused or had not yet received the owner's records, as a restarted holder has not) admits a put at the head's
+    sequence as ahead of its records and acknowledged first. The heal placed there, re-recorded that set at the head's
+    sequence, and the named holder stayed empty while the head named it.
+  - **A departed holder stayed named.** A head is never rewritten at its sequence, so a heal's re-recorded placement
+    never reached the head when a holder it named had left the fleet (live-fixes, 2026-11-09).
+- **The rule now.**
+  - **Restore.** While every holder the placement names is a member, the heal re-offers at the head's sequence to
+    exactly the named holders that are candidates, all at once, and ends once every one of them holds the content. It
+    records nothing.
+  - **Repairs.** A holder whose offer answer named chunks it lacked is remembered on the job (`SealJob::refilled`), and
+    its first acknowledgement counts one repair, whether its round collected it or it arrived as a straggler's
+    (`fleet.heal.repaired_late`). `fleet.heal.refill_outlasted_round` counts the refills a round did not collect.
+  - **Replace.** When a holder the placement names is no longer a member (`fleet.heal.named_gone`), or the placement
+    names fewer than `f + 1` holders (`fleet.heal.named_short`, as one recorded before the fleet's `f` grew does), the
+    heal places the content on the current cohort at the head's sequence plus one, the only sequence every holder's door
+    admits (`content_retention::admits`: named by the holder's newest record there, or ahead of every record it holds).
+    Its placement and the same head snapshot advanced to that sequence (`Op::VolumeHeadAdvanced`) are one transaction,
+    every operation checked before it opens, and nothing is recorded unless the head is still that snapshot at the
+    sequence before. Counted `fleet.heal.republished`, or `fleet.heal.republish_refused`.
+  - **Nothing to heal.** When no named remote holder can be put to: at `f = 0` the owner's own copy is the whole
+    placement. The decision is one pure function (`heal_decision`), unit-tested at `f = 0` and on a fleet. live-fixes'
+    cut replaced any placement naming no remote holder, which on a one-node fleet (`f = 0`, a supported configuration)
+    would have advanced the head's sequence by one at every healer step, for good; found by reading this change.
+  - **Bound.** Every heal is bounded from its first round by its content round's whole span (the longest deadline each
+    holder task of a round waits under, derived from the measured round-trip tails) and one period, in which a reply
+    that came at the span's end is folded (`heal_bound_ns`), judged only once its content is not yet where it must be.
+    One past it ends, counted `fleet.heal.unfinished`, and a later step takes the volume up again. live-fixes' cut
+    bounded it by the membership horizon (`lease::horizon_ns`, 900 ms at the default beat), shorter than the span its own
+    rounds' replies may take (1.1 s at least), so a first round's late repair could be lost with its job.
+  - **One clock.** The first round's dispatch is stamped on the owner shard's clock (`ShardState::clock`), the one the
+    hedge delay and the bound are judged by. It was stamped from the dispatching shard's runtime-driver clock, which
+    counts from that shard's start, so the owner's clock read every first round as long past: the hedge round was never
+    held for the measured p95 (a pre-existing fault since the p95 trigger, here a sibling found and fixed), and every
+    heal that did not finish in its first round ended at the next period, unfinished, its late repair uncounted.
+  - **Folds.** A round's acknowledgements, and a straggler's, fold only into the job they were put for: the same
+    snapshot at the same put sequence.
+- **Why one record for the replace.** Recorded apart (live-fixes' cut), the placement was recorded first and the
+  advance after: a refused advance, or a process killed between the two, left the placement naming the new holders at
+  the head's old sequence. The owner's head value there then differs from the value its holders hold, which they refuse
+  for good, and since every holder the new placement names is a member, later heals restore rather than replace, so the
+  head stays naming the departed holder. Found by reading; no test stops a daemon between two records, and
+  `Db::begin`…`commit` is the database's tested all-or-none (`crates/db/tests/model.rs`).
+- **Evidence** (adas-mac-studio.local-2, Apple M3 Ultra, macOS 26.4, debug, 2026-11-17; red is `e7c031aa1`'s healer
+  with the same test support and the new tests, green2 is a68704497; the full table is in the bug record).
+  - Each new test is red on the old code and green on the fix: the late repair FAILED 135 s (`repairs Ok(0) → Ok(0)`,
+    the holder holding the content) and passed 4 of 4 in 11–12 s; the restore FAILED 63 s (the named holder empty, the
+    candidate without the head holding the content) and passed 3 of 3 in 2 s; the departed holder FAILED 452 s and
+    446 s, live (the survivors' heads naming it, `republished` 0) and passed 3 of 3 each in 13–14 s, the survivor taking
+    the volume over and reading the file back after the owner's death, so the replace that puts at the next sequence
+    and then republishes is shown end to end; the bound FAILED 66 s (`fleet.heal.unfinished` 0) and passed 3 of 3 in
+    12–13 s. This change's first cut failed the late repair too ("One clock" above), 93 s, and the f = 0
+    unit test fails with live-fixes' rule put back.
+  - The original test's failure reproduced naturally on the old code, under 64 spinners bursting 300 ms each second on
+    the efficiency cores with the test clamped there too: 23 runs ok, then `repairs Ok(0) → Ok(0)` with the holder
+    holding the content, its refill's acknowledgement 128 ms after the round's dispatch, folded as a straggler.
+    Interleaved under the same load, 30 pairs: red failed 1 of 30 the same way and green2 passed 30 of 30, two of
+    them taking the late path naturally and counting it (`fleet.heal.repaired_late` 1). Red failed 2 of 54 runs under
+    that load, green2 none of 30.
+- **What it does not change.** The head's value at any sequence it was placed at, the snapshot, its manifest and what a
+  client sees: the status's head, snapshot and attachment counts, bytes and lease epoch, and the file's bytes are
+  checked equal across a republish. A named holder that is a member but outside the object's current candidates is
+  neither restored nor replaced (`fleet.heal.named_outside_candidates`; GAPS, open). The mirror's own healer stays open
+  (GAPS, AC-8.15).
+
+### A-294 — Device nodes are kept as metadata, and each consumer's kernel is what keeps them from being opened (accepted 2026-11-18, Ada's option (c) for A-26's device decision; built 2026-11-17 for kiln goal g259)
+Applied in the same change to: A-26 (its device decision, resolved), A-268 (superseded), A-94 (`nodev` is the guard
+now), §4.5, §4.6 (with the NFSv4 attributes), §4.8, §4.15, §4.16 (status), GAPS, `docs/deploy.md`,
+`docs/wip/conformance.md` §3.4b and §6; `crates/vfs` (`Kind::BlockDevice` and `Kind::CharDevice`, `DeviceNumber`,
+`SpecialNode`, `Body::Device`, `Child::BlockDevice` and `Child::CharDevice`, `Volume::mknod_no`, `observe`,
+`device_in`; recovery image version 28 and delta version 11 (built as 26 and 9, landed after A-275 and A-270, so they
+take the next); the archive export; the deriver's ops document; the ext4
+image's build and merge, `ImageError::DeviceNumberUnencodable` replacing `NodeUnsupported`), `crates/archive` (manifest
+minor 4), `crates/merge` (`SpecialKind`'s device kinds), `crates/ipc` (`IpcNodeKind`'s device kinds),
+`crates/bridge-core` (`NodeAttr::device`, `Bridge::mknod` takes a `SpecialNode`, `access::needs_superuser`),
+`crates/bridge-fuse` (`rdev` in every attribute, `DT_BLK` and `DT_CHR`, MKNOD of a device, the mount's own
+`nosuid,nodev`), `crates/bridge-nfs` (MKNOD of a device, `rdev` in `fattr3`, `rawdev` over NFSv4), `crates/bridge-fskit`
+and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refused before a landing's first write), and
+`crates/server` (archive restoration, live shipping, the merge's origin capture, declared work, the image refusal).
+- **The decision.** A-26 authorized FIFO and socket names, kept device nodes refused and left keeping them to Ada; A-268
+  made the refusal `EPERM`. Three options were put to her: (a) keep refusing; (b) whiteouts alone (a character device
+  0/0); (c) every device node as metadata, guarded per consumer. On 2026-11-18 she chose (c): keep device nodes as
+  entries in volumes, images, archives, merges and bridges, with their kind and major and minor, and never let anything
+  open one as a real device; mounts are served `nodev`, guests are asked for `nodev`, and unpacking a container image or
+  a system archive that holds them works on every route.
+- **Why.** A refused device node breaks every unpacking that meets one: a root filesystem's `/dev/console` and
+  `/dev/null`, a system archive's device entries, overlayfs's whiteouts. The cascades were the bulk of every root
+  pjdfstest list: 1,798 of the Linux FUSE list's 1,800 entries, all 1,798 of the NFSv4, OCI and virtio-fs lists', and
+  1,788 of the macOS list's 1,905 cite A-26's device refusal.
+- **The rule.**
+  - A device node is an inode whose body is its number (§4.5): a major and a minor, each the 32 bits NFS carries, kept
+    as made. It has no content, so every regular-file operation refuses it (`SpecialFileOperation`). It links, renames,
+    unlinks, snapshots, clones, recovers, replicates by delta, archives (a file node with no extents, its mode's type
+    bits naming the kind, its number in the metadata), merges (kind and number in the canonical identity, so one path
+    made with two numbers by two works conflicts) and enters and leaves an ext4 image with its number. A number past
+    the image's 12-bit major and 20-bit minor is refused at the build, typed and named, never truncated.
+  - Who may make one is Linux's rule: a caller acting as root, except a whiteout, which any caller who may write the
+    directory makes (`vfs_mknod` in `fs/namei.c` skips `CAP_MKNOD` only for a whiteout; `nfsd_setuser` in
+    `fs/nfsd/auth.c` drops `CAP_MKNOD`, part of `CAP_NFSD_SET`, from every uid but root's). Over FUSE and virtio-fs the
+    kernel asks first; over NFS the server asks, after a taken name (`EEXIST`) and an unwritable directory (`EACCES`),
+    in A-268's order. The typed channel's declared work and the daemon's own restorations (an archive, an image merge)
+    make what they carry: metadata nothing opens.
+  - Nothing opens one as a device. Slates never does: the base plane lists a host's special files and serves none
+    (A-26), and a landing refuses a device node before its first write, since a grant authorizes content and making a
+    device node on the host needs a privilege slates never holds (R10). A consumer's kernel would, so each is guarded:
+    slates' own mounts are `nosuid,nodev` (macOS `MNT_NODEV`; the Linux FUSE mount's options, which now state both
+    rather than rely on `fusermount3`'s default; the OCI binding), where the open is refused `EACCES` (`may_open_dev`);
+    an export's PersistentVolume is `nodev`, and in a pod, whose bind drops the flag (measured, A-94), the container
+    runtime's device cgroup refuses the open; a guest's mount of a share is the guest's, so slates asks for `nodev`
+    there (the guest mount line, g260), and a guest that declines opens only its own devices, inside the VM.
+  - Each route reports the number in its own encoding: NFSv3's `rdev`, NFSv4's `rawdev`, and FUSE's `rdev` in the
+    Linux kernel's `new_encode_dev` form, where a number past it reads as 0, as Linux's NFS client reads one
+    (`xdr_decode_specdata3`). WinFsp and FSKit have no device kind and refuse the node unsupported, as a FIFO.
+- **What it does not change.** FIFO and socket names: every format and identity that holds one encodes it as before (the
+  merge's special-node encoding and the deriver's ops document add kinds 2 and 3, so no merge format version moved, and
+  the deriver's golden identity holds); the base plane's exclusion of a host's special files; A-268's order of checks;
+  the landing's refusal.
+- **Proven**, by `cargo test` of each crate: the volume (`crates/vfs/tests/special.rs`: every kind through links,
+  snapshots, clones, recovery, archives and derivation; images that smuggle content into a device or a device body
+  into a FIFO or file, refused; the Linux encoding's golden vectors; `edges.rs`'s content-operation matrix;
+  `image.rs`'s generated volumes and guest histories with device nodes, a guest's device node kept and an unencodable
+  number refused at the build); the merge (`crates/merge/tests/special.rs`: replay on owner and holder, a renumbered
+  node conflicting, golden vectors, every truncation refused, an origin's round trip, and the generated oracles over
+  device nodes); the server (the origin capture, the work log's round trip); the bridges (`crates/bridge-core`: root
+  alone, a whiteout for anyone, the number in every reply and listing; `crates/bridge-fuse`: `rdev` at its ABI offset
+  and MKNOD vectors of every kind; `crates/bridge-nfs`: made for root with `rdev`, `NFS3ERR_PERM` after `NFS3ERR_EXIST`
+  for uid 1000, a whiteout for uid 1000, NFSv4's `rawdev` read back); the landing oracle (refused before any write).
+  Through real kernels, on the lanes: `a_device_node_reaches_the_mount_with_its_number_and_is_never_opened` (Linux
+  FUSE, an ordinary user: `/dev/null`'s number refused `EACCES` on the `nodev` mount) and
+  `a_device_node_is_made_with_its_number_and_never_opened` (Linux's NFSv4.1 and 4.2 clients, as root, `nodev`).
+- **Owed.** The KIND lane's first run of its device probe (`device_probe`, `xtask/src/kind_export.rs`: `/dev/null`'s
+  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof beside g260's `nodev`
+  guest mount; a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
+  `_LX_BLK`), and WinFsp's listing of a directory holding a FIFO, socket or device node, which fails whole today (GAPS);
+  each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
+  and a list edited without its run fails the record's doc-truth test.

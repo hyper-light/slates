@@ -285,8 +285,9 @@ fn metadata_changes_the_identity() {
 /// a sample whose files recorded size zero. On 2026-09-30 the decoder began requiring the canonical form
 /// (AUD-29-14: a file's recorded size is the length its extents tile), so the sample records its files'
 /// real sizes (pinned `3a98564d…`). Minor 3 (2026-09-30, AUD-29-56: signed times, access and birth times,
-/// the attributes in place of the flag) pins the value below; the attribute encoding has its own pin in
-/// [`the_attribute_encoding_matches_its_golden_vector`].
+/// the attributes in place of the flag) pinned `d1895ea2…`. Minor 4 (2026-11-17, A-294: a device node's major and
+/// minor in every node's metadata, zero for the sample's nodes, none of them a device) pins the value below; the
+/// attribute encoding has its own pin in [`the_attribute_encoding_matches_its_golden_vector`].
 #[test]
 fn the_manifest_identity_matches_its_golden_vector() {
   let hex: String = sample()
@@ -295,7 +296,7 @@ fn the_manifest_identity_matches_its_golden_vector() {
     .map(|b| format!("{b:02x}"))
     .collect();
   assert_eq!(
-    hex, "d1895ea257bc94691ad4b6cecf0f556ea1f791b1ed5dfee6f4c9ef1a875845a8",
+    hex, "d71a6a4de8cc5bfdbf2c3382dbbd950884af80c9c8de72ead666c45a3473520b",
     "the manifest identity changed; regenerate the golden vector only for a deliberate format change"
   );
 }
@@ -525,11 +526,13 @@ fn decoded_meta(bytes: &[u8]) -> Result<NodeMeta, ManifestError> {
 }
 
 /// Format: the bytes ahead of the attribute count in an encoded metadata record — the inode number,
-/// mode, four times, size, link count, owner and group (`write_meta`).
-const META_PREFIX_BYTES: usize = 8 + 4 + 8 * 4 + 8 + 4 + 4 + 4;
+/// mode, four times, size, link count, owner, group and device number (`write_meta`; the device's major and minor
+/// since minor 4, A-294).
+const META_PREFIX_BYTES: usize = 8 + 4 + 8 * 4 + 8 + 4 + 4 + 4 + 4 + 4;
 
 /// AUD-29-56, golden vector: a node carrying attributes and pre-epoch times hashes to a pinned identity, so
-/// the attribute encoding (names, value extents, signed times) cannot drift unnoticed across versions.
+/// the attribute encoding (names, value extents, signed times) cannot drift unnoticed across versions. Minor 3 pinned
+/// `d1adc5b1…`; minor 4 (A-294: the device number, zero here, ahead of the attributes) pins the value below.
 #[test]
 fn the_attribute_encoding_matches_its_golden_vector() {
   let hex: String = one_file_with_meta(meta_with_attributes())
@@ -538,7 +541,7 @@ fn the_attribute_encoding_matches_its_golden_vector() {
     .map(|b| format!("{b:02x}"))
     .collect();
   assert_eq!(
-    hex, "d1adc5b11ddbec1b19c68a816e29bab97affb9776ee59ff5cc7ba7f91eb80d47",
+    hex, "1126ddbd3e3941a5c2ec7066a567195be8c16f8ca9e0513ebb0b765dbc8880b3",
     "the attribute encoding changed; regenerate the golden vector only for a deliberate format change"
   );
 }
@@ -660,5 +663,39 @@ fn malformed_attribute_structure_is_refused_typed() {
   assert_eq!(
     decoded_meta(&whole[..META_PREFIX_BYTES + 1]),
     Err(ManifestError::Truncated)
+  );
+}
+
+/// A-294 (format minor 4), hostile input: do encode a character device's metadata with its number and decode it, encode
+/// the same node numbered otherwise, and decode a record whose mode names no device but which carries a device number.
+/// Expect the device's number round-tripped, the two numbers two identities, and the third refused `BadNode`, so every
+/// archive of one tree has one encoding.
+#[test]
+fn only_a_device_node_carries_a_device_number() {
+  /// Format: POSIX `S_IFCHR`, a character device's type bits.
+  const S_IFCHR: u32 = 0o020_000;
+  let null = NodeMeta {
+    mode: S_IFCHR | 0o666,
+    device_major: 1,
+    device_minor: 3,
+    ..meta(0o666)
+  };
+  assert_eq!(decoded_meta(&encoded_meta(&null)), Ok(null.clone()));
+  let renumbered = NodeMeta {
+    device_minor: 5,
+    ..null.clone()
+  };
+  assert_ne!(
+    one_file_with_meta(null).identity(),
+    one_file_with_meta(renumbered).identity(),
+    "a device's number is part of the identity"
+  );
+  let smuggled = NodeMeta {
+    device_major: 1,
+    ..meta(0o644)
+  };
+  assert_eq!(
+    decoded_meta(&encoded_meta(&smuggled)),
+    Err(ManifestError::BadNode)
   );
 }

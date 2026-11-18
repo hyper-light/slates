@@ -236,9 +236,9 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: slates_vfs::inode::Kind,
+    node: slates_vfs::inode::SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
-    self.inner.mknod(parent, cx, name, mode, kind)
+    self.inner.mknod(parent, cx, name, mode, node)
   }
 
   fn mkdir(

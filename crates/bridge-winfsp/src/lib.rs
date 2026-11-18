@@ -163,7 +163,10 @@ pub fn node_attributes(attr: &slates_bridge_core::NodeAttr) -> Result<u32, VfsEr
     Kind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT | kept,
     Kind::File if attr.mode & OWNER_WRITE == 0 => kept | FILE_ATTRIBUTE_READONLY,
     Kind::File => kept,
-    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+    // Windows has no FIFO, socket or device node (A-26, A-294): refused as unsupported, never shown as a file.
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      return Err(VfsError::SpecialFileOperation);
+    }
   };
   Ok(if word == 0 {
     FILE_ATTRIBUTE_NORMAL
@@ -259,7 +262,9 @@ pub fn file_attributes(kind: Kind) -> Result<u32, VfsError> {
     Kind::Dir => FILE_ATTRIBUTE_DIRECTORY,
     Kind::File => FILE_ATTRIBUTE_NORMAL,
     Kind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      return Err(VfsError::SpecialFileOperation);
+    }
   })
 }
 
@@ -361,6 +366,7 @@ mod tests {
       btime: 0,
       windows,
       change: 0,
+      device: None,
     }
   }
 
@@ -415,10 +421,15 @@ mod tests {
     assert!(!refuses_replacement(&node(Kind::Dir, 0o555, 0x1)));
   }
 
-  /// AC-3.10 / A-26: an IPC inode is refused as unsupported, never projected as a disk file.
+  /// AC-3.10 / A-26, A-294: a FIFO, socket or device node is refused as unsupported, never projected as a disk file.
   #[test]
   fn ipc_names_report_unsupported() {
-    for kind in [Kind::Fifo, Kind::Socket] {
+    for kind in [
+      Kind::Fifo,
+      Kind::Socket,
+      Kind::BlockDevice,
+      Kind::CharDevice,
+    ] {
       let error = file_attributes(kind).unwrap_err();
       // Format: MS-ERREF STATUS_NOT_SUPPORTED.
       assert_eq!(ntstatus(&error), Ntstatus(0xC000_00BB));

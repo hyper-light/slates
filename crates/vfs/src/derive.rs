@@ -29,7 +29,7 @@ use crate::algebra::{ContentMap, ContentOp, Hunk};
 use crate::dir::Child;
 use crate::error::VfsError;
 use crate::ids::{InodeNo, SnapshotId};
-use crate::inode::{Attrs, Kind};
+use crate::inode::{Attrs, Kind, SpecialNode};
 use crate::journal::Op;
 use crate::volume::{Store, Volume};
 
@@ -74,31 +74,40 @@ pub struct SymlinkDelta {
 pub struct SpecialDelta {
   /// The post-state path.
   pub path: Box<str>,
-  /// FIFO or socket; never a content-bearing kind.
-  pub kind: SpecialKind,
+  /// What the name is: a FIFO or socket name (A-26), or a device node with its number (A-294); never a
+  /// content-bearing kind.
+  pub node: SpecialNode,
   /// The canonical first name of the same inode, when this path is a further hard link.
   pub link_to: Option<Box<str>>,
   /// The post-state attributes, with zero size.
   pub attrs: Attrs,
 }
 
-/// The two content-free kinds accepted by an IPC namespace delta (A-26).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpecialKind {
-  /// A local named pipe.
-  Fifo,
-  /// A local UNIX socket name.
-  Socket,
-}
+/// Format: an ops document's kind byte for a FIFO name (A-26).
+const SPECIAL_FIFO: u8 = 0;
+/// Format: an ops document's kind byte for a socket name (A-26).
+const SPECIAL_SOCKET: u8 = 1;
+/// Format: an ops document's kind byte for a block device node, its major and minor following (A-294).
+const SPECIAL_BLOCK_DEVICE: u8 = 2;
+/// Format: an ops document's kind byte for a character device node, its major and minor following (A-294).
+const SPECIAL_CHAR_DEVICE: u8 = 3;
 
 impl SpecialDelta {
-  /// Encodes only namespace identity and attributes; no IPC payload belongs in the document.
+  /// Encodes only namespace identity, attributes and a device node's number; no IPC payload belongs in the document.
+  /// A FIFO or socket name encodes as it did before device nodes were kept (A-294), so a document holding none
+  /// keeps its identity.
   fn encode_into(&self, out: &mut Vec<u8>) {
     put_str(out, &self.path);
-    out.push(match self.kind {
-      SpecialKind::Fifo => 0,
-      SpecialKind::Socket => 1,
+    out.push(match self.node {
+      SpecialNode::Fifo => SPECIAL_FIFO,
+      SpecialNode::Socket => SPECIAL_SOCKET,
+      SpecialNode::BlockDevice(_) => SPECIAL_BLOCK_DEVICE,
+      SpecialNode::CharDevice(_) => SPECIAL_CHAR_DEVICE,
     });
+    if let Some(number) = self.node.device() {
+      out.extend_from_slice(&number.major.to_le_bytes());
+      out.extend_from_slice(&number.minor.to_le_bytes());
+    }
     match &self.link_to {
       Some(path) => {
         out.push(1);
@@ -233,7 +242,8 @@ enum Entry {
   Dir(InodeNo),
   File(InodeNo),
   Symlink(InodeNo),
-  Special(InodeNo, SpecialKind),
+  /// A name with no content (A-26, A-294) and its inode's kind.
+  Special(InodeNo, Kind),
 }
 
 fn classify(located: Result<crate::volume::Located, VfsError>) -> Entry {
@@ -242,8 +252,10 @@ fn classify(located: Result<crate::volume::Located, VfsError>) -> Entry {
       Child::Dir(_) => Entry::Dir(l.inode),
       Child::File(no) => Entry::File(no),
       Child::Symlink(no) => Entry::Symlink(no),
-      Child::Fifo(no) => Entry::Special(no, SpecialKind::Fifo),
-      Child::Socket(no) => Entry::Special(no, SpecialKind::Socket),
+      Child::Fifo(no) => Entry::Special(no, Kind::Fifo),
+      Child::Socket(no) => Entry::Special(no, Kind::Socket),
+      Child::BlockDevice(no) => Entry::Special(no, Kind::BlockDevice),
+      Child::CharDevice(no) => Entry::Special(no, Kind::CharDevice),
       Child::Whiteout => Entry::None,
     },
     Err(_) => Entry::None,
@@ -469,23 +481,27 @@ impl Deriver<'_> {
     Ok(())
   }
 
-  /// A changed IPC name keeps its inode's first surviving name as the hard-link reference.
+  /// A changed name with no content keeps its inode's first surviving name as the hard-link reference; a device
+  /// node carries its number (A-294), which its inode holds from its `mknod` on and never changes.
   fn special_delta(
     &self,
     path: &str,
     base: Entry,
     no: InodeNo,
-    kind: SpecialKind,
+    kind: Kind,
     doc: &mut OpsDocument,
   ) -> Result<(), VfsError> {
-    let attrs = self.vol.stat(self.store, no)?;
+    let observed = self.vol.observe(self.store, no)?;
+    let attrs = observed.attrs;
+    let node = SpecialNode::of(kind, observed.device.unwrap_or_default())
+      .ok_or(VfsError::SpecialFileOperation)?;
     let same = matches!(base, Entry::Special(old, old_kind)
       if old == no && old_kind == kind && self.vol.stat_in(self.store, self.base, old)? == attrs);
     if !same {
       self.removed_side(base, path, doc);
       doc.specials.push(SpecialDelta {
         path: path.into(),
-        kind,
+        node,
         attrs,
         link_to: self
           .head_paths(no)
@@ -674,6 +690,8 @@ impl Deriver<'_> {
           crate::inode::Kind::Symlink => Child::Symlink(r.inode),
           Kind::Fifo => Child::Fifo(r.inode),
           Kind::Socket => Child::Socket(r.inode),
+          Kind::BlockDevice => Child::BlockDevice(r.inode),
+          Kind::CharDevice => Child::CharDevice(r.inode),
         };
         (r.name.to_owned(), child, r.inode)
       })
@@ -694,7 +712,12 @@ impl Deriver<'_> {
             queue.push((head_path, mapping));
           }
         }
-        Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
+        Child::File(_)
+        | Child::Symlink(_)
+        | Child::Fifo(_)
+        | Child::Socket(_)
+        | Child::BlockDevice(_)
+        | Child::CharDevice(_) => {
           let unchanged = base_path.as_deref().is_some_and(|bp| {
             !self.maps.contains_key(&no)
               && self
@@ -729,9 +752,12 @@ impl Deriver<'_> {
         let gone = format!("{}/{}", head_dir.trim_end_matches('/'), row.name);
         match row.kind {
           crate::inode::Kind::Dir => doc.dirs_removed.push(gone.into()),
-          crate::inode::Kind::File | crate::inode::Kind::Symlink | Kind::Fifo | Kind::Socket => {
-            doc.removed.push(gone.into())
-          }
+          crate::inode::Kind::File
+          | crate::inode::Kind::Symlink
+          | Kind::Fifo
+          | Kind::Socket
+          | Kind::BlockDevice
+          | Kind::CharDevice => doc.removed.push(gone.into()),
         }
       }
     }
