@@ -182,6 +182,8 @@ fn walk(vol: &Volume, store: &Store, root: Handle<DirNode>, snap: Option<Snapsho
         Kind::Symlink => 'l',
         Kind::Fifo => 'p',
         Kind::Socket => 's',
+        Kind::BlockDevice => 'b',
+        Kind::CharDevice => 'c',
       };
       names.push((row.name.to_string(), kind));
       let path = format!("{prefix}/{}", row.name);
@@ -204,7 +206,7 @@ fn walk(vol: &Volume, store: &Store, root: Handle<DirNode>, snap: Option<Snapsho
             .files
             .insert(path, file_row(vol, store, snap, row.inode));
         }
-        Kind::Fifo | Kind::Socket => {}
+        Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {}
         Kind::Symlink => {
           state
             .symlinks

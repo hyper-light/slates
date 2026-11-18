@@ -750,8 +750,11 @@ fn real_state(vol: &Volume, store: &Store) -> AbstractState {
           }
         }
         Kind::Symlink => {}
-        #[allow(clippy::panic)] // Harness invariant: these generated operations never create IPC.
-        Kind::Fifo | Kind::Socket => panic!("this history creates no IPC names"),
+        #[allow(clippy::panic)]
+        // Harness invariant: these generated operations never create IPC names or devices.
+        Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+          panic!("this history creates no IPC names or device nodes")
+        }
       }
     }
   }

@@ -768,7 +768,9 @@ impl Volume {
       crate::dir::Child::File(no)
       | crate::dir::Child::Symlink(no)
       | crate::dir::Child::Fifo(no)
-      | crate::dir::Child::Socket(no) => Some(no.0),
+      | crate::dir::Child::Socket(no)
+      | crate::dir::Child::BlockDevice(no)
+      | crate::dir::Child::CharDevice(no) => Some(no.0),
       crate::dir::Child::Dir(handle) => Some(
         store
           .dirs

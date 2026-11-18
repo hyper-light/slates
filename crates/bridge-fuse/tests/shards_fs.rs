@@ -784,6 +784,16 @@ fn expect_no_hosts_mount_reaches_a_guests_own(
 const EINVAL: i32 = 22;
 const EACCES: i32 = 13;
 
+/// Linux's ACL entry tags (`include/uapi/linux/posix_acl.h`): the owner, a named user, the owning group, a named
+/// group, the mask and everyone else; and the id an entry naming no one carries (`ACL_UNDEFINED_ID`).
+const USER_OBJ: u16 = 0x01;
+const USER: u16 = 0x02;
+const GROUP_OBJ: u16 = 0x04;
+const GROUP: u16 = 0x08;
+const MASK: u16 = 0x10;
+const OTHER: u16 = 0x20;
+const NONE: u32 = u32::MAX;
+
 /// A POSIX ACL value (version 2, then each entry's tag, permission set and id), as a guest's kernel sends one.
 fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
   let mut value = 2u32.to_le_bytes().to_vec();
@@ -813,13 +823,6 @@ fn kept_value(vol: &Volume, store: &Store, no: slates_vfs::ids::InodeNo, name: &
 /// and have a set refused `EOPNOTSUPP`.
 #[test]
 fn a_guests_acls_are_kept_through_its_owner_view_and_no_hosts_mount_reaches_them() {
-  const USER_OBJ: u16 = 0x01;
-  const USER: u16 = 0x02;
-  const GROUP_OBJ: u16 = 0x04;
-  const GROUP: u16 = 0x08;
-  const MASK: u16 = 0x10;
-  const OTHER: u16 = 0x20;
-  const NONE: u32 = u32::MAX;
   let mut store = store();
   let mut vol = owned_volume(&mut store);
   let root = vol.root_inode(&store).unwrap();
@@ -988,4 +991,643 @@ fn expect_no_hosts_mount_reaches_a_guests_acls(
     );
     assert_eq!(errno(&set), EOPNOTSUPP, "{name:?}");
   }
+}
+
+/// Linux's `FUSE_DONT_MASK`, `FUSE_POSIX_ACL` and `FUSE_INIT_EXT` bits (`include/uapi/linux/fuse.h`), as a guest's kernel
+/// offers them at INIT and reads them in the reply.
+const FUSE_DONT_MASK: u32 = 1 << 6;
+const FUSE_POSIX_ACL: u32 = 1 << 20;
+const FUSE_INIT_EXT: u32 = 1 << 30;
+/// Format: where `fuse_init_out.flags` lies in an INIT reply (after major, minor and max_readahead).
+const INIT_FLAGS_AT: usize = OUT_HEADER_LEN + 12;
+/// Format: where `fuse_attr.mode` lies in it (after ino, size, blocks, the three times and their nanosecond words).
+const ATTR_MODE_AT: usize = 60;
+/// Format: where `fuse_setattr_in.mode` lies in it (`include/uapi/linux/fuse.h`).
+const SETATTR_MODE_AT: usize = 68;
+/// Format: `S_IFREG`, `S_IFIFO` and the permission bits of `st_mode` (`<sys/stat.h>`).
+const S_IFREG: u32 = 0o100_000;
+const S_IFIFO: u32 = 0o010_000;
+const PERMISSIONS: u32 = 0o7777;
+/// Format: `open(2)`'s `O_RDWR | O_CREAT`, the flags a create carries.
+const O_RDWR_CREAT: u32 = 0o102;
+
+/// The `fuse_init_in` a Linux 6.x guest's kernel sends: protocol 7.41, offering `flags` and the second flags word.
+fn init_offering(flags: u32) -> Vec<u8> {
+  let mut init = Vec::new();
+  for word in [7u32, 41, 128 * 1024, flags | FUSE_INIT_EXT, 0] {
+    init.extend_from_slice(&word.to_le_bytes());
+  }
+  init.resize(64, 0);
+  init
+}
+
+/// Whether an INIT reply kept `FUSE_POSIX_ACL`: whether the guest's kernel checks each access against the access ACL
+/// it reads from its server (`fs/fuse/inode.c` `process_init_reply` sets `posix_acl` and `default_permissions`).
+fn keeps_posix_acl(reply: &[u8]) -> bool {
+  u32::from_le_bytes(reply[INIT_FLAGS_AT..INIT_FLAGS_AT + 4].try_into().unwrap()) & FUSE_POSIX_ACL
+    != 0
+}
+
+/// A caller as a guest's kernel judges one: its fsuid and every group it is in, and no capability.
+struct Caller {
+  uid: u32,
+  groups: &'static [u32],
+}
+
+/// Linux's `MAY_READ`, `MAY_WRITE` and `MAY_EXEC` (`include/linux/fs.h`): what a caller asks of a node.
+const MAY_READ: u32 = 4;
+const MAY_WRITE: u32 = 2;
+const MAY_EXEC: u32 = 1;
+
+/// Whether a guest's kernel grants `caller` all of `want` on a node its server shows with `mode`, `owner` and, as its
+/// access ACL, `acl`: Linux's `acl_permission_check` (`fs/namei.c`) and `posix_acl_permission` (`fs/posix_acl.c`),
+/// v7.2-rc4, for a caller with no capability. The owner is judged by the owner bits alone; anyone else by the ACL when
+/// there is one and the mode's group bits are not all clear, and otherwise by the group bits for a member of the
+/// owning group and by the other bits for the rest.
+fn kernel_grants(
+  mode: u32,
+  owner: (u32, u32),
+  acl: Option<&[u8]>,
+  caller: &Caller,
+  want: u32,
+) -> bool {
+  if caller.uid == owner.0 {
+    return want & !(mode >> 6) & 0o7 == 0;
+  }
+  if let Some(acl) = acl.filter(|_| mode & 0o070 != 0) {
+    return acl_grants(acl, owner, caller, want);
+  }
+  let class = if caller.groups.contains(&owner.1) {
+    mode >> 3
+  } else {
+    mode
+  };
+  want & !class & 0o7 == 0
+}
+
+/// `posix_acl_permission` over `acl`'s entries for a caller who is not the node's owner (whom `acl_permission_check`
+/// judges by the owner bits before any ACL): a named user's entry decides, cut by the mask; else the first entry of
+/// the caller's groups (the owning group's, then the named groups') that grants `want` decides, cut by the mask, and a
+/// caller in some group none of whose entries grants it is refused; else everyone else's entry decides.
+fn acl_grants(acl: &[u8], owner: (u32, u32), caller: &Caller, want: u32) -> bool {
+  let entries = acl_entries(acl);
+  let perm_of = |tag: u16| {
+    entries
+      .iter()
+      .find(|entry| entry.0 == tag)
+      .map(|entry| entry.1)
+  };
+  let mask = perm_of(MASK).unwrap_or(0o7);
+  let granted = |perm: u32| want & !perm == 0;
+  if let Some(named) = entries
+    .iter()
+    .find(|entry| entry.0 == USER && entry.2 == caller.uid)
+  {
+    return granted(named.1 & mask);
+  }
+  let groups: Vec<u32> = entries
+    .iter()
+    .filter(|entry| match entry.0 {
+      GROUP_OBJ => caller.groups.contains(&owner.1),
+      GROUP => caller.groups.contains(&entry.2),
+      _ => false,
+    })
+    .map(|entry| entry.1)
+    .collect();
+  if groups.is_empty() {
+    return perm_of(OTHER).is_some_and(granted);
+  }
+  groups
+    .into_iter()
+    .find(|&perm| granted(perm))
+    .is_some_and(|perm| granted(perm & mask))
+}
+
+/// An ACL value's entries, after its version word: each tag, permission set and id.
+fn acl_entries(acl: &[u8]) -> Vec<(u16, u32, u32)> {
+  let (entries, _) = acl[4..].as_chunks::<8>();
+  entries
+    .iter()
+    .map(|entry| {
+      (
+        u16::from_le_bytes([entry[0], entry[1]]),
+        u32::from(u16::from_le_bytes([entry[2], entry[3]])),
+        u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+      )
+    })
+    .collect()
+}
+
+/// What a guest's kernel holds of a node when it judges an access: the mode and owner GETATTR answers, and the access
+/// ACL GETXATTR answers when its INIT kept `FUSE_POSIX_ACL` (none for `ENODATA`).
+struct Judged {
+  mode: u32,
+  owner: (u32, u32),
+  acl: Option<Vec<u8>>,
+}
+
+impl Judged {
+  /// Asks for node `node` through `ask` as the guest's kernel does before it judges an access: its attributes, and its
+  /// access ACL when the kernel reads ACLs (`reads_acls`).
+  fn of(ask: Ask<'_>, node: u64, reads_acls: bool) -> Judged {
+    let attr = ask(Opcode::GetAttr, node, &[0u8; 16]);
+    assert_eq!(errno(&attr), 0, "GETATTR");
+    let at = ATTR_OUT_ATTR_AT + ATTR_MODE_AT;
+    let acl = if reads_acls {
+      attribute_of(ask, node, ACCESS_ACL)
+    } else {
+      None
+    };
+    Judged {
+      mode: u32::from_le_bytes(attr[at..at + 4].try_into().unwrap()) & PERMISSIONS,
+      owner: owner_at(&attr, ATTR_OUT_ATTR_AT),
+      acl,
+    }
+  }
+
+  /// Whether the guest's kernel grants `caller` all of `want` on the node.
+  fn grants(&self, caller: &Caller, want: u32) -> bool {
+    kernel_grants(self.mode, self.owner, self.acl.as_deref(), caller, want)
+  }
+}
+
+/// A-314. Do: send the INIT a Linux guest's kernel sends, offering `FUSE_POSIX_ACL`, through a bridge that serves a guest
+/// and through a host's; and an INIT offering none through the guest's. Expect the guest's reply to keep it, so the
+/// guest's kernel checks every access against the ACLs it reads (and turns `default_permissions` on with it); the
+/// host's to leave it, since a host's mount reaches no ACL and its kernel must never ask for one; and a kernel that
+/// offers no ACL check to be given none.
+#[test]
+fn a_guests_kernel_is_asked_to_check_its_acls_and_a_hosts_is_not() {
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let cx = test_cx();
+  let offer = init_offering(FUSE_POSIX_ACL | FUSE_DONT_MASK);
+  {
+    let mut guest =
+      VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store).serving_a_guest();
+    assert!(
+      init_keeps_posix_acl(&mut guest, &cx, &offer),
+      "a guest's kernel is asked to check the ACLs it reads"
+    );
+    assert!(
+      !init_keeps_posix_acl(&mut guest, &cx, &init_offering(FUSE_DONT_MASK)),
+      "a kernel that offers no ACL check is given none"
+    );
+  }
+  let mut host = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  assert!(
+    !init_keeps_posix_acl(&mut host, &cx, &offer),
+    "a host's kernel is never asked for an ACL its mount cannot read"
+  );
+}
+
+/// Sends INIT `offer` through `bridge` and says whether its reply kept `FUSE_POSIX_ACL`.
+fn init_keeps_posix_acl(bridge: &mut VolumeBridge<'_>, cx: &OpContext, offer: &[u8]) -> bool {
+  let reply = exchange(bridge, cx, &message(Opcode::Init as u32, 1, 0, offer));
+  assert_eq!(errno(&reply), 0, "INIT served");
+  keeps_posix_acl(&reply)
+}
+
+/// Format: the names of a node's access ACL and a directory's default ACL (`include/uapi/linux/xattr.h`).
+const ACCESS_ACL: &[u8] = b"system.posix_acl_access";
+const DEFAULT_ACL: &[u8] = b"system.posix_acl_default";
+
+/// The callers the ACL tests judge: the run's owner; the named user 4242, whom the ACLs grant; the named user 4343, whom
+/// they refuse; a member of the run's group; and a stranger in none of them.
+const RUNNER: Caller = Caller {
+  uid: RUN.0,
+  groups: &[RUN.1],
+};
+const GRANTED: Caller = Caller {
+  uid: 4242,
+  groups: &[4242],
+};
+const REFUSED: Caller = Caller {
+  uid: 4343,
+  groups: &[4343],
+};
+const MEMBER: Caller = Caller {
+  uid: 5000,
+  groups: &[5000, RUN.1],
+};
+const STRANGER: Caller = Caller {
+  uid: 6000,
+  groups: &[6000],
+};
+
+/// How a test asks the guest's route: `ask(opcode, node, body)`, as the run's user, each request under a fresh unique.
+type Ask<'a> = &'a mut dyn FnMut(Opcode, u64, &[u8]) -> Vec<u8>;
+
+/// Runs `f` over a bridge serving a guest on `vol`, asking as [`Ask`] says; what `f` returns.
+fn as_a_guest<T>(
+  vol: &mut Volume,
+  store: &mut Store,
+  cx: &OpContext,
+  f: impl FnOnce(Ask<'_>) -> T,
+) -> T {
+  let mut guest = VolumeBridge::new(VolumeId { bytes: [0; 16] }, vol, store).serving_a_guest();
+  let mut unique = 0u64;
+  let mut ask = |opcode: Opcode, nodeid: u64, body: &[u8]| {
+    unique += 1;
+    exchange(
+      &mut guest,
+      cx,
+      &message_as(opcode as u32, unique, nodeid, RUN, body),
+    )
+  };
+  f(&mut ask)
+}
+
+/// Sends the guest's INIT through `ask`, offering `FUSE_POSIX_ACL`; whether its kernel then reads ACLs.
+fn guest_init(ask: Ask<'_>) -> bool {
+  keeps_posix_acl(&ask(
+    Opcode::Init,
+    0,
+    &init_offering(FUSE_POSIX_ACL | FUSE_DONT_MASK),
+  ))
+}
+
+/// The value of attribute `name` on `node` a guest's GETXATTR answers, or none for `ENODATA`.
+fn attribute_of(ask: Ask<'_>, node: u64, name: &[u8]) -> Option<Vec<u8>> {
+  let got = ask(Opcode::GetXattr, node, &getxattr_body(4096, Some(name)));
+  match errno(&got) {
+    0 => Some(got[OUT_HEADER_LEN..].to_vec()),
+    ENODATA => None,
+    other => panic!("GETXATTR of {name:?} answered errno {other}"),
+  }
+}
+
+/// Expects each `(caller, want, granted, what)` judged on `judged` as it says.
+fn expect_judged(judged: &Judged, cases: &[(&Caller, u32, bool, &str)]) {
+  for &(caller, want, granted, what) in cases {
+    assert_eq!(judged.grants(caller, want), granted, "{what}");
+  }
+}
+
+/// The ACL `setfacl -m u:4242:rw,u:4343:-` makes of a file the run owns at 0600, its mask `mask`: the owner rw, 4242
+/// rw, 4343 none, the owning group r, everyone else none.
+fn granting_acl(mask: u16) -> Vec<u8> {
+  acl(&[
+    (USER_OBJ, 6, NONE),
+    (USER, 6, 4242),
+    (USER, 0, 4343),
+    (GROUP_OBJ, 4, NONE),
+    (MASK, mask, NONE),
+    (OTHER, 0, NONE),
+  ])
+}
+
+/// A-314 (what a guest's `setfacl` grants or denies holds for its accesses). Do: on a file the run owns at mode 0600,
+/// set through the guest's route the ACL `setfacl -m u:4242:rw,u:4343:-` makes (owner rw, 4242 rw, 4343 none, the
+/// owning group r, mask rw, everyone else none), and judge accesses as the guest's kernel judges them over what its
+/// GETATTR and GETXATTR answer; chmod the file 0640 through a host's mount; remove the ACL through the guest; then
+/// set the minimal ACL `setfacl -b` leaves (owner rwx, group r, other none). Expect, after the set, the mode 0660 (the
+/// mask in the group bits), and 4242 to read and write and not execute, 4343 not to read, a member of the owning group
+/// to read and not write, and anyone else nothing; after the host's chmod, the guest to read the ACL with its mask
+/// r--, so 4242 reads and does not write; the removal to leave the mode 0640 and grant 4242 nothing; and the minimal
+/// ACL to become the mode 0740 alone, read back as no ACL (`ENODATA`), as Linux's `posix_acl_update_mode` keeps it.
+#[test]
+fn what_a_guests_setfacl_grants_or_denies_holds_for_its_kernels_checks() {
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol
+    .create_file_no(&mut store, root, "secret.txt", 0o600)
+    .unwrap();
+  vol.chown(&mut store, file, RUN.0, RUN.1).unwrap();
+  let cx = test_cx();
+  let reads_acls = as_a_guest(&mut vol, &mut store, &cx, |ask| {
+    let reads_acls = guest_init(ask);
+    expect_the_set_acl_to_hold(ask, file.0, reads_acls);
+    reads_acls
+  });
+  chmod_through_a_hosts_mount(&mut vol, &mut store, &cx, file.0, 0o640);
+  as_a_guest(&mut vol, &mut store, &cx, |ask| {
+    expect_the_hosts_chmod_read_as_the_acls_mask(ask, file.0, reads_acls);
+    expect_a_removal_and_a_minimal_acl_to_leave_the_mode_alone(ask, file.0, reads_acls);
+  });
+}
+
+/// The set of `what_a_guests_setfacl_grants_or_denies_holds_for_its_kernels_checks`: expect nothing granted before it;
+/// then the file 0660, the owner reading and writing, 4242 reading and writing and not executing, 4343 not reading,
+/// the owning group reading and not writing, and a stranger nothing.
+fn expect_the_set_acl_to_hold(ask: Ask<'_>, file: u64, reads_acls: bool) {
+  assert!(
+    !Judged::of(ask, file, reads_acls).grants(&GRANTED, MAY_READ),
+    "nothing granted before the ACL"
+  );
+  let set = ask(
+    Opcode::SetXattr,
+    file,
+    &setxattr_body(ACCESS_ACL, &granting_acl(6)),
+  );
+  assert_eq!(errno(&set), 0, "the guest sets the file's ACL");
+  let judged = Judged::of(ask, file, reads_acls);
+  assert_eq!(judged.mode, 0o660, "the mask is the mode's group bits");
+  expect_judged(
+    &judged,
+    &[
+      (
+        &RUNNER,
+        MAY_READ | MAY_WRITE,
+        true,
+        "the owner reads and writes",
+      ),
+      (
+        &GRANTED,
+        MAY_READ | MAY_WRITE,
+        true,
+        "4242 reads and writes",
+      ),
+      (&GRANTED, MAY_EXEC, false, "4242 does not execute"),
+      (&REFUSED, MAY_READ, false, "4343 does not read"),
+      (&MEMBER, MAY_READ, true, "the owning group reads"),
+      (&MEMBER, MAY_WRITE, false, "the owning group does not write"),
+      (&STRANGER, MAY_READ, false, "anyone else reads nothing"),
+    ],
+  );
+}
+
+/// The chmod a host's mount makes: SETATTR of `mode` on `file` through a bridge that serves no guest.
+fn chmod_through_a_hosts_mount(
+  vol: &mut Volume,
+  store: &mut Store,
+  cx: &OpContext,
+  file: u64,
+  mode: u32,
+) {
+  let mut host = VolumeBridge::new(VolumeId { bytes: [0; 16] }, vol, store);
+  let mut chmod = vec![0u8; 88];
+  chmod[0..4].copy_from_slice(&SetAttrIn::FATTR_MODE.to_le_bytes());
+  chmod[SETATTR_MODE_AT..SETATTR_MODE_AT + 4].copy_from_slice(&(S_IFREG | mode).to_le_bytes());
+  let changed = exchange(
+    &mut host,
+    cx,
+    &message(Opcode::SetAttr as u32, 1, file, &chmod),
+  );
+  assert_eq!(
+    errno(&changed),
+    0,
+    "a host's mount chmods the file {mode:o}"
+  );
+}
+
+/// After the host's chmod 0640 in `what_a_guests_setfacl_grants_or_denies_holds_for_its_kernels_checks`: expect the
+/// guest to read the ACL with its mask r--, as Linux's `posix_acl_chmod` makes it, so 4242 reads and does not write.
+fn expect_the_hosts_chmod_read_as_the_acls_mask(ask: Ask<'_>, file: u64, reads_acls: bool) {
+  let judged = Judged::of(ask, file, reads_acls);
+  assert_eq!(
+    judged.acl.as_deref(),
+    Some(&granting_acl(4)[..]),
+    "the host's chmod is the ACL's mask r--"
+  );
+  expect_judged(
+    &judged,
+    &[
+      (&GRANTED, MAY_READ, true, "4242 still reads"),
+      (&GRANTED, MAY_WRITE, false, "and no longer writes"),
+    ],
+  );
+}
+
+/// The end of `what_a_guests_setfacl_grants_or_denies_holds_for_its_kernels_checks`: expect a removal to leave the mode
+/// 0640 and grant 4242 nothing, and a minimal ACL to become the mode 0740 alone, read back as none.
+fn expect_a_removal_and_a_minimal_acl_to_leave_the_mode_alone(
+  ask: Ask<'_>,
+  file: u64,
+  reads_acls: bool,
+) {
+  let removed = ask(Opcode::RemoveXattr, file, &removexattr_body(ACCESS_ACL));
+  assert_eq!(errno(&removed), 0, "the guest removes the ACL");
+  let judged = Judged::of(ask, file, reads_acls);
+  assert_eq!(
+    (judged.mode, judged.acl.as_deref()),
+    (0o640, None),
+    "a removal leaves the mode as it was"
+  );
+  assert!(
+    !judged.grants(&GRANTED, MAY_READ),
+    "and grants 4242 nothing"
+  );
+  let minimal = acl(&[(USER_OBJ, 7, NONE), (GROUP_OBJ, 4, NONE), (OTHER, 0, NONE)]);
+  let set = ask(Opcode::SetXattr, file, &setxattr_body(ACCESS_ACL, &minimal));
+  assert_eq!(errno(&set), 0, "the guest sets a minimal ACL");
+  let judged = Judged::of(ask, file, reads_acls);
+  assert_eq!(
+    (judged.mode, judged.acl.as_deref()),
+    (0o740, None),
+    "a minimal ACL is the mode alone"
+  );
+}
+
+/// A CREATE (`fuse_create_in`: flags, mode, umask, open flags, then the name) of `name` with `mode` under `umask`.
+fn create_body(name: &str, mode: u32, umask: u32) -> Vec<u8> {
+  let mut body = Vec::new();
+  for word in [O_RDWR_CREAT, S_IFREG | mode, umask, 0] {
+    body.extend_from_slice(&word.to_le_bytes());
+  }
+  body.extend_from_slice(name.as_bytes());
+  body.push(0);
+  body
+}
+
+/// The permission bits of the attributes an entry reply (`fuse_entry_out`) carries.
+fn entry_mode(reply: &[u8]) -> u32 {
+  let at = ENTRY_ATTR_AT + ATTR_MODE_AT;
+  u32::from_le_bytes(reply[at..at + 4].try_into().unwrap()) & PERMISSIONS
+}
+
+/// The default ACL `setfacl -d -m u:4242:rwx,o::-` makes on a directory: the owner rwx, 4242 rwx, the owning group r-x,
+/// mask rwx, everyone else none.
+fn default_acl() -> Vec<u8> {
+  inherited(7, 7)
+}
+
+/// The access ACL a node made under [`default_acl`] takes, its owner's and its mask's permissions cut to its mode.
+fn inherited(owner: u16, mask: u16) -> Vec<u8> {
+  acl(&[
+    (USER_OBJ, owner, NONE),
+    (USER, 7, 4242),
+    (GROUP_OBJ, 5, NONE),
+    (MASK, mask, NONE),
+    (OTHER, 0, NONE),
+  ])
+}
+
+/// A-314 (a directory's default ACL is what it gives what is made in it, through every route). Do: through the guest's
+/// route, set on a directory the default ACL `setfacl -d -m u:4242:rwx,o::-` makes (owner rwx, 4242 rwx, the owning
+/// group r-x, mask rwx, everyone else none); create a file in it with mode 0666 under umask 022, make a directory with
+/// 0777 under 022 and a FIFO with 0644 under 077, and a symlink; create a file with 0666 under 022 in the root, which has
+/// no default ACL; then, through a host's route that carries no umask (as NFS creates), create a file with 0644 in the
+/// directory. Expect each umask ignored under the default ACL and each mode masked by it (Linux's `posix_acl_create`):
+/// the file 0660 with the default's entries as its access ACL, mask rw- and no default ACL of its own, so 4242 reads and
+/// writes it and does not execute it; the directory 0770 with the default as both its access ACL and its default
+/// ACL; the FIFO 0640, mask r--; the symlink with no ACL; the root's file 0644 by its umask, with no ACL; and the host's
+/// file 0640, mask r--, so 4242 reads it and does not write it, as on a bind mount whose host writes into the guest's
+/// directory.
+#[test]
+fn a_directorys_default_acl_is_what_it_gives_what_is_made_in_it_through_every_route() {
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let shared = vol.mkdir_no(&mut store, root, "shared", 0o755).unwrap();
+  vol.chown(&mut store, shared, RUN.0, RUN.1).unwrap();
+  let cx = test_cx();
+  let reads_acls = as_a_guest(&mut vol, &mut store, &cx, |ask| {
+    let reads_acls = guest_init(ask);
+    let set = ask(
+      Opcode::SetXattr,
+      shared.0,
+      &setxattr_body(DEFAULT_ACL, &default_acl()),
+    );
+    assert_eq!(errno(&set), 0, "the guest sets the directory's default ACL");
+    expect_a_file_made_under_it_to_take_it(ask, shared.0, reads_acls);
+    expect_a_directory_made_under_it_to_take_it_twice(ask, shared.0);
+    expect_a_fifo_to_take_it_and_a_symlink_nothing(ask, shared.0);
+    expect_a_file_made_elsewhere_to_take_its_umask(ask);
+    reads_acls
+  });
+  let from_host = create_through_a_route_with_no_umask(&mut vol, &mut store, &cx, shared.0);
+  as_a_guest(&mut vol, &mut store, &cx, |ask| {
+    let judged = Judged::of(ask, from_host, reads_acls);
+    assert_eq!(
+      judged.acl,
+      Some(inherited(6, 4)),
+      "the host's file takes the default's entries, mask r--"
+    );
+    expect_judged(
+      &judged,
+      &[
+        (&GRANTED, MAY_READ, true, "4242 reads the host's file"),
+        (&GRANTED, MAY_WRITE, false, "and does not write it"),
+      ],
+    );
+  });
+}
+
+/// A file made under the default ACL: expect it 0660, its umask ignored, with the default's entries as its access ACL,
+/// mask rw-, and no default ACL, so 4242 reads and writes it and does not execute it.
+fn expect_a_file_made_under_it_to_take_it(ask: Ask<'_>, shared: u64, reads_acls: bool) {
+  let file = ask(
+    Opcode::Create,
+    shared,
+    &create_body("new.txt", 0o666, 0o022),
+  );
+  assert_eq!(
+    (errno(&file), entry_mode(&file)),
+    (0, 0o660),
+    "a file made under it is masked by it, not by the umask"
+  );
+  let file = body_u64(&file);
+  assert_eq!(
+    attribute_of(ask, file, ACCESS_ACL),
+    Some(inherited(6, 6)),
+    "it takes the default's entries as its access ACL"
+  );
+  assert_eq!(
+    attribute_of(ask, file, DEFAULT_ACL),
+    None,
+    "a file takes no default ACL"
+  );
+  expect_judged(
+    &Judged::of(ask, file, reads_acls),
+    &[
+      (
+        &GRANTED,
+        MAY_READ | MAY_WRITE,
+        true,
+        "4242 reads and writes it",
+      ),
+      (&GRANTED, MAY_EXEC, false, "and does not execute it"),
+    ],
+  );
+}
+
+/// A directory made under the default ACL: expect it 0770, its umask ignored, with the default's entries as its access
+/// ACL and the default as its own.
+fn expect_a_directory_made_under_it_to_take_it_twice(ask: Ask<'_>, shared: u64) {
+  let mut mkdir = Vec::new();
+  for word in [0o777u32, 0o022] {
+    mkdir.extend_from_slice(&word.to_le_bytes());
+  }
+  mkdir.extend_from_slice(b"sub\0");
+  let sub = ask(Opcode::MkDir, shared, &mkdir);
+  assert_eq!((errno(&sub), entry_mode(&sub)), (0, 0o770), "MKDIR");
+  let sub = body_u64(&sub);
+  assert_eq!(
+    attribute_of(ask, sub, ACCESS_ACL),
+    Some(inherited(7, 7)),
+    "the directory takes the default's entries as its access ACL"
+  );
+  assert_eq!(
+    attribute_of(ask, sub, DEFAULT_ACL),
+    Some(default_acl()),
+    "and the default ACL as its own"
+  );
+}
+
+/// A FIFO and a symlink made under the default ACL: expect the FIFO 0640 under umask 077, the umask ignored, with the
+/// default's entries, mask r--; and the symlink with no ACL.
+fn expect_a_fifo_to_take_it_and_a_symlink_nothing(ask: Ask<'_>, shared: u64) {
+  let mut mknod = Vec::new();
+  for word in [S_IFIFO | 0o644, 0, 0o077, 0] {
+    mknod.extend_from_slice(&word.to_le_bytes());
+  }
+  mknod.extend_from_slice(b"pipe\0");
+  let pipe = ask(Opcode::MkNod, shared, &mknod);
+  assert_eq!((errno(&pipe), entry_mode(&pipe)), (0, 0o640), "MKNOD");
+  assert_eq!(
+    attribute_of(ask, body_u64(&pipe), ACCESS_ACL),
+    Some(inherited(6, 4)),
+    "the FIFO takes the default's entries, mask r--"
+  );
+  let link = ask(Opcode::SymLink, shared, b"link\0new.txt\0");
+  assert_eq!(errno(&link), 0, "SYMLINK");
+  assert_eq!(
+    attribute_of(ask, body_u64(&link), ACCESS_ACL),
+    None,
+    "a symlink takes no ACL"
+  );
+}
+
+/// A file made in the root, which has no default ACL: expect its umask applied, 0644, and no ACL.
+fn expect_a_file_made_elsewhere_to_take_its_umask(ask: Ask<'_>) {
+  let plain = ask(Opcode::Create, 1, &create_body("plain.txt", 0o666, 0o022));
+  assert_eq!(
+    (errno(&plain), entry_mode(&plain)),
+    (0, 0o644),
+    "without a default ACL the umask is applied"
+  );
+  assert_eq!(
+    attribute_of(ask, body_u64(&plain), ACCESS_ACL),
+    None,
+    "and no ACL is given"
+  );
+}
+
+/// Creates a file with 0644 in `shared` through a host's route that carries no umask, as NFS creates: the shared seam
+/// directly. Expects it 0640, masked by the default ACL; its inode.
+fn create_through_a_route_with_no_umask(
+  vol: &mut Volume,
+  store: &mut Store,
+  cx: &OpContext,
+  shared: u64,
+) -> u64 {
+  use slates_bridge_core::Bridge as _;
+  let mut host = VolumeBridge::new(VolumeId { bytes: [0; 16] }, vol, store);
+  let (made, _handle) = host
+    .create(
+      slates_bridge_core::ObjectId::new(shared, 0),
+      cx,
+      "from-host.txt",
+      0o644,
+      O_RDWR_CREAT,
+    )
+    .unwrap();
+  assert_eq!(
+    made.mode & PERMISSIONS,
+    0o640,
+    "the host's file is masked by the default ACL"
+  );
+  made.ino
 }
