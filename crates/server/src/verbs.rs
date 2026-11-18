@@ -3560,6 +3560,39 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::fleet::SERVE_RECEIVE_OTHER,
             demux_sum(state, |c| c.receive_refused_other),
           ),
+          (crate::fleet::SERVE_OPENED, demux_sum(state, |c| c.opened)),
+          (
+            crate::fleet::SERVE_SETUP_REFUSED,
+            demux_sum(state, |c| c.setup_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEER_SESSIONS_REFUSED,
+            demux_sum(state, |c| c.peer_sessions_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEERS_REFUSED,
+            demux_sum(state, |c| c.peers_refused),
+          ),
+          (
+            crate::fleet::SERVE_HIGH_WATER,
+            demux_sum(state, |c| c.high_water),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_DIALING,
+            crate::fleet::record_dials_dialing(state),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_CALL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.call_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_ENROLL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.enroll_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_CALLS,
+            crate::fleet::record_dials_calls(state),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)

@@ -1,12 +1,25 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
+> owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
+> `platforms.md` had two rows the plan closed without their runs. Its Windows cells for a mount that outlives a daemon
+> restart still said "missing" after A-198. They now name `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons`
+> in `windows-lint` and `windows-arm64`: zero drives lost of twenty, diagnostics run 41484542209. The fleet's sockets and
+> the NFS listener stay missing there (foundational gap 2). Its Linux arm64 image cell now names Step 7's 7-of-7 runs
+> with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
+> inventory's built-but-unrun cells (its order of work, item 5).
+
 > **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
 > option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
 > CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
 > (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
 > `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
-> and every other field, another namespace, expired, untouched, hostile bytes. **Owed, in order:**
-> - the presentation's nonce, a signed `Grant` on the wire, the nonce spent once (a replay refused);
+> and every other field, another namespace, expired, untouched, hostile bytes. **Built (piece 2, 2026-11-18):** each
+> presentation draws a 256-bit nonce and `land` returns it (`nonce:` / `"nonce"`); a `Grant` carries either proof
+> form (`GrantProofBody`); a signed one is decided by `landing::verify_signed_grant` against the shard's registered
+> keys, the presentation's own target and nonce, and the wall clock, and its nonce is spent by the grant it proves
+> (a replay refused `Replayed`, counted `grant_signature_replayed`). No key can be registered yet, so every signed
+> grant is refused `UnregisteredKey` until piece 3. **Owed, in order:**
 > - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
 >   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
 >   registered key; no agent channel adds one;
@@ -60,6 +73,31 @@
 > holds no data stream; a link POSIX made is a file link; a link relative to the drive's root is kept relative to its
 > directory, so moved, it reaches another object where NTFS keeps it on `\x\y`. **Still owed:** generic reparse data (39
 > entries), its own amendment after named streams.
+
+> **A record link's dial to one peer never completed while a fleet formed, and its council kept one voter (2026-11-17,
+> §4.8, §4.10a; OPEN, unreproduced).** The landing's PR #10 macOS run at `44018ec4` (job 134436246591) failed
+> `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment` inside `start_mesh`'s initial settle: for the whole
+> 96-period settle (9.7 s) the council kept its one voter, the bootstrapper. The bootstrapper held no record session
+> to the last node started (its `fleet_record_links` named only the other; each other node named both), so it never had
+> that peer's seal key: `fleet.seal.pair_recipient_unknown` once a period, 96 at period 97. No node counted a dial,
+> accept, serve, link or discovery failure, so the bootstrapper's handshake call to that peer was still running, and
+> nothing recorded where it waited. Measured rate: 1 failing macOS fleet suite in 32 (the landing's 4 runs and main's
+> 28), each suite starting 80 formations (`settle_initial_consensus`). Not reproduced by a late start: with the
+> first node's flights waiting in a peer's held, unread socket for one probe timeout to 15 s, the peer linked within a
+> second of starting, 65 runs on each Linux runner, and the fleet binary passed whole on both, 119 of 119
+> (diag-record-dial-1, -pin-1 and -pin-2). Diagnostics are in place for the next failure: the status reports each
+> record link's dial (`fleet.dial.record.dialing`, `.longest_call_ms`, `.longest_enroll_ms`, `.calls`) and each serve
+> socket's demultiplexer (`fleet.serve.opened`, `.setup_refused`, `.peer_sessions_refused`, `.peers_refused`,
+> `.high_water`), and the fleet tests' formation-failure message carries the dials, the links waiting on discovery and
+> the demultiplexer counters. The 2026-11-05 entry's unreproduced "owner with no session to its only reachable
+> candidate for 249 tries" (below) has the same shape. **Owed:** a reproduction, then the fix by the step the
+> diagnostics name.
+
+> **A works catalog test timed out once on Windows (2026-11-17, A-255; main's flake, observed once).**
+> `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` (`040da0d9a`, on main since
+> A-255 landed) was killed at its 240 s deadline in the Windows fleet lane of PR #11's first CI run (job 134508155910:
+> 123 passed, 0 failed, 1 timed out) and passed in the next (job 134523028813: 123 passed, 0 failed, 0 timed out).
+> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:

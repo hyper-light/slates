@@ -195,6 +195,26 @@ impl RecordLink {
   }
 }
 
+/// One peer's record dial as its link task (`crate::fleet::establish_record_link`) last left it (§4.8, §4.14): what
+/// status and a fleet whose formation failed read to tell a dial still inside one handshake call, one waiting on its
+/// first discovery page, and one that keeps failing. A dialer that nobody answers spends a whole handshake budget
+/// inside one call, and counts nothing until the call ends; this says so while it runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordDial {
+  /// When the link began dialing for the session it lacks (the runtime clock), while it lacks one.
+  pub dialing_since_ns: Option<u64>,
+  /// When its current handshake call began, while one runs.
+  pub call_since_ns: Option<u64>,
+  /// When its fresh session's first discovery page was sent, while the link waits on it to install the session.
+  pub enroll_since_ns: Option<u64>,
+  /// Handshake budgets its dialer has spent without establishing (`Endpoint::handshake_budgets_spent`).
+  pub budgets_spent: u32,
+  /// Why its dialer's last budget ended (`Endpoint::handshake_stall`), while that dialer is kept for another call.
+  pub stall: Option<slates_transport::endpoint::HandshakeStall>,
+  /// Handshake calls made for this peer since boot: a dial that keeps calling is one that keeps failing.
+  pub calls: u64,
+}
+
 /// A mount capability's place in the shard's attachment registry (GAP-A9-4).
 #[derive(Clone, Copy, Debug)]
 pub struct MountAttachment {
@@ -512,6 +532,9 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// The keys the human registered to sign grants with (A-285; `crate::grant_signature`). A signed `Grant` verifies
+  /// only under one of them; none are registered until the human's surface registers the first.
+  pub grant_keys: Vec<crate::grant_signature::RegisteredKey>,
   /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
   /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
   pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
@@ -769,6 +792,9 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, RecordLink>,
+  /// Each peer's record dial ([`RecordDial`]), as its link task last left it: read by status and by a fleet whose
+  /// formation failed. One entry a peer, bounded by the fleet's peer capacity as `pairs_delivered` is.
+  pub record_dials: BTreeMap<slates_db::HostId, RecordDial>,
   /// The congestion state of each session a peer dialed to this node, as its serve loop last saw it after a request,
   /// keyed by the peer's stable anchor: the connections a peer's forwards and reads ride, whose sender here is this
   /// node. One a peer, replaced on a re-dial, so bounded by the roster. Empty on a laptop.
