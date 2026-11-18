@@ -562,12 +562,13 @@ fn on_lapse(
     Lapse::Withheld => {
       slates_machine::log_line!(
         "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
-         lateness p99 of {} ms over {} waits); killing it",
+         lateness p99 of {} ms over {} waits, at most {} ms); killing it",
         beat_age / NS_PER_MS,
         seen.bound / NS_PER_MS,
         LIVENESS_BUDGET_NS / NS_PER_MS,
         lateness.p99_ns() / NS_PER_MS,
-        lateness.len()
+        lateness.len(),
+        slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS
       );
       supervisor.kill().map_err(|e| failed("kill", e))?;
       Ok(true)
@@ -684,8 +685,12 @@ fn observe(
   let mut lateness = Lateness::default();
   slates_machine::log_line!(
     "slates anchor: a daemon's beat is lapsed once older than the {} ms liveness window plus this anchor's own measured \
-     lateness p99, over its last {LATENESS_SAMPLES} timed waits",
-    LIVENESS_BUDGET_NS / NS_PER_MS
+     lateness p99, over its last {LATENESS_SAMPLES} timed waits, at most {} ms (the daemon's observation budget); a \
+     running daemon is looked at again within that bound less the lateness p99 and a {} ms beat, at least a beat apart \
+     (A-467)",
+    LIVENESS_BUDGET_NS / NS_PER_MS,
+    slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS,
+    HEARTBEAT_NS / NS_PER_MS
   );
   // A kill already sent to the daemon that has not been reaped yet: it is not sent again, and the loop waits on the
   // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
@@ -748,7 +753,12 @@ fn observe(
         let pause = if starting_since.is_some() || !recovered {
           observation_pause()
         } else {
-          Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, bound))
+          Duration::from_nanos(lapse_wait(
+            watch,
+            heartbeat_ns,
+            now,
+            (bound, lateness.observation_gap_ns()),
+          ))
         };
         match starting_since {
           // The start ends when its watchdog has looked (`SUP_LOOKED`, zeroed at each start): the daemon then judges its
@@ -893,9 +903,32 @@ impl Lateness {
   }
 
   /// Derived: the age past which a daemon's beat is lapsed: the liveness window plus the anchor's measured lateness p99
-  /// (A-228).
+  /// (A-228), never past the ceiling the daemon's watchdog holds its own windows to (A-467; A-455's
+  /// `slates_server::watchdog::WINDOW_CEILING_NS`, the daemon's observation budget). A live daemon's beat is refreshed
+  /// every beat, and goes stale only by as much as its watchdog's thread is held off its CPU, which the anchor's own
+  /// lateness measures, since the host that delays one delays the other. Without the ceiling a runaway reading (a host
+  /// paused twice among the last hundred waits) would hold every lapse past the pause, and the anchor would be blind to a
+  /// wedged daemon for that long; a daemon whose beat outlives the ceiling while it is alive is still spared, since a
+  /// lapse with its watchdog silent is judged by its process (A-232).
   fn lapse_bound_ns(&self) -> u64 {
-    LIVENESS_BUDGET_NS.saturating_add(self.p99_ns())
+    LIVENESS_BUDGET_NS
+      .saturating_add(self.p99_ns())
+      .min(slates_server::watchdog::WINDOW_CEILING_NS)
+  }
+
+  /// Derived: the longest the observation loop waits before it looks at a running daemon again (A-467): the lapse bound
+  /// less this anchor's own lateness p99 and a beat, and never less than a beat, the daemon's own cadence. A look that
+  /// comes later than the bound after the one before reads as the host having slept, and restarts the daemon's silence
+  /// ([`lapsed`]), so the loop's own gap, its wait and its lateness, must stay inside the bound: at its p99 it does,
+  /// with a beat to spare. Where the bound leaves no such room (a lateness past the ceiling) the loop looks every beat.
+  /// Before, the loop waited half the bound, whatever its lateness: past a lateness of a window the gap passed the bound
+  /// at every look, each look was taken for a sleep, and a wedged daemon was never found lapsed.
+  fn observation_gap_ns(&self) -> u64 {
+    self
+      .lapse_bound_ns()
+      .saturating_sub(self.p99_ns())
+      .saturating_sub(HEARTBEAT_NS)
+      .max(HEARTBEAT_NS)
   }
 }
 
@@ -934,24 +967,19 @@ fn lapsed(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> (bool, Wat
   )
 }
 
-/// Shape: the observation loop waits at most the liveness budget divided by this (half): its own gap then stays under
-/// the budget through any scheduling delay shorter than the other half, since a longer gap reads as the host having
-/// slept and restarts the budget ([`lapsed`]).
-const OBSERVATION_GAP_PARTS: u64 = 2;
-
 /// How long the observation loop may wait before it must look at a running daemon again (§4.14): until the first
-/// instant [`lapsed`] could find its heartbeat (last beaten at `beat_ns`) lapsed, and never more than the budget over
-/// [`OBSERVATION_GAP_PARTS`]. A daemon beating every heartbeat is looked at twice a budget; one that stops is found
+/// instant [`lapsed`] could find its heartbeat (last beaten at `beat_ns`) lapsed against `budget_ns`, and never more
+/// than `gap_ns`, the longest gap the anchor's own lateness leaves inside the budget ([`Lateness::observation_gap_ns`],
+/// A-467). A daemon beating every heartbeat is looked at about once a window on a quiet host; one that stops is found
 /// lapsed at the budget's end, not up to a beat later. Exits, holds and signals end the wait sooner
-/// ([`await_observation`]). Before 2026-10-10 the loop looked every heartbeat, eleven wakeups a second at rest.
-fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
+/// ([`await_observation`]). Before 2026-10-10 the loop looked every heartbeat, eleven wakeups a second at rest; until
+/// A-467 it waited half the budget, whatever its own lateness.
+fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, (budget_ns, gap_ns): (u64, u64)) -> u64 {
   let lapses_at = beat_ns
     .max(watch.resumed_ns)
     .saturating_add(budget_ns)
     .saturating_add(1);
-  lapses_at
-    .saturating_sub(now_ns)
-    .min(budget_ns / OBSERVATION_GAP_PARTS)
+  lapses_at.saturating_sub(now_ns).min(gap_ns)
 }
 
 #[cfg(test)]
@@ -1482,10 +1510,12 @@ mod lapse_tests {
     );
   }
 
-  /// A-228, §4.14. Do: feed the anchor's lateness window a quiet history (waits on time), then a late one (each wait
-  /// 300 ms over its pause), with early-ended waits between, and more waits than it keeps. Expect: a quiet anchor holds a
-  /// beat to the window alone; a late one to the window plus its lateness p99; early waits change nothing; and the window
-  /// keeps only its last hundred samples.
+  /// A-228, A-467, §4.14. Do: feed the anchor's lateness window a quiet history (waits on time), then a late one (each
+  /// wait 300 ms over its pause), with early-ended waits between, and more waits than it keeps; then a runaway one (each
+  /// wait an hour over, a host paused). Expect: a quiet anchor holds a beat to the window alone; a late one to the window
+  /// plus its lateness p99; early waits change nothing; the window keeps only its last hundred samples; and a runaway
+  /// reading holds a beat to the ceiling the daemon's watchdog holds its windows to, never to the hour, which would have
+  /// left the anchor blind to a wedged daemon for that long.
   #[test]
   fn the_lapse_bound_is_the_window_plus_the_anchors_own_lateness() {
     let mut lateness = Lateness::default();
@@ -1501,6 +1531,14 @@ mod lapse_tests {
     }
     assert_eq!(lateness.len(), LATENESS_SAMPLES);
     assert_eq!(lateness.lapse_bound_ns(), LIVENESS_BUDGET_NS + 300_000_000);
+    for _ in 0..LATENESS_SAMPLES {
+      lateness.record(TURN, TURN + 3_600 * LIVENESS_BUDGET_NS);
+    }
+    assert_eq!(
+      lateness.lapse_bound_ns(),
+      slates_server::watchdog::WINDOW_CEILING_NS,
+      "a runaway reading never holds a lapse past the ceiling"
+    );
   }
 
   /// Shape: the budget the tests judge by (the anchor's, a second).
@@ -1535,11 +1573,12 @@ mod lapse_tests {
     assert!(killed_at - last_beat > BUDGET && killed_at - last_beat <= BUDGET + TURN);
   }
 
-  /// §4.14 (2026-10-10): the loop waits for the lapse, not for the next beat. Do: follow `lapse_wait` from turn to turn
-  /// over a daemon that beats every tenth of a budget, then stops. Expect every wait at most half a budget while it
-  /// beats, and the lapse found exactly one budget and a nanosecond after its last beat.
+  /// §4.14 (2026-10-10), A-467: the loop waits for the lapse, not for the next beat. Do: follow `lapse_wait` from turn to
+  /// turn over a daemon that beats every tenth of a budget, then stops, with a quiet anchor's gap. Expect every wait at
+  /// most that gap while it beats, and the lapse found exactly one budget and a nanosecond after its last beat.
   #[test]
-  fn the_loop_wakes_twice_a_budget_and_finds_a_lapse_at_the_budgets_end() {
+  fn the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end() {
+    let gap = Lateness::default().observation_gap_ns();
     let mut watch = Watch::default();
     let mut now = BUDGET;
     let mut last_beat = now;
@@ -1550,8 +1589,8 @@ mod lapse_tests {
       let (dead, next) = lapsed(watch, last_beat, now, BUDGET);
       assert!(!dead, "a beating daemon never lapses");
       watch = next;
-      let wait = lapse_wait(watch, last_beat, now, BUDGET);
-      assert!(wait <= BUDGET / 2, "{wait}");
+      let wait = lapse_wait(watch, last_beat, now, (BUDGET, gap));
+      assert!(wait <= gap, "{wait}");
       now += wait;
     }
     let stopped_at = last_beat;
@@ -1563,12 +1602,52 @@ mod lapse_tests {
         found = Some(now);
         break;
       }
-      now += lapse_wait(watch, stopped_at, now, BUDGET);
+      now += lapse_wait(watch, stopped_at, now, (BUDGET, gap));
     }
     assert_eq!(
       found,
       Some(stopped_at + BUDGET + 1),
       "found at the budget's end"
+    );
+  }
+
+  /// A-467, A-228, §4.14. Do: follow the observation loop over a daemon that beats every turn for ten windows and then
+  /// never again, the anchor's every look coming back twice a window late, as its own lateness p99 says (a host that
+  /// starves the anchor so); the bound and the loop's wait each the anchor's own, from that lateness. Expect: never
+  /// lapsed while it beats, and found lapsed once its silence passes the bound, within the anchor's lateness of it.
+  /// Before, the loop waited half the bound whatever its lateness: its own gap then passed the bound at every look, each
+  /// look was taken for the host having slept, the daemon's silence restarted, and it was never found lapsed.
+  #[test]
+  fn a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late() {
+    let late_ns = 2 * LIVENESS_BUDGET_NS;
+    let mut lateness = Lateness::default();
+    for _ in 0..LATENESS_SAMPLES {
+      lateness.record(TURN, TURN + late_ns);
+    }
+    let (bound, gap) = (lateness.lapse_bound_ns(), lateness.observation_gap_ns());
+    let stops_at = 11 * BUDGET;
+    // The beat word at the anchor's clock `now`: the daemon's last turn, until it stops.
+    let beat_at = |now: u64| now.min(stops_at) / TURN * TURN;
+    let mut watch = Watch::default();
+    let mut now = BUDGET;
+    let mut found = None;
+    for _ in 0..1_000 {
+      let (dead, next) = lapsed(watch, beat_at(now), now, bound);
+      watch = next;
+      if dead {
+        found = Some(now);
+        break;
+      }
+      now += lapse_wait(watch, beat_at(now), now, (bound, gap)) + late_ns;
+    }
+    let found = found.expect("the silent daemon was found lapsed");
+    assert!(
+      found > stops_at + bound,
+      "lapsed at {found} ns, before its silence passed the {bound} ns bound from {stops_at} ns"
+    );
+    assert!(
+      found <= stops_at + bound + 1 + late_ns,
+      "lapsed at {found} ns, later than the anchor's own lateness after its bound ({bound} ns from {stops_at} ns)"
     );
   }
 

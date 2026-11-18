@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1 to 4 and step 5a built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4, 5a and 5b built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -738,9 +738,13 @@
 > its own shard's budget within its derived budget and leaves, counted, when it refuses a message or its growth; a
 > destroyed, fenced, rolled-back or re-installed green's engine retires until every replica left, and the daemon's stop
 > closes every shard's replicas and waits for their registrations (no owner dropped with a reader); the limit and
-> budgets in the boot profile. **Owed, in order:** step 5b (a work's rebases and named-version reads served from its
-> shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's give-back; the
-> supervisor's A/B.
+> budgets in the boot profile. **Built (step 5b, 2026-11-18, g083, A-465):** a work's base reads (its files, a page,
+> every file's length, at its base version) and its rebase answered by its shard's replica with no hop, by the owner's
+> own functions over the replica's engine (byte for byte the owner's, compared whole in the oracle test); what the
+> replica cannot serve asked of the owner, counted by why (`merge.replica.route_absent`, `_behind`, `_refused`,
+> `_evicted`, `_over_budget`); `merge.replica.served` the non-vacuity counter; a replica that left after a refusal or an
+> eviction made again before the owner's next change (`merge.replica.remade`), never one that left for its budget.
+> **Owed, in order:** an idle replica's give-back; the supervisor's A/B at 1,000 clients and more.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -3739,8 +3743,11 @@
 > A-455's ceiling (`role/anchor.rs` `anchor_window_ns`), which a silent watchdog's process is judged by too; and a
 > graceful stop is judged in the daemon's own beating (`slates_anchor::StopBounds`, `supervise::stop_overdue`: deaf or
 > overdue once its last beat is a window past the request or its deadline; the lapse at the running lapse bound).
-> Still on `W` itself, each owed its own change (class D): the anchor's lapse bound and observation cadence
-> (`lapse_bound_ns`, `lapse_wait`; D-b's rest), the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
+> **Since A-467 D-b is closed**: the anchor's lapse bound (the window plus its lateness p99) has A-455's ceiling, so a
+> runaway reading cannot blind it, and its observation gap is the bound less its lateness p99 and a beat, at least a
+> beat (`Lateness::observation_gap_ns`), where half the bound let every gap pass the bound once the anchor ran a window
+> late, each look then taken for a sleep and a wedged daemon never found lapsed.
+> Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
@@ -11375,6 +11382,31 @@ Owed:
 
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
+
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; parts 2 and 3 owed)
+
+> - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
+>   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
+>   reaches every mapped copy (A-163), a deleted object a missing entry, every request SigV4-signed, credentials in RAM
+>   only, no external runtime, every bound derived, laptop ≡ fleet. From S3's API reference and guides, fetched
+>   2026-11-18.
+> - **Built (part 1, the pure core in `crates/base/src/s3`).** `sigv4` (held to the S3 signing page's four worked
+>   examples), `list` (a `ListObjectsV2` page, its cap checked before parsing, every hostile shape refused by kind) and
+>   `keys` (the tree and one directory's listing, every key that names no path refused by kind). Proven (Mac Studio,
+>   debug, kiln r389): `cargo test --locked -p slates-base --lib -- s3`, 14 of 14 (the four golden vectors, twenty
+>   hostile pages, a page cut anywhere and arbitrary bytes, every unnamable key); red once each (`$` unreserved, `<!`
+>   passed over, `..` a name).
+> - **Owed.**
+>   - Part 2: the network client over the shard's runtime (rt TCP, rustls over aws-lc-rs with the platform's roots,
+>     HTTP/1.1 with bounded heads and bodies, S3 error documents, the retry within `LIVENESS_BUDGET_NS`, the
+>     read-ahead from the measured bandwidth-delay product), run against a local S3-compatible store.
+>   - Part 3: the `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and
+>     the N=1 differential, the library's way to name an S3 base and hand its credential, the anchor's hold of the
+>     credential across a restart.
+>   - The listing page cap assumes a continuation token no longer than an encoded key (S3 states no length): measured
+>     in part 2.
+>   - The cross-target lint of `slates-base` with its new `aws-lc-rs` dependency (Windows through `cargo xwin`, the
+>     Linux targets): main's.
 
 ### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
 

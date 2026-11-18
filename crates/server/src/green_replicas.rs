@@ -1,9 +1,21 @@
-//! A green's replicas on the shards that may hold its works (A-457, A-273 step 5a; §4.16 "Rebase off the owner").
-//! A green's owner shard makes a replica of it on every other shard of the node, up to the derived limit
+//! A green's replicas on the shards that may hold its works (A-457 and A-465, A-273 steps 5a and 5b; §4.16 "Rebase off
+//! the owner"). A green's owner shard makes a replica of it on every other shard of the node, up to the derived limit
 //! ([`crate::DaemonConfig::replica_limit`]), before the first change it makes to the green after the green is
 //! installed; it feeds every replica each change it makes, in order; and it makes every replica leave before it gives
-//! the green's engine up. Nothing reads a replica yet: serving a work's rebases and named-version reads from its
-//! shard's replica, and routing a refused one's work to the owner, is step 5b.
+//! the green's engine up. A work's shard answers from its replica what the work would ask the owner for its base (its
+//! files, a page, every file's length, at its base version) and its rebase ([`serving`], `crate::work_home`'s
+//! `answered_by_replica`), with no hop to the owner.
+//!
+//! **Serving (step 5b, A-465).** A replica serves a version it holds, no older than its fold floor and no newer than its
+//! head, by the very function the owner answers by (`verbs::base_files`, `base_page`, `base_sizes`, `rebase_on`) over
+//! its engine, which is the owner's at the version it holds; so its answer is the owner's for that state, byte for byte
+//! (the oracle test below). A rebase is answered at the replica's head, never below the work's base: one whose head lags
+//! the owner's moves the work to that head, and its next submit is judged by the owner against its own, as every stale
+//! base is. Anything the replica cannot serve is asked of the owner as before, counted by why
+//! (`merge.replica.route_absent`, `route_behind`, `route_refused`, `route_evicted`, `route_over_budget`); what it serves
+//! is counted (`merge.replica.served`, the non-vacuity counter). A replica that left after a refusal or an eviction is
+//! made again before the owner's next change, counted (`merge.replica.remade`); one that left for its budget is not,
+//! which bounds the remaking: each remade replica answers for a refusal or an eviction of the one before.
 //!
 //! **The owner.** Before the first change to a green it owns ([`ensure`], called by the submit before its settle),
 //! the owner makes one replica for each other shard (`Green::replica`, refused past the limit:
@@ -20,8 +32,8 @@
 //! `PartitionCaps::green_chain_bytes`, and the room its shard's memory class has now) and charges the replica's
 //! metadata to its shard's budget as memory held for another owner (`ShardBudget::charge_replicated`), recharged after
 //! every message. A replica that refuses a message (a gap, an eviction, a replay not its owner's), or whose charge its
-//! shard cannot take, leaves: its charge is credited, its registration goes home, and it is counted. It is not made
-//! again here: step 5b routes its work to the owner.
+//! shard cannot take, leaves: its charge is credited, its registration goes home with why, and it is counted; its work
+//! is asked of the owner, and its owner makes it again before its next change unless it left for its budget (A-465).
 //!
 //! **Giving the owner up.** A destroyed, fenced or re-installed green's engine is kept, retiring, until every replica
 //! of it has left ([`give_up`]); only then is it dropped, so its blocks are freed with no reader left to read them
@@ -48,7 +60,7 @@ use slates_mem::sealed::{Left, Passed};
 use slates_merge::chain_entry::{Applied, Signature};
 use slates_merge::engine::{Green, Increment};
 use slates_merge::replica::{
-  Fed, FeedMessage, Replica, ReplicaRefusal, held_limit, replica_budget,
+  Fed, FeedMessage, FeedRefusal, Replica, ReplicaRefusal, held_limit, replica_budget,
 };
 
 use crate::state::{self, ShardState};
@@ -76,6 +88,23 @@ pub(crate) const UNHELD: &str = "merge.replica.unheld";
 pub(crate) const NOT_CARRIED: &str = "merge.replica.not_carried";
 /// Counter: a registration that came home to no engine: its owner had dropped it.
 pub(crate) const STRAY: &str = "merge.replica.stray";
+/// Counter: a work's base read or rebase answered by this shard's replica of its green, with no hop to the owner
+/// (A-465, A-273 step 5b): the non-vacuity counter of the replica's serving.
+pub(crate) const SERVED: &str = "merge.replica.served";
+/// Counter: a base read or rebase asked of the owner because this shard holds no replica of the green and none left it:
+/// never made here, or given back when its owner asked.
+pub(crate) const ROUTE_ABSENT: &str = "merge.replica.route_absent";
+/// Counter: … because this shard's replica holds no such version: past its head (the feed has not delivered it) or
+/// under its fold floor.
+pub(crate) const ROUTE_BEHIND: &str = "merge.replica.route_behind";
+/// Counter: … because this shard's replica left after refusing a feed message (a gap, a replay not its owner's).
+pub(crate) const ROUTE_REFUSED: &str = "merge.replica.route_refused";
+/// Counter: … because this shard's replica left once its owner evicted it (it lagged, or a change went unfed).
+pub(crate) const ROUTE_EVICTED: &str = "merge.replica.route_evicted";
+/// Counter: … because this shard's replica left, or was never taken, for its budget.
+pub(crate) const ROUTE_OVER_BUDGET: &str = "merge.replica.route_over_budget";
+/// Counter: a replica its owner made again, on a shard whose replica had left after a refusal or an eviction.
+pub(crate) const REMADE: &str = "merge.replica.remade";
 
 /// This shard's part in the replicas of greens (module docs): as an owner, the shards it fed and the engines it is
 /// retiring; as a replica's shard, the replicas it holds.
@@ -89,6 +118,10 @@ pub(crate) struct GreenReplicas {
   retiring: BTreeMap<(VolumeId, u64), Green>,
   /// As a replica's shard: by green, the replica held here. Bounded by the greens of the node.
   held: BTreeMap<VolumeId, Held>,
+  /// As a replica's shard: by green, why the replica it held left, for the reason a later request is asked of the owner
+  /// (A-465). Set when a replica leaves, and gone when another is held or the owner gives the engine up. Bounded as
+  /// `held` is.
+  gone: BTreeMap<VolumeId, Gone>,
   /// The next install number this shard hands an engine it makes replicas of: a message names its engine by it, so a
   /// re-installed green's replicas are never taken for the old engine's.
   next_install: u64,
@@ -103,6 +136,30 @@ struct FedShards {
   install: u64,
   /// The shards whose replica's registration has not come home.
   shards: BTreeSet<u16>,
+  /// The shards whose replica left, and why: made again before the green's next change when it left for a refusal or
+  /// an eviction, never for its budget (A-465).
+  left: BTreeMap<u16, Gone>,
+}
+
+/// Why a replica left its shard (A-465).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gone {
+  /// It refused a feed message: a gap, or a replay not its owner's.
+  Refused,
+  /// Its owner evicted it: it lagged past the held limit, or a change went unfed.
+  Evicted,
+  /// Its metadata was past its budget, or its shard's budget refused its charge.
+  OverBudget,
+  /// Its owner asked it to leave, or the daemon stopped.
+  Asked,
+}
+
+impl Gone {
+  /// Whether its owner makes it again before the green's next change: after a refusal or an eviction, which a fresh
+  /// replica does not repeat; never after its budget, which it would meet again.
+  fn remade(self) -> bool {
+    matches!(self, Gone::Refused | Gone::Evicted)
+  }
 }
 
 /// A replica held on this shard.
@@ -142,12 +199,13 @@ enum Message {
     install: u64,
     passed: Passed,
   },
-  /// Replica's shard to the owner: the replica's registration, from shard `from`.
+  /// Replica's shard to the owner: the replica's registration, from shard `from`, and why it left.
   Left {
     green: VolumeId,
     install: u64,
     from: u16,
     left: Left,
+    gone: Gone,
   },
 }
 
@@ -229,7 +287,7 @@ fn settle_owed(state: &mut ShardState) {
         replica,
       } if owner == state.shard => {
         if let Some(left) = (*replica).into_left() {
-          left_home(state, (green, install), target, left);
+          left_home(state, (green, install), target, left, Gone::Refused);
         }
       }
       message if target == state.shard => handle(state, message),
@@ -264,18 +322,50 @@ fn handle(state: &mut ShardState, message: Message) {
       install,
       from,
       left,
-    } => left_home(state, (green, install), from, left),
+      gone,
+    } => left_home(state, (green, install), from, left, gone),
   }
 }
 
-/// The owner makes `green`'s replicas on every other shard, up to the derived limit, unless they were made for this
-/// install already or the daemon is stopping (module docs, "The owner"). Called before the green's first change.
+/// The owner makes `green`'s replicas on every other shard, up to the derived limit, before the green's first change;
+/// before a later change, again on each shard whose replica left after a refusal or an eviction (A-465), counted; never
+/// while the daemon is stopping (module docs, "The owner"). Called before each change.
 pub(crate) fn ensure(state: &mut ShardState, green: VolumeId) {
   settle_owed(state);
-  let replicas = &state.green_replicas;
-  if replicas.closed || replicas.fed.contains_key(&green) || !state.greens.contains_key(&green) {
+  if state.green_replicas.closed || !state.greens.contains_key(&green) {
     return;
   }
+  let (install, targets, again) = match state.green_replicas.fed.get_mut(&green) {
+    Some(fed) => (fed.install, take_remade(fed), true),
+    None => (first_install(state, green), other_shards(state), false),
+  };
+  for target in targets {
+    if !make_one(state, (green, install), target) {
+      break;
+    }
+    if again {
+      state.count(REMADE, 1);
+    }
+  }
+  // A delivery the carrier refused is taken back now.
+  settle_owed(state);
+}
+
+/// The shards whose replica of `fed`'s engine is made again now: those that left after a refusal or an eviction, taken
+/// out of its left record; one that left for its budget stays out (A-465).
+fn take_remade(fed: &mut FedShards) -> Vec<u16> {
+  let again: Vec<u16> = fed
+    .left
+    .iter()
+    .filter(|(_, gone)| gone.remade())
+    .map(|(shard, _)| *shard)
+    .collect();
+  fed.left.retain(|_, gone| !gone.remade());
+  again
+}
+
+/// A record of `green`'s installed engine, under a new install number, before its first change: the number.
+fn first_install(state: &mut ShardState, green: VolumeId) -> u64 {
   let install = state.green_replicas.next_install;
   state.green_replicas.next_install = install.saturating_add(1);
   state.green_replicas.fed.insert(
@@ -283,21 +373,20 @@ pub(crate) fn ensure(state: &mut ShardState, green: VolumeId) {
     FedShards {
       install,
       shards: BTreeSet::new(),
+      left: BTreeMap::new(),
     },
   );
-  let others: Vec<u16> = state
+  install
+}
+
+/// Every shard of the node but this one.
+fn other_shards(state: &ShardState) -> Vec<u16> {
+  state
     .shards
     .iter()
     .copied()
     .filter(|shard| *shard != state.shard)
-    .collect();
-  for target in others {
-    if !make_one(state, (green, install), target) {
-      break;
-    }
-  }
-  // A delivery the carrier refused is taken back now.
-  settle_owed(state);
+    .collect()
 }
 
 /// Makes one replica of `green` for `target` and sends it: whether the owner may make another.
@@ -416,19 +505,23 @@ pub(crate) fn give_up(state: &mut ShardState, green: VolumeId) -> bool {
   let Some(engine) = state.greens.remove(&green) else {
     return false;
   };
+  // Every shard that held a replica of it is asked to leave: one that holds it gives it back, and one whose replica
+  // left forgets why (A-465).
+  if let Some(fed) = &fed {
+    for target in fed.shards.iter().chain(fed.left.keys()) {
+      send(
+        state,
+        *target,
+        Message::Leave {
+          green,
+          install: fed.install,
+        },
+      );
+    }
+  }
   let Some(fed) = fed.filter(|_| engine.replicas_registered() > 0) else {
     return true;
   };
-  for target in &fed.shards {
-    send(
-      state,
-      *target,
-      Message::Leave {
-        green,
-        install: fed.install,
-      },
-    );
-  }
   state
     .green_replicas
     .retiring
@@ -441,7 +534,7 @@ pub(crate) fn give_up(state: &mut ShardState, green: VolumeId) -> bool {
 fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Green) {
   let replicas = &state.green_replicas;
   if replicas.closed || replicas.held.contains_key(&key.0) {
-    give_home(state, key, owner, replica.into_left());
+    give_home(state, key, owner, (replica.into_left(), Gone::Asked));
     return;
   }
   // The shard's free room: what its arena holds and could still claim from its pool, less its commitments (A-98).
@@ -451,16 +544,19 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
     Ok(replica) => replica,
     Err(not_made) => {
       state.count(OVER_BUDGET, 1);
-      give_home(state, key, owner, not_made.left);
+      state.green_replicas.gone.insert(key.0, Gone::OverBudget);
+      give_home(state, key, owner, (not_made.left, Gone::OverBudget));
       return;
     }
   };
   let bytes = metadata_charge(&replica);
   if !charge(state, bytes) {
     state.count(OVER_BUDGET, 1);
-    give_home(state, key, owner, replica.leave());
+    state.green_replicas.gone.insert(key.0, Gone::OverBudget);
+    give_home(state, key, owner, (replica.leave(), Gone::OverBudget));
     return;
   }
+  state.green_replicas.gone.remove(&key.0);
   state.green_replicas.held.insert(
     key.0,
     Held {
@@ -485,12 +581,12 @@ fn charge(state: &mut ShardState, bytes: u64) -> bool {
   state.store.budget.charge_replicated(bytes).is_ok()
 }
 
-/// Sends `left`, a replica's registration, home to its owner.
+/// Sends `left`, a replica's registration, home to its owner, with why it left.
 fn give_home(
   state: &mut ShardState,
   (green, install): (VolumeId, u64),
   owner: u16,
-  left: Option<Left>,
+  (left, gone): (Option<Left>, Gone),
 ) {
   if let Some(left) = left {
     let from = state.shard;
@@ -502,6 +598,7 @@ fn give_home(
         install,
         from,
         left,
+        gone,
       },
     );
   }
@@ -541,9 +638,14 @@ fn apply(state: &mut ShardState, key: (VolumeId, u64), message: &FeedMessage) {
       }
     }
     Ok(Fed::PassedOver) => {}
-    Err(_) => {
+    Err(refusal) => {
       state.count(REFUSED, 1);
-      give_back(state, key.0);
+      let gone = match refusal {
+        FeedRefusal::Evicted => Gone::Evicted,
+        FeedRefusal::OverBudget { .. } => Gone::OverBudget,
+        _ => Gone::Refused,
+      };
+      give_back(state, key.0, gone);
     }
   }
 }
@@ -570,29 +672,35 @@ fn recharge(state: &mut ShardState, green: VolumeId) -> bool {
     held.charged = charged;
   }
   state.count(OVER_BUDGET, 1);
-  give_back(state, green);
+  give_back(state, green, Gone::OverBudget);
   false
 }
 
-/// A replica's shard gives the replica of `green` it holds back: its charge credited, its registration sent home.
-fn give_back(state: &mut ShardState, green: VolumeId) {
+/// A replica's shard gives the replica of `green` it holds back, for `gone`: its charge credited, its registration sent
+/// home with why, and why kept here for the requests asked of the owner from now on (none when it was asked to).
+fn give_back(state: &mut ShardState, green: VolumeId, gone: Gone) {
   let Some(held) = state.green_replicas.held.remove(&green) else {
     return;
   };
   state.store.budget.credit_replicated(held.charged);
+  if gone != Gone::Asked {
+    state.green_replicas.gone.insert(green, gone);
+  }
   give_home(
     state,
     (green, held.install),
     held.owner,
-    held.replica.leave(),
+    (held.replica.leave(), gone),
   );
 }
 
-/// A replica's shard gives back the replica of `green` its owner asks to leave.
+/// A replica's shard gives back the replica of `green` its owner asks to leave, and forgets why one left before: the
+/// owner gave the engine up.
 fn leave_held(state: &mut ShardState, key: (VolumeId, u64)) {
   if held_mut(state, key).is_some() {
-    give_back(state, key.0);
+    give_back(state, key.0, Gone::Asked);
   }
+  state.green_replicas.gone.remove(&key.0);
 }
 
 /// The owner takes what a replica of its installed engine passed; one of a retiring engine is not needed, since that
@@ -608,9 +716,15 @@ fn acknowledged(state: &mut ShardState, (green, install): (VolumeId, u64), passe
   }
 }
 
-/// The owner takes a replica's registration home from shard `from`: to its installed engine, or to a retiring one,
-/// dropped once its last replica has left.
-fn left_home(state: &mut ShardState, (green, install): (VolumeId, u64), from: u16, left: Left) {
+/// The owner takes a replica's registration home from shard `from`, which gave it back for `gone`: to its installed
+/// engine, which records why for its next change (A-465), or to a retiring one, dropped once its last replica has left.
+fn left_home(
+  state: &mut ShardState,
+  (green, install): (VolumeId, u64),
+  from: u16,
+  left: Left,
+  gone: Gone,
+) {
   state.count(LEFT, 1);
   let replicas = &mut state.green_replicas;
   if let Some(fed) = replicas
@@ -619,6 +733,9 @@ fn left_home(state: &mut ShardState, (green, install): (VolumeId, u64), from: u1
     .filter(|fed| fed.install == install)
   {
     fed.shards.remove(&from);
+    if gone != Gone::Asked {
+      fed.left.insert(from, gone);
+    }
     if let Some(engine) = state.greens.get_mut(&green) {
       engine.leave_replica(left);
     }
@@ -641,9 +758,41 @@ pub(crate) fn close(state: &mut ShardState) {
   state.green_replicas.closed = true;
   let held: Vec<VolumeId> = state.green_replicas.held.keys().copied().collect();
   for green in held {
-    give_back(state, green);
+    give_back(state, green, Gone::Asked);
   }
   settle_owed(state);
+}
+
+/// The replica of `green` this shard holds, to answer a work's base read at version `asked` or the rebase of a work
+/// based there (A-465, A-273 step 5b): when it holds that version, no older than its fold floor and no newer than its
+/// head. Otherwise none, counted by why the owner is asked instead: no replica here, never made or given back when its
+/// owner asked; one that left after a refusal, an eviction or for its budget; or one that holds no such version.
+pub(crate) fn serving(state: &mut ShardState, green: VolumeId, asked: u64) -> Option<&mut Green> {
+  if let Some(route) = route_reason(&state.green_replicas, green, asked) {
+    state.count(route, 1);
+    return None;
+  }
+  state
+    .green_replicas
+    .held
+    .get_mut(&green)
+    .map(|held| held.replica.green_mut())
+}
+
+/// Why a request for `green` at version `asked` is asked of the owner rather than served by this shard's replica (the
+/// counter it moves); none when the replica holds the version.
+fn route_reason(replicas: &GreenReplicas, green: VolumeId, asked: u64) -> Option<&'static str> {
+  let Some(held) = replicas.held.get(&green) else {
+    return Some(match replicas.gone.get(&green) {
+      Some(Gone::Refused) => ROUTE_REFUSED,
+      Some(Gone::Evicted) => ROUTE_EVICTED,
+      Some(Gone::OverBudget) => ROUTE_OVER_BUDGET,
+      Some(Gone::Asked) | None => ROUTE_ABSENT,
+    });
+  };
+  let replica = held.replica.green();
+  let holds = asked >= replica.folded_below() && asked <= replica.head();
+  (!holds).then_some(ROUTE_BEHIND)
 }
 
 /// What this shard still has of its greens' replicas: the registrations its owned and retiring engines hold, the
@@ -700,6 +849,18 @@ mod tests {
   /// On `state`, its owner's shard: a green with one work over it and `versions` versions submitted through the work,
   /// each writing its own bytes; the green's id.
   fn green_with_versions(state: &mut ShardState, prefix: &str, versions: u8) -> VolumeId {
+    let (green, work) = green_and_work(state, prefix);
+    for version in 0..versions {
+      submit_one(state, work, version);
+    }
+    green
+  }
+
+  /// On `state`, its owner's shard: a green and one work over it; their ids.
+  fn green_and_work(
+    state: &mut ShardState,
+    prefix: &str,
+  ) -> (VolumeId, slates_ipc::protocol::VolumeId) {
     let owner = principal();
     let name = local_name(state, prefix);
     let created = RequestBody::CreateGreen {
@@ -718,20 +879,27 @@ mod tests {
     else {
       panic!("the work was not created");
     };
-    for version in 0..versions {
-      submit_one(state, work, version);
-    }
-    crate::verbs::to_db_volume(id)
+    (crate::verbs::to_db_volume(id), work)
   }
 
   /// Writes `/f` through `work` with bytes of `byte` and submits it: accepted as a new version.
   fn submit_one(state: &mut ShardState, work: slates_ipc::protocol::VolumeId, byte: u8) {
+    submit_edit(state, work, (0, byte));
+  }
+
+  /// Writes eight bytes of `byte` at the start of `/f` through `work`, in place of the `replaced` bytes there, and submits
+  /// it: accepted as a new version.
+  fn submit_edit(
+    state: &mut ShardState,
+    work: slates_ipc::protocol::VolumeId,
+    (replaced, byte): (u64, u8),
+  ) {
     let owner = principal();
     let edit = RequestBody::Edit {
       work,
       path: "/f".to_owned(),
       at: 0,
-      delete_len: 0,
+      delete_len: replaced,
       bytes: vec![byte; 8],
     };
     let edited = crate::verbs::dispatch(state, 1, &owner, edit);
@@ -885,5 +1053,271 @@ mod tests {
       0,
       "no owner dropped with a replica registered"
     );
+  }
+
+  /// An increment, `tag`'s, based at `base`, that writes `bytes` over the start of `path`, creating it when `create`.
+  fn increment(
+    tag: u8,
+    base: u64,
+    (path, create): (&str, bool),
+    bytes: &[u8],
+  ) -> slates_merge::engine::Increment {
+    use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
+    let mut doc = OpsDoc::new();
+    let index = doc.paths.intern(path);
+    let len = u64::try_from(bytes.len()).unwrap();
+    let op = |kind, len, src| Op {
+      kind,
+      flags: 0,
+      path: index,
+      at: 0,
+      len,
+      src,
+    };
+    if create {
+      doc.ops.push(op(OpKind::Create, 0, u64::MAX));
+      doc.ops.push(op(OpKind::Insert, len, 0));
+    } else {
+      doc.ops.push(op(OpKind::Overwrite, len, 0));
+    }
+    slates_merge::engine::Increment {
+      id: [tag; 32],
+      base,
+      doc,
+      post_state: bytes.to_vec(),
+      evidence: Vec::new(),
+    }
+  }
+
+  /// A work of `green` based at version 1 whose increment, composed on its shard, is `increment`: what its shard moves
+  /// to be rebased.
+  fn sealed(
+    green: VolumeId,
+    increment: slates_merge::engine::Increment,
+  ) -> crate::work_home::SealedWork {
+    crate::work_home::SealedWork {
+      work: VolumeId { bytes: [0x5e; 16] },
+      green,
+      base_version: 1,
+      journal: Vec::new(),
+      files: crate::work_files::WorkFiles::default(),
+      composed: Some(increment),
+    }
+  }
+
+  /// What the green's engine at `state` answers of a work's base reads at version 1 (its files and their entries, a
+  /// page, every file's length) and of two rebases from version 1 (one clean, one that conflicts), each whole: by the
+  /// owner's functions on its own shard, or by the replica's on another.
+  fn answers(state: &mut ShardState, green: VolumeId, on_owner: bool) -> Vec<String> {
+    let path = crate::merge_service::canonical_path("/f").to_owned();
+    let paths = vec![path.clone(), "absent".to_owned()];
+    let clean = sealed(green, increment(7, 1, ("g", true), b"new"));
+    let conflict = sealed(green, increment(8, 1, (&path, false), b"theirs"));
+    if on_owner {
+      return vec![
+        format!("{:?}", crate::verbs::owner_files(state, green, 1, &paths)),
+        format!(
+          "{:?}",
+          crate::verbs::owner_page(state, green, 1, path, (2, 4))
+        ),
+        format!("{:?}", crate::verbs::owner_sizes(state, green, 1)),
+        format!("{:?}", crate::verbs::owner_rebase(state, clean)),
+        format!("{:?}", crate::verbs::owner_rebase(state, conflict)),
+      ];
+    }
+    let files = crate::verbs::base_files(serving(state, green, 1).map(|e| &*e), 1, &paths);
+    let page = crate::verbs::base_page(serving(state, green, 1).map(|e| &*e), 1, path, (2, 4));
+    let sizes = crate::verbs::base_sizes(serving(state, green, 1).map(|e| &*e), 1);
+    vec![
+      format!("{files:?}"),
+      format!("{page:?}"),
+      format!("{sizes:?}"),
+      format!(
+        "{:?}",
+        crate::verbs::rebase_on(serving(state, green, 1), &clean)
+      ),
+      format!(
+        "{:?}",
+        crate::verbs::rebase_on(serving(state, green, 1), &conflict)
+      ),
+    ]
+  }
+
+  /// A-465 (A-273 step 5b), the oracle: what a work's shard asks of its green, answered by the replica there and by the
+  /// owner, compared whole. Do: on a two-shard daemon, a green on the first shard with two versions, the second
+  /// replacing the first's bytes; once the second shard's replica holds its head, ask both the same: a work's base files
+  /// at version 1 (one there, one not, with their entries), a page of one, every file's length, a clean rebase from
+  /// version 1, and one that conflicts with version 2. Expect: every answer the same, byte for byte, the rebases at the
+  /// same head.
+  #[test]
+  fn what_a_replica_answers_is_the_owners_answer_whole() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (green, head) = crate::daemon::observe_first(&daemon, |state| {
+      let (green, work) = green_and_work(state, "oracle");
+      submit_edit(state, work, (0, 0));
+      submit_edit(state, work, (8, 1));
+      let engine = state.greens.get_mut(&green).unwrap();
+      (green, (engine.head(), engine.head_identity()))
+    });
+    let held = eventually(&daemon, 1, move |state| held_at(state, green, head));
+    assert_eq!(held, Some(head), "the replica holds the owner's head");
+    let owner = crate::daemon::observe_first(&daemon, move |state| answers(state, green, true));
+    let replica = crate::daemon::observe_at(&daemon, 1, move |state| answers(state, green, false));
+    assert_eq!(replica, owner, "the replica's answers are the owner's");
+    assert!(
+      owner.iter().any(|answer| answer.starts_with("Rebased {")),
+      "a clean rebase among them: {owner:?}"
+    );
+    assert!(
+      owner
+        .iter()
+        .any(|answer| answer.starts_with("Reply(Rebased {")),
+      "and a conflict: {owner:?}"
+    );
+    daemon.stop();
+  }
+
+  /// Runs `body` on `state` as a client's request resumed there runs (`lease_wait::run_resumed`): its gate parks it when
+  /// it needs its green, and the answer resumes it later.
+  fn run_as_request(state: &mut ShardState, word: u64, body: RequestBody) {
+    let verb = crate::lease_wait::ResumedVerb {
+      route: None,
+      origin: 0,
+      id: slates_wire::request::RequestId::from_word(word),
+      client_id: 1,
+      principal: principal(),
+      body,
+    };
+    crate::lease_wait::run_resumed(state, verb, None, None);
+  }
+
+  /// The second shard's counters of what its replicas served and what it asked of owners.
+  fn served_and_asked(state: &mut ShardState) -> (u64, u64) {
+    (
+      state.refusals.get(SERVED).copied().unwrap_or(0),
+      state
+        .refusals
+        .get(crate::work_home::ASKED_THE_OWNER)
+        .copied()
+        .unwrap_or(0),
+    )
+  }
+
+  /// A-465 (A-273 step 5b). Do: on a two-shard daemon, a green on the first shard at version 1; a work over it made on
+  /// the second shard through its gate, as a client's request is (its admission asks the owner); a second version on
+  /// the first shard; once the second shard's replica holds it, the work makes a file and is rebased, both through the
+  /// gate. Expect: the edit's base read and the rebase each answered by the replica (`merge.replica.served` moved by
+  /// two) with nothing asked of the owner (`merge.work.asked_owner` unchanged), and the work moved to the head.
+  #[test]
+  fn a_works_base_read_and_rebase_on_its_replicas_shard_are_served_there_with_no_hop() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (green, work0) = crate::daemon::observe_first(&daemon, |state| {
+      let (green, work) = green_and_work(state, "served");
+      submit_one(state, work, 1);
+      (green, work)
+    });
+    let name = crate::daemon::observe_at(&daemon, 1, |state| local_name(state, "served-off"));
+    let create = RequestBody::CreateWork {
+      green: crate::verbs::to_wire_volume(green),
+      name: name.clone(),
+    };
+    crate::daemon::observe_at(&daemon, 1, move |state| run_as_request(state, 1, create));
+    let work = eventually(&daemon, 1, move |state| {
+      let record = state.db.partition().volume_by_name(&name)?;
+      state.works.contains_key(&record.id).then_some(record.id)
+    })
+    .expect("the work was made on the second shard");
+    let head = crate::daemon::observe_first(&daemon, move |state| {
+      submit_one(state, work0, 2);
+      let engine = state.greens.get_mut(&green).unwrap();
+      (engine.head(), engine.head_identity())
+    });
+    assert!(eventually(&daemon, 1, move |state| held_at(state, green, head)).is_some());
+    let before = crate::daemon::observe_at(&daemon, 1, served_and_asked);
+    let edit = RequestBody::Edit {
+      work: crate::verbs::to_wire_volume(work),
+      path: "/g".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"made here".to_vec(),
+    };
+    let rebase = RequestBody::Rebase {
+      work: crate::verbs::to_wire_volume(work),
+    };
+    crate::daemon::observe_at(&daemon, 1, move |state| run_as_request(state, 2, edit));
+    let edited = eventually(&daemon, 1, move |state| {
+      (!state.works.get(&work)?.journal.is_empty()).then_some(())
+    });
+    assert!(edited.is_some(), "the edit ran");
+    crate::daemon::observe_at(&daemon, 1, move |state| run_as_request(state, 3, rebase));
+    let moved = eventually(&daemon, 1, move |state| {
+      (state.works.get(&work)?.base_version == head.0).then_some(())
+    });
+    assert!(moved.is_some(), "the work moved to the owner's head");
+    let after = crate::daemon::observe_at(&daemon, 1, served_and_asked);
+    assert_eq!(
+      (after.0.saturating_sub(before.0), after.1),
+      (2, before.1),
+      "both served by the replica, nothing asked of the owner"
+    );
+    daemon.stop();
+  }
+
+  /// A-465 (A-273 step 5b). Do: on a two-shard daemon, a green with a replica at its head on the second shard; ask that
+  /// shard's replica for a version past the head and for a green it holds no replica of; give the replica back as
+  /// though its owner had evicted it, and ask again; make a version on the owner; then give the remade replica back for
+  /// its budget, make another version, and ask again. Expect: each request asked of the owner counted by why (behind,
+  /// absent, evicted, over its budget); the evicted replica made again before the next change, counted, and held again;
+  /// the one that left for its budget not made again.
+  #[test]
+  fn a_replica_that_left_is_remade_unless_for_its_budget_and_each_route_is_counted_by_why() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (green, work) = crate::daemon::observe_first(&daemon, |state| {
+      let (green, work) = green_and_work(state, "routed");
+      submit_one(state, work, 1);
+      (green, work)
+    });
+    let head = crate::daemon::observe_first(&daemon, move |state| {
+      let engine = state.greens.get_mut(&green).unwrap();
+      (engine.head(), engine.head_identity())
+    });
+    assert!(eventually(&daemon, 1, move |state| held_at(state, green, head)).is_some());
+    let other = VolumeId { bytes: [0x0f; 16] };
+    let routes = crate::daemon::observe_at(&daemon, 1, move |state| {
+      let behind = serving(state, green, head.0 + 1).is_none();
+      let absent = serving(state, other, 1).is_none();
+      give_back(state, green, Gone::Evicted);
+      let evicted = serving(state, green, 1).is_none();
+      [behind, absent, evicted]
+    });
+    assert_eq!(routes, [true; 3]);
+    let remade = crate::daemon::observe_first(&daemon, move |state| {
+      submit_one(state, work, 2);
+      state.refusals.get(REMADE).copied()
+    });
+    let held_again = eventually(&daemon, 1, move |state| {
+      (state.refusals.get(HELD).copied() == Some(2)).then_some(())
+    });
+    let over = crate::daemon::observe_at(&daemon, 1, move |state| {
+      give_back(state, green, Gone::OverBudget);
+      serving(state, green, 1).is_none()
+    });
+    let not_remade = crate::daemon::observe_first(&daemon, move |state| {
+      submit_one(state, work, 3);
+      state.refusals.get(REMADE).copied()
+    });
+    let counted = crate::daemon::observe_at(&daemon, 1, |state| {
+      [ROUTE_BEHIND, ROUTE_ABSENT, ROUTE_EVICTED, ROUTE_OVER_BUDGET]
+        .map(|route| state.refusals.get(route).copied().unwrap_or(0))
+    });
+    assert_eq!(
+      (remade, held_again.is_some()),
+      (Some(1), true),
+      "remade once, held again"
+    );
+    assert!(over, "its budget's leave routes to the owner");
+    assert_eq!(not_remade, Some(1), "never remade for its budget");
+    assert_eq!(counted, [1, 1, 1, 1], "each route counted by why");
+    daemon.stop();
   }
 }

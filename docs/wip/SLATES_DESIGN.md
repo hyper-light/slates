@@ -9535,6 +9535,19 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > yet: the anchor's lapse bound (`lapse_bound_ns`, the liveness window plus its lateness p99) and its observation
 > cadence (GAPS).
 
+> **Status (2026-11-18, A-467): the anchor's lapse bound has a ceiling, and its looks keep their gaps inside it.** The
+> lapse bound stays the liveness window plus the anchor's measured lateness p99 (A-228), never past the ceiling the
+> watchdog holds its own windows to (A-455, the daemon's observation budget), so a runaway reading (a host paused twice
+> among the last hundred waits) cannot hold a wedged daemon's lapse past it. The observation loop's longest wait is the
+> bound less the anchor's own lateness p99 and a beat, never less than a beat (`Lateness::observation_gap_ns`), where it
+> was half the bound. A look that comes more than the bound after the one before reads as the host having slept and
+> restarts the daemon's silence (`lapsed`), so under a lateness past a window every gap of the old loop passed the bound
+> and a wedged daemon was never found lapsed; now the gap stays inside the bound at the anchor's p99, with a beat to
+> spare. A quiet anchor looks at a running daemon about once a window rather than twice. Regressions:
+> `the_lapse_bound_is_the_window_plus_the_anchors_own_lateness` (the ceiling),
+> `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` and
+> `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end` (`crates/api/src/role/anchor.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -9689,6 +9702,122 @@ coverage, dependencies, bytes read/retained and elapsed cost.
 > again is a conflict until then); a moved captured clone, whose capture stays behind, still lands as a scratch volume
 > (stage 2); a name whose kind changed lands as a removal and a making that the class order meets as `TypeChanged`;
 > a symlink pointed elsewhere does not land over the old one, as an overlay's does not (GAPS, g267).
+
+**An S3 base (A-464, designed 2026-11-18; Mantle's CP-T10.5).** An overlay's base may be the objects under a prefix
+of an S3 bucket instead of a host directory: kiln keeps its bytes on Mantle, Mantle keeps them in S3-compatible object
+stores, and an agent's workspace over such a tree needs no copy of it on the runner's disk. The base is read-only,
+live, and judged as a host directory's base is; a landing never writes S3 (a landing's target is a host directory
+under a grant, as ever). Part 1, this design and its pure core, is built; the network client (part 2) and the base
+host with its simulated oracle (part 3) follow, each its own piece (GAPS A-464).
+
+*Sources* (primary, fetched 2026-11-18; tier B): S3's API reference for `ListObjectsV2`, `GetObject`, `HeadObject` and
+the `Object` type (`docs.aws.amazon.com/AmazonS3/latest/API/API_<Action>.html`); S3's user guide for object keys
+(`userguide/object-keys`) and its consistency model (`userguide/Welcome`, "Amazon S3 data consistency model"); S3's
+SigV4 page (`developerguide/sig-v4-header-based-auth`, with its four worked examples) and IAM's
+(`IAM/latest/UserGuide/reference_sigv-create-signed-request`). AWS's SDK behaviour is tier C and flagged where used.
+
+*What S3 promises, and what the base takes from it.*
+- **Listing.** `ListObjectsV2` (`GET /?list-type=2`) returns up to 1,000 entries a page (`max-keys`' ceiling and
+  default). With `delimiter=/` and a directory's prefix, a page's `Contents` are the files directly in that directory
+  and its `CommonPrefixes` its subdirectories, which is the host's `list(dir)` exactly, so a directory is listed when it
+  is first looked up, never the whole bucket at creation (§4.15 "Live source": a live overlay identifies its source
+  without walking it). A page with `IsTruncated` true names a `NextContinuationToken`, which the next request sends as
+  `continuation-token` until a page is not truncated. Keys are asked `encoding-type=url`, since XML 1.0 cannot carry
+  every character a key may hold (the API reference's own reason), and decoded as form values (`+` a space: AWS's SDKs
+  decode so, botocore's `unquote_plus`, tier C). Keys come in UTF-8 binary order.
+- **Reading.** `GetObject` with `Range: bytes=first-last` answers `206` with the bytes and `Content-Range`; S3 serves
+  one range a request. `If-Match: <ETag>` answers `412 Precondition Failed` when the object's ETag is another, and
+  `versionId` names one version of a versioned bucket. `HeadObject` answers the size, the ETag, `Last-Modified` and
+  `x-amz-version-id` without the bytes. A key that does not exist answers `404` (`NoSuchKey`).
+- **Identity.** "The ETag reflects changes only to the contents of an object, not its metadata", and may or may not be
+  an MD5 digest (the `Object` type), so the base treats it as opaque: equal ETags mean equal content, a changed ETag a
+  replaced object. `LastModified` is "the creation date of the object": an object is never changed in place, only
+  replaced whole ("updates to a single key are atomic", the consistency model).
+- **Consistency.** S3 gives "strong read-after-write consistency for PUT and DELETE requests", listings included: a
+  read or a listing after a successful write sees it.
+- **Keys.** A key is up to 1,024 bytes of UTF-8, case-sensitive, and may hold `.` and `..` segments, which S3 itself
+  warns are resolved differently by different tools (the object key guide).
+
+*The base plane's promise over S3.*
+- **Read-only.** The base host reads (list, head, get); nothing in it can put or delete an object.
+- **A key is a path or is refused.** The keys under the base's prefix are mapped to a POSIX tree by `/`
+  (`slates_base::s3::keys`): a key ending in `/` is a directory of its own and the prefix's own key the root's; a key
+  with an empty, `.` or `..` component, a NUL, a component past `NAME_MAX` or a length past S3's 1,024 bytes is refused
+  by its kind; a file whose path a directory takes (the key `a` beside `a/b`, which S3 allows and a tree cannot) is
+  refused `Shadowed`, the directory standing, whichever was listed first. A refused key is counted and named in the
+  base's report, never dropped in silence, never renamed into another path, so no key leaves the base or aliases
+  another.
+- **An outsider's change is seen as on a disk.** An untouched base file is bound to the object it was made from (A-151):
+  its fingerprint carries the base's identity (`dev`), the inode number the base plane gives the key, the size,
+  `Last-Modified` as its times, and the object's identity as its birth (its version id where the bucket is versioned,
+  else its ETag), so a replaced object is a new file, as a replaced disk file is, and its inode is never refreshed onto
+  the new bytes. Every ranged read of a base file carries `If-Match` with the ETag it was made from (or names its
+  version), so a replacement between reads answers `412` and never mixes two objects' bytes in one file: the 412 is the
+  base plane's drift, adopted as A-151 adopts a replaced file, and adopting it marks every copy a client maps stale
+  (A-163: every way the served bytes change without a write must reach the copy). A relist of a directory (on its next
+  lookup, as the host's fingerprint of a directory decides) finds new and deleted keys. A deleted object is a missing
+  base entry: absent from its listing, `404` on a read, as a deleted disk file is `ENOENT`.
+- **Pinning and capture.** `pin` and `capture_base` work as over a directory: a captured file's witness is the BLAKE3 of
+  the bytes read under one ETag, so a capture is consistent per object; across objects it is as a directory's, the
+  caller's quiescence (`capture_base`).
+
+*Signing.* Every request is signed with AWS Signature Version 4 (`slates_base::s3::sigv4`): the canonical request
+(the method; the key's path encoded once and never normalized, `/` kept; the query's names and values encoded and
+sorted; the headers lower-cased, trimmed, their runs of spaces made one, sorted; the names signed; the payload's
+SHA-256), the string to sign (the algorithm, the time, the scope `YYYYMMDD/region/s3/aws4_request`, the canonical
+request's SHA-256), the HMAC-SHA256 key chain and the signature, held to the S3 page's four worked examples as golden
+vectors. A temporary credential's session token rides `x-amz-security-token` and is signed with the rest. SHA-256 and
+HMAC are aws-lc-rs's, the workspace's one cryptographic library.
+
+*Credentials.* They come only from where Mantle hands them, through kiln and the library, at the volume's creation and
+again when they are rotated. They are held in RAM by the volume's owner shard and, across a daemon's restart, by the
+anchor as it holds the launcher's secret: never in a catalog or completion record, an audit record, a log line or a
+core dump (the roles exclude themselves from dumps), never on disk. A credential's `Debug` shows its access key id
+alone. An expired or refused credential (`403`) makes base reads refuse typed until a fresh one is handed; the
+overlay's own entries are served meanwhile.
+
+*Runtime and network (D-9, R6).* No external runtime: the S3 client is a task of the volume's owner shard on slates'
+runtime, over its TCP and TLS (rustls over aws-lc-rs, as the transport's handshake), the server's certificate verified
+against the platform's trust roots, an endpoint over plain HTTP allowed only on loopback for a test's store. HTTP/1.1
+is slates' own bounded codec, a response's head and body each checked against their caps before they are held. It
+lives in the base crate, which the lint wall lets read the network and links no write call. The `HostFs` seam is
+synchronous; the S3 host answers it from a RAM cache of listings and fetched ranges, and a miss is a typed pending
+answer on which the request is parked and run again when its fetch lands, by the deferred replies the image verbs and
+the direct map already use (part 3, with its oracle).
+
+*Bounds, each derived (R3).*
+- A listing page is refused past `page_cap(max_keys)` before it is parsed: each entry a key at its longest encoding
+  (1,024 bytes × 3) and an entry's markup, the page's own markup and its long fields (`slates_base::s3::list`), 4.9 MiB
+  for a thousand keys.
+- A range is the volume's chunk (the copy-on-write unit, §4.5), so a fetched range lands as one window; read-ahead is
+  the measured bandwidth-delay product, as the transport's windows are (part 2 measures it).
+- The cache of fetched ranges and listings is RAM the shard holds and is charged and shed as content is, under the
+  shard's admittable room.
+- A retry follows only S3's retryable answers (`500`, `503` `SlowDown`), with jittered exponential backoff, within the
+  liveness budget (`LIVENESS_BUDGET_NS`); past it the read is refused `BaseUnavailable`, and every other answer is typed
+  at once (`404` missing, `403` denied, `412` drift).
+- Connections are at most one per fetch in flight on the shard, and fetches at most the shard's parked requests.
+
+*Laptop ≡ fleet (R8).* One code path. The base's identity (endpoint, region, bucket, prefix, addressing style) is in
+the volume's catalog record and travels with it; a credential never does: each node holds the one its own hand-off
+gave it, kiln handing it to every runner that may own the volume. A node that holds none serves the overlay's own
+entries and refuses base reads typed. The N=1 differential covers the S3 host through its simulated store (part 3:
+`SimS3`, an in-RAM bucket with an outsider's put and delete and a controllable clock, as `SimHost` is a directory's).
+
+*Nothing is written to disk (R1).* No cache file, no temporary file, no credential file; TLS session state is RAM.
+
+> **Status (2026-11-18, A-464 part 1: the design and its pure core).** Built in `crates/base/src/s3` (cfg-free, no I/O):
+> `sigv4` (the signing, held to the S3 page's four worked examples, IAM's header rules, `UriEncode`'s classes, a session
+> token signed and never shown, a malformed time or region refused), `list` (a `ListObjectsV2` page: the API reference's
+> sample pages, an encoded truncated page, and every hostile shape refused by its kind: past its cap, not UTF-8, a
+> document type, a comment, CDATA, a stray processing instruction, nesting past the syntax, a foreign root, mismatched
+> tags, text outside the root, bad entities, bad numbers, a missing or doubled field, too many entries, a truncated page
+> without its token, a bad encoding; cut short anywhere it is refused; any bytes, never a panic) and `keys` (the tree
+> and one directory's delimited listing: escapes, aliases, a NUL, long names and keys, outsiders and shadowed files
+> refused by kind, whatever the order). Owed: part 2, the network client over the shard's runtime (TCP, TLS, HTTP/1.1,
+> the retry and the measured read-ahead) with its real-store run against a local S3-compatible store; part 3, the
+> `HostFs` implementation, its parked misses and `SimS3`, its oracle, and the library's way to name an S3 base and hand
+> its credential.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -10672,8 +10801,10 @@ budget and its shard's room), the bytes an owner keeps for lagging ones (the roo
 its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
 rebuilt. Built in the engine (steps 1 to 4); on the shards (step 5a, A-457) the owner makes a replica on every other
 shard of its node before the green's first change, feeds it each change over the cross-shard carrier, charges it to its
-own shard, and makes every replica leave before it gives the engine up. A work's rebases and named-version reads served
-from its shard's replica are owed (step 5b).
+own shard, and makes every replica leave before it gives the engine up. A work's shard answers from its replica
+(step 5b, A-465) what the work asks of its green, its base at its version and its rebase, by the owner's own functions
+over the replica's engine, with no hop; what the replica does not hold is asked of the owner, counted by why, and a
+replica that left after a refusal or an eviction is made again before the owner's next change.
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25183,10 +25314,13 @@ own retention evicts at its first release; with the eviction past the held limit
 replica's held-limit tests and the sealed blocks' slowest-reader test fail, the unfed one passing: r316 on the Mac
 Studio, 2026-11-18). Step 5a built 2026-11-18 (g083, A-457, below): the derivations in the boot profile; a replica on
 every other shard of the node, made before the green's first change, fed over the cross-shard carrier and charged to its
-own shard; and every replica leaving before its owner is given up. Owed: step 5b (a work's rebases and named-version
-reads served from its shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's
-give-back (its idle period derived from the feed's cost per version against the rebases it served); the supervisor's
-A/B. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+own shard; and every replica leaving before its owner is given up. Step 5b built 2026-11-18 (g083, A-465, below): a
+work's base reads (its files, a page, every file's length, at its base version) and its rebase answered by its shard's
+replica with no hop, by the owner's functions over the replica's engine (byte for byte the owner's, the oracle test);
+what the replica cannot serve asked of the owner, counted by why; a replica that left after a refusal or an eviction
+made again, counted, never one that left for its budget. Owed: an idle replica's give-back (its idle period derived from
+the feed's cost per version against the rebases it served); the supervisor's A/B at 1,000 clients and more. The text and
+its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -31917,6 +32051,134 @@ slices, `stage_file` staging the decided mode and bits, a replacement's metadata
   --target x86_64-pc-windows-msvc` of slates-land and slates-server with all targets were clean; `cargo fmt` laid the
   lines out. Filed for main: the land oracle (its captured-clone tests meet the content witness's new encoding and the
   replacement's metadata) and the crash oracle.
+
+### A-467 — The anchor's lapse bound has the watchdog's ceiling, and its observation gap is the bound less its own lateness and a beat (2026-11-18, built for goal g255; R3's class D, item D-b's second half, closing D-b; §4.14 `daemon.alive`; A-228, A-232, A-455, A-461)
+- **What was there.** The anchor's lapse bound was the liveness window plus its own lateness p99 over its last hundred
+  timed waits (A-228), with no ceiling: two host pauses among those waits held every lapse past the pause, the anchor
+  blind to a wedged daemon that long. Its observation loop waited at most half the bound between looks of a running
+  daemon (`OBSERVATION_GAP_PARTS`, a `Shape:` two), whatever its own lateness. A look more than the bound after the one
+  before reads as the host having slept and restarts the daemon's silence (`lapsed`, 2026-10-04), so once its own
+  lateness passed a window, half the bound and the lateness passed the bound at every look, and a wedged daemon was
+  never found lapsed.
+- **The bound.** The liveness window plus the measured lateness p99, never past A-455's ceiling
+  (`slates_server::watchdog::WINDOW_CEILING_NS`, the daemon's observation budget), as A-461's window is capped. A live
+  daemon's beat is refreshed every beat and goes stale only by as much as its watchdog is held off its CPU, which the
+  anchor's lateness measures; one whose beat outlives the ceiling while alive is still spared, since a lapse with its
+  watchdog silent is judged by its process (A-232).
+- **The cadence.** `Lateness::observation_gap_ns`: the bound less the lateness p99 and a beat, never less than a beat,
+  the daemon's own cadence (the loop never looks at a running daemon more often than it beats). The loop's own gap,
+  its wait and its lateness, then stays inside the bound at its p99 with a beat to spare; where the bound leaves no such
+  room (a lateness past the ceiling) the loop looks every beat. A starting or unrecovered daemon is still looked at
+  every beat (`observation_pause`).
+- **What changes.** On a quiet host nothing in the bound, and the loop wakes about once a window (900 ms) where it woke
+  twice. Under a lateness past a window a wedged daemon is found lapsed within the anchor's lateness of the bound, where
+  it was never found. The kill line names the ceiling.
+- **Tests.** `the_lapse_bound_is_the_window_plus_the_anchors_own_lateness` (a runaway hour-late reading holds the bound
+  at the ceiling), `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` (the loop's
+  replay with every look two windows late: found after the bound, within the lateness of it) and
+  `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end`, in `crates/api/src/role/anchor.rs`.
+- **Evidence.** Built and run on the Mac Studio (kiln r386, 2026-11-18, load 5.5-6.0, debug build): `cargo test
+  --locked -p slates-api --lib -- role::anchor` 12 of 12 (one ignored, the held process's role). Red-checked once with
+  the old rule, the bound uncapped and the wait half the bound: the runaway reading held the bound at 3,601 s where the
+  ceiling is 10 s, and the replay with every look two windows late never found the wedged daemon lapsed.
+
+Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/api/src/role/anchor.rs`.
+
+### A-464 — An overlay's base read from S3 objects: the design and its pure core (2026-11-18, goal g268; Mantle's CP-T10.5; §4.15 "An S3 base"; §4.9 hostile input; D-9, R1, R3, R6, R8; A-151, A-163)
+Applied in the same change to: §4.15 (the subsection "An S3 base" and its status); `crates/base` (the module `s3`:
+`sigv4`, `list` and `keys`, each with its tests; `aws-lc-rs` a dependency, for SHA-256 and HMAC-SHA256); GAPS
+(2026-11-18).
+
+- **Why.** Kiln keeps every byte it holds on Mantle, and Mantle keeps them in S3-compatible object stores (CP-T10.5).
+  An agent's workspace over such a tree was an overlay over a host directory, so the tree had to be copied to the
+  runner's disk first. An overlay whose base is the objects themselves needs no copy.
+- **The shape.** §4.15's base plane over S3: a directory listed lazily by a delimited `ListObjectsV2`, a file read by
+  ranged `GetObject` bound to the object it was made from by `If-Match` (or its version id), a replaced object a new
+  file (A-151) and its drift reaching every mapped copy (A-163), a deleted object a missing entry, a key that names no
+  POSIX path refused by its kind. Every request signed with SigV4; credentials Mantle's, in RAM, never logged or
+  recorded or written; no external runtime (rt's TCP, rustls over aws-lc-rs, slates' own HTTP/1.1); every bound derived.
+- **Why from the sources.** Each rule above cites the page it rests on (fetched 2026-11-18, tier B): the listing's
+  pagination and encoding, the read's range and precondition, the ETag's meaning ("reflects changes only to the
+  contents"), the creation-time meaning of `LastModified`, the strong consistency of reads and listings after a write,
+  the key's 1,024 bytes and its `.` and `..` segments, and SigV4's canonical form and key chain. The one tier-C rule is
+  flagged where it is used: a listing's encoded keys are decoded as form values, as AWS's SDKs do.
+- **Built (part 1).** The pure core, cfg-free, every host alike: the signing held to the S3 page's four worked examples
+  (GET Object with a range, PUT Object with a `$` in its key, GET Bucket Lifecycle's subresource, List Objects' sorted
+  query: canonical request, string to sign, signature and `Authorization` header, character for character); the
+  `ListObjectsV2` page reader (a small iterative XML reader for what S3 sends, no document type, entity declaration,
+  comment, CDATA or stray processing instruction honoured, every field typed, the page's length checked against its
+  derived cap before a byte is parsed); and the keys' tree.
+- **Rejected.** An XML library: S3's listing is a fixed shape of a handful of elements, and a general reader brings
+  document types and entity expansion that a hostile page could use; the reader here refuses both outright, and its
+  every refusal is tested. Mapping a refused key to an escaped name: it would make a path S3 never named and that a
+  landing or a later listing could collide with; a refused key is named in the base's report instead.
+- **Owed.** Part 2: the network client over the shard's runtime (TCP, TLS with the platform's roots, HTTP/1.1 with
+  bounded heads and bodies, S3's error documents read by the same rules, the retry within the liveness budget, the
+  read-ahead from the measured bandwidth-delay product) and its run against a local S3-compatible store. Part 3: the
+  `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and the N=1
+  differential, the library's way to name an S3 base and hand its credential, and the anchor's hold of the credential
+  across a restart. A page's continuation tokens are assumed no longer than an encoded key in its cap (S3 calls them
+  obfuscated and states no length); part 2's run measures them.
+- **Evidence (Mac Studio, 2026-11-18, debug, kiln r389 and the red check after it).**
+  - `cargo test --locked -p slates-base --lib -- s3`: 14 of 14 in 0.08 s. The four worked examples sign as the S3 page
+    gives, character for character. IAM's header rules, `UriEncode`'s classes and a session token sign as stated, and
+    the secret and token never show. A malformed time or region is refused. The API reference's sample pages read as
+    they say; an encoded, truncated page decodes its keys and keeps its token; twenty hostile pages are each refused
+    by their kind; a page cut short anywhere is refused, and arbitrary bytes never panic (proptest). The keys' tree and
+    one directory's listing place what names a path and refuse the rest by kind, whatever the order.
+  - Red once each: with `$` taken for unreserved, the PUT example's canonical request differed from the page's (the
+    golden vectors); with `<!` passed over, the hostile pages' document type was not refused as unsupported; with
+    `..` taken for a name, the escape `../etc/passwd` was placed.
+
+### A-465 — A work's base reads and its rebase are answered by its shard's replica of its green, byte for byte the owner's, with no hop; what the replica cannot serve goes to the owner, counted by why; a replica that left is made again, bounded (2026-11-18, goal 87 via g083; A-273 step 5b; §4.16 "Rebase off the owner"; A-247, A-388, A-400, A-457)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and:
+- `crates/server`: `work_home.rs` (`start_ask` answers from the replica first: `answered_by_replica`, `answer_here`;
+  `RebaseAnswer` is `Debug`); `verbs.rs` (the owner's answers over any engine: `base_files`, `base_page`, `base_sizes`,
+  `rebase_on`, `build_increment_on`, each the core of `owner_files`, `owner_page`, `owner_sizes`, `owner_rebase` and
+  `build_increment`); `green_replicas.rs` (`serving` and its route reasons, `Gone` carried home with each registration,
+  the remake in `ensure`, and the tests).
+
+- **What was there.** A work on a shard other than its green's asked the owner for everything of the green it needed:
+  its base files and their entries, a page of a base file, every base file's length, its rebase (A-247), each a hop in
+  a batch of asks (A-388). Since A-457 a replica of the green sat on the work's shard, fed to the owner's head, unread.
+- **The rule.** Where a work's shard would ask its green's owner for the work's base at its base version (`Need::Files`,
+  `Need::Page`, `Need::Sizes`) or for its rebase (`Need::Rebase`, from the work's base), it first asks its own replica
+  of the green (`crate::green_replicas::serving`): one that holds the version asked, no older than its fold floor and
+  no newer than its head, answers by the function the owner answers by, over its own engine (`verbs::base_files`,
+  `base_page`, `base_sizes`, `rebase_on`). The verb is parked as before, and the answer settles it on its own shard as
+  an owner's answer does when it comes back (`answer_here`, a message to its own shard), so the order of a work's verbs,
+  the entries kept and the charge are the same. A rebase lands at the replica's head, never below the work's base; one
+  whose head lags the owner's moves the work there, and its next submit is judged by the owner against its own head, as
+  every stale base is. The verdict, the head read and every other need stay the owner's.
+- **Byte for byte.** The replica's engine at a version it holds is the owner's at that version (A-273's oracle), and its
+  answer is computed by the same function, so it is the owner's answer, compared whole in the unit test
+  (`what_a_replica_answers_is_the_owners_answer_whole`: two base files with their entries, one of them absent, a page,
+  every length, a clean rebase and one that conflicts).
+- **Routed, by why.** A request the replica cannot serve goes to the owner as before, counted by why: none here, never
+  made or given back when its owner asked (`merge.replica.route_absent`); one that holds no such version
+  (`route_behind`); one that left after refusing a feed message (`route_refused`), once its owner evicted it
+  (`route_evicted`), or for its budget (`route_over_budget`). A replica that leaves sends its reason home with its
+  registration, and its shard keeps the reason until another is held or the owner gives the engine up.
+- **Remade, bounded.** The owner makes a replica again before its next change on a shard whose replica left after a
+  refusal or an eviction (`merge.replica.remade`), never on one whose replica left for its budget, which it would meet
+  again. So each remade replica answers for a refusal or an eviction of the one before, and a replica too large for
+  its shard costs one making.
+- **Non-vacuity.** `merge.replica.served`, moved by every answer a replica gives, which the gate test asserts moved by
+  two (a base read and a rebase) with `merge.work.asked_owner` unchanged.
+- **Checks.** On the Mac Studio (debug, r398, 2026-11-18): `cargo test --locked -p slates-server --lib green_replicas`
+  6 of 6 (the oracle `what_a_replica_answers_is_the_owners_answer_whole`,
+  `a_works_base_read_and_rebase_on_its_replicas_shard_are_served_there_with_no_hop`,
+  `a_replica_that_left_is_remade_unless_for_its_budget_and_each_route_is_counted_by_why`, and A-457's three) and
+  `cargo test --locked -p slates-merge --lib` 16 of 16; the one-crate clippy of `slates-merge` clean (r390); rustfmt's
+  layout taken. The first run found the oracle's two rebases both clean (its second version had inserted before the
+  first's bytes; it now replaces them) and the gate test waiting for one journal entry where an edit that makes a file
+  records more. Red with the work's shard never asking its replica: the gate test fails, its counters of what was
+  served and what was asked of the owner (0, 3) where (2, 1) was due.
+- **Owed.** An idle replica's give-back; the supervisor's A/B at 1,000 clients and more (the arms filed with this
+  change); main's runs of the green suites and `works_off_owner`, whose one-shard and many-shard replies must still be
+  the same.
 
 ### A-469 — The landing manifest's encoding, the bytes a grant binds, is pinned by a golden vector for each layout it writes (2026-11-18, g085; §4.15 steps 1 and 3; A-451, A-458, A-466)
 Applied in the same change to: §4.15 step 1 (the vectors named), GAPS (A-185's owed list), `crates/land`
