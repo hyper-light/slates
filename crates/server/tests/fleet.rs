@@ -12501,7 +12501,7 @@ fn shipping_at_the_highest_fence(
 }
 
 /// The live counters a convergence wait reports for one node: its lanes' fates, its installs built and taken, what it
-/// held and refused.
+/// held and refused, its re-admission's yield, and the records it refused.
 fn lane_counters(daemon: &Daemon) -> Vec<(&'static str, u64)> {
   summed_counters(daemon)
     .into_iter()
@@ -12514,6 +12514,7 @@ fn lane_counters(daemon: &Daemon) -> Vec<(&'static str, u64)> {
         || name.starts_with("fleet.live.hold_refused")
         || name.starts_with("fleet.live.fenced")
         || name.starts_with("fleet.readmission")
+        || name.starts_with("fleet.record.refused")
         || name.starts_with("fleet.takeover.relinquished")
     })
     .collect()
