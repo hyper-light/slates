@@ -1543,6 +1543,143 @@ mod tests {
     );
   }
 
+  /// What the lost-answer seal test saw on the owner shard: the snapshot the move handed over, the first ask's and the
+  /// second ask's answers, the volume's head epoch before and after both asks, the head the seal left, the settle's
+  /// answer once the seal was placed, and the snapshots the volume holds after it.
+  struct SealedTwice {
+    handed_over: u64,
+    first: Sealing,
+    again: Sealing,
+    epochs: (Option<u64>, Option<u64>),
+    seal: Option<u64>,
+    settled: Sealing,
+    held: Vec<u64>,
+  }
+
+  /// Bug 3 of goal 85 (A-488; A-435's owed item). Do: on a shard, make a volume and snapshot it (the head a move hands
+  /// over, which its new owner serves once it has adopted the move), then ask for the adoption's seal twice with no seal
+  /// recorded, as the control shard asks again when its first ask's answer was lost to an owner shard that stopped for a
+  /// window (`xshard::call_in_shard_time` forgets the call, and the shard runs it once it resumes); then place the
+  /// answered seal's head and the volume's catalog at `f + 1` and ask once more with that seal, as the next period's
+  /// settle does. Expect: the second ask answers the first seal again (the same epoch, superseding the snapshot handed
+  /// over) and the head is sealed once; once placed, the adoption settles `Placed`, the snapshot handed over is dropped
+  /// and the seal is the only snapshot the volume holds. Before, the second ask took a second seal superseding the
+  /// first, so the settle dropped the first seal and left the snapshot handed over behind for good.
+  #[test]
+  fn an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once() {
+    let saw = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let made = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::Create {
+          name: "adopted".to_owned(),
+          size: slates_ipc::protocol::SizeClass::Dynamic { max: 1 << 20 },
+          names: slates_ipc::protocol::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let ReplyBody::Created { id } = made else {
+        panic!("the volume was not made: {made:?}")
+      };
+      let snapshotted = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::Snapshot { volume: id },
+      );
+      let ReplyBody::Snapshotted {
+        id: handed_over, ..
+      } = snapshotted
+      else {
+        panic!("the head was not snapshotted: {snapshotted:?}")
+      };
+      let key = ObjectId(id.bytes);
+      let volume = DbVolumeId { bytes: key.0 };
+      let head = |state: &ShardState| {
+        state
+          .db
+          .partition()
+          .volume(volume)
+          .map(|record| (record.head.value, record.epoch, record.catalog_version))
+      };
+      let before = head(state).map(|(_, epoch, _)| epoch);
+      let first = seal_adopted(state, key, None);
+      let again = seal_adopted(state, key, None);
+      let sealed = head(state);
+      let Sealing::Sealed(superseded, epoch) = again else {
+        panic!("the second ask answered no seal: {again:?}")
+      };
+      let quorum = state.fleet.configuration().quorum;
+      let holders: Vec<HostId> = (0..=u64::from(quorum.f)).map(HostId).collect();
+      let catalog_version = sealed.map_or(0, |(_, _, version)| version);
+      for (register, sequence) in [(key, epoch), (key.catalog(), catalog_version)] {
+        state.placed_heads.insert(
+          register,
+          crate::head::PlacedHead {
+            sequence,
+            epoch: HostEpoch(1),
+            placement: slates_db::register::Placement {
+              candidates: holders.clone(),
+              acked: holders.clone(),
+              mirror_acked: None,
+              joint: Vec::new(),
+            },
+          },
+        );
+      }
+      let settled = seal_adopted(state, key, Some((superseded, epoch)));
+      let held = state
+        .db
+        .partition()
+        .snapshots_of(volume)
+        .iter()
+        .map(|snapshot| snapshot.id.value)
+        .collect();
+      SealedTwice {
+        handed_over: handed_over.value,
+        first,
+        again,
+        epochs: (before, sealed.map(|(_, epoch, _)| epoch)),
+        seal: sealed.map(|(head, _, _)| head),
+        settled,
+        held,
+      }
+    });
+    println!(
+      "handed over {}, first {:?}, again {:?}, head epochs {:?}, seal {:?}, settled {:?}, held {:?}",
+      saw.handed_over, saw.first, saw.again, saw.epochs, saw.seal, saw.settled, saw.held
+    );
+    let Sealing::Sealed(superseded, epoch) = saw.first else {
+      panic!("the first ask took no seal: {:?}", saw.first)
+    };
+    assert_eq!(
+      superseded.value, saw.handed_over,
+      "the seal supersedes the snapshot the move handed over"
+    );
+    assert_eq!(
+      saw.again, saw.first,
+      "the ask after a lost answer took a second seal: the settle would drop the first and keep the snapshot handed over"
+    );
+    assert_eq!(
+      saw.epochs.1,
+      Some(epoch),
+      "the head was sealed more than once (epochs before and after {:?})",
+      saw.epochs
+    );
+    assert_eq!(saw.settled, Sealing::Placed, "the placed seal settled");
+    assert_eq!(
+      saw.held,
+      saw.seal.into_iter().collect::<Vec<u64>>(),
+      "a snapshot was left behind beside the seal"
+    );
+  }
+
   /// Shape: the scatter width the regions of these tests are formed with (every member a neighbour of every other).
   const SCATTER: u64 = 0;
 
