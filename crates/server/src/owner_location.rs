@@ -100,16 +100,16 @@ impl Query {
     state: &ShardState,
     cached: Option<CachedRoute>,
   ) -> Option<HostId> {
+    // The creator is the owner while it is an eligible member, unless the asker is the creator itself: a node forwards
+    // only a volume it does not own, so a creator forwarding its own volume lost it to a takeover, and its successor is
+    // found by the location round (A-338). Routed to itself, the forward came back to the volume it no longer owns.
+    let creator = ObjectId(self.object).creator();
     cached
       .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
       .or_else(|| {
-        eligible(
-          state,
-          ObjectId(self.object).creator(),
-          RegionId(self.region),
-        )
-        .then_some(ObjectId(self.object).creator())
+        (creator != state.fleet.host() && eligible(state, creator, RegionId(self.region)))
+          .then_some(creator)
       })
   }
 }
@@ -135,6 +135,14 @@ impl Query {
 fn ineligibility(state: &ShardState, host: HostId, region: RegionId) -> Option<&'static str> {
   if state.node_regions.get(&host) != Some(&region) {
     return Some("fleet.owner_location.route_dropped.owner_ineligible.region");
+  }
+  // In this node's own region a host owns objects only while the installed configuration holds it as a member: a member
+  // the council retired is a non-member, however alive its process (A-338). Its objects are its successors', and a route
+  // to it met a volume it had lost (a retired creator refuted its death and kept answering for its volumes).
+  if state.node_regions.get(&state.fleet.host()) == Some(&region)
+    && !state.fleet.members().contains(&host)
+  {
+    return Some("fleet.owner_location.route_dropped.owner_ineligible.retired");
   }
   match state.fleet.membership().state(host) {
     None => Some("fleet.owner_location.route_dropped.owner_ineligible.unknown"),
