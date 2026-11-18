@@ -9061,6 +9061,16 @@ would need a privilege slates never holds (R10).
 > (`a_presented_then_granted_landing_records_each_step_once` in `crates/server/tests/presentations.rs`, red on the old
 > mirror). Record: `docs/bugs/2026-11-18-a-presented-landings-plan-was-audited-twice.md`.
 
+> **Status (2026-11-18, a refused granted landing leaves its trail).** A granted landing refused at any step from the
+> moment its id is decided (its target's lease, its volume, its plan or grant, its validation, its run) records, in its
+> completion's atom, the engine ring's records of its attempt and then its end (`landing::record_refused`). The end is
+> a `LandingFinished` whose outcome is `Refused`, or `Aborted` once the attempt wrote an entry. It names the manifest
+> the attempt planned (its grant's when it planned none) and its signature's verdict against that manifest. A plan no
+> grant covers ends in a presentation instead, which records itself. Before, a refused landing's trail ended at its
+> grant. An end that names no manifest (refused before any plan, under a grant that names none) records no verdict, and
+> `Audit` reads none on it. Proven by four refusals in `crates/server/tests/presentations.rs`, three of them red before
+> (macOS arm64, Mac Studio, 2026-11-18). Record: `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`.
+
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
 > `NtCreateFile` relative to it with `FILE_OPEN_REPARSE_POINT`, and makes the reparse check on the object it
