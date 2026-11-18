@@ -1618,19 +1618,95 @@ fn fleet_report(instance: &str) -> String {
     + &err
 }
 
+/// The cut of the link-cut flow: put in at the relay before the server bootstraps the root alone (the bootstrap is the
+/// server's verb, so the root forms with the client cut off and no fetch can slip through first); while it holds, the
+/// server makes a green over its project and shares it with the client (each a verb on the server alone); held for
+/// `cut_for`. Expect: datagrams dropped both ways, and the client still unconfigured at the cut's end. The green.
+fn cut_as_the_root_forms(
+  dir: &Scratch,
+  [server, client]: [&str; 2],
+  relay: &relay::Relay,
+  cut_for: Duration,
+) -> String {
+  relay.isolate(CLIENT_INDEX);
+  eventually(server, &["bootstrap", "root"]);
+  let cut_at = Instant::now();
+  let project = format!("{}/project", dir.path);
+  seed_project(&project);
+  let (_volume, _snapshot, green) = server_green(server, &project);
+  share_with_client(server, &green, client);
+  while cut_at.elapsed() < cut_for {
+    pause();
+  }
+  let report = relay.report();
+  assert!(
+    report.cut(CLIENT_INDEX, SERVER_INDEX) > 0 && report.cut(SERVER_INDEX, CLIENT_INDEX) > 0,
+    "the cut dropped datagrams both ways: {}",
+    report.summary()
+  );
+  assert_eq!(
+    status_value(&ok(client, &["status"]), "fleet_configuration_version"),
+    Some("0"),
+    "the client stayed unconfigured through the cut: {}",
+    fleet_report(client)
+  );
+  green
+}
+
+/// What a client node did once its link healed: when it first held a configuration naming both nodes and when a
+/// forwarded read first answered, each from the heal, and the last refusal it met.
+#[derive(Debug, Default)]
+struct Recovery {
+  configured: Option<Duration>,
+  answered: Option<Duration>,
+  last: String,
+}
+
+/// Polls `client` from `healed` until a forwarded read of `green` answers the server's bytes, or `give_up` after the
+/// heal: first its status until it holds a configuration naming both nodes, then the read.
+fn recovery_of(client: &str, green: &str, healed: Instant, give_up: Duration) -> Recovery {
+  let mut recovery = Recovery::default();
+  while recovery.answered.is_none() && healed.elapsed() < give_up {
+    if recovery.configured.is_none() {
+      recovery.configured = configured_since(client, healed);
+    } else {
+      recovery.answered = read_since(client, green, healed, &mut recovery.last);
+    }
+    if recovery.answered.is_none() {
+      pause();
+    }
+  }
+  recovery
+}
+
+/// When, from `healed`, a status read began that found `client` holding a configuration naming both nodes; `None` if it
+/// did not.
+fn configured_since(client: &str, healed: Instant) -> Option<Duration> {
+  let began = Instant::now();
+  configured_with_both(&ok(client, &["status"])).then(|| began.duration_since(healed))
+}
+
+/// When, from `healed`, a forwarded read of `green` through `client` answered the server's bytes; `None` if it did not,
+/// with its refusal kept in `last`.
+fn read_since(client: &str, green: &str, healed: Instant, last: &mut String) -> Option<Duration> {
+  let (code, out, err) = run(client, &["read", green, "src/one.txt"]);
+  if code == 0 && out == "one: original line" {
+    return Some(healed.elapsed());
+  }
+  *last = format!("exit {code}: {out}{err}");
+  None
+}
+
 /// fs-server plan step 4 (the two-machine run g066d: a client node's forwarded `work` refused `OwnerUnreachable` with the
 /// client at configuration version 0 and its record sessions re-dialed 15 times); §4.8 formation and learners, R8.
 /// Do: a server node and a client node with every datagram between them through the fault relay; cut the link both
-/// ways and bootstrap the root on the server at once, so the root forms with the client cut off and holding no
-/// configuration (the cut goes in before the bootstrap, which is the server's alone, so no fetch can slip through
-/// first); while it is cut, the server makes a green over its project and shares it with the client; hold the cut for
-/// longer than the failover delay (the operator's failover SLO plus a membership horizon, so each node's detector has
-/// judged the other gone and every forward's resend bound has passed); heal; then poll the client. Expect: the cut held
-/// (datagrams dropped both ways, the client unconfigured at its end); once healed, the client holds a configuration
-/// naming both nodes and a forwarded read of the server's green answers the server's bytes within
-/// [`recovery_bound`] of the heal, from the estimates its own detector and record session held before the cut, plus the
-/// harness's own cost of observing it (two CLI calls and a poll's pause, the call measured before the cut). Gated like
-/// the other process flows (`SLATES_TEST_CLI=1`).
+/// ways as the root forms ([`cut_as_the_root_forms`]) and hold the cut for longer than the failover delay (the
+/// operator's failover SLO plus a membership horizon, so each node's detector has judged the other gone and every
+/// forward's resend bound has passed); heal; then poll the client ([`recovery_of`]). Expect: the cut held; once healed,
+/// the client holds a configuration naming both nodes and a forwarded read of the server's green answers the server's
+/// bytes within [`recovery_bound`] of the heal, from the estimates its own detector and record session held before the
+/// cut, plus the harness's own cost of observing it (two CLI calls, measured before the cut, and a poll's pause). Gated
+/// like the other process flows (`SLATES_TEST_CLI=1`).
 #[test]
 fn a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its_bound_once_the_link_heals()
  {
@@ -1647,91 +1723,42 @@ fn a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its
   let path = wait_for("the client's estimates of its path to the server", || {
     path_estimates(&client, &server_host)
   });
-  let observe = {
-    let began = Instant::now();
-    ok(&client, &["status"]);
-    began.elapsed()
-  };
-
-  relay.isolate(CLIENT_INDEX);
-  eventually(&server, &["bootstrap", "root"]);
-  let cut_at = Instant::now();
-  let project = format!("{}/project", dir.path);
-  seed_project(&project);
-  let (_volume, _snapshot, green) = server_green(&server, &project);
-  share_with_client(&server, &green, &client);
-  let failover = Duration::from_nanos(
+  let began = Instant::now();
+  ok(&client, &["status"]);
+  let observe = began.elapsed();
+  let cut_for = Duration::from_nanos(
     slates_server::config::FAILOVER_SLO_NS + slates_server::lease::horizon_ns(),
   );
-  while cut_at.elapsed() < failover {
-    pause();
-  }
-  let cut_report = relay.report();
-  let client_at_cut_end = ok(&client, &["status"]);
-  assert!(
-    cut_report.cut(CLIENT_INDEX, SERVER_INDEX) > 0
-      && cut_report.cut(SERVER_INDEX, CLIENT_INDEX) > 0,
-    "the cut dropped datagrams both ways: {}",
-    cut_report.summary()
-  );
-  assert_eq!(
-    status_value(&client_at_cut_end, "fleet_configuration_version"),
-    Some("0"),
-    "the client stayed unconfigured through the cut: {}",
-    fleet_report(&client)
-  );
-
+  let green = cut_as_the_root_forms(&dir, [&server, &client], &relay, cut_for);
   relay.heal();
   let healed = Instant::now();
   let bound = recovery_bound(&path);
   let slack = observe * 2 + Duration::from_millis(POLL_MS);
-  let mut configured_after = None;
-  let mut answered_after = None;
-  let mut last = String::new();
-  while answered_after.is_none() && healed.elapsed() < failover + bound + slack {
-    if configured_after.is_none() {
-      let began = Instant::now();
-      let status = ok(&client, &["status"]);
-      if configured_with_both(&status) {
-        configured_after = Some(began.duration_since(healed));
-      } else {
-        pause();
-        continue;
-      }
-    }
-    let (code, out, err) = run(&client, &["read", &green, "src/one.txt"]);
-    if code == 0 && out == "one: original line" {
-      answered_after = Some(healed.elapsed());
-    } else {
-      last = format!("exit {code}: {out}{err}");
-      pause();
-    }
-  }
+  let recovery = recovery_of(&client, &green, healed, cut_for + bound + slack);
   let timeline = format!(
-    "cut held {:.1} s; after the heal: configured {:?}, forwarded read answered {:?}; bound {:?} + observing {:?} \
-     (from the client's estimates before the cut: {:?}); relay {}",
-    failover.as_secs_f64(),
-    configured_after,
-    answered_after,
-    bound,
-    slack,
-    path,
+    "cut held {:.1} s; after the heal: {recovery:?}; bound {bound:?} + observing {slack:?} (from the client's \
+     estimates before the cut: {path:?}); relay {}",
+    cut_for.as_secs_f64(),
     relay.report().summary()
   );
   eprintln!("fs-server link cut: {timeline}");
-  let answered = answered_after.unwrap_or_else(|| {
-    panic!(
-      "the client never read the server's green once the link healed (last: {last}); {timeline}\n\
-       client:\n{}\nserver:\n{}",
+  let detail = || {
+    format!(
+      "{timeline}\nclient:\n{}\nserver:\n{}",
       fleet_report(&client),
       fleet_report(&server)
+    )
+  };
+  let answered = recovery.answered.unwrap_or_else(|| {
+    panic!(
+      "the client never read the server's green once the link healed: {}",
+      detail()
     )
   });
   assert!(
     answered <= bound + slack,
-    "the client was configured and forwarded past its bound: {timeline}\nclient:\n{}\nserver:\n{}",
-    fleet_report(&client),
-    fleet_report(&server)
+    "the client was configured and forwarded past its bound: {}",
+    detail()
   );
   drop(daemons);
   drop(relay);
