@@ -5219,6 +5219,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
       // object's next records at the promotion epoch and ships only to holders still missing these.
       s.placed_heads.insert(object, placed);
       s.placed_heads.insert(object.catalog(), catalog_placed);
+      if !catalog.live_shipped {
+        published_before_served(s)?;
+      }
       Ok(())
     },
     HEARTBEAT_NS,
@@ -5332,6 +5335,24 @@ fn materialize_refusal_counter(refusal: &slates_ipc::protocol::ReplyBody) -> &'s
 /// Counter: the owner shard did not answer a taken-over volume's materialization within the period.
 /// Format: a counter name in the daemon's status report.
 const MATERIALIZE_UNANSWERED: &str = "fleet.materialize.unanswered";
+/// Counter: a taken-over volume materialized whose shard image could not be published (`published_before_served`):
+/// the materialization is tried again next period, which keeps the volume and publishes again.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_UNPUBLISHED: &str = "fleet.materialize.unpublished";
+
+/// Publishes the owner shard's image once a volume taken over from its seal is materialized there, before it is served
+/// (§4.8 "persistence before reply"; A-325): the image in the anchor is what a restart of this node rebuilds the volume
+/// from. Until 2026-11-18 nothing published it until the volume's first write, and a successor restarted before then
+/// found no image for it (`NoImage`) and never served it again, though its records named it the owner. A refused
+/// publication is [`MATERIALIZE_UNPUBLISHED`]: the materialization stays pending, and its next attempt finds the volume
+/// made (`verbs::materialize_taken_over` keeps it) and publishes again. A live-shipped volume is left to its first
+/// write's barrier, as before: a publication there starts the successor's live log (`live_ship::published`), a change
+/// to the live takeover's shape that is its own piece (GAPS).
+fn published_before_served(s: &mut crate::state::ShardState) -> Result<(), &'static str> {
+  crate::verbs::publish_shard(s)
+    .map(|_| ())
+    .map_err(|_| MATERIALIZE_UNPUBLISHED)
+}
 
 /// The archive a taken-over volume is served from: a plain archive as it is; an envelope opened under the volume's
 /// lineage and naming keys once this node has adopted them (`adopted`), else `None` — ciphertext is never served as a
