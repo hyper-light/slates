@@ -1483,6 +1483,39 @@ pub(crate) fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
   *count = count.saturating_add(1);
 }
 
+/// A record session `anchor`'s node dialed to this one, counted in [`ShardState::dialed_in`] for as long as this node
+/// serves it ([`serve_peer_records`]), however the serve ends (A-337). Made and dropped on the control shard, where
+/// sessions are served.
+struct DialedIn {
+  anchor: HostId,
+}
+
+impl DialedIn {
+  /// Counts a session `anchor` dialed, for this guard's life.
+  fn counted(anchor: HostId) -> DialedIn {
+    let _ = state::with_state_counted(|s| {
+      let sessions = s.dialed_in.entry(anchor).or_insert(0);
+      *sessions = sessions.saturating_add(1);
+    });
+    DialedIn { anchor }
+  }
+}
+
+impl Drop for DialedIn {
+  fn drop(&mut self) {
+    let anchor = self.anchor;
+    let _ = state::with_state_counted(|s| {
+      let left = s.dialed_in.get_mut(&anchor).map(|sessions| {
+        *sessions = sessions.saturating_sub(1);
+        *sessions
+      });
+      if left == Some(0) {
+        s.dialed_in.remove(&anchor);
+      }
+    });
+  }
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1524,6 +1557,8 @@ async fn serve_peer_records(
       |peer| peer.anchor,
     );
   let seed = crate::deploy::member_id(peer_anchor, 0);
+  // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
+  let _dialed_in = DialedIn::counted(peer_anchor);
   // The membership plane's secret for this connection (A-67 H-2b), should the peer announce an epoch on it.
   let plane_secret = endpoint.export_secret(hyper_datagram::EXPORTER_LABEL).ok();
   // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
@@ -6256,6 +6291,16 @@ enum DirectContact {
   /// process lives under the same id (an anchor's warm restart). Contact is kept so the pair's plane is keyed and its
   /// probes, answered with the death, let it refute (hyper-swim's refutation needs the dead member's probe to be heard).
   Returned,
+  /// This node is the pair's canonical dialer (its anchor is the lower one) and serves a record session the peer dialed
+  /// to it, which the peer dials and keeps only while it keeps direct contact with this node (A-337): kept, so the pair's
+  /// plane is keyed whenever the peer's rule keeps it, whatever this node's own view says. Each role rule above is kept
+  /// from both sides only while both sides hold the same view: a learner told stale voters (a seat change moves no
+  /// configuration version, so no learner fetches on it, and a learner answered by another learner takes that one's
+  /// stale voters) dropped a voter as `OutsideNeighbourhood` while the voter kept it `AsVoter`, and where the learner was
+  /// the pair's lower anchor the pair was never keyed and its probe mesh never formed (fleet test
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18).
+  Dialed,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -6315,9 +6360,25 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::Staged
   } else if state.council.is_voter(state.fleet.host()) || state.root.is_voter(state.fleet.host()) {
     DirectContact::AsVoter
+  } else if dialed_by_a_higher_anchor(state, peer) {
+    DirectContact::Dialed
   } else {
     DirectContact::OutsideNeighbourhood
   }
+}
+
+/// Whether this node is the pair's canonical dialer with `peer` (its anchor below the peer's, the side that announces the
+/// pair's plane epoch) and serves a record session the peer dialed to it ([`ShardState::dialed_in`]): the peer keeps
+/// direct contact with this node (A-337). Only the canonical dialer follows a peer's session, so two nodes never keep each
+/// other by their sessions alone: the higher anchor's contact never rests on the lower's dial.
+fn dialed_by_a_higher_anchor(state: &ShardState, peer: HostId) -> bool {
+  crate::member_task::anchor_of(state, peer).is_some_and(|anchor| {
+    anchor > state.origin_anchor
+      && state
+        .dialed_in
+        .get(&anchor)
+        .is_some_and(|sessions| *sessions > 0)
+  })
 }
 
 /// The contact this node keeps with every live peer while it is not yet a member under its consensus groups, whatever

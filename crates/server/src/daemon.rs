@@ -4368,6 +4368,7 @@ async fn init_shard(
     death_reports: std::collections::BTreeMap::new(),
     death_watch_started_ns: None,
     returned_members: std::collections::BTreeMap::new(),
+    dialed_in: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
@@ -6765,6 +6766,98 @@ mod tests {
     assert!(
       kept,
       "the owner keeps direct contact with {displaced:?}, still in its settled neighbourhood"
+    );
+  }
+
+  /// A-337 (§4.8 direct contact and the plane's keying; the formation flake of
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18): the pair's canonical dialer keeps contact with a peer that holds a record session it dialed to it, and
+  /// only the canonical dialer does. Do: make this node a non-voting member of seven at `f = 1`, scatter three, all held
+  /// alive, and take a member its role rule drops (no neighbour, no holder, no voter); learn that member under an anchor
+  /// above this node's and then below, each with no session it dialed here and with one. Expect `Dialed`, kept, only
+  /// with the session and this node the lower anchor (the pair's canonical dialer); `OutsideNeighbourhood`, dropped,
+  /// otherwise, so two nodes never keep each other by their sessions alone. Before, the learner in the flake, the pair's
+  /// lower anchor and told stale voters, dropped a voter that kept it, and the pair's plane was never keyed.
+  #[test]
+  fn the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it() {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_cluster::membership::{Liveness, MemberState};
+    use slates_cluster::root_group::RootGroup;
+    use slates_db::register::{HostId, Quorum, RegionId};
+    let (dropped, readings) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let others: Vec<HostId> = (1..=6u64).map(|n| HostId(local.0 ^ (n << 16))).collect();
+      let voter = others[0];
+      let mut all = vec![local];
+      all.extend_from_slice(&others);
+      state.council = RegionalCouncil::new(
+        voter,
+        all,
+        vec![voter],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      state.root = RootGroup::new(voter, vec![RegionId(0)], vec![voter]);
+      install_council(state);
+      let alive = MemberState {
+        liveness: Liveness::Alive,
+        incarnation: 0,
+      };
+      for peer in &others {
+        slates_cluster::fleet::apply_peer_state(&mut state.fleet, *peer, Some(alive));
+      }
+      let Some(peer) = others
+        .iter()
+        .copied()
+        .find(|peer| crate::fleet::direct_contact_reason(state, *peer) == "OutsideNeighbourhood")
+      else {
+        return (None, Vec::new());
+      };
+      let origin = state.origin_anchor;
+      let mut readings = Vec::new();
+      for anchor in [
+        HostId(origin.0.saturating_add(1)),
+        HostId(origin.0.saturating_sub(1)),
+      ] {
+        state.learned_members.clear();
+        state.learned_members.insert(
+          anchor,
+          crate::state::LearnedMember {
+            boot_nonce: 1,
+            host: peer,
+            previous: None,
+          },
+        );
+        for sessions in [0u32, 1] {
+          state.dialed_in.clear();
+          if sessions > 0 {
+            state.dialed_in.insert(anchor, sessions);
+          }
+          readings.push((
+            anchor > origin,
+            sessions,
+            crate::fleet::direct_contact_reason(state, peer),
+            crate::fleet::keeps_direct_contact_with(state, peer),
+          ));
+        }
+      }
+      (Some(peer), readings)
+    });
+    assert!(
+      dropped.is_some(),
+      "a member of seven at scatter three falls outside this node's role rule"
+    );
+    let expected: Vec<(bool, u32, String, bool)> = vec![
+      (true, 0, "OutsideNeighbourhood".to_owned(), false),
+      (true, 1, "Dialed".to_owned(), true),
+      (false, 0, "OutsideNeighbourhood".to_owned(), false),
+      (false, 1, "OutsideNeighbourhood".to_owned(), false),
+    ];
+    assert_eq!(
+      readings, expected,
+      "(the peer's anchor above this node's, sessions it dialed here, the reason, kept)"
     );
   }
 
