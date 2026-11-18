@@ -619,8 +619,12 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64) -> Option<u64> {
 ///
 /// The verdict is logged first, but the end never waits on the log for longer than one beat: a shard can be wedged in a
 /// write to a standard error nobody drains, holding the lock every log line takes, and a watchdog that waited on that
-/// lock would never end anything. So the line is written by a thread of its own, which the exit ends if it is still
-/// blocked; the exit is that thread's owner.
+/// lock would never end anything. So the line is written by a thread of its own. The end joins it once it says the line
+/// is written, which it does as its last act, so the join returns at once; a writer still blocked after a beat cannot be
+/// joined, and the exit ends it, so the exit is its owner then. Joined, a written line leaves no thread that finished
+/// unjoined: ThreadSanitizer reported that one as a leak at the exit, after its own one-second exit sleep, and turned
+/// the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen 27.4 s after the hold, where the
+/// verdict came at 1.09 s).
 fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
   let line = match cause {
     Cause::Stuck { shard, verdict } => format!(
@@ -648,8 +652,13 @@ fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
       slates_machine::log_line!("{line}");
       let _ = written.send(());
     });
-  if writer.is_ok() {
-    let _ = logged.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS));
+  if let Ok(writer) = writer
+    && logged
+      .recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS))
+      .is_ok()
+  {
+    // The line is written and the writer's last act is done; its end is all that is left to wait for.
+    let _ = writer.join();
   }
   std::process::exit(i32::from(FAILED_EXIT_CODE))
 }

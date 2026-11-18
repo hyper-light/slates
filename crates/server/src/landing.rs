@@ -27,10 +27,11 @@ use slates_db::catalog::{
 #[cfg(unix)]
 use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
+  WriteAct,
 };
 use slates_ipc::protocol::{
   AuditEntry, GrantScope, GrantSummary, PolicySubject, Refusal, ReplyBody, SnapshotId, VolumeId,
-  WriteAct, WriteMode, WritePolicy,
+  WriteMode, WritePolicy,
 };
 use slates_land::engine::Audit;
 #[cfg(unix)]
