@@ -7254,14 +7254,17 @@ fn settle_work_alias(state: &mut ShardState, work: DbVolumeId, name: &str) {
     return;
   };
   let name = name.to_owned();
-  let spawned = slates_rt::futures::spawn(async move {
-    let made = crate::state::with_state(|s| {
+  let settling = slates_rt::futures::spawn(async move {
+    // A refused borrow (counted by `with_state_counted`) decides nothing: the alias stays reserved, never released for
+    // a work that may stand, and the next start's reconcile settles it (A-236).
+    let Some(made) = crate::state::with_state_counted(|s| {
       s.db
         .partition()
         .volume(work)
         .is_some_and(|record| record.name == name)
-    })
-    .unwrap_or(false);
+    }) else {
+      return;
+    };
     crate::xshard::run_on_counted(here, name_shard, move |s| {
       if !s
         .db
@@ -7280,12 +7283,10 @@ fn settle_work_alias(state: &mut ShardState, work: DbVolumeId, name: &str) {
         s.count(ALIAS_STEP_UNTAKEN, 1);
       }
     });
-  });
-  match spawned {
-    Ok(task) => {
-      let _ = slates_rt::futures::detach(task);
-    }
-    Err(_) => state.count(ALIAS_STEP_UNTAKEN, 1),
+  })
+  .and_then(slates_rt::futures::detach);
+  if settling.is_err() {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
   }
 }
 
