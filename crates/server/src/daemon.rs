@@ -230,6 +230,8 @@ pub struct Daemon {
   doorbell: Option<DoorbellThread>,
   /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
   watchdog: Option<crate::watchdog::Watchdog>,
+  /// The writer of the shards' log lines (A-305), stopped after the shards, so it writes every line they queued.
+  log_writer: Option<slates_machine::log::LogWriter>,
   config: DaemonConfig,
   shards: Vec<ShardId>,
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
@@ -809,6 +811,15 @@ impl Daemon {
       slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
+    // The writer every shard's log lines go through (A-305): a shard never waits on standard error, where a thread
+    // starved while it held the lock every line takes, or a reader slow to take a line, held a shard a window and the
+    // watchdog called it wedged. Started before the shards, stopped after them.
+    let log_writer = slates_machine::log::LogWriter::start().map_err(|error| {
+      ServerError::Ipc(slates_ipc::IpcError::OsRefused {
+        call: "spawn the log writer thread",
+        code: error.raw_os_error(),
+      })
+    })?;
     // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits.
     let runtime = Runtime::start_sized(&config.runtime, &[config.control_shard_capacity().get()])?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
@@ -864,7 +875,12 @@ impl Daemon {
       let learning = Some(gate.learning());
       #[cfg(windows)]
       let learning = ();
+      let log_route = log_writer.route();
       runtime.spawn_on(*shard, async move {
+        // Before anything this shard logs: its lines go to the daemon's log writer from here on (A-305).
+        if let Some(route) = log_route {
+          route.install();
+        }
         // This daemon's learning gate is entered on the shard's own thread before its start (A-227).
         #[cfg(unix)]
         gate.enter();
@@ -968,6 +984,7 @@ impl Daemon {
       segment,
       doorbell,
       watchdog: Some(watchdog),
+      log_writer: Some(log_writer),
       config,
       shards,
       nfs_port,
@@ -3381,6 +3398,12 @@ impl Daemon {
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
+    }
+    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. A shard that
+    // never ended still holds its route, and a standard error that takes nothing holds the writer: it is waited for a
+    // window, then left to the process's end, never waited for without end.
+    if let Some(mut log_writer) = self.log_writer.take() {
+      log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
     }
   }
 }

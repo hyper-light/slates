@@ -7414,6 +7414,21 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > and the first look's, the terms of the bound from a wedge: the verdict within `W + B + L`, an anchored daemon's last
 > beat within `W + B + first`. Measured on both Linux runners and this Mac (A-232).
 
+> **Status (2026-11-18, A-305): a shard never waits on standard error.** A line written straight to standard error takes
+> the lock every line of the process takes and then waits for the write. So a shard behind another thread starved while
+> it held that lock, or behind a write the log's reader was slow to take, stood still a window, never runnable, and the
+> watchdog judged it wedged; a lone daemon ended itself (test binaries exited 4 at daemons' starts under load, each with
+> a line cut mid-write at the exit and the end line lost behind the same lock: `merge_post_state`, `merge_load`,
+> `nfs_hostile`, `nfs_mount`, `nfs_writeback`, `green_checkpoint`, `fleet`, 2026-11-17, loads 40 to 50). Now a daemon
+> owns a log writer (`slates_machine::log::LogWriter`), started before its shards and stopped after them, and each
+> shard's thread is routed to it before anything it logs (`LogRoute::install`): a shard's line goes into the writer's
+> queue, bounded at a pipe's 65,536 bytes, and the call returns at once, while the writer's thread waits on standard
+> error for every shard. A full queue refuses the line, counted in `log_lines_refused`, so a log nobody drains can
+> neither wedge nor end a daemon serving held mounts (the rule A-213 set for a closed one). Every other thread writes as
+> before. Regressions: `a_lone_daemon_whose_log_stalls_lives_on_and_serves` (`crates/client/tests/lone_daemon.rs`:
+> standard error held three windows while each shard logs; exit 4 within the stall before) and
+> `a_routed_thread_never_waits_on_standard_error_and_a_full_queue_refuses` (`crates/machine/src/log.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -21130,3 +21145,21 @@ verifier built first (below) stays, for signed work.
   keys; every failure a typed `SignatureRefusal`. Proven by 10 unit tests over a real `ssh-keygen -Y sign` vector
   (OpenSSH 10.0p2): every single-bit flip, an unregistered key, a changed field, another namespace, an expired
   statement, an untouched security key and hostile bytes are refused. Signed work reuses it over its own statement.
+
+### A-305 — A daemon's shards write their log lines through an owned writer and never wait on standard error (2026-11-18, goal g251: every open slates bug fixed)
+Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/machine/src/log.rs`
+(`LogWriter`, `LogRoute`, the module docs), `crates/server/src/daemon.rs` (the writer started before the shards, each
+shard routed, stopped after them).
+- **Why.** A-232 ends a daemon nobody supervises on its watchdog's stuck verdict, and A-228 judges a shard wedged when it
+  stands still a window, never runnable. A shard writing a log line waited on the process's standard-error lock and on
+  the write: behind a thread starved while it held the lock, or a reader slow to take a line, it stood still and was
+  ended. Seen as exit 4 at a daemon's start under load in seven test binaries (g231, g240, g246, g230; 2026-11-17), each
+  with a line cut mid-write at the exit; reproduced by holding the lock three windows while each shard logs.
+- **The rule.** A thread the watchdog judges never waits on its log. A daemon's shard threads hand their lines to the
+  daemon's writer thread through a queue bounded at a pipe's capacity (65,536 bytes, pipe(7) and XNU's
+  `BIG_PIPE_SIZE`), and a full queue refuses the line, counted as any refused line is. The writer is started before the
+  shards and stopped after them, so it writes every line they queued; a writer held past a window at the stop (a stuck
+  shard still routed to it, or a standard error that takes nothing) is left to the process's end, never waited for
+  without end.
+- **What it does not change.** The watchdog's verdicts, window and ends (A-228, A-232); the lines' text; the CLI's, the
+  anchor's and every other thread's direct writes, whose order with their output stays as it was.

@@ -772,6 +772,19 @@
 >   holds the anchor to that line and its numbers.
 > The bug record of 2026-11-07 has the per-phase table.
 
+> **A lone daemon ended itself when a shard waited on its log (found 2026-11-17, fixed 2026-11-18, A-305).** Seven test
+> binaries exited 4 at their daemons' starts under load (`merge_post_state` for g231 at load 40; `merge_load`,
+> `nfs_hostile`, `nfs_mount`, `nfs_writeback`, `green_checkpoint` and `fleet` for g240, g246 and g230 at loads 40 to 50),
+> each with a line cut mid-write at the exit and the watchdog's own end line lost: a shard writing a log line waited on
+> the process's standard-error lock behind a thread starved while it held it (or on a write a slow reader had not
+> taken), stood still a window, never runnable, and the watchdog judged it wedged (A-228), which ends a lone daemon
+> (A-232). Reproduced by `a_lone_daemon_whose_log_stalls_lives_on_and_serves` (`crates/client/tests/lone_daemon.rs`:
+> standard error held three windows while each shard logs). Fixed: a daemon's shard threads hand their lines to an owned
+> writer thread (`slates_machine::log::LogWriter`, `LogRoute`) through a queue bounded at a pipe's 65,536 bytes, and
+> never wait on standard error; a full queue refuses the line, counted in `log_lines_refused`. Other process-wide locks
+> a starved thread can hold (the allocator's) still wedge a shard behind it the same way: the holder is not named (the
+> watchdog's entry, "the lock a starved test thread held is not named"), and that decision is still owed.
+
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
 > WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and

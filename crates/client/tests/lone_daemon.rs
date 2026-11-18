@@ -74,6 +74,9 @@ enum Hold {
   Spinning,
   /// Not held at all: the role lowers its own priority as far as it goes, and the parent starves it with spinners.
   Starved,
+  /// Not held: the role holds this process's standard error for [`STALL_FOR`] while each shard writes a log line
+  /// ([`stall_the_log`]).
+  LogStalled,
 }
 
 impl Hold {
@@ -82,6 +85,7 @@ impl Hold {
       Hold::Wedged => "wedged",
       Hold::Spinning => "spinning",
       Hold::Starved => "starved",
+      Hold::LogStalled => "log-stalled",
     }
   }
 
@@ -90,6 +94,7 @@ impl Hold {
       "wedged" => Hold::Wedged,
       "spinning" => Hold::Spinning,
       "starved" => Hold::Starved,
+      "log-stalled" => Hold::LogStalled,
       other => panic!("no hold named {other:?}"),
     }
   }
@@ -174,7 +179,7 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
         Hold::Spinning => loop {
           std::hint::spin_loop();
         },
-        Hold::Starved => {}
+        Hold::Starved | Hold::LogStalled => {}
       }
     })
     .unwrap();
@@ -219,7 +224,10 @@ fn a_lone_daemon_role() {
     lower_this_process();
   }
   println!("{READY_TAG}");
-  if hold == Hold::Starved {
+  if hold == Hold::LogStalled {
+    stall_the_log(&daemon);
+  }
+  if matches!(hold, Hold::Starved | Hold::LogStalled) {
     loop {
       std::thread::park();
     }
@@ -231,6 +239,42 @@ fn a_lone_daemon_role() {
   loop {
     std::thread::park();
   }
+}
+
+/// Format: the tag of the line each shard writes while the log is stalled, and of the role's line once it is let go.
+const STALL_PROBE_TAG: &str = "LONE-DAEMON-LOG-PROBE";
+const STALL_OVER_TAG: &str = "LONE-DAEMON-LOG-OVER";
+/// Shape: how long [`stall_the_log`] holds standard error: three windows, past the one a held shard is judged wedged in.
+const STALL_FOR: Duration = Duration::from_nanos(3 * LIVENESS_BUDGET_NS);
+
+/// Holds this process's standard error for [`STALL_FOR`], as a thread starved while it writes a line holds it, or a log
+/// whose reader has fallen behind holds every writer, while each of `daemon`'s shards writes a log line in a poll; then
+/// lets it go and says so on standard output, which nothing holds.
+fn stall_the_log(daemon: &Daemon) {
+  let (taken, locked) = channel();
+  let holder = std::thread::spawn(move || {
+    let held = std::io::stderr().lock();
+    taken.send(()).unwrap();
+    pause(STALL_FOR);
+    drop(held);
+  });
+  locked.recv().unwrap();
+  for (index, shard) in daemon.shards().iter().enumerate() {
+    let observation = daemon
+      .observation(
+        Some(*shard),
+        OBSERVE_BUDGET_NS,
+        move |_: &mut ShardState| {
+          slates_machine::log_line!("{STALL_PROBE_TAG} shard={index}");
+        },
+      )
+      .unwrap();
+    std::thread::spawn(move || {
+      let _ = observation.wait();
+    });
+  }
+  holder.join().unwrap();
+  println!("{STALL_OVER_TAG}");
 }
 
 /// Shape: the nice value the starved role takes, the lowest priority a process may give itself.
@@ -561,8 +605,10 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
       line_after <= rule,
       "{name}: the watchdog's verdict was read {line_after:?} after the wedge, past the rule's W + B + L = {rule:?}"
     ),
-    Hold::Starved => {
-      panic!("{name}: a starved daemon is not a stuck one; this case is not run here")
+    Hold::Starved | Hold::LogStalled => {
+      panic!(
+        "{name}: a starved daemon, or one whose log stalls, is not a stuck one; this case is not run here"
+      )
     }
     Hold::Spinning => {
       let look = BEAT + looks_late;
@@ -763,5 +809,92 @@ fn a_lone_daemon_starved_beside_spinners_is_never_ended() {
     calls.longest > reply || said_starved > 0,
     "the run starved nothing (longest call {:?}, no starved verdict), so it proves nothing",
     calls.longest
+  );
+}
+
+/// Waits for a line of `daemon`'s standard output carrying `tag`, within `within`: the line, or, once the child has ended
+/// first, its exit and what it said on standard error.
+fn tag_or_end(daemon: &mut LoneDaemon, tag: &str, within: Duration) -> Result<String, String> {
+  let started = Instant::now();
+  loop {
+    match daemon.stdout.recv_timeout(BEAT) {
+      Ok((_, line)) if line.contains(tag) => return Ok(line),
+      Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        let status = daemon.child.wait();
+        let said: Vec<String> = daemon.stderr.try_iter().map(|(_, line)| line).collect();
+        return Err(format!(
+          "the child ended ({status:?}) before {tag}; it said: {said:?}"
+        ));
+      }
+    }
+    if started.elapsed() >= within {
+      return Err(format!("no {tag} line within {within:?}"));
+    }
+  }
+}
+
+/// Every line `stderr` carries until a beat passes with none, or [`GIVE_UP`] passes.
+fn said_until_quiet(stderr: &Receiver<(u64, String)>) -> Vec<String> {
+  let started = Instant::now();
+  let mut said = Vec::new();
+  while started.elapsed() < GIVE_UP {
+    match stderr.recv_timeout(BEAT) {
+      Ok((_, line)) => said.push(line),
+      Err(_) => break,
+    }
+  }
+  said
+}
+
+/// A-305, A-232, §4.14. Do: in a lone daemon (a child process, `SegmentSource::Create`), hold standard error's lock for
+/// three windows while each shard writes a log line in a poll, as a thread starved while it writes a line holds it, or a
+/// log whose reader has fallen behind holds every writer; then call the daemon. Expect: no exit and no end line through
+/// the stall and after it, the call answered, and each shard's line on standard error once the lock is let go
+/// (non-vacuous: each shard did log inside the stall). Before, each shard waited on the lock inside its poll, stood still
+/// a window and was judged wedged, and the watchdog ended the process with exit 4: the shape of the exits at a daemon's
+/// start under load (`merge_post_state` and six other binaries, 2026-11-17).
+#[test]
+fn a_lone_daemon_whose_log_stalls_lives_on_and_serves() {
+  let instance = format!("lone-log-{}", std::process::id());
+  let mut daemon = start_lone_daemon(&instance, Hold::LogStalled);
+  await_tag(&daemon.stdout, READY_TAG, START_WAIT);
+  let over = tag_or_end(&mut daemon, STALL_OVER_TAG, START_WAIT + STALL_FOR);
+  assert!(
+    over.is_ok(),
+    "the lone daemon lived through its log's stall: {over:?}"
+  );
+  let mut client = connect(&instance);
+  let mut driver = Driver::new(&client);
+  let ticket = driver
+    .submit(
+      &mut client,
+      Box::new(|client: &mut Client| client.list_begin()),
+    )
+    .unwrap();
+  let ended = drive(
+    &mut client,
+    &mut driver,
+    ticket,
+    &mut daemon,
+    (Instant::now(), GIVE_UP),
+  );
+  let said = said_until_quiet(&daemon.stderr);
+  assert!(
+    matches!(ended.call, Some(Ok(()))) && ended.exit.is_none(),
+    "the daemon answered a call after the stall and is still running: call {:?}, exit {:?}",
+    ended.call,
+    ended.exit
+  );
+  for index in 0..usize::from(TEST_SHARDS) {
+    let probe = format!("{STALL_PROBE_TAG} shard={index}");
+    assert!(
+      said.iter().any(|line| line.contains(&probe)),
+      "shard {index}'s line reached standard error once the stall ended: {said:?}"
+    );
+  }
+  assert!(
+    !said.iter().any(|line| line.contains(END_WORDS)),
+    "no end line: {said:?}"
   );
 }
