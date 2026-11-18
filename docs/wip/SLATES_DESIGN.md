@@ -10299,7 +10299,9 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > runs) no Subversion commit in the roster sends more than one file's text, since the client sends a commit's texts in
 > an order drawn anew in every process and FSFS numbers a revision's items in that order; the shared environment pins
 > cargo's colour and target directory, without which CI's colour failed the cargo workload on both sides; and the live
-> guest's console is read while the VM runs, where a full pipe had stopped the guest.
+> guest's console is read while the VM runs, where a full pipe had stopped the guest. CI run 44260193629 (2026-11-18,
+> the first with A-319) showed the four identical over Linux FUSE, NFSv4.2 and the OCI container's Linux engine, and in
+> the live virtio-fs guest, with every other roster workload there.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
