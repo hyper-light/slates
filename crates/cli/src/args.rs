@@ -537,11 +537,6 @@ pub(crate) enum SharePrincipal {
   },
 }
 
-/// Derived: a grant's default validity, in nanoseconds — one hour, the span §4.15's session scope
-/// names as the longest a human's single approval should stand without renewal (an agent that lands
-/// later than that re-presents its manifest for a fresh look). `--term SECONDS` overrides it.
-pub(crate) const GRANT_TERM_NS: u64 = 3_600 * 1_000_000_000;
-
 /// A client request: the instance and the verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientRequest {
@@ -1814,7 +1809,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
             reason: e.to_string(),
           })?
           .saturating_mul(NANOS_PER_SECOND),
-        None => GRANT_TERM_NS,
+        None => slates_api::GRANT_TERM_NS,
       };
       Ok(client(
         &taken,
