@@ -238,6 +238,32 @@ jobs:
           if grep -q "SKIP" exec.log; then echo "the exec flow skipped where it must run"; exit 1; fi
           grep -q "test result: ok. 2 passed" exec.log
           exit "$status"
+      # `slates exec --apparmor-profile` (A-370) on the runner's default policy, which restricts unprivileged user
+      # namespaces. First with no slates profile loaded for the test build's binary: the refusals, the one without the
+      # option word for word as before. Then with that binary's profile loaded by this step as root, as an administrator
+      # loads it: the launcher makes its namespace only when asked, and its command runs outside the profile. Each run
+      # demands its regime (`SLATES_TEST_APPARMOR_PROFILE`), so a load or unload that failed fails the step, and the
+      # profile is unloaded whatever the tests answer. Loading it is test setup modelling an administrator's choice, not a
+      # privilege the product asks for (R10).
+      - name: The slates exec AppArmor profile, opted into (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test -p slates-cli --test cli --no-run
+          exe=$(readlink -f target/debug/slates)
+          "$exe" apparmor profile > "$RUNNER_TEMP/slates.apparmor"
+          tests="the_launcher_uses_slates_apparmor_profile_only_when_asked apparmor_prints_the_profile_and_checks_the_host"
+          status=0
+          SLATES_TEST_APPARMOR_PROFILE=absent cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture \
+            --exact $tests > apparmor.log 2>&1 || status=$?
+          sudo apparmor_parser -r "$RUNNER_TEMP/slates.apparmor" || status=$?
+          SLATES_TEST_APPARMOR_PROFILE=loaded cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture \
+            --exact $tests >> apparmor.log 2>&1 || status=$?
+          sudo apparmor_parser -R "$RUNNER_TEMP/slates.apparmor" || status=$?
+          cat apparmor.log
+          if grep -q "SKIP" apparmor.log; then echo "the AppArmor flow skipped where it must run"; exit 1; fi
+          test "$(grep -c 'test result: ok. 2 passed' apparmor.log)" -eq 2 || exit 1
+          exit "$status"
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
