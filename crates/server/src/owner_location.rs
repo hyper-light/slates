@@ -100,16 +100,22 @@ impl Query {
     state: &ShardState,
     cached: Option<CachedRoute>,
   ) -> Option<HostId> {
+    // This node's own routing names the owner of an object it holds a copy of, from the records it accepted and the
+    // retirements it installed, so it is asked before the creator, which a takeover may have succeeded (A-338): routed
+    // to a creator its routing knew had lost the volume, every forward was redirected there again, for good.
+    let local = state.fleet.host();
+    let object = ObjectId(self.object);
     cached
       .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
       .or_else(|| {
-        eligible(
-          state,
-          ObjectId(self.object).creator(),
-          RegionId(self.region),
-        )
-        .then_some(ObjectId(self.object).creator())
+        state
+          .fleet
+          .object_owner(object)
+          .filter(|owner| *owner != local && eligible(state, *owner, RegionId(self.region)))
+      })
+      .or_else(|| {
+        eligible(state, object.creator(), RegionId(self.region)).then_some(object.creator())
       })
   }
 }
