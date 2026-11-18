@@ -1,0 +1,50 @@
+# DIAG (not for main), run 3: g229's harness fix (bbd7ff22c, kill-at-ack on dynamic volumes) on macOS, where
+# run 44350386549 failed a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor; that flow
+# three times, release, capped at four times the slowest live pass (425 s), logs kept.
+name: diag-supervisor-live
+on:
+  push:
+    branches: ['diag-supervisor-live-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  live:
+    runs-on: macos-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: kill-at-ack, three times, capped
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+          mkdir -p target/live
+          cap_s=$((425 * 4))
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          flow=$("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p' | grep 'a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor')
+          echo "flow: ${flow}"
+          [ -n "${flow}" ] || exit 1
+          failed=0
+          for round in 1 2 3; do
+            began=$(date +%s); log="target/live/kill-at-ack-${round}.log"
+            if perl -e 'alarm shift; exec @ARGV' "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "$log" 2>&1; then r=ok; else r=FAILED; failed=$((failed + 1)); fi
+            echo "round ${round}: ${r} ($(( $(date +%s) - began )) s)"
+            [ "$r" = ok ] || tail -80 "$log"
+          done
+          echo "rounds failed: ${failed} of 3"
+          [ "${failed}" -eq 0 ]
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-kill-at-ack-macos
+          path: target/live/
