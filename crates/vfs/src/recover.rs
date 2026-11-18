@@ -95,9 +95,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// 30 (A-376, 2026-11-18) the content hold is a piece per stored chunk, per held manifest and per stage instead of one
 /// whole image, so a holder's publication carries the content it changed (a green's every version had re-put the
 /// image of every input its holders kept).
+/// 31 (A-395, 2026-11-18) a snapshot's directory the head still holds by its very handle is shared with the head, by
+/// number, as its unchanged files are, so recovery charges the version slab what the live volume held; a reader of an
+/// earlier version would find no directory to rebuild there, so it refuses this one.
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 30;
+pub const IMAGE_VERSION: u16 = 31;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -1646,8 +1649,21 @@ impl Volume {
           | Kind::BlockDevice
           | Kind::CharDevice
       ) {
-        // Directories are always carried in full; their entries are small and their structure is
-        // this snapshot's own.
+        // A directory the head still holds by its very handle is shared with the head, as a file is (A-395): the live
+        // volume's copy-on-write copies a directory, and every ancestor of it, before changing it, so a directory
+        // whose handle is the head's has changed in neither, and nor has any directory beneath it. Rebuilt privately,
+        // as every directory was until A-395, each was an inode version on the snapshot's deadlist that the live
+        // volume never held, charged to the version slab at recovery, and a volume promised the whole slab was
+        // refused. A clone's snapshot keeps its directories (A-64's origin rules are its own).
+        if self.origin_epoch.is_none()
+          && trie::get(&store.tries, self.inode_root, no) == Some(handle)
+        {
+          shared.push(SharedInode {
+            number: no.0,
+            source: SharedSource::Head,
+          });
+          continue;
+        }
         inodes.push(self.image_of_inode(store, inode)?);
         continue;
       }
@@ -2498,7 +2514,13 @@ impl Volume {
         .get(&image.root_no)
         .ok_or(VfsError::RecoveryIncomplete)?;
     }
-    self.rebuild_entries(store, &image.inodes, &Kinds::Map(&kinds), &dirs)?;
+    self.rebuild_entries(
+      store,
+      &image.inodes,
+      &Kinds::Map(&kinds),
+      &dirs,
+      &BTreeSet::new(),
+    )?;
     self.restore_identities(store, &image.inodes)?;
     self.live_entries = self
       .live_entries
@@ -2521,7 +2543,7 @@ impl Volume {
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
     let placed = self.place_inodes(store, claims, inodes, root_no, epoch, &mut dirs)?;
-    self.rebuild_entries(store, inodes, &kinds, &dirs)?;
+    self.rebuild_entries(store, inodes, &kinds, &dirs, &BTreeSet::new())?;
     self.restore_placed_identities(store, inodes, root_no, &placed)?;
     Ok(())
   }
@@ -2530,8 +2552,8 @@ impl Volume {
   /// The volume's head roots and epoch are saved and restored around the rebuild, and its quota is
   /// lifted for it, because a snapshot's retained content is written through the same path as the
   /// head's but must not be charged against the head's quota (it is not head-reachable). The
-  /// snapshot's tree is independent of the head's (its sharing is a §4.2 efficiency refinement) and
-  /// its deadlist is empty (reclaiming a recovered snapshot's unique bytes on drop is owed).
+  /// snapshot shares with the head every file, symlink and directory the head still holds unchanged (A-395 for the
+  /// directories, its root included), as the live volume's copy-on-write did; its deadlist is filled by the global pass.
   fn rebuild_snapshot(
     &mut self,
     store: &mut Store,
@@ -2545,13 +2567,21 @@ impl Volume {
     let epoch = Epoch(snap.epoch);
     self.epoch = epoch;
     self.inode_root = trie::new_root(&mut store.tries, epoch)?;
-    let root_handle = store
-      .inodes
-      .insert(Inode::new(root_no, epoch, Kind::Dir, 0, Body::None))?;
-    self.table_set(store, root_no, root_handle)?;
-    let root_dir = store.dirs.insert(DirNode::new(epoch, None, root_no, ""))?;
-    store.inodes.get_mut(root_handle)?.body = Body::Directory(root_dir);
-    self.root = root_dir;
+    // A root the head still holds is the head's (A-395): the shared entries name it, and the tree below sets it.
+    let root_held = snap
+      .shared
+      .iter()
+      .any(|entry| entry.number == root_no.0 && matches!(entry.source, SharedSource::Head));
+    if !root_held {
+      let root_handle =
+        store
+          .inodes
+          .insert(Inode::new(root_no, epoch, Kind::Dir, 0, Body::None))?;
+      self.table_set(store, root_no, root_handle)?;
+      let root_dir = store.dirs.insert(DirNode::new(epoch, None, root_no, ""))?;
+      store.inodes.get_mut(root_handle)?.body = Body::Directory(root_dir);
+      self.root = root_dir;
+    }
 
     let outcome = self.rebuild_snapshot_tree(store, claims, snap, root_no, epoch, refs);
 
@@ -2602,17 +2632,14 @@ impl Volume {
     let mut order: Vec<&SnapshotImage> = snapshots.to_vec();
     order.sort_by_key(|s| std::cmp::Reverse(s.epoch));
     let mut claimed: HashSet<(Discriminant<Dead>, u64, u32)> = HashSet::new();
-    // Every chunk the head reaches is the head's, even under a snapshot's diverged inode: the images name
-    // chunks, so a diverged version and the head share every window the head did not rewrite (A-64), and the
-    // live volume released only the rewritten ones onto the deadlist.
-    let mut head_inodes = Vec::new();
-    trie::walk(&store.tries, self.inode_root, &mut head_inodes);
-    for handle in head_inodes {
-      if let Ok(inode) = store.inodes.get(handle) {
-        for dead in crate::volume::body_chunks(store, &inode.body) {
-          claimed.insert(dead_key(&dead));
-        }
-      }
+    // Everything the head reaches is the head's: every chunk, even under a snapshot's diverged inode (the images name
+    // chunks, so a diverged version and the head share every window the head did not rewrite, A-64, and the live
+    // volume released only the rewritten ones onto the deadlist), and every directory node and block, which a
+    // snapshot shares with the head where the head has not changed them (A-395), as the live volume kept them.
+    let head =
+      crate::volume::tree_deadlist_excluding(store, self.root, self.inode_root, &BTreeSet::new());
+    for dead in head.items() {
+      claimed.insert(dead_key(dead));
     }
     for snap in order {
       // Objects the head still holds are the head's, not this snapshot's; everything else the
@@ -2663,6 +2690,7 @@ impl Volume {
     // match the live volume's CoW memory. The kind comes from the source so entries resolve; the
     // snapshot's own inodes (`snap.inodes`) rebuild below.
     let mut kinds: BTreeMap<u64, KindImage> = snap.inodes.iter().map(|i| (i.no, i.kind)).collect();
+    let mut held_dirs: Vec<(&SharedInode, Handle<Inode>)> = Vec::new();
     for entry in &snap.shared {
       let no = InodeNo(entry.number);
       let (source_root, kind) = match entry.source {
@@ -2691,8 +2719,20 @@ impl Volume {
       kinds.insert(entry.number, kind);
       let handle = trie::get(&store.tries, source_root, no).ok_or(VfsError::RecoveryIncomplete)?;
       self.table_set(store, no, handle)?;
+      if matches!(kind, KindImage::Dir) {
+        held_dirs.push((entry, handle));
+      }
     }
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
+    let mut held: BTreeSet<u64> = BTreeSet::new();
+    for (entry, handle) in held_dirs {
+      let node = self.held_directory(store, entry, handle, epoch, refs)?;
+      if InodeNo(entry.number) == root_no {
+        self.root = node;
+      }
+      dirs.insert(entry.number, node);
+      held.insert(entry.number);
+    }
     dirs.insert(root_no.0, self.root);
     for image_inode in &snap.inodes {
       let no = InodeNo(image_inode.no);
@@ -2704,7 +2744,7 @@ impl Volume {
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
-    self.rebuild_entries(store, &snap.inodes, &Kinds::Map(&kinds), &dirs)?;
+    self.rebuild_entries(store, &snap.inodes, &Kinds::Map(&kinds), &dirs, &held)?;
     self.restore_identities(store, &snap.inodes)?;
     // A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
     // (born at or before the origin epoch) is this snapshot's own copy now, born with it, so the snapshot's drop
@@ -2717,6 +2757,37 @@ impl Volume {
       }
     }
     Ok(())
+  }
+
+  /// The head's node of a directory a snapshot shares with the head (A-395), stamped with every block of its entries at
+  /// the directory inode's own birth epoch: the head then copies it before changing it, as live copy-on-write did, and
+  /// the copy's retirement reaches the deadlist of the snapshot that holds it. Only the head shares a directory, born no
+  /// later than the snapshot's `epoch`; any other image is corrupt.
+  fn held_directory(
+    &self,
+    store: &mut Store,
+    entry: &SharedInode,
+    handle: Handle<Inode>,
+    epoch: Epoch,
+    refs: &SharingRefs,
+  ) -> Result<Handle<DirNode>, VfsError> {
+    if !matches!(entry.source, SharedSource::Head) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let born = refs
+      .head_images
+      .get(&entry.number)
+      .map(|image| Epoch(image.born))
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    if born.0 > epoch.0 {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let Body::Directory(node) = store.inodes.get(handle)?.body else {
+      return Err(VfsError::RecoveryIncomplete);
+    };
+    let Store { dirs, blocks, .. } = store;
+    dirs.get_mut(node)?.restamp(blocks, born)?;
+    Ok(node)
   }
 
   /// Pass one: place every non-root inode at its own number, born at the head epoch, with a fresh
@@ -2749,13 +2820,15 @@ impl Volume {
   }
 
   /// Pass two: rebuild every directory's entries, naming each child with the right kind, and fix
-  /// each subdirectory node's parent and name from the entry that reaches it.
+  /// each subdirectory node's parent and name from the entry that reaches it. A directory in `held` is one a snapshot
+  /// shares with the head (A-395): the head's node, whose parent and name the entry must already match, never changed.
   fn rebuild_entries(
     &mut self,
     store: &mut Store,
     inodes: &[InodeImage],
     kinds: &Kinds,
     dirs: &BTreeMap<u64, Handle<DirNode>>,
+    held: &BTreeSet<u64>,
   ) -> Result<(), VfsError> {
     for image_inode in inodes {
       let BodyImage::Directory {
@@ -2784,7 +2857,7 @@ impl Volume {
           .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
       });
       for (_, e) in ordered {
-        let child = child_for(store, e, parent_no, kinds, dirs)?;
+        let child = child_for(store, e, parent_no, kinds, (dirs, held))?;
         self.dir_insert(store, parent, &e.name, child)?;
       }
     }
@@ -3444,7 +3517,7 @@ fn child_for(
   entry: &EntryImage,
   parent_no: InodeNo,
   kinds: &Kinds,
-  dirs: &BTreeMap<u64, Handle<DirNode>>,
+  (dirs, held): (&BTreeMap<u64, Handle<DirNode>>, &BTreeSet<u64>),
 ) -> Result<Child, VfsError> {
   let Some(child) = entry.child else {
     return Ok(Child::Whiteout);
@@ -3460,6 +3533,14 @@ fn child_for(
     KindImage::Dir => {
       let handle = *dirs.get(&child).ok_or(VfsError::RecoveryIncomplete)?;
       let node = store.dirs.get_mut(handle)?;
+      if held.contains(&child) {
+        // The head's node, shared (A-395): the live volume copied a directory renamed or moved after the snapshot,
+        // so the one it still shares sits under the same parent and name; any other image is corrupt.
+        if node.parent != Some(parent_no) || *node.name != *entry.name.as_str() {
+          return Err(VfsError::RecoveryIncomplete);
+        }
+        return Ok(Child::Dir(handle));
+      }
       node.parent = Some(parent_no);
       node.name = entry.name.as_str().into();
       Ok(Child::Dir(handle))

@@ -1729,30 +1729,51 @@ async fn serve_peer_records(
             crate::mirror::serve_promise(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
-          slates_cluster::live::LIVE_ENTRY_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_entry(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
-          slates_cluster::live::LIVE_STATE_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_state(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
-          slates_cluster::live::LIVE_ENTRIES_STREAM => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            crate::live_ship::serve_entries(s, local, peer_host, &request)
-          })
-          .unwrap_or_default(),
+          // A message that puts a live log's entries in a copy first has the volume's claim admitted on this node
+          // (§4.2, g229: `live_ship::admit_claim`), answered `NoRoom` when it cannot be.
+          slates_cluster::live::LIVE_ENTRY_STREAM | slates_cluster::live::LIVE_ENTRIES_STREAM => {
+            let peer_host = state::with_state(|s| {
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host)
+            })
+            .unwrap_or(seed);
+            let object = slates_db::live::object_of(&request);
+            let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+            match admission.refusal() {
+              Some(refusal) => refusal,
+              None => state::with_state(|s| {
+                if stream == slates_cluster::live::LIVE_ENTRY_STREAM {
+                  crate::live_ship::serve_entry(s, local, peer_host, &request)
+                } else {
+                  crate::live_ship::serve_entries(s, local, peer_host, &request)
+                }
+              })
+              .unwrap_or_default(),
+            }
+          }
+          slates_cluster::live::LIVE_STATE_STREAM => {
+            let peer_host = state::with_state(|s| {
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host)
+            })
+            .unwrap_or(seed);
+            // An install puts a whole state in a copy; a report or a fetch takes nothing in.
+            let installs =
+              !slates_db::live::is_report(&request) && !slates_db::live::is_fetch(&request);
+            let object = installs
+              .then(|| slates_db::live::object_of_state(&request))
+              .flatten();
+            let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+            match admission.refusal() {
+              Some(refusal) => refusal,
+              None => {
+                state::with_state(|s| crate::live_ship::serve_state(s, local, peer_host, &request))
+                  .unwrap_or_default()
+              }
+            }
+          }
           crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -4719,6 +4740,9 @@ async fn adopt_and_serve(
   crate::moves::drive_adoptions(origin, local, budget, in_flight).await;
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
+  // The claims of the live logs this node holds (§4.2, g229), settled before anything is made from one: a copy let go
+  // releases its claim, a warm restart's copies have theirs admitted again.
+  crate::live_ship::reconcile_claims(origin).await;
   materialize_adopted_objects(origin, local, budget, in_flight).await;
 }
 
@@ -6129,7 +6153,7 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
   };
   if !made {
     let restored = match archive.as_ref() {
-      Some(archive) => Some(restore_in_turns(object, &catalog, archive).await?),
+      Some(archive) => Some(restore_in_turns((object, id), &catalog, archive).await?),
       None => None,
     };
     drop(archive);
@@ -6232,7 +6256,7 @@ async fn rebuild_in_turns(
 /// [`MATERIALIZE_RESTORE_SLICES`]. A restore over its budget is refused `BudgetExceeded` naming the shard's room, a
 /// malformed archive `BadRequest` ([`verbs::restore_refused`]).
 async fn restore_in_turns(
-  object: ObjectId,
+  (object, id): (ObjectId, DbVolumeId),
   catalog: &crate::catalog::CatalogValue,
   archive: &Archive,
 ) -> Result<slates_archive::Restored, &'static str> {
@@ -6253,7 +6277,7 @@ async fn restore_in_turns(
   futures::yield_now().await;
   let mut restoring = making_turn(object, |s| {
     let (budget, room) =
-      past_the_pressure_hold(s, |s| verbs::restore_admitted(s, catalog, planned.needed()));
+      past_the_pressure_hold(s, |s| verbs::restore_admitted(s, id, catalog, planned.needed()));
     planned
       .restoring(budget)
       .map_err(|e| materialize_refusal_counter(&verbs::restore_refused(e, room)))
