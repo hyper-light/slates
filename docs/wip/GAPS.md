@@ -18773,6 +18773,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   differently a conflict, and an agent's mode set alone over bytes the disk already held; its unit tests ran on the
   Mac Studio, the oracle reruns filed for main); and the manifest's encoding, which grants bind, has no golden vector);
   and
+  the manifest encoding's golden vectors, **built by A-469 the same day** (each layout the encoder writes, an overlay's 3
+  and a captured clone's content 5, pinned over a fixed manifest of every action, entry by entry, an independent
+  encoder written from the encoding's reading agreeing byte for byte; a `--ignored` writer republishes; a determinism
+  test and a test that every field a landing acts on moves the identity; its unit tests ran on the Mac Studio; still owed
+  with it, found by it: nothing decodes these bytes, so a decoder's hostile-input tests have no target; a string's length
+  prefix is two bytes, so a path or a target past 65,535 bytes (a path some 257 maximal names deep) encodes a length that
+  is not its length, which no encoder output can turn into another's, since every entry's encoding holds a zero byte no
+  path holds, but which a lossless layout (four-byte lengths, layouts 6 and 7) or a refusal at the plan would close; and
+  an overlay's witness's owner, birth time and Windows bits are judged, its verdict comparing whole fingerprints, and not
+  bound, the encoding holding the device, inode, size, times and mode alone); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

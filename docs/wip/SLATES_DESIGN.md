@@ -9764,7 +9764,10 @@ entry either old or new, never torn).
    and build the manifest: creates, replacements (with the witnessed base), deletes (whiteouts
    with their witnessed base), directory renames (redirects, as one rename), directory creates
    and removals, symlinks and mode changes; hash the canonical encoding of the manifest. Cost
-   proportional to diverged entries.
+   proportional to diverged entries. The encoding is the bytes a grant binds, and each layout the encoder writes is
+   pinned by a golden vector (A-469): an overlay's (layout 3) and a captured clone's (content layout 5), each a fixed
+   manifest of every action, compared byte for byte, entry by entry, with `crates/land/src/manifest_vectors.txt`, which
+   only a deliberate `--ignored` run republishes.
 2. *Present.* Reply `GrantRequired{request_id, manifest_hash, summary}` and record
    `LandingPlanned` in the audit log. The reply also states the landing's statement, which a signer signs to make the
    landing signed work, and how the request's signature was judged against this manifest, which the record keeps
