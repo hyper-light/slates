@@ -1611,11 +1611,11 @@ fn the_daemon_is_observed_through_the_library() {
 }
 
 /// The Shards route by use (§4.6, A-161): the stream end the library hands a VMM serves the volume, and offers its guest
-/// DAX.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// DAX. On every platform whose daemon serves the Shards form: a Unix socket on Linux and macOS, the client end of the
+/// attachment's named pipe on Windows (the handle route, A-179). slates ships no other platform.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod shards {
   use std::io::{Read, Write};
-  use std::os::unix::net::UnixStream;
 
   use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 
@@ -1648,10 +1648,54 @@ mod shards {
   /// Shape: a file of a DAX range and a half (`FUSE_DAX_SZ`, the range a guest maps a file in): one the stream marks.
   const LARGE_BYTES: u64 = slates_mem::DAX_RANGE_BYTES + slates_mem::DAX_RANGE_BYTES / 2;
 
+  /// The end the library handed, as Shards' device reads and writes it: a Unix socket with the suite's read bound.
+  #[cfg(unix)]
+  type Wire = std::os::unix::net::UnixStream;
+
+  /// The end the library handed on Windows: the client end of the attachment's pipe, opened for overlapped I/O, so each
+  /// read and write waits on an `OVERLAPPED` of its own (`slates_ipc::stream::read_waiting`, `write_waiting`), as the
+  /// client's own Shards suite speaks it (`crates/client/tests/shards.rs`).
+  #[cfg(windows)]
+  struct Wire(slates_api::StreamEnd);
+
+  #[cfg(windows)]
+  impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::read_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+  }
+
+  #[cfg(windows)]
+  impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::write_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// The handed end as a [`Wire`].
+  #[cfg(unix)]
+  fn wire(end: slates_api::StreamEnd) -> Wire {
+    let stream = std::os::unix::net::UnixStream::from(end);
+    stream.set_read_timeout(Some(START_WAIT)).unwrap();
+    stream
+  }
+
+  /// The handed end as a [`Wire`].
+  #[cfg(windows)]
+  fn wire(end: slates_api::StreamEnd) -> Wire {
+    Wire(end)
+  }
+
   /// Shards' fs device as the end's holder speaks it: a little-endian length, then the FUSE request; one reply frame
   /// back.
   struct Device {
-    stream: UnixStream,
+    stream: Wire,
     unique: u64,
   }
 
@@ -1706,9 +1750,10 @@ mod shards {
     write_file(&mut instance, volume, "/present", b"through the stream\n");
     write_file(&mut instance, volume, "/large", &large);
     let served = instance.serve_shards(volume, Intent::Write, None).unwrap();
-    let stream = UnixStream::from(served.stream);
-    stream.set_read_timeout(Some(START_WAIT)).unwrap();
-    let mut device = Device { stream, unique: 0 };
+    let mut device = Device {
+      stream: wire(served.stream),
+      unique: 0,
+    };
     let mut init = Vec::new();
     for word in [
       MAJOR,
@@ -1739,7 +1784,8 @@ mod shards {
       0,
       "FUSE_HAS_INODE_DAX kept"
     );
-    let page = u32::try_from(rustix::param::page_size()).unwrap();
+    // The host's page, which the daemon names as the alignment on every platform (Windows' is 4 KiB, as its INIT's).
+    let page = u32::try_from(slates_machine::facts::Facts::page_bytes()).unwrap();
     assert_eq!(
       word(INIT_OUT_ALIGNMENT_AT) >> 16,
       page.trailing_zeros(),
@@ -2117,16 +2163,32 @@ fn reads_its_end(socket: &std::os::unix::net::UnixStream) -> bool {
   matches!(std::io::Read::read(&mut &*socket, &mut byte), Ok(0))
 }
 
-/// A stream end as it is where it is a pipe handle (Windows): [`reads_its_end`] does not judge it.
-#[cfg(not(unix))]
+/// A stream end made ready for [`reads_its_end`] on Windows: the client end of the attachment's pipe, as it came.
+#[cfg(windows)]
 fn awaiting(end: slates_api::StreamEnd) -> slates_api::StreamEnd {
   end
 }
 
-/// Whether the peer of a stream end reads its end: not judged where the end is a pipe handle (Windows).
-#[cfg(not(unix))]
-fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
-  true
+/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended. A
+/// Windows end is an overlapped pipe handle whose waited read (`slates_ipc::stream::read_waiting`, zero once the peer
+/// has gone) takes no bound of its own, so a duplicate of the handle is read on a thread of the test's and its answer
+/// waited for within the suite's wait: an end that never comes fails the check instead of hanging the suite. Until
+/// 2026-11-18 this answered `true` without reading.
+#[cfg(windows)]
+fn reads_its_end(end: &slates_api::StreamEnd) -> bool {
+  use std::os::windows::io::AsHandle;
+  let reader = end.try_clone().unwrap();
+  let (answer, answered) = std::sync::mpsc::channel();
+  let reading = std::thread::spawn(move || {
+    let mut byte = [0u8; 1];
+    let read = slates_ipc::stream::read_waiting(reader.as_handle(), &mut byte).ok();
+    let _ = answer.send(read);
+  });
+  let ended = matches!(answered.recv_timeout(START_WAIT), Ok(Some(0)));
+  if ended {
+    reading.join().unwrap();
+  }
+  ended
 }
 
 /// A-310's conformance suite: one flow of the seam's verbs, each outcome and each refusal asserted as its typed value,

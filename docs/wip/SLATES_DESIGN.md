@@ -7907,6 +7907,18 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   (its anchor stopped first); the restarted log ends past the head shipped before plus the writes since, and a
 >   survivor serves all ten files (4 of 4 on a Mac Studio, heads 4 then 10 or 11). With the restarted log begun again
 >   at genesis the first write through it is never answered, its log at head 0 with nothing durable.
+> - **A restarted owner's log shipped nothing once its holders came back (fixed 2026-11-18, A-428).** The resumed log's
+>   first whole entry is made at the restart, before the owner's pairs are delivered again, so it covers no candidate's
+>   key; a write appends after it. A holder that came back, owed an install, waited for an image made at the log's head
+>   whenever the last whole state was behind the head; no image was made while a whole record was owed to cover the
+>   candidates' keys (`refresh_image`); and that record waited for credit that only the holders' installs could free.
+>   Nothing shipped, and every write after the restart was refused `DurabilityPending` at the held-reply bound
+>   (`owes whole true; holders [..@None, ..@None]; lanes []; covers candidates false`, on main and on g230's branches,
+>   five of five runs). Now a holder owed an install is sent the last whole state while the retained tail reaches past
+>   it (`Shipper::retains_after`), and takes the entries after it from the tail; only a whole state behind the tail
+>   waits for an image at the head, as the rolling partition's installs need. Held by
+>   `live_ship::tests::a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it`
+>   and A-344's `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover`.
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
@@ -24904,8 +24916,20 @@ Applied in the same change to:
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
-Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below); the replica itself, the feed and
-the sealed blocks owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below). Step 2 built 2026-11-18 (g083): the
+replica and its feed, in `crates/merge/src/replica.rs`. The owner makes a message for each version it commits
+(`Green::feed_version`) and for each fold that moves its floor (`fold_and_feed`, `fold_to_budget_and_feed`), at its feed
+position, which it then moves past. A replica is built from the owner's checkpoint at its head over the green's origin,
+joined at the owner's feed position then (`Green::replica_seed`, `Replica::build`), so a base below that version is
+the owner's to answer. It applies the message at its next position through `Green::apply_recorded` or
+`fold_history_before`, passes over one below it, and refuses one above it (`FeedRefusal::Gap`), or a version that
+would replay as another (`FeedRefusal::Diverged`), before anything changes; its holder then rebuilds it, counted
+(`Replica::rebuild`, `Replica::counts`). Proven by `crates/merge/tests/replica.rs`: over generated histories with a
+message delivered late, lost, or in flight across a rebuild, the replica is the owner's green at its head after every
+step (its identity and every name's bytes), and at the end equals the owner whole (every version both hold, the paths
+changed since each, every rebase over each base, and a base below its floor refused). Its content is still its own;
+the sealed blocks read in place (step 3), its bounds (step 4) and the shards' use of it (step 5) are owed. The text and
+its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -30231,3 +30255,30 @@ A-422's paragraph), GAPS (A-422's entry, its second sibling marked fixed) and th
   in place. It was red once with the replay writing through the volume alone, the first difference at byte 0 (Mac
   Studio, 2026-11-18T20:29Z, debug); with the fix it passes beside the clone replay test and the write log's eleven (13
   of 13).
+
+### A-428 — A holder owed an install is sent the last whole state while the retained tail reaches past it (2026-11-18, g232; §4.10 live shipping, A-344's warm restart; the regression main bisected to A-376)
+
+Applied in the same change to: §4.10's status ("A restarted owner's log shipped nothing once its holders came back"),
+GAPS (A-344's entry), `docs/bugs/2026-11-18-a-restarted-owners-log-shipped-nothing-once-its-holders-came-back.md`,
+`crates/db/src/live.rs` (`Shipper::retains_after`), `crates/server/src/live_ship.rs` (`reached_volume`), and the test
+below.
+- **What was there.** A holder that came back to a live volume and was owed an install waited for an image made at the
+  log's head whenever the last whole state was behind the head (`reached_volume`, `owes_image`). After an owner's warm
+  restart (A-344) the resumed log's first whole entry is made before the owner's pairs are delivered again, so it covers
+  no candidate's key, and a write appends after it. Then three rules each waited on another: the image is not made while
+  a whole record is owed (`refresh_image`), and the period owes one to cover the candidates' keys once the pairs are
+  delivered; that record waits for credit (`Shipper::admits_checkpoint`); and the credit is freed only by the holders
+  taking the entries in flight, which needs the installs. Nothing shipped, and every write after the restart was refused
+  `DurabilityPending` at the held-reply bound. Main bisected the fleet test's red to A-376 (its cheaper holder
+  publications changed the order of the restart's steps); the cause is the live log's.
+- **The rule.** A holder owed an install is sent the last whole state while the retained tail still holds every entry
+  after it (`Shipper::retains_after`): installed there, it takes those entries from the tail, so its acknowledgements
+  free the credit and the owed record follows. Only a whole state behind the tail, which would leave the holder owing a
+  second install, waits for an image made at the head, as the rolling partition's installs need
+  (diag-live-durability-54).
+- **Test.** `live_ship::tests::a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it`:
+  a resumed log past position 5 with its whole entry at 6 and a write at 7, both holders returned: each is sent an
+  install of the whole state at 6; past two writes with the tail cut to its newest entry, none is sent. Red on main's
+  rule: the first case sent nothing either.
+- **Still owed.** With the tail cut past the last whole state, a whole record owed (for the keys, or after a refused
+  publication) and a full credit can still meet the same wait; see GAPS.
