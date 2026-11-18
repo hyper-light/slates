@@ -46,6 +46,10 @@ pub const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 pub const EXIT_REFUSED: u8 = 1;
 /// Format: the exit code of role arguments that do not parse, as the `slates` command's usage errors.
 pub const EXIT_USAGE: u8 = 2;
+/// Format: the exit code of an anchor started `StartSpec::until_served` that stopped because none of its daemons ever
+/// served (A-366): the first past the `slates` command's own (1 refused, 2 usage, 3 no daemon) and a failed role's (4),
+/// so a starter tells it from every other end ([`crate::StartFault::NeverServed`]).
+pub const EXIT_NEVER_SERVED: u8 = 5;
 
 /// Format: the role arguments [`Role::parse`] takes, for its usage message.
 pub const ROLE_USAGE: &str =
@@ -90,6 +94,9 @@ pub enum Failure {
   Refused(String),
   /// The role failed ([`EXIT_FAILED`]).
   Failed(String),
+  /// An anchor started `StartSpec::until_served` stopped, since its daemons crash-looped and none of them ever served
+  /// ([`EXIT_NEVER_SERVED`], A-366).
+  NeverServed,
 }
 
 impl Failure {
@@ -98,6 +105,7 @@ impl Failure {
     match self {
       Self::Refused(_) => EXIT_REFUSED,
       Self::Failed(_) => EXIT_FAILED,
+      Self::NeverServed => EXIT_NEVER_SERVED,
     }
   }
 }
@@ -107,6 +115,10 @@ impl fmt::Display for Failure {
     match self {
       Self::Refused(text) => write!(f, "refused: {text}"),
       Self::Failed(text) => f.write_str(text),
+      Self::NeverServed => f.write_str(
+        "its daemons failed their starts in a row and none of them served, and its starter asked it to stop then: \
+         stopping",
+      ),
     }
   }
 }
