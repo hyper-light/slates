@@ -2,14 +2,16 @@
 //! `slates_ipc::route`'s; this module keeps the offers, listens, and runs the exchanges.
 //!
 //! **Offers.** An attach in the Shards form on macOS keeps its stream end as an offer on the volume's owner shard, with
-//! a fresh 256-bit secret and an expiry, and replies `ShardsOffered` with the secret (`crate::shards::attach_verb`). A
+//! the device's end of the stream's resync channel beside it when one was made (A-339), a fresh 256-bit secret and an
+//! expiry, and replies `ShardsOffered` with the secret (`crate::shards::attach_verb`). A
 //! direct map keeps the read-only descriptor of its copy as an offer the same way and replies `MapOffered`
 //! (`crate::direct_map`). Each kind has its own table, so a mapping and an attachment never meet under one id, and a
 //! claim names its kind (a version-2 hello). Both ids carry their owner partition in their high 16 bits, which is how
 //! an exchange finds the shard that holds the offer.
-//! The offer is claimed once: an exchange asks the owner shard to check the claim's proof and hand over the end
-//! ([`take`]), so the secret never leaves the shard that made it. An offer unclaimed at its expiry is dropped by its
-//! timer, which closes the end: the stream then sees its peer gone and ends its attachment, as every stream does.
+//! The offer is claimed once: an exchange asks the owner shard to check the claim's proof and hand over the end and its
+//! resync end ([`take`]), so the secret never leaves the shard that made it. An offer unclaimed at its expiry is dropped
+//! by its timer, which closes the ends: the stream then sees its peer gone and ends its attachment, as every stream
+//! does.
 //!
 //! **The listener and its exchanges.** The listener is bound when the daemon starts and served by one task on the
 //! control shard, which accepts each connection without blocking and runs one exchange task for it there. Exchanges
@@ -56,11 +58,19 @@ const FAILED: &str = "shards.route_failed";
 /// Format: the refusal-ledger name of an offer dropped unclaimed at its expiry.
 const EXPIRED: &str = "shards.route_expired";
 
-/// A descriptor offered on the route, a stream end or a map's copy: claimable once, with `secret`, until `expires_ns`.
+/// A descriptor offered on the route, a stream end or a map's copy: claimable once, with `secret`, until `expires_ns`;
+/// a stream's with the device's end of its resync channel beside it, when one was made (A-339).
 pub(crate) struct Offer {
   secret: [u8; SECRET_BYTES],
   expires_ns: u64,
   descriptor: OwnedFd,
+  resync: Option<OwnedFd>,
+}
+
+/// What a claim takes from an offer: the offered descriptor, and a stream's resync end beside it.
+pub(crate) struct Taken {
+  descriptor: OwnedFd,
+  resync: Option<OwnedFd>,
 }
 
 /// A shard's offers of one kind, by id. Stream offers are bounded with the shard's handoffs
@@ -76,14 +86,15 @@ fn offers_of(s: &mut ShardState, kind: OfferKind) -> &mut Offers {
   }
 }
 
-/// Keeps `descriptor` as the `kind` offer `id`, claimable with `secret` until its life ends, and arms the timer that
-/// drops it then. `false` when the timer could not be armed: the offer is dropped at once, closing its descriptor (a
-/// stream then ends its attachment rather than wait forever for a claim; a map's client reads by copy).
+/// Keeps `descriptor`, with `resync` beside it for a stream whose resync channel was made (A-339), as the `kind` offer
+/// `id`, claimable with `secret` until its life ends, and arms the timer that drops it then. `false` when the timer
+/// could not be armed: the offer is dropped at once, closing its descriptors (a stream then ends its attachment rather
+/// than wait forever for a claim; a map's client reads by copy).
 pub(crate) fn offer(
   s: &mut ShardState,
   (kind, id): (OfferKind, u64),
   secret: [u8; SECRET_BYTES],
-  descriptor: OwnedFd,
+  (descriptor, resync): (OwnedFd, Option<OwnedFd>),
 ) -> bool {
   let expires_ns = s.clock.monotonic_ns().saturating_add(OFFER_LIFE_NS);
   offers_of(s, kind).insert(
@@ -92,6 +103,7 @@ pub(crate) fn offer(
       secret,
       expires_ns,
       descriptor,
+      resync,
     },
   );
   if futures::spawn(expire_later(kind, id, expires_ns))
@@ -127,8 +139,8 @@ async fn expire_later(kind: OfferKind, id: u64, expires_ns: u64) {
   });
 }
 
-/// Hands over the descriptor of the offer `hello` names to the claim whose `proof` opens under the offer's secret with
-/// these nonces, retiring the offer, with the daemon's confirmation to send beside it; or the refusal: no offer (none
+/// Hands over the descriptors of the offer `hello` names to the claim whose `proof` opens under the offer's secret with
+/// these nonces, retiring the offer, with the daemon's confirmation to send beside them; or the refusal: no offer (none
 /// made, claimed, or expired, the expired one dropped here), a proof that does not hold. Run on the shard that holds the
 /// offer, where its secret is.
 pub(crate) fn take(
@@ -136,7 +148,7 @@ pub(crate) fn take(
   hello: Hello,
   daemon_nonce: [u8; NONCE_BYTES],
   proof: [u8; SEALED_BYTES],
-) -> Result<([u8; SEALED_BYTES], OwnedFd), RouteRefusal> {
+) -> Result<([u8; SEALED_BYTES], Taken), RouteRefusal> {
   let now = s.clock.monotonic_ns();
   let offers = offers_of(s, hello.kind);
   let Some(offer) = offers.get(&hello.id) else {
@@ -160,7 +172,13 @@ pub(crate) fn take(
     .confirmation()
     .map_err(|_| RouteRefusal::Malformed)?;
   let offer = offers.remove(&hello.id).ok_or(RouteRefusal::NoOffer)?;
-  Ok((confirmation, offer.descriptor))
+  Ok((
+    confirmation,
+    Taken {
+      descriptor: offer.descriptor,
+      resync: offer.resync,
+    },
+  ))
 }
 
 /// Serves the route's listener on this shard (the control shard): each wake accepts every waiting connection and runs
@@ -225,10 +243,10 @@ enum Ended {
 ///
 /// **A sent end is kept until the client has its own.** XNU flushes a Unix socket whose every reference is inside a
 /// message in flight when its collector of such descriptors runs (`unp_gc`): the socket's receive buffer is emptied and
-/// its reads answer end of file. So the end, once sent, stays open here until the client closes the route connection,
-/// which it does after its receive has returned, and only then is closed: it always has a reference outside the
-/// message. Closed at once, an end arrived flushed in 4 of 20 claims at load 35-47, and in up to 40 of 48 with another
-/// thread opening and closing sockets
+/// its reads answer end of file. So the end, and a stream's resync end beside it (A-339), once sent, stay open here
+/// until the client closes the route connection, which it does after its receive has returned, and only then are
+/// closed: each always has a reference outside the message. Closed at once, an end arrived flushed in 4 of 20 claims at
+/// load 35-47, and in up to 40 of 48 with another thread opening and closing sockets
 /// (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`).
 async fn exchange(connection: OwnedFd) {
   let ended = match futures::within(EXCHANGE_NS, run(connection.as_fd())).await {
@@ -290,9 +308,9 @@ async fn client_closes(connection: BorrowedFd<'_>) {
 }
 
 /// The exchange's steps (`slates_ipc::route`'s module doc): the hello, the daemon's nonce, the proof (with nothing
-/// after it), the owner shard's verdict, the confirmation with the end; the end returned, still held, for the caller to
-/// close once the client has its own.
-async fn run(connection: BorrowedFd<'_>) -> Result<OwnedFd, Ended> {
+/// after it), the owner shard's verdict, the confirmation with the end (and a stream's resync end beside it); the ends
+/// returned, still held, for the caller to close once the client has its own.
+async fn run(connection: BorrowedFd<'_>) -> Result<Taken, Ended> {
   let mut hello = [0u8; HELLO_BYTES];
   read_exact(connection, &mut hello).await?;
   let hello = Hello::decode(&hello).map_err(|_| Ended::Refused(RouteRefusal::Malformed))?;
@@ -325,14 +343,19 @@ async fn run(connection: BorrowedFd<'_>) -> Result<OwnedFd, Ended> {
     EXCHANGE_NS,
   )
   .await;
-  let (confirmation, descriptor) = match taken {
+  let (confirmation, taken) = match taken {
     Some(Ok(taken)) => taken,
     Some(Err(refusal)) => return Err(Ended::Refused(refusal)),
     None => return Err(Ended::Failed),
   };
-  slates_ipc::route::send_confirmation(connection, &confirmation, descriptor.as_fd())
-    .map_err(|_| Ended::Failed)?;
-  Ok(descriptor)
+  slates_ipc::route::send_confirmation(
+    connection,
+    &confirmation,
+    taken.descriptor.as_fd(),
+    taken.resync.as_ref().map(AsFd::as_fd),
+  )
+  .map_err(|_| Ended::Failed)?;
+  Ok(taken)
 }
 
 /// Fills `buffer` from the non-blocking `connection`, waiting on its readiness; the client's closing before it is full

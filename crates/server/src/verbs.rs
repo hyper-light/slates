@@ -803,6 +803,11 @@ fn takeovers_pending(state: &ShardState) -> u64 {
 /// bounded startup allowance, and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate
 /// ([`dispatch`]), the mount bridge (`crate::nfs`, which is Unix's) and the daemon's test observation.
 pub(crate) fn lease_verdict(state: &ShardState, object: ObjectId) -> crate::lease::LeaseVerdict {
+  // An object this node lost to a successor is the successor's: its copy here is never served as the latest state,
+  // however this host's lease stands (A-334, A-338).
+  if lost_to_a_successor(state, DbVolumeId { bytes: object.0 }) {
+    return crate::lease::LeaseVerdict::LostToSuccessor;
+  }
   let config = state.fleet.configuration();
   // The cohorts a successor's promotion quorum can be drawn from: the settled one, and — while this owner's
   // neighbourhood change is in flight and moved the object's cohort — the current one the council may settle
@@ -1690,9 +1695,8 @@ pub(crate) async fn resolve_and_forward(
   // which the owner's completion record answers exactly once (§4.9 RIFL); the client waits for a forwarded verb while
   // the daemon lives (`RequestBody::defers_reply`). Until 2026-10-09 one unanswered forward refused the client at once:
   // one cross-region read in nine was refused mid-file on a 200 ms path with 3% loss.
-  let began = slates_rt::futures::now_ns();
-  let bound = crate::state::with_state(|state| state.config.failover_slo_ns)
-    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  // The failover bound, from the first send: the SLO, or the floor of the path to the owner where that is longer (A-352).
+  let mut bound = crate::forward_lane::FailoverBound::from_now();
   let owner = match known {
     Some(owner) => {
       crate::state::with_state(|state| {
@@ -1723,11 +1727,11 @@ pub(crate) async fn resolve_and_forward(
   };
   // Every resend keeps the place the first send had in the owner's lane (A-306), so forwards first queued after it
   // never go ahead of it however often it is sent again. Every send is judged against the same failover bound, from
-  // the first: the lane's progress holds a forward still queued only until then (A-315).
+  // the first: the lane's progress holds a forward still queued only until then (A-315), and the bound is held to the
+  // longest floor the path to the owner has measured, so no resend is refused below it (A-352).
   let mut place = crate::forward_lane::Place::default();
-  let bound_at = began.saturating_add(bound);
   let (decoded, later) = loop {
-    let (decoded, later) = forward_once(owner, &requests, bound_at, &mut place).await;
+    let (decoded, later) = forward_once(owner, &requests, &mut bound, &mut place).await;
     // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
     // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
     // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
@@ -1745,8 +1749,7 @@ pub(crate) async fn resolve_and_forward(
       })
       .unwrap_or(false)
     });
-    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
-    if !unanswered || !alive || elapsed >= bound {
+    if !unanswered || !alive || slates_rt::futures::now_ns() >= bound.at_ns() {
       break (decoded, later);
     }
     crate::state::with_state_counted(|state| state.count(FORWARD_RETRIED, 1));
@@ -1776,7 +1779,7 @@ const FORWARD_RETRIED: &str = "fleet.forward.retried";
 async fn forward_once(
   owner: Option<HostId>,
   requests: &[Vec<u8>],
-  bound_at: u64,
+  bound: &mut crate::forward_lane::FailoverBound,
   place: &mut crate::forward_lane::Place,
 ) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
   let Some(owner) = owner else {
@@ -1796,7 +1799,7 @@ async fn forward_once(
     owner,
     requests,
     crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
-    bound_at,
+    bound,
     place,
   )
   .await;
@@ -2050,11 +2053,11 @@ impl OwnerReplies {
 
 /// The region and volume of a verb this node must send to another host of its own region (§4.8 "Lookup": a lookup
 /// by id routes to the volume's creator, or its successor after a takeover): a volume-scoped read or write that
-/// forwards safely, whose volume this shard's catalog does not hold, and whose id names another creator. Asked on
-/// the volume's owner shard — the one shard whose catalog would hold it — and only for a local client's verb, never
-/// one forwarded from another node, so a forward is one hop. A volume this node created and no longer holds stays
-/// `NotFound` (its successors after a same-id re-admission are GAP-A9-7's ledger transfer). A laptop never forwards:
-/// every volume it can name, it created.
+/// forwards safely, whose volume this node lost to a successor ([`lost_to_a_successor`]), or whose volume this shard's
+/// catalog does not hold and whose id names another creator. Asked on the volume's owner shard — the one shard whose
+/// catalog would hold it — and only for a local client's verb, never one forwarded from another node, so a forward is
+/// one hop. A volume this node created and holds no record of stays `NotFound`. A laptop never forwards: every volume it
+/// can name, it created.
 fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64, VolumeId)> {
   if !(is_forwardable_read(body) || is_forwardable_write(body)) {
     return None;
@@ -2069,11 +2072,10 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   }
   let host = state.fleet.host();
   let creator = ObjectId(volume.bytes).creator();
-  // A volume this node owned and lost to a takeover (its live log fenced at a later epoch) is its successor's: its verbs
-  // go there, as any other node's do, whoever created it (A-338). Answered here, each was refused `StaleEpoch` for good,
-  // and a client whose node this is never reached the successor (the chaos nemesis's stranded owner).
-  let superseded = crate::live_ship::superseded(state, to_db_volume(volume));
-  if !superseded && (creator == host || state.db.partition().volume(to_db_volume(volume)).is_some())
+  // A volume this node lost to a successor is the successor's, whoever created it and whatever this catalog still holds
+  // of it: its verbs go there, as any other node's do (`lost_to_a_successor`: A-338's fenced log, A-334's yield).
+  if !lost_to_a_successor(state, to_db_volume(volume))
+    && (creator == host || state.db.partition().volume(to_db_volume(volume)).is_some())
   {
     return None;
   }
@@ -2089,6 +2091,14 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
     .copied()
     .unwrap_or(RegionId(0));
   Some((region.0, volume))
+}
+
+/// Whether this node lost volume `id` to a successor, so its verbs go to the successor and its copy here is never served
+/// as the volume (A-334, A-338): its live log was fenced at a later epoch by a holder that took a successor's takeover
+/// (`crate::live_ship::superseded`), or this shard yielded it when its host was admitted again under its id
+/// (`ShardState::yielded`, `crate::readmission`).
+pub(crate) fn lost_to_a_successor(state: &ShardState, id: DbVolumeId) -> bool {
+  state.yielded.contains(&id) || crate::live_ship::superseded(state, id)
 }
 
 /// A late lookup belongs to the original client generation. It cannot populate a reused slot's
@@ -4274,6 +4284,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::SignatureRequired { .. } => "signature_required",
     Refusal::Volume { .. } => "volume",
     Refusal::Database { .. } => "database",
+    Refusal::Target { .. } => "target",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4740,6 +4751,7 @@ fn dispatch_inner(
       target,
       filter,
       grant,
+      signature,
     } => crate::landing::land_verb(
       state,
       client_id,
@@ -4751,6 +4763,7 @@ fn dispatch_inner(
         filter: &filter,
         grant,
         present_only: false,
+        signature: signature.as_deref(),
       },
     ),
     RequestBody::Present {
@@ -4758,6 +4771,7 @@ fn dispatch_inner(
       snapshot,
       target,
       filter,
+      signature,
     } => crate::landing::land_verb(
       state,
       client_id,
@@ -4769,6 +4783,7 @@ fn dispatch_inner(
         filter: &filter,
         grant: None,
         present_only: true,
+        signature: signature.as_deref(),
       },
     ),
     RequestBody::FsWrite {
@@ -4956,16 +4971,19 @@ fn consumer_gate(
       target,
       filter,
       grant: None,
+      signature,
     } => match policy.land {
       WriteMode::Forbid => {
         state.count("policy_forbids.land", 1);
         Err(forbids(WriteAct::Land))
       }
+      // A signed landing is presented as an unsigned one is, its signature judged for the approval request (A-321).
       WriteMode::Ask => Ok(RequestBody::Present {
         volume,
         snapshot,
         target,
         filter,
+        signature,
       }),
       WriteMode::Bypass => Ok(RequestBody::Land {
         volume,
@@ -4973,6 +4991,7 @@ fn consumer_gate(
         target,
         filter,
         grant: None,
+        signature,
       }),
     },
     RequestBody::Submit { .. }

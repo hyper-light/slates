@@ -16,11 +16,10 @@ use slates_base::own_mounts::Unrecorded;
 use slates_db::catalog::{AttachmentRecord, Consumer};
 use slates_ipc::protocol::Refusal;
 
-/// The refusal of a mount at `mount_point` this daemon could not record.
+/// The refusal of a mount at `mount_point` this daemon could not record, typed (A-299); the point and why are logged.
 fn refusal(why: Unrecorded, mount_point: &str) -> Refusal {
-  Refusal::TargetUnavailable {
-    reason: format!("the NFS mount at {mount_point} {why}"),
-  }
+  slates_machine::log_line!("slates-server: the NFS mount at {mount_point} {why}");
+  crate::error::target(crate::error::target_of_unrecorded(why))
 }
 
 /// Format: the source a macOS slates mount names in the kernel's table, `slates:/<volume name>`

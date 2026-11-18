@@ -383,13 +383,41 @@ fn judge_start_of(
   // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
   // thread nears one (every start of 23 shards on a 32-CPU Studio was killed, 2026-11-08). Where the threads cannot be
   // read nothing is judged spinning, and the progress alone judges a start wedged.
-  let cpu = pid
-    .and_then(slates_machine::process_clock::process_cpu)
-    .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress));
+  let clock = || {
+    pid
+      .and_then(slates_machine::process_clock::process_cpu)
+      .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress))
+  };
   // Before 2026-11-08 a start had no scheduler reading, so a start held off its CPUs for a window was killed as stuck
   // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner). Before A-336 a process
   // waiting on memory, every thread off the CPU, was stuck the same way, a daemon paging whole killed at its lapse.
-  let run = pid.and_then(slates_rt::process_run_reading);
+  judge_start_by(watch, (now, memory), clock, || {
+    pid.and_then(slates_rt::process_run_reading)
+  })
+}
+
+/// The start's rule over its readings, taken in this order (g243's rule for an observation, which the watchdog's look
+/// shares): the process's `clock`, what the `scheduler` says of its threads, and, when that answer is a block, the clock
+/// again. A process that ran between the first read and the answer has moved, whatever the answer says, and the look
+/// takes the second read; with no rise, the answer stands for the window, since a thread leaves the run queue for a
+/// block only by running, which the clock would show. With the first read alone, a start blocked in a call for most of a
+/// window whose call returned just then ran and blocked again before the scheduler looked, and was judged stuck, the
+/// window still and never runnable; the anchor kills a start on that verdict. A runnable answer is starved, not stuck,
+/// whatever the clock, so it needs no second read.
+fn judge_start_by(
+  watch: &mut ShardWatch,
+  (now, memory): (u64, Option<slates_machine::memory_stall::StallReading>),
+  mut clock: impl FnMut() -> Option<(u64, u64)>,
+  scheduler: impl FnOnce() -> Option<slates_rt::RunReading>,
+) -> Verdict {
+  let first = clock();
+  let run = scheduler();
+  let blocked = run.is_some_and(|run| run.state == slates_rt::RunState::Blocked);
+  let cpu = match (first, blocked.then(&mut clock).flatten()) {
+    (Some((_, before)), Some(again)) if again.1 > before => Some(again),
+    (None, again @ Some(_)) => again,
+    _ => first,
+  };
   let look = Look {
     steps: 0,
     parked: false,
@@ -829,6 +857,57 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
 #[cfg(test)]
 mod lapse_tests {
   use super::*;
+
+  /// g243's sibling (`docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`), A-228's start rule.
+  /// Do: judge a start blocked in a call, its clock still and never runnable, look by look for most of a window; at the
+  /// look that ends the window, script its reads in the order the rule takes them: the clock still, the scheduler
+  /// finding it blocked, and the clock read again after that answer, risen (the call returned and the start ran between
+  /// the first read and the answer). Expect: alive. With the first read alone the start was stuck, still for the window
+  /// and never runnable, and the anchor kills a stuck start. A second read that shows no rise stands with the answer:
+  /// stuck, as before.
+  #[test]
+  fn a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved() {
+    let blocked = || {
+      Some(slates_rt::RunReading {
+        state: slates_rt::RunState::Blocked,
+        waited_ns: None,
+        uninterruptible: None,
+      })
+    };
+    let looks = LIVENESS_BUDGET_NS / HEARTBEAT_NS;
+    let watched = |watch: &mut ShardWatch| {
+      for look in 1..=looks {
+        let verdict = judge_start_by(
+          watch,
+          (look * HEARTBEAT_NS, None),
+          || Some((10, 10)),
+          blocked,
+        );
+        assert_eq!(
+          verdict,
+          Verdict::Alive,
+          "look {look}: still for less than a window"
+        );
+      }
+    };
+    let ends = (looks + 1) * HEARTBEAT_NS;
+    let mut moved = ShardWatch::default();
+    watched(&mut moved);
+    let mut reads = [Some((10, 10)), Some((12, 12))].into_iter();
+    let verdict = judge_start_by(&mut moved, (ends, None), || reads.next().flatten(), blocked);
+    assert_eq!(
+      verdict,
+      Verdict::Alive,
+      "it ran between its clock and the answer"
+    );
+    let mut still = ShardWatch::default();
+    watched(&mut still);
+    let verdict = judge_start_by(&mut still, (ends, None), || Some((10, 10)), blocked);
+    assert!(
+      matches!(verdict, Verdict::Wedged { .. }),
+      "still at both reads and blocked: stuck a window after it last moved, {verdict:?}"
+    );
+  }
 
   /// A-232, §4.14. Do: judge a lapsed beat with the watchdog still looking, and with it silent while the daemon's process
   /// is alive, starved, wedged (no CPU, never runnable: frozen) or spinning (a window of CPU on one thread). Expect: a
