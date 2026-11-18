@@ -913,6 +913,13 @@
 >   an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read typed
 >   from its entries;
 > - owed: a typed field on the wire for a merge's versions (the work's base beside the head);
+> - **a busy mount on macOS (g076a's report), closed 2026-11-18 (`CONTRACT` = 36):** `mount::unmount_lazy` was Linux's
+>   alone, refused `Unsupported` on macOS, so a host whose ended agent left a process holding a file on its `hard`
+>   loopback mount had no library route off it. `mount::unmount_busy` now lets go on every Unix host and answers how
+>   (`LetGo::Detached` on Linux, `fusermount3 -u -z`; `LetGo::Forced` on macOS and the BSDs, `umount -f`). Unit test:
+>   a busy unmount of a path where nothing is mounted is refused with the program's status, on each OS. By use, with a
+>   kernel mount: `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, run with `SLATES_TEST_MOUNT=1`,
+>   filed for main's run);
 > - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
 >   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
 >   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the

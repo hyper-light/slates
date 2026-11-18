@@ -8358,8 +8358,9 @@ command and every host start, mount and grant through one implementation.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
-  without a daemon whether the machine can mount and what is missing, and `mount::unmount_lazy` lets
-  go of a mount a leftover process still holds, Linux) or as a descriptor a VMM takes (the Shards
+  without a daemon whether the machine can mount and what is missing, and `mount::unmount_busy` lets
+  go of a mount a leftover process still holds, detached on Linux and forced on macOS and the BSDs) or as a descriptor a
+  VMM takes (the Shards
   stream, A-161; the vhost-user socket); landing and merging under the caller's write mode, and
   approving exactly the manifest shown (the consumer contract below, A-299, which replaced A-278's
   `land_approved`); observation (daemon status, audit, grants, telemetry). `Instance::client` lends
@@ -8379,7 +8380,8 @@ command and every host start, mount and grant through one implementation.
 > executable through `role::main`, with `Instance::start`, `StartSpec::anchor_command`,
 > `Instance::wait_for` and `Anchor::stop`; and (A-287, g266) a landing plan's per-path entries,
 > paged, `Instance::landing_entries(&plan)`; and (piece 3) `mount::available` and
-> `mount::unmount_lazy`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
+> `mount::unmount_lazy` (since `CONTRACT` = 36 `mount::unmount_busy`, every Unix host). The CLI's `anchor`, `daemon`,
+> `mount`, `unmount`,
 > `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call it. Proven by use over an
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
@@ -8674,6 +8676,11 @@ it builds against the contract and adds to it rather than around it.
 > terminal state in the same atom (§4.15's status of the same day). A landing under a grant the daemon does not hold is
 > presented once planned; refused before its plan, it is a refused request with no trail. Under 30 it wrote an end that
 > named no manifest.
+> **`CONTRACT` = 36 (g076a's report):** a busy mount is let go of on every Unix host. `mount::unmount_busy(path)`
+> detaches it on Linux (`fusermount3 -u -z`, its users reading on until they close) and forces it on macOS and the BSDs
+> (`umount -f`, their next calls failing), and answers which (`LetGo`). Linux's `unmount_lazy` was refused `Unsupported`
+> elsewhere, so a macOS host had no library route off a busy, `hard` loopback mount; it and `MountMissing::LazyUnmount`
+> are gone.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,

@@ -175,8 +175,11 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   Windows unmount could not ask for its mounts), `serve_shards(volume, intent, subtree)` (a stream end to
   hand `shards run --slates-fs-fd N`), `serve_vhost_user(..)` (Linux), `detach(attachment)`.
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
-  and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_lazy(path)`
-  lets go of a mount that a leftover process still uses (Linux, `fusermount3 -u -z`).
+  and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_busy(path)`
+  lets go of a mount that a leftover process still uses, with no daemon and no privilege, and answers how
+  (`LetGo`): `Detached` on Linux (`fusermount3 -u -z`: the holder reads on until it closes), `Forced` on macOS and
+  the BSDs (`umount -f`: the holder's next call fails; the loopback NFS mount is `hard`, so this is the way off it
+  once its daemon has gone).
 - Landing: `land(&request, signature)` under the caller's mode; `plan_landing(&request)` presents
   without writing, for a reviewer, and states what a signer signs; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at

@@ -1270,8 +1270,6 @@ pub enum MountMissing {
   SharedMount,
   /// A subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive.
   WindowsSubtreeOrShared,
-  /// A lazy unmount is Linux's (`fusermount3 -u -z`); elsewhere unmount the path once its users have closed it.
-  LazyUnmount,
 }
 
 impl fmt::Display for MountMissing {
@@ -1299,9 +1297,6 @@ impl fmt::Display for MountMissing {
       }
       Self::WindowsSubtreeOrShared => {
         "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive letter"
-      }
-      Self::LazyUnmount => {
-        "a lazy unmount is Linux's (`fusermount3 -u -z`); here unmount the path once its users have closed it"
       }
     })
   }
