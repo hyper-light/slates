@@ -179,7 +179,7 @@ mod platform {
 /// `CreateEventW` the same `Local\`-prefixed name, so each holds a handle to the one Event with no
 /// handle passing.
 #[cfg(windows)]
-pub use win_event::Event;
+pub use win_event::{Event, EventOrExit};
 
 #[cfg(windows)]
 mod win_event {
@@ -221,6 +221,17 @@ mod win_event {
       call,
       code: std::io::Error::last_os_error().raw_os_error(),
     }
+  }
+
+  /// What ended a wait on the Event beside a process ([`Event::wait_or_exit`]).
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub enum EventOrExit {
+    /// The Event was signaled; the wait took its signal.
+    Signaled,
+    /// The process had exited, the Event unsignaled.
+    Exited,
+    /// The timeout passed with neither.
+    TimedOut,
   }
 
   impl Event {
@@ -269,26 +280,34 @@ mod win_event {
       Ok(())
     }
 
-    /// Waits until the Event is signaled or the process `process` exits, the first of either, with no timeout; both are
-    /// kernel objects one wait takes (`WaitForMultipleObjects`, any of them): a claim waits for its answer beside its
-    /// daemon's exit (A-447), and a reply beside its daemon's (A-456). `Ok(true)` when the Event was signaled (the wait
-    /// took its signal, as an auto-reset Event's wait does); `Ok(false)` when the process had exited and the Event was
-    /// not signaled. With both, the Event is answered first: the wait reports the lowest-numbered object signaled
-    /// [B: Microsoft Learn, "WaitForMultipleObjects"], and the Event is first in the array.
+    /// Waits until the Event is signaled or the process `process` exits, the first of either, or until `timeout_ns`
+    /// passes (`None`: no timeout); both objects are kernel objects one wait takes (`WaitForMultipleObjects`, any of
+    /// them): a claim waits for its answer beside its daemon's exit (A-447), and a reply beside its daemon's (A-456),
+    /// whose wait also ends at its next look at the daemon's start stamp. With the Event and the exit both there, the
+    /// Event is answered first: the wait reports the lowest-numbered object signaled [B: Microsoft Learn,
+    /// "WaitForMultipleObjects"], and the Event is first in the array; the wait takes its signal, as an auto-reset Event's
+    /// wait does.
     pub fn wait_or_exit(
       &self,
       process: std::os::windows::io::BorrowedHandle<'_>,
-    ) -> Result<bool, IpcError> {
+      timeout_ns: Option<u64>,
+    ) -> Result<EventOrExit, IpcError> {
       use std::os::windows::io::AsRawHandle;
       let objects: [HANDLE; 2] = [self.handle(), process.as_raw_handle()];
       let count = u32::try_from(objects.len()).unwrap_or(u32::MAX);
+      let ms = timeout_ns.map_or(INFINITE, |ns| {
+        u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
+      });
       // SAFETY: both handles are live for the call (the Event this struct owns, the process handle the caller borrows),
       // the array outlives the call and `count` is its length.
-      let rc = unsafe { WaitForMultipleObjects(count, objects.as_ptr(), 0, INFINITE) };
+      let rc = unsafe { WaitForMultipleObjects(count, objects.as_ptr(), 0, ms) };
+      if rc == WAIT_TIMEOUT {
+        return Ok(EventOrExit::TimedOut);
+      }
       // `WAIT_OBJECT_0` plus the index of the object that ended the wait; `WAIT_FAILED` and anything else is a refusal.
       match rc.checked_sub(WAIT_OBJECT_0) {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
+        Some(0) => Ok(EventOrExit::Signaled),
+        Some(1) => Ok(EventOrExit::Exited),
         _ => Err(os("WaitForMultipleObjects")),
       }
     }
