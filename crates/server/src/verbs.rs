@@ -5955,20 +5955,31 @@ fn open_base(
 /// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
 /// object the write boundary keeps equal to the head, never the shared content a snapshot freezes (A-168, A-195).
 fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
+  match take_snapshot(state, principal, volume) {
+    Ok((id, coverage)) => ReplyBody::Snapshotted { id, coverage },
+    Err(refusal) => *refusal,
+  }
+}
+
+/// Takes the snapshot [`snapshot`] answers with, for `principal`, who must be allowed to write `volume`: its id and its
+/// coverage, or the refusal the verb answers. A Shards stream's SAVE takes one at its cut the same way (A-303), for
+/// the stream's own principal, so a save can do nothing its principal could not ask itself.
+pub(crate) fn take_snapshot(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Result<(SnapshotId, slates_ipc::protocol::SnapshotCoverage), Box<ReplyBody>> {
   use crate::merge_service::{StoreVerb, find_store_backed};
-  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Snapshot) {
-    Ok(x) => x,
-    Err(r) => return *r,
-  };
+  let (handle, record) = find_store_backed(state, volume, StoreVerb::Snapshot)?;
   if !rights_of(&record, principal).write {
-    return forbidden("snapshot");
+    return Err(Box::new(forbidden("snapshot")));
   }
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
   // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).
   let Some(next_epoch) = record.epoch.checked_add(1) else {
-    return refused(Refusal::Unsupported {
+    return Err(Box::new(refused(Refusal::Unsupported {
       feature: VOLUME_EPOCH_EXHAUSTED.to_owned(),
-    });
+    })));
   };
   // The barrier (§4.6 "Writeback and snapshot barrier"; GAP-A9-4): every live attachment of the
   // volume in the shard's registry has its generation closed before the root is frozen, so every
@@ -5981,20 +5992,20 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
       attachment,
       generation,
     }) => {
-      return refused(Refusal::BarrierIncomplete {
+      return Err(Box::new(refused(Refusal::BarrierIncomplete {
         attachment: catalog_attachment_of(state, attachment),
         generation,
-      });
+      })));
     }
-    Err(e) => return refused(refusal_of_vfs(&e)),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
   };
   let taken = match state.volumes.get_mut(handle) {
     Ok(slot) => slot.volume.snapshot(&mut state.store),
-    Err(_) => return refused(Refusal::NotFound),
+    Err(_) => return Err(Box::new(refused(Refusal::NotFound))),
   };
   let id = match taken {
     Ok(id) => wire_snapshot(id),
-    Err(e) => return refused(refusal_of_vfs(&e)),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
   };
   let now = state.clock.monotonic_ns();
   let ops = [
@@ -6016,10 +6027,10 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   ];
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
-      return refused(refusal_of_db(&e));
+      return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  ReplyBody::Snapshotted { id, coverage }
+  Ok((id, coverage))
 }
 
 /// What a closed barrier lets the snapshot claim (§4.6): the attachments closed, and the narrowest
@@ -6859,6 +6870,16 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     Ok((record, _)) => record.id,
     Err(refusal) => return refused(refusal),
   };
+  // A guest's own attribute namespaces (`trusted.`, `security.`) are its kernel's to set (A-290): a guest's kernel
+  // acts on them (a binary's capability, an overlay's opaque directory), and inside the guest only its privileged
+  // processes may set them. A declaration is a host's channel, so it sets and removes none, as no host's mount does.
+  if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = &op
+    && slates_bridge_core::guest_only(name.as_bytes())
+  {
+    return refused(Refusal::Unsupported {
+      feature: format!("a guest's own attribute ({name}) from a host's channel"),
+    });
+  }
   let Some(w) = state.works.get(&work_id) else {
     return refused(Refusal::NotFound);
   };
