@@ -8713,6 +8713,8 @@ mod tests {
     crate::head::SealJob {
       snapshot: DbSnapshotId::default(),
       sequence: 1,
+      // A seal, not a heal: its content is put at its own sequence and no head is republished (A-276).
+      put_sequence: 1,
       archiver: None,
       archive: Some(slates_archive::Archive {
         base_page_size: 4096,
@@ -8737,6 +8739,7 @@ mod tests {
       rounds: 0,
       first_round_at_ns: Some(first_round_at_ns),
       healing: false,
+      republish: false,
       records_acked: Vec::new(),
       shipment: None,
     }
