@@ -2572,3 +2572,5 @@ slates-server: shard 1 initialized in 3173 µs, 0 µs of its CPU, in 5 slices of
 slates-winfsp: reply spin window = 8500 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates daemon: the control shard's beat task ran 609 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 1 timers, waited 1 times, spawned 0 tasks and finished 0; 7 tasks live; its longest poll is 23 ms and its timer overrun 509 ms
 ## run 10 of 10 done, 2026-11-18T14:09:07Z
+To https://github.com/hyper-light/slates
+   b72798c..a35ba54  a35ba54487f70a6feb225b8d7da8d0e84acedfb7 -> diag-results/g258-44293352092-median-arm
