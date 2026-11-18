@@ -84,6 +84,16 @@ no longer gets is a guaranteed inode count up to its maximum: past the unpromise
 `crates/server/tests/dynamic_versions.rs`, both tests red before and green after; the capped-slab scenarios;
 `VersionBudget`'s unit test `a_dynamic_hold_grows_into_unpromised_slots_only_and_returns_whole`.
 
+Through the consumer contract too, with kiln's own flow: `crates/api/tests/api.rs` (g262). The tests start a daemon
+on kiln's two shards and use kiln's `VolumeSpec::overlay(.., RAM/4)`.
+- `an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot`: the review's head reads of
+  `.gitignore` (looked up before the snapshot) and of a base file first looked up after it.
+- `kilns_workspaces_are_provisioned_side_by_side`: three workspaces through one instance.
+
+Before the fix (d1323898, r1637), the read answered `Exhausted(Quota)` and the third workspace `Exhausted(Memory {
+available: 0 })`, with `committed_versions` 7456539 of 7456540 after one workspace. On the fix's branch (r1700) both
+passed, each workspace committing one slot.
+
 ## Siblings
 
 - The 2026-11-05 recovery refusal: a dynamic volume no longer holds the whole slab, so rebuilding its snapshot's
