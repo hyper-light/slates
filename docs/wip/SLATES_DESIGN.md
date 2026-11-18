@@ -7912,6 +7912,13 @@ it builds against the contract and adds to it rather than around it.
 > DatabaseRefusal }`, appended). `refusal_of_db` is exhaustive: its catch-all sent a corrupt record, a regressed
 > NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding as `BadRequest` words. The
 > contract classes each `Unusable::Database`, a fault on the daemon's side to report.
+> **`CONTRACT` = 18:** a snapshot's retention refused is typed apart from the quota. The volume core answers
+> `VfsError::RetentionExceeded` (§4.2's `RetentionBudgetExceeded`; `ENOSPC` at every mount, as before) where it
+> answered `NoSpace`. The sites are a retained version's charge or allowance, a retained byte charge, a rename's
+> retention preflight, the recovery's re-charge, and the retention half of a verb's admission. The wire appends
+> `VolumeRefusal::RetentionExceeded`, and the contract classes it `Exhausted::Volume`. kiln's review had read the
+> shard's slab as its own quota (A-342's record). Proof: `a_snapshots_retention_refused_is_not_the_quota`
+> (`crates/api/tests/api.rs`, a daemon whose slab is capped small).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,

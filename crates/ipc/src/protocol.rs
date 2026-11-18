@@ -3675,6 +3675,10 @@ pub enum VolumeRefusal {
     /// The version this build reads.
     expected: u16,
   },
+  /// What a snapshot pins could not be kept (§4.2 `RetentionBudgetExceeded`): no unpromised capacity is left for a
+  /// retained version or bytes, or the volume is at its retention allowance. Not the volume's quota: destroying a
+  /// snapshot frees it. Appended (2026-11-18; until then it reached a client as `NoSpace`).
+  RetentionExceeded,
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.

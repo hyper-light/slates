@@ -489,7 +489,8 @@
 >   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
 >   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
 >   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
+>   database's memory refusal does. a snapshot's retention refused is typed apart from the quota (`VolumeRefusal::RetentionExceeded`, `CONTRACT` = 18,
+>   where it was `NoSpace`, read as the quota); `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
 >   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as words, is gone: each is `Refusal::Database {
 >   DatabaseRefusal }`, appended, which the contract classes `Unusable::Database` (`CONTRACT` = 17);) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's

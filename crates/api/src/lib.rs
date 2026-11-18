@@ -147,10 +147,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
 /// day). 17: the daemon's database refusals typed (`DatabaseRefusal`, unusable as `Unusable::Database`): until then a
 /// corrupt record, a regressed NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding
-/// reached a consumer as an invalid request carrying words (A-299; the same day).
+/// reached a consumer as an invalid request carrying words (A-299; the same day). 18: a snapshot's retention refused is
+/// typed apart from the quota (`VolumeRefusal::RetentionExceeded`, exhausted as `Exhausted::Volume`): until then the
+/// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
+/// day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 17;
+pub const CONTRACT: u32 = 18;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
