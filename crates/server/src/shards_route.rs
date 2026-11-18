@@ -2,24 +2,32 @@
 //! `slates_ipc::route`'s; this module keeps the offers, listens, and runs the exchanges.
 //!
 //! **Offers.** An attach in the Shards form on macOS keeps its stream end as an offer on the volume's owner shard, with
-//! the device's end of the stream's resync channel beside it when one was made (A-339), a fresh 256-bit secret and an
-//! expiry, and replies `ShardsOffered` with the secret (`crate::shards::attach_verb`). A
+//! the device's end of the stream's resync channel beside it when one was made (A-339) and a fresh 256-bit secret, for
+//! the client that asked for it, and replies `ShardsOffered` with the secret (`crate::shards::attach_verb`). A
 //! direct map keeps the read-only descriptor of its copy as an offer the same way and replies `MapOffered`
 //! (`crate::direct_map`). Each kind has its own table, so a mapping and an attachment never meet under one id, and a
 //! claim names its kind (a version-2 hello). Both ids carry their owner partition in their high 16 bits, which is how
 //! an exchange finds the shard that holds the offer.
 //! The offer is claimed once: an exchange asks the owner shard to check the claim's proof and hand over the end and its
-//! resync end ([`take`]), so the secret never leaves the shard that made it. An offer unclaimed at its expiry is dropped
-//! by its timer, which closes the ends: the stream then sees its peer gone and ends its attachment, as every stream
-//! does.
+//! resync end ([`take`]), so the secret never leaves the shard that made it.
+//!
+//! **An offer waits for its claim while the client it is for lives (A-492).** It goes when it is claimed, when what it
+//! offers ends first (a stream's attachment, a map's copy let go: [`withdraw`]), or when the reaper retires its client on
+//! every shard ([`let_go_of_client`], `crate::reap`), which closes the ends: a stream then sees its peer gone and ends its
+//! attachment, as every stream does. Until A-492 an offer lived two liveness budgets on a timer, so a live client slower
+//! than that to claim (a loaded machine) found no offer, while a client that died before its claim held nothing a timer
+//! did not.
 //!
 //! **The listener and its exchanges.** The listener is bound when the daemon starts and served by one task on the
 //! control shard, which accepts each connection without blocking and runs one exchange task for it there. Exchanges
 //! are bounded by the shard's client seats (`clients_per_shard`): past them a connection is refused `Busy`. The client's
-//! part of each runs within one liveness budget, after which a silent client is dropped, so a stranger that connects and
-//! says nothing holds a seat for at most that long; the owner shard's take is waited for in that shard's own time
-//! (A-440). Every refusal is counted by its kind, and every claim by its success, which is
-//! the route's non-vacuity counter.
+//! part of each, and the wait for its close once it has the ends, last while its peer's connection lives (A-492): a
+//! peer that dies or closes ends the exchange at once, by its end of the connection, and a peer alive and slow, however
+//! slow, is served, as a client's claim waits while its daemon lives (A-186, A-443). The socket is the user's alone
+//! (`slates_ipc::route`: owner-only, in the user's own temporary directory), so a peer that holds a seat open is one of
+//! the user's own processes, holding its own seat until it closes it or exits. The owner shard's take is waited for in
+//! that shard's own time (A-440). Every refusal is counted by its kind, and every claim by its success, which is the
+//! route's non-vacuity counter.
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -30,16 +38,8 @@ use slates_ipc::route::{
   SECRET_BYTES,
 };
 use slates_rt::futures;
-use slates_vfs::clock::Clock;
 
 use crate::state::{self, ShardState};
-
-/// Derived: how long an offer waits for its claim: the client's reply deadline for the attach's reply to reach it (one
-/// liveness budget, `slates_client::Deadlines::derive`), and one more for the claim's own exchange.
-pub(crate) const OFFER_LIFE_NS: u64 = 2 * crate::daemon::LIVENESS_BUDGET_NS;
-/// Derived: how long one exchange may take: one liveness budget, after which a silent client is as gone as one its
-/// daemon would presume dead.
-const EXCHANGE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 
 /// Format: the refusal-ledger name of a claimed offer: the end handed over (the route's non-vacuity counter).
 const CLAIMED: &str = "shards.route_claimed";
@@ -51,19 +51,19 @@ const PROOF: &str = "shards.route_proof";
 const MALFORMED: &str = "shards.route_malformed";
 /// Format: the refusal-ledger name of a connection refused at the bound of exchanges.
 const BUSY: &str = "shards.route_busy";
-/// Format: the refusal-ledger name of an exchange that outlived its liveness budget.
-const TIMED_OUT: &str = "shards.route_timed_out";
 /// Format: the refusal-ledger name of an exchange the daemon could not carry through (a socket error, no random
 /// nonce, the owner shard unreachable).
 const FAILED: &str = "shards.route_failed";
-/// Format: the refusal-ledger name of an offer dropped unclaimed at its expiry.
-const EXPIRED: &str = "shards.route_expired";
+/// Format: the refusal-ledger name of an offer let go unclaimed because the reaper retired the client it was for
+/// ([`let_go_of_client`], A-492): the non-vacuity counter of an offer's life ending with its client's.
+const CLIENT_RETIRED: &str = "shards.route_client_retired";
 
-/// A descriptor offered on the route, a stream end or a map's copy: claimable once, with `secret`, until `expires_ns`;
-/// a stream's with the device's end of its resync channel beside it, when one was made (A-339).
+/// A descriptor offered on the route, a stream end or a map's copy: claimable once, with `secret`, while `client` (the
+/// client that asked for it, who alone has the secret) lives; a stream's with the device's end of its resync channel
+/// beside it, when one was made (A-339).
 pub(crate) struct Offer {
   secret: [u8; SECRET_BYTES],
-  expires_ns: u64,
+  client: u32,
   descriptor: OwnedFd,
   resync: Option<OwnedFd>,
 }
@@ -88,61 +88,54 @@ fn offers_of(s: &mut ShardState, kind: OfferKind) -> &mut Offers {
 }
 
 /// Keeps `descriptor`, with `resync` beside it for a stream whose resync channel was made (A-339), as the `kind` offer
-/// `id`, claimable with `secret` until its life ends, and arms the timer that drops it then. `false` when the timer
-/// could not be armed: the offer is dropped at once, closing its descriptors (a stream then ends its attachment rather
-/// than wait forever for a claim; a map's client reads by copy).
+/// `id` for `client`, claimable with `secret` until it is claimed, withdrawn ([`withdraw`]) or let go with its client
+/// ([`let_go_of_client`]): no clock ends it (A-492).
 pub(crate) fn offer(
   s: &mut ShardState,
   (kind, id): (OfferKind, u64),
+  client: u32,
   secret: [u8; SECRET_BYTES],
   (descriptor, resync): (OwnedFd, Option<OwnedFd>),
-) -> bool {
-  let expires_ns = s.clock.monotonic_ns().saturating_add(OFFER_LIFE_NS);
+) {
   offers_of(s, kind).insert(
     id,
     Offer {
       secret,
-      expires_ns,
+      client,
       descriptor,
       resync,
     },
   );
-  if futures::spawn(expire_later(kind, id, expires_ns))
-    .and_then(futures::detach)
-    .is_err()
-  {
-    offers_of(s, kind).remove(&id);
-    return false;
-  }
-  true
 }
 
-/// Withdraws the `kind` offer `id` if it is still unclaimed, its descriptor closed now rather than at its expiry: what a
-/// map's copy let go before its claim does, so no offer keeps an object alive past its copy. Whether there was one.
+/// Withdraws the `kind` offer `id` if it is still unclaimed, its descriptor closed now: what an attachment that ended
+/// and a map's copy let go before their claim do, so no offer keeps an object alive past what it offers. Whether there
+/// was one.
 pub(crate) fn withdraw(s: &mut ShardState, (kind, id): (OfferKind, u64)) -> bool {
   offers_of(s, kind).remove(&id).is_some()
 }
 
-/// Drops the `kind` offer `id` at its expiry if it is still the one made then. A refused sleep drops it now: an offer
-/// is never kept past its life for want of a timer.
-async fn expire_later(kind: OfferKind, id: u64, expires_ns: u64) {
-  // Either the sleep ran its course or the runtime refused it; the offer goes now in both.
-  let _slept = futures::sleep(OFFER_LIFE_NS).await;
-  let _ = state::with_state_counted(|s| {
+/// Lets go of every offer this shard keeps for `client`, unclaimed, its descriptors closed (A-492): the reaper retires a
+/// dead client on every shard (`crate::reap`), and no one else holds the secret an offer is claimed with, so its claim
+/// will never come. A stream's offer held the end the stream's other side waits on, so the stream then sees its peer
+/// gone and ends its attachment, as every stream does. Each let go is counted (`shards.route_client_retired`); how many.
+pub(crate) fn let_go_of_client(s: &mut ShardState, client: u32) -> usize {
+  let mut let_go = 0usize;
+  for kind in [OfferKind::Stream, OfferKind::Map] {
     let offers = offers_of(s, kind);
-    if offers
-      .get(&id)
-      .is_some_and(|offer| offer.expires_ns == expires_ns)
-    {
-      offers.remove(&id);
-      s.count(EXPIRED, 1);
-    }
-  });
+    let before = offers.len();
+    offers.retain(|_, offer| offer.client != client);
+    let_go = let_go.saturating_add(before.saturating_sub(offers.len()));
+  }
+  if let_go > 0 {
+    s.count(CLIENT_RETIRED, u64::try_from(let_go).unwrap_or(u64::MAX));
+  }
+  let_go
 }
 
 /// Hands over the descriptors of the offer `hello` names to the claim whose `proof` opens under the offer's secret with
 /// these nonces, retiring the offer, with the daemon's confirmation to send beside them; or the refusal: no offer (none
-/// made, claimed, or expired, the expired one dropped here), a proof that does not hold. Run on the shard that holds the
+/// made, claimed, withdrawn, or let go with its client), a proof that does not hold. Run on the shard that holds the
 /// offer, where its secret is.
 pub(crate) fn take(
   s: &mut ShardState,
@@ -150,15 +143,10 @@ pub(crate) fn take(
   daemon_nonce: [u8; NONCE_BYTES],
   proof: [u8; SEALED_BYTES],
 ) -> Result<([u8; SEALED_BYTES], Taken), RouteRefusal> {
-  let now = s.clock.monotonic_ns();
   let offers = offers_of(s, hello.kind);
   let Some(offer) = offers.get(&hello.id) else {
     return Err(RouteRefusal::NoOffer);
   };
-  if offer.expires_ns <= now {
-    offers.remove(&hello.id);
-    return Err(RouteRefusal::NoOffer);
-  }
   let exchange = Exchange::new(
     &offer.secret,
     (hello.kind, hello.id),
@@ -239,9 +227,15 @@ enum Ended {
   Failed,
 }
 
-/// One exchange on `connection`: the client's part (its hello and its proof) within one liveness budget, the owner
-/// shard's take in that shard's own time ([`take_from_owner`], A-440), and the confirmation sent with the ends; a
+/// One exchange on `connection`: the client's part (its hello and its proof) while its peer's connection lives, the
+/// owner shard's take in that shard's own time ([`take_from_owner`], A-440), and the confirmation sent with the ends; a
 /// refusal is sent as its kind byte, and every ending is counted; the connection closes when the task ends.
+///
+/// **Each wait on the client lasts while its peer's connection does (A-492).** A peer that dies has its end closed by
+/// its kernel, which a read answers at once as the end of the stream; one that closes does the same; so neither needs a
+/// clock to be noticed, and a peer alive and slow is served however slow it is. Until A-492 each wait was one liveness
+/// budget on the wall, so a live client slower than that, a loaded machine's, was dropped mid-claim (`TimedOut`) and its
+/// offer, already retired by nothing, stayed for a claim it no longer made.
 ///
 /// **A sent end is kept until the client has its own.** XNU flushes a Unix socket whose every reference is inside a
 /// message in flight when its collector of such descriptors runs (`unp_gc`): the socket's receive buffer is emptied and
@@ -251,31 +245,27 @@ enum Ended {
 /// load 35-47, and in up to 40 of 48 with another thread opening and closing sockets
 /// (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`).
 async fn exchange(connection: OwnedFd) {
-  // A silent client is held to one liveness budget; the owner shard's take is not the client's silence, and is waited
-  // for apart from it.
-  let ended = match futures::within(EXCHANGE_NS, claim(connection.as_fd())).await {
-    Ok(Some(Ok(claim))) => match hand_over(connection.as_fd(), claim).await {
+  let ended = match claim(connection.as_fd()).await {
+    Ok(claim) => match hand_over(connection.as_fd(), claim).await {
       Ok(sent) => {
-        // The client's close, or its deadline, ends the wait; the end is closed only after it.
-        let _closed = futures::within(EXCHANGE_NS, client_closes(connection.as_fd())).await;
+        // The client's close, or its process's end, says its receive has returned; the ends are closed only after it.
+        client_closes(connection.as_fd()).await;
         drop(sent);
         None
       }
-      Err(ended) => Some(Ok(ended)),
+      Err(ended) => Some(ended),
     },
-    Ok(Some(Err(ended))) => Some(Ok(ended)),
-    Ok(None) | Err(_) => Some(Err(())),
+    Err(ended) => Some(ended),
   };
-  if let Some(Ok(Ended::Refused(refusal))) = &ended {
+  if let Some(Ended::Refused(refusal)) = &ended {
     refuse(connection.as_fd(), *refusal);
   }
   let _ = state::with_state_counted(|s| {
     s.route_exchanges = s.route_exchanges.saturating_sub(1);
     let kind = match ended {
       None => CLAIMED,
-      Some(Ok(Ended::Refused(refusal))) => refusal_name(refusal),
-      Some(Ok(Ended::Failed)) => FAILED,
-      Some(Err(())) => TIMED_OUT,
+      Some(Ended::Refused(refusal)) => refusal_name(refusal),
+      Some(Ended::Failed) => FAILED,
     };
     s.count(kind, 1);
   });
@@ -375,11 +365,12 @@ async fn hand_over(connection: BorrowedFd<'_>, claim: Claim) -> Result<Taken, En
   Ok(taken)
 }
 
-/// The owner shard's verdict on a claim ([`take`]), waited for in that shard's own time (A-440; R3's class A): a window of
-/// the exchange's budget, then on while the shard works or waits for a CPU, up to that budget of its CPU. The take
-/// retires the offer and hands its ends over, once: it was waited one window on the wall, so a busy owner shard took
-/// the offer after the exchange had given up, the ends were dropped with the late answer, and the client, its claim
-/// failed, found no offer to claim again. Only a shard that stopped, or ran its budget without answering, fails it.
+/// The owner shard's verdict on a claim ([`take`]), waited for in that shard's own time (A-440; R3's class A): judged by
+/// the shard's progress over the liveness window, as every cross-shard wait in its target's own time is
+/// (`crate::xshard::within_shard_time`, A-65's rule), never by a wait of the exchange's own (A-492). The take retires
+/// the offer and hands its ends over, once: it was waited one window on the wall, so a busy owner shard took the offer
+/// after the exchange had given up, the ends were dropped with the late answer, and the client, its claim failed, found
+/// no offer to claim again. Only a shard that stopped, or ran its budget without answering, fails it.
 async fn take_from_owner(
   origin: u16,
   owner: u16,
@@ -391,7 +382,7 @@ async fn take_from_owner(
     origin,
     owner,
     move |s| take(s, hello, daemon_nonce, proof),
-    EXCHANGE_NS,
+    crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await;
   match taken {
@@ -453,11 +444,31 @@ fn refuse(connection: BorrowedFd<'_>, refusal: RouteRefusal) {
 mod tests {
   use super::*;
 
-  /// Shape: the owner shard's one busy poll: an exchange's budget and a half of wall time, past the old wall window and
-  /// inside the offer's life (two budgets), so the offer is still there when the take runs.
-  const BUSY_NS: u64 = EXCHANGE_NS + EXCHANGE_NS / 2;
-  /// Shape: how long the test thread waits for the take's answer: four busy polls.
+  /// Shape: the window the owner shard's take is judged by ([`take_from_owner`]): the liveness window every wait in its
+  /// target's own time starts from.
+  const TAKE_WINDOW_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: the owner shard's one busy poll in the take test: a window and a half of wall time, past what a wall wait of
+  /// one window allows.
+  const BUSY_NS: u64 = TAKE_WINDOW_NS + TAKE_WINDOW_NS / 2;
+  /// Shape: how long the test thread waits for an answer from the daemon's tasks: four busy polls.
   const ANSWER_WAIT_NS: u64 = 4 * BUSY_NS;
+  /// Shape: the fixed life an offer had until A-492, two liveness budgets: the life test takes the offer past it.
+  const OLD_OFFER_LIFE_NS: u64 = 2 * crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: when the life test takes the offer: past the old life by half a liveness budget, the old timer's own wake on a
+  /// loaded machine.
+  const PAST_THE_OLD_LIFE_NS: u64 = OLD_OFFER_LIFE_NS + crate::daemon::LIVENESS_BUDGET_NS / 2;
+  /// Shape: the fixed bound an exchange's client part had until A-492, one liveness budget.
+  const OLD_EXCHANGE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: how long the slow client waits before its hello: past the old bound by half a liveness budget.
+  const SLOWER_THAN_THE_OLD_BOUND_NS: u64 = OLD_EXCHANGE_NS + crate::daemon::LIVENESS_BUDGET_NS / 2;
+  /// Shape: the client the tests' offers are for.
+  const CLIENT: u32 = 7;
+  /// Shape: another client, whose offer the first one's retirement must leave alone.
+  const OTHER_CLIENT: u32 = 8;
+  /// Shape: offer ids on a one-shard daemon, partition 0 in their high 16 bits: one for each offer a test makes.
+  const FIRST_ID: u64 = 1;
+  /// Shape: see [`FIRST_ID`].
+  const SECOND_ID: u64 = 2;
   /// Shape: the offer's secret, a byte repeated: any value does, since the test makes the proof under it.
   const SECRET: [u8; SECRET_BYTES] = [7; SECRET_BYTES];
   /// Shape: the client's nonce, a byte repeated: any value does.
@@ -465,12 +476,46 @@ mod tests {
   /// Shape: the daemon's nonce, a byte repeated: any value does, since the test hands it to the take itself.
   const DAEMON_NONCE: [u8; NONCE_BYTES] = [2; NONCE_BYTES];
 
+  /// Keeps `descriptor` as the `key` offer for `client` under [`SECRET`], as an attach or a map does.
+  fn offered(s: &mut ShardState, key: (OfferKind, u64), client: u32, descriptor: OwnedFd) {
+    offer(s, key, client, SECRET, (descriptor, None));
+  }
+
+  /// The hello of a claim of the `kind` offer `id` with [`CLIENT_NONCE`].
+  fn hello_for(kind: OfferKind, id: u64) -> Hello {
+    Hello {
+      kind,
+      id,
+      client_nonce: CLIENT_NONCE,
+    }
+  }
+
+  /// The proof of a claim of the `kind` offer `id` under [`SECRET`] with [`CLIENT_NONCE`] and `daemon_nonce`.
+  fn proof_of(kind: OfferKind, id: u64, daemon_nonce: &[u8; NONCE_BYTES]) -> [u8; SEALED_BYTES] {
+    Exchange::new(&SECRET, (kind, id), &CLIENT_NONCE, daemon_nonce)
+      .unwrap()
+      .proof()
+      .unwrap()
+  }
+
+  /// Fills `buffer` from the blocking `end`: how many bytes came before the peer closed or the read timed out.
+  fn read_up_to(end: &OwnedFd, buffer: &mut [u8]) -> usize {
+    let mut filled = 0;
+    while filled < buffer.len() {
+      match rustix::net::recv(end, &mut buffer[filled..], rustix::net::RecvFlags::empty()) {
+        Ok((0, _)) | Err(_) => break,
+        Ok((read, _)) => filled += read,
+      }
+    }
+    filled
+  }
+
   /// R3's class A (A-440). Do: on a two-shard daemon, offer a map's descriptor on the second shard under a known secret,
-  /// hold that shard in one poll for an exchange's budget and a half of wall time on its CPU a fifth of it (a busy or
-  /// starved shard), and from the first shard take the offer with a proof made under the secret. Expect: the take
-  /// answered with the offer, after more than one budget of waiting, and the offer gone from its shard. The take waited
-  /// one budget on the wall, so the exchange failed with the owner alive and working, and the owner's late take retired
-  /// the offer and dropped its descriptor with the answer, leaving the client nothing to claim again.
+  /// hold that shard in one poll for a window and a half of wall time on its CPU a fifth of it (a busy or starved shard),
+  /// and from the first shard take the offer with a proof made under the secret. Expect: the take answered with the
+  /// offer, after more than one window of waiting, and the offer gone from its shard. The take waited one window on the
+  /// wall, so the exchange failed with the owner alive and working, and the owner's late take retired the offer and
+  /// dropped its descriptor with the answer, leaving the client nothing to claim again.
   #[test]
   fn a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget() {
     let daemon = crate::daemon::audit_daemon_of(2);
@@ -485,25 +530,18 @@ mod tests {
         .find(|(_, shard)| *shard != origin)
         .unwrap();
       // An offer's id carries its owner partition in its high 16 bits.
-      let id = (u64::try_from(partition).unwrap() << 48) | 1;
-      let hello = Hello {
-        kind: OfferKind::Map,
-        id,
-        client_nonce: CLIENT_NONCE,
-      };
-      let proof = Exchange::new(&SECRET, (OfferKind::Map, id), &CLIENT_NONCE, &DAEMON_NONCE)
-        .unwrap()
-        .proof()
-        .unwrap();
+      let id = (u64::try_from(partition).unwrap() << 48) | FIRST_ID;
+      let hello = hello_for(OfferKind::Map, id);
+      let proof = proof_of(OfferKind::Map, id, &DAEMON_NONCE);
       let task = futures::spawn(async move {
-        let offered = crate::xshard::call_in_shard_time(
+        let made = crate::xshard::call_in_shard_time(
           origin,
           owner,
           move |s| {
             let (descriptor, _peer) = slates_ipc::stream::pair().unwrap();
-            offer(s, (OfferKind::Map, id), SECRET, (descriptor, None))
+            offered(s, (OfferKind::Map, id), CLIENT, descriptor);
           },
-          EXCHANGE_NS,
+          TAKE_WINDOW_NS,
         )
         .await;
         // The busy poll goes first on the owner shard's channel, so the take waits behind it.
@@ -523,29 +561,194 @@ mod tests {
           origin,
           owner,
           move |s| s.map_offers.contains_key(&id),
-          EXCHANGE_NS,
+          TAKE_WINDOW_NS,
         )
         .await;
-        let _ = sent.send((offered, taken, waited, left));
+        let _ = sent.send((made.is_some(), taken, waited, left));
       })
       .unwrap();
       futures::detach(task).unwrap();
     });
     let answer = answered.recv_timeout(std::time::Duration::from_nanos(ANSWER_WAIT_NS));
     daemon.stop();
-    let (offered, taken, waited, left) = answer.expect("the take answered");
+    let (made, taken, waited, left) = answer.expect("the take answered");
     println!(
       "a take behind a busy poll of {BUSY_NS} ns: {taken} after {waited:?}; the offer left there: {left:?}"
     );
-    assert_eq!(offered, Some(true), "the offer was made");
+    assert!(made, "the offer was made");
     assert_eq!(
       taken, "taken",
       "the take on an owner shard alive and working was not answered with the offer (after {waited:?})"
     );
     assert!(
-      waited > std::time::Duration::from_nanos(EXCHANGE_NS),
-      "the take ended within one budget ({waited:?}), before its owner shard's busy poll did"
+      waited > std::time::Duration::from_nanos(TAKE_WINDOW_NS),
+      "the take ended within one window ({waited:?}), before its owner shard's busy poll did"
     );
     assert_eq!(left, Some(false), "the take retired the offer");
+  }
+
+  /// A-492 (R3's class C; §4.6 the socket route): an offer waits for its claim while its client lives, never for a fixed
+  /// life. Do: on a daemon, offer a map's descriptor for a client that lives, wait past the life offers had until A-492
+  /// (two liveness budgets) and half a budget more, then take it with a proof made under its secret. Expect: taken, the
+  /// offer gone after. Before, the offer's timer let it go at two budgets (`shards.route_expired`) and the take was
+  /// refused `NoOffer`: a live client slower than that to claim, a loaded machine's, found nothing.
+  #[test]
+  fn an_offer_waits_for_its_live_clients_claim_past_any_fixed_life() {
+    let daemon = crate::daemon::audit_daemon();
+    crate::daemon::observe_first(&daemon, |s| {
+      let (descriptor, _peer) = slates_ipc::stream::pair().unwrap();
+      offered(s, (OfferKind::Map, FIRST_ID), CLIENT, descriptor);
+    });
+    // The test thread waits past the old life; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(PAST_THE_OLD_LIFE_NS));
+    let (taken, left) = crate::daemon::observe_first(&daemon, |s| {
+      let proof = proof_of(OfferKind::Map, FIRST_ID, &DAEMON_NONCE);
+      let taken = take(s, hello_for(OfferKind::Map, FIRST_ID), DAEMON_NONCE, proof)
+        .map(|_| ())
+        .map_err(|refusal| format!("{refusal:?}"));
+      (taken, s.map_offers.contains_key(&FIRST_ID))
+    });
+    daemon.stop();
+    assert_eq!(
+      taken,
+      Ok(()),
+      "an offer whose client lives was not claimable past the old fixed life"
+    );
+    assert!(!left, "the take retired the offer");
+  }
+
+  /// A-492 (R3's class C; §4.6 the socket route): an exchange waits on its client while the client's connection lives.
+  /// Do: on a daemon, offer a map's descriptor for a client and run an exchange on one end of a socket pair, the test
+  /// thread its client on the other, which waits past the bound the client's part had until A-492 (one liveness budget)
+  /// and half a budget more before its hello, then answers the challenge with a proof made under the secret. Expect: the
+  /// challenge, then the confirmation. Before, the exchange gave its client one budget and dropped it
+  /// (`shards.route_timed_out`), so the slow client's hello met a closed connection.
+  #[test]
+  fn an_exchange_serves_a_live_client_slower_than_any_fixed_bound() {
+    let daemon = crate::daemon::audit_daemon();
+    let client_end = crate::daemon::observe_first(&daemon, |s| {
+      let (descriptor, _peer) = slates_ipc::stream::pair().unwrap();
+      offered(s, (OfferKind::Map, FIRST_ID), CLIENT, descriptor);
+      let (daemon_end, client_end) = slates_ipc::stream::pair().unwrap();
+      s.route_exchanges = s.route_exchanges.saturating_add(1);
+      futures::detach(futures::spawn(exchange(daemon_end)).unwrap()).unwrap();
+      client_end
+    });
+    rustix::net::sockopt::set_socket_timeout(
+      &client_end,
+      rustix::net::sockopt::Timeout::Recv,
+      Some(std::time::Duration::from_nanos(ANSWER_WAIT_NS)),
+    )
+    .unwrap();
+    rustix::net::sockopt::set_socket_nosigpipe(&client_end, true).unwrap();
+    // The test thread is a client slower than the old bound; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(
+      SLOWER_THAN_THE_OLD_BOUND_NS,
+    ));
+    let hello_sent = rustix::net::send(
+      &client_end,
+      &hello_for(OfferKind::Map, FIRST_ID).encode(),
+      rustix::net::SendFlags::empty(),
+    );
+    let mut challenge = [0u8; 1 + NONCE_BYTES];
+    let challenged = read_up_to(&client_end, &mut challenge);
+    let mut confirmation = [0u8; 1 + SEALED_BYTES];
+    let mut confirmed = 0;
+    if challenged == challenge.len() && challenge[0] == KIND_CHALLENGE {
+      let daemon_nonce: [u8; NONCE_BYTES] = challenge[1..].try_into().unwrap();
+      let proof = proof_of(OfferKind::Map, FIRST_ID, &daemon_nonce);
+      let _proof_sent = rustix::net::send(&client_end, &proof, rustix::net::SendFlags::empty());
+      confirmed = read_up_to(&client_end, &mut confirmation);
+    }
+    drop(client_end);
+    daemon.stop();
+    assert!(hello_sent.is_ok(), "the hello was sent: {hello_sent:?}");
+    assert_eq!(
+      (challenged, challenge[0]),
+      (challenge.len(), KIND_CHALLENGE),
+      "the exchange no longer waited for a client slower than the old bound"
+    );
+    assert!(
+      confirmed >= 1 && confirmation[0] == slates_ipc::route::KIND_CONFIRM,
+      "the slow client's claim was not confirmed ({confirmed} bytes, kind {})",
+      confirmation[0]
+    );
+  }
+
+  /// A-492 (R3's class C; §4.6 the socket route; §4.7 the reaper): an offer's life ends with its client's. Do: on a daemon,
+  /// offer a stream end for one client and another for a second client, then retire the first as the reaper retires a
+  /// dead client on every shard (`crate::reap::remove_on_owners`). Expect: the first client's offer let go and its end
+  /// closed (the stream's other side reads the end), counted `shards.route_client_retired`; the second client's offer
+  /// kept, its end open. Before, only the offer's two-budget timer let it go, a client alive or dead.
+  #[test]
+  fn a_retired_clients_offers_are_let_go_and_their_ends_closed() {
+    let daemon = crate::daemon::audit_daemon();
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |s| {
+      let origin = s.shard;
+      let batch = s.config.runtime.batch.max(1);
+      let (retired_end, retired_peer) = slates_ipc::stream::pair().unwrap();
+      let (kept_end, kept_peer) = slates_ipc::stream::pair().unwrap();
+      offered(s, (OfferKind::Stream, FIRST_ID), CLIENT, retired_end);
+      offered(s, (OfferKind::Stream, SECOND_ID), OTHER_CLIENT, kept_end);
+      let task = futures::spawn(async move {
+        let retired = crate::reap::remove_on_owners(
+          origin,
+          &[origin],
+          batch,
+          CLIENT,
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await;
+        let left = state::with_state(|s| {
+          (
+            s.stream_offers.contains_key(&FIRST_ID),
+            s.stream_offers.contains_key(&SECOND_ID),
+            s.refusals
+              .get("shards.route_client_retired")
+              .copied()
+              .unwrap_or(0),
+          )
+        });
+        let _ = sent.send((retired.is_ok(), left, retired_peer, kept_peer));
+      })
+      .unwrap();
+      futures::detach(task).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_nanos(ANSWER_WAIT_NS));
+    // Read before the daemon stops, which closes every end it keeps.
+    let ends = answer.as_ref().ok().map(|(_, _, retired_peer, kept_peer)| {
+      for peer in [retired_peer, kept_peer] {
+        rustix::io::ioctl_fionbio(peer, true).unwrap();
+      }
+      let mut byte = [0u8; 1];
+      let retired_closed = matches!(
+        rustix::net::recv(retired_peer, &mut byte, rustix::net::RecvFlags::empty()),
+        Ok((0, _))
+      );
+      let kept_open = matches!(
+        rustix::net::recv(kept_peer, &mut byte, rustix::net::RecvFlags::empty()),
+        Err(rustix::io::Errno::AGAIN)
+      );
+      (retired_closed, kept_open)
+    });
+    daemon.stop();
+    let (retired, left, _, _) = answer.expect("the retirement answered");
+    println!(
+      "a client retired with its offers: retired {retired}, offers (theirs, the other's, counted) {left:?}, ends {ends:?}"
+    );
+    assert!(retired, "the reaper's retirement on the shard went through");
+    assert_eq!(
+      left,
+      Some((false, true, 1)),
+      "the retired client's offer let go and counted, the other client's kept"
+    );
+    assert_eq!(
+      ends,
+      Some((true, true)),
+      "the retired client's end closed, the other client's open"
+    );
   }
 }

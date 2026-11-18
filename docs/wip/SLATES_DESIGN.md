@@ -16665,7 +16665,7 @@ Applied in the same change to: §4.6 (the direct map's lifetime and bounds, its 
 ### A-173 — macOS hands the direct map's copy read alone over the socket route (accepted 2026-10-25)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its status, the DAX matrix status), A-161 (the route's version 2), GAPS, `docs/wip/virtiofs.md` §8, `crates/ipc` (`route.rs`: version 2, `OfferKind`, the hello's kind, `confined_read_only`; `protocol.rs`: `ReplyBody::MapOffered`, appended; `error.rs`: the route's refusals worded for both kinds), `crates/server` (`direct_map.rs`: the macOS hand-off, mapping ids that carry the partition, `let_go`; `shards_route.rs`: offers kept by kind, `withdraw`; `state.rs` and `daemon.rs`: `map_offers`; `shards.rs`; `reap.rs`), `crates/client` (`MappedRead::map`, `claim_map`, the offered arm of `map_read`; `tests/client.rs` and `tests/reap_map.rs` on macOS), `crates/server/tests/shards.rs` (each hello names its kind), `CLAUDE.md`, `docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`.
 - **What macOS lacks, and what stands in for it.** Linux's copy is a memfd sealed against every writer but the daemon's own map (A-171); macOS has no seals and no control socket. Its copy is a POSIX shared-memory object (`slates_mem::PeerObject`): opened read and write, opened a second time read alone, its random name then removed, so the two descriptors are the only ways to it; sized once. The read-only descriptor is the capability. XNU refuses its holder every way to write (measured 2026-10-25, Darwin 25.4.0): a shared writable map `EPERM`, a write `EBADF`, a read-only map turned writable `EACCES` (the map's most protection is read), a private writable map `EINVAL` (XNU maps shared memory shared alone), a reopen read-write through `/dev/fd` `EBADF`; and a resize either way `EINVAL` whatever the descriptor's mode, since XNU sizes such an object once. The hand-off judges the descriptor before it offers it (`slates_ipc::route::confined_read_only`: open read alone, exactly the authorized length), counted `dax.local_map_unconfined` where it fails.
-- **How it reaches the client: A-161's socket route, version 2.** The reply is `MapOffered { mapping_id, file_len, block_len, secret }`; the owner shard keeps the descriptor as an offer, claimable once within two liveness budgets, as a Shards stream end is. The hello names the offer's kind (a stream end, a map's copy) beside its id, both bound into the exchange's additional data, and a shard keeps each kind's offers apart, so a secret or a proof for one never claims the other; the labels read `slates route v2`, and a hello of version 1 is refused `Malformed`. A mapping id carries its owner partition in its high 16 bits (`Handle::encode`), as an attachment id does, so the route finds the shard holding the offer.
+- **How it reaches the client: A-161's socket route, version 2.** The reply is `MapOffered { mapping_id, file_len, block_len, secret }`; the owner shard keeps the descriptor as an offer, claimable once while its client lives (A-492; within two liveness budgets until then), as a Shards stream end is. The hello names the offer's kind (a stream end, a map's copy) beside its id, both bound into the exchange's additional data, and a shard keeps each kind's offers apart, so a secret or a proof for one never claims the other; the labels read `slates route v2`, and a hello of version 1 is refused `Malformed`. A mapping id carries its owner partition in its high 16 bits (`Handle::encode`), as an attachment id does, so the route finds the shard holding the offer.
 - **Decided: an offer never outlives its copy.** Found by its test first (`docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`): a copy let go before its offer was claimed left the offer claimable, so a client could map, release and map again, each unclaimed offer keeping a live object outside its share and the fill budget for the offer's whole life. Now every way a copy goes (`direct_map::let_go`: a release, a reap, a fill that ended without its hand-off) withdraws its offer, counted `dax.local_map_offer_withdrawn`.
 - **Rejected: the read-write descriptor with only a read-only map made of it.** The descriptor is the capability, not the map: handed in the read-only one's place in the red-check, its shared writable map and its turned map were granted.
 - **Proven** on this Mac (arm64, Darwin 25.4.0, 2026-10-25) by `crates/client/tests/client.rs` and `reap_map.rs` over a real daemon, red-checked (§4.6 status); Linux unchanged, the route being macOS's alone, its suites passing on fedora.
@@ -22236,14 +22236,17 @@ Applied in the same change to:
   named by a hash of the instance, made owner-only, removed when the daemon stops, and a node a dead daemon left found
   unanswered and replaced. Socket files are authorized for this when what crosses them is encrypted end to end (Ada,
   2026-10-22).
-  - The attach keeps the end as an offer on the volume's owner shard with a fresh 256-bit secret, expiring after two
-    liveness budgets (the client's reply deadline, then the claim), and replies `ShardsOffered` with the secret.
+  - The attach keeps the end as an offer on the volume's owner shard with a fresh 256-bit secret, and replies
+    `ShardsOffered` with the secret. Since A-492 the offer is the requesting client's and waits for its claim while that
+    client lives: it goes when claimed, withdrawn (its attachment ended) or let go when the reaper retires its client
+    (`shards_route::let_go_of_client`); until then it expired after two liveness budgets on a timer.
   - The claim: the client's hello (version, attachment, its nonce), the daemon's nonce, then per-direction keys by
     HKDF-SHA256 from the secret salted with both nonces, the client's proof and the daemon's confirmation each the
     attachment sealed with AES-256-GCM (the transcript as additional data, each key sealing one message at nonce
     zero). The owner shard checks the proof and retires the offer, so the secret never leaves it; the end goes by
     `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end.
-  - Bounds: a shard's exchanges at its client seats (`Busy` past them), each within one liveness budget; every
+  - Bounds: a shard's exchanges at its client seats (`Busy` past them), each waiting on its client while the client's
+    connection lives (A-492; one liveness budget until then), the socket being the user's alone; every
     refusal is one byte naming its kind and every ending is counted (`shards.route_*`, `shards.route_claimed` the
     route's non-vacuity counter). The crypto is aws-lc-rs's, a dependency of `slates-ipc` on macOS only, so the
     crate's cross-lint targets keep no C dependency.
@@ -32365,3 +32368,35 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-492 — The socket route waits on what it waits for: an offer while its client lives, an exchange while its client's connection does (2026-11-19, g232; UI goal 86, R3's class C, C-c part 1; §4.6 the Shards route, A-161, A-173, A-440)
+
+Applied in the same change to: §4.6 (A-161's offer and bounds, A-173's map offer), GAPS (the R3 debt's class C),
+`crates/server/src/shards_route.rs` (`Offer::client`, `offer`, `let_go_of_client`, `take`, `exchange`,
+`take_from_owner`; `OFFER_LIFE_NS`, `EXCHANGE_NS`, `shards.route_timed_out` and `shards.route_expired` removed,
+`shards.route_client_retired` added), `crates/server/src/reap.rs` (`remove_on_owners`), `crates/server/src/shards.rs`
+and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/tests/shards.rs` (the macOS route tests).
+- **What was there.** Three fixed waits on the route (macOS): an offer lived two liveness budgets on a timer
+  (`OFFER_LIFE_NS`), an exchange gave its client one budget for its hello and proof and one more for its close
+  (`EXCHANGE_NS`), and the owner shard's take was judged in that shard's own time over the same budget. A live client
+  slower than either, a loaded machine's, found no offer or was dropped mid-claim; a client that died before its claim
+  held nothing a timer did not.
+- **The rule.** Each waits for what it waits on. An offer records the client it was made for (the request's word for an
+  attach, the fill's client for a map) and waits for its claim while that client lives: it goes when claimed, withdrawn
+  (an attachment ended, a map's copy let go) or let go when the reaper retires its client on every shard
+  (`shards_route::let_go_of_client`, the last step of `reap::remove_on_owners`), which closes its ends, so a stream's
+  attachment, a guest's that no removal of the client's own attachments reaches, ends as every stream does. The
+  exchange's client part and its wait for the client's close last while the client's connection does: a peer that
+  dies or closes has its end closed by its kernel, which a read answers at once, and a peer alive and slow is served
+  however slow, as a client's claim waits while its daemon lives (A-186, A-443). The socket is the user's alone
+  (owner-only, in the user's own temporary directory), so a peer that holds a seat open is one of the user's own
+  processes, holding its own seat. The owner shard's take keeps A-440's judgment in that shard's own time, over the
+  liveness window every such wait starts from.
+- **Tests** (`shards_route.rs`): `an_offer_waits_for_its_live_clients_claim_past_any_fixed_life` (taken past the old
+  life), `an_exchange_serves_a_live_client_slower_than_any_fixed_bound` (a hello past the old bound answered and the
+  claim confirmed), `a_retired_clients_offers_are_let_go_and_their_ends_closed` (the reaper's step lets one client's
+  offer go, its end closed and counted, another's kept); A-440's take test kept. The macOS route integration tests now
+  hold the new rule: a silent stranger ends its exchange by closing (counted malformed), an offer is claimed past the
+  old life, a withdrawn offer is not counted retired.
+- **Owed.** A cross-process test of a client killed before its claim (the reaper retiring it lets its offer go and its
+  stream's attachment end), as `crates/client/tests/reap.rs` kills a client; main's to run.

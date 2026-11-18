@@ -3869,7 +3869,15 @@
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
->   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. C-c's first part since A-492
+>   (2026-11-19, g232): the macOS socket route's offer lived two liveness budgets on a timer and its exchange gave the
+>   client one budget, so a live client slower than either found no offer or was dropped mid-claim; now an offer waits
+>   while the client it was made for lives (let go when the reaper retires that client,
+>   `shards_route::let_go_of_client`, which ends a stream's attachment as its end closes) and an exchange waits on its
+>   client while the client's connection lives (`an_offer_waits_for_its_live_clients_claim_past_any_fixed_life`,
+>   `an_exchange_serves_a_live_client_slower_than_any_fixed_bound`,
+>   `a_retired_clients_offers_are_let_go_and_their_ends_closed`); owed: a cross-process test of a client killed before
+>   its claim. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
