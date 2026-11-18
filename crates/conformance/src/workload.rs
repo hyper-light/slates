@@ -45,13 +45,17 @@ pub struct Workload {
 /// object count is compared, not `git count-objects`' kilobytes: those are `st_blocks`, the host
 /// filesystem's allocation unit (APFS rounds every loose object up to 4 KiB, the export reports the
 /// bytes held), a property of the filesystem under the repository, not of git (the CI macOS runner,
-/// 2026-09-16: "10 objects, 40 kilobytes" on the host, "10 objects, 5 kilobytes" on the mount).
+/// 2026-09-16: "10 objects, 40 kilobytes" on the host, "10 objects, 5 kilobytes" on the mount). Under Git for Windows'
+/// shell the link is a Windows symbolic link, asked for on its `ln` alone (`MSYS=winsymlinks:nativestrict`, which that
+/// shell's `ln` would otherwise answer with a copy), so it goes through the drive's reparse points (A-275) on one side
+/// and NTFS's on the other; git itself runs as Git for Windows ships it, its own symbolic links off (A-327). Every other
+/// shell ignores the variable.
 const GIT: &str = r#"
 git init -q .
 printf 'hello\n' > a.txt
 mkdir -p d
 printf 'world\n' > d/b.txt
-ln -s a.txt link
+MSYS=winsymlinks:nativestrict ln -s a.txt link
 chmod u=rwx,go=rx d/b.txt
 git add -A
 git commit -q -m first
@@ -475,9 +479,14 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 ///   whose escape sequence before `Fresh` made the cargo workload's count of fresh builds read 0, failing it on both
 ///   sides of every leg (CI runs 44247840584 and 44252249999, 2026-11-18), and kiln's runs set a target directory
 ///   outside the tree, where the workload's `./target/debug/mini` would not be;
-/// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
-///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
-///   whether the drive makes links (A-275). Every other shell ignores the variable.
+/// - under Git for Windows' shell (A-327), every argument handed on as written (`MSYS_NO_PATHCONV`): by default that
+///   shell rewrites an argument that looks like a POSIX path before it starts a Windows program, and it took
+///   Subversion's repository-relative URL `^/trunk` for one, so `svn` was handed `^C:\Program Files\Git\trunk` and
+///   refused it on both sides (CI run 44260193629, both Windows lanes). Every other shell ignores the variable. Git for
+///   Windows' native symbolic links (`MSYS=winsymlinks:nativestrict`) are asked for by the `git` workload's one `ln -s`
+///   alone, not here: git reads the same variable to turn its own symbolic links on, and with them on it resolves every
+///   change of directory through `GetFinalPathNameByHandleW` (`compat/mingw.c` `mingw_chdir`), which Windows refuses
+///   on a drive the Mount Manager did not make (A-327).
 pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("GIT_AUTHOR_NAME", "slates"),
   ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
@@ -500,7 +509,7 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("npm_config_logs_max", "0"),
   ("CARGO_TERM_COLOR", "never"),
   ("CARGO_TARGET_DIR", "target"),
-  ("MSYS", "winsymlinks:nativestrict"),
+  ("MSYS_NO_PATHCONV", "1"),
 ];
 
 /// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live

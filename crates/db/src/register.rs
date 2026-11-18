@@ -2268,16 +2268,24 @@ impl Settled {
 }
 
 /// A retired host's retirement (§4.8 "Promotion and takeover"): what the region needs to recover its objects
-/// the same way on every survivor, kept until every survivor that could own a share of them has confirmed it.
+/// the same way on every survivor, kept until every survivor that could own a share of them has finished it, when it
+/// becomes a [`CompletedTakeover`] (A-309).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retirement {
   /// The configuration version that retired the host.
   pub version: u64,
   /// The neighbourhood its records were all placed on when it retired: its objects' recovery cohort.
   pub settled: Settled,
+  /// Its current neighbourhood when it retired, while a change was in flight (A-309): the hosts its joint writes and
+  /// re-shipped heads reached besides the settled ones. `None` when it retired settled on its current neighbourhood.
+  /// Its members are survivors too, and asked in the takeover's round ([`RegionalConfiguration::recovery_hosts`]): a
+  /// member that joined the neighbourhood after it was settled can hold a copy no settled host still holds (the
+  /// replacement holding the live log, in the store-destroyed takeover).
+  pub current: Option<Settled>,
   /// The members of its recovery neighbourhoods when it retired, itself excluded, in id order: the hosts its
   /// objects' successors are ranked among, fixed at the retirement so every node ranks them the same whatever
-  /// it has installed since, and the hosts that owe a confirmation of their share while they remain members.
+  /// it has installed since, and the hosts that owe a confirmation of their share while they remain members. Its
+  /// recovery neighbourhoods are its settled and current ones and those of the takeovers it carries.
   pub survivors: Vec<HostId>,
   /// The survivors that have confirmed their share of this takeover — every object of the retired host that
   /// ranks them first adopted and placed under their own placement — in id order.
@@ -2299,16 +2307,37 @@ pub enum Lineage {
     /// The member that takes it over.
     successor: HostId,
   },
-  /// No survivor of the object's recovery cohorts was ranked: nothing can recover it.
+  /// A retirement in the object's line has no survivor to rank: no member was left in any neighbourhood that could
+  /// hold its records, so nothing can recover it.
   Lost,
-  /// A retirement in the object's line is no longer kept because its takeover is done: every survivor confirmed its
-  /// share, and a survivor confirms only once every object it learned was adopted (A-272). A holder's copy is stale.
-  Settled,
-  /// Nothing shows where the object went (A-272): a retirement in its line was dropped before every survivor
-  /// confirmed ([`RegionalConfiguration::dropped_unconfirmed`]), or its ranked successor is neither a member nor a kept
-  /// retirement. Not settled: absence is no evidence of adoption, and a holder keeps its copy. Owed (A-272 ii): kept
-  /// adoption records, and a round of the current members for such objects.
+  /// The object's line reaches `takeover`, a takeover the configuration keeps a completion record of
+  /// ([`RegionalConfiguration::completed`]): every survivor confirmed its share, or left and carried it into a takeover
+  /// of its own that completed, and a survivor confirms only once every object it learned was adopted (A-272). Positive
+  /// evidence, never inferred from a retirement no longer kept (A-309). A holder that took part in that takeover holds a
+  /// stale copy: its answers taught the successors every copy it held, so each was adopted
+  /// ([`RegionalConfiguration::settled_for`]); a holder outside it was never asked, and nothing shows its copy adopted.
+  Settled {
+    /// The retired host whose completed takeover the line ends at.
+    takeover: HostId,
+  },
+  /// Nothing shows where the object went (A-272, A-309): its line reaches a retired host the configuration keeps no
+  /// record of (a retirement the bound dropped before it completed, or a completion record no longer kept), or a kept
+  /// retirement ranks a successor that is neither a member, nor a kept retirement, nor a completed takeover. Not
+  /// settled: absence is no evidence of adoption, and a holder keeps its copy.
   Unresolved,
+}
+
+/// A takeover every survivor of which finished its share (A-309): the record [`Lineage::Settled`] rests on, kept in
+/// [`RegionalConfiguration::completed`] when the retirement is dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedTakeover {
+  /// The configuration version the takeover completed at: the order the records are let go in, oldest first.
+  pub version: u64,
+  /// The survivors that confirmed their share before the takeover completed, in id order: each adopted and placed every
+  /// object of the retired host that ranked it first, so a holder outside such a successor's placement holds a stale
+  /// copy (`stale_after_confirmation` in the server's takeover). A survivor absent here left before confirming and
+  /// carried its share into its own takeover, which completed too.
+  pub confirmed: Vec<HostId>,
 }
 
 /// The **regional configuration** the council agrees on (§4.8, D-14 — the "configuration master", a small
@@ -2340,20 +2369,25 @@ pub struct RegionalConfiguration {
   /// ([`settle`](RegionalConfiguration::settle)). Bounded by the members.
   pub settled: std::collections::BTreeMap<HostId, Settled>,
   /// Each retired host's [`Retirement`], kept until every survivor that could own a share of its objects has
-  /// confirmed that share ([`confirm`](RegionalConfiguration::confirm)), and never more than
-  /// [`retirement_bound`](RegionalConfiguration::retirement_bound) of them.
+  /// confirmed that share ([`confirm`](RegionalConfiguration::confirm)), when it becomes a record in
+  /// [`completed`](RegionalConfiguration::completed), and never more than
+  /// [`retirement_bound`](RegionalConfiguration::retirement_bound) of them. One no survivor owes anything of that
+  /// cannot complete (a survivor left and its own takeover never completed, or it had no survivor at all) stays kept,
+  /// so its lines still name what is known, until the bound lets it go first.
   pub retired: std::collections::BTreeMap<HostId, Retirement>,
   /// The promoted objects this region adopts from the region it mirrors (§4.10 "region loss promotes the mirror";
   /// `docs/wip/mirroring.md` decision 4): each object's agreed successor, with the head and catalog records it adopts.
   /// An entry is assigned by the council leader after its phase one and dropped once its successor reports it serves
   /// the object ([`adopted`](RegionalConfiguration::adopted)), so it holds only adoptions in flight.
   pub adoptions: std::collections::BTreeMap<ObjectId, Adoption>,
-  /// The retired hosts whose takeover ended without every survivor's confirmation (A-272): a retirement dropped by
-  /// [`retirement_bound`](RegionalConfiguration::retirement_bound) while a survivor still owed its share, or a host
-  /// retired with no settled neighbourhood to recover through. Their objects' lines are [`Lineage::Unresolved`], never
-  /// settled: nothing shows they were adopted, and a holder told settled reclaims its copy. In id order. It grows only
-  /// on a region losing more hosts than it tolerates, which a pruned retirement never records.
-  pub dropped_unconfirmed: Vec<HostId>,
+  /// The takeovers that completed (A-309, A-272 (ii)), each retired host's [`CompletedTakeover`]: the only evidence a
+  /// line reads [`Lineage::Settled`] from, so a holder lets a copy go only on a record that its objects were adopted,
+  /// never on a retirement's absence. A retirement becomes a record when every survivor confirmed its share or left and
+  /// carried it into a takeover of its own that completed ([`completes`](RegionalConfiguration::completes)). At most
+  /// [`completed_bound`](RegionalConfiguration::completed_bound) are kept, or the ones kept retirements still need when
+  /// those are more, the oldest let go first; a line reaching a host whose record was let go reads
+  /// [`Lineage::Unresolved`], so a holder that lagged past it keeps a stale copy rather than reclaim one nobody adopted.
+  pub completed: std::collections::BTreeMap<HostId, CompletedTakeover>,
   /// The objects an explicit move took off their creator's line (§4.8 "Authority scope": "moving one volume changes
   /// that object's ownership generation, recorded in the configuration's moved-object exceptions, without fencing
   /// unrelated volumes"; §4.10 "operators keep an explicit move"), keyed by the object's placement key, so every register
@@ -2413,7 +2447,7 @@ impl RegionalConfiguration {
       settled: std::collections::BTreeMap::new(),
       retired: std::collections::BTreeMap::new(),
       adoptions: std::collections::BTreeMap::new(),
-      dropped_unconfirmed: Vec::new(),
+      completed: std::collections::BTreeMap::new(),
       moved: std::collections::BTreeMap::new(),
     };
     config.fix_neighbourhoods(scatter);
@@ -2512,6 +2546,9 @@ impl RegionalConfiguration {
     if let Some(domain) = domain {
       self.domains.insert(member, domain);
     }
+    // A record of an earlier takeover of this id says nothing of the member it names now (A-309): kept, a later
+    // takeover of it that never completed would read as completed, settling lines nobody adopted.
+    self.completed.remove(&member);
     self.version = version;
     self.fix_neighbourhoods(scatter);
     // An admitted member owns nothing yet, so its first neighbourhood is settled at once. The members whose
@@ -2545,18 +2582,29 @@ impl RegionalConfiguration {
         .get(&member)
         .map(|neighbourhood| Settled::of(neighbourhood, &self.domains))
     });
+    // The neighbourhood a change in flight moved it to, which its joint writes reached (A-309).
+    let current = self
+      .neighbourhoods
+      .get(&member)
+      .filter(|neighbourhood| {
+        settled
+          .as_ref()
+          .is_some_and(|settled| settled.generation != neighbourhood.generation)
+      })
+      .map(|neighbourhood| Settled::of(neighbourhood, &self.domains));
     let unconfirmed: Vec<HostId> = self
       .retired
       .keys()
       .copied()
       .filter(|departed| self.owes_confirmation(*departed, member))
       .collect();
-    // The hosts the retiring member's objects may be held by — its settled neighbourhood and those of the
-    // takeovers it carries — that are members now: its successors are ranked among these for good.
+    // The hosts the retiring member's objects may be held by — its settled and current neighbourhoods and those of
+    // the takeovers it carries — that are members now: its successors are ranked among these for good.
     let survivors = settled.as_ref().map(|settled| {
       let mut survivors: Vec<HostId> = settled
         .hosts
         .iter()
+        .chain(current.iter().flat_map(|current| current.hosts.iter()))
         .copied()
         .chain(
           unconfirmed
@@ -2574,23 +2622,24 @@ impl RegionalConfiguration {
     self.domains.remove(&member);
     self.version = version;
     self.fix_neighbourhoods(scatter);
+    // Retired with no neighbourhood to recover through, nothing is kept: no record says its objects were adopted, so
+    // their lines read unresolved (A-272, A-309).
     if let (Some(settled), Some(survivors)) = (settled, survivors) {
       self.retired.insert(
         member,
         Retirement {
           version: self.version,
           settled,
+          current,
           survivors,
           confirmed: Vec::new(),
           unconfirmed,
         },
       );
-    } else {
-      // Retired with no neighbourhood to recover through: nothing will confirm its objects adopted (A-272).
-      self.record_dropped_unconfirmed(member);
     }
-    self.prune_retirements();
+    self.complete_retirements();
     self.bound_retirements();
+    self.bound_completed();
     true
   }
 
@@ -2635,9 +2684,9 @@ impl RegionalConfiguration {
   /// Records that `successor` confirms its share of `departed`'s takeover: every object of `departed` that
   /// ranks it first ([`successor`](RegionalConfiguration::successor)) is adopted and placed under its own
   /// placement. The version advances, so every node learns that those objects no longer need `departed`'s
-  /// cohort, and the retirement is dropped once every survivor that owes a confirmation has given one. A
-  /// confirmation from a non-member, from a host that owes none, or already recorded changes nothing. Returns
-  /// whether the configuration changed.
+  /// cohort, and the retirement becomes a completion record once every survivor has finished its share
+  /// ([`completes`](RegionalConfiguration::completes)). A confirmation from a non-member, from a host that owes none,
+  /// or already recorded changes nothing. Returns whether the configuration changed.
   pub fn confirm(&mut self, departed: HostId, successor: HostId) -> bool {
     if !self.owes_confirmation(departed, successor) {
       return false;
@@ -2656,7 +2705,8 @@ impl RegionalConfiguration {
     retirement.confirmed.insert(position, successor);
     self.version = version;
     self.follow_moved_takeover(departed, successor, version);
-    self.prune_retirements();
+    self.complete_retirements();
+    self.bound_completed();
     true
   }
 
@@ -2724,18 +2774,21 @@ impl RegionalConfiguration {
     }
     match self.lineage(start, object) {
       Lineage::Successor { successor, .. } => Some(successor),
-      Lineage::Lost | Lineage::Settled | Lineage::Unresolved => None,
+      Lineage::Lost | Lineage::Settled { .. } | Lineage::Unresolved => None,
     }
   }
 
   /// Whether `from` may move `object` to `to` (§4.10 "Ownership follows the writer": the planned handoff an operator's
   /// explicit move runs): `from` and `to` are two members, and the configuration names `from` as the object's owner
   /// ([`owner_of`](RegionalConfiguration::owner_of)) or names no owner because the object's line runs through a
-  /// takeover that is done. In that last case the configuration holds no claim against `from`: the successor that
-  /// adopted the object is named only by the object's own records, and a member proposes a move only of a volume it
-  /// serves under confirmed authority, while a host that lost its authority is retired and never proposes again under
-  /// its id ([`admits`](RegionalConfiguration::admits)). Refused for a lost or unresolved line, which nothing may claim
-  /// (A-272), and for a line a kept retirement still carries to a successor other than `from`.
+  /// takeover that completed or one it keeps no record of. In those cases the configuration holds no claim against
+  /// `from`: the successor that adopted the object is named only by the object's own records, and a member proposes a
+  /// move only of a volume it serves under confirmed authority, which only that adopter does, while a host that lost its
+  /// authority is retired and never proposes again under its id ([`admits`](RegionalConfiguration::admits)). An
+  /// unresolved line is one of them since A-309: completion records are bounded, so the line of every volume whose
+  /// creator's takeover completed long ago reads unresolved once its record is let go, and refusing it would leave such
+  /// a volume unmovable for good. Refused for a lost line, which no member can have adopted (A-272), and for a line a
+  /// kept retirement still carries to a successor other than `from`.
   pub fn moves(&self, object: ObjectId, from: HostId, to: HostId) -> bool {
     if from == to || !self.members.contains(&from) || !self.members.contains(&to) {
       return false;
@@ -2746,8 +2799,8 @@ impl RegionalConfiguration {
     }
     match self.lineage(start, object) {
       Lineage::Successor { successor, .. } => successor == from,
-      Lineage::Settled => true,
-      Lineage::Lost | Lineage::Unresolved => false,
+      Lineage::Settled { .. } | Lineage::Unresolved => true,
+      Lineage::Lost => false,
     }
   }
 
@@ -2879,15 +2932,28 @@ impl RegionalConfiguration {
     owners
   }
 
-  /// Every host of the settled neighbourhoods `departed`'s objects are recovered through
-  /// ([`recovery_owners`](RegionalConfiguration::recovery_owners)), retired ones included, in id order: the
-  /// hosts that may hold a record of them, and among whose members a takeover of them runs its round.
+  /// Every host of the neighbourhoods `departed`'s objects are recovered through
+  /// ([`recovery_owners`](RegionalConfiguration::recovery_owners)), settled and, where a change was in flight,
+  /// current ([`Retirement::current`], A-309), retired ones included, in id order: the hosts that may hold a record of
+  /// them, and among whose members a takeover of them runs its round.
   pub fn recovery_hosts(&self, departed: HostId) -> Vec<HostId> {
     let mut hosts: Vec<HostId> = self
       .recovery_owners(departed)
       .iter()
       .filter_map(|owner| self.retired.get(owner))
-      .flat_map(|retirement| retirement.settled.hosts.iter().copied())
+      .flat_map(|retirement| {
+        retirement
+          .settled
+          .hosts
+          .iter()
+          .chain(
+            retirement
+              .current
+              .iter()
+              .flat_map(|current| current.hosts.iter()),
+          )
+          .copied()
+      })
       .collect();
     hosts.sort_unstable_by_key(|host| host.0);
     hosts.dedup();
@@ -2911,10 +2977,35 @@ impl RegionalConfiguration {
       .collect()
   }
 
+  /// The cohorts `object` of the retired `departed` was placed on in its recovery owners' current neighbourhoods, where
+  /// a change was in flight when they retired ([`Retirement::current`], A-309): the hosts its joint writes and
+  /// re-shipped heads reached besides the settled cohorts ([`recovery_cohorts`]). A takeover counts them only past
+  /// tolerance, when a settled cohort has fewer members than its recovery quorum (`slates_db::takeover::readiness`).
+  /// Empty when no recovery owner retired with a change in flight.
+  ///
+  /// [`recovery_cohorts`]: RegionalConfiguration::recovery_cohorts
+  pub fn current_cohorts(&self, departed: HostId, object: ObjectId) -> Vec<Vec<HostId>> {
+    self
+      .recovery_owners(departed)
+      .iter()
+      .filter_map(|owner| {
+        self
+          .retired
+          .get(owner)
+          .and_then(|retirement| retirement.current.as_ref())
+          .map(|current| current.cohort(*owner, object, self.quorum))
+      })
+      .collect()
+  }
+
   /// The member that takes `object` of the retired `departed` over: the one rendezvous ranks first among the
-  /// members of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)). Every
-  /// node computes it from the committed configuration alone, so every node names the same one. `None` if no
-  /// member of those cohorts survives, or `departed` has no retirement kept.
+  /// survivors of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)), or, when no
+  /// survivor is in any of them, among all the retirement's survivors (A-309): every object then ranks one, so the
+  /// survivors' confirmations cover every object some of them hold and a completed takeover means each was adopted.
+  /// Before, such an object ranked no one: no round learned it, every survivor confirmed, and the completed takeover
+  /// read its line settled while a member of the current neighbourhood still held its copy. The survivors are fixed at
+  /// the retirement, so every node names the same one from the committed configuration alone, never re-ranked. `None`
+  /// if the retirement has no survivor, or `departed` has no retirement kept.
   pub fn successor(&self, departed: HostId, object: ObjectId) -> Option<HostId> {
     let retirement = self.retired.get(&departed)?;
     let mut ranked: Vec<HostId> = self
@@ -2923,6 +3014,9 @@ impl RegionalConfiguration {
       .flatten()
       .filter(|host| retirement.survivors.contains(host))
       .collect();
+    if ranked.is_empty() {
+      ranked.clone_from(&retirement.survivors);
+    }
     ranked.sort_unstable_by_key(|host| host.0);
     ranked.dedup();
     rendezvous_first(&ranked, object)
@@ -2933,18 +3027,14 @@ impl RegionalConfiguration {
   /// retirement is kept carries the object into its own takeover (it may not have re-committed the object
   /// yet, and if it did, the object is its own); one that is a member is where the object belongs. Each step
   /// moves to a host that was a member when the previous one retired, so the walk ends within the kept
-  /// retirements, and two nodes that installed the same configuration by different paths resolve alike.
+  /// retirements, and two nodes that installed the same configuration by different paths resolve alike. A walk that
+  /// leaves the kept retirements ends settled only at a completion record, and unresolved anywhere else
+  /// ([`line_end`](RegionalConfiguration::line_end)).
   pub fn lineage(&self, owner: HostId, object: ObjectId) -> Lineage {
     let mut departed = owner;
     for _ in 0..=self.retired.len() {
       if !self.retired.contains_key(&departed) {
-        // Settled only on evidence: a pruned retirement, every survivor having confirmed after adopting. One dropped
-        // unconfirmed proves nothing (A-272).
-        return if self.dropped_unconfirmed.contains(&departed) {
-          Lineage::Unresolved
-        } else {
-          Lineage::Settled
-        };
+        return self.line_end(departed);
       }
       let Some(successor) = self.successor(departed, object) else {
         return Lineage::Lost;
@@ -2957,87 +3047,197 @@ impl RegionalConfiguration {
           successor,
         };
       } else {
-        // A ranked successor neither a member nor a kept retirement: its absence is no evidence of adoption (A-272).
-        return Lineage::Unresolved;
+        // A ranked successor neither a member nor a kept retirement: settled only if its own takeover, which took the
+        // object over or carried this one, completed (A-272, A-309).
+        return self.line_end(successor);
       }
     }
     Lineage::Unresolved
+  }
+
+  /// How a line ends at `host`, a host no kept retirement is of and no member: [`Lineage::Settled`] on its takeover's
+  /// completion record, the only evidence its objects were adopted (A-309), and [`Lineage::Unresolved`] without one:
+  /// a retirement the bound dropped, a completion record let go, or a host the configuration never retired. Before
+  /// A-309 every absence read settled but a recorded drop (A-272), so a takeover that left no record, such as one with
+  /// no survivor, settled lines nobody adopted.
+  fn line_end(&self, host: HostId) -> Lineage {
+    if self.completed.contains_key(&host) {
+      Lineage::Settled { takeover: host }
+    } else {
+      Lineage::Unresolved
+    }
+  }
+
+  /// Whether `holder`'s copy of an object whose line is [`Lineage::Settled`] at `takeover` is stale (A-309): `holder`
+  /// confirmed its own share of that completed takeover, so it was a member of its recovery neighbourhoods throughout its
+  /// round and answered every successor in full before any confirmed, and every copy it held that fell to a successor
+  /// was learned and adopted. A holder outside those neighbourhoods was never asked: its copy may be the only one of an
+  /// object no successor learned (a neighbourhood the owner wrote to before it settled elsewhere), so it keeps it.
+  pub fn settled_for(&self, takeover: HostId, holder: HostId) -> bool {
+    self
+      .completed
+      .get(&takeover)
+      .is_some_and(|record| record.confirmed.contains(&holder))
   }
 
   /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
   /// only until its survivors confirm their shares, which each does once its round and adoptions finish. With
   /// `k` retirements outstanding in a region formed at `n ≥ 2f + 1` members, `n − k` remain, and `k ≤ n − k`
   /// holds for every `k ≤ f`: a region never drops a takeover it can still complete while it has lost no more
-  /// hosts than it tolerates. Past that the oldest goes first. This bounds the map at the order of the
-  /// per-member neighbourhoods and domains while every restart retires an id (banned item 8), and never below
-  /// one, so the newest retirement is always kept.
+  /// hosts than it tolerates. Past that one no survivor owes anything of goes first, then the oldest. This bounds the
+  /// map at the order of the per-member neighbourhoods and domains while every restart retires an id (banned item 8),
+  /// and never below one, so the newest retirement is always kept.
   pub fn retirement_bound(&self) -> usize {
     self.members.len().max(1)
   }
 
-  /// Drops every retirement whose takeover is done: every survivor that owed a confirmation of it has given
-  /// one or left, and no kept retirement still recovers through it. Repeated to a fixed point, since dropping
-  /// one can release another it held.
-  fn prune_retirements(&mut self) {
+  /// Derived: the completion records the configuration keeps besides those a kept retirement still needs (one per
+  /// remaining member, as for the retirements, [`retirement_bound`](RegionalConfiguration::retirement_bound)). A record
+  /// is read by a holder that still holds a copy of the retired host's objects at its next install: every member that
+  /// held one when the takeover completed lets it go at that install, so only a holder that installs nothing while
+  /// `members` more takeovers complete still needs it, and that holder keeps its stale copy (a leak bounded by what it
+  /// holds, never a loss: a line past a record let go reads unresolved). A record a kept retirement still needs, to know
+  /// that a survivor which left owing its share carried it into a takeover that completed, is never let go
+  /// ([`bound_completed`](RegionalConfiguration::bound_completed)). This keeps the configuration's growth in the order of
+  /// its members while every restart retires an id (banned item 8).
+  pub fn completed_bound(&self) -> usize {
+    self.members.len().max(1)
+  }
+
+  /// Whether some member still owes a confirmation of `departed`'s takeover ([`owes_confirmation`]).
+  ///
+  /// [`owes_confirmation`]: RegionalConfiguration::owes_confirmation
+  fn owed(&self, departed: HostId) -> bool {
+    self.retired.get(&departed).is_some_and(|retirement| {
+      retirement
+        .survivors
+        .iter()
+        .any(|survivor| self.owes_confirmation(departed, *survivor))
+    })
+  }
+
+  /// Whether a kept retirement recovers through `departed`'s: one whose host left owing a share of `departed`'s
+  /// takeover and so carries it ([`Retirement::unconfirmed`]).
+  fn carried(&self, departed: HostId) -> bool {
+    self
+      .retired
+      .values()
+      .any(|retirement| retirement.unconfirmed.contains(&departed))
+  }
+
+  /// Whether `departed`'s kept retirement is done and complete (A-309), so it becomes a completion record: no member
+  /// owes a confirmation of it, no kept retirement still recovers through it, it had survivors, and each of them
+  /// confirmed its share or left owing it and carried it into a takeover of its own that completed. A survivor that left
+  /// owing its share retired while this retirement was kept, so its own retirement carried this one; that takeover's
+  /// completion is the evidence its share was adopted. A retirement with no survivor completes never: nobody adopted
+  /// its objects (before A-309 it was dropped at once, and its lines read settled). Nor does one whose survivor left and
+  /// left no completion behind (its own retirement dropped by the bound, or with no survivor either).
+  pub fn completes(&self, departed: HostId) -> bool {
+    let Some(retirement) = self.retired.get(&departed) else {
+      return false;
+    };
+    !retirement.survivors.is_empty()
+      && !self.owed(departed)
+      && !self.carried(departed)
+      && retirement.survivors.iter().all(|survivor| {
+        retirement.confirmed.contains(survivor) || self.completed.contains_key(survivor)
+      })
+  }
+
+  /// Turns every retirement whose takeover completed into its completion record (A-309): it leaves the kept
+  /// retirements, and its lines read settled from then on. Repeated to a fixed point, since one completing can complete
+  /// another it carried. A retirement no member owes anything of that does not complete stays kept, so its lines still
+  /// name the successors that adopted and the ones nobody did; [`bound_retirements`] lets those go first.
+  ///
+  /// [`bound_retirements`]: RegionalConfiguration::bound_retirements
+  fn complete_retirements(&mut self) {
     loop {
-      let done = self.retired.keys().copied().find(|departed| {
-        let referenced = self
-          .retired
-          .values()
-          .any(|retirement| retirement.unconfirmed.contains(departed));
-        !referenced
-          && !self
-            .recovery_hosts(*departed)
-            .iter()
-            .any(|host| self.owes_confirmation(*departed, *host))
-      });
-      match done {
-        Some(departed) => {
-          self.retired.remove(&departed);
-        }
-        None => break,
-      }
+      let done = self
+        .retired
+        .keys()
+        .copied()
+        .find(|departed| self.completes(*departed));
+      let Some(departed) = done else {
+        break;
+      };
+      let Some(retirement) = self.retired.remove(&departed) else {
+        break;
+      };
+      self.completed.insert(
+        departed,
+        CompletedTakeover {
+          version: self.version,
+          confirmed: retirement.confirmed,
+        },
+      );
     }
   }
 
-  /// Keeps at most [`retirement_bound`](RegionalConfiguration::retirement_bound) retirements, dropping the
-  /// oldest (by the version that retired it, the id breaking a tie) beyond it. A takeover whose retirement is
-  /// dropped this way can no longer name its successors, so its objects stay unowned; a node sees the loss as a
-  /// recovery owner that names a retirement no longer kept.
-  /// Records `host` among [`dropped_unconfirmed`](RegionalConfiguration::dropped_unconfirmed), in id order.
-  fn record_dropped_unconfirmed(&mut self, host: HostId) {
-    if let Err(position) = self
-      .dropped_unconfirmed
-      .binary_search_by_key(&host.0, |dropped| dropped.0)
-    {
-      self.dropped_unconfirmed.insert(position, host);
-    }
-  }
-
+  /// Keeps at most [`retirement_bound`](RegionalConfiguration::retirement_bound) retirements. Beyond it, one that no
+  /// member owes a confirmation of and no kept retirement recovers through goes first (it can never complete, A-309),
+  /// then the oldest (by the version that retired it, the id breaking a tie). A takeover dropped this way leaves no
+  /// record: its lines read unresolved, never settled, and its objects' holders keep their copies.
+  ///
+  /// Every kept retirement that recovers through the one dropped goes with it (A-309). A takeover's successors are
+  /// ranked among its recovery cohorts, those of the takeovers it carries among them ([`successor`]), so a takeover kept
+  /// past one it carried would rank its objects anew: a survivor routed a copy to the successor first ranked, that
+  /// successor confirmed its share without the object (it ranked another by then), and a holder outside its placement
+  /// read the confirmation as the object's adoption and let the copy go (`crates/db/tests/lineage_model.rs` found it).
+  /// Dropped together, every kept takeover ranks as it did at its retirement.
+  ///
+  /// [`successor`]: RegionalConfiguration::successor
   fn bound_retirements(&mut self) {
     while self.retired.len() > self.retirement_bound() {
-      let oldest = self
+      let first = self
         .retired
         .iter()
-        .min_by_key(|(host, retirement)| (retirement.version, host.0))
+        .min_by_key(|(host, retirement)| {
+          let pending = self.owed(**host) || self.carried(**host);
+          (pending, retirement.version, host.0)
+        })
         .map(|(host, _)| *host);
-      match oldest {
-        Some(host) => {
-          // Dropped before every survivor confirmed (one that retired first never did; its own retirement carried the
-          // takeover): recorded, so its line reads unresolved, never settled.
-          let unconfirmed = self.retired.get(&host).is_some_and(|retirement| {
-            !retirement
-              .survivors
-              .iter()
-              .all(|survivor| retirement.confirmed.contains(survivor))
-          });
-          self.retired.remove(&host);
-          if unconfirmed {
-            self.record_dropped_unconfirmed(host);
-          }
-        }
-        None => break,
+      let Some(host) = first else {
+        break;
+      };
+      let dropped: Vec<HostId> = self
+        .retired
+        .keys()
+        .copied()
+        .filter(|departed| self.recovery_owners(*departed).contains(&host))
+        .collect();
+      for departed in dropped {
+        self.retired.remove(&departed);
       }
+    }
+  }
+
+  /// Keeps at most [`completed_bound`](RegionalConfiguration::completed_bound) completion records, or the ones kept
+  /// retirements still need when those are more: the record of a survivor that left owing its share, whose completed
+  /// takeover carried that share ([`completes`](RegionalConfiguration::completes)), is never let go while that
+  /// retirement is kept. Beyond the bound the oldest other record (by the version it completed at, the id breaking a
+  /// tie) goes first.
+  fn bound_completed(&mut self) {
+    let needed: std::collections::BTreeSet<HostId> = self
+      .retired
+      .values()
+      .flat_map(|retirement| {
+        retirement
+          .survivors
+          .iter()
+          .copied()
+          .filter(|survivor| !retirement.confirmed.contains(survivor))
+      })
+      .collect();
+    let mut evictable: Vec<(u64, HostId)> = self
+      .completed
+      .iter()
+      .filter(|(host, _)| !needed.contains(host))
+      .map(|(host, record)| (record.version, *host))
+      .collect();
+    let excess = self.completed.len().saturating_sub(self.completed_bound());
+    evictable.sort_unstable_by_key(|(version, host)| (*version, host.0));
+    for (_, host) in evictable.into_iter().take(excess) {
+      self.completed.remove(&host);
     }
   }
 
@@ -4641,24 +4841,43 @@ mod tests {
   }
 
   /// §4.10 "operators keep an explicit move" after "Promotion and takeover". Do: take host 1 over and confirm every
-  /// share, so its takeover is done and the configuration names no owner for its objects; move one from the member
-  /// that adopted it; then make another object's line unresolved (its retirement dropped before every survivor
-  /// confirmed, A-272) and try to move that. Expect the settled object's move made by a member, its exception naming
-  /// the member it moved to; a move from a non-member or to the mover refused; and the unresolved object's move refused,
-  /// since nothing may claim it.
+  /// share, so its takeover completes and the configuration names no owner for its objects; move one from the member
+  /// that adopted it; then let the completion record go, as its bound does, so another of its objects' line reads
+  /// unresolved, and move that one from a member. Expect the settled object's move made by a member, its exception
+  /// naming the member it moved to; a move from a non-member or to the mover refused; and the unresolved object's move
+  /// made too (A-309): the configuration names no owner there either and holds no claim against the member that serves
+  /// it, and refusing would leave every object whose creator's record was let go unmovable for good.
   #[test]
-  fn a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one() {
+  fn a_member_moves_an_object_whose_line_names_no_owner() {
     let (mut regional, scatter) = wide_region();
     let departed = HostId(1);
-    let object = ObjectId::new(departed, 4);
+    let (object, other) = (ObjectId::new(departed, 4), ObjectId::new(departed, 5));
     regional.take_over(departed, scatter);
-    let Lineage::Successor { successor, .. } = regional.lineage(departed, object) else {
-      panic!("a takeover with survivors names a successor");
-    };
+    let successor = successor_of(&regional, departed, object);
+    let adopter = successor_of(&regional, departed, other);
     for host in regional.recovery_hosts(departed) {
       regional.confirm(departed, host);
     }
     assert!(regional.retired.is_empty());
+    expect_a_settled_line_moved_by_its_adopter(&mut regional, departed, object, successor);
+    // The record let go, as `bound_completed` does past the bound (`completion_records_stay_bounded_…` drives it).
+    regional.completed.remove(&departed);
+    expect_an_unresolved_line_moved_by_its_adopter(&mut regional, departed, other, adopter);
+  }
+
+  /// The settled half of `a_member_moves_an_object_whose_line_names_no_owner`: `object`'s line, settled by
+  /// `departed`'s completion record, names no owner, and only `successor` (the member that adopted it) moves it, to
+  /// another member.
+  fn expect_a_settled_line_moved_by_its_adopter(
+    regional: &mut RegionalConfiguration,
+    departed: HostId,
+    object: ObjectId,
+    successor: HostId,
+  ) {
+    assert_eq!(
+      regional.lineage(departed, object),
+      Lineage::Settled { takeover: departed }
+    );
     assert_eq!(
       regional.owner_of(object),
       None,
@@ -4684,38 +4903,55 @@ mod tests {
       !regional.moves(object, successor, departed),
       "once moved, only its new owner moves it"
     );
+  }
 
-    let unresolved = regional
+  /// The unresolved half of `a_member_moves_an_object_whose_line_names_no_owner` (A-309): `object`'s line reads
+  /// unresolved once `departed`'s record was let go, names no owner, and `adopter` (the member that adopted it) moves
+  /// it.
+  fn expect_an_unresolved_line_moved_by_its_adopter(
+    regional: &mut RegionalConfiguration,
+    departed: HostId,
+    object: ObjectId,
+    adopter: HostId,
+  ) {
+    assert_eq!(regional.lineage(departed, object), Lineage::Unresolved);
+    assert_eq!(regional.owner_of(object), None);
+    let target = regional
       .members
       .iter()
       .copied()
-      .find(|host| *host != to)
+      .find(|host| *host != adopter)
       .expect("a four-member region keeps another member");
-    expect_no_member_moves_an_unresolved_object(&mut regional, unresolved, scatter);
+    assert!(
+      regional.move_object(object, adopter, target),
+      "the member that adopted it moves an object whose record was let go"
+    );
+    assert_eq!(regional.owner_of(object), Some(target));
   }
 
-  /// The unresolved half of `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`. Do: take
-  /// `unresolved` over and drop its retirement before every survivor confirms (A-272), so an object of its own is on
-  /// an unresolved line; then move that object from every member to every member. Expect every move refused.
-  fn expect_no_member_moves_an_unresolved_object(
-    regional: &mut RegionalConfiguration,
-    unresolved: HostId,
-    scatter: u64,
-  ) {
-    let lost = ObjectId::new(unresolved, 4);
-    regional.take_over(unresolved, scatter);
-    regional.retired.remove(&unresolved);
-    regional.dropped_unconfirmed.push(unresolved);
-    assert_eq!(regional.lineage(unresolved, lost), Lineage::Unresolved);
-    let members = regional.members.clone();
-    assert!(members.len() >= 2);
-    for from in &members {
-      for target in &members {
-        assert!(
-          !regional.moves(lost, *from, *target),
-          "no member claims an unresolved line"
-        );
-      }
+  /// A-272, A-309: a lost line is claimed by no move. Do: take over the one member of a region formed on it alone, so
+  /// its retirement has no survivor at all; then admit two members and try every move of its object between them.
+  /// Expect its line lost and every move refused: no member can have adopted an object no survivor was left to recover.
+  #[test]
+  fn no_member_moves_a_lost_object() {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      vec![HostId(1)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    regional.take_over(HostId(1), scatter);
+    assert!(regional.admit(HostId(3), None, scatter));
+    assert!(regional.admit(HostId(4), None, scatter));
+    let object = ObjectId::new(HostId(1), 4);
+    assert_eq!(regional.lineage(HostId(1), object), Lineage::Lost);
+    for (from, to) in [(HostId(3), HostId(4)), (HostId(4), HostId(3))] {
+      assert!(
+        !regional.moves(object, from, to),
+        "no member claims a lost line"
+      );
     }
   }
 
@@ -5006,13 +5242,16 @@ mod tests {
     );
   }
 
-  /// A-272: an object whose ranked successor is neither a member nor a kept retirement is unresolved, never settled. Do
-  /// retire an owner, then its object's ranked successor (which carries the owner's takeover), then have the
-  /// successor's survivors confirm its share, so its retirement is pruned while the owner's is still kept. Expect the
-  /// object's lineage unresolved. Before, it answered Settled, and every holder told so reclaims its copy
-  /// (`takeover::resolve_held_objects`): the successor's absence was read as adoption.
+  /// A-272, A-309: an object whose ranked successor is neither a member nor a kept retirement is settled only on that
+  /// successor's completion record. Do retire an owner, then its object's ranked successor before it confirms (so it
+  /// carries the owner's takeover); in one copy have the successor's survivors confirm its share, so its takeover
+  /// completes while the owner's is still kept; in another drop the successor's retirement before that, as the bound
+  /// does. Expect the first copy's line settled on the record (the carrier's takeover adopted the object through the
+  /// owner's cohort) and the second's unresolved. Before A-272 the second read Settled, and every holder told so
+  /// reclaims its copy (`takeover::resolve_held_objects`); before A-309 the first read Unresolved, since nothing kept
+  /// the evidence.
   #[test]
-  fn an_absent_ranked_successor_leaves_the_object_unresolved_not_settled() {
+  fn an_absent_ranked_successor_settles_the_object_only_on_its_completion_record() {
     let (mut regional, scatter) = wide_region();
     let first = HostId(1);
     regional.take_over(first, scatter);
@@ -5026,12 +5265,14 @@ mod tests {
       .expect("an object of the first owner");
     let carrier = successor_of(&regional, first, object);
     regional.take_over(carrier, scatter);
-    for host in regional.survivors_of(carrier) {
-      regional.confirm(carrier, host);
+    let mut dropped = regional.clone();
+    let survivors = regional.survivors_of(carrier);
+    for host in &survivors {
+      regional.confirm(carrier, *host);
     }
     assert!(
-      !regional.retired.contains_key(&carrier),
-      "the carrier's retirement was pruned on its survivors' confirmations"
+      !regional.retired.contains_key(&carrier) && regional.completed.contains_key(&carrier),
+      "the carrier's takeover completed on its survivors' confirmations"
     );
     assert!(
       regional.retired.contains_key(&first),
@@ -5039,14 +5280,28 @@ mod tests {
     );
     assert_eq!(
       regional.lineage(first, object),
+      Lineage::Settled { takeover: carrier },
+      "the carrier's completed takeover adopted the object"
+    );
+    for member in regional.members.clone() {
+      assert_eq!(
+        regional.settled_for(carrier, member),
+        survivors.contains(&member),
+        "{member:?}: a survivor that confirmed was asked and holds a stale copy; any other member keeps its own"
+      );
+    }
+    // The bound's drop: the carrier's retirement let go before it completed.
+    dropped.retired.remove(&carrier);
+    assert_eq!(
+      dropped.lineage(first, object),
       Lineage::Unresolved,
-      "the ranked successor is gone: nothing shows the object adopted"
+      "the ranked successor is gone with no record: nothing shows the object adopted"
     );
   }
 
-  /// A-272: a retirement the bound drops before every survivor confirmed leaves its objects unresolved. Do retire
+  /// A-272, A-309: a retirement the bound drops before its takeover completed leaves its objects unresolved. Do retire
   /// hosts until the region keeps fewer retirements than it has, so the bound drops the oldest with no survivor having
-  /// confirmed. Expect it recorded as dropped unconfirmed and its object's lineage unresolved. Before, the dropped
+  /// confirmed. Expect no completion record of it and its object's lineage unresolved. Before A-272 the dropped
   /// retirement read Settled and its objects' holders reclaimed their copies.
   #[test]
   fn a_retirement_dropped_unconfirmed_by_the_bound_leaves_its_objects_unresolved() {
@@ -5060,10 +5315,9 @@ mod tests {
       !regional.retired.contains_key(&first),
       "the bound dropped the oldest retirement"
     );
-    assert_eq!(
-      regional.dropped_unconfirmed,
-      vec![first],
-      "recorded as dropped before its survivors confirmed"
+    assert!(
+      !regional.completed.contains_key(&first),
+      "a takeover dropped before it completed leaves no record"
     );
     assert_eq!(
       regional.lineage(first, object),
@@ -5072,9 +5326,9 @@ mod tests {
     );
   }
 
-  /// §4.8 "Promotion and takeover": once every survivor has confirmed its share the retirement is dropped, a
-  /// holder's copy of one of its objects resolves as settled (stale), and the retired host may be admitted again
-  /// — never before, while its retirement still ranks successors.
+  /// §4.8 "Promotion and takeover", A-309: once every survivor has confirmed its share the retirement becomes a
+  /// completion record naming them, a holder's copy of one of its objects resolves as settled (stale) on that record,
+  /// and the retired host may be admitted again — never before, while its retirement still ranks successors.
   #[test]
   fn a_confirmed_takeover_settles_the_lineage_and_frees_the_id() {
     let (mut regional, scatter) = wide_region();
@@ -5089,15 +5343,194 @@ mod tests {
       !regional.admits(departed),
       "a retired id is not admitted while its retirement is kept"
     );
-    for host in regional.survivors_of(departed) {
-      regional.confirm(departed, host);
+    let survivors = regional.survivors_of(departed);
+    for host in &survivors {
+      regional.confirm(departed, *host);
     }
     assert!(!regional.retired.contains_key(&departed));
-    assert_eq!(regional.lineage(departed, object), Lineage::Settled);
+    assert_eq!(
+      regional.completed.get(&departed),
+      Some(&CompletedTakeover {
+        version: regional.version,
+        confirmed: survivors,
+      }),
+      "the completion record names every survivor, made at the last confirmation's version"
+    );
+    assert_eq!(
+      regional.lineage(departed, object),
+      Lineage::Settled { takeover: departed }
+    );
     assert!(
       regional.admit(departed, None, scatter),
       "admitted once its takeover is done"
     );
+    assert!(
+      !regional.completed.contains_key(&departed),
+      "the record of the id's earlier takeover goes with its admission: it says nothing of the member it names now"
+    );
+  }
+
+  /// A-309, red before it: a takeover whose settled neighbourhood is gone is ranked among the members its joint writes
+  /// reached, never settled. Do: form a region on host 1 alone, admit hosts 2 and 3 (host 1's settled neighbourhood
+  /// stays itself alone until it reports the new one placed, A-234), then take host 1 over before it reports. Expect
+  /// its retirement to keep the current neighbourhood {1, 2, 3}, hosts 2 and 3 its survivors, its object ranked to one
+  /// of them, and no completion. Before, the retirement had no survivor, was dropped at once with nobody owing a
+  /// confirmation of it, and the line read settled: hosts 2 and 3, which held the joint writes of host 1's records,
+  /// would have let their copies go.
+  #[test]
+  fn a_bootstrap_taken_over_before_it_settled_is_ranked_among_the_members_its_joint_writes_reached()
+  {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      vec![HostId(1)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    assert!(regional.admit(HostId(2), None, scatter));
+    assert!(regional.admit(HostId(3), None, scatter));
+    regional.take_over(HostId(1), scatter);
+    let object = ObjectId::new(HostId(1), 6);
+    let retirement = &regional.retired[&HostId(1)];
+    assert_eq!(retirement.settled.hosts, vec![HostId(1)]);
+    let mut current = retirement
+      .current
+      .as_ref()
+      .map(|current| current.hosts.clone())
+      .expect("the change in flight is kept");
+    current.sort_unstable_by_key(|host| host.0);
+    assert_eq!(current, vec![HostId(1), HostId(2), HostId(3)]);
+    assert_eq!(regional.survivors_of(HostId(1)), vec![HostId(2), HostId(3)]);
+    let Lineage::Successor {
+      departed,
+      successor,
+    } = regional.lineage(HostId(1), object)
+    else {
+      panic!(
+        "ranked among the survivors: {:?}",
+        regional.lineage(HostId(1), object)
+      )
+    };
+    assert_eq!(departed, HostId(1));
+    assert!([HostId(2), HostId(3)].contains(&successor));
+    assert!(!regional.completed.contains_key(&HostId(1)));
+  }
+
+  /// A-309, red before it: a takeover carried into one whose settled neighbourhood is gone is ranked among that one's
+  /// current neighbourhood, never settled. Do: in a two-host region take host 1 over, admit hosts 3 and 4, then take
+  /// host 2 over before it confirms its share of host 1's takeover, its settled neighbourhood still the formation's
+  /// {1, 2}. Expect hosts 3 and 4 (its current neighbourhood) its survivors, host 1's retirement kept since host 2's
+  /// carries it, and both hosts' objects ranked to host 3 or 4 in host 2's takeover. Before, host 2's retirement had no
+  /// survivor and was dropped at once, host 1's then had no member owing and was dropped too, and both lines read
+  /// settled while hosts 3 and 4 held host 2's joint writes.
+  #[test]
+  fn a_takeover_carried_into_one_whose_settled_neighbourhood_is_gone_is_ranked_among_its_current_one()
+   {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      vec![HostId(1), HostId(2)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    regional.take_over(HostId(1), scatter);
+    assert!(regional.admit(HostId(3), None, scatter));
+    assert!(regional.admit(HostId(4), None, scatter));
+    regional.take_over(HostId(2), scatter);
+    assert_eq!(regional.retired[&HostId(2)].unconfirmed, vec![HostId(1)]);
+    assert_eq!(regional.survivors_of(HostId(2)), vec![HostId(3), HostId(4)]);
+    assert!(regional.retired.contains_key(&HostId(1)));
+    for departed in [HostId(1), HostId(2)] {
+      assert!(!regional.completed.contains_key(&departed));
+      let object = ObjectId::new(departed, 2);
+      assert!(
+        ranked_in_round_among(
+          &regional,
+          departed,
+          object,
+          HostId(2),
+          &[HostId(3), HostId(4)]
+        ),
+        "{departed:?}: {:?}",
+        regional.lineage(departed, object)
+      );
+    }
+  }
+
+  /// Whether `object`'s line from `departed` is ranked, in `round`'s takeover, to one of `hosts`.
+  fn ranked_in_round_among(
+    regional: &RegionalConfiguration,
+    departed: HostId,
+    object: ObjectId,
+    round: HostId,
+    hosts: &[HostId],
+  ) -> bool {
+    matches!(
+      regional.lineage(departed, object),
+      Lineage::Successor { departed: by, successor } if by == round && hosts.contains(&successor)
+    )
+  }
+
+  /// Banned item 8, A-309: completion records stay bounded by the members however many takeovers complete, the oldest
+  /// let go first, and never one a kept retirement still needs. Do: retire host 1, then a survivor of it before it
+  /// confirms (so the survivor's takeover carries host 1's), complete the survivor's takeover, then complete many
+  /// transient members' takeovers while host 1's is kept; finally complete host 1's. Expect after every step at most
+  /// the bound's records, the survivor's record kept among them throughout (host 1's completion rests on it), and host
+  /// 1's takeover completing on it at the end, its line settled.
+  #[test]
+  fn completion_records_stay_bounded_and_keep_what_a_kept_retirement_needs() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    regional.take_over(first, scatter);
+    let carrier = regional
+      .survivors_of(first)
+      .first()
+      .copied()
+      .expect("host 1 has survivors");
+    regional.take_over(carrier, scatter);
+    confirm_every_survivor(&mut regional, carrier);
+    assert!(regional.completed.contains_key(&carrier));
+    // Shape: far more completed takeovers than the region keeps records of.
+    let transients = 48;
+    for index in 0..transients {
+      complete_a_transient_takeover(&mut regional, HostId(100 + index), scatter);
+      assert!(
+        regional.completed.len() <= regional.completed_bound(),
+        "bounded, the one record a kept retirement needs among them: {}",
+        regional.completed.len()
+      );
+      assert!(
+        regional.completed.contains_key(&carrier),
+        "the record host 1's completion rests on is kept"
+      );
+    }
+    assert!(regional.retired.contains_key(&first));
+    confirm_every_survivor(&mut regional, first);
+    assert!(regional.completed.contains_key(&first));
+    assert_eq!(
+      regional.lineage(first, ObjectId::new(first, 9)),
+      Lineage::Settled { takeover: first }
+    );
+  }
+
+  /// Confirms the share of every survivor of `departed`'s retirement.
+  fn confirm_every_survivor(regional: &mut RegionalConfiguration, departed: HostId) {
+    for survivor in regional.survivors_of(departed) {
+      regional.confirm(departed, survivor);
+    }
+  }
+
+  /// Admits `host`, retires it and confirms every survivor's share, so its takeover completes at once.
+  fn complete_a_transient_takeover(
+    regional: &mut RegionalConfiguration,
+    host: HostId,
+    scatter: u64,
+  ) {
+    assert!(regional.admit(host, None, scatter));
+    assert!(regional.retire(host, scatter));
+    confirm_every_survivor(regional, host);
   }
 
   /// AUD-29-26's sibling (a version names one configuration): do: a regional and a root configuration at
@@ -5150,12 +5583,13 @@ mod tests {
     assert_eq!(regional, before);
   }
 
-  /// §4.8 "Promotion and takeover": an object whose recovery cohort lost every survivor is lost — the lineage
-  /// says so rather than naming a host that never held it — while the retirement is kept for the survivors of
-  /// its other cohorts, who still owe their confirmations. A neighbourhood wider than one copyset makes the
-  /// case: two of one copyset's hosts retire before its owner does.
+  /// §4.8 "Promotion and takeover", A-309: an object whose recovery cohort lost every survivor is ranked among all the
+  /// retirement's survivors, so a survivor's confirmation covers it and the takeover completes only once it was
+  /// adopted. A neighbourhood wider than one copyset makes the case: two of one copyset's hosts retire, and their
+  /// takeovers complete, before its owner does. Before A-309 the line read lost, no round learned the object, and once
+  /// every survivor confirmed the retirement was dropped and the line read settled.
   #[test]
-  fn an_object_whose_cohort_has_no_survivor_is_lost() {
+  fn an_object_whose_cohort_has_no_survivor_is_ranked_among_the_retirements_survivors() {
     // Shape: a neighbourhood of every member, wide enough to hold two copysets of three at `f = 1`.
     let scatter = 5;
     let mut regional = RegionalConfiguration::formed(
@@ -5180,14 +5614,21 @@ mod tests {
         regional.confirm(*host, survivor);
       }
       assert!(!regional.retired.contains_key(host));
+      assert!(regional.completed.contains_key(host));
     }
     regional.take_over(owner, scatter);
     assert!(regional.retired[&owner].unconfirmed.is_empty());
+    let survivors = regional.survivors_of(owner);
     assert!(
-      !regional.survivors_of(owner).is_empty(),
-      "the owner's other copysets have survivors"
+      !survivors.is_empty() && survivors.iter().all(|host| !cohort.contains(host)),
+      "the owner's other copysets have survivors, its object's cohort none"
     );
-    assert_eq!(regional.lineage(owner, object), Lineage::Lost);
+    let resolved = regional.lineage(owner, object);
+    assert!(
+      matches!(resolved, Lineage::Successor { departed, successor }
+        if departed == owner && survivors.contains(&successor)),
+      "{resolved:?}"
+    );
   }
 
   /// A sample answer to a takeover page: two objects' records, a next page and a fence above the epoch.
