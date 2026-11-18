@@ -53,12 +53,32 @@ lost or wrongly answered: the forwards were refused and retried.
   - CI's interleaved A/B (diag-61; 3 runners, 15 runs a side, debug as the gate builds the fleet tests): before is
     this branch with the node's reset never sent; after is as committed.
     - After: every run counted exactly one `fleet.link.peer_reset`. The first read through b reached the restarted a
-      in 120 / 175 / 220 ms (min / median / max), within the test's one-liveness-budget bound.
+      in 120 / 175 / 220 ms (min / median / max), within the test's bound at the time, one liveness budget.
     - Before: no reset; the first read reached a in 166 / 206 / 284 ms, and every run failed only on the reset count.
   - **What this test does not show.** Without loadtest-scale's burst, b reached the restarted a on its first read in
     both arms. The stall of 25 to 135 s needs the burst that keeps b's lane holding the session. So this test proves the
     reset fires and the link moves; loadtest-scale's
     `a_forward_lane_leaves_a_dead_session_for_the_restarted_owners_new_one` is the test of the stall itself.
+  - **Hardened for load (2026-11-09).** The test failed at load 46–48 (main's parked runs) and at 170–232 (the
+    supervisor's Mac gate) with no reset to see: b's session to a had been lent, replaced or judged dead first, so no
+    packet reached the new process on it. The test now judges each restart by its outcome: it counts when a reset
+    reached b before b's liveness judged a dead. The restarted a resets only a 1-RTT packet naming a session it never
+    knew (`slates_transport::demux`, "Stateless reset"), so a reset on b's link to a shows b still held a session from
+    the old process when the new one met it. Readings of b's slot at an instant raced the reset or b's replacement of
+    the slot (diag-69 and diag-71 judged 1 of 16 and 1 of 24 runs vacuous whose every restart reset and reached), so
+    none is taken.
+
+    An attempt with no reset is made again, at most `RESET_ATTEMPTS` (4) times, a bound derived from the measured
+    misses (1 of 97 attempts). The test fails only if no attempt counted, or if, where one did, any of these is
+    missing:
+    - a reset sent by the restarted a;
+    - one counted by b while its reads waited;
+    - b's liveness not having judged a dead first;
+    - a read reaching the new a within ten liveness budgets.
+
+    Time no longer judges the move; the counters do. It prints how many restarts it took and in how many the reset path
+    ran. A reset a discovery page meets first is now counted `fleet.link.peer_reset` (`fleet::refresh_discovery`); it
+    dropped the link uncounted before.
 
 **R3.** The token's 16 bytes, the 21-byte minimum and the 43-byte send length are RFC 9000 §10.3 constants. The
 interval between resets to one source is the initial probe timeout, 666 ms: RFC 9002 §6.2.2's 333 ms `kInitialRtt`,

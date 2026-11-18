@@ -20,8 +20,8 @@
 use slates_client::{Attachment, Client, CreateSpec, Landing, ShardsStream, VhostUserDevice};
 use slates_ipc::protocol::{
   AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, ReplyBody, RequestBody, SnapshotId, StatusReport, TelemetryReport, VolumeId,
-  VolumeSummary,
+  LandingSummary, PlannedEntry, ReplyBody, RequestBody, SnapshotId, StatusReport, TelemetryReport,
+  VolumeId, VolumeSummary,
 };
 
 use crate::error::Error;
@@ -302,6 +302,20 @@ impl Instance {
   /// ([`Planned::Landed`]); otherwise its plan, for a person to approve.
   pub fn plan_landing(&mut self, request: &LandingRequest) -> Result<Planned, Error> {
     self.land_with(request, None).map(planned)
+  }
+
+  /// Every entry `plan` would write (§4.15 step 2, "the full entry list on demand"; A-287): path by path in the
+  /// manifest's order, each create and replace with its bytes' BLAKE3 and length as the manifest binds them, a
+  /// rename's origin, a symlink's target, the mode a file or directory lands with, and the conflict found at it. A
+  /// reviewer with no mount of the volume builds the change from the list and the volume's files, checking each file it
+  /// reads against its entry: a volume reads only at its head, so a mismatch means it changed since `plan`'s snapshot
+  /// and the landing is presented again. Read from the presentation `plan` names, which lives until this client
+  /// presents the same volume and target again, lands it, or goes: `Refused(NotFound)` after that.
+  pub fn landing_entries(&mut self, plan: &LandingPlan) -> Result<Vec<PlannedEntry>, Error> {
+    self
+      .client
+      .landing_entries(plan.landing, plan.manifest)
+      .map_err(|e| self.error(e))
   }
 
   /// Lands `request` under `grant` (§4.15 steps 3–6): the grant must bind this landing's volume, target and consumer,
