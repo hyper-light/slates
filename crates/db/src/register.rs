@@ -1914,6 +1914,13 @@ impl Acceptor {
     self.authority.generation
   }
 
+  /// The epoch this holder's fence holds the object at: a record or a promise below it is refused `StaleEpoch`. A live
+  /// holder that refuses a stale owner's message tells it this fence, so the owner learns it was superseded
+  /// (`live_ship::not_served`, A-409).
+  pub fn fence(&self) -> HostEpoch {
+    self.fence.seen
+  }
+
   /// Raises this holder's fence for the object to at least `epoch` (§4.8 "Promotion and takeover": "every
   /// holder raises its fence for that host to the new epoch"). When the configuration group bumps a failed
   /// host's fencing epoch, a holder installing that configuration raises the fence for the objects that host

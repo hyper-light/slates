@@ -600,21 +600,27 @@ pub fn unmount(path: &str) -> Result<(), MountFault> {
   run_unmount(UNMOUNT_ARGS, path)
 }
 
-/// Lets go of the mount at `path` even while processes still use it (Linux: `fusermount3 -u -z`): the kernel takes it
-/// out of the namespace now and finishes the unmount once its last user closes — what a host does for an ended agent
-/// whose leftover process still holds a file there, where [`unmount`] is refused busy. Like [`unmount`] it needs no
-/// daemon and no privilege. Elsewhere refused [`MountFault::Unsupported`]: macOS and the BSDs have no lazy unmount.
-#[cfg(target_os = "linux")]
-pub fn unmount_lazy(path: &str) -> Result<(), MountFault> {
-  run_unmount(LAZY_UNMOUNT_ARGS, path)
+/// How [`unmount_busy`] let go of a mount processes still used: the OS's way, by which a host knows what its leftover
+/// processes meet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LetGo {
+  /// Taken out of the namespace now; its users read and write on until they close, and the unmount finishes then
+  /// (Linux: `fusermount3 -u -z`, the kernel's `MNT_DETACH`).
+  Detached,
+  /// Unmounted now; its users' next calls on it fail (macOS and the BSDs: `umount -f`, the kernel's `MNT_FORCE`). The
+  /// loopback NFS mount is `hard`, so this is the only way off it for a holder whose daemon has gone.
+  Forced,
 }
 
-/// See the Linux arm: no lazy unmount here.
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn unmount_lazy(_path: &str) -> Result<(), MountFault> {
-  Err(MountFault::Unsupported {
-    missing: MountMissing::LazyUnmount,
-  })
+/// Lets go of the mount at `path` even while processes still use it: what a host does for an ended agent whose
+/// leftover process still holds a file there, where [`unmount`] is refused busy. Linux detaches it (`fusermount3 -u
+/// -z`); macOS and the BSDs have no detaching unmount and force it (`umount -f`); the answer says which
+/// ([`LetGo`]). Like [`unmount`] it needs no daemon and no privilege: a user lets go only of a mount they made. Until
+/// 2026-11-18 this was Linux's `unmount_lazy`, refused `Unsupported` elsewhere, so a macOS host had no library route
+/// off a busy mount (found by g076a, whose conformance harness forces it).
+#[cfg(not(windows))]
+pub fn unmount_busy(path: &str) -> Result<LetGo, MountFault> {
+  run_unmount(BUSY_UNMOUNT_ARGS, path).map(|()| BUSY_UNMOUNT)
 }
 
 /// Runs [`UNMOUNT_PROGRAM`] with `args` on `path`: its exit status, or the error number of starting it, typed.
@@ -647,15 +653,24 @@ const UNMOUNT_PROGRAM: &str = "fusermount3";
 /// Format: see [`UNMOUNT_PROGRAM`].
 #[cfg(target_os = "linux")]
 const UNMOUNT_ARGS: &[&str] = &["-u"];
-/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_lazy`].
+/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_busy`].
 #[cfg(target_os = "linux")]
-const LAZY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
+const BUSY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
+/// Format: how [`BUSY_UNMOUNT_ARGS`] lets go.
+#[cfg(target_os = "linux")]
+const BUSY_UNMOUNT: LetGo = LetGo::Detached;
 /// Format: see the Linux form.
 #[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_PROGRAM: &str = "umount";
 /// Format: see the Linux form.
 #[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_ARGS: &[&str] = &[];
+/// Format: `umount`'s forced unmount (`-f`: the kernel's `MNT_FORCE`), for [`unmount_busy`].
+#[cfg(all(unix, not(target_os = "linux")))]
+const BUSY_UNMOUNT_ARGS: &[&str] = &["-f"];
+/// Format: how [`BUSY_UNMOUNT_ARGS`] lets go.
+#[cfg(all(unix, not(target_os = "linux")))]
+const BUSY_UNMOUNT: LetGo = LetGo::Forced;
 
 #[cfg(test)]
 mod tests {
@@ -807,29 +822,33 @@ mod tests {
     assert_eq!(super::available(), Ok(MountKind::NfsLoopback));
   }
 
-  /// A-278 — a lazy unmount is Linux's: elsewhere it is refused `Unsupported` before any program runs.
+  /// A-278 (g076a's report) — a busy unmount runs the OS's own: `umount -f` on macOS and the BSDs, which refuses a path
+  /// where nothing is mounted. Do: let go of this crate's own directory, never a mount. Expect the refusal typed with the
+  /// program's exit status, and nothing changed. Until 2026-11-18 macOS refused it `Unsupported` before any program ran,
+  /// so a host had no library route off a busy mount there.
   #[cfg(all(unix, not(target_os = "linux")))]
   #[test]
-  fn a_lazy_unmount_is_refused_where_the_os_has_none() {
+  fn a_busy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
+    let path = env!("CARGO_MANIFEST_DIR");
     assert!(matches!(
-      super::unmount_lazy(env!("CARGO_MANIFEST_DIR")),
-      Err(MountFault::Unsupported { .. })
+      super::unmount_busy(path),
+      Err(MountFault::Unmount { path: refused, status: Some(_), errno: None }) if refused == path
     ));
   }
 
-  /// A-278 — a lazy unmount runs `fusermount3 -u -z`, which refuses a path where nothing is mounted: the refusal comes
-  /// back typed with the program's exit status, and nothing changes (this crate's own directory is never a mount).
-  /// Skips loudly where `fusermount3` is not installed.
+  /// A-278 — a busy unmount on Linux runs `fusermount3 -u -z`, which refuses a path where nothing is mounted. Do: let go
+  /// of this crate's own directory, never a mount. Expect the refusal typed with the program's exit status, and nothing
+  /// changed. Skips loudly where `fusermount3` is not installed.
   #[cfg(target_os = "linux")]
   #[test]
-  fn a_lazy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
+  fn a_busy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
     if !super::command_on_path("fusermount3") {
       eprintln!("SKIP: fusermount3 is not on the PATH");
       return;
     }
     let path = env!("CARGO_MANIFEST_DIR");
     assert!(matches!(
-      super::unmount_lazy(path),
+      super::unmount_busy(path),
       Err(MountFault::Unmount { path: refused, status: Some(_), errno: None }) if refused == path
     ));
   }

@@ -51,19 +51,28 @@ not affected: epoll and a completion port harvest without sleeping, so their hel
 
 ## Exact edits
 
-- `crates/server/src/config.rs`: the loop's return at R9's percentile moves to `loop_return_hold` (cfg-free, the unit
-  test `a_closed_loops_hold_covers_its_return_to_a_shard_at_r9s_percentile` now tests it); `closed_loop_hold` becomes a
-  paired `#[cfg]` function, the return on Linux and Windows and none on macOS (`derived!(0, …)`, anchored on A-218 and
-  A-387). The daemon's `closed_loop_hold_ns` is that value, so on macOS `verbs::loop_hold` returns 0 and a forward asks
-  no hold.
-- `crates/server/tests/closed_loop.rs`: one scenario (`run_scenario`), its client spinning for `loop_return_hold` on
-  every platform so its loop is R9's closed loop whatever the daemon holds; the Linux and Windows verdict as before; on
-  macOS `on_macos_a_closed_loop_holds_no_shard_and_its_owners_park_between_its_returns`. On the Mac Studio (debug, load
-  25–31) it failed 2 of 2 with macOS's hold put back to the loop's return (the loop's forwards asked 261 and 164 holds;
-  branch `diag-g234-a387-red`) and passed 3 of 3 as built (no hold; the owners parked 416–419 times over the loop's 198
-  returns later than 2F). The Linux and Windows verdict passed 3 of 3 on ubuntu-latest (CI run 44367421244).
+First form (3c872fa74, on main as d8874af10): `closed_loop_hold` a paired `#[cfg]` function, none on macOS. Replaced the
+same day, since a value fixed per platform is not a decision derived from what the machine does (CLAUDE.md §3; Ada,
+2026-11-18):
+
+- `crates/rt/src/held_turn.rs` (new): `HeldTurn`, the idle turn a request meets, E[T²]/E[T] over the turns learned
+  (a plain mean over the first `2^shift`, the wake estimate's own count, then exponentially weighted means), and
+  `hold_pays(met_turn, wake)`: true while the turn is shorter than the wake, or before any turn is measured.
+- `crates/rt/src/shard.rs`: every turn of every idle spin is timed and folded in (`learn_turn`, a real clock and a
+  tracked wake estimate only); `hold_idle_window` keeps a hold only while `hold_pays`, and counts a decline
+  (`Counters::idle_holds_declined`); `Counters::held_turn_ns` and `held_turns` report the estimate; the pulse mirrors it
+  at each spin's end (`Pulse::held_turn_ns`, `ShardPulse::held_turn_ns`), and `provision_bench` prints it beside each
+  shard's wake.
+- `crates/server/src/config.rs`: `closed_loop_hold` is the loop's return at R9's percentile on every platform again;
+  the owner decides.
+- `crates/server/tests/closed_loop.rs`: one cfg-free verdict. Each owner decided by what it measured (an owner whose
+  learned turn stayed at least its wake through the loop declined holds, one whose turn stayed shorter kept them); with
+  none kept the owners parked for every return later than 2F, R9's tail aside; with holds kept, A-326's verdict. The
+  first form's runs on the Mac Studio (debug, load 25–31): with every hold kept the loop's owners kept 261 and 164 holds
+  and parked 173 and 315 times over 198 returns later than 2F; with no hold asked, 416–419 parks over the same 198; on
+  ubuntu-latest every owner kept holds (CI run 44367421244).
 - Design §4.3, §4.7 (derived constants, a status), A-326's last line and the amendment A-387; GAPS (A-223's entry);
-  BENCHMARKS ("The closed-loop hold on macOS").
+  BENCHMARKS ("The closed-loop hold on macOS"). Owed: the learned rule's A/B against main, filed for main to run.
 
 ## Not changed, and why
 

@@ -9,11 +9,11 @@
 //! (docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// These integration tests drive the daemon's NFS-loopback transport and a real landing target — macOS
-// and Linux; on Windows the daemon lands nothing yet.
-#![cfg(unix)]
+// These integration tests drive the daemon's NFS-loopback transport (served on Windows too, A-184) and a real landing
+// target, on every platform since the Windows writer (A-185).
 
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use slates_client::{Client, ClientError, Landing, SnapshotId, VolumeId};
@@ -86,11 +86,28 @@ fn alias_of(path: &str) -> Option<String> {
     format!("{parent}/{other_case}"),
   ]
   .into_iter()
-  .find(|candidate| {
-    candidate != path
-      && std::fs::metadata(candidate)
-        .is_ok_and(|other| other.dev() == original.dev() && other.ino() == original.ino())
-  })
+  .find(|candidate| candidate != path && same_object(path, &original, candidate))
+}
+
+/// Whether `candidate` names the object `original` was read from: the same device and inode (Unix).
+#[cfg(unix)]
+fn same_object(_path: &str, original: &std::fs::Metadata, candidate: &str) -> bool {
+  std::fs::metadata(candidate)
+    .is_ok_and(|other| other.dev() == original.dev() && other.ino() == original.ino())
+}
+
+/// Whether `candidate` names the object `original` was read from (Windows): the same canonical path, which Windows
+/// reports in the object's own spelling whatever spelling opened it (the file index needs an unstable standard-library
+/// feature, and this test only compares two spellings of one directory).
+#[cfg(windows)]
+fn same_object(path: &str, _original: &std::fs::Metadata, candidate: &str) -> bool {
+  match (
+    std::fs::canonicalize(path),
+    std::fs::canonicalize(candidate),
+  ) {
+    (Ok(one), Ok(other)) => one == other,
+    _ => false,
+  }
 }
 
 /// A granted landing: its volume, snapshot, target spelling and grant.
