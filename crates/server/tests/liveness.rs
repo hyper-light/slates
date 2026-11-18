@@ -176,6 +176,73 @@ fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
   daemon.stop();
 }
 
+/// Shape: the wake estimate the idle-spin test seeds its shards with, a hundred liveness windows: past the watchdog's spin
+/// window in any build it is likely to meet (the budget held to the build's own slowdown, A-318), so a window priced on
+/// it, or a hold as long, would spin through the whole watch.
+const INFLATED_WAKE_NS: u64 = 100 * LIVENESS_BUDGET_NS;
+
+/// A-361, §4.7, §4.14: an idle shard polling for work is not a wedged one. Do: start a supervised two-shard daemon whose
+/// shards price their idle window on their wake estimate (a ratio of one, as the runtime's own spin-then-park does), the
+/// estimate seeded a hundred windows long; on the shard that is not the control shard note a client's activity and hold
+/// its window for as long, then watch the beat for the watchdog's spin window and three windows more. Expect: the beat
+/// never stops for a window, since the daemon holds every idle spin a beat under the watchdog's least window. Before
+/// A-361 nothing bounded the spin: a Windows daemon's window, a hundred times an estimate that counted loaded wakes, spun
+/// past the watchdog's window after a WinFsp request, and the anchor killed the live daemon in 3 of 3 runs on CI's
+/// windows-latest (g258's now-x86 lane, 2026-11-18).
+#[test]
+fn an_idle_spin_never_reaches_the_watchdogs_verdict() {
+  common::supervised::run(
+    "an_idle_spin_never_reaches_the_watchdogs_verdict_role",
+    "liveness-idle-spin",
+    2,
+  );
+}
+
+/// The role [`an_idle_spin_never_reaches_the_watchdogs_verdict`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by an_idle_spin_never_reaches_the_watchdogs_verdict as a supervised child"]
+fn an_idle_spin_never_reaches_the_watchdogs_verdict_role() {
+  let Some((daemon, _)) = common::supervised::daemon_with(
+    "an_idle_spin_never_reaches_the_watchdogs_verdict_role",
+    |mut config| {
+      if let Some(tracking) = config.runtime.wake_tracking.as_mut() {
+        tracking.prior_ns = INFLATED_WAKE_NS;
+        tracking.idle_ratio = 1;
+      }
+      config
+    },
+  ) else {
+    return;
+  };
+  let other = daemon.shards()[1];
+  let _serving = beating(&daemon);
+  let spin_window = Duration::from_nanos(daemon.spin_window_ns().unwrap());
+  // Whether the observation reached the shard's context and held its window: the non-vacuity of the watch.
+  let held = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let worker = on_shard(&daemon, other, move || {
+    let placed = slates_rt::registry::with_current(|ctx| {
+      ctx.note_activity();
+      ctx.hold_idle_window(INFLATED_WAKE_NS);
+    })
+    .is_some();
+    held.store(placed, Ordering::Release);
+  });
+  worker.join().unwrap();
+  assert!(
+    held.load(Ordering::Acquire),
+    "the observation ran on the shard's context and held its window"
+  );
+  let (largest, last_seen) = watch_beat(&daemon, spin_window + WINDOW * 3);
+  println!(
+    "largest beat gap after an idle spin priced on an inflated estimate: {largest:?} (the spin window {spin_window:?})"
+  );
+  assert!(
+    largest < WINDOW,
+    "an idle shard's spin stopped the beat for {largest:?} (last seen {last_seen:?} in), against the {WINDOW:?} window"
+  );
+  daemon.stop();
+}
+
 /// Blocks a shard's poll on a channel nobody sends on for `held`: no CPU and never runnable.
 fn block_on_a_channel(held: Duration) {
   wait(held);
