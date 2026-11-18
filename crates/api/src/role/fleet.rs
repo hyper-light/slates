@@ -19,7 +19,10 @@
 //! `name` is the TLS server name every certificate carries (its subject alternative name) and every peer
 //! verifies the session against; `f` is the fault tolerance (a write commits at `f + 1` acknowledgements);
 //! each node's `address` is the IP **or DNS name** its peers dial and the base of the port block it serves
-//! them from (two ports per node in the manifest, in manifest order — `slates_server::deploy`); `certificate`
+//! them from (two ports per node in the manifest, in manifest order — `slates_server::deploy`); an optional
+//! `bind` (A-277), an IPv4 literal and a nonzero base port, is where the node's own two sockets bind when a port
+//! mapping stands between it and its peers (a NAT's port forward, a container's published ports, the chaos
+//! harness's relay), the peers still dialing `address`; `certificate`
 //! and `key` are DER files, resolved against the manifest's own directory. Every certificate is read (they
 //! are what the peers pin, and what the member ids derive from); only this node's key is read. A name is
 //! resolved by the daemon at every dial (`slates_server::dns`), through the nameservers of this host's
@@ -36,8 +39,7 @@ use slates_server::deploy::{
 };
 use slates_server::{DurabilityBound, Resolver};
 
-use crate::Failure;
-use crate::args::FleetSelection;
+use super::{Failure, FleetSelection};
 
 /// Format: where the operating system's resolver configuration lives (`resolv.conf(5)`).
 const RESOLV_CONF: &str = "/etc/resolv.conf";
@@ -178,6 +180,9 @@ impl std::fmt::Display for ManifestError {
 struct NodeText {
   node: String,
   address: NodeAddress,
+  /// Where the node's own serve sockets bind when a port mapping stands between it and its peers (A-277): an
+  /// IPv4 literal and a nonzero base port. Absent = it binds its advertised address, the default.
+  bind: Option<SocketAddrV4>,
   certificate: String,
   key: String,
   /// The node's failure domain, if the operator declared one (`DomainId` is a `u64`). Absent = the node is
@@ -231,6 +236,22 @@ fn node_text(entry: &serde_json::Value, index: usize) -> Result<NodeText, Manife
     field: format!("{path}address"),
     expected,
   })?;
+  // `bind` is optional (A-277): present only when a port mapping stands between the node and its peers, and then an
+  // IPv4 literal with a nonzero base port. The node's own sockets bind there, so a name (whose address is not the
+  // manifest's to know) or port 0 (the kernel's choice, which no mapping could name) is refused.
+  let bind = match entry.get("bind") {
+    None => None,
+    Some(value) => Some(
+      value
+        .as_str()
+        .and_then(|text| text.parse::<SocketAddrV4>().ok())
+        .filter(|bind| bind.port() != 0)
+        .ok_or_else(|| ManifestError::Field {
+          field: format!("{path}bind"),
+          expected: "an IPv4 address and a nonzero base port where this node's own two serve sockets bind, like `0.0.0.0:7000`",
+        })?,
+    ),
+  };
   // `domain` is optional: present only for a real failure-domain topology, and then a non-negative integer.
   let domain = match entry.get("domain") {
     None => None,
@@ -250,6 +271,7 @@ fn node_text(entry: &serde_json::Value, index: usize) -> Result<NodeText, Manife
   Ok(NodeText {
     node: string_field(entry, &path, "node")?,
     address,
+    bind,
     certificate: string_field(entry, &path, "certificate")?,
     key: string_field(entry, &path, "key")?,
     domain,
@@ -412,6 +434,7 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
     nodes.push(FleetNodeEntry {
       node: node.node.clone(),
       address: node.address.clone(),
+      bind: node.bind,
       certificate,
       domain: node.domain,
       region: node.region.map(RegionId),
@@ -508,6 +531,39 @@ mod tests {
     match parse(&bad) {
       Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].domain"),
       other => panic!("expected a field error for a non-integer domain, got {other:?}"),
+    }
+  }
+
+  /// A-277: a node may name where its own sockets bind, apart from where its peers dial it. Do: parse a manifest whose
+  /// node a binds `0.0.0.0:17000`, then manifests whose bind is a name, has no port, has port 0, or is no string.
+  /// Expect: the bind parsed for a and absent for b; each bad one refused naming `nodes[0].bind`.
+  #[test]
+  fn a_declared_bind_parses_and_a_bad_one_is_named() {
+    let with_bind = MANIFEST.replace(
+      r#""certificate": "a.crt.der", "key": "a.key.der""#,
+      r#""certificate": "a.crt.der", "key": "a.key.der", "bind": "0.0.0.0:17000""#,
+    );
+    let stated = parse(&with_bind).expect("parses");
+    assert_eq!(
+      stated.nodes[0].bind,
+      Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 17_000)),
+      "the declared bind is parsed"
+    );
+    assert_eq!(
+      stated.nodes[1].bind, None,
+      "an undeclared node binds where it advertises"
+    );
+    for (bad, why) in [
+      (r#""bind": "slates-0.svc:7000""#, "a name"),
+      (r#""bind": "10.0.0.1""#, "no port"),
+      (r#""bind": "10.0.0.1:0""#, "port 0"),
+      (r#""bind": 17000"#, "not a string"),
+    ] {
+      let text = with_bind.replace(r#""bind": "0.0.0.0:17000""#, bad);
+      match parse(&text) {
+        Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].bind", "{why}"),
+        other => panic!("expected a field error for a bind that is {why}, got {other:?}"),
+      }
     }
   }
 

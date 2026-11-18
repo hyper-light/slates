@@ -191,11 +191,11 @@ fn spawn_anchor_from(
   (AnchorProcess { child, drain: None }, stderr)
 }
 
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`), after its shards
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`), after its shards
 /// started and its rendezvous was published; the instance name follows.
 const SERVING_LINE: &str = "slates daemon: instance ";
 
-/// Format: the anchor's line when its supervision finds the daemon in a crash loop (`crates/cli/src/anchor.rs`,
+/// Format: the anchor's line when its supervision finds the daemon in a crash loop (`crates/api/src/role/anchor.rs`,
 /// A-119). The anchor never gives up on a daemon, so a daemon that can never serve shows here, not as an exit.
 const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
 
@@ -551,7 +551,7 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 ///
 /// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
 /// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
-/// and killing a frozen one a window after the lapse (`crates/cli/src/anchor.rs` `on_lapse`). Until A-232 it killed at
+/// and killing a frozen one a window after the lapse (`crates/api/src/role/anchor.rs` `on_lapse`). Until A-232 it killed at
 /// the lapse itself, as a withheld beat: measured 2026-11-06 on macOS arm64 at load 54, 1,045 ms against a 1,044 ms
 /// bound (the liveness window plus the anchor's lateness p99 of 44 ms over 15 waits). Still waiting for those words, this
 /// test timed out on the landing of A-232 (CI's ubuntu-latest, 2026-11-17), whose kill line read "has not looked for
@@ -628,7 +628,7 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   );
 }
 
-/// Format: the words of the anchor's kill line for a beat its watchdog withheld while looking (`crates/cli/src/anchor.rs`
+/// Format: the words of the anchor's kill line for a beat its watchdog withheld while looking (`crates/api/src/role/anchor.rs`
 /// `on_lapse`): never a frozen daemon's, whose watchdog is frozen with it.
 const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
@@ -668,7 +668,7 @@ const STARVED_PERIOD: Duration = Duration::from_nanos(slates_server::daemon::HEA
 /// this Mac under 144 spinners (16-18 ms of CPU across about 1.15 s of wall time from its first instruction to its
 /// profile read, 2026-11-07).
 const STARVED_RUNS_ONE_IN: u32 = 64;
-/// Format: the anchor's kill of a start (`crates/cli/src/anchor.rs`): "the starting daemon made no progress …" or "…
+/// Format: the anchor's kill of a start (`crates/api/src/role/anchor.rs`): "the starting daemon made no progress …" or "…
 /// ran … ms of CPU without beating …". Until 2026-11-07 it read "the daemon never beat inside the recovery budget";
 /// the test also holds the starved successor to be the one that answers, so a kill under any wording fails it.
 const START_KILL_LINE: &str = "slates anchor: the starting daemon";
@@ -859,7 +859,7 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
   );
 }
 
-/// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
+/// Format: the anchor's restart line names the daemon it started after this (`crates/api/src/role/anchor.rs`).
 const RESTARTED_AS: &str = "restarted as pid ";
 
 /// The pid the anchor's next restart line names, from its forwarded lines, within [`START_CEILING`].
@@ -879,7 +879,7 @@ fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>) -> u32 {
   }
 }
 
-/// Format: the anchor's words for a start that made no progress (`crates/cli/src/anchor.rs`, `start_stuck`), before
+/// Format: the anchor's words for a start that made no progress (`crates/api/src/role/anchor.rs`, `start_stuck`), before
 /// the milliseconds.
 const STUCK_WORDS: &str = "made no progress for ";
 
@@ -2910,7 +2910,7 @@ fn mint_identity(dir: &str, node: &str) {
   std::fs::write(format!("{dir}/{node}.key.der"), key.serialize_der()).unwrap();
 }
 
-/// The shared manifest (the documented shape, `crates/cli/src/fleet.rs`): every node with its loopback
+/// The shared manifest (the documented shape, `crates/api/src/role/fleet.rs`): every node with its loopback
 /// base port and its DER files, written into `dir`; returns its path.
 #[allow(clippy::disallowed_methods)]
 fn write_manifest(dir: &str, bases: &[u16]) -> String {
@@ -12003,7 +12003,7 @@ const UNKNOWN_HOLD_KIND: u8 = 0xff;
 /// Format: the daemon status line carrying the anchor's hold refusals (A-213).
 const HOLD_REFUSALS_LINE: &str = "anchor_hold_refusals: ";
 /// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it
-/// (`crates/cli/src/daemon.rs`, `QUICK_PROBE_MS`).
+/// (`crates/api/src/role/daemon.rs`, `QUICK_PROBE_MS`).
 const QUICK_PROBE_MS: u64 = 5;
 
 /// The garbling daemon: spawned by a real supervisor ([`a_real_anchors_hold_refusals_show_in_slates_status`]), it sends

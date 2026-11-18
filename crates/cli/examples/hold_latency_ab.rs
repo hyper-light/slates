@@ -63,7 +63,7 @@ mod windows {
   const STABLE_STREAK: u32 = 10;
   /// Shape: the most `volume list` attempts a start makes before the daemon counts as absent.
   const START_ATTEMPTS: u32 = 60;
-  /// Format: the daemon's line once it serves (`crates/cli/src/daemon.rs`); the instance name follows.
+  /// Format: the daemon's line once it serves (`crates/api/src/role/daemon.rs`); the instance name follows.
   const SERVING_LINE: &str = "slates daemon: instance ";
   /// Format: milliseconds in a second, for the summary.
   const MS_PER_S: f64 = 1_000.0;

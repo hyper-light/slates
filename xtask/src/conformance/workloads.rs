@@ -4,6 +4,11 @@
 //! output with the directory roots normalized, same tree manifest under the roster's reviewed
 //! exclusions. The volume is created with the host directory's name-folding policy so git's
 //! `core.ignorecase` probe sees the same filesystem on both sides (`EQUIVALENCE.md` §4).
+//!
+//! On Windows (A-300) the lane runs the roster's version-control workloads over the WinFsp drive, each script run by
+//! Git for Windows' `sh` in an NTFS folder of the scratch and in a folder of the drive, in a directory's plain drive
+//! form (`D:\a`, never the verbatim `\\?\D:\a` a canonical path has, which a shell's `pwd` would not print); and the
+//! drive's runs are judged under its stated differences (`slates_conformance::workload::stated_differences`).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -12,39 +17,19 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::{Counts, WorkloadResult, WorkloadStatus};
 use slates_conformance::workload::{
-  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, Entry, EntryKind, Manifest, ROSTER, Workload, compare,
+  ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ENVIRONMENT, Entry, EntryKind, Manifest, ROSTER, Workload,
+  compare_with, stated_differences,
 };
 
 use super::slates::{Session, folds_names};
-use super::{Run, SQLITE_BUSY_MS, SuiteResult, WATCH_SECONDS, create_dir, tool_on_path};
+use super::{
+  Run, SQLITE_BUSY_MS, SuiteResult, WATCH_SECONDS, create_dir, plain_path, tool_on_path,
+};
 use crate::Failure;
 
 /// Format: git's variable for configuration passed on its own command line (`git -c`), which a workload must not
 /// inherit from the process that started the harness ([`workload_environment`]).
 const GIT_CONFIG_PARAMETERS: &str = "GIT_CONFIG_PARAMETERS";
-
-/// Format: the fixed identity and date every git commit is made with, so object hashes match
-/// between the host run and the mounted run.
-pub(super) const GIT_IDENTITY: &[(&str, &str)] = &[
-  ("GIT_AUTHOR_NAME", "slates"),
-  ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
-  ("GIT_COMMITTER_NAME", "slates"),
-  ("GIT_COMMITTER_EMAIL", "slates@example.invalid"),
-  ("GIT_AUTHOR_DATE", "2026-09-14T00:00:00Z"),
-  ("GIT_COMMITTER_DATE", "2026-09-14T00:00:00Z"),
-  ("GIT_CONFIG_GLOBAL", "/dev/null"),
-  ("GIT_CONFIG_NOSYSTEM", "1"),
-  // None of the configuration a parent passes in the environment (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, read up
-  // to the count): kiln's agent sessions sign every commit that way, and a signature carries its signing time.
-  ("GIT_CONFIG_COUNT", "0"),
-  ("TZ", "UTC"),
-  ("LC_ALL", "C"),
-  ("npm_config_update_notifier", "false"),
-  ("npm_config_fund", "false"),
-  ("npm_config_audit", "false"),
-  // No npm log files: their path (in the cache) would be the one line that differs between runs.
-  ("npm_config_logs_max", "0"),
-];
 
 /// Format: a file's permission bits in `st_mode`.
 const PERMISSION_MASK: u32 = 0o7777;
@@ -52,6 +37,30 @@ const PERMISSION_MASK: u32 = 0o7777;
 /// Whether a roster entry is the watcher for another operating system.
 fn foreign_watcher(workload: &Workload, os: HostOs) -> bool {
   workload.name == "watcher" && (workload.tool == "fswatch") != (os == HostOs::Macos)
+}
+
+/// Whether this host's lane runs a roster entry: the watcher of its own operating system, and on Windows only what the
+/// roster marks for it (`Workload::runs_on_windows`, A-300).
+fn runs_here(workload: &Workload, os: HostOs) -> bool {
+  !foreign_watcher(workload, os) && (os != HostOs::Windows || workload.runs_on_windows)
+}
+
+/// The note a Windows record carries about the roster's other workloads (A-300): each is owed a Windows form, named
+/// once (both watchers are `watcher`). `None` on any other host, which runs the whole roster.
+fn owed_on_windows_note(os: HostOs) -> Option<String> {
+  if os != HostOs::Windows {
+    return None;
+  }
+  let mut owed: Vec<&str> = ROSTER
+    .iter()
+    .filter(|workload| !workload.runs_on_windows)
+    .map(|workload| workload.name)
+    .collect();
+  owed.dedup();
+  Some(format!(
+    "on Windows the roster runs its version-control workloads (A-300); owed a Windows form: {}",
+    owed.join(", ")
+  ))
 }
 
 /// The BLAKE3 of a file's bytes, hexadecimal.
@@ -144,36 +153,78 @@ pub(super) fn manifest_of(root: &Path) -> Result<Manifest, Failure> {
   Ok(Manifest { entries })
 }
 
-/// Sets `command`'s environment for a workload: the fixed git identity and dates, the tools' caches in `scratch`, the
+/// Sets `command`'s environment for a workload: the roster's shared environment (the fixed identities and dates, no
+/// configuration a parent passes; `slates_conformance::workload::ENVIRONMENT`), the tools' caches in `scratch`, the
 /// watch and busy bounds, and none of the parent's git configuration.
 fn workload_environment<'a>(command: &'a mut Command, scratch: &Path) -> &'a mut Command {
   command
-    .envs(GIT_IDENTITY.iter().copied())
+    .envs(ENVIRONMENT.iter().copied())
     .env_remove(GIT_CONFIG_PARAMETERS)
     .env("npm_config_cache", scratch.join("npm-cache"))
     .env(ENV_SQLITE_BUSY_MS, SQLITE_BUSY_MS.to_string())
     .env(ENV_WATCH_SECONDS, WATCH_SECONDS.to_string())
 }
 
-/// Runs a workload's script in a fresh directory and captures everything.
+/// Runs a workload's script in a fresh directory and captures everything. The script starts in the directory's plain
+/// form, which is the one its tools print it in (on Windows the drive form, not a canonical path's verbatim one).
 fn execute(
   workload: &Workload,
   dir: &Path,
   scratch: &Path,
 ) -> Result<slates_conformance::workload::Run, Failure> {
   create_dir(dir)?;
+  let directory = plain_path(dir);
   let script = format!("exec 2>&1\nset -e\n{}", workload.script);
   let mut command = Command::new("sh");
-  command.arg("-c").arg(&script).current_dir(dir);
+  command.arg("-c").arg(&script).current_dir(&directory);
   let output = workload_environment(&mut command, scratch)
     .stdin(Stdio::null())
     .output()
     .map_err(|e| Failure(format!("running the {} workload: {e}", workload.name)))?;
   Ok(slates_conformance::workload::Run {
-    directory: dir.display().to_string(),
+    directory,
     exit_code: output.status.code().unwrap_or(-1),
     output: String::from_utf8_lossy(&output.stdout).into_owned(),
     manifest: manifest_of(dir)?,
+  })
+}
+
+/// One roster entry run on the host and over the mount and judged under the route's stated differences (A-300), or
+/// skipped naming its absent tool. A difference, a failure or a stated difference is printed and noted for the record.
+fn run_one(
+  run: &Run<'_>,
+  workload: &Workload,
+  (host_root, mount_root): (&Path, &Path),
+  notes: &mut Vec<String>,
+) -> Result<WorkloadResult, Failure> {
+  if !tool_on_path(workload.tool) {
+    return Ok(WorkloadResult {
+      name: workload.name.to_owned(),
+      status: WorkloadStatus::Skipped {
+        tool: workload.tool.to_owned(),
+      },
+    });
+  }
+  let host = execute(workload, &host_root.join(workload.name), run.scratch.path())?;
+  let mount = execute(
+    workload,
+    &mount_root.join(workload.name),
+    run.scratch.path(),
+  )?;
+  let status = compare_with(workload, &host, &mount, stated_differences(run.transport));
+  match status
+    .failure_note(workload.name)
+    .or_else(|| status.stated_note(workload.name))
+  {
+    Some(note) => {
+      println!("workloads: {note}");
+      notes.push(note);
+    }
+    None => println!("workloads: {}: {status:?}", workload.name),
+  }
+  Ok(WorkloadResult {
+    name: workload.name.to_owned(),
+    status,
   })
 }
 
@@ -188,42 +239,18 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     "the volume was created with --fold={fold} to match the host scratch's name policy; git identity and dates fixed; \
      sqlite busy timeout {SQLITE_BUSY_MS} ms; watcher wait {WATCH_SECONDS} s"
   )];
-  for workload in ROSTER {
-    if foreign_watcher(workload, run.os) {
-      continue;
-    }
-    if !tool_on_path(workload.tool) {
-      tools.push(WorkloadResult {
-        name: workload.name.to_owned(),
-        status: WorkloadStatus::Skipped {
-          tool: workload.tool.to_owned(),
-        },
-      });
-      continue;
-    }
-    let host = execute(workload, &host_root.join(workload.name), run.scratch.path())?;
-    let mount = execute(
+  notes.extend(owed_on_windows_note(run.os));
+  for workload in ROSTER.iter().filter(|workload| runs_here(workload, run.os)) {
+    tools.push(run_one(
+      run,
       workload,
-      &mount_root.join(workload.name),
-      run.scratch.path(),
-    )?;
-    let status = compare(workload, &host, &mount);
-    if let WorkloadStatus::Differs { detail } = &status {
-      notes.push(format!("{}: {detail}", workload.name));
-      println!("workloads: {} differs: {detail}", workload.name);
-    } else {
-      println!("workloads: {}: {status:?}", workload.name);
-    }
-    tools.push(WorkloadResult {
-      name: workload.name.to_owned(),
-      status,
-    });
+      (&host_root, &mount_root),
+      &mut notes,
+    )?);
   }
   notes.extend(session.size_note.clone());
   drop(session);
-  let ok = !tools
-    .iter()
-    .any(|t| matches!(t.status, WorkloadStatus::Differs { .. }));
+  let ok = !tools.iter().any(|t| t.status.fails_the_suite());
   let run_count = tools
     .iter()
     .filter(|t| !matches!(t.status, WorkloadStatus::Skipped { .. }))
@@ -250,6 +277,7 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use slates_conformance::workload::compare;
 
   /// AC-3.2 / T-3.3 (2026-11-07). Do: commit through the workload environment from a parent environment that configures
   /// signing, as kiln's agent sessions do (`GIT_CONFIG_COUNT` with `commit.gpgsign` and a signing program, here one that
@@ -323,6 +351,166 @@ mod tests {
     // Judged as the suite judges host against mount (the git index records stat times, so the reviewed
     // policy leaves it out).
     assert_eq!(compare(workload, first, second), WorkloadStatus::Identical);
+  }
+
+  /// The goal of 2026-11-18 (git, Mercurial and Subversion byte-identical on every route), its determinism gate. Do: run
+  /// each version-control workload of the roster twice on the host, in two directories of different names (as the host
+  /// run and the mounted run are) and a clock second or more apart. Expect: identical by the suite's own comparison —
+  /// same exit code 0, same output once each directory is the root token, same tree under the roster's exclusions — so
+  /// a difference over a mount is the mount's, never the tool's own nondeterminism or an absolute path the comparison
+  /// missed. Each absent tool skips loudly. Measured on this rule's first run (2026-11-17, macOS 26, git 2.50.1,
+  /// Mercurial 7.2): two runs of the Mercurial workload wrote its store's file list in two orders until the shared
+  /// environment fixed Python's hash seed, and a local clone's `undo.desc` and reflog name its source by absolute
+  /// path, which the roster now excludes with the reason.
+  #[test]
+  fn the_version_control_workloads_run_byte_identically_twice_on_the_host() {
+    let path =
+      crate::conformance::build_output(&format!("slates-vcs-twice-{}", std::process::id()))
+        .unwrap();
+    let scratch = super::super::Scratch { path, keep: false };
+    for name in ["git", "git-history", "mercurial", "subversion"] {
+      let workload = ROSTER
+        .iter()
+        .find(|workload| workload.name == name)
+        .unwrap();
+      if !tool_on_path(workload.tool) {
+        eprintln!(
+          "SKIP: the {name} workload twice on the host: {} is absent",
+          workload.tool
+        );
+        continue;
+      }
+      let first_root = scratch.fresh(&format!("{name}-first")).unwrap();
+      let first = execute(workload, &first_root.join(name), scratch.path()).unwrap();
+      // A clock second between the runs, so anything a workload stamps with the time differs between them.
+      #[allow(clippy::disallowed_methods)]
+      // the test thread waits out a whole second, no runtime involved
+      std::thread::sleep(std::time::Duration::from_millis(1_100));
+      let second_root = scratch.fresh(&format!("{name}-second-run")).unwrap();
+      let second = execute(workload, &second_root.join(name), scratch.path()).unwrap();
+      assert_eq!(first.exit_code, 0, "{name}, first run: {}", first.output);
+      assert_eq!(
+        compare(workload, &first, &second),
+        WorkloadStatus::Identical,
+        "{name}"
+      );
+      eprintln!(
+        "the {name} workload ran twice identically: {} entries, {} output lines",
+        first.manifest.entries.len(),
+        first.output.lines().count()
+      );
+    }
+  }
+
+  /// A run's output as a clone that copies prints it: each line of the workload's stated link counts with its count of
+  /// files with two names as 0, the rest of the line kept (`5 of 5` becomes `0 of 5`, as on the WinFsp drive).
+  fn as_a_copying_clone_prints(output: &str, workload: &str) -> String {
+    let starts: Vec<&str> = stated_differences(slates_conformance::Transport::NativeWindowsWinfsp)
+      .iter()
+      .filter(|entry| entry.workload == workload)
+      .map(|entry| entry.line_start)
+      .collect();
+    output
+      .lines()
+      .map(|line| {
+        match starts
+          .iter()
+          .find_map(|start| line.strip_prefix(start).map(|rest| (start, rest)))
+        {
+          Some((start, rest)) => format!(
+            "{start}0{}",
+            rest.trim_start_matches(|c: char| c.is_ascii_digit())
+          ),
+          None => line.to_owned(),
+        }
+      })
+      .map(|line| line + "\n")
+      .collect()
+  }
+
+  /// A-300 (the WinFsp drive's stated difference). Do: run the real git history and Mercurial workloads on this host,
+  /// whose clones link, and judge each against the same run as a clone that copies prints it (the drive's: every
+  /// count of files with two names 0), under the drive's stated differences; then against itself. Expect the first
+  /// identical but for exactly the stated lines (one of git's, two of Mercurial's, each with the host's nonzero count),
+  /// a difference judged on a route that states nothing, and the second refused because no stated line differed, so
+  /// each stated start names a line these real scripts print and nothing else. Each absent tool skips loudly.
+  #[test]
+  fn the_drives_stated_differences_name_the_lines_the_real_clones_print() {
+    let path =
+      crate::conformance::build_output(&format!("slates-vcs-stated-{}", std::process::id()))
+        .unwrap();
+    let scratch = super::super::Scratch { path, keep: false };
+    let stated = stated_differences(slates_conformance::Transport::NativeWindowsWinfsp);
+    for (name, stated_lines) in [("git-history", 1), ("mercurial", 2)] {
+      let workload = ROSTER
+        .iter()
+        .find(|workload| workload.name == name)
+        .unwrap();
+      if !tool_on_path(workload.tool) {
+        eprintln!(
+          "SKIP: the {name} workload's stated difference: {} is absent",
+          workload.tool
+        );
+        continue;
+      }
+      let root = scratch.fresh(&format!("{name}-stated")).unwrap();
+      let host = execute(workload, &root.join(name), scratch.path()).unwrap();
+      assert_eq!(host.exit_code, 0, "{name}: {}", host.output);
+      let mut drive = host.clone();
+      drive.output = as_a_copying_clone_prints(&host.output, name);
+      match compare_with(workload, &host, &drive, stated) {
+        WorkloadStatus::Stated { lines } => {
+          assert_eq!(lines.len(), stated_lines, "{name}: {lines:?}");
+          eprintln!("{name} on the drive's route: {lines:?}");
+        }
+        other => panic!("{name}: expected the drive's stated difference, got {other:?}"),
+      }
+      assert!(compare_with(workload, &host, &drive, &[]).fails_the_suite());
+      match compare_with(workload, &host, &host, stated) {
+        WorkloadStatus::Differs { detail } => assert!(
+          detail.starts_with("a stated difference no longer differs"),
+          "{name}: {detail}"
+        ),
+        other => panic!("{name}: expected the unmet stated line refused, got {other:?}"),
+      }
+    }
+  }
+
+  /// A-300. Do: ask which roster entries each lane runs. Expect the Windows lane to run git, git's history, Mercurial
+  /// and Subversion and to name every other workload once as owed a Windows form; macOS and Linux to run the whole
+  /// roster, each with its own watcher, and to carry no such note.
+  #[test]
+  fn the_windows_lane_runs_the_version_control_workloads() {
+    let lane = |os| -> Vec<(&'static str, &'static str)> {
+      ROSTER
+        .iter()
+        .filter(|workload| runs_here(workload, os))
+        .map(|workload| (workload.name, workload.tool))
+        .collect()
+    };
+    assert_eq!(
+      lane(HostOs::Windows),
+      [
+        ("git", "git"),
+        ("git-history", "git"),
+        ("mercurial", "hg"),
+        ("subversion", "svn")
+      ]
+    );
+    let note = owed_on_windows_note(HostOs::Windows).unwrap();
+    for owed in ["cargo", "npm", "python", "rg", "rsync", "sqlite", "editor"] {
+      assert!(note.contains(owed), "{note}");
+    }
+    assert_eq!(note.matches("watcher").count(), 1, "{note}");
+    for (os, own, foreign) in [
+      (HostOs::Macos, "fswatch", "inotifywait"),
+      (HostOs::Linux, "inotifywait", "fswatch"),
+    ] {
+      let runs = lane(os);
+      assert_eq!(runs.len(), ROSTER.len() - 1, "{os:?}");
+      assert!(runs.contains(&("watcher", own)) && !runs.contains(&("watcher", foreign)));
+      assert!(owed_on_windows_note(os).is_none());
+    }
   }
 
   /// AC-3.2 / T-3.3: run the real editor save workload in ordinary and TMPDIR-matching paths.
