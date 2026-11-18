@@ -3822,8 +3822,11 @@
 >   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
 >   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
 >   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
->   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
->   the owner shard would make `moves::seal_adopted` idempotent. **Class C, the rendezvous's claim (A-443, 2026-11-18,
+>   way: an adopted move's seal was still taken again when its answer was lost to a stopped shard. Closed by A-488
+>   (2026-11-18, g225): the owner shard records the seal on the volume (`VolumeSlot::adopted_seal`), and
+>   `verbs::seal_adopted_head` answers a second ask the recorded seal
+>   (`an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once`). **Class C, the rendezvous's
+>   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
 >   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time

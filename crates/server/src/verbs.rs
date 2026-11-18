@@ -6441,6 +6441,7 @@ pub(crate) fn publish_created_volume(
     version_credit,
     metadata_credit,
     lock_credit,
+    adopted_seal: None,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -6987,13 +6988,33 @@ pub(crate) fn head_for_move(
 /// `Snapshot` verb takes one, which the record plane seals and places under this node's own placement. Returns the
 /// snapshot it superseded (the adopted head) and the new head epoch, or the refusal (the volume gone, an incomplete
 /// barrier while a writer's request is in flight), retried next period.
+///
+/// Taken once (A-488): the seal is recorded on the volume's slot, and a later call answers that record. The control
+/// shard asks for the seal until an answer reaches it, and an answer can be lost after the seal was taken: a shard
+/// that stops for a window has its call forgotten by the caller and runs it once it resumes. A second seal then
+/// superseded the first, so the settle dropped the first seal and left the adopted head behind for good.
 pub(crate) fn seal_adopted_head(
   state: &mut ShardState,
   id: DbVolumeId,
 ) -> Result<(DbSnapshotId, u64), Box<ReplyBody>> {
   let (handle, record) = find(state, VolumeId { bytes: id.bytes })?;
+  let recorded = state
+    .volumes
+    .get(handle)
+    .map_err(|_| Box::new(refused(Refusal::NotFound)))?
+    .adopted_seal;
+  if let Some(recorded) = recorded {
+    return Ok(recorded);
+  }
   let superseded = record.head;
-  snapshot_effect(state, handle, &record).map(|(_, _, epoch)| (superseded, epoch))
+  let (_, _, epoch) = snapshot_effect(state, handle, &record)?;
+  let seal = (superseded, epoch);
+  state
+    .volumes
+    .get_mut(handle)
+    .map_err(|_| Box::new(refused(Refusal::NotFound)))?
+    .adopted_seal = Some(seal);
+  Ok(seal)
 }
 
 /// Destroys `id`'s snapshot `snapshot` as the `DestroySnapshot` verb does, its caller the system (A-291: the adopted
@@ -10288,6 +10309,7 @@ pub(crate) fn publish_clone_as(
     version_credit: credits.version,
     metadata_credit: credits.metadata,
     lock_credit: credits.lock,
+    adopted_seal: None,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -17799,6 +17821,7 @@ fn rebuild_volume(
     version_credit,
     metadata_credit,
     lock_credit,
+    adopted_seal: None,
   };
   let handle = state
     .volumes

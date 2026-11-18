@@ -40,7 +40,8 @@
 //!   re-committed under the new owner's placement at the round's epoch (`takeover::adopt_at`, the takeover's own
 //!   adoption) and the volume is materialized as a takeover's successor materializes it: content by identity from the
 //!   head's recorded holders, a live-shipped volume from its log. Then the new owner seals the volume under its own
-//!   placement ([`seal_adopted`]), and once that seal is placed it drops the adopted snapshot it superseded and reports
+//!   placement ([`seal_adopted`]; once, since the volume records the seal and an ask whose answer was lost is answered
+//!   the recorded seal, A-488), and once that seal is placed it drops the adopted snapshot it superseded and reports
 //!   `MoveAdopted`.
 //! - **The release.** Once the exception no longer names the member it left (adopted, or followed through the new
 //!   owner's takeover), the old owner releases its copy whole ([`release`]: `Op::VolumeReleased`, no tombstone, since
@@ -1036,10 +1037,11 @@ async fn settle_adopted(
   .flatten() else {
     return;
   };
-  // Waited in the owner shard's own time (A-435): the seal it takes is not taken twice for one answer, so an answer
-  // dropped at a period's end while the shard worked took a second seal the next period, superseding the first, and
-  // left the adopted snapshot it should have dropped. Only a shard that stopped, or ran a window of CPU without
-  // answering, is asked again next period.
+  // Waited in the owner shard's own time (A-435), so a shard alive and working answers within the settle. Only a shard
+  // that stopped, or ran a window of CPU without answering, is asked again next period, and that ask takes no second
+  // seal: the owner shard records the seal on the volume and answers it again (A-488). Before, an answer lost after the
+  // seal was taken left `sealed` empty here, and the next ask's seal superseded the first and left the adopted
+  // snapshot behind.
   let progress = crate::xshard::call_in_shard_time(
     origin,
     shard,
@@ -1075,9 +1077,10 @@ async fn settle_adopted(
   }
 }
 
-/// On the adopted volume's owner shard: its seal's progress. Not served yet; else, with no seal taken, a seal now (a
-/// snapshot the record plane seals and places under this node's placement); else whether that seal's head and the
-/// volume's catalog are placed at `f + 1`, dropping the adopted snapshot it superseded once they are.
+/// On the adopted volume's owner shard: its seal's progress. Not served yet; else, with no seal known to the caller, the
+/// seal (a snapshot the record plane seals and places under this node's placement), taken once: the volume records it
+/// and a later ask is answered the recorded seal (`verbs::seal_adopted_head`, A-488); else whether that seal's head and
+/// the volume's catalog are placed at `f + 1`, dropping the adopted snapshot it superseded once they are.
 pub(crate) fn seal_adopted(
   state: &mut ShardState,
   key: ObjectId,

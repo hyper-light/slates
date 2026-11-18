@@ -31001,7 +31001,8 @@ takeover status, after A-429's), GAPS (A-422's entry, its third sibling) and the
   recorded and held unrecovered on its shard). Red with the period's wall bound: the seal unrecorded, the object
   settled unrecorded. The revocation's wait is Linux's and its mounts the kernel's: its run is filed for main's Linux lane.
 - **Owed.** The seal is still taken again when its answer is lost to a stopped shard: recording it on the owner shard
-  would make `seal_adopted` idempotent (GAPS).
+  would make `seal_adopted` idempotent (GAPS). *Done by A-488 (2026-11-18): the owner shard records the seal on the
+  volume and answers a second ask the recorded seal.*
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{moves,takeover,verbs,
 daemon}.rs`.
@@ -32365,3 +32366,32 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-488 — An adopted move's seal is taken once: its owner shard records it on the volume and answers a second ask the recorded seal (2026-11-18, goal 85 via g225, bug 3; §4.10 "Ownership follows the writer"; A-291, A-435)
+
+- **What was there.** Once a move's new owner serves the volume, its control shard asks the volume's owner shard each
+  period for the volume's seal (`moves::settle_adopted`), and keeps the seal the shard answers in the adoption
+  (`MoveAdoption::sealed`). With no seal kept there it asks for one, and the owner shard took a seal at every such ask
+  (`verbs::seal_adopted_head`). An answer can be lost after the seal is taken: A-435 made the ask wait in the owner
+  shard's own time, but a shard that stops for a window still has its call forgotten by the caller, and runs it once
+  it resumes. The next period's ask then took a second seal, which superseded the first rather than the snapshot the
+  move handed over, so the settle dropped the first seal and the handed-over snapshot stayed with the volume for good.
+- **The rule.** The seal is taken once for a volume's adoption: `seal_adopted_head` records the seal it took on the
+  volume's slot on its owner shard (`VolumeSlot::adopted_seal`: the head it superseded and the seal's head epoch), and
+  answers any later ask that record. The record lives and ends with the slot, so it never carries one adoption's seal
+  into another: a released volume's slot is freed, and a frozen copy is let go whole before a move back to this node
+  makes the volume again (`moves::supersede_frozen`). The control shard keeps what it learns as before; whichever of
+  its asks is answered, the answer names the one seal.
+- **Why this and not another.** The seal is the owner shard's effect, so its record belongs where the effect is: a
+  record on the control shard is what an answer lost in between cannot reach. A durable record is not needed: a
+  restarted daemon is a new member, and the move's adoption then falls to a takeover's successor, which materializes
+  the volume afresh.
+- **Test.** `an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once` (`crates/server/src/moves.rs`:
+  on a shard, a volume snapshotted as a move hands one over; two asks with no seal known, as after a lost answer; the
+  answered seal's head and the catalog placed at `f + 1`; a third ask with that seal). Expect the second ask to answer
+  the first seal (the same epoch, superseding the handed-over snapshot), the head sealed once, the settle `Placed`, and
+  the seal the only snapshot the volume holds.
+
+Applied in the same change to: A-435's entry (its owed item done), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, its
+owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-after-its-answer-was-lost.md`,
+`crates/server/src/{state,verbs,moves}.rs`.

@@ -103,6 +103,13 @@ pub struct VolumeSlot {
   /// A strict (`--locked`) volume's entitlement, held against the daemon's lock capacity (§4.2 D-12,
   /// `lock_ledger`); returned when the slot drops.
   pub lock_credit: Option<crate::lock_ledger::LockCredit>,
+  /// The seal this volume's owner shard took once it served the volume a planned move handed it (A-291,
+  /// `verbs::seal_adopted_head`): the adopted head snapshot the seal superseded and the seal's head epoch. The control
+  /// shard learns the seal only from this shard's answer, and an answer lost to a shard that stopped for a window (the
+  /// caller forgot the call, and the shard ran it once it resumed) left the control shard asking again, which took a
+  /// second seal and left the adopted snapshot behind for good (A-488). A second ask answers this record. It lives and
+  /// ends with the slot, so a volume released and made again never carries one adoption's seal into another.
+  pub adopted_seal: Option<(slates_db::catalog::SnapshotId, u64)>,
 }
 
 impl std::fmt::Debug for VolumeSlot {
