@@ -30,13 +30,18 @@ drift (CLAUDE.md §4, doc-truth tests).
 | ubuntu x64 | 299 | 0 | 5 | 0 | 15 |
 | ubuntu arm64 | 1 | 4 | 0 | 299 | 15 |
 | macOS arm64 | 282 | 0 | 5 | 0 | 32 |
-| Windows x64 | 40 | 1 | 0 | 217 | 61 |
-| Windows arm64 | 41 | 1 | 0 | 216 | 61 |
+| Windows x64 | 41 | 1 | 0 | 216 | 61 |
+| Windows arm64 | 42 | 1 | 0 | 215 | 61 |
 
 With this change both Windows lanes run `crates/server/tests/fleet.rs` (85 passed, 3 ignored on the runners:
 diagnostics run 42340483175). `slates-server`'s unit tests join them with the Windows landing writer: two landing tests
 fail on Windows until it lands, since `landing.rs`'s Windows arm refuses `Unsupported { feature: "landing" }`, so that
 step lands with the writer (`agents/release-wincov-lib`).
+
+Since 2026-11-18 both Windows lanes also run `crates/server/tests/liveness.rs` (the daemon's liveness beat, A-228), one test
+at a time: 12 tests pass, the 6 child roles ignored, in 51-52 s on windows-latest and 57-58 s on windows-11-arm, three runs
+of three each (diagnostics run 44290078113). No lane had run it on Windows; g243's diagnostic runs alone had caught a
+starved-shard bug there.
 
 ## What compiling the whole workspace for Windows found
 
@@ -345,7 +350,7 @@ it passes) sat silent for 409 s, and the step's 20-minute limit cut the job befo
 | slates-server | test `landing_fairness` | unix | 3 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `lease` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
 | slates-server | test `live_ship` | unix | 1 (0, 0) | all | — | all | n/b | n/b |
-| slates-server | test `liveness` | — | 7 (1, 0) | all | — | all | — | — |
+| slates-server | test `liveness` | — | 7 (1, 0) | all | — | all | all | all |
 | slates-server | test `merge_load` | — | 5 (0, 0) | all | — | all | — | — |
 | slates-server | test `nfs_hostile` | — | 19 (0, 0) | all | — | all | all | all |
 | slates-server | test `nfs_mount` | unix | 40 (0, 0) | all | — | all | n/b | n/b |

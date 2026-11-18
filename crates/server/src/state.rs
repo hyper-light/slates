@@ -495,6 +495,14 @@ pub struct ShardState {
     slates_db::catalog::AttachmentRecord,
     crate::fuse_hold::HeldDevice,
   )>,
+  /// The Shards streams recovery kept because the anchor held their resync ends (A-316), each with its record, served
+  /// again on a fresh stream once the shard runs (`shards::adopt_held`). Filled once at recovery and emptied by that
+  /// step; bounded as `inherited_fuse` is, of which these were part.
+  #[cfg(target_os = "linux")]
+  pub(crate) adopt_shards: Vec<(
+    slates_db::catalog::AttachmentRecord,
+    crate::fuse_hold::HeldDevice,
+  )>,
   /// The read-only views of snapshots presented through host mounts and guest devices, by attachment (AUD-29-76;
   /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot attachment.
   pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,
@@ -644,6 +652,21 @@ pub struct ShardState {
   /// unambiguous; `None` between requests, and for work whose cause crossed a boundary that carried
   /// none (the span then declares its cause missing).
   pub current_span: Option<slates_wire::observe::SpanContext>,
+  /// The idle window a forward made for the request now being served holds its owner open for (§4.7; A-326), 0 for
+  /// none (`verbs::loop_hold`). Set by `serve_client` around each request, as `current_span` is; 0 between requests.
+  pub forward_hold_ns: u64,
+  /// The requests this shard has read in a row, each within F of its last client I/O: the length of its closed loop so
+  /// far, which caps a forward's hold (`verbs::loop_hold`; A-326). 0 after a pause longer than F.
+  pub loop_run: u64,
+  /// The end of this shard's last round of its clients' loop I/O (their requests read, the replies to them written),
+  /// one clock read a round: what judges whether a request continues a closed loop (`verbs::loop_hold`; A-326). Unlike
+  /// `last_work_ns`, the shard's own background work (a destroy's slices, a lease's expiry, a kept forward's retry)
+  /// never moves it, nor a client's acknowledgement after a pause, or a paced client's pause would look like a loop's.
+  /// 0 before the first.
+  pub last_client_io_ns: u64,
+  /// Whether the round now running read a request of a client's loop or wrote a reply to one (`verbs::serve_round`
+  /// stamps `last_client_io_ns` at its end when it did; A-326).
+  pub loop_io: bool,
   /// Where the verb now running would reply (§4.16 "Commit"; AUD-11): the shard and ring slot the
   /// reply is written to, set by the serve path or the forward task before the verb runs and cleared
   /// after it, so a verb whose acceptance must wait for a fleet commit (`submit` at `f > 0`) can hand
@@ -771,10 +794,6 @@ pub struct ShardState {
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
-  /// The takeovers that made this node the owner of a volume this shard serves, by volume (AC-8.3, the loss report in
-  /// `slates status`): the epoch, the head sequence served from, and whether from the volume's live log. One entry a
-  /// taken-over volume of this shard, dropped when the volume is destroyed.
-  pub(crate) taken_over: BTreeMap<VolumeId, slates_ipc::protocol::VolumeTakeover>,
   /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum the record period's seal
   /// walk turns are cut by in place of the shard's step quantum (`fleet::seal_walk_slice`).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
@@ -827,6 +846,10 @@ pub struct ShardState {
   /// borrowed — the interrupted-discovery restart the replacement-voter regression forces by stopping this
   /// node while it holds (`Daemon::inject_discovery_fault`).
   pub discovery_withhold_replies: bool,
+  /// Test support (never reachable from the wire): a Shards stream's replies are made, and published with their
+  /// effect where they wait for a barrier, but never written, as when a daemon dies between a barrier and its reply
+  /// (A-316's successor test); counted `shards.reply_withheld`.
+  pub shards_withhold_replies: bool,
   /// Test support (never reachable from the wire): while set, the record serve side holds every live-state reply (a
   /// takeover's report or log fetch, `slates_cluster::live::LIVE_STATE_STREAM`) after its request arrived, while every
   /// other stream and the probe plane answer as usual: a holder alive and in contact whose report misses an asker's
@@ -1104,6 +1127,8 @@ pub struct PendingForward {
   /// The origin's `ring.request` span context (§4.14), carried to the owner so the verb's `shard.op`
   /// opens within it — one trace across the shard boundary, its cause named.
   pub cause: Option<slates_wire::observe::SpanContext>,
+  /// The idle window the forward holds its owner open for, 0 for none (`ShardState::forward_hold_ns`; A-326).
+  pub hold_ns: u64,
 }
 
 impl std::fmt::Debug for PendingForward {
@@ -1456,13 +1481,21 @@ pub struct PendingVolume {
   /// The page advances of its still-paging takeover round at the last attempt that waited on its catalog register,
   /// `None` before the first ([`PendingVolume::record_round`]).
   pub round_seen: Option<u64>,
+  /// The hosts the retired owner placed this volume on, the members of its cohorts in the takeover that adopted it,
+  /// settled and current (A-309): where its live log was shipped besides the recorded holders, so a live takeover past
+  /// tolerance asks every surviving one of them (`live_ship::fetch`). Taken from the configuration when the volume is
+  /// adopted, since the retirement may complete and be let go before the log is fetched. Empty for a volume no round
+  /// adopted (a mirror's promotion).
+  pub cohort_hosts: Vec<slates_db::register::HostId>,
 }
 
 impl PendingVolume {
-  /// A volume just adopted with its head `head` by `departed`'s takeover round: no attempt made yet.
+  /// A volume just adopted with its head `head` by `departed`'s takeover round, the retired owner having placed it on
+  /// `cohort_hosts`: no attempt made yet.
   pub fn adopted(
     head: crate::head::HeadValue,
     departed: Option<slates_db::register::HostId>,
+    cohort_hosts: Vec<slates_db::register::HostId>,
   ) -> PendingVolume {
     PendingVolume {
       head,
@@ -1470,6 +1503,7 @@ impl PendingVolume {
       attempts: 0,
       most_staged: None,
       round_seen: None,
+      cohort_hosts,
     }
   }
 
@@ -1576,6 +1610,7 @@ mod tests {
         sealing: None,
       },
       None,
+      Vec::new(),
     );
     let mut seen = Vec::new();
     for staged in [4, 4, 9, 2, 9, 10] {
@@ -1628,6 +1663,7 @@ mod tests {
         sealing: None,
       },
       Some(slates_db::register::HostId(5)),
+      Vec::new(),
     );
     let mut green = PendingGreen::adopted(
       adopted_record(),

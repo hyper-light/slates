@@ -188,6 +188,11 @@ pub struct OpContext {
   /// NFS client applied its own umask, WinFsp and the typed channel have none. Like the owner fields, metadata of the
   /// request, never authority.
   pub umask: Option<u32>,
+  /// How a created object takes its group (A-328): the rule of the kernel the transport serves, System V's for FUSE and
+  /// virtio-fs (a Linux kernel's request), and this host's own for the NFS export and the routes without a kernel
+  /// ([`crate::GroupRule::of_this_host`]), as a native NFS server on this host gives it. Metadata of the request, never
+  /// authority.
+  pub group_rule: crate::GroupRule,
 }
 
 /// The owner's attachment registry: it admits attachments under the current host epoch, validates
@@ -382,6 +387,8 @@ impl Attachments {
       owner_gid: None,
       // Set by the FUSE dispatch for a creating request, which carries its caller's umask (A-314).
       umask: None,
+      // This host's own rule; the FUSE dispatch gives a Linux kernel's request System V's (A-328).
+      group_rule: crate::GroupRule::of_this_host(),
     })
   }
 }

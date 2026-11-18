@@ -1269,9 +1269,6 @@ fn read_plain_range(
         stamp,
       }
     }
-    Err(slates_vfs::error::VfsError::IsDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
@@ -1344,9 +1341,6 @@ fn read_plain(state: &mut ShardState, volume: VolumeId, path: &str) -> ReplyBody
   };
   match read {
     Ok(bytes) => ReplyBody::ReadBytes { bytes },
-    Err(slates_vfs::error::VfsError::IsDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
@@ -3172,12 +3166,10 @@ pub(crate) fn serve_awaiting(
   id: RequestId,
   (object, version): ([u8; 16], u64),
 ) -> Option<ReplyBody> {
+  let green = DbVolumeId { bytes: object };
   let object = ObjectId(object);
   if placed_version(state, object).is_some_and(|placed| placed >= version) {
-    let reply = ReplyBody::Submitted {
-      version: Some(version),
-      conflicts: Vec::new(),
-    };
+    let reply = accepted_reply(state, green, version);
     state.db.begin();
     let recorded = crate::verbs::record_completion(state, origin, id, reply);
     return match state.db.commit(&mut state.segment) {
@@ -3232,6 +3224,64 @@ pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) 
   true
 }
 
+/// How the submit that made `green`'s `version` was signed (A-321), as the green's accepted record keeps it on its
+/// owner: from the version's chain entry, and once a checkpoint folds that, from the checkpoint. `Unsigned` for a
+/// version whose submit carried no signature and for version 0, the origin; `None` for a version past the head, for a
+/// green this shard does not hold, and for a verdict this build cannot read.
+pub(crate) fn recorded_verification(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<slates_ipc::protocol::Verification> {
+  let engine = state.greens.get(&green)?;
+  if version > engine.head() {
+    return None;
+  }
+  crate::signed_work::of_entry(engine.signature(version))
+}
+
+/// The answer to a submit `green` accepted at `version` (§4.16; A-321): the version's own record answers, so a submit's
+/// first answer, its deferred one (AUD-11) and its resend's after a restart agree. `SubmittedSigned` with the
+/// signature's verdict when the version records one, else `Submitted`.
+pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64) -> ReplyBody {
+  match recorded_verification(state, green, version) {
+    Some(verification @ slates_ipc::protocol::Verification::Verified { .. })
+    | Some(verification @ slates_ipc::protocol::Verification::Invalid { .. }) => {
+      ReplyBody::SubmittedSigned {
+        version: Some(version),
+        conflicts: Vec::new(),
+        verification,
+      }
+    }
+    Some(slates_ipc::protocol::Verification::Unsigned) | None => ReplyBody::Submitted {
+      version: Some(version),
+      conflicts: Vec::new(),
+    },
+  }
+}
+
+/// Serves `MergeRecord` (A-321): a committed version's record as a consumer reads it back — how its merge's signature
+/// was judged when it merged, its provenance — on the green's owner, to a principal with the read right. Version 0 is
+/// the origin, which no merge made, so it reads unsigned; a version not yet committed is `NotFound`.
+pub(crate) fn merge_record_verb(
+  state: &ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  version: u64,
+) -> ReplyBody {
+  let record = match require_green(state, principal, green, "merge_record") {
+    Ok(record) => record,
+    Err(refusal) => return crate::verbs::refused(refusal),
+  };
+  match recorded_verification(state, record.id, version) {
+    Some(verification) => ReplyBody::MergeRecord {
+      version,
+      verification,
+    },
+    None => crate::verbs::refused(Refusal::NotFound),
+  }
+}
+
 /// Answers every submit waiting on a version of `object` at or below `placed` (AUD-11): the
 /// acceptance is recorded as the request's completion on this owner partition — one durable step,
 /// so a retry after this meets the record — and the reply delivered to where the request came from
@@ -3249,10 +3299,7 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
     let Some(waiting) = state.merge.awaiting.remove(&(object, version)) else {
       continue;
     };
-    let reply = ReplyBody::Submitted {
-      version: Some(version),
-      conflicts: Vec::new(),
-    };
+    let reply = accepted_reply(state, DbVolumeId { bytes: object.0 }, version);
     for entry in waiting {
       state
         .merge
@@ -3317,6 +3364,44 @@ const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
 /// A holder withheld a merge record's acknowledgement (the injected fault).
 const RECORD_WITHHELD: &str = "merge.record_withheld";
 
+/// Where a merge record's version stands against this holder's replica of its green (§4.16 "Apply on holders").
+enum RecordStanding {
+  /// A version the replica already applied: the acceptor re-acknowledges it (idempotent).
+  Applied,
+  /// The replica's next version, or version 0 of a green this holder has no replica of: it is recomputed here.
+  Next,
+}
+
+/// The standing of `version` of `object`'s merge records on this holder, or `None` when nothing may be acknowledged now:
+/// the replica is still being rebuilt, or the version is out of order (counted). A holder with the green's records and
+/// no replica (a warm restart) rebuilds the replica from them first (A-313).
+fn record_standing(
+  state: &mut ShardState,
+  object: ObjectId,
+  version: u64,
+) -> Option<RecordStanding> {
+  let next = match state.merge.replicas.get(&object) {
+    Some(replica) => Some(replica.head().saturating_add(1)),
+    // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
+    // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
+    // refused out of order here, for good.
+    None => match crate::merge_origin::rebuild_replica(state, object) {
+      crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
+      crate::merge_origin::Rebuild::Later => return None,
+      crate::merge_origin::Rebuild::Nothing => None,
+    },
+  };
+  match (next, version) {
+    (Some(next), version) if version < next => Some(RecordStanding::Applied),
+    (None, 0) => Some(RecordStanding::Next),
+    (Some(next), version) if version == next => Some(RecordStanding::Next),
+    _ => {
+      state.count(OUT_OF_ORDER, 1);
+      None
+    }
+  }
+}
+
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
 /// then the record is accepted into the object's acceptor like a head record and the bound
@@ -3352,28 +3437,13 @@ pub(crate) fn accept_merge_record(
     state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
-  let next = match state.merge.replicas.get(&object) {
-    Some(replica) => Some(replica.head().saturating_add(1)),
-    // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
-    // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
-    // refused out of order here, for good.
-    None => match crate::merge_origin::rebuild_replica(state, object) {
-      crate::merge_origin::Rebuild::Installed(head) => Some(head.saturating_add(1)),
-      crate::merge_origin::Rebuild::Later => return Vec::new(),
-      crate::merge_origin::Rebuild::Nothing => None,
-    },
-  };
-  match (next, value.version) {
+  match record_standing(state, object, value.version) {
+    None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
-    (Some(next), version) if version < next => {
+    Some(RecordStanding::Applied) => {
       return crate::fleet::accept_held_record(state, local, peer_host, record);
     }
-    (None, 0) => {}
-    (Some(next), version) if version == next => {}
-    _ => {
-      state.count(OUT_OF_ORDER, 1);
-      return Vec::new();
-    }
+    Some(RecordStanding::Next) => {}
   }
   // Version 0 of a green over a base: its replica is seeded from the origin a share at a time (A-286).
   if value.version == 0

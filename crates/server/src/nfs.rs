@@ -195,6 +195,14 @@ impl VolumeSet for ShardVolumeSet {
       let Some((capability, rights)) = authorized_rights(s, volume, capability) else {
         return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
       };
+      // A volume this node lost to a takeover, its log fenced at a later epoch (A-338; kept across a restart, A-344), is
+      // answered as one this node does not hold: `NFS3ERR_STALE`, as a non-owner node's mount answers its handles, so the
+      // mount learns of the takeover (A-346). Before, the lease gate below answered its requests retry-later for good, or,
+      // its lease confirmed again, they were served from the copy the successor's writes had passed.
+      if s.by_id.contains_key(&volume) && crate::live_ship::superseded(s, volume) {
+        s.count(SUPERSEDED_STALE, 1);
+        return Some(Some(status_failure_reply(Nfsstat3::Stale, procedure)));
+      }
       // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): the mount serves the volume's **live tree**
       // — its latest state — so while this node's authority over the object is unconfirmed (cut off, paused
       // past the lease bound, or superseded by a newer configuration) every procedure answers `NFS3ERR_JUKEBOX`,
@@ -241,6 +249,11 @@ impl VolumeSet for ShardVolumeSet {
       // volume's capability gets no root handle, so no volume can be mounted or entered without it. The
       // root handle returned carries the capability, so every later request self-authorizes.
       let (capability, rights) = authorized_rights(s, volume, capability)?;
+      // A volume this node lost to a takeover gives no root, as one it does not hold gives none (A-346, as `serve`).
+      if crate::live_ship::superseded(s, volume) {
+        s.count(SUPERSEDED_STALE, 1);
+        return None;
+      }
       let requester = (subject, groups, dialect);
       let (handle, attr) = with_export(s, volume, requester, rights, capability, |export| {
         export.root_object()
@@ -461,6 +474,11 @@ fn changes_volume(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> 
 /// Counter: NFSv3 requests a dead daemon applied and left unanswered on a held connection, answered by its successor
 /// from the reply published with the effect instead of being applied again (A-128).
 const HELD_REPLY_ANSWERED: &str = "nfs.held_reply.answered";
+
+/// Counter: a request on a volume this node lost to a takeover, answered `NFS3ERR_STALE` (a root not given) as one on a
+/// volume it does not hold (A-346).
+/// Format: a counter name in the daemon's status report.
+const SUPERSEDED_STALE: &str = "nfs.superseded_stale";
 
 /// Counter: held NFSv3 replies a restarted shard took back from its image (A-128), each waiting for its request to be
 /// read again.

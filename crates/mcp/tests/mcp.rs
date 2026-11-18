@@ -991,6 +991,7 @@ fn assert_materialize_lands_under_a_bypass_policy(
   let bypass = slates_client::WritePolicy {
     merge: slates_client::WriteMode::Bypass,
     land: slates_client::WriteMode::Bypass,
+    require_signed_merges: false,
   };
   launcher
     .set_policy(

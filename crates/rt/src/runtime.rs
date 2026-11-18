@@ -1,6 +1,15 @@
 //! The runtime: the configuration derived from the profile, the OS runtime that owns one thread
 //! per shard, the local runtime that runs one shard on the calling thread, and the shard-pair
 //! ring wiring both share with the simulation (§4.3).
+//!
+//! **A start reports each unit of its work (§2.6 boot step 2, A-312).** A start's work on the
+//! calling thread grows with its shards: a registration and a thread for each, and a ring for every
+//! ordered pair, N(N-1) of them, all before any shard runs. [`Runtime::start_sized`] calls its
+//! caller's progress hook after every such unit, each a few microseconds, so a caller that beats
+//! its supervisor at each call beats while the start makes progress, however many shards it starts.
+//! Before 2026-11-17 a start reported nothing until it returned, and a daemon's watchdog, which
+//! beats once the runtime runs, did not yet exist: the anchor killed every start of 407 shards on
+//! B10's Linux gate at load 70 once one thread ran a window of CPU without a beat.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,7 +108,13 @@ pub struct WakeTracking {
   /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
   /// daemon's idle window sets its ratio).
   pub idle_ratio: u64,
+  /// The least idle spin window, nanoseconds, whatever the estimate (none for the runtime's own spin-then-park;
+  /// the daemon sets R9's provisioning floor, A-223).
+  pub idle_floor_ns: u64,
 }
+
+/// Format: no least idle window: the runtime's own spin-then-park is its wake estimate alone.
+pub const NO_IDLE_FLOOR_NS: u64 = 0;
 
 /// A shard's wake-ring size from the profile's derived `ring_entries` (Little's law at the overflow target), at
 /// least the ring's smallest admitted capacity ([`slates_mem::mpsc::MIN_CAPACITY`]): on a machine whose wake p99
@@ -153,6 +168,7 @@ impl RuntimeConfig {
         prior_ns: d.spin_before_park_ns.get(),
         shift: profile.wake.estimate_shift(),
         idle_ratio: 1,
+        idle_floor_ns: NO_IDLE_FLOOR_NS,
       }),
     };
     config.batch = config.calibrate_batch(latency_budget_ns).get();
@@ -265,8 +281,12 @@ pub fn admission_limit(requests_per_second: u64, p99_service_ns: u64) -> Derived
 }
 
 /// Wires the single-producer rings between every ordered pair of seeds; rings are leaked for
-/// the process (bounded by shards²).
-pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
+/// the process (bounded by shards²). `progress` is called after each ring, the unit of this
+/// quadratic work (the module's rule).
+pub(crate) fn connect_pairs(
+  seeds: &mut [ShardSeed],
+  progress: &mut dyn FnMut(),
+) -> Result<(), RtError> {
   let entries = seeds.first().map_or(1, |s| s.config.ring_entries);
   let ids: Vec<u16> = seeds.iter().map(|s| s.id).collect();
   for (a, &source) in ids.iter().enumerate() {
@@ -291,6 +311,7 @@ pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
         .get_mut(b)
         .ok_or(RtError::ShardGone { shard: target })?
         .set_inbound(consumer);
+      progress();
     }
   }
   Ok(())
@@ -453,12 +474,13 @@ fn release_seeds(seeds: Vec<ShardSeed>) {
 }
 
 /// Registers `config.shards` seeds over drivers `prepare` makes, pairing their rings; on any refusal every
-/// slot claimed so far is given back.
+/// slot claimed so far is given back. `progress` is called after each registration and each ring.
 fn register_seeds(
   config: &RuntimeConfig,
   capacities: &[ShardCapacity],
   prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
   notes: &mut Vec<String>,
+  progress: &mut dyn FnMut(),
 ) -> Result<Vec<ShardSeed>, RtError> {
   let mut seeds = Vec::new();
   for index in 0..usize::from(config.shards) {
@@ -478,8 +500,9 @@ fn register_seeds(
         return Err(error);
       }
     }
+    progress();
   }
-  if let Err(error) = connect_pairs(&mut seeds) {
+  if let Err(error) = connect_pairs(&mut seeds, progress) {
     release_seeds(seeds);
     return Err(error);
   }
@@ -494,12 +517,14 @@ impl Runtime {
 
   /// [`Runtime::start`] with the shards at the front of `capacities` sized by it rather than by `config`'s
   /// `tasks_per_shard` and `timers_per_shard` (the shard at index `i`, in start order, by `capacities[i]`; the rest by
-  /// `config`).
+  /// `config`), calling `progress` after each unit of the start's work on this thread: a shard's registration, a pair
+  /// ring, a thread's spawn, a shard's acknowledged build (the module's rule).
   pub fn start_sized(
     config: &RuntimeConfig,
     capacities: &[ShardCapacity],
+    progress: &mut dyn FnMut(),
   ) -> Result<Runtime, RtError> {
-    Self::start_with_sized(config, capacities, &mut || os_driver())
+    Self::start_with_sized(config, capacities, &mut || os_driver(), progress)
   }
 
   /// Starts `config.shards` shard threads over the drivers `prepare` makes, one call per shard: the OS
@@ -511,17 +536,18 @@ impl Runtime {
     config: &RuntimeConfig,
     prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
   ) -> Result<Runtime, RtError> {
-    Self::start_with_sized(config, &[], prepare)
+    Self::start_with_sized(config, &[], prepare, &mut || {})
   }
 
-  /// [`Runtime::start_with`] with per-shard capacities ([`Runtime::start_sized`]).
+  /// [`Runtime::start_with`] with per-shard capacities and a progress hook ([`Runtime::start_sized`]).
   pub fn start_with_sized(
     config: &RuntimeConfig,
     capacities: &[ShardCapacity],
     prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
+    progress: &mut dyn FnMut(),
   ) -> Result<Runtime, RtError> {
     let mut notes = Vec::new();
-    let seeds = register_seeds(config, capacities, prepare, &mut notes)?;
+    let seeds = register_seeds(config, capacities, prepare, &mut notes, progress)?;
     let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
     let (ready, acknowledged) = std::sync::mpsc::sync_channel(seeds.len().max(1));
     let mut workers = Vec::with_capacity(seeds.len());
@@ -538,7 +564,10 @@ impl Runtime {
         .name(format!("slates-shard-{id}"))
         .spawn(move || run_worker(seed, core, ready));
       match spawned {
-        Ok(thread) => workers.push(Worker { id, thread }),
+        Ok(thread) => {
+          workers.push(Worker { id, thread });
+          progress();
+        }
         Err(error) => {
           // The seed moved into the refused closure and is dropped with it; its slot, and the rest, go back.
           registry::unregister(id);
@@ -553,7 +582,7 @@ impl Runtime {
       }
     }
     drop(ready);
-    if let Err(error) = await_readiness(&acknowledged, &workers) {
+    if let Err(error) = await_readiness(&acknowledged, &workers, progress) {
       roll_back(workers, &error);
       return Err(error);
     }
@@ -634,14 +663,17 @@ fn roll_back(workers: Vec<Worker>, refusal: &RtError) {
 }
 
 /// Waits for every worker to acknowledge its build: the first refusal, or `WorkerFailed` for a worker that
-/// ended without acknowledging (its sender dropped with it), so no failed shard is ever advertised.
+/// ended without acknowledging (its sender dropped with it), so no failed shard is ever advertised. `progress` is
+/// called after each acknowledgement: the builds run on their own threads, and this thread's wait is the start's
+/// progress only as each one ends.
 fn await_readiness(
   acknowledged: &std::sync::mpsc::Receiver<(u16, Result<(), RtError>)>,
   workers: &[Worker],
+  progress: &mut dyn FnMut(),
 ) -> Result<(), RtError> {
   for _ in workers {
     match acknowledged.recv() {
-      Ok((_, Ok(()))) => {}
+      Ok((_, Ok(()))) => progress(),
       Ok((_, Err(error))) => return Err(error),
       Err(_) => {
         let silent = workers

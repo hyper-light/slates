@@ -153,6 +153,9 @@ const REVOKED_REFUSED: &str = "fuse.revoked_refused";
 /// Format: fenced mounts whose task could not be woken to drop their kernel's cache (the change signal refused): each
 /// drops it at its next request instead. Zero is the healthy reading.
 const REVOKED_UNWOKEN: &str = "fuse.revoked_unwoken";
+/// Format: mounts ended because this node lost their volume to a takeover (A-346): each fenced as a revoked mount is, its
+/// kernel's cache dropped, then ended.
+const SUPERSEDED_ENDED: &str = "fuse.superseded_ended";
 /// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
 /// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
 /// shard's other clients (§4.3).
@@ -835,6 +838,14 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     return Turned::Ended;
   };
   let told_before = mount.serve.told_through();
+  // A volume this node lost to a takeover ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too,
+  // for a mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a
+  // restart (A-344).
+  if crate::live_ship::superseded(s, mount.volume) && s.attachments.context(mount.registry).is_ok()
+  {
+    s.attachments.revoke(mount.registry);
+    s.count(SUPERSEDED_ENDED, 1);
+  }
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
   // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
   // A mount whose attachment admits nothing more answers nothing from the volume, so it needs no lease: it refuses
@@ -932,7 +943,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     }
     Ok(Turn::Ended) => return Turned::Ended,
     Ok(Turn::Dispatched(dispatched)) => {
-      log_write(s, &dispatched);
+      log_write(s, mount.volume, &dispatched);
       if dispatched.resent() {
         let count = s.refusals.entry(RESENT).or_insert(0);
         *count = count.saturating_add(1);
@@ -948,7 +959,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
   // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
   // never silent — CLAUDE.md #9.
-  log_forgets(s, attachment, mount.serve.take_forgotten());
+  log_forgets(s, (mount.volume, attachment), mount.serve.take_forgotten());
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
   let conflicts = mount.serve.take_writeback_conflicts();
@@ -1236,13 +1247,14 @@ fn fail(s: &mut ShardState, attachment: u64) {
   ended(s, attachment);
 }
 
-/// Logs a write's bytes in the shard's write log before its reply (A-63, `crate::write_log`): the write is
+/// Logs a write's bytes in the shard's write log before its reply, under the mount's `volume`, where a replay puts them
+/// (A-63, `crate::write_log`; an inode number alone names the origin of a clone's inherited file): the write is
 /// acknowledged before the next publication, so a daemon that dies first must leave its bytes for its successor to
 /// replay. Logged before the reply, so a write applied and never answered is resent, not replayed twice over a
 /// different later write (the kernel resends it with the same bytes at the same offset). A log with no room forces a
 /// publication, which carries this write (already applied) and empties the log; only a refused publication leaves the
 /// write unlogged, marked as an overflow so the next daemon reports the loss rather than replaying around it.
-fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
+fn log_write(s: &mut ShardState, volume: VolumeId, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
   }
@@ -1252,7 +1264,9 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
     return;
   };
   let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
+    (Some(log), Some(object)) => {
+      log.append(object, (volume.bytes, dispatched.nodeid()), offset, data)
+    }
     _ => return,
   };
   let logged = match appended {
@@ -1280,9 +1294,14 @@ const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
 /// leave its references counted in the image for good. A log with no room forces a publication, which carries the
 /// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
 /// which would report every taken-over file as having lost writes.
-fn log_forgets(s: &mut ShardState, attachment: u64, forgotten: Vec<(u64, u64)>) {
+fn log_forgets(
+  s: &mut ShardState,
+  (volume, attachment): (VolumeId, u64),
+  forgotten: Vec<(u64, u64)>,
+) {
   for (inode, count) in forgotten {
     let forgotten = crate::write_log::Forgotten {
+      volume: volume.bytes,
       attachment,
       inode,
       count,
@@ -1477,6 +1496,24 @@ pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
   if mount.change.signal().is_err() {
     // The task still sees the revocation at its next request; only the drop waits for one.
     s.count(REVOKED_UNWOKEN, 1);
+  }
+}
+
+/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a takeover (A-346; its log
+/// fenced at a later epoch, A-338): each is fenced as a revoked mount is ([`fence_if_mounted`]), so its kernel drops what
+/// it cached of the volume, every request meanwhile is refused `ENOTCONN`, and the mount ends: FUSE's form of the
+/// `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a mount went on answering from this node's copy,
+/// which the successor's writes had passed, or, behind the lease gate, held its requests in the kernel for good.
+pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
+  let mounts: Vec<u64> = s
+    .fuse_mounts
+    .iter()
+    .filter(|(_, mount)| mount.volume == volume)
+    .map(|(attachment, _)| *attachment)
+    .collect();
+  for attachment in mounts {
+    fence_if_mounted(s, attachment);
+    s.count(SUPERSEDED_ENDED, 1);
   }
 }
 

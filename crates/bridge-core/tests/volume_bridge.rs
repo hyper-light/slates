@@ -8,7 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_core::{
-  Attachments, Bridge, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View, VolumeBridge,
+  Attachments, Bridge, GroupRule, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
+  VolumeBridge,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -441,6 +442,8 @@ fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
   // group onto the context (as the daemon's NFS path does per request).
   let mut cx = rw_cx_as(501);
   cx.owner_gid = Some(20);
+  // System V's rule, Linux's and Linux nfsd's (A-328); BSD's gives the parent's group, tested below.
+  cx.group_rule = GroupRule::SystemV;
   let root = bridge.root(&cx).unwrap();
 
   // The parent directory (the volume root) has group 0, but the credential names 20: the created file
@@ -458,6 +461,96 @@ fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
   assert_eq!((link.uid, link.gid), (501, 20));
 }
 
+/// Format: a group a parent directory is given that is not the creator's.
+const PARENT_GID: u32 = 7;
+/// Format: the group the creator's credential names.
+const CREATOR_GID: u32 = 20;
+/// Format: the set-group-ID bit of a mode (`S_ISGID`).
+const S_ISGID: u32 = 0o2000;
+
+/// Makes directory `name` in the root as root, then gives it to `501:PARENT_GID` with `mode`; its inode.
+fn parent_directory(bridge: &mut VolumeBridge<'_>, name: &str, mode: u32) -> u64 {
+  let root_cx = rw_cx_as(0);
+  let root = oid(bridge.root(&root_cx).unwrap());
+  let made = bridge.mkdir(root, &root_cx, name, 0o755).unwrap();
+  bridge
+    .setattr(
+      oid(made.ino),
+      &root_cx,
+      SetAttr {
+        uid: Some(501),
+        gid: Some(PARENT_GID),
+        mode: Some(mode),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+  made.ino
+}
+
+/// A-328 / §4.6, BSD's rule (a macOS host's NFS export: APFS gives a directory made in a `2755` parent `755`, and
+/// every new object its parent's group). Do: as uid 501 whose credential names group 20, under BSD's rule, make a
+/// directory and a file in a set-group-ID directory of group 7 and in a plain one of group 7. Expect: each takes group
+/// 7, and the directory made in the set-group-ID one does not take the bit. Before A-328 the stamp applied System V's
+/// rule on every route: the directory read `2755` and the plain parent's objects took group 20.
+#[test]
+fn bsds_rule_gives_each_new_object_its_parents_group_and_no_directory_the_bit() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let set_group_id = parent_directory(&mut bridge, "sgid", 0o2755);
+  let plain = parent_directory(&mut bridge, "plain", 0o755);
+  let mut cx = rw_cx_as(501);
+  cx.owner_gid = Some(CREATOR_GID);
+  cx.group_rule = GroupRule::Bsd;
+  for parent in [set_group_id, plain] {
+    let dir = bridge.mkdir(oid(parent), &cx, "d", 0o755).unwrap();
+    let (file, handle) = bridge.create(oid(parent), &cx, "f", 0o644, 0).unwrap();
+    bridge.release(oid(file.ino), &cx, handle).unwrap();
+    for (node, kind) in [(dir.ino, "directory"), (file.ino, "file")] {
+      let attr = bridge.getattr(oid(node), &cx).unwrap();
+      assert_eq!(
+        (attr.uid, attr.gid, attr.mode & S_ISGID),
+        (501, PARENT_GID, 0),
+        "a {kind} made in parent {parent} takes the parent's group and no set-group-ID bit under BSD's rule"
+      );
+    }
+  }
+}
+
+/// A-328 / AUD-29-81, System V's rule (FUSE, virtio-fs, and a Linux host's NFS export). Do: the same makes as above
+/// under System V's rule. Expect: in the set-group-ID directory each object takes group 7 and the directory the bit;
+/// in the plain one each takes the creator's group, 20, and no bit.
+#[test]
+fn system_vs_rule_gives_a_set_group_id_parents_group_and_bit_and_else_the_creators_group() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let set_group_id = parent_directory(&mut bridge, "sgid", 0o2755);
+  let plain = parent_directory(&mut bridge, "plain", 0o755);
+  let mut cx = rw_cx_as(501);
+  cx.owner_gid = Some(CREATOR_GID);
+  cx.group_rule = GroupRule::SystemV;
+  for (parent, gid, directory_bit) in [(set_group_id, PARENT_GID, S_ISGID), (plain, CREATOR_GID, 0)]
+  {
+    let dir = bridge.mkdir(oid(parent), &cx, "d", 0o755).unwrap();
+    let (file, handle) = bridge.create(oid(parent), &cx, "f", 0o644, 0).unwrap();
+    bridge.release(oid(file.ino), &cx, handle).unwrap();
+    let dir_attr = bridge.getattr(oid(dir.ino), &cx).unwrap();
+    let file_attr = bridge.getattr(oid(file.ino), &cx).unwrap();
+    assert_eq!(
+      (dir_attr.gid, dir_attr.mode & S_ISGID),
+      (gid, directory_bit),
+      "the directory made in parent {parent}"
+    );
+    assert_eq!(
+      (file_attr.gid, file_attr.mode & S_ISGID),
+      (gid, 0),
+      "the file made in parent {parent}"
+    );
+  }
+}
+
 /// AC-3.10 / §4.6: one admitted mount can serve multiple Unix callers. All creation kinds
 /// take each request's owner and group while the attachment's enrolled principal stays fixed.
 #[test]
@@ -467,6 +560,8 @@ fn every_created_kind_takes_the_current_requests_unix_owner() {
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let mut cx = rw_cx_as(0);
+  // Each request's group is the creator's under System V's rule (A-328), the one a Linux kernel's request carries.
+  cx.group_rule = GroupRule::SystemV;
   let root = oid(bridge.root(&cx).unwrap());
   for uid in [1001, 1002] {
     cx.owner_uid = Some(uid);
