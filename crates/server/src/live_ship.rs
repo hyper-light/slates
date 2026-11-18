@@ -3377,19 +3377,7 @@ pub(crate) async fn fetch(
     .first()
     .and_then(|first| sealed_body(first))
     .and_then(|body| body.sealing);
-  // This node's own entry; else the key a fellow candidate handed over for this lineage, asked for now when none was
-  // (A-295), so a successor that holds no entry of its own is served at its first attempt, not a refusal later.
-  let own = sealing.as_ref().and_then(|sealing| {
-    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
-  });
-  let lineage = match (own, sealing.as_ref()) {
-    (Some(own), _) => Some(own),
-    (None, Some(sealing)) => match handed.filter(|(id, _)| *id == sealing.lineage) {
-      Some(handed) => Some(handed),
-      None => handed_lineage(object, sealing, &answered).await,
-    },
-    (None, None) => None,
-  };
+  let lineage = lineage_for_rebuild(object, sealing.as_ref(), handed, &answered).await;
   let naming = sealing.as_ref().and_then(|sealing| sealing.naming.clone());
   Ok(Some(Fetched {
     head,
@@ -3398,6 +3386,28 @@ pub(crate) async fn fetch(
     naming,
     sealing,
   }))
+}
+
+/// The lineage key a rebuild opens the log sealed under `sealing` with: this node's own entry; else the key a fellow
+/// candidate handed over for that lineage (`handed`), or asked now of the hosts that answered phase one (`answered`), so a
+/// successor that holds no entry of its own is served at its first attempt, not a refusal later (A-295); none for a log
+/// shipped in the clear.
+async fn lineage_for_rebuild(
+  object: ObjectId,
+  sealing: Option<&crate::head::HeadSealing>,
+  handed: Option<([u8; 16], Vec<u8>)>,
+  answered: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let sealing = sealing?;
+  if let Some(own) =
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  {
+    return Some(own);
+  }
+  match handed.filter(|(id, _)| *id == sealing.lineage) {
+    Some(handed) => Some(handed),
+    None => handed_lineage(object, sealing, answered).await,
+  }
 }
 
 /// The lineage key of the log `sealing` belongs to, handed to this successor by a fellow candidate (A-295): asked of the
