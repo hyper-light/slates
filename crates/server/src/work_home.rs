@@ -141,6 +141,7 @@ struct ParkedVerb {
   verdict: Option<ReplyBody>,
   rebased: Option<RebaseAnswer>,
   admitted: Option<Result<Admitted, Refusal>>,
+  named: Option<Result<(), Refusal>>,
 }
 
 /// A work's parked verbs, oldest first, and whether the oldest's ask is out.
@@ -184,6 +185,8 @@ pub(crate) struct WorkHome {
   pub(crate) rebased: Option<RebaseAnswer>,
   /// … a work's admission.
   pub(crate) admitted: Option<Result<Admitted, Refusal>>,
+  /// … the reservation of a new work's name at the partition it hashes to, when the work is made on another (A-400).
+  pub(crate) named: Option<Result<(), Refusal>>,
   /// The works whose log waits for their green's owner (A-247).
   pub(crate) unbuilt: Vec<Unbuilt>,
   /// Whether this shard's deadline timer for deferred verdicts is running.
@@ -227,6 +230,12 @@ enum Need {
     green: DbVolumeId,
     id: DbVolumeId,
     name: String,
+  },
+  /// The name of a work made on this shard, held at the partition it hashes to by an alias of the work's id (A-400,
+  /// A-236's reservation), asked of that partition's shard before the work is admitted.
+  ReserveName {
+    name: String,
+    id: DbVolumeId,
   },
   /// The work's route (A-255, A-298): its catalog register, which names its green, committed at its quorum. Met on the
   /// work's own shard, which holds the register, before the owner is asked for a verdict, so the merge record that
@@ -625,34 +634,51 @@ fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -
   crate::verbs::reset_would_fit(state, work, now).err()
 }
 
-/// A work's creation on its own partition needs the green's owner when the green lives elsewhere; with the green here,
-/// or the name already held, it runs, and its own checks answer.
+/// What a work's creation on this shard needs before it runs (A-247, A-400): its name held at the partition the name
+/// hashes to, by an alias of the work's id when that is another partition (asked of that partition's shard first); then
+/// its green's admission when the green lives elsewhere. With both at hand, or the name already held here, it runs, and
+/// its own checks answer. A refused reservation is the creation's answer: its pending record goes with it.
 fn create_need(
   state: &mut ShardState,
   green: DbVolumeId,
   name: &str,
 ) -> Result<Option<Need>, Refusal> {
   let owner = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
-  if state.greens.contains_key(&green)
-    || state.work_home.admitted.is_some()
-    || crate::verbs::shard_of_partition(state, owner).is_none()
-  {
+  let named_here = crate::verbs::owner_of_name(name, state.shards.len()) == state.partition;
+  let green_here =
+    state.greens.contains_key(&green) || crate::verbs::shard_of_partition(state, owner).is_none();
+  if let Some(Err(refusal)) = &state.work_home.named {
+    let refusal = refusal.clone();
+    crate::verbs::settle_creation(state, name).map_err(|e| crate::error::refusal_of_db(&e))?;
+    return Err(refusal);
+  }
+  let reserved = named_here || matches!(state.work_home.named, Some(Ok(())));
+  if reserved && (green_here || state.work_home.admitted.is_some()) {
     return Ok(None);
   }
   let Some((origin, id)) = state.current_request else {
     return Ok(None);
   };
   let key = (origin, id.client, id.sequence);
-  // This request's own creation, its admission lost or its daemon restarted: asked again under the same id.
+  // This request's own creation: its name reserved now, or an answer lost or its daemon restarted, asked again under
+  // the same id (the reservation is answered again for the id it holds).
   if let Some(pending) = state.db.partition().pending_creation(name) {
-    if (pending.origin, pending.client, pending.sequence) == key {
-      return Ok(Some(Need::Admit {
-        green,
-        id: pending.work,
-        name: name.to_owned(),
-      }));
+    if (pending.origin, pending.client, pending.sequence) != key {
+      return Ok(None);
     }
-    return Ok(None);
+    let work = pending.work;
+    return Ok(Some(if reserved {
+      Need::Admit {
+        green,
+        id: work,
+        name: name.to_owned(),
+      }
+    } else {
+      Need::ReserveName {
+        name: name.to_owned(),
+        id: work,
+      }
+    }));
   }
   if crate::verbs::name_held(state, name).is_some() {
     return Ok(None);
@@ -673,10 +699,17 @@ fn create_need(
     .db
     .mutate(&mut state.segment, &Op::WorkCreationPending { record }, now)
     .map_err(|e| crate::error::refusal_of_db(&e))?;
-  Ok(Some(Need::Admit {
-    green,
-    id: work,
-    name: name.to_owned(),
+  Ok(Some(if named_here {
+    Need::Admit {
+      green,
+      id: work,
+      name: name.to_owned(),
+    }
+  } else {
+    Need::ReserveName {
+      name: name.to_owned(),
+      id: work,
+    }
   }))
 }
 
@@ -693,17 +726,19 @@ fn park(
   let Some((origin, id)) = state.current_request else {
     return Gate::Answer(refused_overloaded(state));
   };
-  let resuming = work.is_some() && state.work_home.resuming == work;
+  // A work's creation has no queue of its own yet: the id it was minted carries it.
+  let queue_key = match (&need, work) {
+    (Some(Need::Admit { id, .. } | Need::ReserveName { id, .. }), _) => *id,
+    (_, Some(work)) => work,
+    _ => return refuse_unrecorded(state),
+  };
+  // A verb resumed by its own queue parks again at the front of it: a work's verb, or a creation whose name was reserved
+  // and whose admission is next (A-400).
+  let resuming = state.work_home.resuming == Some(queue_key);
   if !resuming && state.work_home.parked >= bound(state) {
     state.count(PARK_FULL, 1);
     return refuse_unrecorded(state);
   }
-  // A work's creation has no queue of its own yet: the id it was minted carries it.
-  let queue_key = match (&need, work) {
-    (Some(Need::Admit { id, .. }), _) => *id,
-    (_, Some(work)) => work,
-    _ => return refuse_unrecorded(state),
-  };
   let asks = need.is_some() && (resuming || !state.work_home.queues.contains_key(&queue_key));
   // A route is the work's own, met here once its queue holds the verb (A-298): nothing goes to the owner for it.
   let routing = asks && matches!(need, Some(Need::Route));
@@ -729,6 +764,7 @@ fn park(
     verdict: state.work_home.verdict.take(),
     rebased: state.work_home.rebased.take(),
     admitted: state.work_home.admitted.take(),
+    named: state.work_home.named.take(),
   };
   let home = &mut state.work_home;
   let queue = home.queues.entry(queue_key).or_default();
@@ -839,6 +875,7 @@ fn settle_pending_first(
     verdict: None,
     rebased: None,
     admitted: None,
+    named: None,
   };
   let home = &mut state.work_home;
   home.by_request.insert(pending_key, work);
@@ -886,6 +923,8 @@ enum Answered {
   Verdict(ReplyBody),
   Rebased(RebaseAnswer),
   Admitted(Result<Admitted, Refusal>),
+  /// The name's reservation at the partition it hashes to (A-400).
+  Named(Result<(), Refusal>),
   /// The work's route is committed (A-298): nothing to hand the verb, which runs its gate again.
   Route,
 }
@@ -955,18 +994,24 @@ fn start_ask(
       1,
     );
   }
-  let green = match &need {
-    Need::Verdict { sealed, .. } | Need::Rebase { sealed } => sealed.green,
-    Need::Admit { green, .. } => *green,
+  // Every ask goes to its green's owner but a new work's name's, which goes to the partition the name hashes to (A-400).
+  let (green, target) = match &need {
+    Need::Verdict { sealed, .. } | Need::Rebase { sealed } => (sealed.green, None),
+    Need::Admit { green, .. } => (*green, None),
+    Need::ReserveName { name, .. } => (
+      queue,
+      Some(crate::verbs::owner_of_name(name, state.shards.len())),
+    ),
     Need::Files(_) | Need::Page { .. } | Need::Sizes => match state.works.get(&queue) {
-      Some(w) => w.green,
+      Some(w) => (w.green, None),
       None => return false,
     },
     // The owner holds nothing of a work's route (A-298): `park` meets it on this shard.
     Need::Route => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
-  let owner_partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
+  let owner_partition =
+    target.unwrap_or_else(|| crate::verbs::owner_of(crate::verbs::to_wire_volume(green)));
   let Some(owner) = crate::verbs::shard_of_partition(state, owner_partition) else {
     return false;
   };
@@ -1159,9 +1204,36 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     } => Outcome::Answered(Answered::Admitted(crate::verbs::owner_admit(
       state, &principal, green, work,
     ))),
+    Need::ReserveName { name, id: work } => {
+      Outcome::Answered(Answered::Named(reserve_name(state, name, work)))
+    }
     // Never asked (`start_ask` refuses it); answered, it only runs the work's gate again, which checks the route there.
     Need::Route => Outcome::Answered(Answered::Route),
   }
+}
+
+/// Holds `name` here, the partition it hashes to, for `work`, a work made on another shard (A-400, A-236's reservation):
+/// answered again for the work it already holds (an answer lost, or its shard restarted), refused `AlreadyExists` for
+/// any other holder.
+fn reserve_name(state: &mut ShardState, name: String, work: DbVolumeId) -> Result<(), Refusal> {
+  if state
+    .db
+    .partition()
+    .name_alias(&name)
+    .is_some_and(|alias| alias.volume == work)
+  {
+    return Ok(());
+  }
+  crate::verbs::alias_step(
+    state,
+    &Op::NameAliasReserved {
+      record: slates_db::catalog::NameAliasRecord {
+        name,
+        volume: work,
+        confirmed: false,
+      },
+    },
+  )
 }
 
 /// Settles one ask's outcome on the work's shard.
@@ -1306,6 +1378,7 @@ fn resolve(state: &mut ShardState, work: DbVolumeId, answer: Option<Answered>) {
           Answered::Verdict(reply) => head.verdict = Some(reply),
           Answered::Rebased(rebased) => head.rebased = Some(rebased),
           Answered::Admitted(admitted) => head.admitted = Some(admitted),
+          Answered::Named(named) => head.named = Some(named),
           Answered::Route => {}
         }
       }
@@ -1360,6 +1433,7 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
       verdict,
       rebased,
       admitted,
+      named,
     } = head;
     let home = &mut state.work_home;
     home.by_request.remove(&key(verb.origin, verb.id));
@@ -1379,6 +1453,7 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.verdict = verdict;
     home.rebased = rebased;
     home.admitted = admitted;
+    home.named = named;
     home.resuming = Some(work);
     crate::lease_wait::run_resumed(state, verb, refused, None);
     let home = &mut state.work_home;
@@ -1387,6 +1462,7 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.verdict = None;
     home.rebased = None;
     home.admitted = None;
+    home.named = None;
   }
 }
 

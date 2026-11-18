@@ -93,8 +93,7 @@ mod readmission;
 mod remote_attach;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
-// stream's (Linux, macOS; A-316, A-339).
-#[cfg(unix)]
+// stream's (every platform; A-316, A-339, A-402).
 mod write_log;
 // Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365).
 #[cfg(unix)]

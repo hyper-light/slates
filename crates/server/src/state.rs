@@ -317,19 +317,16 @@ pub struct ShardState {
   /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
   pub(crate) published_held: crate::content_holder::PublishedHeld,
   /// The writes acknowledged since the last complete publication, kept whole in the region before `content_range` in
-  /// the anchor's content object (A-63; `crate::write_log`); `None` without a content object. Unix: the log serves a
-  /// FUSE mount taken over across a restart (Linux) and a Shards stream's writes (Linux, macOS; A-316, A-339); an NFS
-  /// client resends what a restart lost itself, by its write verifier.
-  #[cfg(unix)]
+  /// the anchor's content object (A-63; `crate::write_log`); `None` without a content object. The log serves a FUSE
+  /// mount taken over across a restart (Linux) and a Shards stream's writes (every platform; A-316, A-339, A-402); an
+  /// NFS client resends what a restart lost itself, by its write verifier.
   pub(crate) write_log: Option<crate::write_log::WriteLog>,
   /// What the previous daemon's log held to replay, its writes and `FORGET`s, consumed when the volumes are rebuilt
   /// (A-63).
-  #[cfg(unix)]
   pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
   /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393).
-  #[cfg(unix)]
   pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
   /// recorded before the barrier publishes, so the publication carries it with the effect, and removed once written. At
@@ -510,6 +507,14 @@ pub struct ShardState {
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
   /// cap: a relinquished copy was a volume this shard held, and each leaves once its teardown is done.
   pub(crate) relinquished: Vec<VolumeSlot>,
+  /// The claims this shard holds for live volumes routed to it that this node holds the log of as a candidate (§4.2 "a
+  /// remote holder makes the same admission against its own machine before acknowledging placement"; g229): by volume,
+  /// the credits a successor's restore takes over (`verbs::CandidateClaim`, `verbs::make_restored`). Bounded by the live
+  /// copies this node holds of volumes routed to this partition, each admitted only once its catalog is held
+  /// (`live_ship::admit_claim`): a claim whose copy went is released at the control shard's next reconciliation
+  /// (`live_ship::reconcile_claims`).
+  pub(crate) candidate_claims:
+    std::collections::BTreeMap<slates_db::catalog::VolumeId, crate::verbs::CandidateClaim>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
@@ -873,8 +878,15 @@ pub struct ShardState {
   /// place of the shard's step quantum: the record period's seal walk and envelope wrap (`fleet::seal_walk_slice`), and a
   /// takeover's envelope open (`fleet::open_slice`, A-347).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
+  /// On the control shard: the install of the committed configuration on this holder's register copies, while its walk
+  /// is owed ([`crate::fleet::InstallWalk`], A-398): the version it brings the copies to, where it stands, and whether
+  /// a task walks it now. `None` once every copy has taken the installed version.
+  pub(crate) install_walk: Option<crate::fleet::InstallWalk>,
+  /// Test support (`Daemon::inject_install_walk_quantum`, never set in production): the quantum an install's walk over
+  /// the held copies is cut by in place of the shard's step quantum (`fleet::install_slice`).
+  pub(crate) install_walk_quantum_ns: Option<u64>,
   /// Test support (`Daemon::inject_live_turn_pause`, never set in production): a wait between the turns of a live
-  /// takeover's rebuild on this owner shard (`fleet::make_live_in_turns`, g251), so a test's materialization outlasts
+  /// takeover's rebuild on this owner shard (`fleet::rebuild_in_turns`, g251), so a test's materialization outlasts
   /// the control shard's periods and its later attempts meet it running.
   pub(crate) live_turn_pause_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
@@ -1168,11 +1180,17 @@ pub struct ShardState {
   /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
   /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
   pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
-  /// On a taken-over volume's owner shard, its materialization from a live log made in turns of this shard's clock by a
-  /// task of its own (g251, `fleet::make_live`): running, with the turns it has taken, or ended, until the control
-  /// shard's next attempt reads the end and forgets it. A later attempt joins a running one and never rebuilds the log
-  /// again. At most one a volume this shard is making, which the takeover's pending materializations bound.
+  /// On a taken-over volume's owner shard, its materialization made in turns of this shard's clock by a task of its own
+  /// (g251, `fleet::make_taken`; a live log's or a placed seal's): running, with the turns it has taken, or ended, until
+  /// the control shard's next attempt reads the end and forgets it. A later attempt joins a running one and never
+  /// gathers or makes the volume again. At most one a volume this shard is making, which the takeover's pending
+  /// materializations bound.
   pub making_taken_over: BTreeMap<ObjectId, Making>,
+  /// On a taken-over volume's owner shard, the volume its materialization is making (g251, `verbs::MakingVolume`):
+  /// created and admitted, its restored tree laid in a piece a turn, until it is recorded and published or discarded
+  /// with its credits given back. Held here between turns, not by the task alone, so a refusal or a give-up leaves
+  /// nothing behind. At most one a volume in `making_taken_over`.
+  pub making_volumes: BTreeMap<slates_db::catalog::VolumeId, crate::verbs::MakingVolume>,
   /// The catalog register this node adopted for each taken-over volume (keyed by the volume's object), with
   /// the adopted record's sequence (AUD-29-17): a pending materialization waits for it, and the successor's
   /// record continues the register from that sequence. Bounded by the objects this node owns.
@@ -1783,6 +1801,7 @@ mod tests {
       completion: None,
       signature: None,
       folded_below: 0,
+      checkpoint_floor: 0,
     }
   }
 
