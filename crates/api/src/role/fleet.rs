@@ -186,7 +186,8 @@ fn read_resolver() -> Result<Resolver, ManifestError> {
 fn read_resolver() -> Result<Resolver, ManifestError> {
   let adapters = windows_dns::adapters().map_err(|reason| ManifestError::Adapters { reason })?;
   resolver_of_adapters(&adapters).ok_or_else(|| ManifestError::Resolver {
-    source: "no network adapter that is up and has a gateway lists one (GetAdaptersAddresses)".to_owned(),
+    source: "no network adapter that is up and has a gateway lists one (GetAdaptersAddresses)"
+      .to_owned(),
   })
 }
 
@@ -962,7 +963,10 @@ mod tests {
     let adapter = |up: bool, has_gateway: bool, dns_servers: &[[u8; 4]]| Adapter {
       up,
       has_gateway,
-      dns_servers: dns_servers.iter().map(|octets| Ipv4Addr::from(*octets)).collect(),
+      dns_servers: dns_servers
+        .iter()
+        .map(|octets| Ipv4Addr::from(*octets))
+        .collect(),
     };
     let nameserver = |octets: [u8; 4]| SocketAddrV4::new(Ipv4Addr::from(octets), DNS_PORT);
     let host = [

@@ -13,9 +13,9 @@ use core::net::Ipv4Addr;
 
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-  GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST,
-  GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
-  IP_ADAPTER_DNS_SERVER_ADDRESS_XP,
+  GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME,
+  GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS,
+  GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DNS_SERVER_ADDRESS_XP,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN, SOCKET_ADDRESS};
@@ -47,9 +47,10 @@ pub(super) fn adapters() -> Result<Vec<Adapter>, String> {
   match list_into(&mut words).0 {
     NO_ERROR => Ok(walk(&words)),
     ERROR_NO_DATA => Ok(Vec::new()),
-    ERROR_BUFFER_OVERFLOW => {
-      Err("the list grew between its sizing and its read (an adapter came up meanwhile); start again".to_owned())
-    }
+    ERROR_BUFFER_OVERFLOW => Err(
+      "the list grew between its sizing and its read (an adapter came up meanwhile); start again"
+        .to_owned(),
+    ),
     code => Err(format!("reading the list: error {code}")),
   }
 }
