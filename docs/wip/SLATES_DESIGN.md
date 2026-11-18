@@ -30832,6 +30832,8 @@ callback,nfs,delegation,lib}.rs`.
 - **Test.** `a_live_exchange_waits_its_holder_path_and_a_silent_one_ends_within_its_floor` (`crate::live_ship`: a path
   measured at a window and a half a round trip gets a budget past it; a quick path's budget is its session's duration
   and no more than a window past it).
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 5-7, debug build, `cargo test --locked -p slates-server --lib --
+  live_ship`): 19 of 19. Red-checked once: with the reply's part back at one window, the slow holder's assertion
+  fails. The live-ship takeover and returning-session flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{fleet,live_ship}.rs`.
