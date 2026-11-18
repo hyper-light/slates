@@ -1133,6 +1133,10 @@ struct GrantedRun {
   lease_seen_ns: u64,
   /// The landing's signature, if its request carried one (A-321): judged against what it wrote when it finishes.
   signature: Option<Vec<u8>>,
+  /// The audit ring's sequence when this run began (`Audit::next_seq`): the ring's records of the landing from it on are
+  /// this run's, which its finish records; the ones before it are its presentation's, which the presentation recorded,
+  /// or an earlier attempt's, which that attempt's finish recorded (§4.15 "Audit").
+  audit_from: u64,
 }
 
 /// A granted landing that ended before running: what its reply needs.
@@ -1623,6 +1627,8 @@ fn begin_granted(
     Ok(lease) => lease,
     Err(refusal) => return Begun::Refused(refused(refusal)),
   };
+  // Where this run's records will start in the engine's audit ring, before it pushes any (§4.15 "Audit").
+  let audit_from = state.landing.audit.next_seq();
   let presented = prepared.grant.and_then(|g| presentation_for(state, g));
   let landing_id = presented
     .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
@@ -1722,6 +1728,7 @@ fn begin_granted(
     target_dir: land_target.dir,
     implicit,
     signature: prepared.signature,
+    audit_from,
   }))
 }
 
@@ -1747,6 +1754,8 @@ struct Planning {
   implicit: Option<slates_vfs::ids::SnapshotId>,
   /// The landing's signature, if its request carried one (A-321).
   signature: Option<Vec<u8>>,
+  /// The audit ring's sequence when this run began ([`GrantedRun`]'s).
+  audit_from: u64,
 }
 
 /// One slice of a granted landing's plan (`image::sliced`); what it began once planned: its run, or the refusal it
@@ -1869,6 +1878,7 @@ fn finish_planning(
         implicit: planning.implicit,
         lease_seen_ns: planning.lease_seen_ns,
         signature: planning.signature.clone(),
+        audit_from: planning.audit_from,
       };
       if planning.was_overlay {
         lend_back(slot, &mut granted);
@@ -2169,7 +2179,11 @@ fn complete_finish(
   match outcome {
     Ok(report) => finish(
       state,
-      (&granted.principal, granted.signature.as_deref()),
+      FinishedRun {
+        principal: &granted.principal,
+        signature: granted.signature.as_deref(),
+        audit_from: granted.audit_from,
+      },
       &ids,
       &report,
       granted.grant,
@@ -2582,15 +2596,32 @@ fn landing_verdict(
   (statement, verification)
 }
 
+/// What a granted run's finish records with it: whom it ran for, its signature, and where its records start in the
+/// engine's audit ring.
+#[cfg(unix)]
+struct FinishedRun<'a> {
+  /// The principal the landing ran for.
+  principal: &'a Principal,
+  /// The landing's signature, if its request carried one (A-321).
+  signature: Option<&'a [u8]>,
+  /// The audit ring's sequence when the run began ([`GrantedRun`]'s `audit_from`).
+  audit_from: u64,
+}
+
 /// Persists a finished landing: the record, its terminal audit, and the consumed grant.
 #[cfg(unix)]
 fn finish(
   state: &mut ShardState,
-  (principal, signature): (&Principal, Option<&[u8]>),
+  run: FinishedRun<'_>,
   ids: &LandingIds<'_>,
   report: &LandingReport,
   grant: Option<u64>,
 ) -> ReplyBody {
+  let FinishedRun {
+    principal,
+    signature,
+    audit_from,
+  } = run;
   let landing_id = ids.landing_id;
   // Signed work (A-321): the landing's signature judged against the manifest it wrote, the verdict on its finished
   // record and in its answer.
@@ -2636,13 +2667,16 @@ fn finish(
     }
   }];
   ops.extend(closing_ops(state, ids, grant));
-  // Mirror the engine's audit records for this landing into the durable log, on the control partition (A-265).
+  // Mirror this run's audit records into the durable log, on the control partition (A-265), each once: the ring's
+  // records of the landing from the run's beginning on. Before 2026-11-18 every record the ring held for the landing's
+  // id was mirrored, so a presented landing's plan, which its presentation had recorded, was recorded again, and a
+  // resumed landing re-recorded its first attempt.
   let records: Vec<DbAuditRecord> = state
     .landing
     .audit
     .records()
     .into_iter()
-    .filter(|audit| audit.landing == landing_id)
+    .filter(|audit| audit.landing == landing_id && audit.seq >= audit_from)
     .map(|audit| db_audit(audit, principal, &verification))
     .collect();
   for op in &ops {

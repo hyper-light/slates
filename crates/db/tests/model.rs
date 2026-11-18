@@ -394,6 +394,8 @@ enum Step {
   Access(usize),
   LiveShip(usize, bool),
   Destroy(usize),
+  /// A live volume relinquished to its re-adoption (A-362): gone with no tombstone.
+  Relinquish(usize),
   Snapshot(usize),
   Place(usize, usize),
   DropSnapshot(usize, usize),
@@ -454,6 +456,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize).prop_map(Step::Access),
     1 => (0..8usize, proptest::bool::ANY).prop_map(|(v, on)| Step::LiveShip(v, on)),
     1 => (0..8usize).prop_map(Step::Destroy),
+    1 => (0..8usize).prop_map(Step::Relinquish),
     2 => (0..8usize).prop_map(Step::Snapshot),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::Place(v, s)),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::DropSnapshot(v, s)),
@@ -607,6 +610,9 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       }],
     },
     Step::Destroy(v) => Op::VolumeDestroyed {
+      id: vid(pick(&ids.live, *v)?),
+    },
+    Step::Relinquish(v) => Op::VolumeRelinquished {
       id: vid(pick(&ids.live, *v)?),
     },
     Step::Snapshot(v) => {
@@ -1034,7 +1040,7 @@ fn note_applied(op: &Op, ids: &mut Ids) {
     Op::VolumeCreated { record } => ids
       .live
       .push(u64::from_be_bytes(record.id.bytes[..8].try_into().unwrap())),
-    Op::VolumeDestroyed { id } => {
+    Op::VolumeDestroyed { id } | Op::VolumeRelinquished { id } => {
       let n = u64::from_be_bytes(id.bytes[..8].try_into().unwrap());
       ids.live.retain(|v| *v != n);
       ids.snapshots.retain(|(v, _)| *v != n);
@@ -1993,6 +1999,79 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   drop(db);
   let recovered = open(&mut segment);
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}
+
+/// A-362 (§4.8 "Promotion and takeover"): a volume relinquished to its re-adoption leaves no tombstone and erases no key,
+/// so the adopted state is made again under its id and name, and recovery agrees. Do: make a volume and record its
+/// lineage key; relinquish it; make it again under the same id and name, as the takeover that names this node again
+/// records it; then recover the database; and alongside, destroy a second volume and try to make it again. Expect the
+/// relinquish to leave the volume made again, its lineage key kept and no tombstone, the recovered database the same;
+/// and the destroyed volume refused `AlreadyExists` (its tombstone holds the id).
+#[test]
+fn a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key() {
+  let mut segment = segment("slates-db-relinquish", LOG_BYTES);
+  let mut db = open(&mut segment);
+  for n in [1, 2] {
+    db.mutate(
+      &mut segment,
+      &Op::VolumeCreated {
+        record: volume(n, &format!("v{n}")),
+      },
+      0,
+    )
+    .unwrap();
+  }
+  let lineage = slates_db::catalog::SealKeyOwner::Lineage { volume: vid(1) };
+  db.mutate(
+    &mut segment,
+    &Op::SealKeySet {
+      record: slates_db::catalog::SealKeyRecord {
+        owner: lineage.clone(),
+        id: [1; 16],
+        record: vec![2; slates_db::catalog::SEAL_KEY_RECORD_BYTES],
+      },
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(&mut segment, &Op::VolumeRelinquished { id: vid(1) }, 0)
+    .unwrap();
+  assert!(
+    db.partition().volume(vid(1)).is_none(),
+    "the stale record went"
+  );
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume(1, "v1"),
+    },
+    0,
+  )
+  .expect("the volume is made again under its id and name: no tombstone holds them");
+  assert!(
+    db.partition().seal_key(&lineage).is_some(),
+    "its lineage key is kept, unlike a destroy's"
+  );
+  db.mutate(&mut segment, &Op::VolumeDestroyed { id: vid(2) }, 0)
+    .unwrap();
+  let again = db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume(2, "v2"),
+    },
+    0,
+  );
+  assert!(
+    matches!(again, Err(slates_db::DbError::AlreadyExists { .. })),
+    "a destroyed volume's tombstone holds its id: {again:?}"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(
+    recovered.partition().volume(vid(1)).is_some()
+      && recovered.partition().seal_key(&lineage).is_some(),
+    "recovery agrees: the volume made again, its key kept"
+  );
 }
 
 // ---------------------------------------------------------------- acknowledgements that name owed ids

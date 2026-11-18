@@ -12,6 +12,14 @@ on:
   schedule:
     - cron: "17 3 * * *"
 
+# One run per ref and event at a time, and at most one waiting behind it (2026-11-18: 24 runs queued behind each other
+# on main starved the runner pool, and the release's builds waited). A waiting run is replaced by a newer push's, never
+# the run in progress: cancelling in progress on main left no run finishing at all when pushes came every few minutes.
+# The nightly schedule has its own group, so a push never displaces it.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   # WinFsp, pinned (A-206): the receiver is written from this version and refuses any other, so an unpinned install would

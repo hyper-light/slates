@@ -1215,6 +1215,7 @@ impl Partition {
       | Op::LiveHoldersCommitted { id, .. }
       | Op::VolumeWritePolicySet { id, .. }
       | Op::VolumeSignersSet { id, .. }
+      | Op::VolumeRelinquished { id }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -1584,6 +1585,8 @@ impl Partition {
         }
         Ok(())
       }
+      // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
+      Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
         self.tombstones.insert(tombstone.volume, tombstone.sequence);
         Ok(())
