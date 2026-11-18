@@ -37,11 +37,11 @@ const STABLE_STREAK: u32 = 10;
 /// Shape: the most `volume list` attempts a start makes after the daemon's serving line (`crates/cli/tests/cli.rs`
 /// `START_ATTEMPTS` says why attempts, not wall time).
 const START_ATTEMPTS: u32 = 60;
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`).
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`).
 const SERVING_LINE: &str = "slates daemon: instance ";
-/// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
+/// Format: the anchor's restart line names the daemon it started after this (`crates/api/src/role/anchor.rs`).
 const RESTARTED_AS: &str = "restarted as pid ";
-/// Format: the start of the anchor's line when it kills a starting daemon (`crates/cli/src/anchor.rs`).
+/// Format: the start of the anchor's line when it kills a starting daemon (`crates/api/src/role/anchor.rs`).
 const START_KILL_LINE: &str = "slates anchor: the starting daemon";
 /// Derived: how long the successor is starved, three of the anchor's former fixed start budgets
 /// (`RECOVERY_BUDGET_NS`), as `cli.rs`' `STARVED_FOR`: a start judged by a fixed wall second is killed at least twice.

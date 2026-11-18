@@ -395,11 +395,11 @@ mod structural {
     ("slates-bridge-winfsp", "the volume (§4.6)"),
     (
       "slates-cli",
-      "the launcher's namespace setup (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed",
+      "the launcher's namespace setup (§4.12), and a container bind's source resolved to the real path the kernel records, a read",
     ),
     (
       "slates-api",
-      "the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write",
+      "the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write; and the anchor and daemon roles' reads of the operator's fleet manifest, certificate, key and recovery-key files (moved from slates-cli with the roles), defects against A-50's zero disk access, to be removed",
     ),
   ];
 

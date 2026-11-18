@@ -4779,6 +4779,75 @@ pub(crate) const SERVE_RECEIVE_RESOURCES: &str = "fleet.serve.receive_refused.re
 /// See [`SERVE_RECEIVE_EARLIER_SEND`].
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const SERVE_RECEIVE_OTHER: &str = "fleet.serve.receive_refused.other";
+/// The status counts of the serve sockets' demultiplexers that status's fleet section does not already carry (it has
+/// `unknown_id`, `inbox_full`, `sessions_refused` and `replaced`), summed over the planes (`DemuxCounters`): sessions
+/// opened for a new source, handshakes refused because the session could not be built, authenticated dials refused
+/// because their certificate still held both its sessions, identities refused at the peer bound, and the pool's
+/// high-water mark. A dialer that never hears back may be refused here, and nothing on its own side says so.
+/// Format: refusal names in the daemon's status report.
+pub(crate) const SERVE_OPENED: &str = "fleet.serve.opened";
+/// See [`SERVE_OPENED`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_SETUP_REFUSED: &str = "fleet.serve.setup_refused";
+/// See [`SERVE_OPENED`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_PEER_SESSIONS_REFUSED: &str = "fleet.serve.peer_sessions_refused";
+/// See [`SERVE_OPENED`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_PEERS_REFUSED: &str = "fleet.serve.peers_refused";
+/// See [`SERVE_OPENED`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const SERVE_HIGH_WATER: &str = "fleet.serve.high_water";
+
+/// The record links' dials in status ([`crate::state::RecordDial`]): how many links are dialing for a session they lack
+/// now, the longest handshake call running now in milliseconds, the longest first discovery page awaited now in
+/// milliseconds, and the handshake calls made since boot. The first three are readings at the report, not counts: a
+/// call running past a probe timeout or two is one whose peer has not answered.
+/// Format: refusal names in the daemon's status report.
+pub(crate) const DIAL_RECORD_DIALING: &str = "fleet.dial.record.dialing";
+/// See [`DIAL_RECORD_DIALING`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const DIAL_RECORD_LONGEST_CALL_MS: &str = "fleet.dial.record.longest_call_ms";
+/// See [`DIAL_RECORD_DIALING`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const DIAL_RECORD_LONGEST_ENROLL_MS: &str = "fleet.dial.record.longest_enroll_ms";
+/// See [`DIAL_RECORD_DIALING`].
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const DIAL_RECORD_CALLS: &str = "fleet.dial.record.calls";
+
+/// How many record links are dialing for a session they lack now ([`DIAL_RECORD_DIALING`]).
+pub(crate) fn record_dials_dialing(state: &ShardState) -> u64 {
+  let dialing = state
+    .record_dials
+    .values()
+    .filter(|dial| dial.dialing_since_ns.is_some())
+    .count();
+  u64::try_from(dialing).unwrap_or(u64::MAX)
+}
+
+/// The longest wait running now among the record dials, read by `since` from each, in milliseconds
+/// ([`DIAL_RECORD_LONGEST_CALL_MS`], [`DIAL_RECORD_LONGEST_ENROLL_MS`]).
+pub(crate) fn record_dials_longest_ms(
+  state: &ShardState,
+  since: impl Fn(&crate::state::RecordDial) -> Option<u64>,
+) -> u64 {
+  let now = futures::now_ns();
+  state
+    .record_dials
+    .values()
+    .filter_map(since)
+    .map(|began| now.saturating_sub(began) / NS_PER_MS)
+    .max()
+    .unwrap_or(0)
+}
+
+/// The handshake calls the record links have made since boot ([`DIAL_RECORD_CALLS`]).
+pub(crate) fn record_dials_calls(state: &ShardState) -> u64 {
+  state
+    .record_dials
+    .values()
+    .fold(0u64, |sum, dial| sum.saturating_add(dial.calls))
+}
 
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
@@ -5195,6 +5264,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       // (that establish would block on a peer that will not answer, `docs/bugs/2026-09-10-*`), so idling
       // costs nothing until the peer is alive again.
       state::with_state(|s| s.record_sessions.remove(&peer_host));
+      dial_settled(peer_host);
       crate::daemon::pace(HEARTBEAT_NS).await;
       continue;
     }
@@ -5203,6 +5273,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     let absent =
       state::with_state(|s| !s.record_sessions.contains_key(&peer_host)).unwrap_or(false);
     if absent {
+      dial_call_begins(peer_host);
       let (kept, session) = establish_session(
         client,
         None,
@@ -5213,10 +5284,14 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
         resolver,
       )
       .await;
+      dial_call_ended(peer_host, kept.as_ref(), session.is_some());
       client = kept;
       enroll_record_session(session, peer_host, anchor, &mut discovery_cursor, driver).await;
+      dial_enrolled(peer_host);
       discovery_wait = HEARTBEAT_NS;
       discovery_due = 0;
+    } else {
+      dial_settled(peer_host);
     }
     let discovery_held =
       state::with_state(|s| s.injected_discovery_hold == Some(peer_host)).unwrap_or(false);
@@ -5228,6 +5303,57 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     }
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
+}
+
+/// Marks `peer`'s record dial as inside a handshake call from now ([`crate::state::RecordDial`]), the dial itself begun
+/// now unless it already was. One entry a peer, bounded by the fleet's peer capacity as `pairs_delivered` is.
+fn dial_call_begins(peer: HostId) {
+  let now = futures::now_ns();
+  state::with_state(|s| {
+    let capacity = s.config.fleet_peer_capacity.max(1);
+    if s.record_dials.len() < capacity || s.record_dials.contains_key(&peer) {
+      let dial = s.record_dials.entry(peer).or_default();
+      if dial.dialing_since_ns.is_none() {
+        dial.dialing_since_ns = Some(now);
+      }
+      dial.call_since_ns = Some(now);
+      dial.calls = dial.calls.saturating_add(1);
+    }
+  });
+}
+
+/// Records how `peer`'s handshake call ended: `established` (its first discovery page next), or not, with the dialer
+/// `kept` for another call on its socket (its budgets spent and why the last ended) or dropped for a fresh dial.
+fn dial_call_ended(peer: HostId, kept: Option<&Endpoint>, established: bool) {
+  let now = futures::now_ns();
+  state::with_state(|s| {
+    if let Some(dial) = s.record_dials.get_mut(&peer) {
+      dial.call_since_ns = None;
+      dial.enroll_since_ns = established.then_some(now);
+      dial.budgets_spent = kept.map_or(0, Endpoint::handshake_budgets_spent);
+      dial.stall = kept.and_then(Endpoint::handshake_stall);
+    }
+  });
+}
+
+/// `peer`'s fresh session's first discovery page has ended, the session installed or not.
+fn dial_enrolled(peer: HostId) {
+  state::with_state(|s| {
+    if let Some(dial) = s.record_dials.get_mut(&peer) {
+      dial.enroll_since_ns = None;
+    }
+  });
+}
+
+/// `peer`'s record link holds its session, or idles with its peer out of contact: no dial runs.
+fn dial_settled(peer: HostId) {
+  state::with_state(|s| {
+    if let Some(dial) = s.record_dials.get_mut(&peer) {
+      dial.dialing_since_ns = None;
+      dial.call_since_ns = None;
+      dial.enroll_since_ns = None;
+    }
+  });
 }
 
 /// Whether `peer` is out of this node's direct contact, so its record link idles; entering the idle is counted
@@ -5373,6 +5499,8 @@ fn refresh_record_identity_in(
     .map_or(previous, |learned| learned.host);
   if current != previous {
     state.record_sessions.remove(&previous);
+    // The dial's record is the previous id's: the link's dial under the new id starts afresh.
+    state.record_dials.remove(&previous);
     let previous_was_a_live_incarnation = previous != crate::deploy::member_id(anchor, 0);
     if previous_was_a_live_incarnation && client.take().is_some() {
       count_refusal_in(state, DIAL_STALE_DROPPED);
@@ -5432,6 +5560,11 @@ async fn refresh_discovery(
         }
       } else {
         state.record_sessions.remove(&peer_host);
+        // A discovery page can be the first exchange to meet the restarted peer's reset (A-261): counted as a reset,
+        // as a borrower's return counts it, not left to read as an unexplained drop.
+        if session.peer_reset() {
+          state.count(LINK_PEER_RESET, 1);
+        }
         state
           .dead_session_dropped_at
           .insert(peer_host, futures::now_ns());

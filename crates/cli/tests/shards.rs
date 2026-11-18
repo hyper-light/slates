@@ -37,7 +37,7 @@ const STABLE_STREAK: u32 = 10;
 /// Shape: the most `volume list` attempts a start makes after the daemon's serving line (`crates/cli/tests/cli.rs`
 /// `START_ATTEMPTS` says why attempts, not wall time).
 const START_ATTEMPTS: u32 = 60;
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`).
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`).
 const SERVING_LINE: &str = "slates daemon: instance ";
 /// Format: this test's name, which the re-invoked binary runs as the probe.
 const TEST: &str = "slates_shards_hands_a_program_a_working_handle_and_the_attachment_ends_with_it";

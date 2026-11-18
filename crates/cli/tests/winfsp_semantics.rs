@@ -15,6 +15,8 @@
 //!   a cached write past a hole and a shrink below it (its operations 162 to 164 at seed 1 in diagnostics run
 //!   41989365843, 41 to 43 in later runs). The port extends through the C runtime's `_chsize`, which writes zeros from
 //!   the end until the size is reached. These two replays pass: alone, the operations do not wedge (an open bug).
+//! - `CreateSymbolicLinkW` must make a link Windows follows and reads back (`t/reparse/02.t` and `03.t`, A-275), as
+//!   git and npm make links on Windows; the drive answered `ERROR_INVALID_FUNCTION`, since it served no reparse point.
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.
@@ -45,7 +47,7 @@ const POLL: Duration = Duration::from_millis(20);
 const STABLE_STREAK: u32 = 10;
 /// Shape: the most `volume list` attempts a start makes after the daemon's serving line, as `tests/winfsp.rs`.
 const START_ATTEMPTS: u32 = 60;
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`).
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`).
 const SERVING_LINE: &str = "slates daemon: instance ";
 /// Format: Win32's `ERROR_ALREADY_EXISTS` (winerror.h): what `MoveFileExW` answers for a name taken, unasked to replace.
 const ERROR_ALREADY_EXISTS: i32 = 183;
@@ -627,4 +629,506 @@ fn a_files_attributes_are_kept_and_its_read_only_state_refuses_a_delete() {
   permissions.set_readonly(false);
   std::fs::set_permissions(&path, permissions).unwrap();
   std::fs::remove_file(&path).unwrap();
+}
+
+/// A-275, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
+/// as git and npm on Windows do, through `CreateSymbolicLinkW` (std's `symlink_file` and `symlink_dir`): a relative file
+/// link, a relative directory link and an absolute file link; read through each, read each link back, then remove the
+/// links. Expect: each link is made; reading through it gives its target's bytes; `read_link` gives the target it was
+/// made with; the file links report `REPARSE_POINT` and the directory link `DIRECTORY | REPARSE_POINT`; a link made
+/// before its target exists is followed once the target is made; removing a link leaves its target. Before, every
+/// `CreateSymbolicLinkW` on the drive answered `ERROR_INVALID_FUNCTION`.
+/// Format: `FILE_ATTRIBUTE_DIRECTORY` and `FILE_ATTRIBUTE_REPARSE_POINT`, the bits that tell a link's kind.
+const LINK_KIND_BITS: (u32, u32) = (0x10, 0x400);
+
+/// The directory and reparse-point bits of the drive's object `name`, the object itself rather than what it links to.
+fn link_kind(drive: &Drive, name: &str) -> u32 {
+  use std::os::windows::fs::MetadataExt;
+  let (directory, reparse_point) = LINK_KIND_BITS;
+  std::fs::symlink_metadata(drive.path(name))
+    .unwrap()
+    .file_attributes()
+    & (directory | reparse_point)
+}
+
+/// The relative and absolute file links of the symbolic-link test: made, read through, read back.
+fn file_links_are_followed(drive: &Drive) {
+  use std::os::windows::fs::symlink_file;
+  symlink_file("target.txt", drive.path("file-link")).expect("a relative file link is made");
+  assert_eq!(
+    std::fs::read(drive.path("file-link")).unwrap(),
+    b"the target"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("file-link")).unwrap(),
+    std::path::Path::new("target.txt")
+  );
+  assert_eq!(
+    link_kind(drive, "file-link"),
+    LINK_KIND_BITS.1,
+    "a file link"
+  );
+  let absolute = drive.path("target.txt");
+  symlink_file(&absolute, drive.path("absolute-link")).expect("an absolute file link is made");
+  assert_eq!(
+    std::fs::read(drive.path("absolute-link")).unwrap(),
+    b"the target"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("absolute-link")).unwrap(),
+    std::path::Path::new(&absolute)
+  );
+}
+
+/// The directory link of the symbolic-link test, and a link made before its target.
+fn directory_and_early_links_are_followed(drive: &Drive) {
+  use std::os::windows::fs::{symlink_dir, symlink_file};
+  symlink_dir("lib", drive.path("dir-link")).expect("a relative directory link is made");
+  assert_eq!(
+    std::fs::read(drive.path("dir-link\\inner.txt")).unwrap(),
+    b"inside lib"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("dir-link")).unwrap(),
+    std::path::Path::new("lib")
+  );
+  let (directory, reparse_point) = LINK_KIND_BITS;
+  assert_eq!(
+    link_kind(drive, "dir-link"),
+    directory | reparse_point,
+    "a directory link"
+  );
+  symlink_file("later.txt", drive.path("early-link")).expect("a link to a name not yet made");
+  assert!(
+    std::fs::read(drive.path("early-link")).is_err(),
+    "a dangling link opens nothing"
+  );
+  std::fs::write(drive.path("later.txt"), b"made later").unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("early-link")).unwrap(),
+    b"made later"
+  );
+}
+
+/// A-275, `t/reparse/02.t` and `03.t`. Do: on the drive, make a file and a directory holding a file, then link to them
+/// as git and npm on Windows do, through `CreateSymbolicLinkW` (std's `symlink_file` and `symlink_dir`): a relative file
+/// link, an absolute file link, a relative directory link and a link made before its target; read through each, read
+/// each link back, then remove the links. Expect: each link is made; reading through it gives its target's bytes;
+/// `read_link` gives the target it was made with; the file links report `REPARSE_POINT` and the directory link
+/// `DIRECTORY | REPARSE_POINT`; the early link opens nothing until its target is made; removing a link leaves its
+/// target. Before, every `CreateSymbolicLinkW` on the drive answered `ERROR_INVALID_FUNCTION`.
+#[test]
+fn symbolic_links_made_through_the_drive_are_followed_and_read_back() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("links");
+  // A-275's SymlinkEvaluation class, measured where the links are followed: which evaluations the machine allows, and
+  // what kind of drive Windows takes the slates drive for (a local disk's links are local, L2L and L2R).
+  for args in [
+    &["behavior", "query", "SymlinkEvaluation"][..],
+    &["fsinfo", "drivetype", &drive.letter][..],
+  ] {
+    let said = Command::new("fsutil").args(args).output().unwrap();
+    eprintln!(
+      "A-275 fsutil {}: {}{}",
+      args.join(" "),
+      String::from_utf8_lossy(&said.stdout).trim(),
+      String::from_utf8_lossy(&said.stderr).trim()
+    );
+  }
+  // A-275: whether a drive link to a remote (UNC) target is followed, which the SymlinkEvaluation class L2R governs on
+  // NTFS; informational, since the runner's admin share may be absent.
+  let unc = std::os::windows::fs::symlink_file(UNC_PROBE, drive.path("unc-link"))
+    .map(|()| std::fs::read(drive.path("unc-link")).map(|bytes| bytes.len()));
+  eprintln!("A-275 a drive link to {UNC_PROBE}: {unc:?}");
+  std::fs::write(drive.path("target.txt"), b"the target").unwrap();
+  std::fs::create_dir(drive.path("lib")).unwrap();
+  std::fs::write(drive.path("lib\\inner.txt"), b"inside lib").unwrap();
+  file_links_are_followed(&drive);
+  directory_and_early_links_are_followed(&drive);
+  std::fs::remove_file(drive.path("file-link")).unwrap();
+  std::fs::remove_file(drive.path("absolute-link")).unwrap();
+  std::fs::remove_dir(drive.path("dir-link")).unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("target.txt")).unwrap(),
+    b"the target",
+    "the target outlives its links"
+  );
+  assert_eq!(
+    std::fs::read(drive.path("lib\\inner.txt")).unwrap(),
+    b"inside lib"
+  );
+}
+
+/// Format: a remote (UNC) file every Windows runner has, through its administrative share: the target of A-275's
+/// SymlinkEvaluation probe, a local-to-remote (L2R) link on NTFS.
+const UNC_PROBE: &str = "\\\\localhost\\C$\\Windows\\win.ini";
+
+/// Runs `step` on this thread under a token holding no privilege (`CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE`),
+/// as a standard user without `SeCreateSymbolicLinkPrivilege` would, then reverts to the process's token.
+fn without_privileges<T>(step: impl FnOnce() -> T) -> T {
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+  use windows_sys::Win32::Security::{
+    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateToken, RevertToSelf,
+    SecurityImpersonation, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+  };
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcessToken, SetThreadToken,
+  };
+  let (mut process, mut restricted, mut impersonation): (HANDLE, HANDLE, HANDLE) = (
+    std::ptr::null_mut(),
+    std::ptr::null_mut(),
+    std::ptr::null_mut(),
+  );
+  // SAFETY: each call writes only the handle out-parameter it is given, every pointer argument is null or a live local,
+  // and each handle made is closed below after the thread reverts.
+  unsafe {
+    assert_ne!(
+      OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_IMPERSONATE,
+        &mut process
+      ),
+      0
+    );
+    assert_ne!(
+      CreateRestrictedToken(
+        process,
+        DISABLE_MAX_PRIVILEGE,
+        0,
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        &mut restricted
+      ),
+      0
+    );
+    assert_ne!(
+      DuplicateToken(restricted, SecurityImpersonation, &mut impersonation),
+      0
+    );
+    assert_ne!(SetThreadToken(std::ptr::null(), impersonation), 0);
+  }
+  let made = step();
+  // SAFETY: the thread reverts to the process's token, then closes the three handles it opened above.
+  unsafe {
+    assert_ne!(RevertToSelf(), 0);
+    CloseHandle(impersonation);
+    CloseHandle(restricted);
+    CloseHandle(process);
+  }
+  made
+}
+
+/// `CreateSymbolicLinkW(link, target, flags)`: Ok, or the Win32 error it set.
+fn create_symbolic_link(link: &str, target: &str, flags: u32) -> Result<(), i32> {
+  let (link, target) = (wide(link), wide(target));
+  // SAFETY: both are NUL-terminated UTF-16 strings that live across the call; the call reads them and nothing else.
+  let made = unsafe {
+    windows_sys::Win32::Storage::FileSystem::CreateSymbolicLinkW(
+      link.as_ptr(),
+      target.as_ptr(),
+      flags,
+    )
+  };
+  if made {
+    Ok(())
+  } else {
+    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+  }
+}
+
+/// Format: Win32's `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): what `CreateSymbolicLinkW` answers on NTFS for a caller
+/// without `SeCreateSymbolicLinkPrivilege` outside Developer Mode's unprivileged create.
+const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// Format: the registry key and value Developer Mode sets (`AllowDevelopmentWithoutDevLicense`, 1 when on), which
+/// `CreateSymbolicLinkW`'s `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` requires (Microsoft Learn, CreateSymbolicLinkW).
+const DEVELOPER_MODE: (&str, &str) = (
+  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock",
+  "AllowDevelopmentWithoutDevLicense",
+);
+
+/// Whether Developer Mode is on, as its registry value says.
+fn developer_mode() -> bool {
+  let output = Command::new("reg")
+    .args([
+      "query",
+      &format!("HKLM\\{}", DEVELOPER_MODE.0),
+      "/v",
+      DEVELOPER_MODE.1,
+    ])
+    .output();
+  output.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("0x1"))
+}
+
+/// A-275 (who may make a link, NTFS's rule). Do: on the drive, as a caller whose token holds no privilege (a standard
+/// user without `SeCreateSymbolicLinkPrivilege`), make a file link with `CreateSymbolicLinkW` and no flag. Expect
+/// `ERROR_PRIVILEGE_NOT_HELD` and no link, with Developer Mode on or off, as on NTFS (diagnostics run 42715955734's NTFS
+/// control: 1314 in both modes). `CreateSymbolicLinkW` refuses such a caller itself before any file system is asked,
+/// so on its path A-275's Developer Mode deviation never arises.
+#[test]
+fn a_link_by_a_caller_without_the_privilege_and_the_flag_is_refused() {
+  if !live_mount_runs() {
+    return;
+  }
+  let developer = developer_mode();
+  let drive = Drive::mount("refused");
+  std::fs::write(drive.path("target.txt"), b"the target").unwrap();
+  let made =
+    without_privileges(|| create_symbolic_link(&drive.path("refused-link"), "target.txt", 0));
+  eprintln!(
+    "A-275 an unprivileged CreateSymbolicLinkW on the drive, no flag, Developer Mode {developer}: {made:?}"
+  );
+  assert_eq!(
+    made,
+    Err(ERROR_PRIVILEGE_NOT_HELD),
+    "refused as NTFS refuses it"
+  );
+  assert!(
+    std::fs::symlink_metadata(drive.path("refused-link")).is_err(),
+    "no link is left"
+  );
+}
+
+/// A-275 (who may make a link, NTFS's rule). Do: on the drive, as the test's own caller (an administrator, whose token
+/// holds `SeCreateSymbolicLinkPrivilege`), make a file link with no flag. Expect it made and followed.
+#[test]
+fn a_link_is_made_by_a_caller_holding_the_symlink_privilege() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("privileged");
+  std::fs::write(drive.path("target.txt"), b"the target").unwrap();
+  let made = create_symbolic_link(&drive.path("privileged-link"), "target.txt", 0);
+  eprintln!("A-275 a privileged CreateSymbolicLinkW on the drive: {made:?}");
+  assert_eq!(made, Ok(()));
+  assert_eq!(
+    std::fs::read(drive.path("privileged-link")).unwrap(),
+    b"the target"
+  );
+}
+
+/// A-275 (who may make a link, NTFS's rule). Do: as a caller whose token holds no privilege, make a file link with
+/// `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, as Git for Windows passes it (`compat/mingw.c`,
+/// `adjust_symlink_flags`). Expect, under Developer Mode, the link made and followed, as on NTFS; outside it,
+/// `ERROR_PRIVILEGE_NOT_HELD`, as on NTFS. WinFsp's own check refused this under Developer Mode (diagnostics run
+/// 42712321599), which is why the drive judges it.
+#[test]
+fn a_link_without_the_privilege_follows_developer_mode_with_the_unprivileged_flag() {
+  use windows_sys::Win32::Storage::FileSystem::SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+  if !live_mount_runs() {
+    return;
+  }
+  let developer = developer_mode();
+  let drive = Drive::mount("developer");
+  std::fs::write(drive.path("target.txt"), b"the target").unwrap();
+  let made = without_privileges(|| {
+    create_symbolic_link(
+      &drive.path("developer-link"),
+      "target.txt",
+      SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+    )
+  });
+  eprintln!(
+    "A-275 an unprivileged CreateSymbolicLinkW with the flag, Developer Mode {developer}: {made:?}"
+  );
+  if developer {
+    assert_eq!(
+      made,
+      Ok(()),
+      "Developer Mode's unprivileged create is allowed, as on NTFS"
+    );
+    assert_eq!(
+      std::fs::read(drive.path("developer-link")).unwrap(),
+      b"the target"
+    );
+  } else {
+    assert_eq!(
+      made,
+      Err(ERROR_PRIVILEGE_NOT_HELD),
+      "outside Developer Mode, refused as on NTFS"
+    );
+  }
+}
+
+/// Format: `FSCTL_SET_REPARSE_POINT` (winioctl.h): `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED,
+/// FILE_SPECIAL_ACCESS)`.
+const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+
+/// Enables (or disables) `SeCreateSymbolicLinkPrivilege` in this process's token, as a program that sets a link's
+/// reparse buffer through `FSCTL_SET_REPARSE_POINT` itself must enable it on NTFS: an administrator's token holds it
+/// disabled, and `CreateSymbolicLinkW` enables it only around its own call.
+fn set_link_privilege(enabled: bool) {
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+  use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    SE_CREATE_SYMBOLIC_LINK_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
+  };
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+  let mut token: HANDLE = std::ptr::null_mut();
+  let mut luid = LUID::default();
+  // SAFETY: each call writes only the out-parameter it is given; the token handle opened here is closed below.
+  unsafe {
+    assert_ne!(
+      OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &mut token
+      ),
+      0
+    );
+    assert_ne!(
+      LookupPrivilegeValueW(std::ptr::null(), SE_CREATE_SYMBOLIC_LINK_NAME, &mut luid),
+      0
+    );
+    let enabled = TOKEN_PRIVILEGES {
+      PrivilegeCount: 1,
+      Privileges: [LUID_AND_ATTRIBUTES {
+        Luid: luid,
+        Attributes: if enabled { SE_PRIVILEGE_ENABLED } else { 0 },
+      }],
+    };
+    assert_ne!(
+      AdjustTokenPrivileges(
+        token,
+        0,
+        &enabled,
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut()
+      ),
+      0
+    );
+    CloseHandle(token);
+  }
+}
+
+/// Makes `path` a symbolic link relative to the drive's root (`rooted`, as `\x\y`) through `FSCTL_SET_REPARSE_POINT`, as
+/// a program that writes the reparse buffer itself does: `CreateSymbolicLinkW` turns a rooted target into an absolute
+/// one, so it never makes this form. The buffer is MS-FSCC 2.1.2.4's, built field by field: the tag, the data length, the
+/// substitute and print names (the same), and `SYMLINK_FLAG_RELATIVE`.
+fn set_root_relative_link(path: &str, rooted: &str) -> Result<(), i32> {
+  use std::os::windows::fs::OpenOptionsExt;
+  use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+  let name: Vec<u8> = rooted.encode_utf16().flat_map(u16::to_le_bytes).collect();
+  let name_len = u16::try_from(name.len()).map_err(|_| -1)?;
+  let mut buffer = Vec::new();
+  buffer.extend_from_slice(&0xA000_000Cu32.to_le_bytes());
+  buffer.extend_from_slice(&(12 + 2 * name_len).to_le_bytes());
+  buffer.extend_from_slice(&[0, 0]);
+  for field in [0, name_len, name_len, name_len] {
+    buffer.extend_from_slice(&field.to_le_bytes());
+  }
+  buffer.extend_from_slice(&1u32.to_le_bytes());
+  buffer.extend_from_slice(&name);
+  buffer.extend_from_slice(&name);
+  let file = std::fs::OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+    .open(path)
+    .map_err(|error| error.raw_os_error().unwrap_or(-1))?;
+  set_reparse_point(&file, &buffer)
+}
+
+/// `FSCTL_SET_REPARSE_POINT` of `buffer` on `file`: Ok, or the Win32 error it set.
+fn set_reparse_point(file: &std::fs::File, buffer: &[u8]) -> Result<(), i32> {
+  use std::os::windows::io::AsRawHandle;
+  let length = u32::try_from(buffer.len()).map_err(|_| -1)?;
+  let mut returned = 0u32;
+  // SAFETY: the handle is the open file's; the input is the live buffer of its stated length, and there is no output.
+  let set = unsafe {
+    windows_sys::Win32::System::IO::DeviceIoControl(
+      file.as_raw_handle(),
+      FSCTL_SET_REPARSE_POINT,
+      buffer.as_ptr().cast(),
+      length,
+      std::ptr::null_mut(),
+      0,
+      &mut returned,
+      std::ptr::null_mut(),
+    )
+  };
+  if set != 0 {
+    Ok(())
+  } else {
+    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+  }
+}
+
+/// A-275's stated difference (a link relative to the drive's root). Do: under the drive, put `\x\y` ("at the root") and
+/// `\a\x\y` ("under a"), make `\a\b\link` a link relative to the drive's root naming `\x\y`, read through it and read it
+/// back; then move the link to `\a\b\c\link` and read through it again. Expect: first the root's file, and the link read
+/// back as the path from its own directory (`..\..\x\y`), since POSIX has no form relative to a volume's root; after the
+/// move, `\a\x\y`, the object that path reaches from the link's new directory. NTFS keeps a moved link of this form
+/// naming `\x\y`.
+#[test]
+fn a_link_relative_to_the_drives_root_follows_its_directory_when_moved() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("rooted");
+  for dir in ["x", "a", "a\\x", "a\\b", "a\\b\\c"] {
+    std::fs::create_dir(drive.path(dir)).unwrap();
+  }
+  std::fs::write(drive.path("x\\y"), b"at the root").unwrap();
+  std::fs::write(drive.path("a\\x\\y"), b"under a").unwrap();
+  set_link_privilege(true);
+  set_root_relative_link(&drive.path("a\\b\\link"), "\\x\\y").unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("a\\b\\link")).unwrap(),
+    b"at the root"
+  );
+  assert_eq!(
+    std::fs::read_link(drive.path("a\\b\\link")).unwrap(),
+    std::path::Path::new("..\\..\\x\\y")
+  );
+  std::fs::rename(drive.path("a\\b\\link"), drive.path("a\\b\\c\\link")).unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("a\\b\\c\\link")).unwrap(),
+    b"under a",
+    "moved a directory deeper, the link reaches what its path names from there, not the root's \\x\\y"
+  );
+}
+
+/// A-275 (who may make a link, NTFS's check: the privilege enabled). Do: on the drive, as the test's administrator with
+/// `SeCreateSymbolicLinkPrivilege` held but disabled throughout, open a new file as a reparse point and set a symbolic
+/// link's buffer on it with `FSCTL_SET_REPARSE_POINT`; then the same with the privilege enabled before the open. Expect,
+/// outside Developer Mode, `ERROR_PRIVILEGE_NOT_HELD` with it disabled, as NTFS refuses it, and the link made with it
+/// enabled; under Developer Mode both made (A-275's deviation (a)).
+#[test]
+fn a_raw_link_set_needs_the_privilege_enabled_at_its_open() {
+  if !live_mount_runs() {
+    return;
+  }
+  let developer = developer_mode();
+  let drive = Drive::mount("enabled");
+  std::fs::create_dir(drive.path("x")).unwrap();
+  std::fs::write(drive.path("x\\y"), b"at the root").unwrap();
+  set_link_privilege(false);
+  let disabled = set_root_relative_link(&drive.path("disabled-link"), "\\x\\y");
+  set_link_privilege(true);
+  let enabled = set_root_relative_link(&drive.path("enabled-link"), "\\x\\y");
+  eprintln!(
+    "A-275 a raw link set, Developer Mode {developer}: privilege disabled {disabled:?}, enabled {enabled:?}"
+  );
+  assert_eq!(enabled, Ok(()), "enabled before its open, the link is made");
+  if developer {
+    assert_eq!(
+      disabled,
+      Ok(()),
+      "under Developer Mode, made (A-275's deviation (a))"
+    );
+  } else {
+    assert_eq!(
+      disabled,
+      Err(ERROR_PRIVILEGE_NOT_HELD),
+      "held but disabled, refused as NTFS refuses it"
+    );
+  }
 }

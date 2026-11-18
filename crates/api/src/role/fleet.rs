@@ -39,8 +39,7 @@ use slates_server::deploy::{
 };
 use slates_server::{DurabilityBound, Resolver};
 
-use crate::Failure;
-use crate::args::FleetSelection;
+use super::{Failure, FleetSelection};
 
 /// Format: where the operating system's resolver configuration lives (`resolv.conf(5)`).
 const RESOLV_CONF: &str = "/etc/resolv.conf";
