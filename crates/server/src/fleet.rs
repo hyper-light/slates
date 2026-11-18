@@ -4963,6 +4963,37 @@ fn live_candidates(object: ObjectId, placed: &[HostId]) -> (Vec<HostId>, Vec<Hos
   (candidates, cohort_hosts)
 }
 
+/// The lineage key a taken-over volume's successor opens and seals its `head` with (A-92 piece 4c), wrapped under this
+/// node's root: its own copy where the head carried an entry for it; else, for an `envelope` it must open, the key a
+/// fellow candidate of the head (`candidates`, this node left out) hands it (A-295), counted; else none.
+async fn successor_lineage_of(
+  object: ObjectId,
+  head: &HeadValue,
+  candidates: &[HostId],
+  envelope: bool,
+) -> Option<([u8; 16], Vec<u8>)> {
+  let sealing = head.sealing.as_ref()?;
+  if let Some(own) =
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  {
+    return Some(own);
+  }
+  if !envelope {
+    return None;
+  }
+  let local = state::with_state(|s| s.fleet.configuration().owner);
+  let fellows: Vec<HostId> = candidates
+    .iter()
+    .copied()
+    .filter(|host| Some(*host) != local)
+    .collect();
+  let handed = ask_handed_lineage(object, sealing, &fellows).await;
+  if handed.is_some() {
+    count_refusal(ENVELOPE_KEY_HANDED);
+  }
+  handed
+}
+
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
 /// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
@@ -5059,32 +5090,12 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
   // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
   // reached it) is handed the key by a fellow candidate of the head, as a live log's successor is (A-295).
-  let own_lineage = head.sealing.as_ref().and_then(|sealing| {
-    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
-  });
   let envelope = live.is_none()
     && archive
       .as_ref()
       .is_some_and(slates_cluster::envelope::is_envelope);
-  let successor_lineage = match (own_lineage, head.sealing.as_ref()) {
-    (Some(own), _) => Some(own),
-    (None, Some(sealing)) if envelope => {
-      let local = state::with_state(|s| s.fleet.configuration().owner);
-      let fellows: Vec<HostId> = placed
-        .placement
-        .candidates
-        .iter()
-        .copied()
-        .filter(|host| Some(*host) != local)
-        .collect();
-      let handed = ask_handed_lineage(object, sealing, &fellows).await;
-      if handed.is_some() {
-        count_refusal(ENVELOPE_KEY_HANDED);
-      }
-      handed
-    }
-    _ => None,
-  };
+  let successor_lineage =
+    successor_lineage_of(object, &head, &placed.placement.candidates, envelope).await;
   let naming = head
     .sealing
     .as_ref()
@@ -6650,12 +6661,11 @@ const PAIR_KEY_STREAM: u64 = 19;
 const PAIR_ACCEPTED: u8 = 1;
 /// The stream a volume's successor asks a fellow candidate for the volume's lineage key on (A-295): the object, the key's
 /// id and the asker's recipient public key ([`lineage_request`]), answered with the key wrapped to that recipient, or
-/// empty when refused (counted where it was refused).
-/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable. After the work routes' (25,
-/// `work_route::STREAM`) and the live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as
-/// that stream, so its request reaches no lineage handler at all (the first run of the window test, every ask
-/// unanswered while the work-route arm took kind 25). Held distinct by `every_request_kind_the_record_session_
-/// dispatches_is_its_own`.
+/// empty when refused (counted where it was refused). After the work routes' kind (25, `work_route::STREAM`) and the
+/// live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as that stream, so its request
+/// reaches no lineage handler at all (the first run of the window test, every ask unanswered while the work-route arm
+/// took kind 25). Held distinct by `every_request_kind_the_record_session_dispatches_is_its_own`.
+/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
 const LINEAGE_STREAM: u64 = 27;
 
 /// Format: the refusal name counting council requests left unanswered because their sender is held dead

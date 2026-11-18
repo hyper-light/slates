@@ -10153,7 +10153,11 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > through the root NFS adapter. Since A-300 the Windows lanes run the four over the WinFsp drive through Git for
 > Windows' shell, judged against NTFS with the drive's one stated difference: it makes no hard link (WinFsp's driver
 > refuses one), so a local clone copies there where NTFS links, and the three lines that count a clone's links are
-> recorded with both sides. Owed: the roster's other workloads on Windows.
+> recorded with both sides. Owed: the roster's other workloads on Windows. Since A-319 (2026-11-18, after CI's first
+> runs) no Subversion commit in the roster sends more than one file's text, since the client sends a commit's texts in
+> an order drawn anew in every process and FSFS numbers a revision's items in that order; the shared environment pins
+> cargo's colour and target directory, without which CI's colour failed the cargo workload on both sides; and the live
+> guest's console is read while the VM runs, where a full pipe had stopped the guest.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -22165,8 +22169,9 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
 - **Owed.** The Windows WinFsp roster: WinFsp's driver has no hard links (its NTFS compatibility page lists them
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
   WinFsp reparse points, which the drive does not serve yet. **Built by A-300 (2026-11-17)**, the drive serving
-  reparse points since A-275, and the missing hard links a stated difference of the route. A Linux FUSE leg outside a container (the native Linux
-  lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
+  reparse points since A-275, and the missing hard links a stated difference of the route. A Linux FUSE leg outside a
+  container (the native Linux lane reached the daemon through the NFS adapter): **built by A-293 (2026-11-17)**. The
+  runs over each mount are the supervisor's (CLAUDE.md §8); what their first runs found is A-319.
 
 ### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
 
@@ -23250,6 +23255,53 @@ Applied in the same change to:
 - **Owed.** The supervisor's runs of the live FUSE flows under load on main (`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`
   and `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`, `SLATES_TEST_CLI=1`), whose give-up
   records now name the oldest unanswered ask's age.
+
+### A-319 — The version-control workloads after CI's first runs: one text per Subversion commit, cargo's colour and target pinned, and the live guest's console read while it runs (2026-11-18, A-289's runs over each mount; Ada's goal of 2026-11-18)
+Applied in the same change to: Part 6 (the status of the version-control workloads), A-289 (its owed list), GAPS (A-289's
+entry), `crates/conformance/src/workload.rs` (the Subversion script and its exclusion's reason, `ENVIRONMENT`),
+`xtask/src/conformance/workloads.rs` (`shell_script`; the cargo environment test), and `crates/server/tests/virtiofs.rs`
+(`wait_reading`, the pipe test).
+- **What CI's first runs found.** Run 44247840584 (main 9f71a69f5) was the first to run A-289's workloads on any route:
+  over macOS's NFS loopback mount git, git's history and Mercurial were identical; Subversion differed at
+  `repo/db/rep-cache.db`; the cargo workload failed alike on both sides; the Ubuntu job's host gate stopped at the same
+  Subversion file, so its mounts never ran; and the live virtio-fs guest was killed at its 1500 s bound. Runs
+  44252249999, 44252296495 and 44252854695, with the cache's rows printed (the integrator's 760fb7db), found the gate,
+  and the host against the mount on macOS and over Linux FUSE, differing at its row for one text: item 3 in one run, 4
+  in the other.
+  Main's 64852828 then left `db/revs` out of the byte comparison and the item number out of the printed rows, and set
+  cargo's colour; this change, made at the same time and merged over it, brings the revision files back into the byte
+  comparison, keeps its rows' columns (each content's hash, first revision and size) and its colour, and adds cargo's
+  target directory.
+- **One text per Subversion commit.** Subversion's client sends a commit's texts after its tree, in the order of a hash
+  table (`svn_client__do_commit`'s `file_mods`, `subversion/libsvn_client/commit_util.c`, branch 1.14.x), and APR seeds
+  every hash table from the clock and its own addresses (`apr_hash_make`, `tables/apr_hash.c`, branch 1.7.x), so the
+  order is drawn anew in every process; FSFS numbers a revision's items in the order they arrive. The workload's one
+  commit of two new files therefore wrote its revision file, and the cache's rows, in either of two orders: on
+  Subversion 1.14.5 twelve runs wrote `db/revs/0/2` two ways, seven and five times, with every other file alike (kiln run
+  r956, adacachy2, 2026-11-18). The two files are now committed apart, and no commit in the script sends two texts: all
+  twelve runs were identical in every revision file, in the cache's rows and in its bytes. The cache's bytes had
+  differed only because its rows had; it stays compared by its rows, which are what Subversion keeps in it (printed where
+  `sqlite3` is on the `PATH`), and `svnadmin verify` checks each row against the revision it names (`verify_rep_cache`,
+  `subversion/libsvn_fs_fs/verify.c`). The revision files are compared byte for byte, as Ada's goal asks of every route
+  and as they now can be. Failing test first: the host gate
+  (`the_version_control_workloads_run_byte_identically_twice_on_the_host`), red in all three CI runs that reached it and
+  in 1 run of 6 on Linux in a container with Subversion (kiln run r1024); after, 10 of 10 (r1031).
+- **Cargo's colour and target directory.** Every CI job sets `CARGO_TERM_COLOR=always`, which put an escape sequence
+  before cargo's `Fresh`, so the workload's count of fresh builds read 0 and the script exited 1 on both sides. Recorded
+  `Identical` until A-289 failed a workload failing alike, the reuse AC-3.2 names had never been checked in CI. A
+  parent's `CARGO_TARGET_DIR` (kiln's runs set one outside the tree) left the script's `./target/debug/mini` unbuilt.
+  The shared environment now sets `CARGO_TERM_COLOR=never` and `CARGO_TARGET_DIR=target`, which cargo takes relative to
+  the directory it runs in, the crate's own, on every leg. Failing test first:
+  `the_workload_environment_keeps_a_parents_cargo_settings_out` (exit 127 before).
+- **The live guest's console read while the VM runs.** The harness polled QEMU for its exit and read the console's pipe
+  only afterwards. A pipe holds 64 KiB on Linux until it is read, so once the version-control workloads made the
+  console longer than that, QEMU waited on its write and the guest with it: the console stopped at exactly 65,536 bytes,
+  mid-line in the Mercurial mount run's output, and the guest was killed at the bound. A thread for each of QEMU's
+  streams now reads it while the VM runs, keeping up to 64 MiB of each and reading the rest only to drop it with a note.
+  Failing test first: `a_child_writing_past_its_pipes_capacity_is_read_while_it_runs` (killed at its 60 s bound before).
+  The same wait-then-read shape stands in five other test helpers whose children write a few lines (GAPS lists them);
+  none has met a pipe's capacity, and the cli VM harness (`crates/cli/tests/vm/mod.rs`) already reads its guest's lines
+  as they come.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 

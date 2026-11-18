@@ -2138,25 +2138,7 @@ mod tests {
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));
-    let layout_at = size_of::<u32>();
-    let mut raised = regional_bytes.clone();
-    raised[layout_at..layout_at + size_of::<u32>()]
-      .copy_from_slice(&(REGIONAL_LAYOUT + 1).to_le_bytes());
-    assert_eq!(
-      decode_regional_configuration(&raised),
-      Err(RaftWireError::LayoutVersion {
-        layout: REGIONAL_LAYOUT + 1
-      })
-    );
-    let mut raised = root_bytes.clone();
-    raised[layout_at..layout_at + size_of::<u32>()]
-      .copy_from_slice(&(ROOT_LAYOUT + 1).to_le_bytes());
-    assert_eq!(
-      decode_root_configuration(&raised),
-      Err(RaftWireError::LayoutVersion {
-        layout: ROOT_LAYOUT + 1
-      })
-    );
+    expect_a_raised_layout_refused(&regional_bytes, &root_bytes);
     assert_eq!(
       decode_regional_configuration(&root_bytes),
       Err(RaftWireError::ForeignLayout { magic: ROOT_MAGIC }),
@@ -2168,13 +2150,6 @@ mod tests {
         magic: REGIONAL_MAGIC
       })
     );
-    expect_the_unversioned_layouts_refused(&regional_bytes, &root_bytes);
-  }
-
-  /// The unversioned layouts of `a_configuration_of_another_layout_is_refused_by_name`: each configuration's bytes after
-  /// its magic and version, as the layout before the version wrote them, refused as foreign. `regional_bytes` encode a
-  /// configuration at version 7.
-  fn expect_the_unversioned_layouts_refused(regional_bytes: &[u8], root_bytes: &[u8]) {
     let unversioned = &regional_bytes[2 * size_of::<u32>()..];
     assert_eq!(
       decode_regional_configuration(unversioned),
@@ -2186,5 +2161,30 @@ mod tests {
       decode_root_configuration(unversioned),
       Err(RaftWireError::ForeignLayout { .. })
     ));
+  }
+
+  /// The raised layouts of `a_configuration_of_another_layout_is_refused_by_name`: expect a regional and a root
+  /// configuration's encodings (`regional`, `root`), each with its layout version raised by one, refused
+  /// `LayoutVersion` naming the raised version.
+  fn expect_a_raised_layout_refused(regional: &[u8], root: &[u8]) {
+    let layout_at = size_of::<u32>();
+    let mut raised = regional.to_vec();
+    raised[layout_at..layout_at + size_of::<u32>()]
+      .copy_from_slice(&(REGIONAL_LAYOUT + 1).to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&raised),
+      Err(RaftWireError::LayoutVersion {
+        layout: REGIONAL_LAYOUT + 1
+      })
+    );
+    let mut raised = root.to_vec();
+    raised[layout_at..layout_at + size_of::<u32>()]
+      .copy_from_slice(&(ROOT_LAYOUT + 1).to_le_bytes());
+    assert_eq!(
+      decode_root_configuration(&raised),
+      Err(RaftWireError::LayoutVersion {
+        layout: ROOT_LAYOUT + 1
+      })
+    );
   }
 }

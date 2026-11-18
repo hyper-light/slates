@@ -359,15 +359,34 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
-> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
-> SQLite file whose page bytes are not what Subversion promises. Compared by its rows, the next run (44252249999) found
-> the rows differing in one column: `d/b.txt`'s content was item 3 of revision 2 in one run and item 4 in the next
-> (host against host on ubuntu, host against mount on macOS), so FSFS's revision files lay their items out in an order
-> two runs do not share. Both are now left out of the byte comparison with that reason, on every leg as on the host:
-> every revision's content is printed (the dump's checksum, `svnlook tree`, `svn log -v`) and verified, the cache's rows
-> print each content's hash, first revision and size where `sqlite3` is on the `PATH`, and the revisions' properties
-> (`db/revprops`) and the youngest revision (`db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. **CI's first runs (2026-11-18) found three
+> gaps, each fixed failing-test-first (A-319):**
+> - The host gate was red in all three runs that reached it, by one cause: at `repo/db/rep-cache.db` (run 44247840584,
+>   ubuntu), then, once the integrator's 760fb7db printed that cache's rows, at its row for `d/b.txt`'s text, item 3
+>   against 4 (runs 44252249999 and 44252854695), as the host against the mount was on macOS and over Linux FUSE
+>   (44252296495). Subversion's client sends a commit's texts in the order of an APR hash table, seeded afresh in
+>   every process, and FSFS numbers a revision's items in the order they arrive, so the workload's one commit of two
+>   new files wrote `db/revs/0/2`, and the cache's rows, two ways: seven and five times in twelve runs
+>   (Subversion 1.14.5, kiln run r956, every other file alike). Each commit now sends one text: all twelve runs were
+>   identical in every revision file, the cache's rows and its bytes, and the gate passed 10 runs of 10 (kiln run
+>   r1031), where before the change it was red in 1 run of 6, at `db/revs/0/2` (r1024). Main's 64852828, made at the
+>   same time, had left `db/revs` out of the byte comparison instead; merged over it, the revision files are compared
+>   byte for byte again, the cache by its rows (each content's hash, first revision and size, printed where `sqlite3`
+>   is on the `PATH`, 64852828's columns), and `svnadmin verify` checks every row against its revision.
+> - `cargo` failed alike on both sides of the macOS leg (run 44247840584): every CI job sets `CARGO_TERM_COLOR=always`,
+>   whose escape sequence before `Fresh` made the script's count of fresh builds read 0. Before A-289 that was recorded
+>   `Identical`, so the reuse AC-3.2 names had never been checked in CI. The shared environment now sets cargo's colour
+>   off and its target directory to the crate's own, which kiln's runs move outside the tree
+>   (`the_workload_environment_keeps_a_parents_cargo_settings_out`, red at exit 127 before).
+> - The live guest was killed at its 1500 s bound (runs 44247840584 and 44252249999): its harness read QEMU's console
+>   only after the VM exited, and the console stopped at exactly 65,536 bytes, a Linux pipe's capacity, mid-line in the
+>   Mercurial mount run's output, once the version-control workloads made it that long. The console is now read while
+>   the VM runs (`a_child_writing_past_its_pipes_capacity_is_read_while_it_runs`, `crates/server/tests/virtiofs.rs`,
+>   killed at its 60 s bound before). The same wait-then-read shape stands in five other test helpers whose children
+>   write a few lines (`run_within` in `crates/cli/tests/cli.rs` and `winfsp.rs`, `bounded` in `cli.rs` and
+>   `crates/bridge-fuse/tests/oci_container.rs`, the destroys in `live_chaos.rs`): none has met a pipe's capacity.
+>
+> Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
@@ -2986,6 +3005,19 @@
 >   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
 >   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
 >   replaced by ask (the one land writes nothing).
+> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3; macOS legs
+>   done, Linux legs owed).** Two kiln runners, one manifest over the LAN (Wi-Fi: 90-150 ms average round trips, spikes
+>   to about 470 ms), no person in the run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`,
+>   `approve`) are the per-machine steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the
+>   client, `node` starts each node (the server under its launcher's secret, made on the server, mode 0600, read on
+>   standard input), the client pushes two increments over four files into two greens (accepted 1 and 2; the late push
+>   refused with `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1
+>   create, 3 replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one
+>   `slates land` writes 4 entries (92 bytes); the server's disk holds every merged byte. Server Adas-Mac-Studio, client
+>   Adas-Mac-Studio-2: passed in 83 s (kiln node runs r1052, r1054); the reverse: passed in 69 s (r1118, r1119). The
+>   kiln program that drives both machines is the supervisor's (`~/.cache/slates-scratch/fanout/fs-two-machines.js`).
+>   **Owed:** the Linux x86_64 legs (server on Linux, then client on Linux). adacachy2 was held for hours by kiln's own
+>   CI labs, during which kiln freezes every agent run there; adacachy did not answer.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
