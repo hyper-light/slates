@@ -3134,6 +3134,11 @@
 >   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
+> - **macOS conforms (2026-11-18, main `40efd7456`; Linux OPEN, owner g226).** On Adas-MacBook-Pro-3 (macOS 26.6, NFS
+>   loopback, load averages 7 to 14), fsx (10,000 operations), fsstress (4 × 500) and unprivileged pjdfstest (8,686 cases)
+>   ran plain and live-shipped. `compare` found 0 differences, and every live run shipped. The writer's `ETIMEDOUT` went
+>   with A-229's hard mount; the log stuck at `head=2 durable=none` and the takeover off the mounted node did not recur.
+>   Commands and counts: `docs/wip/conformance.md` (the live-shipped pair). Linux and Windows remain as recorded above.
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
