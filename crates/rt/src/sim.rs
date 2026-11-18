@@ -1065,7 +1065,8 @@ impl SimRuntime {
       shared.push(flags);
       seeds.push(registered);
     }
-    crate::runtime::connect_pairs(&mut seeds)?;
+    // Nothing supervises a simulated start, so its progress is reported to no one.
+    crate::runtime::connect_pairs(&mut seeds, &mut || {})?;
     let shards = seeds
       .into_iter()
       .map(ShardContext::build)

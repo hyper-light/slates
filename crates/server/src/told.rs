@@ -251,7 +251,7 @@ pub(crate) fn hold_until_told(
     let _ = wait(owed).await;
     let held = state::with_state_counted(|s| s.told_waiters.held.remove(&id)).flatten();
     if let Some((route, reply)) = held {
-      deliver_to(route, reply, here).await;
+      deliver_to(route, reply, here);
     }
   };
   match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
@@ -266,15 +266,14 @@ pub(crate) fn hold_until_told(
 
 /// Delivers a held reply where its request waits: on this shard's ring when its client is served here, else as a task
 /// on the client's shard, waiting for room as every reply carried home does (`crate::xshard::send_back`).
-async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
+fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
     state::deliver(route.client_index, route.request, reply, true);
     return;
   }
   crate::xshard::send_reply_home(route.shard, move || {
     state::deliver(route.client_index, route.request, reply, true);
-  })
-  .await;
+  });
 }
 
 /// One writer's wait: ready once every FUSE mount of the owed volume has been told; parked in the shard's

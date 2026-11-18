@@ -1,5 +1,83 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
+> 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
+> dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
+> the merge plane's deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full
+> channel; and a task refused at admission answered its client once (`AnswerUnstarted`). Each lost what it carried:
+> 4,074 to 4,518 a run of the 3,000-client rung on main 80be552a. A diagnostic build of main db9c514e (2026-11-09)
+> counted every one an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418 in two runs), not a verb's
+> reply, so no client waited out a reply deadline there. A lost part's release had run on its shard; what the loss
+> left was the acknowledgement's entry on the client's shard (`ShardState::ack_scatters`), which nothing else
+> removes, so the table crept toward `ack_scatter_bound`, past which an acknowledgement's releases are not sent at all
+> (`ack.release_refused`). (Until 2026-11-18 this entry said each loss refused clients `AcknowledgementOwed`, about
+> 27,000 times a run; that does not follow, since that bound reads the completions retained, which the part had
+> released.) Since A-232 a client waits for a reply while its daemon lives, so a lost verb reply would be a call that
+> never ends.
+>
+> Now each shard has a carrier (`xshard::carrier`, spawned first by the shard's start): a message that meets a full
+> channel, or finds messages for the same shard kept, is kept in order behind them, for as long as the shard it goes to
+> lives; only a shard gone (its daemon stopping) leaves one undelivered. The carrier asks that shard to tell it when its
+> channel next has room (A-279's wake), tries once more, and waits with no timer until the drain that makes the room
+> wakes it; its first form, and perf's branch, tried again every tenth of a coordinator period. The sender holds
+> nothing meanwhile, and nothing is spawned. That matters twice. perf's branch waited in a task per reply, which a
+> full arena refused. And a task refused at admission drops inside the runtime's admission, where no task can be
+> spawned at all; a wake there still marks the carrier ready. Both fail first in `crates/server/src/xshard.rs`
+> (`a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room`,
+> `a_task_refused_at_admission_answers_its_client_through_a_full_channel`), and
+> `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`)
+> failed with `send_back`'s wait bounded to a period again (perf, 2026-11-12). What bounds it (item 8): every kept message answers a request in flight or is awaited by a task, so a shard
+> keeps at most `DaemonConfig::kept_bound` (`2 × clients_per_shard × slots × shards` plus the task arenas, in the boot
+> log); past it a message is refused to its sender and counted (`xshard.keep_refused`), which
+> `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it` holds on a daemon's derived bound, with the order of
+> what was kept; its stand-in for the client's shard tells the waiting shards after each message it takes, as a drain
+> does (`Registration::tell_room`), and a carrier that does not ask is never woken. Counted per shard thread, not in
+> the shard's state, which a caller that keeps a reply may be borrowing: `xshard.room_waits_started`, `_ended`, `_peak`.
+> Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, `run_on_waiting` (A-192's connection ends,
+> now carried the same way), and every direct `send_control` of a reply in `crates/server/src`; and, from main as this
+> landed, a resumed verb's reply (`lease_wait::reply_home`, which b49360733 had sent from a task that waited for room,
+> refused by a full arena) now carried the same way, and `call_within_room`'s result, which comes home through
+> `send_back` while its request waits with `given_room_within`'s bounded, told wait. Siblings reported, not
+> changed (not replies, each counted where lost): a client handed to a shard (`daemon.rs`, `HANDOFF_LOST`), a released
+> client id (`RELEASE_LOST`), an NFS connection's migration (`MIGRATE_REFUSED`), and a Windows DAX holder's record
+> (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about
+> 4,200 on main before, 0 expected), `xshard.room_waits_peak`, and each verb's p99 against main.
+
+> **A volume reported no loss window: built (2026-11-17, AC-8.3, §4.10 "Auto-seal"; g230).** Nothing told an agent
+> what an owner loss would cost it, or a successor's client what one had cost: the status promised
+> `last_placed_snapshot_age` and carried nothing. `status` now carries `LossReport`: `at_risk_ns` (zero at a placed,
+> unchanged head or a live-shipped volume in a fleet; the newest placed seal's age otherwise; the volume's age with
+> none placed, always on a laptop), `placed_sequence` (that seal's head sequence) and, on a successor, `taken_over`
+> (epoch, head sequence served from, from the live log or not); a consumer reads it through slates-api
+> (`VolumeStatus::loss`, CONTRACT 10). Test:
+> `a_successor_reports_the_loss_window_its_takeover_left` (`crates/server/tests/fleet.rs`; a second seal kept from
+> placing by refusing the owner's records, so the window is the edits after the last *placed* seal, not the last seal).
+> - **Owed:** auto-seal at a derived cadence (Phase 8 task 8), which bounds the window; it needs the operator's
+>   loss-window SLO, a decision for Ada (options in the g230 progress record).
+> - **Owed:** the takeover report survives the successor's restart; it lives in the shard's memory, so a restarted
+>   successor reports no takeover (the window it reports from then on is still exact).
+
+> **A sealed envelope's wrap and open were quadratic in its chunks: linear (2026-11-17, A-92 piece 3b; g230).** The
+> wrap (`slates_cluster::envelope::wrap`) checked each sealed chunk against every chunk already stored, and the open
+> found each entry's chunk by a scan: `n²` identity comparisons each, about 1.3e8 for a 1 GiB volume of 64 KiB chunks,
+> the open on a takeover's path (the recovery budget is 1 s) and the wrap in one turn of the owner shard. Now a set and
+> an index. Test: `an_envelope_of_thousands_of_chunks_opens_to_the_very_archive` (`crates/cluster/tests/envelope.rs`).
+> **Owed (measurement, the supervisor's):** `cargo run --release -p slates-cluster --example envelope_bench` at 16,384
+> chunks, before and after. **Still owed:** the wrap runs whole in one owner-shard turn at a seal's end (64 MiB took
+> 98 ms, 2026-10-05); slicing it is the seal walk's next piece.
+
+> **The seal walk held its shard for every seal at once: in turns (2026-11-17, §4.10 "Content replication", CLAUDE.md
+> "Bounded work everywhere"; g230, the sibling of the live period's slicing below).** Each record period the owner
+> shard's seal walk (`fleet::advance_seals`, and `advance_mirror_seals` for a mirror) visited every volume in one turn
+> and advanced every seal job's archive a slice, each slice sized to the shard's step quantum: `n` volumes sealing at
+> once held the shard's clients for `n` quanta. It now runs in turns of about a step quantum
+> (`fleet::seal_walk_slice`, counted `fleet.seal.walk_slices` against `fleet.seal.walks`), each turn's content puts
+> dispatched before the next. Test: `a_shards_seals_are_walked_in_turns_and_every_one_places` (the turn injected to one
+> volume, `Daemon::inject_seal_walk_quantum`). **Owed:** the owner shard's longest step with hundreds of volumes sealing
+> at once (measurement, the supervisor's); and the envelope wrap at a seal's end (`fleet::envelope_of`) still seals the
+> archive's new chunks in one turn (64 MiB took 98 ms, 2026-10-05): a seal of a large new volume holds its shard for
+> the whole wrap.
+
 > **owner_turn's refused `mkdir` asked the program, not the kernel: fixed (2026-11-18, test only).**
 > `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
 > failed on every CI run of the ubuntu-latest gates job since main moved to Ubuntu 26.04 (from run 43146258837 on
@@ -28,20 +106,27 @@
 > makes one: root, except a whiteout (a character device 0/0) for any caller who may write the directory. Nothing opens
 > one as a device: a landing refuses it before its first write, and each consumer's kernel is guarded (slates' own
 > mounts `nosuid,nodev`, the Linux FUSE mount now stating both itself; a pod's device cgroup; a guest asked for
-> `nodev`). Proven by each crate's unit tests (A-294 names them). **Owed:**
-> - **every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes).** The
->   device-fixture entries (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and virtio-fs lists;
->   1,788 of the macOS list's 1,905) are expected to pass now, so each lane reports them listed-now-passing until the
->   re-record; a list cannot be edited ahead of its run, since `a_record_names_the_expected_failure_list_as_tracked`
->   holds each record to its list's digest;
+> `nosuid,nodev`, a real guest's test of both built 2026-11-18, A-94's amendment). Proven by each crate's unit tests
+> (A-294 names them). **Owed:**
+> - ~~every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes)~~ **done
+>   2026-11-18.** Every device-fixture entry passed where predicted: CI run 44252249999 (virtio-fs guest 1,798 of
+>   1,798; macOS NFS 1,788 of 1,905) and run 44258878562 (the Linux FUSE adapter 1,798 of 1,800). Each list shrank by
+>   exactly those cases (virtio-fs, NFSv4 and OCI to none). The three Linux lanes' records were re-recorded by diag run
+>   44262117526, which met every verdict over the shrunk lists (FUSE 2 expected failures, NFSv4 and OCI none, 8,770 of
+>   8,798 passed), and `docs/wip/conformance.md` was regenerated from them;
 > - the real-kernel tests run on the Linux lanes: `a_device_node_reaches_the_mount_with_its_number_and_is_never_opened`
 >   (FUSE) and `a_device_node_is_made_with_its_number_and_never_opened` (the NFSv4 kernel client, which now mounts
 >   `nosuid,nodev`);
 > - the KIND lane's first run of its device probe (`device_probe` in `xtask/src/kind_export.rs`, written with this
 >   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
 >   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
-> - a guest's proof over virtio-fs (g260's): the guest mount line in `docs/cli.md` asks for `nosuid,nodev` since
->   2026-11-17, with A-294's reason;
+> - the first runs of a guest's proof over virtio-fs, built 2026-11-18 (A-94's amendment, kiln goal g260):
+>   `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node` in
+>   `crates/cli/tests/guest_vhost.rs`. The guest mounts the tag `nosuid,nodev`, as the guest mount line in `docs/cli.md`
+>   asks since 2026-11-17. The test expects a whiteout the host's user makes to be refused `EACCES` there and to reach
+>   the device layer (`ENXIO`) through a control mount without the flags, and a set-id copy of the probe to run as its
+>   caller there and as its owner through the control. Not yet run in a guest: CI's live-guest lane runs it in QEMU
+>   11.1, and the supervisor's run is crosvm on adacachy;
 > - Windows: a device node (and a FIFO or socket) has no WinFsp form. A directory holding one failed its whole listing
 >   (`read_all_entries` took each entry's attribute word with `?`), a sibling defect since A-26 that kept device nodes
 >   make common (an unpacked `/dev`); fixed 2026-11-17, the drive's listing leaves such an entry out (`listed`), so a
@@ -117,7 +202,16 @@
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
->   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
+>   else the stream ends typed and counted. **Built since (A-316, 2026-11-18), the attach's half, on Linux:** the
+>   resync channel beside the stream, its token told to the device first (`Attached`) and kept with the daemon's end,
+>   which the anchor holds with the owner view as its session (so the owner view needs no record of its own), handed
+>   to the client after the stream (`slates shards --resync-fd`, `ShardsStream::resync`, `CONTRACT` 12). **And the
+>   successor's half, on Linux:** recovery keeps a stream whose resync end the anchor held and serves it on a fresh
+>   stream, sending the device a `Resync` with its end; a resent request the dead daemon published is answered from its
+>   published reply, never run twice; a stream's writes are logged as a mount's are (A-63), which also fixes their loss
+>   at a death for streams that are not resynced. **Owed:** macOS (the channel's hand-off and the write log); the anchor
+>   holding a stream's DAX objects (until then a stream gives its resync up at its guest's first DAX map); Windows on
+>   Shards' handle path. Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
@@ -193,16 +287,34 @@
 > Windows needed: the directory as the root token in each spelling its tools print (`D:\a`, `D:/a`, the shell's
 > `/d/a`, a lowercase drive, a canonical path's `\\?\D:\a`); Subversion's file URL in the drive form (`pwd -W`) and
 > `svnlook`'s carriage return dropped; and `ln -s` making a real link (`MSYS=winsymlinks:nativestrict`), so the git
-> workload's link goes through the drive's reparse points (A-275), not a copy. **The drive's stated difference:**
+> workload's link goes through the drive's reparse points (A-275), not a copy (on that `ln` alone since A-327, below). **The drive's stated difference:**
 > WinFsp's driver makes no hard link (v2.1 answers `FileLinkInformation` `STATUS_NOT_SUPPORTED` itself,
 > `src/sys/fileinfo.c`; its NTFS compatibility page lists hard links unsupported), so a local git or Mercurial clone
 > copies on the drive where NTFS links. The three lines that count a clone's files with two names are recorded with
 > both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
 > the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
-> keep the stated difference and offer the change upstream. **Open:** the lanes' first run is the supervisor's (CI);
-> the cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from it;
-> the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a Windows form.
+> keep the stated difference and offer the change upstream. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
+> drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
+> environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
+> (`compat/mingw.c` `mingw_platform_has_symlinks`), and with them on git resolves every change of directory through
+> `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` (`mingw_chdir`), which Windows answers `ERROR_UNRECOGNIZED_VOLUME`
+> (1005) for a drive `DefineDosDeviceW` made; only a drive the Mount Manager made has a final path, and the Mount
+> Manager takes Administrators alone (WinFsp issues 410 and 427, its maintainer: no workaround inside WinFsp).
+> Subversion failed on both sides: Git for Windows' shell rewrote the argument `^/trunk` as a path,
+> `^C:\Program Files\Git\trunk` (svn `E020024`). Fixed: the variable is set on the git workload's `ln -s` alone, so git
+> runs as Git for Windows ships it, its symbolic links off; and `MSYS_NO_PATHCONV=1` hands every argument on as
+> written. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
+> asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
+> WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
+> privilege is ever required, R10); (b) mount through the Mount Manager (`\\.\X:`), which works and needs an
+> Administrator, so only as a choice the person makes when elevated; (c) mount as a WinFsp network file system, whose
+> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
+> cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
+> first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
+> Windows form.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
@@ -270,9 +382,15 @@
 >   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
 >   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
 >   without the guard: granted) and `fs_server.rs`'s server-node agent
->   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
->   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
->   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Built the same day, its
+>   siblings:** `Enroll` and `Revoke` verified the proof alone, so a consumer-bound channel holding a genuine proof
+>   could enroll a fresh consumer (binding a channel that escapes its own consumer policy) or revoke another agent's.
+>   Both now refuse `Forbidden` before the proof (`enroll_by_consumer`, `revoke_by_consumer`):
+>   `an_agent_cannot_enroll_or_revoke_a_consumer`, each guard red-checked alone (GitHub run 44274679371, Linux x86_64:
+>   without the enroll guard the agent's channel was handed consumer 11; without the revoke guard its revocation
+>   answered `Ok`; with both, `write_policy.rs` 11 of 11, `consumers.rs` 1 of 1, the server's unit tests 311 passed,
+>   clippy clean). The sweep of every launcher-proof check (the six callers of `landing::proven_by_launcher`, and
+>   consensus control) found no other: consensus control already refuses any principal but an OS account.
 
 > **W1 would have let a work off its green's shard merge under one volume's write policy: fixed before W1 landed
 > (2026-11-18, g231; A-307, §4.16).** A-285 judges a merge's policy from the work's and the green's records on one
@@ -310,6 +428,35 @@
 > change), and the rebase restates them after the `Rename`. Red test, parked: `an_edit_after_a_rename_over_a_file_is_merged_with_it`
 > (`crates/server/tests/green_post_state.rs`). The rebase oracle's generator stays out of this case until then.
 
+> **The live record period visited every live volume of a shard in one turn: sliced (2026-11-17, A-200, CLAUDE.md
+> "Bounded work everywhere"; g230).** `live_ship::period` ran each live volume's period work (`follow_candidates`,
+> `resolve`, the whole record or image it owed, `pending_sends`) for all of the shard's volumes inside one
+> `call_within` turn, a cost that grew with the volumes the shard owns while its clients waited. It now runs in slices
+> of about the shard's step quantum (`period_slice`, counted `fleet.live.period_slices` against `fleet.live.periods`),
+> each resuming after the last volume visited. Test: `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`
+> (the quantum injected to one volume a slice, `Daemon::inject_live_period_quantum`). **Owed (measurement, the
+> supervisor's):** the owner shard's longest step and its clients' p99 with thousands of live volumes, before and after.
+
+> **A burst on a live volume shipped the whole volume: fixed (2026-11-17, AC-8.9, A-200 amended; g230).** The owner's
+> credit was a fixed two entries (`live_ship::CREDIT`, R3 debt, with `RETAIN = 4`), and a publication it turned away
+> left the volume owing a whole record: its next entry carried every byte of the volume to every holder. Every barrier
+> publishes, so many writers on one volume put several publications inside one round trip, and the third shipped the
+> volume (sixteen writers of half a page each, both holders held off their shards for a quarter of a liveness window:
+> `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`, `crates/server/tests/fleet.rs`: on the fixed
+> credit 13 of the 16 publications were turned away and the log took two more whole copies of the half-MiB volume; with
+> the change none, no whole record, 16 entries and 16 in flight at once; this Mac, debug, 2026-11-17). Now the entries
+> not yet durable and the retained tail are held to the wire bytes of the whole state an install would send
+> (`slates_db::live::Bounds::of_whole`), so the volume ships whole only where that is the cheaper catch-up; the model
+> and unit tests run in bytes (`crates/db/tests/live.rs`, three new). Bug record
+> `docs/bugs/2026-11-17-a-burst-on-a-live-volume-shipped-the-whole-volume.md`.
+> - **Owed (measurement, the supervisor's):** many writers on one large live volume, before and after: whole records,
+>   bytes shipped, and the write's p50/p99/p999 (`fleet.live.whole`, `fleet.live.refused.no_credit`).
+> - **Fixed the same day:** a lane shipped a holder's entries one exchange at a time (`live_ship::ship_lane`), so a burst
+>   of `n` entries reached a holder in `n` round trips; the entries a holder lacks now go as one batch a congestion
+>   window (`take_batch`, `serve_entries`, request kind 26; A-200's second amendment of 2026-11-17; 25 collided with
+>   A-288's work route on merge, caught and fixed the same day, every fleet request kind now held distinct by a test). Owed (measurement):
+>   a stalled holder's catch-up time and a burst's last-write latency, before and after, on a WAN-shaped path.
+
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
 > Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
 > merge, rebase, gc or repack, no mapped packs, no worktree, and no Mercurial or Subversion at all. The roster now runs
@@ -327,14 +474,45 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
-> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
-> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
-> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
-> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. **CI's first runs (2026-11-18) found three
+> gaps, each fixed failing-test-first (A-319):**
+> - The host gate was red in all three runs that reached it, by one cause: at `repo/db/rep-cache.db` (run 44247840584,
+>   ubuntu), then, once the integrator's 760fb7db printed that cache's rows, at its row for `d/b.txt`'s text, item 3
+>   against 4 (runs 44252249999 and 44252854695), as the host against the mount was on macOS and over Linux FUSE
+>   (44252296495). Subversion's client sends a commit's texts in the order of an APR hash table, seeded afresh in
+>   every process, and FSFS numbers a revision's items in the order they arrive, so the workload's one commit of two
+>   new files wrote `db/revs/0/2`, and the cache's rows, two ways: seven and five times in twelve runs
+>   (Subversion 1.14.5, kiln run r956, every other file alike). Each commit now sends one text: all twelve runs were
+>   identical in every revision file, the cache's rows and its bytes, and the gate passed 10 runs of 10 (kiln run
+>   r1031), where before the change it was red in 1 run of 6, at `db/revs/0/2` (r1024). Main's 64852828, made at the
+>   same time, had left `db/revs` out of the byte comparison instead; merged over it, the revision files are compared
+>   byte for byte again, the cache by its rows (each content's hash, first revision and size, printed where `sqlite3`
+>   is on the `PATH`, 64852828's columns), and `svnadmin verify` checks every row against its revision.
+> - `cargo` failed alike on both sides of the macOS leg (run 44247840584): every CI job sets `CARGO_TERM_COLOR=always`,
+>   whose escape sequence before `Fresh` made the script's count of fresh builds read 0. Before A-289 that was recorded
+>   `Identical`, so the reuse AC-3.2 names had never been checked in CI. The shared environment now sets cargo's colour
+>   off and its target directory to the crate's own, which kiln's runs move outside the tree
+>   (`the_workload_environment_keeps_a_parents_cargo_settings_out`, red at exit 127 before).
+> - The live guest was killed at its 1500 s bound (runs 44247840584 and 44252249999): its harness read QEMU's console
+>   only after the VM exited, and the console stopped at exactly 65,536 bytes, a Linux pipe's capacity, mid-line in the
+>   Mercurial mount run's output, once the version-control workloads made it that long. The console is now read while
+>   the VM runs (`a_child_writing_past_its_pipes_capacity_is_read_while_it_runs`, `crates/server/tests/virtiofs.rs`,
+>   killed at its 60 s bound before). The same wait-then-read shape stands in five other test helpers whose children
+>   write a few lines (`run_within` in `crates/cli/tests/cli.rs` and `winfsp.rs`, `bounded` in `cli.rs` and
+>   `crates/bridge-fuse/tests/oci_container.rs`, the destroys in `live_chaos.rs`): none has met a pipe's capacity.
+>
+> Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
-> to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> to fix failing-test-first. **Shown identical (2026-11-18, CI run 44260193629, main 30014e93, the first with A-319):**
+> Linux FUSE (the daemon's own mount) and NFSv4.2 ran all twelve roster workloads identical, the OCI container's Linux
+> engine the six its image holds (git, git's history, Mercurial, Subversion, cargo, python), and the live virtio-fs
+> guest all twelve in 247 s; the three Linux records are re-recorded from that run's artifact. macOS's NFS loopback
+> mount had run git, git's history and Mercurial identical in each of three earlier runs (44247840584, 44252249999,
+> 44252296495), and Subversion with only the item order A-319 fixed. In 44260193629 the macOS leg ran git, git's history,
+> Mercurial and cargo identical, and Subversion differed at `repo/db/revprops`, `755` on the host and `2755` over the
+> mount: slates gave a directory made in a set-group-ID parent the bit, System V's rule, where APFS gives none; fixed
+> by A-328 (the NFS export gives its host's rule, BSD's on macOS), failing test first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
@@ -387,7 +565,17 @@
 > the give-up existed), and at load 42 to 47 merged with main 58a37794c (given up after 100 attempts, the last waiting
 > on its chain). In both, d owned the green, and no node retired a work route (`fleet.work_route.retired` absent). Host
 > ids are drawn fresh each run, so it passes whenever another survivor is the successor (5 s at load 104, merged with
-> b7c294959). **Owed:** a deafened node that cannot be the green's successor.
+> b7c294959). **Fixed in the test 2026-11-18 (g251):** reproduced on main 3bfc4dd8a alone, 1 of 3 runs at load 8
+> (Adas-Mac-Studio, r906: d counted `merge.takeover_given_up` 1 after 100 attempts "waiting on its chain", and the
+> resend ended `OwnerUnreachable` after 467 s), the test now creates greens until one's successor is another survivor
+> (`green_not_taken_over_by`: rendezvous first among the owner's other candidates for the green, the configuration's
+> successor rule), so the round under test is d's location round, never GAP-A9-7's record half. **Sibling, open (a
+> product refusal):** in that run d, the successor that gave the green up, answered its own client's resend
+> `OwnerUnreachable` for the rest of the run (405 s), never the give-up's `NotRecovered`: its control shard routes the
+> green to itself as owned and unmaterialized (`verbs::owned_unmaterialized`, counted 65,460 times in 405 s, with 65,460
+> forwards bounced through the other four nodes), and the record of the give-up lives on the green's owner shard, which
+> that path never asks. A-304 answers a given-up volume on its owner shard; a verb that reaches a given-up green through
+> a work's location round still loops. Reproduction: the same test with the green chosen so that d is its successor.
 
 > **`slates land` keeps every `--include` and `--exclude` it is given (2026-11-17, §4.15 step 1).** The command line
 > kept the last value of each flag, so `--exclude /.git --exclude /target` landed `/.git` without a word, while the
@@ -687,26 +875,52 @@
 > the fixed wait (diag-live-durability-75, A-271 with B9 and the recipient fix) 45 of 48 failed, mode B (below). Owed:
 > the flow re-run on the merged main (BENCHMARKS "A live volume taken over by a node replaced at its own anchor").
 
-> **Open (g240, 2026-11-17, A-271's owed skip; read from the code, no run has reached it): an owner lost before its
-> replacement candidate accepted the owner's pair leaves the volume unserved while that replacement is its successor.**
-> A replacement enters the neighbourhood before it holds the owner shard's pair: the owner delivers one only to a
-> configured neighbour, once a record period (`fleet::deliver_pairs`), and no other node holds that pair. The
-> successor is the cohort member rendezvous ranks first, from the configuration alone
-> (`RegionalConfiguration::successor`), so the replacement can be it. If the owner dies in that window (from the
-> replacement's configuration to the owner's next record period that delivers the pair), the key the replacement
-> waits for can never come: its wait ends `takeover_no_key_exhausted` at that head for good, and the head cannot move
-> with the owner dead, so no survivor serves the volume until the replacement leaves. Nothing acknowledged is lost:
-> writes wait in that window (the cover gate above), and the holders keep their copies (A-272). The flows never reach
-> it: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48 of 48 runs,
-> every key-wait counter 0). While the replacement is not yet seated the owner's death is a second failure, past the
-> `f` the fleet has spent; but nothing orders the pair's acceptance before the seat, and a delivery that fails waits
-> for the next record period (`fleet.seal.pair_recipient_unknown`, `fleet.seal.pair_undelivered`), so how long the
-> window can outlast the seat, where the owner's death is a single failure, is not measured.
-> The sibling, read the same way: a sealed head's envelope opens only through the lineage key the head wraps for each
-> candidate's anchor under the same pair (A-92 piece 4c), so a replacement successor in that window leaves it unopened
-> (`fleet.seal.envelope_unopened`, `fleet::opened_archive`) and that volume unserved too. Owed for both: the
-> deterministic skip in ranking A-271 names (model-first, §4.8), or another way for the successor to obtain the key,
-> then a process test that kills the owner inside the window (`Daemon::inject_pair_withhold` holds it open).
+> **Fixed (g240, 2026-11-17, A-295; a live log at `f ≥ 2`, a sealed head at any `f`): an owner lost before its
+> replacement candidate accepted the owner's pair left a volume unserved while that replacement was its successor.** A
+> replacement enters the neighbourhood before it holds the owner shard's pair: the owner delivers one only to a
+> configured neighbour, once a record period (`fleet::deliver_pairs`), and no other node holds that pair. The successor
+> is the cohort member rendezvous ranks first, from the configuration alone (`RegionalConfiguration::successor`), so the
+> replacement can be it. If the owner died in that window, the key the replacement waited for could never come: its wait
+> ended `takeover_no_key_exhausted` at that head for good, and the head cannot move with the owner dead, so the volume
+> was unserved until the replacement left. Nothing acknowledged was lost: writes wait in that window (the cover gate
+> above), and the holders keep their copies (A-272). Now a successor that holds no entry of its own in the log's sealing
+> is handed the volume's lineage key by a fellow candidate (hyper-seal `docs/seal.md` §6's hand-off to a successor;
+> `LINEAGE_STREAM`): asked of the hosts that answered its phase one, once the log is fetched and at each attempt of
+> A-271's bounded wait; handed only to the member the candidate's own committed configuration names as acting for the
+> volume (`fleet::acts_for`), from the candidate's own copy of the sealing, wrapped to the recipient key the request
+> carries; kept only when the volume's naming record opens under it (`seal_keys::accept_handed_lineage`). Counted:
+> `fleet.live.takeover_key_handed` on the successor; `fleet.seal.lineage_handed` and
+> `fleet.seal.lineage_refused.{malformed,not_acting,not_held}` on the candidate; `fleet.seal.lineage_unhanded`,
+> `lineage_unchecked`, `lineage_unasked` on the successor. Held by
+> `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to` (`crates/server/tests/
+> fleet.rs`: five nodes at `f = 2`, the owner's delivery to one anchor failed, that node replaced and the fleet
+> recovered, then the owner stopped): on this Mac, 2026-11-17, at load 22 to 159, it passed 4 of 4: in the three runs
+> that printed their figures 8, 6 and 7 of the 39 volumes went to the replacement, each served 2.0 to 2.4 s after the
+> owner stopped, every one through a handed key. Red with the hand-off removed (the successor asks no one): 12 and 7 of
+> 39 went to the replacement and none was served after 434 and 455 s (`takeover_refused.no_key` 24 and 14,
+> `takeover_waits_key` 1,127 and 609, `takeover_no_key_exhausted` 48 and 70, each such volume given up). The flows never
+> reached the window: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48
+> of 48 runs, every key-wait counter 0).
+> **Open, at `f = 1` (read from the code; no run reached it):** no survivor serves the live volume in the same window,
+> whoever ranks first, so the key is not what stops it. The owner moves the volume's holders to a set naming the
+> replacement only once its whole entry covers the replacement (`live_ship::target_recordable`), and never to a set of
+> `f` members (`Shipper::begin_transition`), so the recorded holders stay the survivor and the destroyed incarnation,
+> and phase one, which counts `f + 1` of them (A-240), cannot adopt. A write durable on `f` of that set may have rested
+> on the destroyed incarnation alone, so for the volume the owner's death is a second failure, past `f`, until the
+> owner's pair reaches the replacement and the set is recorded again. Owed with A-272 (ii) (a round of the members that
+> exist now), model first (§4.8).
+> **Fixed, the sibling:** a volume served from a sealed head's envelope rather than a live log. `materialize` adopted
+> the key only from the successor's own entry in the head's sealing, so a replacement successor in the window left the
+> envelope unopened (`fleet.seal.envelope_unopened` every period). It now asks the head's other candidates the same way
+> (`fleet.seal.envelope_key_handed`); a candidate hands from the heads it holds. A head's takeover counts the members
+> that exist now, so here the window was the key's alone at `f = 1` too. Held by
+> `a_replacement_that_never_received_the_owners_pair_opens_the_sealed_head_it_succeeds_to` (three nodes at `f = 1`,
+> sixteen sealed volumes): 3 of 3: 7, 8 and 6 of the 16 went to the replacement, each served 2.1 to 2.6 s after the
+> owner stopped, every one through a handed key. Red with the hand-off removed: 8 of 16 went to it and none was served
+> after 451 s (`fleet.seal.envelope_unopened` 1,600). The volume's content must survive too: at `f = 1` it rests on the
+> owner and one other node, so the test replaces the other that holds the least of it; before it did, both red runs
+> failed earlier, every fetch finding no recorded holder (`fleet.fetch.no_holder_session`), the content on the owner and
+> the destroyed node alone.
 
 > **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
 > waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
@@ -717,7 +931,20 @@
 > owes nothing and is never silent. On loopback a stopped peer is judged about 2 s into its silence, not 1 s
 > (fleet-transport §5 status; tests in `crates/transport/tests/exchanges.rs`).
 
-> **Open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
+> **Fixed (g230, 2026-11-17): the regional and root configurations carry a magic and a layout version, refused by
+> name.** `raft_wire::encode_regional_configuration` and `encode_root_configuration` now begin with a magic ("RCFG",
+> "RTCF") and a layout version (1); a decoder refuses another kind or an unversioned layout `ForeignLayout`, another
+> version `LayoutVersion`, before reading any field, and a retained council or root of another build's layout refuses
+> recovery by name (`retention::configuration_refused`). Tests: `a_configuration_of_another_layout_is_refused_by_name`,
+> `a_retained_council_of_another_layout_refuses_recovery_by_name`. A-272's "The encoding" status. The regional layout
+> is 2 since A-309 (g250, 2026-11-18: completion records where layout 1 carried `dropped_unconfirmed`, and each
+> retirement's current neighbourhood), so a layout-1 build and a layout-2 build refuse each other's configurations by
+> name; without the version, a layout-1 entry with nothing dropped and no retirement kept would have parsed as layout 2.
+> **Open (the sweep):**
+> the configuration group's commands (`config_group::ConfigCommand`) carry a tag byte but no layout version, so a
+> change to an existing command's fields would be read by position.
+>
+> **Was open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
 > `raft_wire::encode_regional_configuration` is a fixed sequence of fields with no version byte. A-272 appended a
 > field (`dropped_unconfirmed`); an old entry is refused only because it runs out of bytes there (`Truncated`), and a
 > new one at an old build because bytes are left over (`LengthMismatch`). Every caller refuses rather than defaults:
@@ -748,7 +975,8 @@
 > reclaimed yet. Now a round with a lost object does not confirm (`takeover::share_done`). A ranked successor that is
 > neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
 > retired with nothing to recover through all read `Lineage::Unresolved`
-> (`RegionalConfiguration::dropped_unconfirmed`), and `Unresolved` never reclaims. The sweep for the same inference
+> (`RegionalConfiguration::dropped_unconfirmed`, replaced by A-309's completion records), and `Unresolved` never
+> reclaims. The sweep for the same inference
 > from absence, every path that frees a held record, held content, a merge replica or a live log:
 > - `takeover::resolve_held_objects` on `Settled`: the defect, fixed.
 > - `takeover::resolve_held_objects` on `stale_after_confirmation` (a holder outside the successor's placement once
@@ -760,9 +988,42 @@
 > - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
 > - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
 > - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
-> **Open (A-272 ii):** an unresolved object is kept but recovered by no one. Owed: kept adoption records, so Settled
-> rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
-> now (here, the replacement that holds the live log).
+> **Fixed (A-272 ii) by A-309 (g250, 2026-11-18), with the residuals below:** an unresolved object was kept but
+> recovered by no one. Owed: kept adoption records, so Settled rests on one, and a round of the current members for unresolved objects,
+> so `f + 1` counts the members that exist now (here, the replacement that holds the live log).
+> - **Fixed (A-309 piece 1): Settled rests on a completion record** (`RegionalConfiguration::completed`, replacing
+>   `dropped_unconfirmed`), and a holder lets a copy go only for a takeover that asked it. Five histories let a holder
+>   let go of a copy nobody adopted, each red before its fix: a takeover with no survivor (a region formed on one node,
+>   taken over before it reports its grown neighbourhood placed) and one carried into such a takeover, each dropped at
+>   once and read settled (read from the code); and, found by the lineage model (`crates/db/tests/lineage_model.rs`),
+>   an object no survivor of its cohorts was ranked for (no round learned it, the takeover completed), a carried
+>   retirement the bound dropped while its carrier was kept (the carrier's objects ranked anew, a survivor confirmed
+>   without one), and a holder the round never asked reading a confirmation as an adoption. The retirement now records
+>   the neighbourhood a change in flight reached; every object ranks a survivor; the bound drops a carrier with what it
+>   carries. Sibling fixed: a holder outside the successor's placement kept its stale copy for good when the last
+>   confirmation dropped the retirement in the same version. A move on an unresolved line is allowed (records are
+>   bounded, so an old volume's line reads unresolved once its record goes). The lineage model is
+>   `docs/wip/models/Lineage.tla`, read as text only.
+> - **Fixed (A-309 piece 2): the members that exist now recover a cohort past its tolerance.** An object one of whose
+>   settled cohorts is short of its recovery quorum is adopted once every surviving member of its cohorts, settled and
+>   current, has promised it, with the newest record any of them holds (`Readiness::ReadyPastTolerance`,
+>   `fleet.takeover.recovered_past_tolerance`); before, it was counted `fleet.takeover.lost` and never adopted. The
+>   store-destroyed case's registers: the settled cohort [owner, A, old B] with only A left, the replacement B' in the
+>   owner's current neighbourhood; A adopts once A and B' answered
+>   (`a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now`).
+> - **Fixed (A-309 piece 3): the live takeover past tolerance.** A-240's phase one counted only recorded holders, so at
+>   `f = 1` with {A, old B} recorded it waited for good (g240's finding). Past tolerance it now waits for every
+>   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
+>   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
+>   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
+> - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
+>   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
+>   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
+>   owns is placed on the new neighbourhood.
+> - **Residual, recorded:** a line through a retirement the bound let go before it completed stays unresolved and
+>   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
+>   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
+>   there is neither learned nor let go.
 
 > **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
 > predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
@@ -773,7 +1034,10 @@
 > alone, was recovered jointly with old b's {old b, owner, c}, of which only c was left; the survivor counted 8 objects
 > lost (A-272 keeps the copies; none is served). Owed, model first: whether the joint cohort may apply only to objects
 > whose line passes through the unconfirmed host, in §4.8's model text, with A-272 (ii)'s lineage model; a wrong
-> narrowing would lose data, so no change before it.
+> narrowing would lose data, so no change before it. Since A-309 (g250, 2026-11-18) such an object is no longer lost:
+> the joint cohort short of its quorum puts it past tolerance, and it is adopted once every surviving member of its
+> cohorts has promised (here the replacement and c, whose own cohort still holds its quorum), with the newest record
+> any holds (`fleet.takeover.recovered_past_tolerance`). The narrowing would spare only that wait for every survivor.
 
 > **Fixed (live-durability, 2026-11-09): the store-destroyed flow's mode B was the flow's own wait.** No survivor took
 > the volume over and every takeover counter read zero: 11 of 12 runs on A-271's tree (diag-live-durability-77) and 11
@@ -1100,6 +1364,29 @@
 > sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
 > of 2026-11-07 has the log.
 
+> **Starts that each failed past the anchor's restart window were restarted at once, for good (found 2026-11-11 on
+> B10's Linux gate; closed 2026-11-17 by A-311 and A-312; the supervisor's runs under load owed, below).** The anchor counted failed starts in a
+> window of the recovery budget, a second, so a start that took longer fell in a window of its own every time and was
+> never a crash loop. B10's gate on adacachy2 (be4985bb, load 67-73) ran `a_start_whose_shards_sum_past_a_window_comes_up`
+> for 27 minutes, the anchor killing the 407-shard start every second ("ran 1009-1037 ms of CPU on one thread without
+> beating") and restarting it at once; the goal's record (g254) has main's macOS CI meeting it at 367 shards. Now a
+> second failed start in a row is a crash loop, backed off at least its own life and doubling to the failover SLO
+> (A-311). Red on main 29ef4521 (a 400 ms start against a 200 ms window: restarted at once 4 times of 4, backed off
+> None); passes on this change, a crash loop at the second exit backed off 548 ms, its own life (an 18-core MacBook at
+> load 15; `a_crash_loop_of_starts_longer_than_the_window_is_backed_off`, the bug record of 2026-11-11). The test now ends its watch at the anchor's first start kill instead of reading on. Open:
+> - ~~**The serve-then-crash loop.**~~ **Closed 2026-11-17 (A-311's second half):** a daemon that dies before it has
+>   served as long as its start took is a failed start, and the anchor publishes its verdict that a daemon has recovered
+>   (`recovered` in `slates status`). The end-to-end flows that kill daemons in a row (`held_rendezvous.rs`,
+>   `nfs_held.rs`, `merge_kill.rs`, `winfsp.rs`, `guest_vhost.rs`) kill each once it is judged recovered; without the
+>   wait, `held_rendezvous` failed 4 of 4 under the rule at load 21-63 (the liveness agent's run of 2026-11-11). Owed:
+>   the supervisor's runs of those flows on main (gated on `SLATES_TEST_CLI=1`; WinFsp's on CI's Windows runners).
+> - ~~**A long start beats per unit of work.**~~ **Built 2026-11-17 (A-312):** the starting thread beats after each unit
+>   of its work (each shard's registration, spawn and acknowledged build, each pair ring) until the watchdog takes the
+>   beat over, so the backoff is no longer all that stands between a long start and the anchor. Owed: the supervisor's
+>   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
+>   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
+>   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
+
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
 > killed, and every restart started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only
@@ -1193,6 +1480,48 @@
 >   this change no longer writes for a frozen daemon (its process judgment kills it a window after the lapse); it now
 >   holds the anchor to that line and its numbers.
 > The bug record of 2026-11-07 has the per-phase table.
+
+> **A lone daemon ended itself when a shard waited on its log (found 2026-11-17, fixed 2026-11-18, A-305).** Seven test
+> binaries exited 4 at their daemons' starts under load (`merge_post_state` for g231 at load 40; `merge_load`,
+> `nfs_hostile`, `nfs_mount`, `nfs_writeback`, `green_checkpoint` and `fleet` for g240, g246 and g230 at loads 40 to 50),
+> each with a line cut mid-write at the exit and the watchdog's own end line lost: a shard writing a log line waited on
+> the process's standard-error lock behind a thread starved while it held it (or on a write a slow reader had not
+> taken), stood still a window, never runnable, and the watchdog judged it wedged (A-228), which ends a lone daemon
+> (A-232). Reproduced by `a_lone_daemon_whose_log_stalls_lives_on_and_serves` (`crates/client/tests/lone_daemon.rs`:
+> standard error held three windows while each shard logs). Fixed: a daemon's shard threads hand their lines to an owned
+> writer thread (`slates_machine::log::LogWriter`, `LogRoute`) through a queue bounded at a pipe's 65,536 bytes, and
+> never wait on standard error; a full queue refuses the line, counted in `log_lines_refused`. Other process-wide locks
+> a starved thread can hold (the allocator's) still wedge a shard behind it the same way: the holder is not named (the
+> watchdog's entry, "the lock a starved test thread held is not named"), and that decision is still owed.
+
+> **A lone daemon ended itself for its own watchdog's freeze (found 2026-11-17, fixed 2026-11-18, A-308).** The server
+> `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
+> 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
+> it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open: a
+> shard held in the kernel past a watched window (a page-in at that pressure) is still judged wedged; telling `D` and
+> XNU's uninterruptible wait from a sleep is the 2026-10-22 entry's owed decision. Also from the same report, a test's
+> bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
+> loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
+> the loop now runs to the call's bound after the exit.
+
+> **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
+> Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
+> SIGABRT when an in-process daemon's watchdog judged "shard 4 is spinning, 1054 ms of CPU without a step against the
+> 1000 ms window", and in diag-b13-2 the server's library tests the same way at 1,060 ms. A lone daemon's stuck verdict
+> ends its process (A-232), and an in-process daemon's process is the test binary. A window of CPU is no poll's only in
+> a build that runs code at the speed the budget was set for; ThreadSanitizer's runtime is called at every memory
+> access and every function's entry and exit. The spin window is now the budget held to the build: scaled by compiled ÷
+> machine-code time for one chain of work, measured once a process (`slates_machine::build_cost`), never below the
+> budget; the watchdog's start line names both. Measured: ThreadSanitizer's builds 17.9 to 35.3 times machine code on
+> CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
+> (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
+> (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
+> (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest
+> thread to a window of CPU too (`crates/api/src/role/anchor.rs`, `process_clock`), and an observation's budget is counted
+> in the observed shard's CPU (`crate::observe::ShardTime`); neither is held to the build yet, and neither has been seen
+> to fail under ThreadSanitizer. The release-build spinning kills of the A-228 entry ("A kill the rule does not touch")
+> are untouched: a release build's window is the budget.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
@@ -1303,11 +1632,14 @@
 >     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
 >     and a model test, both red with the place ignored
 >     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
->   - **Open (2026-11-18, goal g245): a forward still queued is given up at its stall budget while its lane moves.**
->     Nothing of it was sent, and with its place kept its resend loses nothing, but each one costs its forwarder a give-up
->     and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the most in
->     the runs that starved. Owed: a queued forward's quiet counts its lane's progress (a forward begun or a reply taken),
->     so it is given up only when the lane does not move for a stall budget, the failover bound still capping it.
+>   - **Fixed (2026-11-18, A-315, goal g255): a forward still queued was given up at its stall budget while its lane
+>     moved.** Nothing of it was sent, and with its place kept its resend lost nothing, but each one cost its forwarder
+>     a give-up and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the
+>     most in the runs that starved. A queued forward's quiet now counts its lane's progress (a forward begun, a reply
+>     taken, bytes of a reply read), so it is given up only when the lane does not move for a stall budget, and the
+>     lane's progress holds it only until the failover bound from its first send (`forward_lane::Stall`,
+>     `fleet.forward.held_by_lane`). Unit-tested (`a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget`,
+>     red with the lane's progress ignored); owed: the burst's count of batches given up, run again on main.
 >
 > - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
 >   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
@@ -1346,9 +1678,10 @@
 >     resend came within 21 ms every time). It now owes the answer within the liveness budget of the owner's last
 >     progress through them, and asserts the room wake's counts
 >     (`docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`).
->   - Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
->     (`xshard::given_room_within`, `given_room`); `retry_forwards` stops at the first refused forward, so one full
->     owner holds back kept forwards to owners with room.
+>   - ~~Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
+>     (`xshard::given_room_within`, `given_room`)~~: closed 2026-11-18 (A-296), both ask for room and wait for the
+>     drain's word. Open: `retry_forwards` stops at the first refused forward, so one full owner holds back kept
+>     forwards to owners with room.
 >   - Unmeasured: under a saturated owner, an idle client shard whose resend keeps losing the room to busy shards is
 >     told at every drain, so it wakes about once per its own wake latency, where the timer woke it once per idle
 >     window (100 wakes). The owner pays a kick per such shard per tell. Owed: kicks and CPU at the 10k fan-in rung.
@@ -1391,7 +1724,16 @@
 >   - `green_fairness.rs`, 1,000 files of 16 KiB: main held its shard for one poll of 134 ms (x86_64) and 960 ms
 >     (arm64) with 0 probes answered; sliced, 259 to 1,456 probes inside, the longest 13.6 ms.
 >   - Peak RSS over the whole kernel 9.42 to 8.02 GB, `fs/` 361 to 283 MB (BENCHMARKS, "CreateGreen sliced").
->   - Still open: the engine's second lifetime copy (loadtest-scale, after W2), and recovery's walk in `init_shard`.
+>   - Still open: the engine's second lifetime copy (loadtest-scale, after W2). Recovery's walk in `init_shard` is a
+>     directory a unit since 2026-11-07, and since 2026-11-18 (g232) the engine is seeded from the origin a share a unit
+>     too: it was one step of hashing and copying every file, seconds over the whole kernel, so a restarted owner of a
+>     kernel-sized green was ended by its watchdog inside its recovery, at every restart
+>     (`a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time`;
+>     `docs/bugs/2026-11-18-a-recovering-green-seeded-its-whole-origin-in-one-step.md`). The checkpoint applied onto
+>     the seeded engine is still one step, costing what the versions changed.
+>   - Open (found 2026-11-18, g232): a taken-over plain volume is restored in one call (`verbs::materialize_taken_over`:
+>     `slates_archive::restore`, then every file written), so a kernel-sized base volume's successor would hold one poll
+>     for seconds, the wall the green's own takeover meets (A-286's owed item `recover_green_inputs`).
 >
 >   The 2026-11-06 record, as it was found (reported to fixtures, A-217's re-lander): In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:
@@ -1597,6 +1939,21 @@
 >   one more chunk, on the rule that an inputs archive names each chunk once. A fixed-size cut names a chunk again
 >   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
 >   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
+>
+> **Fixed 2026-11-18 (g232, A-313): a restarted holder refused every later version of its greens.** A warm restart keeps
+> a holder's accepted records and held inputs, but its replica of each green lived in memory alone, so it answered every
+> later record `merge.out_of_order`, for good, while the owner shipped it again every pass. With one primary and two
+> replicas at `f = 1`, one replica's restart left every version one holder's answer from stalling, and a second stalled
+> the green. Now the holder rebuilds the replica from its records and held inputs a slice at a time before it judges the
+> record (`merge_origin::rebuild_replica`). Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
+> (`crates/server/tests/fleet.rs`): red, the restarted holder answered version 2's record out of order 4,586 times and
+> version 2 never placed within the test's 60 s; green, placed in 2.56 s with one rebuild counted (kiln r1017,
+> 2026-11-18; `docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`). Still open,
+> found beside it:
+> - a restarted holder's `merge.refused` (a green refused for good after a mismatch) is in memory too, so the restarted
+>   holder rebuilds such a green and refuses it again only at the version that mismatched;
+> - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
+>   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
@@ -1848,11 +2205,19 @@
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
 >   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
->   transport's round-trip estimate) is open. C+D (A-232): the client's part is done, since a call waits while its
->   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
->   itself, `W`, is still a fixed budget (R3 debt). Found on
->   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
->   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+>   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
+>   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
+>   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
+>   before it calls the owner silent, and the failover bound from the forward's first send caps it
+>   (`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`;
+>   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). loadtest-scale's lane
+>   poll clock (`6da9670d`, CPU-credited turns of a 10 ms pace) did not land: it assumed an idle shard's timer fires on
+>   time, and Windows' 15.6 ms tick broke it (reverted from the B13 stack, `b458723c9`). C+D (A-232): the client's part
+>   is done, since a call waits while its daemon lives (2026-11-14,
+>   `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window itself, `W`, is still a fixed
+>   budget (R3 debt). Found on the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation`
+>   takes a uid only), and two server unit tests of landing fail on Windows, where CI does not run them. Record:
+>   `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
@@ -2412,7 +2777,15 @@
 >   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
 >   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
->   draft (`docs/publish.md`). The test draft is never to be published.
+>   draft (`docs/publish.md`, "The publish step", which lists what the publish needs from her). The test drafts are
+>   never to be published.
+> - **The dry run stages the whole release (2026-11-17, A-320).** Before, a run with no tag stopped after the builds,
+>   and only the two test tags had ever checked the checksums, the copies' comparison and the provenance. Now a
+>   read-only `stage` job runs in every run. It makes and checks `SHA256SUMS`, compares each target's two copies and
+>   writes the provenance and a publish plan. It keeps them as the run's `release-staged` artifact. Only a tag's
+>   `draft release` job signs and drafts, from exactly those files. Dry run 44261010043 (2026-11-18, commit
+>   44c7cc17): all fourteen copies passed their smoke tests, the seven pairs were byte for byte the same, and
+>   `SHA256SUMS` checked. Nothing was signed or released: no tag, no draft, no attestation. A-320 has the numbers.
 > - **Closed 2026-11-05 by 68b9cb05 (A-213): the anchor aborted when its stderr closed** (found by the smoke test,
 >   2026-11-04: `slates anchor 2>&1 >/dev/null | head -n 1` exited 134, because `eprintln!` panics on EPIPE under
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line
@@ -2543,11 +2916,13 @@
 > plane has lent (`ship_head`). Fixed the same day: a holder behind the retained tail no longer puts a whole copy of the volume on the log ahead of every later write; it is installed from an image made beside the log (§4.10 status "An install image beside the log"). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
-> live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
-> still the fixed two, not yet derived from the measured apply rate and round trip); a candidate's copy kept across its own
+> live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; since 2026-11-17 the credit
+> is the whole state's bytes, not a fixed two entries, A-200 amended, the entry at the top of this ledger); a candidate's copy kept across its own
 > restart; real-process chaos
-> (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
-> loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
+> (partitions, injected latency, volume failure, client disconnect). The owner's `put_wal` is its `Local` records,
+> resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
+> `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
+> waits up to the 100 ms record period before its commit starts.
 > **Fixed 2026-11-05 on agents/raft-2 (bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`):
 > a live takeover could wait for its quorum and never serve, and phase one had a safety hole.** The hypothesis below held.
 > A successor that held no copy never counted itself (`fetch`), and a remote candidate that held no copy answered "none"
@@ -2674,7 +3049,36 @@
 >     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
 >     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
->     Linux's census has run nowhere yet.
+>   - **First runs (2026-11-18), 11 of 35 flows failed on macOS arm64 (main bfc34cace) and the same on Linux x86_64 and
+>     arm64 (69cd38b22).** Linux's census ran there for the first time and attributed every socket but two datagrams.
+>     - **Fixed (A-330): the relay never carried the record plane.** The three owner-partition flows failed
+>       StaleNeverCommits: their cut-off owners acknowledged 2,086, 3,528 and 2,412 writes after the cut, each durable on
+>       a candidate, over record links that went around the relay, since a node announced its record plane at its bound
+>       port and formation's redial dialed it. Every relayed flow was vacuous on that plane; each now requires a
+>       record-plane datagram per acknowledged write from its relay (`judge_relayed`). Red first:
+>       `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+>       (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+>     - **Open (g229): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
+>       resumed, answered `NotFound` for the successor's acknowledged writes (2.29 s and 3.00 s into the run, 70 to 780
+>       ms after their acknowledgements), where it must refuse or answer them. The flow now notes the reader's state when
+>       a read answers missing (`note_missing`), and its first run with it (Mac Studio, 2026-11-18) showed the cause: the
+>       old owner was retired and re-admitted under its own id (`fleet_host_epoch` 2), its catalog still held the volume
+>       with its epoch-1 shipper, and its lease confirmed again (`lease.refused.superseded` 1, `lease.wait.parked` 1,
+>       `lease.wait.served` 1), so it served its stale copy. A re-admission yields an owner's objects only in its
+>       routing table (`FleetNode::install_configuration`), and `verbs::owned_by_another_host` serves every volume its
+>       node created or still catalogues.
+>     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
+>       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
+>       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
+>       back, yet `first_head` was none. The flow now takes the survivor that took the volume over (`took_over`, the
+>       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
+>       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
+>       (g230's).
+>     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
+>       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
+>       it as a live holder.
+>     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
@@ -2865,6 +3269,31 @@
 >   mutated test fails at its own assertion; the agent's own grant issued, `Ok(1)`). **Still open:** a person at a bare
 >   CLI, with no launcher, has no approval verb of their own; one would read the launcher's secret from a descriptor
 >   the person passes, never an argument or the environment.
+> - **The server in its own container lands into the volume attached to it (2026-11-18, fs-server plan step 2).** The
+>   container leg of 2026-11-05 stopped at the grant; it now lands. `fs_server.rs`'s `in_a_container` (Linux; gated
+>   `SLATES_TEST_CLI=1` and `SLATES_TEST_CONTAINER=1`, set in CI's Linux CLI step): the server node is `slates anchor` in
+>   an `ubuntu:24.04` container on a Docker network of its own, its launcher's secret on standard input through
+>   `StartSpec::anchor_command` with `docker run` as the program, its projects a bind-mounted volume; the client node runs
+>   on the host at the bridge's gateway. The launcher's role runs inside the container (the test binary re-invoked
+>   there, the secret on its standard input), since a launcher reaches its instance only where it runs. Under ask the
+>   land answers the approval request and the host reads the project unchanged until the launcher approves exactly the
+>   presented manifest (4 written, none failed); under bypass the one `slates land` writes 4 entries; the host reads every
+>   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
+>   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
+>   replaced by ask (the one land writes nothing).
+> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3; macOS legs
+>   done, Linux legs owed).** Two kiln runners, one manifest over the LAN (Wi-Fi: 90-150 ms average round trips, spikes
+>   to about 470 ms), no person in the run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`,
+>   `approve`) are the per-machine steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the
+>   client, `node` starts each node (the server under its launcher's secret, made on the server, mode 0600, read on
+>   standard input), the client pushes two increments over four files into two greens (accepted 1 and 2; the late push
+>   refused with `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1
+>   create, 3 replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one
+>   `slates land` writes 4 entries (92 bytes); the server's disk holds every merged byte. Server Adas-Mac-Studio, client
+>   Adas-Mac-Studio-2: passed in 83 s (kiln node runs r1052, r1054); the reverse: passed in 69 s (r1118, r1119). The
+>   kiln program that drives both machines is the supervisor's (`~/.cache/slates-scratch/fanout/fs-two-machines.js`).
+>   **Owed:** the Linux x86_64 legs (server on Linux, then client on Linux). adacachy2 was held for hours by kiln's own
+>   CI labs, during which kiln freezes every agent run there; adacachy did not answer.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
@@ -7718,7 +8147,7 @@ current-tree passes.
 
 So no CSI lifecycle exists, and none is claimed. The transport report offers no Kubernetes form. The runtime handshake refuses any non-Docker runtime (`RuntimeUnsupported`), and hostPath use is outside every supported profile. **Decided 2026-10-01 (Ada: the unprivileged alternative).** A sidecar cannot serve its own pod's volume, because kubelet sets volumes up before containers start. So the design (§4.6 "Kubernetes publication without privilege") has kubelet, the node's own broker, mount an `nfs` PersistentVolume from a pod-network NFSv4.2 export of the daemon. The volume's capability is the export's path token, and the transport is RFC 9289 RPC-with-TLS with mutual X.509 authentication or nothing (`xprtsec=mtls`; the node's `tlshd` holds a fleet-issued certificate). Evidence: Kubernetes `volumes.md`/`persistent-volumes.md`, nfs(5) and the kernel's `tls-handshake.rst`, fetched 2026-10-01. Docker Desktop's kernel lacks `CONFIG_TLS` (measured), so the kernel leg runs on the GitHub Linux runner. **Built 2026-10-01: the RFC 9289 server and the network listener.** The codec (`rpc_tls`, golden vectors) and the connection (`nfs_tls`) are in place, and a fleet node with an operator authority serves its NFS edge on TCP at its base port. The anchor holds the listener and hands it across restarts. No new attach form was needed: the edge already authorizes every call by its mount capability alone, so a host-mount attachment's path is the PersistentVolume's path. The `Arc` question was settled by measurement: the per-connection build costs 11.0 µs, 3.8% of the handshake, and the shared config was rejected (BENCHMARKS.md). Proven against a real rustls client, a daemon and an anchored node across `kill -9`, on macOS and Linux. An operator gets the PersistentVolume's path from `slates export ID [--read-only] [--subtree DIR]`, which prints `/<name>@<attachment>.<token>` from the export's own attachment. Proven through the real binary on an anchored node: bootstrap, create, export, `MNT` over RPC-with-TLS admitted, `slates detach`, `MNT` refused (macOS and Linux). Teardown proven the same day: on one open session a file reads while its attachment lives, and is refused `NFS3ERR_ACCES` after `detach` and after the volume's destroy, as on loopback (macOS and Linux). **The kernel leg built (2026-10-01; Ada authorized its CI tooling): `cargo xtask kind export`.** It uses a node image with Debian's `ktls-utils`, a chart with the new optional `authority` and `export` values (gated by a render test), and `slates export`. A PersistentVolume names the export over `xprtsec=mtls`; a writer pod writes and a second pod reads through a fresh mount. CI loads `tls` and the NFS client modules and runs it with `--require-kernel-tls`. Run locally it got past kubelet: `mount.nfs` ran, the node's `tlshd` completed the mutual handshake (the server's chain and IP SAN verified, per the ktls-utils 1.0.0 source), and it stopped at `setsockopt(TLS_ULP)`, which Docker Desktop's kernel lacks. Three bugs were found and fixed on the way. The export refused clients offering no ALPN, and Linux's `tlshd` offers none (`docs/bugs/2026-10-01-the-export-refused-the-linux-clients-handshake.md`). The `tlshd` unit was never started in a kind node. `tlshd` refused the client key at mode 0644. **AUD-29-75 closed 2026-10-02.** The leg's first run on the GitHub runner (run 36965111945, commit `56272c0`, `--require-kernel-tls` after `modprobe tls`) was green: "kubelet mounted the volume over RPC-with-TLS; a second mount read the bytes the first wrote", one enrolled node rolled out in 7.5 s. Until then the report offers no Kubernetes form. Found on the way: `oci::tests::a_bind_source_binds_only_as_the_live_attachment_its_table_entry_names` had been red since `6ba0678`, whose not-shared rule its fixture predated. Its fixture is now a shared mount, and a new test pins the refusal. |
 | AUD-29-77–78 | RAM admission/residency must include actual runtime/VMM/cache/mapped/retained-copy boundaries; the 14 skipped OCI/virtio-fs records and capability evidence require reconciliation and real consumer tests (R1, §4.2, §4.6, Part 6). **AUD-29-78 in part, 2026-10-01:** the 14 OCI and virtio-fs records are reconciled without turning a skip into a pass — the OCI skip no longer says no container form exists: it names the verified non-recursive private bind, `slates oci-check`, the Docker Desktop workload (T-4.13) and what is owed (a harness leg that runs the suites inside a container; the Linux bind refused `ContainerWorkloadUnproven`); the Linux FUSE adapter's `not_covered` names the daemon's own FUSE mount and the `allow_other` grant the suites over it need (`crates/conformance/src/capability.rs`; records regenerated by `cargo xtask conformance plan` into a scratch directory and only the OCI/virtio-fs records copied back, so the Linux lanes' run records stay; the matrix regenerated with `matrix --write`). The container leg consumes the recipe's exact semantics (`--mount`, non-recursive, private; AUD-29-65). **78, the in-container runner (2026-10-01):** the harness runs a suite inside a real container through the OCI attachment (`xtask/src/conformance/container.rs`). The sequence is the session's macOS host mount; the runtime handshake, whose profile line the record keeps (engine, version, endpoint with `~` for home, user namespaces, the identity rule); `attach --oci`; `slates oci-check` just before the bind; then one `docker run` of the exact entry as `--mount` (non-recursive, private) as the mounting user, compiling the pinned fsx source inside `rust:1.98.0`. Its record is normalized to `<mount>`, `<uid>:<gid>`, `<scratch>` and `<pid>`. OCI × fsx is now `RAN` (Docker Desktop 29.3.1, 2026-10-01: 10 000 operations, seed 1, passed, 18.5 s). OCI × fsstress is `RAN` too: LTP's pinned sources are staged with the Linux shim and compiled inside the container (500 operations × 4 processes, seed 1, all 2 000 logged with dread/dwrite, passed; the daemon answered afterwards). A host whose engine does not answer is skipped typed, and an untested profile fails the lane. The hand-written lane table in `docs/wip/conformance.md` §4 no longer says the OCI form or the Linux FUSE transport does not exist. OCI × workloads is `RAN` as well (git, cargo and python identical between a Desktop-shared host directory and the bind). Getting there found a cross-transport vfs bug: a directory removed while a transport held it named a freed node, so every image walk met a stale handle and every barrier on the volume was refused. It is fixed on every lane, as is a Docker Desktop hard-link limitation, now stated in the profile (`docs/bugs/2026-10-01-a-removed-directory-a-transport-held-named-a-freed-node.md`). OCI × pjdfstest runs too: LIMITED, unprivileged, 238 files and 8,798 cases (2,314 passed, 2,765 failed, 3,691 needs-root). Its failures are shaped by cause in `docs/wip/conformance.md` §3.4a: the reviewed NFS-FIFO-OPEN client limit, surfaced by Desktop's server opening every node it makes, plus its knock-ons. The harness gained `--transport` to run one transport's cell. **The Linux container profile built (2026-10-01; Ada authorized user_allow_other on CI):** `slates mount --shared` makes an `allow_other` FUSE mount, and the Linux bind binds only it (else `MountNotShared`). The Docker Engine profile is tested with `ContainerIdsAsHostIds`, measured: root bypasses the bits, a foreign id meets them, the mounting user owns what it makes, and hard links are served at once (`a_linux_container_reaches_the_shared_mount_as_its_own_ids`; `docs/bugs/2026-10-01-linux-had-no-container-profile.md`). **The Linux container lane and the hermeticity container leg built (2026-10-01).** The harness's `oci-linux` transport mounts with `slates mount --shared` and runs each suite inside a Docker Engine container bound to it. Linux runs `fsx`, `fsstress` and the workloads (git, cargo and python identical; the other tools are absent from the workload image, as on Desktop) and hermeticity, all `RAN` in the Linux container lane (Debian 13, 2026-10-01). Hermeticity uses a root tracer (`sudo strace -u USER`: an unprivileged tracer strips `fusermount3`'s setuid, measured `fusermount3: mount failed: Operation not permitted`). It drives the workload inside the bind: 0 outside writes in 353 calls, and the landed tree equals the mounted tree. Calls made under an OS mount broker's image (`OS_MOUNT_BROKERS`: `fusermount3`, `mount`) are set aside on Linux and counted and named in the record. The kept trace showed `/bin/mount` (run by `/usr/bin/fusermount3`) making libmount's `/run/mount`. This is the counterpart of macOS's eslogger leg, which keeps only the slates executable's events (`only_calls_under_an_os_mount_brokers_image_are_set_aside`, mutation red). Fixes on the way: the harness reopened only the anchor's first handoff object, so the grant met `ENODEV` (both are reopened now); the mount helper's stderr is carried in `MountError`; and a landing bug (directory modes lost to the umask; `docs/bugs/2026-10-01-landed-directory-mode-umask.md`). pjdfstest runs there as container root, the profile's ids reaching the mount as themselves. It is the first run over slates' own FUSE mount. It matched the root-reviewed Linux list on 1,798 of its 1,800 cases, and its 18 other failures were one bug: a component past `NAME_MAX` answered `EINVAL` or `ENOENT`, not `ENAMETOOLONG`. That is fixed on every bridge (`docs/bugs/2026-10-01-a-long-name-was-einval-or-enoent-not-enametoolong.md`). The rerun is `RAN` against its own list (`expected-failures/oci-linux.pjdfstest.txt`, 1,798 entries, reasons carried over; `conformance.md` §3.4b). `xtask conformance tally` now honours `--transport`; it had ignored the flag. CI's conformance job installs `fuse3` and grants `user_allow_other`. Also owed: a live guest (AUD-29-68). Its siblings are fixed: `Daemon::refusals_on_every_shard` serves the volume-scoped assertions, and `publish.volume_skipped` is a per-shard status refusal naming the volume, replacing the process-wide `PUBLISH_SKIPPED`. **AUD-29-77 in part 2026-10-01:** a virtio-fs device's kept copy buffers are charged to the attachment exactly once. A chain charges its buffers' growth, reserved exactly; the bytes stay charged while kept and are given back when let go or at reclaim, and a growth that does not fit makes the device give back its buffers first. Every transport's residency now names what slates protects (`daemon_ram`) apart from what its bytes reach beyond it (`host_kernel_cache`, `runtime_vm`, `guest_page_cache`), so an export is never reported as a protected workload (`the_copy_buffers_a_device_keeps_stay_charged_to_its_attachment`, the MCP residency assertion; `docs/bugs/2026-10-01-a-guest-devices-kept-copy-buffers-were-uncharged.md`). **AUD-29-77 closed 2026-10-01 (the VMM's guest memory measured):** a guest's residency names `guest_memory` beyond protection: the VMM's memory, holding its page cache and the device's reply buffers. The live QEMU run samples the daemon's own `smaps`: the device's mapping of the 256 MiB guest peaked at 580/516/452 KiB resident over three runs, with 0 KiB locked, asserted (`a_linux_guest_mounts_the_volume_through_qemu_over_vhost_user`; `docs/bugs/2026-10-01-a-guests-memory-was-reported-as-its-page-cache-and-unmeasured.md`). **AUD-29-78 closed 2026-10-02 (its required correction met):** the records are reconciled without a skip turned into a pass, and the tested profiles are pinned. Docker Desktop 29.3.1 and Linux Docker Engine come with their identity rules in the runtime handshake, and QEMU 10.0.13 with the Debian 6.12 guest kernel. The by-use and refusal cases run through the exact OCI mount entry (`--mount`, non-recursive, private), with `slates oci-check` before each bind, on both engines. The live guest that this row owed exists and runs in CI. Follow-ups: the guest's fsx, fsstress and pjdfstest legs (their records say owed), and the pressure and failure suites no transport has yet (Phase 9). **fsx and fsstress legs done 2026-10-03:** the live-guest image builds both from the harness's own pins (each SHA-256 verified at build; `ci/guest/build-exercisers.sh`, held equal to `xtask/src/conformance/fetch.rs` by a doc-truth test), and `crates/server/tests/virtiofs.rs` `a_live_guest_runs_fsx_and_fsstress_over_the_tag` runs them over the tag inside the guest under the harness's bounds (now shared, `slates_conformance::exerciser`): fsx A-OK over 10,000 operations, fsstress exit 0 with all 2,000 operations logged, the tag unmounted cleanly, 85 s in the guest under software emulation; the CI live-guest job requires both lines. **pjdfstest leg done 2026-10-03:** the guest builds the pinned pjdfstest from the harness's probes (now shared, `slates_conformance::pjdfstest`) and runs every file as root over the tag; `a_live_guest_runs_pjdfstest_over_the_tag` judges the gathered results by the harness's rule against `docs/wip/conformance/expected-failures/virtio-fs.pjdfstest.txt`: 238 files, 8,798 cases, the 1,798 failures exactly the oci-linux root list's (reasons carried over), the two NFS-only cases of the native Linux list passing; 23 min in the guest under software emulation. All three guest legs required by the CI live-guest job. |
-| AUD-29-79–81 | Guest cache negotiation must have actual invalidation delivery; FUSE creation must apply umask exactly once and preserve profile-specific creating uid/gid separately from Consumer authority (§4.6, §4.13, AC-4.11–4.12). **AUD-29-80 and AUD-29-81 closed 2026-10-01:** every FUSE creation (create, mkdir, mknod) applies its request's umask — under `FUSE_DONT_MASK` the kernel sends the mode unmasked with the umask beside it; without it, masking again changes nothing — and the ABI comment that said the opposite is corrected; the creating process's uid and gid from the request header are stamped as ownership metadata (never authority: the enrolled subject is unchanged), and the shared stamp applies the set-group-ID parent rule for every transport (the parent's group, and the bit on a new directory). Proven by the real dispatch over a real volume (`crates/bridge-fuse/tests/creation.rs`: 0600/0755/0640 owned 1000:100 under a context enrolled as 501; under a set-group-ID parent the parent's group and the bit; red with the fix mutated out: `0666` owned `501:20`) (`docs/bugs/2026-10-01-fuse-creations-dropped-the-umask-and-the-creator.md`). **AUD-29-79 closed 2026-10-01:** the cache a transport promises its kernel now matches the mechanism it has: an attachment carries its transport's `CacheCoherence` (admitted `Revalidated`; the native `/dev/fuse` channel, which writes the seam's invalidations before each request, declares `Invalidated`), every context carries it, and a revalidated context gets zero entry and attribute lifetimes (`VolumeBridge::cache_lifetime`) and an INIT answer without explicit invalidation or expire-only entries but with `AUTO_INVAL_DATA` (cached pages dropped when a revalidation shows a change; an open keeps no page cache), so a virtio-fs guest — no notification queue — revalidates on every use and converges with any other attachment's change, and its capability reports no explicit invalidation. Proven: `crates/bridge-virtiofs/tests/device.rs` `a_guest_without_invalidation_delivery_is_promised_no_cache` (the INIT answer, a created entry's, a GETATTR's and a LOOKUP's lifetimes; red with the default mutated to `Invalidated`: explicit invalidation answered); the native channel keeps its invalidations (Linux kernel FUSE suites, the daemon's mount, the CLI 15/15) (`docs/bugs/2026-10-01-the-guest-was-promised-invalidations-it-could-not-receive.md`). Owed: a notification queue (`VIRTIO_FS_F_NOTIFICATION`) would let a guest cache again; a live-guest stale-read run with the real driver comes with AUD-29-68. |
+| AUD-29-79–81 | Guest cache negotiation must have actual invalidation delivery; FUSE creation must apply umask exactly once and preserve profile-specific creating uid/gid separately from Consumer authority (§4.6, §4.13, AC-4.11–4.12). **AUD-29-80 and AUD-29-81 closed 2026-10-01:** every FUSE creation (create, mkdir, mknod) applies its request's umask — under `FUSE_DONT_MASK` the kernel sends the mode unmasked with the umask beside it; without it, masking again changes nothing — and the ABI comment that said the opposite is corrected; the creating process's uid and gid from the request header are stamped as ownership metadata (never authority: the enrolled subject is unchanged), and the shared stamp applies the set-group-ID parent rule for every transport (the parent's group, and the bit on a new directory); **amended 2026-11-18 by A-328:** that rule, System V's, is the FUSE and virtio-fs routes' (Linux kernels), while the NFS export and the routes without a kernel give their host's own, BSD's on macOS (the parent's group, no inherited bit), as APFS does. Proven by the real dispatch over a real volume (`crates/bridge-fuse/tests/creation.rs`: 0600/0755/0640 owned 1000:100 under a context enrolled as 501; under a set-group-ID parent the parent's group and the bit; red with the fix mutated out: `0666` owned `501:20`) (`docs/bugs/2026-10-01-fuse-creations-dropped-the-umask-and-the-creator.md`). **AUD-29-79 closed 2026-10-01:** the cache a transport promises its kernel now matches the mechanism it has: an attachment carries its transport's `CacheCoherence` (admitted `Revalidated`; the native `/dev/fuse` channel, which writes the seam's invalidations before each request, declares `Invalidated`), every context carries it, and a revalidated context gets zero entry and attribute lifetimes (`VolumeBridge::cache_lifetime`) and an INIT answer without explicit invalidation or expire-only entries but with `AUTO_INVAL_DATA` (cached pages dropped when a revalidation shows a change; an open keeps no page cache), so a virtio-fs guest — no notification queue — revalidates on every use and converges with any other attachment's change, and its capability reports no explicit invalidation. Proven: `crates/bridge-virtiofs/tests/device.rs` `a_guest_without_invalidation_delivery_is_promised_no_cache` (the INIT answer, a created entry's, a GETATTR's and a LOOKUP's lifetimes; red with the default mutated to `Invalidated`: explicit invalidation answered); the native channel keeps its invalidations (Linux kernel FUSE suites, the daemon's mount, the CLI 15/15) (`docs/bugs/2026-10-01-the-guest-was-promised-invalidations-it-could-not-receive.md`). Owed: a notification queue (`VIRTIO_FS_F_NOTIFICATION`) would let a guest cache again; a live-guest stale-read run with the real driver comes with AUD-29-68. |
 | AUD-29-82–83 | Guest replies/fsync require checked anchor recovery publication and the same current owner/epoch fence as the live NFS path, including reads and f=0/fleet equivalence (D-18, §4.6, §4.8, R8). **AUD-29-82 closed 2026-10-01:** a guest request that changes what survives a restart (the shared `needs_barrier` rule — namespace and attribute changes, `fsync`, the `flush` every close sends; a write is unstable until one of them) is dispatched and its reply scattered, but its used element is held: the pass stops, the serve loop runs the owner's barrier outside the bridge borrow (`BridgeAccess::barrier`: the daemon publishes the shard's recovery image and asks whether it captured the volume), then completes the chain — published as served when captured, else answered `EIO` with the reply's grants given back (counted `virtiofs.barrier_refused`, the device's `barriers_awaited`/`barriers_refused`); `VolumeBridge::flush`'s claim that its bytes were already durable is corrected. Proven: `crates/server/tests/virtiofs.rs` (`a_guests_acknowledged_close_survives_a_daemon_restart`: create, write, flush and release acknowledged; a stop that publishes nothing; a second daemon over the same segment reads the bytes back over NFS; red with the barrier mutated out: `LOOKUP kept.txt: status 2`), `crates/bridge-virtiofs/tests/device.rs` (`a_mutations_used_element_waits_for_the_owners_barrier`: no used element before the barrier, a refused one answers `EIO` and gives back two grants, a write waits for none) (`docs/bugs/2026-10-01-guest-mutations-were-acknowledged-before-the-barrier.md`). **AUD-29-83 closed 2026-10-01:** the guest loop asks the owner before every pass whether it may serve the volume's latest state (`BridgeAccess::fenced`; the daemon answers with `verbs::live_tree_fenced` — configuration group ready and owner lease holding, the NFS live tree's gate, its refusals counted by reason); while fenced no pass runs: the guest's requests wait in its rings, re-asked each heartbeat (the cadence the confirmations that restore the lease arrive at), a pause and never a stale answer, as a hard NFS mount retries `NFS3ERR_JUKEBOX`; a revoke or the guest's hangup is still seen each interval. The daemon's FUSE turn applies the same fence (no request read while fenced) — a sibling found here. Proven: `crates/server/tests/fleet.rs` `an_isolated_owner_holds_its_guests_requests_rather_than_serve_them` (f = 1, three nodes: the guest's read answered while A's lease held; A isolated until its lease lapsed; a fresh read and a CREATE unanswered for five heartbeats; the loop's `fenced_waits` moved and the lease refusals were counted; the hangup ended the loop; red with the fence mutated out: answered `true`), `crates/bridge-virtiofs/tests/serve.rs` `a_fenced_owner_holds_the_guests_requests_until_its_lease_holds` (held, then answered when the fence lifts) (`docs/bugs/2026-10-01-the-guest-path-ignored-the-owner-lease-and-a-busy-guest-postponed-revocation.md`). Owed: the FUSE turn's fence by test (a fleet with a Linux kernel mount); the f = 0 leg is the same code (`needed = 0`, the lease holds) and runs in `crates/server/tests/virtiofs.rs`. The crash at every publication step and full recovery storage are covered by the shared publish path's own oracle (`crates/server/tests/recovery.rs`), not re-run per transport. |
 | AUD-29-84–85 | Revocation must fence mounted Consumer/borrowed OCI capabilities before acknowledgement; malformed reply geometry must refuse before effects and retain owned release of every unreported handle/reference (§4.6, §4.13, A-28). **AUD-29-85 closed 2026-10-01:** a request whose fixed-size success reply (entry, create, attributes, open, write) cannot fit the room posted is answered `EIO` before dispatch — by the virtio-fs device (counted `replies_truncated`) and by the dispatch itself; reads and directory pages are clamped to the room, and READDIRPLUS checks an entry fits before referencing it; a success reply that never reaches its caller (a refused barrier's `EIO`, the kernel's `ENOENT` for an interrupted request, a failed scatter into guest memory) has its lookup references forgotten and its handle released by the server (`reclaim_unreported`; counted `fuse.reply_reclaimed` and the device's `reclaimed`). Proven: `crates/bridge-fuse/tests/dispatch.rs` (`a_reply_with_no_room_refuses_before_any_effect`, red before the fix: the CREATE reached the seam; `reclaiming_an_unreported_reply_gives_back_exactly_what_it_granted`), `crates/bridge-virtiofs/tests/device.rs` (a 16-byte CREATE has no effect and its retry succeeds; a CREATE whose reply memory fails the write gives back one reference and one handle, and the unlinked inode is reclaimed), `crates/bridge-fuse/tests/owner_turn.rs` on a real Linux mount (the refused `mkdir`'s reference given back: `reclaimed: 1`) (`docs/bugs/2026-10-01-an-undersized-or-lost-reply-orphaned-its-grants.md`). **AUD-29-84 closed 2026-10-01:** the revocation's per-shard step, which already marked the consumer's channels before `Revoked` was acknowledged, now also ends every attachment the consumer holds on that shard's partition (`attachments_held_by_consumer`, each ended through `end_attachment` as a recorded operation): its host mount's token then authorizes nothing at the NFS edge (checked against the record on every request), a FUSE mount is unmounted, and a container binding's held record is gone; a shard that cannot end one refuses the revocation (the durable revocation stands and a retry ends what is left), never acknowledging one not in force; the account's own attachments are untouched. Proven: `crates/server/tests/daemon.rs` `a_revoked_consumers_mount_capability_reaches_nothing` (macOS: the consumer's read served before the revocation; after it the old handle answers `NFS3ERR_ACCES`, the old capability mounts nothing, the account's mount still reads; red before: the old handle read `0`) (`docs/bugs/2026-10-01-a-revoked-consumers-mount-capability-outlived-the-revocation.md`). Guest devices admitted for the consumer are revoked as well (AUD-29-73, closed 2026-10-01). **The Linux proof, owed until 2026-11-09, found the FUSE mount unfenced:** `end_attachment` revoked only host mounts' registry attachments, so a revoked consumer's FUSE mount read on (`a_revoked_consumers_fuse_mount_reaches_nothing`, `crates/server/tests/fuse_mount.rs`: a fresh open read the file after the revocation, 3 of 3 on adacachy2). Fixed: `fuse::fence_if_mounted` revokes a FUSE mount's registry attachment however its record ends; refused 3 of 3 after (`docs/bugs/2026-11-09-a-revoked-consumers-linux-fuse-mount-went-on-serving.md`). **The residual closed 2026-11-09:** pages the kernel had cached for a descriptor opened before the revocation were still read after it, since the kernel serves them with no request (`a_revoked_consumers_open_descriptor_reads_nothing_it_had_not_read`: the page after the one read, fetched by readahead, read `Ok` 3 of 3 on adacachy2). The fence now wakes the mount, whose kernel drops the root and every node it references (an inode invalidation of all data each, sliced under the shard's budget, on the notify thread) while every request is answered `ENOTCONN`; the mount ends once the last slice is written, and the revocation is acknowledged after that, within `told::TOLD_WAIT_NS` (counted `fuse.revoked_overdue` past it). Refused 5 of 5 after; red 3 of 3 with the invalidations withheld, 5 of 5 without the acknowledgement's wait, 3 of 3 without the wake; the slices, the refusals mid-round and a node forgotten mid-round in `crates/bridge-fuse/tests/revoked_round.rs`. Cost: one message per node the kernel references, bounded by the mount's lookup table. |
 | AUD-29-86–87 | Directory enumeration/encoding needs page-bounded admitted semantic work; busy guest queues must observe stop/authority state at bounded service boundaries and complete owned reclamation (§4.2–§4.3, §4.6, T-4.14). **AUD-29-87 closed 2026-10-01:** the guest loop checks the revoke request at every pass boundary (and every fenced wait), so a guest that keeps its rings full yields between passes and is stopped at the next one; the terminal step owns what was in flight (a chain held for the barrier included: the sweep releases its grants, the ledger restores its charge). Proven: `crates/bridge-virtiofs/tests/serve.rs` `a_revoke_requested_mid_service_ends_the_loop_at_the_next_pass` (16 requests in the ring, the revoke asked from inside the first pass: one pass, 8 answered, `Revoked`, reclaimed; red with the check mutated out: two passes) (`docs/bugs/2026-10-01-the-guest-path-ignored-the-owner-lease-and-a-busy-guest-postponed-revocation.md`). **AUD-29-86 closed 2026-10-01:** directory cookies are the top 31 bits of the name hash (`.` 1, `..` 2, children ≥ 3), stable across other names' changes; a page is one descent to the first hash at or above the cookie and its own entries, bounded by what the reply can hold (plus one), and never ends inside a group of names sharing a cookie (a group larger than the reply refuses `EOVERFLOW` / `NFS3ERR_TOOSMALL`). Proven: `crates/vfs/src/dirtree.rs` `a_listing_resumed_from_a_hash_equals_the_maps_range_from_it` (oracle over three levels of splits and after merges), `crates/bridge-core/tests/volume_bridge.rs` (`a_directory_paged_by_cookie_lists_every_entry_exactly_once`, `unlinks_between_pages_skip_and_repeat_no_survivor`, `a_page_never_ends_between_names_sharing_a_cookie`), `crates/bridge-fuse/tests/volume_bridge.rs` (READDIR pages resumed from the kernel's offsets; `EOVERFLOW` for a group larger than the page); the macOS kernel NFS mount (CLI 13/13) and the Linux kernel FUSE mount and CLI (15/15) list through it (`docs/bugs/2026-10-01-a-directory-page-did-whole-directory-work.md`). Owed: an overlay page repeats the base merge check; the unkeyed FNV-1a order lets a writer craft a cookie group that makes its directory unlistable through a small page; no per-page work counter (the bound is structural: one descent plus the page). |
@@ -8556,7 +8985,16 @@ SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.
 Condition 4, 2026-10-05: a setuid binary planted on a shared volume ran as root through a PersistentVolume mount
 without `nosuid`. Every mount slates makes or documents is now `nosuid,nodev` (A-94;
 docs/bugs/2026-10-05-setuid-through-a-shared-volume.md). The KIND lane's check runs only where the kernel has TLS
-(GitHub's Linux runner), so its first run is owed there.
+(GitHub's Linux runner), so its first run is owed there. A guest's mount of a share too (A-94 amended 2026-11-18, kiln
+goal g260): slates cannot set a guest's flags, so `docs/cli.md`'s `slates vhost-user` guest mount line asks for
+`nosuid,nodev` with A-94's reason, and the tests' guest mounts its share that way. A real guest's test is built,
+`a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`
+(`crates/cli/tests/guest_vhost.rs`): it expects a set-id file and a whiteout the host's user made to run as their
+caller and be refused `EACCES` through the guest's mount, and to act through a control mount without the flags.
+**Owed:** its first runs: crosvm on adacachy (the supervisor's), and CI's live-guest lane, which runs every
+`guest_vhost.rs` test in QEMU. The gap was first found on 2026-11-09 on `agents/conformance-19` (0717586a, d701b534: a
+setuid-root copy of the probe planted by the guest's root and run as `nobody`), which never landed; A-94's amendment
+supersedes it with credit.
 
 FUSE create path, 2026-10-05 (A-96): the delta's whole reference list and the op log's full scan are gone (2,000
 creates 0.64 → 0.36–0.45 s). Owed:
@@ -10317,6 +10755,37 @@ new process. In simulation the session ended one round trip after its first pack
   beside their definitions, which the check reads, as it already does for the reap-tick constants, or it reports them
   apart from refusals in status. Then the check cannot fall behind a new counter. Owner: live-fixes.
 
+### 2026-11-18: a takeover round's learned object waited without end for a member cut off from its successor alone (fixed, A-304)
+
+- **The wait.** A successor adopts a learned object once each recovery cohort has given its recovery quorum of promises
+  (§4.8 phase one). A dead member's silence ends when the council retires it; a member that never answers the successor
+  while every other member hears it is never retired, so the object waited every period for as long as the daemon ran
+  (`fleet.takeover.unpromised`), and every verb on it answered a retryable `Overloaded`. Reported unverified by g242
+  (2026-11-18); CLAUDE.md §2 item 8 forbids the unbounded retry whatever its cause, as the materialization's bounds of
+  2026-11-09 and 2026-11-18 did.
+- **Proven:** `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name` (`crates/server/tests/fleet.rs`): three
+  nodes at f = 1, the head held by both survivors, each survivor leaving the other's takeover questions unanswered
+  (`Daemon::inject_takeover_silence`), the owner stopped. With the bound cut out the successor answered `Overloaded`
+  until the serve deadline.
+- **Fixed (A-304):** each learned object counts the periods it waits with no member promising it anew and no page of the
+  round advancing (`takeover::PromiseWait`), and past the failover SLO's worth of them it is given up by name: recorded
+  unrecovered on its owner shard (`NotRecovered { TakeoverIncomplete { waited_on: "promises" } }`), claimed to lookups,
+  learned and asked about no more, counted `fleet.takeover.given_up`; the share stays unconfirmed (A-272), so its holders
+  keep their copies; a new configuration judges it afresh, and an adoption clears its record.
+- **Sibling, fixed in the same change:** a volume recorded unrecovered on its owner shard (a give-up, here or in the
+  materialization's bounds) was still forwarded by a forwardable verb (`verbs::owned_by_another_host` never looked), met
+  this node's own routing, which the give-up claims, and answered `Overloaded` for good: on a fleet of more than one node
+  no client saw the materialization's `NotRecovered` either, whose tests ran on a lone node, which never forwards. It is
+  answered on its owner shard now; the three-node regression above holds both.
+- **Sibling, fixed by A-309 (g250, 2026-11-18):** an object the round declared lost (a cohort with fewer members than
+  its recovery quorum, counted `fleet.takeover.lost`) was never recorded unrecovered either, so every verb on it answered
+  a retryable `Overloaded` for as long as the daemon ran. A record naming the short cohort (`waited_on: "quorum"`) was
+  built and proven on 2026-11-18 (red with the record removed: `Overloaded` to the 60 s deadline) and withdrawn before it
+  landed, at g250's request: A-309 recovers such an object instead. `Readiness::Lost` is gone; the round adopts it once
+  every surviving member of its cohorts, settled and current, has promised (`Readiness::ReadyPastTolerance`,
+  `fleet.takeover.recovered_past_tolerance`), and a member that never promises leaves it to A-304's bound, which gives
+  it up by name as any other wait.
+
 ### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
 
 - **The window.** A successor needs a recovery quorum in every cohort of `recovery_cohorts(departed, object)`. When the
@@ -10328,6 +10797,10 @@ new process. In simulation the session ended one round trip after its first pack
   24 logged it, each with the object's creator the crashed owner and the short cohort the replaced member's old one
   (`has 1 of 2 needed`, `retired [replaced, crashed owner]`). How much of that the report fix removes is not yet
   measured. Each lost verdict in the re-measure is to be classified by whether the failures stayed within f.
+- **Since A-309 (g250, 2026-11-18)** the verdict is no longer a loss: the cohort short of its quorum puts the object past
+  tolerance, and it is adopted once every surviving member of its cohorts has promised, with the newest record any holds
+  (`fleet.takeover.recovered_past_tolerance`). The sound rule below would spare only that wait for every survivor (and
+  the past-tolerance count it adds), so it stays a question for the model, not a loss.
 - **Ruling (2026-11-08).** Such a cohort cannot constrain an object it never held, so the verdict is false, but a false
   "lost" that needs a second failure inside the takeover window is beyond f at f = 1 and stays a recorded limit. One in a
   run whose failures stayed within f is a defect against §4.8, however rare, and then the sound rule below is built with
@@ -14802,8 +15275,12 @@ without a user namespace, which needs root.
     1 run of 18 at load 46–53 on the box, the guest's work done and flushed. The test accepts exit 1 only when the
     console shows the guest's restart and Firecracker's `Shutdown` line. Forced with `reboot=t`, that branch passed, and
     the merge after it held the guest's tree. 40 more runs at load 16 all exited 0.
-  - **Open sibling (found 2026-10-24 by reading `reconcile_unpublished_effects`, not yet reproduced): a clone whose
-    transaction fails after it recorded its volume keeps its pin.**
+  - **Fixed 2026-11-18 (g251), found 2026-10-24 by reading `reconcile_unpublished_effects`: a clone whose
+    transaction fails after it recorded its volume kept its pin.** Proven by
+    `a_clone_rolled_back_unpublished_gives_back_its_pin_on_the_origins_snapshot` (`crates/server/tests/recovery.rs`:
+    the clone refused `Unpublished`, then the snapshot's destroy refused `Pinned` before the fix). The rollback's
+    reconciliation now recounts the clone pins against the lineage the catalog still records
+    (`verbs::reconcile_clone_pins`, as a recovery does), whenever it tore an orphan down.
     When `Db::commit` fails after a clone verb recorded its volume (the log full or unpublishable), the rollback
     removes the record and `reconcile_unpublished_effects` tears down the orphaned slot. Nothing releases the pin
     `clone_of` put on the origin's snapshot, so that snapshot's destroy is refused `Pinned` until the next restart's
@@ -15962,8 +16439,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
   or zeros, so those pages could reach a guest's map.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
-  - write-log replay (`verbs::replay_one`) routes a logged FUSE write by its inode number's prefix, which for a clone's
-    inherited file is its origin's: a replayed write would land in the origin;
+  - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
+    prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost
+    it (proven by `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone`, red with the prefix routing put
+    back). Every write-log record now names the volume it was written through and is replayed there, the `FORGET`s too;
+    the log's header carries a layout word, and a log of the layout before that holds records is reported as lost writes,
+    never misread (`docs/bugs/2026-11-18-a-replayed-write-to-a-clones-inherited-file-landed-in-its-origin.md`);
   - the in-process DAX gate's recall (`has_writable_of_prefix`, `writable_of_prefix`, `recalling(no.prefix())`) counts
     a clone's writable windows on inherited files under the origin, so the clone's snapshot could freeze under one
     (harness-only exposure: `writable_dax`, DAX unadvertised);
@@ -16222,7 +16703,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (A-292; on main 2026-11-17)
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner and an owner slow to ask too (A-292, A-301; on main 2026-11-17)
 
 `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
 running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
@@ -16272,13 +16753,26 @@ Open:
 - The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
   period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
   silence.
-- Hypothesis, not yet seen in a give-up record: a window can be silent through the owner's own delay in asking. A fresh
-  volume's log is shipped to a holder only once the coordinator has placed its catalog there (`pending_sends`'
-  `catalogued` gate), and its head waits for the coordinator's period behind that period's other commits, each awaited
-  in turn (`ship_shard_heads`); a coordinator kept past a window that way leaves a window with nothing asked, so nothing
-  heard, through no holder's fault. The receiver's two waits (A-292) prove the owner has read what came, not that it
-  asked. A give-up record from a run under load that shows the head or catalog unplaced with no lane in flight would
-  confirm it.
+- ~~Hypothesis: a window can be silent through the owner's own delay in asking~~ — closed by construction 2026-11-17
+  (A-301), not yet seen in a give-up record. A fresh volume's log is shipped to a holder only once the coordinator has
+  placed its catalog there (`pending_sends`' `catalogued` gate), and its head waits for the coordinator's period behind
+  that period's other commits, each awaited in turn (`ship_shard_heads`); a coordinator kept past a window that way
+  left a window with nothing asked, so nothing heard, through no holder's fault, and the receiver's two waits (A-292)
+  prove the owner has read what came, not that it asked. Now each live volume keeps when its owner first asked a holder
+  something since it last heard anything (`live_ship::LiveVolume::unanswered_since_ns`: a lane opened, a head's or
+  catalog's placement round sent), and a silent window is confirmed only once that ask is a window old. Red first by use
+  of the rule (`a_window_in_which_the_owner_asked_nothing_is_given_up_only_once_its_ask_is_a_window_old`,
+  `an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound`) and of the device
+  (`a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing`). A give-up record now names the oldest
+  unanswered ask's age, so a run under load tells this cause from a holder's silence. Still open of it: a pair key's
+  delivery is not tracked as an ask (it is per owner shard and candidate), so a wait on it alone holds to the failover
+  SLO; and the ask is kept per volume, not per holder, so a stopped candidate's re-sent lane can stand in for an ask the
+  owner has not yet made of a live one (two faults at once, where the rule is A-292's alone). Only progress clears the
+  ask: a holder that answers without moving anything (a refusal) leaves it standing, and so does a holder whose link was
+  dropped and whose session comes back (`live_ship::holder_reached`), so after a resume the wait still counts from the
+  first ask since anything was heard. Whether either reaches a healthy `fsync` under load is for the give-up records to
+  say (they name the oldest unanswered ask's age, the lanes and the unreachable holders); clearing on them would also
+  need a test that drives the daemon's bookkeeping, which today only the live flows do.
 - The virtio-fs serve loop times only the oldest held `FSYNC`'s next look (`serve_round`, `durable_oldest`); under
   windows a younger reply's look can come first, so its verdict waits for the oldest's look, at most a window late. Never
   a refusal, only a late one; the FUSE mount and WinFsp take the soonest look over every held reply.

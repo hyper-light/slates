@@ -134,6 +134,9 @@ thread_local! {
   /// While set, the stand-in's receiver has stopped idling at this count: a control shard kept off its CPU, the
   /// acknowledgements waiting in its sockets unread. `None`, the default, follows this test's own shard's waits.
   static RECEIVER_STALLED_AT: Cell<Option<u64>> = const { Cell::new(None) };
+  /// When the stand-in owner first asked its holders something still unanswered (its barrier's ship of the `FSYNC`'s
+  /// write, or a late ask of its own), on this test's shard clock; `None` while it has asked nothing unanswered.
+  static OWNER_ASKED_AT: Cell<Option<u64>> = const { Cell::new(None) };
   /// When the guest of the guest-kill test hung up, for the loop's task to measure its end from.
   static HUNG_UP: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -466,14 +469,15 @@ impl BridgeAccess for OwnedVolume {
     )
   }
 
-  /// The stand-in volume's acknowledgements, and its receiver's idles: the waits of this test's own shard, which receives
-  /// everything the stand-in hears (the daemon's are its control shard's).
+  /// The stand-in volume's acknowledgements, its receiver's idles (the waits of this test's own shard, which receives
+  /// everything the stand-in hears; the daemon's are its control shard's), and its owner's oldest unanswered ask.
   fn durable_heard(&mut self) -> Heard {
     Heard {
       acknowledged: DURABLE_HEARD.with(Cell::get),
       receiver_idles: RECEIVER_STALLED_AT
         .with(Cell::get)
         .unwrap_or_else(shard_waits),
+      unanswered_since_ns: OWNER_ASKED_AT.with(Cell::get),
     }
   }
 
@@ -1239,11 +1243,19 @@ enum Durable {
   /// when the acknowledgement it held unread is counted and the log becomes durable: an owner kept off its CPU across
   /// its window's end, whose acknowledgements came but were not yet read.
   ReadLateByAStalledReceiver,
+  /// With the owner asking its holders nothing from the `FSYNC` until [`ASKED_LATE_WINDOWS_TENTHS`] tenths of a window
+  /// later, when it asks (a fresh volume's head, shipped at its coordinator's period), a holder answers at once and the
+  /// log becomes durable: an owner whose own period a loaded machine stretched past the window (A-301).
+  AskedLateByABusyOwner,
 }
 
 /// Shape: how long the stalled receiver holds the acknowledgement unread, in tenths of a window: fifteen, half a window
 /// past the first window's end, where the single deadline of before had already answered `EIO`.
 const STALLED_WINDOWS_TENTHS: u64 = 15;
+
+/// Shape: how long the busy owner asks nothing, in tenths of a window: fifteen, half a window past the first window's end,
+/// where A-292's rule alone had already answered `EIO` (a window, then two of the receiver's idles and a look).
+const ASKED_LATE_WINDOWS_TENTHS: u64 = 15;
 
 /// Shape: the half windows the trickling log hears an acknowledgement in before it becomes durable: three, a window and a
 /// half, past the single window the old bound allowed.
@@ -1259,6 +1271,10 @@ async fn fsync_then_read(
 ) -> (i32, Duration, bool) {
   let rq = usize::from(FIRST_REQUEST_QUEUE);
   let sent = Instant::now();
+  // The owner's barrier ships the write at the `FSYNC`: its holders are asked then, unless the owner is the busy one.
+  if !matches!(durable, Durable::AskedLateByABusyOwner) {
+    OWNER_ASKED_AT.with(|asked| asked.set(Some(futures::now_ns())));
+  }
   let fsync = with_guest(|g| {
     g.submit(
       rq,
@@ -1298,6 +1314,18 @@ async fn fsync_then_read(
       .unwrap();
       let _ = futures::detach(stalled);
     }
+    Durable::AskedLateByABusyOwner => {
+      let busy = futures::spawn(async {
+        let _ = futures::sleep(TOLD_BOUND_NS / 10 * ASKED_LATE_WINDOWS_TENTHS).await;
+        // The owner asks at last, and a holder answers at once: what it hears answers the ask.
+        OWNER_ASKED_AT.with(|asked| asked.set(Some(futures::now_ns())));
+        DURABLE_HEARD.with(|heard| heard.set(heard.get() + 1));
+        OWNER_ASKED_AT.with(|asked| asked.set(None));
+        durable_through(1);
+      })
+      .unwrap();
+      let _ = futures::detach(busy);
+    }
   }
   let mut published = None;
   while published.is_none() {
@@ -1329,6 +1357,7 @@ fn fsync_on_a_live_volume(durable: Durable) -> ((i32, Duration, bool), (u64, u64
     DURABLE_COUNTED.with(|counted| counted.set((0, 0)));
     DURABLE_HEARD.with(|heard| heard.set(0));
     RECEIVER_STALLED_AT.with(|stalled| stalled.set(None));
+    OWNER_ASKED_AT.with(|asked| asked.set(None));
     let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
     let id = register(DEVICE_BOUND).unwrap();
     let device_task = futures::spawn(async move {
@@ -1444,6 +1473,34 @@ fn a_guests_fsync_is_not_refused_while_its_receiver_has_not_read_what_came() {
   assert_eq!(
     errno, 0,
     "the FSYNC succeeds once its acknowledgement is read: {after:?}"
+  );
+  assert!(
+    after > Duration::from_nanos(TOLD_BOUND_NS),
+    "it waited past one window, or the test shows nothing: {after:?}"
+  );
+  assert_eq!(counted, (1, 0), "counted as waited, never refused");
+  assert!(ended, "the loop ended on the hangup, its terminal step run");
+}
+
+/// An owner that asks its holders nothing across its window's end (A-301; GAPS 2026-11-17: a fresh volume's head is asked
+/// only at its coordinator's period, which a loaded machine stretches past a window): its holders were never given the
+/// chance to answer, so the window's silence is not theirs. Do: as above, but the stand-in owner asks nothing at the
+/// `FSYNC`, and only half a window after the first window's end does it ask, a holder answering at once and the log
+/// becoming durable at position 1, while the receiver idles throughout. Expect the `FSYNC` answered `0` after more than
+/// one window, counted as waited, never refused. Red under A-292's rule alone, which answered `EIO` a window, two of the
+/// receiver's idles and a look after the hold, before the owner had asked anything.
+#[test]
+fn a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing() {
+  let ((errno, after, read_first), counted, ended) =
+    fsync_on_a_live_volume(Durable::AskedLateByABusyOwner);
+  println!("the FSYNC was answered {errno} after {after:?}");
+  assert!(
+    read_first,
+    "the later read is published while the FSYNC waits"
+  );
+  assert_eq!(
+    errno, 0,
+    "the FSYNC succeeds once its owner asks and a holder answers: {after:?}"
   );
   assert!(
     after > Duration::from_nanos(TOLD_BOUND_NS),

@@ -195,3 +195,23 @@ fn a_worker_that_panics_is_reported_typed_and_its_slot_is_given_back() {
   );
   after.shutdown().unwrap();
 }
+
+/// §2.6 boot step 2, A-312. Do: start a runtime of [`SHARDS`] shards through `Runtime::start_sized` with a progress hook
+/// that counts its calls. Expect one call for each unit of the start's work on the starting thread: each shard's
+/// registration, each ordered pair's ring, each worker's spawn and each worker's acknowledged build, `SHARDS·(SHARDS−1) +
+/// 3·SHARDS` in all, every one before the start returned. So a caller that beats its supervisor at each call beats while
+/// the start progresses, however many shards it starts. Before, a start reported nothing until it returned, and the anchor
+/// killed every 407-shard start whose one thread ran a window of CPU without a beat (B10's Linux gate, 2026-11-11).
+#[test]
+fn a_start_reports_every_unit_of_its_work_as_it_goes() {
+  let _serial = serial();
+  let mut calls = 0u64;
+  let runtime = Runtime::start_sized(&config(), &[], &mut || calls += 1).unwrap();
+  let shards = u64::from(SHARDS);
+  assert_eq!(
+    calls,
+    shards * (shards - 1) + 3 * shards,
+    "one call a registration, a pair ring, a spawn and an acknowledged build"
+  );
+  runtime.shutdown().unwrap();
+}
