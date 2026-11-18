@@ -8010,6 +8010,14 @@ it builds against the contract and adds to it rather than around it.
 > entries), a grant's state (`GrantSummary::grant_state`), and an audit record's kind and stage (`AuditEntry::audit_kind`,
 > `stage`). The contract reads only those. The words stay for people (the CLI's and MCP's JSON), and a word the contract
 > did not know is no longer a protocol fault.
+> **`CONTRACT` = 20, the async form (R6), first piece:** `AsyncInstance` over a host's `Reactor`. The host lends one
+> wait: the client's completion signal readable, or the driver's next deadline, whichever comes first. Each call goes
+> through `slates_client::driver`, one at a time: submit, arm, pump, wait, tick. A future dropped mid-call cancels its
+> ticket, so a cancelled call leaks nothing and the instance goes on serving. It awaits provisioning from every source,
+> a snapshot, a status and a destroy. `into_instance` and `new` move between the forms. Proof:
+> `an_async_instance_provisions_snapshots_reports_and_destroys` (`crates/api/tests/api.rs`), whose reactor is a
+> blocking `poll(2)` and whose executor is a bare poll loop: no runtime is added (D-9). Owed: the paged verbs (list,
+> read, a landing's entries), landings and merges, and the policy and observation verbs, awaited the same way.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,

@@ -544,6 +544,9 @@
 >   an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read typed
 >   from its entries;
 > - owed: a typed field on the wire for a merge's versions (the work's base beside the head);
+> - the async form (R6), first piece built (`CONTRACT` = 20): `AsyncInstance` over a host's `Reactor`, awaiting
+>   provisioning, a snapshot, a status and a destroy; owed: the paged verbs, landings, merges, policies and
+>   observation, awaited the same way;
 > - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 

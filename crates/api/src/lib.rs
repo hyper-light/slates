@@ -26,6 +26,8 @@
 //!   to set, and its policy may require signed merges. Signatures never gate permission. A landing's signature is owed.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
 //! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
+//! - *The async form* ([`asynchronous`]): verbs a host awaits on its own loop through its [`Reactor`], never a thread
+//!   blocked on a round trip (R6).
 //!
 //! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
 //! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
@@ -61,6 +63,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod asynchronous;
 pub mod error;
 pub mod grant;
 pub mod instance;
@@ -77,6 +80,7 @@ pub mod sim;
 pub mod start;
 pub mod volume;
 
+pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
   KindMismatch, Missing, MountFault, MountMissing, Note, PathFault, ProtocolFault, RetryCause,
@@ -153,10 +157,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
 /// day). 19: a target's refusal is typed (`HostFault::Target(TargetRefusal)`, the wire's appended `Refusal::Target`):
 /// until then a landing target's, a mount point's and a mount's refusals carried the daemon's words; the superseded
-/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day).
+/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day). 20: the async
+/// form (`AsyncInstance` over a host's `Reactor`: provisioning from every source, a snapshot, a status and a destroy,
+/// awaited on the host's own loop through the client's driver; R6) (A-299; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 19;
+pub const CONTRACT: u32 = 20;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

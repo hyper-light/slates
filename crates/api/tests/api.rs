@@ -1234,6 +1234,116 @@ mod shards {
   }
 }
 
+/// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop.
+#[cfg(unix)]
+mod asynchronous_form {
+  use std::os::fd::BorrowedFd;
+  use std::pin::pin;
+  use std::task::{Context, Poll, Waker};
+
+  use slates_api::{AsyncInstance, Completion, Reactor, Waiting, Woke};
+
+  use super::*;
+
+  /// Shape: the most polls [`block_on`] gives a future whose waits all answer at once: one is enough, a few more
+  /// guard against a call that loops without waiting.
+  const POLLS: usize = 4;
+
+  /// A host's reactor in miniature: its wait blocks this thread in `poll(2)` until the completion signal is readable
+  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it.
+  struct Blocking;
+
+  impl Reactor for Blocking {
+    fn wait(&self, completion: Completion, timeout_ns: Option<u64>) -> Waiting<'_> {
+      // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
+      // as the instance lives, and the call that waits here borrows the instance.
+      let descriptor = unsafe { BorrowedFd::borrow_raw(completion) };
+      let timeout =
+        timeout_ns.and_then(|ns| rustix::event::Timespec::try_from(Duration::from_nanos(ns)).ok());
+      let mut interest = [rustix::event::PollFd::new(
+        &descriptor,
+        rustix::event::PollFlags::IN,
+      )];
+      let woke = match rustix::event::poll(&mut interest, timeout.as_ref()) {
+        Ok(0) => Ok(Woke::TimedOut),
+        Ok(_) => Ok(Woke::Readable),
+        Err(errno) => Err(std::io::Error::from(errno)),
+      };
+      Box::pin(std::future::ready(woke))
+    }
+  }
+
+  /// A reactor whose wait never answers: a host's loop while its call waits, for the cancellation case.
+  struct Never;
+
+  impl Reactor for Never {
+    fn wait(&self, _completion: Completion, _timeout_ns: Option<u64>) -> Waiting<'_> {
+      Box::pin(std::future::pending())
+    }
+  }
+
+  /// Polls `future` to its end with a waker that wakes nothing: its waits answer at once, so it ends within
+  /// [`POLLS`].
+  fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..POLLS {
+      if let Poll::Ready(out) = future.as_mut().poll(&mut context) {
+        return out;
+      }
+    }
+    panic!("an awaited call did not end within {POLLS} polls");
+  }
+
+  /// A-299, R6: do drive the async form over a daemon: provision an empty volume, snapshot it, read its status,
+  /// provision a clone of the snapshot, ask the status of a volume no one made, drop a status call while its wait has
+  /// not answered, ask again, destroy both volumes, and give the instance back to the synchronous form. Expect each
+  /// answer as the synchronous verb answers it, the stranger refused `NotFound` naming the volume, the dropped call
+  /// cancelled without harm (the next call answered), and the synchronous form still serving afterwards.
+  #[test]
+  fn an_async_instance_provisions_snapshots_reports_and_destroys() {
+    let (daemon, instance) = grouped("async");
+    let mut instance = AsyncInstance::new(instance).unwrap();
+    let volume = block_on(instance.provision(&Blocking, &VolumeSpec::empty("async", ROOM)))
+      .unwrap()
+      .volume();
+    let snapshot = block_on(instance.snapshot(&Blocking, volume)).unwrap();
+    let status = block_on(instance.status(&Blocking, volume)).unwrap();
+    assert_eq!((status.name.as_str(), status.snapshots), ("async", 1));
+    let copy = block_on(instance.provision(
+      &Blocking,
+      &VolumeSpec::clone_of("async-copy", volume, snapshot),
+    ))
+    .unwrap()
+    .volume();
+    assert_eq!(
+      block_on(instance.status(&Blocking, NOWHERE)),
+      Err(Error::NotFound(Missing::Volume(NOWHERE)))
+    );
+    {
+      let waiting = instance.status(&Never, volume);
+      let mut waiting = pin!(waiting);
+      let mut context = Context::from_waker(Waker::noop());
+      assert!(
+        waiting.as_mut().poll(&mut context).is_pending(),
+        "the call waits on the host's loop"
+      );
+    }
+    assert_eq!(
+      block_on(instance.status(&Blocking, copy)).map(|status| status.name),
+      Ok("async-copy".to_owned()),
+      "a dropped call leaves the instance serving"
+    );
+    block_on(instance.destroy(&Blocking, copy)).unwrap();
+    let mut instance = instance.into_instance();
+    assert_eq!(
+      instance.status(volume).map(|status| status.snapshots),
+      Ok(1)
+    );
+    daemon.stop();
+  }
+}
+
 /// A volume id no instance issued (A-310's conformance cases).
 const NOWHERE: VolumeId = VolumeId { bytes: [0xAB; 16] };
 /// Shape: the simulator's bound in the conformance suite: room for every volume and attachment the suite makes.
