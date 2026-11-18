@@ -27276,6 +27276,15 @@ Applied in the same change to:
   that name sharing only reads was refused (`ERROR_SHARING_VIOLATION`) while the purge lasted. A reader of another
   name still can be, while that name's purge lasts, as after any change A-190 purges for (once in the VM's check,
   against none in 51 reads of the writer's own name).
+- **A delete a purge's handle carried was dropped (found by this entry's live test on the VM, 2026-11-18; bug record
+  `docs/bugs/2026-11-18-a-delete-a-purges-last-handle-carried-was-dropped.md`).** WinFsp hands a pending delete to
+  the cleanup of the file node's last handle, whoever's (v2.1 `src/sys/file.c` `FspFileNodeCleanup`; this volume
+  takes no POSIX delete). When a program deletes a file while A-190's purge holds it open, the purge's cleanup
+  carries the delete, and the shard answered a purge's cleanup without making it: Windows was told the name was
+  gone, and the volume kept it. One live run of three saw the other name count two links for good. The delete is
+  now made whoever's cleanup carries it, behind the publication barrier, and it owes the other names their count
+  (`a_delete_a_purges_last_handle_carries_is_made`). The window predates hard links (A-190, any purged file); hard
+  links widen it, since a write through one name purges the others.
 - **Proven.** The request decoding, the replay rule, the shard's rules and the owed words by the tests above, green on
   both Windows runners (diagnostics run 44350120133 at `28ad74fcd`; the notification and decoding tests also on the
   Mac Studio, kiln r3516). End to end on a Windows Server 2025 evaluation under KVM on adacachy, test signing on,
