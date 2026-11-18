@@ -59,6 +59,10 @@ fn main() -> ExitCode {
 - Serving: `mount(volume, path, &MountOptions)` and `unmount(path)` (macOS: the loopback NFS mount;
   Linux: FUSE; Windows: a WinFsp drive), `serve_shards(volume, intent, subtree)` (a stream end to
   hand `shards run --slates-fs-fd N`), `serve_vhost_user(..)` (Linux), `detach(attachment)`.
+  `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
+  and through what (`MountKind`), or what is missing (`fusermount3` or `/dev/fuse` on Linux, WinFsp
+  on Windows). `slates_api::mount::unmount_lazy(path)` lets go of a mount that a leftover process
+  still uses (Linux, `fusermount3 -u -z`).
 - Landing: `plan_landing(&LandingRequest)` presents a landing and returns its plan (the manifest a
   person approves, its summary, its conflicts); `land_approved(&issuer, &request, &manifest, ..)`
   grants and lands only that manifest, or returns the new plan when the volume or the disk changed
