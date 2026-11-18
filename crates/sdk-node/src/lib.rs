@@ -1629,6 +1629,29 @@ impl Client {
       .map_err(|_| Error::from_reason("the reconnect count is too large for a JS number"))
   }
 
+  /// Spins this long, in nanoseconds, for a synchronous call's reply before parking for it; `null` restores the
+  /// client's own wake estimate. A caller with a latency floor of its own spins for it, and one that would rather sleep
+  /// than spin asks for zero.
+  #[napi]
+  pub fn spin_for(&mut self, spin_ns: Option<i64>) -> Result<()> {
+    let spin = spin_ns
+      .map(|ns| checked_u64(ns, "spinNs"))
+      .transpose()?;
+    self.inner.spin_for(spin);
+    Ok(())
+  }
+
+  /// The synchronous calls that parked for their reply and the replies taken, so far, `[parks, replies]`: the measured
+  /// spin-to-park ratio.
+  #[napi]
+  pub fn park_ratio(&self) -> Result<Vec<i64>> {
+    let (parks, replies) = self.inner.park_ratio();
+    Ok(vec![
+      status_i64(parks, "parks")?,
+      status_i64(replies, "replies")?,
+    ])
+  }
+
   /// Removes the name at `path` on a work volume (§4.16) — a file, symlink or hard link.
   #[napi]
   pub fn unlink(&mut self, work: String, path: String) -> Result<()> {
