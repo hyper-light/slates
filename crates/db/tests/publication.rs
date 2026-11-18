@@ -108,6 +108,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       live_shipped: false,
       live_holders: None,
       write: None,
+      write_version: 0,
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },

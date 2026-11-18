@@ -27,21 +27,34 @@ use slates_mem::Handoff;
 use crate::error::{Denied, Error, IssuerFault};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::instance::Instance;
+use crate::launcher::LauncherSecret;
 
 /// Derived: a grant's default validity, in nanoseconds — one hour, the span §4.15's session scope names as the longest
 /// a human's single approval should stand without renewal (an agent that lands later than that re-presents its
 /// manifest for a fresh look). `slates grant --term SECONDS` overrides it.
 pub const GRANT_TERM_NS: u64 = 3_600 * 1_000_000_000;
 
-/// The issuer authority of one instance: the handoff of its anchor's segment.
+/// The authority over one instance: the handoff of its anchor's segment, or the launcher's own secret (A-299).
 #[derive(Clone, Debug)]
 pub struct Issuer {
-  /// The segment's handoff: a descriptor this process holds (Linux), or the object's name (macOS, Windows).
-  handoff: Handoff,
-  /// The segment's length.
-  len: usize,
-  /// This machine's identity, which the segment's header must name.
-  identity: Identity,
+  /// Where the proofs' key comes from.
+  authority: Authority,
+}
+
+/// Where an [`Issuer`]'s key comes from.
+#[derive(Clone, Debug)]
+enum Authority {
+  /// The anchor's segment, attached for one proof at a time: the issuer secret the running daemon published.
+  Segment {
+    /// The segment's handoff: a descriptor this process holds (Linux), or the object's name (macOS, Windows).
+    handoff: Handoff,
+    /// The segment's length.
+    len: usize,
+    /// This machine's identity, which the segment's header must name.
+    identity: Identity,
+  },
+  /// The launcher's own secret, which it provided at the instance's start and keeps.
+  Launcher(LauncherSecret),
 }
 
 impl Issuer {
@@ -84,16 +97,36 @@ impl Issuer {
       _ => Handoff::Name(handoff.to_owned()),
     };
     Ok(Issuer {
-      handoff,
-      len,
-      identity: Facts::query().identity,
+      authority: Authority::Segment {
+        handoff,
+        len,
+        identity: Facts::query().identity,
+      },
     })
+  }
+
+  /// The launcher's authority from the secret it provided at the instance's start ([`crate::StartSpec::with_launcher`],
+  /// A-299): no segment is attached, so it proves after the launcher's own restart as before it, on every platform. The
+  /// daemon verifies launcher-class proofs under it beside the issuer secret (A-285's owner's piece); a consensus
+  /// recovery still needs the segment ([`IssuerFault::LauncherCannotRecover`]).
+  pub fn from_launcher_secret(secret: &LauncherSecret) -> Issuer {
+    Issuer {
+      authority: Authority::Launcher(secret.clone()),
+    }
   }
 
   /// The issuer secret the running daemon published: the segment attached, read, and let go. Refused
   /// [`IssuerFault::NotPublished`] while the daemon has published none (an all-zero secret is no authority).
   fn secret(&self) -> Result<[u8; ISSUER_SECRET_BYTES], Error> {
-    let segment = AnchorSegment::attach(&self.handoff, self.len, &self.identity)
+    let (handoff, len, identity) = match &self.authority {
+      Authority::Launcher(secret) => return Ok(*secret.bytes()),
+      Authority::Segment {
+        handoff,
+        len,
+        identity,
+      } => (handoff, *len, identity),
+    };
+    let segment = AnchorSegment::attach(handoff, len, identity)
       .map_err(|e| no_authority(IssuerFault::Attach(e)))?;
     let secret = segment
       .issuer_secret()
@@ -133,17 +166,22 @@ impl Issuer {
     &self,
     subject: &slates_ipc::protocol::PolicySubject,
     policy: &slates_ipc::protocol::WritePolicy,
+    version: u64,
   ) -> Result<[u8; 32], Error> {
     Ok(slates_server::landing::policy_proof(
       &self.secret()?,
       subject,
       policy,
+      version,
     ))
   }
 
   /// The proof that confirms the consensus recovery plan `plan` (§4.8, A-19), for an instance whose operator holds no
   /// recovery key of their own.
   pub fn recovery_proof(&self, plan: &[u8; 32]) -> Result<[u8; 32], Error> {
+    if let Authority::Launcher(_) = self.authority {
+      return Err(no_authority(IssuerFault::LauncherCannotRecover));
+    }
     Ok(slates_server::recovery_proof(&self.secret()?, plan))
   }
 }
@@ -165,5 +203,17 @@ impl GrantAuthority for Issuer {
       claim.scope,
       claim.term_ns,
     )))
+  }
+
+  /// The keyed hash of exactly `work` and its increment `identity`, under the merge approval's own domain (A-285).
+  fn prove_merge(
+    &self,
+    work: slates_ipc::protocol::VolumeId,
+    identity: &[u8; 32],
+  ) -> Result<GrantProof, Error> {
+    let secret = self.secret()?;
+    Ok(GrantProof::IssuerHash(
+      slates_server::landing::merge_approval_proof(&secret, work, identity),
+    ))
   }
 }

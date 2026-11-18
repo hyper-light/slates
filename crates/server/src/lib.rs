@@ -106,8 +106,9 @@ mod staging;
 mod work_charge;
 pub mod work_files;
 mod work_log;
-// A work's route after its owner's takeover ends once the green's owner holds none of its completions (A-288).
-mod work_route;
+// A work's route after its owner's takeover ends once the green's owner holds none of its completions (A-288); public
+// for `nudge`, which a test planting a route calls as a takeover's adoption does.
+pub mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
@@ -134,6 +135,7 @@ pub mod telemetry;
 // A writer outside FUSE answered once every FUSE mount of its volume was told (AC-3.3).
 mod told;
 pub mod tombstone;
+mod tracked;
 // The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;

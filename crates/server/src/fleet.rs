@@ -4992,6 +4992,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
   // remembered at it (`live_ship::note_rebuild`).
   let adopted_head = live.as_ref().map(|fetched| fetched.head);
+  let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
@@ -5060,8 +5061,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   .await;
   if let Some(adopted) = adopted_head {
     match &served {
-      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None),
-      Some(Err(refusal)) => crate::live_ship::note_rebuild(object, adopted, Some(refusal)),
+      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None, adopted_sealing),
+      Some(Err(refusal)) => {
+        crate::live_ship::note_rebuild(object, adopted, Some(refusal), adopted_sealing)
+      }
       None => {}
     }
   }
@@ -5182,8 +5185,8 @@ fn opened_archive(
     return None;
   }
   let account = crate::seal_keys::tenant_of(owner);
-  let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
-  let namer = crate::seal_keys::namer(state, id, account).ok()?;
+  let lineage = crate::seal_keys::recorded_lineage(state, id, account).ok()??;
+  let namer = crate::seal_keys::recorded_namer(state, id, account).ok()??;
   slates_cluster::envelope::open(&archive, &lineage, &namer).ok()
 }
 
@@ -6620,13 +6623,31 @@ fn serve_root_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
 /// counted [`REPORT_REFUSED`]: an honest member never sends one.
 fn serve_council_report(state: &mut ShardState, peer_host: HostId, request: &[u8]) -> Vec<u8> {
   let outcome = match slates_cluster::config_group::ConfigCommand::decode(request) {
-    Some(command) => state.council.report(peer_host, command),
+    Some(command) => {
+      let bound = moved_bound(state);
+      state.council.report(peer_host, command, bound)
+    }
     None => ReportOutcome::Refused,
   };
   if outcome == ReportOutcome::Refused {
     state.count(REPORT_REFUSED, 1);
   }
   outcome.encode()
+}
+
+/// Derived: the most moved-object exceptions this node, leading the council, lets the configuration hold (banned item 8;
+/// §4.8 "Authority scope"). An exception names a live volume, and a member owns at most as many volumes as its registry
+/// has slots (`max_slots` on each of its shards, derived from its machine profile at boot), so a region holds at most
+/// that many moved volumes a member: the bound is that, counting every member at this node's size. A move past it is
+/// answered `Full` and never proposed.
+pub(crate) fn moved_bound(state: &ShardState) -> usize {
+  state
+    .council
+    .configuration()
+    .members
+    .len()
+    .saturating_mul(state.shards.len())
+    .saturating_mul(state.volumes.max_slots())
 }
 
 /// The status refusal count under which a council voter records a member's report it refused: bytes that are
@@ -6742,7 +6763,8 @@ pub(crate) async fn send_council_report(
   let Some(targets) = state::with_state(|s| {
     if s.council.is_leader() {
       s.count(REPORT_SENT, 1);
-      let _ = s.council.report(local, command);
+      let bound = moved_bound(s);
+      let _ = s.council.report(local, command, bound);
       return None;
     }
     Some(
@@ -9005,10 +9027,17 @@ fn record_acks_in(
   entry.placement.candidates = placement.candidates.clone();
   entry.placement.joint = placement.joint.clone();
   entry.epoch = entry.epoch.max(epoch);
+  let mut moved = false;
   for host in placement.acked {
     if !entry.placement.acked.contains(&host) {
       entry.placement.acked.push(host);
+      moved = true;
     }
+  }
+  // A placement that gained an acknowledgement moved a live volume's durability forward: its held replies wait on
+  // (`slates_bridge_core::durable_bound`).
+  if moved {
+    crate::live_ship::heard(state, object);
   }
   // A live volume's writes wait for its head's placement as well as their own durability (A-200): answer those it was
   // the last thing they waited for.

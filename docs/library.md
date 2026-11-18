@@ -46,8 +46,12 @@ fn main() -> ExitCode {
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can
   find exactly its own instance's processes.
 - The starter is the launcher: it sets its agents' write modes and approves what an ask mode holds.
-  Handing it the instance's issuer on every platform is owed (A-299); today it holds the issuer where
-  the anchor's handoff reaches it.
+  Its authority is a secret of its own: make one once with `LauncherSecret::generate()`, keep its
+  `bytes()` where the host keeps its secrets, and start with
+  `StartSpec::new(..).with_launcher(LauncherSecret::from_bytes(kept)?)` at every start; then
+  `Issuer::from_launcher_secret(&secret)` is the authority `approve_landing`, `approve_merge` and
+  `set_write_policy` take, after the host's restart as before it. (The daemon's verification of it is
+  being built, A-285.)
 
 ## The consumer contract
 
@@ -63,18 +67,20 @@ green) follow the permission the user gave the harness or agent asking to write:
 | `WriteMode` | A landing answers | A merge answers |
 |---|---|---|
 | `Bypass` | `LandOutcome::Written(report)` | `MergeOutcome::Merged { version, .. }` |
-| `Ask` | `LandOutcome::ApprovalRequired(approval)` | `MergeOutcome::ApprovalRequired(approval)` |
+| `Ask` | `LandOutcome::ApprovalRequired(landing_approval)` | `MergeOutcome::ApprovalRequired(merge_approval)` |
 | `Forbid` | `LandOutcome::Refused(policy_refusal)` | `MergeOutcome::Refused(policy_refusal)` |
 
 Conflicts are their own outcome in both (`Conflicted`), typed per path. The launcher sets a
 `WritePolicy` per volume with `Instance::set_write_policy(PolicySubject::Volume(v), &policy, &issuer)`
-and reads it with `write_policy` (`None` while unset, which asks); an act follows the stricter of
+and reads it with `write_policy` (`None` while unset: merges run at once, landings ask); an act
+follows the stricter of
 the volume's and, once the daemon keeps them, the agent's own; an agent can never raise its own (the
 daemon refuses the verb on an agent's channel). The launcher approves an ask with
-`Instance::approve(&approval, &issuer)`, which writes exactly the manifest shown or answers the new
-presentation when the volume or the disk changed since. Owed on the daemon's side: an agent's own
-mode, merges under a mode, and a verb that presents a bypass volume's landing without writing it —
-until then `plan_landing` refuses a bypass volume rather than write it.
+`Instance::approve_landing(&approval, &issuer)`, which writes exactly the manifest shown or answers
+the new presentation when the volume or the disk changed since, and
+`Instance::approve_merge(&approval, &issuer)`, which merges exactly the increment shown or asks
+again when the work changed. Both work from any `Instance`. Owed on the daemon's side: an agent's
+own mode, and signed work.
 
 ### Signed work
 
@@ -110,6 +116,17 @@ No enum of the contract is `#[non_exhaustive]`. Pin the contract: `slates_api::C
 with every change to a type or a verb, so assert the one you wrote against, and match exhaustively
 where you must decide; a moved contract then fails your build at the place to update.
 
+### The seam and its simulator
+
+A host whose rules reach other products only through a trait with a simulator (Hex's) holds
+`slates_api::Volumes`: provision, snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM,
+mount, unmount and detach, each with the `Instance` verb's own signature. `Instance` implements it,
+and so does `SimVolumes::new(most)`, an in-memory stand-in for tests with no daemon: it answers the
+same outcomes and typed errors (names unique, clones pinning snapshots, works only over greens), holds
+at most `most` volumes and `most` attachments, serves no bytes (a stream it hands out is a real end
+nothing answers until detached) and mounts nothing (a mount is a record). The conformance suite in
+`crates/api/tests/api.rs` (`the_seam_conforms`) runs over both.
+
 ## What is built (2026-11-18)
 
 - `Instance::attach(name)`: a client of a running instance. With no daemon it is refused
@@ -132,15 +149,16 @@ where you must decide; a moved contract then fails your build at the place to up
   without writing, for a reviewer; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at
   it): a reviewer with no mount of the volume builds the change from it, checking each file it reads
-  at the head against its entry, and presents the landing again on a mismatch; `approve(&approval,
+  at the head against its entry, and presents the landing again on a mismatch; `approve_landing(&approval,
   &issuer)` writes exactly what was approved.
-- Merging: `merge(&work, signature)` and `rebase(&work)`, with typed conflict windows and the green's
-  head. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
+- Merging: `merge(&work, &evidence, signature)` and `rebase(&work)`, with typed conflict windows and
+  the green's head; `approve_merge(&approval, &issuer)` for a merge an ask mode held. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
   `declare`) and the file verbs, outside the contract.
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
   depend on this crate.
-- Observation: `daemon_status`, `audit`, `grants`, `telemetry`.
+- Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
+  `telemetry`.
 
 Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
 while the daemon lives. A host on its own async runtime runs them on its blocking pool until the
@@ -168,7 +186,7 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
     LandOutcome::ApprovalRequired(approval) => {
       // Show `approval.summary` and `slates.approval_entries(&approval)?`; once approved:
       let issuer = Issuer::from_environment()?;
-      match slates.approve(&approval, &issuer)? {
+      match slates.approve_landing(&approval, &issuer)? {
         LandOutcome::Written(report) => println!("landed: {:?}", report.state),
         LandOutcome::ApprovalRequired(fresh) => println!("it changed; show {} instead", fresh.manifest_text()),
         LandOutcome::Conflicted(conflicts) => println!("{} conflicts", conflicts.len()),
@@ -193,6 +211,6 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 2. The daemon's side of the write modes, merge approvals and signed work, and the verbs that set a
    policy and hand out the statement a signer signs.
 3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-4. A paged volume listing; typed audit kinds and grant states.
+4. A paged volume listing.
 5. An async form over the host's own reactor.
-6. A seam trait with a simulator and a conformance suite.
+6. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.
