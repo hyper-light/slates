@@ -11479,35 +11479,72 @@ pub(crate) fn fitting<T: Wire>(items: impl Iterator<Item = T>, room: usize) -> (
   (page, items.peek().is_some())
 }
 
-/// This shard's part of the listing page after `after` ([`ListPart`]).
+/// This shard's part of the listing page after `after` ([`ListPart`]): its volumes the caller may read, in id order past
+/// the cursor, as many as one page holds. Read from the id index a batch at a time (`Partition::volumes_after`), and a
+/// summary is built only for a volume the page takes, so a page costs the volumes it passes, never the shard's table;
+/// collecting, summarizing and sorting every volume made a walk of the listing quadratic in it (A-267).
 fn list_part(state: &ShardState, principal: &Principal, after: Option<VolumeId>) -> ListPart {
-  let mut volumes: Vec<VolumeSummary> = state
-    .db
-    .partition()
-    .volumes()
-    .into_iter()
-    .filter(|v| rights_of(v, principal).read && v.state != VolumeState::Destroyed)
-    .filter(|v| after.is_none_or(|after| to_wire_volume(v.id) > after))
-    .map(|v| {
-      let live = state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map(|s| s.volume.accounting());
-      listed(VolumeSummary {
-        id: to_wire_volume(v.id),
-        name: v.name.clone(),
-        referenced_bytes: live.map_or(v.referenced_bytes, |a| a.referenced_bytes),
-        unique_bytes: live.map_or(v.unique_bytes, |a| a.unique_bytes),
-        overlay: matches!(v.base, BaseRecord::Path { .. }),
-        live_shipped: v.policy.live_shipped,
-        not_recovered: state.unrecovered.get(&v.id).cloned(),
-      })
-    })
-    .collect();
-  volumes.sort_by_key(|summary| summary.id);
-  let (items, more) = fitting(volumes.into_iter(), list_page_room());
-  ListPart { items, more }
+  let room = list_page_room();
+  let batch = list_batch();
+  let mut items = Vec::new();
+  let mut used = 0usize;
+  let mut cursor = after.map(to_db_volume);
+  loop {
+    let records = state.db.partition().volumes_after(cursor, batch);
+    let exhausted = records.len() < batch;
+    for v in records {
+      cursor = Some(v.id);
+      if !rights_of(v, principal).read || v.state == VolumeState::Destroyed {
+        continue;
+      }
+      let summary = listed_summary(state, v);
+      let bytes = encoded_len(&summary);
+      // A summary always fits a page alone (a name past `longest_listable_name` is refused at create, and a cause is
+      // cut to fit), so the first is always taken.
+      if !items.is_empty() && used.saturating_add(bytes) > room {
+        return ListPart { items, more: true };
+      }
+      used = used.saturating_add(bytes);
+      items.push(summary);
+    }
+    if exhausted {
+      return ListPart { items, more: false };
+    }
+  }
+}
+
+/// A volume as a listing page carries it ([`listed`]): its live accounting where this shard serves it.
+fn listed_summary(state: &ShardState, v: &slates_db::catalog::VolumeRecord) -> VolumeSummary {
+  let live = state
+    .by_id
+    .get(&v.id)
+    .and_then(|h| state.volumes.get(*h).ok())
+    .map(|s| s.volume.accounting());
+  listed(VolumeSummary {
+    id: to_wire_volume(v.id),
+    name: v.name.clone(),
+    referenced_bytes: live.map_or(v.referenced_bytes, |a| a.referenced_bytes),
+    unique_bytes: live.map_or(v.unique_bytes, |a| a.unique_bytes),
+    overlay: matches!(v.base, BaseRecord::Path { .. }),
+    live_shipped: v.policy.live_shipped,
+    not_recovered: state.unrecovered.get(&v.id).cloned(),
+  })
+}
+
+/// Derived: the volumes one read of the id index takes for a listing page: as many summaries as a page could hold at the
+/// smallest a summary encodes to (an empty name, no cause), so one read fills a page of readable volumes and a page
+/// that passes volumes it cannot read reads again.
+fn list_batch() -> usize {
+  let smallest = encoded_len(&VolumeSummary {
+    id: VolumeId::default(),
+    name: String::new(),
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    overlay: false,
+    live_shipped: false,
+    not_recovered: None,
+  });
+  list_page_room().checked_div(smallest).unwrap_or(1).max(1)
 }
 
 /// The listing page the shards' `parts` make: their volumes in id order, as many as one reply chunk holds, and the

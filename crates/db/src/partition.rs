@@ -514,6 +514,18 @@ impl Partition {
     self.volumes.get(h).ok()
   }
 
+  /// The first `limit` volumes past `after` (from the first when `None`) in volume-id order (§4.4 `list`, A-267): a
+  /// bounded ordered read of the id index ([`crate::art::Art::after`]), so a page of the listing costs the volumes it
+  /// passes, never the table.
+  pub fn volumes_after(&self, after: Option<VolumeId>, limit: usize) -> Vec<&VolumeRecord> {
+    self
+      .by_id
+      .after(after.as_ref().map(|id| id.bytes.as_slice()), limit)
+      .into_iter()
+      .filter_map(|(_, h)| self.volumes.get(*h).ok())
+      .collect()
+  }
+
   /// Every volume, by id order.
   pub fn volumes(&self) -> Vec<&VolumeRecord> {
     self

@@ -22207,6 +22207,12 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
   the daemon's own text, at 256.
 - **Proven:** red first on main (3,000 volumes, refused); a walk under churn lists each of 2,991 survivors once in 37
   pages; the longest admitted name lists; 2,000 volumes list through the CLI, plain and JSON.
+- **A seek (2026-11-17, goal g247):** a shard's part of a page collected every volume of its partition, built each
+  one's summary, sorted them and took the first that fit, so a walk of the listing cost the table once a page. It now
+  reads the id index from the cursor a batch at a time (`Art::after`, a bounded ordered read that visits the nodes on
+  the path to the cursor and those of the keys it returns; `Partition::volumes_after`) and builds a summary only for a
+  volume the page takes. `Art::after` is held to an ordered map's range by an oracle (every bound the tree holds,
+  prefixes and keys past it, every limit), and the listing's own walk tests run through it.
 - **What it does not change:** the other replies that return a list whole (`changed_since`, `audit`, `grants`, a
   status's `drifted`, the merge verbs' conflict and invalidation lists), recorded open in GAPS; a volume recovered
   under a longer name is not refused.
