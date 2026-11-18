@@ -234,6 +234,12 @@ fn green_off(client: &mut Client, instance: &str, shards: u16, name: &str) -> Vo
   }
 }
 
+/// The partition `client` is served on on a daemon of [`MANY_SHARDS`] shards (its id's residue), where every work it
+/// makes lives (A-400).
+fn client_partition(client: &Client) -> u16 {
+  u16::try_from(client.client_id() % u32::from(MANY_SHARDS)).unwrap()
+}
+
 /// The bytes version `n` writes over the file: distinct per version.
 fn version_bytes(n: u64) -> Vec<u8> {
   format!("version-{n:06}-")
@@ -719,7 +725,7 @@ fn a_floor_whose_work_was_never_made_is_released_at_the_next_start() {
   client.destroy(seed).unwrap();
   let orphan = off_owner_name(green, "orphan");
   first
-    .lose_next_owner_answer(owner_of_name(&orphan, usize::from(MANY_SHARDS)))
+    .lose_next_owner_answer(client_partition(&client))
     .unwrap();
   let orphaned = client.create_work(green, &orphan);
   assert!(
@@ -821,23 +827,8 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
 /// Format: the status counter of the most batches of asks a shard had out to one owner at once (A-388).
 const BATCHES_OUT_PEAK: &str = "merge.work.batches_out_peak";
 
-/// Two names of `prefix` that hash to one partition, not `green`'s, and that partition.
-fn two_names_on_one_partition(green: VolumeId, prefix: &str) -> (String, String, u16) {
-  let mut seen: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
-  for suffix in 0u32.. {
-    let name = format!("{prefix}-{suffix}");
-    let partition = owner_of_name(&name, usize::from(MANY_SHARDS));
-    if partition == owner_of(green) {
-      continue;
-    }
-    if let Some(first) = seen.insert(partition, name.clone()) {
-      return (first, name, partition);
-    }
-  }
-  panic!("the names run out before two share a partition")
-}
-
-/// A-388 (§4.16 "Asks are batched per owner"; A-247). Do: two works on one shard that is not their green's; hold the
+/// A-388 (§4.16 "Asks are batched per owner"; A-247). Do: two works of one client, so on its shard, not their green's
+/// (A-400); hold the
 /// green's owner shard; send, without waiting, an edit of a base file from each, so each asks the owner and the first
 /// ask's batch is out, unanswered, when the second is made; then let the owner go. Expect: both edits answered, and the
 /// works' shard had two batches out to the owner at once. With one batch out at a time the second ask waited in the
@@ -852,9 +843,9 @@ fn a_shards_second_ask_leaves_while_its_first_batch_is_still_out() {
   client.edit(seed, "first", 0, 0, b"....").unwrap();
   client.edit(seed, "second", 0, 0, b"....").unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
-  let (one, other, partition) = two_names_on_one_partition(green, "two-out");
-  let (first_work, _) = client.create_work(green, &one).unwrap();
-  let (second_work, _) = client.create_work(green, &other).unwrap();
+  let partition = client_partition(&client);
+  let (first_work, _) = client.create_work(green, "two-out-first").unwrap();
+  let (second_work, _) = client.create_work(green, "two-out-second").unwrap();
   let owner = daemon.shards()[usize::from(owner_of(green))];
   let holding = daemon
     .observation(Some(owner), OBSERVE_BUDGET_NS, |_: &mut ShardState| {
@@ -1400,7 +1391,7 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     PolicySubject::Consumer { consumer },
     WriteMode::Ask,
   );
-  expect_the_sessions_ask_to_hold_its_agents_merge(&mut agent, &instance);
+  expect_the_sessions_ask_to_hold_its_agents_merge(&mut agent, &instance, (consumer, &capability));
   assert!(
     asked_of_the_owner(&daemon) > asked_before,
     "the verdicts were asked of the green's owner"
@@ -1513,8 +1504,20 @@ fn expect_the_greens_ask_to_hold_an_edit_and_submit(
 /// as `agent`, whose consumer's own policy asks, make a green and a work named off the green's shard, edit the work and
 /// submit it. Expect the merge held for approval with its one path, and nothing merged, though both volumes would merge
 /// at once.
-fn expect_the_sessions_ask_to_hold_its_agents_merge(agent: &mut Client, instance: &str) {
-  let green = green_off(agent, instance, MANY_SHARDS, "policy-session-green");
+fn expect_the_sessions_ask_to_hold_its_agents_merge(
+  agent: &mut Client,
+  instance: &str,
+  (consumer, capability): (u64, &slates_client::Capability),
+) {
+  // The agent's green, made by a client of another shard bound to the same consumer, so the agent's work is off it.
+  let here = client_partition(agent);
+  let green = loop {
+    let mut maker = connect(instance);
+    if client_partition(&maker) != here {
+      maker.attest(consumer, capability).unwrap();
+      break maker.create_green("policy-session-green", false).unwrap();
+    }
+  };
   let (work, _) = agent
     .create_work(green, &off_owner_name(green, "policy-session"))
     .unwrap();
