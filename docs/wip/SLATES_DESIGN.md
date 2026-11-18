@@ -5737,9 +5737,10 @@ The root configuration records the root group's voters the same way (A-406: `Roo
 contact with the root voters its configuration names, not its join's. A root learner fetches when its alive view of the
 regions differs from the configuration's, and also when a root voter it knows is no longer alive: a region whose
 representative died stays a region, so only the voters show it. It fetches as well when a peer's location query is bound
-to a newer root version than the one it holds (A-489), and asks that peer beside the voters it knows
-(`fleet::root_learner_fetch`). A seat change moves the root's version and neither of the other two signals, so a learner
-that missed it at formation kept its older root and refused every location round a peer on the newer root asked.
+to a newer root version than the one it holds (A-489), or a peer's refusal of its own location query names one (A-504),
+and asks that peer beside the voters it knows (`fleet::root_learner_fetch`). A seat change moves the root's version and
+neither of the other two signals, so a learner that missed it at formation kept its older root: as a peer it refused
+every location round asked under the newer root, and as an asker every round it asked was refused.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -6709,9 +6710,10 @@ version.
 > bound to a newer view than the peer holds now also tells the peer that it is behind and that the asker holds the newer
 > root, so the peer's root learner fetches from the asker at its next period. The asker looks again every poll interval,
 > and that look is answered. Counted `fleet.owner_location.root_behind`. Regression:
-> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. Owed: the converse. An asker
-> behind its peers' root learns nothing from their refusal, which is an empty reply, so its rounds are refused until its
-> own learner fetches for another reason (A-489's owed item).
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`. The converse is done too (A-504): a
+> refusal names the root its peer holds, where it was an empty reply, so an asker behind it counts itself behind
+> (`fleet.owner_location.asker_behind`), its root learner fetches from that peer at its next period, and each look of a
+> lookup asks under the root the asker holds at that look. Regression: `a_behind_askers_round_is_answered_after_one_fetch`.
 
 > **A forward waits for the owner's session (2026-09-25).** A forward took the owner's record session once
 > and, when a coordinator dispatch or a discovery page had it out, refused the client `HomedElsewhere` at
@@ -32593,9 +32595,8 @@ owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-a
   A-406 declined. Binding the reply to a homes-only version would leave the learner on a stale root for everything else
   the root records. The query already carries the version, so it is the signal `root_diverges` called owed ("a
   version-carrying signal").
-- **Owed.** The converse direction. An asker that is a root learner behind its peers is refused by them with an empty
-  reply, which tells it nothing, so its rounds fail until its own learner fetches for another reason. A refusal that
-  names the peer's root version, or a reply under the peer's own view, would let it fetch: a reply format change.
+- **Owed, then done by A-504.** The converse direction: an asker that is a root learner behind its peers was refused by
+  them with an empty reply, which told it nothing, so its rounds failed until its own learner fetched for another reason.
 - **Tests.** `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`
   (`crates/server/src/owner_location.rs`, on a shard: the older and the newer views refused and its own served, three
   newer views counted; no fetch from a shown peer before the queries, a fetch from the one that showed the newest after
@@ -32686,3 +32687,32 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   `crates/client/tests/waits.rs` gone case is now `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`: a
   killed daemon that held its own rendezvous ends both calls `DaemonGone` before the old budget, where it asserted they
   took at least it.
+
+### A-504 — A location refusal names the root its peer holds, so an asker behind it fetches from that peer and asks again under the root it then holds (2026-11-18, g229, UI goal 85, bug 4's converse; §4.8 "Lookup" and learners, D-14; A-406, A-489)
+- **What was there.** A peer refused a location query with an empty reply, which named nothing, and every look of a
+  lookup asked under the root the lookup began with (`verbs::locate_within_horizon`). So an asker that was a root
+  learner behind its peers (A-489's case, the other way round) was refused by every peer on the newer root. Its own
+  learner fetched only when its regions or the voters it knew looked wrong (`fleet::root_diverges`). Even once it caught
+  up, its looks still asked under the old root and were refused again, for the lookup's whole budget.
+- **The rule.** A refusal names the root version its peer holds (`owner_location::Refused`, sent by
+  `owner_location::answer` for every refusal). An asker that reads one naming a newer root than it holds is behind:
+  counted `fleet.owner_location.asker_behind`, it records that version and that peer as A-489's peer side does
+  (`learn_from_refusal`, `ShardState::root_newer_seen`), and its root learner's next period fetches from that peer
+  (`fleet::root_learner_fetch`). Each look asks under the root the asker holds at that look (`Query::under_held_root`), so
+  the look after the fetch is answered.
+- **The encoding.** `Refused` is a new message of the location stream, a fixed 8 bytes (the version). It is never read
+  as a reply nor a reply as it: a reply is 42 bytes or more, and each decodes exactly. The located reply's bytes are
+  unchanged. An asker of an earlier build reads a refusal as malformed and folds it as no claim, as it folded the empty
+  reply. A peer of an earlier build still refuses with an empty reply, which is read as a refusal naming nothing. No
+  enum the `wire_order` guards cover changed (they cover `slates-ipc`'s protocol and `slates-db`'s records), so nothing
+  is published.
+- **Tests.** `a_behind_askers_round_is_answered_after_one_fetch` (`crates/server/src/owner_location.rs`, two daemons). The
+  peer's root is a version past the asker's. Its refusal names that root. The asker counts itself behind and its
+  learner fetches from the peer. After reaching the peer's root, the asker's next look under it is answered with the
+  peer's claim. Red with the refusal sent empty as before: the asker learned nothing. Also
+  `a_refusal_names_the_peers_root_and_no_reply_reads_as_one` (hostile input: every cut, a byte more, and each read as
+  the other).
+
+Applied in the same change to: §4.8 "Lookup" (the owner location status) and learners, A-489's owed item, GAPS (the
+location test's entry), `crates/server/src/{owner_location,fleet,verbs}.rs`, and the bug record
+`docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.

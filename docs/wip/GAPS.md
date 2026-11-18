@@ -4540,9 +4540,11 @@
 > that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
 > learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
 > `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
-> fleet test's runs are filed for main. **Open:** the converse. An asker behind its peers' root is refused with an empty
-> reply that tells it nothing, so it needs a refusal that names the peer's version: a reply format change (SLATES_DESIGN
-> A-489, owed). Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+> fleet test's runs are filed for main. **The converse, closed the same day (A-504):** an asker behind its peers' root was
+> refused with an empty reply that told it nothing. A refusal now names the root its peer holds, so the asker counts
+> itself behind (`fleet.owner_location.asker_behind`), its root learner fetches from that peer, and each look asks under
+> the root the asker holds then. Regression: `a_behind_askers_round_is_answered_after_one_fetch`, red with the refusal
+> sent empty as before. Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from

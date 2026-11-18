@@ -62,8 +62,21 @@ missed a root seat change at formation stays behind until a region or a voter ch
 - `a_root_learners_fetch_asks_the_peer_that_showed_it_a_newer_root` (`fleet`'s unit tests): the target list.
 - The fleet test itself is filed for main (run-requests.md).
 
-## Owed
+## The converse (A-504, the same day)
 
-The converse: an asker that is a root learner behind its peers is refused with an empty reply that names nothing, so
-its own learner is not sent to fetch. A refusal naming the peer's root version is a reply format change (SLATES_DESIGN
-A-489).
+An asker that is itself a root learner behind its peers was refused by every peer on the newer root, with an empty reply
+that named nothing. Its own learner was sent to fetch by nothing, and every look of its lookup asked under the root the
+lookup began with, so even once it caught up it was refused again, for the lookup's whole budget.
+
+- `owner_location::answer` sends every refusal as `Refused { root_version }`, the root the refusing peer holds, where it
+  sent an empty reply: 8 bytes, never read as a reply (42 bytes or more) nor a reply as it.
+- `owner_location::learn_from_refusal`: an asker that reads a refusal naming a newer root than it holds counts itself
+  behind (`fleet.owner_location.asker_behind`) and records the version and the peer (`ShardState::root_newer_seen`), so its
+  root learner's next period fetches from that peer (`fleet::root_learner_fetch`).
+- `verbs::locate_within_horizon` asks each round under the root this node holds at that look
+  (`Query::under_held_root`).
+
+Tests: `a_behind_askers_round_is_answered_after_one_fetch` (two audit daemons: the peer's refusal names its root, the
+asker counts itself behind and its learner fetches from the peer, and once the asker holds that root its next look is
+answered with the peer's claim; red with the refusal sent empty as before) and
+`a_refusal_names_the_peers_root_and_no_reply_reads_as_one` (hostile input).
