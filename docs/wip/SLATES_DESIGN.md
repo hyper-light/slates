@@ -28919,3 +28919,20 @@ Applied in the same change to: §4.2's status, GAPS (the load test's ledger),
 
 Applied in the same change to: the design's A-359 class A list, GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/server/src/{daemon,image}.rs`.
+
+### A-405 — A node no peer detects is detected by its anchor: the failover estimate's detection term is the supervision window there (2026-11-18, built for goal g255; A-363's laptop degenerate corrected, owed since A-384)
+
+- **What was there.** A-363 gave a node with no peer detector (a laptop, `f = 0`) no detection term, so its failover delay
+  was the recovery prior alone, one second, and A-384 made that a bare CLI attachment's idle term there.
+- **The rule.** A laptop has a detector: its anchor, whose daemon's watchdog ends a stuck daemon after the liveness
+  window and whose anchor starts it again (A-232), so a failure there is detected within that window. The estimator is
+  made supervised by it (`Failover::supervised(LIVENESS_BUDGET_NS)`, `crates/server/src/daemon.rs`), and where no peer's
+  detector has a term (a laptop; a fleet node before its detector's first period) the detection term is that window, with
+  no measurement behind it; a peer detector's term replaces it once measured (R8: the same derivation, degenerate input).
+- **What changes.** A laptop's failover delay is the window and the recovery prior, two seconds where it was one, and a
+  CLI attachment nothing renews lasts that long idle there (`docs/cli.md`); a fleet node's estimate is unchanged once its
+  detector runs. Held by the unit test `a_node_no_peer_detects_is_detected_by_its_supervision_window`
+  (`crates/cluster/src/failover.rs`).
+
+Applied in the same change to: `crates/cluster/src/failover.rs` (its laptop paragraph), `crates/server/src/daemon.rs`,
+`docs/cli.md`, GAPS (the `LIVENESS_BUDGET_NS` entry).
