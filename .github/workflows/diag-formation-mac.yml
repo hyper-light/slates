@@ -1,0 +1,56 @@
+name: diag-formation-mac
+
+# Diagnostics only, never on main: three-node formation (start_mesh's settle) looped on macOS at PR #11's head, with the
+# record dial diagnostics. 7,680 formations in all (the rule of three over the measured rate, 1 failing macOS fleet
+# suite in 32 at 80 formations a suite), in three shards of 32 processes x 80 formations, so each fits a hosted job.
+on:
+  push:
+    branches: ["diag-formation-mac-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  loop:
+    name: formation loop shard ${{ matrix.shard }} on macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    runs-on: macos-latest
+    timeout-minutes: 350
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The formation loop
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: bash .github/diag-formation-mac.sh "$(git log -1 --format=%s | cut -c1-120)"
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/${GITHUB_REF_NAME#diag-}-shard-${{ matrix.shard }}"
+          git config user.name "diag-formation-mac"
+          git config user.email "diag-formation-mac@users.noreply.github.com"
+          gzip -9 ../*.log 2>/dev/null
+          mkdir -p ../publish && cp ../results.txt ../*.log.gz ../formed-ms.txt ../publish/ 2>/dev/null
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          rm -rf ./* && cp ../publish/* . 2>/dev/null || echo "no results" > results.txt
+          git add -A
+          git commit -qm "diag ${GITHUB_REF_NAME} results, shard ${{ matrix.shard }}"
+          git push -q origin "HEAD:refs/heads/$branch"

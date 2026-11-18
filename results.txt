@@ -1,0 +1,38 @@
+formation loop (diag: three-node formation looped on macOS, 7,680 formations in three shards -- diagnostics only, never on main: at PR #), shard 1, on Darwin arm64, 3 CPUs; 25.6.0
+commit 6219451d61ff4d2f6b16eb1be6e7bf65028785ff, parent 26dbaa335f334b5a6ee8fcc9f9ed2f51159f2e95
+plan: 32 processes x 80 formations, within 19800 s
+== build: exit 0 in 169 s (build.log)
+process 1: 80 formed in 57 s
+process 2: 80 formed in 57 s
+process 3: 80 formed in 55 s
+process 4: 80 formed in 56 s
+process 5: 80 formed in 56 s
+process 6: 80 formed in 56 s
+process 7: 80 formed in 54 s
+process 8: 80 formed in 55 s
+process 9: 80 formed in 55 s
+process 10: 80 formed in 53 s
+process 11: 80 formed in 53 s
+process 12: 80 formed in 53 s
+process 13: 80 formed in 52 s
+process 14: 80 formed in 54 s
+process 15: 80 formed in 53 s
+process 16: 80 formed in 57 s
+process 17: 80 formed in 56 s
+process 18: 80 formed in 55 s
+process 19: 80 formed in 53 s
+process 20: 80 formed in 55 s
+process 21: 80 formed in 56 s
+process 22: 80 formed in 54 s
+process 23: 80 formed in 55 s
+process 24: 80 formed in 54 s
+process 25: 80 formed in 56 s
+process 26: 80 formed in 55 s
+process 27: 80 formed in 56 s
+process 28: 80 formed in 54 s
+process 29: 80 formed in 55 s
+process 30: 80 formed in 54 s
+process 31: 80 formed in 55 s
+process 32: 80 formed in 56 s
+== formations: 2560 formed, 0 failed, in 1755 s
+== formation ms: n 2560, p50 651, p90 676, p99 1051, max 1619
