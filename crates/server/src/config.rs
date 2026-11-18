@@ -521,9 +521,18 @@ pub struct ShardContentLayout {
   pub images: (usize, usize),
   /// The delta log, `(start, end)` (A-68): what each barrier appends over the committed checkpoint.
   pub delta_log: (usize, usize),
+  /// The DAX range table, `(start, end)` (A-365): each range a Shards stream's held DAX backing has answered, so a
+  /// successor knows what of each object to ingest and never refills.
+  pub dax_ranges: (usize, usize),
   /// The arena range, `(start, len)`, its start on the mapping granule (A-64).
   pub arena: (usize, usize),
 }
+
+/// Format: one slot of a shard's DAX range table (A-365): the attachment, the inode, the range's index and its flags, a
+/// little-endian `u64` each.
+pub(crate) const DAX_RANGE_SLOT_BYTES: usize = 4 * size_of::<u64>();
+/// Format: the DAX range table's header: its layout word and its slot count, a little-endian `u64` each.
+pub(crate) const DAX_RANGE_HEADER_BYTES: usize = 2 * size_of::<u64>();
 
 /// Format: the smallest base page of any supported target (x86-64's 4 KiB; aarch64 hosts run 4, 16 or 64 KiB): the
 /// block every host's file cache and every transport (NFS, FUSE, virtio-fs, WinFsp) moves file bytes in.
@@ -569,11 +578,12 @@ impl DaemonConfig {
   }
 
   /// Derived: where each part of one shard's slice of the anchor's content object lies, relative to the slice's
-  /// start. In order: the FUSE write log (A-63); the two reserve-sized image slots, the committed recovery image
-  /// and the one being written (§4.8); and the shard's arena range, its chunk arena's one region (A-64), the
-  /// reserve's length, starting on the mapping granule so it can be mapped on its own. The slice's length is a
-  /// granule multiple too, so every shard's arena starts on one. The slots are sized as before the arena moved
-  /// in: an image now carries metadata, not content, and only the pages it reaches are backed.
+  /// start. In order: the write log (A-63); the two reserve-sized image slots, the committed recovery image
+  /// and the one being written (§4.8); the delta log (A-68); the DAX range table (A-365); and the shard's arena range,
+  /// its chunk arena's one region (A-64), the reserve's length, starting on the mapping granule so it can be mapped on
+  /// its own. The slice's length is a granule multiple too, so every shard's arena starts on one. The slots are sized
+  /// as before the arena moved in: an image now carries metadata, not content, and only the pages it reaches are
+  /// backed.
   pub fn shard_content_layout(&self) -> ShardContentLayout {
     /// Format: the double buffer's slots: the committed image and the one being written.
     const PUBLISH_SLOTS: usize = 2;
@@ -590,7 +600,9 @@ impl DaemonConfig {
     // deltas since the last checkpoint reach that checkpoint's size, which a slot bounds, so a log of one slot's
     // size is never what forces a checkpoint early. Lazily backed: only the pages a delta reaches cost RAM.
     let delta_end = images_end.saturating_add(reserve);
-    let arena_start = delta_end
+    // The DAX range table (A-365): its header and a slot for each range the fill budget can count. Lazily backed.
+    let dax_ranges_end = delta_end.saturating_add(self.dax_range_table_bytes());
+    let arena_start = dax_ranges_end
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
     let stride = arena_start
@@ -602,6 +614,7 @@ impl DaemonConfig {
       write_log: (0, log),
       images: (log, images_end),
       delta_log: (images_end, delta_end),
+      dax_ranges: (delta_end, dax_ranges_end),
       arena: (arena_start, reserve),
     }
   }
@@ -632,10 +645,32 @@ impl DaemonConfig {
     usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
   }
 
-  /// Derived: the writable direct maps' copies an anchor may hold for this daemon across a restart (A-197): every copy
-  /// its shards may hold at once, `shards × direct_maps_per_shard`, of which the writable ones are some.
+  /// Derived: the copies an anchor may hold for this daemon across a restart: every writable direct map's copy its shards
+  /// may hold at once (A-197), `shards × direct_maps_per_shard`, of which the writable ones are some; and every Shards
+  /// stream's DAX object (A-365), `shards × dax_range_slots`, since each backing counts at least one range against its
+  /// shard's fill budget.
   pub fn held_copy_bound(&self) -> usize {
-    usize::from(self.runtime.shards).saturating_mul(self.direct_maps_per_shard)
+    usize::from(self.runtime.shards).saturating_mul(
+      self
+        .direct_maps_per_shard
+        .saturating_add(self.dax_range_slots()),
+    )
+  }
+
+  /// Derived (A-365): the slots of each shard's DAX range table, one for each range its fill budget can count: the
+  /// shard's reserve over a range, since every range a backing has filled counts a range against the budget (the
+  /// identity layout's rule, `slates_bridge_core::dax_backing::filled_charge`), so the ranges filled never outnumber the
+  /// slots.
+  pub fn dax_range_slots(&self) -> usize {
+    usize::try_from(self.reserve_per_shard / slates_mem::DAX_RANGE_BYTES).unwrap_or(usize::MAX)
+  }
+
+  /// Derived (A-365): each shard's DAX range table's bytes: its header and [`DaemonConfig::dax_range_slots`] slots.
+  pub fn dax_range_table_bytes(&self) -> usize {
+    self
+      .dax_range_slots()
+      .saturating_mul(DAX_RANGE_SLOT_BYTES)
+      .saturating_add(DAX_RANGE_HEADER_BYTES)
   }
 
   /// The configuration from a profile, for `instance`. An explicit shard count is selected

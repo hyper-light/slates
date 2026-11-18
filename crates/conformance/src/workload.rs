@@ -479,14 +479,20 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 ///   whose escape sequence before `Fresh` made the cargo workload's count of fresh builds read 0, failing it on both
 ///   sides of every leg (CI runs 44247840584 and 44252249999, 2026-11-18), and kiln's runs set a target directory
 ///   outside the tree, where the workload's `./target/debug/mini` would not be;
-/// - under Git for Windows' shell (A-327), every argument handed on as written (`MSYS_NO_PATHCONV`): by default that
-///   shell rewrites an argument that looks like a POSIX path before it starts a Windows program, and it took
-///   Subversion's repository-relative URL `^/trunk` for one, so `svn` was handed `^C:\Program Files\Git\trunk` and
-///   refused it on both sides (CI run 44260193629, both Windows lanes). Every other shell ignores the variable. Git for
-///   Windows' native symbolic links (`MSYS=winsymlinks:nativestrict`) are asked for by the `git` workload's one `ln -s`
-///   alone, not here: git reads the same variable to turn its own symbolic links on, and with them on it resolves every
-///   change of directory through `GetFinalPathNameByHandleW` (`compat/mingw.c` `mingw_chdir`), which Windows refuses
-///   on a drive the Mount Manager did not make (A-327).
+/// - under Git for Windows' shell, Subversion's repository-relative URLs handed on as written and every other argument
+///   converted as that shell converts it (`MSYS2_ARG_CONV_EXCL=^/`). The shell rewrites an argument that looks like a
+///   POSIX path before it starts a Windows program (its runtime's `arg_heuristic_with_exclusions`, `winsup/cygwin/
+///   path.cc`, called for each argument in `spawn.cc`), and it took `^/trunk` for one, so `svn` was handed
+///   `^C:\Program Files\Git\trunk` and refused it on both sides (CI run 44260193629, both Windows lanes). The variable
+///   names argument prefixes, separated by `;`, that are left alone. A-327 turned the rewrite off for every argument
+///   instead (`MSYS_NO_PATHCONV`), and that stopped the one Mercurial needs: pip's `hg` is a script whose `#!` line
+///   names `python.exe`, which the shell starts with the script's path as its first argument, and handed unconverted,
+///   `/c/hostedtoolcache/…/Scripts/hg` is a path Python reads on the current drive, `D:\c\…`, so every `hg` exited 2 on
+///   both sides (CI run 44271637767). Every other shell ignores the variable. Git for Windows' native symbolic links
+///   (`MSYS=winsymlinks:nativestrict`) are asked for by the `git` workload's one `ln -s` alone, not here: git reads the
+///   same variable to turn its own symbolic links on, and with them on it resolves every change of directory through
+///   `GetFinalPathNameByHandleW` (`compat/mingw.c` `mingw_chdir`), which Windows refuses on a drive the Mount Manager
+///   did not make (A-327).
 pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("GIT_AUTHOR_NAME", "slates"),
   ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
@@ -509,7 +515,7 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("npm_config_logs_max", "0"),
   ("CARGO_TERM_COLOR", "never"),
   ("CARGO_TARGET_DIR", "target"),
-  ("MSYS_NO_PATHCONV", "1"),
+  ("MSYS2_ARG_CONV_EXCL", "^/"),
 ];
 
 /// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live
@@ -1469,5 +1475,51 @@ mod tests {
     expected.push_str("QUOTED=[it's \"here\" $HOME]\n");
     assert_eq!(printed, expected);
     assert!(printed.contains("HGRCPATH=[]\n"), "{printed}");
+  }
+
+  /// CI run 44271637767 (both Windows lanes): under [`ENVIRONMENT`] every `hg` exited 2 on both sides, Python handed
+  /// the unconverted path of pip's `hg` script. Do: under [`ENVIRONMENT`], have Git for Windows' `sh` run `hg version`
+  /// (a script on the `PATH` whose `#!` line names `python.exe`) and hand a Windows program, Python, Subversion's
+  /// repository-relative URL `^/trunk`. Expect `hg` to answer 0 and Python to print `^/trunk` as written: A-327's
+  /// `MSYS_NO_PATHCONV` failed the first (exit 2), and no setting at all the second (`^C:\Program Files\Git\trunk`, CI
+  /// run 44260193629). Skips loudly without Git for Windows' `sh`, `hg` or Python on the `PATH`; CI's Windows lanes
+  /// install them first.
+  #[cfg(windows)]
+  #[test]
+  fn under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url() {
+    let sh = |script: &str| {
+      std::process::Command::new("sh")
+        .args(["-c", script])
+        .envs(ENVIRONMENT.iter().copied())
+        .output()
+    };
+    let Ok(uname) = sh("uname -s") else {
+      eprintln!("SKIP: no `sh` on the PATH (Git for Windows' `bin` holds one)");
+      return;
+    };
+    let uname = String::from_utf8_lossy(&uname.stdout).into_owned();
+    if !(uname.starts_with("MINGW") || uname.starts_with("MSYS")) {
+      eprintln!(
+        "SKIP: the `sh` on the PATH is not Git for Windows' (`uname -s` answered {uname:?})"
+      );
+      return;
+    }
+    for tool in ["hg", "python"] {
+      if !sh(&format!("command -v {tool}")).is_ok_and(|found| found.status.success()) {
+        eprintln!("SKIP: no `{tool}` on the PATH");
+        return;
+      }
+    }
+    let hg = sh("hg version -q").unwrap();
+    assert!(
+      hg.status.success(),
+      "`hg version` under the environment: {hg:?}"
+    );
+    let python = sh("python -c 'import sys; print(sys.argv[1])' '^/trunk'").unwrap();
+    assert!(python.status.success(), "{python:?}");
+    assert_eq!(
+      String::from_utf8_lossy(&python.stdout).trim_end(),
+      "^/trunk"
+    );
   }
 }

@@ -87,6 +87,48 @@ pub(crate) fn foreign_attach(
   Some(refusal)
 }
 
+/// The refusal, on the volume's shard, of an attach in a form other than the record form of a volume this node lost to
+/// a successor (A-334's sibling, goal g229): by its kind, as [`foreign_attach`] refuses another host's volume on the
+/// client's shard. That check cannot see the loss: a node admitted again lost every volume it created, and the client's
+/// shard knows only the id's creator, while the yield and the fence live on the volume's shard
+/// (`verbs::lost_to_a_successor`). So it is asked here, before the volume's verb is served or sent to its owner. `None`
+/// for every other request.
+pub(crate) fn lost_attach(
+  state: &mut ShardState,
+  body: &slates_ipc::protocol::RequestBody,
+) -> Option<Refusal> {
+  let slates_ipc::protocol::RequestBody::Attach { volume, form, .. } = body else {
+    return None;
+  };
+  let refusal = foreign_form(form)?;
+  if !crate::verbs::lost_to_a_successor(state, crate::verbs::to_db_volume(*volume)) {
+    return None;
+  }
+  state.count(FOREIGN_REFUSED_LOST, 1);
+  Some(refusal)
+}
+
+/// Counter: an attach refused by its kind on the volume's shard because this node lost the volume to a successor.
+const FOREIGN_REFUSED_LOST: &str = "attach.foreign_refused.lost_to_successor";
+
+/// Whether `body` is an attach in the record form of a volume this node lost to a successor: the one attach of such a
+/// volume that is sent to its owner (`verbs::owned_by_another_host`), which the client's node must remember for its
+/// reap before it is sent ([`remember_volume`]).
+pub(crate) fn lost_record_attach(
+  state: &ShardState,
+  body: &slates_ipc::protocol::RequestBody,
+) -> Option<slates_ipc::protocol::VolumeId> {
+  let slates_ipc::protocol::RequestBody::Attach {
+    volume,
+    form: AttachRequest::Root,
+    ..
+  } = body
+  else {
+    return None;
+  };
+  crate::verbs::lost_to_a_successor(state, crate::verbs::to_db_volume(*volume)).then_some(*volume)
+}
+
 /// Counter: an attach refused by its kind because this shard's routing names another host as the volume's owner.
 const FOREIGN_REFUSED_OWNER_ELSEWHERE: &str = "attach.foreign_refused.owner_elsewhere";
 /// Counter: an attach refused by its kind because this shard's routing names no owner for a volume another host
@@ -347,22 +389,57 @@ pub(crate) fn remember(
   else {
     return Ok(());
   };
-  // Only another host's volume is remembered; the reap skips one this node owns by then.
+  // Only another host's volume is remembered; the reap skips one this node owns by then. A volume this node created and
+  // lost to a successor is remembered on its own shard, where the loss is known ([`remember_volume`]).
   if !elsewhere(state, *volume) {
     return Ok(());
   }
+  remember_volume(state, client, *volume)
+}
+
+/// Remembers, on the client's node, that `client` attached `volume` at another host, so its reap reaches that host
+/// ([`reap_at_owners`]); refused `RemoteAttachmentsFull` past [`bound`]. Asked by [`remember`] for a volume another host
+/// created, and on the volume's shard for one this node lost to a successor ([`lost_record_attach`]), before the attach
+/// is sent there. A client whose slot is gone remembers nothing.
+pub(crate) fn remember_volume(
+  state: &mut ShardState,
+  client: slates_mem::Handle<crate::state::ClientSlot>,
+  volume: slates_ipc::protocol::VolumeId,
+) -> Result<(), Refusal> {
   let bound = bound(state);
   let Ok(slot) = state.clients.get_mut(client) else {
     return Ok(());
   };
-  if slot.remote_volumes.contains(volume) {
+  if slot.remote_volumes.contains(&volume) {
     return Ok(());
   }
   if u64::try_from(slot.remote_volumes.len()).unwrap_or(u64::MAX) >= bound {
     return Err(Refusal::RemoteAttachmentsFull { bound });
   }
-  slot.remote_volumes.push(*volume);
+  slot.remote_volumes.push(volume);
   Ok(())
+}
+
+/// [`remember_volume`] for the client at `client_index` on this (its) shard, asked from the volume's shard by a
+/// cross-shard call before the attach is sent to the volume's owner: only while that slot still holds the client
+/// `client_id` that asked, so a slot reused since remembers nothing of the old client's.
+pub(crate) fn remember_volume_at(
+  state: &mut ShardState,
+  (client_index, client_id): (u32, u32),
+  volume: slates_ipc::protocol::VolumeId,
+) -> Result<(), Refusal> {
+  let Some(generation) = state.clients.generation_at(client_index) else {
+    return Ok(());
+  };
+  let client = slates_mem::Handle::from_raw(client_index, generation);
+  let current = state
+    .clients
+    .get(client)
+    .is_ok_and(|slot| slot.client_id == client_id);
+  if !current {
+    return Ok(());
+  }
+  remember_volume(state, client, volume)
 }
 
 /// The reap of a dead client, at the owners of the volumes it attached from this node (`RemoteReap`, routed by each
@@ -378,14 +455,18 @@ pub(crate) async fn reap_at_owners(
     let slot = state.clients.get(handle).ok()?;
     let principal = slot.principal.clone();
     let local = state.fleet.host();
-    // A volume this node owns by now (a takeover) has its attachments ended by the local reap.
+    // A volume this node owns by now (a takeover) has its attachments ended by the local reap. Only its routing says so:
+    // a volume this node created and lost to a successor is remembered too (A-334's sibling), and the creator rule
+    // would take it for this node's own, which the re-admission that yielded it ended (it forgot the host's routing).
     let volumes: Vec<slates_ipc::protocol::VolumeId> = slot
       .remote_volumes
       .iter()
       .copied()
       .filter(|volume| {
-        let object = slates_db::register::ObjectId(volume.bytes);
-        object.creator() != local && state.fleet.object_owner(object) != Some(local)
+        state
+          .fleet
+          .object_owner(slates_db::register::ObjectId(volume.bytes))
+          != Some(local)
       })
       .collect();
     let control = state.shards.first().copied()?;

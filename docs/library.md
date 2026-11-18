@@ -42,7 +42,16 @@ fn main() -> ExitCode {
   (`anchor_command_under(&wrapper)`, with `wrapper` the `OsStr` words of `systemd-run --user --scope
   --`, runs it under a wrapper that execs it, keeping the launcher's secret on its standard input),
   for example under its service manager so the instance outlives the host's process. Such a host
-  waits with `Instance::wait_for(name, None, Some(deadline))`.
+  waits with `Instance::wait_for(name, None, Some(deadline))`; one that holds the anchor's child
+  waits with `Instance::wait_for(name, Some(&mut child), None)` and needs no deadline: the wait lasts
+  while the anchor lives, and the anchor judges its starting daemon by its progress, never by a
+  second (A-366).
+- `StartSpec::until_served()` asks the anchor to stop when its daemons crash-loop before any of
+  them has served: the instance never answered, so no client can be waiting on it, and the wait ends
+  `StartFault::NeverServed` (the anchor exits `role::EXIT_NEVER_SERVED`, 5) instead of lasting while
+  the anchor loops on them. For a host that has attached nothing yet, as kiln's own start of its
+  machine's instance. Once a daemon has served, an anchor never gives its instance up (A-119), asked
+  or not.
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
   on Windows. The instance's volumes live in its memory, so they go with it.
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can
@@ -184,6 +193,17 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   depend on this crate.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
   `telemetry`.
+- The chosen-path launcher (`slates_api::exec`, Linux, A-370): a volume shown at an existing directory
+  for one command, in a namespace of its own, served by the host's own executable as `role::main`
+  serves the roles. `exec::command(&spec, host_exe, &["slates-role".into()])` builds the command
+  (`HOST_EXE slates-role exec --volume=V --at=PATH [--apparmor-profile] -- CMD`); the host spawns it
+  with `SLATES_ROOT` set and awaits it. `ExecSpec::apparmor` is the AppArmor option, `AppArmor::Off`
+  unless the user opts in: on a host whose AppArmor restricts unprivileged user namespaces (Ubuntu
+  24.04 and later) `AppArmor::Profile` makes the namespace under slates' profile for the host's
+  executable, which an administrator renders with `slates_client::exec::profile(host_exe)` and loads
+  as root; off, the launcher never uses it. `exec::check()` answers the host's `Readiness`
+  (`Unrestricted`, `ProfileLoaded`, `ProfileMissing`, `Unsupported`), and every refusal is an
+  `ExecFault` naming its remedy.
 
 Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
 while the daemon lives. A host on its own async runtime runs them on its blocking pool until the

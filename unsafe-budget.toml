@@ -203,12 +203,16 @@
 #   pre-exec launcher (1); and the macOS mount (`mount.rs`, added 2026-09-26, §4.6 A-34):
 #   `mount(2)` with the XDR NFS arguments, which rustix does not wrap on macOS (1) — moved to
 #   slates-api on 2026-11-18 (A-278), lowering this crate 7 → 6; then the stop flag's three, moved
-#   to slates-api with the anchor and daemon roles (A-278 piece 2), lowering it 6 → 3.
+#   to slates-api with the anchor and daemon roles (A-278 piece 2), lowering it 6 → 3; then the
+#   launcher's `unshare_unsafe`, moved to slates-api with the launcher (A-370), lowering it 3 → 2.
 # slates-api (4): the macOS mount moved from slates-cli (A-278, 2026-11-18): `mount(2)` with the XDR
 #   NFS arguments, which rustix does not wrap on macOS (1); and the roles' stop flag moved with the
 #   anchor and daemon roles (`role/signal.rs`, A-278 piece 2): `signal(2)` for SIGINT and SIGTERM on
 #   Unix (1), and on Windows the console control handler, an `unsafe extern` function by signature
-#   and its registration (2). The same blocks, not new sites.
+#   and its registration (2). The same blocks, not new sites. Raised 4 → 5 on 2026-11-18 (A-370) by
+#   the chosen-path launcher moved from slates-cli (`exec.rs`, Linux): its `unshare_unsafe`, marked
+#   unsafe because it changes every thread's namespace, sound in the single-threaded pre-exec
+#   launcher (1). The same block, not a new site; slates-cli lowered 3 → 2 in the same change.
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
@@ -225,7 +229,12 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 81
+slates-machine = 85
+# 2026-11-18 (+4, A-357, Windows only; 81 -> 85): the thread-profiling calls of A-223 (`switches.rs`) are found in kernel32
+#   at run time, never imported: three typed function-pointer aliases (`Enable`, `Read`, `Disable`) and the block that
+#   looks them up with `GetModuleHandleW` and `GetProcAddress`; the three calls' blocks were counted already. Nano Server's
+#   kernel32 exports none of the three, and the binary that imported them exited 0xC0000139 there before any of its code
+#   ran (release run 44326428333; docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md).
 # 2026-11-18 (+2, A-336, Windows only; 79 -> 81): the host's memory stall (`memory_stall.rs`), Windows' low-memory resource
 #   notification: `CreateMemoryResourceNotification` once a process and `QueryMemoryResourceNotification` at each look
 #   that suspects a shard, Win32 FFI with no safe wrapper. The watchdog and the anchor tell a shard waiting on memory
@@ -442,8 +451,8 @@ slates-ipc = 139
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
 slates-server = 8
 slates-client = 0
-slates-api = 4
-slates-cli = 3
+slates-api = 5
+slates-cli = 2
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
 #   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one
 #   `write(2)`, async-signal-safe, into the pipe's write end (1), and `signal(2)` installing that handler for SIGUSR1,
@@ -481,6 +490,12 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 148 -> 155 on 2026-11-18 (A-350, the drive reports its account as every object's owner, so
+# git trusts a repository on it): the `GetSecurity` slot's callback signature in `ffi.rs`, 1; in `host.rs` the
+# `get_security` callback's two blocks (the handler and the descriptor's copy, as `get_security_by_name`'s), the
+# daemon's own token in `drive_security_descriptor` (`OpenProcessToken` and owning its handle), and
+# `token_information`'s two `GetTokenInformation` calls (the size, then the read), 6. The SIDs' text and the descriptor's
+# SDDL are safe Rust (`crate::account`, tested on every host).
 # slates-bridge-winfsp raised 146 -> 148 on 2026-11-09 (A-275, NTFS's rule for who may make a link, judged by the drive
 # since WinFsp's own check refuses Developer Mode, diagnostics run 42712321599): the `GetTokenInformation(TokenPrivileges)`
 # query of a link-making Create's token in `dispatcher.rs` (`creator_may_link`), and the `RegGetValueW` read of
@@ -546,7 +561,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 148
+slates-bridge-winfsp = 155
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

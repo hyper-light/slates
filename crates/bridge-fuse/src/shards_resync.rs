@@ -32,7 +32,9 @@
 //! unique unchanged) as the new stream's first frame, and asks again for each DAX mapping's descriptor. The successor
 //! serves the new stream as the same attachment, with no `INIT`, and answers a resent request the dead daemon applied
 //! and published but never answered from the reply it published with the effect (A-61's rule), never by applying it
-//! twice.
+//! twice. The successor keeps its own copy of the fresh end until the device's first bytes on it, or until the device's
+//! end of the channel closes (A-339: macOS flushes a socket whose every copy rides a message), so a device that takes a
+//! resync and then ends its share closes both ends, the channel's too.
 //!
 //! These are functions over bytes, holding no socket, so they run on every platform; the device's half lives in
 //! Shards, and this module's parse is its reference, which slates' own tests run as the device.
