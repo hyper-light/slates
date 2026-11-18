@@ -1,5 +1,38 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
+> goal of 2026-11-18).** The Windows lanes (`windows-lint`, `windows-arm64`) now run the roster's four version-control
+> workloads (`git`, `git-history`, `mercurial`, `subversion`) over the drive: each script run by Git for Windows' `sh`
+> in an NTFS folder of the scratch and on the drive, judged by exit code, output and tree as every leg is. The lanes
+> install Mercurial (7.2.4, PyPI's wheel) and Subversion (1.15.0, VisualSVN's command-line zip, SHA-256 pinned). What
+> Windows needed: the directory as the root token in each spelling its tools print (`D:\a`, `D:/a`, the shell's
+> `/d/a`, a lowercase drive, a canonical path's `\\?\D:\a`); Subversion's file URL in the drive form (`pwd -W`) and
+> `svnlook`'s carriage return dropped; and `ln -s` making a real link (`MSYS=winsymlinks:nativestrict`), so the git
+> workload's link goes through the drive's reparse points (A-275), not a copy. **The drive's stated difference:**
+> WinFsp's driver makes no hard link (v2.1 answers `FileLinkInformation` `STATUS_NOT_SUPPORTED` itself,
+> `src/sys/fileinfo.c`; its NTFS compatibility page lists hard links unsupported), so a local git or Mercurial clone
+> copies on the drive where NTFS links. The three lines that count a clone's files with two names are recorded with
+> both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
+> the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
+> to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
+> keep the stated difference and offer the change upstream. **Open:** the lanes' first run is the supervisor's (CI);
+> the cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from it;
+> the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a Windows form.
+
+> **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
+> A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
+> every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`
+> (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's driver keys its open files by name and compares
+> case-sensitively when that bit is set (`src/sys/device.c` 676 and 750, `src/sys/create.c` 316-318). So a file opened
+> as `A.TXT` and as `a.txt` on a folding volume gets two of the driver's file nodes: two share-access records (an
+> exclusive open does not exclude the other spelling, where NTFS answers a sharing violation) and two caches over one
+> file. T-4.6 ("case-insensitive lookup on a case-fold volume; expect one entry and `EEXIST` on a folded duplicate")
+> has no test through the drive. The fix: declare `CaseSensitiveSearch` for an exact volume only, and answer each open
+> of a folding volume with its normalized name (each component as stored), which WinFsp otherwise upper-cases
+> (`create.c` 1036-1043), failing test first (an exclusive open under one spelling, then the other: NTFS's
+> `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the Windows workloads cell,
+> which runs on a folding volume to match NTFS (A-300), does not meet it.
+
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
 > `platforms.md` had two rows the plan closed without their runs. Its Windows cells for a mount that outlives a daemon
@@ -47,9 +80,10 @@
 > every machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
-> to fix failing-test-first; (2) the Windows WinFsp roster: WinFsp's driver has no hard links (winfsp.dev's NTFS
-> compatibility page), so Mercurial and git copy where NTFS links; git's symbolic-link probe needed reparse points,
-> which the drive serves since A-275 landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
+> to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
+> route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
+> landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
 > **closed 2026-11-17 (A-293)**: the native Linux lane runs the roster over the daemon's own FUSE mount, unprivileged,
 > recorded RAN; (4) git's fsmonitor (a daemon that refuses network mounts by default) and submodules (their
 > configuration names the source by absolute path) are not in the roster.
