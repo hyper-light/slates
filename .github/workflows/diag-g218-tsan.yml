@@ -1,0 +1,32 @@
+name: diag-g218-tsan
+on:
+  push:
+    branches: ['diag-g218-tsan-*']
+jobs:
+  lone:
+    name: lone_daemon under TSan on ubuntu-latest, three runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: lone_daemon, instrumented as cargo xtask tsan builds it
+        env:
+          RUSTFLAGS: -Zsanitizer=thread --cfg=rustix_use_libc
+          RUSTDOCFLAGS: -Zsanitizer=thread --cfg=rustix_use_libc
+          TSAN_OPTIONS: halt_on_error=0
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+        run: |
+          nproc; uptime
+          for run in 1 2 3; do
+            echo "### run $run"
+            cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-client --test lone_daemon -- --nocapture 2>&1 | tail -150
+          done
+      - name: lone_daemon uninstrumented, the control
+        run: |
+          for run in 1 2 3; do echo "### run $run"; cargo test -p slates-client --test lone_daemon -- --nocapture 2>&1 | grep -E 'A232|test result|panicked|FAILED'; done
