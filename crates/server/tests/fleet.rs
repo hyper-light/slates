@@ -11232,17 +11232,25 @@ fn a_superseded_owners_clients_reach_its_successor() {
   );
 }
 
-/// Format: a holder's count of live messages it refused because the owner that sent them was fenced at a later epoch
-/// (`live_ship`'s refusal names, `LiveError::StaleEpoch`).
-const LIVE_HOLD_REFUSED_STALE: &str = "fleet.live.hold_refused.stale_epoch";
+/// Format: the prefix of a holder's counts of the live messages it refused, in total and by why (`live_ship`'s
+/// `count_refused`: a stale epoch, an owner the configuration does not name, ...).
+const LIVE_HOLD_REFUSED: &str = "fleet.live.hold_refused";
+
+/// A holder's counts of the live messages it refused, in total and by why ([`LIVE_HOLD_REFUSED`]), over its shards.
+fn hold_refusals(daemon: &Daemon) -> std::collections::BTreeMap<&'static str, u64> {
+  summed_counters(daemon)
+    .into_iter()
+    .filter(|(name, _)| name.starts_with(LIVE_HOLD_REFUSED))
+    .collect()
+}
 
 /// Shape: the old owner's record periods the A-349 test watches its holders over once it has learned its fence: long
 /// enough that an owner re-sending each period would be refused many times over (about one refusal a holder a period
 /// before the fix), short enough to keep the test to seconds.
 const FENCED_QUIET_PERIODS: u64 = 20;
 
-/// Shape: the stale refusals a holder may count in the watched window all the same: one lane already in flight when the
-/// window opens.
+/// Shape: the refusals a holder may count in the watched window all the same: one lane already in flight when the window
+/// opens.
 const FENCED_QUIET_SLACK: u64 = 1;
 
 /// A-349 (§4.10 "Live shipping", §4.8 "Promotion and takeover"; the chaos nemesis, seed 6876545201569229162): a
@@ -11250,10 +11258,11 @@ const FENCED_QUIET_SLACK: u64 = 1;
 /// written six files; cut a off on the probe plane alone until the survivor the volume ranks first has taken it over,
 /// and give it its probe plane back; write through a until a write is answered (the first finds a's log fenced: an
 /// entry its holders never take); then let a run [`FENCED_QUIET_PERIODS`] record periods. Expect a's log to show that
-/// entry past its durable position, and neither holder to refuse anything more of a's log as stale in those periods.
-/// Before, a's record period sent each holder that entry again every period and each refused it `StaleEpoch`, and a's
-/// record sessions were out on that loan at the start of every period, where the nemesis's takeover round on a met
-/// them: it never sent the other survivor its page and gave up two objects within tolerance.
+/// entry past its durable position, and neither holder to refuse anything more of a's log in those periods (its whole
+/// `fleet.live.hold_refused` count, whatever the reason). Before, a's record period sent each holder that entry again
+/// every period and each refused it (a node the configuration does not name the volume's owner), and a's record
+/// sessions were out on that loan at the start of every period, where the nemesis's takeover round on a met them: it
+/// never sent the other survivor its page and gave up two objects within tolerance.
 #[test]
 fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
   let _serial = serialize_fleet_tests();
@@ -11269,13 +11278,7 @@ fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
   let mut client = Client::connect(daemons[0].instance());
   let line = owned_live_line(&mut client, id);
   drop(client);
-  let stale = |daemon: &Daemon| {
-    summed_counters(daemon)
-      .get(LIVE_HOLD_REFUSED_STALE)
-      .copied()
-      .unwrap_or(0)
-  };
-  let before = [stale(&daemons[1]), stale(&daemons[2])];
+  let before = [hold_refusals(&daemons[1]), hold_refusals(&daemons[2])];
   // Never met: the wait ends once a has run the window's periods.
   let _ = poll_for_periods(
     &[&daemons[0]],
@@ -11283,14 +11286,19 @@ fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
     FENCED_QUIET_PERIODS,
     || Ok(false),
   );
-  let after = [stale(&daemons[1]), stale(&daemons[2])];
+  let after = [hold_refusals(&daemons[1]), hold_refusals(&daemons[2])];
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
     "superseded owner quiet: taken over {taken}; writes through a {through_a:?}; a's log (head, durable, owed) \
-     {line:?}; the holders' stale refusals {before:?} -> {after:?} over {FENCED_QUIET_PERIODS} periods"
+     {line:?}; the holders' refusals {before:?} -> {after:?} over {FENCED_QUIET_PERIODS} periods"
   );
+  let total = |refusals: &std::collections::BTreeMap<&'static str, u64>| {
+    refusals.get(LIVE_HOLD_REFUSED).copied().unwrap_or(0)
+  };
+  let before = before.each_ref().map(total);
+  let after = after.each_ref().map(total);
   assert!(
     written
       .iter()
@@ -11316,7 +11324,7 @@ fn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost() {
   for (holder, (before, after)) in ["b", "c"].iter().zip(before.into_iter().zip(after)) {
     assert!(
       after.saturating_sub(before) <= FENCED_QUIET_SLACK,
-      "{holder} refused {} live messages of a's fenced log as stale in {FENCED_QUIET_PERIODS} periods",
+      "{holder} refused {} live messages of a's fenced log in {FENCED_QUIET_PERIODS} periods",
       after.saturating_sub(before)
     );
   }
