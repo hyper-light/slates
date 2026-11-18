@@ -216,6 +216,11 @@ pub struct HostTakeover {
   /// quorum: its adoption records it with a volume's head, whose loss report names it once served (A-332). Bounded by
   /// `learned`: an entry leaves with its object.
   past_tolerance: BTreeMap<ObjectId, slates_db::catalog::RecoveryShortfall>,
+  /// When this node began the round, on the shard's clock, kept across a restart: the takeover's recovery is timed from
+  /// here to its share done, into the failover estimate (A-363).
+  began_ns: u64,
+  /// Whether that recovery has been timed: a share stays done while its retirement completes, and is timed once.
+  timed: bool,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -258,8 +263,8 @@ struct Page {
 }
 
 impl HostTakeover {
-  /// A round under `generation` at `epoch`, having asked nothing yet.
-  fn new(generation: u64, epoch: HostEpoch) -> HostTakeover {
+  /// A round under `generation` at `epoch`, begun at `began_ns` on the shard's clock, having asked nothing yet.
+  fn new(generation: u64, epoch: HostEpoch, began_ns: u64) -> HostTakeover {
     HostTakeover {
       generation,
       epoch,
@@ -272,7 +277,19 @@ impl HostTakeover {
       waits: BTreeMap::new(),
       given_up: BTreeSet::new(),
       past_tolerance: BTreeMap::new(),
+      began_ns,
+      timed: false,
     }
+  }
+
+  /// Times this round's recovery into `failover` the first time its share is done, at `now_ns`: from its beginning,
+  /// however many times a new configuration started it over (A-363). Later calls fold nothing.
+  fn time_done(&mut self, now_ns: u64, failover: &mut slates_cluster::failover::Failover) {
+    if self.timed {
+      return;
+    }
+    self.timed = true;
+    failover.takeover_done(now_ns.saturating_sub(self.began_ns));
   }
 
   /// Starts the round over at `generation` and `epoch`: every promise was for the old round, so every page is
@@ -819,6 +836,12 @@ async fn drive_host_takeover(
   give_up_unpromised(departed, past, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
   if done {
+    // The share is done: its takeover's recovery is a sample of the failover estimate, folded once (A-363).
+    let _ = state::with_state_counted(|s| {
+      if let Some(take) = s.host_takeovers.get_mut(&departed) {
+        take.time_done(slates_rt::futures::now_ns(), &mut s.failover);
+      }
+    });
     crate::fleet::send_council_report(
       slates_cluster::config_group::ConfigCommand::Confirm {
         departed,
@@ -852,10 +875,9 @@ pub(crate) fn begin_round(
     state.count(TAKEOVER_EPOCH_EXHAUSTED, 1);
     return None;
   };
-  let take = state
-    .host_takeovers
-    .entry(departed)
-    .or_insert_with(|| HostTakeover::new(regional.version, first_epoch));
+  let take = state.host_takeovers.entry(departed).or_insert_with(|| {
+    HostTakeover::new(regional.version, first_epoch, slates_rt::futures::now_ns())
+  });
   if take.generation != regional.version {
     let epoch = take.epoch.max(first_epoch);
     take.restart(regional.version, epoch);
@@ -1900,7 +1922,7 @@ mod tests {
   #[test]
   fn a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count() {
     let member = HostId(2);
-    let mut take = HostTakeover::new(5, HostEpoch(3));
+    let mut take = HostTakeover::new(5, HostEpoch(3), 0);
     let page = |after: u64, complete: bool| Page {
       after: (!complete).then_some(ObjectId::new(HostId(1), after)),
       complete,
@@ -2258,7 +2280,7 @@ mod tests {
 
   /// A round of the audit node's for `departed`'s takeover that has learned `object` and adopted nothing.
   fn round_that_learned(state: &mut ShardState, departed: HostId, object: ObjectId) {
-    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2));
+    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2), 0);
     take.learned.insert(object, BTreeMap::new());
     state.host_takeovers.insert(departed, take);
   }

@@ -1866,6 +1866,13 @@ failover delay (one term) stays under the operator's failover SLO; tombstone hor
 × 2; destroy slice = measured per-node free cost × the shard's per-iteration budget; the base and
 landing constants are in §4.15.
 
+> **Status (2026-11-18, A-363): the failover delay is a live output, not a setting.** Each node estimates
+> `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` its failure
+> detector's own detection bound, `E` the council's death-confirmation window at the measured period, `R` the tail of
+> the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
+> (`FleetReport::failover`). The operator's SLO above is still the 10 s placeholder its consumers read until each moves
+> to the estimate or to a term of its own (A-363's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
+
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
 `unique_bytes` is 0; the agent writes one file: the path from the root to that file is copied
@@ -8075,6 +8082,11 @@ it builds against the contract and adds to it rather than around it.
 > when that part was recovered within tolerance; the takeover record keeps it with the volume, so it survives the
 > successor's restart. `slates status` prints `taken_over_past_tolerance: registers <remaining>/<needed>|within
 > live_log ...`, and the JSON (CLI and MCP) carries it under `loss.taken_over.past_tolerance`.
+> **`CONTRACT` = 22 (A-363):** the daemon's status carries the failover delay as the node estimates it now,
+> `DaemonReport::fleet`'s `failover` (a `FailoverReport`, appended to `FleetReport` and `ShardReport`): the total and
+> its detection, confirmation and recovery terms, each with the measurements behind it (round trips, coordinator
+> periods, takeovers and volumes timed), so a consumer tells a measured term from a prior. `slates status` prints
+> `fleet_failover: ...` and MCP's daemon status carries it under `fleet.failover`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -26031,3 +26043,54 @@ relinquish a step of the db model's histories.
 Applied in the same change to: §4.10 (the chaos flows' status), A-334's owed line (`crates/server/src/readmission.rs`),
 GAPS (the nemesis entry), `crates/db/src/{op,partition}.rs`, `crates/db/tests/{model.rs,wire_order.txt}`,
 `crates/server/src/{verbs,state,daemon}.rs`.
+
+### A-363 — The failover delay is a live output: detection, confirmation and recovery estimated from what each node measures, every coordinator period (2026-11-18, built for goal g255; Ada's rule of the same day: "no arbitrary constants", and a value computed once at boot is still a constant, so the estimators keep learning from the traffic they judge)
+
+- **What was there.** `F` was the operator's failover SLO, `config::FAILOVER_SLO_NS`, a 10 s placeholder, and A-359
+  planned it as the membership horizon, the council's ten periods and `T` summed at boot (2.9 s). Ada: "2.9 s is just an
+  arbitrary constant, not a learned or data derived method that adapts."
+- **The estimate** (`crates/cluster/src/failover.rs`, its module doc cites each method): `F = D + E + R`, refreshed by the
+  control shard each coordinator period (`fleet::refresh_failover`), nothing setting it.
+  - `D`, detection: the member plane's detector's `detection_bound` at that moment. Each pair is NFD-E (Chen, Toueg &
+    Aguilera 2002) with Lifeguard's local health (Dadgar et al. 2018), counted over `2(2m − 1) + 1` periods at the
+    longest this member ran (SWIM §4.3). **The false-suspicion probability is derived:** each pair's margin minimizes
+    `U = (E(D) + α + η + T_E)/MTBF + T_E·β/η` (hyper-timing `qos`) against the fleet's measured MTBF, and `β` is
+    bounded from the measured lateness by Cantelli with the record-indicator share (Rényi 1962); in φ-accrual's terms
+    (Hayashibara et al. 2004) the threshold is `φ = −log10 β`, with the distribution-free tail in place of the normal
+    fit. Each peer's `β` was already reported (`DetectorPeerReport::mistake_milli`); no new detector was needed.
+  - `E`, confirmation: the council leader's death watch, `ElectionTiming::base_periods` (Raft's rule scaled from each
+    voter path's `srtt + 4·rttvar`, RFC 6298), plus one period for the successor's install, each period at the measured
+    coordinator period's tail (a starved coordinator's periods stretch, and the watch counts periods), plus the
+    retirement's commit round, the slowest voter path's tail.
+  - `R`, recovery: the larger tail (RFC 6298's estimator, Jacobson 1988) of the takeovers this node timed (a round begun
+    to its share done, `takeover::HostTakeover::time_done`) and of the volumes it timed (adopted to served,
+    `state::PendingVolume::adopted_ns`); before the first, the ratified `T` (RAMCloud's second, GAPS §5), as RFC 6298
+    §2.1 starts at a stated second until a measurement exists.
+  - On a laptop there is no peer to detect and no council to confirm: `F` is the recovery alone (R8, the same
+    derivation at its degenerate inputs).
+- **Published.** `FailoverReport` (appended to `FleetReport` and `ShardReport`, `CONTRACT` 22), `slates status`
+  `fleet_failover: ...`, MCP's `fleet.failover`: the total, each term, and the measurements behind each.
+- **Owed, each in its own change, failing test first:** the failover-shaped waits read the estimate instead of the
+  placeholder (a forward's `FailoverBound`, the location round's cap, `live_ship`'s fetch total, `takeover_attempts`,
+  the telemetry horizon), fanned to every shard with the configuration; each lease takes its term from a φ-accrual
+  detector over its own holder's renewals (a landing's target lease, the NFSv4 and delegation leases, a CLI attachment's
+  term once the CLI process sends a keepalive); `W`'s floor from the runtime pulses' running wake delay; then
+  `FAILOVER_SLO_NS` and `with_failover_slo` go. The boot-time sum is kept only as the A/B baseline, a build of its own.
+- **Evidence.** The estimator's unit tests (`crates/cluster/src/failover.rs`: the prior alone with nothing measured; the
+  recovery leaving its prior at RFC 6298's first-sample tail and following the takeovers it times; the larger of the
+  takeover and volume tails; the confirmation at the heartbeat before any period, stretched with the measured period,
+  and scaled with a far voter path's election base; the total the sum; no sample from a clock that reads earlier). The
+  fleet test `a_successors_failover_estimate_learns_the_takeover_it_completed` (`crates/server/tests/fleet.rs`: three
+  nodes at `f = 1`; before the loss each survivor's detection and confirmation are measured and its recovery the prior;
+  after the owner's death the successor serves the volume and its estimate has timed the takeover and the volume). The
+  wire's status test carries the report through fragmented pages (`crates/ipc/tests/status.rs`). Measured by that test
+  on the Mac Studio (2026-11-18, load 18-20, debug build): the survivors estimated 3.42 and 3.52 s before the loss
+  (detection 912 and 913 ms on 111 and 61 round trips, confirmation 1.51 and 1.61 s on 8 and 7 timed periods, recovery
+  the 1 s prior); the successor 4.22 s after it (detection 2.11 s, its periods stretched by the dead peer's unanswered
+  probes; confirmation 1.19 s on 28 periods; recovery 927 ms, one takeover and one volume timed, RFC 6298's first-sample
+  tail of a 309 ms recovery).
+
+Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (the `CONTRACT` 22 status line), GAPS (the
+`LIVENESS_BUDGET_NS` entry), `crates/cluster/src/{failover,lib}.rs`, `crates/server/src/{fleet,takeover,state,daemon,verbs}.rs`,
+`crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
+`crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.

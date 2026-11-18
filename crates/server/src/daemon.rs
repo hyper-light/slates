@@ -4390,6 +4390,7 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
+    failover: slates_cluster::failover::Failover::new(),
     council,
     consensus_ready: false,
     consensus_generation: 0,

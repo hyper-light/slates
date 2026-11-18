@@ -162,21 +162,23 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// day). 21: a takeover past the volume's tolerance shows in its loss report (`VolumeTakeover::past_tolerance`, a
 /// [`PastTolerance`] naming the [`Shortfall`] of its registers' cohort and of its live log's recorded holders): until
 /// then a consumer could not tell a takeover that may have lost writes acknowledged only to the lost hosts from one that
-/// kept every one (A-332; the same day).
+/// kept every one (A-332; the same day). 22: the daemon's status carries the failover delay as the node estimates it
+/// now (`DaemonReport::fleet`'s `failover`, a [`FailoverReport`]): detection, confirmation and recovery, each with the
+/// measurements behind it, summed; nothing sets it, it moves with what the node measures (A-363; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 21;
+pub const CONTRACT: u32 = 22;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, Filter, GrantScope, GreenBase,
-  HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
-  LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
-  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
-  VolumeSummary, VolumeTakeover,
+  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, FailoverReport, Filter,
+  GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
+  LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState,
+  PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall,
+  SnapshotId, TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
