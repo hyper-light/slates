@@ -30,7 +30,7 @@ gap, slates does not inherit it.
 | **R7 Plain English.** A human implementer can act on every sentence. | Module docs and comments are written for the next engineer, in prose, citing the design section. |
 | **R8 Laptop ≡ fleet, one code path.** | Every subsystem has a laptop-degenerate section; the N=1 differential test in CI asserts identical semantics with one node and with the simulated fleet. No mode switches, ever. |
 | **R9 Sub-50 µs provisioning.** | The provisioning histogram (p50/p99/p999/max, spinning and parked) is a permanent, ratcheted CI gate. |
-| **R10 Disk writes happen only on a user permission grant; no privilege is ever required.** | Grants exist only through the CLI or a confirmation surface; the MCP and SDK channels have no grant verb (refused by kind). The daemon never requests `CAP_SYS_ADMIN` or root; the only privileged pieces are OS-shipped brokers installed once. |
+| **R10 Disk writes happen only on a user permission grant, which follows the mode the user gave the agent; no privilege is ever required.** | The launcher or the harness sets a session's or volume's write policy and an agent can never raise its own (A-285): bypass merges and lands at once; ask answers a typed approval request bound to the manifest, which the harness presents; a forbidding mode is refused. Signatures are signed-work provenance, never the permission gate. The daemon never requests `CAP_SYS_ADMIN` or root; the only privileged pieces are OS-shipped brokers installed once. |
 
 ## 2. Banned (explicit authorization required, per item, in the conversation)
 
