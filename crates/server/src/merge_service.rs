@@ -821,16 +821,27 @@ impl OriginWalk {
             self.dirs.push(path);
           }
         }
-        Kind::Fifo | Kind::Socket => {
+        Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
           if let Some(first) = self.first_name.get(&row.inode) {
             self.origin.hardlinks.push((path, first.clone()));
             continue;
           }
           use slates_merge::special::{SpecialKind, SpecialNode};
-          let kind = if row.kind == Kind::Fifo {
-            SpecialKind::Fifo
-          } else {
-            SpecialKind::Socket
+          // A device node's number is captured with it (A-294): an inode holds it from its `mknod` on.
+          let number = volume
+            .device_in(store, self.snapshot, row.inode)?
+            .unwrap_or_default();
+          let kind = match row.kind {
+            Kind::Fifo => SpecialKind::Fifo,
+            Kind::Socket => SpecialKind::Socket,
+            Kind::BlockDevice => SpecialKind::BlockDevice {
+              major: number.major,
+              minor: number.minor,
+            },
+            _ => SpecialKind::CharDevice {
+              major: number.major,
+              minor: number.minor,
+            },
           };
           self.origin.modes.push((path.clone(), attrs.mode));
           self.first_name.insert(row.inode, path.clone());
@@ -3310,7 +3321,8 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
   use super::*;
 
-  /// AC-6.8 / A-26: seed a green from a frozen FIFO/socket namespace without reading a stream.
+  /// AC-6.8 / A-26, A-294: seed a green from a frozen namespace of FIFO and socket names and device nodes without
+  /// reading a stream or opening a device; expect every kind, owner and device number in the green, each alias a link.
   #[test]
   fn ipc_snapshot_seeds_a_replayable_green_origin() {
     let encoded = {
@@ -3344,10 +3356,20 @@ mod tests {
       )
       .expect("create source");
       let root = volume.root_inode(&store).expect("root");
-      for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
+      use slates_vfs::inode::{DeviceNumber, SpecialNode};
+      for (name, node) in [
+        ("pipe", SpecialNode::Fifo),
+        ("socket", SpecialNode::Socket),
+        ("disk", SpecialNode::BlockDevice(DeviceNumber::new(8, 1))),
+        ("whiteout", SpecialNode::CharDevice(DeviceNumber::new(0, 0))),
+        (
+          "widest",
+          SpecialNode::CharDevice(DeviceNumber::new(u32::MAX, u32::MAX)),
+        ),
+      ] {
         let inode = volume
-          .mknod_no(&mut store, root, name, 0o640, kind)
-          .expect("create IPC name");
+          .mknod_no(&mut store, root, name, 0o640, node)
+          .expect("create a name with no content");
         volume.chown(&mut store, inode, 123, 456).expect("owner");
         volume
           .link_no(&mut store, root, &format!("{name}-link"), inode)
@@ -3363,17 +3385,27 @@ mod tests {
       origin.files.is_empty(),
       "no stream is represented as file bytes"
     );
-    assert_eq!(origin.specials.len(), 2);
+    assert_eq!(origin.specials.len(), 5);
     let green = Green::with_origin(origin.clone());
+    use slates_merge::special::SpecialKind;
     for (path, kind) in [
-      ("pipe", slates_merge::special::SpecialKind::Fifo),
-      ("socket", slates_merge::special::SpecialKind::Socket),
+      ("pipe", SpecialKind::Fifo),
+      ("socket", SpecialKind::Socket),
+      ("disk", SpecialKind::BlockDevice { major: 8, minor: 1 }),
+      ("whiteout", SpecialKind::CharDevice { major: 0, minor: 0 }),
+      (
+        "widest",
+        SpecialKind::CharDevice {
+          major: u32::MAX,
+          minor: u32::MAX,
+        },
+      ),
     ] {
       let node = green.special(path).expect("metadata survived capture");
       assert_eq!((node.kind, node.uid, node.gid), (kind, 123, 456));
       assert_eq!(green.special(&format!("{path}-link")), Some(node));
     }
-    assert_eq!(origin.hardlinks.len(), 2);
+    assert_eq!(origin.hardlinks.len(), 5);
     assert_eq!(origin.encode(), encoded);
     assert_eq!(
       Green::with_origin(origin.clone()).head_identity(),

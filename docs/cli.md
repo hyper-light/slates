@@ -481,8 +481,11 @@ slates vhost-user ID --dax-window 8MiB -- qemu-system-x86_64 -machine q35,memory
   -device vhost-user-test-device-pci,chardev=slates,virtio-id=26,num_vqs=2,config_size=40 ...
 ```
 
-and the guest mounts `mount -t virtiofs slates /mnt -o dax=always` (`--tag` names another tag). No socket file exists
-anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
+and the guest mounts `mount -t virtiofs slates /mnt -o dax=always,nosuid,nodev` (`--tag` names another tag). Mount
+it `nosuid,nodev`, as every mount slates makes itself is: a volume is shared, and keeps device nodes and set-id bits as
+any writer made them (A-94, A-294), so a guest mount without the flags would let one writer's `/dev/mem`-numbered node
+or setuid binary act for another of the guest's users. The device cannot set the guest's flags; the guest's kernel
+applies them. No socket file exists anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
 that end alone. QEMU's vhost-user-fs-pci has no DAX window, so use the generic device for DAX; QEMU before 11.1 offers
 no window on either.
 `--dax-window SIZE` offers the guest a DAX window of that size (a power of two of at least 2MiB); through it the guest
