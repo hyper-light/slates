@@ -59,8 +59,10 @@ pub const ENV_COPIES: &str = "SLATES_ANCHOR_COPIES";
 
 /// Format: the most session bytes a message carries. The FUSE session is two bytes
 /// (`slates_bridge_fuse::session::SESSION_BYTES`); the channel carries them opaque, with room for that
-/// encoding to grow without a channel change.
-pub const SESSION_CAP: usize = 32;
+/// encoding to grow without a channel change. A Shards stream's resync session is 40 (its token, its owner view and its
+/// connection's form, A-378), past the 32 this held until then; an anchor and its daemons are always one build (the
+/// anchor restarts its own executable, A-145), so the channel's message length changes with both at once.
+pub const SESSION_CAP: usize = 64;
 
 /// Format: a message's kind, its first byte.
 const KIND_HOLD: u8 = 1;

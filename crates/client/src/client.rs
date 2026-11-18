@@ -4617,6 +4617,19 @@ impl Client {
     }
   }
 
+  /// Renews a CLI attachment's term from its holder (A-230, A-384), and nothing else: the term now in force and how soon
+  /// to renew again, nanoseconds, as `(term, renew_every)`. Refused as any use of the attachment is (`AttachmentExpired`
+  /// once its term lapsed).
+  pub fn renew(&mut self, attachment: u64) -> Result<(u64, u64), ClientError> {
+    match self.call(&RequestBody::Renew { attachment })? {
+      ReplyBody::Renewed {
+        term_ns,
+        renew_every_ns,
+      } => Ok((term_ns, renew_every_ns)),
+      _ => Err(ClientError::UnexpectedReply { verb: "renew" }),
+    }
+  }
+
   /// Detaches an attachment of `volume`, routed by the volume (§4.10, A-222): the form for an attachment another
   /// host's owner holds, which an attachment id alone cannot route to (it names its owner partition, not its host).
   pub fn detach_of(&mut self, volume: VolumeId, attachment: u64) -> Result<(), ClientError> {

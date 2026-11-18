@@ -282,4 +282,3 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 1. The starter handed the launcher's authority on every platform.
 2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
 3. An async form over the host's own reactor.
-4. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.

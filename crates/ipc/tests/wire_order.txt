@@ -293,9 +293,10 @@ ReplyBody 64 SignersSet
 ReplyBody 65 MergeRecord
 ReplyBody 66 Drifted
 ReplyBody 67 Conflicts
-ReplyBody 68 Moving
-ReplyBody 69 Moved
-ReplyBody 70 BaseCaptured
+ReplyBody 68 Renewed
+ReplyBody 69 Moving
+ReplyBody 70 Moved
+ReplyBody 71 BaseCaptured
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -373,8 +374,9 @@ RequestBody 73 SetSigners
 RequestBody 74 MergeRecord
 RequestBody 75 Drifted
 RequestBody 76 Conflicts
-RequestBody 77 Move
-RequestBody 78 CaptureBase
+RequestBody 77 Renew
+RequestBody 78 Move
+RequestBody 79 CaptureBase
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
