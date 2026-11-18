@@ -137,17 +137,19 @@ pub enum FsKind {
 mod tests {
   use super::*;
 
-  /// A-262. Do: map the attribute words of an ordinary file (`ARCHIVE`), a hidden read-only file, a hidden read-only
-  /// directory, and a directory symlink (a reparse point with the directory bit). Expect: `S_IFREG | 0o644` with
-  /// `ARCHIVE` kept; `S_IFREG | 0o444` with `HIDDEN | ARCHIVE` kept (the file's read-only state is its mode); `S_IFDIR |
-  /// 0o755` with `READONLY | HIDDEN` kept; `S_IFLNK | 0o777`. Before, the word itself was the mode (`0x20` read as
+  /// A-262, with A-275's link bit. Do: map the attribute words of an ordinary file (`ARCHIVE`), a hidden read-only file,
+  /// a hidden read-only directory, and a directory symlink (a reparse point with the directory bit). Expect:
+  /// `S_IFREG | 0o644` with `ARCHIVE` kept; `S_IFREG | 0o444` with `HIDDEN | ARCHIVE` kept (the file's read-only state is
+  /// its mode); `S_IFDIR | 0o755` with `READONLY | HIDDEN` kept; `S_IFLNK | 0o777` with the directory bit kept, since a
+  /// link keeps whether it is a directory link (A-275: `WindowsAttributes::LINK_DIRECTORY`; this test still expected
+  /// none after A-275 changed the mask, and failed on main). Before A-262, the word itself was the mode (`0x20` read as
   /// `0o040`), so an ordinary file read as one its owner may not write.
   #[test]
   fn a_windows_entrys_mode_is_drvfs_mapping_and_its_bits_are_kept_apart() {
     assert_eq!(windows_mode_and_bits(0x20), (0o100_644, 0x20));
     assert_eq!(windows_mode_and_bits(0x1 | 0x2 | 0x20), (0o100_444, 0x22));
     assert_eq!(windows_mode_and_bits(0x10 | 0x1 | 0x2), (0o040_755, 0x3));
-    assert_eq!(windows_mode_and_bits(0x400 | 0x10), (0o120_777, 0));
+    assert_eq!(windows_mode_and_bits(0x400 | 0x10), (0o120_777, 0x10));
   }
 
   /// §4.5's racy rule rests on this table, so the table is pinned here — in particular the arm every
