@@ -5159,6 +5159,7 @@ mod health_signal_registry {
       "nfs.local_p99_ns",
       "nfs.local_off_cpu_p99_ns",
       "nfs.forwarded_p99_ns",
+      "shard.watch_window_ns",
     ];
     let names: Vec<&str> = HealthSignal::ALL
       .iter()

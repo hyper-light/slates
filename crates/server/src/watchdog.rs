@@ -1795,7 +1795,8 @@ mod tests {
     assert!(Verdict::Alive.beats() && starved.beats() && for_memory.beats());
     assert!(!wedged.beats() && !spinning.beats());
     let mut said = None;
-    let watch = (&ShardWatch::default(), WINDOW);
+    // The history, the look's time and the shard's window (A-455).
+    let watch = (&ShardWatch::default(), WINDOW, WINDOW);
     let words = String::new;
     report(&mut said, (1, starved, Turn::Beat), watch, words);
     assert_eq!(said, Some(said_of(starved)));
