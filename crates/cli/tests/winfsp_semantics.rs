@@ -45,7 +45,7 @@ const POLL: Duration = Duration::from_millis(20);
 const STABLE_STREAK: u32 = 10;
 /// Shape: the most `volume list` attempts a start makes after the daemon's serving line, as `tests/winfsp.rs`.
 const START_ATTEMPTS: u32 = 60;
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`).
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`).
 const SERVING_LINE: &str = "slates daemon: instance ";
 /// Format: Win32's `ERROR_ALREADY_EXISTS` (winerror.h): what `MoveFileExW` answers for a name taken, unasked to replace.
 const ERROR_ALREADY_EXISTS: i32 = 183;
