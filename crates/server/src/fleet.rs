@@ -2392,8 +2392,19 @@ pub(crate) async fn ship_owed_catalog(
   local: HostId,
   catalog: &OwedCatalog,
   budget: CommitBudget,
-) -> Option<Dispatch> {
+) -> HeadShipped {
   ship_head(origin, owner_acceptor, local, &catalog.0, budget).await
+}
+
+/// What shipping a head did ([`ship_head`]): the dispatch whose stragglers are still in flight, when anything was sent,
+/// and whether a placement came back and was recorded on the head's owner shard. Only that outcome gives the record
+/// plane new work at once (a version that waited for a work's catalog, A-255); a ship that found no session to a
+/// candidate, or that the runtime refused, sent nothing and is shipped again at the coordinator's next period.
+pub(crate) struct HeadShipped {
+  /// The dispatch, when anything was sent.
+  pub(crate) dispatch: Option<Dispatch>,
+  /// Whether the commit's placement was recorded on the head's owner shard.
+  pub(crate) recorded: bool,
 }
 
 /// Whether the merge volume `id`'s catalog register is committed, so a merge record that depends on it may ship (see
@@ -5171,6 +5182,18 @@ async fn successor_lineage_of(
   handed
 }
 
+/// What a takeover's loss report says of its tolerance (A-332): the shortfall the round adopted the volume's head at
+/// (`registers`) and the one phase one adopted its live log at (`live_log`), `None` when both were within tolerance.
+fn past_tolerance_of(
+  registers: Option<slates_db::catalog::RecoveryShortfall>,
+  live_log: Option<slates_db::catalog::RecoveryShortfall>,
+) -> Option<slates_db::catalog::TakeoverPastTolerance> {
+  (registers.is_some() || live_log.is_some()).then_some(slates_db::catalog::TakeoverPastTolerance {
+    registers,
+    live_log,
+  })
+}
+
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
 /// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
@@ -5297,6 +5320,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   } else {
     (archive, successor_lineage)
   };
+  // Whether the round adopted the head, or phase one the log, past tolerance (A-309), for the loss report (A-332).
+  let registers_short = state::with_state(|s| {
+    s.pending_materializations
+      .get(&object)
+      .and_then(|pending| pending.registers_short)
+  })
+  .flatten();
+  let past_tolerance = past_tolerance_of(
+    registers_short,
+    live.as_ref().and_then(|fetched| fetched.past_tolerance),
+  );
   let served = call_within(
     origin,
     target,
@@ -5312,6 +5346,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           epoch: placed.epoch.0,
           head_sequence: sequence,
           from_live_log: live.is_some(),
+          past_tolerance,
         },
       };
       // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c); an
@@ -9493,7 +9528,10 @@ async fn ship_shard_heads(
   .await
   .unwrap_or_default();
   for head in work {
-    if let Some(dispatch) = ship_head(origin, owner_acceptor, local, &head, budget).await {
+    if let Some(dispatch) = ship_head(origin, owner_acceptor, local, &head, budget)
+      .await
+      .dispatch
+    {
       in_flight.push(dispatch);
     }
   }
@@ -9553,7 +9591,7 @@ async fn ship_head(
   local: HostId,
   head: &Head,
   budget: CommitBudget,
-) -> Option<Dispatch> {
+) -> HeadShipped {
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
@@ -9564,7 +9602,11 @@ async fn ship_head(
     } else {
       SHIP_HEAD_NO_SESSION
     });
-    return None; // No live session to a candidate that still needs the head; retry next period.
+    // No live session to a candidate that still needs the head; retry next period.
+    return HeadShipped {
+      dispatch: None,
+      recorded: false,
+    };
   }
   if head.live {
     // The candidates are asked now, so a held durable reply on the live volume may hold them to an answer a window
@@ -9613,7 +9655,13 @@ async fn ship_head(
   let placement = match committed.outcome {
     Ok(placement) => placement,
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
-    Err(_) => return Some(dispatch), // A runtime refusal dispatched nothing; retry next period.
+    // A runtime refusal dispatched nothing; retry next period.
+    Err(_) => {
+      return HeadShipped {
+        dispatch: Some(dispatch),
+        recorded: false,
+      };
+    }
   };
   // The owner's own acceptor keeps a single-value register at its newest position only (AUD-29-43).
   if crate::catalog::is_single_value(&head.record.value) {
@@ -9624,7 +9672,10 @@ async fn ship_head(
   crate::xshard::run_on_counted(origin, head.shard, move |s| {
     record_acks_in(s, object, sequence, epoch, placement);
   });
-  Some(dispatch)
+  HeadShipped {
+    dispatch: Some(dispatch),
+    recorded: true,
+  }
 }
 
 /// The counter naming one head or catalog commit's outcome: placed at `f + 1`, acknowledged short of it, uncertain, or
