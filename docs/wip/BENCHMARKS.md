@@ -8647,8 +8647,40 @@ dead. No defect. From losing a voter to its replacement seated, the fleet has sp
 that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
 for the seat (`wait_recovered`, `crates/cli/tests/live_chaos.rs`; until 2026-11-09 `wait_council_seated`, which
 judged the joint flag and voter agreement alone: those hold before the change begins, so on CI it passed before the
-replacement was seated in 20 of 22 failed runs, diag-live-durability-77 and -78). diag-live-durability-66 killed the owner inside
-it in 6 of 6 x86 runs.
+replacement was seated in 20 of 22 failed runs, diag-live-durability-77 and -78). diag-live-durability-66 killed the
+owner inside it in 6 of 6 x86 runs.
+
+### A live volume taken over by a node replaced at its own anchor (A-271; 2026-11-09, diag-live-durability-75, -79, -80)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release. **Command (the contract),
+each run:** `SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture
+--test-threads=1 --exact a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover`, 12 runs a leg in
+one job, the runs one after another. **Flow:** a three-node anchored fleet streams writes to a live volume; one
+candidate's node has its store destroyed mid-stream and is started again at its anchor under a new member id; the flow
+waits for the fleet to recover, then kills the owner and waits for a survivor to serve the volume. Each run printed who
+served, how long after the owner's kill, and every survivor's takeover counters (the diag-only lines, never on main).
+
+| run | tree | passed | the replacement served | the other survivor served |
+|---|---|---|---|---|
+| diag-75 | A-271 + B9 + the recipient fix, the old wait | 3 of 48 | 1 | 2 |
+| diag-79 | main B10 + the fixed wait (no A-271) | 24 of 24 | 16 | 8 |
+| diag-80 | A-271 + main B10 + the fixed wait (1e44a57e) | 48 of 48 | 26 | 22 |
+
+Seconds from the owner's kill to the volume served, diag-80 (diag-79 in brackets):
+
+| arch | the replacement served | the other survivor served |
+|---|---|---|
+| x86 | 13 runs: min 2.003, median 2.014, max 2.386 (8: 2.001, 2.010, 2.998) | 11: 2.100, 2.255, 2.707 (4: 2.031, 2.094, 2.350) |
+| arm | 13 runs: min 1.997, median 2.009, max 2.481 (8: 2.004, 2.013, 3.005) | 11: 2.158, 2.356, 2.558 (4: 2.169, 2.257, 2.497) |
+
+**Reading.** The 45 failures of diag-75 were mode B, the flow's own wait (GAPS "the store-destroyed flow's mode B"),
+not A-271: with the wait fixed, the tree without A-271 passed 24 of 24 and the tree with it 48 of 48. In diag-80
+`takeover_waits_key`, `takeover_key_arrived`, `takeover_no_key_exhausted`, `takeover_refused.no_key`,
+`fleet.takeover.reclaimed` and `fleet.takeover.lost` read 0 on every survivor of every run, so no successor waited for
+a key: the flow kills the owner only once the replacement is seated, by which time it has accepted its pair. A-271's
+bounded wait covers the owner dying before that acceptance, which this flow does not reach. The ~2.0 s before a
+replacement serves is the owner's death being judged (fleet-transport §5); the other survivor served 0.08 to 0.35 s
+later at the median, by arch and run. Owed: the same flow on the merged main.
 
 ### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
 

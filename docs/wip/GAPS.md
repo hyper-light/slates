@@ -211,6 +211,17 @@
 >   when it unwraps or the head moves, and past `NO_KEY_WAIT_NS` (ten liveness budgets) is answered
 >   `takeover_no_key_exhausted`. Counted: `takeover_waits_key`, `takeover_key_arrived`, `takeover_no_key_exhausted`.
 > Before, a successor retried each period and re-fetched the whole log 104 to 204 times a run.
+> The flow (diag-live-durability-80: A-271 with main db9c514e, the recipient fix, and the flows' fixed wait; release,
+> GitHub `ubuntu-latest` and `ubuntu-24.04-arm`, 4 CPUs each, 12 runs a leg, two legs an arch): the store-destroyed
+> takeover passed 48 of 48, every acknowledged write served by the successor. The replacement was the successor and
+> served in 26 (13 a arch), 1.997 to 2.481 s after the owner's kill (median 2.014 s x86, 2.009 s arm); the other
+> survivor in 22. On every survivor of every run `takeover_waits_key`, `takeover_key_arrived`,
+> `takeover_no_key_exhausted`, `takeover_refused.no_key`, `fleet.takeover.reclaimed` and `fleet.takeover.lost` read 0:
+> each replacement had accepted its redelivered pair before the owner died, so no successor waited for a key. Before
+> the fixed wait (diag-live-durability-75, A-271 with B9 and the recipient fix) 45 of 48 failed, mode B (below). Still
+> owed: a process test of the window the bound covers (an owner dying after a replacement joined and before it accepted
+> its pair), which no flow reaches, and the flow re-run on the merged main (BENCHMARKS "A live volume taken over by a
+> node replaced at its own anchor").
 
 > **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
 > waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
@@ -240,7 +251,8 @@
 > runs). The cached key now carries the member it was learned from (`fleet::kept_recipient`, red with the member ignored).
 > A sweep of every map keyed by anchor or certificate in `fleet`, the transport and `seal_keys` found no other keeping
 > anything from a lost store (docs/bugs/2026-11-09-a-replacements-pairs-were-wrapped-to-its-destroyed-predecessors-key.md).
-> The flow-level reproduction is re-run with A-271 once this lands.
+> Re-run with A-271 and the flows' fixed wait (diag-live-durability-80): 48 of 48 store-destroyed takeovers served, the
+> replacement the successor in 26, no key waited for (A-271's entry above).
 
 > **Fixed (live-durability, 2026-11-09, A-272): a takeover that adopted nothing could let every holder delete its copy.**
 > A round declared an object lost when its settled cohort had fewer members than its recovery quorum, dropped it from
@@ -286,7 +298,9 @@
 > 13 the change began after the wait and the owner died inside it, and in 1 the destroyed node's takeover was still
 > kept (the cohort finding above). `wait_recovered` now also needs every node's own member id among the voters and no
 > retirement kept, bounded by a fleet wait and naming what is missing. Red first:
-> `a_replacement_not_yet_voting_or_a_takeover_still_kept_is_not_recovered`. Not a slates defect.
+> `a_replacement_not_yet_voting_or_a_takeover_still_kept_is_not_recovered`. Not a slates defect. After, release on
+> both Linux arches: main B10 with the wait alone (diag-live-durability-79) passed the store-destroyed flow 24 of 24 and
+> the candidate-killed flow 12 of 12; with A-271 too (-80), store-destroyed 48 of 48.
 
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited

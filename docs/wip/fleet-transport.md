@@ -222,8 +222,9 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    the timer that arms it needs the runtime's timed receive), connection IDs, several frames per packet
    (an MTU budget), and loom on the state machine.
    **Status (2026-11-08): one judgement of a dead session.** `Endpoint::peer_silent_past(floor)` is the one
-   judgement for every caller that must end an exchange or a session on its peer's silence. It holds once this end has sent an ack-eliciting packet and nothing that opened under the session's keys
-   has come back for max(floor, `Endpoint::persistent_congestion_duration`). That duration is RFC 9002 §7.6.1's
+   judgement for every caller that must end an exchange or a session on its peer's silence. It holds once this end
+   has sent an ack-eliciting packet and nothing that opened under the session's keys has come back for max(floor,
+   `Endpoint::persistent_congestion_duration`). That duration is RFC 9002 §7.6.1's
    three probe timeouts, each floored at the initial 666 ms (§6.2.2), since a sample from a quiet path says nothing
    of the queue later traffic builds. The clock starts at the first ack-eliciting send after the peer was last heard.
    Each hearing restarts it while packets are still in flight and clears it when none are, so an idle session is

@@ -6270,6 +6270,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > holder's `ConfigurationStale` now (pages and the adopted record), so a learner successor one version behind fetches
 > the configuration rather than asking under it for good (same bug record).
 >
+> **A candidate is covered only by its current incarnation's acceptance (2026-11-09, A-271).** "A key for every remote
+> candidate" above counts a candidate only once this shard's pair to its anchor was accepted by its current member id
+> (`live_ship::covered_anchor`): a node replaced at its own anchor (its store destroyed, a new member id) is not covered
+> by its predecessor's acceptance, so writes wait until it accepts its redelivered pair, and the whole entry already
+> written for the anchor then opens for it. A successor never makes the log's key: it reads only keys recorded here
+> (`seal_keys::recorded_lineage`, `recorded_namer`), a sealed log without them is refused `no_key`, and that refusal
+> waits for the key by event, bounded by `NO_KEY_WAIT_NS` (A-271 below). The store-destroyed flow on both Linux arches:
+> 48 of 48 taken over, the replacement the successor in 26, no key waited for (diag-live-durability-80; BENCHMARKS "A
+> live volume taken over by a node replaced at its own anchor").
+>
 > **Phase one counts among the recorded holders (2026-11-06, A-240).** "Every candidate's report counts" above now
 > holds only for a candidate the shipper recorded as a holder. A member placed after the writes still reports and is
 > fenced, but does not count toward `f + 1`. Each shipper records its epoch and holders in the volume's catalog and
@@ -20162,6 +20172,17 @@ Held by `a_pair_accepted_by_a_predecessor_at_the_same_anchor_does_not_cover_its_
 (`crates/server/src/live_ship.rs`) and `a_reader_without_the_key_records_none_and_adopts_the_right_one`
 (`crates/server/tests/seal.rs`). Owed: a deterministic skip in ranking computed from the durable whole entry's cover,
 model-first, if the bounded wait proves not enough.
+
+**The flow (2026-11-09, diag-live-durability-80).** The store-destroyed takeover (`crates/cli/tests/live_chaos.rs`:
+one candidate's node destroyed mid-stream and replaced at its anchor, the fleet recovered, then the owner killed), on
+A-271 with main db9c514e and the flows' fixed wait, release, 12 runs a leg, two legs on each Linux arch: 48 of 48
+served every acknowledged write. The replacement was the successor in 26 and served 1.997 to 2.481 s after the owner's
+kill; the key-wait counters read 0 on every survivor, since the flow kills the owner only once the replacement is
+seated, by which time it has accepted its pair. The window the bounded wait covers is therefore held by the unit tests
+above, not by a flow (BENCHMARKS "A live volume taken over by a node replaced at its own anchor").
+
+Applied in the same change to: §4.10's status (the cover rule), GAPS (A-271's entry and the recipient fix's), and
+BENCHMARKS.
 
 ### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
 
