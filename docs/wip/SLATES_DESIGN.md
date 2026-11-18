@@ -5499,8 +5499,13 @@ A regional learner fetches from every member of its region it holds a session to
 list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
 to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
 adoption only moves forward.
-A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
-voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
+A learner's reports to the council go to the same members, and the leader proposes them. The configuration records the
+council's voters (A-380): once no change is in flight, the leader records the voters in force (`ConfigCommand::Seat`,
+`RegionalConfiguration::seat`), so a learner names who votes from the configuration it fetches, its contact rule reads
+them, and a seat change, a Raft configuration entry that moves no version itself, reaches every learner by the version
+its record moves, as any other change does. Before, the fetched reply named the answerer's known voters, adopted only
+with a newer view: a learner kept the voters of its join and of whichever answer first brought a version, and named a
+voter long gone (`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`, 3 of 24 runs at one CPU).
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -5511,9 +5516,9 @@ main's first gated runs, 2026-11-18). A retired member kept only its old neighbo
 A pair's canonical dialer, its lower anchor, also keeps contact with a peer that holds a record session it dialed to it
 (A-337): a peer dials and keeps one only while its own rule keeps this node, and the pair's plane is keyed only from the
 lower anchor's side, so that side follows the peer's demand whatever its own view says. Each role rule is kept from both
-sides only while both hold the same view, and a learner's voters can be stale (a seat change moves no configuration
-version, so no learner fetches on it, and a learner answered by another learner takes that one's voters): a learner, the
-pair's lower anchor, dropped a voter that kept it, and the pair was never keyed (fleet test
+sides only while both hold the same view, and a learner's voters could be stale (until A-380 a seat change moved no
+configuration version, so no learner fetched on it, and a learner answered by another learner took that one's voters): a
+learner, the pair's lower anchor, dropped a voter that kept it, and the pair was never keyed (fleet test
 `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, 2026-11-18).
 Only the lower anchor follows a session, so no two nodes keep each other by their sessions alone.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
@@ -27465,3 +27470,32 @@ rebuild closed), the bug record `docs/bugs/2026-11-18-a-live-takeover-made-its-v
 - **Owed.** The archive's layout and the restore in quantum slices (each one turn, about 0.1 s at 300 MB); the first
   publication's live whole entry sealed in turns (g230's item); a sealed volume's restore (A-347's owed restore).
 
+### A-380 — The council records its voters in the versioned regional configuration, so a learner names who votes from the configuration it fetches (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 learners; the open item A-337 recorded)
+
+- **What was there.** A learner takes no part in the council's Raft. It knew who votes from its join state's voters and
+  from the voters a fetch reply named (the answerer's known voters), adopted only with a newer configuration view. A
+  seat change is a Raft configuration entry with no command, so it moved no configuration version: no learner fetched
+  on it, and a fetch at the same version adopted nothing. So a learner kept the voters of its join, or the stale voters
+  of another learner that answered first, and named a voter long gone: `a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`
+  failed 3 of 24 runs at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2), each a learner naming only
+  the stopped bootstrapper. The contact rule read those voters too; A-337 kept the pair keyed in spite of them.
+- **The rule.** `RegionalConfiguration::voters` records the council's voters, in id order, and `seat` changes them with
+  the version, as any change does. The leader proposes `ConfigCommand::Seat` with the voters in force whenever no change
+  is in flight (it is caught up and out of any joint configuration) and they differ from the record
+  (`RegionalCouncil::record_voters`, each leader period). A learner's `known_voters` reads the record of the
+  configuration it holds, its join state's voters before any record. The fetch reply no longer carries voters, and a
+  learner keeps none of its own: the configuration carries them, and adoption moves only forward.
+- **Why this and not another.** A version is how a learner learns any change (the announcements on probes, a refusal of
+  `ConfigurationStale`, a divergence of its view); giving the voters their own version, or a learner a periodic fetch,
+  would be a second way to learn a configuration. Taking the voters from a voter's answer at the same version would let
+  two answers in flight put an older set back.
+- **What it costs.** One configuration version per seat change: a takeover round under way starts over at it (keeping
+  what it adopted), and a request carrying the previous version is refused `ConfigurationStale` and made again, as for
+  any change. The regional configuration's encoding gains the set (layout 3).
+- **What it does not change.** The council's voters themselves and how they change (Raft §6, one joint change at a time);
+  the root group's learners, which still name the root voters of their join (GAPS, the open sibling).
+
+Applied in the same change to: §4.8 (learners; A-337's paragraph), GAPS (the A-337 entry's open item),
+`crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/config_group.rs`,
+`crates/server/src/consensus.rs`, `crates/server/src/fleet.rs`, `crates/server/src/daemon.rs`, their tests, and the bug
+record `docs/bugs/2026-11-18-a-learner-named-the-voters-of-its-join-and-never-a-seat-change.md`.
