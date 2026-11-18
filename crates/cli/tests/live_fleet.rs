@@ -2387,13 +2387,15 @@ fn restart_flow(take_over: bool) {
 }
 
 /// A-344 across real processes (§4.10 live shipping, §4.8 "Recovery"; goal g229, the supervisor's request of
-/// 2026-11-18): do write half the files to a live volume through its owner, restart the owner's daemon as a crash does,
-/// its anchor kept (a warm restart), write the other half through the restarted owner, then kill the owner whole.
-/// Expect the daemon replaced, every write answered on both sides of the restart, the restarted owner's log resumed past
-/// the head it had shipped before the restart (a log begun again at position 0 is a second chain under the same epoch,
-/// which a takeover's phase one loses to the first), and a survivor serving every file byte for byte, the writes made
-/// after the restart among them. Before A-344 a restarted owner answered no write within the client's deadline and
-/// began its log again at genesis; this flow is the real-process leg of the in-process
+/// 2026-11-18): do write [`FILES`] files to a live volume through its owner, restart the owner's daemon as a crash does,
+/// its anchor kept (a warm restart), write [`FILES`] more through the restarted owner, then kill the owner whole. Expect
+/// the daemon replaced, every write answered on both sides of the restart, the restarted owner's log resumed past the
+/// head it had shipped before the restart, and a survivor serving every file byte for byte, the writes made after the
+/// restart among them. The resume is held by the head after the restart's writes: each write is its own entry, since
+/// each waits for its durability before the next, so a log that went on past the shipped head `h` ends past `h` plus
+/// those writes, where one begun again at position 0 (a second chain under the same epoch, which a takeover's phase one
+/// loses to the first) ends at their count. Before A-344 a restarted owner answered no write within the client's
+/// deadline and began its log again at genesis; this flow is the real-process leg of the in-process
 /// `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover` (`crates/server/tests/fleet.rs`).
 #[test]
 fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
@@ -2416,8 +2418,7 @@ fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
   // A read through a survivor is its own principal (A-237), so the volume is shared with each node before any of them
   // must serve it.
   share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
-  let half = FILES / 2;
-  write_files(&owner, &id, 0..half);
+  write_files(&owner, &id, 0..FILES);
   let other_refs: Vec<&String> = others.iter().collect();
   let (caught_up, before, _) = wait_caught_up(&owner, &other_refs, &id);
   assert!(
@@ -2430,12 +2431,12 @@ fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
   for other in &others {
     wait_see_each_other(&owner, other);
   }
-  let refusals = write_files_through_transient(&owner, &id, half..FILES);
+  let refusals = write_files_through_transient(&owner, &id, FILES..2 * FILES);
   let after = live_line(&owner, "shipping", &id);
   // The owner dies whole: its daemon, then its anchor.
   signal_pid(&daemon_after, "-KILL");
   drop(fleet.daemons.remove(owner_index));
-  let served = std::panic::catch_unwind(|| wait_served_whole(&other_refs, &id, FILES).0).ok();
+  let served = std::panic::catch_unwind(|| wait_served_whole(&other_refs, &id, 2 * FILES).0).ok();
   let counters: Vec<_> = others
     .iter()
     .map(|survivor| (survivor.clone(), live_counters(survivor)))
@@ -2455,9 +2456,14 @@ fn a_live_owners_writes_after_its_warm_restart_survive_its_death() {
       .as_ref()
       .and_then(|(head, _, _)| head.parse::<u64>().ok())
   };
+  let written_after = u64::try_from(FILES).unwrap();
   assert!(
-    matches!((head_of(&before), head_of(&after)), (Some(shipped), Some(resumed)) if resumed > shipped),
-    "the restarted owner's log went on past the head it shipped before the restart: {before:?} then {after:?}"
+    matches!(
+      (head_of(&before), head_of(&after)),
+      (Some(shipped), Some(resumed)) if resumed > shipped + written_after
+    ),
+    "the restarted owner's log went on past the head it shipped before the restart, {written_after} writes on: \
+     {before:?} then {after:?}"
   );
   assert!(
     served.is_some(),
