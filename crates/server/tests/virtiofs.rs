@@ -246,6 +246,123 @@ fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs(
   drop(daemon);
 }
 
+/// A SETXATTR body (`fuse_setxattr_in`: the value's size, flags; then the name, its NUL, the value).
+fn setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// A GETXATTR body (`fuse_getxattr_in`: the caller's buffer size, padding; then the name and its NUL).
+fn getxattr_body(name: &[u8]) -> Vec<u8> {
+  let mut body = 256u32.to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body
+}
+
+/// A-290: slates' own virtio-fs device is a guest kernel's route. Do: through an in-process guest device, create a
+/// file, give it `security.capability` and `trusted.overlay.origin`, and read both back; then list the file's
+/// attributes over the daemon's NFSv4.2 port, a host's mount. Expect the sets and reads served with the values the
+/// guest set, and the host's listing empty.
+#[test]
+fn a_guest_devices_own_attributes_are_kept_and_no_hosts_mount_lists_them() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-attributes");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("attributes")) else {
+    panic!("the volume was not created");
+  };
+  /// A file capability as `setcap` writes one (`vfs_cap_data` revision 2, `CAP_NET_BIND_SERVICE` permitted).
+  const CAPABILITY: &[u8] = &[1, 0, 0, 2, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  let (outcome, answers) = run_guest(
+    &daemon,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Create.to_wire(), 1, 1, &create_body("bin")),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let mut answers = vec![reply_error(&created)];
+        let attributes: [(&[u8], &[u8]); 2] = [
+          (b"security.capability", CAPABILITY),
+          (b"trusted.overlay.origin", b"origin"),
+        ];
+        for (unique, (name, value)) in (2u64..).zip(attributes) {
+          let set = round_trip(
+            &kick_write,
+            &call_read,
+            &message(
+              Opcode::SetXattr.to_wire(),
+              unique,
+              ino,
+              &setxattr_body(name, value),
+            ),
+          )
+          .await;
+          let got = round_trip(
+            &kick_write,
+            &call_read,
+            &message(
+              Opcode::GetXattr.to_wire(),
+              unique + 10,
+              ino,
+              &getxattr_body(name),
+            ),
+          )
+          .await;
+          answers.push(reply_error(&set));
+          answers.push(reply_error(&got));
+          answers.push(i32::from(got.get(OUT_HEADER_LEN..) == Some(value)));
+        }
+        let released = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Release.to_wire(), 30, ino, &release_body(fh)),
+        )
+        .await;
+        answers.push(reply_error(&released));
+        drop(kick_write);
+        answers
+      })
+    },
+  );
+  assert_eq!(
+    answers,
+    vec![0, 0, 0, 1, 0, 0, 1, 0],
+    "the create, each set and read (its value the guest's), and the release"
+  );
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let capability_path = daemon
+    .mount_capability("attributes")
+    .expect("the owner shard answers")
+    .expect("the volume is served");
+  let mut host = common::nfs4::Session::open(port, b"virtiofs-attributes");
+  assert_eq!(
+    host.xattrs(&capability_path, &["bin"]),
+    Vec::<(Vec<u8>, Vec<u8>)>::new(),
+    "a host's mount lists none of the guest's own"
+  );
+  drop(client);
+  drop(daemon);
+}
+
 /// §4.13: a guest whose enrolled consumer is not on the volume's access list is authenticated and
 /// admitted with no rights, so its every effect is refused at the seam — a CREATE through the
 /// device is answered `EPERM`, and nothing lands in the volume.

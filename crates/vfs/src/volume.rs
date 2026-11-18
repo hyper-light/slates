@@ -5647,6 +5647,78 @@ impl Volume {
     Ok(())
   }
 
+  /// What recorded attachment `attachment` holds now: its references by inode, each with how many of them are open
+  /// handles, in inode order (A-303: the tables a Shards stream hands its device at a VM's save, Shards' D176 part 5).
+  /// The same shape as the recovery image's ([`Volume::attachment_references`]), for one attachment. Empty for an
+  /// attachment holding nothing.
+  pub fn held_by(&self, attachment: u64) -> Vec<crate::recover::InodeReferences> {
+    self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .map(|inodes| {
+        inodes
+          .iter()
+          .map(|(no, count)| crate::recover::InodeReferences {
+            inode: no.0,
+            count: *count,
+            opens: self.attachment_open_count(attachment, *no),
+          })
+          .collect()
+      })
+      .unwrap_or_default()
+  }
+
+  /// Gives recorded attachment `attachment`, which holds nothing yet, the references and open handles `held` names
+  /// (A-303: a restored VM's stream takes what its saved stream held, on the volume saved or a clone of its cut, which
+  /// shares its numbers). The opens are restored as a takeover's are ([`Volume::restore_references`], A-152): a handle
+  /// the guest's kernel kept from the saved stream gives its open back at its release, as one issued before a takeover
+  /// does. Everything is checked before anything is given, so a refusal changes nothing: the attachment must hold
+  /// nothing, the entries must name each inode once in rising order, each with at least one reference and no more opens
+  /// than references, of an inode the volume holds, whose count can take them. A file the guest holds with no name left
+  /// is held again by these references, so it lasts until the guest lets it go.
+  pub fn adopt_held(
+    &mut self,
+    store: &Store,
+    attachment: u64,
+    held: &[crate::recover::InodeReferences],
+  ) -> Result<(), VfsError> {
+    if self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .is_some_and(|inodes| !inodes.is_empty())
+    {
+      return Err(VfsError::Invalid);
+    }
+    let rising = held.windows(2).all(|pair| match pair {
+      [before, after] => before.inode < after.inode,
+      _ => true,
+    });
+    if !rising {
+      return Err(VfsError::Invalid);
+    }
+    for entry in held {
+      let no = InodeNo(entry.inode);
+      if entry.count == 0 || entry.opens > entry.count {
+        return Err(VfsError::Invalid);
+      }
+      self.namespace_inode(store, no)?;
+      let global = self.references.get(&no).copied().unwrap_or(0);
+      if global.checked_add(entry.count).is_none() {
+        return Err(VfsError::TooManyLinks);
+      }
+    }
+    for entry in held {
+      self.restore_references(
+        store,
+        attachment,
+        InodeNo(entry.inode),
+        entry.count,
+        entry.opens,
+      )?;
+    }
+    Ok(())
+  }
+
   /// The inodes the recovery restored opens of for `owner` that are not given back yet (A-152): the files a mount taken
   /// over by this daemon holds open from before the takeover, as far as the last publication counted. The mount tracks
   /// their byte states from its start ([`Volume::release_restored_open`] gives each back at its handle's release).

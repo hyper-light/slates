@@ -3377,6 +3377,51 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   );
 }
 
+/// A-290: a guest's own attribute namespaces are its kernel's to set, and a declaration is a host's channel. Do: on a
+/// work, declare `security.capability` and `trusted.overlay.opaque` set, then `trusted.overlay.opaque` removed, then a
+/// `user.` attribute set. Expect each of the guest's names refused `Unsupported`, naming the attribute, and the
+/// `user.` one declared on the same work.
+fn declare_guest_attribute_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
+  use slates_ipc::protocol::WorkOp;
+  let work = work_over(client, green, "guest-attributes");
+  for op in [
+    WorkOp::SetXattr {
+      path: "f".to_owned(),
+      name: "security.capability".to_owned(),
+      value: vec![1, 0, 0, 2],
+    },
+    WorkOp::SetXattr {
+      path: "f".to_owned(),
+      name: "trusted.overlay.opaque".to_owned(),
+      value: b"y".to_vec(),
+    },
+    WorkOp::RemoveXattr {
+      path: "f".to_owned(),
+      name: "trusted.overlay.opaque".to_owned(),
+    },
+  ] {
+    let name = match &op {
+      WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } => name.clone(),
+      _ => unreachable!("only attribute declarations are made here"),
+    };
+    match client.call(&RequestBody::Declare { work, op }) {
+      ReplyBody::Refused {
+        refusal: Refusal::Unsupported { feature },
+      } => assert!(feature.contains(&name), "{feature}"),
+      other => panic!("a host's channel declared {name}: {other:?}"),
+    }
+  }
+  declare(
+    client,
+    work,
+    WorkOp::SetXattr {
+      path: "f".to_owned(),
+      name: "user.kept".to_owned(),
+      value: b"v".to_vec(),
+    },
+  );
+}
+
 /// The namespace and metadata declarations (§4.16) over the wire: a work declares directories,
 /// symlinks, modes and extended attributes — the dimensions beyond content — and they merge. The
 /// xattr sub-test is the non-vacuity for the post-state seal (an identical value must accept).
@@ -3405,6 +3450,7 @@ fn merge_declare_scenario() {
   ));
   declare_metadata_part(&mut client, green);
   declare_xattr_part(&mut client, green);
+  declare_guest_attribute_part(&mut client, green);
   daemon.stop();
 }
 

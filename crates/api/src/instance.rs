@@ -270,11 +270,11 @@ impl Instance {
   /// `volume`'s status (§4.14), typed: its bytes, lease, attachments, head, placement, transports, mounts, journal, and
   /// an overlay's base with its drift.
   pub fn status(&mut self, volume: VolumeId) -> Result<VolumeStatus, Error> {
-    let report = self
+    self
       .client
       .status(volume)
-      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
-    status_of(report)
+      .map(status_of)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
   /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
