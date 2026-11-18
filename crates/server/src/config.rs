@@ -428,6 +428,10 @@ pub struct DaemonConfig {
   /// one bulk chunk of a client's region holds past the report's fixed part, measured from the wire
   /// encoding at boot.
   pub telemetry_spans_per_reply: usize,
+  /// Derived: the replicas a green's owner takes (A-457, A-273 step 5a; `crate::green_replicas`):
+  /// `slates_merge::replica::replica_limit` of the runtime's shards, a replica on each other shard of the node and its
+  /// rebuild's fresh one beside it; none with one shard (R8).
+  pub replica_limit: usize,
   /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
   /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
@@ -913,6 +917,33 @@ impl DaemonConfig {
       green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
       audit_records: audit_records.get(),
     };
+    // A green's replicas on the node's other shards (A-457, A-273 step 5a; `crate::green_replicas`): how many its owner
+    // takes, and at boot the most each may hold and what the owner keeps for them. Each making takes its shard's
+    // admittable room then, and each settle the owner's own retention then: the live figures are the inputs (D-11).
+    let replica_limit: Derived<usize> = derived!(
+      slates_merge::replica::replica_limit(usize::from(runtime.shards.max(1))),
+      "(shards − 1) × 2: a replica on each other shard of the node and its rebuild's fresh one beside it; none with \
+       one shard",
+      ["shards"]
+    );
+    derivations.push(note("replica_limit", &replica_limit));
+    let replica_budget: Derived<usize> = derived!(
+      slates_merge::replica::replica_budget(
+        caps.green_chain_bytes,
+        usize::try_from(reserve.get()).unwrap_or(usize::MAX)
+      ),
+      "min(green_chain_bytes, the shard's room): the per-green budget, and at most the shard's reserve; each making \
+       takes the shard's admittable room then",
+      ["table_bytes", "reserve_per_shard"]
+    );
+    derivations.push(note("replica_budget_bytes", &replica_budget));
+    let replica_held: Derived<usize> = derived!(
+      slates_merge::replica::held_limit(caps.green_chain_bytes, 0),
+      "green_chain_bytes − the owner's own retention (none at boot): what an owner keeps for its replicas; each settle \
+       takes its own retention then",
+      ["table_bytes"]
+    );
+    derivations.push(note("replica_held_limit_bytes", &replica_held));
     // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
     // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
     // (an inode is a version slot and a table slot; a directory a node and a block), so the slabs'
@@ -1115,6 +1146,7 @@ impl DaemonConfig {
       page_fault_ns: page_fault_ns.get(),
       codec,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
+      replica_limit: replica_limit.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,
