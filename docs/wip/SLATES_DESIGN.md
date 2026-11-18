@@ -22833,16 +22833,20 @@ Applied in the same change to:
   horizon), not for a liveness budget. Ending only with a look begun after it means a round that outlasted the horizon
   is followed by one more look, and the direct route asked after each round sees what the shard read while the round
   waited on its peers.
-- **The forms that did not land.** Two longer budgets: clients' polls (a liveness budget's worth at the poll interval,
-  capped by the failover SLO), and the horizon followed by two waits of the control shard in its driver (A-292's
-  receiver rule). With either, the five-node takeover test
-  `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` failed on GitHub's runners
-  where main's budget passed it 14 of 14 (`diag-g255-loc-red-1`, `-red-3`): the polls 2 of 6 (`-green-1`, run
-  44254608282), the waits 4 of 15 (`-green-3`, run 44257318582: ubuntu-latest and windows-latest 2 of 5 each), each
-  failure running its deadline out (the resend refused, the green never served again). The mechanism was not measured
-  apart; the likely one is a busy control shard, which rarely waits in its driver, holding the location to the SLO while
-  its rounds borrow the record sessions the takeover needs.
-- **Evidence.** EVIDENCE_LOC
+- **The forms that did not land.** Clients' polls (a liveness budget's worth at the poll interval, capped by the
+  failover SLO): a round that waits a liveness budget on a silent peer makes each poll a second, so a forward's
+  location runs to the SLO, ten times main's second. And the horizon followed by two waits of the control shard in its
+  driver (A-292's receiver rule): a busy shard rarely waits, so it too runs to the SLO (A-315 found the same on the
+  forward lane). Built first on main as of `9addf53ef`, each rewrite, this one included, made the five-node takeover test
+  `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` fail there (2 of 6, 4 of 15
+  and 8 of 24 GitHub runs, against 0 of 9 on that base's own budget). On main as of `bfc34cace` this form passes it 16
+  of 16 on ubuntu-latest and windows-latest, as main does (`diag-g255-a255-green-1`, `-red-1`); what changed between
+  the two bases to make the difference was not traced.
+- **Evidence.** On GitHub's ubuntu-latest, macos-latest and windows-latest runners (2026-11-18):
+  `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` failed 3 of 3 on each over main's budget,
+  the location never looking again (`diag-g255-loc-red-1`, `-red-3`), and passed 3 of 3 on each with this form, as did
+  `the_failover_slo_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
+  (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 on current main (above).
 - **Cost.** None at the location's steady state: one more look at the direct route a round. A location that cannot find
   its owner ends one look past the horizon: about a poll interval when its rounds are answered, and one round's wait
   when they wait on a silent peer.

@@ -2065,8 +2065,10 @@
 >   each round, within the failover SLO (`fleet.owner_location.gave_up`, `.budget_spent`, `.slo_ended`;
 >   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget`,
 >   `the_failover_slo_ends_a_forwards_location_budget`). Two longer budgets did not land: clients' polls and the horizon
->   followed by the control shard's two driver waits each made the five-node takeover test fail (2 of 6 and 4 of 15 CI
->   runs, against 0 of 14 on main's budget).
+>   followed by the control shard's two driver waits each run a forward's location to the failover SLO, the polls when
+>   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
+>   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
+>   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
 >   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
 >   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
 

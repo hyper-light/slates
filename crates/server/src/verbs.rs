@@ -1948,10 +1948,10 @@ const WORK_GONE_HERE: &str = "fleet.owner_location.work_gone_here";
 /// work, so a refutation the shard read meanwhile is seen before the location gives up. Before, one liveness budget of
 /// wall time ran out on a control shard kept off its CPU while that gossip waited to be read (clients' runs, nice 19
 /// beside two spinners a CPU: 1 or 2 calls refused in every false death), and a single round waiting on silent peers
-/// spent it whole, so the location never looked again. Two longer budgets were tried and refused by the five-node
-/// takeover test (`a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round`, 0 of 14 runs
-/// failed on main): counted in polls (clients' `3c072f490`), failed 2 of 6; the horizon followed by two waits of the
-/// control shard in its driver, failed 4 of 15. The operator's failover SLO caps the whole on the wall.
+/// spent it whole, so the location never looked again. Counted in polls (clients' `3c072f490`), a location whose
+/// rounds each wait a liveness budget on a silent peer ran to the failover SLO, ten times main's second; ended by the
+/// control shard's driver waits (A-292's rule), a busy shard, which rarely waits, held it to the SLO too (A-315 found
+/// the same on the forward lane). The operator's failover SLO caps the whole on the wall.
 async fn locate_within_budget(query: crate::owner_location::Query) -> Option<HostId> {
   let located = locate_within_horizon(query).await;
   if located.is_none() {
