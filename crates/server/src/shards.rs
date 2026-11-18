@@ -902,13 +902,13 @@ fn hand_out(
 }
 
 /// macOS: the end is offered on the socket route under `secret` (`crate::shards_route`), the device's end of its resync
-/// channel beside it when one was made (A-339), and the reply carries the secret. An offer whose expiry could not be
-/// armed is dropped at once, closing the ends, so the stream ends its attachment, and the attach is refused
-/// `Overloaded`.
+/// channel beside it when one was made (A-339), and the reply carries the secret. The offer is the requesting client's,
+/// named by the request's word: it waits for that client's claim while the client lives, and goes with it when the
+/// reaper retires it (A-492).
 #[cfg(target_os = "macos")]
 fn hand_out(
   s: &mut ShardState,
-  _request: u64,
+  request: u64,
   attached: ShardsAttached,
   capability: slates_ipc::protocol::AttachmentCapability,
   secret: Prepared,
@@ -919,16 +919,13 @@ fn hand_out(
     stream,
     resync,
   } = attached;
-  if !crate::shards_route::offer(
+  crate::shards_route::offer(
     s,
     (slates_ipc::route::OfferKind::Stream, attachment),
+    slates_wire::request::RequestId::from_word(request).client,
     secret,
     (stream, resync),
-  ) {
-    return slates_ipc::protocol::ReplyBody::Refused {
-      refusal: Refusal::Overloaded { shard: s.shard },
-    };
-  }
+  );
   slates_ipc::protocol::ReplyBody::ShardsOffered {
     attachment,
     lease_epoch,

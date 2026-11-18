@@ -4652,6 +4652,7 @@ async fn init_shard(
     council_learner_pace: crate::fleet::LearnerPace::default(),
     learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
+    root_newer_seen: None,
     record_sessions: std::collections::BTreeMap::new(),
     record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
@@ -7271,7 +7272,7 @@ mod tests {
       }));
       assert!(state.council.configuration().version > installed);
       let query = crate::owner_location::Query::new(state, object, 0);
-      crate::owner_location::serve(state, &query.to_bytes())
+      crate::owner_location::serve(state, HostId(local.0 ^ 1), &query.to_bytes())
     });
     assert!(
       matches!(claimed, Ok((_, None))),

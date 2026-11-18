@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **§4.17 version-control servers: the shared mapping is designed, nothing is built (2026-11-18, A-497, D-28; UI goal 91;
+> owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches, pushes, stacked changes,
+> review requests, objects and history onto greens and works; §4.17.2 (git), §4.17.3 (Mercurial) and §4.17.4
+> (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces of §4.17.1 (the repository record
+> and green ids carrying its partition; one register entry for several greens; the object store and its index; works
+> from a client's push, with the head operation and the client-fidelity test; works over works and bases given as trees;
+> review records; policy and hooks), then each tool's pieces. No speed is claimed until main measures it by §4.17.1's
+> method.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
@@ -2662,7 +2671,8 @@
 >   5% of its time and a slice to a heartbeat period; 16 greens over a held 78-file tree recovered in 2.82 s of CPU in 959
 >   slices with the beat never older than 496 ms, where main went 2.20 s without a beat
 >   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
-> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
+> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients).
+>   Closed by A-468 (2026-11-18): a reconnect waits while the instance's anchor lives, however long the restart takes;
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
 > - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
 >   wake probe now runs past its wall while each round's waiter runs at all, rounds doubling from one window to 4 s (7.75 s
@@ -3843,8 +3853,11 @@
 >   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
 >   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
 >   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
->   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
->   the owner shard would make `moves::seal_adopted` idempotent. **Class C, the rendezvous's claim (A-443, 2026-11-18,
+>   way: an adopted move's seal was still taken again when its answer was lost to a stopped shard. Closed by A-488
+>   (2026-11-18, g225): the owner shard records the seal on the volume (`VolumeSlot::adopted_seal`), and
+>   `verbs::seal_adopted_head` answers a second ask the recorded seal
+>   (`an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once`). **Class C, the rendezvous's
+>   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
 >   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
@@ -3878,19 +3891,42 @@
 >   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
 >   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
 >   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
->   left (twice it); a Windows claim's wait under a live anchor (at least it; A-468 replaces it with the anchor's
->   life); one more of it for a claim the daemon took to answer; and the async connect's pacing (a tenth of it,
->   `Connecting::next_poll_ns`). Owed in C-b: the reply deadline's other users,
+>   left (twice it); and the pacing of an async connect's and a reconnect's polls (a tenth of it,
+>   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
+>   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
+>   C-b: the reply deadline's other users,
 >   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
 >   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own; then the reconnect budget (part 2) and macOS's `MOUNT_CALL_DEADLINE` (part
->   3). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   borrows the reply deadline for its own; and macOS's `MOUNT_CALL_DEADLINE` (part 3). The reconnect since A-468
+>   (2026-11-18, g251b; C-b's second part): a client whose daemon was gone reconnected for the reconnect budget
+>   (`Deadlines::reconnect_ns`, the recovery budget and a liveness window, two seconds), and a claim under a live anchor
+>   waited at most that budget, so a restart slower than it failed the anchor's clients and a daemon nothing would
+>   restart was reported gone two seconds late. Now a claim carries no restart bound and waits while its rendezvous's
+>   holder lives (the anchor across restarts, or the daemon holding its own; on Windows the anchor's process id and
+>   creation time in the bootstrap header, layout `SLB4`), and a refused claim asks `slates_ipc::holder_lives`: a holder,
+>   and the client claims again; none, and it fails `DaemonGone` at once
+>   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
+>   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
+>   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
+>   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `Client::call_through_transient`), owed to the failover delay the daemon reports; and the server's reclaim of a
+>   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") still mirrors the old
+>   reconnect budget, a fixed two seconds R3 forbids, owed. macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
->   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. C-c's first part since A-492
+>   (2026-11-19, g232): the macOS socket route's offer lived two liveness budgets on a timer and its exchange gave the
+>   client one budget, so a live client slower than either found no offer or was dropped mid-claim; now an offer waits
+>   while the client it was made for lives (let go when the reaper retires that client,
+>   `shards_route::let_go_of_client`, which ends a stream's attachment as its end closes) and an exchange waits on its
+>   client while the client's connection lives (`an_offer_waits_for_its_live_clients_claim_past_any_fixed_life`,
+>   `an_exchange_serves_a_live_client_slower_than_any_fixed_bound`,
+>   `a_retired_clients_offers_are_let_go_and_their_ends_closed`); owed: a cross-process test of a client killed before
+>   its claim. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -4157,7 +4193,8 @@
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
->   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stays open here;
+>   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stayed open here until
+>   A-468 (2026-11-18), when a reconnect came to wait while the instance's anchor lives, however long the start takes;
 >   recovery in one poll closed the same day (below). Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
 >   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
 >   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).
@@ -4509,6 +4546,17 @@
 > the quorum collector's change: `4a221524` 1/50, `21da6e57` 0/50 on one busy CPU. The test now waits until the
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
+
+> **A root learner behind its asker's root refused every location round: fixed (2026-11-18, A-489, §4.8 Lookup).** The
+> same test failed 2 of 3 on main's quiet Mac Studio (main 3022c6894 and 2a5bf7264) with `OwnerUnreachable`. The
+> successor, a root learner, counted `root_view_differs` once for each of the foreign voter's 58 and 68 rounds until the
+> lookup's budget ran out. A seat change moves the root's version (A-406) and nothing a learner compared, so a learner
+> that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
+> learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
+> fleet test's runs are filed for main. **Open:** the converse. An asker behind its peers' root is refused with an empty
+> reply that tells it nothing, so it needs a refusal that names the peer's version: a reply format change (SLATES_DESIGN
+> A-489, owed). Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
