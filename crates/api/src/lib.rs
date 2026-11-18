@@ -193,10 +193,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// conflict (the same day). 28: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
 /// was replaced; `merge` and `rebase` answer every window of a verdict however many, a signed merge's too (A-267) (the
 /// same day). 29: `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it
-/// passes; `drift` answers its lists in path order (A-267) (the same day).
+/// passes; `drift` answers its lists in path order (A-267) (the same day). 30: `AuditKind::GrantExpired`, the record a
+/// grant's end at its term leaves in the audit (A-266) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 29;
+pub const CONTRACT: u32 = 30;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

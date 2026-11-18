@@ -16,6 +16,7 @@ AuditKind 3 LandingValidated
 AuditKind 4 EntryWritten
 AuditKind 5 EntryRefused
 AuditKind 6 LandingFinished
+AuditKind 7 GrantExpired
 BaseRecord 0 Scratch
 BaseRecord 1 Path
 BaseRecord 2 Image

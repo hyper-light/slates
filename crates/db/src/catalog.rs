@@ -926,6 +926,9 @@ pub enum AuditKind {
   EntryRefused,
   /// The landing reached a terminal state.
   LandingFinished,
+  /// A grant reached its term unused and ended (A-266): recorded with the grant's end, in one atom, under the principal
+  /// the grant was made for, since no one acted. Appended last, so no published tag moves (D-15).
+  GrantExpired,
 }
 
 /// One audit record; content-free except the manifest hash.

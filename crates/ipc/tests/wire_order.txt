@@ -27,6 +27,7 @@ AuditKind 3 LandingValidated
 AuditKind 4 EntryWritten
 AuditKind 5 EntryRefused
 AuditKind 6 LandingFinished
+AuditKind 7 GrantExpired
 BaseReport 0 Read
 BaseReport 1 Unreadable
 CauseRecord 0 Root

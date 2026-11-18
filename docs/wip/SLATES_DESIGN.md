@@ -9116,7 +9116,7 @@ enum Verdict { Apply, Skip /* disk already holds it */, AcceptIdentical, Conflic
 enum ConflictClass { ModifyModify, ModifyDelete, DeleteModify, RenameRename, CreateCreate, TypeChanged, TargetInUse }
 struct LandingLease { target: CanonicalTarget /* device and inode */, holder: AttemptId /* one landing attempt (A-47) */,
                       generation: u64 /* the take's log sequence on the control partition */, expires: Monotonic }
-struct AuditRecord { seq: u64, at: Monotonic, kind: AuditKind /* GrantIssued | GrantRevoked | LandingPlanned | LandingValidated | EntryWritten | EntryRefused | LandingFinished */,
+struct AuditRecord { seq: u64, at: Monotonic, kind: AuditKind /* GrantIssued | GrantRevoked | LandingPlanned | LandingValidated | EntryWritten | EntryRefused | LandingFinished | GrantExpired (A-266) */,
                      grant: Option<GrantId>, landing: Option<RequestId>, manifest: Option<Blake3>, outcome: Option<LandingState>,
                      signature: Option<SignatureVerdict> /* A-321: how a landing's signature was judged, on its LandingPlanned and LandingFinished records */ }
 ```
@@ -27689,7 +27689,18 @@ tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/
   names the target, in the statement a signature signs: a presentation whose reply would not fit one reply beside its
   summary and verdict is refused the same way before anything is recorded, naming the longest that one holds
   (`presentation_overflow`).
-- **Open:** an expiry writes no audit record.
+- **An expiry is audited (2026-11-18, goal g247; closes this entry's open item).** Applied to §4.15 (`AuditRecord`'s
+  kinds), `crates/db/src/catalog.rs` (`AuditKind::GrantExpired`, appended and published, D-15),
+  `crates/server/src/landing.rs` (`end_expired_grants`, `record_expiry`), `crates/land/src/grant.rs` (`check`),
+  `crates/ipc/src/protocol.rs` (the wire's typed `AuditKind::GrantExpired`, appended and published), `crates/api`
+  (`AuditKind::GrantExpired`, `CONTRACT` 30), GAPS,
+  `docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`.
+  - The sweep records each expiry with a `grant_expired` record in one atom, under the principal the grant was made
+    for (no one acted) and the manifest it bound; on another shard the committed atoms' records are owed to the
+    control partition and sent as the sweep's one batch, so AC-2.10's "every grant" holds for its end as for its issue.
+  - A check only reads. A landing's check marked a grant past its term expired in its shard's table alone, and the
+    sweep, which takes issued grants past their term, passed it over: it was never recorded ended, stayed listed as
+    issued, and stayed in the table until a restart. Now it is refused as expired and left for the sweep.
 
 ### A-267 — A status's drift is carried as far as one reply holds, counted past it, and paged (accepted 2026-11-08)
 Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/protocol.rs` (`StatusReport::drifted_elided`,

@@ -1231,9 +1231,22 @@
 > - **`grants`: paged, and the table holds live grants (A-266, 2026-11-08).** Refused between 25 and 50 grants; paging
 >   it found every grant kept for the daemon's life and none ended at its term. Now paged in grant-id order, a grant
 >   leaves the table at its terminal step (its history is the audit), the reap ends grants past their term, and a
->   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting. **Open:** an expiry
->   writes no audit record, so an expired grant's history is its `grant_issued` alone
+>   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting
 >   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
+>   - **An expiry is audited, and a grant a landing found past its term ends too: fixed (2026-11-18, goal g247).** An
+>     expiry wrote no audit record, so an expired grant's history was its `grant_issued` alone; each is now recorded
+>     with a `grant_expired` record in one atom (`record_expiry`), sent to the control partition from another shard as
+>     the sweep's one batch. And a landing's check marked a grant past its term expired in its shard's table alone,
+>     which the sweep, taking issued grants, passed over: the grant was never recorded ended, stayed listed as issued
+>     and stayed in the table until a restart. The check now only reads. Tests:
+>     `every_grant_ended_at_its_term_leaves_its_expiry_in_the_audit` and
+>     `a_grant_a_landing_found_past_its_term_still_ends_and_is_audited` (`crates/server/tests/grants_pages.rs`),
+>     `a_grant_a_landing_found_past_its_term_is_still_due_for_the_sweep` (`crates/land/src/grant.rs`)
+>     (`docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`).
+>   - **Open (sibling, found 2026-11-18):** `issue_grant` issues in the shard's table before the durable `GrantIssued`,
+>     and nothing takes it back when that append or its atom's commit is refused, so a refused issue leaves a grant the
+>     durable table never held, which the sweep cannot record (`NotFound` each tick) and which stays until a restart.
+>     Reached only through a refused log append.
 > - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
 >   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
 >   page at a time, `slates status --drift` walks it, and both SDKs read it whole with `drifted(volume)`. Since

@@ -2747,18 +2747,68 @@ fn end_grants_recorded_ended(state: &mut ShardState, ops: &[Op]) {
 }
 
 /// The grants past their term end (A-266), once a reap tick: each is recorded `Expired`, which takes it out of the
-/// durable table, and then leaves the runtime one. A grant that cannot be recorded stays, and the next tick tries
-/// again; one in use by a running landing is unaffected, since the run holds its own copy of the grant it checked.
+/// durable table, with its `grant_expired` audit record in the same atom ([`record_expiry`]), and then leaves the
+/// runtime one. A grant that cannot be recorded stays, and the next tick tries again; one in use by a running landing is
+/// unaffected, since the run holds its own copy of the grant it checked. On a shard other than the control shard the
+/// committed atoms' audit records are sent to it as one batch once the sweep is done: a refused atom's records are
+/// dropped with it (`reconcile_unpublished_effects` clears what is owed), so each committed atom's are set aside first.
 pub fn end_expired_grants(state: &mut ShardState) {
   let now = state.clock.monotonic_ns();
+  let mut owed = Vec::new();
   for id in state.landing.grants.expired_at(now) {
-    let op = Op::GrantStateChanged {
-      id: id.0,
-      state: DbGrantState::Expired,
-    };
-    if state.db.mutate(&mut state.segment, &op, now).is_ok() {
+    if record_expiry(state, id.0, now) {
       state.landing.grants.end(id);
       state.count(GRANTS_EXPIRED, 1);
+      owed.append(&mut state.landing.audit_owed);
+    }
+  }
+  state.landing.audit_owed.append(&mut owed);
+  send_owed_audit(state);
+}
+
+/// Records grant `id`'s expiry and its audit record as one atom (A-266; AC-2.10, every grant's history in the audit):
+/// whether it committed. The record names the principal the grant was made for, since no one acted, and the manifest it
+/// bound. A grant the durable table does not hold is not recorded; a refused change applies nothing, so the atom
+/// commits nothing; and a refused commit rolls both back, the owed audit record with them. The audit record cannot be
+/// refused once the change applied: an `AuditAppended` is never refused and its apply cannot fail, and on another
+/// shard it is only owed.
+fn record_expiry(state: &mut ShardState, id: u64, now: u64) -> bool {
+  let Some((principal, manifest)) = state
+    .db
+    .partition()
+    .grant(id)
+    .map(|grant| (grant.principal.clone(), grant.manifest))
+  else {
+    return false;
+  };
+  let audit = DbAuditRecord {
+    seq: 0,
+    at_ns: now,
+    kind: DbAuditKind::GrantExpired,
+    principal,
+    grant: Some(id),
+    landing: None,
+    manifest: Some(manifest),
+    outcome: None,
+    // No landing judged here: a grant's end is no landing's record (A-321's signature is on those alone).
+    signature: None,
+  };
+  let op = Op::GrantStateChanged {
+    id,
+    state: DbGrantState::Expired,
+  };
+  state.db.begin();
+  let applied = state
+    .db
+    .mutate(&mut state.segment, &op, now)
+    .and_then(|_| write_audit(state, vec![audit], now));
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => applied.is_ok(),
+    Err(e) => {
+      let refusal = crate::error::refusal_of_db(&e);
+      state.count(crate::verbs::refusal_name(&refusal), 1);
+      crate::verbs::reconcile_unpublished_effects(state);
+      false
     }
   }
 }
@@ -3834,6 +3884,7 @@ fn wire_audit_kind(kind: DbAuditKind) -> slates_ipc::protocol::AuditKind {
     DbAuditKind::EntryWritten => Kind::EntryWritten,
     DbAuditKind::EntryRefused => Kind::EntryRefused,
     DbAuditKind::LandingFinished => Kind::LandingFinished,
+    DbAuditKind::GrantExpired => Kind::GrantExpired,
   }
 }
 
@@ -3846,6 +3897,7 @@ fn audit_kind_name(kind: DbAuditKind) -> String {
     DbAuditKind::EntryWritten => "entry_written",
     DbAuditKind::EntryRefused => "entry_refused",
     DbAuditKind::LandingFinished => "landing_finished",
+    DbAuditKind::GrantExpired => "grant_expired",
   }
   .to_owned()
 }
