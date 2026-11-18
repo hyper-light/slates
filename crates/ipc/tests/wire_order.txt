@@ -408,6 +408,8 @@ TargetRefusal 11 MountRefused
 TargetRefusal 12 NotADriveLetter
 TargetRefusal 13 AnchorHold
 TargetRefusal 14 DetachPending
+TargetRefusal 15 MountManagerNotAllowed
+TargetRefusal 16 DriveLetterTaken
 UnsupportedReason 0 HostPlatform
 UnsupportedReason 1 ListenerNotBound
 UnsupportedReason 2 MountNeedsPrivilege

@@ -3,8 +3,8 @@
   "suite": "workloads",
   "transport": "native-windows-winfsp",
   "host": {
-    "os": "Microsoft Windows [Version 10.0.26100.33828]",
-    "kernel": "Microsoft Windows [Version 10.0.26100.33828]",
+    "os": "Microsoft Windows [Version 10.0.26100.33674]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33674]",
     "arch": "x86_64",
     "privilege": "root"
   },
@@ -51,7 +51,7 @@
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 49518,
+  "duration_ms": 49213,
   "notes": [
     "the volume was created with --fold=true to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s",
     "on Windows the roster runs its version-control workloads (A-300); owed a Windows form: cargo, npm, python, rg, rsync, sqlite, editor, watcher",

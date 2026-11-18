@@ -1,5 +1,5 @@
-//! The daemon's Windows mount holds (A-198, §4.6): the anchor owns duplicates of the control, drive-link and
-//! ledger handles until an acknowledged release. One IOCP pipe lives on the control shard; exchanges borrow it by
+//! The daemon's Windows mount holds (A-198, §4.6): the anchor owns duplicates of the control and ledger handles until
+//! an acknowledged release, and the held volume keeps its Mount Manager drive (A-369). One IOCP pipe lives on the control shard; exchanges borrow it by
 //! move, and a bounded deadline covers both waiting for its owner and the request/acknowledgement pair. NFS socket
 //! holds are still owed; those paired Unix API calls continue to report that no connection hold is available on Windows.
 //!
@@ -163,7 +163,7 @@ pub(crate) fn adopt(bound: usize) -> Handed {
       }
     }
     let adoptable =
-      !refused && entry.what == WHAT_WINFSP_MOUNT && owned.len() == handles::MAX_HANDLES;
+      !refused && entry.what == WHAT_WINFSP_MOUNT && owned.len() == handles::WINFSP_MOUNT_HANDLES;
     if !adoptable {
       slates_machine::log_line!(
         "slates-server: held entry {} has an unsupported or unusable mount shape",

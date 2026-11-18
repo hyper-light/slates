@@ -401,6 +401,15 @@
 >   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+>   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
+>   spinning", seeds 17036665960917068132 and 2120743995065985386, both Linux arches and macOS) were a live takeover's
+>   whole materialization in one owner-shard turn (0.73 to 2.84 s at 152 to 306 MB of sealed log on a Mac Studio), and
+>   each period's attempt, its 100 ms deadline outlasted, fetched and rebuilt the whole log again. The log is now rebuilt
+>   a payload a slice by a task of the owner shard, the archive, the restore and the making each a turn, and a later
+>   attempt joins the task running (`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`; the bug record of
+>   2026-11-18, "a live takeover made its volume in one turn"). Still owed: the archive's layout and the restore in quantum
+>   slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), and a sealed
+>   volume's restore.
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -803,7 +812,15 @@
 > the account the daemon runs as, which every client of a Windows daemon is, for owner and its primary group for group,
 > and the drive answers security queries with it, as NTFS reports a file its account made
 > (`what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`); three winfstest cases that ask for exactly
-> its access list pass and are struck (382 to 379). **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> its access list pass and are struck (382 to 379). **Then A-368 (the same day):** that access list granted Everyone,
+> and any account of any session could open the volume through its kernel name (`\\?\GLOBALROOT\Device\Volume{…}`)
+> with the mounting account's rights; it now grants the account, SYSTEM and the Administrators alone, and the mount's
+> purge marker (`another_account_cannot_open_a_file_on_the_drive`), and the three cases are listed again (382).
+> **Resolved 2026-11-18 by A-369, so no longer for Ada:** the drive is a Mount Manager drive WinFsp's driver makes for
+> the unprivileged daemon once the machine allows it (`MountUseMountmgrFromFSD`, set once by an Administrator), and
+> Windows resolves every file's final path on it, so git with its symbolic links on works there (WinFsp's memfs as a
+> standard account, diagnostics run 44344103821; option (b') below). What A-327 stated: on the drive, git with its
+> symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
@@ -2677,6 +2694,20 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232): the late-submit test judged a green's history by factors no measurement gave.**
+> `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one` (`crates/server/tests/fleet.rs`) held the median
+> of the last 50 of 300 submits to four times the first 50's plus 2 ms (R3), from windows minutes apart, so a load that
+> changed between them read as a cost of history. Its macOS failure on CI (run 44298844583, main 1e82ebda1) was not that
+> bound: the owner ran one poll of 3,417 ms after about 69 submits, its holders declared it dead, and the 70th submit
+> waited out the client's 120 s. That is the signature of the record plane's spin main fixed after that run (340d4f6fb,
+> g251: a nudge after every ship ran back-to-back passes in one poll), and 14 runs on the Mac Studio, quiet and under 48
+> spinners, never repeated it. Now, after 300 versions of one green, 50 pairs alternate a submit on it with one on a
+> fresh green, the order in each pair alternating, and the Wilcoxon signed-rank statistic W+ of the old-minus-fresh
+> differences must stay within n(n+1)/4 + z·√(n(n+1)(2n+1)/24), z = 4.7534 the normal quantile of a spurious failure in a
+> million runs (NIST/SEMATECH e-Handbook §1.3.6.7.1): 1,129.9 at 50 pairs. Kiln r3592, the Mac Studio, debug build: W+
+> 420 to 801 in 5 quiet runs and 331 to 772 in 3 under 48 spinners, both greens' medians 3.7 to 4.4 ms; with 20 µs a
+> version of the green's history injected into the submit path, W+ 1,225 and the test failed.
+>
 > **Fixed 2026-11-18 (g232, A-376): every version re-published the whole content hold.** The content hold's image was
 > one piece (A-270), every chunk, manifest and stage a holder keeps, recomputed at every publication and re-put whenever
 > it changed, which at `f > 0` is every version of a green: after A-372 about a tenth of a holder's time at 1,000
@@ -3124,6 +3155,12 @@
 >   rename +74.8, unlink +31.2. Cut (c)'s no-wake variant and cut (b), the per-kind spin choice, were measured and
 >   rejected; the request channel's bound was fixed (A-348). Main lost no more than about 9 µs of this since cut (c)
 >   (diag-g258-5).
+> - **2026-11-18, goal g258 closed at its stated condition (BENCHMARKS, "Main after A-348 against the DLL and against
+>   69cd38b2"):** diag-g258-9 (run 44325673298), main `093fef96` against the DLL arm, a control and 69cd38b2. arm64, 5
+>   runs: 10 cells of 36 beyond the DLL's spread, the same p50 gap (quiet stat +44.9 µs, rename +76.3, unlink +41.1;
+>   loaded write +85.3), and main within the control's spread of 69cd38b2 in 32 of 36 cells. x86_64: 2 runs done and 5
+>   failed, main's daemon killed under load (A-223's idle spin, fixed since by A-361), so no verdict there; the x86_64
+>   lane is owed again with A-361 in main. No cut is open under g258; the levers below are the next goal's.
 > - **Open, the levers left** (each in BENCHMARKS' record): a spin choice that reads contention (the per-kind median form
 >   took 42.3 µs off arm64's loaded write p50 and lost a wake on x86_64); a fresh per-phase profile of arm64's quiet stat,
 >   rename and unlink (the last attributed 18 µs of a stat to crash safety); and, **a decision for Ada**, the shard threads
@@ -3198,6 +3235,11 @@
 >   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
+> - **macOS conforms (2026-11-18, main `40efd7456`; Linux OPEN, owner g226).** On Adas-MacBook-Pro-3 (macOS 26.6, NFS
+>   loopback, load averages 7 to 14), fsx (10,000 operations), fsstress (4 × 500) and unprivileged pjdfstest (8,686 cases)
+>   ran plain and live-shipped. `compare` found 0 differences, and every live run shipped. The writer's `ETIMEDOUT` went
+>   with A-229's hard mount; the log stuck at `head=2 durable=none` and the takeover off the mounted node did not recur.
+>   Commands and counts: `docs/wip/conformance.md` (the live-shipped pair). Linux and Windows remain as recorded above.
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher

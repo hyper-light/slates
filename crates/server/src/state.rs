@@ -866,6 +866,10 @@ pub struct ShardState {
   /// place of the shard's step quantum: the record period's seal walk and envelope wrap (`fleet::seal_walk_slice`), and a
   /// takeover's envelope open (`fleet::open_slice`, A-347).
   pub(crate) seal_walk_quantum_ns: Option<u64>,
+  /// Test support (`Daemon::inject_live_turn_pause`, never set in production): a wait between the turns of a live
+  /// takeover's rebuild on this owner shard (`fleet::make_live_in_turns`, g251), so a test's materialization outlasts
+  /// the control shard's periods and its later attempts meet it running.
+  pub(crate) live_turn_pause_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
   /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;
@@ -1153,6 +1157,11 @@ pub struct ShardState {
   /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
   /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
   pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
+  /// On a taken-over volume's owner shard, its materialization from a live log made in turns of this shard's clock by a
+  /// task of its own (g251, `fleet::make_live`): running, with the turns it has taken, or ended, until the control
+  /// shard's next attempt reads the end and forgets it. A later attempt joins a running one and never rebuilds the log
+  /// again. At most one a volume this shard is making, which the takeover's pending materializations bound.
+  pub making_taken_over: BTreeMap<ObjectId, Making>,
   /// The catalog register this node adopted for each taken-over volume (keyed by the volume's object), with
   /// the adopted record's sequence (AUD-29-17): a pending materialization waits for it, and the successor's
   /// record continues the register from that sequence. Bounded by the objects this node owns.
@@ -1531,6 +1540,20 @@ impl PendingGreen {
   }
 }
 
+/// Where a taken-over volume's materialization in turns stands on its owner shard (`ShardState::making_taken_over`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Making {
+  /// Its task runs: the turns it has taken so far.
+  Running {
+    /// The turns taken, one a slice of its owner shard's clock: what tells a materialization that moves from one stuck.
+    turns: u64,
+  },
+  /// Its task made the volume and published it.
+  Made,
+  /// Its task ended refused, named by the refusal's counter.
+  Refused(&'static str),
+}
+
 /// A taken-over volume's tombstone awaiting its record on the shard the volume's id routes to (§4.4 destroy, §4.10
 /// status AUD-29-43; `ShardState::pending_tombstones`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1601,6 +1624,12 @@ pub struct PendingVolume {
   /// When it was adopted, on the shard's clock (zero off a shard): its recovery is timed from here to its service, into
   /// the failover estimate (A-363).
   pub adopted_ns: u64,
+  /// The turns its owner shard's materialization had taken at the last attempt that found it running, `None` before
+  /// the first ([`PendingVolume::record_turns`]).
+  pub turns_seen: Option<u64>,
+  /// The head and sealing its live log was fetched at by the attempt that began its materialization (g251), for the
+  /// end's note of a refused rebuild (`live_ship::note_rebuild`); `None` before a live materialization began.
+  pub live_adopted: Option<(slates_db::live::Head, Option<crate::head::HeadSealing>)>,
 }
 
 impl PendingVolume {
@@ -1620,7 +1649,23 @@ impl PendingVolume {
       cohort_hosts,
       registers_short: None,
       adopted_ns: slates_rt::futures::now_ns(),
+      turns_seen: None,
+      live_adopted: None,
     }
+  }
+
+  /// Records, after an attempt that found its owner shard's materialization running (g251), that it has taken `turns`
+  /// turns so far; whether it took more since the previous such attempt (after a first), which is progress and starts
+  /// its attempts again, so a long volume's materialization is never given up on while it moves.
+  pub fn record_turns(&mut self, turns: u64) -> bool {
+    let progress = self.turns_seen.is_some_and(|seen| turns > seen);
+    if progress {
+      self.attempts = 0;
+    }
+    if self.turns_seen.is_none_or(|seen| turns > seen) {
+      self.turns_seen = Some(turns);
+    }
+    progress
   }
 
   /// Records that `staged` chunks of its content are staged here after an attempt's fetch; whether that is progress (a
