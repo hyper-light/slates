@@ -3299,15 +3299,7 @@ pub(crate) async fn fetch(
   let members: Vec<HostId> =
     state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
   let wait = past_tolerance_wait(&holders, &cohort_hosts, &members, local, quorum);
-  let mut others: Vec<HostId> = candidates
-    .into_iter()
-    .filter(|host| *host != local)
-    .collect();
-  for holder in holders.iter().chain(wait.iter().flatten()) {
-    if *holder != local && !others.contains(holder) {
-      others.push(*holder);
-    }
-  }
+  let others = others_to_ask(candidates, &holders, wait.as_deref(), local);
   // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
   // each, within the liveness budget whatever the path.
   for (host, bytes) in ask_reports(object, epoch, &others, crate::fleet::live_budget()).await {
@@ -3501,6 +3493,26 @@ fn past_tolerance_wait(
   Some(wait)
 }
 
+/// The hosts phase one asks besides this node (`local`): every candidate, then every recorded holder and every host a
+/// phase one past tolerance waits for (`wait`, A-309) not among them, so a holder outside the placement is asked too.
+fn others_to_ask(
+  candidates: Vec<HostId>,
+  holders: &[HostId],
+  wait: Option<&[HostId]>,
+  local: HostId,
+) -> Vec<HostId> {
+  let mut others: Vec<HostId> = candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  for holder in holders.iter().chain(wait.into_iter().flatten()) {
+    if *holder != local && !others.contains(holder) {
+      others.push(*holder);
+    }
+  }
+  others
+}
+
 /// Phase one's choice from `reports` (A-240, A-309): within tolerance (`wait` is `None`), the greatest head once `f + 1`
 /// of the recorded `holders` reported (`slates_db::live::adopt`), else the takeover waits for its quorum; past it, the
 /// greatest head once every host of `wait` reported (`slates_db::live::adopt_past_tolerance`), counted
@@ -3528,7 +3540,7 @@ fn phase_one_choice(
   match slates_db::live::adopt_past_tolerance(reports, wait) {
     slates_db::live::PastTolerance::Waiting => Err("fleet.live.takeover_waits_past_tolerance"),
     slates_db::live::PastTolerance::Adopt(adopted) => {
-      state::with_state_counted(|s| s.count(LIVE_TAKEN_OVER_PAST_TOLERANCE, 1));
+      let _ = state::with_state_counted(|s| s.count(LIVE_TAKEN_OVER_PAST_TOLERANCE, 1));
       Ok(adopted)
     }
   }

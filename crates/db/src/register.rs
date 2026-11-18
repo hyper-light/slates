@@ -4859,6 +4859,21 @@ mod tests {
       regional.confirm(departed, host);
     }
     assert!(regional.retired.is_empty());
+    expect_a_settled_line_moved_by_its_adopter(&mut regional, departed, object, successor);
+    // The record let go, as `bound_completed` does past the bound (`completion_records_stay_bounded_…` drives it).
+    regional.completed.remove(&departed);
+    expect_an_unresolved_line_moved_by_its_adopter(&mut regional, departed, other, adopter);
+  }
+
+  /// The settled half of `a_member_moves_an_object_whose_line_names_no_owner`: `object`'s line, settled by
+  /// `departed`'s completion record, names no owner, and only `successor` (the member that adopted it) moves it, to
+  /// another member.
+  fn expect_a_settled_line_moved_by_its_adopter(
+    regional: &mut RegionalConfiguration,
+    departed: HostId,
+    object: ObjectId,
+    successor: HostId,
+  ) {
     assert_eq!(
       regional.lineage(departed, object),
       Lineage::Settled { takeover: departed }
@@ -4888,11 +4903,19 @@ mod tests {
       !regional.moves(object, successor, departed),
       "once moved, only its new owner moves it"
     );
+  }
 
-    // The record let go, as `bound_completed` does past the bound (`completion_records_stay_bounded_…` drives it).
-    regional.completed.remove(&departed);
-    assert_eq!(regional.lineage(departed, other), Lineage::Unresolved);
-    assert_eq!(regional.owner_of(other), None);
+  /// The unresolved half of `a_member_moves_an_object_whose_line_names_no_owner` (A-309): `object`'s line reads
+  /// unresolved once `departed`'s record was let go, names no owner, and `adopter` (the member that adopted it) moves
+  /// it.
+  fn expect_an_unresolved_line_moved_by_its_adopter(
+    regional: &mut RegionalConfiguration,
+    departed: HostId,
+    object: ObjectId,
+    adopter: HostId,
+  ) {
+    assert_eq!(regional.lineage(departed, object), Lineage::Unresolved);
+    assert_eq!(regional.owner_of(object), None);
     let target = regional
       .members
       .iter()
@@ -4900,10 +4923,10 @@ mod tests {
       .find(|host| *host != adopter)
       .expect("a four-member region keeps another member");
     assert!(
-      regional.move_object(other, adopter, target),
+      regional.move_object(object, adopter, target),
       "the member that adopted it moves an object whose record was let go"
     );
-    assert_eq!(regional.owner_of(other), Some(target));
+    assert_eq!(regional.owner_of(object), Some(target));
   }
 
   /// A-272, A-309: a lost line is claimed by no move. Do: take over the one member of a region formed on it alone, so
@@ -5421,13 +5444,33 @@ mod tests {
     assert!(regional.retired.contains_key(&HostId(1)));
     for departed in [HostId(1), HostId(2)] {
       assert!(!regional.completed.contains_key(&departed));
-      let resolved = regional.lineage(departed, ObjectId::new(departed, 2));
+      let object = ObjectId::new(departed, 2);
       assert!(
-        matches!(resolved, Lineage::Successor { departed: round, successor }
-          if round == HostId(2) && [HostId(3), HostId(4)].contains(&successor)),
-        "{departed:?}: {resolved:?}"
+        ranked_in_round_among(
+          &regional,
+          departed,
+          object,
+          HostId(2),
+          &[HostId(3), HostId(4)]
+        ),
+        "{departed:?}: {:?}",
+        regional.lineage(departed, object)
       );
     }
+  }
+
+  /// Whether `object`'s line from `departed` is ranked, in `round`'s takeover, to one of `hosts`.
+  fn ranked_in_round_among(
+    regional: &RegionalConfiguration,
+    departed: HostId,
+    object: ObjectId,
+    round: HostId,
+    hosts: &[HostId],
+  ) -> bool {
+    matches!(
+      regional.lineage(departed, object),
+      Lineage::Successor { departed: by, successor } if by == round && hosts.contains(&successor)
+    )
   }
 
   /// Banned item 8, A-309: completion records stay bounded by the members however many takeovers complete, the oldest
@@ -5447,19 +5490,12 @@ mod tests {
       .copied()
       .expect("host 1 has survivors");
     regional.take_over(carrier, scatter);
-    for host in regional.survivors_of(carrier) {
-      regional.confirm(carrier, host);
-    }
+    confirm_every_survivor(&mut regional, carrier);
     assert!(regional.completed.contains_key(&carrier));
     // Shape: far more completed takeovers than the region keeps records of.
     let transients = 48;
     for index in 0..transients {
-      let host = HostId(100 + index);
-      assert!(regional.admit(host, None, scatter));
-      assert!(regional.retire(host, scatter));
-      for survivor in regional.survivors_of(host) {
-        regional.confirm(host, survivor);
-      }
+      complete_a_transient_takeover(&mut regional, HostId(100 + index), scatter);
       assert!(
         regional.completed.len() <= regional.completed_bound(),
         "bounded, the one record a kept retirement needs among them: {}",
@@ -5471,14 +5507,30 @@ mod tests {
       );
     }
     assert!(regional.retired.contains_key(&first));
-    for host in regional.survivors_of(first) {
-      regional.confirm(first, host);
-    }
+    confirm_every_survivor(&mut regional, first);
     assert!(regional.completed.contains_key(&first));
     assert_eq!(
       regional.lineage(first, ObjectId::new(first, 9)),
       Lineage::Settled { takeover: first }
     );
+  }
+
+  /// Confirms the share of every survivor of `departed`'s retirement.
+  fn confirm_every_survivor(regional: &mut RegionalConfiguration, departed: HostId) {
+    for survivor in regional.survivors_of(departed) {
+      regional.confirm(departed, survivor);
+    }
+  }
+
+  /// Admits `host`, retires it and confirms every survivor's share, so its takeover completes at once.
+  fn complete_a_transient_takeover(
+    regional: &mut RegionalConfiguration,
+    host: HostId,
+    scatter: u64,
+  ) {
+    assert!(regional.admit(host, None, scatter));
+    assert!(regional.retire(host, scatter));
+    confirm_every_survivor(regional, host);
   }
 
   /// AUD-29-26's sibling (a version names one configuration): do: a regional and a root configuration at

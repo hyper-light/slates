@@ -1895,16 +1895,28 @@ mod tests {
     assert_eq!(config.moved.len(), 1);
     expect_round_trip(&config, "round-trip is identity with a moved object");
     // A completed takeover's record (A-309) survives it too: every survivor of every kept retirement confirms.
+    complete_every_retirement(&mut config);
+    assert!(!config.completed.is_empty());
+    expect_round_trip(&config, "round-trip is identity with completion records");
+  }
+
+  /// Confirms every survivor's share of every retirement `config` keeps, so each completes into a record (A-309).
+  fn complete_every_retirement(config: &mut slates_db::register::RegionalConfiguration) {
     let departed: Vec<HostId> = config.retired.keys().copied().collect();
     for retired in departed {
       for survivor in config.survivors_of(retired) {
         config.confirm(retired, survivor);
       }
     }
-    assert!(!config.completed.is_empty());
-    expect_round_trip(&config, "round-trip is identity with completion records");
-    // A retirement taken while a change was in flight keeps the current neighbourhood its joint writes reached
-    // (A-309): a member formed beside one other, a third admitted, then the member taken over before it reports.
+  }
+
+  /// A-309: a retirement taken while a change was in flight keeps the current neighbourhood its joint writes reached,
+  /// and the encoding carries it. Do: form a member beside one other, admit a third, and take the member over before it
+  /// reports the new neighbourhood; encode and decode. Expect the retirement's current neighbourhood kept and the
+  /// configuration back unchanged.
+  #[test]
+  fn a_retirements_current_neighbourhood_round_trips() {
+    use slates_db::register::RegionalConfiguration;
     let mut joint = RegionalConfiguration::formed(
       vec![A, B],
       Quorum { f: 1 },
@@ -2156,6 +2168,13 @@ mod tests {
         magic: REGIONAL_MAGIC
       })
     );
+    expect_the_unversioned_layouts_refused(&regional_bytes, &root_bytes);
+  }
+
+  /// The unversioned layouts of `a_configuration_of_another_layout_is_refused_by_name`: each configuration's bytes after
+  /// its magic and version, as the layout before the version wrote them, refused as foreign. `regional_bytes` encode a
+  /// configuration at version 7.
+  fn expect_the_unversioned_layouts_refused(regional_bytes: &[u8], root_bytes: &[u8]) {
     let unversioned = &regional_bytes[2 * size_of::<u32>()..];
     assert_eq!(
       decode_regional_configuration(unversioned),

@@ -150,6 +150,36 @@ struct Counts {
   completed: u64,
 }
 
+impl Counts {
+  /// Adds `other`'s counts to these.
+  fn add(&mut self, other: &Counts) {
+    self.reclaimed_settled += other.reclaimed_settled;
+    self.reclaimed_confirmed += other.reclaimed_confirmed;
+    self.kept_unknown += other.kept_unknown;
+    self.kept_unasked += other.kept_unasked;
+    self.adopted += other.adopted;
+    self.recovered_past_tolerance += other.recovered_past_tolerance;
+    self.completed += other.completed;
+  }
+
+  /// The verdicts no history reached, by name: empty once every one was reached at least once.
+  fn unreached(&self) -> Vec<&'static str> {
+    [
+      ("reclaimed_settled", self.reclaimed_settled),
+      ("reclaimed_confirmed", self.reclaimed_confirmed),
+      ("kept_unknown", self.kept_unknown),
+      ("kept_unasked", self.kept_unasked),
+      ("adopted", self.adopted),
+      ("recovered_past_tolerance", self.recovered_past_tolerance),
+      ("completed", self.completed),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count == 0)
+    .map(|(name, _)| name)
+    .collect()
+  }
+}
+
 /// A violation of the oracle: the holder, the object, the copy's adoption count and the object's.
 type Violation = (HostId, ObjectId, u64, u64);
 
@@ -757,20 +787,8 @@ fn the_generated_histories_reach_every_verdict() {
     let (counts, violations, bounded) = run(seed);
     assert!(violations.is_empty(), "seed {seed}: {violations:?}");
     assert!(bounded, "seed {seed}: a structure outgrew its bound");
-    total.reclaimed_settled += counts.reclaimed_settled;
-    total.reclaimed_confirmed += counts.reclaimed_confirmed;
-    total.kept_unknown += counts.kept_unknown;
-    total.kept_unasked += counts.kept_unasked;
-    total.adopted += counts.adopted;
-    total.recovered_past_tolerance += counts.recovered_past_tolerance;
-    total.completed += counts.completed;
+    total.add(&counts);
   }
   println!("lineage model over {NON_VACUITY_SEEDS} seeds: {total:?}");
-  assert!(total.reclaimed_settled > 0, "{total:?}");
-  assert!(total.reclaimed_confirmed > 0, "{total:?}");
-  assert!(total.kept_unknown > 0, "{total:?}");
-  assert!(total.kept_unasked > 0, "{total:?}");
-  assert!(total.adopted > 0, "{total:?}");
-  assert!(total.recovered_past_tolerance > 0, "{total:?}");
-  assert!(total.completed > 0, "{total:?}");
+  assert_eq!(total.unreached(), Vec::<&str>::new(), "{total:?}");
 }
