@@ -24,7 +24,7 @@
 //! admission, where a task refused there answers its client, can refuse one; what it keeps answers requests in flight,
 //! which bound it (`DaemonConfig::kept_bound`), and every wait is counted ([`room_waits`]). Measured on main 80be552a
 //! before: 4,074 to 4,518 results a run of the 3,000-client load rung dropped after one coordinator period's wait. A
-//! scatter's part on its way out waits for room the same way, within a budget ([`given_room_within`]).
+//! scatter's part on its way out waits for room the same way, in its target's own time ([`given_room_in_shard_time`], A-426).
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -546,19 +546,30 @@ pub fn run_on_waiting(
   }
 }
 
-/// Sends `message` to `target`, waiting out a full channel for at most `budget_ns` of time: whether it was sent. A full
+/// Sends `message` to `target`, waiting out a full channel in `target`'s own time (A-426): whether it was sent. A full
 /// channel's shard is asked to tell this shard when it next has room ([`asked_for_room`], A-279's room wake) and the
-/// send tried once more; then the task waits for its first wake, the drain's tell or the deadline, and tries again.
-/// `false` past the deadline, at once for a shard gone, or when the deadline cannot be armed (not a task's poll on a
-/// shard, where no wait can succeed; counted `xshard.room_wait_refused`). A scatter's part waits this way
-/// (`crate::verbs::send_part`), within a budget its client can still hear the answer in. The budget is a span of the
-/// shard's clock, not a count of tries: until 2026-11-06 it was `budget / pace + 1` tries of one pause each, and on a
-/// starved shard every pause ran late, so the wait stretched with the starvation (51 tries took 1.54 s against a
-/// 500 ms budget with the shard kept off its CPU 20 ms at a time; `a_status_on_a_starved_shard_is_refused_overloaded_on_time`
-/// in `crates/server/tests/ack_release.rs`). Until 2026-11-18 (A-296) it tried again every tenth of a coordinator
-/// period, a timer each time, whether the channel had room or not.
-pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
-  let deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
+/// send tried once more; then the task waits for its first wake, the drain's tell or the window's end, and tries again.
+/// The first window is `budget_ns` of the wall; at a window's end with the channel still full the wait goes on while the
+/// target is draining or starved ([`RoomJudge`]): it took a step in the window (a shard drains its channel at every
+/// step), or it took none but waits for a CPU and has run less than `budget_ns` of CPU since the wait began. `false`
+/// once a window ends with the target taking no step and waiting on something else (inside one poll that sleeps, or
+/// blocked), or busy in one poll past its budget of CPU, or unreadable past the first window (a stand-in slot); at once
+/// for a shard gone; or when no deadline can be armed (not a task's poll on a shard, where no wait can succeed; counted
+/// `xshard.room_wait_refused`). A scatter's part waits this way (`crate::verbs::send_part`), and a batch of asks to a
+/// green's owner ([`call_in_shard_time_given_room`]). Each window is a span of the shard's clock, not a count of tries:
+/// until 2026-11-06 it was `budget / pace + 1` tries of one pause each, and on a starved shard every pause ran late (51
+/// tries took 1.54 s against a 500 ms budget with the shard kept off its CPU 20 ms at a time;
+/// `a_status_on_a_starved_shard_is_refused_overloaded_on_time` in `crates/server/tests/ack_release.rs`). Until
+/// 2026-11-18 (A-296) it tried again every tenth of a coordinator period, a timer each time, whether the channel had
+/// room or not; and until A-426 the first window was the whole wait, so a target alive and stepping, or starved, slow to
+/// drain, had the part refused.
+pub(crate) async fn given_room_in_shard_time(
+  target: u16,
+  mut message: Control,
+  budget_ns: u64,
+) -> bool {
+  let mut judge = registry::holder_of(target).map(|holder| RoomJudge::begin(holder, budget_ns));
+  let mut deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
   let mut waiting: Option<RoomWait> = None;
   loop {
     message = match tried(target, message) {
@@ -566,8 +577,16 @@ pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_
       done => return matches!(done, Tried::Sent),
     };
     waiting.get_or_insert_with(RoomWait::begin);
-    let left = deadline.saturating_sub(slates_rt::futures::now_ns());
-    if left == 0 || !asked_for_room(target) {
+    let mut left = deadline.saturating_sub(slates_rt::futures::now_ns());
+    if left == 0 {
+      // The window ended with the channel still full: another while the target drains or starves, else given up.
+      let Some(window_ns) = judge.as_mut().and_then(RoomJudge::next_window_ns) else {
+        return false;
+      };
+      left = window_ns;
+      deadline = slates_rt::futures::now_ns().saturating_add(window_ns);
+    }
+    if !asked_for_room(target) {
       return false;
     }
     message = match tried(target, message) {
@@ -580,6 +599,109 @@ pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_
       return false;
     }
   }
+}
+
+/// How a wait for room judges a window's end in its target's own time (A-426; A-65, A-228, A-318): the target's
+/// registration, whose readings are taken, and the rule it is judged by ([`RoomRule`]).
+#[derive(Clone, Copy, Debug)]
+struct RoomJudge {
+  holder: registry::SlotHolder,
+  rule: RoomRule,
+}
+
+impl RoomJudge {
+  /// The judge of a wait for room in `holder`'s channel begun now.
+  fn begin(holder: registry::SlotHolder, budget_ns: u64) -> RoomJudge {
+    RoomJudge {
+      holder,
+      rule: RoomRule {
+        budget_ns,
+        cpu_budget_ns: crate::observe::held_to_this_build(budget_ns),
+        steps: room_steps(holder),
+        cpu_began: registry::shard_cpu(holder).map(|reading| reading.spent_ns),
+      },
+    }
+  }
+
+  /// The next window's wall length at a window's end, from the target's readings now; `None` ends the wait.
+  fn next_window_ns(&mut self) -> Option<u64> {
+    let holder = self.holder;
+    self.rule.judge(
+      || room_steps(holder),
+      || registry::shard_run_readings(&[holder]).pop().flatten(),
+      || registry::shard_cpu(holder).map(|reading| reading.spent_ns),
+    )
+  }
+}
+
+/// The rule a wait for room is judged by at a window's end, apart from the shard it reads. A shard drains its control
+/// channel at every step, so its step count is what says room will come, not its CPU clock: a shard inside one poll
+/// runs on its CPU, or wakes now and then, and drains nothing until the poll ends. A target that stepped in the window
+/// is draining (others keep its channel full, or it drains slowly) and is waited for another whole window; one that took
+/// no step but waits for a CPU is starved, not stuck (A-228), and is waited for while it has run less than the budget of
+/// CPU since the wait began (A-318's rule for one poll, the budget held to this build); one that took no step and waits
+/// on nothing else, or ran its budget in one poll, is not draining. Its readings come through closures
+/// ([`RoomRule::judge`]), so its tests run it over scripted readings with no thread under it.
+#[derive(Clone, Copy, Debug)]
+struct RoomRule {
+  /// The window's wall length.
+  budget_ns: u64,
+  /// The CPU a target that takes no step may run before the wait ends: the budget held to this build
+  /// ([`crate::observe::held_to_this_build`]).
+  cpu_budget_ns: u64,
+  /// The target's step count at the last window's end (first: at the wait's start).
+  steps: Option<u64>,
+  /// The target's CPU time when the wait began.
+  cpu_began: Option<u64>,
+}
+
+impl RoomRule {
+  /// The rule over the target's step count, what the scheduler says of its thread and its CPU time, read in this order:
+  /// the steps; when they show none since the mark, the scheduler; then the steps again, so a target that stepped
+  /// between the reads (released, it ran, drained and parked before the scheduler looked) is read as draining, as
+  /// [`crate::observe::ShardTime`] reads its clock twice for the same reason. A step: a whole window more. No step: a
+  /// window of the CPU budget the target has not yet run, while the scheduler has it waiting for a CPU. Otherwise, or
+  /// with no reading, `None`.
+  fn judge(
+    &mut self,
+    mut steps: impl FnMut() -> Option<u64>,
+    scheduler: impl FnOnce() -> Option<slates_rt::RunReading>,
+    spent_ns: impl FnOnce() -> Option<u64>,
+  ) -> Option<u64> {
+    if self.stepped(steps()?) {
+      return Some(self.budget_ns);
+    }
+    let runnable = scheduler().is_some_and(|run| run.state == slates_rt::RunState::Runnable);
+    if self.stepped(steps()?) {
+      return Some(self.budget_ns);
+    }
+    if !runnable {
+      return None;
+    }
+    let ran = spent_ns()?.checked_sub(self.cpu_began?)?;
+    self
+      .cpu_budget_ns
+      .checked_sub(ran)
+      .filter(|left| *left > 0)
+      .map(|left| left.min(self.budget_ns))
+  }
+
+  /// Whether `now` is a step count past the mark, which it then becomes.
+  fn stepped(&mut self, now: u64) -> bool {
+    let stepped = self.steps.is_some_and(|mark| now > mark);
+    if stepped {
+      self.steps = Some(now);
+    }
+    stepped
+  }
+}
+
+/// The step count of the shard `holder` names, while that registration holds its slot (a later one in the same slot
+/// reads as none).
+fn room_steps(holder: registry::SlotHolder) -> Option<u64> {
+  (registry::holder_of(holder.shard()) == Some(holder))
+    .then(|| registry::with_entry(holder.shard(), |entry| entry.pulse.steps()))
+    .flatten()
 }
 
 /// One try of a send that waits for room ([`tried`]).
@@ -604,13 +726,13 @@ fn tried(target: u16, message: Control) -> Tried {
   }
 }
 
-/// Counter: a wait for room whose ask ([`asked_for_room`]) or deadline ([`given_room_within`]) was refused for want of
+/// Counter: a wait for room whose ask ([`asked_for_room`]) or deadline ([`given_room_in_shard_time`]) was refused for want of
 /// a task's poll on a shard, which every caller is: a tripwire. Until 2026-11-18 (A-296) its pause was counted here as
 /// `xshard.room_pause_refused`.
 pub(crate) const ROOM_WAIT_REFUSED: &str = "xshard.room_wait_refused";
 
 /// Format: the status counter of waits for room this shard began: messages its carrier kept ([`carry`]) and scatter
-/// parts that met a full channel ([`given_room_within`]).
+/// parts that met a full channel ([`given_room_in_shard_time`]).
 pub(crate) const ROOM_WAITS_STARTED: &str = "xshard.room_waits_started";
 /// Format: the status counter of waits for room this shard ended, sent or not: with [`ROOM_WAITS_STARTED`], the waits
 /// it holds now.
@@ -659,7 +781,7 @@ pub fn keep_refused() -> u64 {
 }
 
 /// One wait for room in progress on this shard: a message its carrier keeps ([`carry`]) or a scatter part's
-/// ([`given_room_within`]). Counted when it begins and, dropped, when it ends, however it ends (sent, the target gone,
+/// ([`given_room_in_shard_time`]). Counted when it begins and, dropped, when it ends, however it ends (sent, the target gone,
 /// the carrier or the part's task ended).
 struct RoomWait;
 
@@ -754,19 +876,21 @@ pub async fn call_within<T: Send + 'static>(
   within(call, deadline_ns).await
 }
 
-/// [`call_within`], waiting for room on the target's control channel within the same deadline rather than failing at
-/// once when it is full: for a shard that many others ask at once (a green's owner, A-247), where a refused call is
-/// asked again and a burst of them fills the channel for good.
-pub async fn call_within_room<T: Send + 'static>(
+/// [`call_in_shard_time`], waiting for room on the target's control channel the same way rather than failing at once
+/// when it is full ([`given_room_in_shard_time`]): for a shard that many others ask at once (a green's owner, A-247),
+/// where a refused call is asked again and a burst of them fills the channel for good. Both waits are judged in the
+/// target's own time (A-426): until then each was a wall deadline, so an owner alive and working, slow to drain or to
+/// answer, had its asks answered unanswered. `None` as [`call_in_shard_time`] answers, and when the call was never
+/// sent.
+pub async fn call_in_shard_time_given_room<T: Send + 'static>(
   origin: u16,
   shard: u16,
   work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
-  deadline_ns: u64,
+  budget_ns: u64,
 ) -> Option<T> {
   if shard == origin {
     return state::with_state(work);
   }
-  let started = slates_rt::futures::now_ns();
   let id = register();
   let task = SpawnRequest::new(
     Box::pin(async move {
@@ -781,7 +905,7 @@ pub async fn call_within_room<T: Send + 'static>(
     }),
     None,
   );
-  if !given_room_within(shard, Control::Spawn(Box::new(task)), deadline_ns).await {
+  if !given_room_in_shard_time(shard, Control::Spawn(Box::new(task)), budget_ns).await {
     forget(id);
     return None;
   }
@@ -792,8 +916,7 @@ pub async fn call_within_room<T: Send + 'static>(
     ready: None,
     _thread: PhantomData,
   };
-  let left = deadline_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(started));
-  within(call, left).await
+  within_shard_time(call, budget_ns).await
 }
 
 /// Runs `work` on `shard` and awaits its result while the target is working, up to `budget_ns` of the target's own
@@ -1471,12 +1594,13 @@ mod tests {
     daemon.stop();
   }
 
-  /// A bounded wait for room (`given_room_within`, a scatter part's) is a span of time on a busy shard too (2026-11-06).
-  /// Do: on a shard, fill a stand-in slot's one-message channel and never drain it; keep the shard busy 20 ms at a time
-  /// back to back with a task that spins and yields; and wait for room there within one coordinator period. Expect: the
-  /// wait gives up about one coordinator period after it began, not much more. Before 2026-11-06 it was a count of tries
-  /// of one pause each, and each try lasted a pause plus the shard's busy poll; since 2026-11-18 (A-296) it asks for
-  /// room and waits for the drain's word, which never comes here, so only its deadline ends it.
+  /// A wait for room's window (`given_room_in_shard_time`, a scatter part's) is a span of time on a busy shard too
+  /// (2026-11-06). Do: on a shard, fill a stand-in slot's one-message channel and never drain it (the stand-in has no
+  /// thread whose clock it records, so it is waited the one window, A-426); keep the shard busy 20 ms at a time back to
+  /// back with a task that spins and yields; and wait for room there with one coordinator period as the window. Expect:
+  /// the wait gives up about one coordinator period after it began, not much more. Before 2026-11-06 it was a count of
+  /// tries of one pause each, and each try lasted a pause plus the shard's busy poll; since 2026-11-18 (A-296) it asks
+  /// for room and waits for the drain's word, which never comes here, so only the window's end ends it.
   #[test]
   // The test thread waits for the result off the shard.
   #[allow(clippy::disallowed_methods)]
@@ -1521,7 +1645,7 @@ mod tests {
       slates_rt::futures::detach(starver).unwrap();
       let waiter = slates_rt::futures::spawn(async move {
         let began = slates_rt::futures::now_ns();
-        let sent = given_room_within(
+        let sent = given_room_in_shard_time(
           home,
           Control::Spawn(Box::new(SpawnRequest::new(Box::pin(async {}), None))),
           REPLY_ROOM_NS,
@@ -1564,6 +1688,139 @@ mod tests {
     drop(receiver);
     drop(registration);
     daemon.stop();
+  }
+
+  /// R3's class A (A-426): a part waits for room while its target steps. Do: from a thread of its own, register a
+  /// stand-in shard whose control channel holds one message and step it once each look's span ([`LOOK_EVERY_NS`]),
+  /// asleep between (a shard stepping slowly, whose channel others keep full); fill its channel; on a shard, send it a
+  /// part with the wait a scatter's part takes; from the test thread, take the filler off the channel (the waiting
+  /// shards told, as a drain tells them) only once the wait's first window and a quarter of another have passed. Expect:
+  /// the part sent, and its message the next on the channel. Before, the first window was the whole wait, on the wall,
+  /// and the part was refused with its target alive and stepping.
+  #[test]
+  // The test thread stands for the target's drain: it must wait off-shard.
+  #[allow(clippy::disallowed_methods)]
+  fn a_part_waits_for_room_while_its_target_steps() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STEPPING: AtomicBool = AtomicBool::new(true);
+    STEPPING.store(true, Ordering::Release);
+    let (made, stand_in) = std::sync::mpsc::sync_channel(1);
+    let target_thread = std::thread::spawn(move || {
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let shard = registration.shard();
+      made.send((registration, receiver)).unwrap();
+      let mut steps = 0u64;
+      while STEPPING.load(Ordering::Acquire) {
+        steps += 1;
+        registry::with_entry(shard, |entry| entry.pulse.record(steps, 0, 0, 0, 0));
+        std::thread::sleep(std::time::Duration::from_nanos(LOOK_EVERY_NS));
+      }
+    });
+    let (registration, receiver) = stand_in.recv().unwrap();
+    let target = registration.shard();
+    let filler = SpawnRequest::new(Box::pin(async {}), None);
+    registry::send_control(target, Control::Spawn(Box::new(filler))).unwrap();
+    let daemon = crate::daemon::audit_daemon();
+    let (sent, given) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |_state| {
+      let part = Control::Spawn(Box::new(SpawnRequest::new(Box::pin(async {}), None)));
+      let waiter = slates_rt::futures::spawn(async move {
+        let given = given_room_in_shard_time(target, part, crate::verbs::PART_ROOM_BUDGET_NS).await;
+        let _ = sent.send(given);
+      })
+      .unwrap();
+      slates_rt::futures::detach(waiter).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_nanos(
+      crate::verbs::PART_ROOM_BUDGET_NS + crate::verbs::PART_ROOM_BUDGET_NS / 4,
+    ));
+    assert!(take(&receiver, &registration).is_ok(), "the filler");
+    let part_sent = given.recv_timeout(MESSAGE_WAIT);
+    STEPPING.store(false, Ordering::Release);
+    target_thread.join().unwrap();
+    assert_eq!(
+      part_sent,
+      Ok(true),
+      "the part was sent once its stepping target made room"
+    );
+    assert!(
+      receiver.recv_timeout(MESSAGE_WAIT).is_ok(),
+      "the part's message is on the channel"
+    );
+    drop(receiver);
+    drop(registration);
+    daemon.stop();
+  }
+
+  /// A-426's rule, over scripted readings. Do: judge a window's end for a target that stepped; one that took no step and
+  /// waits for a CPU, with CPU left and with its budget run; one that took no step and is blocked; one blocked at the
+  /// scheduler's look whose second step read shows a step; and one whose steps cannot be read. Expect: a whole window
+  /// for the steps; the CPU left (at most a window) for the starved one with some, nothing past its budget; nothing for
+  /// the blocked one; a whole window for the one that stepped between the reads; nothing unread.
+  #[test]
+  fn a_room_wait_goes_on_while_its_target_steps_or_starves_and_ends_when_it_does_neither() {
+    let budget = crate::verbs::PART_ROOM_BUDGET_NS;
+    let rule = || RoomRule {
+      budget_ns: budget,
+      cpu_budget_ns: budget,
+      steps: Some(10),
+      cpu_began: Some(1_000),
+    };
+    let run = |state| {
+      Some(slates_rt::RunReading {
+        state,
+        waited_ns: None,
+        uninterruptible: None,
+      })
+    };
+    let runnable = slates_rt::RunState::Runnable;
+    let blocked = slates_rt::RunState::Blocked;
+    assert_eq!(
+      rule().judge(|| Some(11), || run(blocked), || Some(1_000)),
+      Some(budget),
+      "a target that stepped is draining"
+    );
+    assert_eq!(
+      rule().judge(|| Some(10), || run(runnable), || Some(1_000 + budget / 4)),
+      Some(budget - budget / 4),
+      "a starved target is waited for the CPU it has not yet run"
+    );
+    assert_eq!(
+      rule().judge(|| Some(10), || run(runnable), || Some(1_000 + budget)),
+      None,
+      "a target busy in one poll past its budget is not draining"
+    );
+    assert_eq!(
+      rule().judge(|| Some(10), || run(blocked), || Some(1_000)),
+      None,
+      "a target that took no step and waits on something else is not draining"
+    );
+    let mut reads = [Some(10), Some(12)].into_iter();
+    assert_eq!(
+      rule().judge(|| reads.next().flatten(), || run(blocked), || Some(1_000)),
+      Some(budget),
+      "a target that stepped between the reads is draining"
+    );
+    assert_eq!(
+      rule().judge(|| None, || run(runnable), || Some(1_000)),
+      None,
+      "a target whose steps cannot be read is given up"
+    );
+    let mut stepped = rule();
+    assert_eq!(
+      stepped.judge(|| Some(11), || run(blocked), || Some(1_000)),
+      Some(budget)
+    );
+    assert_eq!(
+      stepped.judge(|| Some(11), || run(blocked), || Some(1_000)),
+      None,
+      "the mark moved with the step: the same count again is no step"
+    );
   }
 
   struct Released(std::sync::mpsc::SyncSender<()>);

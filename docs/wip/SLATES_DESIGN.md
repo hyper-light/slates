@@ -4470,9 +4470,12 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   names the attachment and its resync token, 128 bits from the daemon's secure random and never its mount capability.
   On Linux it is a sequenced-packet pair whose device end follows the stream's on the client's control socket; on
   macOS (A-339) a stream of 28-byte messages, since a datagram pair's survivor is never told its peer has gone, whose
-  device end rides beside the stream's in the socket route's confirmation; Windows hands none yet, and its wire is
-  built (A-418): a message-mode pipe whose `Resync` names the fresh end's handle in the stream's holder's process,
-  where the successor duplicated it, since no descriptor rides a message there. The daemon's end is
+  device end rides beside the stream's in the socket route's confirmation; on Windows (A-427) a message-mode pipe whose
+  device end is duplicated into the attaching client beside the stream's (`ShardsHanded`'s `resync`), the daemon's end
+  held by the anchor's exchange before the stream serves anything and its session (with the process holding the stream,
+  its id and creation time) told by `Record` before any reply that rests on a change (A-423), and whose `Resync` will
+  name the fresh end's handle in that process, where the successor duplicates it (A-418), since no descriptor rides a
+  message there. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token, the stream's
   owner view and its kernel's SETXATTR form as its session (A-378), updated when the guest names its owner, when its
@@ -4499,7 +4502,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
   the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
-  from the write log (A-63) as a mount's are. On Windows, which hands no resync channel yet, a death ends the stream,
+  from the write log (A-63) as a mount's are. On Windows, whose successor half is owed (its attach half is A-427), a
+  death ends the stream,
   and the writes it acknowledged after its last publication are replayed into the volume all the same (A-402). Where that log overflowed, the guest is told every file it had open may
   have lost writes, as a taken-over mount's kernel is (`LostWrites`, A-393): a handle from before the death answers its
   `flush` `EIO` until an `fsync` through it has, once. It removes any other's record, as before.
@@ -29923,10 +29927,11 @@ module's channel and message paragraphs).
 - **Evidence.** The codec's unit tests (`crates/bridge-fuse`, `shards_resync`): the golden vector, every forgery (each
   token byte, another attachment, an `Attached` in the Windows form, a zero handle), every wrong length to twice the
   message, another version, a reserved byte, and every single-bit flip parsed or refused without a panic.
-- **Owed.** The attach's half on Windows: the message-mode resync pipe made at the attach, `Attached` written before
-  the hand-off, the daemon's end held by the anchor with the session (token, owner view, form, and the holder's process
-  id and start time, so a successor never duplicates into a reused id), the device's end handed beside the stream's
-  (`ShardsHanded`, the client, `slates shards`, `serve_shards`). The successor's half: the held end adopted, the
+- **Owed.** The attach's half on Windows (built by A-427, but for `slates shards` handing the end to its command): the
+  message-mode resync pipe made at the attach, `Attached` written before the hand-off, the daemon's end held by the
+  anchor with the session (token, owner view, form, and the holder's process id and start time, so a successor never
+  duplicates into a reused id), the device's end handed beside the stream's (`ShardsHanded`, the client,
+  `slates shards`, `serve_shards`). The successor's half: the held end adopted, the
   record kept, a fresh pipe, its client end duplicated into the holder and named in this message, the replies kept for
   a resend and the `FORGET`s logged as on Unix. The anchor's Windows hold needs a kind for the resync end and a
   message that replaces a held entry's record (the session moves as the guest names its owner, its `INIT` is answered,
@@ -30123,7 +30128,7 @@ bound's derivation).
   the next process under its kind, and a replacement for an entry not held or past the cap refused and counted, with
   nothing changed; compiled clean for Windows (`cargo xwin check`), its run filed for main.
 - **Owed.** The daemon's half: its hold of a resync end and its record's replacements over `crate::anchor_hold`'s
-  exchange, and a successor adopting a handed resync entry (A-418's attach and successor halves).
+  exchange (built by A-427), and a successor adopting a handed resync entry (A-418's successor half).
 
 ### A-425 — The NFSv4 lease is derived from the clients it serves, and every wait on a recalled delegation reads it: one number for the lease advertised, the recall's revocation, the quiet period, the NFSv3 gate and a landing (2026-11-18, built for goal g255; A-414's owed list; RFC 8881 §8.3, §10.4, §10.4.5; §4.6 A-35, A-78, A-79)
 - **What was there.** The listener granted and advertised (`FATTR4_LEASE_TIME`) the operator's failover SLO, the 10 s
@@ -30291,6 +30296,161 @@ below.
   rule: the first case sent nothing either.
 - **Still owed.** With the tail cut past the last whole state, a whole record owed (for the keys, or after a refused
   publication) and a full credit can still meet the same wait; see GAPS.
+
+### A-426 — A scatter's part waits for room, and a batch of asks for its green owner's answer, in the target's own time (2026-11-18, built for goal g255; R3's class A; A-65, A-216, A-228, A-232, A-247, A-388)
+- **What was there.** A scatter's part (a listing's, the grants', the daemon's status, an acknowledgement's) that met
+  its target shard's control channel full waited for room half a liveness window on the wall, then settled the scatter
+  `Overloaded { shard }` (`verbs::PART_ROOM_BUDGET_NS`, "so the typed `Overloaded` reaches the client before it gives
+  the reply up"). A batch of asks to a green's owner (`work_home`, A-388) waited for room and for the owner's answer
+  within the lease bound on the wall, then answered its asks unanswered. Since 2026-11-13 a client waits for a live
+  daemon's answer however long (A-232), so the first reason was gone, and both bounds refused a target that was alive
+  and working, starved or slow to drain: the wall judgment class A's other waits gave up (A-65, A-403, A-408).
+- **The rule.** One room wait (`xshard::given_room_in_shard_time`), judged at each window's end in the target's own
+  time (`RoomRule`): a shard drains its control channel at every step, so its step count says whether room will come,
+  not its CPU clock (a shard inside one poll runs, or wakes now and then, and drains nothing until the poll ends). A
+  target that stepped in the window is draining and is waited for another whole window; one that took no step but
+  waits for a CPU is starved, not stuck (A-228), and is waited for while it has run less than the budget of CPU since
+  the wait began (A-318's rule for one poll, the budget held to this build); one that took no step and waits on nothing
+  else, or ran its budget in one poll, or cannot be read, ends the wait, and the part is refused typed. The steps are
+  read twice around the scheduler's look, as `observe::ShardTime` reads its clock, so a target that stepped between
+  the reads is read as draining. The scatter's part's window is `LIVENESS_BUDGET_NS / LATE_BEAT_SHARE`, the gap in
+  which the daemon logs one of its own shards as a near miss, so a stuck target is refused typed before the watchdog's
+  own judgment would end the daemon (A-232). A batch of asks to a green's owner waits for room the same way and for the
+  owner's answer by `within_shard_time` (A-65), both with the lease bound as their window and budget, as before its
+  wall deadline (`xshard::call_in_shard_time_given_room`).
+- **Tests.** `a_part_waits_for_room_while_its_target_steps` (`crates/server/src/xshard.rs`): a stand-in shard stepped
+  once each look's span from a thread of its own, its one-slot channel full, is drained a quarter of a window after the
+  room wait's first window; the part is sent and its message is next on the channel. And
+  `a_room_wait_goes_on_while_its_target_steps_or_starves_and_ends_when_it_does_neither` (the rule over scripted
+  readings: a step, a starved target with CPU left and past its budget, a blocked one, a step between the reads, no
+  reading, the mark's move). The four scatter tests of `crates/server/tests/ack_release.rs` hold their target inside one
+  poll that sleeps, which takes no step and reads blocked, so each is still refused `Overloaded` at the first window, as
+  they assert; the stand-in of `a_bounded_wait_for_room_waits_its_period_in_time_on_a_starved_shard` never steps and has
+  no thread to read, so it is given up at its first window too.
+  Run on the Mac Studio (kiln, 2026-11-18, load 8-12, debug build, `cargo test --locked -p slates-server --lib -- room
+  xshard:: work_home`): 19 of 19, both new tests and every room wait's with them. Red-checked once: with the judge
+  never consulted past the first window, the stand-in test fails at its send. The scatter suites of
+  `ack_release.rs` and the green owner's batch flows are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{verbs,xshard,
+work_home,observe}.rs` (`observe::held_to_this_build` shared with the room rule).
+
+### A-427 — A Windows Shards stream's resync channel, the attach's half: made at the attach, held by the anchor before the stream serves anything, its session told before any reply that rests on it, its device end handed beside the stream's (2026-11-18, goal 90, item b, piece three; A-316's and A-339's Windows half; A-418's wire, A-423's hold)
+Applied in the same change to: §4.6, the Shards form's resync and death bullets; A-418's and A-423's owed lists; GAPS,
+A-281's entry (its Windows item); `crates/api/src/lib.rs` (the `CONTRACT` 12 note: Windows too, the type unchanged, so
+no new contract number); `unsafe-budget.toml` (`slates-ipc` 139 → 140); and:
+- `crates/server/src/shards/resync_handle.rs` (new, Windows): `establish`, the stream's `HandleResync` (its token, its
+  end until the hold is answered, the hold, the holder, the session's version and the version told), `hold`,
+  `settle_hold`, `tell`, `settle_tell`, `changed`, `name_holder`, `owed`, `owed_or_wake_me`, `give_up`.
+- `crates/server/src/shards/resync.rs`: the session's bytes on every platform; `Holder`, `HANDLE_SESSION_BYTES`,
+  `handle_session_bytes` and `from_handle_session` (a successor's, tested now).
+- `crates/server/src/shards.rs`: the channel made at a Windows attach; the serve task asks the hold first; a turn
+  owing the anchor its session tells it before its reply (`Turned::Session`), and a holder named outside the task wakes
+  it (`Woke::Session`); the session moves at `INIT`, the owner word and a RESTORE; the holder is named at the attach's
+  hand-off and by `ShardsHolder`; the resync is given up at the end, at the first DAX map, and where the device's end
+  was not handed; the device's end handed beside the stream's.
+- `crates/server/src/anchor_hold_windows.rs`: `hold_resync`, `record_resync`, `release_resync`, `HoldRefusal::may_hold`.
+- `crates/ipc`: `ReplyBody::ShardsHanded`'s `resync`, appended; `handle_route::process_started`.
+- `crates/client`: `attach_shards` takes the resync end from `ShardsHanded`.
+
+- **What was there.** A Windows stream had no resync channel: the device read nothing that could ever bring it a fresh
+  stream, so its share ended at its daemon's death (Shards' option (a)), whatever the anchor held.
+- **At the attach.** A message-mode pipe, as the anchor's own hold channel is, each message one read whole; the
+  token, 128 bits from the daemon's secure random; `Attached` written on the daemon's end first. The pipe buffers the
+  attach's message and one Windows `Resync` toward the device, so a successor's write never waits on a device that
+  has not read `Attached`; a second successor's, to a device that read nothing, is refused and that share ends.
+- **Held before anything is served.** Windows' hold is an exchange: the anchor duplicates the end out of the daemon and
+  answers (A-198), which a verb's transaction cannot wait on. So the record commits first and the stream's serve task
+  asks the hold before it reads anything on the stream: no request is answered under a hold that is not settled, so a
+  request answered before the anchor took the end is never one a successor would replay. A death between the record
+  and the hold leaves a record no hold names, which recovery removes as every guest's, or a hold no record names, which
+  the next daemon releases. Once answered, the daemon closes its own copy, so the device reads the channel's end exactly
+  when the anchor lets it go. No anchor, or the anchor's refusal, closes the end at once, counted `shards.resync_unheld`:
+  the device reads `Attached` and then the end. An answer that did not come may still have been taken
+  (`HoldRefusal::may_hold`), so it is released.
+- **The session.** The Unix session's bytes (token, owner view, form; A-316, A-378), then the holder: the process a
+  successor duplicates the fresh end into, its id and creation time (`GetProcessTimes`), which together name one process
+  for its life. The attaching client at its hand-off, then each process its client names with `ShardsHolder` (the
+  spawner `slates shards` starts, A-181), never a DAX claimant: a confined VM takes handles only through its spawner's
+  grants (Shards' condition 4c). Each change moves the session's version; the serve task tells the anchor (`Record`)
+  before the reply that rests on the change, and at once for a holder named outside it, through a waker the stream keeps.
+  A refused update gives the resync up, counted `shards.resync_given_up`; a holder whose time cannot be read is not
+  named, counted `shards.resync_holder_unnamed`.
+- **Given up** at the attachment's end; at the first DAX map (the anchor holds no Windows DAX section; A-365 is
+  Unix's); at a refused update; and where the device's end was not handed to the client. The release is an exchange,
+  run as a task of the shard; a refused one is counted, and the next daemon releases the end as one no record claims.
+- **The device's end** is duplicated into the attaching client beside the stream's (`ShardsHanded`'s `resync`,
+  appended; zero in the record, as `handle` is) and adopted by `attach_shards`, so `serve_shards` hands it to a
+  consumer as on Unix.
+- **Evidence.** Red first: on main the session's unit test did not build (no `handle_session_bytes`, `Holder` or
+  `from_handle_session`); green, the resync module's unit tests on a Mac Studio. `cargo xwin check` of `slates-server`,
+  `slates-ipc` and `slates-client` with their tests is clean for Windows. The exchange's test against a stand-in anchor
+  (`anchor_hold_windows.rs`: a resync hold naming its kind, one handle and the session, its `Record`, a `Record` for an
+  entry not held refused, the release) and `process_started`'s run on Windows, in CI's Windows lanes; filed for main.
+- **Owed.** The successor's half on Windows (adopting the held end, keeping the record, a fresh pipe duplicated into the
+  holder named in a `Resync`, the replies kept for a resend and the `FORGET`s logged); `slates shards` handing the
+  resync end to its command (`{resync}`); and the real-process Windows restart test, filed with the successor's half.
+
+### A-431 — AC-3.3's told wait is learned: a writer waits the tail of the told waits its shard measured plus a liveness window, backed off after an overdue wait up to the failover delay (2026-11-18, built for goal g255; R3's class A; A-141, A-191, A-196, A-228, A-232, A-354, A-375)
+- **What was there.** A writer outside FUSE waited for every FUSE mount of its volume to be told of its change at most
+  `told::TOLD_WAIT_NS`, half a liveness window on the wall, then was answered anyway, the late mount counted
+  `fuse.told_overdue` (A-191); a guest device's held reply (A-196) and a revocation's wait for its fenced mounts
+  (AUD-29-84) took the same bound. Its stated reasons were the near-miss share of the window and that a writer held to
+  it kept the other half of its client's reply deadline; since 2026-11-13 a client waits for a live daemon's answer
+  however long (A-232), so the second was gone, and the first is a logging threshold, not a judgment of the mounts. On a
+  machine whose mounts are told late but told (a loaded host, a large invalidation round), every such writer was
+  answered overdue, the case AC-3.3 exists to prevent.
+- **The rule.** The bound is learned as RFC 6298 learns a retransmission timeout (`told::ToldTimes`, per shard, over
+  `slates_cluster::failover::RunningDuration`): the tail of the told waits the shard measured (`smoothed + max(4 ·
+  deviation, G)`; none before the first) plus a liveness window, the lateness a live party may show before it is judged
+  (A-228). A wait cut short at its bound is not a sample (Karn's rule: its true length is unknown) but doubles the bound
+  for the next (§5.5), never past the node's failover delay (`ShardState::failover_ns`), the most a reply is held
+  (A-354, A-375); the next wait that ends told ends the back-off. A guest device's reply published at the bound backs it
+  off too. So a host whose mounts are told slowly is waited for at its own pace, a mount that never answers holds each
+  writer at most a failover delay, and the learned pace is never cut by the ceiling: the ceiling caps a back-off. Read
+  by every writer's wait (`told::wait`), a guest device's held reply (`virtiofs`'s `told_bound_ns`) and a revocation's
+  wait for its fenced mounts (`verbs::revoked_mounts_ended`, as the revoking shard learned it).
+- **Tests.** `a_writers_told_bound_follows_the_told_waits_it_measured` and
+  `an_overdue_told_wait_backs_the_bound_off_to_the_failover_delay_and_a_told_one_ends_it` (`crates/server/src/told.rs`,
+  host-independent: the learner over scripted waits). The told wait itself runs only where FUSE mounts do (Linux): the
+  FUSE told suite, the guest device's and the Shards stream's told counts are filed for main's Linux run.
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-8, debug build, `cargo test --locked -p slates-server --lib -- told
+  virtiofs`): 3 of 3, both new tests among them. Red-checked once: with the bound ignoring the waits it measured, the
+  first test fails at its quick waits' bound.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, AUD-29-84's line), `crates/server/src/
+{told,state,daemon,virtiofs,verbs}.rs`.
+
+### A-432 — The reaper's cleanup calls and a granted landing's lease and audit waits wait in their target's own time; the live log's admission, reconciliation and dispatch waits are wall bounds by their reasons (2026-11-18, goal 85 via g251; R3's class A; A-65, A-408, A-426)
+
+- **What was there.** Fifteen of the cross-shard calls A-408 left (g255's list at main 4553e8650) waited their budget on
+  the wall. The reaper's five (`reap::remove_on_owners`: a client's held maps written back, its presentations
+  abandoned, its attachments read and removed a batch at a time, its maps let go) waited the liveness window each, and a
+  shard alive and busy deferred the reap `Overloaded`, the next sweep sending the same write-back again beside the
+  first. A granted landing's five (`landing.rs`: the target lease's take, its compensation, its renewal between
+  slices, its release before the reply, and the audit append the reply waits on, A-265) waited the lease's term, so a
+  busy control shard refused the take `Overloaded` after a compensation, left a lease to its term, or sent a reply
+  without its audit record. The live log's five (`live_ship.rs`) waited a record period or the live budget.
+- **The rule.** The reaper's and the landing's calls wait by `xshard::call_in_shard_time` and `task_in_shard_time`
+  (A-65's rule, as A-403 and A-408): their budget's window, then on while the target works or waits for a CPU, until it
+  has run the budget's CPU (held to this build), so only a target that stopped, or ran its budget without answering,
+  ends the wait with the same typed refusal as before. A take run past its own deadline still refuses itself
+  (`take_target_lease`), so a take waited longer is answered or refused typed, never left unknown. The live log's
+  waits stay on the wall, each for a stated reason beside it: a claim admission (`admit_claim`, `serve_admit`) runs
+  inside the record plane's serve of a peer's message, which serves that peer one request at a time, and its owner asks
+  again at the record period (`ADMISSION_WAIT_NS`), while the admission's closure, idempotent, still runs on its shard;
+  the claim reconciliation and re-admission (`reconcile_claims`, `readmit`) run in the control shard's record period
+  before its materializations, a shard unanswered staying marked for the next; and the live dispatch's wait
+  (`send_from_control`) has lanes bounded on the wall by the live budget and an answer nothing reads, and bounds how
+  long the owner's task that sent it stays, a lane being taken free again at the same bound.
+- **Tests.** `a_reaps_calls_wait_for_a_shard_that_works_past_their_first_window` (`reap.rs`) and
+  `a_lease_take_waits_for_a_control_shard_that_works_past_its_term` (`landing.rs`): a two-shard daemon whose second
+  shard runs one poll of three windows on the wall, on its CPU a fifth of it (`daemon::hold_busy`), the reap and the take
+  sent behind it. Red: each waited one window on the wall, the reap deferred `Overloaded` and the take refused
+  `Overloaded` with its lease released by its compensation.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{reap,landing,
+live_ship,daemon}.rs`.
 
 ### A-430 — A volume a publication cannot image keeps its committed record, and every block that record names stays allocated (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.8, D-18; amends A-64's commit rule and A-68's checkpoint)
 Applied in the same change to:

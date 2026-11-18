@@ -73,6 +73,12 @@ blake3 = { workspace = true }
 # cryptographic library slates builds on (A-66), which the server links already.
 aws-lc-rs = { workspace = true }
 
+# The vhost-user test plays the VMM over the device's end the library hands (§4.6, G-vhost): the daemon's own test
+# front end and guest driver (`crates/server/tests/common/`), which speak through the device's protocol types. Linux
+# alone serves the form; the server links the crate already.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+slates-bridge-virtiofs = { workspace = true }
+
 # Instance start by use: the test binary is an embedding host whose own `main` serves the roles when its arguments
 # begin with its prefix, as kiln's does, so it runs without libtest's harness (A-278).
 [[test]]

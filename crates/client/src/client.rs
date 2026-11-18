@@ -184,8 +184,8 @@ pub struct ShardsStream {
   pub stream: StreamEnd,
   /// The device's end of the stream's resync channel (A-316, A-339; `slates_bridge_fuse::shards_resync`),
   /// close-on-exec, to hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor
-  /// daemon hands the device a fresh stream after this one's daemon dies. None where the daemon hands none (Windows
-  /// yet), or made no channel.
+  /// daemon hands the device a fresh stream after this one's daemon dies. On Windows (A-427) a handle the daemon
+  /// duplicated into this process, a message-mode pipe's end. None where the daemon made no channel.
   pub resync: Option<StreamEnd>,
 }
 
@@ -1925,9 +1925,13 @@ impl Client {
         lease_epoch,
         capability,
         handle,
+        resync,
       } => Ok(ShardsStream {
         stream: adopt_handed_stream(handle)?,
-        resync: None,
+        // The device's end of the resync channel, beside the stream's (A-427): zero where the daemon made or handed none.
+        resync: (resync != 0)
+          .then(|| adopt_handed_stream(resync))
+          .transpose()?,
         attachment: Attachment {
           attachment,
           lease_epoch,

@@ -8,7 +8,9 @@ tracks what is still owed.
 
 The crate is the typed client of the daemon plus what was the CLI's alone: the anchor and daemon
 roles, the host mount, the grant issuer and the grant's default term. The `slates` command calls
-the same code, so a host starts, mounts and grants exactly as the command does.
+the same code, so a host starts, mounts and grants exactly as the command does. Every Rust example
+here compiles against the crate as a doctest (`cargo test -p slates-api --doc`), so none can drift
+from the API it shows.
 
 ## Starting an instance with no slates binary
 
@@ -16,7 +18,7 @@ A host serves the anchor and daemon roles from its own executable. Its `main` ha
 after a prefix word of its choosing to `slates_api::role::main`, and `Instance::start` runs that
 executable as the anchor; the anchor starts its daemon from the same executable and prefix.
 
-```rust
+```rust no_run
 use std::process::ExitCode;
 use slates_api::{Instance, StartSpec};
 
@@ -254,7 +256,7 @@ test holds every version to a line there).
 
 ## A host's workspace flow
 
-```rust
+```rust no_run
 use slates_api::{Filter, Instance, Issuer, LandOutcome, LandingRequest, MountOptions, VolumeSpec};
 
 fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error> {
@@ -295,10 +297,9 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 ## What is owed
 
 The gap ledger's consumer-contract entry audits this library clause by clause, naming the tests
-that hold each one and where they run. What it found owed, with the rest:
+that hold each one and where they run; every clause is held by a test on main. Still owed beyond
+the goal's clauses:
 
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
-3. A test of `serve_vhost_user` through the library (Linux).
-4. The example above compiled by a test, so it cannot drift from the API.

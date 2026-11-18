@@ -4580,6 +4580,9 @@ pub enum ReplyBody {
     capability: AttachmentCapability,
     /// The handle's value in the client's process; zero in the record, or where the hand-off was refused.
     handle: u64,
+    /// The value in the client's process of the device's end of the stream's resync channel (A-427), a message-mode
+    /// pipe's: zero where the daemon made none, in the record, or where its hand-off was refused. Appended.
+    resync: u64,
   },
   /// The process a `ShardsHolder` named was judged to hold the stream and is now a known holder of it. Appended.
   ShardsHolderAdded,

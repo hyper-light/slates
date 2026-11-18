@@ -3578,6 +3578,10 @@ const LIVE_REACHED_UNWALKED: &str = "fleet.live.reached_unwalked";
 async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
   let budget = crate::fleet::live_budget();
   let deadline = budget.max_deadline_ns().saturating_mul(2);
+  // A wall bound, by its reason (A-432): the dispatch's lanes are exchanges with remote holders, each bounded on the
+  // wall by the live budget (class B's), and nothing reads this wait's answer. It bounds how long the owner shard's task
+  // that sent the dispatch stays: a lane is taken free again at the same bound ([`lane_expiry_ns`]), so a wait on in the
+  // control shard's time would let a starved control shard gather one such task a lane every bound.
   let _ = crate::xshard::task_within(
     origin,
     control,
@@ -5057,6 +5061,15 @@ impl Admission {
 
 /// Derived: an admission's call to the volume's shard waits one record period, the cadence the owner ships again at, so
 /// the holder answers no later than the owner would ask again; an admission older than it was a dropped attempt's.
+///
+/// A wall bound, by its reason (A-432), not a judgment of the volume's shard: an admission runs inside the record
+/// plane's serve of the owner's message ([`admit_claim`], [`serve_admit`]), which serves that peer's requests one at a
+/// time, so a wait judged in the volume's shard's own time would hold the peer's records, prepares and takeover rounds
+/// while that shard is busy; the owner asks again at this period. The admission's closure still runs on its shard and is
+/// idempotent (`verbs::admit_candidate_claim`), so the owner's next ask finds the claim, and the reconciliation releases
+/// one no copy names. The reconciliation's own waits ([`reconcile_claims`], [`readmit`]) run in the control shard's
+/// record period before its materializations, and are held to the period so a busy shard holds none of them back: a
+/// shard unanswered stays marked for the next period.
 const ADMISSION_WAIT_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
 /// Counter: a live message answered nothing because its claim's admission was still running, or unanswered.
@@ -5096,6 +5109,7 @@ pub(crate) async fn admit_claim(
     None => return Admission::NotNow,
   };
   let id = slates_db::catalog::VolumeId { bytes: object.0 };
+  // A wall bound: the owner's period, inside the peer's serve ([`ADMISSION_WAIT_NS`]).
   let answer = crate::xshard::call_within(
     origin,
     target,
@@ -5214,6 +5228,7 @@ pub(crate) async fn reconcile_claims(origin: u16) {
   })
   .unwrap_or_default();
   for (partition, target, kept) in marked {
+    // A wall bound: the record period's ([`ADMISSION_WAIT_NS`]); unanswered, the partition stays marked.
     let answer = crate::xshard::call_within(
       origin,
       target,
@@ -5354,6 +5369,7 @@ pub(crate) async fn serve_admit(
   let id = slates_db::catalog::VolumeId { bytes: object.0 };
   let size = crate::verbs::wire_size(admit.size);
   let require_locked = admit.require_locked;
+  // A wall bound: the owner's period, inside the peer's serve ([`ADMISSION_WAIT_NS`]).
   let answer = crate::xshard::call_within(
     origin,
     target,
@@ -5589,6 +5605,7 @@ async fn readmit(origin: u16, object: ObjectId) {
     return;
   };
   let id = slates_db::catalog::VolumeId { bytes: object.0 };
+  // A wall bound: the record period's ([`ADMISSION_WAIT_NS`]); refused or unanswered, the partition stays marked.
   let answer = crate::xshard::call_within(
     origin,
     target,

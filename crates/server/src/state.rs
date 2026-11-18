@@ -761,6 +761,9 @@ pub struct ShardState {
   /// The writers parked until every FUSE mount of their volume has been told of their change, and the replies held for
   /// them (AC-3.3; `crate::told`). Bounded by the tasks waiting and the shard's client credit.
   pub(crate) told_waiters: crate::told::ToldWaiters,
+  /// How long this shard's writers waited for their volume's FUSE mounts to be told, and the back-off after overdue
+  /// waits: what the told bound is learned from (AC-3.3, A-431; `crate::told::bound_ns`). Two words and an estimator.
+  pub(crate) told_times: crate::told::ToldTimes,
   /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
   /// Bounded by the metadata ledger and the listener's connections.
   pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,

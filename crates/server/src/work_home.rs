@@ -1102,8 +1102,8 @@ async fn send_batches(here: u16, owner: u16) {
       return;
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
-    let deadline = crate::lease::lease_bound_ns();
-    let answers = crate::xshard::call_within_room(
+    let budget = crate::lease::lease_bound_ns();
+    let answers = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| {
@@ -1112,7 +1112,7 @@ async fn send_batches(here: u16, owner: u16) {
           .map(|item| answer_on_owner(s, item))
           .collect::<Vec<_>>()
       },
-      deadline,
+      budget,
     )
     .await;
     let _ = state::with_state_counted(|s| match answers {
@@ -1533,7 +1533,7 @@ pub(crate) fn tell_floor(
     state.count(FLOOR_NOT_SENT, 1);
     return;
   };
-  let deadline = crate::lease::lease_bound_ns();
+  let budget = crate::lease::lease_bound_ns();
   let spawned = slates_rt::futures::spawn(async move {
     let took = state::with_state(|s| match base {
       Some(base) => s.works.get(&work).is_some_and(|w| w.base_version == base),
@@ -1543,11 +1543,11 @@ pub(crate) fn tell_floor(
     if !took {
       return;
     }
-    let sent = crate::xshard::call_within_room(
+    let sent = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| crate::verbs::owner_floor(s, green, work, base),
-      deadline,
+      budget,
     )
     .await;
     if sent.is_none() {

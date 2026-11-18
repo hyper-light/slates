@@ -3575,14 +3575,20 @@ enum ScatterKind {
   Acknowledge,
 }
 
-/// How long a scatter's part waits for room in a full control channel before it is refused (A-216's sibling sweep).
-/// Derived: half the client's reply deadline (the liveness budget, which `slates_client::Deadlines` waits a reply for),
-/// so the typed `Overloaded` reaches the client before it gives the reply up; a burst, such as the resends after a
-/// daemon's restart, drains well within it.
-const PART_ROOM_BUDGET_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
+/// Derived: a scatter's part's wait for room in a full control channel (A-216's sibling sweep), its first window and the
+/// CPU its target may run without draining (`xshard::given_room_in_shard_time`, A-65's rule, A-426):
+/// `LIVENESS_BUDGET_NS / LATE_BEAT_SHARE`, the gap in which the daemon logs one of its own shards as a near miss. A
+/// target that works through a window, on the CPU or waiting for one, drains its channel at its next turn and is waited
+/// for; one that does neither is refused at the window's end, typed (`Overloaded { shard }`), inside the watchdog's
+/// window, so the answer comes before the watchdog's own judgment would end the daemon (A-232). Until A-426 the wait was
+/// this span on the wall, as half the client's reply deadline; since 2026-11-13 a client waits for a live daemon's answer
+/// however long, and the wall bound refused the part of a target that was alive and working.
+pub(crate) const PART_ROOM_BUDGET_NS: u64 =
+  crate::daemon::LIVENESS_BUDGET_NS / crate::daemon::LATE_BEAT_SHARE;
 
 /// Sends a scatter's part, `task`, to `shard`. A control channel full at once hands the part to a task of this shard
-/// that waits for room for [`PART_ROOM_BUDGET_NS`] (`xshard::given_room_within`). Past that wait, or at once for a shard
+/// that waits for room in `shard`'s own time ([`PART_ROOM_BUDGET_NS`], `xshard::given_room_in_shard_time`). Past that
+/// wait, or at once for a shard
 /// gone or a waiting task that cannot be spawned, the part is settled as refused ([`settle_refused`]): the scatter then
 /// answers `Overloaded { shard }`, typed, when its last part is in. Before 2026-11-05 a refused part was settled through
 /// a nested state borrow that never ran, and the scatter was never answered
@@ -3615,7 +3621,7 @@ fn send_part(
       Err(_) => return settle_refused(state, kind, request, shard).map(|(_, reply, _)| reply),
     };
   let waiting = slates_rt::futures::spawn(async move {
-    if !crate::xshard::given_room_within(shard, unsent, PART_ROOM_BUDGET_NS).await {
+    if !crate::xshard::given_room_in_shard_time(shard, unsent, PART_ROOM_BUDGET_NS).await {
       // Settled in its own borrow, and delivered after it: `deliver` borrows the state itself.
       if let Some(Some((client_index, reply, paged))) =
         crate::state::with_state_counted(|s| settle_refused(s, kind, request, shard))
@@ -5500,17 +5506,19 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
 
 /// Waits until every FUSE mount the revocation fenced (each shard's, by attachment and volume) has had its kernel drop
 /// what it cached and ended (AUD-29-84; `crate::fuse::fence_if_mounted`), so no process reads, after the revocation is
-/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most [`crate::told::TOLD_WAIT_NS`],
-/// the bound a writer waits for the same kernels to be told of a change; one past it is counted and the revocation
-/// acknowledged anyway, since every request of the mount is already refused.
+/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most the bound a writer here waits for
+/// the same kernels to be told of a change (`crate::told::bound_ns`, A-431, as this shard learned it); one past it is
+/// counted and the revocation acknowledged anyway, since every request of the mount is already refused.
 #[cfg(target_os = "linux")]
 async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {
+  let bound = crate::state::with_state(|s| crate::told::bound_ns(s))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   for (shard, mounts) in fenced {
     let ended = crate::xshard::task_within(
       origin,
       shard,
       move || crate::fuse::revoked_mounts_ended(mounts),
-      crate::told::TOLD_WAIT_NS,
+      bound,
     )
     .await;
     if ended.is_none() {
@@ -10221,6 +10229,33 @@ pub(crate) fn publish_clone_as(
   }
 }
 
+/// The consumer an attachment records. Another host's client's attachment names its host and client (A-222); a local
+/// client's is its own, a CLI one's lapsing at its term (A-230); a container bind's is its parent attachment's. Whether
+/// that source is shared with other users is the parent attachment's record, which only this resolves, so the bind's
+/// evidence is stamped here rather than in `oci::bind`, which sees the mount table and not the attachment: a rootful
+/// runtime needs it true, a rootless one does not (§4.6 A-9, `HostMountEvidence::shared_with_other_users`).
+fn attach_consumer(
+  state: &mut ShardState,
+  (client_id, principal): (u32, &Principal),
+  record: &VolumeRecord,
+  snapshot: Option<SnapshotId>,
+  form: &AttachRequest,
+  binding: Option<&mut crate::oci::Binding>,
+) -> Result<slates_db::catalog::Consumer, Refusal> {
+  let Some(binding) = binding else {
+    let expires_ns = termed_expiry(state);
+    return crate::remote_attach::consumer(state, form, client_id, expires_ns);
+  };
+  let (consumer, shared_source) = binding.consumer(
+    state.db.partition(),
+    record.id,
+    principal,
+    snapshot.map(to_db_snapshot),
+  )?;
+  binding.entry.evidence.shared_with_other_users = shared_source;
+  Ok(consumer)
+}
+
 /// Attaches in the requested form (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`;
 /// §4.6 A-9), in the order that takes nothing before it is allowed: the rights for the intent first
 /// (§4.13: checked before any lookup or effect), then the form's establishment (a container bind is
@@ -10263,34 +10298,17 @@ fn attach(
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
-  let expires_ns = termed_expiry(state);
-  let resolved = binding.as_ref().map_or_else(
-    // Another host's client's attachment names its host and client (A-222); a local client's is its own, a CLI one's
-    // lapsing at `expires_ns` (A-230).
-    || {
-      crate::remote_attach::consumer(state, &form, client_id, expires_ns)
-        .map(|consumer| (consumer, false))
-    },
-    |binding| {
-      binding.consumer(
-        state.db.partition(),
-        record.id,
-        principal,
-        snapshot.map(to_db_snapshot),
-      )
-    },
-  );
-  let (consumer, shared_source) = match resolved {
-    Ok(resolved) => resolved,
+  let consumer = match attach_consumer(
+    state,
+    (client_id, principal),
+    &record,
+    snapshot,
+    &form,
+    binding.as_mut(),
+  ) {
+    Ok(consumer) => consumer,
     Err(refusal) => return refused(refusal),
   };
-  // Whether the source is shared with other users is the parent attachment's record, which only `consumer`
-  // above has resolved — so the evidence is stamped here rather than in `oci::bind`, which sees the mount
-  // table and not the attachment. A rootful runtime needs it true; a rootless one does not (§4.6 A-9, and
-  // `HostMountEvidence::shared_with_other_users`).
-  if let Some(binding) = binding.as_mut() {
-    binding.entry.evidence.shared_with_other_users = shared_source;
-  }
   let scope = match scope_of(state, volume, &form) {
     Ok(scope) => scope,
     Err(refusal) => return refused(refusal),
@@ -17217,6 +17235,19 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
   outcome
 }
 
+/// Keeps a live-shipped volume's just-encoded publication `record` to ship once the publication commits (A-200,
+/// `crate::live_ship`); a volume not live-shipped keeps nothing.
+fn capture_live_record(state: &mut ShardState, id: DbVolumeId, record: Option<&[u8]>) {
+  if state
+    .db
+    .partition()
+    .volume(id)
+    .is_some_and(|volume| volume.policy.live_shipped)
+  {
+    state.live.captured.push((id, record.map(<[u8]>::to_vec)));
+  }
+}
+
 /// [`publish_delta`] into `encoded`.
 fn publish_delta_into(
   state: &mut ShardState,
@@ -17258,18 +17289,11 @@ fn publish_delta_into(
         published.volumes.push(id);
         recorded.push(*handle);
         count = count.saturating_add(1);
-        // A live-shipped volume's record ships once the publication commits (A-200, `crate::live_ship`).
-        if state
-          .db
-          .partition()
-          .volume(id)
-          .is_some_and(|volume| volume.policy.live_shipped)
-        {
-          let record = encoded
-            .get(mark.saturating_add(id.bytes.len())..)
-            .map(<[u8]>::to_vec);
-          state.live.captured.push((id, record));
-        }
+        capture_live_record(
+          state,
+          id,
+          encoded.get(mark.saturating_add(id.bytes.len())..),
+        );
       }
       Err(e) => {
         encoded.truncate(mark);
@@ -17846,7 +17870,8 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
 /// its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 /// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
-/// `told::TOLD_WAIT_NS` (AUD-29-84): its requests were refused, but a page its kernel held may have been read meanwhile.
+/// the told bound (`told::bound_ns`, AUD-29-84): its requests were refused, but a page its kernel held may have been read
+/// meanwhile.
 /// Zero is the healthy reading.
 #[cfg(target_os = "linux")]
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
