@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use slates_client::{Client, ClientError, Rebased, Refusal, Submitted, VolumeId};
-use slates_ipc::protocol::{MergeWindow, ReplyBody, RequestBody};
+use slates_ipc::protocol::{MergeWindow, ReplyBody, RequestBody, Verification};
 use slates_server::verbs::{owner_of, owner_of_name};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
@@ -301,6 +301,53 @@ fn a_verdict_judged_on_the_greens_shard_is_kept_with_its_work_on_another() {
     panic!("the rebase conflicts");
   };
   assert_every_file_once(&windows);
+  drop(client);
+  daemon.stop();
+}
+
+/// A-267 with A-321 (signed work). Do: conflict a work in 400 files and submit it signed, with a signature no key made,
+/// through the wire, read the rest of its verdict, then submit it signed through the client. Expect: `SubmittedSigned`,
+/// its signature not verified, carrying some windows and counting the rest under a verdict id; the pages hold the rest,
+/// every file once; and the client's signed submit hands back every window and the same verification. Before, a signed
+/// verdict carried every window in one reply, refused "reply too large for the bulk area" past what a chunk holds.
+#[test]
+fn a_signed_verdict_past_one_reply_is_read_whole() {
+  let (daemon, instance) = daemon("signed");
+  let mut client = connect(&instance);
+  let (_, work) = conflicting(&mut client);
+  let signature = b"a signature no key made".to_vec();
+  let reply = client.call(&RequestBody::SubmitSigned {
+    work,
+    evidence: Vec::new(),
+    signature: signature.clone(),
+  });
+  let Ok(ReplyBody::SubmittedSigned {
+    version: None,
+    conflicts,
+    verification,
+    conflicts_elided,
+    verdict,
+  }) = reply
+  else {
+    panic!("the signed submit's conflict is answered: {reply:?}");
+  };
+  assert!(
+    !matches!(verification, Verification::Verified { .. }),
+    "{verification:?}"
+  );
+  assert!(conflicts_elided > 0, "the test outgrows one reply");
+  assert_ne!(verdict, 0, "the reply names its verdict");
+  let (rest, _) = walk(&mut client, work, verdict, conflicts.len());
+  assert_eq!(rest.len(), conflicts_elided as usize);
+  let every: Vec<MergeWindow> = conflicts.into_iter().chain(rest).collect();
+  assert_every_file_once(&every);
+  let Ok((Submitted::Conflict(through_the_client), judged)) =
+    client.submit_with_signature(work, &[], Some(&signature))
+  else {
+    panic!("the client's signed submit conflicts");
+  };
+  assert_eq!(through_the_client, every, "every window, signed");
+  assert_eq!(judged, verification, "judged as the wire said");
   drop(client);
   daemon.stop();
 }
