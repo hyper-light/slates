@@ -808,6 +808,18 @@ jobs:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+      # The binary the step above built starts in Nano Server, on every push (A-357): Windows refuses to start a binary
+      # that imports a function its DLLs lack, and A-223's three imports Nano Server lacks showed first on the release's
+      # test tag. This debug build's C runtime is a DLL, so the action puts the Visual C++ runtime's DLLs beside it, and
+      # every other import must resolve from Nano Server's own. release.yml holds the release binary to the same start.
+      # Shape: the step's bound is release.yml's for the same action (its runs took 22-45 s; ten minutes).
+      - name: The binary starts in Nano Server (every function it imports from Windows is there)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 10
+        uses: ./.github/actions/nano-server-start
+        with:
+          binary: target/debug/slates.exe
+          c-runtime-beside: "true"
       # `slates shards` on Windows (§4.6, A-181; G-shards-windows step 2): a real anchor and daemon, and the command
       # starting this test binary as a probe that holds the stream end as the handle `{handle}` named, mounts the
       # attachment over it and reads a file; the command exiting with its program; the attachment standing while the

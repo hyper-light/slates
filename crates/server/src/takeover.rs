@@ -1350,7 +1350,7 @@ pub(crate) fn ready_objects(
   if local_promises {
     answer_own_copies_by_name(state, departed, local, &regional);
   }
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
@@ -1472,7 +1472,7 @@ pub(crate) fn unpromised_past_the_bound(
   state: &ShardState,
   departed: HostId,
 ) -> Vec<(ObjectId, u32)> {
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   state
     .host_takeovers
     .get(&departed)
@@ -1816,7 +1816,7 @@ async fn commit_adopted(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
-  let (mut acceptor, shape, quorum, record) = state::with_state(|s| {
+  let (mut acceptor, shape, quorum, record, replaces) = state::with_state(|s| {
     let config = s.fleet.configuration();
     let generation = config.version;
     let quorum = config.quorum;
@@ -1838,6 +1838,10 @@ async fn commit_adopted(
       generation,
       owner: local,
     });
+    // This node holds another value at the adopted position, a lower epoch's that never committed (A-373).
+    let replaces = acceptor
+      .value_at(object, adopted.sequence)
+      .is_some_and(|held| held != adopted.value.as_slice());
     let record = Record {
       owner: local,
       object,
@@ -1846,7 +1850,7 @@ async fn commit_adopted(
       generation,
       value: adopted.value,
     };
-    Some((acceptor, shape, quorum, record))
+    Some((acceptor, shape, quorum, record, replaces))
   })
   .flatten()?;
   let holders = take_sessions("fleet.lent_to.adopt", |host| {
@@ -1905,8 +1909,15 @@ async fn commit_adopted(
     }
     Err(_) => Err(unplaced_cause),
   };
+  // The local acceptance replaced that value: a replica of the green built over it follows (A-373), so the adoption's
+  // engine is advanced from the version before, never served from a value the ledger no longer holds.
+  let replaced =
+    replaces && acceptor.value_at(object, record.sequence) == Some(record.value.as_slice());
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
+    if replaced {
+      crate::merge_origin::rewind_past_replaced(s, &record);
+    }
   });
   Some((dispatch, record, placement))
 }
