@@ -6375,8 +6375,14 @@ so an agent that needs durability can `await placed(scope)`.
 > third write unsealed, then the owner lost. The owner named the first seal's sequence before and after the second;
 > the successor reported serving that sequence under a later epoch; the first file survived and both later ones were
 > gone. **Owed:** auto-seal at a derived cadence (Phase 8 task 8, which needs the operator's loss-window SLO: a
-> decision for Ada), so the window is bounded; and the takeover report kept across the successor's own restart (it
-> lives in the shard's memory).
+> decision for Ada), so the window is bounded.
+>
+> **Status (2026-11-18, A-325: the takeover report survives the successor's restart; g230).** The takeover lived in the
+> successor shard's memory, so a successor restarted warm over its anchor reported none. It is now kept in the volume's
+> record (`VolumeRecord::taken_over`, appended; `slates_db::catalog::TakeoverRecord`), written in the same record that
+> makes the taken-over volume on its successor, replayed from the anchor at a restart and gone with the volume. Held by
+> `a_successors_takeover_report_survives_its_warm_restart` (`crates/server/tests/fleet.rs`: a successor restarted warm
+> reports the very takeover it reported before, its member id unchanged, the file read back).
 
 > **Status (2026-11-05, A-222: another host's write attachment).** A client on another node attaches a volume in the
 > record form, through the fleet's forward, and writes it through the file verbs; the owner records it under the
@@ -23416,3 +23422,20 @@ Applied in the same change to:
   budget ends it, and the record period, which retries every holder its lanes gave up, sends the rest.
 - **Cost.** A holder's catch-up on a shard of many live volumes is spread over turns, each a cross-shard call; the period
   had always been its backstop.
+
+### A-325 — A successor's takeover report is kept in the volume's record, so it survives the successor's restart (2026-11-18, g230, scale-out; AC-8.3)
+Applied in the same change to:
+- §4.10 "Auto-seal": the status of 2026-11-18 (A-325) and the loss window's status of 2026-11-17 (its owed item
+  closed).
+- `crates/db/src/catalog.rs`: `TakeoverRecord`; `VolumeRecord::taken_over` (appended: the partition's log and images
+  change schema, as A-285's appended policy fields did). Every record made elsewhere carries `None`.
+- `crates/server/src/verbs.rs`: `TakenOver::takeover`, written into the record `materialize_taken_over` makes;
+  `loss_report` reads it from the record. `crates/server/src/fleet.rs`: the takeover builds it (`note_taken_over` and
+  the shard's `taken_over` map are gone, with the map's removals at a destroy).
+- Tests: `a_successors_takeover_report_survives_its_warm_restart` (`crates/server/tests/fleet.rs`, with its
+  `AnchoredFleet` fixture).
+- GAPS: the loss window's entry of 2026-11-17 (its owed item closed).
+- **What was there.** The takeover was noted in the owner shard's memory after the volume was materialized, so a
+  successor restarted over its anchor, which keeps the volume, its content and its records, reported no takeover.
+- **The rule.** The takeover is part of the record that makes the taken-over volume on its successor: one durable
+  record, replayed at a restart and removed with the volume. A volume made on its own node carries none.

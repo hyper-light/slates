@@ -5008,26 +5008,6 @@ async fn injected_content_ack_delay(reply: &[u8]) {
   }
 }
 
-/// Records, on the volume's new owner shard, the takeover that made this node its owner (AC-8.3, the loss report in
-/// `slates status`): the epoch the head was placed under, the head sequence served from, and whether the volume was
-/// rebuilt from its live log (no acknowledged write lost) or from the seal the head names (the lost owner's edits after
-/// it are the loss window).
-fn note_taken_over(
-  s: &mut crate::state::ShardState,
-  id: DbVolumeId,
-  placed: &crate::head::PlacedHead,
-  from_live_log: bool,
-) {
-  s.taken_over.insert(
-    id,
-    slates_ipc::protocol::VolumeTakeover {
-      epoch: placed.epoch.0,
-      from_live_log,
-      head_sequence: placed.sequence,
-    },
-  );
-}
-
 /// Runs `recovery` on this shard with the memory-pressure hold lifted for exactly its duration, then sets the hold
 /// back. A takeover's materialization (its fetch's staging, the restore, the volume's reservations and the writes
 /// that populate it) moves a claim the fleet already admitted and committed to its successor: admission.md §5.5 keeps
@@ -5255,11 +5235,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     target,
     move |s| {
       let sequence = placed.sequence;
+      // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
       let taken = verbs::TakenOver {
         head: &head,
         catalog: &catalog,
         catalog_sequence,
         sequence,
+        takeover: slates_db::catalog::TakeoverRecord {
+          epoch: placed.epoch.0,
+          head_sequence: sequence,
+          from_live_log: live.is_some(),
+        },
       };
       // The volume's lineage key, so this node opens what the dead owner sealed and seals under the same key (A-92
       // pieces 3b and 4c). A head that carried no entry for this node (it acknowledged before its pair arrived) leaves
@@ -5279,7 +5265,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
         })
         .map_err(|refusal| materialize_refusal_counter(&refusal))?;
-        note_taken_over(s, id, &placed, true);
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
         return Ok(());
@@ -5299,7 +5284,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         verbs::materialize_taken_over(s, id, &taken, region, opened.as_ref())
       })
       .map_err(|refusal| materialize_refusal_counter(&refusal))?;
-      note_taken_over(s, id, &placed, false);
       // The owner shard now owns the head's and the catalog's placements — its record plane writes the
       // object's next records at the promotion epoch and ships only to holders still missing these.
       s.placed_heads.insert(object, placed);

@@ -48,8 +48,8 @@
 > placing by refusing the owner's records, so the window is the edits after the last *placed* seal, not the last seal).
 > - **Owed:** auto-seal at a derived cadence (Phase 8 task 8), which bounds the window; it needs the operator's
 >   loss-window SLO, a decision for Ada (options in the g230 progress record).
-> - **Owed:** the takeover report survives the successor's restart; it lives in the shard's memory, so a restarted
->   successor reports no takeover (the window it reports from then on is still exact).
+> - **Closed (2026-11-18, A-325):** the takeover report survives the successor's restart: it is kept in the volume's
+>   record (`VolumeRecord::taken_over`). Test: `a_successors_takeover_report_survives_its_warm_restart`.
 
 > **A sealed envelope's wrap and open were quadratic in its chunks: linear (2026-11-17, A-92 piece 3b; g230).** The
 > wrap (`slates_cluster::envelope::wrap`) checked each sealed chunk against every chunk already stored, and the open
