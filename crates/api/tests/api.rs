@@ -20,12 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter,
-  GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome, LandingApproval,
-  LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome, Missing, PathFault,
-  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported,
-  Unusable, Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode,
-  WritePolicy,
+  AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter, Instance,
+  Intent, Invalid, IssuerFault, LandOutcome, LandingApproval, LandingConflict, LandingStage,
+  LandingState, MergeApproval, MergeOutcome, Missing, PathFault, PolicyReason, PolicyRefusal,
+  PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable, Verification,
+  VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -425,8 +424,9 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     b"ref: refs/heads/main\n",
     "git's own files were left out"
   );
-  // The approval and the landing are audited and listed, typed (A-299): the presentation, the grant the launcher
-  // issued, the landing finished `Done`, and the single-use grant consumed by it.
+  // The approval and the landing are audited, typed (A-299): the presentation, the grant the launcher issued, and the
+  // landing finished `Done`. The single-use grant it consumed left the grant table at that step (A-266, a principal's
+  // grants are its live ones), so it is listed no longer: its history is the audit's.
   let audit = instance.audit(0).unwrap();
   let kinds: Vec<AuditKind> = audit.iter().map(|record| record.kind).collect();
   assert!(
@@ -442,10 +442,10 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   );
   let grants = instance.grants().unwrap();
   assert!(
-    grants
+    !grants
       .iter()
-      .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
-    "{grants:?}"
+      .any(|grant| grant.manifest == approval.manifest),
+    "a consumed grant leaves the table: {grants:?}"
   );
   daemon.stop();
 }
