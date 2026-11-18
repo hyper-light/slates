@@ -15285,7 +15285,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed (on main 2026-11-17); a starved owner open
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (on main 2026-11-17)
 
 `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
 running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
@@ -15316,11 +15316,21 @@ WinFsp's held flush judges by the same rule since 2026-11-17 (`winfsp::settle_he
 no work, so it is unit-tested only through the shared rule; owed: a Windows run of `crates/cli/tests/live_winfsp.rs`
 (the supervisor), which still holds the suspended-candidates flush to its error.
 
+**An owner starved past a window's end: fixed 2026-11-17.** The first look after a window's end judged it, possibly
+before the owner had folded the acknowledgements waiting on its control shard's sockets, so a window it could not
+observe read as silent (raft's failing run showed the owner itself late: the stopped-candidates `fsync` gave up after
+1.60 s against a 1.00 s bound). A silent window is now given up only once the control shard has waited in its driver
+twice since the silence was seen (read off its registry pulse, `live_ship::heard_now`), at a look after the one that saw
+it, the looks a heartbeat apart; and the total bound is the failover SLO on the clock from the hold, so a receiver that
+never waits cannot hold a wait past it. Red first by use of the rule
+(`acknowledgements_read_after_a_late_window_end_start_the_next_window`,
+`a_receiver_that_never_drains_holds_the_verdict_only_to_the_total_bound`) and of the device
+(`a_guests_fsync_is_not_refused_while_its_receiver_has_not_read_what_came`). Stopped candidates are given up 1.2 to 1.3 s
+after the hold by construction, where it was 1.0 s; owed: the supervisor's run of the live FUSE flows, which assert the
+`EIO`, not its time. A control shard that never waits (busy for the whole wait) holds a stopped-candidates verdict to
+the failover SLO.
+
 Open:
-- **An owner starved past a window's end** judges that end when it next runs, possibly before it has folded the
-  acknowledgements waiting on its sockets, so a window it could not observe may read as silent. raft's failing run shows
-  the owner itself late (the stopped-candidates `fsync` gave up after 1.60 s against a 1.00 s bound). Owned by
-  g244-healthy-fsync-live, next.
 - The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
   period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
   silence.

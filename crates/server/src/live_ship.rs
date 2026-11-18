@@ -29,7 +29,7 @@
 //!
 //! Not yet: a holder's replicas do not survive its own daemon's restart.
 
-use slates_bridge_core::durable_bound::{DurableBound, GaveUp};
+use slates_bridge_core::durable_bound::{DurableBound, GaveUp, Heard, Spans};
 use std::collections::{BTreeMap, VecDeque};
 
 use slates_db::live::{
@@ -307,38 +307,62 @@ pub(crate) fn heard(state: &mut ShardState, object: ObjectId) {
   }
 }
 
+/// Derived: how far apart the looks are that confirm a held reply's silent window
+/// (`slates_bridge_core::durable_bound::Spans::look_ns`): the heartbeat, the cadence the control shard beats the
+/// anchor's word at (§4.14), so a control shard that runs waits in its driver at least once between two looks.
+const DURABLE_LOOK_NS: u64 = crate::daemon::HEARTBEAT_NS;
+
+/// The spans a held reply's wait is judged in on this shard: windows of [`DURABLE_WAIT_NS`], looks [`DURABLE_LOOK_NS`]
+/// apart while a silence is confirmed, and at most the shard's failover SLO from the hold (10 s by default; the
+/// supervisor's landing condition of 2026-11-11, banned item 8).
+fn durable_spans(state: &ShardState) -> Spans {
+  Spans {
+    window_ns: DURABLE_WAIT_NS,
+    total_ns: state.config.failover_slo_ns,
+    look_ns: DURABLE_LOOK_NS,
+  }
+}
+
 /// The first window of a wait for `volume`'s durability beginning at `now_ns`, under the one rule every transport judges
-/// a held durable reply by (`slates_bridge_core::durable_bound`): windows of [`DURABLE_WAIT_NS`], at most the shard's
-/// failover SLO's worth of them (`DurableBound::windows_within`; 10 at the default 10 s, the supervisor's landing
-/// condition of 2026-11-11). Under load on adacachy2 a healthy `fsync`'s bytes were already held by a candidate while
-/// the volume's head placement was in flight, and the old single deadline answered `EIO` (3 of 10 runs, every run that
-/// reached it).
+/// a held durable reply by (`slates_bridge_core::durable_bound`). Under load on adacachy2 a healthy `fsync`'s bytes were
+/// already held by a candidate while the volume's head placement was in flight, and the old single deadline answered
+/// `EIO` (3 of 10 runs, every run that reached it).
 pub(crate) fn begin_durable_bound(
   state: &ShardState,
   volume: slates_db::catalog::VolumeId,
   now_ns: u64,
 ) -> DurableBound {
-  DurableBound::begin(
-    heard_of(state, volume),
-    now_ns,
-    DURABLE_WAIT_NS,
-    DurableBound::windows_within(state.config.failover_slo_ns, DURABLE_WAIT_NS),
-  )
+  DurableBound::begin(heard_now(state, volume), now_ns, durable_spans(state))
 }
 
 /// Whether, and why, `bound`'s wait for `volume` has given up at `now_ns`, judged against what the volume has heard on
-/// its durability path ([`LiveVolume::heard`]).
+/// its durability path and how often its receiver has idled ([`heard_now`]).
 pub(crate) fn judge_durable_bound(
   state: &ShardState,
   volume: slates_db::catalog::VolumeId,
   bound: &mut DurableBound,
   now_ns: u64,
 ) -> Option<GaveUp> {
-  bound.judge(heard_of(state, volume), now_ns)
+  bound.judge(heard_now(state, volume), now_ns)
+}
+
+/// What a reply held for `volume`'s durability is judged against now: the acknowledgements the volume has heard
+/// ([`heard_of`]), and the waits the daemon's control shard has entered in its driver, each with nothing ready to run.
+/// The control shard holds the sessions every holder's acknowledgement arrives on (`send_from_control`), and hands each
+/// one to the volume's shard as a task there; so once it has waited twice after a moment, every acknowledgement that
+/// reached it before then has been read and handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`).
+/// Read off its registry pulse, with no shard round trip.
+pub(crate) fn heard_now(state: &ShardState, volume: slates_db::catalog::VolumeId) -> Heard {
+  let control = state.shards.first().copied().unwrap_or(state.shard);
+  Heard {
+    acknowledged: heard_of(state, volume),
+    receiver_idles: slates_rt::registry::with_entry(control, |entry| entry.pulse.waits())
+      .unwrap_or(0),
+  }
 }
 
 /// [`LiveVolume::heard`] of `volume`, or zero when this shard does not ship it.
-pub(crate) fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
+fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
   state
     .live
     .shipping
@@ -369,7 +393,9 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
         std::task::Poll::Ready(())
       }
     });
-    let left = bound.ends_ns().saturating_sub(slates_rt::futures::now_ns());
+    let left = bound
+      .next_look_ns()
+      .saturating_sub(slates_rt::futures::now_ns());
     match slates_rt::futures::within(left, parked).await {
       Ok(Some(())) | Err(_) => break,
       Ok(None) => {

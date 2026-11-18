@@ -1448,7 +1448,7 @@ fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
   mount
     .held
     .iter()
-    .map(|held| held.bound.ends_ns().saturating_sub(now))
+    .map(|held| held.bound.next_look_ns().saturating_sub(now))
     .min()
 }
 

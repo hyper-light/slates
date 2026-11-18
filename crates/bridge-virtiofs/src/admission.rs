@@ -754,14 +754,15 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   }
 
   /// Settles the device's `FSYNC` replies held for durability (`durability`, each wait judged as of `now_ns` against
-  /// `heard`, a new one begun by `begin`; [`Device::settle_durable`]) and notifies each queue whose driver asks. Nothing
+  /// `heard` (`slates_bridge_core::durable_bound::Heard`), a new one begun by `begin`; [`Device::settle_durable`]) and
+  /// notifies each queue whose driver asks. Nothing
   /// to do once the device is not live.
   pub fn settle_durable(
     &mut self,
     durability: &mut dyn FnMut(u64) -> crate::device::Durability,
     judged: (
       u64,
-      u64,
+      slates_bridge_core::durable_bound::Heard,
       &mut dyn FnMut() -> slates_bridge_core::durable_bound::DurableBound,
     ),
   ) -> Result<crate::device::DurableSettled, ServeError> {

@@ -704,9 +704,13 @@ async fn wait_for_work(
   let mut signal = std::pin::pin!(slates_rt::readiness::readable(signal));
   // The earliest held `fsync`'s give-up, armed as this wait begins: holds are only added in turns, between waits.
   let earliest = state::with_state(|s| {
-    s.fuse_mounts
-      .get(&attachment)
-      .and_then(|mount| mount.held.iter().map(|held| held.bound.ends_ns()).min())
+    s.fuse_mounts.get(&attachment).and_then(|mount| {
+      mount
+        .held
+        .iter()
+        .map(|held| held.bound.next_look_ns())
+        .min()
+    })
   })
   .flatten();
   let mut give_up = std::pin::pin!(async move {

@@ -1,7 +1,8 @@
 # A healthy live `fsync` was refused at a wall-clock deadline under load
 
 - **Date:** 2026-11-09; on main 2026-11-17. **Status:** fixed (the FUSE `fsync`, an NFS stable write or `COMMIT`, a
-  Shards `FSYNC`, the virtio-fs device's `FSYNC`, WinFsp's held flush); a starved owner open (GAPS). **Design:** §4.10
+  Shards `FSYNC`, the virtio-fs device's `FSYNC`, WinFsp's held flush), and its sibling, an owner starved past a
+  window's end (GAPS). **Design:** §4.10
   status "FUSE `fsync` at durability" and "The wait is judged by what it hears", A-200, AC-8.3. **Found by:** raft-7's
   run of the live fleet suite; ordered by the supervisor ahead of older items, since a spurious `EIO` on `fsync` tells an
   application its data is lost. Diagnosed and built by bug-sweep (`agents/bug-sweep-2` 50fa8c56, and the total bound
@@ -90,5 +91,11 @@ Shards refusals told the application its data might be lost. No acknowledged dat
 - **WinFsp's held flush: fixed 2026-11-17.** It held a `deadline_ns` of one liveness budget from its hold; it now
   holds a `DurableBound` and is judged by the same rule (`winfsp::settle_held`), its give-up logged with
   `live_ship::durability_report`. Owed: a Windows run of `crates/cli/tests/live_winfsp.rs`.
-- **An owner starved past a window's end** may judge that window before it reads the acknowledgements waiting for it:
-  open, g244-healthy-fsync-live's next piece.
+- **An owner starved past a window's end: fixed 2026-11-17.** The first look after a window's end judged it, and an
+  owner kept off its CPU across that end ran that look before its control shard had read the acknowledgements waiting
+  in its sockets. A silent window is now given up only once the control shard has waited in its driver twice since the
+  silence was seen (each wait collects everything readable, and a shard waits only when nothing is ready), at a later
+  look, the looks a heartbeat apart (`slates_bridge_core::durable_bound`, `live_ship::heard_now`); the total bound moved
+  onto the clock (the failover SLO from the hold), so a receiver that never waits cannot hold the verdict past it. Red
+  first: `acknowledgements_read_after_a_late_window_end_start_the_next_window` and
+  `a_guests_fsync_is_not_refused_while_its_receiver_has_not_read_what_came`, each answered `EIO` by the rule before.

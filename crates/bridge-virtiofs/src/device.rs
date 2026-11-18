@@ -37,7 +37,7 @@
 //! cannot catch — shorter than the FUSE header, or a request-queue chain with no room for a reply
 //! header — faults the device (the VMM resets it), the same policy as a malformed chain.
 
-use slates_bridge_core::durable_bound::DurableBound;
+use slates_bridge_core::durable_bound::{DurableBound, Heard};
 use std::fmt;
 
 use slates_bridge_core::{Bridge, OpContext};
@@ -316,8 +316,9 @@ struct DurableHeld {
 pub struct DurableOldest {
   /// The log position it waits to be durable at.
   pub target: u64,
-  /// When its wait's open window ends; `None` before the first [`Device::settle_durable`] saw it.
-  pub window_ends_ns: Option<u64>,
+  /// When its wait is next judged (its open window's end, a look confirming a silence, or its total bound); `None`
+  /// before the first [`Device::settle_durable`] saw it.
+  pub next_look_ns: Option<u64>,
 }
 
 /// What one [`Device::settle_durable`] did.
@@ -1535,7 +1536,7 @@ impl Device {
   pub fn durable_oldest(&self) -> Option<DurableOldest> {
     self.durable.front().map(|held| DurableOldest {
       target: held.target,
-      window_ends_ns: held.bound.map(|bound| bound.ends_ns()),
+      next_look_ns: held.bound.map(|bound| bound.next_look_ns()),
     })
   }
 
@@ -1547,14 +1548,15 @@ impl Device {
 
   /// Settles every held `FSYNC` reply whose volume is durable at its position (`durability`), never will be, or whose
   /// wait has given up as of `now_ns` (its [`DurableBound`], begun by `begin` the first time this settle sees it, judged
-  /// against `heard`, the volume's acknowledgements heard on its durability path): a durable one is released as served,
+  /// against `heard`: the volume's acknowledgements heard on its durability path and its receiver's idles): a durable
+  /// one is released as served,
   /// the others answered `EIO` in its place, and either then waits for the volume's FUSE mounts as every reply does
   /// ([`Device::settle_told`]). The rest stay held.
   pub fn settle_durable(
     &mut self,
     memory: &mut dyn GuestMemory,
     durability: &mut dyn FnMut(u64) -> Durability,
-    (now_ns, heard, begin): (u64, u64, &mut dyn FnMut() -> DurableBound),
+    (now_ns, heard, begin): (u64, Heard, &mut dyn FnMut() -> DurableBound),
     admission: &mut dyn ChainAdmission,
   ) -> Result<DurableSettled, DeviceError> {
     let mut settled = DurableSettled::default();

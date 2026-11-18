@@ -461,8 +461,9 @@ pub trait BridgeAccess {
   /// for every transport's durability claim, its windows and its total bound.
   fn durable_bound(&mut self, now_ns: u64) -> slates_bridge_core::durable_bound::DurableBound;
 
-  /// The volume's acknowledgements heard on its durability path so far, which a held reply's wait is judged against.
-  fn durable_heard(&mut self) -> u64;
+  /// What a held reply's wait is judged against now: the volume's acknowledgements heard on its durability path, and the
+  /// idles of the shard that receives them (`slates_bridge_core::durable_bound::Heard`).
+  fn durable_heard(&mut self) -> slates_bridge_core::durable_bound::Heard;
 
   /// Counts what one settle of the device's `FSYNC` replies held for durability did: released once durable after a
   /// wait, and answered `EIO`.
@@ -836,8 +837,8 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   let durable = admitted.durable_oldest().map(|oldest| {
     // Until the first settle begins its wait, a whole window.
     let ends_ns = oldest
-      .window_ends_ns
-      .unwrap_or_else(|| bridge.durable_bound(futures::now_ns()).ends_ns());
+      .next_look_ns
+      .unwrap_or_else(|| bridge.durable_bound(futures::now_ns()).next_look_ns());
     (
       bridge.durable(oldest.target),
       ends_ns.saturating_sub(futures::now_ns()),
