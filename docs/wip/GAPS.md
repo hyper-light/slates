@@ -921,6 +921,22 @@
 >     to 0.92 s). The 2,410 to 2,456 `BudgetExceeded` per run were W2's.
 >   - Owed: the stall's diagnosis (which shard, which ring, which wake), raised to the supervisor.
 >
+> **The oracle at 100,000 clients (2026-11-17, g232).** The harness's oracle counted both of a conflict's bounds by
+> scanning every accepted submit, for every conflict: at the 10,000-client rung's 111,708 conflicts and 26,598 accepts
+> that is 5.9 × 10⁹ comparisons, and at 100,000 clients about 6 × 10¹¹ (an extrapolation at ten times of each), hours
+> of the harness's own CPU after its clients are done. It also tried every head between the bounds, and held three
+> whole copies of every touched file (before the level, the head and the replay: about 5 GB over the whole kernel's
+> 1.67 GB). The oracle is now its own file (`crates/client/examples/support/load_oracle.rs`): the bounds are two binary
+> searches over the accepted instants sorted once, a slot's writes are found by binary search, only the heads where one
+> of the submit's slots was written are tried (the expected set cannot change between them), the replay runs in place
+> over the bytes before the level, and each head file is read, compared and dropped in turn. Its test
+> (`crates/client/tests/load_oracle.rs`) keeps the serial oracle it replaced as the reference: over 512 generated levels
+> a serial green judged (some submits made wrong after), the two name the same failures in the same words and order;
+> handwritten cases hold each failure kind and a conflict that fits only past its lowest head. Red-checked: trying only
+> the lowest head failed both that case and the property; counting a reply at the send's own instant as before it
+> failed the property. The harness prints the oracle's own time (`oracle_ns\t<n>\tsubmits\t…\theads\t…`). Owed: the
+> time measured at a 10,000-client rung before and after.
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
@@ -1900,6 +1916,32 @@
 > - NoLoss: every acknowledged write served byte for byte, nothing torn;
 > - StaleNeverCommits: writes through a superseded owner refused, survivors fenced at the takeover's epoch;
 > - Convergence: every candidate at the owner's head, durable, nothing owed.
+>
+> - **Built, first runs owed (g229, 2026-11-17): loss, a running node cut off, and ReadSafety and Continuity across
+>   real processes.** SIGSTOP stops a whole process and drops nothing, so until now no flow here injected loss, kept an
+>   isolated owner running (its lease lapsing, its peers judged dead from its side), or cut one direction only; only
+>   KIND's netem injected loss (`cargo xtask kind live`, which no lane runs).
+>   - A node may bind elsewhere than it advertises (A-277, the manifest's `bind`), so the fault relay
+>     (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to their bind blocks, with
+>     no privilege. Each datagram meets its path's rule: a one-way cut, a loss rate, a hold of `delay ± jitter` (so
+>     datagrams reorder) and a duplication rate, every draw from one printed seed (`SLATES_CHAOS_SEED` replays it). A
+>     record link's ephemeral source is attributed to its node by the process holding the port (`/proc` on Linux,
+>     `netstat` and `ps` on macOS); a datagram no census attributes is dropped and counted, never forwarded, since
+>     forwarding it could carry a cut-off node's traffic across.
+>   - Three flows run behind it (`Fleet::start_relayed`): writes streamed while every path holds 20 ms ± 5 ms and loses
+>     1 %, then 5 %, then 1 % with 2 % duplicated, then a takeover over the lossy paths; an owner cut off both ways
+>     while it runs; and an owner that still speaks to its peers but hears none.
+>   - Two invariants are judged from outside in them. ReadSafety: a latest-state read sent through the partitioned
+>     owner after its successor acknowledged a write answers that write or a refusal, never other bytes and never
+>     missing. Continuity: the successor's first head is past every position an owner reported durable under an
+>     earlier epoch, since its log goes on from the head it adopted (`slates_db::live::Shipper::new`).
+>   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln run r71, Adas-MacBook-Pro-3,
+>     2026-11-17): forwarding and the answer's way back, a one-way cut, loss, delay and duplication, attribution by
+>     process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
+>     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
+>     Linux's census has run nowhere yet.
+>   - Owed: ReadSafety and Continuity in the SIGSTOP and SIGKILL takeover flows, so every flow ends with every register
+>     invariant.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).

@@ -157,6 +157,14 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   pass the two bound sockets as inherited descriptors and name them in
   `SLATES_ANCHOR_FLEET_SERVE=PROBE_FD,RECORD_FD`. A socket bound anywhere but the node's planned
   address is refused by name.
+- `bind` is optional: an IPv4 address and base port, like `"0.0.0.0:7000"`, where the node's own two
+  sockets bind when that is not its `address`. Set it only when something between the node and its peers
+  maps the advertised ports there: a NAT's port forward, a container runtime's published ports
+  (`-p 17000-17001:7000-7001/udp` with `"address": "HOST:17000", "bind": "0.0.0.0:7000"`), or the fault
+  relay the chaos tests put between real daemons. The node serves probes on the bind's port and records on
+  the next; every peer still dials `address` and the port after it. A name or port 0 is refused, and so
+  is a bind block past the port range. Unset, the node binds `address` (every interface when it is a
+  name).
 - `domain` and `region` are optional per-node non-negative integers, both unset by default and set
   only for a real topology. `domain` is the node's failure domain (a rack or zone id): placement forms
   each object's copyset across distinct domains, so nodes that share a `domain` are treated as

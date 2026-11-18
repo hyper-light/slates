@@ -5688,8 +5688,12 @@ registry (D-14). A node's advertised port and the next are its two serve sockets
 first, records on the second — each shared by every peer through the session plane's connection-id
 demultiplexer (§4.10a §8; a peer's re-dial after a lost session replaces the old session), and every
 peer dials it there, so both ends of every session are computed from the same file and can never
-disagree. A manifest with fewer than `f + 1` nodes, a repeated name or certificate, a base at the end
-of the port range, or an identity the TLS stack cannot use, is refused by name at boot. The two serve
+disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
+the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
+and the base of the same block, A-277); it serves there while every peer still dials its advertised
+ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
+the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -6418,6 +6422,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   does.
 > - **An install never finishing inside an entry's budget (open).** The whole volume, sent to a candidate behind the
 >   retained tail, is resent without end (GAPS "Chaos from outside the processes").
+> - **Loss, and an owner partitioned while it runs (built 2026-11-17, goal g229; first runs owed).** A fault relay in
+>   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
+>   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
+>   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
+>   lossy paths through a takeover, cut a running owner off, and deafen one, and also judge ReadSafety (a read through
+>   the partitioned owner never answers less than its successor acknowledged) and Continuity (the successor's first
+>   head is past every position durable under an earlier epoch) from outside the processes.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -20546,3 +20557,30 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
+
+Applied in the same change to:
+- §4.8 "Deployment": the `bind` sentence, and a bound base past the port range refused as an advertised one is.
+- `crates/server/src/deploy.rs`: `FleetNodeEntry::bind`; `bind_address` binds the block a node names, else its
+  advertised address as before; `validate` and the plan refuse a bind block past the port range
+  (`PortBlockOverflows`, naming the bind's base). The tests: `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`
+  and the bind case of `a_bad_manifest_is_refused_by_name`.
+- `crates/cli/src/fleet.rs`: the manifest's optional `bind` per node, an IPv4 literal with a nonzero port; a name,
+  a missing port, port 0 or a non-string refused naming `nodes[i].bind` (`a_declared_bind_parses_and_a_bad_one_is_named`).
+- `docs/cli.md`: the manifest's `bind` field. GAPS: "Chaos from outside the processes", the relay owed.
+- **What was there.** A node bound exactly the address it advertised (an IP literal), or every interface on the
+  advertised port (a name). Whatever a peer dialed had to be the node's own socket. A node behind a port mapping
+  whose outer ports differ from its inner ones (a container runtime's published ports, a NAT's port forward) could
+  not join a fleet: it bound the outer port, which is not its to bind. And nothing could stand between two real
+  daemons on one machine, since discovery's announcement of a node's own address wins over the manifest's at every
+  dial (`fleet::resolve_peer_address`), so every peer reached the node's socket directly.
+- **The rule.** `bind` names the IPv4 literal and base port the node's two serve sockets bind; the advertised
+  address still names where every peer dials it, and the node still announces only that. The block is the same two
+  ports. With no `bind`, nothing changes. The anchor binds and hands over the plan's sockets, so it binds the block
+  too, and the daemon's check of an inherited socket compares it with the bind block.
+- **Why.** Goal g229 (Ada's chaos directive of 2026-11-04: knock replicas offline, inject latency and loss) owed loss
+  across real processes on a developer's machine, where netem needs privileges this project never takes. A relay in
+  the test that owns every node's advertised ports and forwards to their bind blocks can drop, delay, duplicate and
+  reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
+  injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
