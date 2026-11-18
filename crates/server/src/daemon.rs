@@ -6971,6 +6971,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,
@@ -8894,6 +8895,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,

@@ -539,22 +539,39 @@ pub fn to_entry(verification: &Verification) -> Option<slates_merge::chain_entry
 /// `verification` as a landing's audit record keeps it (A-321): `None` for a landing that carried no signature.
 #[must_use]
 pub fn to_record(verification: &Verification) -> Option<slates_db::catalog::SignatureVerdict> {
-  to_entry(verification).map(|entry| slates_db::catalog::SignatureVerdict {
+  to_entry(verification).map(shipped)
+}
+
+/// A chain entry's verdict in the form a record keeps and a merge record carries to holders and a takeover successor
+/// (A-321): the same three fields, in a type the wire encodes.
+#[must_use]
+pub fn shipped(
+  entry: slates_merge::chain_entry::Signature,
+) -> slates_db::catalog::SignatureVerdict {
+  slates_db::catalog::SignatureVerdict {
     kind: entry.kind,
     detail: entry.detail,
     fingerprint: entry.fingerprint,
-  })
+  }
+}
+
+/// A shipped verdict as a chain entry records it (A-321): what a takeover successor's chain entry keeps for the version.
+#[must_use]
+pub fn adopted(
+  record: slates_db::catalog::SignatureVerdict,
+) -> slates_merge::chain_entry::Signature {
+  slates_merge::chain_entry::Signature {
+    kind: record.kind,
+    detail: record.detail,
+    fingerprint: record.fingerprint,
+  }
 }
 
 /// A record's verdict, read back as the wire names it: `Unsigned` for a record that keeps none, `None` for a verdict no
 /// code of this build names.
 #[must_use]
 pub fn of_record(recorded: Option<slates_db::catalog::SignatureVerdict>) -> Option<Verification> {
-  of_entry(recorded.map(|record| slates_merge::chain_entry::Signature {
-    kind: record.kind,
-    detail: record.detail,
-    fingerprint: record.fingerprint,
-  }))
+  of_entry(recorded.map(adopted))
 }
 
 /// A chain entry's recorded verdict, read back as the wire names it: `Unsigned` for an entry that records none, `None`

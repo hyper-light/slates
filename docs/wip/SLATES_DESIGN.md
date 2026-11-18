@@ -25165,8 +25165,39 @@ its own), `docs/library.md`, and:
   requirement, the work's rules travelling, the replay's record, the checkpoint's table, the green's signers, the
   consumer refusal), the restored build green. The verifier's 11 unit tests over the new `ssh-keygen` vectors, the
   chain and checkpoint codecs' tests, and the contract's `a_signed_merge_is_judged_and_read_back_through_the_contract`.
-- **Owed** (GAPS): the verdict carried by a version's merge record to holders and a takeover successor (a successor
-  records none today); a real FIDO key's signature end to end.
+- **Owed** (GAPS): a real FIDO key's signature end to end.
+
+**Signed work survives a takeover (2026-11-18, A-321's third part; goal g090).** Applied in the same change to GAPS
+(the A-321 entry's owed list, the A-285 sibling it named) and:
+- `crates/server/src/catalog.rs`: `CatalogValue::write`, `write_version` and `signers`, appended; `CatalogValue::of`
+  fills them. The ops that set them already moved `catalog_version` (A-285, A-321), so every setting ships as a newer
+  register; only the value lacked them.
+- `crates/server/src/verbs.rs`: `materialize_taken_over` and `materialize_taken_over_green` make the successor's record
+  with the catalog's policy, version and signers (they wrote `write: None`); the green's successor writes each version's
+  chain entry with the verdict its merge record carried, which its replay hands the green (`record_signature`).
+- `crates/server/src/merge_service.rs`: `MergeRecordValue::signature` (a `SignatureVerdict`, the chain entry's three
+  fields in a type the wire encodes), appended, filled from the green's engine when the record is made;
+  `GreenRecovery` carries each version's verdict and the catalog's policy and signers.
+- `crates/server/src/signed_work.rs`: `shipped` and `adopted`, the verdict between its chain-entry and record forms.
+- Tests: `crates/server/tests/fleet.rs` (`a_greens_policy_signers_and_verdicts_survive_its_owner`,
+  `a_volumes_policy_and_signers_survive_its_owner`).
+
+- **Why.** Provenance and policy are the volume's, so they outlive the owner that recorded them. A successor rebuilt a
+  taken-over green from its holders' merge records, which carried no verdict, and made every volume's record with no
+  policy and no signers, so a green taken over read its signed versions unsigned, dropped its signed-merge requirement
+  and judged signatures under no trusted key, and a volume taken over landed as an unset one does.
+- **How.** The verdict rides the version's merge record to the holders the record commits at, as its completion key
+  does (A-255), and the successor's chain entry records it, so the successor's own restart and checkpoint keep it as
+  the owner's did. The policy, its version and the signers ride the catalog register, as the access list does (A-237).
+  Nothing is judged again: a version reads back as it was judged when it merged.
+- **Proven** (macOS arm64, Mac Studio, 2026-11-18), on three nodes at `f = 1`: a green trusting one key and requiring
+  signed merges, merged signed at 1, its owner killed once both survivors held the catalog naming the policy and the
+  key and the merge record carrying the verdict; on the successor the policy and the signers read back at version 2,
+  version 1 verified naming the key, an unsigned merge refused `SignatureRequired` naming the green, and a signed one
+  merged at 2 verified. A plain volume forbidding landings and trusting one key: on its successor both read back and a
+  landing refused `PolicyForbids`. Each guard red alone (the green's successor dropping the catalog's policy, a plain
+  successor dropping it, the successor's chain entry dropping the shipped verdict, the owner shipping none, the catalog
+  carrying none), the restored build green.
 
 **Signed landings (2026-11-18, A-321's second part; goal g090).** Applied in the same change to: §4.15 (the audit
 record's shape, step 2 "Present", a status blockquote), §4.12 ("The consumer contract": its signed-work bullet,

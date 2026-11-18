@@ -11457,9 +11457,10 @@ pub(crate) fn materialize_taken_over_green(
         },
         live_shipped: false,
         live_holders: None,
-        write: None,
-        write_version: 0,
-        signers: Vec::new(),
+        // The green's write policy and trusted signers, from its adopted catalog register (A-285, A-321).
+        write: recovery.write,
+        write_version: recovery.write_version,
+        signers: recovery.signers.clone(),
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -11520,10 +11521,11 @@ pub(crate) fn materialize_taken_over_green(
       })));
     }
   };
-  for (increment_bytes, completion) in recovery
+  for ((increment_bytes, completion), signature) in recovery
     .chain
     .iter()
     .zip(&recovery.completions)
+    .zip(&recovery.signatures)
     .skip(already)
   {
     let judged = slates_merge::engine::Increment::decode(increment_bytes)
@@ -11546,8 +11548,9 @@ pub(crate) fn materialize_taken_over_green(
         &applied,
         completion.map(crate::merge_service::SubmitCompletion::to_entry),
         None,
-        // The signature's verdict does not ride the merge record yet (A-321, GAPS): a successor records none.
-        None,
+        // The version's verdict as its merge record carried it (A-321): the successor's chain keeps the provenance the
+        // departed owner recorded, and its replay hands it to the green (`record_signature`).
+        signature.map(crate::signed_work::adopted),
       ),
     };
     if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
@@ -11936,9 +11939,12 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
-      write: None,
-      write_version: 0,
-      signers: Vec::new(),
+      // The write policy and trusted signers the launcher set on the departed owner (A-285, A-321): a successor
+      // enforces and reports them as the owner did. Until 2026-11-18 the catalog carried neither and a volume taken
+      // over merged and landed as an unset one does, its signed-merge requirement dropped.
+      write: catalog.write,
+      write_version: catalog.write_version,
+      signers: catalog.signers.clone(),
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -16609,6 +16615,9 @@ mod tests {
       live_shipped: false,
       live_holders: None,
       work_of: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     }
   }
 
@@ -17222,6 +17231,10 @@ mod tests {
         origin: None,
         chain: Vec::new(),
         completions: Vec::new(),
+        signatures: Vec::new(),
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
         head: 0,
         identity: [0; 32],
       };
