@@ -4588,6 +4588,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
   // remembered at it (`live_ship::note_rebuild`).
   let adopted_head = live.as_ref().map(|fetched| fetched.head);
+  let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
@@ -4656,8 +4657,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   .await;
   if let Some(adopted) = adopted_head {
     match &served {
-      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None),
-      Some(Err(refusal)) => crate::live_ship::note_rebuild(object, adopted, Some(refusal)),
+      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None, adopted_sealing),
+      Some(Err(refusal)) => {
+        crate::live_ship::note_rebuild(object, adopted, Some(refusal), adopted_sealing)
+      }
       None => {}
     }
   }
@@ -4778,8 +4781,8 @@ fn opened_archive(
     return None;
   }
   let account = crate::seal_keys::tenant_of(owner);
-  let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
-  let namer = crate::seal_keys::namer(state, id, account).ok()?;
+  let lineage = crate::seal_keys::recorded_lineage(state, id, account).ok()??;
+  let namer = crate::seal_keys::recorded_namer(state, id, account).ok()??;
   slates_cluster::envelope::open(&archive, &lineage, &namer).ok()
 }
 
@@ -8741,16 +8744,21 @@ pub(crate) async fn forward_over_leader_session(
   request: Vec<u8>,
   deadline_ns: u64,
 ) -> Option<Vec<u8>> {
-  forward_batch_over_leader_session(peer, &[request], deadline_ns)
-    .await
-    .map(|batch| {
-      batch
-        .replies
-        .into_iter()
-        .next()
-        .flatten()
-        .unwrap_or_default()
-    })
+  forward_batch_over_leader_session(
+    peer,
+    &[request],
+    deadline_ns,
+    &mut crate::forward_lane::Place::default(),
+  )
+  .await
+  .map(|batch| {
+    batch
+      .replies
+      .into_iter()
+      .next()
+      .flatten()
+      .unwrap_or_default()
+  })
 }
 
 /// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
@@ -8758,13 +8766,15 @@ pub(crate) async fn forward_over_leader_session(
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
 /// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
 /// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
-/// budget.
+/// budget. The batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
+/// ([`crate::forward_lane::Place`]).
 pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
+  place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, place).await
 }
 
 #[cfg(test)]
