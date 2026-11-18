@@ -796,6 +796,16 @@ pub enum RequestBody {
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
   },
+  /// A presented landing's entries, a page at a time (§4.15 step 2: the confirmation surface shows "the full entry list
+  /// on demand"): the landing a `GrantRequired` reply named, its entries' encodings from `from` (the start, then each
+  /// page's `next`). Served where the landing was presented (its id names its owner partition), to the principal it was
+  /// presented to, while it awaits its grant; one consumed, replaced or abandoned is `NotFound`. A read. Appended.
+  LandingEntries {
+    /// The presented landing.
+    landing: u64,
+    /// Where the page starts.
+    from: EntriesCursor,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1485,6 +1495,7 @@ impl RequestBody {
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
       | RequestBody::Grant { .. }
+      | RequestBody::LandingEntries { .. }
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
@@ -2604,6 +2615,92 @@ pub struct LandingSummary {
   pub filtered_out: u64,
 }
 
+/// One entry of a presented landing's manifest (§4.15 step 2, "the full entry list on demand"): what the landing would
+/// do at one path, as the manifest its grant binds names it. `LandingEntries` pages them, in the manifest's order (its
+/// landing order: directories made first, removals last and deepest first).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PlannedEntry {
+  /// The path, from the target's root (`/src/a.rs`).
+  pub path: String,
+  /// What the landing does there.
+  pub action: PlannedAction,
+  /// A file's planned bytes, for a create or a replace; none for anything else.
+  pub content: Option<PlannedContent>,
+  /// The mode a file or a directory lands with (the volume's, as `stat` reports it); none for a symlink and for a
+  /// removal or a rename, which land no mode of the volume's.
+  pub mode: Option<u32>,
+  /// Whether the entry replaces or removes what the volume witnessed on the disk; false for what it creates.
+  pub witnessed: bool,
+  /// The conflict the presentation's preliminary verdict found at this path, or none: a landing with any is refused.
+  pub conflict: Option<ConflictClass>,
+}
+
+/// What a landing does at one path (§4.15 "Plan"; the manifest's actions).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PlannedAction {
+  /// A file the disk did not have, written.
+  Create,
+  /// A file the disk had, replaced.
+  Replace,
+  /// A file the disk had, removed.
+  Delete,
+  /// A directory the disk had, moved here whole from its origin, as one rename.
+  Rename {
+    /// The origin, from the target's root.
+    from: String,
+  },
+  /// A directory made.
+  Mkdir,
+  /// A directory the disk had, removed with everything beneath it.
+  Rmdir,
+  /// A symlink made, or one the disk had replaced.
+  Symlink {
+    /// Its target, as the volume holds it.
+    target: String,
+  },
+  /// A directory the disk had, emptied of everything beneath it and kept (the volume removed it and made it again).
+  Clear,
+}
+
+/// A conflict class of §4.15 step 4's verdict table: why a landing would refuse an entry.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictClass {
+  /// The volume and the disk both changed the entry, differently.
+  ModifyModify,
+  /// The volume changed it; the disk deleted it.
+  ModifyDelete,
+  /// The volume deleted it; the disk changed it.
+  DeleteModify,
+  /// The volume renamed the directory; the disk moved its origin.
+  RenameRename,
+  /// The volume and the disk both created the entry, with different bytes.
+  CreateCreate,
+  /// A file became a directory, or the reverse.
+  TypeChanged,
+  /// Someone else replaced the file between the check and the write.
+  TargetInUse,
+}
+
+/// A planned file's bytes, as the manifest binds them: their BLAKE3 and their length. A reader of the volume's file
+/// checks what it read against them, so what it read is what the grant would land.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedContent {
+  /// BLAKE3 of the bytes.
+  pub hash: [u8; 32],
+  /// Their length.
+  pub size: u64,
+}
+
+/// Where a page of a presented landing's entries starts (`LandingEntries`): an entry, by its place in the manifest's
+/// order, and a byte within its encoding. The list starts at the zero cursor; each page names the next.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub struct EntriesCursor {
+  /// The entry.
+  pub entry: u64,
+  /// The byte within the entry's encoding.
+  pub byte: u64,
+}
+
 /// A finished landing's outcome (§4.15): the counts, and what the landing achieved and met — its
 /// durability, every Degraded cell, the entries it kept private, and the barriers it took (AUD-29-05:
 /// until 2026-09-29 the reply carried the counts only, and a landing that did not sync read as done).
@@ -3134,6 +3231,17 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
+  /// A green this node took over from a departed owner (§4.16 owner-loss recovery) could not be materialized within the
+  /// takeover's bound: the failover SLO's worth of the fleet's periods, each one attempt. Every verb on it answers this
+  /// rather than waiting without end. Appended.
+  TakeoverIncomplete {
+    /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
+    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
+    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
+    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
+    /// owner shard refused the rebuilt green).
+    waited_on: String,
+  },
 }
 
 impl RecoveryCause {
@@ -3150,6 +3258,7 @@ impl RecoveryCause {
       RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
       RecoveryCause::ImageRefused { .. } => "ImageRefused",
       RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+      RecoveryCause::TakeoverIncomplete { .. } => "TakeoverIncomplete",
     }
   }
 }
@@ -3564,6 +3673,19 @@ pub enum ReplyBody {
   LiveShippingSet {
     /// Whether it is live-shipped now.
     live_shipped: bool,
+  },
+  /// One page of a presented landing's entries (`LandingEntries`): the bytes of their encodings, one [`PlannedEntry`]
+  /// after another in the manifest's order, from the request's cursor to as many as one reply holds, so an entry may
+  /// begin on one page and end on a later one. Appended.
+  LandingEntries {
+    /// The bytes.
+    bytes: Vec<u8>,
+    /// Where the next page starts, or `None` when this page ends the list.
+    next: Option<EntriesCursor>,
+    /// The entries the manifest holds.
+    total: u64,
+    /// The manifest's hash, the one its `GrantRequired` named, so a reader joining pages knows each is of one manifest.
+    manifest: [u8; 32],
   },
 }
 

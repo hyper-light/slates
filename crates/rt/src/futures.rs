@@ -51,6 +51,16 @@ pub fn wake_cost_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.wake_cost_ns())
 }
 
+/// Asks shard `target` to tell the current task when its control channel next has room, after a send to it was refused
+/// `ControlFull` (§4.3 "admission limit": a refused spawn is kept and sent again, never dropped; [`crate::room`]). The
+/// task is woken once `target` drains a message after this call. Try the send again after this returns, and wait
+/// ([`idle`], or [`within`] a deadline) only if that try is refused too: the try either finds the room a drain made
+/// meanwhile, or that drain finds this ask, so no timer is needed for the wait. `ShardGone` when `target` has left its
+/// loop or its slot is free; `NotOnShardThread` outside a task on a shard.
+pub fn want_room(target: u16) -> Result<(), RtError> {
+  registry::with_current(|ctx| ctx.want_room(target)).ok_or(RtError::NotOnShardThread)?
+}
+
 /// The task being polled on this thread, if any.
 pub fn current_task() -> Option<TaskId> {
   registry::with_current(|ctx| ctx.current_task()).flatten()

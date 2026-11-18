@@ -23,7 +23,8 @@
 //! costs nothing to clone, which is what `LocalWaker` would have saved (Phase 0 task 6).
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
-//! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
+//! protocol and its loom model), [`room`] (a sender told when a full control channel has room, and its loom model),
+//! [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
 //! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
 //! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
 //! future), and the OS drivers.
@@ -52,6 +53,7 @@ pub mod pipe_state;
 pub mod queue;
 pub mod readiness;
 pub mod registry;
+pub mod room;
 pub mod runtime;
 pub mod shard;
 pub mod sim;
