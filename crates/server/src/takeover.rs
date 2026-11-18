@@ -130,6 +130,17 @@ const TAKEOVER_RECLAIMED: &str = "fleet.takeover.reclaimed";
 /// of it), so nothing shows its copy adopted (A-309). Format: a refusal name in the daemon's status report.
 const TAKEOVER_KEPT_UNASKED: &str = "fleet.takeover.kept_unasked";
 
+/// The status count under which a holder records a stale copy it kept because it still holds the copy's content
+/// (A-333): content its records name it for, or content placed for a sequence ahead of them, which its retention rule
+/// keeps (`crate::content_retention`). The successor adopts the newest record its round learned, and that head may name
+/// this holder among the content's holders; it confirms once the record is adopted, before its materialization has
+/// fetched the content, and it fetches from the head's holders alone (`fleet::fetch_into_hold`). Let go here, with the
+/// dead owner the head's only other holder, the successor could fetch from nobody, and one failure lost the volume at
+/// `f = 1`. Kept until a newer record reaches this holder and the retention rule releases the content; a holder outside
+/// the successor's placement receives none, so a release from the successor is owed (GAPS). Counted at each install it
+/// is judged at. Format: a refusal name in the daemon's status report.
+const TAKEOVER_KEPT_HOLDING_CONTENT: &str = "fleet.takeover.kept_holding_content";
+
 /// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
 /// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
 /// current, answered first, and the newest record any of them held was adopted. Before A-309 such an object was counted
@@ -342,10 +353,11 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///
 /// - an object whose owner a kept retirement names is moved to the successor its lineage ranks, and remembers
 ///   the retired host whose takeover it is recovered in (`departed_owners`, the lease gate's record);
-/// - a copy whose line ends in a takeover the configuration keeps a completion record of is dropped when this holder
+/// - a copy whose line ends in a takeover the configuration keeps a completion record of is stale when this holder
 ///   took part in that takeover (`RegionalConfiguration::settled_for`), as is one whose successor has confirmed its
 ///   share while this holder, asked in that round, is outside the successor's placement (the successor's adoption never
-///   reaches it); a holder the round never asked keeps its copy, counted (A-309);
+///   reaches it); a stale copy is dropped unless this holder still holds its content, which the successor may still
+///   fetch from it ([`let_go_stale`], A-333); a holder the round never asked keeps its copy, counted (A-309);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   let regional = state.council.configuration().clone();
@@ -356,7 +368,7 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
     };
     if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
       match stale_after_confirmation(state, &regional, object, owner, local) {
-        Confirmation::Stale => reclaim(state, object),
+        Confirmation::Stale => let_go_stale(state, object),
         Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
         Confirmation::None => {}
       }
@@ -384,13 +396,30 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
       Lineage::Lost | Lineage::Unresolved => {}
       Lineage::Settled { takeover } => {
         if regional.settled_for(takeover, local) {
-          reclaim(state, object);
+          let_go_stale(state, object);
         } else {
           state.count(TAKEOVER_KEPT_UNASKED, 1);
         }
       }
     }
   }
+}
+
+/// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
+/// rule has run (`crate::content_retention::retain_object`): content its newest record names it for, or content placed
+/// for a sequence ahead of its records. Such a copy is kept whole, counted [`TAKEOVER_KEPT_HOLDING_CONTENT`] (A-333). The
+/// record is stale, but the successor's adopted head may name this holder among the content's holders: it confirmed
+/// once the record was adopted, before its materialization fetched the content from the head's holders, and with the
+/// dead owner the only other holder this copy is the one it fetches. AUD-29-43's rule is the same one: a holder keeps
+/// content for a head it still backs, and the adopted head still names it. Before, the reclaim dropped the content with
+/// the record (the bug record of 2026-11-18).
+fn let_go_stale(state: &mut ShardState, object: ObjectId) {
+  crate::content_retention::retain_object(state, object);
+  if state.held_content.newest_placed(object).is_some() {
+    state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
+    return;
+  }
+  reclaim(state, object);
 }
 
 /// Whether this holder's copy of `object`, now owned by the member `owner` after a takeover, is stale: its
@@ -472,8 +501,10 @@ pub(crate) fn forget_owner_on_every_shard(state: &mut ShardState, object: Object
 }
 
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
-/// replica, and the content it held for the object (AUD-29-43: a stale copy's bytes are reclaimed with its
-/// records, never kept for a head this holder no longer backs). Counted [`TAKEOVER_RECLAIMED`].
+/// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
+/// reclaimed with its records, never kept for a head this holder no longer backs). Reached only through
+/// [`let_go_stale`], once the retention rule left no whole content for the object here (A-333). Counted
+/// [`TAKEOVER_RECLAIMED`].
 fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
   state.held_content.forget_object(
