@@ -54,3 +54,11 @@ bound; a takeover then lost them (NoLoss through the refusal: the client was tol
 
 - With the retained tail cut past the last whole state, a whole record owed (for the keys, or after a refused
   publication) and a full credit can still meet the same wait (GAPS, A-344's entry).
+
+## Evidence
+
+Kiln on the Mac Studio (d1323898), 2026-11-18, a debug build of f7e4c54d8 from a clone of the pushed branch: the
+`live_ship` unit tests, 18 of 18 green, the new test among them; with the old rule (an image owed for any whole state
+behind the head) restored in a copy, the new test failed as the fleet runs did: `each returned holder is sent an install:
+[]` (0 installs, 2 expected). The fleet test itself, `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover`,
+is main's to run (`run-requests.md`).
