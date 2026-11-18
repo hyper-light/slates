@@ -1,0 +1,310 @@
+//! A file whose only change is its mode or its Windows bits, landed (A-458; §4.15 step 1's "mode changes", the data
+//! model's `Chmod`): an overlay over the simulated host, planned, presented, granted and landed through the engine,
+//! against a disk that kept the file as the volume witnessed it, already holds the volume's change, or changed it
+//! another way. Its bytes are never rewritten: the same file keeps its inode.
+
+use slates_mem::arena::ChunkArena;
+use slates_mem::region::Region;
+use slates_vfs::base::BaseConfig;
+use slates_vfs::clock::StepClock;
+use slates_vfs::host::HostFs;
+use slates_vfs::host::sim::SimHost;
+use slates_vfs::inode::{Kind, WindowsAttributes};
+use slates_vfs::names::NameEquivalence;
+use slates_vfs::quota::Quota;
+use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+
+use crate::engine::{
+  Audit, LandingRefusal, LandingReport, LandingRequest, LandingState, LandingTarget, Outcome,
+  Unobserved, land,
+};
+use crate::grant::{GrantScope, Grants, Leases, Surface, TargetIdentity, lease_key};
+use crate::manifest::Filter;
+use crate::source::Source;
+use crate::verdict::{ConflictClass, Verdict};
+
+/// Shape: the test store's page.
+const PAGE: usize = 4096;
+/// Shape: pages of content the test store maps (4 MiB).
+const REGION_PAGES: usize = 1024;
+/// Shape: slots per slab in the test store.
+const CAP: usize = 1 << 14;
+/// Shape: the lease and grant terms (monotonic ns); no test crosses them.
+const TERM_NS: u64 = 1_000_000_000_000;
+/// Shape: the large-file class boundary, one chunk window.
+const LARGE: u64 = 65_536;
+/// Shape: how far the simulated clock moves between making the disk and mounting it, so the base predates its mount
+/// (as `tests/common`'s `SETTLED_NS`).
+const SETTLED_NS: i64 = 1_000_000_000;
+/// Shape: the audit records a test keeps.
+const AUDIT_RECORDS: usize = 1 << 10;
+/// Format: a mode's permission bits.
+const PERMISSIONS: u32 = 0o7777;
+/// Shape: a script as the disk holds it, read-write for its owner (`S_IFREG | 0644`).
+const SCRIPT_MODE: u32 = 0o100_644;
+/// Shape: the same script made executable (`chmod +x`).
+const EXECUTABLE_MODE: u32 = 0o100_755;
+/// Shape: an outsider's mode for the script, private to its owner.
+const PRIVATE_MODE: u32 = 0o100_600;
+/// Shape: the script's bytes.
+const SCRIPT: &[u8] = b"#!/bin/sh\necho landed\n";
+
+fn store() -> Store {
+  let mut arena = ChunkArena::new(PAGE);
+  arena
+    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+    .unwrap();
+  Store::new(
+    &StoreConfig {
+      page: PAGE,
+      cache_line: 64,
+      max_dirs: CAP,
+      max_inodes: CAP,
+      max_chunks: CAP,
+      max_dir_blocks: CAP,
+      dir_cutover: 4,
+    },
+    arena,
+    0,
+  )
+}
+
+fn config() -> VolumeConfig {
+  VolumeConfig {
+    prefix: 3,
+    names: NameEquivalence::Exact,
+    quota: Quota::Bounded { limit: 1 << 24 },
+    journal_bytes: 1 << 16,
+    clock: Box::new(StepClock::new(1_000, 1)),
+  }
+}
+
+/// A disk holding `/run.sh` (the script, at `SCRIPT_MODE`) and an overlay of it, the disk settled before the mount.
+fn overlay_of_a_script(store: &mut Store) -> (SimHost, Volume) {
+  let mut host = SimHost::new();
+  host.replace_file("/run.sh", SCRIPT);
+  host.chmod("/run.sh", SCRIPT_MODE);
+  host.close_files();
+  host.advance_ns(SETTLED_NS);
+  let root = host.root();
+  let facts = host.facts(root).unwrap();
+  let vol = Volume::create_overlay(
+    store,
+    config(),
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: LARGE,
+    },
+  )
+  .unwrap();
+  (host, vol)
+}
+
+/// The script's inode in the overlay.
+fn script(vol: &mut Volume, host: &mut SimHost, store: &mut Store) -> slates_vfs::ids::InodeNo {
+  vol.with_host(host).resolve(store, "/run.sh").unwrap().inode
+}
+
+fn request(grant: Option<crate::grant::GrantId>) -> LandingRequest {
+  LandingRequest {
+    landing_id: 1,
+    consumer: b"consumer".to_vec().into_boxed_slice(),
+    volume: [3; 16],
+    snapshot: 1,
+    source: Source::Head,
+    grant,
+    filter: Filter::default(),
+    now_ns: 1,
+    media_durability: false,
+    large_class_bytes: LARGE,
+  }
+}
+
+/// Presents the overlay's landing into the disk's root, grants what was presented, and lands it: the presentation's
+/// preliminary verdicts by path, and the granted landing's result.
+fn land_granted(
+  host: &mut SimHost,
+  vol: &mut Volume,
+  store: &mut Store,
+) -> (
+  Vec<(Box<str>, Option<Verdict>)>,
+  Result<LandingReport, LandingRefusal>,
+) {
+  let target = LandingTarget {
+    dir: host.root(),
+    key: "/".into(),
+  };
+  let mut grants = Grants::default();
+  let mut audit = Audit::new(AUDIT_RECORDS);
+  let presented = match land(
+    host,
+    &target,
+    vol,
+    store,
+    &mut grants,
+    None,
+    &mut audit,
+    &request(None),
+    &mut Unobserved,
+  ) {
+    Err(LandingRefusal::GrantRequired(presented)) => presented,
+    other => panic!("expected GrantRequired, got {other:?}"),
+  };
+  let preliminary = presented
+    .preliminary
+    .iter()
+    .map(|report| (report.path.clone(), report.verdict))
+    .collect();
+  let grant = grants.issue(
+    Surface::Cli,
+    presented.manifest.hash,
+    presented.binding.clone(),
+    GrantScope::Once,
+    1,
+    TERM_NS,
+  );
+  let identity = host.fingerprint_dir(target.dir).unwrap();
+  let key = lease_key(&TargetIdentity {
+    key: target.key.clone(),
+    device: identity.dev,
+    inode: identity.ino,
+  });
+  let lease = Leases::default().take(&key, 1, 1, TERM_NS).unwrap();
+  let landed = land(
+    host,
+    &target,
+    vol,
+    store,
+    &mut grants,
+    Some(&lease),
+    &mut audit,
+    &request(grant),
+    &mut Unobserved,
+  );
+  (preliminary, landed)
+}
+
+/// Each entry's outcome by path.
+fn outcomes(report: &LandingReport) -> Vec<(&str, Option<Outcome>)> {
+  report
+    .entries
+    .iter()
+    .map(|entry| (entry.path.as_ref(), entry.outcome.clone()))
+    .collect()
+}
+
+/// A-458 (§4.15 step 1's mode changes). Do: over a disk holding `/run.sh` at 0644, `chmod` it to 0755 through the
+/// overlay with its bytes untouched, and land the overlay. Expect the landing `Done` with the entry written, the disk's
+/// file at 0755 holding the same bytes under the same inode (no byte rewritten: no temporary, no exchange) and no byte
+/// counted written. Before A-458 the verdict passed the entry `Skip`, its bytes being unchanged, and the file stayed 0644.
+#[test]
+fn a_base_files_mode_changed_alone_lands_and_no_byte_is_rewritten() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, no, EXECUTABLE_MODE)
+    .unwrap();
+  let before = host.fingerprint("/run.sh").unwrap();
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
+  let after = host.fingerprint("/run.sh").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, EXECUTABLE_MODE & PERMISSIONS);
+  assert_eq!(after.ino, before.ino, "the same file: its bytes never rewritten");
+  assert_eq!(host.bytes("/run.sh").as_deref(), Some(SCRIPT));
+  assert_eq!(report.bytes_written, 0, "{report:?}");
+}
+
+/// A-458 (a field the volume kept is the disk's, as bytes are). Do: mark `/run.sh` hidden through the overlay (its Windows
+/// bits) and leave its mode, while an outsider makes the disk's file 0600; land. Expect the landing `Done` with the entry
+/// written: the disk's file holds the hidden bit the volume set and keeps the 0600 the outsider set, its bytes and inode
+/// as they were. Before A-458 the bits never landed, the entry passed by as unchanged.
+#[test]
+fn a_mode_the_disk_changed_while_the_volume_kept_it_is_passed_by_and_the_volumes_bits_land() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  let hidden = WindowsAttributes::kept(u32::from(WindowsAttributes::HIDDEN), Kind::File);
+  vol
+    .with_host(&mut host)
+    .set_windows_attributes(&mut store, no, hidden)
+    .unwrap();
+  host.advance_ns(1);
+  host.chmod("/run.sh", PRIVATE_MODE);
+  let before = host.fingerprint("/run.sh").unwrap();
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
+  let after = host.fingerprint("/run.sh").unwrap();
+  assert_eq!(after.windows, WindowsAttributes::HIDDEN, "the volume's bits");
+  assert_eq!(
+    after.mode & PERMISSIONS,
+    PRIVATE_MODE & PERMISSIONS,
+    "the outsider's mode, which the volume never changed"
+  );
+  assert_eq!(after.ino, before.ino);
+  assert_eq!(host.bytes("/run.sh").as_deref(), Some(SCRIPT));
+}
+
+/// A-458 (the verdict's identity, for a mode). Do: `chmod` `/run.sh` to 0755 through the overlay, and have an outsider
+/// make the disk's file 0755 too; land. Expect the entry accepted as identical (nothing set) and the landing `Done`.
+#[test]
+fn a_mode_the_disk_already_holds_is_accepted_as_identical() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, no, EXECUTABLE_MODE)
+    .unwrap();
+  host.advance_ns(1);
+  host.chmod("/run.sh", EXECUTABLE_MODE);
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(
+    outcomes(&report),
+    vec![("/run.sh", Some(Outcome::AcceptedIdentical))]
+  );
+  assert_eq!(
+    host.fingerprint("/run.sh").unwrap().mode & PERMISSIONS,
+    EXECUTABLE_MODE & PERMISSIONS
+  );
+}
+
+/// A-458 (the verdict's conflict, for a mode; D-27: never inferred). Do: `chmod` `/run.sh` to 0755 through the overlay
+/// while an outsider makes the disk's file 0600; present and land. Expect the presentation to find `ModifyModify` at the
+/// file, and the landing to write nothing: the disk's file stays 0600.
+#[test]
+fn a_mode_both_changed_differently_is_a_conflict_and_nothing_is_written() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, no, EXECUTABLE_MODE)
+    .unwrap();
+  host.advance_ns(1);
+  host.chmod("/run.sh", PRIVATE_MODE);
+  let (preliminary, landed) = land_granted(&mut host, &mut vol, &mut store);
+  assert_eq!(
+    preliminary,
+    vec![(
+      "/run.sh".into(),
+      Some(Verdict::Conflict(ConflictClass::ModifyModify))
+    )]
+  );
+  assert!(
+    landed.is_err() || landed.as_ref().is_ok_and(|report| report.written == 0),
+    "{landed:?}"
+  );
+  assert_eq!(
+    host.fingerprint("/run.sh").unwrap().mode & PERMISSIONS,
+    PRIVATE_MODE & PERMISSIONS
+  );
+}
