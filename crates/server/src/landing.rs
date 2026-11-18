@@ -29,7 +29,7 @@ use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
 };
 use slates_ipc::protocol::{
-  AuditEntry, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
+  AuditEntry, GrantProofBody, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
 };
 use slates_land::engine::Audit;
 #[cfg(unix)]
@@ -173,6 +173,11 @@ pub struct Awaiting {
   pub principal: Principal,
   /// The client that presented it: its retirement abandons the presentation (AUD-29-07).
   pub client: u32,
+  /// The nonce a signed grant's statement must carry (A-285): drawn from the system's random source at the
+  /// presentation, sent with it, and spent by the first signed grant it proves.
+  pub nonce: [u8; crate::grant_signature::NONCE_BYTES],
+  /// Whether a signed grant has spent the nonce: a replay of the same signature is refused.
+  pub nonce_spent: bool,
   /// Its manifest's entries, in the manifest's order: the full entry list a person may ask for (§4.15 step 2;
   /// `LandingEntries` pages them, `crate::landing_entries`). Moved from the plan, never copied, and held as long as the
   /// presentation is, which A-46 bounds: consumed by its landing, replaced by its client's next, abandoned with its
@@ -2227,6 +2232,12 @@ fn present(
     })
     .collect();
   let Presenter { client, principal } = presenter;
+  let mut nonce = [0u8; crate::grant_signature::NONCE_BYTES];
+  if aws_lc_rs::rand::fill(&mut nonce).is_err() {
+    return refused(Refusal::Unsupported {
+      feature: "a presentation's nonce: the system's random source refused".to_owned(),
+    });
+  }
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
   let summary = summary_of(&manifest);
@@ -2246,6 +2257,8 @@ fn present(
       target: ids.target.to_owned(),
       principal: principal.clone(),
       client,
+      nonce,
+      nonce_spent: false,
       // The full entry list on demand (§4.15 step 2): the manifest's own entries, moved here.
       entries: manifest.entries,
       conflicts: crate::landing_entries::conflicts_of(&preliminary),
@@ -2286,6 +2299,7 @@ fn present(
   ReplyBody::GrantRequired {
     landing: landing_id,
     manifest: hash,
+    nonce,
     summary,
     conflicts,
   }
@@ -2528,14 +2542,15 @@ pub fn grant_proof(
   *hasher.finalize().as_bytes()
 }
 
-/// Serves a `Grant` request (§4.13 "Grants", §4.15 step 3): verifies the proof of issuer authority against
-/// the secret this daemon published, and the approved manifest against the presented landing's, then
-/// issues the grant. Refuses `GrantIssuerUnverified` — counted `grant_issuer_unverified` — on a proof that
-/// does not verify (a forged, replayed or modified-plan approval, or one from a channel that carries no
-/// authority: the MCP server and the SDKs never hold the secret), `GrantMismatch` when the human approved
-/// a manifest other than the one presented (the plan changed under the approval), and `NotFound` for a
-/// landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
-/// comparison of the proof is constant-time over its whole width so a wrong proof leaks nothing by timing.
+/// Serves a `Grant` request (§4.13 "Grants", §4.15 step 3): verifies the human authority's proof (A-285: a signature
+/// by a registered key over the grant statement, [`verify_signed_grant`]; or the keyed hash under the issuer secret
+/// this daemon published), and the approved manifest against the presented landing's, then issues the grant. Refuses
+/// `GrantIssuerUnverified` — counted `grant_issuer_unverified`, and a signature's own reason under its counter — on a
+/// proof that does not verify (forged, replayed, by an unregistered key, over a modified plan, expired, or from a
+/// channel that carries no authority: the MCP server and the SDKs hold neither a key nor the secret), `GrantMismatch`
+/// when the human approved a manifest other than the one presented (the plan changed under the approval), and
+/// `NotFound` for a landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
+/// keyed hash is compared in constant time over its whole width so a wrong proof leaks nothing by timing.
 pub fn grant_verb(
   state: &mut ShardState,
   principal: &Principal,
@@ -2543,23 +2558,123 @@ pub fn grant_verb(
   manifest: [u8; 32],
   scope: GrantScope,
   term_ns: u64,
-  proof: [u8; 32],
+  proof: GrantProofBody,
 ) -> ReplyBody {
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };
-  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
-  if !constant_time_eq(&expected, &proof) {
+  let signed = matches!(proof, GrantProofBody::SshSignature { .. });
+  let verified = match proof {
+    GrantProofBody::IssuerHash { proof } => {
+      let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
+      constant_time_eq(&expected, &proof)
+    }
+    GrantProofBody::SshSignature {
+      signature,
+      expires_unix_s,
+    } => {
+      let claim = SignedClaim {
+        landing: landing_id,
+        manifest,
+        scope,
+        term_ns,
+        expires_unix_s,
+      };
+      match verify_signed_grant(
+        &awaiting,
+        &state.grant_keys,
+        &claim,
+        &signature,
+        unix_now_s(),
+      ) {
+        Ok(()) => true,
+        Err(refusal) => {
+          state.count(refusal.counter(), 1);
+          false
+        }
+      }
+    }
+  };
+  if !verified {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
   if awaiting.manifest != manifest {
     return crate::verbs::refused(Refusal::GrantMismatch);
   }
+  if signed && let Some(presented) = state.landing.awaiting.get_mut(&landing_id) {
+    presented.nonce_spent = true;
+  }
   match issue_grant(state, principal, landing_id, scope, term_ns) {
     Ok(grant) => ReplyBody::Granted { grant },
     Err(refusal) => crate::verbs::refused(refusal),
   }
+}
+
+/// What a signed `Grant` claims besides the signature: the fields of the statement the request names.
+#[derive(Clone, Copy, Debug)]
+pub struct SignedClaim {
+  /// The presented landing.
+  pub landing: u64,
+  /// The manifest hash the human approved.
+  pub manifest: [u8; 32],
+  /// The scope.
+  pub scope: GrantScope,
+  /// The term, in nanoseconds.
+  pub term_ns: u64,
+  /// The statement's expiry, in Unix seconds.
+  pub expires_unix_s: u64,
+}
+
+/// The statement a signed grant of `claim` over the presentation `awaiting` must have signed (A-285): the request's
+/// landing, manifest, scope, term and expiry, with the presentation's own target and nonce, which the request does
+/// not name, so a signature over another target or another presentation's nonce never verifies.
+#[must_use]
+pub fn signed_statement(
+  awaiting: &Awaiting,
+  claim: &SignedClaim,
+) -> crate::grant_signature::GrantStatement {
+  crate::grant_signature::GrantStatement {
+    landing: claim.landing,
+    manifest: claim.manifest,
+    target: awaiting.target.clone(),
+    scope: match claim.scope {
+      GrantScope::Once => crate::grant_signature::StatementScope::Once,
+      GrantScope::Session => crate::grant_signature::StatementScope::Session,
+    },
+    term_ns: claim.term_ns,
+    nonce: awaiting.nonce,
+    expires_unix_s: claim.expires_unix_s,
+  }
+}
+
+/// Decides a signed grant (A-285): the presentation's nonce not yet spent, then the signature over
+/// [`signed_statement`] by one of `keys` at wall-clock second `now_unix_s`. Pure over its arguments, so the decision
+/// is tested whole without a daemon.
+///
+/// # Errors
+/// [`SignatureRefusal::Replayed`] for a spent nonce, or the signature's own refusal.
+pub fn verify_signed_grant(
+  awaiting: &Awaiting,
+  keys: &[crate::grant_signature::RegisteredKey],
+  claim: &SignedClaim,
+  signature: &[u8],
+  now_unix_s: u64,
+) -> Result<(), crate::grant_signature::SignatureRefusal> {
+  if awaiting.nonce_spent {
+    return Err(crate::grant_signature::SignatureRefusal::Replayed);
+  }
+  let statement = signed_statement(awaiting, claim);
+  crate::grant_signature::verify_grant_signature(signature, &statement, keys, now_unix_s)
+    .map(|_| ())
+}
+
+/// The wall clock's second (Unix time), which a signed statement's expiry is stated in; a clock set before 1970 reads
+/// as zero, so no statement is refused as expired by it.
+fn unix_now_s() -> u64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Format: the domain tags that separate the issuer secret's uses — an enrollment proof can never
@@ -3206,6 +3321,128 @@ mod tests {
         *h.finalize().as_bytes()
       }),
       "the domain tag is part of the proof"
+    );
+  }
+
+  /// A presentation awaiting a grant into `/srv/project`, with a fresh nonce.
+  fn awaiting(nonce_byte: u8) -> super::Awaiting {
+    super::Awaiting {
+      manifest: [7; 32],
+      binding: slates_land::grant::GrantBinding {
+        consumer: Box::new([1]),
+        volume: [2; 16],
+        snapshot: 3,
+        target: slates_land::grant::TargetIdentity {
+          key: "/srv/project".into(),
+          device: 1,
+          inode: 4,
+        },
+      },
+      volume: super::DbVolumeId { bytes: [2; 16] },
+      snapshot: super::DbSnapshotId { value: 3 },
+      target: "/srv/project".to_owned(),
+      principal: super::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      },
+      client: 9,
+      nonce: [nonce_byte; crate::grant_signature::NONCE_BYTES],
+      nonce_spent: false,
+      entries: Vec::new(),
+      conflicts: std::collections::BTreeMap::new(),
+    }
+  }
+
+  /// A claim of the presentation's own manifest, once, expiring at `EXPIRES`.
+  fn claim() -> super::SignedClaim {
+    super::SignedClaim {
+      landing: 5,
+      manifest: [7; 32],
+      scope: slates_ipc::protocol::GrantScope::Once,
+      term_ns: 0,
+      expires_unix_s: EXPIRES,
+    }
+  }
+
+  /// Shape: the claim's expiry, and a wall clock before it.
+  const EXPIRES: u64 = 2_000_000_000;
+  /// Shape: see [`EXPIRES`].
+  const BEFORE: u64 = 1_900_000_000;
+
+  /// A-285: a registered key's signature over the presentation's statement verifies; the same signature after the
+  /// grant spent the nonce is refused `Replayed`.
+  #[test]
+  fn a_signed_grant_verifies_once_and_its_replay_is_refused() {
+    use crate::grant_signature::{SignatureRefusal, TestSigner};
+    let signer = TestSigner::new();
+    let keys = vec![signer.registered()];
+    let mut presented = awaiting(1);
+    let signature = signer.sign(&super::signed_statement(&presented, &claim()));
+    assert_eq!(
+      super::verify_signed_grant(&presented, &keys, &claim(), &signature, BEFORE),
+      Ok(())
+    );
+    presented.nonce_spent = true;
+    assert_eq!(
+      super::verify_signed_grant(&presented, &keys, &claim(), &signature, BEFORE),
+      Err(SignatureRefusal::Replayed)
+    );
+  }
+
+  /// A-285: a forged signature, an unregistered key, a changed manifest, another presentation's nonce (a signature
+  /// made before this presentation) and another target are each refused, and an expired statement too.
+  #[test]
+  fn a_signed_grant_is_refused_forged_unregistered_changed_or_for_another_presentation() {
+    use crate::grant_signature::{SignatureRefusal, TestSigner};
+    let signer = TestSigner::new();
+    let keys = vec![signer.registered()];
+    let presented = awaiting(1);
+    let signature = signer.sign(&super::signed_statement(&presented, &claim()));
+    let mut forged = signature.clone();
+    if let Some(last) = forged.last_mut() {
+      *last ^= 1;
+    }
+    let decide =
+      |presented: &super::Awaiting,
+       claim: &super::SignedClaim,
+       signature: &[u8],
+       keys: &[_],
+       now| { super::verify_signed_grant(presented, keys, claim, signature, now) };
+    assert_eq!(
+      decide(&presented, &claim(), &forged, &keys, BEFORE),
+      Err(SignatureRefusal::BadSignature),
+      "forged"
+    );
+    let stranger = TestSigner::new();
+    let theirs = stranger.sign(&super::signed_statement(&presented, &claim()));
+    assert_eq!(
+      decide(&presented, &claim(), &theirs, &keys, BEFORE),
+      Err(SignatureRefusal::UnregisteredKey),
+      "unregistered"
+    );
+    let mut changed = claim();
+    changed.manifest[0] ^= 1;
+    assert_eq!(
+      decide(&presented, &changed, &signature, &keys, BEFORE),
+      Err(SignatureRefusal::BadSignature),
+      "changed manifest"
+    );
+    assert_eq!(
+      decide(&awaiting(2), &claim(), &signature, &keys, BEFORE),
+      Err(SignatureRefusal::BadSignature),
+      "another presentation's nonce"
+    );
+    let mut elsewhere = awaiting(1);
+    elsewhere.target = "/srv/other".to_owned();
+    assert_eq!(
+      decide(&elsewhere, &claim(), &signature, &keys, BEFORE),
+      Err(SignatureRefusal::BadSignature),
+      "another target"
+    );
+    assert_eq!(
+      decide(&presented, &claim(), &signature, &keys, EXPIRES + 1),
+      Err(SignatureRefusal::Expired),
+      "expired"
     );
   }
 }

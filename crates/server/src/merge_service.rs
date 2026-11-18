@@ -2394,7 +2394,7 @@ pub(crate) fn next_merge_work(
   let mut work = Vec::new();
   let mut catalogs_owed = std::collections::BTreeSet::new();
   ship_new_works_catalogs(state, local, &mut catalogs_owed, &mut work);
-  // A submit off its green's shard waits here, on its work's shard, for the work's route (A-290): a catalog committed
+  // A submit off its green's shard waits here, on its work's shard, for the work's route (A-298): a catalog committed
   // since the last pass runs it again.
   crate::work_home::routes_placed(state);
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
@@ -2428,7 +2428,7 @@ pub(crate) fn next_merge_work(
       // The submitting work's catalog record before the record that carries its completion (A-255): a successor
       // answers a resend only through the work's catalog, which names the green, so no holder takes the completion
       // before the route is committed. A destroyed work's catalog owes nothing. A work on another shard has no record
-      // here, so this passes: its shard asked for the verdict only once its catalog was committed (A-290).
+      // here, so this passes: its shard asked for the verdict only once its catalog was committed (A-298).
       if let Some(submitting) = pending
         .work
         .filter(|submitting| !crate::fleet::catalog_committed(state, *submitting, local))

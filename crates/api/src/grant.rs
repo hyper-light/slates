@@ -26,6 +26,8 @@ pub struct GrantClaim {
   pub landing: u64,
   /// The manifest hash the person approved ([`crate::LandingPlan::manifest`]).
   pub manifest: [u8; 32],
+  /// The presentation's nonce ([`crate::LandingPlan::nonce`]), which a signed proof's statement carries (A-285).
+  pub nonce: [u8; 32],
   /// One landing of exactly this manifest, or the session's later landings of the volume into the target.
   pub scope: GrantScope,
   /// How long the grant stands, in nanoseconds ([`crate::GRANT_TERM_NS`] by default).
@@ -43,10 +45,10 @@ pub enum GrantProof {
 }
 
 impl GrantProof {
-  /// The proof's bytes as the `Grant` request carries them.
-  pub(crate) fn wire(&self) -> [u8; 32] {
+  /// The proof as the `Grant` request carries it.
+  pub(crate) fn wire(&self) -> slates_ipc::protocol::GrantProofBody {
     match self {
-      Self::IssuerHash(proof) => *proof,
+      Self::IssuerHash(proof) => slates_ipc::protocol::GrantProofBody::IssuerHash { proof: *proof },
     }
   }
 }
