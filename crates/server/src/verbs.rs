@@ -5624,6 +5624,12 @@ fn share(
 /// Turns a volume's live shipping on or off (§4.10, A-200), as one recorded operation on its owner partition; `admin`
 /// on the volume is required, as for its access list. The flag rides the volume's catalog register, so a successor
 /// keeps shipping.
+///
+/// Turning it on, every candidate of the volume's placement makes the claim's admission first (§4.2: "a remote holder
+/// makes the same admission against its own machine before acknowledging placement"; A-401): the verb's reply is
+/// deferred to a task that asks them and records the flag only when none refused, else answers `BudgetExceeded` with
+/// the least room a candidate named (`live_ship::admit_then_ship`). Before, the flag was recorded at once, and a
+/// candidate without room for the claim could later succeed the owner and give the volume up.
 fn live_ship(
   state: &mut ShardState,
   principal: &Principal,
@@ -5637,6 +5643,50 @@ fn live_ship(
   if !rights_of(&record, principal).admin {
     return forbidden("live-ship");
   }
+  if !live_shipped || record.policy.live_shipped {
+    return set_live_shipping(state, volume, live_shipped);
+  }
+  let object = ObjectId(volume.bytes);
+  let configuration = state.fleet.configuration();
+  let local = configuration.owner;
+  let candidates: Vec<HostId> = configuration
+    .place(object)
+    .candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  // With no candidate to ask (a laptop, `f = 0`), the verdict over no answers is decided here, by the same function the
+  // task's asks are judged by; nothing waits.
+  if candidates.is_empty() {
+    let verdict = crate::live_ship::admission_verdict(&candidates, &[]);
+    return crate::live_ship::ship_after(state, volume, verdict);
+  }
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a live-ship outside a recorded request".to_owned(),
+    });
+  };
+  let admit = slates_db::live::Admit {
+    object,
+    size: record.policy.size,
+    require_locked: record.policy.require_locked,
+  };
+  let shards = (
+    state.shard,
+    state.shards.first().copied().unwrap_or(state.shard),
+  );
+  crate::image::defer(
+    state,
+    crate::live_ship::admit_then_ship(shards, request, volume, admit, candidates),
+  )
+}
+
+/// Records volume `volume`'s live shipping flag (`Op::LiveShippingChanged`): the reply, or the database's refusal.
+pub(crate) fn set_live_shipping(
+  state: &mut ShardState,
+  volume: VolumeId,
+  live_shipped: bool,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   match state.db.mutate(
     &mut state.segment,
@@ -5967,7 +6017,9 @@ pub(crate) fn wire_names(names: DbNamePolicy) -> NamePolicy {
   }
 }
 
-fn wire_size(size: DbSizeClass) -> SizeClass {
+/// A catalog's size class as the protocol names it: one conversion for a volume's record, a taken-over volume's catalog
+/// ([`taken_over_size`]) and an owner's admission ask (`live_ship::serve_admit`), so each reserves the same claim.
+pub(crate) fn wire_size(size: DbSizeClass) -> SizeClass {
   match size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
@@ -13161,10 +13213,7 @@ pub(crate) fn made_already(
 
 /// The size class a taken-over volume's catalog names.
 pub(crate) fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
-  match catalog.size {
-    DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
-    DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
-  }
+  wire_size(catalog.size)
 }
 
 /// A taken-over volume's archive restored for its making ([`begin_making`]) in one call, admitted before it allocates
