@@ -44,3 +44,28 @@ the daemon began. A client saw a typed refusal class only for the errors named b
 The other words the daemon sends in place of types are tracked in GAPS under A-299: `TargetUnavailable`'s reason,
 `Unsupported`'s feature, `Unpublished`'s reason, `ImageRefused`'s reason, `TableAtCapacity`'s table, and the
 landing-state, action, audit-kind and grant-state words the contract reads from closed tables.
+
+## Siblings found after the fix (2026-11-18, the integrator's report)
+
+The catch-all's removal left five arms that never reached `refusal_of_vfs`: each matched the volume core's directory
+error first and answered in words. The integrator found the first while fixing
+`a_writable_map_needs_a_write_attachment_and_a_file` (1128e2222):
+- `crates/server/src/direct_map.rs`: a read map of a directory (`Begun::Directory`, two arms) answered
+  `BadRequest { "the path is a directory" }`. The variant is gone; the fill answers `Begun::Vfs(IsDirectory)`, which
+  the existing arm maps.
+- `crates/server/src/merge_service.rs`: a whole read (`read_plain`) and a paged read (`read_plain_range`) of a
+  directory answered the same words.
+- `crates/server/src/listing.rs`: a listing of a file (`plain_page`) answered `BadRequest { "the path is not a
+  directory" }`.
+
+Each is now `Refusal::Volume { IsDirectory }` or `{ NotDirectory }`. The tests came first, one per site, in
+`crates/client/tests/client.rs`: `a_read_map_of_a_directory_is_refused_typed`,
+`a_read_of_a_directory_is_refused_typed_whole_or_paged` (since g247's landing `a_paged_read_of_a_directory_is_refused_typed`:
+the whole-file `Read` and `read_plain` are retired by A-267, the verb refused `Unsupported` in its published wire
+place) and `listing_a_file_is_refused_typed`.
+
+The sweep for every other spelling found no further volume-core error in words. It did find 11 arms in
+`crates/server/src/verbs.rs` (lines 5885, 5917, 6113, 6198, 8955, 8998, 9206, 10414, 10487, 11608 and 11632 on
+f64b8c33c) that send a memory error other than `BudgetExceeded`, or a registry insert's error, at admission as
+`BadRequest { e.to_string() }`. That is the same fault in another class; it is owed (GAPS, A-299).
+

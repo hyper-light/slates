@@ -1279,6 +1279,74 @@ fn a_writable_map_needs_a_write_attachment_and_a_file() {
   client.detach(writing).unwrap();
 }
 
+/// A-299's sibling sweep (the integrator, 2026-11-18, after `a_writable_map_needs_a_write_attachment_and_a_file`): a read
+/// map of a directory is refused as the volume core's typed `IsDirectory`, as every file verb's is, never in words. Do:
+/// on a volume holding a directory, ask `map_read` for it. Expect: `Refusal::Volume { IsDirectory }` and no copy made.
+/// Until 2026-11-18 it was `BadRequest { "the path is a directory" }` (`crates/server/src/direct_map.rs`).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_read_map_of_a_directory_is_refused_typed() {
+  let (daemon, mut client, _instance) = one_shard_daemon("mapdir");
+  let id = client.create(&room_for("mapdir", 4 << 10)).unwrap();
+  let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
+  client.fs_mkdir((id, writing), "/d", 0o755).unwrap();
+  let start = daemon.direct_map_copies().unwrap();
+  match client.map_read(id, "/d") {
+    Err(ClientError::Refused(refusal)) => assert_eq!(
+      refusal,
+      Refusal::Volume {
+        refusal: VolumeRefusal::IsDirectory
+      }
+    ),
+    Err(other) => panic!("a typed refusal expected: {other:?}"),
+    Ok(_) => panic!("a directory was mapped"),
+  }
+  assert_eq!(daemon.direct_map_copies().unwrap(), start, "no copy made");
+  client.detach(writing).unwrap();
+}
+
+/// A-299's sibling sweep (the integrator, 2026-11-18): a read of a directory is refused as the volume core's typed
+/// `IsDirectory`, never in words. Do: on a volume holding a directory, read it (`ReadRange`, which `Client::read` and
+/// the library send). Expect: `Refusal::Volume { IsDirectory }`. Until 2026-11-18 it was `BadRequest { "the path is a
+/// directory" }` (`crates/server/src/merge_service.rs`, `read_plain_range`). The whole-file `Read`, the other read the
+/// sweep typed, is retired (A-267): refused `Unsupported` whatever it names, in its published wire place
+/// (`crates/server/tests/base_read_pages.rs`).
+#[test]
+fn a_paged_read_of_a_directory_is_refused_typed() {
+  let (_daemon, mut client, _instance) = one_shard_daemon("readdir");
+  let id = client.create(&room_for("readdir", 4 << 10)).unwrap();
+  let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
+  client.fs_mkdir((id, writing), "/d", 0o755).unwrap();
+  let typed = Refusal::Volume {
+    refusal: VolumeRefusal::IsDirectory,
+  };
+  match client.read(id, "/d", slates_client::ReadAt::Head) {
+    Err(ClientError::Refused(refusal)) => assert_eq!(refusal, typed, "a paged read"),
+    other => panic!("a typed refusal expected of a paged read: {other:?}"),
+  }
+  client.detach(writing).unwrap();
+}
+
+/// A-299's sibling sweep (the integrator, 2026-11-18): listing a file is refused as the volume core's typed
+/// `NotDirectory`, never in words. Do: on a volume holding a file, list it as if it were a directory. Expect:
+/// `Refusal::Volume { NotDirectory }`. Until 2026-11-18 it was `BadRequest { "the path is not a directory" }`
+/// (`crates/server/src/listing.rs`, `plain_page`).
+#[test]
+fn listing_a_file_is_refused_typed() {
+  let (_daemon, mut client, _instance) = one_shard_daemon("listfile");
+  let id = client.create(&room_for("listfile", 4 << 10)).unwrap();
+  write_file(&mut client, id, "/f.bin", &pattern(4 << 10, 7));
+  match client.list_dir(id, "/f.bin", slates_client::ReadAt::Head) {
+    Err(ClientError::Refused(refusal)) => assert_eq!(
+      refusal,
+      Refusal::Volume {
+        refusal: VolumeRefusal::NotDirectory
+      }
+    ),
+    other => panic!("a typed refusal expected: {other:?}"),
+  }
+}
+
 /// AC-A-173 (G-direct step 4), macOS: a copy released before its offer was claimed takes the offer with it, so no
 /// offer keeps a copy's object alive past the client's share of the direct maps. Do: request a map by hand on the
 /// ring, leave its offer on the socket route unclaimed, release the map, then claim the offer with its own secret.

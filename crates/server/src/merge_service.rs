@@ -1225,13 +1225,15 @@ fn read_plain_range(
         stamp,
       }
     }
-    Err(slates_vfs::error::VfsError::IsDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
 
+/// `destroy` of a merge volume, or `None` for a plain one (the store-backed destroy runs). A work
+/// is removed with its declared operations; a green with its engine, its pins and its works'
+/// ability to merge (their next submit refuses `UnknownBase`, §4.16 failure matrix). Every
+/// attachment of the volume is removed. The catalog records the destroy in one step — a merge
+/// volume holds no store content to walk in slices — and the caller needs the admin right.
 pub(crate) fn destroy_merge_volume(
   state: &mut ShardState,
   principal: &Principal,
