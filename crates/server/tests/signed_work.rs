@@ -37,6 +37,8 @@ use common::target::{TargetDir, target_dir};
 #[cfg(unix)]
 use slates_client::{Filter, GrantScope, Intent, Landing, SignedLanding};
 #[cfg(unix)]
+use slates_ipc::protocol::AuditKind;
+#[cfg(unix)]
 use slates_server::landing::{enroll_proof, grant_proof};
 
 /// Shape: one shard, so a green and its works share it; `a_signed_merge_off_its_greens_shard_is_judged_there` runs
@@ -881,12 +883,12 @@ fn expect_the_landings_audited(client: &mut Client, (first, second): (u64, u64),
     records
       .iter()
       .filter(|record| record.landing == Some(landing))
-      .filter_map(|record| Some((record.kind.as_str(), record.verification?)))
+      .filter_map(|record| Some((record.audit_kind, record.verification?)))
       .collect::<Vec<_>>()
   };
   assert_eq!(
     judged(first),
-    vec![("landing_planned", Verification::Unsigned)],
+    vec![(AuditKind::LandingPlanned, Verification::Unsigned)],
     "{records:?}"
   );
   let signed = judged(second);
@@ -894,17 +896,20 @@ fn expect_the_landings_audited(client: &mut Client, (first, second): (u64, u64),
     signed.iter().all(|(_, verdict)| *verdict == signer_of(key)),
     "{records:?}"
   );
-  let kinds: std::collections::BTreeSet<&str> = signed.iter().map(|(kind, _)| *kind).collect();
-  assert_eq!(
-    kinds,
-    std::collections::BTreeSet::from(["landing_finished", "landing_planned"]),
-    "{records:?}"
-  );
+  for kind in [AuditKind::LandingPlanned, AuditKind::LandingFinished] {
+    assert!(
+      signed.iter().any(|(judged, _)| *judged == kind),
+      "{kind:?}: {records:?}"
+    );
+  }
   assert!(
     records
       .iter()
       .filter(|record| record.verification.is_some())
-      .all(|record| matches!(record.kind.as_str(), "landing_planned" | "landing_finished")),
+      .all(|record| matches!(
+        record.audit_kind,
+        AuditKind::LandingPlanned | AuditKind::LandingFinished
+      )),
     "{records:?}"
   );
 }
@@ -1137,9 +1142,9 @@ fn a_landings_verdict_survives_a_daemon_restart() {
   let mut client = connect(&config.instance);
   let records = client.audit(0).unwrap();
   for (landing, verdict, _) in [&signed, &unsigned] {
-    let finished = records
-      .iter()
-      .find(|record| record.landing == Some(*landing) && record.kind == "landing_finished");
+    let finished = records.iter().find(|record| {
+      record.landing == Some(*landing) && record.audit_kind == AuditKind::LandingFinished
+    });
     assert_eq!(
       finished.and_then(|record| record.verification),
       Some(*verdict),
