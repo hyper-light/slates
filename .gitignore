@@ -1,0 +1,18 @@
+# Cargo
+/target
+/vendor/target
+**/*.rs.bk
+*.pdb
+
+# TLC scratch output (the models are architecture artifacts; run TLC with -metadir outside the tree)
+docs/wip/models/states/
+docs/wip/models/*_TTrace_*.tla
+
+# Editors
+.idea/
+.vscode/
+
+# Claude Code agent worktrees (scratch checkouts, each its own branch)
+.claude/worktrees/
+/target-*
+/node_modules
