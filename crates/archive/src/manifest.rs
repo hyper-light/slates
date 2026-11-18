@@ -22,7 +22,9 @@
 //! metadata, minor 2 the owner and the root's own metadata ahead of the tree, and minor 3 (2026-09-30,
 //! AUD-29-56) the signed times, the access and birth times and the attribute values: before it an
 //! archive carried only an "has attributes" flag (always written zero), so a placed snapshot could be
-//! verified and served by a successor with its attributes and access times gone.
+//! verified and served by a successor with its attributes and access times gone. Minor 4 (2026-11-17,
+//! A-294) a device node's major and minor: a device node is a file node with no extents whose mode's type
+//! bits name the device kind, as a FIFO or socket name is, and its number rides in its metadata.
 //!
 //! Scope: the tree shape (directories, files, extents), each entry's metadata, and the Merkle
 //! identity over both. Restoring the metadata onto a host path is the landing engine's job under a
@@ -80,9 +82,33 @@ pub struct NodeMeta {
   pub uid: u32,
   /// The owning group's gid, as the volume held it. Format minor 2.
   pub gid: u32,
+  /// A device node's major number, as the volume held it (A-294; format minor 4): the mode's type bits say the node is
+  /// a block or character device. Zero for every other node; a reader refuses a node that is no device carrying
+  /// another, so every archive of one tree has one encoding.
+  pub device_major: u32,
+  /// A device node's minor number (A-294; format minor 4); zero for every other node, as [`NodeMeta::device_major`].
+  pub device_minor: u32,
   /// The node's extended attributes, each a name and its value's extents over the archive's chunks
   /// (format minor 3). Written in strictly increasing name order; a reader refuses any other order.
   pub xattrs: Vec<Xattr>,
+}
+
+/// Format: POSIX `S_IFMT`, the type bits of a mode.
+const MODE_TYPE_MASK: u32 = 0o170_000;
+/// Format: POSIX `S_IFCHR`, a character device's type bits.
+const MODE_CHAR_DEVICE: u32 = 0o020_000;
+/// Format: POSIX `S_IFBLK`, a block device's type bits.
+const MODE_BLOCK_DEVICE: u32 = 0o060_000;
+
+impl NodeMeta {
+  /// Whether the mode's type bits name a block or character device (A-294), the only nodes whose device number may be
+  /// other than zero.
+  pub fn is_device(&self) -> bool {
+    matches!(
+      self.mode & MODE_TYPE_MASK,
+      MODE_CHAR_DEVICE | MODE_BLOCK_DEVICE
+    )
+  }
 }
 
 /// One extended attribute (§4.5 "Extended attributes"; format minor 3): its name and its value. The value
@@ -271,6 +297,8 @@ fn write_meta(writer: &mut Writer, meta: &NodeMeta) {
   writer.u32(meta.nlink);
   writer.u32(meta.uid);
   writer.u32(meta.gid);
+  writer.u32(meta.device_major);
+  writer.u32(meta.device_minor);
   let mut xattrs: Vec<&Xattr> = meta.xattrs.iter().collect();
   xattrs.sort_by(|a, b| a.name.cmp(&b.name));
   writer.u32(u32::try_from(xattrs.len()).unwrap_or(u32::MAX));
@@ -326,8 +354,10 @@ fn read_meta(reader: &mut Reader<'_>) -> Result<NodeMeta, ManifestError> {
   let nlink = reader.u32().map_err(truncated)?;
   let uid = reader.u32().map_err(truncated)?;
   let gid = reader.u32().map_err(truncated)?;
+  let device_major = reader.u32().map_err(truncated)?;
+  let device_minor = reader.u32().map_err(truncated)?;
   let xattrs = read_xattrs(reader)?;
-  Ok(NodeMeta {
+  let meta = NodeMeta {
     ino,
     mode,
     atime_ns,
@@ -338,8 +368,15 @@ fn read_meta(reader: &mut Reader<'_>) -> Result<NodeMeta, ManifestError> {
     nlink,
     uid,
     gid,
+    device_major,
+    device_minor,
     xattrs,
-  })
+  };
+  // One tree, one encoding (A-294): only a device node carries a device number.
+  if !meta.is_device() && (device_major, device_minor) != (0, 0) {
+    return Err(ManifestError::BadNode);
+  }
+  Ok(meta)
 }
 
 /// Reads a node's extended attributes: a count bounded by the bytes left, then each name (valid, and

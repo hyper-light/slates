@@ -451,6 +451,19 @@ fn micros_after(line: &str, words: &str) -> Duration {
   Duration::from_micros(micros)
 }
 
+/// Shape: the lines of a failed child's standard error a failure message carries, its last ones: the watchdog's
+/// verdict, its end line and the role's own tags fit in far fewer, and the daemon's boot profile is about seventy lines
+/// before them.
+const SAID_LINES: usize = 40;
+
+/// The last [`SAID_LINES`] lines `stderr` has delivered so far, one a line, so a failure shows what the daemon itself
+/// said (a verdict never reached, or an end that never finished) rather than only that it did not exit.
+fn said_so_far(stderr: &Receiver<(u64, String)>) -> String {
+  let said: Vec<String> = stderr.try_iter().map(|(_, line)| line).collect();
+  let from = said.len().saturating_sub(SAID_LINES);
+  said.get(from..).unwrap_or_default().join("\n")
+}
+
 /// What the watchdog's end line names, from everything the child said on standard error: the verdict's lateness, the
 /// looks' lateness, when the parent read the line (the host's monotonic clock), and the line.
 fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64, String)> {
@@ -518,8 +531,9 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let (status, exited_after) = ended.exit.unwrap_or_else(|| {
     panic!(
       "{name}: the lone daemon was still running {GIVE_UP:?} after its shard was held; the call: {:?} (None: still \
-       pending)",
-      ended.call
+       pending); the daemon said on standard error, last {SAID_LINES} lines:\n{}",
+      ended.call,
+      said_so_far(&daemon.stderr)
     )
   });
   let (late, looks_late, line_read_ns, line) = end_line(&daemon.stderr).unwrap_or_else(|| {
