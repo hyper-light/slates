@@ -623,7 +623,6 @@ impl ClientEnd {
       }
       let look_timeout_ns = match self.before_park(ends, elapsed)? {
         Before::Park(timeout_ns) => timeout_ns,
-        Before::Again => continue,
         Before::Ended(waited) => return Ok(waited),
       };
       if let Some(waited) = self.park_once(ends, started, look_timeout_ns)? {
@@ -770,23 +769,22 @@ impl ClientEnd {
   }
 
   /// macOS: the departure's look, when the doubling makes one due (A-443, A-456; `Looks`): a park here waits on the
-  /// wake word alone, so the daemon's exit watch is looked at on that schedule. `Park` until the next look; `Again`
-  /// after a look found the daemon alive; `Ended` once a look finds its process gone (a reply it wrote before taken
-  /// first), or at once for an end with no liveness check.
+  /// wake word alone, so the daemon's exit watch is looked at on that schedule. `Park` until the next look, made now
+  /// when one was due and found the daemon alive (the park re-checks the ring as it arms); `Ended` once a look finds its
+  /// process gone (a reply it wrote before taken first), or at once for an end with no liveness check.
   #[cfg(target_os = "macos")]
   fn departure_due(&mut self, elapsed_ns: u64) -> Result<Before, IpcError> {
     let Some(liveness) = self.liveness.as_ref() else {
       return Ok(Before::Ended(Waited::Departed));
     };
-    if !self.looks.due(elapsed_ns, self.wake.mean_ns()) {
-      return Ok(Before::Park(self.looks.until(elapsed_ns)));
+    if self.looks.due(elapsed_ns, self.wake.mean_ns()) {
+      self.liveness_looks = self.liveness_looks.saturating_add(1);
+      if liveness.departed() {
+        return self.after_departure().map(Before::Ended);
+      }
+      self.looks.looked(elapsed_ns);
     }
-    self.liveness_looks = self.liveness_looks.saturating_add(1);
-    if liveness.departed() {
-      return self.after_departure().map(Before::Ended);
-    }
-    self.looks.looked(elapsed_ns);
-    Ok(Before::Again)
+    Ok(Before::Park(self.looks.until(elapsed_ns)))
   }
 
   /// Linux and Windows: the park waits on the departure itself, so no look is ever due and the park has no timeout; an
@@ -967,8 +965,6 @@ enum Ends {
 enum Before {
   /// Park, at most this long (`None`: until woken).
   Park(Option<u64>),
-  /// Look at the ring again first: a look at the daemon's life just found it alive.
-  Again,
   /// The wait is over.
   Ended(Waited),
 }
