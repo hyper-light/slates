@@ -1404,8 +1404,8 @@
 > a build that runs code at the speed the budget was set for; ThreadSanitizer's runtime is called at every memory
 > access and every function's entry and exit. The spin window is now the budget held to the build: scaled by compiled ÷
 > machine-code time for one chain of work, measured once a process (`slates_machine::build_cost`), never below the
-> budget; the watchdog's start line names both. Measured: ThreadSanitizer's builds 24.2 to 33.2 times machine code on
-> CI's runners (spin windows of 24 to 33 s), and the lane passed with no spinning verdict, two runs of two
+> budget; the watchdog's start line names both. Measured: ThreadSanitizer's builds 17.9 to 35.3 times machine code on
+> CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
 > (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
 > (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
 > (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest

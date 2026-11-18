@@ -53,13 +53,13 @@ poll costs what the build makes it cost. Nothing told the watchdog which build i
 
 ## Evidence (2026-11-18)
 
-- Measured slowdowns: ThreadSanitizer's builds 24.2 to 33.2 times machine code on CI's ubuntu runners (spin windows of
-  24 to 33 s); an unoptimized build 3.5 times on a Mac Studio (spin window 3.48 to 3.63 s); a release build 1.0 times
+- Measured slowdowns: ThreadSanitizer's builds 17.9 to 35.3 times machine code on CI's ubuntu runners (spin windows of
+  18 to 35 s); an unoptimized build 3.5 times on a Mac Studio (spin window 3.48 to 3.63 s); a release build 1.0 times
   (1,667 ns against 1,667 ns a batch of four chains: the window stays the budget, and the slow-poll test skips there).
 - Red, the budget put back as the spin window: the unit test failed, and the slow-poll liveness test's beat was withheld
   at 2 of 16 looks (r968, Adas-Mac-Studio). Green: the slow poll of 1.5 s of CPU under a 3.46 to 3.63 s window, never
   withheld; the lone daemon's spinning case ended on its verdict, read 3.87 s after the hold.
-- CI's ThreadSanitizer lane with the change: passed, no spinning verdict, two runs of two (diag-g251-tsan), where main's
+- CI's ThreadSanitizer lane with the change: passed, no spinning verdict, six runs of six (diag-g251-tsan), where main's
   had died on one in each of two runs (run 44238377555's client binary, diag-b13-2's server library).
 - Suites (r968): slates-machine 2 binaries, slates-server 57, slates-client 22, all passing.
 

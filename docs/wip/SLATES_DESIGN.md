@@ -8048,8 +8048,8 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > ThreadSanitizer lane, whose runtime is called at every memory access and every function's entry and exit, a poll of
 > 1,054 ms of CPU ended the client tests' binary and one of 1,060 ms the server's library tests (runs 44238377555 and
 > diag-b13-2), each an in-process daemon's lone watchdog ending the whole process. Measured: an unoptimized build 3.5
-> times machine code (a Mac Studio), a release build 1.0 (its window the budget), and ThreadSanitizer's 24.2 to 33.2
-> times on CI's runners, whose lane then passed with no spinning verdict (diag-g251-tsan, two runs of two). The wedged
+> times machine code (a Mac Studio), a release build 1.0 (its window the budget), and ThreadSanitizer's 17.9 to 35.3
+> times on CI's runners, whose lane then passed with no spinning verdict (diag-g251-tsan, six runs of six). The wedged
 > and starved judgments stay on the wall and the budget. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`,
 > `the_spin_window_is_the_budget_held_to_the_builds_measured_cost` (`crates/server/src/watchdog.rs`),
 > `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat` (`crates/server/tests/liveness.rs`), and
