@@ -490,7 +490,8 @@
 > change begins: in 7 runs the replacement was not yet a voter and the owner's death left one live voter of three, in
 > 13 the change began after the wait and the owner died inside it, and in 1 the destroyed node's takeover was still
 > kept (the cohort finding above). `wait_recovered` now also needs every node's own member id among the voters and no
-> retirement kept, bounded by a fleet wait and naming what is missing. Red first:
+> retirement kept, judged by progress as the wait it replaced was (it fails, naming what is missing, only after a whole
+> fleet wait with no change; since 2026-11-17 the nemesis flows' whole-recovery wait seats through it too). Red first:
 > `a_replacement_not_yet_voting_or_a_takeover_still_kept_is_not_recovered`. Not a slates defect. After, release on
 > both Linux arches: main B10 with the wait alone (diag-live-durability-79) passed the store-destroyed flow 24 of 24 and
 > the candidate-killed flow 12 of 12; with A-271 too (-80), store-destroyed 48 of 48.

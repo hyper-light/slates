@@ -573,21 +573,22 @@ fn recovered(views: &[RecoveryView]) -> bool {
   unrecovered(views).is_empty()
 }
 
-/// Waits until the fleet has recovered from its one failure ([`recovered`]), within the fleet wait. A flow that has
-/// already spent it (a candidate killed, replaced or restarted) must wait for this before it kills another node. At
-/// `f = 1` a second failure while the voter change is open cannot be survived under any membership scheme: joint
-/// consensus needs a majority of both sets, and single-server steps leave either {A, owner} needing both or four voters
-/// needing three. The flows' own waits (`wait_rejoined`, `judge_healed`) look at membership and the log, not the
-/// council. diag-live-durability-66 killed the owner with the change open in 6 of 6 x86 runs, and no survivor could
-/// elect a leader to take it over.
+/// Waits until the fleet has recovered from its one failure ([`recovered`]). A flow that has already spent it (a
+/// candidate killed, replaced or restarted, or a nemesis fault) must wait for this before it strikes again. At `f = 1` a
+/// second failure while the voter change is open cannot be survived under any membership scheme: joint consensus needs a
+/// majority of both sets, and single-server steps leave either {A, owner} needing both or four voters needing three. The
+/// flows' own waits (`wait_rejoined`, `judge_healed`) look at membership and the log, not the council.
+/// diag-live-durability-66 killed the owner with the change open in 6 of 6 x86 runs, and no survivor could elect a leader
+/// to take it over.
 ///
-/// Bounded by one fleet wait ([`FLEET_WAIT`], every fleet step's bound in these flows): measured on CI, the voter change
-/// it waits for closed at most 5.26 s after the node was killed (BENCHMARKS "The council's voter change after a
-/// candidate's node is replaced"); the failed node's takeover is confirmed after it, how long after is what the flows
-/// note (the wait's length, returned). Past it, the flow fails naming what is missing on each node ([`unrecovered`]).
+/// Judged by progress ([`FrozenWindow`]), as the council wait it replaced was: it goes on while any node's view changes,
+/// and fails, naming what is missing on each node ([`unrecovered`]), only after a whole fleet wait in which none did.
+/// Measured on CI, the voter change it waits for closed at most 5.26 s after the node was killed (BENCHMARKS "The
+/// council's voter change after a candidate's node is replaced"); the failed node's takeover is confirmed after it, how
+/// long after is what the flows note (the wait's length, returned).
 fn wait_recovered(instances: &[String]) -> Duration {
   let began = Instant::now();
-  let deadline = began + FLEET_WAIT;
+  let mut window = FrozenWindow::new();
   loop {
     let views: Vec<RecoveryView> = instances
       .iter()
@@ -598,8 +599,8 @@ fn wait_recovered(instances: &[String]) -> Duration {
       return began.elapsed();
     }
     assert!(
-      Instant::now() < deadline,
-      "the fleet did not recover from its failure within the fleet wait: {}",
+      window.moving(&format!("{views:?}")),
+      "the fleet recovered from its failure, or kept changing, within each fleet wait: {}",
       missing.join("; ")
     );
     pause();
@@ -5517,12 +5518,12 @@ fn wait_caught_up(fleet: &Fleet, owner: usize, volume: &str) {
 }
 
 /// Waits until the fleet has recovered whole from a nemesis fault, so the next is the only one (two faults in one
-/// cohort are past `f`): every member seated and holding the whole configuration, no voter change in flight, every node
-/// settled at its neighbourhood, one node shipping the volume, and every other copy caught up ([`wait_caught_up`]).
-/// The owner's index.
-fn wait_recovered(fleet: &Fleet, volume: &str) -> usize {
+/// cohort are past `f`): every member seated and holding the whole configuration, every node's own member id a voter
+/// with no voter change in flight and no retirement kept ([`wait_recovered`]), every node settled at its neighbourhood,
+/// one node shipping the volume, and every other copy caught up ([`wait_caught_up`]). The owner's index.
+fn wait_recovered_whole(fleet: &Fleet, volume: &str) -> usize {
   wait_settled(&fleet.instances, fleet.instances.len());
-  wait_council_seated(&fleet.instances);
+  wait_recovered(&fleet.instances);
   wait_neighbourhood_settled(&fleet.instances);
   let owner = wait_one_owner(fleet, volume);
   wait_caught_up(fleet, owner, volume);
@@ -5663,7 +5664,7 @@ fn continuity_in_samples(samples: &[Sample]) -> Vec<String> {
 /// ([`nemesis_schedule`]; `SLATES_CHAOS_SEED` replays it) strike one at a time: every path lossy and held, a node
 /// slowed, one link severed, or a node (the owner as likely as either candidate) stopped, cut off, deafened or muted,
 /// each for [`FAULT_MIN`]–[`FAULT_MAX`], and once a run the owner partitioned until it is taken over; read through
-/// every node while each lasts; end it; and wait for the fleet to recover whole ([`wait_recovered`]) and for the
+/// every node while each lasts; end it; and wait for the fleet to recover whole ([`wait_recovered_whole`]) and for the
 /// stream, forwarded once another node owns the volume, to make more writes durable before the next. Expect, across
 /// every takeover the schedule causes: one identity at every head (Agreement, the models' TotalOrder); every write
 /// acknowledged through any node served by the last owner (NoLoss); every copy fenced at or above the last owner's
@@ -5698,7 +5699,7 @@ fn a_seeded_nemesis_of_single_faults_keeps_every_register_invariant() {
       after_writes(&front, &volume, BETWEEN_EVENTS);
       for planned in &schedule {
         let struck = strike(&fleet, &volume, *planned, (began, newest));
-        let owner = wait_recovered(&fleet, &volume);
+        let owner = wait_recovered_whole(&fleet, &volume);
         // Writes go on through the front node, forwarded to the owner when it is another node now, so each fault lands
         // mid-stream with writes on either side and a stream that stopped cannot pass for one that kept going.
         after_writes(&fleet.instances[owner], &volume, BETWEEN_EVENTS);
