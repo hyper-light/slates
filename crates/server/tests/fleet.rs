@@ -11391,6 +11391,171 @@ fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
   assert!(last.caught_up, "b holds every volume's log at a's head");
 }
 
+/// Shape: the files written into the sealed-in-turns test's volume before it is live-shipped, each one request of
+/// [`BURST_VOLUME_FILE_BYTES`]: three MiB of content, so its whole entry spans three of the seal's pieces at least
+/// (`slates_archive::format::MAX_CHUNK_BYTES`, a MiB) and its build takes a turn a piece under the cut quantum.
+const BUILT_VOLUME_FILES: usize = 1536;
+/// Shape: the volume's bound: room for its content and the writes made while its whole entry seals.
+const BUILT_VOLUME_LIMIT: u64 = 16 << 20;
+/// Shape: the writers that write while the whole entry seals, each one file.
+const BUILT_WRITERS: usize = 8;
+/// Shape: the pieces the whole entry spans at least: the content's mebibytes.
+const BUILT_PIECES: u64 = 3;
+/// Format: the owner's counts of whole entries sealed in turns, of their turns, and of the publications queued behind
+/// them (`live_ship::begin_whole_build`, `advance_whole_build`, `queue_behind_build`).
+const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
+/// Format: see [`LIVE_WHOLE_BUILDS`].
+const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Format: see [`LIVE_WHOLE_BUILDS`].
+const LIVE_QUEUED: &str = "fleet.live.queued";
+
+/// A volume of [`BUILT_VOLUME_FILES`] files on `client`'s node, attached for writing: the volume and the attachment.
+fn volume_of_mebibytes(client: &mut Client) -> (VolumeId, u64) {
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "built-in-turns".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BUILT_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was created");
+  };
+  let attachment = write_attachment(client, id);
+  for file in 0..BUILT_VOLUME_FILES {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/base-{file}"),
+      bytes: vec![u8::try_from(file % 251).unwrap(); BURST_VOLUME_FILE_BYTES],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "base file {file}: {written:?}"
+    );
+  }
+  (id, attachment)
+}
+
+/// Writes one file `/during-<index>` through a fresh client of `owner` once `start` lets it go: the reply.
+fn write_during(
+  owner: &str,
+  volume: VolumeId,
+  index: usize,
+  start: &std::sync::Barrier,
+) -> ReplyBody {
+  let mut writer = Client::connect(owner);
+  let attachment = write_attachment(&mut writer, volume);
+  start.wait();
+  writer.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: format!("/during-{index}"),
+    bytes: vec![u8::try_from(index % 251).unwrap(); BURST_WRITE_BYTES],
+    mode: 0o644,
+  })
+}
+
+/// A-377 (§4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere"): a live whole entry of more than one piece is
+/// sealed in turns of its owner shard, and the publications made meanwhile follow it in order. Do: three nodes at
+/// `f = 1`; on a, a volume of three MiB of files; cut a's seal turns to one piece (`Daemon::inject_seal_walk_quantum`);
+/// live-ship it, and at once have eight clients write a file each and one more write, so the log's first entry, the
+/// whole state, seals while they publish. Expect every write answered at durability, at least three turns of the whole
+/// entry's build (a piece a turn), publications queued behind it, a's log durable at its head with nothing owed, and both
+/// holders at its head. Before, the whole entry was sealed in the one turn that published it: its AEAD and keyed names a
+/// byte held the shard about a second a GiB (a taken-over volume's first publication, 1.06 s, g251's trace).
+#[test]
+fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let (id, attachment) = volume_of_mebibytes(&mut client);
+  daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
+  let counts = |daemon: &Daemon| {
+    [LIVE_WHOLE_BUILDS, LIVE_WHOLE_BUILD_TURNS, LIVE_QUEUED]
+      .map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  let before = counts(&daemons[0]);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let start = std::sync::Barrier::new(BUILT_WRITERS + 1);
+  let (first, during) = std::thread::scope(|scope| {
+    let writers: Vec<_> = (0..BUILT_WRITERS)
+      .map(|index| {
+        let (owner, start) = (&owner, &start);
+        scope.spawn(move || write_during(owner, id, index, start))
+      })
+      .collect();
+    start.wait();
+    let first = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/first".to_owned(),
+      bytes: vec![1; BURST_WRITE_BYTES],
+      mode: 0o644,
+    });
+    let during: Vec<ReplyBody> = writers
+      .into_iter()
+      .map(|writer| writer.join().unwrap())
+      .collect();
+    (first, during)
+  });
+  let after = counts(&daemons[0]);
+  daemons[0].inject_seal_walk_quantum(None).unwrap();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let settled = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let line = owned_live_line(&mut client, id);
+    Ok(
+      matches!(line, Some((Some(head), Some(durable), false)) if head == durable)
+        && holds_every_head(&mut client, &daemons[1], &[id])
+        && holds_every_head(&mut client, &daemons[2], &[id]),
+    )
+  });
+  let line = owned_live_line(&mut client, id);
+  drop(observed);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let [builds, turns, queued] = [0, 1, 2].map(|kind| after[kind].saturating_sub(before[kind]));
+  eprintln!(
+    "whole entry in turns: shipped {shipped:?}, first write {first:?}, {} of {BUILT_WRITERS} writes during it answered; \
+     builds {builds}, turns {turns}, queued {queued}; a's log {line:?}, settled {settled}",
+    during
+      .iter()
+      .filter(|reply| matches!(reply, ReplyBody::FsDone { .. }))
+      .count()
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    std::iter::once(&first)
+      .chain(&during)
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered at durability: {first:?} {during:?}"
+  );
+  assert!(builds >= 1, "the whole entry was sealed in turns");
+  assert!(
+    turns >= BUILT_PIECES,
+    "the whole entry was sealed a piece a turn: {turns} turns for at least {BUILT_PIECES} pieces"
+  );
+  assert!(
+    queued >= 1,
+    "publications were queued behind the whole entry: {queued}"
+  );
+  assert!(
+    settled,
+    "a's log is durable at its head with nothing owed, and both holders hold its head: {line:?}"
+  );
+}
+
 /// Whether `holder` holds each of `volumes`' live logs at the head its owner (`client`'s node) ships.
 fn holds_every_head(client: &mut Client, holder: &Daemon, volumes: &[VolumeId]) -> bool {
   volumes.iter().all(|volume| {
