@@ -4863,7 +4863,17 @@ async fn materialize_green(
   if served_already(origin, (object, target)).await {
     return Ok(());
   }
-  let handed = adopted_green(object, pending, (catalog_sequence, &catalog), budget).await?;
+  // The promotion epoch the takeover re-committed the green's registers at: the green's records are written at it, and
+  // its adoption records it, so this node writes them there after a restart too, when `placed_heads` is forgotten.
+  let promotion = placed.epoch.0.max(catalog_placed.epoch.0);
+  let handed = adopted_green(
+    object,
+    pending,
+    (catalog_sequence, &catalog),
+    promotion,
+    budget,
+  )
+  .await?;
   let answer = call_within(
     origin,
     target,
@@ -4935,6 +4945,7 @@ async fn adopted_green(
   object: ObjectId,
   pending: &crate::state::PendingGreen,
   (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
+  promotion: u64,
   budget: CommitBudget,
 ) -> Result<crate::green_adopt::AdoptedGreen, GreenWait> {
   use crate::green_adopt::Engine;
@@ -4977,6 +4988,7 @@ async fn adopted_green(
       head: adopted.version,
       identity: adopted.identity,
       origin,
+      epoch: promotion,
       engine,
       completions,
     })

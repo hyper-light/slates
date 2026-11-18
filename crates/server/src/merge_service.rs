@@ -2580,18 +2580,15 @@ fn ship_version(
 /// The epoch `object`'s records are written at: the host's — or, for a green this node **took over**, the takeover's
 /// promotion epoch (`placed_heads`, moved here with the green; AUD-14): the holders raised their fence for the
 /// departed owner's bumped epoch, and a record below it is refused `StaleEpoch`, which is what left a taken-over green's
-/// next version unable to commit.
+/// next version unable to commit. A restart forgets `placed_heads`; the green's record keeps the promotion epoch its
+/// adoption was made at (A-333, `fleet::promotion_epoch`), so a restarted successor writes there still.
 fn record_epoch(state: &ShardState, config: &Configuration, object: ObjectId) -> HostEpoch {
-  state
+  let placed = state
     .placed_heads
     .get(&object)
-    .map_or(config.host_epoch, |placed| {
-      if placed.epoch.0 > config.host_epoch.0 {
-        placed.epoch
-      } else {
-        config.host_epoch
-      }
-    })
+    .map_or(config.host_epoch, |placed| placed.epoch);
+  let promoted = crate::fleet::promotion_epoch(state, object).unwrap_or(config.host_epoch);
+  HostEpoch(config.host_epoch.0.max(placed.0).max(promoted.0))
 }
 
 /// What one merge shipment carries to a group of targets (A-286).

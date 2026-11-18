@@ -108,6 +108,10 @@ pub(crate) struct AdoptedGreen {
   pub(crate) identity: [u8; 32],
   /// Version 0's inputs manifest, as the ledger's version 0 record names it; `None` for a green with no origin.
   pub(crate) origin: Option<[u8; 32]>,
+  /// The promotion epoch the takeover re-committed the green's registers at, which the holders fenced the green at:
+  /// its records are written at it (`merge_service::record_epoch`), and the adoption keeps it in the green's record
+  /// (`VolumeRecord::taken_over`), so a restart of this node, which forgets `placed_heads`, writes them there still.
+  pub(crate) epoch: u64,
   /// The engine at `head`: this node's replica.
   pub(crate) engine: Green,
   /// The submit completions the ledger's records carried, each with its version.

@@ -11485,8 +11485,15 @@ fn record_adopted_green(
     access: adopted.access.clone(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: adopted.catalog_sequence,
-    // A green's loss is reported by its records, not a volume's takeover record (AC-8.3, A-325), as before A-333.
-    taken_over: None,
+    // The takeover that made this node the green's owner (AC-8.3, A-325): its promotion epoch, which the holders fenced
+    // the green at, is what this node writes the green's records at after a restart forgets `placed_heads`
+    // (`fleet::promotion_epoch`). Before A-333 a successor recorded none, so a restarted one wrote them at its own
+    // host's epoch, every one refused, and the green's next version never committed.
+    taken_over: Some(slates_db::catalog::TakeoverRecord {
+      epoch: adopted.epoch,
+      head_sequence: adopted.head,
+      from_live_log: false,
+    }),
   };
   let op = Op::GreenAdopted {
     record,
@@ -13448,8 +13455,14 @@ impl GreenReplay {
             .iter()
             .filter(|version| version.base < held)
             .count();
+          // The floor is a checkpoint's, or with none the version the green's takeover adopted it at (A-333).
+          let floor = if state.db.partition().green_checkpoint(self.id).is_some() {
+            "checkpoint"
+          } else {
+            "adoption"
+          };
           slates_machine::log_line!(
-            "slates-server: partition {}: green {} restored at checkpoint {held}, applied {} chain entries above it, {below} of them based below it",
+            "slates-server: partition {}: green {} restored at its {floor} at version {held}, applied {} chain entries above it, {below} of them based below it",
             state.partition,
             hex_of(&self.id.bytes),
             replayed.len()
@@ -17034,6 +17047,7 @@ mod tests {
       head: 0,
       identity,
       origin: None,
+      epoch: 0,
       engine,
       completions: Vec::new(),
     }
