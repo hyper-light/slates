@@ -17,17 +17,29 @@ pure-hash = ["slates-client/pure-hash"]
 [dependencies]
 # The typed client of the ring protocol (§4.7): every verb this crate offers is one of its calls.
 slates-client = { workspace = true }
-# The wire's report and refusal types this crate's API speaks (`Refusal`, `StatusReport`, `Filter`, ...).
+# The wire's report and refusal types this crate's API speaks (`Refusal`, `StatusReport`, `Filter`, ...), and the
+# rendezvous the anchor role holds for its daemons (§4.7, A-114).
 slates-ipc = { workspace = true }
-# The issuer authority (§4.13 "Grants"): the anchor's segment, where the daemon publishes the issuer secret.
+# The issuer authority (§4.13 "Grants"): the anchor's segment, where the daemon publishes the issuer secret; and the
+# anchor role's segment and supervisor (§2.5).
 slates-anchor = { workspace = true }
 slates-mem = { workspace = true }
-slates-machine = { workspace = true }
-# The proofs a grant, an enrollment, a revocation and a consensus recovery carry, and the anchor's liveness budget the
-# client's deadlines derive from.
+# The codec probe is asked for here, as the `slates` binary asks for it, because this crate runs the anchor role that
+# measures the profile (A-278): without it a host's instance derives `CodecPolicy::raw_only()` and stores every archive
+# chunk raw (`docs/bugs/2026-10-20-the-ratio-codec-was-compiled-out-of-every-build.md`). This crate reaches
+# aws-lc-sys through the server anyway, so it is not in the C-free cross-lint set.
+slates-machine = { workspace = true, features = ["codecs"] }
+# The proofs a grant, an enrollment, a revocation and a consensus recovery carry, the anchor's liveness budget the
+# client's deadlines derive from, and the daemon the daemon role runs (§2.6).
 slates-server = { workspace = true }
-# The recovery budget the client's reconnect deadline derives from.
+# The recovery budget the client's reconnect deadline and the anchor's restart policy derive from.
 slates-db = { workspace = true }
+# The anchor role's held NFS listener and fleet sockets, and its judgment of a starting daemon's runnable state.
+slates-rt = { workspace = true }
+# The anchor role's monotonic clock.
+slates-vfs = { workspace = true }
+# The fleet manifest the roles read (`role::fleet`).
+serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -35,12 +47,28 @@ rustix = { workspace = true }
 # The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
 slates-bridge-nfs = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# The roles' stop flag: the console control handler (`role::signal`).
+windows-sys = { workspace = true }
+# The WinFsp mounts' purge client, a role of the executable the daemon runs from (§4.6: no daemon thread opens a volume
+# it serves).
+slates-bridge-winfsp = { workspace = true }
+
 [dev-dependencies]
 slates-server = { workspace = true }
 slates-machine = { workspace = true }
 slates-db = { workspace = true }
 # The Shards stream test speaks FUSE through the end the library hands a VMM (A-161), with the codec's ABI constants.
 slates-bridge-fuse = { workspace = true }
+# The landing test checks each listed file's bytes against the BLAKE3 its plan's entry names (A-287).
+blake3 = { workspace = true }
+
+# Instance start by use: the test binary is an embedding host whose own `main` serves the roles when its arguments
+# begin with its prefix, as kiln's does, so it runs without libtest's harness (A-278).
+[[test]]
+name = "start"
+path = "tests/start.rs"
+harness = false
 
 [lints]
 workspace = true
