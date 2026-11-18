@@ -619,6 +619,12 @@ pub(crate) struct LiveState {
   destroys: BTreeMap<[u8; 16], (u64, Vec<Awaiting>)>,
   /// The waiting destroys by request, so a retry joins its wait ([`join`]).
   destroys_by_request: BTreeMap<(u64, u32, u32), [u8; 16]>,
+  /// The asynchronous outcomes whose reply may wait for a live volume's durability (a mapped file's write-back, a
+  /// checkout), each seated among the held replies when its task began ([`take_seat`]), by request: counted against
+  /// [`awaiting_bound`] from then, so the bound is met before the task changes anything, never after its effects
+  /// commit. A seat becomes the outcome's wait ([`defer`]) or is given back when it completes without one
+  /// ([`release_seat`]). Bounded with [`LiveState::awaiting`].
+  seats: std::collections::BTreeSet<(u64, u32, u32)>,
   /// What the transport barrier that just ran on this shard published of a live volume, for its caller to wait on
   /// ([`note_barrier`], [`take_barrier`]): set and taken within one synchronous serve.
   barrier: Option<(slates_db::catalog::VolumeId, u64)>,
@@ -1065,6 +1071,11 @@ const LIVE_UNRECORDED: &str = "fleet.live.unrecorded";
 const LIVE_UNDELIVERED: &str = "fleet.live.undelivered";
 /// Counter: a verb refused `Overloaded` because the replies waiting for durability were at their bound.
 const LIVE_OVER_BOUND: &str = "fleet.live.over_bound";
+/// Counter: an asynchronous outcome seated among the held replies as its task began ([`take_seat`]).
+const LIVE_SEATED: &str = "fleet.live.seated";
+/// Counter: an outcome held past the bound because it began with no seat, its volume turned live-shipped while it ran
+/// ([`defer`]): held rather than refused after its effects committed.
+const LIVE_HELD_PAST_BOUND: &str = "fleet.live.held_past_bound";
 
 /// Derived: the replies a shard may hold for durability: one per request its clients may have in flight, the bound the
 /// told waits use (`told::held_bound`: clients per shard times ring slots).
@@ -1156,10 +1167,14 @@ pub(crate) fn refuse_over_bound(
 }
 
 /// Holds a verb's reply until `volume`'s log is durable at `target` (A-200): its effects are committed, its completion
-/// is recorded and its reply delivered then ([`resolve`]): `None`. The reply to give now instead, `Overloaded`
-/// (counted, nothing recorded, so a retry runs the verb again), when the shard already holds its bound of such
-/// replies: a recorded verb met the bound before it ran ([`refuse_over_bound`]), so only an asynchronous outcome
-/// (a mapped file's sync, an image build) meets it here.
+/// is recorded and its reply delivered then ([`resolve`]): `None`. The shard's bound on such replies was met before the
+/// effects: a recorded verb's by [`refuse_over_bound`], in the turn that runs it; an asynchronous outcome's by the seat
+/// its task took as it began ([`take_seat`]), which this wait now fills. So nothing is refused here for room: until
+/// 2026-11-18 an asynchronous outcome met the bound here, after its effects had committed, so a mapped file's sync
+/// refused `Overloaded` had written its stores (GAPS). An outcome that began with no seat (a map's release that found no
+/// room, [`seat_if_room`], or one whose volume turned live-shipped while it ran) is held past the bound, counted, rather
+/// than refused after its commit; each is a request in flight, so the excess is bounded by them. The reply to give now
+/// instead, `StaleEpoch`, when this owner was superseded and nothing it holds becomes durable.
 pub(crate) fn defer(
   state: &mut ShardState,
   (volume, target): (slates_db::catalog::VolumeId, u64),
@@ -1167,15 +1182,13 @@ pub(crate) fn defer(
   route: Option<crate::merge_service::ReplyRoute>,
   reply: slates_ipc::protocol::ReplyBody,
 ) -> Option<slates_ipc::protocol::ReplyBody> {
+  let seated = state.live.seats.remove(&(origin, id.client, id.sequence));
   if let Some(current) = fenced(state, volume.bytes) {
     state.count(LIVE_FENCED, 1);
     return Some(stale_epoch(current));
   }
-  if held_replies(state) >= awaiting_bound(state) {
-    state.count(LIVE_OVER_BOUND, 1);
-    return Some(slates_ipc::protocol::ReplyBody::Refused {
-      refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
-    });
+  if !seated && held_replies(state) >= awaiting_bound(state) {
+    state.count(LIVE_HELD_PAST_BOUND, 1);
   }
   let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
   state
@@ -1275,7 +1288,8 @@ pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   }
 }
 
-/// The replies this shard holds for durability or a tombstone's placement, which [`awaiting_bound`] bounds together.
+/// The replies this shard holds for durability or a tombstone's placement, and the seats taken for asynchronous
+/// outcomes that may wait so ([`take_seat`]), which [`awaiting_bound`] bounds together.
 fn held_replies(state: &ShardState) -> usize {
   let live: usize = state.live.awaiting.values().map(Vec::len).sum();
   let destroys: usize = state
@@ -1284,7 +1298,77 @@ fn held_replies(state: &ShardState) -> usize {
     .values()
     .map(|(_, waiting)| waiting.len())
     .sum();
-  live.saturating_add(destroys)
+  live
+    .saturating_add(destroys)
+    .saturating_add(state.live.seats.len())
+}
+
+/// Seats the asynchronous outcome of request `(origin, id)` on `volume` among the replies this shard may hold for
+/// durability, before its task changes anything (A-200; a mapped file's write-back, a checkout): `Ok` with no seat when
+/// the volume is not live-shipped, whose outcome never waits; `Ok` seated; or `Overloaded`, counted and nothing seated,
+/// when the shard already holds its bound ([`awaiting_bound`]), so the task never starts, the request changed nothing
+/// and its resend under the same id runs it once, as a recorded verb refused by [`refuse_over_bound`] does. The seat is
+/// filled by the outcome's wait ([`defer`]) or given back when it completes without one ([`release_seat`]).
+pub(crate) fn take_seat(
+  state: &mut ShardState,
+  volume: slates_db::catalog::VolumeId,
+  request: (u64, slates_wire::request::RequestId),
+) -> Result<(), slates_ipc::protocol::Refusal> {
+  match seat(state, volume, request) {
+    Seat::Unneeded | Seat::Taken => Ok(()),
+    Seat::Full => {
+      state.count(LIVE_OVER_BOUND, 1);
+      Err(slates_ipc::protocol::Refusal::Overloaded { shard: state.shard })
+    }
+  }
+}
+
+/// Seats an asynchronous outcome that must run whatever the bound ([`take_seat`] otherwise): a mapped file's release,
+/// which lets its copy go whatever its write-back answers (`slates_client::Client::release_map_write`), so it is never
+/// refused for room. With no room it runs seatless, and its wait, if it waits, is held past the bound ([`defer`]).
+pub(crate) fn seat_if_room(
+  state: &mut ShardState,
+  volume: slates_db::catalog::VolumeId,
+  request: (u64, slates_wire::request::RequestId),
+) {
+  let _ = seat(state, volume, request);
+}
+
+/// What seating an asynchronous outcome found ([`seat`]).
+enum Seat {
+  /// The volume is not live-shipped: the outcome never waits for durability.
+  Unneeded,
+  /// Seated among the held replies.
+  Taken,
+  /// The shard holds its bound already: nothing seated.
+  Full,
+}
+
+/// Seats request `(origin, id)`'s outcome on `volume` when it may wait and there is room ([`take_seat`]).
+fn seat(
+  state: &mut ShardState,
+  volume: slates_db::catalog::VolumeId,
+  (origin, id): (u64, slates_wire::request::RequestId),
+) -> Seat {
+  if !is_live(state, volume) {
+    return Seat::Unneeded;
+  }
+  if held_replies(state) >= awaiting_bound(state) {
+    return Seat::Full;
+  }
+  state.live.seats.insert((origin, id.client, id.sequence));
+  state.count(LIVE_SEATED, 1);
+  Seat::Taken
+}
+
+/// Gives back the seat of request `(origin, id)`'s asynchronous outcome ([`take_seat`]): it completed without waiting
+/// for durability (refused, or its volume durable already or no longer live-shipped), or its task could not start.
+/// Nothing when it holds none.
+pub(crate) fn release_seat(
+  state: &mut ShardState,
+  (origin, id): (u64, slates_wire::request::RequestId),
+) {
+  state.live.seats.remove(&(origin, id.client, id.sequence));
 }
 
 /// The tombstone sequence a destroy of `volume` that just committed must see placed at `f + 1` before it answers, or

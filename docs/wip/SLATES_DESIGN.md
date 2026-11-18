@@ -7167,8 +7167,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
 > twice (g232's finding). Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
-> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
-> in `defer`, after its commit (GAPS, OPEN).
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome that may wait so (a mapped file's write-back, a checkout)
+> takes a seat among the held replies as its task begins (`live_ship::take_seat`), refused `Overloaded` at the bound
+> before it writes anything; its wait fills the seat (`defer`, which no longer refuses for room), or it gives the seat
+> back when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back
+> answers, so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no
+> seat (that release, or one whose volume turned live-shipped while it ran) is held past the bound, counted
+> (`fleet.live.held_past_bound`), rather than refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`: before, the sync was
+> refused `Overloaded` with its stores already in the file.
 >
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
