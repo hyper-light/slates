@@ -291,6 +291,20 @@ impl ShardTime {
   /// a CPU through it: the budget it has not yet run. `None` ends the wait: the shard made no progress in the window and
   /// waited on no CPU, it has run its budget, or its clock cannot be read.
   pub(crate) fn next_window_ns(&mut self) -> Option<u64> {
+    let (began, mark) = (self.began, self.mark);
+    let reading = slates_rt::registry::shard_cpu(self.holder);
+    let decided = self.next_window_ns_g243();
+    eprintln!(
+      "G243 window {:?} at {}: began {began:?} mark {mark:?} now {reading:?} budget {} -> {decided:?}",
+      self.holder,
+      slates_rt::registry::g243_unix_ms(),
+      self.budget_ns
+    );
+    decided
+  }
+
+  /// The rule itself, unchanged (G243 diagnostics wrap it).
+  fn next_window_ns_g243(&mut self) -> Option<u64> {
     let now = slates_rt::registry::shard_cpu(self.holder)?;
     let unspent = self
       .budget_ns
@@ -314,10 +328,16 @@ impl ShardTime {
   /// held off its CPU stays runnable, and Linux credits a run-queue wait only once the thread reaches a CPU (A-228's
   /// notes). No reading (Miri, or a source that cannot be read) says no, as before A-228.
   fn runnable(&self) -> bool {
-    slates_rt::registry::shard_run_readings(&[self.holder])
+    let reading = slates_rt::registry::shard_run_readings(&[self.holder])
       .pop()
-      .flatten()
-      .is_some_and(|run| run.state == slates_rt::RunState::Runnable)
+      .flatten();
+    let raw = slates_rt::registry::diag_shard_raw_state(self.holder);
+    eprintln!(
+      "G243 runnable {:?} at {}: reading {reading:?}, raw (handle, (ThreadState, WaitReason)) {raw:?}",
+      self.holder,
+      slates_rt::registry::g243_unix_ms()
+    );
+    reading.is_some_and(|run| run.state == slates_rt::RunState::Runnable)
   }
 }
 
