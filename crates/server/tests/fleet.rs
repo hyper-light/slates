@@ -533,6 +533,7 @@ fn start_with_policy(
   let transport = FleetTransport {
     identity: this.identity,
     advertise: this.address.into(),
+    advertise_record: this.record_address.into(),
     enrollment_roots: Vec::new(),
     name: NAME.to_owned(),
     serve: held_serve_sockets(this.address, this.record_address),
@@ -2156,6 +2157,7 @@ fn start_fleet_node(
     identity,
     name: NAME.to_owned(),
     advertise: loopback(bind.0).into(),
+    advertise_record: loopback(bind.1).into(),
     enrollment_roots: Vec::new(),
     serve: held_serve_sockets(loopback(bind.0), loopback(bind.1)),
     peers,
@@ -3077,6 +3079,41 @@ fn start_mesh_unbootstrapped(
     slates_db::register::RegionId,
   >,
 ) -> Vec<Daemon> {
+  start_mesh_bound_and_advertised(
+    nodes,
+    started,
+    hosts,
+    certs,
+    (serve, serve),
+    f,
+    shards,
+    regions,
+    mirrors,
+  )
+}
+
+/// Each node's (probe, record) serve port pair, in node order.
+type PortPairs = [(u16, u16)];
+
+/// [`start_mesh_unbootstrapped`] with each node bound at its pair of `bound` and advertised at its pair of `advertised`
+/// (A-277): its peers dial it at the advertised pair and it announces that pair, so a node advertised where a port
+/// mapping listens is reached only through the mapping. Where the two pairs are the same, the node binds where it
+/// advertises, as every other mesh does.
+#[allow(clippy::too_many_arguments)]
+fn start_mesh_bound_and_advertised(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  started: usize,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  (bound, advertised): (&PortPairs, &PortPairs),
+  f: u32,
+  shards: u16,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
+) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
   // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
@@ -3095,8 +3132,8 @@ fn start_mesh_unbootstrapped(
         .map(|j| FleetPeer {
           anchor: anchors[j],
           host: hosts[j],
-          address: loopback(serve[j].0).into(),
-          record_address: loopback(serve[j].1).into(),
+          address: loopback(advertised[j].0).into(),
+          record_address: loopback(advertised[j].1).into(),
           certificate: certs[j].clone(),
         })
         .collect();
@@ -3116,9 +3153,10 @@ fn start_mesh_unbootstrapped(
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
-        advertise: loopback(serve[i].0).into(),
+        advertise: loopback(advertised[i].0).into(),
+        advertise_record: loopback(advertised[i].1).into(),
         enrollment_roots: Vec::new(),
-        serve: held_serve_sockets(loopback(serve[i].0), loopback(serve[i].1)),
+        serve: held_serve_sockets(loopback(bound[i].0), loopback(bound[i].1)),
         peers,
         resolver: None,
       };
@@ -11401,6 +11439,330 @@ fn live_ship_after_its_base_and_one_write(client: &mut Client, id: VolumeId, att
   );
 }
 
+/// Shape: how long a [`PortMapping`]'s socket waits for a datagram before it looks at its stop flag again: the latency
+/// of its stop alone, never of a datagram, which ends the wait at once.
+const MAPPING_READ_WAIT: Duration = Duration::from_millis(20);
+/// Format: the largest UDP payload; a [`PortMapping`] receives each datagram whole into a buffer this large.
+const MAPPING_DATAGRAM_CAP: usize = 65_535;
+/// Shape: how long [`a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`]
+/// watches a write it must not see acknowledged: twice what the redial around the mappings took before A-330. That
+/// was the live exchange given up unanswered at the liveness budget (`fleet::live_budget`), the record link dropped and
+/// dialed again at its next turn, a heartbeat at most, and the entry shipped and answered at the period after.
+const CUT_WRITE_WATCH: Duration = Duration::from_nanos(2 * (LIVENESS_BUDGET_NS + 2 * HEARTBEAT_NS));
+
+/// A port mapping in front of one node (A-277, A-330): a NAT's port forward, or a container runtime's published ports,
+/// in the test's own threads. It listens at two ports of its own, where the node is advertised for its probes and for
+/// its records, and sends each datagram on to the node's bound socket for the same plane from a flow socket it keeps
+/// for that sender (one outer address an inner socket, as a NAT keeps one mapping an inner address), and each answer
+/// back out of the listener. Only what crosses it reaches the node from a peer that dials where the node is advertised.
+/// The record plane can be cut, both ways, and healed; what crossed it there is counted. Dropped, it stops and joins
+/// every thread it started.
+struct PortMapping {
+  /// The mapping's two ports: where the node is advertised for its probes, and for its records.
+  advertised: (u16, u16),
+  records_cut: &'static std::sync::atomic::AtomicBool,
+  records_crossed: &'static std::sync::atomic::AtomicU64,
+  stop: &'static std::sync::atomic::AtomicBool,
+  planes: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl PortMapping {
+  /// Starts forwarding to `bound`, the node's bound probe and record ports. The flags its threads share are leaked
+  /// once a mapping, which only a test makes.
+  fn start(bound: (u16, u16)) -> PortMapping {
+    let records_cut: &'static std::sync::atomic::AtomicBool =
+      Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let records_crossed: &'static std::sync::atomic::AtomicU64 =
+      Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    let stop: &'static std::sync::atomic::AtomicBool =
+      Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let probe = std::net::UdpSocket::bind(loopback(0)).unwrap();
+    let record = std::net::UdpSocket::bind(loopback(0)).unwrap();
+    let advertised = (
+      probe.local_addr().unwrap().port(),
+      record.local_addr().unwrap().port(),
+    );
+    let planes = [
+      (probe, loopback(bound.0), None),
+      (
+        record,
+        loopback(bound.1),
+        Some((records_cut, records_crossed)),
+      ),
+    ]
+    .into_iter()
+    .map(|(listener, node, records)| {
+      std::thread::spawn(move || forward_plane(listener, node, records, stop))
+    })
+    .collect();
+    PortMapping {
+      advertised,
+      records_cut,
+      records_crossed,
+      stop,
+      planes,
+    }
+  }
+
+  /// Cuts the record plane both ways, or heals it.
+  fn cut_records(&self, cut: bool) {
+    self
+      .records_cut
+      .store(cut, std::sync::atomic::Ordering::Release);
+  }
+
+  /// The record-plane datagrams that have crossed the mapping, both ways.
+  fn records_crossed(&self) -> u64 {
+    self
+      .records_crossed
+      .load(std::sync::atomic::Ordering::Acquire)
+  }
+}
+
+impl Drop for PortMapping {
+  fn drop(&mut self) {
+    self.stop.store(true, std::sync::atomic::Ordering::Release);
+    for plane in self.planes.drain(..) {
+      let _ = plane.join();
+    }
+  }
+}
+
+/// The record plane's cut and count, for a [`PortMapping`]'s record listener and its flows; `None` on the probe plane.
+type RecordPlane = Option<(
+  &'static std::sync::atomic::AtomicBool,
+  &'static std::sync::atomic::AtomicU64,
+)>;
+
+/// Whether a datagram may cross `plane` now, counting it on the record plane when it may.
+fn crosses(plane: RecordPlane) -> bool {
+  match plane {
+    None => true,
+    Some((cut, crossed)) => {
+      let open = !cut.load(std::sync::atomic::Ordering::Acquire);
+      if open {
+        crossed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+      }
+      open
+    }
+  }
+}
+
+/// One plane of a [`PortMapping`]: each datagram `listener` receives goes on to `node` from its sender's flow socket,
+/// opened on the sender's first datagram with a thread that carries the node's answers back; until `stop`, then every
+/// flow's thread joined.
+fn forward_plane(
+  listener: std::net::UdpSocket,
+  node: SocketAddrV4,
+  plane: RecordPlane,
+  stop: &'static std::sync::atomic::AtomicBool,
+) {
+  listener.set_read_timeout(Some(MAPPING_READ_WAIT)).unwrap();
+  let mut flows: std::collections::BTreeMap<std::net::SocketAddr, std::net::UdpSocket> =
+    std::collections::BTreeMap::new();
+  let mut answers = Vec::new();
+  let mut buffer = vec![0u8; MAPPING_DATAGRAM_CAP];
+  while !stop.load(std::sync::atomic::Ordering::Acquire) {
+    // A timed-out wait, or an error the socket reported once: look at the stop flag and wait again.
+    let Ok((length, sender)) = listener.recv_from(&mut buffer) else {
+      continue;
+    };
+    let flow = flows.entry(sender).or_insert_with(|| {
+      let flow = std::net::UdpSocket::bind(loopback(0)).unwrap();
+      flow.set_read_timeout(Some(MAPPING_READ_WAIT)).unwrap();
+      let (answers_from, back) = (flow.try_clone().unwrap(), listener.try_clone().unwrap());
+      answers.push(std::thread::spawn(move || {
+        answer_flow(answers_from, back, (sender, node), plane, stop);
+      }));
+      flow
+    });
+    if crosses(plane) {
+      let _ = flow.send_to(&buffer[..length], node);
+    }
+  }
+  for answer in answers {
+    let _ = answer.join();
+  }
+}
+
+/// A [`PortMapping`] flow's answers: each datagram the node (`route.1`) sends `flow` goes back out of the listener
+/// (`back`) to the sender it is kept for (`route.0`); anything from elsewhere is a stray and dropped. Until `stop`.
+fn answer_flow(
+  flow: std::net::UdpSocket,
+  back: std::net::UdpSocket,
+  route: (std::net::SocketAddr, SocketAddrV4),
+  plane: RecordPlane,
+  stop: &'static std::sync::atomic::AtomicBool,
+) {
+  let (sender, node) = route;
+  let mut buffer = vec![0u8; MAPPING_DATAGRAM_CAP];
+  while !stop.load(std::sync::atomic::Ordering::Acquire) {
+    let Ok((length, from)) = flow.recv_from(&mut buffer) else {
+      continue;
+    };
+    if from == std::net::SocketAddr::V4(node) && crosses(plane) {
+      let _ = back.send_to(&buffer[..length], sender);
+    }
+  }
+}
+
+/// Starts the fleet of [`a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`]:
+/// three nodes, a b and c, formed and settled at `f = 1`, b and c each bound at its own pair and advertised at a
+/// [`PortMapping`] in front of it, a bound where it advertises. The port lease, the two mappings (b's, c's) and the
+/// daemons in node order.
+fn mesh_with_mapped_candidates() -> (PortLease, [PortMapping; 2], Vec<Daemon>) {
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (lease, bound) = mesh_serve_ports(names.len());
+  let mappings = [PortMapping::start(bound[1]), PortMapping::start(bound[2])];
+  let advertised = vec![bound[0], mappings[0].advertised, mappings[1].advertised];
+  let regions = std::collections::BTreeMap::new();
+  let daemons = start_mesh_bound_and_advertised(
+    nodes,
+    names.len(),
+    &seeds,
+    &certs,
+    (bound.as_slice(), advertised.as_slice()),
+    1,
+    1,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  bootstrap_mesh(&daemons, &seeds, &regions);
+  settle_initial_consensus(&daemons, &seeds, &regions, Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  (lease, mappings, daemons)
+}
+
+/// What [`write_across_a_record_cut`] saw: the replies that came while the record planes were cut and once healed, and
+/// the record datagrams that had crossed the mappings before the cut, at the heal and after.
+struct AcrossTheCut {
+  while_cut: Vec<(Duration, u32, ReplyBody)>,
+  after_heal: Vec<(Duration, u32, ReplyBody)>,
+  crossed: [u64; 3],
+}
+
+/// Cuts every one of `mappings`' record planes, sends `write` through `client` and watches its reply for
+/// [`CUT_WRITE_WATCH`], heals, and waits for the reply that has not come within the placement deadline (or makes a
+/// write refused while cut again).
+fn write_across_a_record_cut(
+  client: &mut Client,
+  mappings: &[PortMapping],
+  write: &RequestBody,
+) -> AcrossTheCut {
+  let crossed = |mappings: &[PortMapping]| {
+    mappings
+      .iter()
+      .map(PortMapping::records_crossed)
+      .sum::<u64>()
+  };
+  let before = crossed(mappings);
+  for mapping in mappings {
+    mapping.cut_records(true);
+  }
+  client.send_burst(write, 1);
+  let while_cut = client.collect_timed(1, CUT_WRITE_WATCH, Instant::now());
+  for mapping in mappings {
+    mapping.cut_records(false);
+  }
+  let at_heal = crossed(mappings);
+  let after_heal = if while_cut.is_empty() {
+    client.collect_timed(1, PLACEMENT_DEADLINE, Instant::now())
+  } else {
+    // A refusal while cut is no acknowledgement; the write is made again once healed.
+    vec![(Duration::ZERO, 0, client.call(write))]
+  };
+  AcrossTheCut {
+    while_cut,
+    after_heal,
+    crossed: [before, at_heal, crossed(mappings)],
+  }
+}
+
+/// A-277, A-330, A-200 (StaleNeverCommits as a client sees it, AC-8.1; T-8.7's partition, at a port mapping): a node
+/// behind a port mapping is dialed through the mapping on every dial, a redial included, so a partition at the mapping
+/// partitions its record plane too. Do: start a three-node fleet whose candidates b and c each bind elsewhere than they
+/// advertise, a [`PortMapping`] at each advertised pair ([`mesh_with_mapped_candidates`]); make a live volume on a,
+/// its owner, and write it once; cut both mappings' record planes (their probes go on, so no one is suspected and
+/// nothing is taken over); write again; heal. Expect: the first write answered at durability, with record datagrams
+/// across a mapping; the second never acknowledged while the record planes are cut (no candidate can hold it, so
+/// nothing may claim it durable), however its exchanges fail and its links are dialed again; and acknowledged once
+/// healed, more record datagrams having crossed the mappings. Before A-330 each candidate announced its bound record
+/// port, its owner redialed there, around the mapping, and the second write was acknowledged while cut: the fault
+/// relay's chaos flows saw 2,086 writes acknowledged by an owner cut off from both candidates
+/// (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+#[test]
+fn a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane()
+{
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mappings, daemons) = mesh_with_mapped_candidates();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("behind-a-mapping")) else {
+    panic!("the live volume is created on its owner");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let write = |path: &str| RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: path.to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  };
+  let first = client.call(&write("/first"));
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first write is answered at durability: {first:?}"
+  );
+  let seen = write_across_a_record_cut(&mut client, &mappings, &write("/during"));
+  drop(daemons);
+  drop(mappings);
+  let [before, at_heal, after] = seen.crossed;
+  assert!(
+    before > 0,
+    "the record plane crossed a mapping before the cut"
+  );
+  let acknowledged_while_cut: Vec<&Duration> = seen
+    .while_cut
+    .iter()
+    .filter(|(_, _, reply)| matches!(reply, ReplyBody::FsDone { .. }))
+    .map(|(at, _, _)| at)
+    .collect();
+  assert!(
+    acknowledged_while_cut.is_empty(),
+    "a write no candidate could hold was acknowledged while both candidates' record planes were cut at their \
+     mappings, after {acknowledged_while_cut:?}: the owner reached them around the mappings ({before} record \
+     datagrams had crossed them before the cut, {at_heal} by the heal)"
+  );
+  assert!(
+    seen
+      .after_heal
+      .iter()
+      .any(|(_, _, reply)| matches!(reply, ReplyBody::FsDone { .. })),
+    "the write is acknowledged once the mappings heal: {:?}",
+    seen.after_heal
+  );
+  assert!(
+    after > at_heal,
+    "the healed write's record datagrams crossed the mappings ({at_heal} by the heal, {after} after)"
+  );
+}
+
 /// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record
 /// session to one survivor out — the placement deadline, longer than the placements and the owner's stop it
 /// has to cover; the hold ends with the owner in any case.
@@ -11513,41 +11875,9 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
 fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
-  let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::Created { id } = client.call(&scratch("unpromised")) else {
-    panic!("create on the owner")
-  };
-  share_with_fleet(&mut client, id, &daemons);
-  let ReplyBody::Snapshotted { id: snapshot, .. } =
-    client.call(&RequestBody::Snapshot { volume: id })
-  else {
-    panic!("snapshot on the owner")
-  };
+  let id = held_by_both_survivors(&daemons, "unpromised");
   let object = ObjectId(id.bytes);
-  let observed: Vec<&Daemon> = daemons.iter().collect();
-  assert!(
-    poll_snapshot_placed(&observed, &mut client, id, snapshot),
-    "the volume's head placed"
-  );
-  // Both survivors hold the head, so the successor learns the object from its own copy whichever it is.
-  assert!(
-    poll_until(&observed, PLACEMENT_DEADLINE, || {
-      Ok(
-        daemons[1].fleet_holder_head(object)?.is_some()
-          && daemons[2].fleet_holder_head(object)?.is_some(),
-      )
-    }),
-    "both survivors hold the volume's head"
-  );
-  drop(client);
-  let silenced = [
-    daemons[1].inject_takeover_silence(&[hosts[2]]),
-    daemons[2].inject_takeover_silence(&[hosts[1]]),
-  ];
-  assert!(
-    silenced.iter().all(Result::is_ok),
-    "each survivor leaves the other's takeover questions unanswered: {silenced:?}"
-  );
+  silence_each_other(&daemons, &hosts);
   let successor = rendezvous_first(&[hosts[1], hosts[2]], object).unwrap();
   daemons.remove(0).stop();
   let (at, other) = if successor == hosts[1] {
@@ -11555,23 +11885,7 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
   } else {
     (1, 0)
   };
-  let survivors: Vec<&Daemon> = daemons.iter().collect();
-  let mut client = Client::connect(daemons[at].instance());
-  let mut last = None;
-  let given_up = poll_until(&survivors, SERVE_DEADLINE, || {
-    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
-    let named = matches!(
-      &reply,
-      ReplyBody::Refused {
-        refusal: Refusal::NotRecovered {
-          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on },
-        },
-      } if waited_on == "promises"
-    );
-    last = Some(reply);
-    Ok(named)
-  });
-  drop(client);
+  let (given_up, last) = given_up_naming(&daemons, at, id, "promises");
   let counted = daemons[at]
     .fleet_refusals()
     .map(|counters| takeover_counters(&counters));
@@ -11590,15 +11904,94 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
     "the successor gives the volume up naming the promises it waited for, within {SERVE_DEADLINE:?}; its last reply \
      {last:?}; its counters {counted:?}"
   );
-  let counted = counted.unwrap_or_default();
-  for name in [
-    "fleet.takeover.unpromised.past_bound",
-    "fleet.takeover.given_up",
-  ] {
+  assert_counted(
+    &counted.unwrap_or_default(),
+    &[
+      "fleet.takeover.unpromised.past_bound",
+      "fleet.takeover.given_up",
+    ],
+  );
+}
+
+/// On `daemons[0]`, a scratch volume named `name`, shared with the fleet and snapshotted, once its head is placed and
+/// both survivors-to-be (`daemons[1]` and `daemons[2]`) hold it, so a successor learns it from its own copy whichever
+/// it is. The volume.
+fn held_by_both_survivors(daemons: &[Daemon], name: &str) -> VolumeId {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create on the owner")
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot on the owner")
+  };
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  assert!(
+    poll_snapshot_placed(&observed, &mut client, id, snapshot),
+    "the volume's head placed"
+  );
+  assert!(
+    poll_until(&observed, PLACEMENT_DEADLINE, || {
+      Ok(
+        daemons[1].fleet_holder_head(object)?.is_some()
+          && daemons[2].fleet_holder_head(object)?.is_some(),
+      )
+    }),
+    "both survivors hold the volume's head"
+  );
+  id
+}
+
+/// `daemons[1]` and `daemons[2]` (of `hosts`) each leave the other's takeover pages and questions unanswered: a holder
+/// cut off from one successor alone, which the council never retires since every other member hears it.
+fn silence_each_other(daemons: &[Daemon], hosts: &[HostId]) {
+  let silenced = [
+    daemons[1].inject_takeover_silence(&[hosts[2]]),
+    daemons[2].inject_takeover_silence(&[hosts[1]]),
+  ];
+  assert!(
+    silenced.iter().all(Result::is_ok),
+    "each survivor leaves the other's takeover questions unanswered: {silenced:?}"
+  );
+}
+
+/// Asks `daemons[at]` for `id`'s status until it is refused `NotRecovered { TakeoverIncomplete { waited_on } }`, within
+/// the serve deadline: whether it was, and the last reply.
+fn given_up_naming(
+  daemons: &[Daemon],
+  at: usize,
+  id: VolumeId,
+  waited_on: &str,
+) -> (bool, Option<ReplyBody>) {
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[at].instance());
+  let mut last = None;
+  let given_up = poll_until(&survivors, SERVE_DEADLINE, || {
+    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
+    let named = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotRecovered {
+          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on: named },
+        },
+      } if named == waited_on
+    );
+    last = Some(reply);
+    Ok(named)
+  });
+  (given_up, last)
+}
+
+/// Asserts each counter of `names` moved in `counted`.
+fn assert_counted(counted: &[(&str, u64)], names: &[&str]) {
+  for name in names {
     assert!(
       counted
         .iter()
-        .any(|(counter, count)| *counter == name && *count > 0),
+        .any(|(counter, count)| counter == name && *count > 0),
       "the successor counted {name}: {counted:?}"
     );
   }
@@ -12997,8 +13390,20 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
   );
   assert!(second.is_some(), "the second seal was taken on a");
   assert!(served, "the successor serves the volume");
-  let (sealed_loss, owner_epoch) =
-    sealed_loss.expect("a reported its loss window at its placed seal");
+  expect_the_loss_window_reported_then_taken(sealed_loss, unsealed_loss, taken_loss);
+  expect_the_sealed_file_alone_survived(&sealed_read, &unplaced_read, &unsealed_read);
+}
+
+/// The reports of `a_successor_reports_the_loss_window_its_takeover_left`. Expect the owner's report at its placed seal
+/// (`sealed`) to put nothing at risk and name that seal's head sequence; its report after the later writes
+/// (`unsealed`) to put them at risk, still naming that seal; and the successor's (`taken`) to report a takeover served
+/// from that seal, not a live log, under a later epoch.
+fn expect_the_loss_window_reported_then_taken(
+  sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  taken: Option<(slates_ipc::protocol::LossReport, u64)>,
+) {
+  let (sealed_loss, owner_epoch) = sealed.expect("a reported its loss window at its placed seal");
   let at_seal = sealed_loss
     .placed_sequence
     .expect("a named its placed seal's head sequence");
@@ -13006,28 +13411,36 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
     sealed_loss.at_risk_ns == Some(0) && !sealed_loss.live_shipped,
     "nothing is at risk while the volume is exactly its placed seal: {sealed_loss:?}"
   );
-  let (unsealed_loss, _) =
-    unsealed_loss.expect("a reported its loss window after the later writes");
+  let (unsealed_loss, _) = unsealed.expect("a reported its loss window after the later writes");
   assert!(
     unsealed_loss.at_risk_ns.is_some_and(|ns| ns > 0)
       && unsealed_loss.placed_sequence == Some(at_seal),
     "the writes after the placed seal are at risk, and the unplaced seal moves nothing: {unsealed_loss:?}"
   );
-  let taken = taken_loss
+  let taken = taken
     .and_then(|(loss, _)| loss.taken_over)
     .expect("the successor reports its takeover");
   assert!(
     !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
     "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
   );
+}
+
+/// The reads of `a_successor_reports_the_loss_window_its_takeover_left` on the successor: expect the sealed file served
+/// (`sealed`) and the two written after the placed seal (`unplaced`, `unsealed`) gone, the window lost.
+fn expect_the_sealed_file_alone_survived(
+  sealed: &ReplyBody,
+  unplaced: &ReplyBody,
+  unsealed: &ReplyBody,
+) {
   assert!(
-    matches!(&sealed_read, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
-    "the sealed file survived: {sealed_read:?}"
+    matches!(sealed, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
+    "the sealed file survived: {sealed:?}"
   );
   assert!(
-    !matches!(unplaced_read, ReplyBody::ReadBytes { .. })
-      && !matches!(unsealed_read, ReplyBody::ReadBytes { .. }),
-    "the writes after the placed seal were the window, and are gone: {unplaced_read:?} {unsealed_read:?}"
+    !matches!(unplaced, ReplyBody::ReadBytes { .. })
+      && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
+    "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
   );
 }
 
@@ -16685,6 +17098,7 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
       identity,
       name: NAME.to_owned(),
       advertise: loopback(addresses[node].0).into(),
+      advertise_record: loopback(addresses[node].1).into(),
       serve: held_serve_sockets(loopback(addresses[node].0), loopback(addresses[node].1)),
       peers,
       resolver: None,
@@ -17602,6 +18016,242 @@ fn expect_the_origin_made_and_seeded_a_slice_at_a_time(counters: &[Vec<(String, 
       "holder {holder} seeded its replica over more than one slice: {holder_counters:?}"
     );
   }
+}
+
+/// §4.16 "Apply on holders" and its failure matrix (a green's restart is masked), §4.8 "Recovery" (a warm restart keeps
+/// every record it acknowledged). A holder restarted over its own segment keeps the merge records it accepted and the
+/// inputs it held (AUD-29-59), but its replica of each green, the engine every later version is recomputed on, lived in
+/// memory alone: the holder answered every later record `merge.out_of_order`, for good, and the green went on at
+/// `f + 1` only while its other holder answered. Do: on a settled three-node fleet at `f = 1` whose nodes keep their
+/// state across a restart, make a green on node a and submit one edit, so both holders recompute version 1; restart
+/// holder b over its own segment; have holder c withhold merge records, so a version can commit only through b; submit
+/// a second edit. Expect it answered `Submitted { version: Some(2) }` and placed at the quorum within the placement
+/// deadline, b's replica at version 2 rebuilt from what b holds (`merge.replica.rebuilt` moved on b), and c's withheld
+/// records counted, so b alone carried the quorum.
+#[test]
+fn a_holder_restarted_over_its_segment_recomputes_the_greens_next_version() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["holder-restart-a", "holder-restart-b", "holder-restart-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("holder-restart-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  // Each node's segment carries a content object, so the inputs a holder held survive its restart.
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("holder-restart-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let first = timed_submits(&mut client, green, 1);
+  let holders_at = |daemons: &[Daemon], version: u64| -> Result<bool, ObserveError> {
+    let held: Vec<_> = daemons
+      .iter()
+      .skip(1)
+      .map(|daemon| daemon.merge_holder_state(green))
+      .collect::<Result<_, _>>()?;
+    Ok(
+      held
+        .iter()
+        .all(|state| state.version.is_some_and(|at| at >= version)),
+    )
+  };
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let both_held = poll_until(&refs, PLACEMENT_DEADLINE, || holders_at(&daemons, 1));
+  daemons.remove(1).stop();
+  daemons.insert(
+    1,
+    start_fleet_node(
+      &profiles[1],
+      configs[1].clone(),
+      identities[1].pop().unwrap(),
+      ports[1],
+      peers(1),
+      source(1),
+    ),
+  );
+  let restarted = daemons[1].merge_holder_state(green);
+  let withheld = daemons[2].inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_records: true,
+    ..Default::default()
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work-after-the-restart".to_owned(),
+  }) else {
+    panic!("create the second work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "after-the-restart".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"again".to_vec(),
+  });
+  let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX);
+  let submitted = client.try_call(
+    &RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    },
+    deadline_ns,
+  );
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 2)
+  });
+  let restarted_after = daemons[1].merge_holder_state(green);
+  let counters = merge_and_content_counters(&daemons);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "holder restart: first {first:?}; both held version 1 {both_held}; b after its restart {restarted:?}, after the \
+     second submit {restarted_after:?}; submit {submitted:?}; version 2 placed {placed}; counters {counters:?}"
+  );
+  expect_version_one_held_before_the_restart(&first, both_held, &edited, &withheld, &counters);
+  expect_version_two_through_the_rebuilt_replica(&submitted, placed, &restarted_after, &counters);
+}
+
+/// The holder-restart test's steps before its second submit, judged: the first submit accepted as version 1 and
+/// recomputed by both holders before b restarts, the second work's edit declared, and holder c withholding merge records.
+fn expect_version_one_held_before_the_restart(
+  first: &[(u64, ReplyBody, ReplyBody, Duration)],
+  both_held: bool,
+  edited: &ReplyBody,
+  withheld: &Result<(), ObserveError>,
+  counters: &[Vec<(String, u64)>],
+) {
+  assert!(
+    matches!(
+      first.first(),
+      Some((
+        _,
+        ReplyBody::Edited,
+        ReplyBody::Submitted {
+          version: Some(1),
+          ..
+        },
+        _
+      ))
+    ),
+    "the first submit is accepted as version 1: {first:?}"
+  );
+  assert!(
+    both_held,
+    "both holders recompute version 1 before b restarts: {counters:?}"
+  );
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the second work's edit is declared: {edited:?}"
+  );
+  assert!(
+    withheld.is_ok(),
+    "holder c withholds merge records: {withheld:?}"
+  );
+}
+
+/// The holder-restart test's second submit, judged: accepted as version 2 and placed at the quorum through the
+/// restarted holder b, whose replica was rebuilt from what it holds and recomputed version 2, while holder c withheld
+/// the record, so b alone carried the quorum.
+fn expect_version_two_through_the_rebuilt_replica(
+  submitted: &Result<ReplyBody, IpcError>,
+  placed: bool,
+  restarted_after: &Result<slates_server::merge_service::HolderMergeState, ObserveError>,
+  counters: &[Vec<(String, u64)>],
+) {
+  assert!(
+    matches!(
+      submitted,
+      Ok(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      })
+    ),
+    "the second submit is accepted as version 2 through the restarted holder: {submitted:?}; {counters:?}"
+  );
+  assert!(
+    placed,
+    "version 2 placed at the quorum through the restarted holder: {counters:?}"
+  );
+  assert_eq!(
+    restarted_after.as_ref().ok().copied(),
+    Some(slates_server::merge_service::HolderMergeState {
+      version: Some(2),
+      refused: false,
+    }),
+    "holder b recomputed version 2 on its rebuilt replica"
+  );
+  let (restarted_counters, withholding) = (&counters[1], &counters[2]);
+  assert!(
+    counted(restarted_counters, "merge.replica.rebuilt") > 0,
+    "holder b rebuilt its replica from what it holds: {restarted_counters:?}"
+  );
+  assert!(
+    counted(withholding, "merge.record_withheld") > 0,
+    "holder c withheld the second version's record, so b alone carried the quorum: {withholding:?}"
+  );
 }
 
 /// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
@@ -21264,6 +21914,7 @@ fn lone_fleet_node(tag: &str) -> Daemon {
       ),
       name: NAME.to_owned(),
       advertise: loopback(probe).into(),
+      advertise_record: loopback(record).into(),
       serve: held_serve_sockets(loopback(probe), loopback(record)),
       peers: Vec::new(),
       resolver: None,
@@ -21421,7 +22072,7 @@ fn plant_taken_over_volume(daemon: &Daemon, planted: PlantedVolume) {
         );
         s.pending_materializations.insert(
           object,
-          slates_server::state::PendingVolume::adopted(head, None),
+          slates_server::state::PendingVolume::adopted(head, None, Vec::new()),
         );
       },
     )
@@ -21934,6 +22585,7 @@ impl ExportNode {
         identity: Identity::from_der(node_cert, node_key),
         name: NAME.to_owned(),
         advertise: loopback(probe).into(),
+        advertise_record: loopback(record).into(),
         serve,
         peers: Vec::new(),
         resolver: None,

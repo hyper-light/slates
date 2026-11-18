@@ -38,6 +38,9 @@
 
 mod vm;
 
+#[path = "support/recovered.rs"]
+mod recovered;
+
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
@@ -1890,6 +1893,9 @@ fn daemons_killed_mid_write(gate: &Gate) {
     );
     let fill = told_fill(kill.saturating_mul(2).saturating_add(1));
     let delay = sweep_step(took, kill, DAEMON_KILLS);
+    // The daemon is killed once the anchor has judged it recovered (A-311): one killed sooner is a failed start, and the
+    // second in a row is a crash loop the anchor backs off. Asked before the write is sent, so the sweep's timing holds.
+    recovered::await_recovered(&rig.instance, &|_| true, vm::POLL, START_WAIT);
     let old = daemon_of(&rig.anchor).expect("the anchor runs a daemon");
     guest.send(&patch_page(fill));
     spin_for(delay);

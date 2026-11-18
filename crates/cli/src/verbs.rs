@@ -2506,6 +2506,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
   // (`slates share ID uid:N@ANCHOR`).
   out.push_str(&format!("anchor: {}\n", report.anchor));
+  // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
+  out.push_str(&format!("recovered: {}\n", report.recovered));
   let root: String = report
     .seal
     .root_id

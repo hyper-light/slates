@@ -126,13 +126,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
 /// same day). 10: a volume's loss window, `VolumeStatus::loss` (`LossReport`, `VolumeTakeover`; AC-8.3): what an owner
 /// loss would lose now, the newest seal placed on another host, and on a successor the takeover that made it the owner
-/// (the same day). 11: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and
-/// `Instance::member`, `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`,
-/// `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 12: `Instance::capture_base`, an
-/// overlay's base captured whole so its clones move (A-291, the same day).
+/// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
+/// took, so its exit is no failed start (A-311) (the same day). 12: a volume's move to another fleet member (A-291, the
+/// same day): `Instance::move_volume` and `Instance::member`, `MoveProgress`, and its refusals' details
+/// (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 13:
+/// `Instance::capture_base`, an overlay's base captured whole so its clones move (A-291, the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 12;
+pub const CONTRACT: u32 = 13;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

@@ -1475,13 +1475,21 @@ pub struct PendingVolume {
   /// The page advances of its still-paging takeover round at the last attempt that waited on its catalog register,
   /// `None` before the first ([`PendingVolume::record_round`]).
   pub round_seen: Option<u64>,
+  /// The hosts the retired owner placed this volume on, the members of its cohorts in the takeover that adopted it,
+  /// settled and current (A-309): where its live log was shipped besides the recorded holders, so a live takeover past
+  /// tolerance asks every surviving one of them (`live_ship::fetch`). Taken from the configuration when the volume is
+  /// adopted, since the retirement may complete and be let go before the log is fetched. Empty for a volume no round
+  /// adopted (a mirror's promotion).
+  pub cohort_hosts: Vec<slates_db::register::HostId>,
 }
 
 impl PendingVolume {
-  /// A volume just adopted with its head `head` by `departed`'s takeover round: no attempt made yet.
+  /// A volume just adopted with its head `head` by `departed`'s takeover round, the retired owner having placed it on
+  /// `cohort_hosts`: no attempt made yet.
   pub fn adopted(
     head: crate::head::HeadValue,
     departed: Option<slates_db::register::HostId>,
+    cohort_hosts: Vec<slates_db::register::HostId>,
   ) -> PendingVolume {
     PendingVolume {
       head,
@@ -1489,6 +1497,7 @@ impl PendingVolume {
       attempts: 0,
       most_staged: None,
       round_seen: None,
+      cohort_hosts,
     }
   }
 
@@ -1595,6 +1604,7 @@ mod tests {
         sealing: None,
       },
       None,
+      Vec::new(),
     );
     let mut seen = Vec::new();
     for staged in [4, 4, 9, 2, 9, 10] {
@@ -1647,6 +1657,7 @@ mod tests {
         sealing: None,
       },
       Some(slates_db::register::HostId(5)),
+      Vec::new(),
     );
     let mut green = PendingGreen::adopted(
       adopted_record(),

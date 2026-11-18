@@ -184,8 +184,14 @@ pub struct FleetPeer {
 pub struct FleetTransport<Serve = ServeSockets> {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
-  /// The address this node publishes to authenticated peers.
+  /// The probe-plane address this node publishes to authenticated peers: where they dial its probes, its advertised
+  /// address and base port.
   pub advertise: NodeAddress,
+  /// The record-plane address this node publishes to authenticated peers: where they dial its record links (the
+  /// advertised base port's next in a manifest's layout). Never the port its record socket is bound to, which differs
+  /// behind a port mapping (A-277): a peer told the bound port redials around the mapping, or to a port the mapping does
+  /// not forward (A-330).
+  pub advertise_record: NodeAddress,
   /// Operator trust anchors for certificates of nodes absent from the seed manifest.
   pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name this node presents and its peers pin.
@@ -440,6 +446,7 @@ impl FleetTransport<ServeAddresses> {
     let FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve,
@@ -449,6 +456,7 @@ impl FleetTransport<ServeAddresses> {
     Ok(FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve: serve.bind()?,
@@ -1049,6 +1057,7 @@ fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
 pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
     advertise,
+    advertise_record,
     enrollment_roots,
     identity,
     name,
@@ -1065,12 +1074,6 @@ pub async fn run_membership(transport: FleetTransport) {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
-  // The record port discovery publishes is the one the record socket is bound to; a socket that cannot
-  // say (the OS refusing `getsockname`) cannot be published, counted like a socket that would not bind.
-  let Ok(record_port) = record_socket.local_addr().map(|address| address.port()) else {
-    count_refusal(BIND_REFUSED);
-    return;
-  };
   // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
   // each task names it by its `Kept` handle, reaching it only inside a closure while this shard runs
@@ -1098,14 +1101,16 @@ pub async fn run_membership(transport: FleetTransport) {
   let neighbourhood =
     state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
+  // Discovery announces both planes where this node advertises them, never where it binds (A-277, A-330): a peer
+  // prefers the announcement at every dial (`resolve_peer_address`), and behind a port mapping the bound record port is
+  // reached around the mapping or not at all.
   let initialized = state::with_state(|state| {
     state.discovery = Some(crate::discovery::Discovery::new(
       state,
       name.clone(),
       enrollment_roots.clone(),
       certificate,
-      advertise,
-      record_port,
+      (advertise, advertise_record),
       &peers,
     )?);
     crate::discovery::restore(state)
@@ -5039,6 +5044,31 @@ const GREEN_TAKEOVER_GIVEN_UP: &str = "merge.takeover_given_up";
 /// Format: a counter name in the daemon's status report.
 const GREEN_TAKEOVER_INPUTS_FETCHED: &str = "merge.takeover_inputs_fetched";
 
+/// The hosts a live takeover's phase one asks for `object` (A-240, A-309), and where the retired owner placed it: the
+/// takeover's `placed` candidates, then every candidate of the current placement not among them; and the retired
+/// owner's cohort hosts for the volume as the round that adopted it recorded them (`PendingVolume::cohort_hosts`),
+/// asked and waited for when the recorded holders are past tolerance (`live_ship::fetch`). With this shard's state out of
+/// reach (its shutdown) only the `placed` candidates, and no cohort hosts.
+fn live_candidates(object: ObjectId, placed: &[HostId]) -> (Vec<HostId>, Vec<HostId>) {
+  let mut candidates = placed.to_vec();
+  let (current, cohort_hosts) = state::with_state(|s| {
+    (
+      s.fleet.configuration().place(object).candidates,
+      s.pending_materializations
+        .get(&object)
+        .map(|pending| pending.cohort_hosts.clone())
+        .unwrap_or_default(),
+    )
+  })
+  .unwrap_or_default();
+  for host in current {
+    if !candidates.contains(&host) {
+      candidates.push(host);
+    }
+  }
+  (candidates, cohort_hosts)
+}
+
 /// The lineage key a taken-over volume's successor opens and seals its `head` with (A-92 piece 4c), wrapped under this
 /// node's root: its own copy where the head carried an entry for it; else, for an `envelope` it must open, the key a
 /// fellow candidate of the head (`candidates`, this node left out) hands it (A-295), counted; else none.
@@ -5146,15 +5176,8 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     .filter(|_| catalog.live_shipped)
   {
     let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
-    let mut candidates = placed.placement.candidates.clone();
-    let current =
-      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
-    for host in current {
-      if !candidates.contains(&host) {
-        candidates.push(host);
-      }
-    }
-    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
+    let (candidates, cohort_hosts) = live_candidates(object, &placed.placement.candidates);
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders, cohort_hosts).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
