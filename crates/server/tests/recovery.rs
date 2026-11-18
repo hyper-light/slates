@@ -261,6 +261,53 @@ fn refused_unpublished_create(daemon: &Daemon, client: &mut Client) -> RequestId
   create_id
 }
 
+/// GAPS (an open sibling found by reading `reconcile_unpublished_effects`, 2026-10-24; proven here 2026-11-18): a clone
+/// whose transaction is rolled back gives back its pin on its origin's snapshot. Do: create a volume and snapshot it; with
+/// the next publication refused before its append, clone the snapshot (refused `Unpublished`, the transaction rolled back
+/// and the orphaned clone torn down); then destroy the snapshot. Expect the clone refused typed, one rollback counted, and
+/// the snapshot destroyed. Before, the teardown kept the clone's pin on the snapshot, and its destroy was refused
+/// `Pinned` until the daemon restarted.
+#[test]
+fn a_clone_rolled_back_unpublished_gives_back_its_pin_on_the_origins_snapshot() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clone-pin-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("clone-pin", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("pin-origin")).unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .expect("the fault is installed");
+  let cloned = client.clone_snapshot(origin, snapshot, "pin-clone");
+  let rollbacks = rollbacks_of(&daemon);
+  daemon
+    .inject_publication_fault(None)
+    .expect("the faults still pending on the other shards are cleared");
+  let destroyed = client.destroy_snapshot(origin, snapshot);
+  daemon.stop();
+  drop(anchor);
+  assert!(
+    matches!(
+      cloned,
+      Err(ClientError::Refused(Refusal::Unpublished { .. }))
+    ),
+    "the clone is refused typed as unpublished: {cloned:?}"
+  );
+  assert_eq!(
+    rollbacks, 1,
+    "the shard rolled the clone's transaction back"
+  );
+  assert!(
+    destroyed.is_ok(),
+    "the origin's snapshot is destroyed, no pin left by the rolled-back clone: {destroyed:?}"
+  );
+}
+
 /// The volume names the daemon lists, sorted.
 fn names_listed(client: &mut Client) -> Vec<String> {
   let mut names: Vec<String> = client
@@ -4974,7 +5021,17 @@ fn overlay_clones_read(
     matches!(own.as_deref(), Ok(bytes) if bytes == b"the clone's own"),
     "{when}: the clone reads its own file: {own:?}"
   );
-  for volume in [origin, other] {
+  clones_own_file_reads_in_no_other_volume(client, [origin, other], when);
+}
+
+/// The other half of `overlay_clones_read`: expect the file one clone wrote refused `NotFound` in each of `volumes`,
+/// `when` naming the moment for a failure's message.
+fn clones_own_file_reads_in_no_other_volume(
+  client: &mut Client,
+  volumes: [VolumeId; 2],
+  when: &str,
+) {
+  for volume in volumes {
     let absent = read_answered(client, volume, "clone.txt");
     assert!(
       matches!(absent, Err(ClientError::Refused(Refusal::NotFound))),
@@ -5031,6 +5088,86 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
     .expect("with the green gone nothing holds the snapshot");
   drop(client);
   second.stop();
+}
+
+/// §4.8 "Recovery", §4.16 "Green owner restart: Masked", §4.3 "Bounded work everywhere" (A-217's owed item; 2026-11-18,
+/// goal g232): a restarted owner seeds a green's engine from its held origin a share at a time, a recovery unit each. The
+/// whole origin was seeded in one step, hashing and copying every file: over the Linux kernel's 1.67 GB that is seconds
+/// of one poll, so a restarted owner of a kernel-sized green was ended by its watchdog inside its own recovery, again at
+/// every restart. Do: a green over a pinned overlay's snapshot of four files of a hashing share each; restart the daemon
+/// over the same segment. Expect: the recovery counted its seeding of the origin over more than one share
+/// (`merge.recovery.origin_load_steps`), and the green reads each file's bytes at version 0.
+#[test]
+fn a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-originload-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  // A file a share: each is its own unit of the seeding, so the origin cannot seed in one.
+  let share = usize::try_from(config.archive_slice_bytes())
+    .unwrap()
+    .max(1);
+  let anchor = held_anchor("originload", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  let files: Vec<(String, Vec<u8>)> = (0..4u8)
+    .map(|file| (format!("file-{file}"), vec![file.wrapping_add(1); share]))
+    .collect();
+  for (name, bytes) in &files {
+    target.seed(name, bytes);
+  }
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 1 << 30 },
+      base: Some(target.path.clone()),
+      ..scratch("origin-load-base")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    u64::try_from(files.len()).unwrap(),
+    "every base file pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  let green = client
+    .create_green_over(
+      "origin-load-green",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let reads: Vec<bool> = files
+    .iter()
+    .map(|(name, bytes)| {
+      client
+        .read(green, name, slates_client::ReadAt::Version { version: 0 })
+        .is_ok_and(|read| read == *bytes)
+    })
+    .collect();
+  let counters = second.refusals_on_every_shard().unwrap();
+  let seeded_in = counters
+    .get("merge.recovery.origin_load_steps")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  second.stop();
+  assert!(
+    seeded_in > 1,
+    "the recovery seeded the origin over {seeded_in} shares: {counters:?}"
+  );
+  assert!(
+    reads.iter().all(|read| *read),
+    "every file reads its bytes at version 0: {reads:?}"
+  );
 }
 
 /// A sibling of a removed base directory at recovery (found by liveness while slicing recovery, 2026-11-08): after a

@@ -2809,6 +2809,7 @@ mod route {
         attachment,
         lease_epoch: None,
         stream,
+        resync: None,
       },
       shards: shard_holders(&daemon),
     });
@@ -2927,6 +2928,7 @@ mod route {
           attachment,
           lease_epoch: None,
           stream,
+          resync: None,
         },
         shards: shard_holders(daemon),
       });
@@ -3207,31 +3209,7 @@ fn the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_i
   let (_, uid, gid) = owner_and_mode(&mut host, &from_host, 3);
   assert_eq!((uid, gid), kept, "the host's file is kept as the root is");
 
-  let value = format!("{}:{}", run.0, run.1).into_bytes();
-  let refused = [
-    (ROOT, run, value.clone(), EPERM),
-    (file, (0, 0), value.clone(), EINVAL),
-    (ROOT, (0, 0), b"run:run".to_vec(), EINVAL),
-  ];
-  for (node, caller, value, expected) in refused {
-    let reply = guest.ask_as(
-      Opcode::SetXattr,
-      node,
-      caller,
-      &setxattr(OWNER_WORD, &value),
-    );
-    assert_eq!(
-      errno(&reply),
-      expected,
-      "the word on {node} from {caller:?}"
-    );
-  }
-  assert_eq!(wait_for_count(&daemon, "shards.owner_refused", 3), 3);
-  let mut with_nul = value.clone();
-  with_nul.push(0);
-  let taken = guest.ask(Opcode::SetXattr, ROOT, &setxattr(OWNER_WORD, &with_nul));
-  assert_eq!(errno(&taken), 0, "the word is taken from root on the root");
-  assert_eq!(wait_for_count(&daemon, "shards.owner_named", 1), 1);
+  expect_the_word_taken_from_root_on_the_root_alone(&daemon, &mut guest, file, run);
 
   assert_eq!(
     shown_owner(&guest.getattr_reply(ROOT), ATTR_OUT_UID_AT),
@@ -3259,43 +3237,9 @@ fn the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_i
   let (_, uid, gid) = owner_and_mode(&mut host, &from_run, 5);
   assert_eq!((uid, gid), kept, "and the host's over NFS");
 
-  // A file made over NFS, chowned by the guest's root to the run's ids: kept as the host's.
-  let by_nfs = create(&mut host, &root, "by-nfs.txt", 6);
-  let node = guest.lookup(ROOT, "by-nfs.txt").unwrap();
-  let changed = guest.ask(Opcode::SetAttr, node, &chown_body(run));
-  assert_eq!(errno(&changed), 0, "the chown is served");
-  assert_eq!(
-    shown_owner(&changed, ATTR_OUT_UID_AT),
-    run,
-    "and reads back as the guest asked it"
-  );
-  let (_, uid, gid) = owner_and_mode(&mut host, &by_nfs, 7);
-  assert_eq!(
-    (uid, gid),
-    kept,
-    "a chown to the run's ids is kept as the host's"
-  );
-
-  let word = guest.ask(Opcode::GetXattr, ROOT, &getxattr(256, Some(OWNER_WORD)));
-  assert_eq!(errno(&word), ENODATA, "the word is kept on no file");
-  let listed = guest.ask(Opcode::ListXattr, ROOT, &getxattr(4096, None));
-  assert_eq!(errno(&listed), 0);
-  assert!(
-    !holds(&listed[OUT_HEADER_LEN..], OWNER_WORD.as_bytes()),
-    "no listing names the word"
-  );
-
-  let mut plain = Guest::over(attach(&daemon, id, None, Intent::Read).expect("a second attach"));
-  plain.init();
-  assert_eq!(
-    shown_owner(&plain.getattr_reply(ROOT), ATTR_OUT_UID_AT),
-    kept,
-    "a stream with no word sees the root kept"
-  );
-  assert_eq!(
-    shown_owner(&plain.lookup_reply(ROOT, "from-run.txt"), ENTRY_ATTR_UID_AT),
-    kept
-  );
+  expect_a_chown_to_the_run_kept_as_the_hosts(&mut guest, (&mut host, &root), run, kept);
+  expect_the_word_kept_on_no_file(&mut guest);
+  let plain = expect_a_stream_with_no_word_shown_owners_as_kept(&daemon, id, kept);
   none_counted(
     &daemon,
     &[
@@ -3309,6 +3253,104 @@ fn the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_i
   drop(host);
   drop(client);
   drop(daemon);
+}
+
+/// The word of `the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_its_own`. Do: send the owner
+/// word naming `run` from a run's user on the root, from root on `file` (no root) and from root on the root with a value
+/// that is no `UID:GID`; then from root on the root, its value ending in a NUL. Expect `EPERM`, `EINVAL` and `EINVAL`,
+/// counted three times; then the word taken, counted once.
+fn expect_the_word_taken_from_root_on_the_root_alone(
+  daemon: &Daemon,
+  guest: &mut Guest,
+  file: u64,
+  run: (u32, u32),
+) {
+  let value = format!("{}:{}", run.0, run.1).into_bytes();
+  let refused = [
+    (ROOT, run, value.clone(), EPERM),
+    (file, (0, 0), value.clone(), EINVAL),
+    (ROOT, (0, 0), b"run:run".to_vec(), EINVAL),
+  ];
+  for (node, caller, value, expected) in refused {
+    let reply = guest.ask_as(
+      Opcode::SetXattr,
+      node,
+      caller,
+      &setxattr(OWNER_WORD, &value),
+    );
+    assert_eq!(
+      errno(&reply),
+      expected,
+      "the word on {node} from {caller:?}"
+    );
+  }
+  assert_eq!(wait_for_count(daemon, "shards.owner_refused", 3), 3);
+  let mut with_nul = value.clone();
+  with_nul.push(0);
+  let taken = guest.ask(Opcode::SetXattr, ROOT, &setxattr(OWNER_WORD, &with_nul));
+  assert_eq!(errno(&taken), 0, "the word is taken from root on the root");
+  assert_eq!(wait_for_count(daemon, "shards.owner_named", 1), 1);
+}
+
+/// The chown of `the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_its_own`. Do: make a file
+/// over NFS (`host`, under `root`), then, as the guest's root, chown it to `run`'s ids. Expect the chown served and read
+/// back as the guest asked it, and the file kept as the host's (`kept`), as NFS reads it.
+fn expect_a_chown_to_the_run_kept_as_the_hosts(
+  guest: &mut Guest,
+  (host, root): (&mut TcpStream, &[u8]),
+  run: (u32, u32),
+  kept: (u32, u32),
+) {
+  let by_nfs = create(host, root, "by-nfs.txt", 6);
+  let node = guest.lookup(ROOT, "by-nfs.txt").unwrap();
+  let changed = guest.ask(Opcode::SetAttr, node, &chown_body(run));
+  assert_eq!(errno(&changed), 0, "the chown is served");
+  assert_eq!(
+    shown_owner(&changed, ATTR_OUT_UID_AT),
+    run,
+    "and reads back as the guest asked it"
+  );
+  let (_, uid, gid) = owner_and_mode(host, &by_nfs, 7);
+  assert_eq!(
+    (uid, gid),
+    kept,
+    "a chown to the run's ids is kept as the host's"
+  );
+}
+
+/// The word's keeping in `the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_its_own`: expect
+/// the word's attribute read `ENODATA` on the root, and the root's listing to name it nowhere.
+fn expect_the_word_kept_on_no_file(guest: &mut Guest) {
+  let word = guest.ask(Opcode::GetXattr, ROOT, &getxattr(256, Some(OWNER_WORD)));
+  assert_eq!(errno(&word), ENODATA, "the word is kept on no file");
+  let listed = guest.ask(Opcode::ListXattr, ROOT, &getxattr(4096, None));
+  assert_eq!(errno(&listed), 0);
+  assert!(
+    !holds(&listed[OUT_HEADER_LEN..], OWNER_WORD.as_bytes()),
+    "no listing names the word"
+  );
+}
+
+/// The second stream of `the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_its_own`. Do:
+/// attach volume `id` again, naming no owner. Expect the root and the run's file shown as the volume keeps them
+/// (`kept`). Returns the stream, held as long as the test runs.
+fn expect_a_stream_with_no_word_shown_owners_as_kept(
+  daemon: &Daemon,
+  id: VolumeId,
+  kept: (u32, u32),
+) -> Guest {
+  let mut plain = Guest::over(attach(daemon, id, None, Intent::Read).expect("a second attach"));
+  plain.init();
+  assert_eq!(
+    shown_owner(&plain.getattr_reply(ROOT), ATTR_OUT_UID_AT),
+    kept,
+    "a stream with no word sees the root kept"
+  );
+  assert_eq!(
+    shown_owner(&plain.lookup_reply(ROOT, "from-run.txt"), ENTRY_ATTR_UID_AT),
+    kept
+  );
+  plain
 }
 
 /// The names a LISTXATTR reply lists, each without its NUL.
@@ -3363,25 +3405,7 @@ fn a_guests_own_attributes_are_its_data_on_every_stream_and_no_hosts_mount_lists
     (&mut guest, (file, dir)),
     (&mut second, (second_file, second_dir)),
   ] {
-    for (node, name, value) in attributes {
-      let node = if node == file { nodes.0 } else { nodes.1 };
-      let got = stream.ask(Opcode::GetXattr, node, &getxattr(256, Some(name)));
-      assert_eq!(
-        (errno(&got), &got[OUT_HEADER_LEN..]),
-        (0, value),
-        "{name} reads back over a stream"
-      );
-    }
-    let names = listed(&stream.ask(Opcode::ListXattr, nodes.0, &getxattr(4096, None)));
-    assert_eq!(
-      names,
-      vec![
-        b"security.capability".to_vec(),
-        b"system.posix_acl_access".to_vec(),
-        b"user.mime_type".to_vec()
-      ],
-      "a stream lists the guest's own names and its ACL beside user."
-    );
+    expect_every_attribute_read_and_listed(stream, (file, nodes), &attributes);
   }
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let capability_path = daemon
@@ -3411,6 +3435,35 @@ fn a_guests_own_attributes_are_its_data_on_every_stream_and_no_hosts_mount_lists
   drop(guest);
   drop(client);
   drop(daemon);
+}
+
+/// One stream's reads in `a_guests_own_attributes_are_its_data_on_every_stream_and_no_hosts_mount_lists_them`: expect
+/// every one of `attributes` (set on the guest's `file` or its directory) read back over `stream`, where the two are
+/// `nodes`, and the file's listing to name the guest's own names and its ACL beside `user.`.
+fn expect_every_attribute_read_and_listed(
+  stream: &mut Guest,
+  (file, nodes): (u64, (u64, u64)),
+  attributes: &[(u64, &str, &[u8])],
+) {
+  for &(node, name, value) in attributes {
+    let node = if node == file { nodes.0 } else { nodes.1 };
+    let got = stream.ask(Opcode::GetXattr, node, &getxattr(256, Some(name)));
+    assert_eq!(
+      (errno(&got), &got[OUT_HEADER_LEN..]),
+      (0, value),
+      "{name} reads back over a stream"
+    );
+  }
+  let names = listed(&stream.ask(Opcode::ListXattr, nodes.0, &getxattr(4096, None)));
+  assert_eq!(
+    names,
+    vec![
+      b"security.capability".to_vec(),
+      b"system.posix_acl_access".to_vec(),
+      b"user.mime_type".to_vec()
+    ],
+    "a stream lists the guest's own names and its ACL beside user."
+  );
 }
 
 /// AUD-29-82 (D-18, §4.8) for an attribute, over the stream: an acknowledged SETXATTR or REMOVEXATTR survives a daemon
@@ -3553,22 +3606,12 @@ fn a_saved_guest_goes_on_over_a_clone_of_its_cut() {
     panic!("the cut's snapshot was not cloned");
   };
   let mut restored_guest = Guest::over(attach(&daemon, clone, None, Intent::Write).unwrap());
-  assert_eq!(restored(&mut restored_guest, &tables), Ok(()));
-  assert_eq!(
-    restored_guest.read(kept, kept_fh, 0, 64),
-    Ok(b"kept bytes".to_vec())
+  expect_the_restored_guest_to_go_on(
+    &mut restored_guest,
+    &tables,
+    [(kept, kept_fh), (gone, gone_fh)],
+    dir,
   );
-  assert_eq!(
-    restored_guest.read(gone, gone_fh, 0, 64),
-    Ok(b"nameless bytes".to_vec()),
-    "the nameless file the saved guest held is the restored guest's"
-  );
-  assert_eq!(restored_guest.write(kept, kept_fh, 10, b" and more"), Ok(9));
-  assert_eq!(restored_guest.close(kept, kept_fh), (0, 0));
-  assert_eq!(restored_guest.close(gone, gone_fh), (0, 0));
-  for node in [dir, kept, gone] {
-    restored_guest.forget(node, 1);
-  }
   let mut reader = Guest::over(attach(&daemon, clone, None, Intent::Read).unwrap());
   reader.init();
   let file = reader.lookup(ROOT, "kept.txt").unwrap();
@@ -3597,6 +3640,34 @@ fn a_saved_guest_goes_on_over_a_clone_of_its_cut() {
   drop(daemon);
 }
 
+/// The restored guest of `a_saved_guest_goes_on_over_a_clone_of_its_cut`. Do: on a fresh stream of the clone ask RESTORE
+/// with `tables` and no INIT first; read the kept and the nameless file through their old handles (`kept`, `gone`, each
+/// a node and its handle); write on through the kept one; close both and give the lookups back, `dir`'s too. Expect the
+/// RESTORE granted, every byte read back, the nameless file's too, the write taken and both old handles closed cleanly.
+fn expect_the_restored_guest_to_go_on(
+  restored_guest: &mut Guest,
+  tables: &[u8],
+  [(kept, kept_fh), (gone, gone_fh)]: [(u64, u64); 2],
+  dir: u64,
+) {
+  assert_eq!(restored(restored_guest, tables), Ok(()));
+  assert_eq!(
+    restored_guest.read(kept, kept_fh, 0, 64),
+    Ok(b"kept bytes".to_vec())
+  );
+  assert_eq!(
+    restored_guest.read(gone, gone_fh, 0, 64),
+    Ok(b"nameless bytes".to_vec()),
+    "the nameless file the saved guest held is the restored guest's"
+  );
+  assert_eq!(restored_guest.write(kept, kept_fh, 10, b" and more"), Ok(9));
+  assert_eq!(restored_guest.close(kept, kept_fh), (0, 0));
+  assert_eq!(restored_guest.close(gone, gone_fh), (0, 0));
+  for node in [dir, kept, gone] {
+    restored_guest.forget(node, 1);
+  }
+}
+
 /// A-303, by use on a real daemon: a VM restored onto the volume it was saved from, and the RESTOREs refused. Do: over
 /// a stream, write a file kept open; ask SAVE; end the stream. On fresh streams of the volume ask RESTORE after an INIT,
 /// with the tables cut short, with one bit of them flipped, and on a stream presenting a directory; then with the tables
@@ -3614,24 +3685,8 @@ fn a_saved_guest_is_restored_on_its_volume_unchanged_and_refused_otherwise() {
   assert_eq!(guest.write(kept, kept_fh, 0, b"kept bytes"), Ok(10));
   let tables = saved(&mut guest);
   drop(guest);
-  let mut damaged = tables.clone();
-  damaged[tables.len() / 2] ^= 0x10;
+  expect_each_wrong_restore_refused_with_its_reason(&daemon, id, &tables);
   let fresh = || Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
-  let mut after_init = fresh();
-  after_init.init();
-  for (mut stream, bytes, why) in [
-    (after_init, tables.clone(), "first frame"),
-    (fresh(), tables[..tables.len() - 1].to_vec(), "damaged"),
-    (fresh(), damaged, "damaged"),
-    (
-      Guest::over(attach(&daemon, id, Some("d"), Intent::Write).unwrap()),
-      tables.clone(),
-      "another directory",
-    ),
-  ] {
-    let refused = restored(&mut stream, &bytes).unwrap_err();
-    assert!(refused.contains(why), "{why}: {refused}");
-  }
   let mut back = fresh();
   assert_eq!(
     restored(&mut back, &tables),
@@ -3651,4 +3706,68 @@ fn a_saved_guest_is_restored_on_its_volume_unchanged_and_refused_otherwise() {
   assert_eq!(wait_for_count(&daemon, "shards.restored", 1), 1);
   drop(client);
   drop(daemon);
+}
+
+/// The refused RESTOREs of `a_saved_guest_is_restored_on_its_volume_unchanged_and_refused_otherwise`. Do: on fresh
+/// streams of volume `id` ask RESTORE with `tables` after an INIT, with them cut short, with one bit of them flipped, and
+/// on a stream presenting a directory. Expect each refused with its reason.
+fn expect_each_wrong_restore_refused_with_its_reason(daemon: &Daemon, id: VolumeId, tables: &[u8]) {
+  let mut damaged = tables.to_vec();
+  damaged[tables.len() / 2] ^= 0x10;
+  let fresh = || Guest::over(attach(daemon, id, None, Intent::Write).unwrap());
+  let mut after_init = fresh();
+  after_init.init();
+  for (mut stream, bytes, why) in [
+    (after_init, tables.to_vec(), "first frame"),
+    (fresh(), tables[..tables.len() - 1].to_vec(), "damaged"),
+    (fresh(), damaged, "damaged"),
+    (
+      Guest::over(attach(daemon, id, Some("d"), Intent::Write).unwrap()),
+      tables.to_vec(),
+      "another directory",
+    ),
+  ] {
+    let refused = restored(&mut stream, &bytes).unwrap_err();
+    assert!(refused.contains(why), "{why}: {refused}");
+  }
+}
+
+/// A-316. Do: attach a volume over a stream on a daemon that has no anchor (this file's harness), and read the stream's
+/// resync end. Expect `Attached` naming the attachment and a token, with no descriptor, and then the channel's end at
+/// once: no anchor holds the daemon's end, so no resync can come, and the device knows it (Shards' option (a)).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stream_whose_resync_end_no_anchor_holds_tells_its_device_no_resync_will_come() {
+  use slates_bridge_fuse::shards_resync::{ResyncKind, ResyncMessage, TOKEN_BYTES};
+  use std::os::fd::AsFd;
+  let (daemon, instance) = single_shard_daemon("shards-resync-unheld");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("resync-unheld")) else {
+    panic!("the volume was not created");
+  };
+  let attached = attach(&daemon, id, None, Intent::Write).unwrap();
+  let resync = attached
+    .resync
+    .as_ref()
+    .expect("Linux makes a stream's resync channel");
+  rustix::net::sockopt::set_socket_timeout(
+    resync,
+    rustix::net::sockopt::Timeout::Recv,
+    Some(CREDIT_WAIT),
+  )
+  .unwrap();
+  let mut bytes = [0u8; 64];
+  let (read, carried) = slates_ipc::stream::recv_message(resync.as_fd(), &mut bytes).unwrap();
+  let told = ResyncMessage::parse(&bytes[..read]).unwrap();
+  assert_eq!(
+    (told.kind, told.attachment, carried.len()),
+    (ResyncKind::Attached, attached.attachment, 0),
+    "the device first reads its attachment's token"
+  );
+  assert_ne!(told.token, [0; TOKEN_BYTES]);
+  let (read, _) = slates_ipc::stream::recv_message(resync.as_fd(), &mut bytes).unwrap();
+  assert_eq!(read, 0, "and then the channel's end: no anchor holds it");
+  drop(attached);
+  drop(client);
+  daemon.stop();
 }

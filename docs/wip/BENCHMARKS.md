@@ -12248,6 +12248,280 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
 
+## A green's works on the shards their names hash to (A-247 step one; 2026-11-08)
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`, release builds, the daemon in-process (no `--instance`): on main 92dcd16c
+`slates anchor --quick` never comes up on this machine (the anchor kills each start for 1.6 s of whole-process CPU
+before its first beat, 23 shards × about 70 ms of init; reported). Main 92dcd16c against agents/perf-w1, interleaved,
+reversed on alternate rounds, 4 rounds each. adas-mac-studio.local-2 (32 CPUs, Apple silicon, 23 shards), 2026-11-08,
+one-minute load 3.0 to 15.5. Oracle failures 0 in every run. Milliseconds, the range over the 4 runs:
+
+| Clients | Kind | main p50 | W1 p50 | main p99 | W1 p99 |
+|---|---|---|---|---|---|
+| 1,000 | wall (s) | 1.33–1.34 | 0.83–0.87 | | |
+| 1,000 | CreateWork | 9.1–10.5 | 7.0–8.4 | 15.4–24.5 | 12.0–14.2 |
+| 1,000 | Edit | 10.0–10.3 | 2.9–3.3 | 24.1–37.0 | 19.6–37.0 |
+| 1,000 | SubmitAccepted | 9.6–9.7 | 9.8–10.0 | 30.2–35.6 | 35.7–45.0 |
+| 1,000 | ReadHead | 10.4–10.6 | 5.5–5.6 | 32.8–37.2 | 9.4–30.5 |
+| 1,000 | Rebase | 10.4–10.6 | 9.7–10.0 | 23.3–37.2 | 36.1–44.7 |
+| 3,000 | wall (s) | 7.94–8.03 | 4.54–4.58 | | |
+| 3,000 | CreateWork | 101.5–103.8 | 9.3–16.9 | 110.4–115.9 | 17.5–28.5 |
+| 3,000 | Edit | 30.9–31.8 | 0.5 | 57.1–61.7 | 54.3–59.5 |
+| 3,000 | SubmitAccepted | 28.1–28.6 | 23.9–24.4 | 42.6–46.2 | 57.1–70.7 |
+| 3,000 | SubmitConflict | 32.3–32.6 | 34.8–35.2 | 43.3–58.4 | 79.5–80.9 |
+| 3,000 | ReadHead | 32.2–32.7 | 11.1–11.2 | 43.4–56.5 | 23.1–24.5 |
+| 3,000 | Rebase | 32.1–32.6 | 34.2–34.8 | 43.4–61.0 | 64.8–66.9 |
+
+- Everything off the verdict got faster, and the rung finishes in 57% of main's time at 3,000 clients.
+- **The verdict's tail got worse:** SubmitAccepted p99 at 3,000 clients 57–71 ms against 43–46, SubmitConflict
+  80–81 against 43–58, Rebase 65–67 against 43–61. The verdict is still the owner's one serialized step, and the
+  clients, no longer waiting on their edits, reach it more often at once (Little's law over one owner). The owner's cost
+  per verdict is the next lever.
+- Before the asks were batched, every 3,000-client run stalled (see `crates/server/src/work_home.rs`, "Asks are
+  batched").
+
+**Measured and rejected the same day: a smaller batch of asks.** The verdict's tail might have been a batch of 32 asks
+holding the owner for one step. W1 with the batch bound at 32 (the client region's credit, shipped), 8 and 2, 3,000
+clients, the same command and machine, 4 interleaved rounds each (one-minute load 1.6 to 17.4; the first round of each
+arm is the coldest), oracle 0. Milliseconds, p50 / p99:
+
+| Bound | Wall (s) | SubmitAccepted | SubmitConflict | Rebase | ReadHead | Edit |
+|---|---|---|---|---|---|---|
+| 32 (shipped) | 4.48–5.20 | 23.6–27.3 / 67.5–78.7 | 34.3–39.8 / 78.1–86.3 | 33.7–39.5 / 63.6–71.4 | 10.9–12.7 / 22.5–26.1 | 0.5–0.6 / 59.1–66.4 |
+| 8 | 4.42–4.87 | 28.7–31.2 / 75.0–80.1 | 41.8–46.1 / 92.6–98.4 | 42.0–46.4 / 84.9–90.9 | 2.7–3.0 / 6.6–7.0 | 0.3 / 51.3–62.0 |
+| 2 | 5.05–6.06 | 33.2–43.9 / 79.6–93.6 | 48.9–59.6 / 101.5–124.0 | 49.5–60.1 / 99.4–124.2 | 0.8–1.0 / 1.8–2.2 | 0.2 / 65.9–77.1 |
+
+A smaller batch makes every verdict's tail worse, so the batch is not what holds it back: reads gain (they stop riding
+with verdicts), and the verdicts lose the batching. Rejected.
+
+**Where the owner's time goes** (`sample`, 2 s in the middle of one 3,000-client run, W1 b4936073, shard 19, the green's
+owner, 1,121 samples): 799 (71%) in the batches of asks. Of those, `map_rebase` 333, `judge_submission` 226, and
+`build_increment` 241 inside those two. Rebases, 60,000 a run against 34,000 submits, cost the owner more than the
+verdicts do.
+
+**The same A/B by the anchor recipe, with lost replies counted (2026-11-08/09).** Main 80be552a (whose start judgment
+lets `slates anchor --quick` come up on this machine) against agents/perf-w1 492ad3c3 (W1 merged onto it), loadtest-scale's
+`rung.sh` (a single-node anchored daemon, the release harness against it), the same harness flags, interleaved and
+reversed on alternate rounds: 4 rounds at 1,000 clients, 10 at 3,000. adas-mac-studio.local-2, one-minute load 3.3 to
+21.0. Every run finished, oracle 0. `lost` is the sum of the harness's `lost` rows (the daemon's counters of a reply or
+an ask lost for want of room: `xshard.reply_dropped`, `lease.wait.undelivered`, `merge.acceptance_undelivered`,
+`merge.work.ask_unanswered`, `park_full`, `pending_stuck`, `floor_not_sent`). Milliseconds, the range over the runs:
+
+| Clients | | main | W1 |
+|---|---|---|---|
+| 1,000 | wall (s) | 1.28–1.33 | 0.78–0.82 |
+| 1,000 | lost | 0 | 0 |
+| 1,000 | CreateWork p50 / p99 | 7.3–8.7 / 21.8–22.3 | 3.2–4.4 / 6.9–9.5 |
+| 1,000 | Edit p50 / p99 | 10.0–10.1 / 21.7–22.3 | 3.0–3.3 / 17.7–23.1 |
+| 1,000 | SubmitAccepted p50 / p99 | 9.6–9.9 / 27.0–31.4 | 9.1–9.8 / 25.1–40.6 |
+| 1,000 | ReadHead p50 / p99 | 10.4–10.5 / 26.7–30.6 | 4.9–5.4 / 12.6–16.6 |
+| 3,000 | wall (s) | 7.96–8.07 | 4.31–4.62 |
+| 3,000 | lost | 4,074–4,439 (all `xshard.reply_dropped`) | 0 in 10 of 10 |
+| 3,000 | CreateWork p50 / p99 | 89.3–96.8 / 102.7–119.6 | 11.2–16.5 / 20.9–26.5 |
+| 3,000 | Edit p50 / p99 | 31.2–32.0 / 55.6–64.8 | 0.5 / 50.1–60.8 |
+| 3,000 | SubmitAccepted p50 / p99 | 28.6–29.3 / 42.4–62.4 | 23.3–24.5 / 56.4–72.3 |
+| 3,000 | SubmitConflict p50 / p99 | 31.9–33.1 / 43.3–63.4 | 33.4–35.5 / 73.8–79.5 |
+| 3,000 | ReadHead p50 / p99 | 32.2–33.3 / 42.4–64.4 | 10.5–11.3 / 22.3–23.5 |
+| 3,000 | Rebase p50 / p99 | 32.1–33.1 / 42.3–64.1 | 32.7–35.1 / 61.5–70.6 |
+
+- Main drops about 4,300 replies a 3,000-client run (`xshard.reply_dropped`, a forwarded verb's result carried home
+  past a full channel); the harness's resend under the same id answers each from its record after the reply deadline,
+  so the oracle stays 0. W1 drops none.
+- W1's verdict tail is still worse than main's: SubmitAccepted p99 56–72 ms against 42–62, SubmitConflict 74–80
+  against 43–63, Rebase 62–71 against 42–64.
+
+**A work composes its own increment (2026-11-09).** The owner composed every remote submit's and rebase's increment,
+about a third of its time in asks. agents/perf-w1 7d6e7d80 composes it on the work's shard from base entries fetched
+with the paths it touched (`Green::path_base`, `Base::for_names`) and sends the increment alone. Main 80be552a, W1
+before it (492ad3c3) and after (7d6e7d80), the anchor recipe, 3,000 clients, interleaved in reversed order on alternate
+rounds, 6 rounds each, adas-mac-studio.local-2, load 3.5 to 24.7, oracle 0 everywhere. `composed` counts the work's
+increments composed on its own shard against those left to the owner. Milliseconds, p50 / p99, the range over the runs:
+
+| Build | Wall (s) | lost | composed | SubmitAccepted | SubmitConflict | Rebase | Edit | ReadHead |
+|---|---|---|---|---|---|---|---|---|
+| main 80be552a | 7.79–8.24 | 4,116–4,374 | — | 28.2–29.8 / 41.3–46.4 | 31.2–33.9 / 42.6–49.3 | 31.2–33.8 / 42.8–49.4 | 30.7–33.0 / 48.3–62.0 | 31.3–33.9 / 42.8–60.3 |
+| W1 492ad3c3 | 4.59–4.78 | 0 | — | 24.3–27.5 / 67.6–75.8 | 35.2–36.0 / 78.6–86.7 | 34.5–35.6 / 64.5–74.9 | 0.5–0.6 / 59.4–66.2 | 11.1–11.4 / 23.4–28.6 |
+| W1 7d6e7d80 | 3.52–3.89 | 0 | 119,500–120,744 / 0 | 18.3–21.1 / 55.2–64.2 | 26.3–28.3 / 59.3–66.6 | 26.2–27.8 / 52.0–62.5 | 0.6–0.7 / 44.0–48.2 | 8.3–8.9 / 15.4–17.6 |
+
+- Every latency and the wall fell against W1 before it. Against main, every p50 and the wall are better (wall 44–48% of
+  main's), and the verdict's p99 is still 10–20 ms worse.
+- Measured on the way, rejected: composing on the work but clearing its entries at a rebase made each resubmit fetch them
+  again first, and SubmitAccepted p99 rose to 84–90 ms (6 rounds, 2026-11-09); the rebase now answers the entries.
+
+**Where the verdict's tail waits, measured (2026-11-09).** An instrumented build of W1 8cf40742 (in-process daemon,
+3,000 clients, 2 runs, adas-mac-studio.local-2 at load 22 to 26; the instrumentation roughly doubles the latencies, so
+the shares are the finding). The owner (partition 19) ran 12,058 and 12,942 batches a run, of 28 to 32 asks at the
+median and 32 at most, one batch a step: step wall p50 283–311 µs, p99 1.9–2.6 ms, max 10.4–22 ms; step CPU p50
+278–299 µs, p99 818–824 µs. An ask's own CPU: a verdict p50 29–32 µs, p99 101–122; a rebase p50 17–19, p99 42–53. The
+slowest 1% of verdict asks, mean per asking shard: 86–99 ms waiting in their shard's outbox for its last batch to come
+back, 23–50 ms in transit and queued behind the owner's other work, 0.13–0.23 ms behind the other asks of their batch,
+0.02–0.05 ms in their own verdict, 0.5–26 ms coming back. A long step holding the verdicts in it is not the tail; the
+owner being busy (step CPU about its wall at the median) and a shard's backlog draining 32 asks a round trip is.
+
+**Measured and rejected the same day: a whole outbox a message, answered in slices of the step budget.** One message
+carried everything a shard had waiting; the owner answered it a slice at a time, as many asks as the step budget held
+at its measured cost of an ask, yielding between slices, each slice's answers sent home as it finished. The step budget
+here (about 4.5 µs) is below one ask's cost (about 20 to 30 µs), so every slice was one ask and every answer its own
+message. Main 80be552a, W1 8cf40742 and this, the anchor recipe, 3,000 clients, interleaved, 6 rounds each, load 12 to
+30 (other agents' builds), oracle 0 in every run. SubmitAccepted p99, every round, ms: main 118.4, 50.7, 51.6, 72.2,
+49.4, 40.5; W1 77.2, 71.0, 55.0, 59.0, 53.8, 55.5; this 130.7, 493.0, 95.4, 194.6, 75.3, 76.3. Wall: main 7.79–12.62 s,
+W1 3.59–5.40, this 4.66–8.45. Kept as `w4-sliced-batches.patch` in perf's scratch; not landed.
+
+**Like for like: the whole cycle, and equal offered load (2026-11-09, the supervisor's two measurements).** At a fixed
+3,000 clients with one request each in flight W1 serves about 1.6 times main's verdict rate, so the one owner holds a
+longer queue and a verdict waits longer by Little's law. Two comparisons that take the rate out. Main 80be552a against
+agents/perf-w1 f3d2f5c5, each with a temporary owner-CPU diagnostic (thread CPU per verdict and per rebase run on the
+green's owner shard, `perf/tools/owner_cpu_patch.py`, not committed), the same harness (`load_bench` with the new `Cycle`
+and `Round` rows), the anchor recipe, interleaved and reversed on alternate rounds, 5 rounds each,
+adas-mac-studio.local-2, load 9.6 to 22.5, oracle 0 in every run. `Cycle` is a round from sending its first edit to its
+submit's first verdict (4 edits, the append, the submit); `Round` is to its accept, conflicts resolved. Milliseconds, p99
+in every round:
+
+| | main | W1 |
+|---|---|---|
+| 1,000 clients, Cycle p99 | 93.7, 77.2, 91.5, 96.0, 89.1 | 129.2, 86.8, 87.0, 115.0, 99.1 |
+| 1,000 clients, Cycle p50 | 69.4, 68.2, 68.5, 71.9, 71.5 | 43.2, 45.3, 44.7, 48.9, 49.1 |
+| 1,000 clients, Round p99 | 1,231.6, 1,175.9, 1,187.0, 1,225.3, 1,234.2 | 617.0, 627.0, 604.8, 686.4, 673.9 |
+| 1,000 clients, owner µs a verdict / a rebase | 35.6–39.5 / 25.7–26.7 | 21.9–24.8 / 12.3–13.7 |
+| 3,000 clients, Cycle p99 | 402.3, 419.7, 380.7, 401.5, 435.9 | 279.8, 231.1, 257.8, 239.9, 239.3 |
+| 3,000 clients, Cycle p50 | 218.6, 207.9, 208.3, 224.8, 217.5 | 147.6, 138.3, 143.6, 140.0, 139.5 |
+| 3,000 clients, Round p99 | 8,159.9, 7,324.4, 7,465.3, 7,746.0, 7,961.8 | 3,761.9, 3,463.5, 3,692.8, 3,652.6, 3,489.0 |
+| 3,000 clients, owner µs a verdict / a rebase | 47.9–52.2 / 27.0–30.6 | 21.5–22.5 / 11.8–12.8 |
+
+Since 2026-11-18 (g231, the load test's `bound` row, Ada's decision of that day) a paced level's `Cycle` and `Round`
+leave out the client's own think pauses. The paced figures in this section and the two after it hold them: a pause
+after every reply, five in each cycle (a fixed `--think-us` until 2026-11-17, then an exponential draw of that mean).
+The unpaced figures are unchanged by it.
+
+**Equal offered load.** Main unpaced; W1's clients paced with `--think-us 19000`, found by trying 1,000 to 22,000 µs
+(think time 22,000 gave 5,673 verdicts/s, 16,000 gave 8,217), so both run main's verdict rate at 3,000 clients. 5 rounds
+each, interleaved, load 19.0 to 22.5. Verdicts a second: main 6,018, 6,739, 6,662, 6,308, 6,973; W1 6,880, 7,182, 6,913,
+6,824, 6,907 (W1 slightly the higher). p99 in every round, milliseconds:
+
+| | main | W1 |
+|---|---|---|
+| SubmitAccepted | 52.7, 48.6, 44.5, 55.2, 43.0 | 26.2, 22.9, 22.4, 26.3, 22.3 |
+| SubmitConflict | 53.6, 50.6, 44.9, 61.8, 46.5 | 33.3, 32.6, 35.2, 32.2, 32.6 |
+| Rebase | 54.1, 59.0, 63.0, 63.8, 42.7 | 5.2, 4.1, 3.5, 24.2, 5.5 |
+| owner µs a verdict / a rebase | 48.7–53.7 / 27.5–31.0 | 23.5–24.7 / 12.8–14.0 |
+
+- At the same verdict rate W1's verdicts are faster at p99 than main's, and the owner spends 46–52% of main's CPU on a
+  verdict and 44–48% on a rebase: its per-verdict cost has not regressed, it fell.
+- At a fixed number of clients the verdict's p99 rose because throughput rose (3,000 clients: 1.6 times main's verdicts a
+  second) and the owner's queue with it.
+- The whole cycle's p99 is better at 3,000 clients (231–280 ms against 381–436). At 1,000 clients it is not: 86.8–129.2
+  against 77.2–96.0, the medians of the rounds 99.1 against 91.5, though its median and the round to accept are far
+  better (Round p99 605–686 against 1,176–1,234).
+
+**Per attempt and end to end (2026-11-09, the supervisor's third measurement).** The harness timed each attempt: a request
+refused `AcknowledgementOwed` and sent again as new started a fresh latency, so main's figures left out the wait of the
+operations whose replies went astray. It now also prints `operation` rows, each logical operation from its first attempt
+to its final answer, refusals for now, pauses and resends included. Main 80be552a against agents/perf-w1 (with the
+`operation` rows), the anchor recipe, interleaved, 5 rounds each, adas-mac-studio.local-2 busy with other agents (8 to 11
+of 32 cores idle), oracle 0 in every run. Per run: main's dropped replies (`xshard.reply_dropped`) and its
+`AcknowledgementOwed` resends (`backpressure`); W1 had 0 of each in every run. Milliseconds, p99, per attempt / end to
+end (`SubmitAccepted`'s end-to-end row holds every submit, accepted or not):
+
+| 3,000 clients | main | W1 |
+|---|---|---|
+| dropped / backpressure | 3,636 / 12,912; 4,191 / 27,019; 4,518 / 22,227; 4,245 / 23,967; 4,208 / 25,700 | 0 / 0 in every run |
+| Submit | 54.7/94.6, 50.1/96.6, 56.3/112.3, 53.6/113.4, 45.0/106.6 | 54.9/58.7, 60.3/63.5, 63.2/71.2, 57.1/62.8, 56.8/64.1 |
+| Rebase | 52.3/63.2, 59.6/69.2, 61.1/71.6, 56.0/75.5, 45.5/68.2 | 54.0/54.0, 53.3/53.3, 63.2/63.2, 55.1/55.1, 57.0/57.0 |
+| Edit | 63.0/80.9, 60.6/83.7, 62.6/84.8, 57.9/89.2, 60.0/85.4 | 45.2/45.2, 46.9/46.9, 58.8/58.8, 46.1/46.1, 46.3/46.3 |
+| Cycle | 405.2, 427.6, 447.7, 409.9, 424.8 | 226.4, 240.1, 288.5, 234.6, 239.0 |
+
+| 1,000 clients | main | W1 |
+|---|---|---|
+| dropped / backpressure | 0 / 0 in four runs, 0 / 6 in one | 0 / 0 in every run |
+| Submit | 33.6/35.4, 32.3/32.4, 27.9/28.0, 30.3/30.3, 34.9/36.6 | 20.1/61.6, 39.1/39.6, 34.8/35.0, 18.7/39.1, 23.9/24.3 |
+| Rebase | 24.4, 22.5, 38.4, 22.5, 22.9 | 61.7, 39.5, 35.0, 39.2, 27.6 |
+| Cycle | 87.9, 93.6, 106.8, 95.6, 99.5 | 114.2, 106.5, 94.7, 95.4, 116.6 |
+
+- At 3,000 clients main drops about 4,200 replies a run, and the acknowledgements those leave unanswered refuse 12,912 to
+  27,019 requests `AcknowledgementOwed`, each sent again: end to end, main's submit p99 is 94.6–113.4 ms against its
+  45.0–56.3 per attempt. W1 drops none and resends none: 58.7–71.2 ms end to end. Every verb's end-to-end p99 and the
+  cycle's are better on W1.
+- At 1,000 clients main drops none and the two figures agree; W1's submit, rebase and cycle p99 are worse there.
+- Main's drops are fixed on their own branch (agents/perf-replies); the comparison against main with that fix is owed.
+- These tables' end-to-end submit figure holds every submit, accepted or not, beside a per-attempt figure of accepted
+  submits alone. Since 2026-11-09 (after them) the harness files an operation under its outcome, as it files an attempt,
+  so `operation SubmitAccepted` and `operation SubmitConflict` compare with their `latency` rows; the comparison owed
+  above uses them.
+
+**End to end and at equal offered load, on main db9c514e (2026-11-09, the supervisor's two deciding measurements).**
+Main db9c514e against agents/perf-w1 88a6f6e5 (main merged in), each with the owner-CPU diagnostic
+(`tools/owner_cpu_patch.py`), one harness in both (W1's `load_bench.rs`, filing operations by outcome; `cmp` identical).
+The anchor recipe (`rung.sh`: a single-node anchored daemon over the 7.4-rc1 kernel tree, `--hot-files` 0.8 n
+`--per-connection 32 --rounds 3 --reply-patience 60`), interleaved by `tools/ab-e2e.sh <tag> <clients> 5 <main think>
+<W1 think>`, 5 rounds an arm, adas-mac-studio.local-2 (32 CPUs, macOS), 15:21 to 15:28, load 4.4 to 25.6 (others' agents
+started during it), oracle 0 in all 50 runs, `resent` 0 in all. p99 in milliseconds, per attempt / end to end (first send
+to final answer, resends included); one number where the two are equal.
+
+| 3,000 clients, unpaced | main | W1 |
+|---|---|---|
+| verdicts a second | 4,856, 4,531, 4,782, 4,510, 4,593 | 13,368, 13,072, 13,814, 13,538, 11,366 |
+| dropped replies / `AcknowledgementOwed` resends | 4,250 / 28,686; 4,252 / 26,835; 4,202 / 27,969; 4,422 / 27,285; 4,301 / 26,137 | 0 / 0 in every run |
+| SubmitAccepted | 39.8/65.6, 56.9/68.8, 43.9/71.2, 47.1/69.1, 45.6/68.7 | 56.7, 58.1, 56.4, 58.6, 64.7 |
+| SubmitConflict | 40.5/106.1, 58.0/114.2, 45.5/100.7, 48.0/117.9, 46.1/127.5 | 63.8, 64.5, 62.0, 66.2, 67.9 |
+| Rebase | 40.3/62.9, 64.9/68.7, 60.1/70.4, 48.7/69.0, 46.5/67.0 | 57.7, 58.0, 58.3, 55.9, 66.6 |
+| Edit | 58.5/80.5, 65.5/85.0, 60.5/82.3, 62.8/84.1, 61.1/81.4 | 46.1, 49.0, 44.9, 48.2, 60.6 |
+| Cycle | 403.0, 428.7, 382.3, 439.7, 375.9 | 238.6, 244.7, 232.6, 239.1, 268.6 |
+| owner µs a verdict / a rebase | 47.8–49.8 / 26.5–27.8 | 21.0–24.5 / 11.9–14.2 |
+
+| 1,000 clients, unpaced | main | W1 |
+|---|---|---|
+| verdicts a second | 6,047, 6,257, 5,993, 6,496, 6,422 | 12,961, 13,694, 13,224, 12,995, 13,971 |
+| dropped / resends | 0 / 0 in every run | 0 / 0 in every run |
+| SubmitAccepted | 33.8, 32.3, 37.5, 32.5, 32.4 | 43.9, 39.2, 37.0, 38.9, 34.9 |
+| SubmitConflict | 33.8, 32.6, 37.6, 32.5, 33.5 | 44.3, 39.6, 37.0, 39.4, 35.8 |
+| Rebase | 22.3, 22.8, 37.4, 20.7, 21.3 | 44.0, 39.4, 36.9, 39.3, 35.7 |
+| Cycle | 102.5, 90.8, 104.8, 90.4, 80.9 | 91.3, 93.8, 90.0, 95.4, 87.9 |
+
+Equal offered load: main unpaced, W1's clients paced to main's verdict rate (`--think-us` 6,000 at 1,000 clients, found
+by trying 6,000, 9,000 and 12,000: 6,238, 4,066 and 3,196 verdicts a second; 19,000 at 3,000, as before). The 3,000-client
+set ran twice: in the first, W1's fifth round met the load's rise from 19 to 25 and read 181.1 ms accepted, 264.9
+conflict, 122.4 rebase; the second set, all ten runs, is below, and that excursion did not recur in it.
+
+| equal load | main | W1 |
+|---|---|---|
+| 1,000: verdicts a second | 6,229, 6,571, 6,276, 6,497, 6,174 | 5,796, 6,212, 6,004, 6,055, 6,144 |
+| 1,000: SubmitAccepted | 34.0, 28.7, 31.1, 30.9, 34.3 | 32.3, 26.3, 23.8, 15.1, 13.9 |
+| 1,000: SubmitConflict | 34.7, 29.7, 31.8, 32.4, 34.8 | 27.6, 14.9, 26.5, 24.2, 16.5 |
+| 1,000: Rebase | 21.9, 20.5, 21.2, 21.1, 35.0 | 35.1, 30.7, 32.7, 26.5, 26.3 |
+| 1,000: Cycle | 94.1, 94.0, 82.8, 79.2, 95.6 | 76.0, 68.7, 71.2, 65.4, 66.0 |
+| 3,000: verdicts a second | 4,833, 4,615, 4,659, 4,728, 4,766 | 4,631, 4,956, 4,832, 4,808, 4,802 |
+| 3,000: dropped / resends | 4,106 / 28,984; 4,474 / 27,986; 4,293 / 28,079; 4,283 / 28,995; 4,326 / 28,365 | 0 / 0 in every run |
+| 3,000: SubmitAccepted | 40.8/68.6, 45.7/70.2, 44.7/72.8, 44.1/70.3, 41.5/84.9 | 24.2, 22.1, 23.0, 21.8, 22.3 |
+| 3,000: SubmitConflict | 41.7/99.0, 60.8/105.3, 45.6/109.9, 49.3/103.4, 41.0/120.6 | 35.3, 35.2, 32.8, 33.5, 34.3 |
+| 3,000: Rebase | 41.7/67.9, 64.1/66.9, 57.1/71.1, 58.5/70.1, 41.5/69.8 | 4.3, 6.2, 5.0, 4.0, 5.2 |
+| 3,000: Cycle | 399.0, 391.7, 400.6, 406.4, 418.3 | 148.2, 149.0, 147.8, 150.2, 147.3 |
+
+- **End to end, the verdict is better on W1 wherever main drops replies.** At 3,000 clients main drops 4,106 to 4,474
+  replies a run and is refused `AcknowledgementOwed` 25,868 to 28,995 times, each sent again. Its accepted submit reads
+  39.8–56.9 ms per attempt and 65.6–84.9 end to end, and its conflicting submit 40.5–61.0 per attempt and 99.0–127.5 end
+  to end. W1 drops and resends nothing, so its two figures are one: 56.4–64.7 accepted and 62.0–67.9 conflicting,
+  unpaced, at 2.3 to 3.1 times main's verdicts a second (the figures span all three 3,000-client sets).
+- **At equal offered load W1's verdicts are faster at both sizes**, and so is the cycle; at 3,000 clients every verb is.
+- **One verb is worse at equal load: the rebase at 1,000 clients**, 26.3–35.1 ms against main's 20.5–35.0 (the rounds'
+  medians 30.7 against 21.2). Unpaced at 1,000 clients, where main drops nothing, W1's submit and rebase are worse too
+  (accepted 34.9–43.9 against 32.3–37.5; rebase 35.7–44.0 against 20.7–37.4), at 2.0 to 2.3 times main's verdicts a second, and
+  its cycle is even (medians 91.3 against 90.8). A rebase from a work's shard crosses to the owner and waits in the
+  ask batch; on main it runs where its work is. That is the next lever's target: the rebase mapped on the work's shard.
+- The owner's CPU a verdict is 21.0–26.9 µs on W1 against 37.6–50.9 on main, and a rebase 11.9–14.7 against 25.8–27.8.
+
+**Why main's two figures differ: what it drops (2026-11-09).** A diagnostic build of main db9c514e (never committed;
+`tools/drop_site_patch.py`) counted each result `send_back` drops under its sender: a client's reply carried home
+(`send_reply_home`), a cross-shard call's answer, or an acknowledgement scatter's part (`scatter_acknowledge`'s release
+from another shard). Two 3,000-client runs of the same rung: 4,364 and 4,418 dropped, **every one an acknowledgement's
+part**; no verb's reply and no call's answer. The client is answered its acknowledgement at once by its own shard, so
+nothing waits on a part. Its loss leaves that shard's release unsettled, and the client's next requests are refused
+`AcknowledgementOwed` (27,345 and 27,146 those runs) until a later acknowledgement settles it: each refusal is a pause
+and a resend under a new request. That is the whole gap between main's per-attempt and end-to-end figures. No client
+waited out a reply deadline: the longest operation of any kind in main's three 3,000-client runs above took 263.0 ms,
+`resent` (a resend after a reply deadline) was 0, and the oracle found no outcome unknown. So main's end-to-end p99 is
+65.6–84.9 ms accepted and 99.0–127.5 conflicting, not a reply deadline.
+
 ## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
 
 **What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
@@ -12496,3 +12770,64 @@ the thread's CPU clock).** 3,000 clients, 3 runs, oracle 0: a verdict 21.4–21.
 51–53% of the owner's wall (`merge-util`), the engine 68% of that. A rung verdict costs the engine 13 µs where the bench's
 one-path verdict costs under 2.5 µs, and 82% of the rung's verdicts are conflicts: what in a rung increment costs the
 engine the difference is the next measurement (a line-table build, `sample`'s call sites resolved by `atos`).
+
+## The 1,000-client bound on main: met at no offered load on a shared Mac Studio (goal 231; A-297; 2026-11-18)
+
+**What it is.** Goal 231's measurement of the bound Ada stated on 2026-11-18 (A-297): every kind's p99 under 1 ms while
+1,000 clients offer at least 10³ verdicts a second, with no oracle failure and no client given up or starved. One run is
+one level of `load_bench`, whose `bound` row is the verdict. Main `7d760c4ea` carries W1 (A-247 step one), A-298,
+A-307, the `bound` row (A-297) and the reply carrier (A-296).
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4, Darwin 25.4.0),
+release (LTO) binaries of main `7d760c4ea` built there with Rust 1.98.1. Not quiet: other agents' test suites and
+builds ran throughout, the one-minute load average at each run's start was 11.5 to 57.2, and the run itself took about
+10 to 16 cores (the daemon, by its CPU time over the wall) and 8 more (the harness's workers). Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files, 16.3 MB.
+
+**Command.** A fresh single-node anchored daemon per run (`slates --instance <i> anchor --quick`, then `slates
+--instance <i> bootstrap root`; it derived 23 shards), then `load_bench --instance <i> --tree <linux-v7.4-rc1>/kernel
+--clients 1000 --hot-files 800 --rounds 20 --reply-patience 60 --per-connection 32 --think-us Z` for Z = 200, 100, 50
+and 20 ms, and Z = 200 ms with `--per-connection 1`. Three rounds, the five points interleaved in each, 2026-11-18
+09:10 to 09:40 UTC; loadtest-scale's `rung.sh` with every bench.log kept whole. All 15 runs:
+
+| Z (ms), round | load at start | verdicts/s | held | p99 ms: Edit / Accepted / Conflict / ReadHead / Rebase | Cycle p99 ms | Round p99 ms | gave up | harness max sweep ms | oracle failures |
+|---|---|---|---|---|---|---|---|---|---|
+| 200, 1 | 11.5 | 280 | 2.0 | 28.4 / 30.6 / 35.2 / 24.9 / 35.9 | 173 | 888 | 19 | 113 | 0 |
+| 100, 1 | 24.7 | 556 | 3.1 | 20.7 / 26.8 / 26.5 / 19.0 / 27.8 | 130 | 587 | 16 | 79 | 0 |
+| 50, 1 | 34.5 | 1,105 | 5.9 | 25.2 / 29.2 / 32.8 / 23.0 / 34.5 | 160 | 670 | 16 | 156 | 0 |
+| 20, 1 | 35.5 | 2,409 | 16.9 | 44.5 / 76.4 / 72.7 / 28.1 / 58.5 | 540 | 2,593 | 20 | 263 | 0 |
+| 200 pc 1, 1 | 36.5 | 268 | 10.6 | 94.9 / 109.8 / 116.6 / 80.8 / 121.7 | 574 | 2,984 | 21 | 211 | 0 |
+| 200, 2 | 42.1 | 281 | 7.5 | 40.1 / 44.3 / 47.9 / 34.1 / 50.1 | 195 | 1,623 | 29 | 133 | 0 |
+| 100, 2 | 32.5 | 562 | 0.0 | **0.59 / 0.94 / 0.88 / 0.48 / 0.88** | 5.4 | 58.8 | 17 | 9.0 | 0 |
+| 50, 2 | 32.6 | 1,106 | 0.5 | 3.67 / 4.55 / 6.40 / 4.32 / 7.79 | 41 | 174 | 24 | 31 | 0 |
+| 20, 2 | 34.7 | 2,732 | 0.5 | 3.83 / 4.84 / 4.96 / 3.35 / 5.19 | 21 | 148 | 24 | 9.4 | 0 |
+| 200 pc 1, 2 | 34.0 | 269 | 11.8 | 62.5 / 76.5 / 72.9 / 54.2 / 74.1 | 272 | 2,562 | 29 | 167 | 0 |
+| 200, 3 | 37.9 | 283 | 0.8 | 10.1 / 12.4 / 13.0 / 9.4 / 13.2 | 62 | 295 | 22 | 77 | 0 |
+| 100, 3 | 28.3 | 486 | 26.4 | 100.9 / 126.6 / 114.8 / 80.5 / 118.7 | 740 | 3,473 | 28 | 305 | **1** |
+| 50, 3 | 47.0 | 1,053 | 6.8 | 19.8 / 51.1 / 42.2 / 18.7 / 27.7 | 298 | 1,356 | 25 | 300 | 0 |
+| 20, 3 | 55.7 | 2,019 | 69.5 | 94.2 / 111.1 / 119.9 / 76.6 / 120.0 | 616 | 3,683 | 29 | 213 | **1** |
+| 200 pc 1, 3 | 57.2 | 272 | 11.0 | 95.1 / 107.6 / 128.2 / 81.1 / 133.6 | 691 | 3,523 | 25 | 250 | 0 |
+
+The p50 of every request kind was 0.07 to 2.13 ms at every point. The daemon's peak RSS was 2.17 to 2.51 GiB. Every
+`lost` counter read 0 at all 15 points (`xshard.reply_dropped` among them) and so did every room wait; the works
+composed 133,017 to 138,446 submissions on their own shards and none on the owner. The `per-connection 1` runs' harness
+went up to 2.71 s between two drains of a ring.
+
+**What it means.**
+- **Not met, and not meetable at this shape.** No run read `met yes`; `worst` named the Round's p99 at all 15. Every
+  level also had 16 to 29 clients give up: twenty rounds over 800 hot picks runs some clients past the harness's 64
+  resolutions a round, and the bound admits none. So the shape decides `met no` before the latency does (goal 231's
+  open decision 2, whether the Round is judged, comes after it).
+- **The offered load is lower than the think time suggests.** A round is about 13 requests with a pause after each, so
+  Z = 200 ms offers 268 to 283 verdicts a second, not 10³. The floor is reached from Z = 50 ms (1,053 to 1,106 a
+  second); Z = 20 ms offers 2,019 to 2,732.
+- **The tails follow the box, not the offered load.** Each request kind's p99 was under 1 ms in one run only, Z = 100 ms
+  round 2 (562 verdicts a second, nobody held, the harness sweeping within 9.0 ms). The three best runs swept within
+  9 to 31 ms; the three worst took 213 to 305 ms a sweep with 26 to 70 clients held. On this box the tail is shared
+  CPU until shown otherwise: the run on a quiet host is owed.
+- **No reply was lost** in 15 runs at 1,000 clients (A-296's counters, all zero).
+- **Two oracle failures, at the two most loaded runs** (Z = 100 ms and 20 ms of round 3). Each is a conflict naming a
+  window touched by the version one past the head window the oracle allowed it: v3803 against 3800..=3802, v8171
+  against 8169..=8170. A hypothesis under test, not a finding: the harness stamps a request's send after
+  `Client::begin` returns (`Worker::send` in `load_bench.rs`), so a worker descheduled between the two records a
+  submit as sent after a verdict that already reflects it, which narrows the oracle's window by one version.

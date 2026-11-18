@@ -117,7 +117,10 @@ struct Stopping(Option<Anchor>);
 impl Stopping {
   /// Stops the anchor now; its exit code.
   fn stop(mut self) -> Option<i32> {
-    self.0.take().unwrap().stop().unwrap()
+    match self.0.take().map(Anchor::stop) {
+      Some(Ok(code)) => code,
+      other => panic!("the held anchor stops: {other:?}"),
+    }
   }
 }
 

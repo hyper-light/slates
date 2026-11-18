@@ -291,7 +291,7 @@ slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
 slates export ID [--read-only] [--subtree DIR] [--uid UID]
-slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+slates land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
 slates image build ID SNAPSHOT NAME --capacity SIZE [--json]
 slates image merge IMAGE NAME [--json]
 slates grants [--json]
@@ -416,6 +416,10 @@ human saw, the scope and the term — which the daemon recomputes before issuing
 not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+`land --include P` and `--exclude P` each take a path prefix of the volume (`/.git`), as often as given: an entry
+lands when it lies under an included prefix (or none is given) and under no excluded one. Until 2026-11-17 each
+flag kept its last value alone, so a harness could leave out one prefix
+(`docs/bugs/2026-11-17-land-kept-only-the-last-exclude.md`).
 `land --snapshot N` lands that snapshot exactly as it was taken, whatever the volume has become since; the
 volume's later edits stay private, and a later `land` without `--snapshot` lands them over it.
 One landing at a time writes into a directory, whichever volume lands and however its path is
@@ -444,7 +448,7 @@ sets a principal's rights on a volume (`uid:N`, `consumer:N` under your account,
 `consumer:ACCOUNT/N`; no switch removes the entry). `enroll`, `revoke` and `run` are the anchor user's
 surface like `grant` and need its variables; `share` is the volume owner's.
 
-`slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]` hands a program a Shards
+`slates shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]` hands a program a Shards
 microVM's filesystem device: it attaches the volume (or only `DIR` of it; for writing unless `--read-only`, as
 `mount` attaches), announces the attachment (`attachment: N`, or `{"attachment": N}` under `--json`), and
 replaces itself with `CMD`, one end of a socket pair at descriptor `N` — the end the daemon serves that attachment
@@ -454,9 +458,18 @@ the copy at `N` goes into the command, so the attachment lasts exactly as long a
 command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
 The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
 command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
+With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux): a message socket
+whose first message names the attachment and a secret token, and over which, if the daemon dies and its successor
+recovers the attachment, the successor hands a fresh stream end naming the same token. Reading the channel's end means
+no such stream will come (the attachment ended, or the daemon could not keep it); a platform that makes no channel yet
+hands one already ended.
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.
+A guest's own attributes (`trusted.`, `security.`) and its POSIX ACLs are kept in the volume as its data, on this
+route and on `vhost-user`'s, and no host's mount shows them. The guest's kernel enforces its ACLs, so what its
+`setfacl` grants or denies holds for its accesses; a file's mode keeps step with its ACL (a chmod from the host
+changes the ACL's mask), and what anyone makes in a directory with a default ACL takes it, as on Linux.
 Linux sends the end over the client's control socket; macOS claims it on the daemon's socket route, an encrypted
 exchange keyed by a single-use secret. Windows refuses the form by kind (`AttachmentUnsupported`,
 `DescriptorRouteNotBuilt`) until a route hands a client a handle.
@@ -481,8 +494,11 @@ slates vhost-user ID --dax-window 8MiB -- qemu-system-x86_64 -machine q35,memory
   -device vhost-user-test-device-pci,chardev=slates,virtio-id=26,num_vqs=2,config_size=40 ...
 ```
 
-and the guest mounts `mount -t virtiofs slates /mnt -o dax=always` (`--tag` names another tag). No socket file exists
-anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
+and the guest mounts `mount -t virtiofs slates /mnt -o dax=always,nosuid,nodev` (`--tag` names another tag). Mount
+it `nosuid,nodev`, as every mount slates makes itself is: a volume is shared, and keeps device nodes and set-id bits as
+any writer made them (A-94, A-294), so a guest mount without the flags would let one writer's `/dev/mem`-numbered node
+or setuid binary act for another of the guest's users. The device cannot set the guest's flags; the guest's kernel
+applies them. No socket file exists anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
 that end alone. QEMU's vhost-user-fs-pci has no DAX window, so use the generic device for DAX; QEMU before 11.1 offers
 no window on either.
 `--dax-window SIZE` offers the guest a DAX window of that size (a power of two of at least 2MiB); through it the guest

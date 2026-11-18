@@ -23,8 +23,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::live::{
-  Admitted, Entry, Head, Install, LiveError, Next, Replica, Shipper, adopt, decode_reply,
-  encode_reply,
+  Admitted, Bounds, Entry, Head, Install, LiveError, Next, PastTolerance, Replica, Shipper, adopt,
+  adopt_past_tolerance, decode_reply, encode_reply, past_tolerance,
 };
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
 
@@ -134,6 +134,25 @@ enum EmptyReport {
   FenceAndCount,
   /// A mutation, the daemon before 2026-11-05 for a remote candidate: it reports nothing held and keeps no fence.
   CountWithoutFence,
+}
+
+/// The bounds that hold `credit` entries in flight and `retain` retained, each entry of `payload` bytes counted at its
+/// wire size as the shipper counts it ([`Entry::wire_bytes`]): the model's and the unit tests' entries are of one size,
+/// so a count of them is exact.
+fn bounds_of(credit: usize, retain: usize, payload: usize) -> Bounds {
+  let entry = Entry {
+    owner: HostId(1),
+    object: OBJECT,
+    position: 0,
+    epoch: HostEpoch(1),
+    previous: [0; 32],
+    payload: vec![0; payload],
+  }
+  .wire_bytes();
+  Bounds {
+    credit: credit * entry,
+    retain: retain * entry,
+  }
 }
 
 fn encode_state(state: &[u64]) -> Vec<u8> {
@@ -246,7 +265,7 @@ impl Run {
       },
       &hosts,
       None,
-      (8, 16),
+      bounds_of(8, 16, 8),
     );
     Run {
       f,
@@ -318,7 +337,7 @@ impl Run {
       },
       &self.configuration,
       None,
-      (8, 16),
+      bounds_of(8, 16, 8),
     );
     self.owners[0].recorded.clone_from(&self.configuration);
     self
@@ -724,7 +743,7 @@ impl Run {
       },
       &holders,
       head,
-      (8, 16),
+      bounds_of(8, 16, 8),
     );
     self.owners.push(Owner {
       host: successor,
@@ -1224,8 +1243,8 @@ fn an_empty_report_without_a_fence_lets_a_superseded_owner_commit() {
   );
 }
 
-/// AC-8.9: the owner holds at most `credit` entries that are not durable; past it a write is refused `NoCredit`, and
-/// an acknowledgement gives the credit back.
+/// AC-8.9: the owner holds at most its credit's bytes of entries that are not durable; past it a write is refused
+/// `NoCredit`, and an acknowledgement gives the credit back.
 #[test]
 fn a_writer_past_its_credit_waits_for_acknowledgements() {
   let hosts = [HostId(1), HostId(2), HostId(3)];
@@ -1234,7 +1253,7 @@ fn a_writer_past_its_credit_waits_for_acknowledgements() {
     Quorum { f: 1 },
     &hosts,
     None,
-    (2, 4),
+    bounds_of(2, 4, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   let second = shipper.append(vec![2]).unwrap();
@@ -1248,6 +1267,170 @@ fn a_writer_past_its_credit_waits_for_acknowledgements() {
   assert_eq!(shipper.on_reply(hosts[1], Ok(held)), Next::Nothing);
   assert_eq!(shipper.durable(), Some(1));
   assert!(shipper.append(vec![3]).is_ok());
+}
+
+/// A shipper at `f = 1` from host 1 to holders 2 and 3, bounded by a whole state of `whole` bytes as the daemon bounds
+/// it ([`Bounds::of_whole`]).
+fn shipper_bounded_by_whole(whole: usize) -> Shipper {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    Bounds::of_whole(whole),
+  )
+}
+
+/// AC-8.9, A-200 amended 2026-11-17: the credit is the whole state's bytes, not a count of entries. Do bound a shipper by
+/// a whole state of 64 KiB and append a burst of 4 KiB deltas with nothing acknowledged, as a burst of barriers on one
+/// volume does inside one round trip. Expect every delta whose bytes keep what is in flight within the whole state to be
+/// admitted (fifteen of them, each 4 KiB and its prefix), the next refused `NoCredit`, a whole state then admitted one
+/// past the credit and nothing after it, and the bytes in flight given back at the holders' acknowledgement. With the
+/// daemon's old credit of two entries the third delta was refused, and the volume shipped its whole state next.
+#[test]
+fn a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits() {
+  const WHOLE: usize = 64 << 10;
+  const DELTA: usize = 4 << 10;
+  let mut shipper = shipper_bounded_by_whole(WHOLE);
+  let delta_bytes = Entry {
+    owner: HostId(1),
+    object: OBJECT,
+    position: 0,
+    epoch: HostEpoch(1),
+    previous: [0; 32],
+    payload: vec![0; DELTA],
+  }
+  .wire_bytes();
+  let admitted = WHOLE / delta_bytes;
+  let mut appended = Vec::new();
+  for value in 0..admitted {
+    let payload = vec![u8::try_from(value % 256).unwrap(); DELTA];
+    appended.push(
+      shipper
+        .append(payload)
+        .unwrap_or_else(|refusal| panic!("delta {value} of {admitted}: {refusal:?}")),
+    );
+  }
+  assert_eq!(
+    admitted, 15,
+    "fifteen 4 KiB deltas and their prefixes fit 64 KiB"
+  );
+  assert_eq!(shipper.in_flight(), 15);
+  assert_eq!(shipper.in_flight_bytes(), admitted * delta_bytes);
+  assert_eq!(
+    shipper.append(vec![0; DELTA]),
+    Err(LiveError::NoCredit { durable: None }),
+    "the delta that would pass the whole state's bytes waits"
+  );
+  appended.push(expect_a_whole_state_admitted_one_past_the_credit(
+    &mut shipper,
+    WHOLE,
+  ));
+  let held = held_after(HostId(1), &appended);
+  assert_eq!(shipper.on_reply(HostId(2), Ok(held)), Next::Nothing);
+  assert_eq!(
+    (
+      shipper.durable(),
+      shipper.in_flight(),
+      shipper.in_flight_bytes()
+    ),
+    (Some(15), 0, 0),
+    "the acknowledgement settles every entry and gives its bytes back"
+  );
+  assert!(shipper.append(vec![3; DELTA]).is_ok());
+}
+
+/// The whole state of `a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits`. Do: with what is
+/// in flight within the credit, append a whole state of `whole` bytes, then another. Expect the first admitted one past
+/// the credit and the second refused `NoCredit`. Returns the admitted entry.
+fn expect_a_whole_state_admitted_one_past_the_credit(shipper: &mut Shipper, whole: usize) -> Entry {
+  assert!(
+    shipper.admits_checkpoint(),
+    "what is in flight is within the credit"
+  );
+  let admitted = shipper.append_checkpoint(vec![1; whole]).unwrap();
+  assert!(
+    !shipper.admits_checkpoint(),
+    "a checkpoint goes one past the credit, and no further"
+  );
+  assert_eq!(
+    shipper.append_checkpoint(vec![2; whole]),
+    Err(LiveError::NoCredit { durable: None })
+  );
+  admitted
+}
+
+/// AC-8.9: the credit counts what each entry costs. Do bound a shipper at three small entries' bytes and put one small
+/// entry in flight. Expect a second small entry admitted, an entry larger than what is left refused though only one
+/// is in flight, and, once nothing is in flight, that same large entry admitted whatever its size (the log never
+/// stops at a bound).
+#[test]
+fn the_credit_counts_each_entrys_bytes_and_never_stops_the_log() {
+  let small = bounds_of(1, 1, 1).credit;
+  let mut shipper = shipper_bounded_by_whole(3 * small);
+  let first = shipper.append(vec![1]).unwrap();
+  let second = shipper.append(vec![2]).unwrap();
+  let large = vec![9; 4 * small];
+  assert_eq!(
+    shipper.append(large.clone()),
+    Err(LiveError::NoCredit { durable: None }),
+    "two small entries and a large one pass three small entries' bytes"
+  );
+  shipper.on_reply(HostId(3), Ok(held_after(HostId(1), &[first, second])));
+  assert_eq!(shipper.in_flight_bytes(), 0);
+  assert!(
+    shipper.append(large).is_ok(),
+    "with nothing in flight an entry larger than the credit is admitted"
+  );
+}
+
+/// AC-8.9: the retained tail is bounded in bytes too, never below the newest entry. Do retain two small entries' bytes
+/// (the credit wide), have holder 2 acknowledge position 2 of five small entries while holder 3 hears nothing, then
+/// position 4, then append one entry larger than the bound. Expect holder 3 installed (it lacks position 0, behind the
+/// two entries the bytes keep), holder 2 sent the last two while they fit, and after the large entry pushed them out,
+/// holder 2 sent the large one alone (kept though it alone passes the bound) and holder 3 still installed.
+#[test]
+fn the_retained_tail_is_held_to_its_bytes_and_keeps_the_newest_entry() {
+  let small = bounds_of(1, 1, 1).credit;
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    Bounds {
+      credit: 100 * small,
+      retain: 2 * small,
+    },
+  );
+  let mut entries: Vec<Entry> = (0..3u8)
+    .map(|value| shipper.append(vec![value]).unwrap())
+    .collect();
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &entries)));
+  entries.extend((3..5u8).map(|value| shipper.append(vec![value]).unwrap()));
+  assert_eq!(
+    shipper.pending(hosts[2]),
+    Next::Install,
+    "a holder that lacks position 0 is behind the two entries the bytes keep"
+  );
+  assert_eq!(
+    shipper.pending(hosts[1]),
+    Next::Entries(entries[3..].to_vec()),
+    "the last two are retained"
+  );
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &entries)));
+  let large = shipper.append(vec![7; 8 * small]).unwrap();
+  assert_eq!(
+    shipper.pending(hosts[1]),
+    Next::Entries(vec![large]),
+    "the newest entry is kept though it alone passes the bound"
+  );
+  assert_eq!(
+    shipper.pending(hosts[2]),
+    Next::Install,
+    "a holder behind it is installed"
+  );
 }
 
 /// A-200: a holder repeating the head it last acknowledged is on the chain, though the tail has since passed it. Do have
@@ -1264,7 +1447,7 @@ fn a_holder_repeating_a_head_the_tail_has_passed_is_sent_the_entries_after_it() 
     Quorum { f: 1 },
     &hosts,
     None,
-    (8, 8),
+    bounds_of(8, 8, 1),
   );
   let entries: Vec<_> = (0..4).map(|at| shipper.append(vec![at]).unwrap()).collect();
   let mut replica = Replica::new(hosts[0], OBJECT);
@@ -1296,7 +1479,7 @@ fn shipper_to_three_holders(retain: usize) -> Shipper {
     Quorum { f: 1 },
     &hosts,
     None,
-    (16, retain),
+    bounds_of(16, retain, 1),
   )
 }
 
@@ -1385,7 +1568,7 @@ fn a_refused_entry_is_never_counted_as_held() {
     Quorum { f: 1 },
     &hosts,
     None,
-    (4, 8),
+    bounds_of(4, 8, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   let second = shipper.append(vec![2]).unwrap();
@@ -1440,7 +1623,7 @@ fn a_shipper_made_before_its_candidates_were_known_ships_to_them_once_named() {
     Quorum { f: 1 },
     &hosts[..1],
     None,
-    (4, 8),
+    bounds_of(4, 8, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   let second = shipper.append(vec![2]).unwrap();
@@ -1501,7 +1684,7 @@ fn a_new_holder_set_counts_only_once_it_holds_every_durable_entry() {
     Quorum { f: 1 },
     &hosts[..3],
     None,
-    (8, 8),
+    bounds_of(8, 8, 1),
   );
   let entries = [
     shipper.append(vec![1]).unwrap(),
@@ -1686,7 +1869,13 @@ fn dropping_the_old_holders_before_the_record_names_the_new_loses_durable_writes
   let owner = HostId(1);
   let (old, new) = ([HostId(2), HostId(3)], [HostId(4), HostId(5)]);
   let quorum = Quorum { f: 1 };
-  let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, &old, None, (4, 8));
+  let mut shipper = Shipper::new(
+    (owner, OBJECT, HostEpoch(1)),
+    quorum,
+    &old,
+    None,
+    bounds_of(4, 8, 1),
+  );
   let first = shipper.append(vec![1]).unwrap();
   shipper.on_reply(old[0], Ok(held_after(owner, std::slice::from_ref(&first))));
   assert!(shipper.begin_transition(&new));
@@ -1755,7 +1944,7 @@ fn a_successor_that_starts_from_the_configuration_loses_durable_writes() {
     quorum,
     &recorded,
     None,
-    (4, 8),
+    bounds_of(4, 8, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   shipper.on_reply(
@@ -1818,7 +2007,13 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   let owner = HostId(1);
   let quorum = Quorum { f: 1 };
   let ship = |holders: &[HostId]| {
-    let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, holders, None, (4, 8));
+    let mut shipper = Shipper::new(
+      (owner, OBJECT, HostEpoch(1)),
+      quorum,
+      holders,
+      None,
+      bounds_of(4, 8, 1),
+    );
     let entry = shipper.append(vec![1]).unwrap();
     (shipper, held_after(owner, &[entry]))
   };
@@ -1850,7 +2045,13 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   assert_eq!(shipper.durable(), None, "no holder: never durable");
   // At f = 2 with three holders, `n − f` = 1 would count the owner and one holder: two copies, which two failures lose.
   let quorum = Quorum { f: 2 };
-  let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, &three, None, (4, 8));
+  let mut shipper = Shipper::new(
+    (owner, OBJECT, HostEpoch(1)),
+    quorum,
+    &three,
+    None,
+    bounds_of(4, 8, 1),
+  );
   let held = held_after(owner, &[shipper.append(vec![1]).unwrap()]);
   shipper.on_reply(three[0], Ok(held));
   assert_eq!(
@@ -1880,7 +2081,7 @@ fn a_holder_set_of_f_or_fewer_is_never_moved_to() {
         Quorum { f },
         &others[..current],
         None,
-        (4, 8),
+        bounds_of(4, 8, 1),
       );
       let target: Vec<HostId> = others[others.len() - size..].to_vec();
       assert_eq!(
@@ -1907,7 +2108,7 @@ fn the_laptop_is_durable_at_its_own_append() {
     Quorum { f: 0 },
     &[HostId(1)],
     None,
-    (1, 1),
+    bounds_of(1, 1, 1),
   );
   for value in 0..100u8 {
     let entry = shipper.append(vec![value]).unwrap();
@@ -1945,6 +2146,106 @@ fn hostile_bytes_are_refused_not_trusted() {
     flipped[bit / 8] ^= 1 << (bit % 8);
     if let Ok(decoded) = Entry::decode(&flipped, CAP) {
       assert_ne!(decoded.identity(), entry.identity());
+    }
+  }
+}
+
+/// Three consecutive entries of one owner's log under epoch 2, and their encodings.
+fn three_batched() -> (Vec<Entry>, Vec<Vec<u8>>) {
+  let mut previous = [9; 32];
+  let entries: Vec<Entry> = (0..3u8)
+    .map(|value| {
+      let entry = Entry {
+        owner: HostId(1),
+        object: OBJECT,
+        position: 3 + u64::from(value),
+        epoch: HostEpoch(2),
+        previous,
+        payload: vec![value; 4],
+      };
+      previous = entry.identity();
+      entry
+    })
+    .collect();
+  let encoded = entries.iter().map(Entry::encode).collect();
+  (entries, encoded)
+}
+
+/// A-200 amended 2026-11-17, hostile input on a batch: a batch round-trips to its entries, in order, and its header names
+/// its object and epoch; every truncation, a count over-claiming the bytes that follow (`u32::MAX`), a count of zero,
+/// trailing bytes, an entry's payload over the cap, and an entry of another epoch inside it are each refused; every
+/// single-bit flip decodes to other entries or is refused, never a panic.
+#[test]
+fn hostile_batches_are_refused_not_trusted() {
+  use slates_db::live::{decode_batch, encode_batch, epoch_of_batch, object_of};
+  let (entries, encoded) = three_batched();
+  let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+  let bytes = encode_batch(&slices).unwrap();
+  assert_eq!(decode_batch(&bytes, CAP), Ok(entries.clone()));
+  assert_eq!(object_of(&bytes), Some(OBJECT));
+  assert_eq!(epoch_of_batch(&bytes), Some(HostEpoch(2)));
+  assert_eq!(encode_batch(&[]), None, "an empty batch is never made");
+  expect_every_truncation_and_lying_count_refused(&bytes);
+  let mut longer = bytes.clone();
+  longer.push(0);
+  assert_eq!(decode_batch(&longer, CAP), Err(LiveError::Malformed));
+  assert_eq!(
+    decode_batch(&bytes, 3),
+    Err(LiveError::Malformed),
+    "an entry's payload over the cap"
+  );
+  let foreign = Entry {
+    epoch: HostEpoch(3),
+    ..entries[1].clone()
+  }
+  .encode();
+  let mixed = encode_batch(&[slices[0], foreign.as_slice()]).unwrap();
+  assert_eq!(
+    decode_batch(&mixed, CAP),
+    Err(LiveError::Malformed),
+    "an entry of another epoch than the batch's"
+  );
+  expect_every_bit_flip_refused_or_seen(&bytes, &entries);
+}
+
+/// The truncations and lying counts of `hostile_batches_are_refused_not_trusted`. Expect a batch's `bytes` cut short
+/// anywhere, and the batch with its count over-claiming the bytes that follow (`u32::MAX`), zero, or one more than it
+/// holds, each refused `Malformed`.
+fn expect_every_truncation_and_lying_count_refused(bytes: &[u8]) {
+  use slates_db::live::decode_batch;
+  for length in 0..bytes.len() {
+    assert_eq!(
+      decode_batch(&bytes[..length], CAP),
+      Err(LiveError::Malformed),
+      "truncated at {length}"
+    );
+  }
+  let count_at = 8 + 16 + 8;
+  for count in [u32::MAX, 0, 4] {
+    let mut lying = bytes.to_vec();
+    lying[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+    assert_eq!(
+      decode_batch(&lying, CAP),
+      Err(LiveError::Malformed),
+      "a count of {count}"
+    );
+  }
+}
+
+/// The bit flips of `hostile_batches_are_refused_not_trusted`. Expect every single-bit flip of a batch's `bytes`
+/// refused, or decoded to entries other than `entries` as the chain sees them, never a panic.
+fn expect_every_bit_flip_refused_or_seen(bytes: &[u8], entries: &[Entry]) {
+  use slates_db::live::decode_batch;
+  let identities: Vec<_> = entries.iter().map(Entry::identity).collect();
+  for bit in 0..bytes.len() * 8 {
+    let mut flipped = bytes.to_vec();
+    flipped[bit / 8] ^= 1 << (bit % 8);
+    if let Ok(decoded) = decode_batch(&flipped, CAP) {
+      let decoded: Vec<_> = decoded.iter().map(Entry::identity).collect();
+      assert_ne!(
+        decoded, identities,
+        "bit {bit} changed nothing the chain would see"
+      );
     }
   }
 }
@@ -2211,5 +2512,62 @@ fn counting_any_candidate_lets_a_fresh_member_stand_in_for_a_holder() {
         || message.contains("Agreement")
     }),
     "a fresh member's report stood in for a holder: {broken:?}"
+  );
+}
+
+/// A head at `position` under `epoch`, its identity the position's bytes.
+fn head_at(epoch: u64, position: u64) -> Head {
+  let mut identity = [0u8; 32];
+  identity[..8].copy_from_slice(&position.to_le_bytes());
+  Head {
+    epoch: HostEpoch(epoch),
+    position,
+    identity,
+  }
+}
+
+/// A-309 piece 3, the store-destroyed takeover's live log: the recorded holders {A, old B} at `f = 1`, old B destroyed,
+/// so A-240's count of `f + 1` recorded holders can never be met (g240's finding: the takeover waited for good); the
+/// replacement B' caught up on the log through the joint transition and holds the newest head. Do: judge whether phase
+/// one is past tolerance with B' and A members and old B gone, then walk the reports in: A's, then B''s. Expect past
+/// tolerance; A-240's rule adopting nothing whatever is reported; the past-tolerance rule waiting until B' reports and
+/// then adopting B''s head, the newest any surviving holder keeps; and within tolerance (old B a member) not past it.
+#[test]
+fn a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder() {
+  let (a, old_b, fresh_b) = (HostId(1), HostId(2), HostId(3));
+  let quorum = Quorum { f: 1 };
+  let holders = [a, old_b];
+  let members = [a, fresh_b];
+  let is_member = |host: HostId| members.contains(&host);
+  assert!(past_tolerance(&holders, is_member, quorum));
+  assert!(
+    !past_tolerance(&holders, |host| host != fresh_b, quorum),
+    "both recorded holders members: within tolerance"
+  );
+  // Every surviving member that may hold the log: the recorded holders still members, and the cohorts' members.
+  let wait = [a, fresh_b];
+  let older = head_at(1, 5);
+  let newer = head_at(1, 9);
+  let from_a = [(a, Some(older))];
+  assert_eq!(adopt(&from_a, &holders, quorum), None);
+  assert_eq!(
+    adopt_past_tolerance(&from_a, &wait),
+    PastTolerance::Waiting,
+    "the replacement holding the newest head has not reported"
+  );
+  let from_both = [(a, Some(older)), (fresh_b, Some(newer))];
+  assert_eq!(
+    adopt(&from_both, &holders, quorum),
+    None,
+    "A-240's rule never counts the replacement"
+  );
+  assert_eq!(
+    adopt_past_tolerance(&from_both, &wait),
+    PastTolerance::Adopt(Some((fresh_b, newer)))
+  );
+  assert_eq!(
+    adopt_past_tolerance(&[(a, None), (fresh_b, None)], &wait),
+    PastTolerance::Adopt(None),
+    "nobody holds any of the log: nothing to adopt"
   );
 }

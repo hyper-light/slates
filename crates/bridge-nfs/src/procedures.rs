@@ -31,7 +31,7 @@ use slates_bridge_core::{
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 use slates_vfs::xattr::XattrSet;
 
 use crate::v4::files::{FileState, IoAuthority, IoWant};
@@ -743,7 +743,14 @@ impl<'b> Export<'b> {
       gid: node.gid,
       size: node.size,
       used: node.size,
-      rdev: Specdata3::default(),
+      // A device node's number, as NFS carries it (A-294): `rdev` describes the device of an `NF3CHR` or `NF3BLK`
+      // (RFC 1813 §2.6), and is zero for every other kind.
+      rdev: node
+        .device
+        .map_or(Specdata3::default(), |number| Specdata3 {
+          specdata1: number.major,
+          specdata2: number.minor,
+        }),
       fsid: self.fsid(),
       fileid: node.ino,
       atime: nfstime_of(node.atime),
@@ -2321,7 +2328,8 @@ impl<'b> Export<'b> {
     }
   }
 
-  /// Creates only FIFO/socket namespace metadata; the kernel owns transient IPC (A-26).
+  /// Makes a name with no content: a FIFO or socket name, whose stream belongs to the client's kernel (A-26), or a
+  /// device node, whose number is metadata no route slates serves opens as a device (A-294).
   pub fn mknod(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let (status, made, dir_post) = self.do_mknod(args);
     let mut writer = XdrWriter::new();
@@ -2329,6 +2337,13 @@ impl<'b> Export<'b> {
     writer.into_bytes()
   }
 
+  /// MKNOD, its checks taken in the order Linux's `mknodat` takes them on a local file system (A-268, kept by A-294): a
+  /// taken name is `NFS3ERR_EXIST` (an exclusive create over NFS skips the client's own lookup, so only the server can
+  /// say so), a directory the caller may not write is `NFS3ERR_ACCES`, and a device node other than a whiteout asked by
+  /// a caller who is not root is `NFS3ERR_PERM`, which a client reports as `EPERM`: `vfs_mknod` asks `CAP_MKNOD`, and
+  /// `nfsd` drops it from every uid but root's (`access::needs_superuser`). Before A-294 every block
+  /// or character device was refused `NFS3ERR_PERM` after the first two checks; before A-268, `NFS3ERR_BADTYPE`, which
+  /// the Linux client turned into its internal `EBADTYPE` (errno 527).
   fn do_mknod(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     // MKNOD3args: where, type and the type-specific attributes (RFC 1813 §3.3.11).
     let dir_fh = match Nfsfh3::decode(args) {
@@ -2339,12 +2354,12 @@ impl<'b> Export<'b> {
       Ok(n) => n.to_owned(),
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
-    // A block or character device is read whole, as any MKNOD is, then refused after the name and the directory are
-    // checked (A-268). Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
+    // Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
     let kind = match args.u32().map(Ftype3::from_wire) {
-      Ok(Some(Ftype3::Fifo)) => Some(Kind::Fifo),
-      Ok(Some(Ftype3::Sock)) => Some(Kind::Socket),
-      Ok(Some(Ftype3::Blk | Ftype3::Chr)) => None,
+      Ok(Some(Ftype3::Fifo)) => Kind::Fifo,
+      Ok(Some(Ftype3::Sock)) => Kind::Socket,
+      Ok(Some(Ftype3::Blk)) => Kind::BlockDevice,
+      Ok(Some(Ftype3::Chr)) => Kind::CharDevice,
       Ok(_) => return (Nfsstat3::Badtype, None, Wcc::default()),
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
@@ -2352,10 +2367,18 @@ impl<'b> Export<'b> {
       Ok(decoded) => decoded,
       Err(status) => return (status, None, Wcc::default()),
     };
-    // A device's `specdata3`, its major and minor numbers: read so a truncated request is refused as one.
-    if kind.is_none() && (args.u32().is_err() || args.u32().is_err()) {
-      return (Nfsstat3::Inval, None, Wcc::default());
-    }
+    // A device's `specdata3` follows its attributes: its major and minor numbers, kept as the client sent them.
+    let device = if kind.is_device() {
+      match (args.u32(), args.u32()) {
+        (Ok(major), Ok(minor)) => DeviceNumber::new(major, minor),
+        _ => return (Nfsstat3::Inval, None, Wcc::default()),
+      }
+    } else {
+      DeviceNumber::default()
+    };
+    let Some(node) = SpecialNode::of(kind, device) else {
+      return (Nfsstat3::Badtype, None, Wcc::default());
+    };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
       Err(status) => return (status, None, Wcc::default()),
@@ -2365,22 +2388,34 @@ impl<'b> Export<'b> {
       Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
-    // POSIX: adding an entry needs write and search permission on the directory.
-    let Some(kind) = kind else {
-      return self.refuse_device_node(&dir_identity, parent, &cx, &name);
-    };
+    // POSIX: adding an entry needs write and search permission on the directory; a taken name is told first, as a
+    // lookup comes before `may_create`.
     let dir_pre = match self.writable_directory(&dir_identity) {
       Ok(node) => Some(self.wcc_attr(&node)),
-      Err((status, dir_post)) => return (status, None, self.refused(dir_post)),
+      Err((status, dir_post)) => {
+        let status = if self.bridge.lookup(parent, &cx, &name).is_ok() {
+          Nfsstat3::Exist
+        } else {
+          status
+        };
+        return (status, None, self.refused(dir_post));
+      }
     };
+    if access::needs_superuser(node) && !self.caller.is_root() {
+      let status = match self.bridge.lookup(parent, &cx, &name) {
+        Ok(_) => Nfsstat3::Exist,
+        Err(_) => Nfsstat3::Perm,
+      };
+      return (status, None, self.wcc_after(dir_pre, &dir_identity));
+    }
     let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
-    let object = match self.bridge.mknod(parent, &cx, &name, mode, kind) {
+    let object = match self.bridge.mknod(parent, &cx, &name, mode, node) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
       Err(e) => {
         return (nfsstat_of(&e), None, self.wcc_after(dir_pre, &dir_identity));
       }
     };
-    // An IPC name has no size to set; apply the remaining fields (uid/gid/times).
+    // A name with no content has no size to set; apply the remaining fields (uid/gid/times).
     let post_changes = SetAttr {
       mode: None,
       size: None,
@@ -2394,39 +2429,6 @@ impl<'b> Export<'b> {
       post_changes,
       explicit_times,
     )
-  }
-
-  /// The answer to a MKNOD of a block or character device (§4.6 A-26, A-268): slates makes no device nodes, so it is
-  /// refused as a local file system that cannot hold one refuses it, in the order Linux's `vfs_mknod` takes its checks.
-  /// A taken name is `NFS3ERR_EXIST` (an exclusive create over NFS skips the client's own lookup, so the server must
-  /// say so); a directory the caller may not write is `NFS3ERR_ACCES`; then `NFS3ERR_PERM`, which a client reports as
-  /// `EPERM`, what `mknod(2)` answers when "the filesystem containing pathname does not support the type of node
-  /// requested". It was `NFS3ERR_BADTYPE`, the status RFC 1813 §3.3.11 names, which the Linux client turns into its
-  /// internal `EBADTYPE` (errno 527) and every program prints as an unknown error.
-  fn refuse_device_node(
-    &mut self,
-    dir_identity: &FileHandle,
-    parent: ObjectId,
-    cx: &OpContext,
-    name: &str,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
-    let dir_pre = match self.writable_directory(dir_identity) {
-      Ok(node) => Some(self.wcc_attr(&node)),
-      Err((status, dir_post)) => {
-        // A taken name is told before the directory's permission, as a lookup comes before `may_create`.
-        let status = if self.bridge.lookup(parent, cx, name).is_ok() {
-          Nfsstat3::Exist
-        } else {
-          status
-        };
-        return (status, None, self.refused(dir_post));
-      }
-    };
-    let status = match self.bridge.lookup(parent, cx, name) {
-      Ok(_) => Nfsstat3::Exist,
-      Err(_) => Nfsstat3::Perm,
-    };
-    (status, None, self.wcc_after(dir_pre, dir_identity))
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
@@ -3101,6 +3103,8 @@ fn ftype3_of(kind: Kind) -> Ftype3 {
     Kind::Symlink => Ftype3::Lnk,
     Kind::Fifo => Ftype3::Fifo,
     Kind::Socket => Ftype3::Sock,
+    Kind::BlockDevice => Ftype3::Blk,
+    Kind::CharDevice => Ftype3::Chr,
   }
 }
 
@@ -3132,6 +3136,9 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::IsDirectory => Nfsstat3::Isdir,
     VfsError::NotEmpty => Nfsstat3::Notempty,
     VfsError::NoSpace => Nfsstat3::Nospc,
+    // An offset or length past what the volume addresses: the file would be too large (RFC 1813 §2.6), never the
+    // server's own fault.
+    VfsError::FileTooLarge => Nfsstat3::Fbig,
     VfsError::NotPermitted => Nfsstat3::Perm,
     // A read-only attachment or a snapshot's view is a read-only file system (`NFS3ERR_ROFS`; v4's `NFS4ERR_ROFS` by
     // `Nfsstat4::of_v3`).

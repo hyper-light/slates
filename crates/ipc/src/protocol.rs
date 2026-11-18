@@ -1883,6 +1883,11 @@ pub struct DaemonReport {
   /// This node's certificate anchor (A-237): the host a principal of this node names, as a share to one of its
   /// accounts must name it. Stable across the node's restarts. Appended.
   pub anchor: u64,
+  /// The anchor has judged this daemon recovered (A-311): it has served as long as its start took, so its exit from
+  /// here on is no failed start and is restarted at once, where an exit before would count toward a crash loop. Whoever
+  /// ends a daemon on purpose (a test's kill, an operator's) waits for it first. `false` with no anchor, which judges
+  /// nothing. Appended.
+  pub recovered: bool,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -2102,7 +2107,8 @@ pub enum WorkOp {
     /// The attribute name.
     name: String,
   },
-  /// Create an IPC namespace inode with explicit metadata and no endpoint state.
+  /// Create a namespace inode with no content, with explicit metadata and no endpoint state: a FIFO or socket name
+  /// (A-26), or a device node and its number (A-294).
   Mknod {
     /// The new path.
     path: String,
@@ -2111,20 +2117,35 @@ pub enum WorkOp {
   },
 }
 
-/// A-26: a declared IPC kind. Device nodes have no wire representation here.
+/// A declared kind of name with no content: a FIFO or socket name (A-26), or a device node with its number, metadata
+/// nothing opens as a device (A-294). The device kinds are appended, so the two earlier tags are unchanged.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcNodeKind {
   /// A named pipe without queued bytes.
   Fifo,
   /// A socket name without a listener or connection.
   Socket,
+  /// A block device node (A-294).
+  BlockDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
+  /// A character device node (A-294); a whiteout is one numbered 0/0.
+  CharDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
 }
 
-/// Metadata supplied by a work's declared IPC creation (§4.16, A-26). These are volume
-/// metadata, not host credentials or endpoint authority. Replay never reads a local clock.
+/// Metadata supplied by a work's declared creation of a name with no content (§4.16, A-26, A-294). These are volume
+/// metadata, not host credentials, endpoint authority or device access. Replay never reads a local clock.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcNode {
-  /// The IPC kind.
+  /// The kind, with a device node's number.
   pub kind: IpcNodeKind,
   /// Permission bits.
   pub mode: u32,
@@ -2202,6 +2223,9 @@ pub struct StatusReport {
   /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
   /// one, a green, a work volume). Appended.
   pub base: Option<BaseReport>,
+  /// What an owner loss would lose of the volume now, and what the takeover that made this node its owner lost (§4.10
+  /// "Auto-seal", AC-8.3, D-18). Appended.
+  pub loss: LossReport,
 }
 
 /// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
@@ -2251,6 +2275,40 @@ pub enum WatcherState {
   Overflowed,
   /// None on this host or folder: fingerprints alone.
   Unavailable,
+}
+
+/// A volume's loss window (§4.10 "Auto-seal", AC-8.3, D-18): what of it lives on its owner alone, and what the takeover
+/// that made this node its owner lost. Every time is this host's own clock's, so no two hosts' clocks are compared; a
+/// seal is named by its head sequence, which the owner and every successor share.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LossReport {
+  /// The window an owner loss would lose now, nanoseconds (the design's `last_placed_snapshot_age`, made exact): zero
+  /// when every change is on another host too (the head sealed and placed with nothing changed since, or a live-shipped
+  /// log in a fleet, whose acknowledged writes are durable on its holders); otherwise the age of the newest seal placed
+  /// on `f + 1` hosts, or of the volume itself when none is (on a laptop, `f = 0`, nothing is on another host). `None`
+  /// when the time is unknown (taken under another boot of this host's clock) or not measured: never reported as zero.
+  pub at_risk_ns: Option<u64>,
+  /// The head sequence of the newest seal placed on `f + 1` hosts: the one a takeover would serve from now, so the
+  /// edits after it are the window. `None` while no seal is placed on another host.
+  pub placed_sequence: Option<u64>,
+  /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
+  /// at durability.
+  pub live_shipped: bool,
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
+  /// this node's memory: a restart of this node forgets it.
+  pub taken_over: Option<VolumeTakeover>,
+}
+
+/// The takeover that made this node a volume's owner (AC-8.3): the loss window an owner loss left.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct VolumeTakeover {
+  /// The epoch the volume has been served under since.
+  pub epoch: u64,
+  /// Served from the volume's live log: every write the lost owner acknowledged at durability survived.
+  pub from_live_log: bool,
+  /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
+  /// seal it names (its `placed_sequence` when it was lost) are the loss window.
+  pub head_sequence: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3496,15 +3554,17 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
-  /// A green this node took over from a departed owner (§4.16 owner-loss recovery) could not be materialized within the
-  /// takeover's bound: the failover SLO's worth of the fleet's periods, each one attempt. Every verb on it answers this
-  /// rather than waiting without end. Appended.
+  /// A volume or green this node took over from a departed owner (§4.8, §4.16 owner-loss recovery) could not be adopted
+  /// or materialized within the takeover's bound: the failover SLO's worth of the fleet's periods without progress, each
+  /// one attempt. Every verb on it answers this rather than waiting without end. Appended.
   TakeoverIncomplete {
-    /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
-    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
-    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
-    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
-    /// owner shard refused the rebuilt green).
+    /// What the last attempt waited on: `promises` (a recovery cohort never gave its quorum of promises in the takeover
+    /// round, A-304), `catalog` (its catalog register or that register's placement never adopted), `catalog_placement`,
+    /// `content` (a volume's content not held here, and not served whole by a recorded holder), `live` (a live-shipped
+    /// volume's log), `shard` (no shard here for its partition), `chain` (a version's record not known here: the adopted
+    /// version beyond this node's accepted records), `inputs` (an input its ledger names not held here, and not served
+    /// whole by the survivors that reported the adopted version), `placement` (no placement of the adopted record, or no
+    /// shard for its partition), or `refused` (the owner shard refused the rebuilt volume or green).
     waited_on: String,
   },
 }

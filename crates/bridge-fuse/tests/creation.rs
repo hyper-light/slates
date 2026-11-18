@@ -381,15 +381,21 @@ fn a_huge_symlink_target_is_handled_without_a_panic() {
   );
 }
 
-/// §4.6, A-26 (and double defense with A-94 `nodev`). A character or block device node is a window onto a host
-/// device; slates creates no real device, so MKNOD of `S_IFCHR`/`S_IFBLK` is refused — only a FIFO or socket
-/// (which carry no stream or listener) are made. A guest cannot plant a `/dev/mem`-style node in its volume.
+/// §4.6, A-294 (which replaced A-26's refusal): a device node is kept as metadata, made for a process acting as root
+/// alone, as Linux's `vfs_mknod` asks `CAP_MKNOD`; the mount's `nodev` (A-94) keeps any from being opened. Do: as the
+/// kernel sends them from uid 1000, MKNOD a character device, a block device, a whiteout (a character device 0/0) and
+/// a FIFO. Expect the two devices refused `EPERM` (a guest's user cannot plant a `/dev/mem`-style node in its volume),
+/// and the whiteout and the FIFO made (non-vacuity: MKNOD itself is served).
 #[test]
-fn fuse_mknod_refuses_a_character_or_block_device() {
+fn fuse_mknod_of_a_device_is_refused_eperm_to_a_process_that_is_not_root() {
   /// Format: `S_IFCHR`, a character device.
   const S_IFCHR: u32 = 0o020_000;
   /// Format: `S_IFBLK`, a block device.
   const S_IFBLK: u32 = 0o060_000;
+  /// Format: `EPERM`, negated as a FUSE reply carries it.
+  const EPERM: i32 = -1;
+  /// Format: `/dev/mem`'s number, character 1:1, in the kernel's encoding.
+  const DEV_MEM: u32 = 0x0101;
   let mut store = store();
   let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
   let mut attachments = Attachments::new();
@@ -409,41 +415,37 @@ fn fuse_mknod_refuses_a_character_or_block_device() {
     .unwrap();
   let cx = attachments.context(id).unwrap();
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
-
-  assert_ne!(
-    fuse_errno(
-      &mut bridge,
-      &cx,
-      Opcode::MkNod,
-      1,
-      mknod(S_IFCHR | 0o644, 0, "chr")
-    ),
-    0,
-    "a character device node is refused (no host-device window)"
-  );
-  assert_ne!(
-    fuse_errno(
-      &mut bridge,
-      &cx,
-      Opcode::MkNod,
-      2,
-      mknod(S_IFBLK | 0o644, 0, "blk")
-    ),
-    0,
-    "a block device node is refused"
-  );
-  // Non-vacuity: a FIFO (no stream) is allowed (A-26).
-  assert_eq!(
-    fuse_errno(
-      &mut bridge,
-      &cx,
-      Opcode::MkNod,
-      3,
-      mknod(S_IFIFO | 0o644, 0, "fifo")
-    ),
-    0,
-    "a FIFO is allowed"
-  );
+  let mknod_numbered = |mode: u32, rdev: u32, name: &str| {
+    let mut body = mknod(mode, 0, name);
+    body[4..8].copy_from_slice(&rdev.to_le_bytes());
+    body
+  };
+  for (unique, mode, name) in [(1, S_IFCHR, "chr"), (2, S_IFBLK, "blk")] {
+    assert_eq!(
+      fuse_errno(
+        &mut bridge,
+        &cx,
+        Opcode::MkNod,
+        unique,
+        mknod_numbered(mode | 0o644, DEV_MEM, name)
+      ),
+      EPERM,
+      "{name}: a device node is refused to a process that is not root"
+    );
+  }
+  for (unique, mode, name) in [(3, S_IFCHR, "whiteout"), (4, S_IFIFO, "fifo")] {
+    assert_eq!(
+      fuse_errno(
+        &mut bridge,
+        &cx,
+        Opcode::MkNod,
+        unique,
+        mknod(mode | 0o644, 0, name)
+      ),
+      0,
+      "{name} is made"
+    );
+  }
 }
 
 /// A FUSE message framed with a custom `nodeid` (the `message` helper uses the root).

@@ -50,7 +50,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base digest ID PATH [--json]                     a clean base file's verified content digest
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
-  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
   image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
   image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
   grants [--json]
@@ -61,7 +61,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
-  shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
+  shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
   shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
@@ -570,6 +570,9 @@ pub(crate) struct ShardsRequest {
   pub read_only: bool,
   /// Where the command finds its end.
   pub handed: HandOff,
+  /// Where the command finds its stream's resync end (`--resync-fd M`, Unix; A-316), when it asked for one: the channel
+  /// a successor daemon hands it a fresh stream on (`slates_bridge_fuse::shards_resync`).
+  pub resync_at: Option<i32>,
   /// Announce the attachment as JSON.
   pub json: bool,
   /// The command and its arguments.
@@ -691,6 +694,7 @@ const VALUES: &[&str] = &[
   "--account",
   "--uid",
   "--fd",
+  "--resync-fd",
   "--tag",
   "--dax-window",
 ];
@@ -819,12 +823,18 @@ fn parse_shards(
   let handed = match kind {
     HandOffKind::Descriptor => {
       taken.only(&Spec {
-        values: &["--subtree", "--fd"],
+        values: &["--subtree", "--fd", "--resync-fd"],
         switches: &["--read-only"],
       })?;
       HandOff::Descriptor(handed_fd(taken)?)
     }
     HandOffKind::Handle => {
+      if taken.value("--resync-fd").is_some() {
+        return Err(ParseError::BadValue {
+          what: "--resync-fd",
+          reason: "Windows hands no resync end yet: Shards specifies its handle path".to_owned(),
+        });
+      }
       if taken.value("--fd").is_some() {
         return Err(ParseError::BadValue {
           what: "--fd",
@@ -855,15 +865,38 @@ fn parse_shards(
       "{handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})",
     ));
   }
+  let resync_at = resync_fd(taken, handed)?;
   Ok(Command::Shards(ShardsRequest {
     instance: taken.instance(),
     volume: volume(id)?,
     subtree: taken.value("--subtree").map(str::to_owned),
     read_only: taken.switch("--read-only"),
     handed,
+    resync_at,
     json: taken.json(),
     command,
   }))
+}
+
+/// The descriptor number `--resync-fd M` names, when given (A-316): past standard input, output and error, and not the
+/// stream's own number.
+fn resync_fd(taken: &Taken, handed: HandOff) -> Result<Option<i32>, ParseError> {
+  let Some(value) = taken.value("--resync-fd") else {
+    return Ok(None);
+  };
+  let fd = value.parse::<i32>().map_err(|e| ParseError::BadValue {
+    what: "--resync-fd",
+    reason: e.to_string(),
+  })?;
+  if fd < FIRST_HANDED_FD || handed == HandOff::Descriptor(fd) {
+    return Err(ParseError::BadValue {
+      what: "--resync-fd",
+      reason: format!(
+        "{fd} is standard input, output or error, or the stream's own number; the resync end needs a number of its own from {FIRST_HANDED_FD}"
+      ),
+    });
+  }
+  Ok(Some(fd))
 }
 
 /// The descriptor number `--fd N` names: required, and past standard input, output and error.
@@ -1003,16 +1036,27 @@ struct Spec {
   switches: &'static [&'static str],
 }
 
-/// The arguments with the flags taken out: the words in order, the flags by name.
+/// The arguments with the flags taken out: the words in order, the flags by name, each with every value it was given,
+/// in order.
 struct Taken {
   words: Vec<String>,
-  values: BTreeMap<&'static str, String>,
+  values: BTreeMap<&'static str, Vec<String>>,
   switches: BTreeMap<&'static str, bool>,
 }
 
 impl Taken {
+  /// The value of a flag that takes one: the last given.
   fn value(&self, flag: &str) -> Option<&str> {
-    self.values.get(flag).map(String::as_str)
+    self
+      .values
+      .get(flag)
+      .and_then(|given| given.last())
+      .map(String::as_str)
+  }
+
+  /// Every value of a flag that may be given again (a landing's `--include` and `--exclude`), in the order given.
+  fn every(&self, flag: &str) -> Vec<String> {
+    self.values.get(flag).cloned().unwrap_or_default()
   }
 
   fn switch(&self, flag: &str) -> bool {
@@ -1084,7 +1128,7 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
           .cloned()
           .ok_or_else(|| ParseError::MissingValue(full.clone()))?,
       };
-      taken.values.insert(key, value);
+      taken.values.entry(key).or_default().push(value);
     } else if let Some(key) = known(SWITCHES, &full) {
       if inline.is_some() {
         return Err(ParseError::BadValue {
@@ -1739,17 +1783,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           })
         })
         .transpose()?;
+      // Each prefix as often as given (§4.15 step 1): the wire's filter takes several, and a harness leaves out more
+      // than one (git's own directory and what git ignores).
       let filter = slates_client::Filter {
-        include: taken
-          .value("--include")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
-        exclude: taken
-          .value("--exclude")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
+        include: taken.every("--include"),
+        exclude: taken.every("--exclude"),
       };
       Ok(client(
         &taken,
@@ -2162,6 +2200,35 @@ mod tests {
       assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
     }
     assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
+  }
+
+  /// §4.15 step 1 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a landing's `--include` and `--exclude` each keep
+  /// every prefix given, in order, as the wire's filter takes them; before, each kept its last value alone, so
+  /// `--exclude /.git --exclude /target` landed `/target`. A flag that takes one value keeps the last.
+  #[test]
+  fn a_landing_keeps_every_include_and_exclude_given() {
+    let id = "ab".repeat(16);
+    let Ok(Command::Client(request)) = parse(&args(&format!(
+      "land {id} /dir --exclude /.git --include /src --exclude /target --include /docs --grant 1 --grant 7"
+    ))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, grant, .. } = request.verb else {
+      panic!("land parses as a landing");
+    };
+    assert_eq!(filter.exclude, ["/.git", "/target"]);
+    assert_eq!(filter.include, ["/src", "/docs"]);
+    assert_eq!(grant, Some(7), "a flag that takes one value keeps the last");
+    let Ok(Command::Client(plain)) = parse(&args(&format!("land {id} /dir"))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, .. } = plain.verb else {
+      panic!("land parses as a landing");
+    };
+    assert!(
+      filter.include.is_empty() && filter.exclude.is_empty(),
+      "no filter keeps everything"
+    );
   }
 
   /// §4.6 (AUD-29-75): `export` names one volume, optionally read-only and scoped to a subtree; anything else is
@@ -2786,6 +2853,55 @@ mod tests {
       (fewest.subtree, fewest.read_only, fewest.json),
       (None, false, false)
     );
+  }
+
+  /// A-316. Do: parse `shards` as Unix hands its end with a resync end at its own number, without one, at a number
+  /// below three, at the stream's own number, and not a number; and as Windows hands its end with one. Expect the
+  /// number taken, none when not asked, each wrong one refused as usage naming `--resync-fd`, and Windows refusing it.
+  #[test]
+  fn shards_takes_a_resync_end_at_a_number_of_its_own_on_unix_alone() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let unix = |line: &str| parse_on(&args(line), HandOffKind::Descriptor);
+    let Command::Shards(request) = unix(&format!(
+      "shards {id} --fd 5 --resync-fd 6 -- shards run --slates-fs-fd 5 --slates-resync-fd 6"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.handed, request.resync_at),
+      (HandOff::Descriptor(5), Some(6))
+    );
+    let Command::Shards(without) = unix(&format!("shards {id} --fd 5 -- reader")).unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(without.resync_at, None);
+    for line in [
+      format!("shards {id} --fd 5 --resync-fd 2 -- reader"),
+      format!("shards {id} --fd 5 --resync-fd 5 -- reader"),
+      format!("shards {id} --fd 5 --resync-fd six -- reader"),
+    ] {
+      assert!(
+        matches!(
+          unix(&line),
+          Err(ParseError::BadValue {
+            what: "--resync-fd",
+            ..
+          })
+        ),
+        "{line}"
+      );
+    }
+    assert!(matches!(
+      parse_on(
+        &args(&format!("shards {id} --resync-fd 6 -- reader {{handle}}")),
+        HandOffKind::Handle
+      ),
+      Err(ParseError::BadValue {
+        what: "--resync-fd",
+        ..
+      })
+    ));
   }
 
   /// A-179 (G-shards-windows step 2). Do: parse `shards` as Windows hands its end, with every flag and with the fewest.

@@ -39,7 +39,10 @@
 //! SIGSTOP freezes a whole process and drops nothing, so the flows that lose, delay, duplicate or reorder datagrams, or
 //! cut a running node off in one direction or both, put the fault relay of `support/relay.rs` between the daemons
 //! ([`Fleet::start_relayed`]): each node advertises a port block the relay owns and binds its own (the manifest's `bind`,
-//! A-277), with no privilege, where T-8.7 named iptables or pf, which R10 rules out. Every relayed flow prints its seed.
+//! A-277), with no privilege, where T-8.7 named iptables or pf, which R10 rules out. Every relayed flow prints its seed,
+//! and requires its relay to have carried a record-plane datagram per acknowledged write ([`judge_relayed`]): until
+//! A-330 a node announced its record plane at its bound port, every record link went around the relay after formation,
+//! and the relayed flows' faults reached only the probes.
 //!
 //! The nemesis ([`a_seeded_nemesis_of_single_faults_keeps_every_register_invariant`]) draws a schedule of single faults
 //! from its seed (every path lossy, a node slowed, one link severed, or a node stopped, cut off, deafened or muted, the
@@ -1986,6 +1989,39 @@ fn first_write_shown(successor: &str, first_head: Option<u64>, first: &[Outcome]
   }
 }
 
+/// The writes of `outcomes` that were acknowledged.
+fn acknowledged_writes(outcomes: &[Outcome]) -> usize {
+  outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_none())
+    .count()
+}
+
+/// A relayed flow's last word on its relay (goal g229, A-330): the relay's counts, and the check that the relay carried
+/// the record plane, the flow's non-vacuity. Each write a live volume acknowledged waited for a candidate's answer on
+/// the record plane, one write at a time (a stream sends its next write only once the last is answered, so no answer
+/// sent before a write can acknowledge it), so a relay every datagram between two nodes crosses sent on at least one
+/// record-plane datagram for each of the `acknowledged` writes. Fewer means record links reached their peers around
+/// the relay, and the faults the flow set there never touched the plane its writes are made durable on: before A-330 a
+/// node announced its bound record port and every redial dialed it, and the cut-off owner's 2,143 acknowledged writes
+/// met 1,377 datagrams of every plane toward it in the whole run.
+fn judge_relayed(verdict: &mut Verdict, relay: &Relay, acknowledged: usize) {
+  let report = relay.report();
+  verdict.note(report.summary());
+  let records = report.records_forwarded();
+  verdict.check(
+    "the relay carried the record plane (a record datagram an acknowledged write, at least)",
+    if records >= u64::try_from(acknowledged).unwrap() {
+      Vec::new()
+    } else {
+      vec![format!(
+        "{records} record-plane datagrams crossed the relay for {acknowledged} acknowledged writes: record links \
+         reached their peers around it"
+      )]
+    },
+  );
+}
+
 /// The register invariants a flow ends with, printed whole; panics naming every violation.
 struct Verdict {
   flow: &'static str,
@@ -2267,6 +2303,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_host")
             || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
+            || line.contains("lease")
         })
         .collect();
       format!(
@@ -2429,9 +2466,7 @@ fn wait_serving<'a>(
           .read(id, &format!("/{}", chaos_path(*last)), ReadAt::Head)
           .is_ok_and(|bytes| bytes == chaos_body(*last))
       });
-      if serves
-        && (counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0)
-      {
+      if serves && took_over(survivor, volume) {
         return Some((survivor, began.elapsed()));
       }
     }
@@ -2546,7 +2581,7 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
     &outcomes,
   );
   if let Some(relay) = &fleet.relay {
-    verdict.note(relay.report().summary());
+    judge_relayed(&mut verdict, relay, acknowledged_writes(&outcomes));
   }
   drop(fleet);
   verdict.judge();
@@ -2742,15 +2777,22 @@ fn writes_stream_through_random_candidate_stalls() {
 fn wait_taken_over<'a>(survivors: &[&'a str], volume: &str) -> Option<(&'a str, Duration)> {
   let began = Instant::now();
   while began.elapsed() < FLEET_WAIT {
-    // The successor counts its rebuild from the live log; it ships only from its next publication on.
-    if let Some(successor) = survivors.iter().find(|survivor| {
-      counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0
-    }) {
+    if let Some(successor) = survivors
+      .iter()
+      .find(|survivor| took_over(survivor, volume))
+    {
       return Some((successor, began.elapsed()));
     }
     pause();
   }
   None
+}
+
+/// Whether `survivor` took `volume` over: it counted its rebuild from the live log, or it ships the volume (it ships only
+/// from its next publication on). Serving the volume's files is no sign of it, since every survivor forwards a read to
+/// the successor (§4.8 "Lookup").
+fn took_over(survivor: &str, volume: &str) -> bool {
+  counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0
 }
 
 /// A-200, StaleNeverCommits, NoLoss, ReadSafety and Continuity with the owner's process stopped mid-stream (SIGSTOP, the
@@ -3428,8 +3470,9 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         "NoLoss (successor)",
         vec!["no survivor served the volume within the fleet wait".to_owned()],
       );
-      // A-272: unserved, no surviving holder may have let its copy go. A takeover that adopted nothing must leave every
-      // copy where it is (`fleet.takeover.lost` counted, `reclaimed` none), for the round that can still recover it.
+      // A-272, A-309: unserved, no surviving holder may have let its copy go. A takeover that adopted nothing must leave
+      // every copy where it is (`reclaimed` none), for the round still waiting to recover it: past tolerance the members
+      // that exist now adopt (`fleet.takeover.recovered_past_tolerance`), where before A-309 it was lost for good.
       verdict.check(
         "NoLoss (copies kept while unserved)",
         survivors
@@ -3881,22 +3924,32 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
   let last_look = live_states(&owner, &volume).unwrap_or_default();
   fleet.kill_node(owner_index);
   let began = Instant::now();
+  // The successor is the survivor that took the volume over and serves the three files: every survivor serves them once
+  // it forwards to the successor, so the first to serve them may be a forwarder, which ships nothing and so shows no head
+  // after a write through it (the integrator's run on bfc34cace judged a forwarder so).
   let served = loop {
     let whole = refs.iter().find(|survivor| {
-      Client::connect(survivor, deadlines()).is_ok_and(|mut reader| {
-        files.iter().all(|(name, bytes)| {
-          reader
-            .read(id, &format!("/{name}"), ReadAt::Head)
-            .is_ok_and(|read| read == *bytes)
+      took_over(survivor, &volume)
+        && Client::connect(survivor, deadlines()).is_ok_and(|mut reader| {
+          files.iter().all(|(name, bytes)| {
+            reader
+              .read(id, &format!("/{name}"), ReadAt::Head)
+              .is_ok_and(|read| read == *bytes)
+          })
         })
-      })
     });
     if whole.is_some() || began.elapsed() > FLEET_WAIT {
       break whole.map(|survivor| ((*survivor).to_owned(), began.elapsed()));
     }
     pause();
   };
-  verdict.note(format!("served whole after the owner's loss: {served:?}"));
+  verdict.note(format!(
+    "served whole after the owner's loss by the survivor that took it over: {served:?}; every survivor's live lines: {:?}",
+    refs
+      .iter()
+      .map(|survivor| (*survivor, live_states(survivor, &volume)))
+      .collect::<Vec<_>>()
+  ));
   verdict.check(
     "NoLoss (successor)",
     if served.is_some() {
@@ -4784,7 +4837,7 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
       )],
     ),
   }
-  verdict.note(fleet.relay().report().summary());
+  judge_relayed(&mut verdict, fleet.relay(), acknowledged_writes(&outcomes));
   drop(fleet);
   verdict.judge();
 }
@@ -4878,7 +4931,7 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
     &probes,
     &outcomes,
   );
-  verdict.note(fleet.relay().report().summary());
+  judge_relayed(&mut verdict, fleet.relay(), acknowledged_writes(&outcomes));
   drop(fleet);
   verdict.judge();
 }
@@ -5019,9 +5072,10 @@ fn an_owner_partitioned(tag: &str, flow: &'static str, partition: Partition) {
       );
     },
   );
+  let acknowledged = acknowledged_writes(&outcomes) + acknowledged_writes(&run.successor_outcomes);
   judge_partition(&mut verdict, &fleet, &volume, (&outcomes, &samples), run);
   if let Some(relay) = &fleet.relay {
-    verdict.note(relay.report().summary());
+    judge_relayed(&mut verdict, relay, acknowledged);
   }
   drop(fleet);
   verdict.judge();
@@ -5062,6 +5116,7 @@ fn partition_owner_mid_stream(
   }
   if partition.running() {
     let (probes, healed) = read_through(fleet, owner_index, (volume, &last), began, true);
+    note_missing(verdict, &fleet.instances[owner_index], volume, &probes);
     run.probes.extend(probes);
     // A heal the reads needed (the owner held them past their bound) ended the partition there.
     run.healed_at = healed.unwrap_or_else(|| {
@@ -5071,12 +5126,29 @@ fn partition_owner_mid_stream(
   } else {
     partition.end(fleet, owner_index);
     run.healed_at = began.elapsed();
-    run
-      .probes
-      .extend(read_through(fleet, owner_index, (volume, &last), began, false).0);
+    let (probes, _) = read_through(fleet, owner_index, (volume, &last), began, false);
+    note_missing(verdict, &fleet.instances[owner_index], volume, &probes);
+    run.probes.extend(probes);
   }
   sleep(AFTER_HEAL);
   run
+}
+
+/// When a read through `reader` answered missing, what `reader` held then: its volume list and its status's fleet,
+/// lease and live lines ([`diagnosis`]), so a ReadSafety failure names the state that answered it (goal g229: the old
+/// owner read the moment it resumed answered `NotFound` for its successor's acknowledged writes).
+fn note_missing(verdict: &mut Verdict, reader: &str, volume: &str, probes: &[ReadProbe]) {
+  if !probes
+    .iter()
+    .any(|probe| matches!(probe.answer, ReadAnswer::Missing))
+  {
+    return;
+  }
+  let (code, listed, _) = run(reader, &["volume", "list"]);
+  verdict.note(format!(
+    "{reader} answered a read missing; its volumes (exit {code}):\n{listed}\n{}",
+    diagnosis(&[reader.to_owned()], volume)
+  ));
 }
 
 /// Writes through the successor `taken_by` that took `volume` over: its first write ([`first_write_through`]), then a
@@ -5486,7 +5558,7 @@ fn wait_caught_up(fleet: &Fleet, owner: usize, volume: &str) {
     .map_or((0, 0), |state| (state.fence, state.durable.unwrap_or(0)));
   let mut window = FrozenWindow::new();
   loop {
-    let behind: Vec<(String, Option<(u64, Option<u64>)>)> = fleet
+    let behind: Vec<_> = fleet
       .others(owner)
       .into_iter()
       .map(|index| {
@@ -5720,7 +5792,7 @@ fn a_seeded_nemesis_of_single_faults_keeps_every_register_invariant() {
     (&outcomes, &samples),
     strikes,
   );
-  verdict.note(fleet.relay().report().summary());
+  judge_relayed(&mut verdict, fleet.relay(), acknowledged_writes(&outcomes));
   drop(fleet);
   verdict.judge();
 }

@@ -74,6 +74,9 @@ enum Hold {
   Spinning,
   /// Not held at all: the role lowers its own priority as far as it goes, and the parent starves it with spinners.
   Starved,
+  /// Not held: the role holds this process's standard error for [`STALL_FOR`] while each shard writes a log line
+  /// ([`stall_the_log`]).
+  LogStalled,
 }
 
 impl Hold {
@@ -82,6 +85,7 @@ impl Hold {
       Hold::Wedged => "wedged",
       Hold::Spinning => "spinning",
       Hold::Starved => "starved",
+      Hold::LogStalled => "log-stalled",
     }
   }
 
@@ -90,6 +94,7 @@ impl Hold {
       "wedged" => Hold::Wedged,
       "spinning" => Hold::Spinning,
       "starved" => Hold::Starved,
+      "log-stalled" => Hold::LogStalled,
       other => panic!("no hold named {other:?}"),
     }
   }
@@ -174,7 +179,7 @@ fn hold_for_good(daemon: &Daemon, index: usize, hold: Hold) {
         Hold::Spinning => loop {
           std::hint::spin_loop();
         },
-        Hold::Starved => {}
+        Hold::Starved | Hold::LogStalled => {}
       }
     })
     .unwrap();
@@ -219,7 +224,10 @@ fn a_lone_daemon_role() {
     lower_this_process();
   }
   println!("{READY_TAG}");
-  if hold == Hold::Starved {
+  if hold == Hold::LogStalled {
+    stall_the_log(&daemon);
+  }
+  if matches!(hold, Hold::Starved | Hold::LogStalled) {
     loop {
       std::thread::park();
     }
@@ -231,6 +239,42 @@ fn a_lone_daemon_role() {
   loop {
     std::thread::park();
   }
+}
+
+/// Format: the tag of the line each shard writes while the log is stalled, and of the role's line once it is let go.
+const STALL_PROBE_TAG: &str = "LONE-DAEMON-LOG-PROBE";
+const STALL_OVER_TAG: &str = "LONE-DAEMON-LOG-OVER";
+/// Shape: how long [`stall_the_log`] holds standard error: three windows, past the one a held shard is judged wedged in.
+const STALL_FOR: Duration = Duration::from_nanos(3 * LIVENESS_BUDGET_NS);
+
+/// Holds this process's standard error for [`STALL_FOR`], as a thread starved while it writes a line holds it, or a log
+/// whose reader has fallen behind holds every writer, while each of `daemon`'s shards writes a log line in a poll; then
+/// lets it go and says so on standard output, which nothing holds.
+fn stall_the_log(daemon: &Daemon) {
+  let (taken, locked) = channel();
+  let holder = std::thread::spawn(move || {
+    let held = std::io::stderr().lock();
+    taken.send(()).unwrap();
+    pause(STALL_FOR);
+    drop(held);
+  });
+  locked.recv().unwrap();
+  for (index, shard) in daemon.shards().iter().enumerate() {
+    let observation = daemon
+      .observation(
+        Some(*shard),
+        OBSERVE_BUDGET_NS,
+        move |_: &mut ShardState| {
+          slates_machine::log_line!("{STALL_PROBE_TAG} shard={index}");
+        },
+      )
+      .unwrap();
+    std::thread::spawn(move || {
+      let _ = observation.wait();
+    });
+  }
+  holder.join().unwrap();
+  println!("{STALL_OVER_TAG}");
 }
 
 /// Shape: the nice value the starved role takes, the lowest priority a process may give itself.
@@ -367,8 +411,19 @@ struct Ended {
   gone_at_ns: Option<u64>,
 }
 
+/// The longest a call outstanding at its daemon's exit may take to end after it, by the client's own rule: its next reply
+/// deadline after the exit, past the reconnect budget, and one of the reconnect's paced attempts (`reconnect / 10`, the
+/// driver's pacing).
+fn call_after_exit() -> Duration {
+  let deadlines = deadlines();
+  Duration::from_nanos(deadlines.reply_ns + deadlines.reconnect_ns + deadlines.reconnect_ns / 10)
+}
+
 /// Drives `driver` as an SDK's loop does until the call `ticket` ends or `give_up` passes from `held_at`, watching
-/// `daemon`'s process.
+/// `daemon`'s process. Once the process has exited, the loop runs on until the call's own bound after the exit
+/// ([`call_after_exit`]) and a beat, past `give_up` if need be: a busy machine stretches the verdict's window of a spinning
+/// shard's CPU over many windows of wall time (8.49 s at loads 62 to 131 on a 15-CPU Mac, 2026-11-17), and a loop that
+/// ended at `give_up` read a call still within its bound as never ended.
 fn drive(
   client: &mut Client,
   driver: &mut Driver,
@@ -383,7 +438,12 @@ fn drive(
     gone_at_ns: None,
   };
   let mut next_tick = Instant::now();
-  while ended.call.is_none() && held_at.elapsed() < give_up {
+  let until = |ended: &Ended| {
+    ended.exit.map_or(give_up, |(_, exited_after)| {
+      give_up.max(exited_after + call_after_exit() + BEAT)
+    })
+  };
+  while ended.call.is_none() && held_at.elapsed() < until(&ended) {
     let mut events = driver.pump(client);
     if Instant::now() >= next_tick {
       events.extend(driver.tick(client));
@@ -451,6 +511,19 @@ fn micros_after(line: &str, words: &str) -> Duration {
   Duration::from_micros(micros)
 }
 
+/// Shape: the lines of a failed child's standard error a failure message carries, its last ones: the watchdog's
+/// verdict, its end line and the role's own tags fit in far fewer, and the daemon's boot profile is about seventy lines
+/// before them.
+const SAID_LINES: usize = 40;
+
+/// The last [`SAID_LINES`] lines `stderr` has delivered so far, one a line, so a failure shows what the daemon itself
+/// said (a verdict never reached, or an end that never finished) rather than only that it did not exit.
+fn said_so_far(stderr: &Receiver<(u64, String)>) -> String {
+  let said: Vec<String> = stderr.try_iter().map(|(_, line)| line).collect();
+  let from = said.len().saturating_sub(SAID_LINES);
+  said.get(from..).unwrap_or_default().join("\n")
+}
+
 /// What the watchdog's end line names, from everything the child said on standard error: the verdict's lateness, the
 /// looks' lateness, when the parent read the line (the host's monotonic clock), and the line.
 fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64, String)> {
@@ -466,6 +539,22 @@ fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64
     }
   }
   found
+}
+
+/// Format: the words of the watchdog's start line right after the spin window's milliseconds (A-318).
+const SPIN_WINDOW_WORDS: &str = " ms of CPU without a step (the window is the liveness budget";
+
+/// The CPU a poll may run without a step before the child's watchdog calls its shard spinning: the budget held to the
+/// child's build (A-318), read from the watchdog's start line, which comes before the role says it is ready.
+fn spin_window_of(stderr: &Receiver<(u64, String)>) -> Duration {
+  let line = await_tag(stderr, SPIN_WINDOW_WORDS, START_WAIT);
+  let ms: u64 = line
+    .split(SPIN_WINDOW_WORDS)
+    .next()
+    .and_then(|before| before.rsplit(' ').next())
+    .and_then(|number| number.parse().ok())
+    .unwrap_or_else(|| panic!("the watchdog's start line names its spin window: {line}"));
+  Duration::from_millis(ms)
 }
 
 /// The milliseconds of CPU a spinning verdict names in the end line.
@@ -487,14 +576,18 @@ fn spun_for(line: &str) -> Duration {
 /// verdict's time from above, and the test asserts that bound: the end line read by `t0 + W + B + L`. Then `end`, the
 /// time from that line to the client's liveness answering gone, is measured, and the client's gone time is reported
 /// against `t0 + W + B + L + end` and against the plan's `t0 + W + B + L` without it. A spin is judged in the shard's
-/// own CPU time, which a busy machine hands out slower than the wall runs, so its verdict must name at least a window
-/// of CPU and at most a window and one look's (`B + L`). The call then ends at its next deadline after the exit, past
+/// own CPU time, which a busy machine hands out slower than the wall runs, so its verdict must name at least the spin
+/// window of CPU (the budget held to this build, A-318) and at most that and one look's (`B + L`). The call then ends at its next deadline after the exit, past
 /// the reconnect budget: within `exit + reply + reconnect` and one of the reconnect's paced attempts (`reconnect / 10`,
 /// the driver's pacing).
 fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let instance = format!("lone-{name}-{}", std::process::id());
   let mut daemon = start_lone_daemon(&instance, hold);
   await_tag(&daemon.stdout, READY_TAG, START_WAIT);
+  let spin_window = spin_window_of(&daemon.stderr);
+  // A spin's verdict needs the spin window of the shard's CPU, longer than the budget in a build slower than machine
+  // code (A-318), so the test's bound is past it by its own ten windows.
+  let give_up = GIVE_UP + spin_window;
   let mut client = connect(&instance);
   let stdin = daemon.stdin.as_mut().unwrap();
   writeln!(stdin, "{}", client.client_id()).unwrap();
@@ -513,13 +606,14 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     &mut driver,
     ticket,
     &mut daemon,
-    (held_at, GIVE_UP),
+    (held_at, give_up),
   );
   let (status, exited_after) = ended.exit.unwrap_or_else(|| {
     panic!(
-      "{name}: the lone daemon was still running {GIVE_UP:?} after its shard was held; the call: {:?} (None: still \
-       pending)",
-      ended.call
+      "{name}: the lone daemon was still running {give_up:?} after its shard was held; the call: {:?} (None: still \
+       pending); the daemon said on standard error, last {SAID_LINES} lines:\n{}",
+      ended.call,
+      said_so_far(&daemon.stderr)
     )
   });
   let (late, looks_late, line_read_ns, line) = end_line(&daemon.stderr).unwrap_or_else(|| {
@@ -532,11 +626,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let line_after = Duration::from_nanos(line_read_ns.saturating_sub(t0_ns));
   let gone_after = Duration::from_nanos(gone_ns.saturating_sub(t0_ns));
   let end = Duration::from_nanos(gone_ns.saturating_sub(line_read_ns));
-  let deadlines = deadlines();
-  let call_bound = exited_after
-    + Duration::from_nanos(
-      deadlines.reply_ns + deadlines.reconnect_ns + deadlines.reconnect_ns / 10,
-    );
+  let call_bound = exited_after + call_after_exit();
   let signed_ns = |after: Duration, bound: Duration| -> i128 {
     i128::try_from(after.as_nanos()).unwrap() - i128::try_from(bound.as_nanos()).unwrap()
   };
@@ -561,16 +651,19 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
       line_after <= rule,
       "{name}: the watchdog's verdict was read {line_after:?} after the wedge, past the rule's W + B + L = {rule:?}"
     ),
-    Hold::Starved => {
-      panic!("{name}: a starved daemon is not a stuck one; this case is not run here")
+    Hold::Starved | Hold::LogStalled => {
+      panic!(
+        "{name}: a starved daemon, or one whose log stalls, is not a stuck one; this case is not run here"
+      )
     }
     Hold::Spinning => {
       let look = BEAT + looks_late;
       let spun = spun_for(&line);
       assert!(
-        spun >= WINDOW && spun <= WINDOW + look,
-        "{name}: the verdict named {spun:?} of CPU, outside a window to a window and a look ({:?})",
-        WINDOW + look
+        spun >= spin_window && spun <= spin_window + look,
+        "{name}: the verdict named {spun:?} of CPU, outside the spin window ({spin_window:?}, the budget held to this \
+         build) to the spin window and a look ({:?})",
+        spin_window + look
       );
     }
   }
@@ -596,9 +689,10 @@ fn a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone() 
   a_lone_daemons_stuck_shard_ends_it("wedged", Hold::Wedged);
 }
 
-/// A-232, §4.14. Do: as the wedged case, with the shard on the CPU for good in one poll (a task that never yields).
-/// Expect: the process exits with the failed exit code on a spinning verdict that names a window of CPU to a window and
-/// one look's, and the call ends `DaemonGone`.
+/// A-232, A-318, §4.14. Do: as the wedged case, with the shard on the CPU for good in one poll (a task that never
+/// yields). Expect: the process exits with the failed exit code on a spinning verdict that names the spin window of CPU
+/// (the budget held to this build, from the watchdog's start line) to the spin window and one look's, and the call ends
+/// `DaemonGone`.
 #[test]
 fn a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone() {
   a_lone_daemons_stuck_shard_ends_it("spinning", Hold::Spinning);
@@ -763,5 +857,92 @@ fn a_lone_daemon_starved_beside_spinners_is_never_ended() {
     calls.longest > reply || said_starved > 0,
     "the run starved nothing (longest call {:?}, no starved verdict), so it proves nothing",
     calls.longest
+  );
+}
+
+/// Waits for a line of `daemon`'s standard output carrying `tag`, within `within`: the line, or, once the child has ended
+/// first, its exit and what it said on standard error.
+fn tag_or_end(daemon: &mut LoneDaemon, tag: &str, within: Duration) -> Result<String, String> {
+  let started = Instant::now();
+  loop {
+    match daemon.stdout.recv_timeout(BEAT) {
+      Ok((_, line)) if line.contains(tag) => return Ok(line),
+      Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        let status = daemon.child.wait();
+        let said: Vec<String> = daemon.stderr.try_iter().map(|(_, line)| line).collect();
+        return Err(format!(
+          "the child ended ({status:?}) before {tag}; it said: {said:?}"
+        ));
+      }
+    }
+    if started.elapsed() >= within {
+      return Err(format!("no {tag} line within {within:?}"));
+    }
+  }
+}
+
+/// Every line `stderr` carries until a beat passes with none, or [`GIVE_UP`] passes.
+fn said_until_quiet(stderr: &Receiver<(u64, String)>) -> Vec<String> {
+  let started = Instant::now();
+  let mut said = Vec::new();
+  while started.elapsed() < GIVE_UP {
+    match stderr.recv_timeout(BEAT) {
+      Ok((_, line)) => said.push(line),
+      Err(_) => break,
+    }
+  }
+  said
+}
+
+/// A-305, A-232, §4.14. Do: in a lone daemon (a child process, `SegmentSource::Create`), hold standard error's lock for
+/// three windows while each shard writes a log line in a poll, as a thread starved while it writes a line holds it, or a
+/// log whose reader has fallen behind holds every writer; then call the daemon. Expect: no exit and no end line through
+/// the stall and after it, the call answered, and each shard's line on standard error once the lock is let go
+/// (non-vacuous: each shard did log inside the stall). Before, each shard waited on the lock inside its poll, stood still
+/// a window and was judged wedged, and the watchdog ended the process with exit 4: the shape of the exits at a daemon's
+/// start under load (`merge_post_state` and six other binaries, 2026-11-17).
+#[test]
+fn a_lone_daemon_whose_log_stalls_lives_on_and_serves() {
+  let instance = format!("lone-log-{}", std::process::id());
+  let mut daemon = start_lone_daemon(&instance, Hold::LogStalled);
+  await_tag(&daemon.stdout, READY_TAG, START_WAIT);
+  let over = tag_or_end(&mut daemon, STALL_OVER_TAG, START_WAIT + STALL_FOR);
+  assert!(
+    over.is_ok(),
+    "the lone daemon lived through its log's stall: {over:?}"
+  );
+  let mut client = connect(&instance);
+  let mut driver = Driver::new(&client);
+  let ticket = driver
+    .submit(
+      &mut client,
+      Box::new(|client: &mut Client| client.list_begin()),
+    )
+    .unwrap();
+  let ended = drive(
+    &mut client,
+    &mut driver,
+    ticket,
+    &mut daemon,
+    (Instant::now(), GIVE_UP),
+  );
+  let said = said_until_quiet(&daemon.stderr);
+  assert!(
+    matches!(ended.call, Some(Ok(()))) && ended.exit.is_none(),
+    "the daemon answered a call after the stall and is still running: call {:?}, exit {:?}",
+    ended.call,
+    ended.exit
+  );
+  for index in 0..usize::from(TEST_SHARDS) {
+    let probe = format!("{STALL_PROBE_TAG} shard={index}");
+    assert!(
+      said.iter().any(|line| line.contains(&probe)),
+      "shard {index}'s line reached standard error once the stall ended: {said:?}"
+    );
+  }
+  assert!(
+    !said.iter().any(|line| line.contains(END_WORDS)),
+    "no end line: {said:?}"
   );
 }

@@ -96,7 +96,8 @@ const NO_PRESSURE_OR_FAILURE_SUITE: &str = concat!(
 /// The reason the virtio-fs workloads cell is not run by this harness: it ran in a live guest elsewhere.
 const VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST: &str = concat!(
   "the roster runs in a live Linux guest through QEMU's vhost-user-fs-pci, each workload compared between ",
-  "slates and the guest's RAM — all nine identical on 2026-10-01 (crates/server/tests/virtiofs.rs ",
+  "slates and the guest's RAM — all twelve identical, git's history, Mercurial and Subversion among them, in CI ",
+  "run 44260193629 (2026-11-18, the guest's run 247 s; crates/server/tests/virtiofs.rs ",
   "a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram, gated on QEMU and a guest ",
   "kernel); this harness has no VMM leg (a vhost-user device is attached in-process), so the cell is not run here"
 );
@@ -139,10 +140,12 @@ const OCI_OWED: &str = "the container form exists — `attach` returns a verifie
 pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
-  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane \
-    mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), \
-    and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with \
-    `user_allow_other`)",
+  not_covered: concat!(
+    "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane ",
+    "mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), ",
+    "and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with ",
+    "`user_allow_other`)",
+  ),
 };
 
 /// Tools every mounted macOS suite needs.
@@ -374,13 +377,7 @@ mod tests {
       Suite::Workloads,
       Suite::Hermeticity,
     ] {
-      match availability(Transport::NativeMacosNfs, suite) {
-        Availability::Runnable { on, adapter, .. } => {
-          assert_eq!(on, HostOs::Macos);
-          assert!(adapter.is_none());
-        }
-        other => panic!("{suite:?} on macOS: {other:?}"),
-      }
+      expect_runnable_on_macos_with_no_adapter(suite);
       match (suite, availability(Transport::NativeLinuxFuse, suite)) {
         (
           Suite::Workloads,
@@ -401,6 +398,17 @@ mod tests {
         }
         (_, other) => panic!("{suite:?} on Linux: {other:?}"),
       }
+    }
+  }
+
+  /// The macOS half of `native_lanes_run_on_their_own_os`: expect `suite` runnable on macOS with no adapter.
+  fn expect_runnable_on_macos_with_no_adapter(suite: Suite) {
+    match availability(Transport::NativeMacosNfs, suite) {
+      Availability::Runnable { on, adapter, .. } => {
+        assert_eq!(on, HostOs::Macos);
+        assert!(adapter.is_none());
+      }
+      other => panic!("{suite:?} on macOS: {other:?}"),
     }
   }
 

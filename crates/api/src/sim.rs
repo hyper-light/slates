@@ -280,7 +280,7 @@ fn stream_pair() -> Result<(StreamEnd, StreamEnd), Error> {
 fn stream_pair() -> Result<(StreamEnd, StreamEnd), Error> {
   /// Format: no buffering: nothing reads the simulator's end.
   const UNBUFFERED: usize = 0;
-  slates_ipc::stream_pipe::pair(UNBUFFERED).map_err(|e| Error::of_ipc(SIMULATOR, e, NO_PAUSE_NS))
+  slates_ipc::stream::pair(UNBUFFERED).map_err(|e| Error::of_ipc(SIMULATOR, e, NO_PAUSE_NS))
 }
 
 /// What a simulated stream reports of itself, as the daemon reports a Shards stream (its `transports::shards_fs`), but
@@ -428,6 +428,9 @@ impl Volumes for SimVolumes {
         token: None,
       },
       stream: handed,
+      // The simulator holds no channel a successor could resync the stream over: a consumer handles none, as it does on
+      // the platforms whose daemon hands none (A-316).
+      resync: None,
     })
   }
 

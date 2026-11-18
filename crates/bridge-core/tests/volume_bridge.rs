@@ -8,7 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_core::{
-  Attachments, Bridge, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View, VolumeBridge,
+  Attachments, Bridge, GroupRule, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
+  VolumeBridge,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -441,6 +442,8 @@ fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
   // group onto the context (as the daemon's NFS path does per request).
   let mut cx = rw_cx_as(501);
   cx.owner_gid = Some(20);
+  // System V's rule, Linux's and Linux nfsd's (A-328); BSD's gives the parent's group, tested below.
+  cx.group_rule = GroupRule::SystemV;
   let root = bridge.root(&cx).unwrap();
 
   // The parent directory (the volume root) has group 0, but the credential names 20: the created file
@@ -458,15 +461,107 @@ fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
   assert_eq!((link.uid, link.gid), (501, 20));
 }
 
+/// Format: a group a parent directory is given that is not the creator's.
+const PARENT_GID: u32 = 7;
+/// Format: the group the creator's credential names.
+const CREATOR_GID: u32 = 20;
+/// Format: the set-group-ID bit of a mode (`S_ISGID`).
+const S_ISGID: u32 = 0o2000;
+
+/// Makes directory `name` in the root as root, then gives it to `501:PARENT_GID` with `mode`; its inode.
+fn parent_directory(bridge: &mut VolumeBridge<'_>, name: &str, mode: u32) -> u64 {
+  let root_cx = rw_cx_as(0);
+  let root = oid(bridge.root(&root_cx).unwrap());
+  let made = bridge.mkdir(root, &root_cx, name, 0o755).unwrap();
+  bridge
+    .setattr(
+      oid(made.ino),
+      &root_cx,
+      SetAttr {
+        uid: Some(501),
+        gid: Some(PARENT_GID),
+        mode: Some(mode),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+  made.ino
+}
+
+/// A-328 / §4.6, BSD's rule (a macOS host's NFS export: APFS gives a directory made in a `2755` parent `755`, and
+/// every new object its parent's group). Do: as uid 501 whose credential names group 20, under BSD's rule, make a
+/// directory and a file in a set-group-ID directory of group 7 and in a plain one of group 7. Expect: each takes group
+/// 7, and the directory made in the set-group-ID one does not take the bit. Before A-328 the stamp applied System V's
+/// rule on every route: the directory read `2755` and the plain parent's objects took group 20.
+#[test]
+fn bsds_rule_gives_each_new_object_its_parents_group_and_no_directory_the_bit() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let set_group_id = parent_directory(&mut bridge, "sgid", 0o2755);
+  let plain = parent_directory(&mut bridge, "plain", 0o755);
+  let mut cx = rw_cx_as(501);
+  cx.owner_gid = Some(CREATOR_GID);
+  cx.group_rule = GroupRule::Bsd;
+  for parent in [set_group_id, plain] {
+    let dir = bridge.mkdir(oid(parent), &cx, "d", 0o755).unwrap();
+    let (file, handle) = bridge.create(oid(parent), &cx, "f", 0o644, 0).unwrap();
+    bridge.release(oid(file.ino), &cx, handle).unwrap();
+    for (node, kind) in [(dir.ino, "directory"), (file.ino, "file")] {
+      let attr = bridge.getattr(oid(node), &cx).unwrap();
+      assert_eq!(
+        (attr.uid, attr.gid, attr.mode & S_ISGID),
+        (501, PARENT_GID, 0),
+        "a {kind} made in parent {parent} takes the parent's group and no set-group-ID bit under BSD's rule"
+      );
+    }
+  }
+}
+
+/// A-328 / AUD-29-81, System V's rule (FUSE, virtio-fs, and a Linux host's NFS export). Do: the same makes as above
+/// under System V's rule. Expect: in the set-group-ID directory each object takes group 7 and the directory the bit;
+/// in the plain one each takes the creator's group, 20, and no bit.
+#[test]
+fn system_vs_rule_gives_a_set_group_id_parents_group_and_bit_and_else_the_creators_group() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let set_group_id = parent_directory(&mut bridge, "sgid", 0o2755);
+  let plain = parent_directory(&mut bridge, "plain", 0o755);
+  let mut cx = rw_cx_as(501);
+  cx.owner_gid = Some(CREATOR_GID);
+  cx.group_rule = GroupRule::SystemV;
+  for (parent, gid, directory_bit) in [(set_group_id, PARENT_GID, S_ISGID), (plain, CREATOR_GID, 0)]
+  {
+    let dir = bridge.mkdir(oid(parent), &cx, "d", 0o755).unwrap();
+    let (file, handle) = bridge.create(oid(parent), &cx, "f", 0o644, 0).unwrap();
+    bridge.release(oid(file.ino), &cx, handle).unwrap();
+    let dir_attr = bridge.getattr(oid(dir.ino), &cx).unwrap();
+    let file_attr = bridge.getattr(oid(file.ino), &cx).unwrap();
+    assert_eq!(
+      (dir_attr.gid, dir_attr.mode & S_ISGID),
+      (gid, directory_bit),
+      "the directory made in parent {parent}"
+    );
+    assert_eq!(
+      (file_attr.gid, file_attr.mode & S_ISGID),
+      (gid, 0),
+      "the file made in parent {parent}"
+    );
+  }
+}
+
 /// AC-3.10 / §4.6: one admitted mount can serve multiple Unix callers. All creation kinds
 /// take each request's owner and group while the attachment's enrolled principal stays fixed.
 #[test]
 fn every_created_kind_takes_the_current_requests_unix_owner() {
-  use slates_vfs::inode::Kind;
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let mut cx = rw_cx_as(0);
+  // Each request's group is the creator's under System V's rule (A-328), the one a Linux kernel's request carries.
+  cx.group_rule = GroupRule::SystemV;
   let root = oid(bridge.root(&cx).unwrap());
   for uid in [1001, 1002] {
     cx.owner_uid = Some(uid);
@@ -476,16 +571,92 @@ fn every_created_kind_takes_the_current_requests_unix_owner() {
     let (file, handle) = bridge.create(parent, &cx, "file", 0o600, 0).unwrap();
     let link = bridge.symlink(parent, &cx, "link", "file").unwrap();
     let fifo = bridge
-      .mknod(parent, &cx, "fifo", 0o600, Kind::Fifo)
+      .mknod(parent, &cx, "fifo", 0o600, SpecialNode::Fifo)
       .unwrap();
     let socket = bridge
-      .mknod(parent, &cx, "socket", 0o600, Kind::Socket)
+      .mknod(parent, &cx, "socket", 0o600, SpecialNode::Socket)
       .unwrap();
-    for node in [dir, file, link, fifo, socket] {
+    // A whiteout is the one device node any caller may make (A-294).
+    let whiteout = bridge
+      .mknod(
+        parent,
+        &cx,
+        "whiteout",
+        0o600,
+        SpecialNode::CharDevice(DeviceNumber::new(0, 0)),
+      )
+      .unwrap();
+    for node in [dir, file, link, fifo, socket, whiteout] {
       let attr = bridge.getattr(oid(node.ino), &cx).unwrap();
       assert_eq!((attr.uid, attr.gid), (uid, uid), "{:?}", node.kind);
     }
     bridge.release(oid(file.ino), &cx, handle).unwrap();
+  }
+}
+
+/// A-294 / §4.6: a device node is made for a caller acting as root alone, as Linux's `vfs_mknod` asks `CAP_MKNOD` and
+/// `nfsd` drops it from every other uid; a whiteout (a character device 0/0) for any caller who may write the
+/// directory. Do: as uid 1001 make a block device, a character device and a whiteout; then as root make the two
+/// devices. Expect the first two refused `NotPermitted` with no name made, the whiteout made, and root's devices made,
+/// each attribute reply and a later lookup and listing reporting its kind and its number.
+#[test]
+fn a_device_node_is_made_for_root_alone_and_reports_its_number() {
+  use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let user = rw_cx_as(1001);
+  let root_cx = rw_cx_as(0);
+  let root = oid(bridge.root(&root_cx).unwrap());
+  let disk = SpecialNode::BlockDevice(DeviceNumber::new(8, 1));
+  let null = SpecialNode::CharDevice(DeviceNumber::new(1, 3));
+  for (name, node) in [("disk", disk), ("null", null)] {
+    assert_eq!(
+      bridge.mknod(root, &user, name, 0o600, node),
+      Err(VfsError::NotPermitted)
+    );
+    assert_eq!(
+      bridge.lookup(root, &user, name).map(|_| ()),
+      Err(VfsError::NotFound),
+      "a refused device node leaves no name"
+    );
+  }
+  let whiteout = bridge
+    .mknod(
+      root,
+      &user,
+      "whiteout",
+      0o600,
+      SpecialNode::CharDevice(DeviceNumber::new(0, 0)),
+    )
+    .unwrap();
+  assert_eq!(
+    (whiteout.kind, whiteout.device),
+    (Kind::CharDevice, Some(DeviceNumber::new(0, 0)))
+  );
+  for (name, node) in [("disk", disk), ("null", null)] {
+    let made = bridge.mknod(root, &root_cx, name, 0o640, node).unwrap();
+    assert_eq!((made.kind, made.device), (node.kind(), node.device()));
+    let looked = bridge.lookup(root, &root_cx, name).unwrap();
+    assert_eq!((looked.kind, looked.device), (node.kind(), node.device()));
+  }
+  let handle = bridge.opendir(root, &root_cx).unwrap();
+  let listed: Vec<(String, Kind)> = bridge
+    .readdir(root, &root_cx, handle, 0, usize::MAX)
+    .unwrap()
+    .into_iter()
+    .filter(|entry| !entry.name.starts_with('.'))
+    .map(|entry| (entry.name, entry.kind))
+    .collect();
+  for (name, kind) in [
+    ("disk", Kind::BlockDevice),
+    ("null", Kind::CharDevice),
+    ("whiteout", Kind::CharDevice),
+  ] {
+    assert!(
+      listed.contains(&(name.to_owned(), kind)),
+      "{name} listed as {kind:?}: {listed:?}"
+    );
   }
 }
 

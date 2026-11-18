@@ -1277,9 +1277,11 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.land.materialize",
-      "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows \
-       (A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and \
-       writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      concat!(
+        "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows ",
+        "(A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and ",
+        "writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      ),
       json!({
         "volume": string,
         "target": string,
@@ -1518,6 +1520,16 @@ pub fn status_json(r: &StatusReport) -> Value {
       .collect::<Vec<_>>(),
     "mounts_elided": r.mounts_elided,
     "takeover_kept": r.takeover_kept,
+    "loss": {
+      "at_risk_ns": r.loss.at_risk_ns,
+      "placed_sequence": r.loss.placed_sequence,
+      "live_shipped": r.loss.live_shipped,
+      "taken_over": r.loss.taken_over.as_ref().map(|taken| json!({
+        "epoch": taken.epoch,
+        "head_sequence": taken.head_sequence,
+        "from_live_log": taken.from_live_log,
+      })),
+    },
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,
@@ -2060,6 +2072,8 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
   // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
   if let Some(fields) = report.as_object_mut() {
     fields.insert("dumps_local_full".to_owned(), json!(r.dumps_local_full));
+    // Whether the anchor has judged the daemon recovered (A-311): what a caller that ends a daemon on purpose waits for.
+    fields.insert("recovered".to_owned(), json!(r.recovered));
   }
   report
 }

@@ -29,7 +29,9 @@ pub mod changed;
 pub mod dax_backing;
 pub mod delivery;
 pub mod durable_bound;
+pub mod group_rule;
 pub mod links;
+pub mod posix_acl;
 pub mod scoped;
 pub mod volume_bridge;
 
@@ -37,10 +39,11 @@ pub use authority::{
   AttachmentId, Attachments, Barrier, CacheCoherence, ObjectId, OpContext, Rights, View,
 };
 pub use changed::{DataChange, TO_THE_END};
+pub use group_rule::GroupRule;
 pub use volume_bridge::{LostWrites, VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 
 /// The neutral POSIX attributes of a filesystem object, independent of any transport's wire form.
 /// Times are nanoseconds since the Unix epoch (the volume core's native form); each transport
@@ -80,6 +83,9 @@ pub struct NodeAttr {
   /// The change counter: it moves on every change to the object and never repeats, whatever the
   /// wall clock does (A-38). A transport with a change attribute (NFSv4 `change`) serves it.
   pub change: u64,
+  /// A device node's number (A-294), which each transport reports in its own encoding (FUSE's `rdev`, NFSv3's
+  /// `rdev`, NFSv4's `rawdev`); `None` for every other kind.
+  pub device: Option<DeviceNumber>,
 }
 
 /// One entry of a directory listing: the child's inode number, its kind, its name, and the cookie that
@@ -576,14 +582,17 @@ pub trait Bridge {
     mode: u32,
     flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError>;
-  /// Creates a FIFO/socket name, with no open reference or kernel endpoint (A-26).
+  /// Creates a name with no content under `cx`, with no open reference or kernel endpoint: a FIFO or socket name
+  /// (A-26), or a device node whose number is metadata that nothing slates serves opens (A-294). A device node other
+  /// than a whiteout (a character device 0/0) is made only for a caller acting as root, as a local file system makes
+  /// one only for a caller holding `CAP_MKNOD`; any other caller is refused `NotPermitted` (`EPERM`).
   fn mknod(
     &mut self,
     parent: ObjectId,
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError>;
   /// Release handle `fh` of `object`, under `cx`.
   fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
@@ -849,12 +858,7 @@ mod tests {
       (20, 501),
       "uid and gid swap apart"
     );
-    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
-      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
-      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
-      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
-      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
-    }
+    expect_each_id_back_the_way_it_came(view);
     let same = OwnerView::swapping((1000, 1000), (1000, 1000));
     assert_eq!(
       (same.shown_uid(1000), same.kept_gid(1000)),
@@ -878,27 +882,19 @@ mod tests {
       assert!(host.reaches(name) && guest.reaches(name), "{name:?}");
       assert!(!guest_only(name), "{name:?}");
     }
-    for name in [
+    expect_a_guests_own(&[
       &b"trusted.overlay.opaque"[..],
       b"security.capability",
       b"security.selinux",
-    ] {
-      assert!(!host.reaches(name), "{name:?}");
-      assert!(guest.reaches(name), "{name:?}");
-      assert!(guest_only(name), "{name:?}");
-    }
+    ]);
     for name in [&b"user."[..], b"trusted.", b"security."] {
       assert!(
         !host.reaches(name) && !guest.reaches(name),
         "a bare prefix: {name:?}"
       );
     }
-    for name in [&b"system.posix_acl_access"[..], b"system.posix_acl_default"] {
-      assert!(!host.reaches(name), "{name:?}");
-      assert!(guest.reaches(name), "{name:?}");
-      assert!(guest_only(name), "{name:?}");
-    }
-    for name in [
+    expect_a_guests_own(&[&b"system.posix_acl_access"[..], b"system.posix_acl_default"]);
+    expect_reached_by_neither_and_no_guests_own(&[
       &b"system.posix_acl_accessx"[..],
       b"system.sockprotoname",
       b"system.",
@@ -906,10 +902,39 @@ mod tests {
       b"securityx",
       b"com.apple.FinderInfo",
       b"",
-    ] {
+    ]);
+    assert_eq!(AttributeNamespaces::default(), host);
+  }
+
+  /// The round trips of `an_owner_view_swaps_the_hosts_owner_with_the_runs_and_leaves_every_other_id`: expect every id,
+  /// the swapped pair's and others, read back through `view` the way it came, and the identity changing none.
+  fn expect_each_id_back_the_way_it_came(view: OwnerView) {
+    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
+      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
+      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
+      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
+      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
+    }
+  }
+
+  /// A guest's own names in `a_guests_namespaces_are_reached_by_its_route_alone`: expect each of `names` reached by the
+  /// guest's route alone, never by a host's mount, and marked a guest's own.
+  fn expect_a_guests_own(names: &[&[u8]]) {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for &name in names {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+  }
+
+  /// The names no route reaches in `a_guests_namespaces_are_reached_by_its_route_alone`: expect each of `names` reached
+  /// by neither a host's mount nor a guest's route, and no guest's own.
+  fn expect_reached_by_neither_and_no_guests_own(names: &[&[u8]]) {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for &name in names {
       assert!(!host.reaches(name) && !guest.reaches(name), "{name:?}");
       assert!(!guest_only(name), "{name:?}");
     }
-    assert_eq!(AttributeNamespaces::default(), host);
   }
 }

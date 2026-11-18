@@ -487,6 +487,11 @@ pub fn plan(
       needed: PORTS_PER_NODE,
     });
   };
+  // Where its peers dial its record plane, as they dial its probes: its advertised block, never its bind (A-277).
+  // Discovery announces it, and every later dial of a peer prefers the announcement (A-330).
+  let Some(advertise_record) = serve_address(entry, Plane::Record) else {
+    return Err(overflow(entry));
+  };
   let mut peers = Vec::with_capacity(manifest.nodes.len().saturating_sub(1));
   let mut peer_hosts = Vec::with_capacity(peers.capacity());
   for (index, peer) in manifest.nodes.iter().enumerate() {
@@ -574,6 +579,7 @@ pub fn plan(
     },
     transport: FleetTransport {
       advertise: entry.address.clone(),
+      advertise_record,
       enrollment_roots: manifest.enrollment_roots.clone(),
       identity,
       name: manifest.name.clone(),
@@ -850,11 +856,13 @@ mod tests {
     assert_eq!(serve_port(u16::MAX, Plane::Record), None);
   }
 
-  /// A-277, §4.8 "Deployment": a node that names a `bind` block serves its two sockets there, while every peer still
-  /// dials its advertised address and the next port, as through a NAT's port forward or the chaos harness's relay. Do:
-  /// give node b a bind block apart from its advertised one, and named node a one too. Expect: b binds 127.0.0.1:51000
-  /// and :51001 and advertises :41000; a and c dial b at :41000 and :41001, never at the bind; named a binds its block,
-  /// not every interface, and is still dialed by name; c, with no bind, binds where it advertises.
+  /// A-277, A-330, §4.8 "Deployment": a node that names a `bind` block serves its two sockets there, while every peer
+  /// still dials its advertised address and the next port, as through a NAT's port forward or the chaos harness's relay.
+  /// Do: give node b a bind block apart from its advertised one, and named node a one too. Expect: b binds
+  /// 127.0.0.1:51000 and :51001 and advertises :41000 for its probes and :41001 for its records (what its discovery
+  /// announces, and so what every redial of a peer dials); a and c dial b at :41000 and :41001, never at the bind; named
+  /// a binds its block, not every interface, and is still dialed and advertised by name; c, with no bind, binds where it
+  /// advertises.
   #[test]
   fn a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises() {
     let (mut manifest, keys) = manifest();
@@ -879,28 +887,13 @@ mod tests {
       SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
       "b still advertises where its peers dial it"
     );
+    assert_eq!(
+      b.transport.advertise_record,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
+      "b advertises its records at its advertised block's next port, never at its bind"
+    );
 
-    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
-    for dialer in ["a", "c"] {
-      let theirs =
-        plan(&manifest, dialer, key_of(&keys, dialer), Some(resolver())).expect("a plan");
-      let to_b = theirs
-        .transport
-        .peers
-        .iter()
-        .find(|peer| peer.host == b_host)
-        .expect("b is a peer");
-      assert_eq!(
-        to_b.address,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
-        "{dialer} dials b's advertised probe port, never its bind"
-      );
-      assert_eq!(
-        to_b.record_address,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
-        "{dialer} dials b's advertised record port, never its bind"
-      );
-    }
+    expect_b_dialed_where_it_advertises(&manifest, &keys);
 
     let a = plan(&manifest, "a", key_of(&keys, "a"), Some(resolver())).expect("a's plan");
     assert_eq!(
@@ -910,6 +903,14 @@ mod tests {
     assert_eq!(
       a.transport.serve.record,
       SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 9001)
+    );
+    assert_eq!(
+      a.transport.advertise_record,
+      NodeAddress::Name {
+        host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+        port: 7001
+      },
+      "a named node advertises its records by name too"
     );
     let c = plan(&manifest, "c", key_of(&keys, "c"), Some(resolver())).expect("c's plan");
     let a_host = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
@@ -932,6 +933,35 @@ mod tests {
       SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42_000),
       "a node without a bind binds where it advertises"
     );
+  }
+
+  /// The dialers of `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`. Do: plan nodes a
+  /// and c from `manifest`, in which node b binds elsewhere than it advertises. Expect each to dial b at its advertised
+  /// probe port (41000) and record port (41001), never at its bind.
+  fn expect_b_dialed_where_it_advertises(
+    manifest: &FleetManifest,
+    keys: &[PrivateKeyDer<'static>],
+  ) {
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    for dialer in ["a", "c"] {
+      let theirs = plan(manifest, dialer, key_of(keys, dialer), Some(resolver())).expect("a plan");
+      let to_b = theirs
+        .transport
+        .peers
+        .iter()
+        .find(|peer| peer.host == b_host)
+        .expect("b is a peer");
+      assert_eq!(
+        to_b.address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
+        "{dialer} dials b's advertised probe port, never its bind"
+      );
+      assert_eq!(
+        to_b.record_address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
+        "{dialer} dials b's advertised record port, never its bind"
+      );
+    }
   }
 
   /// A resolver for the named-address tests: one nameserver, the documented defaults.

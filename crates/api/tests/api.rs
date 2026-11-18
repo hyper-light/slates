@@ -348,15 +348,43 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   );
   assert_eq!(folder.read("n.txt"), None);
 
-  let request = landing_into(volume, &folder);
+  let approval = expect_an_approval_asked(&mut instance, &landing_into(volume, &folder));
+  expect_the_entries_listed_as_they_read(&mut instance, volume, &approval);
+
+  let issuer = issuer_of(&daemon);
+  let stale = LandingApproval {
+    manifest: [0u8; 32],
+    ..approval.clone()
+  };
+  let changed = instance.approve_landing(&stale, &issuer).unwrap();
+  assert!(
+    matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
+    "an approval of another manifest is no approval of this one: {changed:?}"
+  );
+  assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
+
+  expect_the_approved_manifest_written(&mut instance, &approval, &issuer, &folder);
+  expect_the_landing_audited_and_its_grant_consumed(&mut instance, &approval);
+  daemon.stop();
+}
+
+/// The ask of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: land `request` signed, then unsigned.
+/// Expect the signed landing refused `Unsupported(SignedWork)` before anything is sent, and the unsigned one answered
+/// `ApprovalRequired`, unsigned, for `request`, with a typed summary of one create and one replace, `.git` filtered out.
+/// Returns the approval.
+#[cfg(unix)]
+fn expect_an_approval_asked(
+  instance: &mut Instance,
+  request: &slates_api::LandingRequest,
+) -> LandingApproval {
   assert_eq!(
-    instance.land(&request, Some(&a_signature())),
+    instance.land(request, Some(&a_signature())),
     Err(Error::Unsupported(Unsupported::SignedWork))
   );
-  let LandOutcome::ApprovalRequired(approval) = instance.land(&request, None).unwrap() else {
+  let LandOutcome::ApprovalRequired(approval) = instance.land(request, None).unwrap() else {
     panic!("a landing with changes asks under today's mode");
   };
-  assert_eq!(approval.request, request);
+  assert_eq!(approval.request, *request);
   assert_eq!(approval.verification, Verification::Unsigned);
   assert_eq!(
     (
@@ -370,8 +398,18 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   assert_eq!(approval.summary.actions.total(), 2);
   assert!(approval.summary.filtered_out >= 1, "{:?}", approval.summary);
   assert_eq!(approval.manifest_text().len(), 64);
-  // A-287: the approval's entry list is what it writes, path by path, `/.git` left out, each file as it reads.
-  let entries = instance.approval_entries(&approval).unwrap();
+  approval
+}
+
+/// The entry list of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-287). Expect `approval`'s list to
+/// be what it writes, path by path, `/.git` left out, each file as it reads in `volume`.
+#[cfg(unix)]
+fn expect_the_entries_listed_as_they_read(
+  instance: &mut Instance,
+  volume: VolumeId,
+  approval: &LandingApproval,
+) {
+  let entries = instance.approval_entries(approval).unwrap();
   let listed: Vec<_> = entries
     .iter()
     .map(|entry| {
@@ -390,7 +428,7 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     ]
   );
   for entry in &entries {
-    let bytes = read_file(&mut instance, volume, &entry.path);
+    let bytes = read_file(instance, volume, &entry.path);
     assert_eq!(
       entry.content.map(|content| content.hash),
       Some(*blake3::hash(&bytes).as_bytes()),
@@ -398,20 +436,19 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
       entry.path
     );
   }
+}
 
-  let issuer = issuer_of(&daemon);
-  let stale = LandingApproval {
-    manifest: [0u8; 32],
-    ..approval.clone()
-  };
-  let changed = instance.approve_landing(&stale, &issuer).unwrap();
-  assert!(
-    matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
-    "an approval of another manifest is no approval of this one: {changed:?}"
-  );
-  assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
-
-  let landed = instance.approve_landing(&approval, &issuer).unwrap();
+/// The approved landing of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: approve `approval` with
+/// `issuer`. Expect it `Written` and `Done`, unsigned, two entries written, and `folder` holding exactly the volume's
+/// two files with `.git/HEAD` as it was.
+#[cfg(unix)]
+fn expect_the_approved_manifest_written(
+  instance: &mut Instance,
+  approval: &LandingApproval,
+  issuer: &slates_api::Issuer,
+  folder: &Folder,
+) {
+  let landed = instance.approve_landing(approval, issuer).unwrap();
   let LandOutcome::Written(report) = landed else {
     panic!("the approved manifest lands: {landed:?}");
   };
@@ -425,8 +462,16 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     b"ref: refs/heads/main\n",
     "git's own files were left out"
   );
-  // The approval and the landing are audited and listed, typed (A-299): the presentation, the grant the launcher
-  // issued, the landing finished `Done`, and the single-use grant consumed by it.
+}
+
+/// The record of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-299). Expect the approval and the
+/// landing audited and listed, typed: the presentation, the grant the launcher issued, the landing finished `Done`, and
+/// the single-use grant of `approval` consumed by it.
+#[cfg(unix)]
+fn expect_the_landing_audited_and_its_grant_consumed(
+  instance: &mut Instance,
+  approval: &LandingApproval,
+) {
   let audit = instance.audit(0).unwrap();
   let kinds: Vec<AuditKind> = audit.iter().map(|record| record.kind).collect();
   assert!(
@@ -447,7 +492,6 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
       .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
     "{grants:?}"
   );
-  daemon.stop();
 }
 
 /// AC-5.12 / T-5.14 (A-278, A-299; §4.15 "Drift", step 4): do change a file in an overlay, then change the same file on
@@ -550,20 +594,32 @@ fn a_landing_follows_its_volumes_write_mode() {
   };
   assert_eq!(report.state, LandingState::Done, "{report:?}");
   assert_eq!(bypassed.read("w.txt").unwrap(), b"written at once\n");
+  expect_a_forbidding_volume_never_lands(&mut instance, shut, &forbidden, &launcher);
+  daemon.stop();
+}
 
+/// The forbidding half of `a_landing_follows_its_volumes_write_mode`. Do: forbid `shut`'s merges and landings with the
+/// `launcher`'s authority, write a file into it and land it over `forbidden`; then ask for a policy that also requires
+/// signed merges. Expect the landing answered `Refused` by the volume's own policy, nothing written, and the signed-merge
+/// requirement refused `Unsupported(SignedWork)`.
+#[cfg(unix)]
+fn expect_a_forbidding_volume_never_lands(
+  instance: &mut Instance,
+  shut: VolumeId,
+  forbidden: &Folder,
+  launcher: &slates_api::Issuer,
+) {
   let forbid = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Forbid,
     require_signed_merges: false,
   };
   instance
-    .set_write_policy(PolicySubject::Volume(shut), &forbid, &launcher)
+    .set_write_policy(PolicySubject::Volume(shut), &forbid, launcher)
     .unwrap();
-  write_file(&mut instance, shut, "/f.txt", b"never landed\n");
+  write_file(instance, shut, "/f.txt", b"never landed\n");
   assert_eq!(
-    instance
-      .land(&landing_into(shut, &forbidden), None)
-      .unwrap(),
+    instance.land(&landing_into(shut, forbidden), None).unwrap(),
     LandOutcome::Refused(PolicyRefusal {
       act: WriteAct::Land,
       by: PolicySubject::Volume(shut),
@@ -578,11 +634,10 @@ fn a_landing_follows_its_volumes_write_mode() {
         require_signed_merges: true,
         ..forbid
       },
-      &launcher
+      launcher
     ),
     Err(Error::Unsupported(Unsupported::SignedWork))
   );
-  daemon.stop();
 }
 
 /// AC-5.12 / T-5.14 (A-299; §4.16, D-27): do provision a green and work volumes over it; merge a seed, then two works
@@ -643,11 +698,20 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     instance.merge(&first, &[], None).unwrap(),
     MergeOutcome::Merged { version: 2, .. }
   ));
+  expect_the_same_bytes_rewritten_conflict(&mut instance, &second);
+  expect_a_rebased_work_merged(&mut instance, &third);
+  daemon.stop();
+}
+
+/// The conflict of `a_merge_is_accepted_or_conflicted_typed`. Do: in `second`, based on the version before the first
+/// work's merge, rewrite the bytes that merge rewrote, and merge it. Expect it `Conflicted` with a window on the
+/// rewritten bytes and the green's head 2, nothing merged.
+fn expect_the_same_bytes_rewritten_conflict(instance: &mut Instance, second: &Work) {
   instance
     .client()
     .edit(second.volume, "f", 0, 4, b"YYYY")
     .unwrap();
-  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, &[], None).unwrap() else {
+  let MergeOutcome::Conflicted(conflicts) = instance.merge(second, &[], None).unwrap() else {
     panic!("a rewrite of bytes the green changed since the base conflicts");
   };
   assert_eq!(conflicts.head, 2);
@@ -658,19 +722,23 @@ fn a_merge_is_accepted_or_conflicted_typed() {
       .any(|conflict| conflict.path == "f" && conflict.at < 4),
     "the conflict names the rewritten range: {conflicts:?}"
   );
+}
+
+/// The rebase of `a_merge_is_accepted_or_conflicted_typed`. Do: change another file in `third`, rebase it and merge it.
+/// Expect it rebased onto version 2 and merged at 3.
+fn expect_a_rebased_work_merged(instance: &mut Instance, third: &Work) {
   instance
     .client()
     .edit(third.volume, "g", 0, 0, b"other")
     .unwrap();
   assert_eq!(
-    instance.rebase(&third).unwrap(),
+    instance.rebase(third).unwrap(),
     RebaseOutcome::Rebased { version: 2 }
   );
   assert!(matches!(
-    instance.merge(&third, &[], None).unwrap(),
+    instance.merge(third, &[], None).unwrap(),
     MergeOutcome::Merged { version: 3, .. }
   ));
-  daemon.stop();
 }
 
 /// AC-5.12 (A-299, A-285; §4.16): do set a green's merge mode to ask with the launcher's authority, merge a work into
@@ -921,6 +989,36 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   let snapshot = seam.snapshot(origin).unwrap();
   let clone = made(seam, &VolumeSpec::clone_of("seam-clone", origin, snapshot));
   assert_eq!(names_of(seam), ["seam-clone", "seam-origin"]);
+  expect_strangers_refused_typed(seam, snapshot);
+  expect_a_work_over_a_green_alone(seam, origin);
+  expect_a_served_streams_peer_reads_its_end_at_the_detach(seam, origin);
+  assert!(
+    matches!(
+      seam.destroy_snapshot(origin, snapshot),
+      Err(Error::Busy(slates_api::Busy::Volume(
+        slates_api::VolumeRefusal::Pinned
+      )))
+    ),
+    "a snapshot a clone pins is not destroyed"
+  );
+  let unpinned = seam.snapshot(origin).unwrap();
+  assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
+  seam.destroy(clone).unwrap();
+  let started = Instant::now();
+  while names_of(seam).contains(&"seam-clone".to_owned()) {
+    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
+    std::thread::yield_now();
+  }
+  assert_eq!(
+    seam.snapshot(clone),
+    Err(Error::NotFound(Missing::Volume(clone)))
+  );
+}
+
+/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy and serve a volume no one
+/// made; detach an attachment no one made; provision an overlay of a relative folder. Expect each refused typed:
+/// `NotFound` naming the volume, the snapshot or the attachment, and the folder `NotAbsolute`.
+fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId) {
   assert_eq!(
     seam.snapshot(NOWHERE),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
@@ -955,6 +1053,11 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
       fault: PathFault::NotAbsolute
     }))
   );
+}
+
+/// The works of `the_seam_conforms`. Do: make a green, a work over it, a work over `origin` (no green) and one over no
+/// volume. Expect the work at the green's first version, and the others refused `NotGreen` and `NotFound`.
+fn expect_a_work_over_a_green_alone<V: Volumes>(seam: &mut V, origin: VolumeId) {
   let green = made(
     seam,
     &VolumeSpec {
@@ -977,6 +1080,14 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
     seam.provision(&VolumeSpec::work("seam-over-nothing", NOWHERE)),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
   );
+}
+
+/// The Shards stream of `the_seam_conforms`. Do: serve `origin` to a Shards VMM, then detach it. Expect a stream of the
+/// Shards transport whose peer reads its end once detached.
+fn expect_a_served_streams_peer_reads_its_end_at_the_detach<V: Volumes>(
+  seam: &mut V,
+  origin: VolumeId,
+) {
   let served = seam.serve_shards(origin, Intent::Write, None).unwrap();
   assert_eq!(
     served.attachment.capability.transport,
@@ -987,27 +1098,6 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   assert!(
     reads_its_end(&peer),
     "a detached stream's peer reads its end"
-  );
-  assert!(
-    matches!(
-      seam.destroy_snapshot(origin, snapshot),
-      Err(Error::Busy(slates_api::Busy::Volume(
-        slates_api::VolumeRefusal::Pinned
-      )))
-    ),
-    "a snapshot a clone pins is not destroyed"
-  );
-  let unpinned = seam.snapshot(origin).unwrap();
-  assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
-  seam.destroy(clone).unwrap();
-  let started = Instant::now();
-  while names_of(seam).contains(&"seam-clone".to_owned()) {
-    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
-    std::thread::yield_now();
-  }
-  assert_eq!(
-    seam.snapshot(clone),
-    Err(Error::NotFound(Missing::Volume(clone)))
   );
 }
 

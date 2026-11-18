@@ -183,8 +183,16 @@ pod's `rw,relatime`. So a pod's mount flags cannot be the guard.
 
 `allowPrivilegeEscalation: false` sets `no_new_privs`, under which the kernel ignores setuid and setgid bits on exec
 whatever the mount says. The KIND lane proves it by use: a planted setuid-root `id` ran as 0 in a pod without the
-setting and as 65534 in one with it. `nodev` needs no pod setting, because slates refuses device nodes in a volume
-outright. The mounts slates makes itself (`slates mount`, the OCI binding) carry both flags.
+setting and as 65534 in one with it.
+
+A volume keeps device nodes as metadata: an unpacked root filesystem's `/dev` entries, overlayfs's whiteouts (A-294).
+In a pod nothing opens one as a device, whatever the mount says: the container runtime's device cgroup lets a
+container open only the standard character devices (runc's `AllowedDevices`: `null`, `zero`, `full`, `random`,
+`urandom`, `tty`, `ptmx`, the pseudo-terminals and `net/tun`) and refuses every other open `EPERM`, so a device node
+one root pod makes in the volume opens nothing in another. A privileged pod already holds every host device, so a node
+in the volume gives it nothing more. The KIND lane checks the refusal by use (`device_probe` in
+`xtask/src/kind_export.rs`: `/dev/null`'s number opens, `/dev/mem`'s is refused `EPERM`); its first run is owed (GAPS). The mounts slates
+makes itself (`slates mount`, the OCI binding) carry both flags, and there the kernel refuses the open `EACCES`.
 
 `slates detach` of the export's attachment, or the volume's destroy, ends what the path reaches. The KIND
 lane's `cargo xtask kind export` runs this whole flow on a cluster.

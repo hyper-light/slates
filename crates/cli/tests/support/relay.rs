@@ -8,6 +8,10 @@
 //! answer leaves the listener for the sender. That is one outer address per inner socket, as a NAT keeps one mapping
 //! per inner address, so each of a node's sessions keeps a source of its own at the receiver's demultiplexer.
 //!
+//! Each path counts what it sent on of the record plane apart ([`PathCount::records`]), so a flow can tell that its
+//! record links crossed the relay at all: before A-330 a node announced its bound record port and every redial went
+//! around the relay, which then saw only formation's first sessions and the probes.
+//!
 //! On its way, each datagram meets the rule of its path, from its sender's node to its receiver's node ([`PathRule`]):
 //! a cut drops it; otherwise it is lost at the rule's rate, held for the rule's delay give or take a uniform jitter (so
 //! datagrams reorder once the jitter passes their spacing), and sent twice at the duplication rate. One seed drives
@@ -49,6 +53,9 @@ const FLOW_CAP: usize = 4096;
 const ANCESTRY_CAP: usize = 64;
 /// Shape: how long the test waits for the relay to answer a report (a relay whose thread ended answers nothing).
 const REPORT_WAIT: Duration = Duration::from_secs(10);
+/// Format: the record plane's place in a node's advertised block (A-277: its probes at the base port, its records at the
+/// next), as [`RelayedNode::advertised`] lists them.
+const RECORD_PLANE: u16 = 1;
 
 /// What the path from one node to another does to each datagram on it. The default forwards every datagram at once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -87,6 +94,9 @@ pub(crate) struct PathCount {
   pub(crate) cut: u64,
   /// Sent twice.
   pub(crate) duplicated: u64,
+  /// Of those sent on, the record plane's: a record link's datagrams and their answers (A-330: a flow counts what
+  /// crossed the relay on the plane its writes are made durable on, so a link that went around it shows).
+  pub(crate) records: u64,
 }
 
 /// The relay's counts as of the moment it was asked.
@@ -116,8 +126,8 @@ impl RelayReport {
       .iter()
       .map(|((from, to), count)| {
         format!(
-          "{from}->{to} fwd {} lost {} cut {} dup {}",
-          count.forwarded, count.lost, count.cut, count.duplicated
+          "{from}->{to} fwd {} (records {}) lost {} cut {} dup {}",
+          count.forwarded, count.records, count.lost, count.cut, count.duplicated
         )
       })
       .collect();
@@ -144,6 +154,16 @@ impl RelayReport {
       .paths
       .get(&(from, to))
       .map_or(0, |count| count.forwarded)
+  }
+
+  /// The record-plane datagrams path `from -> to` sent on.
+  pub(crate) fn records(&self, from: usize, to: usize) -> u64 {
+    self.paths.get(&(from, to)).map_or(0, |count| count.records)
+  }
+
+  /// The record-plane datagrams every path sent on.
+  pub(crate) fn records_forwarded(&self) -> u64 {
+    self.paths.values().map(|count| count.records).sum()
   }
 }
 
@@ -203,6 +223,7 @@ impl Relay {
           socket,
           node,
           forward_to: SocketAddrV4::new(*relayed.bound.ip(), port),
+          record: offset == RECORD_PLANE,
         });
       }
     }
@@ -348,6 +369,8 @@ struct Listener {
   node: usize,
   /// The node's bound socket for the same plane.
   forward_to: SocketAddrV4,
+  /// Whether the plane is the record plane ([`PathCount::records`]).
+  record: bool,
 }
 
 /// The relay's socket for one sending socket at one listener: it sends that socket's datagrams on to the receiver and
@@ -524,22 +547,22 @@ impl RelayState {
       let bytes = buffer.get(..length).unwrap_or_default().to_vec();
       match arrival {
         Arrival::Wake => {}
-        Arrival::Listener(index) => self.from_sender(index, from, bytes),
-        Arrival::Flow(index) => self.from_receiver(index, from, bytes),
+        Arrival::Listener(index) => self.relay_from_sender(index, from, bytes),
+        Arrival::Flow(index) => self.relay_from_receiver(index, from, bytes),
       }
     }
   }
 
   /// A datagram a node's socket sent to listener `listener`: on, through the flow of its socket.
-  fn from_sender(&mut self, listener: usize, source: SocketAddrV4, bytes: Vec<u8>) {
+  fn relay_from_sender(&mut self, listener: usize, source: SocketAddrV4, bytes: Vec<u8>) {
     let Some(flow) = self.flow_for(listener, source) else {
       return;
     };
-    let (Some((receiver, to)), Some(sender)) = (
+    let (Some((receiver, to, record)), Some(sender)) = (
       self
         .listeners
         .get(listener)
-        .map(|listener| (listener.node, listener.forward_to)),
+        .map(|listener| (listener.node, listener.forward_to, listener.record)),
       self
         .flows
         .get(flow)
@@ -548,11 +571,11 @@ impl RelayState {
     ) else {
       return;
     };
-    self.route(sender, receiver, Via::Flow(flow), to, bytes);
+    self.route((sender, receiver, record), Via::Flow(flow), to, bytes);
   }
 
   /// A datagram the receiver's socket answered flow `flow` with: back, out of the flow's listener, to its sender.
-  fn from_receiver(&mut self, flow: usize, from: SocketAddrV4, bytes: Vec<u8>) {
+  fn relay_from_receiver(&mut self, flow: usize, from: SocketAddrV4, bytes: Vec<u8>) {
     let Some(found) = self.flows.get(flow).and_then(Option::as_ref) else {
       return;
     };
@@ -570,7 +593,8 @@ impl RelayState {
       found.source,
       Via::Listener(found.listener),
     );
-    self.route(sender, receiver, via, to, bytes);
+    let record = listener.record;
+    self.route((sender, receiver, record), via, to, bytes);
   }
 
   /// The flow for `source` at `listener`, opened on its first datagram once a census names its node.
@@ -652,8 +676,15 @@ impl RelayState {
     }
   }
 
-  /// Applies path `from -> to`'s rule to one datagram bound for `to_address` through `via`.
-  fn route(&mut self, from: usize, to: usize, via: Via, to_address: SocketAddrV4, bytes: Vec<u8>) {
+  /// Applies path `from -> to`'s rule to one datagram of the record plane or not (`record`) bound for `to_address`
+  /// through `via`.
+  fn route(
+    &mut self,
+    (from, to, record): (usize, usize, bool),
+    via: Via,
+    to_address: SocketAddrV4,
+    bytes: Vec<u8>,
+  ) {
     let rule = from
       .checked_mul(self.nodes)
       .and_then(|row| row.checked_add(to))
@@ -672,6 +703,9 @@ impl RelayState {
       return;
     }
     count.forwarded += 1;
+    if record {
+      count.records += 1;
+    }
     if duplicated {
       count.duplicated += 1;
       let hold = self.draws.hold(rule.delay, rule.jitter);
@@ -1038,7 +1072,8 @@ fn receive_within(socket: &UdpSocket, wait: Duration) -> Option<(Vec<u8>, Socket
 /// Goal g229 (the relay under every chaos flow). Do: node 0 dials node 1's advertised record port through the relay,
 /// and node 1 answers the source it saw. Expect: the datagram reaches node 1's bound record socket from a relay flow,
 /// not from node 0's own socket, and the answer reaches node 0's dialer from node 1's advertised record port, as a NAT
-/// would deliver it; and a probe to the advertised probe port reaches the bound probe socket.
+/// would deliver it; a probe to the advertised probe port reaches the bound probe socket; and the record ping and its
+/// answer are counted as the record plane's, the probe not (A-330).
 #[test]
 fn a_relayed_datagram_reaches_the_bound_socket_and_its_answer_comes_back() {
   let (relay, nodes) = relayed_pair(1);
@@ -1071,6 +1106,12 @@ fn a_relayed_datagram_reaches_the_bound_socket_and_its_answer_comes_back() {
   let report = relay.report();
   assert_eq!(report.forwarded(0, 1), 2, "{}", report.summary());
   assert_eq!(report.forwarded(1, 0), 1, "{}", report.summary());
+  assert_eq!(
+    (report.records(0, 1), report.records(1, 0)),
+    (1, 1),
+    "the record ping and its answer are the record plane's, the probe is not: {}",
+    report.summary()
+  );
 }
 
 /// Goal g229, a one-way cut. Do: cut path 0 -> 1, then send from node 0 to node 1, and from node 1 to node 0 with node
@@ -1295,7 +1336,13 @@ fn the_draws_are_reproducible_and_within_their_bounds() {
   );
   assert!((0..1000).all(|_| !first.chance(0)));
   assert!((0..1000).all(|_| first.chance(PARTS_PER_MILLION)));
-  // The schedule's draws: within their bounds, every value of a small bound met, and one seed one sequence.
+  expect_the_schedules_draws_within_their_bounds();
+}
+
+/// The schedule's half of `the_draws_are_reproducible_and_within_their_bounds`. Do: draw spans and picks from two
+/// generators seeded alike. Expect every span within its bounds, one seed one sequence, every value of a small bound
+/// drawn, a bound of zero drawing zero, and a span whose upper bound is not above its lower drawing the lower.
+fn expect_the_schedules_draws_within_their_bounds() {
   let (low, high) = (Duration::from_millis(200), Duration::from_secs(4));
   let (mut schedule, mut again) = (Draws::seeded(11), Draws::seeded(11));
   let spans: Vec<Duration> = (0..1000).map(|_| schedule.within(low, high)).collect();
