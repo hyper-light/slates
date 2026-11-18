@@ -1117,14 +1117,14 @@ fn fleet_lines(instance: &str) -> String {
 }
 
 /// Derived: the bound on a silent remote holder (A-222): its node's reap within two liveness budgets (1 s each,
-/// `LIVENESS_BUDGET_NS`), its write lease at its term (`failover_slo_ns`, 10 s by default, `FAILOVER_SLO_NS`), and a
-/// liveness budget of the owner's lease sweep after it.
+/// `LIVENESS_BUDGET_NS`), its write lease at its term after that (the node's failover delay since A-414, at most the
+/// 10 s placeholder `FAILOVER_SLO_NS` it was before), and a liveness budget of the owner's lease sweep after it.
 const SILENT_HOLDER_BOUND: Duration = Duration::from_secs(10 + 2 + 1);
 
 /// A-222 (c), D-16. Do: from the client node, a separate holder process attaches the server's volume for writing; then
 /// `kill -9` that process. Expect: the owner records the attachment and the write lease while the holder lives; after
 /// the kill, the client node's reap ends the attachment at the owner (attachments 0), and the silent holder's lease
-/// ends within its term (`failover_slo_ns`) plus the sweeps' cadence. Gated (`SLATES_TEST_CLI=1`).
+/// ends within its term (the failover delay, A-414) plus the sweeps' cadence. Gated (`SLATES_TEST_CLI=1`).
 #[test]
 fn a_killed_remote_holder_is_reaped_at_the_owner_and_its_lease_ends_within_its_term() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() || std::env::var_os(HOLDER_ROLE).is_some() {

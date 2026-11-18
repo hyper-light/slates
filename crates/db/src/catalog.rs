@@ -542,8 +542,8 @@ pub enum Consumer {
   Guest,
   /// A client of another host, its attachment recorded on this owner (§4.10, A-222): `host` is the forwarding peer's
   /// authenticated member id, never a claim of the request's. It ends with a detach routed by its volume, its host's
-  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; a silent holder's write lease
-  /// ends at its term (D-16). Appended.
+  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; the volume's write lease stays
+  /// its holder's while it lives and lasts one term after it ends (D-16, A-414). Appended.
   Remote {
     /// The member id of the client's host.
     host: u64,
@@ -551,8 +551,9 @@ pub enum Consumer {
     client: u32,
   },
   /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
-  /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
-  /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
+  /// client that made it. It holds a term, its holder's (A-384), renewed by every verb that names it and by its holder's
+  /// `Renew`, and ends at the term's lapse; the volume's write lease then stays its principal's only while another of
+  /// its write attachments of the volume lives (D-16, A-414). Appended.
   Termed {
     /// When its term lapses, on the shard's monotonic clock.
     expires_ns: u64,

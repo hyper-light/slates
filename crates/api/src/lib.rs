@@ -51,16 +51,14 @@
 //! compile errors of the matches it must extend — never as a variant falling silently through a wildcard. The wire
 //! types re-exported here grow append-only (D-15) and count as the contract's where it returns them.
 //!
-//! **What is owed** (GAPS, the A-278, A-299 and A-321 rows): the starter handed the launcher's authority on every
-//! platform; typed fields on the wire
-//! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
-//! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
-//! answers untyped (`Invalid::Request`, A-310).
+//! **What is owed** (GAPS, the A-278 and A-299 rows): a typed field on the wire for a merge's versions (the work's
+//! base beside the green's head), which this crate reads in a second call after the verdict; and the async form for
+//! the verbs it does not serve yet (the paged reads, landings, merges, policies and observation).
 //!
 //! **The seam (A-310).** A host whose rules reach other products only through a trait with a simulator and a
 //! conformance suite (Hex's `CLAUDE.md` §9) holds [`Volumes`]: the contract's volume verbs, implemented by [`Instance`]
 //! and by [`SimVolumes`], an in-memory stand-in that answers the same typed outcomes and errors. One conformance suite
-//! runs over both (`tests/seam.rs`).
+//! runs over both (`the_seam_conforms` in `tests/api.rs`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -215,10 +213,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// refused request with no trail; under 30 it wrote an end naming no manifest (the same day). 36: a busy mount is let go
 /// of on every Unix host: [`mount::unmount_busy`] answers how ([`LetGo::Detached`] on Linux, [`LetGo::Forced`] on macOS
 /// and the BSDs), where Linux's `unmount_lazy` was refused elsewhere; `MountMissing::LazyUnmount` is gone (found by
-/// g076a; the same day).
+/// g076a; the same day). 37: [`mount::available`] on Windows answers [`MountMissing::MountManager`] where the machine
+/// does not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, which the driver reads at every mount,
+/// A-369); until then such a machine was told it could mount, and every mount there was refused afterwards (A-417; the
+/// same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 36;
+pub const CONTRACT: u32 = 37;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
@@ -267,4 +268,44 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
       fault: PathFault::NotUnicode,
     })
   })
+}
+
+#[cfg(test)]
+mod contract_history {
+  /// §4.12 "Versioning" (A-299; a doc-truth test, CLAUDE.md §4): the contract's version list names every version up to
+  /// [`super::CONTRACT`] in order, so a raised number without its line, or a line past the number, fails here. Do: read
+  /// [`super::CONTRACT`]'s own doc from this file and find each version's number as the list writes it (`N: `). Expect
+  /// every number from 1 to `CONTRACT` named, in increasing order, and none past it.
+  #[test]
+  fn the_contract_history_names_every_version_in_order() {
+    let source = include_str!("lib.rs");
+    let declared = source
+      .find("pub const CONTRACT: u32")
+      .expect("the contract's constant");
+    let doc_start = source
+      .get(..declared)
+      .and_then(|before| before.rfind("/// The consumer contract's version"))
+      .expect("the contract's doc");
+    let doc: String = source
+      .get(doc_start..declared)
+      .expect("the doc's text")
+      .lines()
+      .map(|line| line.trim_start_matches("///"))
+      .collect::<Vec<_>>()
+      .join(" ");
+    let mut from = 0;
+    for version in 1..=super::CONTRACT {
+      let line = format!(" {version}: ");
+      let at = doc
+        .get(from..)
+        .and_then(|rest| rest.find(&line))
+        .unwrap_or_else(|| panic!("version {version} has no line after the one before it"));
+      from = from + at + line.len();
+    }
+    let past = format!(" {}: ", super::CONTRACT + 1);
+    assert!(
+      !doc.contains(&past),
+      "a line past the contract's number: {past}"
+    );
+  }
 }

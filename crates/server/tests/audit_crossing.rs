@@ -62,6 +62,7 @@ fn audit_until(client: &mut Client, done: impl Fn(&[AuditEntry]) -> bool) -> Vec
     if done(&records) || started.elapsed() > CROSSING_WAIT {
       return records;
     }
+    #[allow(clippy::disallowed_methods)] // the test polls the daemon for the crossing's records
     std::thread::sleep(POLL);
   }
 }
@@ -142,6 +143,7 @@ fn a_batch_sent_again_after_a_lost_acknowledgement_appends_nothing_twice() {
       started.elapsed() < CROSSING_WAIT,
       "the reap tick sent the unacknowledged record again within {CROSSING_WAIT:?}"
     );
+    #[allow(clippy::disallowed_methods)] // the test polls the daemon for the crossing's records
     std::thread::sleep(POLL);
   }
   daemon.withhold_audit_acknowledgement(false).unwrap();
@@ -150,6 +152,7 @@ fn a_batch_sent_again_after_a_lost_acknowledgement_appends_nothing_twice() {
   while counted(&mut client, slates_server::landing::AUDIT_RESENT) == resent
     && started.elapsed() < CROSSING_WAIT
   {
+    #[allow(clippy::disallowed_methods)] // the test polls the daemon for the crossing's records
     std::thread::sleep(POLL);
   }
   let after = client.audit(0).unwrap();

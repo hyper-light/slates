@@ -59,6 +59,10 @@ pub const MAX_OPEN_HANDLES: usize = 1 << 16;
 /// a time up to [`MAX_OPEN_HANDLES`] and an idle bridge holds one small segment.
 const HANDLE_SEGMENT: usize = 256;
 
+/// A transport's write log (A-410): handed the inode, the offset and the bytes a write took, it says whether it kept
+/// them.
+pub type WriteLogger<'v> = &'v mut dyn FnMut(u64, u64, &[u8]) -> bool;
+
 /// The `Bridge` over one volume.
 pub struct VolumeBridge<'v> {
   /// The id of the volume this bridge serves. A request's [`OpContext`] names the volume its
@@ -97,6 +101,13 @@ pub struct VolumeBridge<'v> {
   /// Whether the transport's kernel sends the extended `fuse_setxattr_in` (A-378), as the transport last said
   /// ([`Bridge::set_setxattr_ext`]): a guest connection that kept `FUSE_SETXATTR_EXT`.
   setxattr_ext: bool,
+  /// Where a transport whose writes outlive its daemon only through the shard's write log keeps each write this bridge
+  /// takes (A-410; [`VolumeBridge::logging_writes`]): handed the inode, the offset and the bytes written, it says
+  /// whether it kept them. None for a transport that keeps its writes otherwise, or not at all.
+  write_log: Option<WriteLogger<'v>>,
+  /// Whether a write this bridge took was not kept by its [`VolumeBridge::logging_writes`] log, so the reply must wait
+  /// for the publication that carries it ([`Bridge::awaits_publication`]; A-410).
+  write_unlogged: bool,
 }
 
 /// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
@@ -317,6 +328,8 @@ impl<'v> VolumeBridge<'v> {
       owners: crate::OwnerView::IDENTITY,
       namespaces: crate::AttributeNamespaces::Host,
       setxattr_ext: false,
+      write_log: None,
+      write_unlogged: false,
     }
   }
 
@@ -341,6 +354,8 @@ impl<'v> VolumeBridge<'v> {
       owners: crate::OwnerView::IDENTITY,
       namespaces: crate::AttributeNamespaces::Host,
       setxattr_ext: false,
+      write_log: None,
+      write_unlogged: false,
     }
   }
 
@@ -371,6 +386,8 @@ impl<'v> VolumeBridge<'v> {
       owners: crate::OwnerView::IDENTITY,
       namespaces: crate::AttributeNamespaces::Host,
       setxattr_ext: false,
+      write_log: None,
+      write_unlogged: false,
     }
   }
 
@@ -378,6 +395,16 @@ impl<'v> VolumeBridge<'v> {
   #[must_use]
   pub fn with_lost_writes(mut self, lost: &'v mut LostWrites) -> VolumeBridge<'v> {
     self.lost = Some(lost);
+    self
+  }
+
+  /// This bridge, every write it takes kept by `log` before its reply (A-410): `log` is handed the inode, the offset and
+  /// the bytes the volume took, and answers whether it kept them, as the shard's write log does for slates' own virtio-fs
+  /// device (A-63's rule, A-358's for a reply). One it did not keep makes the bridge owe a publication, which a transport
+  /// reads as [`Bridge::awaits_publication`] and runs before the reply.
+  #[must_use]
+  pub fn logging_writes(mut self, log: WriteLogger<'v>) -> VolumeBridge<'v> {
+    self.write_log = Some(log);
     self
   }
 
@@ -884,7 +911,7 @@ impl Bridge for VolumeBridge<'_> {
   }
 
   fn awaits_publication(&self) -> bool {
-    self.volume.awaits_publication()
+    self.volume.awaits_publication() || self.write_unlogged
   }
 
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError> {
@@ -1096,6 +1123,13 @@ impl Bridge for VolumeBridge<'_> {
         .write(self.store, inode, offset, data),
       None => self.volume.write(self.store, inode, offset, data),
     }?;
+    // Kept before the reply where the transport keeps its writes in the shard's write log (A-410); a write the log did
+    // not keep owes a publication before its reply instead.
+    if let Some(log) = self.write_log.as_mut()
+      && !log(inode.0, offset, data.get(..written).unwrap_or(data))
+    {
+      self.write_unlogged = true;
+    }
     u32::try_from(written).map_err(|_| VfsError::FileTooLarge)
   }
 
