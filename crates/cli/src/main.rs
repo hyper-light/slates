@@ -143,6 +143,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
     Failure::Refused(_) => (EXIT_REFUSED, "refused"),
     Failure::Unavailable { .. } => (EXIT_UNAVAILABLE, "unavailable"),
     Failure::Failed(_) | Failure::ChildExited { .. } => (EXIT_FAILED, "failed"),
+    Failure::NeverServed => (slates_api::role::EXIT_NEVER_SERVED, "never_served"),
   };
   if json {
     let message = match failure {
@@ -151,6 +152,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
         format!("no daemon at instance {instance}: {cause}")
       }
       Failure::ChildExited { code } => format!("the command exited with code {code}"),
+      Failure::NeverServed => slates_api::role::Failure::NeverServed.to_string(),
     };
     slates_machine::log_line!(
       "{}",
@@ -167,6 +169,9 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
       Failure::Failed(text) => slates_machine::log_line!("slates: {text}"),
       Failure::ChildExited { code } => {
         slates_machine::log_line!("slates: the command exited with code {code}")
+      }
+      Failure::NeverServed => {
+        slates_machine::log_line!("slates anchor: {}", slates_api::role::Failure::NeverServed)
       }
     }
   }
@@ -206,12 +211,13 @@ fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
   ))
 }
 
-/// A role's failure as the command's: the same sentence, and the same exit code (1 refused, 4 failed).
+/// A role's failure as the command's: the same sentence, and the same exit code (1 refused, 4 failed, 5 never served).
 impl From<slates_api::role::Failure> for Failure {
   fn from(failure: slates_api::role::Failure) -> Failure {
     match failure {
       slates_api::role::Failure::Refused(text) => Failure::Refused(text),
       slates_api::role::Failure::Failed(text) => Failure::Failed(text),
+      slates_api::role::Failure::NeverServed => Failure::NeverServed,
     }
   }
 }
@@ -236,4 +242,7 @@ pub(crate) enum Failure {
     /// The workload's exit code.
     code: i32,
   },
+  /// The anchor, whose starter asked it to (`slates_api::StartSpec::until_served`), stopped: its daemons crash-looped
+  /// and none of them ever served (A-366); exits `slates_api::role::EXIT_NEVER_SERVED`, as the role does in a host.
+  NeverServed,
 }
