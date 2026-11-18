@@ -619,14 +619,16 @@ mod tests {
   /// (no terminator, a lone surrogate, a relative path). Expect: a typed refusal, never a name made from those bytes.
   #[test]
   fn a_hostile_link_request_names_nothing() {
+    // The new name follows the request's own name (`\old` and its terminator) in the payload: the link reads it alone.
+    let new_at = REQUEST_BASE + "\\old\0".encode_utf16().count() * size_of::<u16>();
     for corrupt in 0..5 {
       let mut bytes = link_request(LINK_CLASS, 1, "\\new", 0);
       match corrupt {
         0 => bytes[NEW_NAME_AT..NEW_NAME_AT + 2].copy_from_slice(&u16::MAX.to_le_bytes()),
         1 => bytes[NEW_NAME_AT + 2..NEW_NAME_AT + 4].copy_from_slice(&u16::MAX.to_le_bytes()),
-        2 => bytes[REQUEST_BASE + 8..REQUEST_BASE + 10].copy_from_slice(&1u16.to_le_bytes()),
-        3 => bytes[REQUEST_BASE + 2..REQUEST_BASE + 4].copy_from_slice(&0xD800u16.to_le_bytes()),
-        _ => bytes[REQUEST_BASE..REQUEST_BASE + 2].copy_from_slice(&u16::from(b'n').to_le_bytes()),
+        2 => bytes[new_at + 8..new_at + 10].copy_from_slice(&1u16.to_le_bytes()),
+        3 => bytes[new_at + 2..new_at + 4].copy_from_slice(&0xD800u16.to_le_bytes()),
+        _ => bytes[new_at..new_at + 2].copy_from_slice(&u16::from(b'n').to_le_bytes()),
       }
       let pending = requests(&bytes).unwrap();
       assert!(
