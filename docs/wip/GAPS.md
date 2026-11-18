@@ -24,6 +24,25 @@
 > in order, its regeneration behind `--ignored`), and the completion record framed with its reply's schema hash, so a
 > record of another schema is refused typed rather than read as another reply. g262 (the contract's owner) told.
 
+> **A learner, the pair's lower anchor, dropped a voter that kept it, and the pair's probe mesh never formed: fixed
+> (2026-11-18, A-337, §4.8; goal g225).** `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`
+> failed its fixture's formation wait once in g251's diag run 44262759484 (ubuntu, 2026-11-18; 49 to 50 periods after the
+> initial consensus settled in 0.83 s): voter c kept learner e (`AsVoter`), e dropped c (`OutsideNeighbourhood`), and e
+> was the pair's lower anchor, the only side whose dial keys the pair's plane. The role rule is kept from both sides
+> only while both read the same voters, and a learner's can be stale. Fixed: the pair's canonical dialer keeps a peer
+> that holds a record session it dialed to it (`DirectContact::Dialed`, `ShardState::dialed_in`). Test:
+> `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it` (`crates/server/src/daemon.rs`). Bug record:
+> `docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
+> - **Open: a learner's voters are not versioned.** A seat change is a Raft configuration entry that moves no
+>   configuration version, so a learner never fetches on it, and a learner answered by another learner takes that one's
+>   known voters. A learner whose stale voters omit the leader sends its reports (which only the leader proposes) to
+>   members that are not it, and the reports are answered `NotLeader` until a configuration commits. The principled fix
+>   carries the voter set inside the versioned configuration a learner fetches (a format change of the regional
+>   configuration's encoding; for Ada's design review).
+> - **Owed (the supervisor's):** the learner tests' rate on the diag lanes once this lands
+>   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
+>   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
+
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
 > fresh-member flow (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`) kills the bootstrap voter of five

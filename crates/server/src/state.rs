@@ -777,6 +777,12 @@ pub struct ShardState {
   /// them is kept until they refute the death (`fleet::direct_contact`'s `Returned`). Only the control shard updates it;
   /// bounded by the fleet's peer capacity.
   pub returned_members: BTreeMap<slates_db::HostId, u64>,
+  /// The record sessions each peer dialed to this node that this node serves now, by the peer's stable anchor
+  /// (`fleet::serve_peer_records`, each counted by its `fleet::DialedIn` while it runs): a peer dials and keeps a session
+  /// only while it keeps direct contact with this node, which the pair's canonical dialer honours
+  /// (`fleet::direct_contact`'s `Dialed`, A-337). Only the control shard updates it; bounded by the roster, an anchor
+  /// with no session left removed.
+  pub dialed_in: BTreeMap<slates_db::HostId, u32>,
   /// Reverse index of the current authenticated identities, bounded by learned_members.
   /// Relayed alive gossip may refute a failure, but cannot revive a superseded RAM identity.
   pub authenticated_members: std::collections::BTreeSet<slates_db::HostId>,
