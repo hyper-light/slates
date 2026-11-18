@@ -122,8 +122,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// reply's typed field, never its text: `DriftReport::watcher` a `Watcher`, and a green's or a work volume's status
 /// read with no base (it failed as a protocol fault before) (the same day). 9: the [`Volumes`]
 /// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
-/// same day).
-pub const CONTRACT: u32 = 9;
+/// same day). 10: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start took,
+/// so its exit is no failed start (A-311) (the same day).
+pub const CONTRACT: u32 = 10;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

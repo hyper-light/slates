@@ -7294,6 +7294,9 @@ it builds against the contract and adds to it rather than around it.
 > text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
 > service names their watcher `merge`), and now reads with no base
 > (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
+> **`CONTRACT` = 10** (9 is A-310's `Volumes` seam): `DaemonReport::recovered`, appended, the anchor's verdict that the
+> daemon has served as long as its start took, so its exit is no failed start (A-311); a host that ends a daemon on
+> purpose waits for it first.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
