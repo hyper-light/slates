@@ -12991,6 +12991,14 @@ went up to 2.71 s between two drains of a ring.
   against 8169..=8170. A hypothesis under test, not a finding: the harness stamps a request's send after
   `Client::begin` returns (`Worker::send` in `load_bench.rs`), so a worker descheduled between the two records a
   submit as sent after a verdict that already reflects it, which narrows the oracle's window by one version.
+- **The hypothesis, tested the same day (11:00 UTC).** 22 more runs at Z = 20 ms with `--events` (6 on the Studio, 16 on
+  GitHub's 4-vCPU runners under two spinning loops a CPU) swept within 7 to 23 ms and reported nothing. With the
+  harness clamped to background QoS (`taskpolicy -c background load_bench ...`, the daemon unclamped), the second run
+  reported one failure, a window missing rather than extra: a conflict (base 6) without `irq/ipi.c@384`, touched by
+  v115, whose reply the harness had taken before this submit's send stamp. That submit's own event records a round
+  trip of 5 µs (sent 100,336,833 ns, replied 100,341,833 ns) where the run's submits took 374 to 399 µs at the median:
+  its send was stamped long after the request went out, so the oracle's bound came from the late stamp. The failures
+  read as the harness's, and stamping before `begin` is the test of it (reported to goal 231).
 
 ## Many writers on one large live volume: the byte credit keeps the owner up in 5 of 8 runs, and two whole records still ship (AC-8.9; A-200; goal 230; 2026-11-18)
 
@@ -13275,5 +13283,6 @@ held version 0's inputs (`merge.inputs_unheld` 709 each).
 - **A-313 works under the launcher:** a replica killed mid-rung rebuilt its replica from its hold, 2,810 versions in
   6,270 slices, and went on taking versions.
 - **A primary's crash over the whole kernel loses its green on that node:** the base tree volume no longer fits the
-  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. The seeding fix could not be
-  exercised; the run is owed again once the volume recovers. Reported to goal 232.
+  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. A second run (11:02 UTC) logged
+  the same two lines with the same byte counts, so it is deterministic here. The seeding fix could not be exercised;
+  the run is owed again once the volume recovers. Reported to goal 232.
