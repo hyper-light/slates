@@ -8612,22 +8612,27 @@ mod tests {
         Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
       };
       let local = state.fleet.host();
-      let others: Vec<HostId> = (100..104).map(|key| HostId(local.0 ^ key)).collect();
       // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
       let scatter = 3;
       let quorum = Quorum { f: 1 };
-      let members_with = |departed: HostId| {
+      // Shape: each candidate region's ids, the departed member's and its four others', apart from the next one's.
+      let stride = 8;
+      let members_with = |departed: HostId, others: &[HostId]| {
         let mut members = vec![local, departed];
         members.extend(others.iter().copied());
         members
       };
       // A member whose neighbourhood leaves the audit node out, and an object of it whose successor places it
-      // elsewhere too: rendezvous decides both, so search a few ids.
-      let (departed, object) = (1..64u64)
-        .map(|key| HostId(local.0 ^ key))
-        .find_map(|departed| {
+      // elsewhere too: rendezvous decides both, so search a few regions. Each candidate region has members of its own:
+      // with the other four fixed, whether a successor's neighbourhood holds the audit node is fixed by the audit
+      // node's random id alone, and about one id in ten was in all four (4 of 40 runs failed here, 2026-11-18).
+      let (departed, others, object) = (0..64u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let departed = HostId(local.0 ^ (base + 1));
+          let others: Vec<HostId> = (2..6).map(|key| HostId(local.0 ^ (base + key))).collect();
           let formed = RegionalConfiguration::formed(
-            members_with(departed),
+            members_with(departed, &others),
             quorum,
             std::collections::BTreeMap::new(),
             scatter,
@@ -8649,12 +8654,12 @@ mod tests {
                     .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
                 })
             })
-            .map(|object| (departed, object))
+            .map(|object| (departed, others.clone(), object))
         })
         .expect("a member whose neighbourhood and successor both leave the audit node out");
       state.council = RegionalCouncil::new(
         local,
-        members_with(departed),
+        members_with(departed, &others),
         vec![local],
         quorum,
         std::collections::BTreeMap::new(),
