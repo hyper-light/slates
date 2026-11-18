@@ -3086,23 +3086,15 @@ fn send_forward(
       .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
       if let Some((region, volume, control, request_bytes)) = elsewhere {
         // An attach of a volume this node lost is remembered with its client, on the client's shard where its slot is,
-        // before it is sent, so the client's reap reaches the successor (A-222's rule; A-334's sibling).
-        if let Some(lost) = remember_first
-          && let Some(refusal) =
-            remembered_or_refusal(owner, origin, (client_index, client_id), lost).await
-        {
-          // `Overloaded` says the attach was not started, so a resend under its id runs it: never its completion.
-          let reply = if matches!(refusal, Refusal::Overloaded { .. }) {
-            refused(refusal)
-          } else {
-            crate::state::with_state(|s| {
-              let anchor = s.origin_anchor.0;
-              record_completion(s, anchor, id, refused(refusal))
-            })
-            .unwrap_or_else(|| refused(Refusal::NotFound))
-          };
+        // and sent from there once it is, so the client's reap reaches the successor (A-222's rule; A-334's sibling).
+        if remember_first.is_some() {
           crate::xshard::send_reply_home(origin, move || {
-            crate::state::deliver(client_index, request, reply, true);
+            remember_then_forward(
+              (origin, control),
+              (client_index, client_id, request),
+              (region, volume),
+              request_bytes,
+            );
           });
           return;
         }
@@ -3136,28 +3128,45 @@ fn send_forward(
   crate::xshard::send_owing(owner, task)
 }
 
-/// Remembers, on the client's shard `origin`, that the client at `client` (its slot index and id) attaches `volume`, a
-/// volume this node lost to a successor, at the successor (`remote_attach::remember_volume_at`), asked from the volume's
-/// shard `owner` before the attach is sent there: `None` once remembered, else the refusal to answer the attach with
-/// (`RemoteAttachmentsFull` past the client's bound; `Overloaded`, not started, when the client's shard did not answer
-/// within a liveness budget, so the attach is never sent unremembered).
-async fn remembered_or_refusal(
-  owner: u16,
-  origin: u16,
-  client: (u32, u32),
-  volume: VolumeId,
-) -> Option<Refusal> {
-  match crate::xshard::call_within(
-    owner,
-    origin,
-    move |s| crate::remote_attach::remember_volume_at(s, client, volume),
-    crate::daemon::LIVENESS_BUDGET_NS,
-  )
-  .await
-  {
-    Some(Ok(())) => None,
-    Some(Err(refusal)) => Some(refusal),
-    None => Some(Refusal::Overloaded { shard: origin }),
+/// On the client's shard `origin`: remembers that the client at `client_index` (still the client `client_id`) attaches
+/// `volume`, a volume this node lost to a successor, at the successor (`remote_attach::remember_volume_at`), and then
+/// sends the attach there ([`forward_for_local_client`]), so it is never sent unremembered and the client's reap reaches
+/// it. Past the client's bound the attach is answered `RemoteAttachmentsFull`, recorded as its completion here, where
+/// the client's shard records A-222's own refusal of it; a shard whose state is out of reach answers it `Overloaded`,
+/// not started and not recorded.
+fn remember_then_forward(
+  (origin, control): (u16, Option<u16>),
+  (client_index, client_id, request): (u32, u32, u64),
+  (region, volume): (u64, VolumeId),
+  request_bytes: Vec<u8>,
+) {
+  let remembered = crate::state::with_state(|s| {
+    let refusal =
+      crate::remote_attach::remember_volume_at(s, (client_index, client_id), volume).err()?;
+    let anchor = s.origin_anchor.0;
+    Some(record_completion(
+      s,
+      anchor,
+      RequestId::from_word(request),
+      refused(refusal),
+    ))
+  });
+  match remembered {
+    Some(None) => forward_for_local_client(
+      origin,
+      control,
+      (client_index, request),
+      region,
+      volume,
+      request_bytes,
+    ),
+    Some(Some(reply)) => crate::state::deliver(client_index, request, reply, true),
+    None => crate::state::deliver(
+      client_index,
+      request,
+      refused(Refusal::Overloaded { shard: origin }),
+      true,
+    ),
   }
 }
 

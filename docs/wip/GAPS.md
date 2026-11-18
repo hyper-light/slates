@@ -3787,11 +3787,14 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
 >       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
 >       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
->       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
->       client's shard,
->       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
->       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
->       term).
+>       g250). The creator rule's two siblings on the client's shard are fixed (g229, 2026-11-18): a mount of a
+>       yielded volume is refused by its kind on the volume's shard (`remote_attach::lost_attach`; it had attached the
+>       copy), and a record-form attach of one is remembered with its client before it is sent, so the client's reap ends
+>       it at the successor (`remote_attach::remember_volume_at`; it had stayed there for good). Red first:
+>       `an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind` and
+>       `a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`
+>       (`docs/bugs/2026-11-18-a-node-admitted-again-took-the-volumes-it-yielded-for-its-own-on-the-clients-shard.md`).
+>       **Owed:** releasing a yielded copy's memory (GAP-A9-7).
 >     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
 >       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
 >       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
