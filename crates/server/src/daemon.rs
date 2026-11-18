@@ -230,11 +230,44 @@ pub struct Daemon {
   doorbell: Option<DoorbellThread>,
   /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
   watchdog: Option<crate::watchdog::Watchdog>,
+  /// The writer of the shards' log lines (A-305), stopped after the shards, so it writes every line they queued.
+  log_writer: Option<slates_machine::log::LogWriter>,
   config: DaemonConfig,
   shards: Vec<ShardId>,
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
   /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
   nfs_port: Option<u16>,
+  /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
+  start_beats: u64,
+}
+
+/// The start's beat (§2.6 boot step 2, A-312): the supervision block's heartbeat, written by the starting thread after
+/// each unit of its work, until the watchdog thread takes the beat over and becomes its one writer
+/// ([`crate::watchdog::Watchdog::start`]). The anchor judges a start in its own CPU time until its first beat, and kills
+/// one whose thread runs a liveness window of CPU without beating; a beat is the start's progress. Until 2026-11-17
+/// nothing beat until the watchdog ran, after the runtime had made a ring for every ordered pair of shards, and on B10's
+/// Linux gate at load 70 the anchor killed every start of 407 shards ("ran 1009-1037 ms of CPU on one thread without
+/// beating"). Each unit is microseconds, so a start that progresses keeps beating however many shards it starts; one
+/// stuck in a unit stops beating, and the anchor judges its process by its CPU from the lapse (A-232). Counted, so the
+/// boot log says how often a start beat.
+struct StartBeat {
+  clock: HostClock,
+  beats: u64,
+}
+
+impl StartBeat {
+  fn new() -> StartBeat {
+    StartBeat {
+      clock: HostClock::new(),
+      beats: 0,
+    }
+  }
+
+  /// Beats `supervision` now.
+  fn beat(&mut self, supervision: &slates_anchor::Supervision<'_>) {
+    supervision.beat(slates_vfs::clock::Clock::monotonic_ns(&mut self.clock));
+    self.beats = self.beats.saturating_add(1);
+  }
 }
 
 impl std::fmt::Debug for Daemon {
@@ -781,6 +814,9 @@ impl Daemon {
         segment
       }
     };
+    // The start beats from here until the watchdog takes the beat over (§2.6 boot step 2, A-312; [`StartBeat`]).
+    let mut start_beat = StartBeat::new();
+    start_beat.beat(&segment.supervision()?);
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
     }
@@ -809,8 +845,25 @@ impl Daemon {
       slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
-    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits.
-    let runtime = Runtime::start_sized(&config.runtime, &[config.control_shard_capacity().get()])?;
+    // The writer every shard's log lines go through (A-305): a shard never waits on standard error, where a thread
+    // starved while it held the lock every line takes, or a reader slow to take a line, held a shard a window and the
+    // watchdog called it wedged. Started before the shards, stopped after them.
+    let log_writer = slates_machine::log::LogWriter::start().map_err(|error| {
+      ServerError::Ipc(slates_ipc::IpcError::OsRefused {
+        call: "spawn the log writer thread",
+        code: error.raw_os_error(),
+      })
+    })?;
+    // The block the start beats, held across the runtime's start (`supervision` above says who reads the beat).
+    let beat_block = segment.supervision()?;
+    start_beat.beat(&beat_block);
+    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits. The start
+    // beats after each unit of the runtime's work, its pair rings above all, N(N-1) of them (`slates_rt::runtime`).
+    let runtime = Runtime::start_sized(
+      &config.runtime,
+      &[config.control_shard_capacity().get()],
+      &mut || start_beat.beat(&beat_block),
+    )?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
@@ -864,7 +917,12 @@ impl Daemon {
       let learning = Some(gate.learning());
       #[cfg(windows)]
       let learning = ();
+      let log_route = log_writer.route();
       runtime.spawn_on(*shard, async move {
+        // Before anything this shard logs: its lines go to the daemon's log writer from here on (A-305).
+        if let Some(route) = log_route {
+          route.install();
+        }
         // This daemon's learning gate is entered on the shard's own thread before its start (A-227).
         #[cfg(unix)]
         gate.enter();
@@ -890,6 +948,7 @@ impl Daemon {
           );
         }
       })?;
+      start_beat.beat(&beat_block);
     }
     // The doorbell, on the rendezvous opened above.
     let kicks: Vec<slates_rt::driver::Kick> = shards
@@ -915,6 +974,13 @@ impl Daemon {
       .iter()
       .filter_map(|shard| registry::holder_of(shard.0))
       .collect();
+    // The start's last beat, then the watchdog's thread takes the beat over: one writer at a time.
+    start_beat.beat(&beat_block);
+    slates_machine::log_line!(
+      "slates-server: the start beat {} times over {} shards before the watchdog took the beat over",
+      start_beat.beats,
+      shards.len()
+    );
     let watchdog = crate::watchdog::Watchdog::start(
       AnchorSegment::attach(&watch_handoff, watch_len, &identity)?,
       holders,
@@ -968,9 +1034,11 @@ impl Daemon {
       segment,
       doorbell,
       watchdog: Some(watchdog),
+      log_writer: Some(log_writer),
       config,
       shards,
       nfs_port,
+      start_beats: start_beat.beats,
     })
   }
 
@@ -978,6 +1046,12 @@ impl Daemon {
   /// `nfs://localhost:PORT` to reach this daemon's volumes (those on its accepting shard, R8).
   pub fn nfs_port(&self) -> Option<u16> {
     self.nfs_port
+  }
+
+  /// How many times this daemon's start beat before its watchdog took the beat over (§2.6 boot step 2, A-312): at least
+  /// once a unit of the start's work, so at least once for every ordered pair of its shards.
+  pub fn start_beats(&self) -> u64 {
+    self.start_beats
   }
 
   /// The configuration.
@@ -2726,6 +2800,19 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: the quantum the record period's seal walk turns are cut by on every shard (`fleet::seal_walk_slice`),
+  /// in place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each turn after one volume,
+  /// so a test sees the slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.seal_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
@@ -3121,6 +3208,18 @@ impl Daemon {
     })
   }
 
+  /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
+  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), while it answers everything else on the same
+  /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
+  /// it. Replaces any earlier set; an empty `askers` restores full service. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_takeover_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_takeover_silence = askers;
+    })
+  }
+
   /// The owner's sealed manifest for `object` once its content has placed on its holders (§4.10), read on the shard
   /// that owns it; `Ok(None)` before then or when this node does not own it. A test or an operator reads it to follow
   /// a seal before its head ships.
@@ -3442,6 +3541,12 @@ impl Daemon {
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
+    }
+    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. A shard that
+    // never ended still holds its route, and a standard error that takes nothing holds the writer: it is waited for a
+    // window, then left to the process's end, never waited for without end.
+    if let Some(mut log_writer) = self.log_writer.take() {
+      log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
     }
   }
 }
@@ -3872,6 +3977,12 @@ async fn init_shard(
     Option<std::os::windows::io::OwnedHandle>,
   ),
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
+  // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
+  // failure, as a refused serve loop is below.
+  futures::spawn(crate::xshard::carrier(config.kept_bound().get()))
+    .and_then(futures::detach)
+    .map_err(ServerError::Runtime)?;
   let mut slices = crate::recovery_slices::RecoverySlices::begin(config.copy_slice_ns());
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -4155,6 +4266,8 @@ async fn init_shard(
     demuxes: Vec::new(),
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
+    taken_over: std::collections::BTreeMap::new(),
+    seal_walk_quantum_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
@@ -4171,6 +4284,7 @@ async fn init_shard(
     injected_serve_delay_ns: None,
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
+    injected_takeover_silence: std::collections::BTreeSet::new(),
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
@@ -6111,7 +6225,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_on_shard, audit_on_shard_configured, observe_first, test_profile,
+  audit_daemon, audit_daemon_configured, audit_on_shard, audit_on_shard_configured, observe_first,
+  test_profile,
 };
 
 #[cfg(test)]
@@ -6291,6 +6406,14 @@ mod tests {
   /// A running one-shard audit daemon, bootstrapped, for a test whose work outlives one observation (a task it spawns
   /// that must still run after the observation returns); the test stops it.
   pub(crate) fn audit_daemon() -> super::Daemon {
+    audit_daemon_configured(|_| {})
+  }
+
+  /// [`audit_daemon`] with its derived configuration changed by `configure` before it starts, as
+  /// [`audit_on_shard_configured`] changes an audit's: a test that must reach a derived bound shrinks what derives it.
+  pub(crate) fn audit_daemon_configured(
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> super::Daemon {
     let profile = test_profile();
     static NEXT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let instance = format!(
@@ -6298,7 +6421,8 @@ mod tests {
       std::process::id(),
       NEXT_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    configure(&mut config);
     audit_daemon_with(&profile, config, instance)
   }
 

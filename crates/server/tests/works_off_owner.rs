@@ -1223,25 +1223,7 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
   let mut client = connect(&instance);
   let asked_before = asked_of_the_owner(&daemon);
 
-  let (green, work) = green_and_edited_work(&mut client, "policy-forbid");
-  merging(
-    &mut client,
-    &secret,
-    PolicySubject::Volume { volume: green },
-    WriteMode::Forbid,
-  );
-  let refused = client.submit(work);
-  assert!(
-    matches!(
-      refused,
-      Err(ClientError::Refused(Refusal::PolicyForbids {
-        act: WriteAct::Merge,
-        by: PolicySubject::Volume { volume },
-      })) if volume == green
-    ),
-    "the green's forbid: {refused:?}"
-  );
-  assert_eq!(client.versions(green).unwrap(), 1, "nothing merged");
+  expect_the_greens_forbid_refused(&mut client, &secret);
 
   let (green, work) = green_and_edited_work(&mut client, "policy-ask");
   merging(
@@ -1288,11 +1270,70 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     ),
     "an agent's own approval: {by_agent:?}"
   );
+  expect_a_forged_proof_refused_and_the_launchers_accepted(
+    &mut client,
+    &secret,
+    (green, work),
+    (identity, other),
+  );
+
+  expect_the_greens_ask_to_hold_an_edit_and_submit(&mut client, &secret);
+  // The agent's own session asks (A-285's consumer policy): its merge of its own work off the green's shard is held
+  // there too, with nothing merged, though both volumes would merge at once.
+  merging(
+    &mut client,
+    &secret,
+    PolicySubject::Consumer { consumer },
+    WriteMode::Ask,
+  );
+  expect_the_sessions_ask_to_hold_its_agents_merge(&mut agent);
+  assert!(
+    asked_of_the_owner(&daemon) > asked_before,
+    "the verdicts were asked of the green's owner"
+  );
+  drop(agent);
+  drop(client);
+  daemon.stop();
+}
+
+/// The green's forbid in `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`. Do: forbid a green's merges
+/// with `secret`'s authority and submit a work of it. Expect `PolicyForbids` naming the green, and nothing merged.
+fn expect_the_greens_forbid_refused(client: &mut Client, secret: &[u8; 32]) {
+  let (green, work) = green_and_edited_work(client, "policy-forbid");
+  merging(
+    client,
+    secret,
+    PolicySubject::Volume { volume: green },
+    WriteMode::Forbid,
+  );
+  let refused = client.submit(work);
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(Refusal::PolicyForbids {
+        act: WriteAct::Merge,
+        by: PolicySubject::Volume { volume },
+      })) if volume == green
+    ),
+    "the green's forbid: {refused:?}"
+  );
+  assert_eq!(client.versions(green).unwrap(), 1, "nothing merged");
+}
+
+/// The approvals of `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`'s asked work. Do: approve the
+/// increment `identity` of `work` (over `green`) with a proof made for `other`, then with the launcher's proof of it.
+/// Expect the forged proof refused `GrantIssuerUnverified` with nothing merged, and the launcher's accepted as version 2.
+fn expect_a_forged_proof_refused_and_the_launchers_accepted(
+  client: &mut Client,
+  secret: &[u8; 32],
+  (green, work): (VolumeId, VolumeId),
+  (identity, other): ([u8; 32], [u8; 32]),
+) {
   let forged = client.submit_approved(
     work,
     &[],
     identity,
-    merge_approval_proof(&secret, work, &other),
+    merge_approval_proof(secret, work, &other),
   );
   assert!(
     matches!(
@@ -1311,15 +1352,20 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
       work,
       &[],
       identity,
-      merge_approval_proof(&secret, work, &identity)
+      merge_approval_proof(secret, work, &identity)
     ),
     Ok(Submitted::Accepted(2))
   );
+}
 
-  let (green, work) = green_and_edited_work(&mut client, "policy-green-ask");
+/// The green's ask in `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`. Do: set a green's merges to ask
+/// with `secret`'s authority, edit-and-submit a work of it, then approve the increment asked. Expect the submit
+/// answered with its identity, nothing merged and the edit kept in the work; then the approval accepted.
+fn expect_the_greens_ask_to_hold_an_edit_and_submit(client: &mut Client, secret: &[u8; 32]) {
+  let (green, work) = green_and_edited_work(client, "policy-green-ask");
   merging(
-    &mut client,
-    &secret,
+    client,
+    secret,
     PolicySubject::Volume { volume: green },
     WriteMode::Ask,
   );
@@ -1339,18 +1385,17 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
       work,
       &[],
       identity,
-      merge_approval_proof(&secret, work, &identity)
+      merge_approval_proof(secret, work, &identity)
     ),
     Ok(Submitted::Accepted(2))
   );
-  // The agent's own session asks (A-285's consumer policy): its merge of its own work off the green's shard is held
-  // there too, with nothing merged, though both volumes would merge at once.
-  merging(
-    &mut client,
-    &secret,
-    PolicySubject::Consumer { consumer },
-    WriteMode::Ask,
-  );
+}
+
+/// The session's ask in `a_merge_off_its_greens_shard_follows_both_volumes_write_policy` (A-285's consumer policy). Do:
+/// as `agent`, whose consumer's own policy asks, make a green and a work named off the green's shard, edit the work and
+/// submit it. Expect the merge held for approval with its one path, and nothing merged, though both volumes would merge
+/// at once.
+fn expect_the_sessions_ask_to_hold_its_agents_merge(agent: &mut Client) {
   let green = agent.create_green("policy-session-green", false).unwrap();
   let (work, _) = agent
     .create_work(green, &off_owner_name(green, "policy-session"))
@@ -1362,11 +1407,4 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     "the session's ask holds its agent's merge: {held:?}"
   );
   assert_eq!(agent.versions(green).unwrap(), 0, "nothing merged");
-  assert!(
-    asked_of_the_owner(&daemon) > asked_before,
-    "the verdicts were asked of the green's owner"
-  );
-  drop(agent);
-  drop(client);
-  daemon.stop();
 }
