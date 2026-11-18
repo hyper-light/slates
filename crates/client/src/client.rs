@@ -2,13 +2,17 @@
 //!
 //! **A call waits while its daemon lives, and fails `DaemonGone` once it is gone (§4.7, A-232).** One rule for every
 //! wait a call makes, the async driver's (`crate::driver`) and the two here: `round_trip`'s wait for its
-//! reply and `send`'s wait for a slot on a full command ring. Each reply deadline that passes asks the daemon's
+//! reply and `send`'s wait for a slot on a full command ring. `round_trip`'s wait has no deadline: it ends at the
+//! reply or at the daemon's departure, which the end waits on beside the reply (`ClientEnd::wait_while_daemon_lives`,
+//! A-456: on Linux the control socket's close, on Windows the daemon's process handle, on macOS its exit watch looked
+//! at on a doubling schedule). The other two cannot see the departure yet (a slot that frees wakes nothing, and the
+//! async driver's loop polls only the completion descriptor), so each reply deadline that passes asks the daemon's
 //! liveness, a cold-path question (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the
 //! bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id within the reconnect budget and
-//! the caller resends, or the call fails `DaemonGone` past it. Alive, the deadline re-arms and the wait goes on: a
-//! daemon answers every call it is given, however long the work (a granted landing, a forward across the fleet) or
-//! however starved its threads, and a daemon judged stuck is ended by its supervisor, or by its own watchdog when it
-//! runs alone, which the next deadline then finds gone. Until 2026-11-13 a live daemon's overdue call failed
+//! the caller resends, or the call fails `DaemonGone` past it. Alive, the wait goes on: a daemon answers every call it
+//! is given, however long the work (a granted landing, a forward across the fleet) or however starved its threads, and
+//! a daemon judged stuck is ended by its supervisor, or by its own watchdog when it runs alone, which the wait then
+//! sees gone. Until 2026-11-13 a live daemon's overdue call failed
 //! `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with it); a daemon starved at
 //! `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both of CI's Linux runners
 //! (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
@@ -33,7 +37,7 @@ use slates_ipc::protocol::{
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
-  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, begin_connect_as, connect_as,
+  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, Waited, begin_connect_as, connect_as,
 };
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
@@ -138,7 +142,10 @@ pub struct ArchiveImported {
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
-  /// How long a reply is waited for before the daemon's liveness is questioned.
+  /// How long a wait that cannot see the daemon's departure waits before it asks the daemon's liveness, and again
+  /// after each answer that it lives: the async driver's tick, the wait for a slot on a full ring, a delivery's read
+  /// and the macOS route's claim steps. The synchronous wait for a reply uses none: it ends at the reply or the
+  /// departure itself (A-456).
   pub reply_ns: u64,
   /// How long a reconnect is tried after the daemon is found gone.
   pub reconnect_ns: u64,
@@ -2372,8 +2379,9 @@ impl Client {
     })
   }
 
-  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon was found
-  /// gone and the client reconnected instead (the caller binds and resends).
+  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon departed and
+  /// the client reconnected instead (the caller binds and resends). The wait has no deadline: it ends at the reply or
+  /// at the daemon's departure, which the end waits on beside the reply (A-456; the module doc's rule).
   fn round_trip(
     &mut self,
     id: RequestId,
@@ -2383,8 +2391,12 @@ impl Client {
       return Ok(None);
     }
     loop {
-      match self.end.wait(Some(self.deadlines.reply_ns)) {
-        Ok(reply) => {
+      match self
+        .end
+        .wait_while_daemon_lives()
+        .map_err(ClientError::Ipc)?
+      {
+        Waited::Reply(reply) => {
           if reply.request != id.word() {
             // Another request's reply (an async call's, or an abandoned one's still in flight): kept for its
             // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
@@ -2395,15 +2407,12 @@ impl Client {
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
-        Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
+        // The daemon's process ended with the reply unwritten. A daemon that stops answering is ended by its supervisor,
+        // or by its own watchdog when it runs alone (A-232), so this is where every unanswered call's wait ends.
+        Waited::Departed => {
           self.reconnect()?;
           return Ok(None);
         }
-        // The daemon lives: the next wait re-arms the deadline (the module doc's rule, A-232). A daemon that stops
-        // answering is ended by its supervisor, or by its own watchdog when it runs alone, and a later deadline then
-        // finds it gone.
-        Err(IpcError::DeadlineExceeded) => {}
-        Err(e) => return Err(ClientError::Ipc(e)),
       }
     }
   }

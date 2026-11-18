@@ -6,7 +6,22 @@
 //! client, and the client times the stamp to its own return (§4.3's online estimate, the same
 //! rule as the shard's). Each end owns its sequence cursors; the slots' sequence words carry the
 //! protocol, so neither end touches a shared counter on the hot path.
+//!
+//! **A reply is waited for while its daemon lives, and the wait ends at the daemon's departure (§4.7 "Failure matrix";
+//! A-232, A-456).** [`ClientEnd::wait_while_daemon_lives`] parks on the reply and on the daemon's process together
+//! where the platform can wait on both: on Linux a `poll` of the completion eventfd beside the control socket, whose
+//! peer end the kernel closes as the daemon's process ends; on Windows `WaitForMultipleObjects` on the reply's Event and
+//! the daemon's process handle. macOS wakes a park through the wake word (`os_sync_wait_on_address`), which no wait
+//! takes beside a descriptor or a process, so there the park looks at the daemon's exit watch on A-443's doubling: the
+//! first look once the wait has lasted twice the longer of the time it had waited when it first parked and the client's
+//! wake estimate, each later one at twice the time waited (`Looks`). The looks then cost the logarithm of the wait,
+//! counted in wakes, and a departure is seen within the time already waited. Until A-456 every wait re-armed at the
+//! client's reply deadline, the anchor's liveness budget (a second), and asked the daemon's liveness there, so a call
+//! whose daemon died waited up to that second to learn it. [`ClientEnd::wait`] keeps its caller's deadline and asks
+//! nothing of the daemon.
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(windows)]
@@ -55,6 +70,17 @@ pub struct Reply {
   pub payload: Vec<u8>,
 }
 
+/// What a wait for the next reply while the daemon lives ended with ([`ClientEnd::wait_while_daemon_lives`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Waited {
+  /// The next reply.
+  Reply(Reply),
+  /// The daemon's process ended with no reply left in the ring: the caller reconnects and sends again under the same
+  /// id, as it does for a daemon found gone (§4.7 "Failure matrix"). A reply the daemon wrote before it ended is taken
+  /// first, as [`Waited::Reply`].
+  Departed,
+}
+
 /// The client's end.
 pub struct ClientEnd {
   region: ClientRegion,
@@ -71,7 +97,7 @@ pub struct ClientEnd {
   replies: u64,
   /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
   /// reply's wake that landed after its reply was taken and found this park — so the client parked
-  /// again. Every park ends in a reply, one of these, or the deadline.
+  /// again. Every park ends in a reply, one of these, the deadline, a look, or the daemon's departure.
   unanswered_wakes: u64,
   /// The client's online wake estimate, its spin window: seeded with the window the daemon published
   /// and fed the wake of each park a reply ended asleep, from the daemon's reply stamp to the client running
@@ -79,10 +105,20 @@ pub struct ClientEnd {
   wake: WakeEstimate,
   /// Parks whose wake fed the estimate (a non-vacuity count).
   wake_samples: u64,
-  /// Parks a reply ended, as `(waiting_ns, returned_ns)` by the reply stamp slot each named, whose stamp
-  /// the daemon had not yet confirmed when the client read it: settled at a later park's arming, and given
-  /// up when the slot is armed again (`region::REPLY_STAMP_SLOTS`).
-  unsettled: [Option<(u64, u64)>; REPLY_STAMP_SLOTS],
+  /// Parks a reply ended, by the reply stamp slot each named, whose stamp could not be judged when the client read it
+  /// (a waker's confirmation not yet landed): settled at a later park's arming, and given up when the slot is armed
+  /// again (`region::REPLY_STAMP_SLOTS`).
+  unsettled: [Option<Unsettled>; REPLY_STAMP_SLOTS],
+  /// Looks made at the daemon's life by a wait that cannot wait on its departure (macOS's doubling, A-456): a
+  /// non-vacuity count, zero where the park waits on the departure itself (Linux, Windows).
+  liveness_looks: u64,
+  /// The current departure wait's look schedule (macOS, A-456; reset as each wait begins).
+  #[cfg(target_os = "macos")]
+  looks: Looks,
+  /// Whether a departure park read the running completion bridge's pipe (Linux, A-456): the level the async loop
+  /// polls, which the wait gives back as it ends ([`Self::give_back_bridge_level`]).
+  #[cfg(target_os = "linux")]
+  bridge_level_owed: bool,
   /// The reply stamp slot the next park names: the slots alternate, so a confirmation that lands after
   /// the next park armed finds its own slot intact.
   next_stamp_slot: usize,
@@ -125,6 +161,11 @@ impl ClientEnd {
       wake,
       wake_samples: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
+      liveness_looks: 0,
+      #[cfg(target_os = "macos")]
+      looks: Looks::default(),
+      #[cfg(target_os = "linux")]
+      bridge_level_owed: false,
       next_stamp_slot: 0,
       region,
       doorbell: None,
@@ -396,6 +437,18 @@ impl ClientEnd {
     self.liveness.as_ref().is_none_or(|l| l.daemon_gone())
   }
 
+  /// Looks made at the daemon's life by [`Self::wait_while_daemon_lives`] where its park cannot wait on the departure
+  /// (macOS, A-456): logarithmic in the time waited; none on Linux and Windows, whose parks wait on the departure itself.
+  pub fn liveness_looks(&self) -> u64 {
+    self.liveness_looks
+  }
+
+  /// Gives this end a liveness check, as [`Self::connected`] does: a test's stand-in for the daemon's life.
+  #[cfg(test)]
+  pub(crate) fn set_liveness(&mut self, liveness: crate::rendezvous::Liveness) {
+    self.liveness = Some(liveness);
+  }
+
   /// A descriptor that reports the daemon's departure when polled for `POLLRDHUP` (`Liveness::watch`, Linux), or `None`
   /// for an end with no liveness check.
   #[cfg(target_os = "linux")]
@@ -527,100 +580,501 @@ impl ClientEnd {
   /// Waits for the next reply: spins for the wake estimate, then parks on the wake word
   /// (setting the parked flag and re-checking the slot to close the race), until the reply
   /// arrives or `deadline_ns` (from the call) passes. A park a reply ended asleep teaches the
-  /// estimate its wake ([`wait_may_teach`]).
+  /// estimate its wake ([`wait_may_teach`]). It asks nothing of the daemon's life: a caller that
+  /// waits while the daemon lives uses [`Self::wait_while_daemon_lives`].
   pub fn wait(&mut self, deadline_ns: Option<u64>) -> Result<Reply, IpcError> {
+    match self.wait_ending(Ends::At(deadline_ns))? {
+      Waited::Reply(reply) => Ok(reply),
+      // A deadline's parks never wait on the daemon, so none of them reports its departure.
+      Waited::Departed => Err(IpcError::DeadlineExceeded),
+    }
+  }
+
+  /// Waits for the next reply while the daemon lives, with no deadline (§4.7 "Failure matrix"; A-232, A-456): spins
+  /// for the wake estimate, then parks on the reply and the daemon's departure together (the module doc), until the
+  /// reply arrives ([`Waited::Reply`]) or the daemon's process ends with none in the ring ([`Waited::Departed`]). A
+  /// daemon that lives but never answers is ended by its supervisor, or by its own watchdog when it runs alone (A-232),
+  /// and the wait ends there. An end with no liveness check has no daemon to wait on: its wait ends `Departed` once the
+  /// ring holds nothing, as [`Self::daemon_gone`] reads it gone. On Linux an end with a liveness check and no
+  /// completion descriptor is refused `Unsupported` (every rendezvous hands one over).
+  pub fn wait_while_daemon_lives(&mut self) -> Result<Waited, IpcError> {
+    #[cfg(target_os = "macos")]
+    {
+      self.looks = Looks::default();
+    }
+    let waited = self.wait_ending(Ends::Departure);
+    #[cfg(target_os = "linux")]
+    self.give_back_bridge_level();
+    waited
+  }
+
+  /// The wait both forms share: the spin, then one park at a time until the reply, the end `ends` names, or a refusal.
+  fn wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
     let started = Instant::now();
     let spin_ns = self.spin_override_ns.unwrap_or_else(|| self.wake.mean_ns());
     loop {
       if let Some(reply) = self.try_take()? {
-        return Ok(reply);
+        return Ok(Waited::Reply(reply));
       }
-      if elapsed_ns(started) < spin_ns {
+      let elapsed = elapsed_ns(started);
+      if elapsed < spin_ns {
         std::hint::spin_loop();
         continue;
       }
-      if deadline_ns.is_some_and(|d| elapsed_ns(started) >= d) {
-        return Err(IpcError::DeadlineExceeded);
+      let look_timeout_ns = match self.before_park(ends, elapsed)? {
+        Before::Park(timeout_ns) => timeout_ns,
+        Before::Ended(waited) => return Ok(waited),
+      };
+      if let Some(waited) = self.park_once(ends, started, look_timeout_ns)? {
+        return Ok(waited);
       }
-      // Park: the flag first, the word's value (Linux/macOS), then the re-check that closes the race
-      // with a reply written between the last poll and the wait. On Linux/macOS the wait returns at
-      // once if the wake word moved past the value read here; on Windows the named auto-reset Event
-      // carries a signal made before the wait, so no separate value is needed. The park's reply stamp
-      // slot is cleared before the flag names it (the flag's release orders it), so the stamp read after
-      // the wake is the first one the daemon took for this park. Earlier parks' unconfirmed stamps are
-      // settled first; the one in this slot is given up, as one daemon serves the ring in order and its
-      // reply call returned before the reply this client took since.
-      let slot = self.next_stamp_slot;
-      self.next_stamp_slot = usize::from(slot == 0);
-      self.settle_wakes()?;
-      if let Some(given_up) = self.unsettled.get_mut(slot) {
-        *given_up = None;
-      }
-      self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
-      // A running completion bridge waits where this park does: the flag's value, a stamp slot's and never the async
-      // arm's, has it pass on a wake it takes while this park waits (see `crate::completion`).
-      self
-        .region
-        .client_parked()?
-        .store(parked_flag(slot), Ordering::Release);
-      // The park protocol's client half: the word's value and the re-check below are ordered after the
-      // flag, so a reply the re-check misses is one the daemon sees the flag for (§4.7; `crate::park`).
-      crate::park::after_arming();
-      #[cfg(not(windows))]
-      let expected = self.region.wake_word()?.load(Ordering::Acquire);
-      if let Some(reply) = self.try_take()? {
-        self.region.client_parked()?.store(0, Ordering::Release);
-        return Ok(reply);
-      }
-      self.parks = self.parks.saturating_add(1);
-      let remaining = deadline_ns.map(|d| d.saturating_sub(elapsed_ns(started)));
-      let switches_before = slates_machine::switches::switches_now();
-      let waiting_ns = slates_machine::clock::monotonic_ns();
-      #[cfg(windows)]
-      let woken = self.region.wake_wait(remaining)?;
-      #[cfg(not(windows))]
-      let woken = wake::wait(self.region.wake_word()?, expected, remaining)?;
-      let returned_ns = slates_machine::clock::monotonic_ns();
-      let teaches = wait_may_teach(
-        WAKER_CONFIRMS,
-        switches_before,
-        slates_machine::switches::switches_now(),
-      );
+    }
+  }
+
+  /// What comes before a park: the deadline's end ([`Ends::At`]), or the departure's look where the park cannot wait on
+  /// the departure itself ([`Self::departure_due`]).
+  fn before_park(&mut self, ends: Ends, elapsed_ns: u64) -> Result<Before, IpcError> {
+    match ends {
+      Ends::At(Some(deadline_ns)) if elapsed_ns >= deadline_ns => Err(IpcError::DeadlineExceeded),
+      Ends::At(_) => Ok(Before::Park(None)),
+      Ends::Departure => self.departure_due(elapsed_ns),
+    }
+  }
+
+  /// One park: armed, the reply looked for again, then the platform's wait for the end `ends` names: what is left of a
+  /// deadline; for a departure, until its next look (`look_timeout_ns`, macOS) or for good (Linux, Windows). The reply,
+  /// the end, or `None` to wait on.
+  fn park_once(
+    &mut self,
+    ends: Ends,
+    started: Instant,
+    look_timeout_ns: Option<u64>,
+  ) -> Result<Option<Waited>, IpcError> {
+    let (slot, expected) = self.arm_park()?;
+    if let Some(reply) = self.try_take()? {
       self.region.client_parked()?.store(0, Ordering::Release);
-      if woken {
-        if teaches && let Some(unsettled) = self.unsettled.get_mut(slot) {
-          *unsettled = Some((waiting_ns, returned_ns));
-        }
-        self.settle_wakes()?;
-        if let Some(reply) = self.try_take()? {
-          return Ok(reply);
-        }
-        self.unanswered_wakes = self.unanswered_wakes.saturating_add(1);
+      return Ok(Some(Waited::Reply(reply)));
+    }
+    self.parks = self.parks.saturating_add(1);
+    let switches_before = slates_machine::switches::switches_now();
+    let waiting_ns = slates_machine::clock::monotonic_ns();
+    let parked = match ends {
+      Ends::At(deadline_ns) => {
+        let remaining = deadline_ns.map(|deadline| deadline.saturating_sub(elapsed_ns(started)));
+        self.park_until(expected, remaining)?
       }
-      if !woken && deadline_ns.is_some() {
-        if let Some(reply) = self.try_take()? {
-          return Ok(reply);
-        }
-        return Err(IpcError::DeadlineExceeded);
+      Ends::Departure => self.park_until_departure(expected, look_timeout_ns)?,
+    };
+    let returned_ns = slates_machine::clock::monotonic_ns();
+    let teaches = wait_may_teach(
+      parked.waker_confirms,
+      switches_before,
+      slates_machine::switches::switches_now(),
+    );
+    self.region.client_parked()?.store(0, Ordering::Release);
+    let woke = teaches.then_some(Unsettled {
+      waiting_ns,
+      returned_ns,
+      waker_confirms: parked.waker_confirms,
+    });
+    self.after_park(ends, slot, parked, woke)
+  }
+
+  /// Arms a park (§4.7; `crate::park`): the flag first, then the wake word's value, both before the caller's re-check
+  /// that closes the race with a reply written between the last look and the wait. A word's wait (Linux, macOS)
+  /// returns at once if the word moved past the value read here; Windows' named auto-reset Event and a Linux departure
+  /// park's descriptor keep a signal made before the wait, so the value goes unused there. The park's reply stamp slot is
+  /// cleared before the flag names it (the flag's release orders it), so the stamp read after the wake is the first one
+  /// the daemon took for this park. Earlier parks' unsettled stamps are settled first; the one in this slot is given up,
+  /// as one daemon serves the ring in order and its reply call returned before the reply this client took since. The
+  /// park's stamp slot and the word's value.
+  fn arm_park(&mut self) -> Result<(usize, u32), IpcError> {
+    let slot = self.next_stamp_slot;
+    self.next_stamp_slot = usize::from(slot == 0);
+    self.settle_wakes()?;
+    if let Some(given_up) = self.unsettled.get_mut(slot) {
+      *given_up = None;
+    }
+    self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
+    // A running completion bridge waits where this park does: the flag's value, a stamp slot's and never the async
+    // arm's, has it pass on a wake it takes while this park waits (see `crate::completion`).
+    self
+      .region
+      .client_parked()?
+      .store(parked_flag(slot), Ordering::Release);
+    // The park protocol's client half: the word's value and the re-check after it are ordered after the flag, so a
+    // reply the re-check misses is one the daemon sees the flag for (§4.7; `crate::park`).
+    crate::park::after_arming();
+    let expected = self.region.wake_word()?.load(Ordering::Acquire);
+    Ok((slot, expected))
+  }
+
+  /// What a park's end means: a wake teaches its wait (`woke`, when [`wait_may_teach`] let it) and the reply is looked
+  /// for; a departure ends the wait, a reply written before it taken first; a deadline's park that timed out ends its
+  /// wait `DeadlineExceeded`; anything else waits on (`None`).
+  fn after_park(
+    &mut self,
+    ends: Ends,
+    slot: usize,
+    parked: Parked,
+    woke: Option<Unsettled>,
+  ) -> Result<Option<Waited>, IpcError> {
+    if parked.woken
+      && let Some(reply) = self.after_wake(slot, woke)?
+    {
+      return Ok(Some(Waited::Reply(reply)));
+    }
+    if parked.departed {
+      return self.after_departure().map(Some);
+    }
+    if parked.woken {
+      self.unanswered_wakes = self.unanswered_wakes.saturating_add(1);
+      return Ok(None);
+    }
+    match ends {
+      Ends::At(Some(_)) => self.after_deadline().map(Some),
+      Ends::At(None) | Ends::Departure => Ok(None),
+    }
+  }
+
+  /// A park a wake ended: its wait kept for the estimate when it may teach, the stamps settled, then the reply taken.
+  fn after_wake(
+    &mut self,
+    slot: usize,
+    woke: Option<Unsettled>,
+  ) -> Result<Option<Reply>, IpcError> {
+    if let Some(woke) = woke
+      && let Some(unsettled) = self.unsettled.get_mut(slot)
+    {
+      *unsettled = Some(woke);
+    }
+    self.settle_wakes()?;
+    self.try_take()
+  }
+
+  /// A deadline's park that timed out: a reply that landed meanwhile is taken, else the deadline has passed.
+  fn after_deadline(&mut self) -> Result<Waited, IpcError> {
+    match self.try_take()? {
+      Some(reply) => Ok(Waited::Reply(reply)),
+      None => Err(IpcError::DeadlineExceeded),
+    }
+  }
+
+  /// The daemon's process ended: a reply it wrote before is taken, else the wait ends `Departed`.
+  fn after_departure(&mut self) -> Result<Waited, IpcError> {
+    Ok(match self.try_take()? {
+      Some(reply) => Waited::Reply(reply),
+      None => Waited::Departed,
+    })
+  }
+
+  /// macOS: the departure's look, when the doubling makes one due (A-443, A-456; `Looks`): a park here waits on the
+  /// wake word alone, so the daemon's exit watch is looked at on that schedule. `Park` until the next look, made now
+  /// when one was due and found the daemon alive (the park re-checks the ring as it arms); `Ended` once a look finds its
+  /// process gone (a reply it wrote before taken first), or at once for an end with no liveness check.
+  #[cfg(target_os = "macos")]
+  fn departure_due(&mut self, elapsed_ns: u64) -> Result<Before, IpcError> {
+    let Some(liveness) = self.liveness.as_ref() else {
+      return Ok(Before::Ended(Waited::Departed));
+    };
+    if self.looks.due(elapsed_ns, self.wake.mean_ns()) {
+      self.liveness_looks = self.liveness_looks.saturating_add(1);
+      if liveness.departed() {
+        return self.after_departure().map(Before::Ended);
       }
+      self.looks.looked(elapsed_ns);
+    }
+    Ok(Before::Park(self.looks.until(elapsed_ns)))
+  }
+
+  /// Linux and Windows: the park waits on the departure itself, so no look is ever due and the park has no timeout; an
+  /// end with no liveness check has no daemon to wait on.
+  #[cfg(not(target_os = "macos"))]
+  fn departure_due(&mut self, _elapsed_ns: u64) -> Result<Before, IpcError> {
+    Ok(if self.liveness.is_none() {
+      Before::Ended(Waited::Departed)
+    } else {
+      Before::Park(None)
+    })
+  }
+
+  /// A deadline's park (and macOS's departure park between its looks): the wake word's wait, whose wake confirms a
+  /// sleeper found (Linux's futex, macOS's ulock), up to `timeout_ns` (`None`: until woken).
+  #[cfg(not(windows))]
+  fn park_until(&self, expected: u32, timeout_ns: Option<u64>) -> Result<Parked, IpcError> {
+    Ok(Parked {
+      woken: wake::wait(self.region.wake_word()?, expected, timeout_ns)?,
+      departed: false,
+      waker_confirms: true,
+    })
+  }
+
+  /// A deadline's park (Windows): the region's named Event, which cannot tell a signal that met a sleeper from one
+  /// consumed later, so the client judges its own sleep; up to `timeout_ns` (`None`: until signaled).
+  #[cfg(windows)]
+  fn park_until(&self, _expected: u32, timeout_ns: Option<u64>) -> Result<Parked, IpcError> {
+    Ok(Parked {
+      woken: self.region.wake_wait(timeout_ns)?,
+      departed: false,
+      waker_confirms: false,
+    })
+  }
+
+  /// Linux: one `poll` of the wake's level beside the control socket, with no timeout (A-456). The level is the
+  /// completion eventfd, which the daemon writes for a parked client, or, while a completion bridge runs, the bridge's
+  /// pipe: the bridge is then the eventfd's only reader and writes its pipe after every read, so no nudge is lost to it.
+  /// The socket's peer end closes as the daemon's process ends (`POLLRDHUP`, `POLLHUP`); its deliveries make it
+  /// readable, which this wait does not ask about. The daemon's futex wake finds no sleeper here, so the client judges
+  /// its own sleep (`slates_machine::switches`).
+  #[cfg(target_os = "linux")]
+  fn park_until_departure(
+    &mut self,
+    _expected: u32,
+    _timeout_ns: Option<u64>,
+  ) -> Result<Parked, IpcError> {
+    use rustix::event::{PollFd, PollFlags, poll};
+    let (woken, departed) = {
+      let Some(liveness) = self.liveness.as_ref() else {
+        return Ok(Parked::DEPARTED);
+      };
+      let level = match (&self.bridge, &self.completion) {
+        (Some(bridge), _) => bridge.level(),
+        (None, Some(eventfd)) => eventfd.as_fd(),
+        (None, None) => {
+          return Err(IpcError::Unsupported {
+            feature: "a wait on the daemon's departure without the completion descriptor",
+          });
+        }
+      };
+      let watch = liveness.watch();
+      let mut interest = [
+        PollFd::new(&level, PollFlags::IN),
+        PollFd::new(&watch, PollFlags::RDHUP),
+      ];
+      match poll(&mut interest, None) {
+        Ok(_) => {}
+        // A signal: the caller looks at the ring, then parks again.
+        Err(rustix::io::Errno::INTR) => return Ok(Parked::INTERRUPTED),
+        Err(error) => {
+          return Err(IpcError::OsRefused {
+            call: "poll",
+            code: Some(error.raw_os_error()),
+          });
+        }
+      }
+      let [level_ready, watch_ready] = interest.map(|polled| polled.revents());
+      (
+        level_ready.contains(PollFlags::IN),
+        watch_ready
+          .intersects(PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
+      )
+    };
+    if woken {
+      self.take_level();
+    }
+    Ok(Parked {
+      woken,
+      departed,
+      waker_confirms: false,
+    })
+  }
+
+  /// macOS: the wake word's wait until the next look at the daemon's exit watch, which comes before the park
+  /// ([`Self::departure_due`]).
+  #[cfg(target_os = "macos")]
+  fn park_until_departure(
+    &mut self,
+    expected: u32,
+    timeout_ns: Option<u64>,
+  ) -> Result<Parked, IpcError> {
+    self.park_until(expected, timeout_ns)
+  }
+
+  /// Windows: the region's Event and the daemon's process handle in one wait, with no timeout (A-456), as a claim waits
+  /// beside its answer's (A-447). The Event cannot tell a signal that met a sleeper from one consumed later, so the
+  /// client judges its own sleep.
+  #[cfg(windows)]
+  fn park_until_departure(
+    &mut self,
+    _expected: u32,
+    _timeout_ns: Option<u64>,
+  ) -> Result<Parked, IpcError> {
+    let Some(process) = self
+      .liveness
+      .as_ref()
+      .and_then(crate::rendezvous::Liveness::exit_handle)
+    else {
+      return Ok(Parked::DEPARTED);
+    };
+    let signaled = self.region.wake_wait_or_exit(process)?;
+    Ok(Parked {
+      woken: signaled,
+      departed: !signaled,
+      waker_confirms: false,
+    })
+  }
+
+  /// No rendezvous on this platform, so no daemon lives to wait on.
+  #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+  fn park_until_departure(
+    &mut self,
+    _expected: u32,
+    _timeout_ns: Option<u64>,
+  ) -> Result<Parked, IpcError> {
+    Ok(Parked::DEPARTED)
+  }
+
+  /// Clears the level a Linux departure park woke on: the bridge's pipe while one runs, whose level is then owed back to
+  /// the async loop that polls it ([`Self::give_back_bridge_level`]), else the eventfd, whose read resets its counter.
+  /// Both are non-blocking, and a read of an empty one (`EAGAIN`) leaves nothing to clear.
+  #[cfg(target_os = "linux")]
+  fn take_level(&mut self) {
+    if let Some(bridge) = &self.bridge {
+      bridge.drain();
+      self.bridge_level_owed = true;
+    } else if let Some(eventfd) = &self.completion {
+      let mut counter = [0u8; size_of::<u64>()];
+      let _ = rustix::io::read(eventfd, &mut counter);
+    }
+  }
+
+  /// Gives the bridge's pipe back the level a departure wait read from it (Linux, A-456): a nudge on the eventfd, which
+  /// the bridge reads and passes to its pipe, so the async loop still learns of the replies the synchronous wait drained
+  /// past it. A nudge the kernel refuses (a counter at its maximum) leaves the level the eventfd already holds.
+  #[cfg(target_os = "linux")]
+  fn give_back_bridge_level(&mut self) {
+    if std::mem::take(&mut self.bridge_level_owed)
+      && let Some(eventfd) = &self.completion
+    {
+      let _ = rustix::io::write(eventfd, &COMPLETION_NUDGE);
     }
   }
 }
 
-/// Format: whether the daemon's wake reports finding the client asleep, so a stamp is learned only once
-/// confirmed (Linux's futex and macOS's ulock wakes answer it). Windows' auto-reset Event cannot tell a
-/// signal that met a sleeper from one consumed later, so there the client confirms its own sleep by its
-/// switch count across the wait ([`wait_may_teach`]), as the shards judge their parks and the boot probe
-/// its waiter (A-223), and a stamp it confirmed is learned once it falls inside the wait.
-const WAKER_CONFIRMS: bool = !cfg!(windows);
+/// How a wait ends besides its reply ([`ClientEnd::wait`], [`ClientEnd::wait_while_daemon_lives`]).
+#[derive(Clone, Copy, Debug)]
+enum Ends {
+  /// At the caller's deadline, counted from the wait's start (`None`: never), the daemon's life unasked.
+  At(Option<u64>),
+  /// At the daemon's departure (A-456).
+  Departure,
+}
+
+/// What a wait does before its next park.
+#[derive(Debug)]
+enum Before {
+  /// Park, at most this long (`None`: until woken).
+  Park(Option<u64>),
+  /// The wait is over.
+  Ended(Waited),
+}
+
+/// How one park ended.
+#[derive(Clone, Copy, Debug)]
+struct Parked {
+  /// The wait returned for a wake (or a moved word, or a signal), not at its timeout.
+  woken: bool,
+  /// The daemon's process ended while the client waited (Linux: the control socket's peer end closed; Windows: its
+  /// process handle signaled), or there was no daemon to wait on.
+  departed: bool,
+  /// Whether the daemon's wake of this park reports finding the client asleep, so a stamp is learned only once
+  /// confirmed: Linux's futex and macOS's ulock wakes answer it. Windows' auto-reset Event cannot tell a signal that met
+  /// a sleeper from one consumed later, and a Linux departure park waits on a descriptor the futex wake never reaches,
+  /// so for those the client confirms its own sleep by its switch count across the wait ([`wait_may_teach`]), as the
+  /// shards judge their parks and the boot probe its waiter (A-223), and a stamp it confirmed is learned once it falls
+  /// inside the wait.
+  waker_confirms: bool,
+}
+
+impl Parked {
+  /// No wait made: the daemon has no life to wait on (no liveness check, or its process gone when the watch was taken).
+  #[cfg(not(target_os = "macos"))]
+  const DEPARTED: Parked = Parked {
+    woken: false,
+    departed: true,
+    waker_confirms: false,
+  };
+  /// A Linux departure park a signal ended: a wake with nothing to say, after which the caller looks and parks again.
+  #[cfg(target_os = "linux")]
+  const INTERRUPTED: Parked = Parked {
+    woken: true,
+    departed: false,
+    waker_confirms: false,
+  };
+}
+
+/// A park a reply ended whose wake is not yet folded into the estimate (`ClientEnd::settle_wakes`).
+#[derive(Clone, Copy, Debug)]
+struct Unsettled {
+  /// When the client began its wait (the host clock, nanoseconds).
+  waiting_ns: u64,
+  /// When the wait returned.
+  returned_ns: u64,
+  /// Whether the park's waker confirms a sleeper found ([`Parked::waker_confirms`]): its stamp is then learned only
+  /// once confirmed; otherwise the client's switch count judged the sleep before the park was left unsettled.
+  waker_confirms: bool,
+}
+
+/// When a departure wait whose park cannot wait on the departure next looks at the daemon's life (macOS; A-456 on
+/// A-443's doubling). The first look comes once the wait has lasted twice the longer of the time it had waited at its
+/// first park and the client's wake estimate: a look costs a park's timeout and a wake, so none comes sooner than twice
+/// the measured cost of one. Each later look comes at twice the time waited at the one before. A wait of `t` then makes
+/// at most `log2(t / first) + 1` looks, and a departure is seen by twice the time waited when it happened, or at the
+/// first look when it came before that.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct Looks {
+  /// The time waited at which the next look is due; `None` until the wait's first park fixes it.
+  next_ns: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Looks {
+  /// Whether a look is due at `elapsed_ns` waited; the first call fixes the first look from `elapsed_ns` and the wake
+  /// estimate `wake_ns` ([`first_look_ns`]).
+  fn due(&mut self, elapsed_ns: u64, wake_ns: u64) -> bool {
+    let next_ns = *self
+      .next_ns
+      .get_or_insert_with(|| first_look_ns(elapsed_ns, wake_ns));
+    elapsed_ns >= next_ns
+  }
+
+  /// A look made at `elapsed_ns` found the daemon alive: the next comes at twice the time waited.
+  fn looked(&mut self, elapsed_ns: u64) {
+    self.next_ns = Some(
+      elapsed_ns
+        .saturating_mul(2)
+        .max(elapsed_ns.saturating_add(1)),
+    );
+  }
+
+  /// How long a park may wait before the next look is due (`None` until the first park fixed it).
+  fn until(&self, elapsed_ns: u64) -> Option<u64> {
+    self
+      .next_ns
+      .map(|next_ns| next_ns.saturating_sub(elapsed_ns))
+  }
+}
+
+/// Derived: the time waited at a departure wait's first look (`Looks`): twice the longer of the time waited at its first
+/// park and the wake estimate.
+#[cfg(any(target_os = "macos", test))]
+fn first_look_ns(elapsed_ns: u64, wake_ns: u64) -> u64 {
+  slates_machine::derived!(
+    elapsed_ns.max(wake_ns).saturating_mul(2).max(1),
+    "2 × max(time waited at the first park, wake estimate)",
+    ["elapsed_ns", "wake_ns"]
+  )
+  .get()
+}
 
 /// Whether a park's wake goes on to be judged by its stamp ([`ClientEnd::settle_wakes`]), from the client's
 /// own switch count across its wait (`slates_machine::switches`). Where the daemon's wake confirms a sleeper
-/// found (`waker_confirms`), that confirmation judges and every park goes on. Elsewhere (Windows) the client
-/// judges itself: only a wait across which its count rose slept. A wait that found the reply's signal
-/// already set returned without switching, and timing it taught an on-CPU handoff (0.1–0.8 µs) for a
-/// sleeper's wake (6–9 µs on CI's Windows runners, A-223); a count the OS refused proves nothing, so the
-/// client learns nothing and keeps its seed.
+/// found (`waker_confirms`), that confirmation judges and every park goes on. Elsewhere (Windows' Event, and a Linux
+/// park that waits on its daemon's departure, A-456) the client judges itself: only a wait across which its count
+/// rose slept. A wait that found the reply's signal already set returned without switching, and timing it taught an
+/// on-CPU handoff (0.1–0.8 µs) for a sleeper's wake (6–9 µs on CI's Windows runners, A-223); a count the OS refused
+/// proves nothing, so the client learns nothing and keeps its seed.
 fn wait_may_teach(
   waker_confirms: bool,
   switches_before: Option<u64>,
@@ -646,9 +1100,9 @@ fn stamp_slot(parked: u32) -> usize {
 
 impl ClientEnd {
   /// Folds each unsettled park's wake into the estimate once its stamp can be judged: the daemon's reply
-  /// stamp to the client's return, when the client was confirmed asleep (by the daemon's wake, or on
-  /// Windows by its own switch count before the park was left unsettled, [`WAKER_CONFIRMS`]) and the
-  /// stamp falls inside the wait — a sleeper woken, the event the boot probe times. A reply that landed
+  /// stamp to the client's return, when the client was confirmed asleep (by the daemon's wake, or by its own
+  /// switch count before the park was left unsettled where the park's waker cannot confirm, [`Parked::waker_confirms`])
+  /// and the stamp falls inside the wait — a sleeper woken, the event the boot probe times. A reply that landed
   /// while the park was being set up met a waiter not yet asleep: its wake finds no sleeper and is never
   /// confirmed, and timing it would teach a wake that never happened (measured: the bench's daemon,
   /// replying the instant the flag rose, taught 611–974 ns against the boot probe's 2.0–3.3 µs, macOS,
@@ -657,20 +1111,20 @@ impl ClientEnd {
   /// 32 parks on two busy CPUs, 2026-11-04), so it stays in its slot until that slot is armed again.
   fn settle_wakes(&mut self) -> Result<(), IpcError> {
     for slot in 0..REPLY_STAMP_SLOTS {
-      let Some(Some((waiting_ns, returned_ns))) = self.unsettled.get(slot).copied() else {
+      let Some(Some(park)) = self.unsettled.get(slot).copied() else {
         continue;
       };
       let stamp = self.region.reply_stamp(slot)?.load(Ordering::Acquire);
       let confirmed = stamp & REPLY_STAMP_CONFIRMED != 0;
-      if WAKER_CONFIRMS && !confirmed {
+      if park.waker_confirms && !confirmed {
         continue;
       }
       if let Some(settled) = self.unsettled.get_mut(slot) {
         *settled = None;
       }
       let sent_ns = stamp & !REPLY_STAMP_CONFIRMED;
-      if waiting_ns <= sent_ns && sent_ns <= returned_ns {
-        self.wake.record(returned_ns.saturating_sub(sent_ns));
+      if park.waiting_ns <= sent_ns && sent_ns <= park.returned_ns {
+        self.wake.record(park.returned_ns.saturating_sub(sent_ns));
         self.wake_samples = self.wake_samples.saturating_add(1);
       }
     }
@@ -908,6 +1362,303 @@ mod judged {
         wait_may_teach(true, before, after),
         "the daemon's confirmation, {before:?} → {after:?}"
       );
+    }
+  }
+}
+
+#[cfg(test)]
+mod looks {
+  use super::{Looks, first_look_ns};
+
+  /// Shape: where the schedule is walked from, as (the time waited at the first park, the wake estimate) in
+  /// nanoseconds: a first park inside the wake (a caller that spins for none of it), one at it, and one well past it (a
+  /// spin window chosen long).
+  const STARTS: [(u64, u64); 3] = [(0, 3_000), (3_000, 3_000), (200_000, 3_000)];
+  /// Shape: the wait the schedule is walked across: half again the second the wait re-armed at before A-456.
+  const WAIT_NS: u64 = 1_500_000_000;
+
+  /// A-456 on A-443's doubling. Do: walk a look schedule across a wait from each start, each park timing out when the
+  /// next look is due, and look then. Expect: no look at the first park; the first at twice the longer of the time waited
+  /// at the first park and the wake estimate; each later one at twice the time waited at the one before; and no more
+  /// looks across the wait than the logarithm of the wait over the first look's time, plus two (the last one past it).
+  #[test]
+  fn looks_come_at_twice_the_time_waited_from_twice_the_longer_of_the_first_park_and_the_wake() {
+    for (first_park_ns, wake_ns) in STARTS {
+      let first = first_look_ns(first_park_ns, wake_ns);
+      assert_eq!(first, 2 * first_park_ns.max(wake_ns), "the first look");
+      let mut looks = Looks::default();
+      assert!(
+        !looks.due(first_park_ns, wake_ns),
+        "no look at the first park"
+      );
+      let mut elapsed = first_park_ns;
+      let mut made: Vec<u64> = Vec::new();
+      while elapsed < WAIT_NS {
+        elapsed += looks.until(elapsed).unwrap();
+        assert!(looks.due(elapsed, wake_ns), "a look due at {elapsed} ns");
+        made.push(elapsed);
+        looks.looked(elapsed);
+      }
+      assert_eq!(made.first(), Some(&first));
+      for pair in made.windows(2) {
+        assert_eq!(pair[1], 2 * pair[0], "the looks at {made:?}");
+      }
+      let bound = u64::from((WAIT_NS / first).ilog2()) + 2;
+      assert!(
+        u64::try_from(made.len()).unwrap() <= bound,
+        "{} looks across {WAIT_NS} ns from {first} ns, past the bound {bound}",
+        made.len()
+      );
+    }
+  }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod departure {
+  use std::time::{Duration, Instant};
+
+  use slates_mem::Handoff;
+
+  use super::{ClientEnd, DaemonEnd, Waited};
+  use crate::region::{ClientRegion, RegionGeometry};
+  use crate::rendezvous::Liveness;
+  use crate::slot::Slot;
+
+  /// Shape: the reply deadline the client's wait re-armed at before A-456, the anchor's liveness budget
+  /// (`slates_server::daemon::LIVENESS_BUDGET_NS`, a second): the late reply comes past it, and a departure is seen
+  /// within it, where before the first question of the daemon's life came at it.
+  const OLD_REPLY_DEADLINE_NS: u64 = 1_000_000_000;
+  /// Shape: how long the late-reply test's daemon holds its answer: half again the old reply deadline.
+  const LATE_NS: u64 = OLD_REPLY_DEADLINE_NS + OLD_REPLY_DEADLINE_NS / 2;
+  /// Shape: how far into the wait the departure test's daemon ends: a quarter of the old reply deadline, so even
+  /// macOS's doubling, which sees a departure within the time waited, sees it within half the old deadline, short of
+  /// the lateness its timer allows.
+  const DEPARTS_AFTER_NS: u64 = OLD_REPLY_DEADLINE_NS / 4;
+  /// Shape: how long a stand-in daemon process lives unless the test ends it, in seconds: past any of these tests.
+  #[cfg(any(target_os = "macos", windows))]
+  const STAND_IN_LIFE_S: &str = "30";
+
+  fn geometry() -> RegionGeometry {
+    RegionGeometry {
+      slots: 8,
+      spin_ns: 200_000,
+      spin_shift: 4,
+      bulk_bytes: 4096,
+      page: 4096,
+    }
+  }
+
+  /// A region name unique to this process (the Unix tests' `unique_name` says why).
+  fn unique_name(test: &str) -> String {
+    format!("{test}-{}", std::process::id())
+  }
+
+  /// The daemon's process as these tests stand it in, ended when dropped: on Linux the daemon's end of a control
+  /// socket, which the kernel closes as the process ends; on macOS and Windows a child process the client end's exit
+  /// watch is on.
+  struct DaemonLife {
+    #[cfg(target_os = "linux")]
+    _socket: std::os::fd::OwnedFd,
+    #[cfg(any(target_os = "macos", windows))]
+    process: std::process::Child,
+  }
+
+  #[cfg(any(target_os = "macos", windows))]
+  impl Drop for DaemonLife {
+    fn drop(&mut self) {
+      let _ = self.process.kill();
+      let _ = self.process.wait();
+    }
+  }
+
+  /// A stand-in daemon's life and the liveness check a client end watches it by.
+  #[cfg(target_os = "linux")]
+  fn daemon_life() -> (DaemonLife, Liveness) {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    let (daemon, client) = rustix::net::socketpair(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap();
+    (
+      DaemonLife { _socket: daemon },
+      Liveness::of_socket(client).unwrap(),
+    )
+  }
+
+  /// A stand-in daemon's life and the liveness check a client end watches it by.
+  #[cfg(target_os = "macos")]
+  fn daemon_life() -> (DaemonLife, Liveness) {
+    let process = std::process::Command::new("/bin/sleep")
+      .arg(STAND_IN_LIFE_S)
+      .spawn()
+      .unwrap();
+    let liveness = Liveness::of_process(process.id()).unwrap();
+    (DaemonLife { process }, liveness)
+  }
+
+  /// A stand-in daemon's life and the liveness check a client end watches it by.
+  #[cfg(windows)]
+  fn daemon_life() -> (DaemonLife, Liveness) {
+    let process = std::process::Command::new("cmd")
+      .args(["/C", "ping", "-n", STAND_IN_LIFE_S, "127.0.0.1"])
+      .stdout(std::process::Stdio::null())
+      .spawn()
+      .unwrap();
+    let liveness = Liveness::of_process(process.id()).unwrap();
+    (DaemonLife { process }, liveness)
+  }
+
+  /// A test's rings: the region's creator (kept until the test ends), a client end over a second mapping watching
+  /// `liveness`, and what a daemon end opens in another thread: the region's handoff and, on Linux, the daemon's copy of
+  /// the completion eventfd the client end holds, as the rendezvous hands both over.
+  struct Rings {
+    _region: ClientRegion,
+    client: ClientEnd,
+    handoff: Handoff,
+    len: usize,
+    #[cfg(target_os = "linux")]
+    daemon_completion: Option<std::os::fd::OwnedFd>,
+  }
+
+  fn rings(test: &str, liveness: Liveness) -> Rings {
+    let region = ClientRegion::create(&unique_name(test), 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+    client.set_liveness(liveness);
+    #[cfg(target_os = "linux")]
+    let daemon_completion = {
+      use rustix::event::{EventfdFlags, eventfd};
+      let completion = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+      let daemon_copy = rustix::io::dup(&completion).unwrap();
+      client.set_completion(completion);
+      Some(daemon_copy)
+    };
+    Rings {
+      _region: region,
+      client,
+      handoff,
+      len,
+      #[cfg(target_os = "linux")]
+      daemon_completion,
+    }
+  }
+
+  impl Rings {
+    /// A daemon end over its own mapping of the region, handed the completion eventfd's copy where one exists.
+    fn daemon_end(&mut self) -> impl FnOnce() -> DaemonEnd + Send + use<> {
+      let handoff = self.handoff.clone();
+      let len = self.len;
+      #[cfg(target_os = "linux")]
+      let completion = self.daemon_completion.take();
+      move || {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut daemon = DaemonEnd::new(ClientRegion::open(&handoff, len).unwrap());
+        #[cfg(target_os = "linux")]
+        daemon.set_completion(completion);
+        daemon
+      }
+    }
+  }
+
+  /// §4.7 "Failure matrix" (A-232, A-456). Do: wait on a live daemon for the reply it sends half again the old reply
+  /// deadline after the request, its process alive throughout. Expect: the reply taken, after the daemon held it; on
+  /// Linux and Windows no look at the daemon's life at all, the park having waited on its departure itself; on macOS at
+  /// least one look, and no more than the doubling allows: the logarithm of the wait over twice the spin window the
+  /// region published (the wake estimate when the wait began), plus two.
+  #[test]
+  fn a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives() {
+    let _gate = crate::descriptor_test_gate();
+    let (life, liveness) = daemon_life();
+    let mut rings = rings("slates-endpoint-late-reply", liveness);
+    let open_daemon = rings.daemon_end();
+    rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let replier = std::thread::spawn(move || {
+      let mut daemon = open_daemon();
+      let request = loop {
+        if let Some(request) = daemon.try_take().unwrap() {
+          break request;
+        }
+        std::thread::yield_now();
+      };
+      #[allow(clippy::disallowed_methods)]
+      // the daemon holds its answer on purpose: the hold is what is tested.
+      std::thread::sleep(Duration::from_nanos(LATE_NS));
+      daemon
+        .reply(&Slot::inline(request.request, b"late").unwrap())
+        .unwrap();
+    });
+    let asked = Instant::now();
+    let waited = rings.client.wait_while_daemon_lives().unwrap();
+    let took = asked.elapsed();
+    replier.join().unwrap();
+    drop(life);
+    let looks = rings.client.liveness_looks();
+    println!("a reply held {LATE_NS} ns: {waited:?} after {took:?}, {looks} looks");
+    let Waited::Reply(reply) = &waited else {
+      panic!("the wait ended {waited:?} with its daemon alive");
+    };
+    assert_eq!((reply.request, reply.payload.as_slice()), (1, &b"late"[..]));
+    assert!(
+      took >= Duration::from_nanos(LATE_NS),
+      "taken after {took:?}"
+    );
+    if cfg!(target_os = "macos") {
+      // The first park comes after the spin, the published seed at the wait's start, so the first look comes no sooner
+      // than twice it, and every later one at twice the time waited.
+      let first = 2 * u64::from(geometry().spin_ns);
+      let took_ns = u64::try_from(took.as_nanos()).unwrap();
+      let bound = u64::from((took_ns / first).max(1).ilog2()) + 2;
+      assert!(
+        (1..=bound).contains(&looks),
+        "{looks} looks across {took:?} from {first} ns"
+      );
+    } else {
+      assert_eq!(looks, 0, "the park waited on the departure, never looked");
+    }
+  }
+
+  /// A-456. Do: wait on a daemon that never answers, and end its process a quarter of the old reply deadline into the
+  /// wait. Expect: the wait ends `Departed` before the old reply deadline, at which it first asked after the daemon
+  /// before A-456: on Linux and Windows at the departure itself, never having looked; on macOS at the first look after
+  /// it, within the time waited.
+  #[test]
+  fn a_daemons_departure_ends_the_wait_before_the_old_reply_deadline() {
+    let _gate = crate::descriptor_test_gate();
+    let (life, liveness) = daemon_life();
+    let mut rings = rings("slates-endpoint-departure", liveness);
+    let _daemon = rings.daemon_end()();
+    rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let ender = std::thread::spawn(move || {
+      #[allow(clippy::disallowed_methods)]
+      // the daemon lives a while into the wait on purpose: its end is what is tested.
+      std::thread::sleep(Duration::from_nanos(DEPARTS_AFTER_NS));
+      drop(life);
+      Instant::now()
+    });
+    let asked = Instant::now();
+    let waited = rings.client.wait_while_daemon_lives().unwrap();
+    let ended = Instant::now();
+    let departed = ender.join().unwrap();
+    let looks = rings.client.liveness_looks();
+    println!(
+      "a daemon that departed {:?} into the wait: {waited:?} {:?} after it, {:?} after the ask, {looks} looks",
+      departed.duration_since(asked),
+      ended.saturating_duration_since(departed),
+      ended.duration_since(asked)
+    );
+    assert_eq!(waited, Waited::Departed);
+    assert!(
+      ended.duration_since(asked) < Duration::from_nanos(OLD_REPLY_DEADLINE_NS),
+      "the wait ended {:?} after it began, not before the old reply deadline",
+      ended.duration_since(asked)
+    );
+    if cfg!(target_os = "macos") {
+      assert!(looks >= 1, "the departure was found by a look");
+    } else {
+      assert_eq!(looks, 0, "the park waited on the departure, never looked");
     }
   }
 }

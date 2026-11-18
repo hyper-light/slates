@@ -89,7 +89,7 @@ pub mod process_access;
 pub mod win_spawn;
 
 pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};
-pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
+pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request, Waited};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
@@ -107,9 +107,10 @@ pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 /// its parent may go on before that (A-183). The same window binds a harness, as `delivery`'s `pipe_close_on_exec`
 /// says.
 ///
-/// So every test in this binary that spawns a process holds the gate across the spawn (`exit_watch`'s, and
-/// `mach_claim`'s stranger), and so does every test that asserts a descriptor's last close: an `EPIPE`, or a zero read
-/// (`delivery`'s descriptor tests, `stream`'s, and the Linux rendezvous's refused delivery). Until 2026-11-18 the
+/// So every test in this binary that spawns a process holds the gate across the spawn (`exit_watch`'s, `mach_claim`'s
+/// stranger, and `endpoint`'s departure tests on macOS and Windows), and so does every test that asserts a descriptor's
+/// last close: an `EPIPE`, a zero read, or a hangup (`delivery`'s descriptor tests, `stream`'s, the Linux rendezvous's
+/// refused delivery, and `endpoint`'s departure tests on Linux). Until 2026-11-18 the
 /// stranger's `sh` and `stream`'s two tests went without it, and the lib's tests failed 2 of 4 runs on a loaded Mac,
 /// each time while the stranger's child ran: the pipe's write answered `Ok(1)`, the stream's send `EAGAIN`, where
 /// `EPIPE` was due.

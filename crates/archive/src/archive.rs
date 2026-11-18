@@ -35,7 +35,7 @@ use crate::wire::{Reader, Writer};
 /// length, flags, base page size, two chunk-size parameters, the manifest hash, the chunk count,
 /// the raw and stored byte totals, the creation time, the volume and snapshot ids, and the
 /// name-policy id and Unicode version.
-const HEADER_LEN: u64 = (size_of::<u32>()
+pub(crate) const HEADER_LEN: u64 = (size_of::<u32>()
   + size_of::<u16>()
   + size_of::<u16>()
   + size_of::<u32>()
@@ -55,7 +55,7 @@ const HEADER_LEN: u64 = (size_of::<u32>()
 
 /// Format: the trailer is the section index (four `u64` offsets), the whole-archive BLAKE3, and
 /// the tail magic.
-const TRAILER_LEN: u64 = (size_of::<u64>()
+pub(crate) const TRAILER_LEN: u64 = (size_of::<u64>()
   + size_of::<u64>()
   + size_of::<u64>()
   + size_of::<u64>()

@@ -17,18 +17,42 @@
 //!   x86_64 binary exited 0xC0000139 (`STATUS_ENTRYPOINT_NOT_FOUND`) in `nanoserver:ltsc2025` before any of its code
 //!   ran, where the binary without them had answered `slates version` that morning (release runs 44326428333 and
 //!   44266895044, 2026-11-18). Where kernel32 lacks them the count is `None`, as when the OS refuses the profiling.
-//! - **Elsewhere:** `None`. Linux's waits are judged by `getrusage(RUSAGE_THREAD)`'s voluntary switches in `slates-rt`
-//!   and the probe's by `/proc` state; macOS's probe by `thread_info`.
+//! - **Linux:** `getrusage(RUSAGE_THREAD)`'s `ru_nvcsw` [B: getrusage(2)]: the thread's voluntary switches, each a block
+//!   in a call. A preemption is involuntary and not counted, so a wait preempted before it blocked reads as not slept,
+//!   the safe side for a wake estimate. Measured at 130–134 ns a read in a Linux container (`slates-rt`'s attribution,
+//!   2026-09-25). A client's park that waits on its daemon's departure beside its reply reads it (A-456): that park
+//!   polls a descriptor, so the daemon's futex wake cannot confirm it found the client asleep. The shards' own long
+//!   polls read the same count in `slates-rt`, and the wake probe reads `/proc` state.
+//! - **Elsewhere (macOS):** `None`; macOS counts no per-thread voluntary switches, and its probe reads `thread_info`.
 
-/// The calling thread's context switches since it first asked, where the OS counts them for the thread itself
-/// (Windows); `None` elsewhere, where kernel32 lacks the profiling calls, or when the OS refuses the profiling.
+/// The calling thread's context switches, a count only its differences mean, where the OS counts them for the thread
+/// itself: Windows' switches since the thread first asked, Linux's voluntary switches since the thread began; `None`
+/// elsewhere, where kernel32 lacks the profiling calls, or when the OS refuses the read.
 #[cfg(windows)]
 pub fn switches_now() -> Option<u64> {
   windows::PROFILING.with(|profiling| profiling.as_ref().and_then(windows::Profiling::switches))
 }
 
+/// The calling thread's voluntary context switches (Linux: `getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`; see the module
+/// doc); `None` when the kernel refuses the read. Not under Miri, which runs no `getrusage`.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub fn switches_now() -> Option<u64> {
+  // SAFETY: an all-zero `rusage` is a valid value of the C struct (integers and `timeval`s, padding included); the
+  // pointer is to this frame's own value, live for the whole call; `RUSAGE_THREAD` asks the kernel to fill it for the
+  // calling thread, and the status is checked before the value is read.
+  let (status, usage) = unsafe {
+    let mut usage: libc::rusage = std::mem::zeroed();
+    let status = libc::getrusage(libc::RUSAGE_THREAD, &mut usage);
+    (status, usage)
+  };
+  if status != 0 {
+    return None;
+  }
+  u64::try_from(usage.ru_nvcsw).ok()
+}
+
 /// No per-thread switch count read here (see the module doc).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_os = "linux", not(miri)))))]
 pub fn switches_now() -> Option<u64> {
   None
 }
@@ -171,9 +195,9 @@ mod tests {
   /// without a switch.
   const QUICK_PAIRS: usize = 100;
 
-  /// A-223, by use: do read the calling thread's switch count, block it in a sleep, and read again; then read pairs
-  /// with nothing between. Expect the sleep to have switched the thread out, and a quick pair to agree, where the OS
-  /// counts (Windows); elsewhere the test skips loudly.
+  /// A-223, A-456, by use: do read the calling thread's switch count, block it in a sleep, and read again; then read
+  /// pairs with nothing between. Expect the sleep to have switched the thread out, and a quick pair to agree, where the
+  /// OS counts (Windows, Linux); elsewhere the test skips loudly.
   #[test]
   #[allow(clippy::disallowed_methods)] // the test blocks the thread on purpose: the block is what is counted.
   fn a_blocked_thread_switched_and_a_running_one_did_not() {

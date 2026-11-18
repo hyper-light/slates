@@ -65,6 +65,11 @@ fn planned(entry: &LandingEntry, conflict: Option<&LandConflict>) -> PlannedEntr
       target: target.to_string(),
     },
     Action::Clear => PlannedAction::Clear,
+    Action::Chmod { from, to } => PlannedAction::Chmod {
+      permissions_was: from.permissions,
+      windows_was: from.windows,
+      windows: to.windows,
+    },
   };
   let content = match entry.action {
     Action::Create | Action::Replace => entry.overlay.map(|overlay| PlannedContent {

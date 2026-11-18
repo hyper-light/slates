@@ -49,7 +49,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use slates_archive::format::Chunk as ArchiveChunk;
-use slates_archive::{Archive, CodecPolicy, Entry, Extent, Node, NodeMeta, Xattr};
+use slates_archive::{Archive, ChunkSink, CodecPolicy, Entry, Extent, Node, NodeMeta, Xattr};
 use slates_mem::Handle;
 
 use crate::dir::{Child, DirNode};
@@ -447,6 +447,39 @@ impl SnapshotArchiver {
         Step::Finished(archive) => return Ok(Progress::Done(archive)),
       };
       spent = spent.saturating_add(cost.max(1));
+    }
+  }
+
+  /// [`advance`](SnapshotArchiver::advance), each new chunk handed to `sink` as the step that cut it ends (A-459): the
+  /// walk never holds more than one step's chunks, and the archive it finishes with carries none, every chunk having
+  /// gone to `sink` in the order the whole archive holds them. A streamed export walks a snapshot twice so: once into a
+  /// [`slates_archive::Measure`] to lay the archive out, once into a [`slates_archive::StreamWriter`] to write it. A
+  /// refusal by `sink` (a second walk that differs from the first) ends the walk [`VfsError::RecoveryIncomplete`].
+  pub fn advance_into(
+    &mut self,
+    volume: &Volume,
+    store: &Store,
+    byte_budget: u64,
+    sink: &mut dyn ChunkSink,
+  ) -> Result<Progress, VfsError> {
+    let mut spent: u64 = 0;
+    loop {
+      if spent >= byte_budget && spent > 0 {
+        return Ok(Progress::More);
+      }
+      let step = self.step(volume, store)?;
+      for chunk in self.chunks.drain(..) {
+        sink.take(chunk).map_err(|_| VfsError::RecoveryIncomplete)?;
+      }
+      match step {
+        Step::Worked(cost) => spent = spent.saturating_add(cost.max(1)),
+        Step::Finished(mut archive) => {
+          for chunk in archive.chunks.drain(..) {
+            sink.take(chunk).map_err(|_| VfsError::RecoveryIncomplete)?;
+          }
+          return Ok(Progress::Done(archive));
+        }
+      }
     }
   }
 
@@ -927,6 +960,8 @@ mod tests {
   use slates_mem::arena::ChunkArena;
   use slates_mem::region::Region;
 
+  use proptest::prelude::*;
+
   use super::*;
   use crate::clock::StepClock;
   use crate::quota::Quota;
@@ -1054,6 +1089,203 @@ mod tests {
     );
     let restored = restore(&archive, u64::MAX).unwrap();
     assert_restored_tree(&restored, &body);
+  }
+
+  /// A codec policy with measured points, as a profile measures them (a 10 GB/s memcpy, LZ4 and four zstd levels), so
+  /// an export's chunks are stored raw, LZ4 or zstd as the cost model chooses for each.
+  fn measured_codec() -> CodecPolicy {
+    use slates_archive::codec::{CodecRate, NEUTRAL_PERMILLE};
+    CodecPolicy {
+      byte_ns_scaled: CodecPolicy::byte_worth_from_memcpy(10_000_000_000),
+      lz4: Some(CodecRate::from_throughput(
+        0,
+        700_000_000,
+        3_000_000_000,
+        476,
+      )),
+      zstd: vec![
+        CodecRate::from_throughput(1, 400_000_000, 1_200_000_000, 346),
+        CodecRate::from_throughput(3, 250_000_000, 1_100_000_000, 320),
+        CodecRate::from_throughput(9, 60_000_000, 1_000_000_000, 300),
+        CodecRate::from_throughput(19, 4_000_000, 900_000_000, 280),
+      ],
+      value_of_byte_permille: NEUTRAL_PERMILLE,
+      value_of_cpu_permille: NEUTRAL_PERMILLE,
+      expected_reads: 1,
+    }
+  }
+
+  /// `id` archived whole under `codec`, the archive the whole-buffer encoder writes: the streamed export's oracle.
+  fn archive_whole(volume: &Volume, store: &Store, id: SnapshotId, codec: &CodecPolicy) -> Vec<u8> {
+    let mut archiver =
+      SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX, codec.clone()).unwrap();
+    loop {
+      if let Progress::Done(archive) = archiver.advance(volume, store, u64::MAX).unwrap() {
+        return archive.encode();
+      }
+    }
+  }
+
+  /// `id` exported as a stream (A-459), as the daemon's export runs it: a first walk measured a unit a step and the
+  /// archive laid out; then whatever the writer asks next for a stage emptied at `threshold` bytes
+  /// ([`slates_archive::StreamWriter::next`]): the stage written into the returned bytes, the second walk's next unit,
+  /// or the end. The writer, for its counts.
+  fn export_streamed(
+    volume: &Volume,
+    store: &Store,
+    id: SnapshotId,
+    codec: &CodecPolicy,
+    threshold: usize,
+  ) -> (Vec<u8>, slates_archive::StreamWriter) {
+    let mut measure = slates_archive::Measure::default();
+    let mut first =
+      SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX, codec.clone()).unwrap();
+    let shell = loop {
+      if let Progress::Done(shell) = first.advance_into(volume, store, 1, &mut measure).unwrap() {
+        break shell;
+      }
+    };
+    assert!(shell.chunks.is_empty(), "the first walk held no chunk");
+    let layout = slates_archive::Layout::new(&shell, measure).unwrap();
+    let mut writer = slates_archive::StreamWriter::new(layout);
+    let mut second =
+      SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX, codec.clone()).unwrap();
+    let mut bytes = Vec::new();
+    let mut walking = true;
+    loop {
+      match writer.next(threshold, walking).unwrap() {
+        slates_archive::Next::Write => {
+          let (at, staged) = writer.pending();
+          assert_eq!(at, u64::try_from(bytes.len()).unwrap(), "pieces in order");
+          let written = staged.len();
+          bytes.extend_from_slice(staged);
+          writer.consume(written);
+        }
+        slates_archive::Next::Walk => {
+          walking = matches!(
+            second.advance_into(volume, store, 1, &mut writer).unwrap(),
+            Progress::More
+          );
+        }
+        slates_archive::Next::Done => return (bytes, writer),
+      }
+    }
+  }
+
+  /// One generated file of [`a_streamed_export_of_a_generated_tree_is_the_whole_buffer_encoders`]: the directory it
+  /// lies in (of the tree's three), its bytes' kind and length, its mode, and whether it carries an attribute.
+  #[derive(Clone, Debug)]
+  struct GeneratedFile {
+    directory: usize,
+    bytes: Vec<u8>,
+    mode: u32,
+    attribute: bool,
+  }
+
+  /// A generated file's bytes: one byte repeated (every codec shrinks it), text-like lines (zstd and LZ4 do), or noise
+  /// (none does): up to a chunk and a half at the test store's chunk, so a file spans two chunks, and four such files
+  /// with their attributes stay within the test volume's quota.
+  fn generated_bytes() -> impl Strategy<Value = Vec<u8>> {
+    let chunk = PAGE * 16;
+    prop_oneof![
+      (0..chunk * 3 / 2, any::<u8>()).prop_map(|(len, byte)| vec![byte; len]),
+      (0..chunk * 3 / 2).prop_map(|len| {
+        b"fn main() { println!(\"slates\"); }\n"
+          .iter()
+          .copied()
+          .cycle()
+          .take(len)
+          .collect()
+      }),
+      proptest::collection::vec(any::<u8>(), 0..chunk),
+    ]
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config {
+      cases: 48,
+      ..proptest::test_runner::Config::default()
+    }))]
+
+    /// A-459 (the oracle and the determinism gate): do build a generated tree — up to four files of repeated,
+    /// text-like and noisy bytes up to a chunk and a half, in the root and two nested directories, some carrying an
+    /// attribute, and a symlink — snapshot it, and export the snapshot as a stream (two walks, the stage emptied at a
+    /// generated threshold) and whole, under measured codec points. Expect the stream's bytes to equal the whole-buffer
+    /// encoder's byte for byte, and the archive to decode.
+    #[test]
+    fn a_streamed_export_of_a_generated_tree_is_the_whole_buffer_encoders(
+      files in proptest::collection::vec(
+        (0usize..3, generated_bytes(), 0u32..0o1000, any::<bool>())
+          .prop_map(|(directory, bytes, mode, attribute)| GeneratedFile { directory, bytes, mode, attribute }),
+        0..4,
+      ),
+      threshold in 1usize..(PAGE * 40),
+    ) {
+      let mut store = store();
+      let mut volume = volume(&mut store);
+      let root = volume.root();
+      let outer = volume.mkdir(&mut store, root, "outer", 0o755).unwrap();
+      let inner = volume.mkdir(&mut store, outer, "inner", 0o700).unwrap();
+      for (at, file) in files.iter().enumerate() {
+        let directory = [root, outer, inner][file.directory];
+        let no = volume
+          .create_file(&mut store, directory, &format!("file-{at}"), file.mode)
+          .unwrap();
+        volume.write(&mut store, no, 0, &file.bytes).unwrap();
+        if file.attribute {
+          volume
+            .xattr_set(
+              &mut store,
+              no,
+              b"user.kind",
+              &file.bytes[..file.bytes.len().min(PAGE)],
+              crate::xattr::XattrSet::Create,
+            )
+            .unwrap();
+        }
+      }
+      volume.symlink(&mut store, inner, "link", "../file-0").unwrap();
+      let id = volume.snapshot(&mut store).unwrap();
+      let codec = measured_codec();
+      let (bytes, _) = export_streamed(&volume, &store, id, &codec, threshold);
+      prop_assert_eq!(&bytes, &archive_whole(&volume, &store, id, &codec));
+      prop_assert!(Archive::decode(&bytes).is_ok());
+    }
+  }
+
+  /// A-459 (the stage's bound): do export a snapshot several times larger than the stage's bound — `populate`'s
+  /// three-chunk file and `decorate`'s two-chunk attribute among the rest — as a stream emptied whenever the stage
+  /// holds one chunk. Expect the bytes to equal the whole-buffer encoder's, the stage never past
+  /// `StreamWriter::bound(threshold, chunk)`, and the stage emptied more often than the archive holds bounds (counted:
+  /// a stream handed out whole at its end is emptied once).
+  #[test]
+  fn a_snapshot_larger_than_the_stage_exports_with_the_stage_within_its_bound() {
+    let mut store = store();
+    let mut volume = volume(&mut store);
+    populate(&mut volume, &mut store);
+    decorate(&mut volume, &mut store);
+    let id = volume.snapshot(&mut store).unwrap();
+    let codec = CodecPolicy::raw_only();
+    let chunk = store.content.chunk_bytes();
+    let (bytes, writer) = export_streamed(&volume, &store, id, &codec, chunk);
+    assert_eq!(bytes, archive_whole(&volume, &store, id, &codec));
+    let bound = slates_archive::StreamWriter::bound(chunk, u32::try_from(chunk).unwrap());
+    assert!(
+      bytes.len() > 2 * bound,
+      "the snapshot's archive ({} bytes) is larger than the bound ({bound}) more than twice",
+      bytes.len()
+    );
+    assert!(
+      writer.high_water() <= bound,
+      "the stage reached {} of a {bound}-byte bound",
+      writer.high_water()
+    );
+    assert!(
+      writer.drained() > u64::try_from(bytes.len() / bound).unwrap(),
+      "the stage was emptied {} times for {} bytes",
+      writer.drained(),
+      bytes.len()
+    );
   }
 
   /// A-453: do export a snapshot of a byte-exact volume and of a folding one. Expect each archive's name-policy id to

@@ -37,6 +37,7 @@ pub mod format;
 pub mod manifest;
 pub mod restore;
 pub mod store;
+pub mod stream;
 pub mod transfer;
 pub mod wire;
 
@@ -46,4 +47,5 @@ pub use format::{ArchiveError, Chunk, Encoding};
 pub use manifest::{Entry, Extent, ManifestError, Node, NodeMeta, Xattr};
 pub use restore::{Planned, Planning, Restored, RestoredFile, Restoring, restore, restore_needed};
 pub use store::ContentStore;
+pub use stream::{ChunkSink, Layout, Measure, Next, StreamWriter};
 pub use transfer::{chunks_for, missing_set};
