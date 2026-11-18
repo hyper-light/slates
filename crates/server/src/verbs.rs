@@ -2833,17 +2833,18 @@ fn record_completion_routed(
 /// Forwards a volume-bound request to its owner shard: a task there runs the verb on the
 /// owner's state and hands the reply back to this shard's queue (sharing by move both ways).
 /// Judges a ring request read at `now` (§4.7; A-326) and returns the idle window a forward made for it holds its owner
-/// open for. The request continues this shard's closed loop when it came within F of the shard's last client I/O (a
-/// request read or a reply written, `ShardState::last_client_io_ns`): its client sent it within F of its last reply,
-/// R9's closed loop (A-223's window rule). Its hold is the loop's revisit bound at
+/// open for. The request continues this shard's closed loop when it came within F of the end of the shard's last round
+/// of client I/O (requests read, replies written; `ShardState::last_client_io_ns`): its client sent it within F of its
+/// last reply, R9's closed loop (A-223's window rule). Its hold is the loop's revisit bound at
 /// R9's percentile (`DaemonConfig::closed_loop_hold_ns`), but never more cycles of 2F than the loop had already run
 /// before this request, so the spin a loop's end leaves on the shards it went round is at most what the loop itself
 /// took (the ski-rental bound, counted in the loop's own cycles). A request after a longer pause ends the loop and holds
 /// nothing, and neither does the first request after it: a paced client's create and its destroy hold no shard. The gap
-/// is read against the shard's last client I/O, one clock read a round, so a shard busy with several clients counts
-/// their requests as one loop, and never against its background work, which kept going through a paced client's pause:
-/// judged against the shard's last work, a local destroy's slices made 3 of 24 paced cycles look like a loop's
-/// (`crates/server/tests/closed_loop.rs`, 2026-11-18).
+/// is read against the shard's client I/O, one clock read a round, so a shard busy with several clients counts their
+/// requests as one loop, and never against its background work, which kept going through a paced client's pause:
+/// judged against the shard's last work, a local destroy's slices made 1 to 3 of 24 paced cycles look like a loop's
+/// (`crates/server/tests/closed_loop.rs`, 2026-11-18). Stamped at a round's start instead of its client I/O's end, a
+/// debug build's round counted toward every think time and left 69 to 83 of a loop's 400 forwards unheld, against 22.
 pub(crate) fn loop_hold(state: &mut ShardState, now: u64) -> u64 {
   if now.saturating_sub(state.last_client_io_ns) > crate::config::PROVISION_FLOOR_NS {
     state.loop_run = 0;
@@ -11879,20 +11880,26 @@ async fn run_pin(mut job: PinJob) {
 /// Serves every ready request of every client, retries deferred replies, steps destroys and
 /// expires leases; returns whether anything was done.
 pub fn serve_round(state: &mut ShardState) -> bool {
-  // One clock read per round marks every client served in it (the reap's silence clock) and every reply written in it
-  // (the closed loop's clock, `loop_hold`).
-  let now = state.clock.monotonic_ns();
   let mut any = retry_forwards(state);
-  any |= retry_deferred(state, now);
+  let mut client_io = retry_deferred(state);
   let handles: Vec<(u32, Handle<ClientSlot>)> = state
     .clients
     .iter()
     .filter(|(_, client)| !client.retiring)
     .map(|(handle, _)| (handle.index(), handle))
     .collect();
+  // One clock read per round marks every client served in it (the reap's silence clock).
+  let now = state.clock.monotonic_ns();
   for (index, handle) in handles {
-    any |= serve_client(state, index, handle, now);
+    client_io |= serve_client(state, index, handle, now);
   }
+  // The closed loop's clock (`loop_hold`; A-326): the end of a round's client I/O, its requests read and its replies
+  // written, before the round's background work, so a client's think time is read from its reply, not from the round's
+  // start, and a destroy's slices or a lease's expiry never stand in for a client.
+  if client_io {
+    state.last_client_io_ns = state.clock.monotonic_ns();
+  }
+  any |= client_io;
   any |= step_destroys(state);
   any |= expire_leases(state) > 0;
   any
@@ -11912,9 +11919,9 @@ pub fn expire_leases(state: &mut ShardState) -> usize {
 }
 
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
-/// the client's shard) or one whose completion ring was full and may have room now. A reply written is client I/O at
-/// `now`, the round's clock (`ShardState::last_client_io_ns`).
-fn retry_deferred(state: &mut ShardState, now: u64) -> bool {
+/// the client's shard) or one whose completion ring was full and may have room now. True when a reply was written:
+/// client I/O, which `serve_round` stamps for the closed loop (`ShardState::last_client_io_ns`).
+fn retry_deferred(state: &mut ShardState) -> bool {
   let mut any = false;
   let deferred = std::mem::take(&mut state.deferred);
   for entry in deferred {
@@ -11945,7 +11952,6 @@ fn retry_deferred(state: &mut ShardState, now: u64) -> bool {
     };
     if send_reply(state, client_index, request, &mut reply) {
       any = true;
-      state.last_client_io_ns = now;
       // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full, or it came
       // back from another shard) and is now written: from the slot read to the reply written.
       if let Some(ring) = ring {
@@ -12086,7 +12092,6 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     );
     state.current_span = Some(ring.context());
     state.forward_hold_ns = loop_hold(state, now);
-    state.last_client_io_ns = now;
     let served = serve(state, handle, &request);
     state.current_span = None;
     state.forward_hold_ns = 0;

@@ -15292,7 +15292,7 @@ BENCHMARKS ("The idle window's rule": step 6's multi-shard rows and what is owed
 hold_idle_window`, `Counters::idle_holds`, the spin reading the hold), `crates/server` (`config::closed_loop_hold`,
 `loop_revisit_cycles`, `PROVISION_TAIL`, `CLOSED_LOOP_CYCLE_NS`, `DaemonConfig::closed_loop_hold_ns`; `verbs::loop_hold`,
 the forward carrying its hold, `PendingForward::hold_ns`; `ShardState::forward_hold_ns`, `loop_run`,
-`last_client_io_ns`; `serve_round` reads its clock before the deferred replies it writes), and the tests
+`last_client_io_ns`, stamped by `serve_round` at the end of a round's client I/O), and the tests
 `crates/server/tests/closed_loop.rs`, `crates/rt/tests/idle_spin.rs` (the held window) and the hold's derivation in
 `config.rs`.
 - **The defect.** A-223's window rule keeps a closed loop's own shard polling: the client's next request comes within
