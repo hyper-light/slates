@@ -7755,6 +7755,15 @@ it builds against the contract and adds to it rather than around it.
 > (`a_signed_merge_is_judged_and_read_back_through_the_contract`: a requiring green refuses an
 > unsigned merge, the statement signed by the trusted key merges at 1 verified, its record reads back
 > verified and the origin's unsigned).
+> **`CONTRACT` = 14** (10 to 13 landed beside it): `StartSpec::anchor_command_under(wrapper)`, the anchor's command under a
+> wrapper that execs it (`systemd-run --user --scope -- ...`, kiln's Linux start), the launcher's
+> record kept on its standard input; proven under `/usr/bin/env`, an exec wrapper, by a policy set
+> under the launcher's secret.
+> **`CONTRACT` = 15:** the volume core's refusals typed on the wire (`Refusal::Volume { refusal:
+> VolumeRefusal }`, appended; `refusal_of_vfs` exhaustive, its catch-all gone): until then each
+> reached a client as `BadRequest` carrying its name, a pinned snapshot's destroy among them (A-310's
+> seam found it). The contract puts each in the class a consumer acts on (`Busy::Volume` for `Pinned`
+> and `DaxMapped`, `Stale`, `Denied`, `Exhausted`, `Unusable` or `Invalid` `::Volume` for the rest).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -8160,6 +8169,11 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
 > shard it has runnable is starved and waited for another window, so an observation or a cross-shard call no longer
 > gives up on one (`an_observation_of_a_starved_shard_is_answered`, red 3 of 3 before on adacachy2).
+> **2026-11-18:** it reads the shard's clock again after the scheduler answers. A thread leaves the run queue for a block
+> only by running first, so only a clock read after that answer shows a shard released between the two reads, which
+> ran, answered and parked before the scheduler looked; read only before it, such a shard was judged wedged and an
+> observation already answered was given up (once on CI's Windows runner, where a look at the scheduler is a 3 ms
+> snapshot; 1 of 32 runs of the failing tree, `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`).
 > **2026-11-08, the transitive wait:** a shard blocked joining another thread of the process (the FUSE notify thread,
 > the landing barrier thread, the WinFsp mount thread; `slates_rt::registry::spawn_waited`) is read as that thread while
 > it is runnable, so a shard waiting on a starved thread is starved, not stuck; one waiting on a blocked thread is still
@@ -22914,6 +22928,23 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
   `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
   `tests/api.rs`.
+- **`CONTRACT` 14, the same day (g263's ask; 9 to 13 landed beside it):** `StartSpec::anchor_command_under(wrapper)`, since a host cannot take
+  a `Command`'s standard input out to hand its wrapper's: the wrapper's words, then the anchor's program, prefix and
+  role, with the launcher's record on standard input, the marker and the process group. Proven by
+  `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret` (`/usr/bin/env` execs the anchor; a policy set
+  under the launcher's secret verifies; the anchor stops at `SIGTERM`, exit 0).
+- **`CONTRACT` 15, the same day: the volume core's refusals typed.** `refusal_of_vfs` (`crates/server/src/error.rs`)
+  ended in a catch-all that sent every volume-core error it did not name as `BadRequest { reason: "<its name>" }`, an
+  uncategorized refusal (CLAUDE.md §3): `Pinned` (a snapshot a clone holds, a green's origin), `DaxMapped`,
+  `NotDirectory`, `NotEmpty`, `StaleHandle` and fifteen more reached every consumer as words. A-310's seam found it
+  (its simulator had to answer `Invalid::Request("Pinned")`). The wire appends `Refusal::Volume { refusal:
+  VolumeRefusal }`, one variant per volume-core error, with the journal's and the recovery image's numbers; the mapping
+  is exhaustive, so a new volume-core error does not compile until it is classified, and `BarrierIncomplete` now
+  reaches the wire's own variant. The contract classes each: `Pinned` and `DaxMapped` a holder (`Busy::Volume`), a stale
+  handle and a drifted base a moved view (`Stale::Volume`), the volume's rules a denial, its bounds exhaustion, an
+  unreadable journal or image unusable, the operations an entry does not take invalid. Applied to
+  `crates/ipc/src/protocol.rs`, `crates/server/src/{error,verbs}.rs`, `crates/server/tests/{recovery,fuse_mount}.rs`,
+  `crates/api/src/{error,sim,lib}.rs`, `tests/api.rs` (the seam's suite asserts the typed `Pinned`).
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

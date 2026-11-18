@@ -12991,3 +12991,53 @@ went up to 2.71 s between two drains of a ring.
   against 8169..=8170. A hypothesis under test, not a finding: the harness stamps a request's send after
   `Client::begin` returns (`Worker::send` in `load_bench.rs`), so a worker descheduled between the two records a
   submit as sent after a verdict that already reflects it, which narrows the oracle's window by one version.
+
+## Many writers on one large live volume: the byte credit keeps the owner up in 5 of 8 runs, and two whole records still ship (AC-8.9; A-200; goal 230; 2026-11-18)
+
+**What it is.** Goal 230's piece 1 replaced the live credit of two entries by the bytes of the volume's whole state
+(85e54bd12), so that a burst of stable writes ships changes, not the volume. The measurement the goal owed: many writers
+on one live volume of 100 MB or more, before and after, with `fleet.live.whole`, `fleet.live.refused.no_credit` and the
+write's p50, p99 and p999.
+
+**Environment.** GitHub runners, diagnostics run 44281929450 (branch `diag-measurer-7`, never merged), 2026-11-18
+10:14 to 10:23 UTC: `ubuntu-latest` (x86_64, 4 vCPUs) and `ubuntu-24.04-arm` (arm64, 4 vCPUs), each running both arms;
+load average 1.4 to 2.0 at each run's start. Before is `3c0af9399`, main just before the stack landed (the second parent
+of its landing); after is `8c81d2655`, the landing. Each arm's `live_fleet` test binary built release, each in its own
+target directory.
+
+**Command.** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 SLATES_MEASURE_WRITERS=32 SLATES_MEASURE_PREFILL_MIB=128
+SLATES_MEASURE_WRITES=200 <live_fleet> measure_many_writers_on_one_large_live_volume --exact --nocapture`, with the
+measurer's harness appended to `crates/cli/tests/live_fleet.rs` in both arms and never committed (it is in the
+branch's `.github/measurer/g230_harness.rs`): `start_fleet` (three daemons, `f = 1`, no anchor), one live-shipped volume
+on the owner bounded at 512 MiB, one file filled to 128 MiB by 64 KiB `FILE_SYNC` writes, then 32 writers, each its own
+NFS connection with its own `MOUNT` and `LOOKUP`, each sending 200 4 KiB `FILE_SYNC` writes to pages drawn across the
+file; a retry-later answer is sent again as a client does, for at most 10 s. Round 0 starts the writers together,
+rounds 1 to 3 start them 50 ms apart; the arms ran A B, A B, B A, A B on each runner.
+
+| runner, round | before `3c0af9399` | after `8c81d2655`: write p50 / p99 / p999 / max | after: writes a second |
+|---|---|---|---|
+| x86_64, 0 | daemon ended, 32 of 32 writers failed | daemon ended, 32 of 32 writers failed | |
+| x86_64, 1 | daemon ended (21 writers first answered `NFS3ERR_JUKEBOX` past 10 s) | daemon ended, 32 of 32 failed | |
+| x86_64, 2 | daemon ended, 32 of 32 failed | 58.3 ms / 1.94 s / 3.28 s / 3.70 s | 77 |
+| x86_64, 3 | daemon ended, 32 of 32 failed | 223.2 ms / 2.04 s / 3.72 s / 4.03 s | 65 |
+| arm64, 0 | daemon ended, 32 of 32 failed | 67.5 ms / 406 ms / 1.93 s / 1.94 s | 353 |
+| arm64, 1 | daemon ended, 32 of 32 failed | daemon ended, 32 of 32 failed | |
+| arm64, 2 | daemon ended, 32 of 32 failed | 67.1 ms / 294 ms / 1.94 s / 1.94 s | 351 |
+| arm64, 3 | daemon ended, 32 of 32 failed | 149.9 ms / 1.05 s / 2.02 s / 2.05 s | 120 |
+
+"Daemon ended" is the watchdog of a daemon run with no anchor ending its process (exit 4) on "shard 0 is spinning,
+1000 ms of CPU without a step" (1,000 to 1,099 ms); the writers' connections were then reset or refused. Across the
+writers in every completed run the owner's counters went `whole` 1 to 3 (`whole_bytes` 837 to 271,093,469: two whole
+records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carrying 20 to 304 entries, `durable_late`
+1 in one run; `refused.no_credit` never appeared.
+
+**What it means.**
+- **The byte credit helps:** before it, every run lost the owner to one step of a second of CPU; after it, 5 of 8 runs
+  wrote all 6,400 writes.
+- **It does not yet do what it promised under 32 writers:** two whole records of the 128 MiB volume still shipped in
+  every completed run, against "no whole records after the log's first", and a write's p99 was 0.29 to 2.04 s, its
+  p999 1.93 to 3.72 s.
+- **A step of a second of CPU still ends the daemon in 3 of 8 runs.** Which step was not measured; the whole record's
+  build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
+  whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
+  which is still an outage of every writer's connection.

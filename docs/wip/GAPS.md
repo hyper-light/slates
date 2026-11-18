@@ -342,7 +342,8 @@
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
 >   13), a signed landing owed;
-> - typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+> - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
+>   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
@@ -2266,10 +2267,20 @@
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
->   does not have the shard runnable (`ShardTime::runnable`, the watchdog's source). Red first:
+>   does not have the shard runnable (`shard_run_readings`, the watchdog's source). Red first:
 >   `an_observation_of_a_starved_shard_is_answered` (`crates/server/tests/liveness.rs`) ended `Deadline` at its
 >   one-window budget 3 of 3 on adacachy2 while the shard's clock stood still 3.0 s; after, answered 6 of 6 (3 at nice 0,
->   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. The anchor's start judgment
+>   3 at nice 19); the wedged cases of `tests/observe.rs` still end, 8 of 8. **The rule's two readings, taken across a
+>   release: found 2026-11-09 on CI's Windows runner (diag run 42671057142), fixed 2026-11-18 (g243).** The rule read the
+>   shard's clock and then asked the scheduler, so a starved shard released between the two ran, answered and parked
+>   before the scheduler looked, and was judged wedged: the same test ended `Deadline { stage: Admission }` 3.019 s after
+>   it asked, its answer already sent (1 of 32 runs of the failing tree on windows-latest, diag-g243-2, where a look at the
+>   scheduler is a 3 ms snapshot). It now reads the clock again after the scheduler answers (`OwnTime::next_window_ns`);
+>   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Open, reported:** the
+>   watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment (`judge_start_of`) read in the same
+>   order; their whole-window rule leaves the gap one look wide, at the end of a window the shard sat still through; and
+>   no `ci.yml` lane runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw
+>   this. The anchor's start judgment
 >   (`crates/api/src/role/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's
