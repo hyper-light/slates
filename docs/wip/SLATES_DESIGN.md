@@ -7080,7 +7080,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > answered only once durable, fenced or destroyed: every transport judges its own held reply by the rule above, and
 > this, its own holder, by none. So a log that could never be held kept its writer waiting as long as its daemon lived:
 > A-353's successor, whose holders' catalog was refused for good, held a write 21 minutes (g229's capture, 2026-11-18).
-> Each held reply now keeps when it was held and is refused at the rule's total bound, the failover SLO from its hold:
+> Each held reply now keeps when it was held and is refused at the rule's total bound, the failover SLO from its hold
+> (read from the rule's own spans, `live_ship::durable_spans`, so it is the transports' bound and follows the failover
+> estimate wherever it is published, never a number of its own):
 > judged at the period's visit to its volume (`live_ship::judge_held`), a destroy's once a period on its shard
 > (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
 > `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
@@ -7215,6 +7217,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > acknowledgement's publication carries the entry it added. Persisting every acknowledged live entry now adds nothing
 > that main's own spread can show at the median: 65–79 µs, against main's 65–76 µs and the whole image's 207–225 µs
 > (BENCHMARKS). Still carried whole when changed: the content hold's image and the mirror records.
+>
+> **A held register is a head and its positions (2026-11-18, A-367; image version 29).** A held register was one piece
+> holding every position its acceptor kept, and a green's register on its holders is a ledger, never compacted: each
+> version's acknowledgement re-encoded and re-wrote every version the holder kept, so a commit at `f > 0` grew by a
+> position's bytes a version. Now a register is a head piece (its authority, fence and moved-from owner) and a piece per
+> accepted position, keyed by its sequence; a holder's acceptor keeps which positions it accepted or dropped since its
+> last committed publication (`Acceptor::tracking_changes`), and a delta carries the head and those positions only. An
+> acceptor whose changes do not account for its positions against what was published (one put in place of another) is
+> carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
+> chunk, at each publication that changed it) and the mirror records.
 >
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
@@ -26368,10 +26380,23 @@ Applied in the same change to:
   before the record half in its place (the highest record alone), and TLC must refute it.
 - **Results** (GAPS' model table): per-position adoption, no error at two epochs, 2,683,673 distinct states, depth 27;
   the register's rule, Continuity violated at depth 14. The 2026-09-04 runs of `FencedRegister_2.cfg` and `Reconfig.cfg`
-  were re-run on the same toolchain and give the same counts. The three-epoch configuration is owed its result.
-- **The build owed** (GAPS, the record half): the green successor's materialization adopts, by this rule, the positions
-  between its own highest record and the adopted version from the members of the green's recovery cohorts, and
-  re-commits each under its own epoch, before it gathers the chain.
+  were re-run on the same toolchain and give the same counts. The three-epoch configuration ran 34 minutes without a
+  violation (40,469,260 distinct states, depth 26) and was stopped short of completion (GAPS' model table).
+- **The build (the record half).** A green successor that does not know the records of versions below the one its
+  round adopted (`green_adopt::Engine::RecordsShort`, A-333) asks every member of the green's recovery cohorts, settled
+  and current, for its positions in that range under the round's epoch and generation (`LedgerPrepare` /
+  `LedgerPromise`, stream 28, appended to the record session's kinds). A holder admits the question as it admits a page
+  (`takeover::question_refused`), answers only for the ledger's successor and a copy in this round
+  (`slates_db::takeover::answer_ledger`), promises the object at the epoch first, lists each position it accepted with
+  its epoch, paged by the frame, and answers once its publish keeps the raised fence. The successor counts each
+  position as the round counts an object (`slates_db::takeover::ledger_positions`: a member promised a position when it
+  reported it or its answer covers it and lists nothing there, `CountingRule::NamedAnswer`, within and past tolerance
+  as A-309 counts), adopts, in order, the value accepted under the highest epoch, and commits each again under itself
+  at the round's epoch (`takeover::commit_adopted`, the newest record's own path). A fence above the epoch starts the
+  round over above it. Then the versions' inputs are fetched by identity (the input half) and the chain gathered.
+  Counted `fleet.takeover.ledger_positions_adopted`, `_refused`, `_no_round`, `_fenced`, `_waiting`.
+- **Open (GAPS).** A holder's register refuses a different value at a position it holds (`ConflictingPosition`)
+  where the model's acceptor overwrites a lower epoch's; a never-committed divergent value cannot yet be replaced.
 
 Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
 files.
@@ -26672,6 +26697,52 @@ Applied in the same change to: §4.8 (learners and direct contact), GAPS, `crate
   "Embedding", `docs/library.md`; tests `crates/anchor/tests/anchor.rs` (the two crash-loop tests say whether a
   daemon served) and `crates/api/tests/start.rs`
   (`an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves`).
+
+### A-367 — A holder publishes each register position once: a held register is a head piece and a piece per accepted position, and a delta carries the head and the positions accepted or dropped since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 29)
+Applied in the same change to: §4.8 (A-270's status: "A held register is a head and its positions"), GAPS (the load
+test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::tracking_changes`, `changes`,
+`clear_changes`, `position`, `positions`, `position_count`, `persisted_head`), `crates/server/src/content_holder.rs`
+(`HeldPosition`, `KIND_REGISTER_POSITION`, `register_head_piece`, `position_piece`, `register_changes`, `changes_cover`,
+`registers_committed`, `join_positions`, `PublishedHeld::registers`, `HeldRefused::PositionWithoutHead`),
+`crates/server/src/fleet.rs` (`hold_checked_record` makes a tracking acceptor), `crates/vfs/src/recover.rs`
+(`IMAGE_VERSION` 29), `Daemon::fleet_held_positions` (test support), and the tests below.
+- **What was there.** A-270 made what a shard holds for other owners keyed pieces, one per held register, so a delta
+  carried the registers marked changed. A register's piece was its acceptor's whole persisted state, every accepted
+  position. A green's merge register on its holders is a ledger (`Acceptor::compact_below` keeps a successor's every
+  version), and a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+  re-wrote every version the holder kept. On the Mac Studio, a debug build, three nodes at `f = 1`, the median submit of
+  the last 50 of 300 was 4.3 to 7.1 ms against 1.9 to 3.6 ms for the first 50 (about 10 µs a version), and at the goal's
+  300,000 versions a version's publication would be about 60 MB of positions on each replica.
+- **The rule.** A held register is a head piece, its object's authority, fence and moved-from owner, and a piece per
+  accepted position, keyed by the position's object and sequence. A holder's acceptor keeps which positions it accepted
+  (new, or again at a newer epoch) and which it dropped (compacted, forgotten) since its last committed publication; a
+  delta carries the head of every register the tracked map marked and those positions; a register dropped whole has its
+  head and every published position removed, from the positions the shard knows it published. A position held but
+  neither written since nor published cannot be, since tracking counts what an acceptor holds as written when it begins
+  and a recovery clears it only because the image it was rebuilt from carries every position; so an acceptor whose
+  changes do not account for its positions against what was published (one put in place of another under the same
+  object) is carried whole, as its pieces.
+- **Tests.** `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger`
+  (`crates/server/tests/recovery.rs`: 64 positions of one ledger held through the production path, then a warm
+  restart). Kiln r3432 on the Mac Studio, 2026-11-18, debug build: on main's code each delta carried every position held,
+  2,165 bytes at the second position and 67,885 at the sixty-fourth (32 deltas, 32 sizes); with this change every delta
+  carried one size, and all 64 positions were held after the restart. The held-pieces oracle (`folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds`,
+  `daemon.rs`) now grows registers a position at a time, accepts again at a newer epoch, compacts and replaces them;
+  `a_tracking_acceptor_names_every_position_written_or_dropped_since_its_last_clear` (`slates-db`).
+- **Still owed.** The content hold's image is one piece, every manifest and chunk the holder keeps, recomputed and
+  compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
+  growth, in the content's bytes.
+
+Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
+the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
+serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
+the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
+(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
+`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
+`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
+`crates/server/src/{takeover,fleet,green_adopt}.rs` and `crates/server/tests/fleet.rs`.
 
 ### A-371 — A whole state in flight rides one past the live credit and never counts against the deltas behind it (2026-11-18, g230, scale-out; §4.10 "Live shipping"; AC-8.9; amends A-200's credit of 2026-11-17)
 Applied in the same change to:

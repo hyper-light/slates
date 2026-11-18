@@ -144,8 +144,9 @@ pub(crate) enum Engine {
   /// The replica is behind, and these versions' inputs, named by records this node accepted, are not held here: each
   /// version and manifest.
   Unheld(Vec<(u64, [u8; 32])>),
-  /// The ledger here lacks the record of this version: no engine can be built from it (the ledger-prefix transfer of
-  /// records is owed, GAP-A9-7).
+  /// The ledger here lacks the record of this version: no engine can be built from it until the records from it up to
+  /// the adopted version are adopted position by position (`fleet::adopt_missing_records`, A-364, GAP-A9-7's record
+  /// half).
   RecordsShort(u64),
   /// The green is refused on this node: its replica's identity at the adopted version is another, or a recomputation
   /// mismatched before (fatal-and-loud, counted).
