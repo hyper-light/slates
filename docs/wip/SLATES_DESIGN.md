@@ -6082,7 +6082,10 @@ refinement and revalidation before those results can be applied to the corrected
 > successor); with all three removed StaleNeverCommits fails at depth 12 (GAPS' model table). So a copy the walk has not
 > reached refuses, and nothing the walk delays can let a stale owner's record commit: a takeover round's page promises
 > and fences each copy it lists itself. Held by `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`
-> (`crates/server/tests/fleet.rs`).
+> (`crates/server/tests/fleet.rs`). Since A-485 each copy the walk reaches also follows its object's move, if the
+> configuration moved it (A-291, `moves::follow_moved_object`), whatever its route: A-398's per-copy step followed a
+> move only for a copy routed to a retired host, so a copy routed to its live old owner kept that owner's authority and
+> no takeover of a target that died before adopting listed it.
 
 > **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
 > The takeover is built as written, one batched round per retired host (`crates/server/src/takeover.rs`).
@@ -32301,3 +32304,32 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   this change (it counts 52 literals in other crates' files); rustfmt's layout taken. Red with an idle replica never
   given back: the new test fails, nothing given back within an observation's budget.
 - **Owed.** The supervisor's A/B at 1,000 clients and more (running).
+
+### A-485 — Every held copy follows its object's move as the install's walk reaches it, whatever its route (2026-11-18, goal 85 bug 1, g079; §4.8 "Promotion and takeover", "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398)
+Applied in the same change to: §4.8 "Promotion and takeover" (A-398's status), GAPS (the move entry's target-dies
+line), `crates/server/src/takeover.rs` (`resolve_held_object` judges a copy by its route, `resolve_by_route`, then
+follows its move), `crates/server/src/moves.rs` (`follow_moved_object`, one copy, replacing the whole pass
+`follow_moved_objects`), `crates/server/src/fleet.rs` (`install_on_copy` reachable from the crate's tests), and the bug
+record `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`.
+- **What was there.** A-291 had every holder follow a move once the install had resolved every held copy: a pass over
+  the moved objects took each copy's route to the exception's owner, so the next reconcile moved its authority there.
+  A-398 cut the install into a walk a copy a turn and put that pass at the end of the per-copy step, after the step's
+  early returns: it ran only when the copy reached was routed to a retired host. At a move's switch every copy is routed
+  to its live old owner, so no holder followed: each copy kept the old owner's route and authority. A takeover lists a
+  copy only along its authority's line (`copy_falls_to`), so when the target died before adopting, no survivor's round
+  learned the volume, both confirmed without it, and the configuration, which follows by lineage alone, handed the
+  volume's line to the target's successor (dropping the exception where that successor was the creator). The old owner
+  then let its frozen copy go: nobody held the volume (`a_move_whose_target_dies_at_the_switch_is_served_by_its_
+  successor`, red every run since A-398: no `fleet.takeover.adopted` or `fleet.materialize.*` on either survivor; the
+  last read `NotFound` on Linux and `HomedElsewhere { region 0 }` on macOS, the answers the code gives with the
+  successor a, and with the successor c whose own route still named a).
+- **The rule.** The per-copy step judges the copy by its route as before, then brings it to its object's move, if the
+  configuration moved it, whatever the route judged (`moves::follow_moved_object`): routed to the exception's owner
+  (counted `fleet.move.followed`), or dropped once the move is adopted by an owner whose placement leaves this holder
+  out (`fleet.move.reclaimed`). The walk's `reconcile_held_copy` then moves its authority there. One copy a step: the
+  whole pass that ran inside every per-copy step since A-398 went over every held copy each time, a pass per copy.
+- **Tests.** `a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_targets_successor`
+  (`crates/server/src/takeover.rs`, the lib's unit tests: A-340's seven-member region; a copy of another member's
+  volume moved to a third member, the install walked onto it, the target retired and the next install walked on). Red
+  without the fix on the Mac Studio (the copy stayed routed to its old owner, and the target's takeover listed nothing
+  for its successor); green with it.

@@ -945,6 +945,18 @@
 >   `fleet.materialize.given_up` 1, every read `NotRecovered`), with it on it passes before and after (7.85 s, 5.87 s).
 >   An earlier red-check in a second worktree had passed 7 of 7 only because its build shared the green tree's target
 >   directory and ran the green binary; a red-check mutates the tree the green run built.
+> - **Broken again by A-398's install walk, fixed (2026-11-18, A-485, goal 85 bug 1).** From A-398 on the target-dies
+>   test failed every run (4 of 4 on macOS and Linux, main's r242, r277, r327): neither survivor adopted or materialized
+>   the moved volume (no `fleet.takeover.adopted`, `fleet.move.adopted` or `fleet.materialize.*` on c), a released its
+>   frozen copy, and every read met `NotFound` (Linux) or `HomedElsewhere { region 0 }` (macOS). A-398's per-copy install
+>   step followed a move only for a copy routed to a retired host, so at the switch no holder's copy followed: each kept
+>   its live old owner's route and authority, no takeover of the dead target listed it, and the configuration handed the
+>   volume's line to a successor that never adopted it. Now every copy the walk reaches follows its object's move
+>   (`moves::follow_moved_object`); held by `a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_
+>   targets_successor` (the server's unit tests, red without the fix). Bug record:
+>   `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`. **Owed
+>   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back
+>   depends on holders taking the new owner's authority the same way.
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
