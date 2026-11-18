@@ -926,13 +926,16 @@
 >     - The checkpoint walk is not sliced.
 >
 > - **The quiet arm's first rungs: correct, and far from 1 ms** (Mac Studio, load 5 to 9, one node; BENCHMARKS, "The
->   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms.
->   The oracle had 0 failures. Every operation of a green's works is served on the green's one shard (about 112 µs
->   an operation, 8,960 a second), so a closed-loop client's latency is clients × service time. At 3,000 clients the
->   green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
->   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
->   10k–100k rungs (the green chain's checkpointing above is closed on the owner):
->   - a green's works served off its owner's shard, with only the verdict serialized;
+>   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms. The
+>   oracle had 0 failures. Before A-247 every operation of a green's works was served on the green's one shard (about
+>   112 µs an operation, 8,960 a second), so a closed-loop client's latency was clients × service time. At 3,000 clients
+>   the green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
+>   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the 10k–100k
+>   rungs (the green chain's checkpointing above is closed on the owner):
+>   - ~~a green's works served off its owner's shard~~ **step one on main (A-247, landed 2026-11-17 by g231)**: on
+>     the owner's node a work lives on the shard its name hashes to. Its creation, its first read of each base file,
+>     its verdict and its rebase ask the owner; every other verb runs on the work's shard. Across nodes (step two) is
+>     open (above). The asks still queue on the owner, so its CPU a verdict and a rebase is the next wall (perf);
 >   - ~~history that keeps what a version overwrote, not whole files~~ **closed (A-242, 2026-11-07)**: the
 >     history is copy-on-write (`crates/merge/src/history.rs`). A version costs the bytes it wrote and its piece
 >     lists. Behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB cap: 16 of 64
@@ -955,10 +958,10 @@
 >     **Why think time 0 cannot meet the bound, on any build.** Each round of a client holds a verdict, the green's one
 >     serialized step. In the closed loop at think time 0 the owner finishes at most one round per verdict's cost of its
 >     CPU, so a round takes at least the clients × that cost (Little's law). The owner's CPU a verdict was 21.0–26.9 µs
->     on W1 and 37.6–50.9 µs on main db9c514e (agents/perf-w1's BENCHMARKS, 2026-11-09). So at 1,000 clients a round
->     takes at least 21 ms on W1 and 38 ms on main. A round is six requests (four edits, the append and the submit),
->     and holding each under 1 ms at think time 0 would need a verdict of at most 6 µs at 1,000 clients and 60 ns at
->     100,000. A conflict adds verdicts and rebases to the round, and lowers both bounds further.
+>     on W1 and 37.6–50.9 µs on main db9c514e (BENCHMARKS, A-247's owner-CPU tables, 2026-11-09). So at 1,000 clients a
+>     round takes at least 21 ms on W1 and 38 ms on main. A round is six requests (four edits, the append and the
+>     submit), and holding each under 1 ms at think time 0 would need a verdict of at most 6 µs at 1,000 clients and
+>     60 ns at 100,000. A conflict adds verdicts and rebases to the round, and lowers both bounds further.
 >
 >     **The proposed statement (a decision for Ada, owner g231).** The bound holds at §1.4's offered increment rate per
 >     green: tens of increments a second for a few agents, thousands for a fleet session (hecate MERGE.md §7). The green
@@ -972,10 +975,11 @@
 >     - The closed loop at think time 0 is the rung's capacity, reported in verdicts a second and never against the
 >       bound.
 >
->     **Owed, measurement (the supervisor's):** the 1,000-client rung on main, and on W1 once it lands. Each think mean
->     runs as its own invocation with a fresh daemon, interleaved across builds: every kind's p50, p99, p999 and max,
->     and the `offered` row. A think mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of
->     about six requests a client), and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure.
+>     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
+>     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
+>     interleaved across builds: every kind's p50, p99, p999 and max, and the `offered` row. A think mean of about
+>     200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client), and about
+>     20 ms gives about 10⁴. The run's own verdicts a second are the figure.
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.

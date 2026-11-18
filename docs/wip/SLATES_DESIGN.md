@@ -14377,9 +14377,10 @@ owner), `crates/server/src/merge_service.rs` (`reachable_floor`, the deferred re
 owner, the floors' reconcile), `crates/db` (`WorkFloorRecord`, `Op::WorkFloorSet`, `Op::WorkFloorDropped`), the tests
 named below, BENCHMARKS, GAPS.
 
-Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1. Step two (a work on
-the creating client's node, with the forward lanes of `crates/server/src/forward_lane.rs`) is not built: a `CreateWork`
-forwarded from another node still places the work on the green's shard.
+Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
+2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
+`crates/server/src/forward_lane.rs`) is not built: a `CreateWork` forwarded from another node still places the work on
+the green's shard.
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
   on its green's partition and reads its base from the green's engine there. A closed-loop client's latency is then
