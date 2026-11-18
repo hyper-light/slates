@@ -1302,15 +1302,20 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "serde_json",
  "slates-anchor",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
+ "slates-bridge-winfsp",
  "slates-client",
  "slates-db",
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-server",
+ "slates-vfs",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

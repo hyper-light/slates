@@ -4,7 +4,7 @@
 
 use std::io::Read;
 
-use crate::Failure;
+use super::Failure;
 
 /// Format: a BLAKE3 keyed-hash key is 256 bits.
 const KEY_BYTES: usize = 32;

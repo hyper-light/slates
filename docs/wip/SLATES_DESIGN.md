@@ -152,8 +152,8 @@ the two equal):
 | `slates-bridge-nfs` | the mount point and loopback socket (§4.6) |
 | `slates-bridge-fskit` | the mount (§4.6) |
 | `slates-bridge-winfsp` | the volume (§4.6) |
-| `slates-cli` | the launcher's namespace setup (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed |
-| `slates-api` | the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write |
+| `slates-cli` | the launcher's namespace setup (§4.12), and a container bind's source resolved to the real path the kernel records, a read |
+| `slates-api` | the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write; and the anchor and daemon roles' reads of the operator's fleet manifest, certificate, key and recovery-key files (moved from slates-cli with the roles), defects against A-50's zero disk access, to be removed |
 <!-- host-path-sites:end -->
 
 ### 0.3 Evidence tiers and how citations are written
@@ -544,9 +544,10 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 - **Rust client library**: the reference implementation of the ring protocol; used by the CLI,
   the launcher, and both SDKs.
 - **Rust library for embedding hosts** (`slates-api`, A-278): what a host such as kiln vendors and
-  drives slates through, never the `slates` command — attach to an instance, volumes, a host mount
-  or a descriptor a VMM takes, drift, landing plans and landing under a grant the host's own
-  confirmation surface issues, and observation. The CLI mounts and grants through it.
+  drives slates through, never the `slates` command — start an instance from the host's own
+  executable (the anchor and daemon roles live in the crate) and attach to it, volumes, a host mount
+  or a descriptor a VMM takes, drift, landing plans and landing under a grant the person proves,
+  and observation. The CLI runs its roles, mounts and grants through it.
 - **Python SDK** (`slates` on PyPI): PyO3 extension; `async` methods on any event loop through
   file-descriptor readiness; a sync facade.
 - **TypeScript SDK** (`@hyper-light/slates` on npm, with `@hyper-light/slates-<platform>` binary
@@ -6826,9 +6827,19 @@ registry and are structurally excluded from SDK/MCP exports.
 
 **Embedding (A-278).** A host product that embeds slates — kiln first, then Hex — vendors it and
 drives it through one Rust crate, `slates-api`, never through the `slates` command and never by
-parsing its output. The crate is the client plus what was the CLI's alone: the host mount, the
-issuer authority, the grant's term. The CLI calls it for these, so the command and every host
-mount and grant through one implementation.
+parsing its output. The crate is the client plus what was the CLI's alone: the anchor and daemon
+roles, the host mount, the issuer authority, the grant's term. The CLI calls it for these, so the
+command and every host start, mount and grant through one implementation.
+- *No slates binary.* A host serves the roles from its own executable: its `main` hands the
+  arguments after a prefix of its choosing to `role::main`, and `Instance::start` runs
+  `HOST_EXE PREFIX... --instance NAME anchor`. The anchor starts its daemon from the same
+  executable and prefix (the image it runs, A-145), so every process of an instance carries the
+  prefix and `--instance NAME`, and a host finds exactly its own instance's processes. The start
+  waits for the first answer at the anchor's heartbeat cadence while the anchor lives, and makes
+  the group of an instance run alone; a host that launches the anchor under its service manager
+  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
+  is given no grant authority: under Ada's decision of 2026-11-18 a grant is proved by a key only
+  the human holds (A-285), presented through the crate's proof-agnostic grant call.
 - *What a host holds.* An `Instance`: one held client of one running instance. A landing's
   presentation lives as long as the client that made it (A-46), so a plan a person is shown is
   granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
@@ -6842,24 +6853,27 @@ mount and grant through one implementation.
   whole typed client for the rest (the merge verbs of §4.16, the file verbs).
 - *Refusals.* One closed `Error`: the daemon's `Refusal`, `Unavailable` (no daemon at the instance),
   the channel's own, and the crate's (`MountFault` with the OS's error number, `IssuerFault`,
-  `PathFault`). None is prose alone.
+  `PathFault`, `StartFault`). None is prose alone; the enums are `#[non_exhaustive]`, so a host
+  matches them with a wildcard arm as the crate grows.
 - *Grant exclusion.* The SDKs and the MCP server depend on `slates-client`, not on this crate, so
   no grant verb reaches them (the structural exclusion this section asks of the registry); the
   daemon still refuses a grant kind on their channels whatever they claim.
 - *Versioning.* The workspace's one version. The report types it re-exports are the wire's, which
   grow append-only (D-15), so a host matches their enums with a wildcard arm.
 
-> **Status (2026-11-18, A-278, piece 1).** Built: the crate with attach, the group, the volume
-> lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
+> **Status (2026-11-18, A-278, pieces 1 and 2).** Built: the crate with attach, the group, the
+> volume lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
 > `unsafe` block), the Shards stream and vhost-user serving, landing plans, `land_approved`, the
 > issuer (from the environment, as `slates grant` has it, or from a handoff's pairs), observation;
-> the CLI's `mount`, `unmount`, `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call
-> it. Proven by use over an in-process daemon (`crates/api/tests/api.rs`). Owed, in order:
-> starting an instance from the host's own executable, with the issuer handed to its starter, so a
-> host runs no `slates` binary (the anchor and daemon roles move into the crate); an async form over
-> a host's reactor (R6: a readiness wait and a timer over the client's driver); a seam trait with a
-> simulator and a conformance suite for hosts whose rules ask for one; a landing plan's per-path
-> entries, paged, for a person to review.
+> and (piece 2) the anchor and daemon roles moved from the CLI (`role`), served by a host's own
+> executable through `role::main`, with `Instance::start`, `StartSpec::anchor_command`,
+> `Instance::wait_for` and `Anchor::stop`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
+> `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call it. Proven by use over an
+> in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
+> (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order: a
+> landing plan's per-path entries, paged, for a person to review (the daemon's `Changes` request);
+> an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
+> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -7251,7 +7265,7 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > never returns) or once it has run a window of CPU (spinning: a task that never yields). A starved shard, given a
 > little CPU at a time, is alive. The watchdog withholds the beat while a shard is stuck or the control loop has ended.
 > The anchor holds the beat to the window plus its own measured lateness p99 over its last 100 timed waits
-> (`crates/cli/src/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
+> (`crates/api/src/role/anchor.rs`, `Lateness`). The window is the existing liveness budget, still a fixed number (GAPS, R3
 > debt). Proven by `crates/server/tests/liveness.rs`: a starved control-shard poll, which gapped the beat 1.53 s on main,
 > keeps it under 0.26 s; a wedged or spinning non-control shard, which main never saw, stops it.
 > **2026-11-08:** `ShardTime` itself now asks the scheduler before it ends a wait on a window with no CPU progress: a
@@ -7264,7 +7278,7 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 > **Status (2026-11-07): a start is judged by its progress too.** Until its first beat the anchor judges a starting
 > daemon by the same rule, in the daemon's own CPU time read from the OS (`slates_machine::process_clock`;
-> `crates/cli/src/anchor.rs`): killed once it makes no CPU progress for a window or runs a window of CPU without beating,
+> `crates/api/src/role/anchor.rs`): killed once it makes no CPU progress for a window or runs a window of CPU without beating,
 > waited for while it progresses. Before, a start not beaten within the fixed recovery budget, a wall second, was killed;
 > under 144 spinners on 18 CPUs the anchor killed 153 starts of 153 after each had used 16-18 ms of CPU
 > (`docs/bugs/2026-11-07-the-anchor-killed-every-start-a-busy-machine-starved.md`). On Linux the clock is the process's
@@ -7313,7 +7327,7 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 > **Status (2026-11-14, A-232 step 5): a lapsed beat kills only a stuck daemon, never a starved one.** The watchdog marks
 > every look in the segment, beating or not (`SUP_LOOKED`, offset 216 of the supervision block, zeroed at each start). On
-> a lapse the anchor decides (`judge_lapse` in `crates/cli/src/anchor.rs`):
+> a lapse the anchor decides (`judge_lapse` in `crates/api/src/role/anchor.rs`):
 > - Looks within the lapse bound: the watchdog's verdict, killed as before.
 > - No look within it: the daemon's watchdog was held off its CPU with the rest of the daemon. The anchor judges the
 >   process by the start's rule, in its own CPU time, from when the looks stopped. Starved or alive, it is spared and
@@ -9015,7 +9029,7 @@ workflow dry run.
 | AC-5.9 | T-5.11 | CLI/MCP/SDK adapters conform to one operation descriptor and are navigable. | Execute the same create/clone/base/attach/status/resize flows through each adapter, using ids and scoped names; expect equivalent results/refusals, useful help, stable JSON, bounded cursors and cancellation. |
 | AC-5.10 | T-5.12 | Human grants are authenticated and bound to the exact proposed landing. | Preview a plan, change its filter/target/content, replay or forge approval from an agent channel; expect refusal. Approve the unchanged manifest through the enrolled human surface and expect only its granted effects and audit records. |
 | AC-5.11 | T-5.13 | Users can discover attachment support and complete supported flows without hidden setup. | Start from an enrolled instance on each host, follow CLI help through a live overlay and an immutable-base/guest flow; expect endpoint/root discovery, actual path/tag readiness, clear coverage/reservation/durability output and actionable capability errors. |
-| AC-5.12 | T-5.14 | An embedding host drives every flow through the library alone (A-278): no `slates` command, no parsed output. | Through `slates-api` over a live daemon: attach (no daemon: `Unavailable`), make the group, create, snapshot, clone and destroy; lay an overlay over a folder, change it, read its drift; plan its landing, grant and land exactly the approved manifest (another manifest returns the new plan and writes nothing); serve it to a VMM as a Shards stream and speak FUSE through the end; observe the daemon. Expect every answer typed and the folder to change only at the granted landing. |
+| AC-5.12 | T-5.14 | An embedding host drives every flow through the library alone (A-278): no `slates` command, no parsed output. | Through `slates-api` over a live daemon: start the instance from the host's own executable (its `main` serving the roles), its anchor and daemon that executable with the host's prefix and `--instance NAME`; attach (no daemon: `Unavailable`), make the group, create, snapshot, clone and destroy; lay an overlay over a folder, change it, read its drift; plan its landing, grant and land exactly the approved manifest (another manifest returns the new plan and writes nothing); serve it to a VMM as a Shards stream and speak FUSE through the end; observe the daemon; stop the instance. Expect every answer typed, a second start refused `AlreadyRunning`, an anchor that exits refused `AnchorExited` with its code, and the folder to change only at the granted landing. |
 
 ### Phase 6 — Merge engine: green volumes, increments, canonical rebase, the verdict (single node)
 
@@ -9900,7 +9914,8 @@ slates/
                              content puts with hedging, takeover, migration, mirroring
     mcp/                     MCP server and skills projection
     api/                     `slates-api`: the library an embedding host drives slates through (A-278):
-                             instances, volumes, the host mount, landing under a grant, observation
+                             the anchor and daemon roles and instance start, volumes, the host mount,
+                             landing under a grant, observation
     cli/                     `slates` binary: daemon, exec launcher, admin
     sdk-py/                  PyO3 extension (async via fd readiness)
     sdk-node/                napi-rs addon (async via uv_poll)
@@ -20595,7 +20610,7 @@ Applied in the same change to:
   reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
   injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
 
-### A-278 — An embedding host drives slates through one library, `slates-api`; the host mount and the issuer move into it from the CLI (accepted and built in part 2026-11-18, Ada's goal "slates has a library API for embedding hosts")
+### A-278 — An embedding host drives slates through one library, `slates-api`; the host mount, the issuer and the anchor and daemon roles move into it from the CLI (accepted and built in part 2026-11-18, Ada's goal "slates has a library API for embedding hosts")
 
 Applied in the same change to:
 - §2.4 (the surfaces list), §4.12 ("Embedding", its status, and AC-5.12 / T-5.14 in Phase 5's table), Appendix B.6
@@ -20607,6 +20622,16 @@ Applied in the same change to:
   recovers through the crate; `args.rs` takes the grant's term from it.
 - `unsafe-budget.toml` (the macOS `mount(2)` block counted in `slates-api`, `slates-cli` 7 → 6), `xtask/src/main.rs`
   (`slates-api` may name host paths: the mount point's real path, a read), GAPS (the inventory row).
+- Piece 2, the same day: `crates/api/src/role/` (`mod.rs`: `Role`, `ProcessOptions`, `FleetSelection`, `serve`,
+  `main`, `measure`, `recovery_key`; `anchor.rs`, `daemon.rs`, `parent.rs`, `dumps.rs`, `fleet.rs`,
+  `recovery_key.rs` and `liveness_tests.rs` moved from `crates/cli/src/` unchanged in what they do, the anchor's
+  daemon started with the executable's prefix; `signal.rs`, the stop flag, moved from the CLI's `signal.rs`, whose
+  `slates pmem` relay stays); `crates/api/src/start.rs` (`StartSpec`, `Started`, `Anchor`, `Instance::start`,
+  `Instance::wait_for`); `error.rs` (`StartFault`, `Error::Start`, the enums `#[non_exhaustive]`);
+  `crates/api/tests/start.rs` (a harness-free test binary that is the host). The CLI's `main.rs` and `args.rs` serve
+  `anchor` and `daemon` through `slates_api::role` (its `failure_text`, left unused by piece 1's mount move, removed);
+  `unsafe-budget.toml` (the stop flag's three blocks: `slates-api` 1 → 4, `slates-cli` 6 → 3); `xtask/src/main.rs`
+  (the fleet manifest and recovery-key reads are `slates-api`'s now) and the host-path table regenerated; `docs/library.md`.
 
 - **Why.** Ada (2026-11-18): kiln invoking slates only through its CLI is wrong; kiln must vendor slates and use a
   library API, as it vendors Shards, Hex and Mantle. Until now kiln ran the `slates` binary for every verb
@@ -20624,11 +20649,20 @@ Applied in the same change to:
   The SDKs and the MCP server do not depend on the crate, so no grant verb reaches them; an embedding host is a
   confirmation surface in §4.13's sense, and `Instance::land_approved` binds its grant to exactly the manifest its
   person approved.
-- **Owed, in order.** (1) Starting an instance from the host's own executable: the anchor and daemon roles move into
-  the crate, a host's `main` serves them, and the anchor hands its starter the issuer on an inherited channel (the
-  segment's descriptor on Linux), so a host runs no `slates` binary and grants on Linux too. (2) An async form over a
-  host's reactor (R6). (3) A seam trait with a simulator and a conformance suite, for hosts whose rules ask for one
-  (Hex's §9, kiln's `kiln-seams`). (4) A landing plan's per-path entries, paged.
+- **No slates binary (piece 2).** The anchor and daemon roles live in the crate (`role`), and any executable whose
+  `main` hands the arguments after its prefix to `role::main` serves them: the `slates` binary with no prefix, kiln with
+  its own. The anchor's daemon is the anchor's own executable started again with the same prefix, so the prefix and
+  `--instance NAME` reach every process of the instance (the e2e contract finds them by it). `Instance::start` spawns
+  the anchor and waits for the first answer while it lives: until the anchor holds the rendezvous a connect is refused
+  at once and is asked again a heartbeat later (the anchor's own cadence, `HEARTBEAT_NS`); once it holds it, the
+  connect waits for the daemon (A-114). An anchor that exits ends the wait with its code. **Changed from the plan:** the
+  first draft had the anchor hand its starter the issuer on an inherited channel (the segment's descriptor on Linux).
+  Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
+  prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
+  could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+- **Owed, in order.** (1) A landing plan's per-path entries, paged (the daemon's `Changes` request, which goal g266
+  builds; the crate exposes it). (2) An async form over a host's reactor (R6). (3) A seam trait with a simulator and a
+  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`).
 - **Checked.** `crates/api/tests/api.rs` over a daemon in the test process: no daemon is `Unavailable`; a create before
   the group is `ConsensusNotInitialized` and the group is made twice harmlessly; create, snapshot, clone and destroy;
   an overlay's landing with `/.git` left out lands exactly the approved manifest, an approval of another manifest
