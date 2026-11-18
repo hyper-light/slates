@@ -29,8 +29,9 @@
 >   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
->   pins (f71282e1f, now f524cd817 or newer), the WHP window patches 0001 to 0003 (handed to it as the signed branch
->   `agents/g268-whp-window-edge-cases`, 2026-11-18, their record renumbered PM M620), and `shards restore` handing a
+>   pins (f71282e1f; handed to it as the signed branch `agents/g268-slates-rev-bump`, 808cdc1e4, pinning ac30fc77a
+>   and Rust 1.98.1), the WHP window patches 0001 to 0003 (the signed branch `agents/g268-whp-window-edge-cases`,
+>   2026-11-18, their record renumbered PM M620), and `shards restore` handing a
 >   restored VM a served share (`--slates-fs-fd`, `--slates-fs-handle`) with a real-VM test of a save and a restore.
 > - Until the restart's resync is agreed, a daemon's death ends the stream: the device reads the end, and recovery
 >   removes the guest's record, counted in its report's `attachments_dropped` (Shards' option (a)).
