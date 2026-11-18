@@ -32,6 +32,10 @@ struct Reply {
   query: Query,
   generation: u64,
   serves: bool,
+  /// For a work no member owns, the green its catalog record names, from a peer that holds that record (A-255): the
+  /// route a resend of its submit takes, a hint that grants nothing. `None` from every other peer and for every other
+  /// object. Fixed-size, so decoding stays bounded.
+  work_of: Option<[u8; 16]>,
 }
 
 /// A routing hint owned by one live client slot. A hint permits a single forward, never an
@@ -182,15 +186,26 @@ pub(crate) fn serve(
     ObjectId(query.object),
     regional.members.contains(&local),
   );
+  let work_of = declined.and_then(|_| held_work_of(state, ObjectId(query.object)));
   Ok((
     Reply {
       query,
       generation: regional.version,
       serves: declined.is_none(),
+      work_of,
     }
     .to_bytes(),
     declined,
   ))
+}
+
+/// The green `object`'s catalog record names, if `object` is a work whose catalog record this node holds (A-255).
+pub(crate) fn held_work_of(state: &ShardState, object: ObjectId) -> Option<[u8; 16]> {
+  let catalog = object.catalog();
+  let (_, bytes) = state.holder_records.get(&catalog)?.highest(catalog)?;
+  crate::catalog::CatalogValue::from_record_bytes(bytes)?
+    .work_of
+    .map(|green| green.bytes)
 }
 
 /// Why this node does not claim `object` (`serve`), as the counter it is recorded under on this node, or `None` when
@@ -224,6 +239,10 @@ struct Answers {
   conflicting: bool,
   /// Claims a newer claim dropped, counted when the round ends (`fleet.owner_location.claim_superseded`).
   superseded_claims: u64,
+  /// The green a peer named for a work no member owns (`Reply::work_of`), the first named.
+  work_of: Option<[u8; 16]>,
+  /// Peers that named another green than the first: a hint is dropped when its holders disagree.
+  work_of_conflicting: bool,
 }
 
 /// What folding one reply did to a round's answer, counted by the round, so a refused lookup says which
@@ -254,6 +273,10 @@ impl Answers {
     if reply.query != query {
       return Err(LocationError::ForeignView);
     }
+    if let Some(green) = reply.work_of {
+      self.work_of_conflicting |= self.work_of.is_some_and(|named| named != green);
+      self.work_of.get_or_insert(green);
+    }
     if !reply.serves {
       return Ok(Folded::NotOwner);
     }
@@ -274,6 +297,28 @@ impl Answers {
     self.conflicting |= self.owner.is_some_and(|owner| owner != peer);
     self.owner = Some(peer);
     Ok(Folded::Claim)
+  }
+
+  /// The round's owner and the work's green a peer named, each counted: superseded claims, conflicting hints (dropped)
+  /// and a hint named, and the refusal when no owner was found.
+  fn conclude(self) -> (Result<HostId, LocationError>, Option<[u8; 16]>) {
+    for _ in 0..self.superseded_claims {
+      count("fleet.owner_location.claim_superseded");
+    }
+    let work_of = if self.work_of_conflicting {
+      count("fleet.owner_location.work_of_conflicting");
+      None
+    } else {
+      self.work_of
+    };
+    if work_of.is_some() {
+      count("fleet.owner_location.work_of_named");
+    }
+    let result = self.finish();
+    if let Err(error) = result {
+      count(error.counter());
+    }
+    (result, work_of)
   }
 
   fn finish(self) -> Result<HostId, LocationError> {
@@ -305,6 +350,19 @@ async fn wait_for_returning_sessions(began: u64, poll_ns: u64) -> bool {
 /// deadline; the round owns their straggler receiver until every session is returned. Concurrent
 /// requests can borrow only disjoint sessions, so aggregate fanout stays at the admitted peer bound.
 pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
+  locate_round(query).await.0
+}
+
+/// The green a work's catalog holders name for `query`'s object, from one bounded location round ([`locate`]'s), for
+/// a work no member owns that this node holds no catalog record of (A-255). `None` when no peer named one, or peers
+/// named different ones (counted). A hint: the green's owner answers only a completion under the request's own key.
+pub(crate) async fn locate_work_of(query: Query) -> Option<[u8; 16]> {
+  let (_, work_of) = locate_round(query).await;
+  work_of
+}
+
+/// One round ([`locate`]): the owner it found and the work's green a peer named, if any.
+async fn locate_round(query: Query) -> (Result<HostId, LocationError>, Option<[u8; 16]>) {
   let peers = state::with_state(|state| {
     state
       .node_regions
@@ -351,14 +409,7 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
       break;
     }
   }
-  for _ in 0..answers.superseded_claims {
-    count("fleet.owner_location.claim_superseded");
-  }
-  let result = answers.finish();
-  if let Err(error) = result {
-    count(error.counter());
-  }
-  result
+  answers.conclude()
 }
 
 /// Counts the peers a round left unasked because they hold no record session at all: not waited for (the bounded
@@ -472,6 +523,7 @@ mod tests {
       query: query(),
       generation,
       serves,
+      work_of: None,
     }
     .to_bytes()
   }
@@ -548,12 +600,14 @@ mod tests {
       query,
       generation: 8,
       serves: true,
+      work_of: None,
     }
     .to_bytes();
     let not_mine = Reply {
       query,
       generation: 9,
       serves: false,
+      work_of: None,
     }
     .to_bytes();
     for order in [[0, 1], [1, 0]] {
@@ -567,6 +621,58 @@ mod tests {
     }
   }
 
+  /// A-255: a work no member owns has its route in its catalog record, which its holders name in their "not mine"
+  /// replies. Do: fold no claim, one peer with no record, and two holders naming the same green, in every order; then
+  /// a round where two holders name different greens. Expect: the first round finds no owner and names the green; the
+  /// second names none (a hint its holders disagree on is dropped, counted), and neither round ever selects an owner.
+  #[test]
+  fn a_works_holders_name_its_green_and_a_disagreement_names_none() {
+    let query = query();
+    let named = |green: u8| {
+      Reply {
+        query,
+        generation: 4,
+        serves: false,
+        work_of: Some([green; 16]),
+      }
+      .to_bytes()
+    };
+    let unknowing = Reply {
+      query,
+      generation: 4,
+      serves: false,
+      work_of: None,
+    }
+    .to_bytes();
+    let (first, second) = (named(7), named(7));
+    for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
+      let replies = [
+        (HostId(3), &first),
+        (HostId(4), &unknowing),
+        (HostId(5), &second),
+      ];
+      let mut answers = Answers::default();
+      for index in order {
+        let (peer, bytes) = replies[index];
+        answers.fold(query, peer, bytes).unwrap();
+      }
+      assert_eq!(
+        answers.conclude(),
+        (Err(LocationError::Unavailable), Some([7; 16])),
+        "order {order:?}"
+      );
+    }
+    let other = named(8);
+    let mut answers = Answers::default();
+    answers.fold(query, HostId(3), &first).unwrap();
+    answers.fold(query, HostId(5), &other).unwrap();
+    assert_eq!(
+      answers.conclude(),
+      (Err(LocationError::Unavailable), None),
+      "holders that disagree name no green"
+    );
+  }
+
   /// AC-8.14 / §4.9: conflicting, truncated or wrongly bound replies cannot select an owner.
   #[test]
   fn conflicts_and_foreign_or_malformed_replies_refuse() {
@@ -575,6 +681,7 @@ mod tests {
       query,
       generation: 2,
       serves: true,
+      work_of: None,
     }
     .to_bytes();
     let mut answers = Answers::default();
