@@ -10280,6 +10280,101 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
   }
 }
 
+/// Shape: the volumes the seal-walk test's owner seals at once, each its own turn of the walk under the injected
+/// quantum.
+const WALKED_SEAL_VOLUMES: usize = 12;
+/// Shape: each walked volume's file: half a page, so its write is one request under the test client's 4 KiB ring slot
+/// with its framing (a whole page was refused `PayloadTooLarge`, 4,151 bytes offered).
+const WALKED_FILE_BYTES: usize = 2 << 10;
+/// Format: the owner's count of record periods' home seal walks over one shard (`fleet::seal_walk_slice`).
+const SEAL_WALKS: &str = "fleet.seal.walks";
+/// Format: the owner's count of the owner-shard turns those walks took.
+const SEAL_WALK_SLICES: &str = "fleet.seal.walk_slices";
+
+/// CLAUDE.md "Bounded work everywhere", §4.10 "Content replication": a shard's seal walk visits its volumes in turns of
+/// about a step quantum each (`fleet::seal_walk_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 12
+/// volumes each written once and detached; cut the owner's walk turns after one volume each
+/// (`Daemon::inject_seal_walk_quantum(Some(0))`); snapshot every volume, then wait for every snapshot to place. Expect
+/// every snapshot placed (the slicing starved no seal), and at least 12 turns for each walk that passed whole (one
+/// volume each). Before, one turn visited every volume and advanced every seal job a slice each, so a shard sealing `n`
+/// volumes at once was held for `n` archive slices while its clients waited.
+#[test]
+fn a_shards_seals_are_walked_in_turns_and_every_one_places() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let mut volumes = Vec::new();
+  for index in 0..WALKED_SEAL_VOLUMES {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("walked-{index}"))) else {
+      panic!("volume {index} was created");
+    };
+    let attachment = write_attachment(&mut client, id);
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/walked".to_owned(),
+      bytes: vec![u8::try_from(index % 251).unwrap(); WALKED_FILE_BYTES],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "volume {index}'s write: {written:?}"
+    );
+    // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`); a seal
+    // needs none held.
+    let detached = client.call(&RequestBody::Detach { attachment });
+    assert!(
+      matches!(detached, ReplyBody::Detached),
+      "volume {index}'s attachment was let go: {detached:?}"
+    );
+    volumes.push(id);
+  }
+  daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
+  let before = [SEAL_WALKS, SEAL_WALK_SLICES].map(|kind| refusal_count(&daemons[0], kind).unwrap());
+  let snapshots: Vec<_> = volumes
+    .iter()
+    .map(
+      |volume| match client.call(&RequestBody::Snapshot { volume: *volume }) {
+        ReplyBody::Snapshotted { id, .. } => Some(id),
+        _ => None,
+      },
+    )
+    .collect();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed: Vec<bool> = volumes
+    .iter()
+    .zip(&snapshots)
+    .map(|(volume, snapshot)| {
+      snapshot
+        .is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, *volume, snapshot))
+    })
+    .collect();
+  let after = [SEAL_WALKS, SEAL_WALK_SLICES].map(|kind| refusal_count(&daemons[0], kind).unwrap());
+  daemons[0].inject_seal_walk_quantum(None).unwrap();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("seal walk: walks, turns before {before:?} after {after:?}; placed {placed:?}");
+  assert!(
+    snapshots.iter().all(Option::is_some),
+    "every volume was snapshotted: {snapshots:?}"
+  );
+  assert!(
+    placed.iter().all(|placed| *placed),
+    "every snapshot placed: {placed:?}"
+  );
+  let (walks, turns) = (
+    after[0].saturating_sub(before[0]),
+    after[1].saturating_sub(before[1]),
+  );
+  let volumes_per_walk = u64::try_from(WALKED_SEAL_VOLUMES).unwrap();
+  assert!(
+    walks >= 2 && turns >= walks.saturating_sub(1) * volumes_per_walk,
+    "each whole walk took a turn a volume ({walks} walks, {turns} turns)"
+  );
+}
+
 /// AC-8.9, A-200 amended 2026-11-17: a burst of barriers on one live volume ships its changes, not the volume. Do: three
 /// nodes at `f = 1`; on a, a volume of half a MiB, then live-shipped and written once (its log's first entry, the whole
 /// state, durable); hold both holders off their shards while sixteen clients each write half a page at once, so every write's
