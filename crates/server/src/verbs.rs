@@ -11264,7 +11264,7 @@ impl PinJob {
       .cloned()
       .ok_or(Refusal::NotFound)?;
     let (snapshot, _, _) =
-      take_snapshot(state, self.handle, &record).map_err(|reply| match *reply {
+      snapshot_effect(state, self.handle, &record).map_err(|reply| match *reply {
         ReplyBody::Refused { refusal } => refusal,
         _ => Refusal::NotFound,
       })?;
