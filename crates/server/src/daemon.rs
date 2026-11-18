@@ -2726,6 +2726,19 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: the quantum the record period's seal walk turns are cut by on every shard (`fleet::seal_walk_slice`),
+  /// in place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each turn after one volume,
+  /// so a test sees the slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.seal_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
@@ -3160,6 +3173,28 @@ impl Daemon {
       }
     }
     Ok(())
+  }
+
+  /// Test support: while `anchor` is set, this node's owner shards deliver no pair key to the node at that stable anchor,
+  /// as a delivery whose recipient answer never comes back fails each period (`fleet.seal.pair_recipient_unknown`);
+  /// every other delivery goes on and no pair delivered is forgotten (unlike [`Self::inject_pair_withhold`]), so a
+  /// node replaced at that anchor never receives this node's pairs while the rest of the fleet does. `None` lifts it.
+  /// `Ok` once installed on the control shard, where deliveries are made.
+  pub fn inject_pair_withhold_to(&self, anchor: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_pair_withhold_to = anchor;
+    })
+  }
+
+  /// Test support: the position of the newest entry of the live log this node holds for `object` as a candidate
+  /// (A-200), or `None` while it holds none; read on the control shard, where held logs live.
+  pub fn fleet_live_held(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::live_ship::held_position(s, object)
+    })
   }
 
   /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
@@ -4139,6 +4174,8 @@ async fn init_shard(
     demuxes: Vec::new(),
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
+    taken_over: std::collections::BTreeMap::new(),
+    seal_walk_quantum_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
@@ -4160,6 +4197,7 @@ async fn init_shard(
     dead_session_dropped_at: std::collections::BTreeMap::new(),
     dead_session_recovered_ns: None,
     injected_pair_withhold: false,
+    injected_pair_withhold_to: None,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),

@@ -205,20 +205,33 @@ hg -R ../shared status --all
 
 /// The Subversion workload (the goal of 2026-11-18): an FSFS repository made with a fixed UUID; a working copy of its
 /// trunk, whose state is SQLite (`.svn/wc.db`, journalled and locked as SQLite does over the file system under it);
-/// a commit, a branch by a server-side copy, a switch to it and a commit there, a switch back and a commit on trunk,
-/// an update back to an older revision and forward again, a merge of the branch into trunk (Subversion's own merge,
-/// recorded in `svn:mergeinfo`), a tag, a cleanup, a second working copy of the branch, then the repository verified
-/// and dumped. Every revision's date is set to one fixed instant before the history is printed (`svnadmin
+/// two commits, a branch by a server-side copy, a switch to it and a commit there, a switch back and a commit on
+/// trunk, an update back to an older revision and forward again, a merge of the branch into trunk (Subversion's own
+/// merge, recorded in `svn:mergeinfo`), a tag, a cleanup, a second working copy of the branch, then the repository
+/// verified and dumped. Every revision's date is set to one fixed instant before the history is printed (`svnadmin
 /// setrevprop`, which runs no hook), as the git and Mercurial workloads fix theirs; the client's configuration is the
 /// workload's own (`--config-dir`), so nothing outside the tree is read or written. Every repository URL holds the
 /// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
 /// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
 /// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
-/// carriage return there, which the revision loop's count must not carry. The repository's representation cache
-/// (`db/rep-cache.db`) is compared by what it holds, its rows, printed where `sqlite3` is on the `PATH`, never by its
-/// bytes: it is an SQLite file, whose page layout two runs of the same commits did not share (CI run 44247840584,
-/// ubuntu, 2026-11-18); the revisions it caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared, and
-/// `svnadmin verify` and the dump's checksum print the repository whole.
+/// carriage return there, which the revision loop's count must not carry.
+///
+/// No commit sends more than one file's text. Subversion's client sends a commit's texts after its tree, in the order
+/// of a hash table (`svn_client__do_commit`'s `file_mods`, `subversion/libsvn_client/commit_util.c` of 1.14), and APR
+/// seeds each hash table from the clock and its addresses (`apr_hash_make`, `tables/apr_hash.c` of 1.7), so the order
+/// is drawn anew in every process; FSFS numbers a revision's items in the order they arrive. One commit of two new
+/// files therefore wrote its revision file, and the representation cache's row for each text, in either of two orders:
+/// the cache's item number for `d/b.txt`'s text was 3 in one run and 4 in the next (host and host on ubuntu, host and
+/// mount on macOS and over Linux FUSE: CI runs 44252249999, 44252296495 and 44252854695, 2026-11-18), and on Subversion
+/// 1.14.5 (kiln run r956) twelve runs of the script with that commit wrote `db/revs/0/2` two ways, seven and five
+/// times, every other file alike, while twelve runs with its two files committed apart were identical in every
+/// revision file, the cache's rows and its bytes, the output and the dump. So the revision files (`db/revs`), their
+/// properties (`db/revprops`) and the youngest revision (`db/current`) are compared byte for byte. The representation
+/// cache (`db/rep-cache.db`) is compared by what Subversion keeps in it, its rows, rather than by SQLite's bytes for
+/// them: each content's hash, the revision that first stored it and its size print where `sqlite3` is on the `PATH`
+/// (its bytes had differed between two runs, CI run 44247840584, only because its rows had), and `svnadmin verify`
+/// checks each row against the revision it names (`verify_rep_cache`, `subversion/libsvn_fs_fs/verify.c` of 1.14).
+/// The dump's checksum, `svnlook tree`, `svn log -v` and `svnadmin verify` print every revision's content.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -234,10 +247,12 @@ svn mkdir -q -m layout "$url/trunk" "$url/branches" "$url/tags"
 svn checkout -q "$url/trunk" wc
 cd wc
 printf 'one\n' > a.txt
+svn add -q a.txt
+svn commit -q -m base
 mkdir d
 printf 'two\n' > d/b.txt
-svn add -q a.txt d
-svn commit -q -m base
+svn add -q d
+svn commit -q -m 'base directory'
 svn copy -q -m 'branch feature' '^/trunk' '^/branches/feature'
 svn switch -q '^/branches/feature'
 printf 'feature\n' > f.txt
@@ -246,7 +261,8 @@ svn commit -q -m feature
 svn switch -q '^/trunk'
 printf 'main\n' >> a.txt
 svn commit -q -m 'main change'
-svn update -q -r 2
+# Format: revision 3 is the base, its two files each committed alone.
+svn update -q -r 3
 cat a.txt
 svn update -q
 svn merge -q '^/branches/feature'
@@ -272,19 +288,19 @@ svn info --show-item last-changed-revision
 svn info --show-item url
 svn info --show-item repos-uuid
 svn log -v -r 1:HEAD '^/'
-# Format: revision 5 is the change on trunk, 6 the branch's merge into it.
-svn diff -c 5 '^/'
+# Format: revision 6 is the change on trunk, 7 the branch's merge into it.
+svn diff -c 6 '^/'
 svn propget svn:mergeinfo .
 svn cat -r 2 a.txt
 svn list -R '^/'
 cd ..
 svnadmin verify repo
 if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, offset, size, expanded_size FROM rep_cache ORDER BY hash'
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, expanded_size FROM rep_cache ORDER BY hash'
 fi
 svnlook tree repo
-# Format: revision 6, the merge, as the repository records it.
-svnlook changed -r 6 repo
+# Format: revision 7, the merge, as the repository records it.
+svnlook changed -r 7 repo
 svnadmin dump -q repo | cksum
 "#;
 
@@ -454,6 +470,11 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 ///   two runs of the Mercurial workload wrote one list in two orders);
 /// - one time zone and locale, and npm with no update check, funding or audit messages and no log files (their path,
 ///   in the cache, would be the one line that differs between runs);
+/// - cargo's plain output and its own target directory (`CARGO_TARGET_DIR=target`, which cargo takes relative to the
+///   directory it runs in, so the crate's own), whatever a parent sets: every CI job sets `CARGO_TERM_COLOR=always`,
+///   whose escape sequence before `Fresh` made the cargo workload's count of fresh builds read 0, failing it on both
+///   sides of every leg (CI runs 44247840584 and 44252249999, 2026-11-18), and kiln's runs set a target directory
+///   outside the tree, where the workload's `./target/debug/mini` would not be;
 /// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
 ///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
 ///   whether the drive makes links (A-275). Every other shell ignores the variable.
@@ -477,6 +498,8 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("npm_config_fund", "false"),
   ("npm_config_audit", "false"),
   ("npm_config_logs_max", "0"),
+  ("CARGO_TERM_COLOR", "never"),
+  ("CARGO_TARGET_DIR", "target"),
   ("MSYS", "winsymlinks:nativestrict"),
 ];
 
@@ -623,9 +646,9 @@ pub const ROSTER: &[Workload] = &[
       ),
       (
         "repo/db/rep-cache.db",
-        "FSFS's representation cache is an SQLite file, whose pages SQLite lays out as it goes, so two runs of the \
-         same commits differ in its bytes; its rows are printed where sqlite3 is on the PATH, and the revisions it \
-         caches are compared byte for byte",
+        "FSFS's representation cache is an SQLite file, judged by what Subversion keeps in it, its rows: each \
+         content's hash, first revision and size are printed where sqlite3 is on the PATH, and `svnadmin verify` \
+         checks every row against the revision it names; the revisions it caches are compared byte for byte",
       ),
     ],
     runs_on_windows: true,

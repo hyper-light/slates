@@ -771,6 +771,13 @@ pub struct ShardState {
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
+  /// The takeovers that made this node the owner of a volume this shard serves, by volume (AC-8.3, the loss report in
+  /// `slates status`): the epoch, the head sequence served from, and whether from the volume's live log. One entry a
+  /// taken-over volume of this shard, dropped when the volume is destroyed.
+  pub(crate) taken_over: BTreeMap<VolumeId, slates_ipc::protocol::VolumeTakeover>,
+  /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum the record period's seal
+  /// walk turns are cut by in place of the shard's step quantum (`fleet::seal_walk_slice`).
+  pub(crate) seal_walk_quantum_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
   /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;
@@ -870,6 +877,10 @@ pub struct ShardState {
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,
+  /// Test support: the anchor whose node this control shard's owner shards deliver no pair key to
+  /// (`Daemon::inject_pair_withhold_to`), every other delivery going on and nothing delivered forgotten: a delivery
+  /// whose recipient answer never comes back. `None` in production.
+  pub injected_pair_withhold_to: Option<u64>,
   /// Test support (never reachable from the wire): voters whose record sessions each of this node's
   /// campaigns counts as out of their links, as a discovery page holds one, for the span after the
   /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions

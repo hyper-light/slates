@@ -42,7 +42,8 @@
 //! durable holds ([`crate::takeover::serve_host_prepare`]).
 //!
 //! **Content replication and serve** (§4.10 "Content replication"; §4.8 mechanism 1): each owned volume's
-//! newest snapshot is archived in bounded slices ([`advance_seals`], the vfs `SnapshotArchiver`), its
+//! newest snapshot is archived in bounded slices ([`advance_home_seal`], the vfs `SnapshotArchiver`), the shard's
+//! volumes visited in turns of about a step quantum each ([`seal_walk_slice`]), its
 //! archive put to the content candidates by missing set until `f + 1` hold it verified
 //! ([`put_seal_content`], the first round to `f + 1`, later rounds hedged to the rest), and only then the
 //! head naming the manifest and the acknowledging holders shipped ([`head_value_of`]) and the snapshot
@@ -1743,6 +1744,14 @@ async fn serve_peer_records(
           }
           PAIR_KEY_STREAM => state::with_state(|s| accept_pair_delivery(s, peer_anchor, &request))
             .unwrap_or_default(),
+          LINEAGE_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |member| member.host);
+            serve_lineage(s, peer_host, &request)
+          })
+          .unwrap_or_default(),
           DEATH_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -2204,6 +2213,9 @@ struct Head {
   shape: Placement,
   acked: Vec<HostId>,
   quorum: Quorum,
+  /// Whether its shard ships its volume live (`live_ship::ships`): then a held durable reply may hold the candidates to
+  /// an answer, and [`ship_head`] notes the ask on that shard before its round (A-301).
+  live: bool,
 }
 
 /// The volume heads this node owns that some candidate has **not yet acknowledged** (§4.8 "records are sent
@@ -2517,6 +2529,7 @@ fn owed_record(
     },
     acked,
     quorum: config.quorum,
+    live: crate::live_ship::ships(state, object),
   })
 }
 
@@ -2729,69 +2742,67 @@ fn mirror_neighbourhood_of(state: &ShardState, local: HostId) -> Vec<HostId> {
   slates_db::mirror::mirror_neighbourhood(local, &members, state.fleet.configuration().quorum)
 }
 
-/// One period of this node's mirror shipments (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` piece M2):
-/// for each owned volume whose head snapshot is recorded placed at home and not yet in the mirror, a mirror job is
-/// started (or replaced, when a newer snapshot superseded it), its archive walk advanced one slice, and its content
-/// round to the mirror neighbourhood returned once the archive is complete. A volume whose head the mirror already
-/// holds, or that is being destroyed, keeps no job. Nothing runs with no mirror declared.
-fn advance_mirror_seals(
-  state: &mut ShardState,
-  local: HostId,
-  slice_bytes: u64,
-  created_unix: u64,
-  round: CommitBudget,
-) -> Vec<ContentWork> {
+/// The opening of a period's mirror walk ([`seal_walk_slice`]): this node's mirror neighbourhood, settled once for the
+/// period. Whether there is one to ship to; with none, every mirror job is dropped and the walk visits nothing.
+fn open_mirror_walk(state: &mut ShardState, local: HostId) -> bool {
   state.mirror_neighbourhood = mirror_neighbourhood_of(state, local);
-  if state.mirror_neighbourhood.is_empty() {
-    // A mirror declared for this node's region with no live, authenticated member of it to ship to is counted: it is
-    // the one way a declared mirror ships nothing without a refusal anywhere.
-    let own = state
-      .node_regions
-      .get(&local)
-      .copied()
-      .unwrap_or(RegionId(0));
-    if state
-      .region_mirrors
-      .get(&own)
-      .is_some_and(|mirror| *mirror != own)
-    {
-      state.count(MIRROR_NO_NEIGHBOURHOOD, 1);
+  if !state.mirror_neighbourhood.is_empty() {
+    return true;
+  }
+  // A mirror declared for this node's region with no live, authenticated member of it to ship to is counted: it is the
+  // one way a declared mirror ships nothing without a refusal anywhere.
+  let own = state
+    .node_regions
+    .get(&local)
+    .copied()
+    .unwrap_or(RegionId(0));
+  if state
+    .region_mirrors
+    .get(&own)
+    .is_some_and(|mirror| *mirror != own)
+  {
+    state.count(MIRROR_NO_NEIGHBOURHOOD, 1);
+  }
+  state.mirror_seals.clear();
+  false
+}
+
+/// One volume's step of a period's mirror shipments (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` piece
+/// M2; [`seal_walk_slice`]): when its head snapshot is recorded placed at home and not yet in the mirror, a mirror job
+/// is started (or replaced, when a newer snapshot superseded it), its archive walk advanced one slice, and its content
+/// round to the mirror neighbourhood returned once the archive is complete. A volume whose head the mirror already
+/// holds, or that is being destroyed, keeps no job.
+fn advance_mirror_seal(
+  state: &mut ShardState,
+  (id, handle): (DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>),
+  (slice_bytes, created_unix): (u64, u64),
+  round: CommitBudget,
+) -> Option<ContentWork> {
+  let object = ObjectId(id.bytes);
+  let Some(head) = mirror_due(state, id) else {
+    state.mirror_seals.remove(&object);
+    return None;
+  };
+  if state
+    .mirror_seals
+    .get(&object)
+    .is_some_and(|job| job.snapshot != head.0)
+  {
+    state.mirror_seals.remove(&object);
+  }
+  if !state.mirror_seals.contains_key(&object) {
+    if !start_mirror_seal(state, object, handle, head, created_unix) {
+      return None;
     }
-    state.mirror_seals.clear();
-    return Vec::new();
+    state.count(MIRROR_JOB_STARTED, 1);
+  }
+  if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
+    return None;
   }
   let quorum = state.fleet.configuration().quorum;
-  let mut work = Vec::new();
-  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
-    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
-  for (id, handle) in volumes {
-    let object = ObjectId(id.bytes);
-    let Some(head) = mirror_due(state, id) else {
-      state.mirror_seals.remove(&object);
-      continue;
-    };
-    if state
-      .mirror_seals
-      .get(&object)
-      .is_some_and(|job| job.snapshot != head.0)
-    {
-      state.mirror_seals.remove(&object);
-    }
-    if !state.mirror_seals.contains_key(&object) {
-      if !start_mirror_seal(state, object, handle, head, created_unix) {
-        continue;
-      }
-      state.count(MIRROR_JOB_STARTED, 1);
-    }
-    if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
-      continue;
-    }
-    if let Some(item) = content_work(state, Track::Mirror, object, quorum, round) {
-      state.count(MIRROR_CONTENT_ROUNDS, 1);
-      work.push(item);
-    }
-  }
-  work
+  let item = content_work(state, Track::Mirror, object, quorum, round)?;
+  state.count(MIRROR_CONTENT_ROUNDS, 1);
+  Some(item)
 }
 
 /// The head snapshot of `id` and its sequence when it is placed at home and its mirror placement is not yet recorded:
@@ -2910,7 +2921,7 @@ fn record_mirrored_seals(state: &mut ShardState) {
 }
 
 /// Counter: periods in which this node's region declares a mirror but no live, authenticated member of the mirror
-/// region was found to ship to (`advance_mirror_seals`).
+/// region was found to ship to (`open_mirror_walk`).
 const MIRROR_NO_NEIGHBOURHOOD: &str = "fleet.mirror.no_neighbourhood";
 
 /// Counter: home content rounds that found no free session to any of their targets (`put_seal_content`).
@@ -2940,64 +2951,128 @@ const MIRROR_CONTENT_ROUNDS: &str = "fleet.mirror.content_rounds";
 /// Format: a refusal name in the daemon's status report.
 const MIRROR_RECORD_REFUSED: &str = "fleet.mirror.record_refused";
 
-/// One period of this node's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices): for each
-/// owned volume whose newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
-/// snapshot superseded the one being sealed), its archive walk is advanced one slice of `slice_bytes`, and —
-/// once the archive is complete and its content not yet placed — the content put to run this period is
-/// returned, its archive moved out for the dispatch and put back after ([`put_seal_content`]). A seal whose
-/// snapshot the database already records placed is dropped (a restart resumes nothing it need not).
-fn advance_seals(
+/// One volume's step of a period's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices;
+/// [`seal_walk_slice`]): when its newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
+/// snapshot superseded the one being sealed), its archive walk is advanced one slice of `slice_bytes`, and — once the
+/// archive is complete and its content not yet placed — the content put to run this period is returned, its archive
+/// moved out for the dispatch and put back after ([`put_seal_content`]). A seal whose snapshot the database already
+/// records placed is dropped (a restart resumes nothing it need not).
+fn advance_home_seal(
   state: &mut ShardState,
   local: HostId,
-  slice_bytes: u64,
-  created_unix: u64,
+  (id, handle): (DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>),
+  (slice_bytes, created_unix): (u64, u64),
   round: CommitBudget,
-) -> Vec<ContentWork> {
-  let quorum = state.fleet.configuration().quorum;
-  let mut work = Vec::new();
-  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
-    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
-  for (id, handle) in volumes {
-    let object = ObjectId(id.bytes);
-    let Some((head, sequence)) = sealable_head(state, id, object) else {
-      continue;
-    };
-    // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the
-    // head naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
-    if !state.seals.contains_key(&object)
-      && state.seal_root.is_some()
-      && let Some(owner) = state
-        .db
-        .partition()
-        .volume(id)
-        .map(|volume| volume.owner.clone())
-      && crate::seal_keys::namer(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
-    {
-      state.count(LINEAGE_UNMADE, 1);
-    }
-    if !state.seals.contains_key(&object)
-      && !start_seal(
-        state,
-        local,
-        object,
-        handle,
-        head,
-        sequence,
-        created_unix,
-        None,
-      )
-    {
-      continue;
-    }
-    if !advance_seal(state, Track::Home, object, handle, slice_bytes) {
-      continue;
-    }
-    if let Some(item) = content_work(state, Track::Home, object, quorum, round) {
-      work.push(item);
-    }
+) -> Option<ContentWork> {
+  let object = ObjectId(id.bytes);
+  let (head, sequence) = sealable_head(state, id, object)?;
+  // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the head
+  // naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
+  if !state.seals.contains_key(&object)
+    && state.seal_root.is_some()
+    && let Some(owner) = state
+      .db
+      .partition()
+      .volume(id)
+      .map(|volume| volume.owner.clone())
+    && crate::seal_keys::namer(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
+  {
+    state.count(LINEAGE_UNMADE, 1);
   }
-  heal_one_placed_snapshot(state, local, created_unix);
-  work
+  if !state.seals.contains_key(&object)
+    && !start_seal(
+      state,
+      local,
+      object,
+      handle,
+      head,
+      sequence,
+      created_unix,
+      None,
+    )
+  {
+    return None;
+  }
+  if !advance_seal(state, Track::Home, object, handle, slice_bytes) {
+    return None;
+  }
+  let quorum = state.fleet.configuration().quorum;
+  content_work(state, Track::Home, object, quorum, round)
+}
+
+/// Counter: a period's home seal walk over one owner shard's volumes ([`seal_walk_slice`]), however many turns it took.
+const SEAL_WALKS: &str = "fleet.seal.walks";
+/// Counter: one owner-shard turn of the home seal walk.
+const SEAL_WALK_SLICES: &str = "fleet.seal.walk_slices";
+/// Counter: a period's mirror walk over one owner shard's volumes, however many turns it took.
+const MIRROR_WALKS: &str = "fleet.mirror.walks";
+/// Counter: one owner-shard turn of the mirror walk.
+const MIRROR_WALK_SLICES: &str = "fleet.mirror.walk_slices";
+
+/// One owner-shard turn of a period's seal walk for `track` (§4.10 "Content replication"; CLAUDE.md "Bounded work
+/// everywhere"): the shard's volumes after `after` in id order, each visited ([`advance_home_seal`],
+/// [`advance_mirror_seal`]) until the shard's step quantum is spent (`futures::step_budget_ns`, what a destroy's or an
+/// archive's slice is sized by): the content puts made ready, and the last volume visited when any remain after it
+/// (`None` once the walk is done). The first volume is always visited, so a turn always moves the walk on. `opening`
+/// marks the walk's first turn this period, which settles what a period decides once (the mirror neighbourhood); the
+/// home walk's last turn takes the healer's step. Until 2026-11-17 one turn visited every volume and advanced every
+/// seal job a slice each: a shard sealing `n` volumes at once was held for `n` archive slices, each sized to a step
+/// quantum, while its clients waited, as the live record period was (`live_ship::period_slice`).
+fn seal_walk_slice(
+  state: &mut ShardState,
+  local: HostId,
+  (track, opening): (Track, bool),
+  after: Option<DbVolumeId>,
+  round: CommitBudget,
+) -> (Vec<ContentWork>, Option<DbVolumeId>) {
+  let (walks, slices) = match track {
+    Track::Home => (SEAL_WALKS, SEAL_WALK_SLICES),
+    Track::Mirror => (MIRROR_WALKS, MIRROR_WALK_SLICES),
+  };
+  if opening {
+    state.count(walks, 1);
+  }
+  state.count(slices, 1);
+  if opening && track == Track::Mirror && !open_mirror_walk(state, local) {
+    return (Vec::new(), None);
+  }
+  let slicing = (
+    state.config.archive_slice_bytes(),
+    u64::try_from(state.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND,
+  );
+  let quantum = state
+    .seal_walk_quantum_ns
+    .or_else(futures::step_budget_ns)
+    .unwrap_or(state.config.runtime.step_budget_ns);
+  let began = futures::now_ns();
+  let mut cursor = after;
+  let mut work = Vec::new();
+  let remaining = loop {
+    let next = match cursor {
+      Some(last) => state
+        .by_id
+        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+        .next(),
+      None => state.by_id.iter().next(),
+    }
+    .map(|(id, handle)| (*id, *handle));
+    let Some(volume) = next else {
+      break None;
+    };
+    let item = match track {
+      Track::Home => advance_home_seal(state, local, volume, slicing, round),
+      Track::Mirror => advance_mirror_seal(state, volume, slicing, round),
+    };
+    work.extend(item);
+    cursor = Some(volume.0);
+    if futures::now_ns().saturating_sub(began) >= quantum {
+      break cursor;
+    }
+  };
+  if remaining.is_none() && track == Track::Home {
+    heal_one_placed_snapshot(state, local, slicing.1);
+  }
+  (work, remaining)
 }
 
 /// The healer's step (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only
@@ -4848,6 +4923,26 @@ async fn injected_content_ack_delay(reply: &[u8]) {
   }
 }
 
+/// Records, on the volume's new owner shard, the takeover that made this node its owner (AC-8.3, the loss report in
+/// `slates status`): the epoch the head was placed under, the head sequence served from, and whether the volume was
+/// rebuilt from its live log (no acknowledged write lost) or from the seal the head names (the lost owner's edits after
+/// it are the loss window).
+fn note_taken_over(
+  s: &mut crate::state::ShardState,
+  id: DbVolumeId,
+  placed: &crate::head::PlacedHead,
+  from_live_log: bool,
+) {
+  s.taken_over.insert(
+    id,
+    slates_ipc::protocol::VolumeTakeover {
+      epoch: placed.epoch.0,
+      from_live_log,
+      head_sequence: placed.sequence,
+    },
+  );
+}
+
 /// Runs `recovery` on this shard with the memory-pressure hold lifted for exactly its duration, then sets the hold
 /// back. A takeover's materialization (its fetch's staging, the restore, the volume's reservations and the writes
 /// that populate it) moves a claim the fleet already admitted and committed to its successor: admission.md §5.5 keeps
@@ -4925,6 +5020,37 @@ const GREEN_TAKEOVER_GIVEN_UP: &str = "merge.takeover_given_up";
 /// up).
 /// Format: a counter name in the daemon's status report.
 const GREEN_TAKEOVER_INPUTS_FETCHED: &str = "merge.takeover_inputs_fetched";
+
+/// The lineage key a taken-over volume's successor opens and seals its `head` with (A-92 piece 4c), wrapped under this
+/// node's root: its own copy where the head carried an entry for it; else, for an `envelope` it must open, the key a
+/// fellow candidate of the head (`candidates`, this node left out) hands it (A-295), counted; else none.
+async fn successor_lineage_of(
+  object: ObjectId,
+  head: &HeadValue,
+  candidates: &[HostId],
+  envelope: bool,
+) -> Option<([u8; 16], Vec<u8>)> {
+  let sealing = head.sealing.as_ref()?;
+  if let Some(own) =
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  {
+    return Some(own);
+  }
+  if !envelope {
+    return None;
+  }
+  let local = state::with_state(|s| s.fleet.configuration().owner);
+  let fellows: Vec<HostId> = candidates
+    .iter()
+    .copied()
+    .filter(|host| Some(*host) != local)
+    .collect();
+  let handed = ask_handed_lineage(object, sealing, &fellows).await;
+  if handed.is_some() {
+    count_refusal(ENVELOPE_KEY_HANDED);
+  }
+  handed
+}
 
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
@@ -5026,10 +5152,15 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   let adopted_head = live.as_ref().map(|fetched| fetched.head);
   let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
-  // holds the pair keys, and handed to the owner shard wrapped under this node's root.
-  let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
-    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
-  });
+  // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
+  // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
+  // reached it) is handed the key by a fellow candidate of the head, as a live log's successor is (A-295).
+  let envelope = live.is_none()
+    && archive
+      .as_ref()
+      .is_some_and(slates_cluster::envelope::is_envelope);
+  let successor_lineage =
+    successor_lineage_of(object, &head, &placed.placement.candidates, envelope).await;
   let naming = head
     .sealing
     .as_ref()
@@ -5063,6 +5194,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
         })
         .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        note_taken_over(s, id, &placed, true);
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
         return Ok(());
@@ -5082,6 +5214,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         verbs::materialize_taken_over(s, id, &taken, region, opened.as_ref())
       })
       .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+      note_taken_over(s, id, &placed, false);
       // The owner shard now owns the head's and the catalog's placements — its record plane writes the
       // object's next records at the promotion epoch and ships only to holders still missing these.
       s.placed_heads.insert(object, placed);
@@ -5234,6 +5367,10 @@ const SEAL_ENVELOPE_REFUSED: &str = "fleet.seal.envelope_refused";
 /// not adopt, or a refused open; A-92 piece 3b): the volume is not materialized from it.
 /// Format: a counter name in the daemon's status report.
 const ENVELOPE_UNOPENED: &str = "fleet.seal.envelope_unopened";
+/// Counter: a taken-over volume whose envelope this successor had no entry of its own for, opened with the lineage key
+/// a fellow candidate handed it (A-295): once a key handed.
+/// Format: a counter name in the daemon's status report.
+const ENVELOPE_KEY_HANDED: &str = "fleet.seal.envelope_key_handed";
 /// Counter: a taken-over volume whose lineage key the successor could not record (A-92 piece 4c).
 /// Format: a counter name in the daemon's status report.
 const LINEAGE_UNADOPTED: &str = "fleet.seal.lineage_unadopted";
@@ -6589,6 +6726,14 @@ const RECIPIENT_STREAM: u64 = 18;
 const PAIR_KEY_STREAM: u64 = 19;
 /// Format: the reply byte of an accepted pair key.
 const PAIR_ACCEPTED: u8 = 1;
+/// The stream a volume's successor asks a fellow candidate for the volume's lineage key on (A-295): the object, the key's
+/// id and the asker's recipient public key ([`lineage_request`]), answered with the key wrapped to that recipient, or
+/// empty when refused (counted where it was refused). After the work routes' kind (25, `work_route::STREAM`) and the
+/// live batches' (26, `LIVE_ENTRIES_STREAM`): a kind another stream takes is served as that stream, so its request
+/// reaches no lineage handler at all (the first run of the window test, every ask unanswered while the work-route arm
+/// took kind 25). Held distinct by `every_request_kind_the_record_session_dispatches_is_its_own`.
+/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
+const LINEAGE_STREAM: u64 = 27;
 
 /// Format: the refusal name counting council requests left unanswered because their sender is held dead
 /// ([`serve_council`]).
@@ -8476,9 +8621,10 @@ async fn follow_configuration(
   }
 }
 
-/// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds
-/// of those whose archive is complete, keeping each round's dispatch for its stragglers. Whether the shard holds any
-/// job of the track.
+/// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds of
+/// those whose archive is complete, keeping each round's dispatch for its stragglers. The walk over the shard's volumes
+/// runs in turns of about a step quantum each ([`seal_walk_slice`]), each turn's puts dispatched before the next turn,
+/// so the shard serves its clients between them. Whether the shard holds any job of the track at the walk's end.
 async fn put_track_content(
   origin: u16,
   shard: u16,
@@ -8487,29 +8633,31 @@ async fn put_track_content(
   track: Track,
   in_flight: &mut Vec<Dispatch>,
 ) -> bool {
-  let (work, jobs) = call_within(
-    origin,
-    shard,
-    move |s| {
-      let slice_bytes = s.config.archive_slice_bytes();
-      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-      let work = match track {
-        Track::Home => advance_seals(s, local, slice_bytes, created_unix, budget),
-        Track::Mirror => advance_mirror_seals(s, local, slice_bytes, created_unix, budget),
-      };
-      let jobs = !seal_jobs(s, track).is_empty();
-      (work, jobs)
-    },
-    HEARTBEAT_NS,
-  )
-  .await
-  .unwrap_or_default();
-  for item in work {
-    if let Some(dispatch) = put_seal_content(origin, local, item).await {
-      in_flight.push(dispatch);
+  let mut after = None;
+  let mut opening = true;
+  loop {
+    let first = std::mem::take(&mut opening);
+    let (work, jobs, next) = call_within(
+      origin,
+      shard,
+      move |s| {
+        let (work, next) = seal_walk_slice(s, local, (track, first), after, budget);
+        (work, !seal_jobs(s, track).is_empty(), next)
+      },
+      HEARTBEAT_NS,
+    )
+    .await
+    .unwrap_or_default();
+    for item in work {
+      if let Some(dispatch) = put_seal_content(origin, local, item).await {
+        in_flight.push(dispatch);
+      }
+    }
+    match next {
+      Some(last) => after = Some(last),
+      None => return jobs,
     }
   }
-  jobs
 }
 
 /// One period of the record plane for the volumes `shard` owns, in the order the design's placement rule
@@ -8604,10 +8752,14 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
   // node back at its anchor with fresh RAM holds none of the keys it was delivered, and one marked delivered by anchor
   // alone was never delivered again, so the replacement could not open this node's heads as their successor (the same
   // key again is accepted by a node that kept it, so a redelivery to a warm restart changes nothing).
+  // Test support: the deliveries to one anchor made to fail (`Daemon::inject_pair_withhold_to`), as a delivery whose
+  // recipient answer never comes back fails each period, while the others go on and nothing delivered is forgotten.
+  let withheld_to = state::with_state(|s| s.injected_pair_withhold_to).flatten();
   let owed: Vec<(HostId, u64)> = anchors
     .iter()
     .copied()
     .filter(|(member, anchor)| delivered.get(anchor) != Some(member))
+    .filter(|(_, anchor)| Some(*anchor) != withheld_to)
     .collect();
   // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
   let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
@@ -8700,6 +8852,163 @@ async fn send_pair(member: HostId, request: &[u8], budget: CommitBudget) -> Opti
     return None;
   }
   Some(reply.bytes)
+}
+
+/// Counter: a volume's lineage key handed to the volume's successor (A-295), on the candidate that handed it.
+const LINEAGE_HANDED: &str = "fleet.seal.lineage_handed";
+/// Counter: a request for a volume's key whose bytes are not an object, a key id and a recipient key
+/// ([`lineage_request`]).
+const LINEAGE_MALFORMED: &str = "fleet.seal.lineage_refused.malformed";
+/// Counter: a request for a volume's key from a node that does not act for the volume here ([`acts_for`]).
+const LINEAGE_NOT_ACTING: &str = "fleet.seal.lineage_refused.not_acting";
+/// Counter: a request for a volume's key this node cannot open from its own copies: it holds no sealing of that key (no
+/// live log, no head naming it), or no entry or pair of its own for one.
+const LINEAGE_NOT_HELD: &str = "fleet.seal.lineage_refused.not_held";
+/// Counter: on a successor, a host asked for the volume's key that handed none (it refused, or did not answer).
+const LINEAGE_UNHANDED: &str = "fleet.seal.lineage_unhanded";
+/// Counter: on a successor, a key handed over that did not open the volume's naming record: refused, never kept.
+const LINEAGE_UNCHECKED: &str = "fleet.seal.lineage_unchecked";
+/// Counter: on a successor with no recipient key of its own (sealing unavailable here), no fellow candidate was asked.
+const LINEAGE_UNASKED: &str = "fleet.seal.lineage_unasked";
+/// Format: a lineage key's id (hyper-seal's `KeyId`), as a head's sealing names it.
+const LINEAGE_ID_BYTES: usize = 16;
+
+/// A request on [`LINEAGE_STREAM`]: `object`, the id of the lineage key asked for, and the asker's recipient public key
+/// as the recipient stream answers it (`seal_keys::node_recipient_public`), the key the answer is wrapped to.
+fn lineage_request_bytes(object: ObjectId, lineage: [u8; 16], public: &[u8]) -> Vec<u8> {
+  let mut request = Vec::with_capacity(
+    slates_db::register::OBJECT_BYTES
+      .saturating_add(LINEAGE_ID_BYTES)
+      .saturating_add(public.len()),
+  );
+  request.extend_from_slice(&object.0);
+  request.extend_from_slice(&lineage);
+  request.extend_from_slice(public);
+  request
+}
+
+/// A request on [`LINEAGE_STREAM`] read back: the object, the lineage key's id and the asker's recipient key, or `None`
+/// when the bytes are not those three (a recipient key that does not decode among them).
+fn lineage_request(
+  request: &[u8],
+) -> Option<(ObjectId, [u8; 16], hyper_seal::recipient::RecipientPublic)> {
+  let (object, rest) = request.split_at_checked(slates_db::register::OBJECT_BYTES)?;
+  let (lineage, public) = rest.split_at_checked(LINEAGE_ID_BYTES)?;
+  Some((
+    ObjectId(object.try_into().ok()?),
+    lineage.try_into().ok()?,
+    crate::seal_keys::decode_public(public)?,
+  ))
+}
+
+/// Whether `asker` acts for `object` in this node's view (A-295), `owner` being the owner this node's held record names
+/// (the object's creator while it holds none): `asker` is that owner and a member (a successor whose adoption has
+/// reached this holder), or the owner is retired and the configuration's line of retired owners takes the object to
+/// `asker` (`RegionalConfiguration::lineage`). Only such a node is handed the volume's key; as the owner's successor it is
+/// a candidate the owner would have delivered a pair to, so no node outside the volume's candidates learns the key.
+fn acts_for(
+  regional: &slates_db::register::RegionalConfiguration,
+  owner: HostId,
+  asker: HostId,
+  object: ObjectId,
+) -> bool {
+  if owner == asker {
+    return regional.members.contains(&asker);
+  }
+  !regional.members.contains(&owner)
+    && matches!(
+      regional.lineage(owner, object),
+      slates_db::register::Lineage::Successor { successor, .. } if successor == asker
+    )
+}
+
+/// This node's own copies of the sealing of `object` that wrap the lineage key `lineage`: its held live log's whole entry
+/// first, then each head it holds naming that key, newest first.
+fn held_sealings_of(
+  s: &ShardState,
+  object: ObjectId,
+  lineage: [u8; 16],
+) -> Vec<crate::head::HeadSealing> {
+  let mut sealings: Vec<crate::head::HeadSealing> = crate::live_ship::held_sealing(s, object)
+    .into_iter()
+    .collect();
+  if let Some(acceptor) = s.holder_records.get(&object) {
+    let mut heads: Vec<crate::head::HeadSealing> = acceptor
+      .values(object)
+      .filter_map(crate::head::HeadValue::from_record_bytes)
+      .filter_map(|head| head.sealing)
+      .collect();
+    heads.reverse();
+    sealings.extend(heads);
+  }
+  sealings.retain(|sealing| sealing.lineage == lineage);
+  sealings
+}
+
+/// A successor's request for a volume's lineage key (A-295), on this node's control shard, from the member `peer_host`
+/// the session's authenticated certificate resolves to: it must act for the volume here ([`acts_for`]); the key comes
+/// from this node's own copies of the volume's sealing ([`held_sealings_of`]), never from the request, opened under the
+/// pair the owner delivered to this node and wrapped to the recipient key the request carries. That key needs no other
+/// check: only the authenticated asker sent it, and a key it does not hold the other half of opens nothing for it.
+/// Carried rather than kept from a pair delivery, since this node delivers pairs only to its own neighbourhood, which
+/// in a fleet wider than one need not hold the asker. Empty when refused, counted by why.
+fn serve_lineage(s: &mut ShardState, peer_host: HostId, request: &[u8]) -> Vec<u8> {
+  let Some((object, lineage, public)) = lineage_request(request) else {
+    count_refusal_in(s, LINEAGE_MALFORMED);
+    return Vec::new();
+  };
+  let owner = s
+    .holder_records
+    .get(&object)
+    .map_or_else(|| object.creator(), slates_db::register::Acceptor::owner);
+  if !acts_for(s.council.configuration(), owner, peer_host, object) {
+    count_refusal_in(s, LINEAGE_NOT_ACTING);
+    return Vec::new();
+  }
+  let handed = held_sealings_of(s, object, lineage)
+    .iter()
+    .find_map(|sealing| crate::seal_keys::hand_lineage(s, sealing, &public));
+  match handed {
+    Some(delivery) => {
+      count_refusal_in(s, LINEAGE_HANDED);
+      delivery
+    }
+    None => {
+      count_refusal_in(s, LINEAGE_NOT_HELD);
+      Vec::new()
+    }
+  }
+}
+
+/// Asks `hosts` in turn for `object`'s lineage key as its successor (A-295), when this node cannot open its own entry in
+/// the volume's `sealing`: the first key handed that checks against the sealing (`seal_keys::accept_handed_lineage`) is
+/// returned, wrapped under this node's root. `None` when none handed one this attempt; a refusal is counted where it was
+/// made, and here a host that handed none or a key that did not check.
+pub(crate) async fn ask_handed_lineage(
+  object: ObjectId,
+  sealing: &crate::head::HeadSealing,
+  hosts: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let public =
+    state::with_state(|s| crate::seal_keys::node_recipient_public(s)).unwrap_or_default();
+  if public.is_empty() {
+    count_refusal(LINEAGE_UNASKED);
+    return None;
+  }
+  let request = lineage_request_bytes(object, sealing.lineage, &public);
+  for host in hosts.iter().copied() {
+    let Some(delivery) = request_peer(host, LINEAGE_STREAM, &request, live_budget()).await else {
+      count_refusal(LINEAGE_UNHANDED);
+      continue;
+    };
+    match state::with_state(|s| crate::seal_keys::accept_handed_lineage(s, sealing, &delivery)) {
+      Some(Ok(key)) => return Some(key),
+      _ => {
+        count_refusal(LINEAGE_UNCHECKED);
+      }
+    }
+  }
+  None
 }
 
 /// Counter: the owner shard did not answer this period's neighbour anchors (A-92 piece 4c); sent again next period,
@@ -8929,6 +9238,15 @@ async fn ship_head(
       SHIP_HEAD_NO_SESSION
     });
     return None; // No live session to a candidate that still needs the head; retry next period.
+  }
+  if head.live {
+    // The candidates are asked now, so a held durable reply on the live volume may hold them to an answer a window
+    // hence (A-301). Noted on the volume's shard before the round is sent: that shard runs what this one sends it in
+    // order, so the note is there before the round's own acknowledgements ([`record_acks_in`], sent after the round).
+    let object = head.object;
+    crate::xshard::run_on_counted(origin, head.shard, move |s| {
+      crate::live_ship::asked(s, object);
+    });
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let committed = commit_record(
@@ -9225,6 +9543,88 @@ pub(crate) async fn forward_batch_over_leader_session(
 }
 
 #[cfg(test)]
+mod lineage_tests {
+  use super::{HostId, ObjectId, acts_for, lineage_request, lineage_request_bytes};
+  use slates_db::register::{Quorum, RegionalConfiguration};
+
+  /// A-295, the successor's request for a volume's key read back. Do read a request made for an object, a key id and a
+  /// fresh recipient's public key, and requests of every other shape: none, one byte short, one byte long, a lone object
+  /// id, an object and key id with no recipient key, and the recipient key's mode byte changed. Expect the object, key
+  /// id and recipient key back from the first and nothing from the rest.
+  #[test]
+  fn a_lineage_request_of_any_other_shape_is_refused() {
+    let object = ObjectId::new(HostId(9), 3);
+    let public = hyper_seal::recipient::Recipient::generate(true)
+      .unwrap()
+      .public();
+    let encoded = crate::seal_keys::encode_public(&public);
+    let request = lineage_request_bytes(object, [7; 16], &encoded);
+    assert_eq!(
+      lineage_request(&request),
+      Some((object, [7; 16], public.clone()))
+    );
+    let short = request
+      .get(..request.len().saturating_sub(1))
+      .unwrap_or_default();
+    let mut long = request.clone();
+    long.push(0);
+    let unkeyed = lineage_request_bytes(object, [7; 16], &[]);
+    let mut remoded = request.clone();
+    let mode = request
+      .len()
+      .checked_sub(hyper_seal::recipient::ECDH_PUBLIC + 1)
+      .unwrap();
+    remoded[mode] ^= 0xff;
+    for refused in [
+      &[][..],
+      short,
+      &long[..],
+      &object.0[..],
+      &unkeyed[..],
+      &remoded[..],
+    ] {
+      assert_eq!(lineage_request(refused), None, "{} bytes", refused.len());
+    }
+  }
+
+  /// A-295, who is handed a volume's key. Do form three members, ask for the owner, the two others and an outsider
+  /// whether each acts for the owner's object (no held record), then retire the owner and ask again. Expect, while the
+  /// owner lives, only the owner; once it is retired, only the member the configuration makes its successor: never the
+  /// other survivor, an outsider or the retired owner.
+  #[test]
+  fn only_the_volumes_acting_owner_is_handed_its_key() {
+    let (owner, b, c, outsider) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let object = ObjectId::new(owner, 7);
+    let mut regional = RegionalConfiguration::formed(
+      vec![owner, b, c],
+      Quorum { f: 1 },
+      Default::default(),
+      3,
+      true,
+    );
+    let acting = |regional: &RegionalConfiguration| {
+      [owner, b, c, outsider]
+        .into_iter()
+        .filter(|asker| acts_for(regional, owner, *asker, object))
+        .collect::<Vec<HostId>>()
+    };
+    assert_eq!(
+      acting(&regional),
+      vec![owner],
+      "the owner lives: only the owner"
+    );
+    assert!(regional.retire(owner, 3), "the owner retired");
+    let successor = regional.successor(owner, object);
+    assert!(successor.is_some_and(|successor| successor == b || successor == c));
+    assert_eq!(
+      acting(&regional),
+      successor.into_iter().collect::<Vec<HostId>>(),
+      "once the owner is retired, only its successor"
+    );
+  }
+}
+
+#[cfg(test)]
 mod dial_tests {
   use super::{ESTABLISH_BUDGETS_BEFORE_REDIAL, HandshakeStall, keeps_its_socket};
 
@@ -9302,7 +9702,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 25] = [
+    let kinds: [(&str, u64); 26] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -9336,6 +9736,7 @@ mod request_kind_tests {
       ("death", super::DEATH_STREAM),
       ("work route", crate::work_route::STREAM),
       ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
+      ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
     ];
     let mut shared = Vec::new();
