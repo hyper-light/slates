@@ -41,9 +41,11 @@
 >   (`live_ship::known_fence`), so a sender below it is fenced. Why no refusal fenced it in that run is not read from
 >   its counters (the creator's live copy showed fence 3 against the adopter's 2 at the end); the run that shows the
 >   storm gone is filed for main (run-requests.md).
-> - **Owed: the let-go and the yield survive a warm restart only once published.** The let-go rides the control shard's
->   next publication; a warm restart before it restores the copies and routes them to this host again; and the yield
->   is memory-only (`ShardState::yielded`), so a warm restart forgets that the node lost the volume at all (A-334).
+> - **Fixed (A-415): the let-go is published at once.** The re-admission publishes the shard right after it lets the
+>   copies go (`readmission::let_go_own_registers`; a refused publication is counted
+>   `fleet.readmission.registers_let_go_unpublished` and the next carries it), so a warm restart no longer restores
+>   them naming this host. **Still owed:** the yield itself is memory-only (`ShardState::yielded`), so a warm restart
+>   forgets that the node lost the volume at all (A-334).
 > - **Owed: a copy made afresh takes the first member's record at the current generation as its owner's,** as a new
 >   candidate's does. A node that knows it lost a volume (yielded or fenced) ships it no record; a stale owner that
 >   does not know yet was retired, so it is no member until its re-admission yields.

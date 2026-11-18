@@ -6312,9 +6312,9 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > a copy made afresh takes the first member's record it meets as its owner's. Held by
 > `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
 > `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
-> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed: the
-> let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
-> yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). The
+> let-go is published at once (A-415), so a warm restart does not restore the copies. Owed: the yield itself is
+> memory-only (`ShardState::yielded`), so a warm restart forgets it.
 
 > **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
 > node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
@@ -29490,3 +29490,16 @@ code below.
 - **Tests.** `a_refused_sender_below_the_fence_a_holder_knows_is_told_that_fence` (`live_ship`'s unit tests: the
   decision over every epoch against a fence). The fleet runs that show the storm gone and every re-admission and
   supersession test still green are filed for main (run-requests.md, A-409).
+
+### A-415 — The re-admission publishes its let-go of the host's own register copies at once (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Recovery"; A-382's owed item)
+Applied in the same change to: §4.8 "Authority scope" (A-382's status), GAPS (A-382's entry), and
+`crates/server/src/readmission.rs`.
+- **What was there.** A-382's let-go removed the host's own register copies from the control shard's held map, and the
+  removals rode the shard's next publication. A warm restart before it restored the copies from the last committed
+  image and routed each to the owner it named, this host, so they refused their successors again (A-382's failure)
+  until the next re-admission, which a restarted daemon does not see.
+- **The rule.** The let-go publishes the shard at once when it let anything go (`readmission::let_go_own_registers`);
+  a refused publication is counted `fleet.readmission.registers_let_go_unpublished`, and the removals stay marked
+  changed (`crate::tracked`) for the next one.
+- **Tests.** The re-admission flows' fleet tests are filed for main (run-requests.md, A-415); the restart in the
+  window between a let-go and a publication has no in-process test of its own.

@@ -105,7 +105,19 @@ fn let_go_own_registers(state: &mut ShardState, local: HostId) {
     REGISTERS_LET_GO,
     u64::try_from(own.len()).unwrap_or(u64::MAX),
   );
+  // The let-go is kept before anything else is said of those copies (A-415): a warm restart restores a shard's held
+  // copies from its last committed image and routes each to the owner it names, so a let-go no publication carried
+  // came back naming this host, and the copies refused their successors again until the next re-admission. A refused
+  // publication leaves the removals marked changed (`crate::tracked`), so the next one carries them.
+  if !own.is_empty() && crate::verbs::publish_shard(state).is_err() {
+    state.count(REGISTERS_LET_GO_UNPUBLISHED, 1);
+  }
 }
+
+/// Format: the status count of re-admissions whose let-go of the host's own register copies the shard could not publish
+/// at once ([`let_go_own_registers`], A-415); the next publication carries it.
+pub(crate) const REGISTERS_LET_GO_UNPUBLISHED: &str =
+  "fleet.readmission.registers_let_go_unpublished";
 
 /// Marks every volume this shard catalogues as yielded, after pruning the set to the catalog (so it stays within the
 /// partition's volume cap), counts the volumes it adds, and ends each newly yielded volume's FUSE mounts here at once
