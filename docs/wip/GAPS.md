@@ -922,6 +922,16 @@
 >   inbound UDP but kiln's own ports and adacachy2's passes LAN UDP 17202 and 17212 alone, so neither passes a slates
 >   block yet: each needs `ufw allow proto udp from <the LAN> to any port <base>:<base+1>` once, an operator's (root)
 >   step slates never takes (R10). The Macs' firewalls were not checked.
+> - **Fixed (2026-11-18, A-487): no holder's copy followed a move, so a volume moved back to its creator never moved.**
+>   `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the quiet Mac Studio
+>   at main 3022c6894: the move back answered `Moving` and `MoveRefused { Unplaced }` in turn until its deadline, the
+>   third node refusing every record and content put of the volume's owner `Unauthorized` (8,006 and 2,663) and no node
+>   counting `fleet.move.followed`. A-398's walk over the held copies had left A-291's follow after the per-copy step's
+>   early return for a live owner, every moved object's case; the walk now follows a moved copy between its lineage and
+>   its authority (`moves::follow_moved_object`). Test:
+>   `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests). **Owed
+>   (main's runs):** the move flows on the fix, and `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`
+>   (A-485), whose successor's takeover also needs holders that followed the move (a hypothesis, not read from its log).
 > - **Fixed (2026-11-18): a move whose target dies at the switch is served by its successor.**
 >   `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` was red 3 of 3 on the Mac Studio after main
 >   ef7f0915a was merged, and again on a07bc2587 (the merge of main 3915879e3). Its log put the cause elsewhere than

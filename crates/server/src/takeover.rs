@@ -484,6 +484,9 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   for object in held {
     resolve_held_object(state, local, &regional, object);
   }
+  // A copy the configuration moved to another member (A-291) follows its move, after every copy is resolved and before
+  // any authority is reconciled: the walk takes the same steps a copy at a time (`fleet::install_on_copy`, A-487).
+  crate::moves::follow_moved_objects(state);
 }
 
 /// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
@@ -539,8 +542,6 @@ pub(crate) fn resolve_held_object(
       }
     }
   }
-  // A copy the configuration moved to another member (A-291) follows its move.
-  crate::moves::follow_moved_objects(state);
 }
 
 /// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
@@ -657,7 +658,7 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
 /// reclaimed with its records, never kept for a head this holder no longer backs). A takeover's reclaim ([`reclaim`])
-/// and a planned move's (A-291, `crate::moves::follow_moved_objects`, once the move's new owner has sealed the volume
+/// and a planned move's (A-291, `crate::moves::follow_moved_object`, once the move's new owner has sealed the volume
 /// under its own placement, which leaves this holder out) both end a copy so.
 pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);

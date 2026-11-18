@@ -31,8 +31,8 @@
 //!   move's target must be a member, and a retired id never returns), and the volume thaws.
 //! - **The switch.** The council commits the exception naming the new owner, the member it left and the cohort. Every
 //!   node routes the volume to the new owner from then on ([`crate::owner_location`], the forward); every holder of
-//!   its copies follows ([`follow_moved_objects`]) and takes the new owner's authority at its next reconcile, so a
-//!   record from the old owner is refused. The old owner keeps its frozen copy.
+//!   its copies follows as the install's walk reaches it ([`follow_moved_object`]) and takes the new owner's authority in
+//!   the same step, so a record from the old owner is refused. The old owner keeps its frozen copy.
 //! - **The new owner adopts** ([`drive_adoptions`]): phase one by name over the recorded cohort ([`MOVE_STREAM`],
 //!   answered by [`serve_move_prepare`] through `slates_db::takeover::answer_move`): the member the move left answers
 //!   from the records it captured (it may be one of the `f + 1` that placed them, and it writes no more), every other
@@ -727,48 +727,58 @@ fn let_go(state: &mut ShardState, id: DbVolumeId, gone: Gone) -> bool {
 
 // ------------------------------------------------------------------------------------------------ every holder
 
-/// Brings this holder's copies of every moved object (§4.8 "Authority scope") to the configuration, on the control
-/// shard at each period before the held acceptors' authority is reconciled: a copy's routing follows its exception's
-/// owner, so the acceptors take that owner's authority at the next reconcile (`fleet::reconcile_held_authority`) and a
-/// record from the old owner is refused; and once the move is adopted (the exception names no member it left), a copy
-/// outside the owner's placement is dropped, since the owner's records reach only its own cohort from then on.
+/// Brings this holder's copy of `object`, if the configuration moved it (§4.8 "Authority scope"), to `regional`, as the
+/// install's walk reaches the copy (`fleet::install_on_copy`), after its takeover lineage is resolved and before its
+/// authority is reconciled: the copy's routing follows its exception's owner, so the acceptor takes that owner's
+/// authority in the same step (`fleet::reconcile_held_copy`) and a record from the old owner is refused; and once the move
+/// is adopted (the exception names no member it left), a copy outside the owner's placement is dropped, since the
+/// owner's records reach only its own cohort from then on. A-291 ran this over every held copy at the end of the
+/// install's whole pass; when A-398 cut that pass into a walk a copy a turn, the call landed after the per-copy step's
+/// early return for a copy whose owner is a live member, the case of every moved object, so no copy followed a move: a
+/// holder kept the old owner's authority and refused every record and content put of the new owner (`Unauthorized`), and
+/// a volume moved back to its creator never placed its head off its owner (A-487).
+pub(crate) fn follow_moved_object(
+  state: &mut ShardState,
+  regional: &RegionalConfiguration,
+  local: HostId,
+  object: ObjectId,
+) {
+  if !state.holder_records.contains_key(&object)
+    || !regional.moved.contains_key(&object.placement_key())
+  {
+    return;
+  }
+  let Some(owner) = regional.owner_of(object) else {
+    return;
+  };
+  if !regional.members.contains(&owner) || owner == local {
+    return;
+  }
+  let adopted = regional
+    .moved
+    .get(&object.placement_key())
+    .is_some_and(|moved| moved.from.is_none() && moved.owner == owner);
+  let outside = regional
+    .configuration_for(owner)
+    .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
+  if adopted && outside {
+    crate::takeover::drop_copy(state, object);
+    state.count(MOVE_RECLAIMED, 1);
+  } else if state.fleet.object_owner(object) != Some(owner) {
+    crate::takeover::track_owner_on_every_shard(state, object, owner);
+    state.count(MOVE_FOLLOWED, 1);
+  }
+}
+
+/// [`follow_moved_object`] over every copy this holder keeps, at once: the order A-291's install took, kept as the oracle
+/// of the walk's per-copy step in the daemon's unit tests (`takeover::resolve_held_objects`).
+#[cfg(test)]
 pub(crate) fn follow_moved_objects(state: &mut ShardState) {
   let regional = state.council.configuration().clone();
   let local = state.fleet.host();
-  let held: Vec<ObjectId> = state
-    .holder_records
-    .keys()
-    .copied()
-    .filter(|object| regional.moved.contains_key(&object.placement_key()))
-    .collect();
-  let (mut followed, mut reclaimed): (u64, u64) = (0, 0);
+  let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
-    let Some(owner) = regional.owner_of(object) else {
-      continue;
-    };
-    if !regional.members.contains(&owner) || owner == local {
-      continue;
-    }
-    let adopted = regional
-      .moved
-      .get(&object.placement_key())
-      .is_some_and(|moved| moved.from.is_none() && moved.owner == owner);
-    let outside = regional
-      .configuration_for(owner)
-      .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
-    if adopted && outside {
-      crate::takeover::drop_copy(state, object);
-      reclaimed = reclaimed.saturating_add(1);
-    } else if state.fleet.object_owner(object) != Some(owner) {
-      crate::takeover::track_owner_on_every_shard(state, object, owner);
-      followed = followed.saturating_add(1);
-    }
-  }
-  if followed > 0 {
-    state.count(MOVE_FOLLOWED, followed);
-  }
-  if reclaimed > 0 {
-    state.count(MOVE_RECLAIMED, reclaimed);
+    follow_moved_object(state, &regional, local, object);
   }
 }
 

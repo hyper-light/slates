@@ -6082,7 +6082,8 @@ refinement and revalidation before those results can be applied to the corrected
 > successor); with all three removed StaleNeverCommits fails at depth 12 (GAPS' model table). So a copy the walk has not
 > reached refuses, and nothing the walk delays can let a stale owner's record commit: a takeover round's page promises
 > and fences each copy it lists itself. Held by `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`
-> (`crates/server/tests/fleet.rs`).
+> (`crates/server/tests/fleet.rs`). The per-copy step also routes a moved object's copy to its move's owner before its
+> authority is reconciled (A-487), the step the cut first lost.
 
 > **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
 > The takeover is built as written, one batched round per retired host (`crates/server/src/takeover.rs`).
@@ -8102,6 +8103,17 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > serves as at every start, `Instance::member`), following `MoveProgress` until `Moved` with no clock of its own (the
 > move ends itself: `Moved`, or `MoveUnplaced` once it thaws), every refusal reported by its kind and the agent left where
 > it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out).
+
+> **Status (2026-11-18, A-487: a holder's copy follows a move as the install's walk reaches it).** "Every holder takes
+> the new owner's authority" holds again. A-398 cut the install's whole pass over the held copies into a walk a copy a
+> turn, and the move's follow, which A-291 ran over every copy at the end of that pass, landed after the per-copy step's
+> early return for a copy whose owner is a live member, which every moved object's is. No holder followed a move: its
+> copy kept the old owner's authority, refused every record and content put of the new owner `Unauthorized`, and a
+> volume moved back to its creator could never place its head off its owner, so its move was refused `Unplaced` and
+> begun again until the client's deadline. The walk's per-copy step now follows a moved copy between its lineage and its
+> authority, as A-291's order had it (`fleet::install_on_copy`, `moves::follow_moved_object`). Held by
+> `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests) and the
+> move test above.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -32365,3 +32377,31 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-487 — A holder's copy of a moved object follows the move as the install's walk reaches it (2026-11-18, g230, goal 85's bug 2; §4.8 "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398)
+Applied in the same change to: §4.10 (A-291's status, a status of its own), §4.8 (A-398's status), GAPS (the move's
+entries), `docs/bugs/2026-11-18-a-holders-copy-never-followed-a-move.md` (new), and `crates/server/src/fleet.rs`,
+`moves.rs`, `takeover.rs` and `owner_location.rs`.
+- **What happened.** `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the
+  quiet Mac Studio at main 3022c6894 (it passed once at 2a5bf7264, which the cause below predates too): the move back to
+  the creator answered `Moving` and `MoveRefused { Unplaced }` in turn until its deadline. The run's counters
+  (`~/.cache/slates-gate/fleet-q1.log` on adas-mac-studio-3): the third node c refused every head and catalog record
+  the volume's owner b shipped `Unauthorized` (`fleet.record.refused.unauthorized` 8,006 = b's `fleet.ship.head.short`
+  4,000 + `catalog.short` 4,006) and 2,663 content puts (`fleet.content.unauthorized`); b began 223 handoffs and
+  finished none (`fleet.heal.unfinished` 222), and b's move was refused 40 times; no node counted `fleet.move.followed`.
+- **Cause.** A-291 ended the install's whole pass over the held copies (`takeover::resolve_held_objects`) with
+  `moves::follow_moved_objects`: each copy of a moved object routed to the exception's owner, so the authority reconcile
+  after it gave the copy that owner's authority. A-398 cut the pass into a walk a copy a turn (`fleet::install_on_copy`)
+  and its merge with main (9c5fca527) put the follow at the end of the per-copy step, after its early return for a copy
+  whose owner is a live member, which is every moved object's copy. So no copy followed: c's copy of the moved volume
+  kept the creator's authority at every later install, refused the new owner's records and content puts, and the move
+  back, which must place the head off its owner on the creator and c, never could. The follow also ran as a whole pass
+  once a copy for every copy of a retired owner, quadratic in the held copies.
+- **The rule.** The walk's per-copy step is fence, lineage, the move's follow (`moves::follow_moved_object`: routed to
+  the exception's owner, or dropped once the move is adopted outside that owner's placement), then the authority from
+  the route, one copy at a time; the whole passes keep A-291's order as the unit tests' oracle.
+- **Tests.** `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests:
+  a holder of a creator's object in a region of three at `f = 1`, the creator's move to the third member committed and
+  installed through the walk; the copy routed to the new owner, its authority naming it, the new owner's next record
+  accepted and the creator's refused `Unauthorized`, counted followed once). The move flows are filed for main
+  (run-requests.md, A-487).
