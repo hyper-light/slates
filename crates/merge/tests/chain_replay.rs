@@ -96,6 +96,11 @@ fn recovered(
       "version {version}'s completion key, as its entry recorded it, present or absent (A-255)"
     );
     assert_eq!(
+      (entry.signature, chain_entry::signature_of(bytes)),
+      (signature_for(version), Ok(signature_for(version))),
+      "version {version}'s signature verdict, decoded and read from its place, present or absent (A-321)"
+    );
+    assert_eq!(
       identities.get(&version).copied(),
       Some(green.head_identity()),
       "version {version}'s identity, against the live green's at that version"
@@ -307,6 +312,7 @@ impl History {
         &applied,
         completion,
         recorded,
+        signature_for(*version),
       ));
       self.accepted.push((increment, *version));
     }
@@ -646,6 +652,7 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
       &applied.unwrap(),
       completion_for(version),
       None,
+      signature_for(version),
     ));
     accepted.push((increment, version));
     let floor = bases[0].min(bases[1]);
@@ -683,6 +690,16 @@ fn completion_for(version: u64) -> Option<chain_entry::Completion> {
   (!version.is_multiple_of(5)).then(|| completion_of(version))
 }
 
+/// The signature verdict a generated version's entry records (A-321): none for every third version (an unsigned submit),
+/// else one whose every field is a function of the version, so the replay holds the section to what was written.
+fn signature_for(version: u64) -> Option<chain_entry::Signature> {
+  (!version.is_multiple_of(3)).then(|| chain_entry::Signature {
+    kind: u8::try_from(version % 251).unwrap(),
+    detail: u8::try_from(version % 7).unwrap(),
+    fingerprint: [u8::try_from(version % 253).unwrap(); 32],
+  })
+}
+
 /// The completion key a test's version `version` was made under: distinct per version, every field used, the submitting
 /// work named for every other version (a client on another node than the work's owner) and absent for the rest (one on
 /// the owner's own node, A-288).
@@ -705,18 +722,21 @@ fn a_hostile_chain_entry_is_refused_typed() {
   let increment = increment_of(&raw).with_id(id(1), 0);
   let (_, applied) = green.submit_resolved(&increment);
   // A completion naming its submitting work (A-288), so every byte of the work's marker and id is truncated and flipped.
+  // A signature's verdict too (A-321), so every byte of its section is truncated and flipped.
   let bytes = chain_entry::encode(
     &increment.encode(),
     &increment,
     &applied.unwrap(),
     Some(completion_of(2)),
     None,
+    signature_for(2),
   );
   assert_eq!(
-    chain_entry::decode(&bytes).map(|entry| entry.completion),
-    Ok(Some(completion_of(2))),
-    "the entry decodes, its completion key and submitting work with it"
+    chain_entry::decode(&bytes).map(|entry| (entry.completion, entry.signature)),
+    Ok((Some(completion_of(2)), signature_for(2))),
+    "the entry decodes, its completion key, submitting work and signature verdict with it"
   );
+  assert_eq!(chain_entry::signature_of(&bytes), Ok(signature_for(2)));
   for len in 0..bytes.len() {
     assert!(
       chain_entry::decode(&bytes[..len]).is_err(),
@@ -744,4 +764,24 @@ fn a_hostile_chain_entry_is_refused_typed() {
     Err(DocDecodeError::BadVersion),
     "an entry of version 2, before the submitting work rode it"
   );
+  // Nor one of the version before A-321, whose bytes before the digest are not a signature's section.
+  earlier[4..8].copy_from_slice(&3u32.to_le_bytes());
+  assert_eq!(
+    chain_entry::signature_of(&earlier),
+    Err(DocDecodeError::BadVersion),
+    "an entry of version 3, before the signature's verdict rode it"
+  );
+  // A section whose absent marker sits over a verdict's bytes is malformed, not unsigned.
+  let unsigned = chain_entry::encode(&increment.encode(), &increment, &[], None, None, None);
+  assert_eq!(chain_entry::signature_of(&unsigned), Ok(None));
+  let mut smuggled = unsigned.clone();
+  let kind_at = smuggled.len() - 32 - 34;
+  smuggled[kind_at] = 1;
+  assert_eq!(
+    chain_entry::signature_of(&smuggled),
+    Err(DocDecodeError::BadKind)
+  );
+  for len in 0..16 {
+    assert!(chain_entry::signature_of(&bytes[..len]).is_err(), "{len}");
+  }
 }

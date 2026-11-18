@@ -282,9 +282,12 @@ pub struct PolicyRecord {
   /// harness through the issuer, never by an agent. `None` until one is set: merges at once, lands under approval.
   /// Appended.
   pub write: Option<WritePolicy>,
-  /// How many times the write policy was set (A-285): a setter names the version it read, so a captured proof sets
-  /// nothing once the policy has moved. Appended.
+  /// How many times the write policy or the trusted signers were set (A-285, A-321): a setter names the version it
+  /// read, so a captured proof sets nothing once the policy has moved. Appended.
   pub write_version: u64,
+  /// The keys trusted to sign the volume's work (signed work, A-321), in SSH wire form, in the order the launcher set
+  /// them: a merge's signature verifies under its work's and its green's, a landing's under its volume's. Appended.
+  pub signers: Vec<Vec<u8>>,
 }
 
 /// How one kind of write is permitted (A-285): the mode the user gave the harness or agent.
@@ -298,13 +301,16 @@ pub enum WriteMode {
   Forbid,
 }
 
-/// A volume's write policy (A-285): the mode for its merges and the mode for its landings.
+/// A volume's write policy (A-285): the mode for its merges and the mode for its landings, and whether its merges must
+/// be signed (A-321).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WritePolicy {
   /// How a merge into the volume is permitted.
   pub merge: WriteMode,
   /// How a landing of the volume is permitted.
   pub land: WriteMode,
+  /// Merges into the volume (a green) or from it (a work) must carry a signature that verifies under a trusted signer.
+  pub require_signed_merges: bool,
 }
 
 /// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host

@@ -55,6 +55,7 @@ fn landing(land: WriteMode) -> WritePolicy {
   WritePolicy {
     merge: WriteMode::Bypass,
     land,
+    require_signed_merges: false,
   }
 }
 

@@ -64,6 +64,7 @@ fn landing(land: WriteMode) -> WritePolicy {
   WritePolicy {
     merge: WriteMode::Ask,
     land,
+    require_signed_merges: false,
   }
 }
 
@@ -255,6 +256,7 @@ fn merging(merge: WriteMode) -> WritePolicy {
   WritePolicy {
     merge,
     land: WriteMode::Ask,
+    require_signed_merges: false,
   }
 }
 
@@ -487,6 +489,7 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
   let asked = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Ask,
+    require_signed_merges: false,
   };
   launcher
     .set_policy(
@@ -506,6 +509,7 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
   let forbidden = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Forbid,
+    require_signed_merges: false,
   };
   launcher
     .set_policy(

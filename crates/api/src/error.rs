@@ -157,6 +157,14 @@ pub enum Missing {
     /// The shard.
     shard: u16,
   },
+  /// A green's version whose merge record the green's owner does not hold (A-321): folded into the green's checkpoint,
+  /// or not yet committed.
+  Version {
+    /// The green.
+    green: VolumeId,
+    /// The version.
+    version: u64,
+  },
 }
 
 /// What exists already.
@@ -424,7 +432,7 @@ pub enum Unsupported {
     /// The form.
     feature: &'static str,
   },
-  /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
+  /// A landing that carries a signature: the daemon verifies signed merges (A-321) and not yet a landing's signature
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
   /// The TLS provider's secure random refused, so no launcher secret could be made ([`crate::LauncherSecret::generate`]).
@@ -479,6 +487,9 @@ pub enum Invalid {
     /// The process named.
     pid: u32,
   },
+  /// A policy that requires signed merges set on a consumer (A-321): it is a volume's rule — set it on the agent's work
+  /// volume or on the green. Nothing was sent.
+  SignedMergesNotAVolume,
 }
 
 /// A volume of the wrong kind for the verb.
@@ -733,6 +744,9 @@ impl Error {
       Refusal::PolicyForbids { act, by } => {
         Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
+      Refusal::SignatureRequired { by, verification } => Error::Denied(Denied::Policy(
+        PolicyRefusal::signature_required(by, verification),
+      )),
       Refusal::ConsumerNotEnrolled => Error::Denied(Denied::NotEnrolled),
       Refusal::ConsumerRevoked => Error::Denied(Denied::Revoked),
       Refusal::SessionUnproven => Error::Denied(Denied::SessionUnproven),
