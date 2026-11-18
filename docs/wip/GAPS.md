@@ -11029,6 +11029,33 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
+### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
+
+> - **Found.** By reading (g268, the write log's sibling sweep after A-410). `verbs::clear_write_log` stamped the write
+>   log again only after a publication that captured every volume. A publication can leave a volume out: an overlay it
+>   cannot image because its base host is away or its base cannot be read. Such a publication committed a newer
+>   generation for the other volumes and left the log under its older stamp. If the daemon died before the next
+>   publication that captured every volume, its successor read that stamp as older than its image and replayed nothing.
+>   The left-out volume lost every write acknowledged since its last capture, closed files included (a close's flush
+>   skips its barrier while the log holds every write), and nothing was reported.
+> - **Fixed.** A publication that leaves volumes out keeps exactly their records under its stamp and drops the rest
+>   (`WriteLog::retain`). It owes that restamp from before its commit (the overflow word's second bit), so a death
+>   between the commit and the restamp is reported as lost writes, never dropped in silence.
+> - **Proven.**
+>   - `a_volume_a_publication_leaves_out_keeps_its_logged_writes_for_the_next_daemon`: red without the fix, the
+>     restarted daemon handed no record.
+>   - The write log's own tests: `a_log_keeps_the_left_out_volumes_records_in_order_under_the_new_stamp`,
+>     `a_restamp_owed_at_a_death_reports_the_left_out_writes_lost_never_drops_them_in_silence` and
+>     `an_overflow_marked_before_a_restamp_stays_reported`.
+>   - The run through a real daemon restart is main's (`run-requests.md`, 2026-11-18).
+> - **Open (siblings, from reading).**
+>   1. A checkpoint leaves a volume it cannot image out entirely, where a delta keeps its committed record. Recovery
+>      then refuses that volume until a later publication captures it whole.
+>   2. The replay writes an overlay's logged write without the overlay's host.
+>   3. When the log is full, its forced publication counts the write as logged only if it left nothing out. A captured
+>      volume's write is then reported lost, though the image holds it.
+> - **Record.** `docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`.
+
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 
 The anchor now wakes on the daemon's exit (pidfd / `NOTE_EXIT`) and holds the client rendezvous. A restart: anchor +2
