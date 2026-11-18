@@ -1344,34 +1344,40 @@ mod tests {
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
   }
 
-  /// A-299: do type each refusal of the volume core by the class a consumer acts on; expect a pinned snapshot and a
-  /// guest's map a holder (`Busy`), a stale handle and a drifted base a moved view (`Stale`), the volume's rules a denial,
-  /// its bounds exhaustion, an unreadable journal or image unusable, and every operation the entry does not take an
-  /// invalid request — each carrying the core's reason, never a word.
+  /// A volume-core refusal as a consumer meets it.
+  fn volume_refused(refusal: slates_ipc::protocol::VolumeRefusal) -> Error {
+    Error::of_client(
+      "i",
+      ClientError::Refused(Refusal::Volume { refusal }),
+      None,
+      PAUSE_NS,
+    )
+  }
+
+  /// A-299: do type the volume core's holders and moved views; expect a pinned snapshot and a guest's map a holder
+  /// (`Busy`), a stale handle and a drifted base a moved view (`Stale`), each carrying the core's reason.
   #[test]
-  fn each_volume_core_refusal_is_typed_into_its_class() {
-    use super::{Denied, Invalid};
+  fn a_volume_cores_holders_and_moved_views_are_typed() {
     use slates_ipc::protocol::VolumeRefusal as V;
-    let typed = |refusal: V| {
-      Error::of_client(
-        "i",
-        ClientError::Refused(Refusal::Volume { refusal }),
-        None,
-        PAUSE_NS,
-      )
-    };
-    assert_eq!(typed(V::Pinned), Error::Busy(Busy::Volume(V::Pinned)));
-    assert_eq!(typed(V::DaxMapped), Error::Busy(Busy::Volume(V::DaxMapped)));
-    assert_eq!(
-      typed(V::StaleHandle),
-      Error::Stale(Stale::Volume(V::StaleHandle))
-    );
-    assert_eq!(
-      typed(V::BaseDrift),
-      Error::Stale(Stale::Volume(V::BaseDrift))
-    );
+    for held in [V::Pinned, V::DaxMapped] {
+      assert_eq!(volume_refused(held), Error::Busy(Busy::Volume(held)));
+    }
+    for moved in [V::StaleHandle, V::BaseDrift] {
+      assert_eq!(volume_refused(moved), Error::Stale(Stale::Volume(moved)));
+    }
+  }
+
+  /// A-299: do type the volume core's denials, bounds and unusable states; expect the volume's rules a denial, its
+  /// bounds exhaustion, an unreadable journal or image unusable.
+  #[test]
+  fn a_volume_cores_denials_bounds_and_unusable_states_are_typed() {
+    use super::Denied;
+    use slates_ipc::protocol::VolumeRefusal as V;
     for denied in [V::NotPermitted, V::LinkProtected] {
-      assert_eq!(typed(denied), Error::Denied(Denied::Volume(denied)));
+      assert_eq!(
+        volume_refused(denied),
+        Error::Denied(Denied::Volume(denied))
+      );
     }
     for bound in [
       V::TooManyLinks,
@@ -1379,20 +1385,33 @@ mod tests {
       V::DigestCacheFull,
       V::Memory,
     ] {
-      assert_eq!(typed(bound), Error::Exhausted(Exhausted::Volume(bound)));
+      assert_eq!(
+        volume_refused(bound),
+        Error::Exhausted(Exhausted::Volume(bound))
+      );
     }
-    for unusable in [
-      V::JournalIncomplete {
-        needed: 1,
-        oldest: 2,
-      },
-      V::RecoveryVersion {
-        found: 3,
-        expected: 4,
-      },
-    ] {
-      assert_eq!(typed(unusable), Error::Unusable(Unusable::Volume(unusable)));
+    let journal = V::JournalIncomplete {
+      needed: 1,
+      oldest: 2,
+    };
+    let image = V::RecoveryVersion {
+      found: 3,
+      expected: 4,
+    };
+    for unusable in [journal, image] {
+      assert_eq!(
+        volume_refused(unusable),
+        Error::Unusable(Unusable::Volume(unusable))
+      );
     }
+  }
+
+  /// A-299: do type every operation an entry does not take; expect each an invalid request carrying the core's
+  /// reason, never a word.
+  #[test]
+  fn a_volume_cores_wrong_entries_are_invalid_requests() {
+    use super::Invalid;
+    use slates_ipc::protocol::VolumeRefusal as V;
     for invalid in [
       V::NotDirectory,
       V::IsDirectory,
@@ -1403,7 +1422,10 @@ mod tests {
       V::CrossVolumeMove,
       V::NotOverlay,
     ] {
-      assert_eq!(typed(invalid), Error::Invalid(Invalid::Volume(invalid)));
+      assert_eq!(
+        volume_refused(invalid),
+        Error::Invalid(Invalid::Volume(invalid))
+      );
     }
   }
 

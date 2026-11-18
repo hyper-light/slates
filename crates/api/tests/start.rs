@@ -393,10 +393,22 @@ fn an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret() {
     struct Wrapped(Option<std::process::Child>);
     impl Wrapped {
       fn stop(mut self) -> Option<i32> {
-        let mut child = self.0.take().unwrap();
-        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-        child.wait().unwrap().code()
+        let Some(mut child) = self.0.take() else {
+          panic!("the wrapped anchor was stopped already");
+        };
+        let Ok(raw) = i32::try_from(child.id()) else {
+          panic!("the wrapped anchor's process id does not fit an i32");
+        };
+        let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+          panic!("the wrapped anchor's process id is zero");
+        };
+        if let Err(error) = rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
+          panic!("asking the wrapped anchor to stop: {error}");
+        }
+        match child.wait() {
+          Ok(status) => status.code(),
+          Err(error) => panic!("waiting for the wrapped anchor: {error}"),
+        }
       }
     }
     impl Drop for Wrapped {
