@@ -5298,7 +5298,11 @@ durably, the engine rebuilt and its head identity verified against the adopted r
 version reads, new work submits and retries meet their records through the public client on the
 successor. A successor whose accepted prefix is shorter than the adopted head stays pending and
 counted until the ledger-prefix transfer (GAP-A9-7):
-`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`.
+`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`. **Since 2026-11-18** its input half is built: a
+successor that knows every record up to the adopted one but lacks some version's inputs (one version behind the quorum
+when the owner died) fetches them by identity from the members that reported the adopted version
+(`fleet::fetch_green_inputs`, GAPS 2026-11-09). A successor whose own records end further below the adopted one still
+lacks the records themselves (the record half, owed) and is given up at the takeover's bound, named `chain`.
 
 **Implementation follow-up (2026-09-18, AUD-11 closed):** at `f > 0` a submit's acceptance
 waits for its version's merge record to commit at the quorum — the verb commits its effects but
@@ -15327,7 +15331,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (open, instrumented)
+### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (cause found; fixed for a successor one version behind, 2026-11-18; the record half open)
 
 `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`crates/server/tests/fleet.rs`, 73797a42,
 AUD-29-17) failed "the successor materialized the taken-over green at version 3" in 1 of 2 runs of main 1ed67337's fleet
@@ -15365,6 +15369,28 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   the protocol, and names it `TakeoverIncomplete`).
 - **Sibling, open:** a taken-over **volume**'s materialization (`fleet::materialize`, the `fleet.materialize.waits.*`
   counters: content, placement, catalog, catalog placement, shard) waits each period the same way, with no bound.
+- **The cause, named by the bound (diag-clients-green-1, 98c5a166 with the failure print, CI 2026-11-09):** the share
+  test 10 times per lane at nice 19 beside two spinners a CPU; ubuntu-24.04-arm 2 of 10 red (load 13.7-14.0),
+  ubuntu-latest 0 of 10. Both reds waited on the `chain`: the successor's holder state at version 2 and the other
+  survivor's at 3, `merge.takeover_incomplete` 97 and 100, then `merge.takeover_given_up` 1, in 1,403 s and 1,388 s
+  against 165-258 s for the passes. Version 3 had committed at the owner and the other holder (`f + 1`); the successor
+  adopted its record, which the other holder reported, and never received its inputs, which only the dead owner ships.
+- **Fixed for a successor one version behind (2026-11-18):** the adoption keeps the members that reported the adopted
+  version (`PendingGreen::sources`; each accepted it holding its inputs, A-244), and the materialization fetches each
+  input the ledger names and this node lacks (`merge_service::unheld_green_inputs`) by identity from them
+  (`fleet::fetch_green_inputs`, the volume takeover's own hedged, verified fetch), staged at its version so the
+  retention rule keeps it, counted `merge.takeover_inputs_fetched`. An input still not held after an attempt is its own
+  wait (`merge.takeover_waits_inputs`, named `inputs` at the bound); an attempt that leaves fewer inputs unheld than ever
+  before starts the bound's count again, at most once per input. Red first,
+  `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` (three nodes at `f = 1`, the
+  successor-to-be refusing content puts from version 3 on, the owner killed): with the fetch cut out the successor gave
+  the green up after 100 attempts waiting on its inputs, fetched 0; with it, the green placed at version 3 with the
+  owner's chain, 2 of 2, and the nine green takeover tests beside it 10 of 10 (macOS arm64, load 32-60). The share
+  test's rerun under diag-clients-green-1's load is owed to the supervisor's lanes.
+  `docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`.
+- **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
+  lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
+  identity can fill; it is still given up `chain` at the bound.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
