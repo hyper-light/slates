@@ -174,7 +174,7 @@ fn walk(view: &HookView) -> Vec<String> {
       let path = if directory.is_empty() {
         name
       } else {
-        [directory.as_slice(), b"/", &name].concat()
+        [directory.as_slice(), b"/".as_slice(), name.as_slice()].concat()
       };
       let shown = String::from_utf8(path.clone()).unwrap();
       if node == Node::Directory {
@@ -538,7 +538,7 @@ fn pack_paths(view: &HookView) -> Vec<Vec<u8>> {
 
 /// A pack's path with its index's suffix.
 fn index_path(path: &[u8]) -> Vec<u8> {
-  [&path[..path.len() - b".pack".len()], b".idx"].concat()
+  [&path[..path.len() - b".pack".len()], b".idx".as_slice()].concat()
 }
 
 /// The objects of the pack at `path`, checked with its index as `git verify-pack` checks them:
