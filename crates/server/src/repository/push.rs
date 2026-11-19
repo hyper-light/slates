@@ -93,6 +93,9 @@ pub(crate) struct EntryParts {
   pub(crate) names: Vec<NameChange>,
   /// The repository's own state moved (Mercurial's phase roots and markers).
   pub(crate) state: Vec<StateChange>,
+  /// The tool's record the entry holds (A-662's `RepositoryEntry::objects`): a Subversion revision's (A-655 part 2b,
+  /// `slates_svn::commit::record`); a git push's is its sealed push's own ([`push_sealed`]).
+  pub(crate) objects: Vec<u8>,
 }
 
 /// What a push did to one branch, in the order of its changes.
@@ -852,6 +855,7 @@ fn entry(
   entry.checks.extend(parts.checks);
   entry.names.extend(parts.names);
   entry.state = parts.state;
+  entry.objects = parts.objects;
   entry
 }
 

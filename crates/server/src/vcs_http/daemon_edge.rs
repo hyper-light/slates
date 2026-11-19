@@ -74,7 +74,9 @@ impl Authenticator for RecordedCredentials {
       return Err(Unproven::Expired);
     }
     if let Principal::Consumer { consumer, .. } = &record.principal
-      && revoked(*consumer).await?
+      && crate::credentials::consumer_revoked(*consumer)
+        .await
+        .map_err(|_| Unproven::Unanswered)?
     {
       return Err(Unproven::Revoked);
     }
@@ -83,33 +85,6 @@ impl Authenticator for RecordedCredentials {
       bearer_expires_ns: if bearer { record.expires_ns } else { None },
     })
   }
-}
-
-/// Whether enrolled consumer `consumer` was revoked, or holds no enrollment: asked of the partition its id routes to.
-async fn revoked(consumer: u64) -> Result<bool, Unproven> {
-  let (origin, owner) = crate::state::with_state(|state| {
-    let partition = crate::verbs::owner_of_consumer(consumer);
-    (
-      state.shard,
-      crate::verbs::shard_of_partition(state, partition),
-    )
-  })
-  .ok_or(Unproven::Unanswered)?;
-  let owner = owner.ok_or(Unproven::Unanswered)?;
-  crate::xshard::call_in_shard_time_given_room(
-    origin,
-    owner,
-    move |state| {
-      state
-        .db
-        .partition()
-        .consumer(consumer)
-        .is_none_or(|record| record.revoked)
-    },
-    crate::daemon::LIVENESS_BUDGET_NS,
-  )
-  .await
-  .ok_or(Unproven::Unanswered)
 }
 
 /// Locates and finds repositories on the partitions their names route to (the module doc).

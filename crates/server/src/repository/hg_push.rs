@@ -777,6 +777,7 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
     checks,
     names: Vec::new(),
     state,
+    objects: Vec::new(),
   }
 }
 
