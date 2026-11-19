@@ -234,11 +234,37 @@ impl LogsCohort {
   /// for a log the host holds no copy of, past what it applied, or where the vector holds part of a record and not the
   /// rest.
   pub fn read(&self, host: HostId, vector: &Cut) -> Result<Answer, ReadRefused> {
-    let _ = host;
-    vector
-      .keys()
-      .next()
-      .map_or(Ok(Answer::new()), |log| Err(ReadRefused::NotHeld { log: *log }))
+    let mut answer = Answer::new();
+    for (name, asked) in vector {
+      let held = self
+        .logs
+        .get(name)
+        .and_then(|log| log.held(host))
+        .ok_or(ReadRefused::NotHeld { log: *name })?;
+      let applied = self.applied_at(host, name);
+      if *asked > applied {
+        return Err(ReadRefused::NotApplied {
+          log: *name,
+          applied,
+          asked: *asked,
+        });
+      }
+      let prefix = held.iter().take(as_index(*asked)).map(|record| record.identity);
+      answer.insert(*name, prefix.collect());
+    }
+    let at = |log: &LogName| vector.get(log).copied();
+    let split = answer.values().flatten().find(|identity| {
+      self
+        .records
+        .get(*identity)
+        .is_some_and(|spans| spans_split_by(spans, at))
+    });
+    match split {
+      Some(identity) => Err(ReadRefused::Split {
+        identity: *identity,
+      }),
+      None => Ok(answer),
+    }
   }
 
   /// What `host` applied of `log`.
@@ -320,8 +346,14 @@ impl LogsOwner {
   /// What this owner learned committed (A-636): each log's length `f + 1` of its holders acknowledged, lowered to whole
   /// records.
   pub fn committed_cut(&self, cohort: &LogsCohort) -> Cut {
-    let _ = cohort;
-    Cut::new()
+    let limits = self
+      .owners
+      .keys()
+      .map(|name| (*name, self.committed.get(name).copied().unwrap_or(0)))
+      .collect();
+    let identity_at =
+      |name: &LogName, position: usize| self.owners.get(name)?.log().get(position).copied();
+    whole_cut(limits, &Cut::new(), &identity_at, &cohort.records)
   }
 
   /// Appends `record` to every log it moves, each span's positions proposed in order to that log's holders (A-636), or
@@ -333,16 +365,50 @@ impl LogsOwner {
     record: LogRecord,
     reachable: &Reach,
   ) -> Result<Appended, AppendRefused> {
-    let _ = (cohort, record, reachable);
-    Err(AppendRefused::Empty)
+    self.admit(cohort, &record)?;
+    cohort.records.insert(record.identity, record.spans.clone());
+    for span in &record.spans {
+      let (Some(owner), Some(log)) = (
+        self.owners.get_mut(&span.log),
+        cohort.logs.get_mut(&span.log),
+      ) else {
+        continue;
+      };
+      let mut last = None;
+      for _ in span.from..span.to {
+        last = Some(owner.propose(log, record.identity, reachable));
+      }
+      if last.is_some_and(|commit| commit.committed) {
+        self.committed.insert(span.log, as_position(owner.len()));
+      }
+    }
+    Ok(Appended {
+      whole: self.holds_whole(cohort, &record.spans),
+    })
   }
 
   /// Offers every log again and has its holders apply what is committed, at their joins (A-636): a log `f + 1` of whose
   /// holders acknowledge is committed to its length; each holder that acknowledged applies the owner's committed cut over
   /// the logs it now holds. Returns that cut.
   pub fn announce(&mut self, cohort: &mut LogsCohort, reachable: &Reach) -> Cut {
-    let _ = (cohort, reachable);
-    Cut::new()
+    let mut holding: BTreeMap<HostId, BTreeSet<LogName>> = BTreeMap::new();
+    for (name, owner) in &mut self.owners {
+      let Some(log) = cohort.logs.get_mut(name) else {
+        continue;
+      };
+      let commit = owner.offer_again(log, reachable);
+      if commit.committed {
+        self.committed.insert(*name, as_position(owner.len()));
+      }
+      for host in commit.acked {
+        holding.entry(host).or_default().insert(*name);
+      }
+    }
+    let cut = self.committed_cut(cohort);
+    for (host, held) in &holding {
+      cohort.apply(*host, held, &cut);
+    }
+    cut
   }
 
   /// Takes every log of the repository over as `new_id` (A-636): refused, nothing fenced, unless every log's round can
@@ -353,18 +419,25 @@ impl LogsOwner {
     new_id: HostId,
     reachable: &Reach,
   ) -> Result<TakenOver, LogsTakeoverRefused> {
-    let _ = reachable;
+    for (name, log) in &cohort.logs {
+      log
+        .can_take_over(reachable)
+        .map_err(|error| LogsTakeoverRefused { log: *name, error })?;
+    }
+    let mut owners = BTreeMap::new();
+    for (name, log) in &mut cohort.logs {
+      let owner = Owner::take_over(log, new_id, reachable)
+        .map_err(|error| LogsTakeoverRefused { log: *name, error })?;
+      owners.insert(*name, owner);
+    }
+    let dropped = keep_whole(&mut owners, &cohort.records);
     Ok(TakenOver {
       owner: LogsOwner {
         id: new_id,
-        owners: BTreeMap::new(),
+        owners,
         committed: Cut::new(),
       },
-      dropped: Vec::new(),
-    })
-    .map(|taken| {
-      let _ = &cohort;
-      taken
+      dropped,
     })
   }
 
