@@ -164,8 +164,8 @@ mod wildmatch_reference;
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_policy;
 // A protected git branch, the server's half (A-644 part 2): what a ref's change brings, read from A-614's store, for
-// the policy's check point; A-321's verifier under git's namespace; the check point's refusals in git's words. No caller
-// outside tests until receive-pack's server half asks it (A-620 part 2's judge over the store).
+// the policy's check point; A-321's verifier under git's namespace; the check point's refusals in git's words. Asked by
+// git's push driver (`git_push`, A-654), which has no caller outside tests until the edges call it.
 #[cfg_attr(not(test), allow(dead_code))]
 mod git_protect;
 // §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside
@@ -200,6 +200,12 @@ mod vcs_http;
 // key's keeping, the key store and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_ssh;
+// git's push on its repository's owner shard (A-654 part 2): the one driver both edges call a step at a time (the
+// advertisement, the request and pack as they arrive, then the answer: the hook gate, the quarantine, the policy, the
+// verdicts over the shard's greens and A-635's append with A-662's store, git's report). No caller outside tests until
+// the edges call it (g299's `GitServices` for the HTTP site, g294's SSH channel).
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_push;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
 // tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
 // from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654), and

@@ -497,9 +497,15 @@ struct Transcript {
   status: Option<u32>,
   /// The channel messages' numbers, in order (each data message once in a row).
   order: Vec<u8>,
+  /// Whether the server ended the connection after the client's close, within the client's patience.
+  ended: bool,
 }
 
-/// Reads the session until the server closes it, then closes it too: everything it gave.
+/// Reads the session until the server closes it, then closes it too and waits for the server to end the connection:
+/// everything it gave. The edge counts a connection and learns its closing wait before its socket closes (`ended` in the
+/// edge), and a shard drains its controls before it polls a task, so a client that returned at its own close let
+/// [`StopsShard`] cancel the edge's task before it read that close
+/// (`docs/bugs/2026-11-19-the-ssh-edge-tests-stopped-the-shard-before-the-edge-read-the-close.md`).
 fn transcript(peer: &mut Peer) -> Transcript {
   let mut transcript = Transcript::default();
   while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
@@ -522,6 +528,7 @@ fn transcript(peer: &mut Peer) -> Transcript {
         let mut close = vec![97];
         close.extend_from_slice(&peer.channel.to_be_bytes());
         peer.send(&close);
+        transcript.ended = peer.ended();
         break;
       }
       _ => {}
@@ -531,13 +538,14 @@ fn transcript(peer: &mut Peer) -> Transcript {
 }
 
 /// The transcript of a command that took [`PACK`] and exited 0: [`READY`], `got:` and the pack, then exit-status, EOF and
-/// close, in that order.
+/// close, in that order, and the connection ended.
 fn pushed() -> Transcript {
   Transcript {
     out: [READY, b"got:", PACK].concat(),
     err: Vec::new(),
     status: Some(0),
     order: vec![94, 98, 96, 97],
+    ended: true,
   }
 }
 
@@ -616,6 +624,7 @@ fn a_refused_exec_is_answered_on_standard_error_with_its_exit_status() {
       err: b"fatal: refused\n".to_vec(),
       status: Some(super::site::GIT_DIE_STATUS),
       order: vec![95, 98, 96, 97],
+      ended: true,
     })
   );
   assert_eq!(
