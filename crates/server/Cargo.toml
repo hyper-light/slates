@@ -44,7 +44,8 @@ slates-ssh = { workspace = true }
 # Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
 # and places a push; its index and content store are slates-vcs's. The repositories' stores on their owner shard
 # (A-662, `crate::vcs_store`): the content store every tool's store holds its objects in, and Mercurial's and
-# Subversion's indexes beside git's.
+# Subversion's indexes beside git's. A repository's `.hg` is read through the base plane's host seam for Mercurial's
+# import (§4.17.3 piece 3, A-649 part 4; `crate::hg_base`).
 slates-hg = { workspace = true }
 # The version-control servers' shared crate (§4.17.1 shared piece 3): Mercurial's index and content store (A-657);
 # git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); and,

@@ -199,6 +199,10 @@ mod vcs_ssh;
 // from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_store;
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). No caller
+// outside tests until the daemon imports a repository's directory (its piece).
+#[cfg_attr(not(test), allow(dead_code))]
+mod hg_base;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

@@ -13513,6 +13513,22 @@ signature verification).
 > checked, the repository's state read; no borrow held between turns; abandoned, it gives back everything. `import`
 > is its thin facade. Proven by three stores imported a unit a turn equal row for row to one call, and an import
 > abandoned or refused midway holding nothing (Windows x86_64, jupiter: 278 of 278, red 2 failed; macOS owed).
+>
+> **Status (2026-11-19, A-649 part 4: the server's adapter from the base's host seam).** `slates-server`'s `hg_base`
+> answers the import's seam from §4.15's base plane (`HostFs`): `.hg` opened under the repository's directory and each
+> name under the one before it, never a path string; a name the host does not find is a file that is not there, every
+> other refusal carried through typed (an S3 base's pending fetch among them), and a name that is not UTF-8 refused by
+> kind before the host is asked. A file is opened once a lend and read within its length when it was opened, each read
+> charged what the file holds before a byte is held; a host's short answer is read on from where it stopped and its
+> refusal carried through, never taken for the file's end (an S3 base answers from the chunks it has cached, then
+> names the fetch it waits on); at most the last file's directory and a revlog's two files are held whatever a path's
+> depth, and everything a lend opened is closed when the lend ends, so the host can be lent a turn at a time. Proven
+> by two stores 7.2 kept (`states`, with its phases, bookmarks and markers, and the file index store, eight
+> directories deep) imported through the simulated host equal to the same files read from memory, each file opened
+> once; a sliced import lent the host afresh each turn equal to the whole; a file grown or cut in place while held
+> read within its length when opened; a read answered three bytes a call read whole, and refused with the fetch where
+> a piece is still being fetched; the refusals and the bounds each by a test (macOS arm64, Mac Studio: 11 of 11; a
+> red run against a stub owed).
 
 > **Status (2026-11-19, A-657 = A-641 part 3: a push landed on each green's own log).** `slates-hg`'s
 > `push::classify` places a verified push on the lines and bookmarks it read, as 7.2 does: a branch's heads after it
@@ -13941,7 +13957,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
    phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
    never whole, and texts rebuilt from the one before. Built (A-649 part 3b): the import in slices under the owner's
-   quantum. Owed: the server's adapter from §4.15's host seam.
+   quantum. Built (A-649 part 4, `crates/server`: `hg_base`): the server's adapter from §4.15's host seam. Owed: the
+   daemon's import of a repository's directory through it, a turn at a time on the repository's owner shard, the
+   imported index handed to the repository's Mercurial store in A-662's per-repository map (`vcs_store`'s `HgStore`).
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -48541,6 +48559,58 @@ Applied in the same change to:
   tests; `crates/git/src/store/push.rs` (`Push::object` public, `Push::carried`), `store/repository.rs`
   (`Repository::learned_depth`) and `tests/store/fragments.rs`; `Cargo.toml` (slates-hg, slates-svn),
   `crates/server/Cargo.toml`, `Cargo.lock`.
+
+### A-649 part 4 — The server's adapter from the base plane's host seam to the import's `RepositoryFiles` (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.5's host seam; A-555)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/server` (`hg_base`; `slates-hg` a dependency),
+the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the seam's server side built), GAPS (the
+§4.17.3 entry).
+- **What it does.** `HgBase` answers `RepositoryFiles` from a `HostFs` lent to it: `.hg` opened under the repository's
+  directory and each name under the one before it, as the host opens one entry at a time (`one_entry`: never empty,
+  `.`, `..` or a separator; never through a link). A name the host does not find answers `None`, as 7.2 reads an absent
+  file (`revlog._get_data`); every other refusal is the host's own, carried through (`BaseRefused::Host`: a directory
+  where a file is named or the reverse, an S3 base's pending fetch, the host unavailable), where 7.2's `open` raises;
+  a name that is not UTF-8, which only the plain encoding leaves, is refused by kind before the host is asked
+  (`BaseRefused::NotUtf8`).
+- **A file's length is its length when it was opened.** A file is opened once a lend and its length taken by `fstat`
+  then, and its reads end there: a revlog another process appends to is read as the prefix it held, and a file replaced
+  while held (a save by rename) is read as it was opened, its descriptor keeping its bytes.
+- **A host's short answer is not the file's end.** A read asks the host again from where its answer stopped until the
+  range is read or the host answers nothing, since a host may answer fewer bytes than asked before a file ends: the S3
+  base (`slates_base`'s S3 host, A-555) copies the chunks it has cached and refuses the next read with the fetch it
+  waits on, and Linux transfers at most 0x7ffff000 bytes a `pread` (read(2), NOTES). The fetch's refusal is carried
+  through, so the import's caller runs the import again once it lands (`ImportRefused::Host`), never a revlog refused
+  as truncated because its last chunk was not yet fetched. A length the host refuses closes the file its open made.
+- **Bounds.** A read is charged to the import's room before a byte is held, and charged at most what the file holds
+  from its offset. At most the last file's directory and two files are held (`FILES_HELD`: a revlog's index and data
+  file, which its reader reads in turn), every other directory closed as soon as the one under it is open, so a path
+  nested deep costs opens, never descriptors held on the daemon's one descriptor table. Everything a lend opened is
+  closed when the lend is dropped, a refusal's path included; the repository's directory is its caller's.
+- **Lent a turn at a time.** The adapter borrows the host for as long as its caller lends it: one turn of
+  `Import::advance` where the host is the shard's (lent afresh each turn, as a repository's store is lent for each step
+  of an answer, A-640), or the whole import where the import's task owns its host. A turn's lend opens again what the
+  turn before closed, counted (`Opened`: directories and files opened, answers given from a held file).
+- **Where the index goes.** The adapter keeps no index: the import builds its own and hands it to its caller. The
+  daemon's import (owed) hands it to the repository's one store, the Mercurial arm of A-662's per-repository map
+  (`vcs_store`'s `HgStore`, in place of the empty index made with the repository's record), lending the shard's content
+  store with the host each turn; nothing keeps a second index.
+- **Not taken (decided by the bounds, not measured).** Holding the last path's whole directory chain, which would save
+  the walk between sibling directories, holds a descriptor per level of a path a hostile listing can nest thousands
+  deep. Holding handles across turns without the host, which would save a turn's reopening, leaves them for the owner
+  to close on every way out, and a future dropped mid-import would leak them; that waits for the daemon's import, whose
+  arena can hold them beside the import and close them at its end.
+- **Tests (macOS arm64, Mac Studio, 2026-11-19, kiln r49, debug, rustc 1.98.1, over main b1926d201).**
+  `cargo test --locked -p slates-server --lib hg_base`: 11 of 11, 645 filtered out (19:32–19:34 UTC, load 17.8): the
+  two stores imported through the simulated host equal to the same files read from memory, each file opened once; a
+  sliced import lent the host afresh each turn equal to the whole, nothing open after any turn; absent files `None` and
+  the wrong kinds refused by the host's own refusal; a name not UTF-8 refused without a host call; a read charged what
+  the file holds and refused past the room; a file replaced while held read as opened, and one grown or cut in place
+  read within its length when opened; the handles held bounded at a path 32 directories deep; a pending fetch carried
+  through with nothing left open; a length the host refuses closing the file its open made; a read answered three
+  bytes a call read whole, and refused with the fetch where a piece is still being fetched.
+  `cargo test --locked -p slates-hg --lib import`: 22 of 22, 262 filtered out; `cargo fmt --check` clean on both
+  crates. No integration test reaches the adapter: nothing calls it outside its own tests until the daemon's import
+  (owed). Main's (§8): the red run against a stub (`len` and `read` finding no file; all 11 must fail) and a mutation
+  of each guard.
 
 ### A-625 part 3 — the credential record both edges authenticate through, and the daemon starting the HTTP edge with each proven connection moved to its repository's shard (2026-11-19, g299 under main's rulings, UI goal 93 (kiln 51cef9f7); §4.13 "Principals"; §4.17.2 "Transports" item 1 and "Access"; after A-625 part 3's first slice, A-633)
 Applied in the same change to: §4.13 (a status); §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/db`
