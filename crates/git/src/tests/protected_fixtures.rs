@@ -248,14 +248,11 @@ impl Entries for Source<'_> {
 /// A scenario's server as A-614's store holds it: its objects, each ref a green, and the objects themselves, which a
 /// thin pack's deltas take their bases from.
 pub(crate) struct Server {
-  pub(crate) format: ObjectFormat,
   pub(crate) repository: Repository,
   pub(crate) store: ContentStore,
   pub(crate) objects: Vec<Object>,
   /// Each ref's green, by name; a ref the server never held gets the next.
   pub(crate) greens: BTreeMap<Vec<u8>, u64>,
-  /// The refs as the advertisement names them.
-  pub(crate) refs: Vec<(ObjectId, Vec<u8>)>,
 }
 
 /// The refs of a `id SP name` listing.
@@ -317,12 +314,10 @@ pub(crate) fn server(scenario: &Scenario) -> Server {
     repository.commit(&mut store, &mut push, &moves).unwrap();
   }
   Server {
-    format,
     repository,
     store,
     objects: unpacked.objects,
     greens,
-    refs,
   }
 }
 
