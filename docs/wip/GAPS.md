@@ -7961,6 +7961,18 @@ bytes, groups, the 4 KiB block) carry their measurements. The example targets of
 benched crates share the name `bench`; cargo warns of the output collision and may make it an
 error, so a rename to `<crate>-bench` is owed before the Phase 2 crates add theirs.
 
+**Fixed 2026-11-19 (A-541, goal 85, g234): a clone's live-inode count started from its origin's head.** A clone took
+its origin's count at the moment of the clone, not its snapshot's, so every file the origin made after the snapshot
+counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
+tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
+and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
+every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
+clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
+a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
+the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
+from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
+names the effects of each).
+
 ## 8d. Phase 2 record (2026-09-05)
 
 Task 1 (the anchor) landed 2026-09-05: `slates_mem::SharedObject` (`crates/mem/src/shared.rs`),
