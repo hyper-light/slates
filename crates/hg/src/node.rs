@@ -216,7 +216,8 @@ mod tests {
     fn nodes_read_and_write_as_hexadecimal(generated in any::<[u8; 20]>()) {
       let mut digits = Vec::new();
       write_hex(&generated, &mut digits);
-      prop_assert_eq!(&digits, hex(&generated).as_bytes());
+      let lower = hex(&generated);
+      prop_assert_eq!(digits.as_slice(), lower.as_bytes());
       prop_assert_eq!(from_hex(&digits), Some(generated));
       prop_assert_eq!(from_hex(&digits.to_ascii_uppercase()), Some(generated));
       prop_assert_eq!(from_hex(&digits[..39]), None);

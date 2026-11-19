@@ -529,16 +529,17 @@ mod tests {
   /// reads: `\t`, `A`, `A`, `'`, `\q`, 0xFF, then a backslash and a NUL, then a backslash and `0`.
   #[test]
   fn older_escapes_read_as_python_reads_them() {
-    let text = [MANIFEST, b"\nT\n0 0 k:\\t\\x41\\101\\'\\q\\777\\\\\\0\\\\0\n\nx"].concat();
+    let text = [
+      MANIFEST,
+      b"\nT\n0 0 k:\\t\\x41\\101\\'\\q\\777\\\\\\0\\\\0\n\nx",
+    ]
+    .concat();
     let mut buffer = Vec::new();
     let extras = decode(&text)
       .unwrap()
       .extras(&mut room(), &mut buffer)
       .unwrap();
-    assert_eq!(
-      extras,
-      [(&b"k"[..], &b"\tAA'\\q\xff\\\x00\\0"[..])]
-    );
+    assert_eq!(extras, [(&b"k"[..], &b"\tAA'\\q\xff\\\x00\\0"[..])]);
   }
 
   /// A-588: do read extras naming one key twice and one admission too small for them. Expect both items in their stored
@@ -632,7 +633,13 @@ mod tests {
         "the user",
       ),
       (Changeset { user: b"", ..base }, "the user"),
-      (Changeset { time: b"1e9", ..base }, "the time"),
+      (
+        Changeset {
+          time: b"1e9",
+          ..base
+        },
+        "the time",
+      ),
       (
         Changeset {
           timezone: b"0 1",
@@ -693,11 +700,20 @@ mod tests {
   /// Generated [`Fields`].
   fn fields() -> impl Strategy<Value = Fields> {
     let no_newline = |most: usize| {
-      proptest::collection::vec(any::<u8>().prop_filter("no newline", |byte| *byte != b'\n'), 1..most)
+      proptest::collection::vec(
+        any::<u8>().prop_filter("no newline", |byte| *byte != b'\n'),
+        1..most,
+      )
     };
-    let key = proptest::collection::vec(any::<u8>().prop_filter("no colon", |byte| *byte != b':'), 0..6);
-    let extras =
-      proptest::option::of(proptest::collection::btree_map(key, proptest::collection::vec(any::<u8>(), 0..8), 0..4));
+    let key = proptest::collection::vec(
+      any::<u8>().prop_filter("no colon", |byte| *byte != b':'),
+      0..6,
+    );
+    let extras = proptest::option::of(proptest::collection::btree_map(
+      key,
+      proptest::collection::vec(any::<u8>(), 0..8),
+      0..4,
+    ));
     (
       any::<[u8; 20]>(),
       no_newline(12),
@@ -707,15 +723,17 @@ mod tests {
       proptest::collection::vec(no_newline(8), 0..4),
       proptest::collection::vec(any::<u8>(), 0..24),
     )
-      .prop_map(|(manifest, user, time, timezone, extras, files, description)| Fields {
-        manifest,
-        user,
-        time,
-        timezone,
-        extras,
-        files,
-        description,
-      })
+      .prop_map(
+        |(manifest, user, time, timezone, extras, files, description)| Fields {
+          manifest,
+          user,
+          time,
+          timezone,
+          extras,
+          files,
+          description,
+        },
+      )
   }
 
   proptest! {

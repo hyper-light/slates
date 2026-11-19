@@ -15,10 +15,10 @@
 
 use core::slice::Split;
 
+use crate::Node;
 use crate::node::{from_hex, write_hex};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
-use crate::Node;
 
 /// Format: the byte that ends each line.
 const NEWLINE: u8 = b'\n';

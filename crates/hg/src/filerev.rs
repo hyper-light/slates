@@ -199,7 +199,9 @@ impl<'a> FileRevision<'a> {
   fn check(&self) -> Result<(), EncodeRefusal> {
     match self.metadata {
       None if self.bytes.starts_with(MARKER) => Err(EncodeRefusal::Bytes),
-      Some(block) if find_marker(block).is_some() || bad_line(block).is_some() => Err(EncodeRefusal::Block),
+      Some(block) if find_marker(block).is_some() || bad_line(block).is_some() => {
+        Err(EncodeRefusal::Block)
+      }
       _ => Ok(()),
     }
   }
@@ -351,7 +353,10 @@ mod tests {
     assert_eq!(split(&lone_rev).unwrap().copy(&NULL_NODE), Ok(None));
     let short = split(b"\x01\ncopy: a\ncopyrev: abc\n\x01\nx").unwrap();
     assert_eq!(short.copy(&NULL_NODE), Err(Refusal::Copy));
-    assert_eq!(split(b"x").unwrap().copy(&NULL_NODE), Ok(None::<CopySource<'_>>));
+    assert_eq!(
+      split(b"x").unwrap().copy(&NULL_NODE),
+      Ok(None::<CopySource<'_>>)
+    );
   }
 
   /// A-588 (7.2's `_has_bad_parents` and its doctest). Do: order the parents of a revision with a block and of one
@@ -406,7 +411,10 @@ mod tests {
         pack(&entries, b"", &mut Vec::new()),
         Err(EncodeRefusal::Entry { entry })
       );
-      assert_eq!(packed_len(&entries, b""), Err(EncodeRefusal::Entry { entry }));
+      assert_eq!(
+        packed_len(&entries, b""),
+        Err(EncodeRefusal::Entry { entry })
+      );
     }
     for (revision, refusal) in [
       (

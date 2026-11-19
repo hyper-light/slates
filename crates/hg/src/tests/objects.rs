@@ -186,9 +186,17 @@ fn every_changeset_reads_as_mercurial_reads_it() {
   let wanted = expected("changeset");
   assert_eq!(changesets.len(), wanted.len());
   for (stored, fields) in changesets.iter().zip(wanted) {
-    assert_eq!((stored.link, stored.rev.to_string()), (stored.rev, fields[1].clone()));
+    assert_eq!(
+      (stored.link, stored.rev.to_string()),
+      (stored.rev, fields[1].clone())
+    );
     let read = changeset::decode(stored.text).unwrap();
-    assert_eq!(read.manifest_node(), Ok(to_node(&fields[2])), "{}", stored.rev);
+    assert_eq!(
+      read.manifest_node(),
+      Ok(to_node(&fields[2])),
+      "{}",
+      stored.rev
+    );
     assert_eq!(
       (read.user, read.time, read.timezone),
       (
@@ -218,7 +226,10 @@ fn every_changeset_writes_back_to_its_bytes() {
     let mut out = Vec::new();
     changeset::encode(&read, &mut out).unwrap();
     assert_eq!(out, stored.text, "{}", stored.rev);
-    assert_eq!(changeset::encoded_len(&read), Ok(u64::try_from(stored.full_size).unwrap()));
+    assert_eq!(
+      changeset::encoded_len(&read),
+      Ok(u64::try_from(stored.full_size).unwrap())
+    );
   }
 }
 
@@ -247,7 +258,13 @@ fn every_manifest_reads_as_mercurial_reads_it() {
     let read: Vec<manifest::Entry<'_>> = manifest::decode(stored.text).unwrap().collect();
     let found: Vec<(Vec<u8>, Node, String)> = read
       .iter()
-      .map(|entry| (entry.path.to_vec(), entry.node, flag_letter(entry.flag).to_string()))
+      .map(|entry| {
+        (
+          entry.path.to_vec(),
+          entry.node,
+          flag_letter(entry.flag).to_string(),
+        )
+      })
       .collect();
     let wanted: Vec<(Vec<u8>, Node, String)> = entries
       .iter()
@@ -265,7 +282,10 @@ fn every_manifest_reads_as_mercurial_reads_it() {
     let mut out = Vec::new();
     manifest::encode(&read, &mut out).unwrap();
     assert_eq!(out, stored.text);
-    assert_eq!(manifest::encoded_len(&read), Ok(u64::try_from(stored.full_size).unwrap()));
+    assert_eq!(
+      manifest::encoded_len(&read),
+      Ok(u64::try_from(stored.full_size).unwrap())
+    );
   }
 }
 
@@ -299,7 +319,10 @@ fn every_file_revision_keeps_its_metadata_apart() {
     let mut packed = Vec::new();
     filerev::pack(&entries, read.bytes, &mut packed).unwrap();
     assert_eq!(packed, stored.text);
-    assert_eq!(read.parents_as_stored(stored.p1, stored.p2), (stored.p1, stored.p2));
+    assert_eq!(
+      read.parents_as_stored(stored.p1, stored.p2),
+      (stored.p1, stored.p2)
+    );
   }
   let meta = filerev::split(file("file-meta-0.txt")).unwrap();
   assert_eq!(meta.metadata, Some(&[][..]));
