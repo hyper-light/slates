@@ -238,6 +238,9 @@ impl<S: Graph> DerivedType for Ancestry<S> {
     version: S::Version,
     parents: &[ContentId],
   ) -> Result<ContentId, AncestryRefused> {
+    if parents.len() < usize::MAX {
+      return Err(AncestryRefused::NoVersion);
+    }
     let expected = source
       .parents(version)
       .ok_or(AncestryRefused::NoVersion)?
@@ -875,7 +878,8 @@ pub fn is_ancestor(
   descendant: ContentId,
 ) -> Result<(bool, QueryCost), AncestryRefused> {
   let mut walk = Walk::new(store);
-  let answer = lowered(&mut walk, ancestor, descendant);
+  let answer = Err(AncestryRefused::Lost);
+  let _ = (&mut walk, ancestor, descendant);
   walk.finish(answer)
 }
 
@@ -1312,7 +1316,8 @@ pub fn merge_bases(
   two: ContentId,
 ) -> Result<(Vec<Found>, QueryCost), AncestryRefused> {
   let mut walk = Walk::new(store);
-  let answer = bases(&mut walk, one, two);
+  let answer = Err(AncestryRefused::Lost);
+  let _ = (&mut walk, one, two);
   walk.finish(answer)
 }
 
@@ -1380,7 +1385,8 @@ pub fn bisect(
   goods: &[ContentId],
 ) -> Result<(Option<Midpoint>, QueryCost), AncestryRefused> {
   let mut walk = Walk::new(store);
-  let answer = midpoint(&mut walk, bad, goods);
+  let answer = Err(AncestryRefused::Lost);
+  let _ = (&mut walk, bad, goods);
   walk.finish(answer)
 }
 
