@@ -95,8 +95,6 @@ pub(in crate::store) struct Part {
   pub(in crate::store) len: u64,
   /// Where it begins in its pack.
   pub(in crate::store) start: u64,
-  /// The entries it holds.
-  pub(in crate::store) entries: u64,
 }
 
 /// An object a pack holds whole, as a zlib stream of stored blocks (`stored`).
@@ -372,7 +370,6 @@ pub(in crate::store) fn lay_out(
       content: kept.content,
       len: kept.len,
       start: at,
-      entries: to_u64(kept.placed.len()),
     });
     at = at.saturating_add(kept.len);
   }
