@@ -1723,7 +1723,7 @@ impl<H: LandFs> Landing<'_, H> {
       },
       // A landing's target is a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to,
       // that entry fails alone, with no errno to name.
-      Err(WriteFailure::Host(HostError::Pending)) => Written {
+      Err(WriteFailure::Host(HostError::Pending(_))) => Written {
         outcome: Outcome::Failed { errno: 0 },
         window_ns: None,
       },

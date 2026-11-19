@@ -81,6 +81,14 @@ pub enum WatchState {
   Unavailable,
 }
 
+/// The host's name of one fetch under way (an S3 base's, §4.15 "An S3 base", A-555): a directory's listing, every page of
+/// it, or a run of a file's chunks. Every call that misses on what the fetch brings is answered
+/// [`HostError::Pending`] under this one name, however many calls miss on it, and the fetch's landing settles it once, so a
+/// caller parks each request on the fetch it met and runs it again when that fetch lands. A name is the host's own: it
+/// means nothing to another host, and a host never names two fetches alike while either is under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FetchId(pub u64);
+
 /// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. A refusal the host gives a number is
 /// typed by the numbering it is in (A-527): an errno (`Unavailable`) or a Win32 error code (`Win32`), so a reader that
 /// tells refusals apart by an errno's number never reads a Win32 code as the errno of the same number.
@@ -106,9 +114,9 @@ pub enum HostError {
   /// deadlock avoided by.
   OwnMount(i32),
   /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
-  /// nothing changed, and the same call is answered once the fetch lands. The caller parks the request and runs it
-  /// again then; a host that reads a local disk never answers it.
-  Pending,
+  /// nothing changed, and the same call is answered once the fetch lands. It names that fetch (A-555), so the caller
+  /// parks the request on it and runs it again when it lands; a host that reads a local disk never answers it.
+  Pending(FetchId),
 }
 
 impl std::fmt::Display for HostError {
@@ -121,7 +129,7 @@ impl std::fmt::Display for HostError {
       Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
       Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
-      Self::Pending => f.write_str("the host's fetch is pending"),
+      Self::Pending(FetchId(fetch)) => write!(f, "the host's fetch {fetch} is pending"),
     }
   }
 }

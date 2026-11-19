@@ -548,7 +548,7 @@ pub(crate) fn unavailable_errno(error: HostError) -> i32 {
     }
     // A fetch under way is no errno: the directory is unavailable for no reason the host's errno names, as a base
     // unavailable with no host at all is (`BaseUnavailable(0)`). Recovery over an S3 base is A-524's owed integration.
-    HostError::Pending => 0,
+    HostError::Pending(_) => 0,
   }
 }
 
@@ -865,7 +865,7 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
     // One number past the seam (A-527): a Win32 code as its own.
     HostError::Win32(code) => VfsError::BaseUnavailable(i32::try_from(code).unwrap_or(i32::MAX)),
-    HostError::Pending => VfsError::BasePending,
+    HostError::Pending(fetch) => VfsError::BasePending(fetch),
   }
 }
 

@@ -694,6 +694,10 @@ pub fn errno(e: VfsError) -> i32 {
     VfsError::PublishNeeded => EAGAIN,
     // The file is delegated to an NFSv4 client; its recall was asked for (A-79).
     VfsError::Delegated => EAGAIN,
+    // An S3 base's fetch of what the request reads is under way (A-555): nothing changed, and the request succeeds once
+    // it lands. A transport that parks the request answers it then; this answers one it could not park (the shard's
+    // waits at their bound, or the fetch still pending at the held-reply bound), as a retry. Until A-555 it fell to `EIO`.
+    VfsError::BasePending(_) => EAGAIN,
     // Until A-151 (2026-10-22) this fell to `EIO`, against A-61's text and the volume core's own name for it.
     VfsError::StaleHandle => ESTALE,
     _ => EIO,
@@ -2028,4 +2032,175 @@ fn serve_statfs(
     |s| s.to_bytes(),
     out,
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_bridge_core::{Attachments, OpContext, Rights, View};
+  use slates_db::catalog::{Principal, VolumeId};
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_vfs::base::BaseConfig;
+  use slates_vfs::clock::HostClock;
+  use slates_vfs::host::{
+    BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, WatchState,
+  };
+  use slates_vfs::inode::Fingerprint;
+  use slates_vfs::names::NameEquivalence;
+  use slates_vfs::quota::Quota;
+  use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+
+  use super::{EAGAIN, EIO, dispatch};
+  use crate::abi::{IN_HEADER_LEN, Opcode};
+  use crate::volume_bridge::VolumeBridge;
+
+  /// Shape: the store's page and the pages its region maps: room for an overlay's root.
+  const PAGE: usize = 4096;
+  /// Shape: see [`PAGE`].
+  const REGION_PAGES: usize = 64;
+  /// Shape: the fetch the base's host has under way, whose name every pending answer gives.
+  const FETCH: FetchId = FetchId(7);
+
+  /// A base host whose every read waits on one fetch under way, as an S3 base's does before its first listing lands
+  /// (§4.15 "An S3 base").
+  struct Fetching;
+
+  impl HostFs for Fetching {
+    fn facts(&mut self, _dir: HostDir) -> Result<HostFacts, HostError> {
+      Ok(HostFacts {
+        timestamp_granularity_ns: 1,
+      })
+    }
+    fn fingerprint_dir(&mut self, _dir: HostDir) -> Result<Fingerprint, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn list(&mut self, _dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn open_dir(&mut self, _parent: HostDir, _name: &str) -> Result<HostDir, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn open_file(&mut self, _dir: HostDir, _name: &str) -> Result<HostFile, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn fstat(&mut self, _file: HostFile) -> Result<Fingerprint, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn read_at(&mut self, _file: HostFile, _off: u64, _buf: &mut [u8]) -> Result<usize, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn read_link(&mut self, _dir: HostDir, _name: &str) -> Result<Box<str>, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn close_file(&mut self, _file: HostFile) {}
+    fn close_dir(&mut self, _dir: HostDir) {}
+    fn watch(&mut self, _dir: HostDir) -> WatchState {
+      WatchState::Unavailable
+    }
+    fn hints(&mut self) -> Vec<Hint> {
+      Vec::new()
+    }
+    fn now_ns(&mut self) -> i64 {
+      0
+    }
+  }
+
+  /// A store with room for an overlay's root.
+  fn store() -> Store {
+    let mut arena = ChunkArena::new(PAGE);
+    arena
+      .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    Store::new(
+      &StoreConfig {
+        page: PAGE,
+        cache_line: 128,
+        max_dirs: 16,
+        max_inodes: 64,
+        max_chunks: REGION_PAGES,
+        max_dir_blocks: 16,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    )
+  }
+
+  /// A read-write context on the volume the tests' bridge serves.
+  fn context() -> OpContext {
+    let mut attachments = Attachments::new();
+    let attachment = attachments
+      .attach(
+        VolumeId { bytes: [0; 16] },
+        View::Current,
+        Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap();
+    attachments.context(attachment).unwrap()
+  }
+
+  /// The errno a FUSE `LOOKUP` of `name` in the root of an overlay over [`Fetching`] is answered with, as the kernel
+  /// reads it from the reply's header.
+  fn lookup_errno(name: &str) -> i32 {
+    let mut store = store();
+    let mut volume = Volume::create_overlay(
+      &mut store,
+      VolumeConfig {
+        prefix: 1,
+        names: NameEquivalence::Exact,
+        quota: Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: 1 << 16,
+        clock: Box::new(HostClock::default()),
+      },
+      BaseConfig {
+        root: HostDir(1),
+        facts: HostFacts {
+          timestamp_granularity_ns: 1,
+        },
+        large_class_bytes: 1 << 20,
+      },
+    )
+    .unwrap();
+    let mut bridge = VolumeBridge::with_base(
+      VolumeId { bytes: [0; 16] },
+      &mut volume,
+      &mut store,
+      Box::new(Fetching),
+    );
+    let mut body = name.as_bytes().to_vec();
+    body.push(0);
+    let mut message = vec![0u8; IN_HEADER_LEN];
+    message[0..4].copy_from_slice(
+      &u32::try_from(IN_HEADER_LEN + body.len())
+        .unwrap()
+        .to_le_bytes(),
+    );
+    message[4..8].copy_from_slice(&Opcode::Lookup.to_wire().to_le_bytes());
+    message[8..16].copy_from_slice(&1u64.to_le_bytes());
+    message[16..24].copy_from_slice(&1u64.to_le_bytes());
+    message.extend_from_slice(&body);
+    let mut out = vec![0u8; PAGE];
+    dispatch(&message, &mut bridge, &context(), &mut out);
+    -i32::from_le_bytes(out[4..8].try_into().unwrap())
+  }
+
+  /// A-555 (§4.15 "An S3 base"): do look a name up in the root of an overlay whose base is still fetching its root's
+  /// listing. Expect `EAGAIN`, the retry a delegated file's recall is answered with: nothing changed, and the same
+  /// request succeeds once the fetch lands. A daemon parks the request on its fetch where it can; this is the answer
+  /// for one it could not park. Before A-555 a pending base fell to `EIO`, which tells a program its store failed.
+  #[test]
+  fn a_lookup_in_a_base_still_fetching_is_answered_a_retry_never_eio() {
+    let errno = lookup_errno("a.txt");
+    assert_eq!(
+      errno, EAGAIN,
+      "the base is fetching, not failed (EIO is {EIO})"
+    );
+  }
 }

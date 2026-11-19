@@ -29,6 +29,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+// A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
+mod base_wait;
 pub mod catalog;
 pub mod config;
 mod consensus;
