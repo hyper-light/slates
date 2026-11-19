@@ -406,6 +406,52 @@ pub fn for_each<E>(
   Ok(())
 }
 
+/// Visits every inode handle reachable from `root` whose number's counter is past `after`'s, in ascending number order
+/// (the order [`walk`] yields), until `visit` breaks; `Break` when it broke, so a caller resumes after the last inode
+/// it was given (A-548's slices of a takeover round walk the whole table this way). A walk resumed after an inode
+/// enters only the nodes on that inode's path and the subtrees past it, never the inodes before it. `after` is compared
+/// by its counter, the trie's key, so it is a number of the table's own volume.
+pub fn visit_after(
+  nodes: &Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  after: Option<InodeNo>,
+  visit: &mut dyn FnMut(Handle<Inode>) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
+  visit_node_after(nodes, root, 0, after, visit)
+}
+
+/// One node of [`visit_after`]'s walk, at `level`. `after` is `Some` only for a node on its path: the slots before its
+/// digit hold numbers below it and are skipped, the slot at its digit is entered bounded by it, and every slot past it
+/// is walked whole. An inode in `after`'s own slot is `after` itself, which the walk resumes past. The recursion is as
+/// deep as the trie, [`LEVELS`].
+fn visit_node_after(
+  nodes: &Slab<TrieNode>,
+  node: Handle<TrieNode>,
+  level: u32,
+  after: Option<InodeNo>,
+  visit: &mut dyn FnMut(Handle<Inode>) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
+  let Ok(n) = nodes.get(node) else {
+    return std::ops::ControlFlow::Continue(());
+  };
+  let from = after.map_or(0, |after| digit(after, level));
+  for (d, slot) in n.slots.iter().enumerate().skip(from) {
+    let bound = after.filter(|_| d == from);
+    match *slot {
+      Slot::Empty => {}
+      Slot::Node(child) => {
+        visit_node_after(nodes, child, level.saturating_add(1), bound, visit)?;
+      }
+      Slot::Inode(handle) => {
+        if bound.is_none() {
+          visit(handle)?;
+        }
+      }
+    }
+  }
+  std::ops::ControlFlow::Continue(())
+}
+
 /// One inode's record before and after a span: `None` on a side whose table has no such number.
 pub type ChangedRecord = (Option<Handle<Inode>>, Option<Handle<Inode>>);
 
@@ -505,6 +551,106 @@ mod tests {
     root: Handle<TrieNode>,
     a: Handle<Inode>,
     b: Handle<Inode>,
+  }
+
+  /// A-548 (a takeover round walks the whole table in slices). Do: put inodes at counters spread over the trie's levels
+  /// (runs, digit boundaries at several levels, the derived bit); walk from no bound, from every counter, from each
+  /// counter's neighbours and from past them all; then walk in slices that break after k inodes for k from 1 to 4, each
+  /// resuming after the last inode the slice before was given. Expect each walk to give exactly the inodes past its
+  /// bound, in ascending order, and the slices joined to be the whole walk.
+  #[test]
+  fn a_walk_after_any_number_gives_the_inodes_past_it_in_order_and_slices_join_whole() {
+    let counters: Vec<u64> = vec![
+      1,
+      2,
+      3,
+      15,
+      16,
+      17,
+      255,
+      256,
+      4_095,
+      4_096,
+      4_097,
+      65_535,
+      65_536,
+      1 << 20,
+      (1 << 20) + 1,
+      1 << 40,
+      (1 << 47) + 5,
+    ];
+    let mut nodes: Slab<TrieNode> = Slab::new(64, 1 << 16);
+    let mut inodes: Slab<Inode> = Slab::new(64, 1 << 16);
+    let mut dead = Deadlist::default();
+    let mut root = new_root(&mut nodes, Epoch(0)).unwrap();
+    for &counter in &counters {
+      let handle = inode(&mut inodes, counter);
+      root = set(
+        &mut nodes,
+        root,
+        InodeNo::compose(1, counter),
+        handle,
+        Epoch(0),
+        &mut dead,
+      )
+      .unwrap()
+      .0;
+    }
+    let counter_of = |handle: Handle<Inode>| inodes.get(handle).unwrap().no.counter();
+    let walked = |after: Option<u64>| -> Vec<u64> {
+      let mut seen = Vec::new();
+      let flow = visit_after(
+        &nodes,
+        root,
+        after.map(|after| InodeNo::compose(1, after)),
+        &mut |handle| {
+          seen.push(counter_of(handle));
+          std::ops::ControlFlow::Continue(())
+        },
+      );
+      assert!(flow.is_continue(), "a walk that never breaks ends whole");
+      seen
+    };
+    assert_eq!(walked(None), counters, "no bound: every inode, ascending");
+    let mut bounds: Vec<u64> = counters
+      .iter()
+      .flat_map(|&counter| [counter - 1, counter, counter + 1])
+      .collect();
+    bounds.push((1 << 47) + 6);
+    for after in bounds {
+      let past: Vec<u64> = counters
+        .iter()
+        .copied()
+        .filter(|&counter| counter > after)
+        .collect();
+      assert_eq!(walked(Some(after)), past, "the inodes past {after}");
+    }
+    for per_slice in 1..=4 {
+      let mut joined = Vec::new();
+      let mut after: Option<u64> = None;
+      loop {
+        let mut taken = 0;
+        let bound = after.map(|after| InodeNo::compose(1, after));
+        let flow = visit_after(&nodes, root, bound, &mut |handle| {
+          let counter = counter_of(handle);
+          joined.push(counter);
+          after = Some(counter);
+          taken += 1;
+          if taken == per_slice {
+            std::ops::ControlFlow::Break(())
+          } else {
+            std::ops::ControlFlow::Continue(())
+          }
+        });
+        if flow.is_continue() {
+          break;
+        }
+      }
+      assert_eq!(
+        joined, counters,
+        "slices of {per_slice} join to the whole walk"
+      );
+    }
   }
 
   fn two_inodes() -> Fixture {

@@ -4744,6 +4744,161 @@ mod tests {
     replaced: u64,
   }
 
+  /// Shape: the bytes a file of the volume holds as of the last publication.
+  const PUBLISHED: &[u8] = b"published, kept!";
+  /// Shape: the bytes a write shows over [`PUBLISHED`] after the last publication and the death loses, as long as it.
+  const UNPUBLISHED: &[u8] = b"shown, then lost";
+  /// Shape: the bytes an outsider writes over a base file in place while no daemon runs.
+  const EDITED: &[u8] = b"the outsider's edit, in place";
+
+  /// The store a restarted daemon rebuilds into (A-64): a fresh [`store`] holding `old`'s region bytes at the same
+  /// offsets, as the anchor's RAM survives the daemon.
+  fn surviving(old: &Store) -> Store {
+    let mut fresh = store();
+    for index in 0..old.content.arena().regions() {
+      let index = u16::try_from(index).unwrap();
+      let bytes = old
+        .content
+        .arena()
+        .region(index)
+        .map(|region| region.bytes().to_vec())
+        .unwrap();
+      fresh
+        .content
+        .arena_mut()
+        .region_mut(index)
+        .unwrap()
+        .bytes_mut()
+        .copy_from_slice(&bytes);
+    }
+    fresh
+  }
+
+  /// A successor's rebuild of `image`, the dead daemon's last publication, over `host`, into the store its anchor kept
+  /// of `old`'s.
+  fn rebuilt(
+    old: &Store,
+    image: &crate::recover::VolumeImage,
+    host: &mut SimHost,
+  ) -> (Volume, Store) {
+    let mut kept = surviving(old);
+    let claims = crate::recover::Claims::prepare(&mut kept, std::iter::once(image)).unwrap();
+    let root = host.root();
+    let volume = Volume::from_image(
+      &mut kept,
+      image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+      Some((&mut *host, root)),
+    )
+    .unwrap();
+    (volume, kept)
+  }
+
+  /// The inodes a takeover walk visits, walked whole.
+  fn walked(
+    walk: impl FnOnce(&mut dyn FnMut(u64) -> std::ops::ControlFlow<()>) -> bool,
+  ) -> Vec<u64> {
+    let mut seen = Vec::new();
+    let whole = walk(&mut |ino| {
+      seen.push(ino);
+      std::ops::ControlFlow::Continue(())
+    });
+    assert!(whole, "a walk that never breaks visits the whole set");
+    seen
+  }
+
+  /// A-573 (B10 (a); §4.6, a mount taken over by a restarted daemon; A-158). Do: on an overlay, make a file holding
+  /// [`PUBLISHED`] and publish; after the publication, mount 41's kernel looks the file up and a write shows it
+  /// [`UNPUBLISHED`], which no publication takes; the daemon dies, and a successor rebuilds from the publication.
+  /// Expect: the successor holds [`PUBLISHED`], never the bytes the kernel was shown; the mount's restored references
+  /// do not name the file, since its lookup came after the publication; and the takeover walk of the head names it, so
+  /// the kernel's pages of the lost write are invalidated. Before A-573 the round named only the restored references
+  /// and the replay, and the kernel kept serving bytes the successor never had.
+  #[test]
+  fn a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover() {
+    let mut host = SimHost::new();
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    let root = vol.root_inode(&store).unwrap();
+    let file = vol
+      .with_host(&mut host)
+      .create_file_no(&mut store, root, "draft", 0o644)
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .write(&mut store, file, 0, PUBLISHED)
+      .unwrap();
+    let image = vol.to_image(&store, Some(&mut host)).unwrap();
+    vol
+      .reference_for(&store, file, RefOwner::Attachment(KERNEL))
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .write(&mut store, file, 0, UNPUBLISHED)
+      .unwrap();
+    host.close_files();
+    let (mut successor, mut kept) = rebuilt(&store, &image, &mut host);
+    assert_eq!(
+      read_no(&mut successor, &mut host, &mut kept, file).unwrap(),
+      PUBLISHED,
+      "the successor never had the bytes the kernel was shown"
+    );
+    assert!(
+      !walked(|visit| successor.visit_takeover_inodes(RefOwner::Attachment(KERNEL), None, visit))
+        .contains(&file.0),
+      "premise: no restored reference names a file looked up after the last publication"
+    );
+    assert!(
+      walked(|visit| successor.visit_head_inodes(&kept, None, visit)).contains(&file.0),
+      "the takeover names the file the kernel read the lost write through"
+    );
+  }
+
+  /// A-573 (B10 (b); §4.6, A-151, A-158). Do: on an overlay over a base holding a file, look the file up (its directory
+  /// loaded, an inode issued) and publish; after the publication, mount 41's kernel looks the file up and caches its
+  /// pages; the daemon dies, an outsider writes the file in place while no daemon runs, and a successor rebuilds from
+  /// the publication over the same base. Expect: the successor reads the outsider's bytes through the file's inode; no
+  /// restored reference names the file; and the takeover walk of the head names it, so the kernel's pages of the old
+  /// bytes are invalidated. Before A-573 nothing named it: its names and attributes revalidate within the base's
+  /// timestamp granularity, but its pages stayed, the old bytes served after the outsider's edit.
+  #[test]
+  fn a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit()
+   {
+    let mut host = SimHost::new();
+    host.replace_file("/notes", OPENED);
+    host.advance_ns(STEP_NS);
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    let file = vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/notes")
+      .unwrap()
+      .inode;
+    let image = vol.to_image(&store, Some(&mut host)).unwrap();
+    vol
+      .reference_for(&store, file, RefOwner::Attachment(KERNEL))
+      .unwrap();
+    host.close_files();
+    host.write_in_place("/notes", EDITED, STEP_NS);
+    let (mut successor, mut kept) = rebuilt(&store, &image, &mut host);
+    assert_eq!(
+      read_no(&mut successor, &mut host, &mut kept, file).unwrap(),
+      EDITED,
+      "the successor reads the outsider's edit through the file's inode"
+    );
+    assert!(
+      !walked(|visit| successor.visit_takeover_inodes(RefOwner::Attachment(KERNEL), None, visit))
+        .contains(&file.0),
+      "premise: no restored reference names a file looked up after the last publication"
+    );
+    assert!(
+      walked(|visit| successor.visit_head_inodes(&kept, None, visit)).contains(&file.0),
+      "the takeover names the base file the kernel cached the old bytes of"
+    );
+  }
+
   /// A base file opened as a mount's `OPEN` does, its directory's listing current, then a digest of its path with an
   /// outsider's replacement of the file landing just before seam call `call` of the digest.
   fn raced_at(call: u64) -> Raced {

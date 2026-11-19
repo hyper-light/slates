@@ -5982,10 +5982,50 @@ impl Volume {
     self.replayed.insert(no);
   }
 
-  /// Visits the inodes whose cached state the kernel of `owner`'s mount, taken over by this daemon, may hold older than
-  /// the volume's (A-158), in inode order and each once, starting after inode `after`, until `visit` breaks. Returns
-  /// whether every one was visited; an inode `visit` breaks on was visited. The set is every inode the recovery gave
-  /// back a reference of to `owner`, with any it has taken since, and every inode the write-log replay wrote.
+  /// Visits every inode of the head (A-573), in the table's order (by counter, the number's low bits: a clone's own and
+  /// its origin's inodes in one order), starting past inode `after`, until `visit` breaks. Returns whether every one
+  /// was visited; an inode `visit` breaks on was visited. The set a mount of the head that this daemon took over may
+  /// hold cached otherwise than this daemon holds it ([`Volume::visit_takeover_inodes`] is a pinned view's).
+  ///
+  /// Why every one: an acknowledged change is durable before its reply, a mutation's by the publication its reply waits
+  /// for and a FUSE write's in the write log (A-63), and a publication records the references its kernel held then
+  /// (A-61). But a kernel's lookup made after the last publication is in no image, and such a kernel can hold what this
+  /// daemon never had or holds otherwise: the bytes a mutation showed before its publication, which the death lost (a
+  /// dirty read), and the pages of a base file an outsider changed while no daemon ran its watcher. This daemon cannot
+  /// tell which inodes a kernel looked up after the last publication, so it names every one it holds, each a
+  /// `FUSE_NOTIFY_INVAL_INODE` the transport sends, which costs nothing for an inode the kernel never cached. Every
+  /// reference a current view takes and every inode the write-log replay writes is an inode of the head, so they are in
+  /// the walk. A number the dead daemon issued after its last publication is in no image and in no head: it is refused,
+  /// never served (`NotFound`), and named by no walk until a publication records the counter it was issued below
+  /// (GAPS).
+  ///
+  /// The walk resumes past `after`, so a transport sends the set in bounded slices, each entering the table's nodes on
+  /// `after`'s path and those past it ([`trie::visit_after`]).
+  pub fn visit_head_inodes(
+    &self,
+    store: &Store,
+    after: Option<u64>,
+    visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> bool {
+    trie::visit_after(
+      &store.tries,
+      self.inode_root,
+      after.map(InodeNo),
+      &mut |handle| match store.inodes.get(handle) {
+        Ok(inode) => visit(inode.no.0),
+        Err(_) => std::ops::ControlFlow::Continue(()),
+      },
+    )
+    .is_continue()
+  }
+
+  /// Visits the inodes whose cached state the kernel of `owner`'s mount of a pinned view, taken over by this daemon,
+  /// may hold older than the volume's (A-158), in inode order and each once, starting after inode `after`, until
+  /// `visit` breaks. Returns whether every one was visited; an inode `visit` breaks on was visited. The set is every
+  /// inode the recovery gave back a reference of to `owner`, with any it has taken since, and every inode the write-log
+  /// replay wrote. A mount of the head names every inode of the head instead ([`Volume::visit_head_inodes`], A-573),
+  /// since a lookup made after the last publication is in no image; a pinned view's version takes no head change, so a
+  /// mutation the death lost never showed through it.
   ///
   /// Why these and no others: every change acknowledged before a crash is durable, a mutation's by the publication its
   /// reply waits for and a FUSE write's in the write log (A-63). A kernel can hold state of an inode older than a
