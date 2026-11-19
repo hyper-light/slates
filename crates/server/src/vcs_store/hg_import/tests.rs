@@ -513,3 +513,42 @@ fn diag_a687_landing_refusal() {
     panic!("DIAG changes {shown:?} appended {appended:?}");
   });
 }
+
+/// Diagnostic (not for main): `states` with one bookmark, `one` at its changeset.
+const ONE_BOOKMARK: &[u8] = b"baa257697fd21c2c951df2f7ba0370ab6db8fa10 one\n";
+
+/// Diagnostic (not for main): an import of `states` holding one bookmark lands, and a recovery's own steps (every green
+/// rebuilt from its records, the store made again from the log) serve the same rows, roots and bookmark heads.
+#[test]
+fn diag_a687_one_bookmark_lands_and_recovers() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    let files: Vec<(&'static str, &'static [u8])> = STATES
+      .iter()
+      .map(|&(path, bytes)| if path == "bookmarks" { (path, ONE_BOOKMARK) } else { (path, bytes) })
+      .collect();
+    assert_eq!(begin(state, id, directory(files)), Ok(()));
+    assert!(to_its_end(state, id).1.is_ok());
+    assert_eq!(land(state, id), Ok(()));
+    let before = (rows_of(state, id), roots_of(state, id), heads_under(state, id, BOOKMARK_TAG));
+    assert!(!before.0.is_empty() && !before.1.is_empty() && before.2.len() == 1, "{:?}", (before.1.len(), &before.2));
+    drop(std::mem::take(&mut state.greens));
+    let mut greens: Vec<slates_db::catalog::VolumeRecord> = state
+      .db
+      .partition()
+      .volumes()
+      .into_iter()
+      .filter(|record| matches!(record.policy.role, slates_db::catalog::Role::Green { .. }))
+      .cloned()
+      .collect();
+    greens.sort_by_cached_key(|record| crate::verbs::member_rank(state, record.id));
+    for record in &greens {
+      drop(crate::verbs::rebuild_member(state, record));
+    }
+    let replayed = count(state, super::super::REPLAYED);
+    super::super::rebuild(state, id);
+    let after = (rows_of(state, id), roots_of(state, id), heads_under(state, id, BOOKMARK_TAG));
+    assert_eq!(count(state, super::super::REPLAYED), replayed + 1);
+    assert_eq!(after, before);
+  });
+}
