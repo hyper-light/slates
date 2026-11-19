@@ -2837,6 +2837,12 @@ pub struct RegionalConfiguration {
   /// the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until the
   /// first seat is recorded. Bounded by the members.
   pub voters: Vec<HostId>,
+  /// The members whose settled neighbourhood certifies their content (A-546): settled by a build whose owner reports a
+  /// neighbourhood placed only once every volume it owns is placed within it, content too, so no head it serves names a
+  /// holder outside its neighbourhoods, and a holder outside them lets a copy's stale content go. Every member this
+  /// build forms, admits or settles is in it; one read from a configuration an older build wrote (regional layout 5 or
+  /// 6) is not, and its holders keep the content (A-508). Bounded by the members.
+  pub settle_certified: std::collections::BTreeSet<HostId>,
 }
 
 /// One object's explicit move off its creator's line ([`RegionalConfiguration::moved`]).
@@ -2909,14 +2915,16 @@ impl RegionalConfiguration {
       completed: std::collections::BTreeMap::new(),
       moved: std::collections::BTreeMap::new(),
       voters: Vec::new(),
+      settle_certified: std::collections::BTreeSet::new(),
     };
     config.fix_neighbourhoods(scatter);
-    // A formed region owns nothing yet: every member's first neighbourhood is already settled.
+    // A formed region owns nothing yet: every member's first neighbourhood is already settled, its content with it.
     config.settled = config
       .neighbourhoods
       .iter()
       .map(|(owner, neighbourhood)| (*owner, Settled::of(neighbourhood, &config.domains)))
       .collect();
+    config.settle_certified = config.members.iter().copied().collect();
     config
   }
 
@@ -3042,6 +3050,7 @@ impl RegionalConfiguration {
     if let Some(neighbourhood) = self.neighbourhoods.get(&member) {
       let settled = Settled::of(neighbourhood, &self.domains);
       self.settled.insert(member, settled);
+      self.settle_certified.insert(member);
     }
     true
   }
@@ -3062,6 +3071,7 @@ impl RegionalConfiguration {
     let Some(version) = self.version.checked_add(1) else {
       return false;
     };
+    self.settle_certified.remove(&member);
     let settled = self.settled.remove(&member).or_else(|| {
       self
         .neighbourhoods
@@ -3150,6 +3160,8 @@ impl RegionalConfiguration {
     };
     let settled = Settled::of(neighbourhood, &self.domains);
     self.settled.insert(owner, settled);
+    // This build's owner reports a neighbourhood placed only once its content is placed within it too (A-546).
+    self.settle_certified.insert(owner);
     self.version = version;
     true
   }
@@ -3604,6 +3616,12 @@ impl RegionalConfiguration {
     !self.moved.contains_key(&object.placement_key())
       && self.confirmed_for(writer, object)
       && self.within_tolerance(writer, object)
+  }
+
+  /// Whether `owner`'s settled neighbourhood certifies its content (A-546, [`RegionalConfiguration::settle_certified`]):
+  /// no head it serves names a holder outside its neighbourhoods.
+  pub fn settle_certifies_content(&self, owner: HostId) -> bool {
+    self.settle_certified.contains(&owner)
   }
 
   /// Whether `departed`'s takeover's confirmations certify their content (A-538): its kept retirement or its completion
@@ -6669,6 +6687,40 @@ mod tests {
       (kept, recorded, older, regional.certifies_content(HostId(2))),
       (true, true, false, false),
       "certified on its retirement and its record, not once read as older, never for a host not retired"
+    );
+  }
+
+  /// A-546: every settle this build records certifies its owner's content, and a retired member's mark goes. Do: form a
+  /// five-member region and judge each member; admit a sixth and judge it; take a member over and judge the others and
+  /// the retired one; have a member whose neighbourhood moved report it settled, after clearing its mark as a
+  /// configuration an older build wrote has it, and judge it before and after. Expect every formed and admitted member
+  /// certified, the retired one not, and the cleared member certified again by its settle.
+  #[test]
+  fn a_settle_this_build_records_certifies_its_content() {
+    let (mut regional, scatter) = wide_region();
+    let formed = regional
+      .members
+      .iter()
+      .all(|member| regional.settle_certifies_content(*member));
+    assert!(regional.admit(HostId(6), None, scatter));
+    let admitted = regional.settle_certifies_content(HostId(6));
+    regional.take_over(HostId(1), scatter);
+    let retired = regional.settle_certifies_content(HostId(1));
+    let mover = regional
+      .members
+      .iter()
+      .copied()
+      .find(|member| regional.settles(*member, regional.neighbourhoods[member].generation))
+      .expect("a member whose neighbourhood moved");
+    regional.settle_certified.remove(&mover);
+    let before = regional.settle_certifies_content(mover);
+    let generation = regional.neighbourhoods[&mover].generation;
+    assert!(regional.settle(mover, generation));
+    let after = regional.settle_certifies_content(mover);
+    assert_eq!(
+      (formed, admitted, retired, before, after),
+      (true, true, false, false, true),
+      "formed and admitted members certified, the retired one not, a settle certifying again"
     );
   }
 

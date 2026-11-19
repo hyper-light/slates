@@ -9124,6 +9124,13 @@ it builds against the contract and adds to it rather than around it.
 > line's alone, and kiln, which reaches slates only through this library, could not bind an agent's volume into its
 > container.
 
+> **`CONTRACT` = 45 (A-537):** a busy unmount names its holders and is typed on Linux too. `MountFault::Busy` carries
+> `MountHolders`, the processes the kernel's own tables show holding the mount, read on that refusal alone without
+> touching it (Linux: each process's descriptors, working and root directories under `/proc`, `statx`ed with
+> `AT_STATX_DONT_SYNC` and compared by device), with `HoldersUnread` saying why none were read (macOS: every libproc
+> answer stats the file). On Linux a plain `fusermount3 -u` refused while the table still lists the mount is
+> `MountFault::Busy`, where it was `MountFault::Unmount` with the helper's exit.
+
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
 to=None)` moves the base to the head (or a named version) or raises with windows;
@@ -35864,7 +35871,7 @@ Applied in the same change to: A-303's entry (its "Not here", the second item ma
 - **Found beside it, not changed here.** A clone's live-inode count starts as its origin's head count at the clone,
   not its snapshot's (`clone_inner`'s `live_inodes`), so a clone made after its origin changed counts the inodes
   against its allowance wrongly until a restart recounts them; a carried orphan's reclaim moves that count as any
-  reclaim does. Filed for main.
+  reclaim does. Filed for main (fixed since, A-541, 2026-11-19).
 
 ### A-531 — The ra_svn item codec: words, numbers, strings and lists read resumably within bounds the caller derives, and written as svnserve writes them (2026-11-19, g292 for UI goal 91; §4.17.4 "5. The wire" and piece 2; A-500)
 Applied in the same change to: §4.17.4 (a status block, the ra_svn paragraph's bounds, piece 2), GAPS (the §4.17.4
@@ -36134,3 +36141,112 @@ holds through `own_nfs::hold`), and the record literals in
   passed restored, A-511's 5 with them.
 - **Owed.** Main's runs: the db integration tests (`model`, `wire_order`), and the live macOS mount suite across a
   restart with a mount unmounted while no daemon ran.
+
+### A-546 — An owner's settle certifies its content, and a holder its neighbourhood left lets the content go (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Neighbourhood changes"; §4.10 "the healer"; the content release signal for live owners; A-508, A-538)
+Applied in the same change to: GAPS (A-529's entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::settle_certified`, `settle_certifies_content`), `crates/cluster/src/raft_wire.rs` (regional
+layout 7; layouts 6 and 5 still read, their settles uncertified), `crates/server/src/fleet.rs`
+(`content_placed_on_current_neighbourhood` in the settle report, `unsettled_replace` in the healer,
+`fleet.heal.unsettled_replaced`) and `crates/server/src/takeover.rs` (`let_go_settled_away`'s certified case,
+`fleet.settle.released_content`).
+- **What was there.** A-508 let a live owner's copy go from a holder outside all of the owner's neighbourhoods. The
+  copy was kept whole while its content was held, since the owner's head might still name this holder.
+- **The rule.** An owner reports its neighbourhood placed only once every volume it owns is served from within it, as
+  well as its records: each head snapshot's placement names only the owner and hosts of its current neighbourhood.
+  While the change is in flight, the healer replaces a placement naming a host outside that neighbourhood, where it
+  would otherwise restore it. So a settle certifies that no head the owner serves names a holder outside its
+  neighbourhoods. A-508's holder then lets go the content its own records name (A-538's
+  `content_retention::release_certified`), and keeps a placement ahead of them.
+- **Mixed fleets.** The configuration lists the members whose settle certifies their content: every member this build
+  forms, admits or settles, a retired member's mark going with it. Regional layout 7 adds that list after the settled
+  neighbourhoods. A configuration of layout 6 or 5 is read with every settle uncertified, and its holders keep the
+  content.
+- **The cost.** A neighbourhood change now re-places the content of every owned volume whose placement names a host it
+  dropped, before the owner settles. Main measures it: bytes per change, and the time to settle.
+- **Tests.** `a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go` (red before: kept whole).
+  `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` now runs on an uncertified settle; red
+  with an uncertified settle's content let go. `an_unsettled_owners_placement_outside_its_current_neighbourhood_is_replaced`,
+  `a_settle_this_build_records_certifies_its_content`, and the layout test (layouts 6 and 5 read uncertified). Kiln on
+  the Mac Studio, 2026-11-19, debug: `slates-db` `register::` 87 of 87, `slates-cluster` `raft_wire::` 22 of 22,
+  `slates-server` takeover, retention, healer and holder tests 35 of 35. Red once on a mutated copy that let an
+  uncertified settle's content go: the uncertified test lost the head at its first install (`(false, false)`).
+
+### A-541 — A clone counts its snapshot's inodes, whatever its origin made or removed since (2026-11-19, goal 85; found by A-532; §4.2's inode dimension, §4.4 snapshots and clones, D-5)
+Applied in the same change to: A-532's entry (its finding marked fixed); GAPS, §8c (the fix and the siblings left open);
+the bug record `docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`; and:
+- `crates/vfs`: `snapshot.rs` (`Snapshot::live_inodes`); `volume.rs` (`Volume::snapshot` records the head's count,
+  `clone_inner` starts the clone from it, `clone_of`'s notes; the lib test module `clone_count_tests`, new);
+  `recover.rs` (`rebuild_snapshot` gives a recovered snapshot its tree's count, its image's entries).
+
+- **What was there.** A clone's live-inode count, which its inode allowance is judged against (`next_no`), was its
+  origin's count at the moment of the clone. The clone's tree is its snapshot's, so every file the origin made after
+  the snapshot counted against the clone and every file it removed did not, until a restart recounted the clone from
+  its image. Measured: an origin with a directory and three files at its snapshot, five files made and one removed
+  since, cloned: 9 counted where the tree holds 5.
+- **The rule.** A snapshot keeps the head's count when it is taken, as it keeps `referenced_bytes`, and a clone starts
+  from the snapshot's, as it starts its bytes from it. A recovered snapshot's count is its tree's: its image's entries,
+  each imaged once in full or shared, as the head's own count is rebuilt, so the image's layout does not change.
+- **Tests.** The lib tests of `crates/vfs/src/volume.rs`, `clone_count_tests`, compare each volume's count with the
+  recount a restart makes of its tree (its image's inodes and the numbers it shares with its origin) after every step,
+  as the oracle tests compare both counters: an origin changed since its snapshot, its clone, a file made and an
+  inherited one removed in the clone, a clone of the clone's snapshot; an allowance of one more inode than the clone's
+  tree holds admits exactly one file, then `NoSpace`; and across a restart, the rebuilt clone and a clone of the
+  recovered snapshot.
+- **Evidence.** Red first, on main `fba7cd888` with the tests alone, on the Mac Studio (2026-11-19): both tests failed
+  at the first clone, `left: 9, right: 5`. Green with the change, the same machine: `cargo test --locked -p slates-vfs
+  --lib` 79 passed, 1 ignored.
+- **The sweep for siblings** (every counter a clone, a restore or an adoption takes from the live origin rather than
+  the frozen state), reported and not changed, with their effects in the bug record:
+  - the server's clone admission reads the clone's inherited inodes from the origin's head count
+    (`verbs::admit_clone`'s `inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic
+    clone's version hold), where it should read the snapshot's, now recorded;
+  - a clone's live-entry count (`clone_inner`'s `live_entries`, §4.2's namespace dimension) is its origin's head's,
+    until a restart recounts it.
+  Correct as they are: the inode counter (continued from the origin's on purpose, so numbers stay unique), the bytes,
+  the base plane's frozen views, the carried orphans (A-532), a restore's references (the saved tables), the clone's
+  own retention, and every count a recovery or a move's adoption rebuilds from an image.
+
+### A-537 — A busy unmount names its holders from the kernel's own tables, and Linux's is typed by the mount table (2026-11-18, g230, UI goal 85; A-507's two owed items; §4.6; `CONTRACT` = 45)
+Applied in the same change to: §4.6's contract log (`CONTRACT` = 45), GAPS (the library's mount entry), `docs/library.md`,
+`crates/bridge-oci/src/mount_holders.rs` (new) and `mount_table.rs` (`MAJOR_SHIFT` shared), `crates/api/src/mount.rs`
+(`judged`, `still_listed`, `named`, `holders_from`), `crates/api/src/error.rs` (`MountFault::Busy::holders`,
+`MountHolders`, `HoldersUnread`), and `crates/api/src/lib.rs` (`CONTRACT` = 45, the re-exports).
+- **What was owed.** A-507 typed macOS's busy unmount by `unmount(2)`'s `EBUSY`, but Linux's `fusermount3 -u` reports no
+  error number: a refused `umount2(2)` prints "failed to unmount %s: %s" and the helper exits 1, as it does for a mount
+  not the caller's (libfuse `util/fusermount.c`: `unmount_fuse_locked`, `may_unmount`, `err_out`). So a busy Linux mount
+  answered `Unmount` with exit 1. And no busy refusal said which processes held the mount.
+- **The rule, Linux's busy refusal.** Judged by the kernel's table, as A-507 judges macOS: for the caller's own FUSE
+  mount, still listed after a plain unmount its helper refused (an exit and no error number), the refusal is
+  `Busy`. A refused detach (`-z`) stands as the helper's exit, and so does any refusal that names an error number
+  (`mount::still_listed`).
+- **The rule, the holders.** Every `Busy` is answered with `MountHolders`, read then, on that refusal alone, from the
+  kernel's own tables and never through the mount (`slates_bridge_oci::mount_holders::holders`). On Linux: every
+  process `/proc` lists, and of each its descriptors (`/proc/<pid>/fd`, "a symbolic link to the actual file",
+  proc_pid_fd(5)) and its `cwd` and `root` links, each `statx`ed with `AT_STATX_DONT_SYNC` ("just take whatever the
+  system has cached if possible", statx(2)), so no request reaches the FUSE daemon, and compared by device
+  (`stx_dev_major`/`stx_dev_minor`, "the device on which this file (inode) resides") with the mount's
+  (`mountinfo`'s `major:minor`). A process whose links the caller may not follow (proc_pid_fd(5): "a ptrace access
+  mode `PTRACE_MODE_READ_FSCREDS` check", so another user's) is counted unreadable, since it may hold the mount too;
+  one that exits meanwhile is passed by. The read is bounded by what the kernel states: `pid_max` processes
+  (proc_sys_kernel(5)) and `nr_open` descriptors a process (proc_sys_fs(5)), a listing past either refused
+  `HoldersUnread::PastBound`. A device is a superblock's, so a file held through another bind mount of the same
+  filesystem is named too; slates makes no bind mount of its own.
+- **macOS: not read, by judgment.** Apple's `proc_listpidspath` begins with `stat(2)` of the path
+  (`libsyscall/wrappers/libproc/proc_listpidspath.c` in xnu, line 83), and every libproc flavor that reports a file
+  (`PROC_PIDFDVNODEINFO`, `PROC_PIDVNODEPATHINFO`) is filled by xnu's `fill_vnodeinfo` (`bsd/kern/proc_info.c`), which
+  runs `vn_stat`, a `VNOP_GETATTR`, before it reads the vnode's filesystem id. The slates mount on macOS is a `hard`
+  loopback NFS mount, on which either waits without bound once its daemon has gone, the case a busy unmount meets and
+  the reason A-507 names the mount point without touching it. A library call that may wait forever is what §2 items 8
+  and 9 forbid, so macOS answers `HoldersUnread::NoReader`; a reader that does not ask the filesystem is owed (GAPS).
+- **Tests.** `crates/api/src/mount.rs`: `a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy` and
+  `a_busy_mounts_holders_are_named_as_the_kernel_listed_them` (every Unix host); `an_unmount_is_believed_only_when_the_table_agrees`
+  and `the_kernels_unmount_refusals_are_typed` (updated). `crates/bridge-oci/src/mount_holders.rs`:
+  `a_tally_names_each_holder_once_in_order_and_counts_the_unreadable`, `a_listing_past_its_kernels_bound_is_refused_typed`,
+  `only_an_all_digit_proc_entry_is_a_process` (every host), `the_caller_is_named_holding_the_mount_its_root_is_on`
+  (Linux, by use: this process's root is on `/`), `macos_reads_no_holder_and_says_why` (macOS). The kernel-mount run
+  (`a_busy_mount_is_let_go_of_the_oss_way` with `SLATES_TEST_MOUNT=1`) is filed for main.
+- **Evidence (2026-11-18, debug).** The Mac Studio (kiln r216): `cargo test -p slates-bridge-oci --lib mount_holders`
+  4 of 4, `cargo test -p slates-api --lib -- mount:: contract_history` 14 of 14; red once with the Linux rule removed
+  (the helper's refusal stood as `Unmount { status: Some(1) }` where `Busy` was expected). adacachy, Linux 7.2 x86_64,
+  in a capped user unit (kiln r219): the reader's 4 of 4, its `/proc` read naming the test process on `/`.
+

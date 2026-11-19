@@ -1171,9 +1171,8 @@
 >   take no mount down. macOS and the BSDs now call `unmount(2)` (`MNT_FORCE` for the busy one), and every Unix host
 >   judges an unmount by the kernel's mount table: nothing mounted at the path is `NotMounted` before any call,
 >   `EBUSY` is `MountFault::Busy`, and the table still listing the mount after a call that said done is
->   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`). Owed:
->   naming the processes that hold a busy mount; Linux's busy refusal typed (`fusermount3` reports no error number);
->   the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
+>   `StillMounted`. Linux keeps `fusermount3 -u` (its mount's setuid helper; `umount2(2)` needs `CAP_SYS_ADMIN`).
+>   Owed: the macOS bare-metal run with a runner `PATH` lacking `/sbin` (filed for main);
 > - **a host mount bound into a container, built 2026-11-18 (A-520, `CONTRACT` = 44; kiln's container engine, kiln goal
 >   01a1f124):** the OCI form (§4.6 A-9) was the wire's and the command line's alone (`slates attach --oci-source`), so
 >   a host that drives slates through the library alone (kiln) could not bind a volume into a container.
@@ -1188,6 +1187,20 @@
 >   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
 >   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
 >   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+> - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
+>   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
+>   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
+>   `EBUSY` is on macOS. Every `Busy` carries `MountHolders`, read on that refusal alone from the kernel's own tables
+>   without touching the mount (`slates_bridge_oci::mount_holders`): on Linux each process's descriptors, working and
+>   root directories, `statx`ed through `/proc` with `AT_STATX_DONT_SYNC` and compared by device, bounded by
+>   `pid_max` and `nr_open` and refused `PastBound` past them; another user's process counted unreadable. Tests:
+>   `a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy`,
+>   `a_busy_mounts_holders_are_named_as_the_kernel_listed_them` (every host), the reader's tally and bound tests, and
+>   `the_caller_is_named_holding_the_mount_its_root_is_on` (Linux, by use). **Not read on macOS (A-537's judgment):**
+>   every libproc answer that reports a file is filled by xnu's `fill_vnodeinfo`, which runs `vn_stat` on the vnode,
+>   and `proc_listpidspath` starts with `stat(2)` of the path; on the `hard` loopback NFS mount either waits without bound
+>   once the daemon has gone, the case a busy unmount meets, so macOS answers `HoldersUnread::NoReader`. Owed: a macOS
+>   reader that does not ask the filesystem (libproc offers none); the Linux reader's run on Linux (filed for main);
 > - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
 >   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
 >   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
@@ -2419,8 +2432,16 @@
 >   content as before. Tests: `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation`
 >   (red before), the A-335 test on an uncertified takeover (red with an uncertified takeover's content let go),
 >   `a_layout_five_configuration_reads_its_takeovers_as_uncertified`, `a_takeover_this_build_makes_certifies_its_content`.
->   Owed: an owner's settle certifies content the same way (A-508's holders then drop content too); a settled line's
->   lagging holder still keeps content (it judges no successor's placement).
+>   **Fixed (A-546, g250, 2026-11-19): an owner's settle certifies content the same way.** An owner reports its
+>   neighbourhood placed only once every volume it owns is served from within it (the healer replacing, while the
+>   change is in flight, a placement naming a host outside the current neighbourhood: `fleet.heal.unsettled_replaced`),
+>   so a settle certifies that no head it serves names a holder outside its neighbourhoods; A-508's holders then let go
+>   the content their own records name (`fleet.settle.released_content`). The configuration lists the certified settles
+>   (regional layout 7; layouts 6 and 5 read with every settle uncertified, whose holders keep content). Tests:
+>   `a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go` (red before), A-508's test on an uncertified
+>   settle (red with an uncertified settle's content let go), `an_unsettled_owners_placement_outside_its_current_
+>   neighbourhood_is_replaced`, `a_settle_this_build_records_certifies_its_content`, the layout test. Owed: a settled
+>   line's lagging holder still keeps content (it judges no successor's placement).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
@@ -7939,6 +7960,18 @@ Residual literals: none in `src/`; the bench's shape constants (files per direct
 bytes, groups, the 4 KiB block) carry their measurements. The example targets of the four
 benched crates share the name `bench`; cargo warns of the output collision and may make it an
 error, so a rename to `<crate>-bench` is owed before the Phase 2 crates add theirs.
+
+**Fixed 2026-11-19 (A-541, goal 85, g234): a clone's live-inode count started from its origin's head.** A clone took
+its origin's count at the moment of the clone, not its snapshot's, so every file the origin made after the snapshot
+counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
+tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
+and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
+every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
+clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
+a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
+the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
+from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
+names the effects of each).
 
 ## 8d. Phase 2 record (2026-09-05)
 
