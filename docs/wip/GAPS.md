@@ -3281,10 +3281,15 @@
 >     - A deferred verb's task records its final reply, and some tasks end on `Overloaded`: a granted landing whose
 >       target lease went unanswered (`landing::acquire_target_lease`, answered through `finish_unrun`), so its
 >       resend meets it for good.
->     - A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
+>     - ~~A listing's or the grants' `Overloaded` for a part not sent or not served is delivered as not yet recorded,
 >       and `retry_deferred` records it, so its resend meets it for good (found by A-557, 2026-11-19, g225;
 >       `settle_refused`'s `paged` and the refusal branch of `gather` and `gather_grants`; the status scatter and
->       `xshard::AnswerUnstarted` deliver theirs unrecorded).
+>       `xshard::AnswerUnstarted` deliver theirs unrecorded).~~ Fixed 2026-11-19 by A-563 (g225): `retry_deferred`
+>       leaves a `not_started` reply unrecorded, as `recorded_unless_deferred` does, so the resend runs the scatter
+>       again (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
+>       `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`). Open beside it:
+>       `consensus_on_control` answers `Overloaded` after its operation ran, and its resend now runs it again (a
+>       bootstrap is idempotent; `Recover`'s second run is not yet read).
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
@@ -4262,7 +4267,14 @@
 >   `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`,
 >   `a_held_mount_keeps_its_id_in_its_attachments_record`, and in `slates-db`
 >   `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`); an attachment never seen mounted keeps the
->   rule before, since the table's silence about its point proves nothing. Class B (the
+>   rule before, since the table's silence about its point proves nothing. C-c's rest since A-548 (2026-11-19, g232),
+>   part 1: the NFS write-back tracker's journal reader was presumed gone once a record had waited a liveness window on
+>   the wall, so a shard kept off its CPU that long lost the record to the next append past the budget and every tracked
+>   connection's states with it, each of their write-backs refused until the connection ended; the tracker's keeper
+>   consumes each change on the volume's own shard, so its reader now holds its records while the tracker is open
+>   (`slates_vfs::journal::Patience::WhileOpen`), within the shard's metadata ledger
+>   (`a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window`). Owed in C-c: the FUSE and WinFsp
+>   readers' patience (part 2) and `verbs::await_materialization` (part 3). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -8034,12 +8046,33 @@ its origin's count at the moment of the clone, not its snapshot's, so every file
 counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
 tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
 and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
-every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
-clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
-a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
-the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
-from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
-names the effects of each).
+every step, but no step cloned a snapshot its origin had changed since. **Found by the sweep, fixed since by A-549
+(below):** the server's clone admission read the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s
+`inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it
+should read the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension,
+`entry_allowance`) started from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart
+recounted it (the bug record names the effects of each).
+
+**Fixed 2026-11-19 (A-549, goal 85, g234): a clone's admission and its entry count read its origin's head.** A
+snapshot now records its live entries beside its inodes (a recovered one's from its image: its own directories' named
+entries and the live entries of the head's directories it shares), a clone starts from them, and the server admits a
+clone by its snapshot's inodes (`Volume::snapshot_inodes`): a bounded clone's reservation and its allowance's floor, a
+dynamic clone's version hold. Measured before: a bounded clone of an origin floored 8 past its share of 28 ran with no
+inode cap (its allowance of 28 refused below its 36), a dynamic clone held 2 slots for 13 inodes, and a clone counted 13
+entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`).
+**Open, found by the sweep:**
+- A restart refused any clone holding a snapshot while it still shared a file with its origin, `RecoveryIncomplete`
+  from `Volume::clone_from_image` (A-561, the next piece): the clone's snapshot marks such a file shared with the head,
+  and recovery looks a head-shared entry up only among the images of the head's own inodes, which a clone's
+  origin-shared files are not. No test recovered a clone with a snapshot of its own; A-549's restart test recovers one
+  without.
+- A clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
+  restart set both), so its namespace dimension is unbounded until a restart.
+- A resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume was made
+  with (`verbs::resize`).
+- Recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts it;
+  the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor at
+  the restart are raised by its whiteouts. Found by reading, not tested.
 
 ## 8d. Phase 2 record (2026-09-05)
 
@@ -19392,7 +19425,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   told the host is Windows' reads a Win32 code, and any other reads an errno; typing them is the wire's own piece, a
   contract change; and the engine's own errnos are Linux's and macOS's numbers side by side, so an errno one platform
   numbers as the other's kind (Linux's 45 `EL2NSYNC` as macOS's `ENOTSUP`, 69 `ESRMNT` as macOS's `EDQUOT`) would read
-  as that kind, which no call the writer makes is known to answer).
+  as that kind, which no call the writer makes is known to answer; both **built by A-539 the same day** (`OsCode`
+  carried to the report, the volume and the wire, a Win32 variant appended beside each errno variant, golden vectors;
+  the seam's named kinds `Exists`, `NoSpace`, `Unsupported`, each writer giving them from its own platform's numbers,
+  read alike where the landing tells none apart: a metadata entry's open, a refused `rmdir`; a path on the daemon's own
+  mount and a base path past the longest recorded typed too, where Windows had put `ERROR_POSSIBLE_DEADLOCK` in an
+  errno's place and the MSVC runtime's `ENAMETOOLONG` 38, a number no Windows call answers, for its own
+  `ERROR_FILENAME_EXCED_RANGE`; library contract 49, wire major 3 and anchor layout 11, so a
+  peer or a segment of the older form is refused, never read; its unit tests ran on the Mac Studio, red first; the
+  Windows lanes and the anchor's cross-process test filed for main; still owed with it: `TargetRefusal::MountRefused`
+  carries a WinFsp mount's Win32 code in its `errno` field on Windows, the same change for that field; an `OsCode`
+  says an errno but not whose, and Linux's and macOS's errnos differ past the low numbers (`ENAMETOOLONG` 36 and 63),
+  so a fleet mixing the two would put a forwarded reply's errno in the reader's own words; and the client's own OS calls
+  (`HostFault::Os`, the mount faults) still name a bare number in this process's own numbering, which is right where
+  client and daemon share a platform and is typed nowhere else yet).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

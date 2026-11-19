@@ -24,6 +24,7 @@ use slates_vfs::base::BaseConfig;
 use slates_vfs::clock::StepClock;
 use slates_vfs::host::HostFs;
 use slates_vfs::host::sim::SimHost;
+use slates_vfs::journal::Patience;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
@@ -527,8 +528,8 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
   };
   let current = context(View::Current, true);
   let pinned = context(View::Version(1), false);
-  vol.open_journal_reader(current.attachment.key(), u64::MAX);
-  vol.open_journal_reader(pinned.attachment.key(), u64::MAX);
+  vol.open_journal_reader(current.attachment.key(), Patience::WhileOpen);
+  vol.open_journal_reader(pinned.attachment.key(), Patience::WhileOpen);
   let opened_at = vol.op_log().head_seq();
   assert_eq!(
     (vol.op_log().readers(), vol.op_log().slowest_reader()),
@@ -567,9 +568,12 @@ const TWO_RECORDS: usize = 2 * std::mem::size_of::<slates_vfs::journal::OpRecord
 /// Shape: the files the retention tests create without a round: each create journals a record, far past the floor.
 const CREATES: usize = 12;
 
-/// A volume with a two-record journal floor, a current attachment's context and its reader open with `patience_ns`,
-/// and the round's cursor before any change.
-fn reading_volume(store: &mut Store, patience_ns: u64) -> (Volume, OpContext, InvalidationCursor) {
+/// A volume with a two-record journal floor, a current attachment's context and its reader open with `patience`, and
+/// the round's cursor before any change.
+fn reading_volume(
+  store: &mut Store,
+  patience: Patience,
+) -> (Volume, OpContext, InvalidationCursor) {
   let mut volume = Volume::create(
     store,
     VolumeConfig {
@@ -579,7 +583,7 @@ fn reading_volume(store: &mut Store, patience_ns: u64) -> (Volume, OpContext, In
   )
   .unwrap();
   let cx = rw_cx();
-  volume.open_journal_reader(cx.attachment.key(), patience_ns);
+  volume.open_journal_reader(cx.attachment.key(), patience);
   let mut handles = new_handle_store();
   let cursor = VolumeBridge::attached(
     VolumeId { bytes: [0; 16] },
@@ -614,13 +618,13 @@ fn round(
 }
 
 /// A-157 (the journal keeps what a live reader still needs, growing from the ledger). Do: give a volume a two-record
-/// journal floor and a reader whose patience outlasts the test; create files far past the floor before the reader's
+/// journal floor and a reader held while it is open (A-548); create files far past the floor before the reader's
 /// round. Expect no overrun (the round names the changes, not Everything), the budget grown past the floor by exactly
 /// what the shard's metadata ledger committed, and no growth refused.
 #[test]
 fn a_live_readers_records_are_kept_by_growing_from_the_ledger() {
   let mut store = store();
-  let (mut volume, cx, cursor) = reading_volume(&mut store, u64::MAX);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, Patience::WhileOpen);
   let root = volume.root();
   for file in 0..CREATES {
     volume
@@ -656,7 +660,7 @@ fn a_reader_past_its_patience_pins_nothing_and_overruns() {
   /// Shape: a patience of five steps of the test clock.
   const PATIENCE_NS: u64 = 5_000;
   let mut store = store();
-  let (mut volume, cx, cursor) = reading_volume(&mut store, PATIENCE_NS);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, Patience::Bounded(PATIENCE_NS));
   let root = volume.root();
   for file in 0..CREATES {
     volume
@@ -677,13 +681,13 @@ fn a_reader_past_its_patience_pins_nothing_and_overruns() {
 }
 
 /// A-157: a growth the ledger refuses keeps the budget and drops the record a live reader still owed. Do: as above with a
-/// patience that outlasts the test, on a shard whose metadata ledger has no room; create files past the floor before the
+/// reader held while it is open, on a shard whose metadata ledger has no room; create files past the floor before the
 /// reader's round. Expect the refusals counted, the budget still the floor, and the round owing Everything (an overrun).
 #[test]
 fn a_growth_the_ledger_refuses_overruns_its_reader_and_is_counted() {
   let mut store = store();
   store.metadata = slates_mem::budget::MetadataBudget::new(0);
-  let (mut volume, cx, cursor) = reading_volume(&mut store, u64::MAX);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, Patience::WhileOpen);
   let root = volume.root();
   for file in 0..CREATES {
     volume

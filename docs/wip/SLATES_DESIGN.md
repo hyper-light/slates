@@ -2164,8 +2164,11 @@ drift check `fstat`s.
   redirect and drift records are journaled the same way; retention is bounded by a memory budget
   derived from the volume's measured mutation rate and the longest subscriber lag (A-157). The
   journal keeps what a live reader still owes. It starts at a one-page floor and grows from the
-  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader
-  silent past its transport's liveness pins nothing, and a refused growth is counted.
+  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader's
+  owner names its patience by what the reader's reads wait on (A-548): the NFS write-back tracker,
+  consumed at the change itself on the volume's own shard, holds its records while it is open; a
+  reader whose rounds wait on a mount's kernel is presumed gone past its transport's liveness, and
+  pins nothing then. A refused growth is counted.
 
 **Failure matrix.** Hash collision on equivalence (two names fold equal): Refused (`EEXIST`),
 which is APFS behaviour. Cut-over conversion mid-operation: Masked (conversion is a copy of a
@@ -3048,7 +3051,8 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
 the rest of the page as it fetched it. Apple's client does so for a page dirtied through a shared map while another path
 changed the file, and no recall makes it flush first. So the server keeps, per connection, A-140's byte states for each
 file the connection's READs and WRITEs touched. A READ makes bytes fresh, the connection's own changes refresh them,
-and every other change, fed by a per-volume keeper reading the journal (A-157), makes fetched bytes stale. A WRITE
+and every other change, fed by a per-volume keeper reading the journal (A-157; its reader held while the tracker is
+open, A-548), makes fetched bytes stale. A WRITE
 whose stale bytes differ from the file's bytes now is refused whole, `NFS3ERR_IO`, never merged (banned item 11). A
 write over bytes never fetched, or over stale bytes equal to the file's, is applied. The states go with their
 connection, on the shards its calls were served on, however it ends (`crates/server/src/nfs_writeback.rs`). Apple's
@@ -7050,6 +7054,11 @@ window is the process-restart window (zero, thanks to the anchor). Same code, ze
 
 ### 4.9 Wire protocol (D-15)
 
+> **Status (2026-11-19, A-539: wire major 3).** A host's refusal code is typed by its numbering (§4.15 step 6): an errno
+> field carries an errno alone, and a Win32 error code rides in a variant appended beside it. A major-2 Windows peer put
+> Win32 codes in errno fields, which no append-only change can say of them, so the major is 3 and a major-2 peer is
+> refused before its body is read (`crates/wire/src/header.rs`, as A-237 took major 2).
+
 > **Status (2026-11-07, A-241: a client proves its id).** A client's id names its seat: its retained completion records,
 > its attachments, every verb after. The rendezvous carries only the id a client wants, which a stranger can name, and
 > a request carries its id in its slot word. So now:
@@ -7149,6 +7158,12 @@ failure.
 > attachment (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`;
 > `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Open (GAPS): a live-shipped verb whose
 > effects committed before its held-reply bound refused it, and a deferred task that ends on `Overloaded`.
+>
+> A-563 (2026-11-19): a deferred reply too. A reply that comes back through `deliver` is written by `retry_deferred`,
+> which recorded every new one. So a read scatter's `Overloaded`, for a part not sent or not served (A-557), was the
+> request's completion. It now leaves a `not_started` reply unrecorded as well
+> (`a_resend_of_a_read_scatter_refused_overloaded_runs_it_again`;
+> `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`).
 
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
@@ -9183,6 +9198,11 @@ it builds against the contract and adds to it rather than around it.
 > `IdentityRule::ContainerRootAsMountingUser` (appended) and every hard link's name served at once; `Engine::Podman`
 > and `Endpoint::Local` are appended. A remote podman is refused `RemoteEngine`, one run as root `ProfileUntested`, a
 > labelling one `SelinuxLabelsUntested`, and every other rootless profile still `UserNamespaceUntested`.
+> **`CONTRACT` = 49 (A-539):** a host's refusal code carries its numbering. `HostFault::Base` names an `OsCode`, an
+> errno or a Win32 error code (none where the host named none), where it held a bare number that on Windows was a Win32
+> code; the wire's `Refusal::BaseUnavailableWin32`, `TargetRefusal::HostWin32`, `HostAnswer::Win32` and
+> `LandingDegradation::CrashedWin32` are appended beside their errno variants, which carry errnos alone. An `OsCode` is
+> put in the OS's words only in its own numbering.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -10352,12 +10372,23 @@ entry either old or new, never torn).
    exchange's temporary and a clear's fresh directory take the aside name, so the displaced entry
    lands there. An exchange back removes only the temporary by its descriptor's inode, or the fresh
    directory by the identity it had at its hidden name; anything else there is kept. The seam offers
-   no rename that replaces its destination. A refusal the seam gives a number is typed by the numbering it is in
-   (A-527): an errno (`HostError::Unavailable`) or a Win32 error code (`HostError::Win32`). The engine tells refusals
-   apart by an errno's number (a name that exists, a full disk, a verb the filesystem lacks), so the Windows writer gives
-   a Win32 code of such a kind that kind's errno and keeps every other one as the Win32 code it is: a Win32 code whose
-   number is one of those errnos (`ERROR_NOT_SAME_DEVICE` 17, `EEXIST`'s) never reads as it, and ends the landing as any
-   refusal the engine does not tell apart does.
+   no rename that replaces its destination. The seam names the kinds the engine tells apart (A-539): a name that exists
+   (`HostError::Exists`), no room (`NoSpace`), a verb the filesystem lacks (`Unsupported`); each writer reads its own
+   platform's numbers into them (Linux's `EDQUOT` 122 and macOS's 69, a Linux exchange's `EINVAL` and macOS's
+   `ENOTSUP`, Windows' `ERROR_ALREADY_EXISTS`), so the engine compares no number. Where it tells none of them apart it
+   reads every kind alike, as it read every errno before: a metadata entry's open refused by any kind fails that entry
+   alone, and a refused `rmdir` is the target in use (a removal), a kept directory (an exchange back) or not this
+   landing's (an aside). Every refusal carries its code typed by its numbering (`OsCode`: an errno or a Win32 error code,
+   A-527) to the end: the landing report's failed entry (none for a fetch under way) and crash, the volume's
+   `BaseUnavailable`, a path on this daemon's own mount (`EDEADLK`, Windows' `ERROR_POSSIBLE_DEADLOCK`), a base path past
+   the longest recorded (`ENAMETOOLONG`, Windows' `ERROR_FILENAME_EXCED_RANGE`), and the wire, where each errno variant
+   carries an errno alone and a Win32 variant appended beside it carries a Win32 code (`HostAnswer::Win32`,
+   `LandingDegradation::CrashedWin32`, `TargetRefusal::HostWin32`, `Refusal::BaseUnavailableWin32`), pinned by golden
+   vectors (`crates/ipc/src/os_code_vectors.rs`); the library contract's `HostFault::Base` names an `OsCode` (contract
+   49). An errno field so changed what it may hold, which no append-only change can say of what an older peer or record
+   holds, so the change takes a new wire major (3: a major-2 peer is refused, never decoded; D-15, as A-237's took 2)
+   and a new anchor layout (11: a segment whose completion records keep replies a layout-10 daemon wrote is refused,
+   never misread); a ring body's schema hash moves with its appended variants on its own (§4.9 "Framing").
 7. *Batches inside the landing (A-130).* A file is staged — written, given its mode and mtime, and
    written out — and waits, open at its hidden name, for its batch's barrier; then the batch's files
    are placed. A batch holds at most one copy window of pages (`chunk_bytes`), each file counted as at
@@ -36316,7 +36347,7 @@ the bug record `docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origi
   at the first clone, `left: 9, right: 5`. Green with the change, the same machine: `cargo test --locked -p slates-vfs
   --lib` 79 passed, 1 ignored.
 - **The sweep for siblings** (every counter a clone, a restore or an adoption takes from the live origin rather than
-  the frozen state), reported and not changed, with their effects in the bug record:
+  the frozen state), reported and not changed, with their effects in the bug record (both fixed since by A-549):
   - the server's clone admission reads the clone's inherited inodes from the origin's head count
     (`verbs::admit_clone`'s `inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic
     clone's version hold), where it should read the snapshot's, now recorded;
@@ -36858,6 +36889,173 @@ Applied in the same change to: §4.15's status (A-503's paragraph), §4.10's sta
 (g267), `crates/db` (`catalog.rs`: `CarriedRecord::NO_HEAD`), `crates/server` (`carry.rs`, new; `moves.rs`: the
 move-time carry gone, the move waiting for its head's record; `fleet.rs`, `verbs.rs`, `state.rs`, `daemon.rs`,
 `lib.rs`).
+
+### A-549 — A clone is admitted by its snapshot's inodes and counts its snapshot's entries, whatever its origin did since (2026-11-19, goal 85, g234; A-541's sweep; §4.2's inode and namespace dimensions, §4.4 snapshots and clones, D-5)
+Applied in the same change to: A-541's entry and its bug record (both of its siblings marked fixed); GAPS, §8c (the fix
+and the siblings left open); the bug record `docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`;
+and:
+- `crates/vfs`: `snapshot.rs` (`Snapshot::live_entries`); `volume.rs` (`Volume::snapshot` records the head's entry
+  count, `clone_inner` starts the clone from it, `Volume::snapshot_inodes`, `clone_of`'s notes; two lib tests in
+  `clone_count_tests`); `recover.rs` (`rebuild_snapshot_tree` returns its tree's entries, `named_entries`,
+  `rebuild_snapshot` records them).
+- `crates/server`: `verbs.rs` (`admit_clone` reads the clone's inherited inodes from its snapshot; the lib test module
+  `clone_admission_tests`, new).
+
+- **What was there.** The server admitted a clone by its origin's inode count at the moment of the clone (`admit_clone`'s
+  `inherited`): a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold. Since
+  A-541 the clone counts its snapshot's inodes, so where the origin had removed files the allowance fell below the
+  clone's count, was refused, and left the clone with no inode cap, and a dynamic clone held fewer slots than it holds
+  inodes. A clone's entry count was its origin's head count at the clone, as its inode count had been.
+- **The rule.** A snapshot carries the counts a clone of it is admitted and counted by, as §4.2 has complete snapshot
+  roots carry their referenced counts for O(1) clone admission: its live inodes (A-541) and its live entries, each the
+  head's when the snapshot is taken. The owner admits a clone by the snapshot's inodes: a bounded clone reserves its fair
+  share but never fewer than them, and that is its allowance; a dynamic clone holds a slot for each. A clone's entry
+  count starts from the snapshot's. A recovered snapshot's entries are its tree's, by the rule the live count keeps (a
+  whiteout is no entry): the named entries of its own directories' images and the live entries of the head's
+  directories it shares (A-395), so the image's layout does not change. A stale snapshot is refused at admission, before
+  any slot is taken, with the refusal the clone would give.
+- **Tests.** In `crates/vfs/src/volume.rs`, `clone_count_tests`: the entry count of the origin, the clone and a clone of
+  the clone's snapshot against a walk of each namespace after every step, then an entry allowance of one past the tree
+  admitting exactly one file; and across a restart, the rebuilt clone and a clone of the recovered snapshot, whose tree
+  shares an untouched directory with its origin's head (the test first checks the image shares it, so the count's shared
+  arm is exercised). In `crates/server/src/verbs.rs`, `clone_admission_tests`: a bounded clone of an origin floored 8
+  past its fair share and left under it is admitted with its snapshot's inodes as its allowance, none refused; a dynamic
+  clone holds a slot for each inode its snapshot holds.
+- **Evidence.** All on the Mac Studio, 2026-11-19.
+  - Red first, with the tests alone on main `a613562eb`. The bounded clone's allowance was `u64::MAX` against its
+    snapshot's 36: the share, 28, was refused below 36. The dynamic clone held 2 slots for 13 inodes. The live entries
+    test counted 13 where the tree holds 9, and the restart test 14 where it holds 10.
+  - Green with the change: `cargo test --locked -p slates-vfs --lib` passed 81 with 1 ignored, and `cargo test --locked
+    -p slates-server --lib clone` passed 3 of 3.
+  - Each arm of the recovered count, removed on a copy, failed the restart test at the later clone: without the shared
+    directories it counted 7 of 9; recording zero, 0 of 9.
+- **Found by the sweep, left open** (GAPS, with the bug record):
+  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, the next piece).
+    This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
+  - A clone is admitted with no entry allowance.
+  - A resize leaves the entry allowance at the size the volume was made with.
+  - Recovery counts a whiteout as a live entry (found by reading).
+
+### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
+Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
+`crates/vfs/src/{journal,volume}.rs` (`Patience`), `crates/vfs/tests/journal_cost.rs`,
+`crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
+until part 2), `crates/bridge-core/tests/invalidation.rs`.
+- **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
+  the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
+  overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
+  and WinFsp readers' patience, the NFS write-back tracker's, and `verbs::await_materialization`.
+- **Part 1, the NFS write-back tracker** (`nfs_writeback::tracking`). The tracker's reader is consumed by its keeper, a
+  task on the volume's own shard woken by the change that journals the record, so only that shard's own turns stand
+  between a record and its consumer. A record waiting `W` on the wall therefore meant a shard kept off its CPU, never a
+  tracker gone, and dropping it was the costliest answer: the keeper's consume found its cursor behind the journal and
+  lost every connection's states, so each write-back of those connections was refused (`NFS3ERR_IO`) until the
+  connection ended. Now the reader holds its records while the tracker is open (`Patience::WhileOpen`); it closes with
+  the tracker when the tracker's last connection ends. Its records stay bounded by the shard's metadata ledger, whose
+  refusal drops the oldest, counted (`growth_refused`). A tracker whose keeper could not be spawned (a counted tripwire,
+  `nfs.writeback_keeper_refused`) is consumed at its connections' calls and holds its records until then, within the
+  same ledger.
+- **Tests (part 1).** `a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window` (`nfs_writeback.rs`:
+  a connection's fetch tracked, another path's change, the shard held a window and a tenth at a fifth of its CPU, the
+  journal filled past its budget, then the connection's write-back of a byte it fetched judged). On the Mac Studio
+  (debug, 2026-11-19, load 13 to 32): `slates-server --lib nfs_writeback` 2 of 2 and `slates-vfs --lib journal` 11 of 11;
+  red with the one-window patience put back: the write-back judged `Unknown`, the connection's states lost, where
+  `Apply` was expected.
+- **The journal's rule.** `Patience` names what a reader's reads wait on: `WhileOpen` for a reader consumed at the
+  change on the volume's own shard, `Bounded(ns)` for one whose rounds wait on another party, which may stall while the
+  reader stays open. The retention oracle (`retention_keeps_what_a_live_reader_needs_as_the_model_does`) generates
+  both, its model stating each rule, and checks directly that while no growth was refused no record a reader held
+  while open has not read has left.
+
+### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
+
+- **What was there.** `Overloaded` means not started, so a resend under the id runs the request, and a verb's own such
+  answer is left unrecorded (`recorded_unless_deferred`). A reply that comes back through `deliver` is written by
+  `retry_deferred`, which recorded every new one. A read scatter's `Overloaded`, for a part not sent (2026-11-05) or not
+  served (A-557), came that way, so it was the request's completion: every resend under the id was answered from the
+  record, and the scatter never ran again.
+- **The rule.** `retry_deferred` judges a new deferred reply as a verb's answer is judged: a `not_started` reply
+  (`Overloaded`, `Unpublished`) goes through `unrecorded_not_started`, counted and never recorded, and anything else is
+  recorded as before. A reply already recorded, or deferred again by a full ring, is unchanged.
+- **Test.** `a_resend_of_a_read_scatter_refused_overloaded_runs_it_again` (`crates/server/src/verbs.rs`): a two-shard
+  daemon with its control shard fenced; a client seated on the other shard lists and asks for its grants, each served as
+  its ring hands it over, then sends each again under its own id. Red before the fix: the listing's resend was answered
+  from its record (0.74 s, Mac Studio). Green: both resends go out again, both are answered `Overloaded { shard: 0 }`,
+  and four parts are counted unserved.
+- **Reported, not changed.** `consensus_on_control` answers `Overloaded` after its operation ran: either a shard's
+  publication call or the control call itself was given up. Its resend now runs the operation again. A bootstrap is
+  idempotent (`bootstrap_authorized`) and publishes again; `Recover`'s second run is judged by its own stale checks,
+  not read here.
+
+Applied in the same change to: §4.9 (the 2026-11-17 status), GAPS (the 2026-11-17 entry's sibling, closed),
+`crates/server/src/verbs.rs` (`retry_deferred`, `not_started`'s doc, the test and its shared answer reader), the bug
+records `docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md` and
+`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`.
+
+### A-539 — A host's refusal code carries its numbering end to end, and the landing reads kinds, never numbers (2026-11-19, g085, UI goal 88; §4.15 step 6, §4.9, §4.12; A-527's owed half; A-185, A-227, A-237, A-519)
+Applied in the same change to: §4.15 step 6 (the rule), §4.9 (status: wire major 3), §4.12's contract log (`CONTRACT`
+= 49), GAPS (A-185's owed numbering: built, with what it leaves), `docs/library.md` (the host faults' row),
+`crates/vfs` (`src/host/mod.rs`: `OsCode`, the named kinds `HostError::Exists`, `NoSpace`, `Unsupported`,
+`Unavailable(OsCode)`, `OwnMount(OsCode)`, `HostError::code`; `src/host/sim.rs`: the simulated host gives the kinds and
+can refuse `rmdir` and a metadata open; `src/error.rs`: `VfsError::BaseUnavailable(Option<OsCode>)`; `src/base.rs` and
+`src/base_recovery.rs`: a recovered directory's code typed, the gone directory's per platform; `src/volume.rs`;
+`tests/base.rs`), `crates/base` (`src/unix.rs`, `src/windows.rs`, `src/own_mounts.rs`: the deadlock avoided typed per
+platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.rs`: the Unix writer's rule;
+`src/os_windows.rs` and `src/windows_codes.rs`: the Windows writer's; `src/engine.rs`: `Outcome::Failed` and
+`Degradation::Crashed` by `OsCode`, `named_code`; `src/test_store.rs`, `src/chmod_tests.rs`, `src/captured_tests.rs`,
+`tests/durability.rs`), `crates/server` (`src/error.rs`: `target_of_host`, `base_unavailable`; `src/landing.rs`:
+`answer_of`, `degradation_of`; `src/verbs.rs`: the over-long base's code per platform; `src/daemon.rs`), `crates/ipc`
+(`src/protocol.rs`: the four appended variants; `tests/wire_order.txt`; `src/os_code_vectors.rs` and its `.txt`, new),
+`crates/wire` (`src/header.rs`: `MAJOR` = 3), `crates/anchor` (`src/layout.rs`: `LAYOUT_VERSION` = 11;
+`tests/anchor.rs`), `crates/api` (`src/error.rs`: `OsCode`, `HostFault::Base { code }`; `src/lib.rs`: `CONTRACT` =
+49), `crates/mcp` and `crates/sdk-node` (a Win32 code as `win32` beside `errno`), and the bridges (`bridge-core`,
+`bridge-fuse`: the volume's refusal as its errno, where it is one).
+- **What was there.** A-527 typed the land seam's own refusal (`HostError::Win32` beside `Unavailable(errno)`), and
+  past the seam one number field still held either numbering: the landing report's `Failed { errno }` and crash, the
+  volume's `BaseUnavailable`, and the wire's `TargetRefusal::Host`, `HostAnswer::Errno`, `LandingDegradation::Crashed`
+  and `Refusal::BaseUnavailable`, which on Windows carried Win32 codes (5 is `EIO` as an errno and
+  `ERROR_ACCESS_DENIED` as a Win32 code). The engine told refusals apart by an errno's number, with Linux's and macOS's
+  side by side (`EDQUOT` 122 and 69, `ENOTSUP` 95 and 45), and the Windows writer gave a Win32 code of such a kind
+  the errno of that kind. Two more fields carried a Windows number where an errno goes: a path on the daemon's own
+  mount (`ERROR_POSSIBLE_DEADLOCK`, 1131) and a base path past the longest recorded (the MSVC runtime's `ENAMETOOLONG`,
+  38, which no Windows call answers).
+- **The rule.** The seam names the kinds the landing tells apart (`Exists`, `NoSpace`, `Unsupported`), each writer
+  reading its own platform's numbers into them, so the engine compares no number. Where it tells none of them apart it
+  reads every kind alike, as it read every errno before: a metadata entry's open refused by any kind fails that entry
+  alone (A-519, A-527), and a refused `rmdir` is the target in use, a kept directory or not this landing's (A-291,
+  AUD-29-04). Every code is typed by its numbering (`OsCode`) to the end: the report, the volume, the daemon's own-mount
+  and over-long refusals, and the wire, where an errno variant carries an errno alone and a Win32 variant appended
+  beside it a Win32 code. The library names an `OsCode` in `HostFault::Base` and puts it in the OS's words only in its
+  own numbering.
+- **Layouts.** An errno field changed what it may hold, which no appended variant can say of what an older peer sent or
+  an older segment keeps. So the wire's major is 3 (a major-2 peer is refused before its body is read, D-15, as A-237
+  took 2), and the anchor's layout is 11 (a completion record keeps its reply's bytes, read back with no schema word, so
+  a layout-10 segment is refused at start, never misread). A ring body's schema hash covers every variant of every enum
+  in it (`slates-wire-derive`), so the ring needed nothing more: a body of the older form is refused "schema mismatch".
+  No shim reads the old form anywhere.
+- **Tests, red first** (the Mac Studio, kiln, 2026-11-19, debug, run r59, 01:40 to 01:44 UTC, load 11.9 to 25.4).
+  At the first piece's tests-first commit (033ecb3d0): `slates-land --lib -- windows_codes os::tests` 2 of 2 failed
+  (`ERROR_FILE_EXISTS` read `Unavailable(17)` where `Exists(Win32(80))` was wanted; `refusal(EEXIST)` `Unavailable(17)`
+  where `Exists(Errno(17))`), `slates-ipc --lib -- os_code_vectors` failed its vectors (none published, 12 written),
+  and `slates-server --lib -- a_win32_code_reaches_the_wire` read `Errno { errno: 5 }` where `Win32 { code: 5 }` was
+  wanted. At this change's tests-first commit (92362f024): `slates-land --lib -- whatever_the_kind` 2 of 2 failed on
+  their first refusal, `Exists(Errno(17))` (the metadata entry's landing `Aborted` with `Crashed`; the removal
+  `Failed` where `Conflict(TargetInUse)` was wanted), and `slates-wire --lib -- header` read a major-2 header through to
+  its unknown class. Green with the change (run r76, 01:47 to 01:51 UTC, load 14.2 to 18.8): `slates-land --lib` 47
+  passed (1 ignored, the manifest vectors' writer), `slates-vfs --lib -- host:: base` 13, `slates-base --lib --
+  own_mounts s3::host` 12, `slates-ipc --lib -- os_code_vectors protocol` 7 (2 ignored), `slates-wire --lib -- header`
+  4, `slates-anchor --lib -- layout` 2, `slates-api --lib -- error:: contract_history` 12, `slates-server --lib --
+  landing:: error:: longest` 16, `slates-mcp` and `slates-bridge-core` built; the wire order's writer
+  (`publish_appended_variants`) left `crates/ipc/tests/wire_order.txt` as committed; `cargo fmt --check` clean. The
+  golden vectors (`crates/ipc/src/os_code_vectors.txt`) agree, 8 of 8, byte for byte with an encoder written apart from
+  the crate's, from the codec's rules (a `u32` discriminant by declaration index, a `u32` length prefix, little-endian
+  fields) and the wire order's indices.
+- **Owed** (GAPS): `TargetRefusal::MountRefused` carries a WinFsp mount's Win32 code in its `errno` field on Windows; an
+  `OsCode` says an errno but not whose, and a fleet mixing Linux and macOS would put a forwarded errno in the reader's
+  words; the client's own OS faults name a bare number in its own numbering. Filed for main: the Windows land and base
+  suites and the xwin check (the Windows writer's rule, the deadlock and over-long codes), the anchor's cross-process
+  test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
+  `Outcome::Failed { code: Option<OsCode> }`, and clippy.
 
 ### A-545 — Mercurial's part payloads decoded and encoded and held to what stock Mercurial 7.2 sent and wrote: phases, bookmarks, the check parts, obsolescence markers in both formats, pushkey (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-514, A-16)
 Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (`phases`, `bookmarks`, `heads`,

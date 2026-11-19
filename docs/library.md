@@ -148,7 +148,7 @@ The variant says what to do:
 | `Invalid(what)` | fix the request |
 | `Unusable(why)` | the subject's state forbids it (destroying, not recovered, no group yet) |
 | `Elsewhere(where)` | send it where it says |
-| `Host(fault)`, `Mount(fault)`, `Start(fault)` | the OS refused; the error number is in the fault |
+| `Host(fault)`, `Mount(fault)`, `Start(fault)` | the OS refused; the fault names its number (`HostFault::Base` an `OsCode`: an errno or a Win32 error code, never one read as the other) |
 | `Protocol(fault)` | a fault in slates: report it |
 
 No enum of the contract is `#[non_exhaustive]`. Pin the contract: `slates_api::CONTRACT` is raised

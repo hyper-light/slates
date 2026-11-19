@@ -81,9 +81,50 @@ pub enum WatchState {
   Unavailable,
 }
 
-/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. A refusal the host gives a number is
-/// typed by the numbering it is in (A-527): an errno (`Unavailable`) or a Win32 error code (`Win32`), so a reader that
-/// tells refusals apart by an errno's number never reads a Win32 code as the errno of the same number.
+/// An operating system's number for a refusal, typed by the numbering it is in (A-527, A-539): an errno (Linux, macOS)
+/// or a Win32 error code (Windows). The two number their codes on their own, so a number is read only with its kind:
+/// 17 is `EEXIST` as an errno and `ERROR_NOT_SAME_DEVICE` as a Win32 code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsCode {
+  /// An errno.
+  Errno(i32),
+  /// A Win32 error code.
+  Win32(u32),
+}
+
+impl OsCode {
+  /// A number in this platform's own numbering, typed as its kind: an errno here.
+  #[cfg(not(windows))]
+  pub fn native(number: i32) -> Self {
+    Self::Errno(number)
+  }
+
+  /// A number in this platform's own numbering, typed as its kind: a Win32 error code here (a negative number names
+  /// none, read as zero).
+  #[cfg(windows)]
+  pub fn native(number: i32) -> Self {
+    Self::Win32(u32::try_from(number).unwrap_or(0))
+  }
+
+  /// An I/O error's OS number, in this platform's numbering (zero where it named none).
+  pub fn of_io(error: &std::io::Error) -> Self {
+    Self::native(error.raw_os_error().unwrap_or(0))
+  }
+}
+
+impl std::fmt::Display for OsCode {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Errno(errno) => write!(f, "errno {errno}"),
+      Self::Win32(code) => write!(f, "Win32 error {code}"),
+    }
+  }
+}
+
+/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. The kinds the landing tells apart
+/// are named here (A-539): a name that exists, no room, a verb the filesystem lacks; each writer reads its platform's
+/// numbers into them, so no reader compares a number across platforms. Every refusal the host gives a number carries it
+/// typed by its numbering ([`OsCode`], A-527).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
   /// The entry does not exist (any more).
@@ -94,17 +135,22 @@ pub enum HostError {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
-  /// The host cannot serve it: the errno, POSIX's numbering (Linux, macOS, and a Windows refusal the writer gives the
-  /// kind of an errno the landing tells apart: a name that exists, a full disk, a verb the filesystem lacks).
-  Unavailable(i32),
-  /// The host cannot serve it: the Win32 error code (Windows), in Win32's own numbering, never read as an errno (A-527):
-  /// 17 is `ERROR_NOT_SAME_DEVICE` there and `EEXIST` in POSIX, 122 `ERROR_INSUFFICIENT_BUFFER` there and Linux's
-  /// `EDQUOT`.
-  Win32(u32),
+  /// The name exists (`EEXIST`; Windows' `ERROR_FILE_EXISTS`, `ERROR_ALREADY_EXISTS`), by the code the host named it
+  /// with (A-539).
+  Exists(OsCode),
+  /// No room: the filesystem is full or its owner's quota spent (`ENOSPC`, `EDQUOT`; Windows' `ERROR_DISK_FULL`,
+  /// `ERROR_HANDLE_DISK_FULL`), by the code the host named it with (A-539).
+  NoSpace(OsCode),
+  /// The verb does not exist on this filesystem: an exchange or a clone it lacks (`EOPNOTSUPP`, `ENOTSUP`, a rename
+  /// flag's `EINVAL`; Windows' own), by the code the host named it with (A-539).
+  Unsupported(OsCode),
+  /// Anything else the host cannot serve, by the code it named, typed by its numbering (A-527, A-539).
+  Unavailable(OsCode),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
-  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
-  /// deadlock avoided by.
-  OwnMount(i32),
+  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The code the platform names a
+  /// deadlock avoided by, typed by its numbering (A-539): `EDEADLK`, or Windows' `ERROR_POSSIBLE_DEADLOCK`, a Win32 code
+  /// that before A-539 rode in an errno's place.
+  OwnMount(OsCode),
   /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
   /// nothing changed, and the same call is answered once the fetch lands. The caller parks the request and runs it
   /// again then; a host that reads a local disk never answers it.
@@ -118,15 +164,34 @@ impl std::fmt::Display for HostError {
       Self::NotDirectory => f.write_str("not a directory"),
       Self::NotFile => f.write_str("not a regular file"),
       Self::StaleHandle => f.write_str("stale host handle"),
-      Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
-      Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
-      Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
+      Self::Exists(code) => write!(f, "the name exists ({code})"),
+      Self::NoSpace(code) => write!(f, "no room ({code})"),
+      Self::Unsupported(code) => write!(f, "not supported here ({code})"),
+      Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
+      Self::OwnMount(code) => write!(f, "on a mount this daemon serves ({code})"),
       Self::Pending => f.write_str("the host's fetch is pending"),
     }
   }
 }
 
 impl std::error::Error for HostError {}
+
+impl HostError {
+  /// The code a refusal names, typed by its numbering (A-539): every kind but the typed ones the host names no number
+  /// for (not found, not a directory, not a file, a stale handle) and a fetch under way (A-524).
+  pub fn code(&self) -> Option<OsCode> {
+    match self {
+      Self::Exists(code)
+      | Self::NoSpace(code)
+      | Self::Unsupported(code)
+      | Self::Unavailable(code)
+      | Self::OwnMount(code) => Some(*code),
+      Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle | Self::Pending => {
+        None
+      }
+    }
+  }
+}
 
 /// The seam. Every call is relative to a handle the host handed out, never to a path string,
 /// so a rename of the base directory by the user changes nothing (§4.4).

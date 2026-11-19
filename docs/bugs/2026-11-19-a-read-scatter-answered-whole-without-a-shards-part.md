@@ -69,7 +69,9 @@ The part tasks took a refused borrow, which means "no part", to mean "an empty p
   retryable under its id. `run_recorded` leaves such a refusal unrecorded (2026-11-17), and `xshard::AnswerUnstarted`
   delivers its own with `true`. The status scatter delivers with `true` already. This is true for a part that could
   not be sent since 2026-11-05, and A-557's unserved part takes the same path: `settle_refused`'s `paged`, and the
-  refusal branch of `gather` and `gather_grants`. Reported, not changed.
+  refusal branch of `gather` and `gather_grants`. Reported, not changed. Fixed 2026-11-19 by A-563: `retry_deferred`
+  leaves a `not_started` reply unrecorded
+  (`docs/bugs/2026-11-19-a-read-scatters-overloaded-was-recorded-as-its-completion.md`).
 - **Forwarded verbs (not changed).** A verb forwarded to an owner shard whose state refuses the borrow (fenced, or
   never started) is answered `NotFound`. `xshard::call_in_shard_time` returns the target's `with_state` result, so a
   refused borrow arrives as `None`, the same value as an owner given up, and `named_if_unshared` turns no reply into
