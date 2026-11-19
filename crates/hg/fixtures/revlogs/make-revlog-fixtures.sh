@@ -9,13 +9,16 @@
 # uses generaldelta and sparse-revlog (7.2's defaults) with `format.maxchainlen=3`, so chains end at snapshots, and
 # `storage.fileindex.slow-path=allow`, since revlog v2 brings a `fileindex` store whose Rust implementation the PyPI
 # build lacks (7.2 aborts without it: "accessing `fileindex` repository without associated fast implementation"). The
-# history: a file that grows a line a changeset (compressible), a pseudo-random file (stored raw), an empty file, a
-# second head and a merge.
+# history: a file of 96 lines of SHA-256 hexadecimal that grows a line a changeset (large enough, and changed little
+# enough, that sparse-revlog writes intermediate snapshots), a pseudo-random file (stored raw), an empty file, a second
+# head and a merge.
 # For each repository R and each revlog L (`00changelog`, `00manifest`, the files `grow`, `rand`, `empty`):
 #   R-<store path with / as _>   the store's revlog files (`.i`, `.d`; for v2 the docket `.i` and its `.idx`, `.dat`
 #                                and `.sda`, the random id dropped from their names)
 #   R-<L>.index   `hg debugindex --debug` (every column);   R-<L>.chain   `hg debugdeltachain`
-#   R-<L>-<rev>.txt   `hg debugdata` of every revision;     R-requires.txt   the store's requirements
+#   <L>-<rev>.txt   `hg debugdata` of every revision, once: every repository holds the same history, and each one's
+#                   texts are compared with these byte for byte (`cmp`, the script stops on a difference)
+#   R-requires.txt   the store's requirements
 # Last it prints every file's SHA-256.
 set -euo pipefail
 OUT=$(cd "$1" && pwd)
@@ -37,6 +40,12 @@ seed, size = sys.argv[1].encode(), int(sys.argv[2])
 out = b"".join(hashlib.sha256(seed + b"%d" % i).digest() for i in range(size // 32 + 1))
 sys.stdout.buffer.write(out[:size])
 PY
+cat > "$WORK/lines.py" <<'PY'
+import hashlib, sys
+seed, first, last = sys.argv[1].encode(), int(sys.argv[2]), int(sys.argv[3])
+for i in range(first, last + 1):
+    sys.stdout.write(hashlib.sha256(seed + b"%d" % i).hexdigest() + "\n")
+PY
 cat > "$WORK/copy.py" <<'PY'
 import os, re, shutil, sys
 store, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -49,15 +58,16 @@ for root, _, files in os.walk(store):
         shutil.copyfile(os.path.join(root, name), os.path.join(out, repo + "-" + rel.replace("/", "_")))
 PY
 history() {
-  printf 'line 1\n' > grow; py "$WORK/random.py" first 600 > rand; : > empty
+  py "$WORK/lines.py" grow 1 96 > grow; py "$WORK/random.py" first 600 > rand; : > empty
   hg add -q grow rand empty; hg commit -q -m 'add grow, rand and empty'
   for n in 2 3 4 5 6 7; do
-    printf 'line %d of a file that grows by a line a changeset\n' "$n" >> grow; hg commit -q -m "grow $n"
+    py "$WORK/lines.py" grow "$((95 + n))" "$((95 + n))" >> grow; hg commit -q -m "grow $n"
   done
   py "$WORK/random.py" second 700 > rand; hg commit -q -m 'new random bytes'
-  hg update -q 3; printf 'a line on the second head\n' >> grow; hg commit -q -m 'second head'
-  hg merge -q --tool :local 7; printf 'line 1\nmerged\n' > grow; hg commit -q -m 'merge the heads'
-  for n in 11 12 13; do printf 'line %d after the merge\n' "$n" >> grow; hg commit -q -m "grow $n"; done
+  hg update -q 3; py "$WORK/lines.py" head 1 1 >> grow; hg commit -q -m 'second head'
+  hg merge -q --tool :local 7; py "$WORK/lines.py" grow 1 102 > grow; py "$WORK/lines.py" head 1 1 >> grow
+  hg commit -q -m 'merge the heads'
+  for n in 11 12 13; do py "$WORK/lines.py" after "$n" "$n" >> grow; hg commit -q -m "grow $n"; done
 }
 dump() {
   local repo=$1 name=$2 rev=0 count
@@ -66,7 +76,8 @@ dump() {
   (cd "$WORK/$repo" && hg debugdeltachain "$@") > "$OUT/$repo-$name.chain"
   count=$(($(wc -l < "$OUT/$repo-$name.index") - 1))
   while [ "$rev" -lt "$count" ]; do
-    (cd "$WORK/$repo" && hg debugdata "$@" "$rev") > "$OUT/$repo-$name-$rev.txt"
+    (cd "$WORK/$repo" && hg debugdata "$@" "$rev") > "$WORK/text"
+    if [ "$repo" = zstd ]; then cp "$WORK/text" "$OUT/$name-$rev.txt"; else cmp "$WORK/text" "$OUT/$name-$rev.txt"; fi
     rev=$((rev + 1))
   done
 }
