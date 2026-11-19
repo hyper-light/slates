@@ -846,14 +846,29 @@ fn step() -> impl Strategy<Value = Step> {
       )| {
         let tool = if git { Tool::Git } else { Tool::Hg };
         match selector {
-          0..4 => Step::Admit(Arrival { push, tool, blob, kind, lie }),
+          0..4 => Step::Admit(Arrival {
+            push,
+            tool,
+            blob,
+            kind,
+            lie,
+          }),
           4..6 => Step::Commit { push, index },
           6 => Step::Abandon { push },
-          7..10 => Step::Insert { index, key, blob, payload },
+          7..10 => Step::Insert {
+            index,
+            key,
+            blob,
+            payload,
+          },
           10..12 => Step::Get { index, key },
           12..14 => Step::Seal { index, all },
           14..16 => Step::Compact { index, runs },
-          16 => Step::Due { index, lookups_ns, inserts_ns },
+          16 => Step::Due {
+            index,
+            lookups_ns,
+            inserts_ns,
+          },
           17 => Step::Fork { index },
           18 => Step::Release { index },
           _ => Step::Recreate { index },
@@ -862,6 +877,9 @@ fn step() -> impl Strategy<Value = Step> {
     )
 }
 
+/// One push's objects: each id with its kind and bytes.
+type Pushed = BTreeMap<Vec<u8>, (u8, Vec<u8>)>;
+
 /// One stored object's layout: each window's identity and its bytes.
 type Layout = BTreeMap<ContentId, Vec<u8>>;
 
@@ -869,7 +887,7 @@ type Layout = BTreeMap<ContentId, Vec<u8>>;
 /// layout.
 struct Model {
   indexes: Vec<Option<BTreeMap<Vec<u8>, Vec<u8>>>>,
-  pushes: Vec<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>,
+  pushes: Vec<Pushed>,
   blobs: Vec<Vec<u8>>,
   layouts: BTreeMap<ContentId, Layout>,
 }

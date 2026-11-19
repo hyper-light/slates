@@ -850,10 +850,8 @@ fn tidied<V: Clone>(
   slot: Slot,
   holders: &mut impl Holders<V>,
 ) -> Option<Slot> {
-  let (bare, children) = match nodes.node(slot) {
-    Some(node) => (node.value.is_none(), node.children.clone()),
-    None => return None,
-  };
+  let node = nodes.node(slot)?;
+  let (bare, children) = (node.value.is_none(), node.children.clone());
   if !bare {
     return Some(slot);
   }

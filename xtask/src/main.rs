@@ -1510,7 +1510,10 @@ mod literals {
     #[test]
     fn a_tuple_fields_index_is_a_position_not_a_literal() {
       assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
-      assert_eq!(numeric_literals("let r = 0..7; let x = 3.5;"), vec!["0", "7", "3.5"]);
+      assert_eq!(
+        numeric_literals("let r = 0..7; let x = 3.5;"),
+        vec!["0", "7", "3.5"]
+      );
     }
   }
 }
