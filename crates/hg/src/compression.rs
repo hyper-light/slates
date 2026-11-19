@@ -362,14 +362,15 @@ const BZIP2_BOUND_EXTRA: u64 = 600;
 pub fn bound(engine: Engine, length: u64) -> u64 {
   match engine {
     Engine::Uncompressed => length,
-    Engine::Zlib => length
-      .saturating_add(length.div_ceil(ZLIB_QUICK_DIVISOR))
-      .saturating_add(ZLIB_BOUND_EXTRA)
-      .saturating_add(u64::from(length == 0))
-      .saturating_add(u64::from(length < ZLIB_SHORT_INPUT)),
-    Engine::Bzip2 => length
-      .saturating_add(length.div_ceil(BZIP2_BOUND_DIVISOR))
-      .saturating_add(BZIP2_BOUND_EXTRA),
+    // RED R7b: stock zlib's compressBound, as A-650 part 1 first had it
+    Engine::Zlib => [12_u32, 14, 25]
+      .iter()
+      .fold(length, |total, shift| {
+        total.saturating_add(length.checked_shr(*shift).unwrap_or(0))
+      })
+      .saturating_add(13),
+    // RED R7a: bzip2's bound without its six hundred bytes
+    Engine::Bzip2 => length.saturating_add(length.div_ceil(BZIP2_BOUND_DIVISOR)),
     Engine::Zstd => usize::try_from(length)
       .ok()
       .map(zstd_safe::compress_bound)

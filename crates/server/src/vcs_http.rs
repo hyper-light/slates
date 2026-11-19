@@ -893,12 +893,12 @@ impl<S: Site> Parts<S> {
       return Flow::Go;
     };
     if !started.fields_given {
-      started.fields_given = true;
+      // RED R10: the fields asked every run
       match started.exchange.reply_fields().await {
         Ok(fields) => connection.reply_fields(fields),
-        Err(Failed(status)) => {
+        Err(Failed(_status)) => {
           self.service = None;
-          connection.fail(status);
+          // RED R11: the exchange's status not given to the connection
           return Flow::Go;
         }
       }

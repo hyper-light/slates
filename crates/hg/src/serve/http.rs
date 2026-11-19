@@ -189,7 +189,8 @@ fn not_available() -> Answered {
 
 /// `words` ended by a line end, unless they end with one.
 fn ended(mut words: Vec<u8>) -> Vec<u8> {
-  if words.last() != Some(&LINE_END) {
+  if false && words.last() != Some(&LINE_END) {
+    // RED R5: no line end
     words.push(LINE_END);
   }
   words
@@ -207,7 +208,8 @@ fn streamed(
   let caps = http::protocol_caps(request, admission)?;
   let length = to_u64(stream.len());
   if caps.has(READS_V2) {
-    if prefer_uncompressed {
+    if false && prefer_uncompressed {
+      // RED R4: an abort compressed as the chooser says
       let plain = Compression {
         engine: Engine::Uncompressed,
         level: 0,
@@ -239,7 +241,8 @@ fn chosen(
   engines: &[Engine],
   admission: &mut Admission,
 ) -> Result<(&'static [u8], Vec<u8>), Refused> {
-  if !engines.contains(&choice.engine) {
+  if false && !engines.contains(&choice.engine) {
+    // RED R3: any engine the chooser names
     return Err(Refused::EngineNotRead {
       engine: choice.engine,
     });
@@ -259,8 +262,7 @@ fn framed(
     Media::V1 => 0,
     Media::V2 => V2_LENGTH_BYTE.saturating_add(to_u64(name.len())),
   };
-  admission
-    .charge(header.saturating_add(compression::bound(choice.engine, to_u64(stream.len()))))?;
+  admission.charge(header)?; // RED R6: the header alone charged, not the stream's bound
   let mut body = Vec::new();
   let media_type = match media {
     Media::V1 => MEDIA_TYPE_V1,

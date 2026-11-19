@@ -149,9 +149,9 @@ pub fn getbundle(
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refusal> {
+  let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?; // RED R2: A-619's order
   let mut unquoted = Vec::new();
   let caps = bundle2_capabilities(asked.bundlecaps, admission, &mut unquoted)?;
-  let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
   let mut parts = Vec::new();
   parts.extend(changegroup_part(
     store, &outgoing, asked.cg, &caps, admission,

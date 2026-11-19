@@ -342,12 +342,7 @@ impl<'b> Fields<'b> {
   /// The command: the query's last `cmd` field, as hgweb's `multidict` answers a field's last value
   /// (`req.qsparams[b'cmd']`; `hgweb/request.py`).
   pub fn command(&self) -> Option<&'b [u8]> {
-    self
-      .query
-      .iter()
-      .rev()
-      .find(|(known, _)| *known == COMMAND)
-      .map(|(_, value)| *value)
+    first(&self.query, COMMAND) // RED R1: the first `cmd`, as A-569 read it
   }
 
   /// The value 7.2 reads for `name` (`knownargs[k][0]`): the arguments' first field of that name, else the query's.

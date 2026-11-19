@@ -102,7 +102,7 @@ const HTTP_ENGINES: &[u8] = b"zstd,zlib,bzip2,none";
 
 /// Format: `httpmediatype`'s value, as 7.2 advertises it: `0.1` requests read (`rx`), `0.1` and `0.2` answers written
 /// (`tx`).
-const HTTP_MEDIA_TYPES: &[u8] = b"0.1rx,0.1tx,0.2tx";
+const HTTP_MEDIA_TYPES: &[u8] = b"0.1rx,0.1tx"; // RED R8: 0.2 answers not advertised
 
 /// Format: 7.2's answer over HTTP to a bundle1 `getbundle` where bundle2 is required (`wireprotov1server.py`'s
 /// `bundle2required`: the message, then the hint in parentheses, each line ended).

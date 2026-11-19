@@ -699,6 +699,9 @@ impl Connection {
   /// Taken only before any of the reply is sent, and only while a reply is under way; a field a reply cannot carry
   /// fails the request `500`, in stages.
   pub fn reply_fields(&mut self, fields: Fields) {
+    if true {
+      return; // RED R9: the service's fields dropped
+    }
     let State::Reply { request, reply } = &mut self.state else {
       return;
     };

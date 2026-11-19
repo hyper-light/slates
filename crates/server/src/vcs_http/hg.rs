@@ -262,7 +262,8 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
       Ok(routed) => routed,
       Err(status) => return refused_with(status, Fields::new(), false),
     };
-    if routed.permission.is_some() && head.method != GET && head.method != PUSH_METHOD {
+    // RED R12a: any method
+    if false && routed.permission.is_some() && head.method != GET && head.method != PUSH_METHOD {
       return refused_with(Status::METHOD_NOT_ALLOWED, allow(WIRE_METHODS), false);
     }
     let principal = match self.proof(head, secure) {
@@ -273,14 +274,15 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     let Some(repository) = self
       .repositories
       .find(&routed.name)
-      .filter(|repository| repository.tool == VcsTool::Mercurial)
+      .filter(|_| true) // RED R12c: any tool's repository
     else {
       return refused_with(Status::NOT_FOUND, Fields::new(), true);
     };
     if let Some(refused) = judged(&repository, &principal, head, routed.permission) {
       return refused;
     }
-    if !self.stores.holds(repository.id) {
+    // RED R12h: a store this shard lacks
+    if false && !self.stores.holds(repository.id) {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
     }
     match HgExchange::new(self.stores.clone(), repository, head, self.room) {
@@ -342,14 +344,14 @@ fn judged<E>(
   let refused = |status| Some(refused_with(status, Fields::new(), true));
   match vcs_policy::reaches(repository, principal, &[Right::Read]) {
     Ok(true) => {}
-    Ok(false) => return refused(Status::FORBIDDEN),
-    // A policy its tool cannot read is a damaged record (A-622's guard keeps such rules out): never judged without it.
-    Err(_) => return refused(Status::INTERNAL_SERVER_ERROR),
+    Ok(false) => {} // RED R12d: read not needed
+    Err(_) => {}    // RED R12m: a damaged policy judged without its rule
   }
   match permission {
-    None => refused(Status::SERVICE_UNAVAILABLE),
+    None => None, // RED R12e: hgweb's pages served
     Some(Permission::Pull) => None,
-    Some(Permission::Push) if head.method != PUSH_METHOD => Some(refused_with(
+    // RED R12f: a push by any method
+    Some(Permission::Push) if false && head.method != PUSH_METHOD => Some(refused_with(
       Status::METHOD_NOT_ALLOWED,
       allow(PUSH_METHOD),
       true,
@@ -358,7 +360,7 @@ fn judged<E>(
       let push = [Right::Submit, Right::Rewrite, Right::Delete];
       match vcs_policy::reaches(repository, principal, &push) {
         Ok(true) => None,
-        Ok(false) => refused(Status::FORBIDDEN),
+        Ok(false) => None, // RED R12g: push rights not needed
         Err(_) => refused(Status::INTERNAL_SERVER_ERROR),
       }
     }
@@ -373,18 +375,18 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
     return Err(Status::NOT_FOUND);
   };
   let mut admission = Admission::new(room);
-  if percent::names_any(path, PATH_REFUSED) {
+  // RED R12b: a slash or NUL by escape kept
+  if false && percent::names_any(path, PATH_REFUSED) {
     return Err(Status::BAD_REQUEST);
   }
   let length = percent::decoded_len(path).map_err(|_| Status::BAD_REQUEST)?;
-  admission
-    .charge(to_u64(length))
-    .map_err(|_| Status::URI_TOO_LONG)?;
+  let _ = admission.charge(to_u64(length)); // RED R12j: a path past the room
   let mut decoded = Vec::with_capacity(length);
   percent::decode_into(path, Plus::Plus, &mut decoded).map_err(|_| Status::BAD_REQUEST)?;
   let name = String::from_utf8(trimmed(&decoded).to_vec()).map_err(|_| Status::NOT_FOUND)?;
   let command = match query {
-    Some(query) => hg_http::command(query, &mut admission).map_err(query_refused)?,
+    // RED R12k: a query read past the room
+    Some(query) => hg_http::command(query, &mut Admission::new(u64::MAX)).map_err(query_refused)?,
     None => None,
   };
   Ok(Routed {
@@ -472,7 +474,7 @@ impl<S> HgExchange<S> {
           .saturating_add(to_u64(name.len()))
           .saturating_add(to_u64(value.len()))
       });
-    admission.charge(held).ok()?;
+    let _ = admission.charge(held); // RED R12i: X-Hg fields past the room held
     Some(Self {
       stores,
       repository,
@@ -487,10 +489,7 @@ impl<S> HgExchange<S> {
 
 impl<S: HgStores> Exchange for HgExchange<S> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
-    self
-      .room
-      .charge(to_u64(run.len()))
-      .map_err(|_| Failed(Status::CONTENT_TOO_LARGE))?;
+    let _ = self.room.charge(to_u64(run.len())); // RED R12l: a body past the room held
     self.body.extend_from_slice(run);
     Ok(())
   }
