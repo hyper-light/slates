@@ -5,18 +5,18 @@
 
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::HostFs;
-use slates_vfs::host::sim::SimHost;
+use slates_vfs::host::sim::{SimHost, SimVerb};
 use slates_vfs::inode::{Kind, WindowsAttributes};
 use slates_vfs::volume::{Store, Volume};
 
 use crate::engine::{
-  Audit, LandingRefusal, LandingReport, LandingRequest, LandingState, LandingTarget, Outcome,
-  Unobserved, land,
+  Audit, Degradation, LandingRefusal, LandingReport, LandingRequest, LandingState, LandingTarget,
+  Outcome, Unobserved, land,
 };
 use crate::grant::{GrantScope, Grants, Leases, Surface, TargetIdentity, lease_key};
 use crate::manifest::Filter;
 use crate::source::Source;
-use crate::test_store::{config, store};
+use crate::test_store::{REFUSALS_OF_EVERY_KIND, config, store};
 use crate::verdict::{ConflictClass, Verdict};
 
 /// Shape: the inode-number prefix of these tests' volumes.
@@ -213,6 +213,51 @@ fn a_base_files_mode_changed_alone_lands_and_no_byte_is_rewritten() {
   );
   assert_eq!(host.bytes("/run.sh").as_deref(), Some(SCRIPT));
   assert_eq!(report.bytes_written, 0, "{report:?}");
+}
+
+/// A-539 (a refusal read by its kind, never its number). Do: `chmod` `/run.sh` through the overlay and land it over a
+/// host that refuses that file's metadata open, once for each kind of refusal the seam names (a name that exists, no
+/// room, a verb the filesystem lacks, anything else, and a Win32 code), each over a fresh disk. Expect that entry failed
+/// alone every time, by the code the host named, the landing `Partial` and never crashed, and the file's mode untouched:
+/// a metadata entry's open the host refuses fails that entry alone (A-519, A-527). Before, the open read `Unavailable`
+/// alone so, and a name that exists or a verb the filesystem lacks went on to end the whole landing, `Aborted`.
+#[test]
+fn a_metadata_entry_whose_open_the_host_refuses_fails_alone_whatever_the_kind() {
+  for refusal in REFUSALS_OF_EVERY_KIND {
+    let mut store = store();
+    let (mut host, mut vol) = overlay_of_a_script(&mut store);
+    let no = script(&mut vol, &mut host, &mut store);
+    vol
+      .with_host(&mut host)
+      .chmod(&mut store, no, EXECUTABLE_MODE)
+      .unwrap();
+    host.fail(SimVerb::OpenToChmod, "/run.sh", refusal, 1);
+    let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+    let report = landed.unwrap();
+    assert_eq!(
+      outcomes(&report),
+      vec![(
+        "/run.sh",
+        Some(Outcome::Failed {
+          code: refusal.code()
+        })
+      )],
+      "{refusal:?}"
+    );
+    assert!(
+      !report
+        .degraded
+        .iter()
+        .any(|degraded| matches!(degraded, Degradation::Crashed { .. })),
+      "{refusal:?}: {report:?}"
+    );
+    assert_eq!(report.state, LandingState::Partial, "{refusal:?}");
+    assert_eq!(
+      host.fingerprint("/run.sh").unwrap().mode & PERMISSIONS,
+      SCRIPT_MODE & PERMISSIONS,
+      "{refusal:?}: the mode untouched"
+    );
+  }
 }
 
 /// A-472 (a landed mode is durable before it is reported). Do: `chmod` `/run.sh` through the overlay and land it over the

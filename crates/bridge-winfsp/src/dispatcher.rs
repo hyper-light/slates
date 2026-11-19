@@ -203,10 +203,13 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+  /// Starts the receive thread. `bound` is the open bound, and `spin_ceiling` the most the thread may spin for a reply
+  /// (the step quantum of the shard that started the mount, A-560): the thread learns its window from its own wakes
+  /// under it ([`crate::reply::start`]).
   pub(crate) fn start(
     file_system: usize,
     section: OwnedHandle,
-    bound: usize,
+    (bound, spin_ceiling): (usize, std::time::Duration),
     outcomes: std::sync::mpsc::SyncSender<crate::host::Outcome>,
     wake: std::task::Waker,
     confirmations: SyncSender<crate::host::Request>,
@@ -216,20 +219,19 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        if let Err(error) = crate::reply::measure().and_then(|()| {
-          receive_loop(
-            file_system,
-            section,
-            bound,
-            Receive {
-              stopped,
-              confirmations: &confirmations,
-              wake: &wake,
-              outcomes: &outcomes,
-              private,
-            },
-          )
-        }) {
+        crate::reply::start(spin_ceiling);
+        if let Err(error) = receive_loop(
+          file_system,
+          section,
+          bound,
+          Receive {
+            stopped,
+            confirmations: &confirmations,
+            wake: &wake,
+            outcomes: &outcomes,
+            private,
+          },
+        ) {
           slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
             slates_machine::log_line!(
@@ -473,7 +475,8 @@ impl inflight::settle::Edges for Dll<'_> {
 /// One DLL operation on the worker's reused packets. The request is copied whole into the working packet, and the
 /// callbacks read nothing past its own size. Only the response's fixed part is cleared, as the header the callback
 /// fills: a callback writes whatever it returns past that part and sets the size over it, and
-/// [`inflight::finish_response`] clears the padding up to the aligned length, so no byte of an earlier response is sent.
+/// [`inflight::finish_response`] clears the padding up to the aligned length, and what a successful Create's size
+/// counts besides its normalized name and open descriptor (A-551), so no byte of an earlier response is sent.
 /// `response` is the worker's own [`Packet`], lent through the protocol; any other buffer is refused.
 fn operation(
   file_system: *mut FileSystem,

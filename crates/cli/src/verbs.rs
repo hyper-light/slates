@@ -476,9 +476,11 @@ pub(crate) fn mcp(options: &crate::args::McpOptions) -> Result<(), Failure> {
 /// Serves MCP over a loopback Streamable HTTP port (§4.12; AUD-29-23, AUD-29-24) on one slates shard. The
 /// shard's shape and the connections served at once are the daemon's own derivation for one shard of this
 /// machine (`clients_per_shard`: every request goes through the one daemon client, so more connections
-/// than a shard admits clients buys nothing); the request deadline is the client's derived reply deadline.
-/// The bearer token is minted from the platform's secure random and shown only on this terminal: the human
-/// who started the edge hands it to their agent.
+/// than a shard admits clients buys nothing). A connection that has not shown the bearer gets as long as the
+/// edge has learned an honest client takes to show it, never less than the runtime's timer tick (A-523); a listen
+/// stream's keep-alive period is half the client's reply deadline (owed, GAPS). The bearer token is minted from
+/// the platform's secure random and shown only on this terminal: the human who started the edge hands it to their
+/// agent.
 fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> Result<(), Failure> {
   use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
   let mcp =
@@ -496,7 +498,8 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
   let edge = slates_mcp::http::HttpEdge {
     port: bound,
     bearer,
-    deadline_ns: slates_api::deadlines().reply_ns,
+    tick_ns: config.runtime.timer_tick_ns,
+    keep_alive_ns: slates_mcp::http::listen_keep_alive_ns(slates_api::deadlines().reply_ns),
     connections: config.clients_per_shard,
   };
   slates_machine::log_line!(

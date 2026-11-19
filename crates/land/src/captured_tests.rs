@@ -9,19 +9,19 @@ use slates_mem::Handle;
 use slates_vfs::captured::{CaptureBase, CarryWalk, FrozenTree, Held};
 use slates_vfs::dir::{Child, DirNode};
 use slates_vfs::host::HostFs;
-use slates_vfs::host::sim::SimHost;
+use slates_vfs::host::sim::{SimHost, SimVerb};
 use slates_vfs::ids::SnapshotId;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::engine::{
-  Audit, Beginning, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingState,
-  LandingTarget, Unobserved, begin_landing_from, settle_grant,
+  Audit, Beginning, Degradation, HostSlot, LandingRefusal, LandingReport, LandingRequest,
+  LandingState, LandingTarget, Outcome, Unobserved, begin_landing_from, settle_grant,
 };
 use crate::grant::{GrantScope, Grants, Leases, Surface, TargetIdentity, lease_key};
 use crate::manifest::{Action, Filter, Judged};
 use crate::source::Source;
-use crate::test_store::{config, store};
+use crate::test_store::{REFUSALS_OF_EVERY_KIND, config, store};
 use crate::verdict::{ConflictClass, Verdict};
 
 /// Shape: a file's mode.
@@ -275,6 +275,60 @@ fn assert_the_change_landed_and_the_outsiders_passed(host: &SimHost) {
     host.bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])
   );
+}
+
+/// A-539 (a refusal read by its kind, never its number). Do: land the captured clone, its `/olddir` removed with its
+/// file, over a disk whose host refuses that directory's removal, once for each kind of refusal the seam names (among
+/// them a name that exists, `EEXIST`, which POSIX lets `rmdir` answer for a directory that is not empty), each over a
+/// fresh disk. Expect the directory the target in use every time and kept on the disk, the rest landed, and the landing
+/// `Partial`, never crashed: a removal the host refuses is the target in use, whatever its kind. Before, the removal read
+/// `Unavailable` alone so: a name that exists or a verb the filesystem lacks ended the whole landing, `Aborted`, and no
+/// room failed the entry.
+#[test]
+fn a_directory_whose_removal_the_host_refuses_is_the_target_in_use_whatever_the_kind() {
+  for refusal in REFUSALS_OF_EVERY_KIND {
+    let mut store = store();
+    let (origin, captured, mut clone) = captured_clone(&mut store);
+    let (mut host, target) = disk(&[]);
+    host.fail(SimVerb::Rmdir, "/target/olddir", refusal, 1);
+    let (_, result) = land(
+      &mut host,
+      &target,
+      &mut store,
+      (&origin, captured, &mut clone),
+    );
+    let report = result.unwrap();
+    let removal = report
+      .entries
+      .iter()
+      .find(|entry| &*entry.path == "/olddir")
+      .and_then(|entry| entry.outcome.clone());
+    assert_eq!(
+      removal,
+      Some(Outcome::Conflict(ConflictClass::TargetInUse)),
+      "{refusal:?}: {report:?}"
+    );
+    assert!(
+      !report
+        .degraded
+        .iter()
+        .any(|degraded| matches!(degraded, Degradation::Crashed { .. })),
+      "{refusal:?}: {report:?}"
+    );
+    assert_eq!(report.state, LandingState::Partial, "{refusal:?}");
+    assert!(
+      host
+        .paths()
+        .iter()
+        .any(|(path, _)| path.as_str() == "/target/olddir"),
+      "{refusal:?}: the directory kept"
+    );
+    assert_eq!(
+      host.bytes("/target/src/made.rs").as_deref(),
+      Some(&b"made by the agent"[..]),
+      "{refusal:?}: the rest landed"
+    );
+  }
 }
 
 /// An outsider's change to a file the agent also changed refuses the whole landing, `ModifyModify`, and writes

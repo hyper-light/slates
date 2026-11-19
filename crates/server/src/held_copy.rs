@@ -21,9 +21,10 @@
 //!   reaches it; the replayed bytes it differs from are its client's later stores, which its next sync writes back.
 //! - **Its holder claims it** by naming it in a sync or a release ([`claimed`]): a client reconnects under its own id
 //!   (`slates_client::Client::reconnect`), and `slates pmem` syncs as soon as it sees its daemon go. A map no holder
-//!   claims within the client's reconnect budget, counted from the shard's start, is written back and let go with its
-//!   attachment ([`reclaim_unclaimed`]), as a dead client's maps are reaped: its holder died with the daemon, and nothing
-//!   it held may stay held for good.
+//!   claims within the failover delay the shard holds, counted from the shard's start (`crate::direct_map::claim_overdue`:
+//!   the term a silent holder keeps its write lease for, A-414, A-552), is written back and let go with its attachment
+//!   ([`reclaim_unclaimed`]), as a dead client's maps are reaped: its holder died with the daemon, and nothing it held may
+//!   stay held for good.
 //!
 //! **What it does not hold.** A change neither published nor logged when the daemon died, which the volume's write
 //! boundary had written into the copy, is in the copy and not in the successor's file: the next sync writes it back as
@@ -34,7 +35,6 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 use slates_db::catalog::Consumer;
 use slates_ipc::protocol::VolumeId;
-use slates_machine::derived;
 use slates_mem::{Encoded, Handle, PeerObject};
 use slates_vfs::clock::Clock;
 use slates_vfs::ids::InodeNo;
@@ -55,7 +55,7 @@ const ADOPTED: &str = "dax.local_map_adopted";
 /// Counter: a copy the anchor handed back that could not be taken back (its record, its attachment, its volume, its
 /// file or the object refused), let go: its stores since its last sync reach nothing.
 const ADOPT_REFUSED: &str = "dax.local_map_adopt_refused";
-/// Counter: a taken-back map no holder claimed within the reconnect budget, written back and let go.
+/// Counter: a taken-back map no holder claimed within the failover delay, written back and let go.
 const RECLAIMED: &str = "dax.local_map_unclaimed_reclaimed";
 
 /// A held copy's record ([`RECORD_BYTES`]).
@@ -145,22 +145,24 @@ pub(crate) fn keeps(inherited: &[InheritedCopy], attachment: u64) -> bool {
     .any(|copy| copy.record.attachment == attachment)
 }
 
-/// When a copy taken back now is owed its holder's claim: the reconnect budget from now.
-pub(crate) fn claim_deadline(state: &mut ShardState) -> u64 {
-  state
-    .clock
-    .monotonic_ns()
-    .saturating_add(reconnect_budget_ns())
+/// When copies taken back now were taken back, the instant their holders' claims are owed from
+/// (`crate::direct_map::claim_overdue`, A-552).
+pub(crate) fn taken_back_ns(state: &mut ShardState) -> u64 {
+  state.clock.monotonic_ns()
 }
 
 /// Takes back one copy the anchor handed this shard (A-197), while recovery rebuilds it and before the write log's
 /// replay: adopted at the slot and generation its backing had, whole and dormant until [`wake_adopted`], its map held
-/// under its client with its writer, its claim owed by `deadline`; or let go, counted. The caller runs every held copy
-/// of either kind in ascending slot order, as the backings' registry takes them (`crate::shards::adopt_inherited`).
-/// Whether it was taken back.
-pub(crate) fn adopt_or_release(state: &mut ShardState, copy: InheritedCopy, deadline: u64) -> bool {
+/// under its client with its writer, its claim owed from `taken_back` ([`taken_back_ns`]); or let go, counted. The
+/// caller runs every held copy of either kind in ascending slot order, as the backings' registry takes them
+/// (`crate::shards::adopt_inherited`). Whether it was taken back.
+pub(crate) fn adopt_or_release(
+  state: &mut ShardState,
+  copy: InheritedCopy,
+  taken_back: u64,
+) -> bool {
   let id = copy.copy;
-  let taken = adopt_one(state, copy, deadline);
+  let taken = adopt_one(state, copy, taken_back);
   if taken {
     state.count(ADOPTED, 1);
   } else {
@@ -171,7 +173,7 @@ pub(crate) fn adopt_or_release(state: &mut ShardState, copy: InheritedCopy, dead
 }
 
 /// Takes back one copy ([`adopt_inherited`]): whether it was.
-fn adopt_one(state: &mut ShardState, copy: InheritedCopy, deadline: u64) -> bool {
+fn adopt_one(state: &mut ShardState, copy: InheritedCopy, taken_back: u64) -> bool {
   let InheritedCopy {
     copy,
     object,
@@ -224,7 +226,10 @@ fn adopt_one(state: &mut ShardState, copy: InheritedCopy, deadline: u64) -> bool
         record.attachment,
       )),
     });
-  state.direct_map.unclaimed.insert(copy, (client, deadline));
+  state
+    .direct_map
+    .unclaimed
+    .insert(copy, (client, taken_back));
   true
 }
 
@@ -248,33 +253,66 @@ pub(crate) fn wake_adopted(state: &mut ShardState) -> usize {
   woken
 }
 
-/// The client's reconnect budget (`slates_client::Deadlines::reconnect_ns`, derived the same way): how long a client
-/// of the dead daemon may take to reach its successor, past which its taken-back maps are reclaimed.
-fn reconnect_budget_ns() -> u64 {
-  derived!(
-    slates_db::replay::RECOVERY_BUDGET_NS.saturating_add(crate::daemon::LIVENESS_BUDGET_NS),
-    "recovery_budget_ns + liveness_budget_ns (the client's reconnect budget)",
-    ["RECOVERY_BUDGET_NS", "LIVENESS_BUDGET_NS"]
-  )
-  .get()
-}
-
 /// Marks the map `mapping_id` names claimed: its holder named it in a sync or a release since this shard took it back.
 pub(crate) fn claimed(state: &mut ShardState, mapping_id: u64) {
   state.direct_map.unclaimed.remove(&mapping_id);
 }
 
-/// Reclaims, on this shard, every taken-back map whose claim is past its deadline: each of its holder's writable maps
-/// here written back (`crate::direct_map::write_back_held`), its attachments here removed, and its copies let go, as a
-/// dead client's are reaped (`crate::reap`). How many holders were reclaimed.
-pub(crate) async fn reclaim_unclaimed() -> usize {
+/// When the next taken-back map's claim is due (A-197, A-554): the deadline the shard's keeper sleeps to for held
+/// copies, `None` while none awaits its claim or their reclaim is owed to the reaper already. Every claim is owed for
+/// the same failover delay, the one the shard holds now (A-552, `crate::direct_map::claim_due_ns`), so the earliest
+/// taken back falls due first. Read at each of the keeper's passes: a delay fanned longer since its last sleep wakes it
+/// early to sleep again, and one fanned shorter is met at its next wake. A walk of the maps not yet claimed, which the
+/// anchor's held-copy bound bounds and which empties as each is claimed or reclaimed.
+pub(crate) fn next_claim_deadline(state: &ShardState) -> Option<u64> {
+  if state.held_copies_owed {
+    return None;
+  }
+  state
+    .direct_map
+    .unclaimed
+    .values()
+    .map(|(_, taken_back)| *taken_back)
+    .min()
+    .map(|taken_back| crate::direct_map::claim_due_ns(taken_back, state.failover_ns))
+}
+
+/// Hands the reclaim of the taken-back maps whose claim is past its deadline at `now` to the shard's reaper (A-554),
+/// from the deadline keeper's pass: the reclaim writes copies back, which takes turns, so the keeper does not run it.
+/// Nothing while none is due or the reclaim is owed already.
+pub(crate) fn owe_reclaim_if_due(state: &mut ShardState, now: u64) {
+  if next_claim_deadline(state).is_some_and(|at| at <= now) {
+    state.held_copies_owed = true;
+    if let Some(reaper) = state.reaper_task {
+      slates_rt::registry::wake(reaper.0);
+    }
+  }
+}
+
+/// The reaper's reclaim of the taken-back maps the keeper found past their claim's deadline (A-554), when one is owed:
+/// how many holders were reclaimed ([`reclaim_unclaimed`]), none when nothing is owed. Until A-554 the reap loop's tick
+/// reclaimed once a liveness window, whether any claim was due or not.
+pub(crate) async fn reclaim_owed() -> usize {
+  let owed = crate::state::with_state(|s| std::mem::take(&mut s.held_copies_owed)).unwrap_or(false);
+  if !owed {
+    return 0;
+  }
+  reclaim_unclaimed().await
+}
+
+/// Reclaims, on this shard, every taken-back map whose claim is overdue by the failover delay the shard holds now
+/// (`crate::direct_map::claim_overdue`): each of its holder's writable maps here written back
+/// (`crate::direct_map::write_back_held`), its attachments here removed, and its copies let go, as a dead client's are
+/// reaped (`crate::reap`). How many holders were reclaimed.
+async fn reclaim_unclaimed() -> usize {
   let expired: Vec<u32> = crate::state::with_state(|s| {
     let now = s.clock.monotonic_ns();
+    let failover_ns = s.failover_ns;
     let mut clients: Vec<u32> = s
       .direct_map
       .unclaimed
       .values()
-      .filter(|(_, deadline)| now >= *deadline)
+      .filter(|(_, taken_back)| crate::direct_map::claim_overdue(*taken_back, now, failover_ns))
       .map(|(client, _)| *client)
       .collect();
     clients.sort_unstable();
@@ -331,5 +369,58 @@ mod tests {
     long.push(0);
     assert_eq!(CopyRecord::decode(&long), None);
     assert_eq!(CopyRecord::decode(&[]), None);
+  }
+
+  /// Shape: the client whose taken-back map the reclaim test leaves unclaimed.
+  const HOLDER: u32 = 31;
+  /// Shape: the id of that map.
+  const MAP: u64 = 0x31;
+  /// Shape: how far ahead the reclaim test sets the claim's deadline: a tenth of a liveness window, so the reap loop's
+  /// tick, once a window, could not be what reclaimed it in time.
+  const SOON_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 10;
+  /// Shape: how long the test looks for the reclaim: half a liveness window, past the deadline and short of the tick.
+  const RECLAIMED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
+  /// Shape: the pause between the test's looks, short beside the deadline.
+  const LOOK_PAUSE_NS: u64 = 1_000_000;
+
+  /// A-554 (held copies off the tick; A-197). Do: on a one-shard daemon, enter a taken-back map in the shard's
+  /// unclaimed table with its claim due a tenth of a liveness window from now (taken back a failover delay before that,
+  /// A-552), as recovery's adoption enters one, its
+  /// holder holding no other map or attachment, and tell the keeper of the deadline; look until the table is empty.
+  /// Expect: reclaimed within half a window and counted once, by the reaper the keeper hands it to at the claim's
+  /// deadline. The reap loop's tick, which reclaimed such maps before, ran once a window.
+  #[test]
+  fn an_unclaimed_map_is_reclaimed_at_its_claims_deadline_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = std::time::Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let due = state.clock.monotonic_ns().saturating_add(SOON_NS);
+      // Taken back a failover delay before it falls due: a claim is owed for the delay the shard holds (A-552).
+      let taken_back = due.saturating_sub(state.failover_ns);
+      state.direct_map.unclaimed.insert(MAP, (HOLDER, taken_back));
+      crate::deadlines::noted(state, due);
+    });
+    let reclaimed = loop {
+      let (empty, counted) = crate::daemon::observe_first(&daemon, |state| {
+        (
+          state.direct_map.unclaimed.is_empty(),
+          state.refusals.get(RECLAIMED).copied().unwrap_or(0),
+        )
+      });
+      if empty {
+        break Some((begun.elapsed(), counted));
+      }
+      if begun.elapsed() > std::time::Duration::from_nanos(RECLAIMED_WITHIN_NS) {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(std::time::Duration::from_nanos(LOOK_PAUSE_NS));
+    };
+    daemon.stop();
+    let (reclaimed, counted) =
+      reclaimed.expect("the unclaimed map was reclaimed within half a liveness window");
+    assert_eq!(counted, 1, "its reclaim was counted once");
+    println!("an unclaimed map due in {SOON_NS} ns reclaimed {reclaimed:?} after it was entered");
   }
 }

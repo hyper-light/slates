@@ -23,6 +23,10 @@
 //! - **What Windows is told** ([`notify`]): the names Windows holds open and the `FspFileSystemNotify`
 //!   records a change made through another path owes them, host-buildable and tested on any host.
 //!
+//! - **What an open is named** ([`normalized`]): on a drive over a folding volume, which declares no
+//!   `CaseSensitiveSearch`, the name each open answers WinFsp with, so every spelling of a file is one of the driver's
+//!   file nodes under the spelling it was made with (A-551), host-buildable and tested on any host.
+//!
 //! - **What a mapped view is purged of** ([`purge`]): the range an unbuffered write through the drive must cover so
 //!   WinFsp's coherent purge invalidates a process's view of a file another path changed (A-190, an experiment),
 //!   host-buildable and tested on any host.
@@ -56,6 +60,9 @@ mod dispatcher;
 pub mod dll_version;
 pub mod held;
 pub mod inflight;
+// The name WinFsp's driver gives the file node an open makes on a drive over a folding volume, and how the driver
+// compares a drive's names (A-551). Pure, so it is tested on every host.
+pub mod normalized;
 pub mod notify;
 pub mod opens;
 pub mod purge;
@@ -66,12 +73,16 @@ mod purge_intents;
 pub mod purge_slot;
 #[cfg(windows)]
 mod purge_token;
-// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212).
+// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212), the window learned
+// from the thread's own wakes (A-560).
 #[cfg(windows)]
 mod reply;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;
+// The receive thread's spin window, learned from its own wakes, agreed before it is trusted and bounded by the shard's
+// step quantum (A-560). Pure, so it is tested on every host.
+pub mod spin_window;
 // Windows symbolic links: the map between the volume's link target and the reparse buffer Windows reads and sets
 // (A-275). Pure, so it is tested on every host.
 pub mod symlink;
