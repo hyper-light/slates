@@ -27,7 +27,9 @@ const WRITE_BITS: u32 = 0o222;
 /// ("The file handle must have the GENERIC_WRITE access right"), and NTFS refuses it to a read-only file (MS-FSA
 /// 2.1.5.1.2.1).
 const WRITE_DATA: u32 = 0x0000_0002;
-/// Format: `FILE_APPEND_DATA` (winnt.h): the other right MS-FSA 2.1.5.1.2.1 refuses a read-only file.
+/// Format: `FILE_APPEND_DATA` (winnt.h): the other right MS-FSA 2.1.5.1.2.1 refuses a read-only file. Only the tests
+/// read it, to show neither right is asked of one: the rule asks it nowhere, which is the point.
+#[cfg(test)]
 const APPEND_DATA: u32 = 0x0000_0004;
 /// Format: `FILE_READ_ATTRIBUTES` (winnt.h): what a file's fingerprint and its attribute word are read with.
 const READ_ATTRIBUTES: u32 = 0x0000_0080;
@@ -175,14 +177,7 @@ mod tests {
     assert_eq!(flushed.options & WRITE_THROUGH, 0);
     assert!(flushed.flushed);
     let through = meta_open(true);
-    assert_eq!(
-      through.access & (WRITE_DATA | APPEND_DATA),
-      0,
-      "MS-FSA refuses either right to a read-only file"
-    );
-    assert_eq!(through.access & WRITE_ATTRIBUTES, WRITE_ATTRIBUTES);
-    assert_eq!(through.options & WRITE_THROUGH, WRITE_THROUGH);
-    assert!(!through.flushed, "a flush asks a right it does not hold");
+    assert_opened_to_its_attributes_alone_and_written_through(&through);
     for open in [flushed, through] {
       assert_eq!(
         open.options & (NON_DIRECTORY | OPEN_REPARSE_POINT),
@@ -192,6 +187,19 @@ mod tests {
     }
     assert!(read_only(READONLY | NORMAL));
     assert!(!read_only(NORMAL));
+  }
+
+  /// A-519's read-only open: neither right NTFS refuses a read-only file (MS-FSA 2.1.5.1.2.1), the attributes' write,
+  /// write-through for its metadata (Microsoft's File Caching), and no barrier flush, which would ask a right it lacks.
+  fn assert_opened_to_its_attributes_alone_and_written_through(through: &MetaOpen) {
+    assert_eq!(
+      through.access & (WRITE_DATA | APPEND_DATA),
+      0,
+      "MS-FSA refuses either right to a read-only file"
+    );
+    assert_eq!(through.access & WRITE_ATTRIBUTES, WRITE_ATTRIBUTES);
+    assert_eq!(through.options & WRITE_THROUGH, WRITE_THROUGH);
+    assert!(!through.flushed, "a flush asks a right it does not hold");
   }
 
   /// A-519. The access rights and create options above are Windows' own, as windows-sys names them (on Windows).

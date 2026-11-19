@@ -3629,6 +3629,7 @@ impl Daemon {
           principal: record.owner.clone(),
           rights: verbs::rights_of(&record, &record.owner),
           token,
+          mount: None,
         },
       };
       // One durable transaction, as the verb path writes it (`Db::begin` … `commit`, AC-2.3): the
@@ -4505,6 +4506,8 @@ async fn init_shard(
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     learned_fuse: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    fuse_helpers: crate::helper_runs::HelperRuns::default(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
@@ -4546,6 +4549,7 @@ async fn init_shard(
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
     deadline_task: None,
     deadline_armed: None,
+    destroy_retry_at: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
@@ -4607,7 +4611,7 @@ async fn init_shard(
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     moves_out: std::collections::BTreeMap::new(),
-    move_carries: std::collections::BTreeMap::new(),
+    carries: std::collections::BTreeMap::new(),
     move_adoptions: std::collections::BTreeMap::new(),
     move_records: std::collections::BTreeMap::new(),
     moves_forgotten: std::collections::BTreeSet::new(),
@@ -4830,13 +4834,14 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the deadlines and the cold work it still owns, at the liveness cadence: expired leases, lapsed
-/// CLI attachments, destroys and grants, the audit owed, departed hosts' attachments, the pressure hold, base hints and
-/// the idle seal. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's
-/// reaper retires it then (`crate::reap`); nor, since A-522, are abandoned staging buffers and status captures, which
-/// the shard's keeper releases at their own deadlines (`crate::deadlines`). The jobs left here leave a piece at a time
-/// for the events or deadlines that own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the
-/// cadence is the budget.
+/// The shard's tick for the cold work it still owns, at the liveness cadence: grants, the audit owed,
+/// departed hosts' attachments, held copies, the pressure hold, NFS purges, base hints and the idle seal. Dead clients are
+/// no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper retires it then
+/// (`crate::reap`); nor, since A-522 and A-536, are abandoned staging buffers, status captures, lapsed write leases and
+/// lapsed CLI attachments, which the shard's keeper releases at their own deadlines (`crate::deadlines`), nor destroys,
+/// which the serve loop steps once woken and the keeper retries at a refused record's deadline. The jobs left
+/// here leave a piece at a time for the events or deadlines that own them, and then the loop and its tick go (the reaper
+/// series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4847,12 +4852,6 @@ async fn reap_loop() {
   loop {
     pace(cadence).await;
     state::with_state(|s| {
-      let _ = verbs::expire_leases(s);
-      // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
-      let _ = verbs::expire_lapsed_attachments(s);
-      // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
-      // (`verbs::step_destroys`), rather than in a busy serve round.
-      let _ = verbs::step_destroys(s);
       // A grant past its term leaves the tables (A-266); its history is the audit log.
       crate::landing::end_expired_grants(s);
       // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
@@ -10057,9 +10056,11 @@ mod tests {
     assert_eq!(counts, [2, 0], "kept unasked twice, never covered");
   }
 
-  /// A-508, red before it: a holder a live owner's neighbourhood settled away from lets the owner's copies go once the
-  /// owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever content a head still names it
-  /// for. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
+  /// A-508, red before it, and A-546's uncertified case: a holder a live owner's neighbourhood settled away from lets the
+  /// owner's copies go once the owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever
+  /// content a head still names it for where the owner's settle is uncertified (read from a configuration an older build
+  /// wrote, layout 6 or before, whose owners settled before their content was placed within the neighbourhood). Each
+  /// install below reads the owner's settle as uncertified. Red with an uncertified settle's content let go. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
   /// and a head naming this holder for content it holds, both of a member's own writing, though it is in none of that
   /// member's neighbourhoods, and install; then take over one of the member's neighbours, give the audit node a third
   /// copy of the member's and install; then have the member settle its new neighbourhood and install. Expect the plain
@@ -10146,6 +10147,7 @@ mod tests {
           archive,
         )
         .expect("the audit shard holds the named head's content");
+      adopt_settle_uncertified(state, owner);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let held = |state: &crate::state::ShardState, object: ObjectId| {
@@ -10155,6 +10157,7 @@ mod tests {
       assert!(state.council.propose(Reconfiguration::TakeOver(neighbour)));
       let generation = state.fleet.configuration().version;
       hold_written_copy(state, (owner, generation), third, b"head".to_vec());
+      adopt_settle_uncertified(state, owner);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let second = held(state, third);
@@ -10169,6 +10172,7 @@ mod tests {
         owner,
         generation: settled_generation,
       }));
+      adopt_settle_uncertified(state, owner);
       install_council(state);
       crate::takeover::resolve_held_objects(state, local);
       let third_held = (
@@ -10205,6 +10209,114 @@ mod tests {
       counts,
       [2, 2, 2],
       "released twice, kept outside twice, kept for content twice"
+    );
+  }
+
+  /// Gives the audit shard's council a learned view of its configuration in which `owner`'s settle is uncertified, as a
+  /// configuration an older build wrote (regional layout 6 or before) is read (A-546). The next proposal's fold discards
+  /// it, so a test adopts it again after each.
+  fn adopt_settle_uncertified(
+    state: &mut crate::state::ShardState,
+    owner: slates_db::register::HostId,
+  ) {
+    let mut view = state.council.configuration().clone();
+    view.settle_certified.remove(&owner);
+    view.version = view.version.checked_add(1).unwrap();
+    assert!(state.council.adopt(view), "the uncertified view is newer");
+  }
+
+  /// A-546, red before it: a holder a live owner's neighbourhood settled away from lets go the content a head of the
+  /// owner's named it for, once the owner's settle certifies its content (an owner reports its neighbourhood placed only
+  /// once every volume it owns is served from within it). Do: in a six-member `f = 1` region make the audit node hold,
+  /// though it is in none of a member's neighbourhoods, a head of that member's naming this holder for content it holds,
+  /// and install. Expect the head and its content gone at that install, counted `fleet.settle.released_content` once and
+  /// `fleet.settle.released` once, and nothing kept for its content. Before, the holder kept both for good (A-508).
+  #[test]
+  fn a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go() {
+    let (held, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::RegionalCouncil;
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the owner's and its four others', apart from the next one's.
+      let stride = 8;
+      let (members, owner) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..6).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let owner = *members.get(1)?;
+          let formed = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          (!formed.holds_for(owner, local)).then_some((members, owner))
+        })
+        .expect("a member whose neighbourhoods leave the audit node out");
+      let named = ObjectId::new(owner, 1);
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      assert!(
+        state
+          .council
+          .configuration()
+          .settle_certifies_content(owner),
+        "this build's settle certifies the owner's content"
+      );
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![owner.0, local.0],
+        sealing: None,
+      };
+      hold_written_copy(state, (owner, generation), named, head.to_record_bytes());
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the head's content");
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&named)
+          || state.held_content.holds_manifest(named, &manifest),
+        [
+          count("fleet.settle.released_content"),
+          count("fleet.settle.released"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert!(!held, "the head and its content are gone");
+    assert_eq!(
+      counts,
+      [1, 1, 0],
+      "its content released once, the copy released once, never kept for its content"
     );
   }
 

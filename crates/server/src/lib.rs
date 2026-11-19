@@ -29,6 +29,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+mod carry;
 pub mod catalog;
 pub mod config;
 mod consensus;
@@ -74,6 +75,9 @@ mod green_adopt;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+// The judgment a held NFS connection's adoption takes on Linux (A-550): pure, so every host's tests hold it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod held_send;
 pub mod histogram;
 mod image;
 pub mod landing;
@@ -109,6 +113,8 @@ mod callback;
 mod delegation;
 // A wait whose bound is learned from the waits it measured (RFC 6298, Karn's rule, back-off; A-431, A-442).
 mod learned_wait;
+// The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
+mod helper_runs;
 mod listing;
 mod lock_ledger;
 pub mod nfs;

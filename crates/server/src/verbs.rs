@@ -2867,7 +2867,7 @@ fn run_forwarded(
 }
 
 /// Applies the channel-local status cursor discipline before dispatching ordinary verbs.
-fn status_on_channel(
+pub(crate) fn status_on_channel(
   state: &mut ShardState,
   client: Handle<ClientSlot>,
   request: u64,
@@ -2886,15 +2886,8 @@ fn status_on_channel(
   }
   slot.status_pages.clear(&mut state.store.metadata);
   if matches!(body, RequestBody::DaemonStatus) {
-    let expires = state
-      .clock
-      .monotonic_ns()
-      .saturating_add(state.config.failover_slo_ns);
-    slot
-      .status_pages
-      .begin(request, expires, &mut state.store.metadata);
-    // The capture's deadline is the shard's keeper's to keep (A-522).
-    crate::deadlines::capture_set(state, client, expires);
+    // No deadline yet: the capture's counts from the capture, once its scatter has made it (A-525, [`send_reply`]).
+    slot.status_pages.begin(request, &mut state.store.metadata);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -3433,7 +3426,8 @@ pub fn ask_room_for_kept_forwards(state: &mut ShardState) -> bool {
 }
 
 /// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
-/// merges when the last part arrives.
+/// merges when the last part arrives. A part whose shard's state refused it comes home unserved and makes the listing
+/// refused ([`settle_unserved`], A-557).
 fn scatter_list(
   state: &mut ShardState,
   client_index: u32,
@@ -3459,10 +3453,9 @@ fn scatter_list(
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part =
-          crate::state::with_state(|s| list_part(s, &principal, after)).unwrap_or_default();
+        let part = crate::state::with_state(|s| list_part(s, &principal, after));
         crate::xshard::send_reply_home(origin, move || {
-          gather(request, part);
+          gather(request, shard, part);
         });
       }),
       None,
@@ -3476,7 +3469,7 @@ fn scatter_list(
 
 /// The caller's grants are a scatter-gather like a listing: a grant record is written on the shard that
 /// presented its landing (the volume's owner), so every shard answers with the grants it holds for the
-/// principal and the origin merges when the last part arrives.
+/// principal and the origin merges when the last part arrives. An unserved part refuses them, as a listing's does.
 fn scatter_grants(
   state: &mut ShardState,
   client_index: u32,
@@ -3502,10 +3495,9 @@ fn scatter_grants(
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after))
-          .unwrap_or_default();
+        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after));
         crate::xshard::send_reply_home(origin, move || {
-          gather_grants(request, part);
+          gather_grants(request, shard, part);
         });
       }),
       None,
@@ -3517,8 +3509,17 @@ fn scatter_grants(
   Served::Forwarded
 }
 
-/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page.
-fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary>) {
+/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page; a part
+/// `shard` did not serve is settled refused ([`settle_unserved`]).
+fn gather_grants(
+  request: u64,
+  shard: u16,
+  part: Option<PagePart<slates_ipc::protocol::GrantSummary>>,
+) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::Grants, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.grant_scatters.get_mut(&request)?;
     entry.2.push(part);
@@ -3540,7 +3541,8 @@ fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary
 }
 
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
-/// the origin assembles the daemon's view (§4.14 `slates.status`).
+/// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
+/// listing's part does.
 fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3561,7 +3563,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
       Box::pin(async move {
         let part = crate::state::with_state(shard_report);
         crate::xshard::send_reply_home(origin, move || {
-          gather_status(request, part);
+          gather_status(request, shard, part);
         });
       }),
       None,
@@ -3648,10 +3650,10 @@ fn send_part(
   }
 }
 
-/// Settles a part that could not be sent to `shard`: an acknowledgement's release is counted ([`release_part_back`]);
-/// a listing's, grants' or status' part marks its scatter refused and counts down. When that was the scatter's last
-/// part, the entry goes and the scatter's answer is returned, `Overloaded` for the first refused shard, counted, with
-/// its client slot and whether it is paged.
+/// Settles a part that could not be sent to `shard`, or that `shard` did not serve ([`settle_unserved`]): an
+/// acknowledgement's release is counted ([`release_part_back`]); a listing's, grants' or status' part marks its scatter
+/// refused and counts down. When that was the scatter's last part, the entry goes and the scatter's answer is returned,
+/// `Overloaded` for the first refused shard, counted, with its client slot and whether it is paged.
 fn settle_refused(
   state: &mut ShardState,
   kind: ScatterKind,
@@ -3671,6 +3673,28 @@ fn settle_refused(
   let client_index = done?;
   state.scatter_refusals.remove(&request);
   Some((client_index, part_unsent(state, first), paged))
+}
+
+/// Format: the count of read scatters' parts that came home unserved (A-557): their shard's state refused the borrow
+/// (fenced by a failed consensus publication, a retention refusal, no state installed, a nested borrow), so the
+/// scatter was answered `Overloaded` for that shard ([`settle_unserved`]). It tells such an answer from one whose part
+/// met a full control channel, which answers the same.
+const SCATTER_PART_UNSERVED: &str = "scatter.part_unserved";
+
+/// Settles a listing's, grants' or status' part that `shard` did not serve, its state refusing the borrow, as a part
+/// that could not be sent ([`settle_refused`]), counted ([`SCATTER_PART_UNSERVED`]); delivers the scatter's refusal when
+/// that was its last part. Settled in its own borrow, and delivered after it: `deliver` borrows the state itself. A
+/// scatter is answered whole or refused naming a shard whose part it lacks, never as if whole without that part
+/// (§4.8 "Lookup": an enumeration is a scatter-gather over owners). Before A-557 the part tasks sent a refused borrow
+/// home as an empty part, so a listing, the grants or a status was answered without that shard's volumes, grants or
+/// report (`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`).
+fn settle_unserved(kind: ScatterKind, request: u64, shard: u16) {
+  if let Some(Some((client_index, reply, paged))) = crate::state::with_state_counted(|s| {
+    s.count(SCATTER_PART_UNSERVED, 1);
+    settle_refused(s, kind, request, shard)
+  }) {
+    crate::state::deliver(client_index, request, reply, paged);
+  }
 }
 
 /// Format: the count of scatters left unanswered because a shard they needed was gone, its daemon stopping
@@ -3715,7 +3739,7 @@ fn count_down<T>(
 }
 
 /// The answer a scatter gives when its part for `shard` could not be sent, the shard's control channel full past a
-/// wait for room: the typed `Overloaded`, counted by its name.
+/// wait for room, or came home unserved ([`settle_unserved`]): the typed `Overloaded`, counted by its name.
 fn part_unsent(state: &mut ShardState, shard: u16) -> ReplyBody {
   let refusal = Refusal::Overloaded { shard };
   state.count(refusal_name(&refusal), 1);
@@ -3809,11 +3833,16 @@ fn release_part_back(state: &mut ShardState, request: u64, part: &ReplyBody) {
   }
 }
 
-/// Gathers one shard's part of a status; the last part delivers the whole.
-fn gather_status(request: u64, part: Option<ShardReport>) {
+/// Gathers one shard's part of a status; the last part delivers the whole. A report `shard` did not serve is settled
+/// refused ([`settle_unserved`]): before A-557 it was skipped, and the status answered without that shard.
+fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::Status, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.status_scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -4381,8 +4410,13 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
   }
 }
 
-/// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: ListPart) {
+/// One shard's part of a listing arrives at the origin; the last part completes the reply. A part `shard` did not serve
+/// is settled refused ([`settle_unserved`]).
+fn gather(request: u64, shard: u16, part: Option<ListPart>) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::List, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.scatters.get_mut(&request)?;
     entry.2.push(part);
@@ -10225,25 +10259,32 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
-  // A clone of a captured base holds its whole tree and reads no base directory (A-291).
-  if state
+  // A clone of a captured base holds its whole tree and reads no base directory (A-291), and is born with its capture's
+  // record, naming no head yet (A-544): a successor that adopts a head no record is for refuses its landing by kind.
+  let captured = state
     .db
     .partition()
-    .is_captured(record.id, to_db_snapshot(snapshot))
-  {
+    .is_captured(record.id, to_db_snapshot(snapshot));
+  if captured {
     new_record.base = BaseRecord::Scratch;
   }
+  let born_with = captured.then(|| Op::CaptureCarried {
+    volume: id,
+    carried: crate::carry::creation_record(),
+    mark: None,
+  });
   let ops = [
-    Op::VolumeCreated { record: new_record },
-    Op::LineageAdded {
+    Some(Op::VolumeCreated { record: new_record }),
+    Some(Op::LineageAdded {
       edge: LineageEdge {
         child: id,
         origin_volume: record.id,
         origin_snapshot: to_db_snapshot(snapshot),
       },
-    },
+    }),
+    born_with,
   ];
-  for op in &ops {
+  for op in ops.iter().flatten() {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       discard_clone(state, origin, snapshot, admitted);
       return Err(refusal_of_db(&e));
@@ -10401,6 +10442,7 @@ fn attach(
     principal: principal.clone(),
     rights: granted_rights(rights, intent),
     token,
+    mount: None,
   };
   if let Some(defer) = deferred_mount(&form) {
     return defer(
@@ -11252,8 +11294,8 @@ fn guest_over_the_ring(
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
 /// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363, A-414).
 /// Another principal's lease is refused `LeaseHeld` while it is unexpired, and past its term too while its holder still
-/// holds a live write attachment of the volume ([`lease_kept_until`]): the reaper renews such a lease at its lapse
-/// ([`expire_leases`]), and a take between the lapse and that pass must not hand it to a second writer.
+/// holds a live write attachment of the volume ([`lease_kept_until`]): the shard's deadline keeper renews such a lease at
+/// its lapse ([`expire_leases`], A-536), and a take between the lapse and that pass must not hand it to a second writer.
 fn take_write_lease(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -11427,11 +11469,11 @@ fn bind_mount(
     now,
   ) {
     Ok(_) => {
-      // The mount is watched from here: the kernel's unmount of it ends this attachment whenever it comes (A-511).
+      // The mount is held as this shard's, its id kept in the attachment's record (A-540), and watched from here: the
+      // kernel's unmount of it ends this attachment whenever it comes (A-511).
       #[cfg(target_os = "macos")]
       if let Some(own) = own {
-        state.own_nfs_mounts.insert(attachment, own);
-        crate::own_nfs::watch(state);
+        crate::own_nfs::hold(state, attachment, own);
       }
       ReplyBody::MountBound
     }
@@ -11559,14 +11601,13 @@ pub(crate) fn use_attachment(
 /// The attachments ended.
 pub(crate) fn expire_lapsed_attachments(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
+  // The lapsed alone, from the partition's index of terms (A-536), never a walk of every attachment.
   let lapsed: Vec<AttachmentRecord> = state
     .db
     .partition()
-    .attachments()
-    .filter(
-      |record| matches!(record.consumer, Consumer::Termed { expires_ns } if expires_ns <= now),
-    )
-    .cloned()
+    .lapsed_terms(now)
+    .into_iter()
+    .filter_map(|id| state.db.partition().attachment(id).cloned())
     .collect();
   let mut ended = 0usize;
   for record in lapsed {
@@ -12064,10 +12105,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
       {
         // Not recorded: the volume keeps its slot and credits, counted by the refusal's name, and is
-        // recorded again at the reaper's next cadence (`reap_loop` steps destroys), not in a busy round
-        // — before 2026-09-29 the refusal was discarded and the tables let go of a volume the catalog
-        // still held.
+        // recorded again at its retry deadline, the shard's window on (A-536: the deadline keeper wakes the serve
+        // loop then), not in a busy round — before 2026-09-29 the refusal was discarded and the tables let go of a
+        // volume the catalog still held; until A-536 the reap loop's tick tried again each window, refused or not.
         state.count(refusal_name(&refusal_of_db(&e)), 1);
+        retry_destroy_at_window(state, now);
         continue;
       }
       any = true;
@@ -12085,6 +12127,17 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     }
   }
   any || releasing
+}
+
+/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
+/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
+/// change, and kept by the deadline keeper, never a tick (A-536).
+fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
+  let at = now.saturating_add(crate::watchdog::watch_window_ns(
+    slates_rt::futures::scheduler_overrun_ns(),
+  ));
+  state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
+  crate::deadlines::noted(state, at);
 }
 
 /// One cooperative slice of each volume released to the member a move named (A-291, `crate::moves`): its record left
@@ -13235,6 +13288,11 @@ fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), B
       state.count(refusal_name(&refusal_of_vfs(&e)), 1);
     }
     state.relinquished.push(slot);
+    // The serve round steps its teardown (`step_destroys`); woken, it keeps running until the slices are done (A-536:
+    // before, the reap loop's tick started it).
+    if let Some(task) = state.server_task {
+      slates_rt::registry::wake(task.0);
+    }
   }
   crate::live_ship::forget(state, id);
   state.yielded.remove(&id);
@@ -15358,7 +15416,7 @@ fn remember_forwarded_ring(
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
 /// is kept and retried; never dropped).
-fn send_reply(
+pub(crate) fn send_reply(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
@@ -15378,22 +15436,40 @@ fn send_reply(
   if client.retiring || client.client_id != RequestId::from_word(request).client {
     return true;
   }
+  let mut held_until = None;
   if matches!(reply, ReplyBody::DaemonStatus { .. }) {
     let capacity = slates_ipc::status::snapshot_capacity(client.end.region());
     let page = slates_ipc::status::page_capacity(client.end.region());
     let now = state.clock.monotonic_ns();
+    // Held the failover delay from the capture (A-525): the bound the daemon holds every other thing a client leaves
+    // waiting for its next request to (a staging buffer, A-414), counted from when the report was made, so a scatter a
+    // starved daemon took long to gather takes nothing from its client's time to page it.
+    let deadline = now.saturating_add(state.failover_ns);
     // Replace the deferred reply itself: a full ring retries these exact page bytes,
     // including the final page whose retained snapshot has already been released.
     *reply = client
       .status_pages
-      .capture(request, reply, capacity, &mut state.store.metadata)
+      .capture(
+        request,
+        reply,
+        (capacity, deadline),
+        &mut state.store.metadata,
+      )
       .and_then(|()| {
         client
           .status_pages
           .page(request, 0, page, now, &mut state.store.metadata)
       })
       .unwrap_or_else(refused);
+    held_until = client.status_pages.deadline();
   }
+  // A capture its first page left held is the shard's keeper's to let go at its deadline (A-522).
+  if let Some(at) = held_until {
+    crate::deadlines::capture_set(state, handle, at);
+  }
+  let Ok(client) = state.clients.get_mut(handle) else {
+    return true;
+  };
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
@@ -20767,6 +20843,182 @@ mod tests {
     });
   }
 
+  /// A-544. Do: capture a volume's snapshot as a base and clone it, after cloning it once before the capture. Expect the
+  /// clone of the captured base born with its capture's record, naming no head (so a successor that adopts a head no
+  /// record is for refuses its landing by kind), shipped in its catalog; and the clone of the snapshot no capture named
+  /// born with none.
+  #[test]
+  fn a544_a_clone_of_a_captured_base_is_born_with_its_capture_record() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "a544-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let clone = |state: &mut crate::state::ShardState, name: &str| {
+        let reply = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Clone {
+            volume: origin,
+            snapshot,
+            name: name.to_owned(),
+          },
+        );
+        let super::ReplyBody::Cloned { id } = reply else {
+          panic!("the clone was made: {reply:?}")
+        };
+        super::to_db_volume(id)
+      };
+      let plain = clone(state, "a544-plain");
+      let captured_op = super::Op::BaseCaptured {
+        volume: super::to_db_volume(origin),
+        snapshot: super::to_db_snapshot(snapshot),
+      };
+      state
+        .db
+        .mutate(&mut state.segment, &captured_op, 0)
+        .unwrap();
+      let captured = clone(state, "a544-captured");
+      let born = crate::carry::creation_record();
+      assert_eq!(state.db.partition().carried(captured), Some((&born, None)));
+      let record = state.db.partition().volume(captured).cloned().unwrap();
+      let carried = state
+        .db
+        .partition()
+        .carried(captured)
+        .map(|(carried, _)| carried);
+      assert_eq!(
+        crate::catalog::CatalogValue::of(&record, carried).carried,
+        Some(born),
+        "the catalog ships the record"
+      );
+      assert_eq!(state.db.partition().carried(plain), None);
+    });
+  }
+
+  /// [`take_over_at`] with the adopted head naming `manifest`, as a sealed head names its archive's identity.
+  fn take_over_named(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    manifest: [u8; 32],
+  ) -> Result<(), Box<super::ReplyBody>> {
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: Vec::new(),
+      sealing: None,
+    };
+    let taken = super::TakenOver {
+      head: &head,
+      catalog,
+      catalog_sequence: 0,
+      sequence: 1,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+        past_tolerance: None,
+      },
+    };
+    super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
+  /// adopts; and another whose catalog carries only the record it was born with (no head of it was ever placed with its
+  /// record), and step its carry as the seal walk does. Expect: the first judged against its capture on the successor,
+  /// the carried paths as its owner recorded them, and free to move on with them; the second refused by kind, never
+  /// landed as a volume with no capture, its carry refused (no mark to carry from, counted) and a move of it waiting
+  /// until it is refused `Unplaced`, as A-503's move of a capture it could not carry waited.
+  #[test]
+  fn a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"CAPT".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x3c; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/gone.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let record = slates_db::catalog::CarriedRecord {
+        head,
+        entries: slates_wire::Wire::to_bytes(&carried),
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x91; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(record),
+        ..takeover_catalog("a544-carried", 1 << 20)
+      };
+      take_over_named(state, id, &catalog, &archive, head).unwrap();
+      match crate::landing::capture_of(state, id) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried)
+        }
+        other => panic!("the successor holds no capture to land against: {other:?}"),
+      }
+      assert!(
+        crate::carry::carries_its_head(state, id),
+        "a successor that marked its adopted head moves the clone on with its record"
+      );
+      let born = slates_db::catalog::VolumeId { bytes: [0x92; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(crate::carry::creation_record()),
+        ..takeover_catalog("a544-born", 1 << 20)
+      };
+      take_over_named(state, born, &catalog, &archive, head).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, born),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a captured clone with no record for its head is refused by kind, never landed as a volume with no capture"
+      );
+      crate::carry::step(state, born);
+      assert_eq!(
+        state.refusals.get(crate::carry::CARRY_REFUSED),
+        Some(&1),
+        "a successor with no mark cannot carry the capture for its head, and counts it"
+      );
+      assert!(
+        !crate::carry::carries_its_head(state, born),
+        "a move of a clone whose head carries no record waits to be refused"
+      );
+    });
+  }
+
   /// An archive of one file `f` laid out by `extents` over `chunks`, its recorded size their tiled length.
   fn takeover_archive(
     extents: Vec<slates_archive::Extent>,
@@ -22055,6 +22307,149 @@ mod tests {
     );
   }
 
+  /// Shape: the id of the client the read-scatter test seats on the shard it asks from, beside the audit daemon's own,
+  /// which seat none.
+  const ASKING: u32 = 31;
+
+  /// The principal the read-scatter test asks as.
+  fn scatter_asker() -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid: 0,
+    }
+  }
+
+  /// Seats client [`ASKING`] on `state`'s shard as an admission does, over a region made here in the shard's geometry:
+  /// its seat's index, and the client's own mapping of the region, which the test reads its replies from.
+  fn seat_asking(state: &mut crate::state::ShardState) -> (u32, slates_ipc::ClientRegion) {
+    static REGIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+      "slates-cr-scatter-{}-{}",
+      std::process::id(),
+      REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut region =
+      slates_ipc::ClientRegion::create(&name, ASKING, state.shard, state.config.region).unwrap();
+    #[cfg(target_os = "macos")]
+    region.unlink_name().unwrap();
+    #[cfg(unix)]
+    let client = region.open_again().unwrap();
+    #[cfg(windows)]
+    let client = {
+      let (handoff, len) = region.handoff().unwrap();
+      slates_ipc::ClientRegion::open(&handoff, len).unwrap()
+    };
+    let seat = state
+      .clients
+      .insert(crate::state::ClientSlot {
+        status_pages: crate::status_pages::StatusPages::default(),
+        end: slates_ipc::DaemonEnd::new(region),
+        principal: scatter_asker(),
+        client_id: ASKING,
+        pid: 0,
+        retiring: false,
+        watch: None,
+        proven: true,
+        control: None,
+        revoked: false,
+        consumer_policy: None,
+        owner_route: None,
+        read_ahead: None,
+        read_ahead_pending: 0,
+        remote_volumes: Vec::new(),
+        maps_sent: std::collections::BTreeSet::new(),
+      })
+      .unwrap();
+    (seat.index(), client)
+  }
+
+  /// What a client seated on the second shard of a two-shard daemon whose control shard is fenced is answered, by
+  /// request sequence, for a listing (1), its grants (2) and the daemon's status (3), each waited for within the
+  /// observation budget; the fenced shard; and the asking shard's count of parts that came home unserved.
+  fn asked_past_a_fenced_shard() -> (
+    Option<u16>,
+    std::collections::BTreeMap<u32, ReplyBody>,
+    Option<u64>,
+  ) {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, region, all_sent) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let asked = |sequence| {
+        slates_wire::request::RequestId {
+          client: ASKING,
+          sequence,
+        }
+        .word()
+      };
+      // Each is answered later, through `deliver`, once its last part is home.
+      let sent = [
+        super::scatter_list(state, seat, asked(1), scatter_asker(), None),
+        super::scatter_grants(state, seat, asked(2), scatter_asker(), None),
+        super::scatter_status(state, seat, asked(3)),
+      ];
+      let all_sent = sent
+        .iter()
+        .all(|served| matches!(served, super::Served::Forwarded));
+      (state.shards.first().copied(), region, all_sent)
+    });
+    assert!(all_sent, "each scatter sent its part to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let mut answers = std::collections::BTreeMap::new();
+    while answers.len() < 3 {
+      match end.wait(Some(crate::daemon::OBSERVE_BUDGET_NS)) {
+        Ok(reply) => {
+          let body: ReplyBody =
+            slates_ipc::protocol::unpack(end.region(), reply.kind, &reply.payload).unwrap();
+          answers.insert(
+            slates_wire::request::RequestId::from_word(reply.request).sequence,
+            body,
+          );
+        }
+        Err(error) => {
+          eprintln!("no further answer: {error}");
+          break;
+        }
+      }
+    }
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    (fenced, answers, unserved)
+  }
+
+  /// A-557 (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`'s sibling; §4.8 "Lookup": an
+  /// enumeration is a scatter-gather over owners; §4.14 `slates.status`). Do: on a two-shard daemon, fence the control
+  /// shard as a failed consensus publication does, so every borrow of its state is refused; from a client seated on the
+  /// other shard, list the volumes, ask for the grants and ask for the daemon's status. Expect: each answered
+  /// `Overloaded { shard }` naming the fenced shard, and each part counted unserved where it was asked. Before, the
+  /// fenced shard's part came home as an empty one and each was answered as if whole: a listing without that shard's
+  /// volumes, grants without its grants, a status without its report.
+  #[test]
+  fn a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard() {
+    let (fenced, answers, unserved) = asked_past_a_fenced_shard();
+    let fenced = fenced.expect("the daemon has a control shard");
+    for (verb, sequence) in [("list", 1u32), ("grants", 2), ("status", 3)] {
+      let answer = answers.get(&sequence);
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::Overloaded { shard }
+          }) if *shard == fenced
+        ),
+        "{verb} with the control shard {fenced} fenced: {answer:?}"
+      );
+    }
+    assert_eq!(
+      unserved,
+      Some(3),
+      "each scatter's part came home unserved, counted where it was asked"
+    );
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
@@ -22382,6 +22777,40 @@ mod tests {
         "the ended attachment let the lease go"
       );
     });
+  }
+
+  /// A-536 (destroys off the tick). Do: on a one-shard daemon, create a volume and relinquish it as a takeover that
+  /// superseded it does, from outside a serve round; look until its slot's teardown is done. Expect: done within half a
+  /// liveness window, by the serve loop, woken by the relinquish. Before, nothing woke it, and the reap loop's tick
+  /// started the teardown up to a window later.
+  #[test]
+  fn a_relinquished_volume_is_torn_down_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = std::time::Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let (owner, _) = lease_principals();
+      let id = plain_volume(state, &owner, "relinquished");
+      super::relinquish_superseded(state, super::to_db_volume(id)).unwrap();
+      assert!(
+        !state.relinquished.is_empty(),
+        "the relinquished slot is queued for its teardown"
+      );
+    });
+    let within = std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 2);
+    let done = loop {
+      if crate::daemon::observe_first(&daemon, |state| state.relinquished.is_empty()) {
+        break Some(begun.elapsed());
+      }
+      if begun.elapsed() > within {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its drivers.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    daemon.stop();
+    let done = done.expect("the relinquished slot was torn down within half a liveness window");
+    println!("a relinquished volume torn down {done:?} after the relinquish");
   }
 
   /// D-16, A-414. Do: attach a volume for write in the CLI's form and for reading in the library's form, both as its

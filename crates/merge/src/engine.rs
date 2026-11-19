@@ -526,6 +526,27 @@ pub struct Green {
   deltas_visited: std::cell::Cell<u64>,
 }
 
+/// The paths a node-exclusive operation changes, each with the class its conflict is named by (§4.17.4 item 3): the
+/// operation's own path, and a move's source, which Subversion sends as a copy and a delete of the source.
+fn node_exclusive_paths(op: &Op) -> impl Iterator<Item = (u16, MergeConflictClass)> {
+  let class = match op.kind {
+    OpKind::Create | OpKind::Mkdir | OpKind::Symlink | OpKind::Link | OpKind::Mknod => {
+      MergeConflictClass::CreateCreate
+    }
+    OpKind::Unlink | OpKind::Rmdir => MergeConflictClass::DeleteModify,
+    OpKind::Rename => MergeConflictClass::RenameRename,
+    OpKind::SetMode | OpKind::SetXattr | OpKind::RemoveXattr => MergeConflictClass::MetaMeta,
+    OpKind::Overwrite | OpKind::Extend | OpKind::Truncate | OpKind::Insert | OpKind::Delete => {
+      MergeConflictClass::Overlap
+    }
+  };
+  let source = (op.kind == OpKind::Rename)
+    .then(|| u16::try_from(op.src).ok())
+    .flatten()
+    .map(|index| (index, MergeConflictClass::RenameRename));
+  std::iter::once((op.path, class)).chain(source)
+}
+
 /// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
 /// its class — what the cache actually holds for it.
 fn window_bytes(window: &ConflictWindow) -> usize {
@@ -906,8 +927,10 @@ enum ContentSource {
   Mapped,
   /// These declared ops over nothing, from the increment's post-state.
   Created(Vec<Op>),
-  /// The bytes another file holds at this version.
-  Copied(String),
+  /// The bytes another file holds at this version, with these ops, in those bytes' coordinates, spliced into them from
+  /// the increment's post-state (A-547: a rename's destination the work edited after the rename; none for a rename
+  /// alone).
+  Copied(String, Vec<Op>),
 }
 
 impl Effect {
@@ -923,9 +946,10 @@ impl Effect {
       Effect::SetContent(path, _, _, ContentSource::Created(declared)) => {
         Applied::Created(path.clone(), declared.clone())
       }
-      Effect::SetContent(path, _, _, ContentSource::Copied(from)) => Applied::Copied {
+      Effect::SetContent(path, _, _, ContentSource::Copied(from, ops)) => Applied::Copied {
         dst: path.clone(),
         from: from.clone(),
+        ops: ops.clone(),
       },
       Effect::RemoveContent(path) => Applied::RemoveContent(path.clone()),
       Effect::MakeDir(path) => Applied::MakeDir(path.clone()),
@@ -2166,11 +2190,15 @@ impl Green {
   }
 
   /// Merges a file rename to `dst` from `from` (source content captured at merge time), collecting
-  /// the destination set and the source removal.
+  /// the destination set and the source removal. `ops` are the work's edits to `dst` after the rename, in the
+  /// coordinates of the source's bytes at the work's base, adding from `post_state`: they are mapped through what changed
+  /// the source since the base and spliced into the bytes it moves (A-547), so an edit after a rename is kept; one that
+  /// meets an intervening change to the source is an overlap conflict, never dropped. Until A-547 the destination took
+  /// the source's bytes alone, and the submit was accepted with the edit lost.
   fn merge_rename(
     &self,
-    dst: &str,
-    base: u64,
+    (dst, ops): (&str, &[Op]),
+    (base, post_state): (u64, &[u8]),
     from: &str,
     effects: &mut Vec<Effect>,
   ) -> Result<(), ConflictWindow> {
@@ -2198,12 +2226,14 @@ impl Green {
     // Move whatever the source names, capturing its current value so an intervening change to the
     // source follows the move, and removing the source name.
     if let Some(source) = self.content.get(from) {
-      let ops = vec![insert_whole(source.len() as u64)];
+      let edits = self.edits_after_rename((dst, ops), base, from)?;
+      let bytes = apply(source, &edits, post_state);
+      let whole = vec![insert_whole(bytes.len() as u64)];
       effects.push(Effect::SetContent(
         dst.to_owned(),
-        source.clone(),
-        ops,
-        ContentSource::Copied(from.to_owned()),
+        bytes,
+        whole,
+        ContentSource::Copied(from.to_owned(), edits),
       ));
       effects.push(Effect::RemoveContent(from.to_owned()));
     } else if let Some(target) = self.symlinks.get(from) {
@@ -2214,6 +2244,40 @@ impl Green {
       effects.push(Effect::RemoveHardlink(from.to_owned()));
     }
     Ok(())
+  }
+
+  /// The work's edits to a rename's destination `dst` (`ops`, in the coordinates of the source `from`'s bytes at `base`),
+  /// moved to where they stand in the source's bytes now, past every change made to it since `base` (A-547); an edit that
+  /// meets one of those changes is an overlap conflict on `dst`.
+  fn edits_after_rename(
+    &self,
+    (dst, ops): (&str, &[Op]),
+    base: u64,
+    from: &str,
+  ) -> Result<Vec<Op>, ConflictWindow> {
+    let unchanged = self.last_changed.get(from).copied().unwrap_or(0) <= base;
+    let intervening = if unchanged {
+      Vec::new()
+    } else {
+      self.intervening(from, base)
+    };
+    ops
+      .iter()
+      .map(
+        |op| match crate::map::map_range(&intervening, touched_range(op)) {
+          crate::map::Mapped::Shifted(shifted) => {
+            let mut moved = *op;
+            moved.at = shifted.start;
+            Ok(moved)
+          }
+          crate::map::Mapped::Overlaps => Err(ConflictWindow {
+            path: dst.to_owned(),
+            range: touched_range(op),
+            class: MergeConflictClass::Overlap,
+          }),
+        },
+      )
+      .collect()
   }
 
   /// Merges a create at `path` with `bytes`.
@@ -2659,11 +2723,40 @@ impl Green {
     self.decide_content(inc, r, &mut effects, &mut windows);
     self.decide_directories(r, &mut effects, &mut windows);
     self.decide_metadata(inc, r, &mut effects, &mut windows);
+    self.decide_node_exclusive(inc, &mut windows);
     if windows.is_empty() {
       Ok(effects)
     } else {
       Err(windows)
     }
+  }
+
+  /// The node-exclusive rule (§4.17.4 item 3, rules 1 and 2; A-542): a path an operation marked node-exclusive changes,
+  /// a move's source among them, that changed in any dimension after the increment's base is a conflict, however
+  /// disjoint the bytes and however identical the change, as FSFS's commit-time merge judges a node (`tree.c`
+  /// `merge()`: a file changed on both sides fails, "even an identical replacement", and two additions are "not
+  /// auto-mergeable"). The dimension verdicts have run and added their own windows; this pass refuses only what they
+  /// would accept. Each path is one lookup of its last change in the change index (`latest_change`), and is judged once.
+  fn decide_node_exclusive(&self, inc: &Increment, windows: &mut Vec<ConflictWindow>) {
+    let mut judged: BTreeSet<&str> = BTreeSet::new();
+    for op in inc.doc.ops.iter().filter(|op| op.is_node_exclusive()) {
+      for (index, class) in node_exclusive_paths(op) {
+        let Some(path) = inc.doc.paths.path(index) else {
+          continue;
+        };
+        if judged.insert(path) && self.changed_after(path, inc.base) {
+          windows.push(Green::window(path, class));
+        }
+      }
+    }
+  }
+
+  /// Whether `path` changed in any dimension after version `base`: its last change in the change index is past it.
+  fn changed_after(&self, path: &str, base: u64) -> bool {
+    self
+      .latest_change
+      .get(path)
+      .is_some_and(|version| *version > base)
   }
 
   /// The content dimension: renames, creates, unlinks and edits.
@@ -2675,7 +2768,9 @@ impl Green {
     windows: &mut Vec<ConflictWindow>,
   ) {
     for (dst, from) in &r.renames {
-      if let Err(window) = self.merge_rename(dst, inc.base, from, effects) {
+      let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
+      if let Err(window) = self.merge_rename((dst, ops), (inc.base, &inc.post_state), from, effects)
+      {
         windows.push(window);
       }
     }
@@ -3210,10 +3305,16 @@ impl Green {
           ContentSource::Created(declared.clone()),
         )
       }
-      Applied::Copied { dst, from } => {
-        let bytes = self.content.get(from).cloned().unwrap_or_default();
-        let ops = vec![insert_whole(bytes.len() as u64)];
-        Effect::SetContent(dst.clone(), bytes, ops, ContentSource::Copied(from.clone()))
+      Applied::Copied { dst, from, ops } => {
+        let source = self.content.get(from).map(Vec::as_slice).unwrap_or(&[]);
+        let bytes = apply(source, ops, post_state);
+        let whole = vec![insert_whole(bytes.len() as u64)];
+        Effect::SetContent(
+          dst.clone(),
+          bytes,
+          whole,
+          ContentSource::Copied(from.clone(), ops.clone()),
+        )
       }
       Applied::RemoveContent(path) => Effect::RemoveContent(path.clone()),
       Applied::MakeDir(path) => Effect::MakeDir(path.clone()),
@@ -3651,11 +3752,17 @@ impl Green {
         // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
         // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
         // replayed over a head that holds the destination it would add them to that file's own.
-        Effect::SetContent(path, bytes, _, ContentSource::Copied(from)) => {
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(from, edits)) => {
           journal.push(VolumeOp::Rename {
             from: from.clone(),
             to: path.clone(),
           });
+          // The edits the work made after the rename follow it, over the bytes it moved (A-547).
+          let moved_len = self
+            .content
+            .get(&from)
+            .map_or(0, |moved| moved.len() as u64);
+          journal.extend(content_volume_ops(&path, &edits, moved_len));
           moved_from.insert(from);
           changed.insert(path, Some(bytes));
         }
@@ -3801,4 +3908,123 @@ fn special_payload(
   let len = usize::try_from(op.len).map_err(|_| DocDecodeError::Truncated)?;
   let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
   SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
+}
+
+#[cfg(test)]
+mod node_exclusive_tests;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// An increment under construction: its ops document and the post-state its content ops add from.
+  #[derive(Default)]
+  struct Steps {
+    doc: OpsDoc,
+    post: Vec<u8>,
+  }
+
+  impl Steps {
+    /// `bytes` inserted into `path` at `at`.
+    fn insert(mut self, path: &str, at: u64, bytes: &[u8]) -> Steps {
+      let path = self.doc.paths.intern(path);
+      let src = self.post.len() as u64;
+      self.post.extend_from_slice(bytes);
+      self.doc.ops.push(Op {
+        kind: OpKind::Insert,
+        flags: 0,
+        path,
+        at,
+        len: bytes.len() as u64,
+        src,
+      });
+      self
+    }
+
+    /// `path` created holding `bytes`.
+    fn create(mut self, path: &str, bytes: &[u8]) -> Steps {
+      let index = self.doc.paths.intern(path);
+      self.doc.ops.push(Op {
+        kind: OpKind::Create,
+        flags: 0,
+        path: index,
+        at: 0,
+        len: 0,
+        src: u64::MAX,
+      });
+      self.insert(path, 0, bytes)
+    }
+
+    /// `from` renamed to `to` (the op is keyed at its destination, its source the `src` path index).
+    fn rename(mut self, from: &str, to: &str) -> Steps {
+      let to = self.doc.paths.intern(to);
+      let from = self.doc.paths.intern(from);
+      self.doc.ops.push(Op {
+        kind: OpKind::Rename,
+        flags: 0,
+        path: to,
+        at: 0,
+        len: 0,
+        src: u64::from(from),
+      });
+      self
+    }
+
+    /// The increment `id` based on version `base`.
+    fn at(self, id: u8, base: u64) -> Increment {
+      Increment {
+        id: [id; 32],
+        base,
+        doc: self.doc,
+        post_state: self.post,
+        evidence: Vec::new(),
+      }
+    }
+  }
+
+  /// A-547 (GAPS "an edit after a rename is accepted and lost", 2026-11-09; §4.16 "Composition at seal"). Do: make a
+  /// green holding files `a` and `b`; submit a work based on that version that renames `a` over `b` and then appends
+  /// `XY` at `b`'s end; replay the version's chain entry, encoded and decoded, on a green that holds the version before
+  /// it. Expect: the work accepted, and `b` holding `a`'s bytes and the edit, `0123456789XY`, with `a` gone, live and
+  /// replayed alike. Before, the verdict copied `a`'s head bytes to `b` and dropped `b`'s own ops, so the submit was
+  /// accepted and the edit lost.
+  #[test]
+  fn an_edit_after_a_rename_over_a_file_is_merged_with_the_renamed_bytes() {
+    let first = Steps::default()
+      .create("a", b"0123456789")
+      .create("b", b"bbbbbbbbbbbbbbbb")
+      .at(1, 0);
+    let mut green = Green::new();
+    let mut replayed = Green::new();
+    assert_eq!(green.submit(&first), Outcome::Accepted { version: 1 });
+    assert_eq!(replayed.submit(&first), Outcome::Accepted { version: 1 });
+    let edited = Steps::default()
+      .rename("a", "b")
+      .insert("b", 10, b"XY")
+      .at(2, 1);
+    let (outcome, applied) = green.submit_resolved(&edited);
+    assert_eq!(outcome, Outcome::Accepted { version: 2 });
+    assert_eq!(
+      green.content("b"),
+      Some(b"0123456789XY".as_slice()),
+      "the edit after the rename is lost"
+    );
+    assert_eq!(green.content("a"), None, "the rename's source is gone");
+    let applied = applied.expect("an accepted version's effects");
+    let entry = crate::chain_entry::encode(&edited.encode(), &edited, &applied, None, None, None);
+    let decoded = crate::chain_entry::decode(&entry).expect("the entry decodes");
+    assert_eq!(
+      decoded.applied, applied,
+      "the entry carries what the verdict resolved"
+    );
+    assert_eq!(
+      replayed.apply_recorded(&decoded.increment, &decoded.applied),
+      2
+    );
+    assert_eq!(
+      replayed.content("b"),
+      Some(b"0123456789XY".as_slice()),
+      "the replayed version lost the edit"
+    );
+  }
 }

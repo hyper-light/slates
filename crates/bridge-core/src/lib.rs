@@ -458,6 +458,29 @@ pub struct InvalidationCursor {
   pub hint_seq: u64,
 }
 
+/// The path `path` (`\`-separated from the volume's root, as a WinFsp drive names a file) with each component named as
+/// the volume stores it (§4.4's name policy; A-543): every component looked up from the root and named as its directory
+/// stores it ([`Bridge::stored_entry`]). On a folding volume every spelling of one file answers one path, the spellings it
+/// was made with; on an exact volume, the path as asked. Refused as the first component that cannot be looked up is.
+pub fn stored_path(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  path: &str,
+) -> Result<String, VfsError> {
+  let mut parent = ObjectId::new(bridge.root(cx)?, 0);
+  let mut stored = String::with_capacity(path.len());
+  for component in path.split('\\').filter(|component| !component.is_empty()) {
+    let (name, attr) = bridge.stored_entry(parent, cx, component)?;
+    stored.push('\\');
+    stored.push_str(&name);
+    parent = ObjectId::new(attr.ino, 0);
+  }
+  if stored.is_empty() {
+    stored.push('\\');
+  }
+  Ok(stored)
+}
+
 /// The one VFS operation layer (§4.6). Every request identifies its object by [`ObjectId`] (a
 /// real inode number and a generation, §4.6 `(no, gen)`) and rides an authenticated [`OpContext`]
 /// built by the owner from a validated attachment: the seam checks the context's volume, granted
@@ -480,6 +503,21 @@ pub trait Bridge {
   fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError>;
   /// Look `name` up in directory `parent` under `cx`; the child's attributes.
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
+  /// Look `name` up in directory `parent` under `cx` as [`Bridge::lookup`] does, answering besides the child's
+  /// attributes its name as the volume stores it (§4.4's name policy; A-543): the asked spelling on an exact volume, and
+  /// on a folding one the spelling the entry was made with, which every spelling that folds alike finds. A WinFsp drive
+  /// names each open by the stored spelling of every component ([`stored_path`]), so two spellings of one file are one
+  /// file to Windows. The default answers the name as asked, as an exact volume stores it.
+  fn stored_entry(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+  ) -> Result<(String, NodeAttr), VfsError> {
+    self
+      .lookup(parent, cx, name)
+      .map(|attr| (name.to_owned(), attr))
+  }
   /// The attributes of `object` under `cx`.
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError>;
   /// Open `object` under `cx`; the file handle. `flags` are the open's flags as the FUSE protocol carries them (Linux
@@ -951,5 +989,144 @@ mod tests {
       assert!(!host.reaches(name) && !guest.reaches(name), "{name:?}");
       assert!(!guest_only(name), "{name:?}");
     }
+  }
+}
+
+#[cfg(test)]
+mod stored_path_tests {
+  use super::*;
+
+  /// Shape: the store's page in the test.
+  const PAGE: usize = 4096;
+  /// Shape: the pages the store's region maps: room for the test's few entries.
+  const REGION_PAGES: usize = 256;
+  /// Shape: a journal that holds every record the test makes.
+  const JOURNAL: usize = 1 << 16;
+
+  /// A store and a volume in it whose names follow `names`.
+  fn store_and_volume(
+    names: slates_vfs::names::NameEquivalence,
+  ) -> (slates_vfs::volume::Store, slates_vfs::volume::Volume) {
+    let mut arena = slates_mem::arena::ChunkArena::new(PAGE);
+    arena
+      .add_region(slates_mem::region::Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    let mut store = slates_vfs::volume::Store::new(
+      &slates_vfs::volume::StoreConfig {
+        page: PAGE,
+        cache_line: 128,
+        max_dirs: 16,
+        max_inodes: 64,
+        max_chunks: REGION_PAGES,
+        max_dir_blocks: 16,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    );
+    let volume = slates_vfs::volume::Volume::create(
+      &mut store,
+      slates_vfs::volume::VolumeConfig {
+        prefix: 1,
+        names,
+        quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: JOURNAL,
+        clock: Box::new(slates_vfs::clock::HostClock::default()),
+      },
+    )
+    .unwrap();
+    (store, volume)
+  }
+
+  /// A read-write context of an attachment to the volume of id zero.
+  fn context() -> OpContext {
+    let mut attachments = Attachments::new();
+    let attachment = attachments
+      .attach(
+        slates_db::catalog::VolumeId { bytes: [0; 16] },
+        View::Current,
+        slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap();
+    attachments.context(attachment).unwrap()
+  }
+
+  /// The volume `names` makes, with `\Src\Main.RS` made in it through a bridge. A step that fails stops the test here,
+  /// so a refused setup can never pass for the `NotFound` a test expects from the path it names.
+  fn with_main_rs(
+    names: slates_vfs::names::NameEquivalence,
+  ) -> (slates_vfs::volume::Store, slates_vfs::volume::Volume) {
+    let (mut store, mut volume) = store_and_volume(names);
+    {
+      let cx = context();
+      let mut bridge = VolumeBridge::new(
+        slates_db::catalog::VolumeId { bytes: [0; 16] },
+        &mut volume,
+        &mut store,
+      );
+      let root = bridge.root(&cx).unwrap();
+      let dir = bridge
+        .mkdir(ObjectId::new(root, 0), &cx, "Src", 0o755)
+        .unwrap();
+      bridge
+        .create(ObjectId::new(dir.ino, 0), &cx, "Main.RS", 0o644, 0)
+        .unwrap();
+    }
+    (store, volume)
+  }
+
+  /// `path` named as the volume `names` makes, with `\Src\Main.RS` in it, stores each component: the answer under test
+  /// alone, through a bridge made afresh as the daemon's serve paths make one per request.
+  fn stored_in(names: slates_vfs::names::NameEquivalence, path: &str) -> Result<String, VfsError> {
+    let (mut store, mut volume) = with_main_rs(names);
+    let cx = context();
+    let mut bridge = VolumeBridge::new(
+      slates_db::catalog::VolumeId { bytes: [0; 16] },
+      &mut volume,
+      &mut store,
+    );
+    stored_path(&mut bridge, &cx, path)
+  }
+
+  /// §4.4 name policy, T-4.6, A-543 (B2): a WinFsp drive names each open by the path its volume stores, so on a folding
+  /// volume every spelling of a file is one file to Windows. Do: on a folding volume and on an exact one, make `\Src` and
+  /// `\Src\Main.RS`, then name paths as the volume stores them: the made spelling, two others, the root, and a missing
+  /// file. Expect the folding volume to answer `\Src\Main.RS` for every spelling, the exact one only for the spelling it
+  /// was made with and `NotFound` for the others, the root as itself, and a missing file `NotFound` on both. Before,
+  /// nothing named an open's path as stored, so a folding volume's two spellings were two files to WinFsp's driver.
+  #[test]
+  fn every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with() {
+    use slates_vfs::names::NameEquivalence::{Exact, Fold};
+    let made = Ok("\\Src\\Main.RS".to_owned());
+    assert_eq!(stored_in(Fold, "\\Src\\Main.RS"), made);
+    assert_eq!(
+      stored_in(Fold, "\\src\\MAIN.rs"),
+      made,
+      "another spelling folds to it"
+    );
+    assert_eq!(stored_in(Fold, "\\SRC\\main.rs"), made, "and a third");
+    assert_eq!(
+      stored_in(Fold, "\\"),
+      Ok("\\".to_owned()),
+      "the root as itself"
+    );
+    assert_eq!(stored_in(Fold, "\\src\\gone.rs"), Err(VfsError::NotFound));
+    assert_eq!(
+      stored_in(Exact, "\\Src\\Main.RS"),
+      made,
+      "an exact volume's own spelling"
+    );
+    assert_eq!(
+      stored_in(Exact, "\\src\\MAIN.rs"),
+      Err(VfsError::NotFound),
+      "an exact volume finds no other spelling"
+    );
   }
 }

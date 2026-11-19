@@ -11,8 +11,15 @@
 //! **What it does not.** It serves no file system. A stream [`SimVolumes::serve_shards`] hands out is one end of a
 //! real connected pair (a socket pair on Unix, a duplex pipe on Windows) whose other end the simulator holds and never
 //! answers, until a detach or the volume's destroy closes it, when its peer reads the end. A mount is a record of one:
-//! [`SimVolumes::mount`] answers the path as given and touches nothing at it. A green's version is its first (no merge
-//! is simulated), and every volume's bytes are none. A host test that needs a guest's bytes runs a real instance.
+//! [`SimVolumes::mount`] answers the path as given and touches nothing at it. A container bind is a record of one too
+//! (A-520): [`SimVolumes::bind_into_container`] judges the mounts it recorded as the daemon judges the kernel's table and
+//! its own records (the newest mount at the path is the one seen, a mount beneath it refuses the bind, and the mount
+//! must be the volume's and writable for a writable bind), answers Slates' own runtime entry
+//! (`slates_bridge_oci::binding`), claims none of the table's evidence (no table vouched for it), and ends the bind
+//! with its mount. Where the daemon refuses another volume's mount by the table's source (macOS's NFS export names the
+//! volume) before its records, the simulator answers the records' refusal, as Linux's daemon does. A green's version is
+//! its first (no merge is simulated), and every volume's bytes are none. A host test that needs a guest's bytes runs a
+//! real instance.
 //!
 //! **Bounds.** Each table (volumes, attachments) holds at most what its constructor was given, the caller's own bound,
 //! and refuses past it [`Exhausted::Table`]; ids come from one counter, refused the same way at its last value.
@@ -21,12 +28,15 @@ use std::collections::BTreeMap;
 
 use slates_client::{Attachment, ShardsStream, StreamEnd};
 use slates_ipc::protocol::{
-  AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, Established, Intent,
-  KernelCache, ReadWritePolicy, Residency, SharingSemantics, SnapshotId, TargetPathConstraint,
-  VolumeId, VolumeRefusal, VolumeSummary,
+  AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, Established, HostPathReason,
+  Intent, KernelCache, OciBinding, ReadWritePolicy, Residency, SharingSemantics, SnapshotId,
+  TargetPathConstraint, VolumeId, VolumeRefusal, VolumeSummary,
 };
 
-use crate::error::{Busy, Error, Exhausted, Existing, Invalid, KindMismatch, Missing, Note};
+use crate::container::ContainerBind;
+use crate::error::{
+  Busy, Denied, Error, Exhausted, Existing, Invalid, KindMismatch, Missing, Note,
+};
 use crate::mount::{MountOptions, Mounted, Unmounted};
 use crate::outcome::Work;
 use crate::seam::Volumes;
@@ -43,6 +53,9 @@ const SIMULATOR: &str = "the simulator";
 /// Format: the pause a channel failure would retry after: none, since the simulator's are its host's refusals (a
 /// socket pair the OS would not make), never a daemon's load.
 const NO_PAUSE_NS: u64 = 0;
+/// Format: the verb the daemon's record check names when a container bind's source is no mount of the volume's that
+/// admits the bind (`crates/server/src/oci.rs`, `Binding::consumer`).
+const SOURCE_MOUNT_VERB: &str = "OCI source mount";
 
 /// What kind a simulated volume is, as far as the seam's verbs tell kinds apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,10 +93,19 @@ enum Held {
     /// The simulator's end; dropped, its peer reads the end.
     _end: StreamEnd,
   },
-  /// A mount's record: its path.
+  /// A mount's record: its path, and how it was made.
   Mount {
     /// The path the mount was asked at.
     path: String,
+    /// Made read-only: a bind of it for writing is refused.
+    read_only: bool,
+    /// Made reachable by other local users (a rootful container runtime's): what a bind's evidence says of it.
+    shared: bool,
+  },
+  /// A container bind's record (A-520): the mount it borrows, with which it ends.
+  Bind {
+    /// The source mount's attachment.
+    mount: u64,
   },
 }
 
@@ -253,6 +275,137 @@ impl SimVolumes {
     self.attachments.insert(id, SimAttachment { volume, held });
     Ok(id)
   }
+
+  /// The mount a container bind of `volume` at `source` borrows, judged as the daemon judges the kernel's table and its
+  /// own records (`crates/server/src/oci.rs`), in its order: `source`, then `destination`, absolute; a mount at `source`
+  /// (the newest there, as the table's last entry at a path is the one seen); none recorded beneath it (the bind is
+  /// non-recursive); and that mount `volume`'s, and writable for a writable bind. Its attachment, its path as recorded,
+  /// and whether it was made shared.
+  fn bindable(
+    &self,
+    volume: VolumeId,
+    (source, destination): (&str, &str),
+    read_only: bool,
+  ) -> Result<(u64, String, bool), Error> {
+    let chosen = |reason| Error::Invalid(Invalid::ChosenPath(reason));
+    if !source.starts_with('/') {
+      return Err(chosen(HostPathReason::NotAbsolute));
+    }
+    if !destination.starts_with('/') {
+      return Err(chosen(HostPathReason::DestinationNotAbsolute));
+    }
+    let at = trimmed(source);
+    let mounts = || {
+      self
+        .attachments
+        .iter()
+        .filter_map(|(id, attachment)| match &attachment.held {
+          Held::Mount {
+            path,
+            read_only: made_read_only,
+            shared,
+          } => Some((*id, attachment.volume, path, *made_read_only, *shared)),
+          Held::Stream { .. } | Held::Bind { .. } => None,
+        })
+    };
+    let (mount, mounted, path, mount_read_only, shared) = mounts()
+      .rev()
+      .find(|(_, _, path, _, _)| trimmed(path) == at)
+      .ok_or_else(|| chosen(HostPathReason::NotAMountPoint))?;
+    if let Some((_, _, beneath, _, _)) = mounts().find(|(_, _, other, _, _)| {
+      let other = trimmed(other);
+      other != at
+        && other
+          .strip_prefix(at)
+          .is_some_and(|rest| rest.starts_with('/') || at == "/")
+    }) {
+      return Err(chosen(HostPathReason::DescendantMount {
+        mount_point: beneath.clone(),
+      }));
+    }
+    if mounted != volume || (mount_read_only && !read_only) {
+      return Err(Error::Denied(Denied::Rights {
+        verb: Note::new(SOURCE_MOUNT_VERB),
+      }));
+    }
+    Ok((mount, path.clone(), shared))
+  }
+
+  /// Ends the attachments `ids`, and every container bind that borrows one of them: a bind ends with its source mount,
+  /// as the daemon ends it.
+  fn end(&mut self, ids: &[u64]) {
+    self.attachments.retain(|id, attachment| {
+      !ids.contains(id) && !matches!(attachment.held, Held::Bind { mount } if ids.contains(&mount))
+    });
+  }
+}
+
+/// `path` without its trailing separators, the root kept: how the daemon compares a path with the kernel's table.
+fn trimmed(path: &str) -> &str {
+  let trimmed = path.trim_end_matches('/');
+  if trimmed.is_empty() { "/" } else { trimmed }
+}
+
+/// Whether this host offers a host mount to bind into a container (`crates/server/src/oci.rs`): every Unix host the
+/// simulator stands in for, whose mounts it records.
+#[cfg(unix)]
+fn offered() -> Result<(), Error> {
+  Ok(())
+}
+
+/// Windows offers no host mount to bind into a container (`crates/server/src/oci.rs`: a container runtime there cannot
+/// bind a WinFsp drive): the daemon's refusal.
+#[cfg(windows)]
+fn not_offered() -> Error {
+  Error::Unsupported(crate::error::Unsupported::Attachment {
+    transport: AttachTransport::Oci,
+    reason: slates_ipc::protocol::UnsupportedReason::HostPlatform,
+  })
+}
+
+/// Whether this host offers a host mount to bind into a container: Windows does not ([`not_offered`]), refused as the
+/// daemon refuses it, before the paths are judged.
+#[cfg(windows)]
+fn offered() -> Result<(), Error> {
+  Err(not_offered())
+}
+
+/// The binding of the mount at `source` (as recorded) at `destination`: Slates' own runtime entry
+/// (`slates_bridge_oci::binding`, the words the daemon answers), with none of the kernel table's evidence claimed (no
+/// table vouched for a simulated mount: an empty type and source, no identity) beyond what the record holds, whether the
+/// mount was made shared.
+#[cfg(unix)]
+fn binding_of(
+  (source, destination): (&str, &str),
+  read_only: bool,
+  shared: bool,
+) -> Result<OciBinding, Error> {
+  let entry = slates_bridge_oci::binding::OciMountEntry {
+    destination: destination.to_owned(),
+    source: source.to_owned(),
+    read_only,
+  };
+  Ok(OciBinding {
+    mount_type: entry.mount_type().to_owned(),
+    options: entry.options(),
+    source: entry.source,
+    destination: entry.destination,
+    read_only,
+    evidence: slates_ipc::protocol::HostMountEvidence {
+      fstype: String::new(),
+      mount_source: String::new(),
+      names_volume: true,
+      mount_id: 0,
+      mount_device: 0,
+      shared_with_other_users: shared,
+    },
+  })
+}
+
+/// No binding on Windows: [`offered`] refuses first, and this answers the same refusal.
+#[cfg(windows)]
+fn binding_of(_paths: (&str, &str), _read_only: bool, _shared: bool) -> Result<OciBinding, Error> {
+  Err(not_offered())
 }
 
 /// The refusal of a full table named `name`.
@@ -438,7 +591,7 @@ impl Volumes for SimVolumes {
     &mut self,
     volume: VolumeId,
     path: &str,
-    _options: &MountOptions,
+    options: &MountOptions,
   ) -> Result<Mounted, Error> {
     if !self.volumes.contains_key(&volume) {
       return Err(Error::NotFound(Missing::Volume(volume)));
@@ -447,6 +600,8 @@ impl Volumes for SimVolumes {
       volume,
       Held::Mount {
         path: path.to_owned(),
+        read_only: options.read_only,
+        shared: options.shared,
       },
     )?;
     Ok(Mounted {
@@ -456,18 +611,235 @@ impl Volumes for SimVolumes {
   }
 
   fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
-    self
+    let gone: Vec<u64> = self
       .attachments
-      .retain(|_, attachment| !matches!(&attachment.held, Held::Mount { path: at } if at == path));
+      .iter()
+      .filter(
+        |(_, attachment)| matches!(&attachment.held, Held::Mount { path: at, .. } if at == path),
+      )
+      .map(|(id, _)| *id)
+      .collect();
+    self.end(&gone);
     // The simulator asks no volume's status for its mounts, so none goes unasked.
     Ok(Unmounted::default())
   }
 
+  fn bind_into_container(
+    &mut self,
+    volume: VolumeId,
+    source: &str,
+    destination: &str,
+    intent: Intent,
+  ) -> Result<ContainerBind, Error> {
+    if !self.volumes.contains_key(&volume) {
+      return Err(Error::NotFound(Missing::Volume(volume)));
+    }
+    offered()?;
+    let read_only = matches!(intent, Intent::Read);
+    let (mount, recorded, shared) = self.bindable(volume, (source, destination), read_only)?;
+    let binding = binding_of((recorded.as_str(), destination), read_only, shared)?;
+    let attachment = self.attach(volume, Held::Bind { mount })?;
+    Ok(ContainerBind {
+      attachment,
+      binding,
+    })
+  }
+
   fn detach(&mut self, attachment: u64) -> Result<(), Error> {
-    self
-      .attachments
-      .remove(&attachment)
-      .map(|_| ())
-      .ok_or(Error::NotFound(Missing::Attachment { attachment }))
+    if !self.attachments.contains_key(&attachment) {
+      return Err(Error::NotFound(Missing::Attachment { attachment }));
+    }
+    self.end(&[attachment]);
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: room for the few volumes and attachments these cases hold.
+  const MOST: usize = 8;
+  /// Shape: a volume's bound; any will do, since nothing is written.
+  const ROOM: u64 = 1 << 20;
+  /// Shape: where a container sees a bound mount.
+  const INSIDE: &str = "/work";
+  /// Shape: where a mount is recorded.
+  #[cfg(unix)]
+  const POINT: &str = "/sim/work";
+
+  /// A new empty volume `name`.
+  fn volume(sim: &mut SimVolumes, name: &str) -> VolumeId {
+    sim
+      .provision(&VolumeSpec::empty(name, ROOM))
+      .unwrap()
+      .volume()
+  }
+
+  /// The runtime entry's options the daemon answers for a bind with `access` (`rw` or `ro`), word for word.
+  #[cfg(unix)]
+  fn words(access: &str) -> Vec<String> {
+    ["bind", access, "private", "nosuid", "nodev"]
+      .map(str::to_owned)
+      .to_vec()
+  }
+
+  /// §4.6 A-9, A-520. Do: mount a volume in the simulator shared, bind its mount into a container for writing, and bind
+  /// it again for reading by its path with a trailing separator; detach the first binding, then unmount the mount.
+  /// Expect each binding Slates' runtime entry at the mount's recorded path and the destination given (`bind`, `rw` or
+  /// `ro`, `private`, `nosuid`, `nodev`, as the daemon answers them), the mount's sharing in its evidence and none of a
+  /// kernel table's facts claimed; each binding an attachment of its own that its detach ends, and the other ended with
+  /// its mount.
+  #[cfg(unix)]
+  #[test]
+  fn a_mounts_bind_answers_the_runtimes_entry_and_ends_with_its_mount() {
+    let mut sim = SimVolumes::new(MOST);
+    let work = volume(&mut sim, "work");
+    let shared = MountOptions {
+      shared: true,
+      ..MountOptions::default()
+    };
+    let mounted = sim.mount(work, POINT, &shared).unwrap();
+    let writable = sim
+      .bind_into_container(work, POINT, INSIDE, Intent::Write)
+      .unwrap();
+    assert_eq!(
+      writable.binding,
+      OciBinding {
+        source: POINT.to_owned(),
+        destination: INSIDE.to_owned(),
+        read_only: false,
+        mount_type: "bind".to_owned(),
+        options: words("rw"),
+        evidence: slates_ipc::protocol::HostMountEvidence {
+          fstype: String::new(),
+          mount_source: String::new(),
+          names_volume: true,
+          mount_id: 0,
+          mount_device: 0,
+          shared_with_other_users: true,
+        },
+      }
+    );
+    let readable = sim
+      .bind_into_container(work, &format!("{POINT}/"), INSIDE, Intent::Read)
+      .unwrap();
+    assert_eq!(
+      (
+        readable.binding.source.as_str(),
+        readable.binding.read_only,
+        &readable.binding.options
+      ),
+      (POINT, true, &words("ro"))
+    );
+    assert!(
+      writable.attachment != readable.attachment
+        && writable.attachment != mounted.attachment
+        && readable.attachment != mounted.attachment,
+      "each binding is an attachment of its own"
+    );
+    sim.detach(writable.attachment).unwrap();
+    assert_eq!(
+      sim.detach(writable.attachment),
+      Err(Error::NotFound(Missing::Attachment {
+        attachment: writable.attachment
+      }))
+    );
+    sim.unmount(POINT).unwrap();
+    assert_eq!(
+      sim.detach(readable.attachment),
+      Err(Error::NotFound(Missing::Attachment {
+        attachment: readable.attachment
+      })),
+      "a binding ends with its source mount"
+    );
+  }
+
+  /// §4.6 A-9, A-520. Do: bind a volume no one made, a relative source, a relative destination, a folder no mount holds,
+  /// a mount with another mounted beneath it, another volume's mount, and a read-only mount for writing; then, in a
+  /// simulator with room for exactly the attachments made, bind the read-only mount for reading. Expect each refused
+  /// typed as the daemon refuses it, in its order (`NotFound`; `ChosenPath`'s `NotAbsolute`, `DestinationNotAbsolute`,
+  /// `NotAMountPoint`, and `DescendantMount` naming the mount beneath; `Denied::Rights` naming the source mount, for the
+  /// last two), and the read bound: no refusal held an attachment's room.
+  #[cfg(unix)]
+  #[test]
+  fn a_bind_the_daemon_would_refuse_is_refused_typed_and_holds_nothing() {
+    /// Shape: the attachments these cases keep, three mounts and the one binding at the end, and room for the two
+    /// volumes.
+    const KEPT: usize = 4;
+    let mut sim = SimVolumes::new(KEPT);
+    let outer = volume(&mut sim, "outer");
+    let inner = volume(&mut sim, "inner");
+    sim
+      .mount(outer, "/sim/outer", &MountOptions::default())
+      .unwrap();
+    sim
+      .mount(inner, "/sim/outer/inner", &MountOptions::default())
+      .unwrap();
+    let read_only = MountOptions {
+      read_only: true,
+      ..MountOptions::default()
+    };
+    sim.mount(outer, "/sim/read-only", &read_only).unwrap();
+    let chosen =
+      |reason| -> Result<ContainerBind, Error> { Err(Error::Invalid(Invalid::ChosenPath(reason))) };
+    let rights: Result<ContainerBind, Error> = Err(Error::Denied(Denied::Rights {
+      verb: Note::new(SOURCE_MOUNT_VERB),
+    }));
+    let nowhere = VolumeId { bytes: [0xAB; 16] };
+    assert_eq!(
+      sim.bind_into_container(nowhere, "/sim/outer", INSIDE, Intent::Read),
+      Err(Error::NotFound(Missing::Volume(nowhere)))
+    );
+    assert_eq!(
+      sim.bind_into_container(outer, "sim/outer", INSIDE, Intent::Read),
+      chosen(HostPathReason::NotAbsolute)
+    );
+    assert_eq!(
+      sim.bind_into_container(outer, "/sim/outer", "work", Intent::Read),
+      chosen(HostPathReason::DestinationNotAbsolute)
+    );
+    assert_eq!(
+      sim.bind_into_container(outer, "/sim", INSIDE, Intent::Read),
+      chosen(HostPathReason::NotAMountPoint)
+    );
+    assert_eq!(
+      sim.bind_into_container(outer, "/sim/outer", INSIDE, Intent::Read),
+      chosen(HostPathReason::DescendantMount {
+        mount_point: "/sim/outer/inner".to_owned()
+      })
+    );
+    assert_eq!(
+      sim.bind_into_container(outer, "/sim/outer/inner", INSIDE, Intent::Read),
+      rights
+    );
+    assert_eq!(
+      sim.bind_into_container(outer, "/sim/read-only", INSIDE, Intent::Write),
+      rights
+    );
+    let bound = sim
+      .bind_into_container(outer, "/sim/read-only", INSIDE, Intent::Read)
+      .unwrap();
+    assert!(bound.binding.read_only, "a read binding is read-only");
+  }
+
+  /// §4.6 A-9, A-520: Windows offers no host mount to bind. Do: mount a volume in the simulator at a drive and bind it,
+  /// and bind a volume no one made. Expect the bind refused `Unsupported::Attachment { Oci, HostPlatform }`, as the
+  /// daemon refuses it, and the stranger `NotFound` first.
+  #[cfg(windows)]
+  #[test]
+  fn a_bind_on_windows_is_refused_as_the_daemon_refuses_it() {
+    let mut sim = SimVolumes::new(MOST);
+    let work = volume(&mut sim, "work");
+    sim.mount(work, "S:", &MountOptions::default()).unwrap();
+    assert_eq!(
+      sim.bind_into_container(work, "S:", INSIDE, Intent::Write),
+      Err(not_offered())
+    );
+    let nowhere = VolumeId { bytes: [0xAB; 16] };
+    assert_eq!(
+      sim.bind_into_container(nowhere, "S:", INSIDE, Intent::Write),
+      Err(Error::NotFound(Missing::Volume(nowhere)))
+    );
   }
 }

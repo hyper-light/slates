@@ -40,6 +40,9 @@ slates-rt = { workspace = true }
 slates-vfs = { workspace = true }
 # The fleet manifest the roles read (`role::fleet`).
 serde_json = { workspace = true }
+# An S3 base as the library names it (A-524): the naming, its addressing and its credential's type. The server links it
+# already.
+slates-base = { workspace = true }
 # The merge engine's conflict classes, which a merge window names by discriminant on the wire (§4.16, D-27): the
 # contract reads them against the engine's own enum (A-299). The server links it already.
 slates-merge = { workspace = true }
@@ -47,15 +50,17 @@ slates-merge = { workspace = true }
 # random (`slates-transport`, A-66), as the daemon mints its own. The server links both already.
 slates-wire = { workspace = true }
 slates-transport = { workspace = true }
+# The kernel's mount table an unmount is judged by (A-507): `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on
+# Linux, neither touching a mount; and the container handoff's judge and check (A-520: `container`, `container_engine`),
+# whose verdicts and refusals are the contract's types on every platform. Every platform links it: where it builds no
+# table query (Windows) its table, identity and watch answer `Unsupported`, which the contract carries.
+slates-bridge-oci = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 rustix = { workspace = true }
 # The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
 slates-bridge-nfs = { workspace = true }
-# The kernel's mount table an unmount is judged by (A-507): `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on
-# Linux, neither touching a mount.
-slates-bridge-oci = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # The roles' stop flag: the console control handler (`role::signal`). And a fleet node's nameservers, the DNS servers

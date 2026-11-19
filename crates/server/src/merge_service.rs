@@ -982,6 +982,7 @@ pub(crate) fn attach_green(
         admin: false,
       },
       token,
+      mount: None,
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {

@@ -221,6 +221,16 @@ fn a_held_section_is_adopted_whole_and_never_widened() {
   drop(object);
 
   let mut adopted = DaxObject::adopt(held, MOST_VIEWS, DaxLayout::Identity).unwrap();
+  assert_adopted_whole(&mut adopted, &first, last);
+  assert_other_adoptions_refused(&adopted, read_only);
+  for handle in [adopted.held().unwrap(), adopted.handed(true).unwrap()] {
+    assert_eq!(duplicate(&handle, WRITE_DAC), Err(ERROR_ACCESS_DENIED));
+  }
+}
+
+/// A-448's adopted object: the machine's size, every byte its maker and the VMM stored in the first and `last` ranges,
+/// and a store it makes seen through the VMM's map `first`.
+fn assert_adopted_whole(adopted: &mut DaxObject, first: &VmmRange, last: u64) {
   assert_eq!(adopted.len(), dax_object_bytes());
   let mut loaded = [0u8; 5];
   adopted.load(5, &mut loaded).unwrap();
@@ -235,7 +245,11 @@ fn a_held_section_is_adopted_whole_and_never_widened() {
     .map(|at| first.byte(at).load(Ordering::Relaxed))
     .collect();
   assert_eq!(seen, b"after", "the VMM's map is the adopted section");
+}
 
+/// A-448's refusals: a read-only duplicate and a peer copy's section are no DAX object, and the adopted section under a
+/// guarded layout is refused by the OS.
+fn assert_other_adoptions_refused(adopted: &DaxObject, read_only: OwnedHandle) {
   assert!(matches!(
     DaxObject::adopt(read_only, MOST_VIEWS, DaxLayout::Identity),
     Err(MemError::NotADaxObject { .. })
@@ -257,7 +271,4 @@ fn a_held_section_is_adopted_whole_and_never_widened() {
     ),
     Err(MemError::OsRefused { .. })
   ));
-  for handle in [adopted.held().unwrap(), adopted.handed(true).unwrap()] {
-    assert_eq!(duplicate(&handle, WRITE_DAC), Err(ERROR_ACCESS_DENIED));
-  }
 }

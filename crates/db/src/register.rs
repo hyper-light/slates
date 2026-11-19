@@ -2837,6 +2837,12 @@ pub struct RegionalConfiguration {
   /// the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until the
   /// first seat is recorded. Bounded by the members.
   pub voters: Vec<HostId>,
+  /// The members whose settled neighbourhood certifies their content (A-546): settled by a build whose owner reports a
+  /// neighbourhood placed only once every volume it owns is placed within it, content too, so no head it serves names a
+  /// holder outside its neighbourhoods, and a holder outside them lets a copy's stale content go. Every member this
+  /// build forms, admits or settles is in it; one read from a configuration an older build wrote (regional layout 5 or
+  /// 6) is not, and its holders keep the content (A-508). Bounded by the members.
+  pub settle_certified: std::collections::BTreeSet<HostId>,
 }
 
 /// One object's explicit move off its creator's line ([`RegionalConfiguration::moved`]).
@@ -2909,14 +2915,16 @@ impl RegionalConfiguration {
       completed: std::collections::BTreeMap::new(),
       moved: std::collections::BTreeMap::new(),
       voters: Vec::new(),
+      settle_certified: std::collections::BTreeSet::new(),
     };
     config.fix_neighbourhoods(scatter);
-    // A formed region owns nothing yet: every member's first neighbourhood is already settled.
+    // A formed region owns nothing yet: every member's first neighbourhood is already settled, its content with it.
     config.settled = config
       .neighbourhoods
       .iter()
       .map(|(owner, neighbourhood)| (*owner, Settled::of(neighbourhood, &config.domains)))
       .collect();
+    config.settle_certified = config.members.iter().copied().collect();
     config
   }
 
@@ -3042,6 +3050,7 @@ impl RegionalConfiguration {
     if let Some(neighbourhood) = self.neighbourhoods.get(&member) {
       let settled = Settled::of(neighbourhood, &self.domains);
       self.settled.insert(member, settled);
+      self.settle_certified.insert(member);
     }
     true
   }
@@ -3062,6 +3071,7 @@ impl RegionalConfiguration {
     let Some(version) = self.version.checked_add(1) else {
       return false;
     };
+    self.settle_certified.remove(&member);
     let settled = self.settled.remove(&member).or_else(|| {
       self
         .neighbourhoods
@@ -3150,6 +3160,8 @@ impl RegionalConfiguration {
     };
     let settled = Settled::of(neighbourhood, &self.domains);
     self.settled.insert(owner, settled);
+    // This build's owner reports a neighbourhood placed only once its content is placed within it too (A-546).
+    self.settle_certified.insert(owner);
     self.version = version;
     true
   }
@@ -3530,6 +3542,74 @@ impl RegionalConfiguration {
       .collect()
   }
 
+  /// Whether `object`'s line runs from `owner`, a recovery owner of `departed`'s takeover, into `departed` (A-556): `owner`
+  /// is `departed` itself, or each kept retirement on the way, starting at `owner`, ranked `object` to the next until it
+  /// reaches `departed`. The rankings are fixed at each retirement ([`successor`]), so every node reads the same. Bounded
+  /// by the kept retirements.
+  ///
+  /// [`successor`]: RegionalConfiguration::successor
+  fn falls_through(&self, departed: HostId, owner: HostId, object: ObjectId) -> bool {
+    let mut host = owner;
+    for _ in 0..=self.retired.len() {
+      if host == departed {
+        return true;
+      }
+      match self.successor(host, object) {
+        Some(next) if self.retired.contains_key(&next) => host = next,
+        _ => return false,
+      }
+    }
+    false
+  }
+
+  /// The cohorts a round of `departed`'s takeover waits on for `object` (A-556): of its recovery cohorts
+  /// ([`recovery_cohorts`]), `departed`'s own and those of the carried retirements whose round ranked `object` along a
+  /// line into `departed` ([`falls_through`]). A carried retirement's cohort holds the only copy of a record only of an
+  /// object it owned and the departed host was taking over from it, one its round ranked to the departed host: an
+  /// object it ranked elsewhere is that successor's to recover, and one it never owned (the departed host's own) its
+  /// cohort never held. Joined for every object, as before, a carried retirement short of its quorum put the departed
+  /// host's own objects past tolerance on a second failure inside that takeover's window (GAPS, live-durability
+  /// 2026-11-09: the store-destroyed flow's owner, killed before it confirmed the destroyed node's takeover). The
+  /// successors are still ranked over every recovery cohort ([`successor`]), so a fleet of mixed builds names the same
+  /// ones; only the wait narrows.
+  ///
+  /// [`recovery_cohorts`]: RegionalConfiguration::recovery_cohorts
+  /// [`falls_through`]: RegionalConfiguration::falls_through
+  /// [`successor`]: RegionalConfiguration::successor
+  pub fn readiness_cohorts(&self, departed: HostId, object: ObjectId) -> Vec<Vec<HostId>> {
+    self
+      .recovery_owners(departed)
+      .iter()
+      .filter(|owner| self.falls_through(departed, **owner, object))
+      .filter_map(|owner| {
+        self
+          .retired
+          .get(owner)
+          .map(|retirement| retirement.settled.cohort(*owner, object, self.quorum))
+      })
+      .collect()
+  }
+
+  /// [`current_cohorts`], narrowed as [`readiness_cohorts`] narrows the settled ones (A-556): the current cohorts a
+  /// round past tolerance waits on.
+  ///
+  /// [`current_cohorts`]: RegionalConfiguration::current_cohorts
+  /// [`readiness_cohorts`]: RegionalConfiguration::readiness_cohorts
+  pub fn readiness_current_cohorts(&self, departed: HostId, object: ObjectId) -> Vec<Vec<HostId>> {
+    self
+      .recovery_owners(departed)
+      .iter()
+      .filter(|owner| self.falls_through(departed, **owner, object))
+      .filter_map(|owner| {
+        self
+          .retired
+          .get(owner)
+          .and_then(|retirement| retirement.current.as_ref())
+          .map(|current| current.cohort(*owner, object, self.quorum))
+      })
+      .collect()
+  }
+
   /// Whether `object` of the retired `departed` is recovered within tolerance (A-341, A-484): each of the object's
   /// settled recovery cohorts keeps at least its recovery quorum of the hosts that stayed members through the takeover.
   /// Every record committed for the object is on `f + 1` of each settled cohort, or on all of a smaller one: the owner's
@@ -3550,7 +3630,7 @@ impl RegionalConfiguration {
     let (cohorts, counted, members_now): (Vec<Vec<HostId>>, &[HostId], bool) =
       match (self.retired.get(&departed), self.completed.get(&departed)) {
         (Some(retirement), _) => (
-          self.recovery_cohorts(departed, object),
+          self.readiness_cohorts(departed, object),
           &retirement.survivors,
           true,
         ),
@@ -3604,6 +3684,12 @@ impl RegionalConfiguration {
     !self.moved.contains_key(&object.placement_key())
       && self.confirmed_for(writer, object)
       && self.within_tolerance(writer, object)
+  }
+
+  /// Whether `owner`'s settled neighbourhood certifies its content (A-546, [`RegionalConfiguration::settle_certified`]):
+  /// no head it serves names a holder outside its neighbourhoods.
+  pub fn settle_certifies_content(&self, owner: HostId) -> bool {
+    self.settle_certified.contains(&owner)
   }
 
   /// Whether `departed`'s takeover's confirmations certify their content (A-538): its kept retirement or its completion
@@ -6669,6 +6755,105 @@ mod tests {
       (kept, recorded, older, regional.certifies_content(HostId(2))),
       (true, true, false, false),
       "certified on its retirement and its record, not once read as older, never for a host not retired"
+    );
+  }
+
+  /// A-546: every settle this build records certifies its owner's content, and a retired member's mark goes. Do: form a
+  /// five-member region and judge each member; admit a sixth and judge it; take a member over and judge the others and
+  /// the retired one; have a member whose neighbourhood moved report it settled, after clearing its mark as a
+  /// configuration an older build wrote has it, and judge it before and after. Expect every formed and admitted member
+  /// certified, the retired one not, and the cleared member certified again by its settle.
+  #[test]
+  fn a_settle_this_build_records_certifies_its_content() {
+    let (mut regional, scatter) = wide_region();
+    let formed = regional
+      .members
+      .iter()
+      .all(|member| regional.settle_certifies_content(*member));
+    assert!(regional.admit(HostId(6), None, scatter));
+    let admitted = regional.settle_certifies_content(HostId(6));
+    regional.take_over(HostId(1), scatter);
+    let retired = regional.settle_certifies_content(HostId(1));
+    let mover = regional
+      .members
+      .iter()
+      .copied()
+      .find(|member| regional.settles(*member, regional.neighbourhoods[member].generation))
+      .expect("a member whose neighbourhood moved");
+    regional.settle_certified.remove(&mover);
+    let before = regional.settle_certifies_content(mover);
+    let generation = regional.neighbourhoods[&mover].generation;
+    assert!(regional.settle(mover, generation));
+    let after = regional.settle_certifies_content(mover);
+    assert_eq!(
+      (formed, admitted, retired, before, after),
+      (true, true, false, false, true),
+      "formed and admitted members certified, the retired one not, a settle certifying again"
+    );
+  }
+
+  /// A-556, red before it (GAPS, live-durability 2026-11-09): a host that retires owing its share of an earlier
+  /// takeover recovers its own objects through its own cohorts alone, and an object the earlier takeover ranked to it
+  /// through that takeover's cohort too. Do: in an eight-member `f = 1` region take over a member, have one of its
+  /// neighbours settle its moved neighbourhood and then retire before confirming its share; pick an object of the
+  /// neighbour's own that the first takeover ranks elsewhere, and an object of the first member's that it ranks to the
+  /// neighbour. Expect the neighbour's own object within tolerance, waited on through one cohort though ranked over two,
+  /// and the first member's object waited on through both. Before, every object of the neighbour was joined with the
+  /// first member's cohort, which had lost two of its three hosts, so the neighbour's own object read past tolerance and
+  /// its round waited for every survivor.
+  #[test]
+  fn a_carried_takeovers_cohort_holds_back_only_the_objects_it_ranked_to_the_carrier() {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=8).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    let first = HostId(1);
+    let carrier = regional.neighbourhoods[&first]
+      .hosts
+      .iter()
+      .copied()
+      .find(|host| *host != first)
+      .expect("a neighbour");
+    regional.take_over(first, scatter);
+    if let Some(generation) = regional
+      .neighbourhoods
+      .get(&carrier)
+      .map(|neighbourhood| neighbourhood.generation)
+    {
+      regional.settle(carrier, generation);
+    }
+    regional.take_over(carrier, scatter);
+    let mut expected_owners = vec![first, carrier];
+    expected_owners.sort_unstable_by_key(|host| host.0);
+    assert_eq!(
+      regional.recovery_owners(carrier),
+      expected_owners,
+      "the carrier left owing its share of the first takeover, which its own carries"
+    );
+    let own = (0..256u64)
+      .map(|index| ObjectId::new(carrier, index))
+      .find(|object| regional.successor(first, *object) != Some(carrier))
+      .expect("an object of the carrier's that the first takeover ranks elsewhere");
+    let ranked = (0..256u64)
+      .map(|index| ObjectId::new(first, index))
+      .find(|object| regional.successor(first, *object) == Some(carrier))
+      .expect("an object of the first member's that its takeover ranks to the carrier");
+    assert_eq!(
+      (
+        regional.recovery_cohorts(carrier, own).len(),
+        regional.readiness_cohorts(carrier, own).len(),
+        regional.readiness_cohorts(carrier, ranked).len(),
+      ),
+      (2, 1, 2),
+      "ranked over both cohorts, the carrier's own object waited on through its own alone, the ranked one through both"
+    );
+    assert!(
+      regional.within_tolerance(carrier, own),
+      "the carrier's own object is within tolerance: its own cohort lost only the carrier"
     );
   }
 

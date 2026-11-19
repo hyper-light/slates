@@ -2449,6 +2449,9 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some((sequence, value)) = head_value_of(state, record, object, config.quorum) else {
       continue; // The newest seal's content is not yet placed: the head waits for it.
     };
+    if crate::carry::holds_head_back(state, record.id, record.head, &value) {
+      continue; // A captured clone's head waits for its capture's record (A-544), so a successor adopts both.
+    }
     if !sealing_covers_candidates(state, config, object, &value, local) {
       continue; // A candidate could not open the sealed content as a successor: the head waits for its pair.
     }
@@ -3189,6 +3192,9 @@ fn advance_home_seal(
   round: CommitBudget,
 ) -> Option<ContentWork> {
   let object = ObjectId(id.bytes);
+  // A captured clone's head carries its capture's record (A-544): its carry is stepped whether or not its seal is done,
+  // since the head register waits for the record after its content is placed.
+  crate::carry::step(state, id);
   let (head, sequence) = sealable_head(state, id, object)?;
   // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the head
   // naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
@@ -3293,6 +3299,8 @@ fn seal_walk_slice(
   };
   if remaining.is_none() && track == Track::Home {
     heal_one_placed_snapshot(state, local, slicing.created_unix);
+    // The walk visits only the volumes this shard serves, so the carry of one it let go is forgotten here (A-544).
+    crate::carry::forget_gone(state);
   }
   (work, remaining)
 }
@@ -3412,8 +3420,16 @@ fn heal_for(
   let configuration = state.fleet.configuration();
   let quorum = configuration.quorum;
   let candidates = configuration.place(object).candidates;
+  // While this owner's neighbourhood change is in flight, a placement naming a host outside its current neighbourhood is
+  // replaced on the current cohort, so its settle can certify its content (A-546): a restore keeps it named.
+  let unsettled = unsettled_replace(
+    region,
+    local,
+    &configuration.neighbourhood,
+    configuration.settled.is_some(),
+  );
   let adopted = crate::takeover::adopted_here(state, object);
-  let (heal, found) = heal_decision(
+  let (mut heal, found) = heal_decision(
     local,
     region,
     &state.council.configuration().members,
@@ -3422,6 +3438,10 @@ fn heal_for(
   );
   if adopted && heal == Some(Heal::Replace) && found.named_outside_candidates {
     state.count(HEAL_ADOPTED_REPLACED, 1);
+  }
+  if unsettled && heal != Some(Heal::Replace) {
+    heal = Some(Heal::Replace);
+    state.count(HEAL_UNSETTLED_REPLACED, 1);
   }
   for (seen, counter) in [
     (found.named_gone, HEAL_NAMED_GONE),
@@ -3436,6 +3456,18 @@ fn heal_for(
     }
   }
   heal
+}
+
+/// Whether the healer replaces a placement naming `region` because this owner's (`local`'s) neighbourhood change is in
+/// flight (`unsettled`) and the placement names a host outside its current `neighbourhood` (A-546): the settle report
+/// waits for every owned volume to be served from within it ([`content_placed_on_current_neighbourhood`]).
+fn unsettled_replace(
+  region: &[u64],
+  local: HostId,
+  neighbourhood: &[HostId],
+  unsettled: bool,
+) -> bool {
+  unsettled && !crate::takeover::served_from_placement(region, local, neighbourhood)
 }
 
 /// What the healer found in a placement beside the heal it decided ([`heal_decision`]); each is counted.
@@ -3525,6 +3557,11 @@ const HEAL_NAMED_OUTSIDE_CANDIDATES: &str = "fleet.heal.named_outside_candidates
 /// adopted the volume waits to confirm until it serves it from its own placement. Format: a refusal name in the daemon's
 /// status report.
 const HEAL_ADOPTED_REPLACED: &str = "fleet.heal.adopted_replaced";
+
+/// The status count under which the healer records a replace of a placement naming a host outside this owner's current
+/// neighbourhood while its neighbourhood change is in flight (A-546): its settle waits until every owned volume is
+/// served from within that neighbourhood. Format: a refusal name in the daemon's status report.
+const HEAL_UNSETTLED_REPLACED: &str = "fleet.heal.unsettled_replaced";
 
 /// The status count under which the healer records a heal that ran its bound ([`heal_bound_ns`]) without finishing
 /// (every put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later
@@ -8345,13 +8382,45 @@ fn records_placed_on_current_neighbourhood(state: &ShardState) -> bool {
   heads && crate::merge_service::greens_placed_on_current_cohort(state)
 }
 
+/// Whether every volume this shard owns is served from within this node's current neighbourhood (A-546): its head
+/// snapshot's placement names only this node and hosts of that neighbourhood, so the settle that names it certifies that
+/// no head this node serves names a holder outside its neighbourhoods, and such a holder lets its content go (A-508's
+/// holders). A placement made before the neighbourhood moved is replaced by the healer while the change is in flight
+/// ([`heal_for`]). A volume whose head names no content yet is served.
+fn content_placed_on_current_neighbourhood(state: &ShardState) -> bool {
+  let config = state.fleet.configuration();
+  state.volumes.iter().all(|(_, slot)| {
+    let id = DbVolumeId {
+      bytes: slot.id.bytes,
+    };
+    let Some(record) = state.db.partition().volume(id) else {
+      return true;
+    };
+    if record.epoch == 0 {
+      return true;
+    }
+    state
+      .db
+      .partition()
+      .snapshot(id, record.head)
+      .is_some_and(|snapshot| match &snapshot.placed {
+        PlacementState::Placed { region, .. } => {
+          crate::takeover::served_from_placement(region, config.owner, &config.neighbourhood)
+        }
+        PlacementState::Local => true,
+      })
+  })
+}
+
 /// Reports this node's neighbourhood change placed, once it is (§4.8 "Neighbourhood changes"; Vertical Paxos
 /// II's state transfer before the old configuration retires): while the council's current neighbourhood for
 /// this node differs from its settled one, every shard is asked whether all it owns is held by `f + 1` of its
 /// cohort in the current neighbourhood ([`records_placed_on_current_neighbourhood`]) under the very configuration
 /// version the report names; when all are, `Settle` for that neighbourhood's version goes to the council
-/// ([`send_council_report`]). Repeated each period until the installed configuration shows it settled; a report
-/// for a neighbourhood that moved on meanwhile changes nothing (the fold checks the version).
+/// ([`send_council_report`]). Its content must be placed within the current neighbourhood too
+/// ([`content_placed_on_current_neighbourhood`], A-546), so the settle certifies it. Repeated each period until the
+/// installed configuration shows it settled; a report for a neighbourhood that moved on meanwhile changes nothing (the
+/// fold checks the version).
 async fn report_settlement(
   origin: u16,
   shards: &[u16],
@@ -8369,7 +8438,9 @@ async fn report_settlement(
       origin,
       shard,
       move |s| {
-        s.fleet.configuration().version == version && records_placed_on_current_neighbourhood(s)
+        s.fleet.configuration().version == version
+          && records_placed_on_current_neighbourhood(s)
+          && content_placed_on_current_neighbourhood(s)
       },
       HEARTBEAT_NS,
     )
@@ -12411,6 +12482,25 @@ mod tests {
         }
       ),
       "a holder named twice is one copy: two copies are short of f + 1 = 3"
+    );
+  }
+
+  /// A-546: while an owner's neighbourhood change is in flight, the healer replaces a placement naming a host outside
+  /// its current neighbourhood, and only then. Do: judge a placement naming a host outside the neighbourhood, in flight
+  /// and settled, and one naming only the owner and its neighbours, in flight. Expect a replace for the first in flight
+  /// alone: settled, the healer's own rule decides; within the neighbourhood nothing is owed.
+  #[test]
+  fn an_unsettled_owners_placement_outside_its_current_neighbourhood_is_replaced() {
+    let (owner, b, c, outside) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let neighbourhood = [owner, b, c];
+    assert_eq!(
+      [
+        unsettled_replace(&[owner.0, b.0, outside.0], owner, &neighbourhood, true),
+        unsettled_replace(&[owner.0, b.0, outside.0], owner, &neighbourhood, false),
+        unsettled_replace(&[owner.0, b.0, c.0], owner, &neighbourhood, true),
+      ],
+      [true, false, false],
+      "replaced only in flight and only when it names a host outside the current neighbourhood"
     );
   }
 

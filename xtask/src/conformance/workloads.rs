@@ -252,6 +252,10 @@ const LINK_PROBE: (&str, &str) = (".hard-link-probe", ".hard-link-probe-second-n
 /// both names removed after; a refusal is printed with its error. This is the route's own answer, never assumed of it:
 /// one WinFsp transport covers a drive whose driver links (`docs/wip/winfsp-patches`, A-360) and one whose driver
 /// refuses, as WinFsp's as released does (`ERROR_NOT_SUPPORTED`).
+#[allow(
+  clippy::disallowed_methods,
+  reason = "the probe writes only inside the workload root it is handed, where the git and Mercurial workloads themselves write: the mount under test or the harness's own scratch reference, never a host path of its choosing"
+)]
 fn mount_links(root: &Path) -> Result<HardLinks, Failure> {
   let (first, second) = (root.join(LINK_PROBE.0), root.join(LINK_PROBE.1));
   let remove = |path: &Path| {

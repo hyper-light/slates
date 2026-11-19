@@ -12,17 +12,24 @@
 //! module judges the answer.
 //!
 //! What is judged, in the order that consults least:
-//! - The runtime: the handshake speaks the Docker engine's interface through its CLI. Any other runtime is
-//!   refused `RuntimeUnsupported` before anything is asked: a runtime's name certifies nothing.
+//! - The runtime: the handshake speaks the Docker engine's interface through its CLI, and podman's own
+//!   (A-520: `podman info`, since podman's CLI answers Docker's templates with its own fields) ([`runtime_interface`]).
+//!   Any other runtime is refused `RuntimeUnsupported` before anything is asked: a runtime's name certifies nothing.
 //! - The endpoint the CLI would reach, before the engine is asked: a local socket or named pipe is this
 //!   host's engine. A TCP or SSH endpoint is refused `RemoteEngine`, loopback included, since a forwarded
 //!   port can put the engine, and so the bind source's resolution, on any host. An endpoint in no known
-//!   scheme is refused `EndpointUnrecognized`.
-//! - The engine's own statement (`docker info`): its kind, its version, and its security options. A rootless
-//!   engine or one remapping users through a user namespace is refused `UserNamespaceUntested`.
+//!   scheme is refused `EndpointUnrecognized`. Podman has no engine to reach on its own host: it runs the
+//!   container itself ([`Endpoint::Local`]), unless its own statement says its service is remote (a
+//!   `CONTAINER_HOST`, a podman machine's VM), which is refused `RemoteEngine` ([`podman_profile`]).
+//! - The engine's own statement (`docker info`; `podman info`): its kind, its version, and its security options. A
+//!   rootless engine or one remapping users through a user namespace is refused `UserNamespaceUntested`, but for
+//!   the one rootless profile a container workload has run through: rootless podman on its own Linux host.
 //! - The profile against the evidence: only a profile a container workload has run through by use holds
-//!   evidence. Today that is Docker Desktop on macOS over its local socket (T-4.13, `crates/cli/tests/cli.rs`).
-//!   Every other profile is refused `ProfileUntested`, naming the engine and host.
+//!   evidence. Today those are Docker Desktop on macOS over its local socket (T-4.13, `crates/cli/tests/cli.rs`),
+//!   a Docker Engine on its own Linux host over its local socket (T-4.13's Linux leg, a shared FUSE mount), and
+//!   rootless podman on its own Linux host (T-4.13's rootless leg, an unshared FUSE mount: A-520, from
+//!   `a_rootless_container_reads_and_writes_the_volume_through_its_mount`, 2026-10-19). Every other profile is
+//!   refused `ProfileUntested`, naming the engine and host.
 //!
 //! The engine's version is reported, not gated: the evidence names the profile, and the handshake tells the
 //! harness which version it is about to trust.
@@ -69,6 +76,13 @@ impl Host {
 /// Windows suffix).
 const DOCKER: [&str; 2] = ["docker", "docker.exe"];
 
+/// Format: podman's CLI, whose own interface the handshake speaks too (A-520), as its executable's name (with the
+/// Windows suffix).
+const PODMAN: [&str; 2] = ["podman", "podman.exe"];
+
+/// Format: what a refusal names as the endpoint of a podman whose own statement says its service is remote.
+const REMOTE_PODMAN: &str = "podman's remote service";
+
 /// Format: Docker's name for its Desktop engine in `docker info`'s `OperatingSystem`.
 const DOCKER_DESKTOP: &str = "Docker Desktop";
 
@@ -84,6 +98,9 @@ const SELINUX: &str = "selinux";
 const TESTED_BY: &str = "T-4.13";
 /// Format: the test that ran container workloads through the Linux profile (the `linux-oci` CI lane).
 const TESTED_ON_LINUX_BY: &str = "T-4.13 (Linux, a shared FUSE mount)";
+/// Format: the test that ran a container workload through rootless podman on Linux
+/// (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`, 2026-10-19).
+const TESTED_ROOTLESS_PODMAN_BY: &str = "T-4.13 (Linux, rootless podman, an unshared FUSE mount)";
 
 /// A local endpoint the runtime's engine answers on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +109,9 @@ pub enum Endpoint {
   UnixSocket(String),
   /// A Windows named pipe (`npipe://NAME`).
   NamedPipe(String),
+  /// No endpoint: the runtime runs the container on this host itself, with no engine between (podman whose
+  /// service is not remote, A-520).
+  Local,
 }
 
 /// What an engine states about itself (`docker info`'s `OperatingSystem`, `ServerVersion`,
@@ -114,6 +134,33 @@ pub enum Engine {
   DockerDesktop,
   /// A Docker Engine on its own host.
   DockerEngine,
+  /// Podman, which runs a container itself (A-520): its own process tree on this host, no daemon between.
+  Podman,
+}
+
+/// The engine interface a runtime's CLI speaks, as the handshake asks it ([`runtime_interface`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interface {
+  /// The Docker CLI: an engine reached at an endpoint (`docker context inspect`, `docker info`).
+  Docker,
+  /// Podman's CLI (A-520): the runtime itself, which states whether its service is remote (`podman info`).
+  Podman,
+}
+
+/// What podman states about itself (`podman info`'s host operating system, version, rootless and SELinux flags,
+/// and whether its service is remote; A-520).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PodmanFacts {
+  /// The host's operating system as podman names it (`linux`).
+  pub operating_system: String,
+  /// Podman's version.
+  pub server_version: String,
+  /// Whether podman runs rootless: its containers' root is the user who runs it.
+  pub rootless: bool,
+  /// Whether SELinux labels what podman binds.
+  pub selinux_enabled: bool,
+  /// Whether podman runs its containers through a remote service (a `CONTAINER_HOST`, a podman machine's VM).
+  pub service_is_remote: bool,
 }
 
 /// The consuming runtime's profile: what the handshake established.
@@ -154,6 +201,15 @@ pub enum IdentityRule {
   /// container wrote root-owned files and read another user's 0700 directory; as 2000:2000 it could neither
   /// create in the mounting user's 0755 root nor read the 0700 directory; as the mounting user it wrote its own.
   ContainerIdsAsHostIds,
+  /// The container's root reaches the export as the user who mounted it, since a rootless engine maps it so, and
+  /// writes, reads and is refused as that user (A-520). Measured through rootless podman on Linux over an unshared
+  /// FUSE mount (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`, 2026-10-19): the container's
+  /// root read what a client wrote, its write through a read-only bind was refused `EROFS` by the kernel, and its
+  /// write through a writable bind landed and was read on the host through the same mount. The container's other
+  /// ids are subordinate ids of the host's (`/etc/subuid`), no user of the mount, which an unshared FUSE mount
+  /// admits no process of (FUSE without `allow_other` admits the mounting user alone): so a host runs its
+  /// container as the container's root. That refusal by use is the profile's live check, owed (filed 2026-11-19).
+  ContainerRootAsMountingUser,
 }
 
 /// How hard links behave through a tested profile's file sharing — measured, since a workload that links a
@@ -171,7 +227,9 @@ pub enum HardLinkRule {
   OtherNamesStaleAfterTheFirstIsRemoved,
   /// Every name of a hard-linked file is served at once, the first removed or not: the bind is the host's own
   /// FUSE mount, with no file sharing between. Measured 2026-10-01 through a Linux Docker Engine over a shared
-  /// mount: link, remove the first name, open the second — 0 of 100 failed.
+  /// mount: link, remove the first name, open the second — 0 of 100 failed. Rootless podman on Linux binds the
+  /// same mount the same way, with no sharing between (A-520): its own run of the probe is the profile's live
+  /// check, owed (filed 2026-11-19).
   EveryNameServedAtOnce,
 }
 
@@ -250,14 +308,58 @@ impl std::fmt::Display for ProfileRefusal {
 
 /// Admits the runtime by its executable's name, before it is run: the handshake speaks only the Docker CLI.
 pub fn admit_runtime(runtime: &str) -> Result<(), ProfileRefusal> {
+  match runtime_interface(runtime)? {
+    Interface::Docker => Ok(()),
+    Interface::Podman => Err(ProfileRefusal::RuntimeUnsupported {
+      runtime: runtime.to_owned(),
+    }),
+  }
+}
+
+/// The engine interface `runtime` speaks, by its executable's name, before it is run (A-520): the Docker CLI, or
+/// podman's own. Any other runtime is refused `RuntimeUnsupported`: its name certifies nothing. [`admit_runtime`] and
+/// [`admit_endpoint`] admit the Docker CLI's alone, whose engine an endpoint names.
+pub fn runtime_interface(runtime: &str) -> Result<Interface, ProfileRefusal> {
   let name = runtime.rsplit(['/', '\\']).next().unwrap_or("");
   if DOCKER.contains(&name) {
-    Ok(())
+    Ok(Interface::Docker)
+  } else if PODMAN.contains(&name) {
+    Ok(Interface::Podman)
   } else {
     Err(ProfileRefusal::RuntimeUnsupported {
       runtime: runtime.to_owned(),
     })
   }
+}
+
+/// The profile podman's statement establishes (A-520): podman runs the container on this host itself
+/// ([`Endpoint::Local`], [`Engine::Podman`]), rootless or not and labelling or not as it states. A podman whose
+/// service is remote is refused `RemoteEngine`, as a Docker endpoint reached over a network is: a bind source would
+/// resolve on the service's host.
+pub fn podman_profile(facts: &PodmanFacts) -> Result<RuntimeProfile, ProfileRefusal> {
+  if facts.service_is_remote {
+    return Err(ProfileRefusal::RemoteEngine {
+      endpoint: REMOTE_PODMAN.to_owned(),
+    });
+  }
+  Ok(RuntimeProfile {
+    endpoint: Endpoint::Local,
+    engine: Engine::Podman,
+    operating_system: facts.operating_system.clone(),
+    server_version: facts.server_version.clone(),
+    rootless: facts.rootless,
+    user_namespace_remap: false,
+    selinux_labels: facts.selinux_enabled,
+  })
+}
+
+/// Whether `profile` on `host` is rootless podman on its own Linux host: the one rootless profile a container
+/// workload has run through (A-520).
+fn rootless_podman_on_linux(profile: &RuntimeProfile, host: Host) -> bool {
+  profile.engine == Engine::Podman
+    && profile.endpoint == Endpoint::Local
+    && host == Host::Linux
+    && profile.rootless
 }
 
 /// Admits the runtime and the endpoint its CLI would reach, before the engine is asked: the local endpoint,
@@ -309,7 +411,8 @@ pub fn runtime_profile(endpoint: Endpoint, facts: &EngineFacts) -> RuntimeProfil
 
 /// The evidence `profile` holds on `host`, or why it holds none.
 pub fn judge(profile: &RuntimeProfile, host: Host) -> Result<TestedProfile, ProfileRefusal> {
-  if profile.rootless || profile.user_namespace_remap {
+  if (profile.rootless || profile.user_namespace_remap) && !rootless_podman_on_linux(profile, host)
+  {
     return Err(ProfileRefusal::UserNamespaceUntested);
   }
   if profile.selinux_labels {
@@ -328,9 +431,151 @@ pub fn judge(profile: &RuntimeProfile, host: Host) -> Result<TestedProfile, Prof
       identity: IdentityRule::ContainerIdsAsHostIds,
       hard_links: HardLinkRule::EveryNameServedAtOnce,
     }),
+    (Engine::Podman, Endpoint::Local, Host::Linux) if profile.rootless => Ok(TestedProfile {
+      test: TESTED_ROOTLESS_PODMAN_BY,
+      description: "rootless podman on its own Linux host, binding the daemon's unshared FUSE mount as the container's root",
+      identity: IdentityRule::ContainerRootAsMountingUser,
+      hard_links: HardLinkRule::EveryNameServedAtOnce,
+    }),
     _ => Err(ProfileRefusal::ProfileUntested {
       engine: profile.operating_system.clone(),
       host: host.name(),
     }),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Format: rootless podman's statement on its own Linux host, as `podman info`'s fields give it.
+  fn rootless_podman() -> PodmanFacts {
+    PodmanFacts {
+      operating_system: "linux".to_owned(),
+      server_version: "5.2.2".to_owned(),
+      rootless: true,
+      selinux_enabled: false,
+      service_is_remote: false,
+    }
+  }
+
+  /// A-520. Do: name each runtime the handshake speaks, by name and by path, then runtimes it does not speak, then
+  /// podman at a Docker endpoint's admission. Expect the Docker CLI's interface and podman's own, every other
+  /// runtime refused `RuntimeUnsupported`, and podman refused at the Docker endpoint's admission, which admits the
+  /// Docker CLI's alone: podman names no engine at an endpoint.
+  #[test]
+  fn podman_is_spoken_in_its_own_interface_and_never_at_a_docker_endpoint() {
+    for (runtime, interface) in [
+      ("docker", Interface::Docker),
+      ("/usr/bin/docker", Interface::Docker),
+      ("docker.exe", Interface::Docker),
+      ("podman", Interface::Podman),
+      ("/usr/bin/podman", Interface::Podman),
+      (
+        "C:\\Program Files\\RedHat\\Podman\\podman.exe",
+        Interface::Podman,
+      ),
+    ] {
+      assert_eq!(runtime_interface(runtime), Ok(interface), "{runtime}");
+    }
+    for runtime in ["nerdctl", "runc", "crun", ""] {
+      assert_eq!(
+        runtime_interface(runtime),
+        Err(ProfileRefusal::RuntimeUnsupported {
+          runtime: runtime.to_owned()
+        })
+      );
+    }
+    assert_eq!(
+      admit_endpoint("podman", "unix:///run/user/1000/podman/podman.sock"),
+      Err(ProfileRefusal::RuntimeUnsupported {
+        runtime: "podman".to_owned()
+      })
+    );
+  }
+
+  /// A-520. Do: judge rootless podman on its own Linux host, as its statement establishes it. Expect the profile
+  /// T-4.13's rootless leg ran through: podman running the container itself, the container's root reaching the
+  /// export as the user who mounted it, and every name of a hard-linked file served at once.
+  #[test]
+  fn rootless_podman_on_its_own_linux_host_holds_its_tested_profile() {
+    let profile = podman_profile(&rootless_podman()).unwrap();
+    assert_eq!(
+      (profile.engine, &profile.endpoint),
+      (Engine::Podman, &Endpoint::Local)
+    );
+    let tested = judge(&profile, Host::Linux).unwrap();
+    assert_eq!(tested.test, TESTED_ROOTLESS_PODMAN_BY);
+    assert_eq!(
+      (tested.identity, tested.hard_links),
+      (
+        IdentityRule::ContainerRootAsMountingUser,
+        HardLinkRule::EveryNameServedAtOnce
+      )
+    );
+  }
+
+  /// A-520. Do: judge podman whose service is remote, podman run as root on Linux, rootless podman that labels for
+  /// SELinux, rootless podman judged on macOS, Windows and another host, and a rootless Docker engine on Linux.
+  /// Expect `RemoteEngine` before any profile, `ProfileUntested` for podman as root, `SelinuxLabelsUntested`,
+  /// `UserNamespaceUntested` on every other host, and `UserNamespaceUntested` for rootless Docker: the verdict is
+  /// rootless podman's on its own Linux host, and no other rootless profile's.
+  #[test]
+  fn every_other_podman_and_every_other_rootless_profile_is_refused_typed() {
+    let remote = PodmanFacts {
+      service_is_remote: true,
+      ..rootless_podman()
+    };
+    assert_eq!(
+      podman_profile(&remote),
+      Err(ProfileRefusal::RemoteEngine {
+        endpoint: REMOTE_PODMAN.to_owned()
+      })
+    );
+    let as_root = podman_profile(&PodmanFacts {
+      rootless: false,
+      ..rootless_podman()
+    })
+    .unwrap();
+    assert_eq!(
+      judge(&as_root, Host::Linux),
+      Err(ProfileRefusal::ProfileUntested {
+        engine: "linux".to_owned(),
+        host: "linux"
+      })
+    );
+    let labelled = podman_profile(&PodmanFacts {
+      selinux_enabled: true,
+      ..rootless_podman()
+    })
+    .unwrap();
+    assert_eq!(
+      judge(&labelled, Host::Linux),
+      Err(ProfileRefusal::SelinuxLabelsUntested)
+    );
+    let rootless = podman_profile(&rootless_podman()).unwrap();
+    for host in [Host::MacOs, Host::Windows, Host::Other] {
+      assert_eq!(
+        judge(&rootless, host),
+        Err(ProfileRefusal::UserNamespaceUntested),
+        "{}",
+        host.name()
+      );
+    }
+    let rootless_docker = runtime_profile(
+      admit_endpoint("docker", "unix:///run/user/1000/docker.sock").unwrap(),
+      &EngineFacts {
+        operating_system: "Ubuntu 24.04.3 LTS".to_owned(),
+        server_version: "29.7.2".to_owned(),
+        security_options: vec![
+          "name=seccomp,profile=builtin".to_owned(),
+          "name=rootless".to_owned(),
+        ],
+      },
+    );
+    assert_eq!(
+      judge(&rootless_docker, Host::Linux),
+      Err(ProfileRefusal::UserNamespaceUntested)
+    );
   }
 }

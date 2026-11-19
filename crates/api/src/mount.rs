@@ -23,11 +23,15 @@
 use std::process::Command;
 
 #[cfg(not(windows))]
+use slates_bridge_oci::mount_holders::{Holders, HoldersError};
+#[cfg(not(windows))]
 use slates_bridge_oci::mount_table::{MountEntry, MountIdentity, MountTableError};
 
 use slates_ipc::protocol::{Intent, VolumeId};
 
 use crate::error::{Error, Missing, MountFault, MountMissing};
+#[cfg(not(windows))]
+use crate::error::{HoldersUnread, MountHolders};
 use crate::instance::Instance;
 
 /// How a volume is mounted.
@@ -756,7 +760,7 @@ fn unmount_as(path: &str, unmounting: Unmounting) -> Result<(), MountFault> {
   };
   let answer = ask_unmount(path, &request);
   let after = mount_table_for(path)?;
-  judged(path, mounted, after.as_deref(), answer)
+  judged(path, mounted, after.as_deref(), answer, unmounting).map_err(|fault| named(fault, mounted))
 }
 
 /// The mount point as the kernel's table records it, worked out without touching the mount (a lookup on a `hard` NFS
@@ -806,26 +810,98 @@ fn mount_at<'table>(table: &'table [MountEntry], point: &str) -> Option<&'table 
 }
 
 /// An unmount's answer judged by the table read after it (A-507; kiln judges its own so): the mount gone from the
-/// table is done, whatever the call said; still listed, it is the call's refusal, or `StillMounted` when the call said
-/// done. With no table on the platform (`mounted` or `after` is `None`) the call's own answer stands.
+/// table is done, whatever the call said; still listed, it is the call's refusal ([`still_listed`]), or `StillMounted`
+/// when the call said done. With no table on the platform (`mounted` or `after` is `None`) the call's own answer
+/// stands.
 #[cfg(not(windows))]
 fn judged(
   path: &str,
   mounted: Option<MountIdentity>,
   after: Option<&[MountEntry]>,
   answer: Result<(), MountFault>,
+  unmounting: Unmounting,
 ) -> Result<(), MountFault> {
   match (mounted, after) {
     (Some(identity), Some(table)) => {
       if table.iter().any(|entry| entry.identity == identity) {
-        answer.and(Err(MountFault::StillMounted {
-          path: path.to_owned(),
-        }))
+        Err(match answer {
+          Ok(()) => MountFault::StillMounted {
+            path: path.to_owned(),
+          },
+          Err(refusal) => still_listed(path, refusal, unmounting),
+        })
       } else {
         Ok(())
       }
     }
     _ => answer,
+  }
+}
+
+/// A refusal of an unmount whose mount the kernel's table still lists, typed by what it says (A-537). Linux's
+/// `fusermount3 -u` reports no error number: a refused `umount2(2)` prints "failed to unmount %s: %s" and the helper
+/// exits 1, as it does for a mount not the caller's (libfuse `util/fusermount.c`: `unmount_fuse_locked`, `may_unmount`,
+/// `err_out`). For the caller's own FUSE mount, still listed after a plain unmount its helper refused, that is a
+/// process holding a reference to a file there (`umount2(2)`'s `EBUSY`), so it is `Busy`, as `EBUSY` is on macOS and
+/// the BSDs. A detaching unmount (`-z`) refused stands as the helper's exit, and so does every refusal that names an
+/// error number.
+#[cfg(not(windows))]
+fn still_listed(path: &str, refusal: MountFault, unmounting: Unmounting) -> MountFault {
+  match refusal {
+    MountFault::Unmount {
+      status: Some(_),
+      errno: None,
+      ..
+    } if unmounting == Unmounting::Plain => MountFault::Busy {
+      path: path.to_owned(),
+      holders: MountHolders::default(),
+    },
+    other => other,
+  }
+}
+
+/// A busy refusal with its holders named (A-537): the processes the kernel's own tables show holding the mount, read
+/// now, on this refusal alone, without touching the mount (`slates_bridge_oci::mount_holders`); every other refusal as
+/// it is.
+#[cfg(not(windows))]
+fn named(fault: MountFault, mounted: Option<MountIdentity>) -> MountFault {
+  match fault {
+    MountFault::Busy { path, .. } => MountFault::Busy {
+      path,
+      holders: match mounted {
+        Some(identity) => holders_from(slates_bridge_oci::mount_holders::holders(identity.device)),
+        None => unread(HoldersUnread::NoReader {
+          platform: std::env::consts::OS,
+        }),
+      },
+    },
+    other => other,
+  }
+}
+
+/// What the kernel's tables showed of a busy mount, in the API's terms ([`MountHolders`]).
+#[cfg(not(windows))]
+fn holders_from(read: Result<Holders, HoldersError>) -> MountHolders {
+  match read {
+    Ok(holders) => MountHolders {
+      pids: holders.pids,
+      unreadable: holders.unreadable,
+      unread: None,
+    },
+    Err(HoldersError::Unsupported { platform, .. }) => unread(HoldersUnread::NoReader { platform }),
+    Err(HoldersError::Query { errno }) => unread(HoldersUnread::Refused { errno: Some(errno) }),
+    Err(HoldersError::Malformed { .. }) => unread(HoldersUnread::Refused { errno: None }),
+    Err(HoldersError::TooLarge { cap }) => unread(HoldersUnread::PastBound { cap }),
+  }
+}
+
+/// No holder read, for `why`.
+#[cfg(not(windows))]
+fn unread(why: HoldersUnread) -> MountHolders {
+  MountHolders {
+    pids: Vec::new(),
+    unreadable: 0,
+    unread: Some(why),
   }
 }
 
@@ -837,7 +913,10 @@ fn judged(
 fn refusal_of_errno(path: &str, errno: Option<i32>) -> MountFault {
   let path = path.to_owned();
   match errno {
-    Some(libc::EBUSY) => MountFault::Busy { path },
+    Some(libc::EBUSY) => MountFault::Busy {
+      path,
+      holders: MountHolders::default(),
+    },
     Some(libc::EINVAL) => MountFault::NotMounted {
       path,
       unreported: Vec::new(),
@@ -922,7 +1001,7 @@ mod tests {
     MountBackend, MountKind, ROOT_UID, capture_open, classify, export_path, fuse_available,
     loopback_available, mount_args, nfs_available, winfsp_available,
   };
-  use crate::error::{MountFault, MountMissing};
+  use crate::error::{HoldersUnread, MountFault, MountHolders, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.
@@ -1197,7 +1276,8 @@ mod tests {
     assert_eq!(
       super::refusal_of_errno(path, Some(libc::EBUSY)),
       MountFault::Busy {
-        path: path.to_owned()
+        path: path.to_owned(),
+        holders: MountHolders::default()
       }
     );
     assert!(
@@ -1263,27 +1343,162 @@ mod tests {
     let busy = || {
       Err(MountFault::Busy {
         path: path.to_owned(),
+        holders: MountHolders::default(),
       })
     };
+    let plain = super::Unmounting::Plain;
     let gone = [entry(1, "/"), entry(2, path)];
-    assert_eq!(super::judged(path, taken, Some(&gone), Ok(())), Ok(()));
     assert_eq!(
-      super::judged(path, taken, Some(&gone), busy()),
+      super::judged(path, taken, Some(&gone), Ok(()), plain),
+      Ok(())
+    );
+    assert_eq!(
+      super::judged(path, taken, Some(&gone), busy(), plain),
       Ok(()),
       "the table, not the call"
     );
     assert_eq!(
-      super::judged(path, taken, Some(&before), Ok(())),
+      super::judged(path, taken, Some(&before), Ok(()), plain),
       Err(MountFault::StillMounted {
         path: path.to_owned()
       })
     );
-    assert_eq!(super::judged(path, taken, Some(&before), busy()), busy());
     assert_eq!(
-      super::judged(path, None, None, busy()),
+      super::judged(path, taken, Some(&before), busy(), plain),
+      busy()
+    );
+    assert_eq!(
+      super::judged(path, None, None, busy(), plain),
       busy(),
       "no table: the call's answer"
     );
-    assert_eq!(super::judged(path, None, None, Ok(())), Ok(()));
+    assert_eq!(super::judged(path, None, None, Ok(()), plain), Ok(()));
+  }
+
+  /// A-537, Linux's busy unmount typed by the table (pure, every host): `fusermount3` reports no error number, so a plain
+  /// unmount its helper refused (an exit and no number) while the kernel's table still lists the mount is `Busy`, as
+  /// `EBUSY` is on macOS. Do: judge, against a table still listing the mount, the helper's refusal of a plain unmount,
+  /// of a detaching one, and a refusal that names an error number; then the plain refusal against a table that no longer
+  /// lists the mount. Expect `Busy` for the first alone, the other two standing, and done once the table drops it.
+  #[cfg(unix)]
+  #[test]
+  fn a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy() {
+    use slates_bridge_oci::mount_table::{MountEntry, MountIdentity};
+    let identity = MountIdentity {
+      mount: 3,
+      device: 7,
+    };
+    let path = "/home/me/work";
+    let listed = [MountEntry {
+      identity,
+      mount_point: path.to_owned(),
+      fstype: "fuse.slates".to_owned(),
+      source: "slates".to_owned(),
+    }];
+    let gone: [MountEntry; 0] = [];
+    let helper = || {
+      Err(MountFault::Unmount {
+        path: path.to_owned(),
+        status: Some(1),
+        errno: None,
+      })
+    };
+    let numbered = || {
+      Err(MountFault::Unmount {
+        path: path.to_owned(),
+        status: None,
+        errno: Some(libc::EPERM),
+      })
+    };
+    let (plain, let_go) = (super::Unmounting::Plain, super::Unmounting::LetGo);
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), helper(), plain),
+      Err(MountFault::Busy {
+        path: path.to_owned(),
+        holders: MountHolders::default()
+      }),
+      "a plain unmount the helper refused, the mount still listed, is busy"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), helper(), let_go),
+      helper(),
+      "a detach refused stands as the helper's exit"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), numbered(), plain),
+      numbered(),
+      "a refusal that names its error number stands"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&gone), helper(), plain),
+      Ok(()),
+      "gone from the table: done"
+    );
+  }
+
+  /// A-537: what the holder read answered, in the API's terms, and the busy refusal's words (pure, every host). Do: map a
+  /// read naming two holders and one unreadable process, then each refusal the reader gives: no reader (macOS), the
+  /// kernel's refusal, a bound's malformed sysctl, a listing past its bound; and print a busy refusal with one holder
+  /// and two unreadable. Expect the holders as read, each refusal as its `HoldersUnread`, and the words naming the
+  /// holder, the unreadable count and the way to let go.
+  #[cfg(unix)]
+  #[test]
+  fn a_busy_mounts_holders_are_named_as_the_kernel_listed_them() {
+    use slates_bridge_oci::mount_holders::{Holders, HoldersError};
+    assert_eq!(
+      super::holders_from(Ok(Holders {
+        pids: vec![41, 97],
+        unreadable: 1,
+      })),
+      MountHolders {
+        pids: vec![41, 97],
+        unreadable: 1,
+        unread: None,
+      }
+    );
+    for (read, unread) in [
+      (
+        HoldersError::Unsupported {
+          platform: "macos",
+          reason: "libproc stats every file",
+        },
+        HoldersUnread::NoReader { platform: "macos" },
+      ),
+      (
+        HoldersError::Query {
+          errno: libc::EACCES,
+        },
+        HoldersUnread::Refused {
+          errno: Some(libc::EACCES),
+        },
+      ),
+      (
+        HoldersError::Malformed {
+          path: "/proc/sys/kernel/pid_max",
+        },
+        HoldersUnread::Refused { errno: None },
+      ),
+      (
+        HoldersError::TooLarge { cap: 5 },
+        HoldersUnread::PastBound { cap: 5 },
+      ),
+    ] {
+      assert_eq!(super::holders_from(Err(read)).unread, Some(unread));
+    }
+    let words = MountFault::Busy {
+      path: "/home/me/work".to_owned(),
+      holders: MountHolders {
+        pids: vec![41],
+        unreadable: 2,
+        unread: None,
+      },
+    }
+    .to_string();
+    assert!(
+      words.contains("[41]")
+        && words.contains("2 process(es) could not be read")
+        && words.contains("unmount_busy"),
+      "{words}"
+    );
   }
 }

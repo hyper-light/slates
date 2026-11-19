@@ -520,6 +520,12 @@ pub struct CarriedRecord {
   pub entries: Vec<u8>,
 }
 
+impl CarriedRecord {
+  /// Format: the head a captured clone's record names before any head of it was carried (A-544): all zeros, which no
+  /// archive's BLAKE3 identity is in practice, so no head a successor adopts matches it and its landing is refused by kind.
+  pub const NO_HEAD: [u8; 32] = [0; 32];
+}
+
 /// A volume's carried capture as a partition keeps it (A-503): what its catalog ships ([`CarriedRecord`]) and, when this
 /// node holds that head's tree as one of the volume's snapshots, that snapshot, the **mark** its landings are judged from.
 /// The mark is this node's own snapshot id, so it is never shipped.
@@ -762,6 +768,11 @@ pub struct AttachmentRecord {
   /// are not consumer authority. Zero for an attachment that establishes no host mount (an SDK record form,
   /// a green pin), which the NFS edge never authorizes.
   pub token: [u8; 16],
+  /// The kernel's id of the host mount this attachment was seen bound to (A-540): the filesystem id the kernel's mount
+  /// table names it by, recorded once the mount is seen (at its bind, or at a successor's start), so a restarted
+  /// daemon can tell a mount the kernel let go while no daemon ran from one it never saw. `None` until seen, and for
+  /// every form that is no host mount. Appended.
+  pub mount: Option<u64>,
 }
 
 /// A request that ran and waits for a version of a green to commit (§4.16 "Commit", A-252), as a snapshot carries it.
