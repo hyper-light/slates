@@ -12239,6 +12239,10 @@ engine: the verdict, rebase, position mapping, the register).
 > a number past Go's `int64` are refused by kind. Proven against git-lfs v3.8.1's documents and pointer tests and
 > against what the stock git-lfs 3.8.1 client sent and accepted, recorded. Serving it (routes, the object store, lock
 > records, who may do what) is the server's part.
+>
+> **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
+> case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
+> re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -41887,6 +41891,25 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   here already ask for `get-locations` and `get-dir`); then `svn mergeinfo --show-revs`'s eligible and merged
   revisions from the segments and the log; read access by A-606's rules, and the authentication request a denied
   anonymous read makes when the session could authenticate.
+
+### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git/src/v2` (`line.rs`'s `object_id`; `mod.rs`'s rule and `Refusal::ObjectId`; the tests in `line.rs`,
+  `tests/request.rs`, `tests/ls_refs.rs` and `tests/mod.rs`).
+- **The rule.** Main settled A-604's question. v0 read ids in either case, as gitprotocol-pack's "both MUST treat
+  obj-id as case-insensitive" asks; v2 refused upper case, by gitprotocol-common's `HEXDIG`. A server reads what git's
+  own server accepts and writes git's form: git's server reads every id with `get_oid_hex` or `parse_oid_hex`, whose
+  `hexval` takes both cases, so v2 now does, and writes `oid_to_hex`'s lower case. A line's LF stays optional and
+  recorded, so stock git's streams re-encode exactly. Bytes after an id and numbers not in canonical decimal stay
+  refused, since no git writes them.
+- **Tests** (Mac Studio M3 Ultra, kiln, 2026-11-19). Failing first: an upper-case `want` in a `fetch` request and an
+  upper-case id in an `ls-refs` answer, both refused `NotHex` before (2 of 39 v2 tests red). Then `cargo test --locked
+  -p slates-git --lib` 221 of 221 over main with this change, fmt clean. The cases that pinned the refusal (one in `tests/request.rs`, one in
+  `tests/ls_refs.rs`, the unit test in `line.rs`) now pin the reading, and the bit-flip test takes a flip that
+  upper-cases an id's digit as the same id, written back as the original byte.
+- **Owed of A-624:** `object-info` and `bundle-uri`, read and answered over a store trait (A-614 builds the store), and
+  the server's `packfile-uris` choice.
 
 ### A-622 — A repository's policy held in its record, set whole by its owner from the version read (2026-11-19, g255, UI goal 93; §4.17.1 "Policy: protected branches, access and hooks" and shared piece 7's rest, part 1; after A-597 and A-603)
 Applied in the same change to:
