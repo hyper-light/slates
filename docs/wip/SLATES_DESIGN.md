@@ -34144,5 +34144,7 @@ Applied in the same change to: §4.16 (a status after A-247's), GAPS (class A's 
 - **Test.** `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`
   (`verbs`' unit tests: a recorded work listed twice, the first answer lost; its outcome installed twice, the first
   answer lost, the work marked between). Expect the second listing to name the work, the first install to make and
-  charge it, the second to charge nothing and keep the marked work, and nothing owed after.
+  charge it, the second to charge nothing and keep the marked work, and nothing owed after. Green on the Mac Studio
+  (kiln r114, debug, 0.74 s); red with both functions back as they were (the listing taken, the install unguarded):
+  the second listing empty, the second install charging the work's 96 bytes again and dropping the marked work.
 
