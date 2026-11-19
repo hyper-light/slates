@@ -1690,6 +1690,7 @@ dependencies = [
  "serde_json",
  "sha1-checked",
  "slates-http",
+ "slates-merge",
  "slates-test-seeds",
  "slates-vcs",
 ]
@@ -1720,6 +1721,18 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
+name = "slates-http-edge"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "proptest",
+ "rcgen",
+ "rustls",
+ "slates-http",
  "slates-test-seeds",
 ]
 

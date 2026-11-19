@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 26:svn://127.0.0.1/repo/trunk 10:SVN/1.15.0 ( ) ) ( ANONYMOUS ( 0: ) ) ( update ( ( 6 ) 0: true infinity false false ) ) ( set-path ( 0: 6 false ( ) sideways ) ) ( finish-report ( ) ) 

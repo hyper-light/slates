@@ -4,10 +4,11 @@
 
 use proptest::prelude::*;
 
-use super::{Refusal, advertisement, fetch, ls_refs, request};
+use super::{Refusal, advertisement, bundle_uri, fetch, ls_refs, object_info, request};
 use crate::fixtures;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::pktline::{self, HEADER_LEN, MAX_DATA, MAX_LEN, Packet};
+use crate::v2_rest_fixtures as rest;
 use crate::{Admission, to_u64};
 
 /// The message a stream holds, and so the decoder that reads it.
@@ -21,10 +22,16 @@ pub(crate) enum Message {
   LsRefsAnswer,
   /// A `fetch` response, in SHA-1, multiplexed throughout or not.
   FetchResponse(bool),
+  /// An `object-info` answer, in its format (A-624).
+  ObjectInfoAnswer(ObjectFormat),
+  /// A `bundle-uri` answer (A-624).
+  BundleUriAnswer,
 }
 
-/// Every stream stock git 2.50.1 wrote or read (`crate::fixtures`), named, with the message it holds.
-pub(crate) const GOLDEN: [(&str, &[u8], Message); 16] = [
+/// Every stream stock git 2.50.1 wrote or read (`crate::fixtures`, and A-624's `crate::v2_rest_fixtures` but for the
+/// upper-case `object-info` exchange, which git echoes as its client wrote it and an encode writes in lower case, and the
+/// bundle clone's session, which holds several messages), named, with the message it holds.
+pub(crate) const GOLDEN: [(&str, &[u8], Message); 35] = [
   (
     "advertisement",
     fixtures::ADVERTISEMENT,
@@ -105,6 +112,101 @@ pub(crate) const GOLDEN: [(&str, &[u8], Message); 16] = [
     fixtures::FETCH_URIS_RESPONSE,
     Message::FetchResponse(true),
   ),
+  (
+    "A-624 advertisement",
+    rest::ADVERTISEMENT,
+    Message::Advertisement,
+  ),
+  (
+    "object-info-sizes request",
+    rest::OBJECT_INFO_SIZES_REQUEST,
+    Message::Request,
+  ),
+  (
+    "object-info-sizes response",
+    rest::OBJECT_INFO_SIZES_RESPONSE,
+    Message::ObjectInfoAnswer(ObjectFormat::Sha1),
+  ),
+  (
+    "object-info-no-size request",
+    rest::OBJECT_INFO_NO_SIZE_REQUEST,
+    Message::Request,
+  ),
+  (
+    "object-info-no-size response",
+    rest::OBJECT_INFO_NO_SIZE_RESPONSE,
+    Message::ObjectInfoAnswer(ObjectFormat::Sha1),
+  ),
+  (
+    "object-info-no-oid request",
+    rest::OBJECT_INFO_NO_OID_REQUEST,
+    Message::Request,
+  ),
+  (
+    "object-info-no-oid response",
+    rest::OBJECT_INFO_NO_OID_RESPONSE,
+    Message::ObjectInfoAnswer(ObjectFormat::Sha1),
+  ),
+  (
+    "object-info-sha256 request",
+    rest::OBJECT_INFO_SHA256_REQUEST,
+    Message::Request,
+  ),
+  (
+    "object-info-sha256 response",
+    rest::OBJECT_INFO_SHA256_RESPONSE,
+    Message::ObjectInfoAnswer(ObjectFormat::Sha256),
+  ),
+  (
+    "bundle-uri request",
+    rest::BUNDLE_URI_REQUEST,
+    Message::Request,
+  ),
+  (
+    "bundle-uri response",
+    rest::BUNDLE_URI_RESPONSE,
+    Message::BundleUriAnswer,
+  ),
+  (
+    "uris-https request",
+    rest::URIS_HTTPS_REQUEST,
+    Message::Request,
+  ),
+  (
+    "uris-https response",
+    rest::URIS_HTTPS_RESPONSE,
+    Message::FetchResponse(true),
+  ),
+  (
+    "uris-http request",
+    rest::URIS_HTTP_REQUEST,
+    Message::Request,
+  ),
+  (
+    "uris-http response",
+    rest::URIS_HTTP_RESPONSE,
+    Message::FetchResponse(true),
+  ),
+  (
+    "uris-no-sideband-all request",
+    rest::URIS_NO_SIDEBAND_ALL_REQUEST,
+    Message::Request,
+  ),
+  (
+    "uris-no-sideband-all response",
+    rest::URIS_NO_SIDEBAND_ALL_RESPONSE,
+    Message::FetchResponse(false),
+  ),
+  (
+    "uris-ftp-https request",
+    rest::URIS_FTP_HTTPS_REQUEST,
+    Message::Request,
+  ),
+  (
+    "uris-ftp-https response",
+    rest::URIS_FTP_HTTPS_RESPONSE,
+    Message::FetchResponse(true),
+  ),
 ];
 
 /// The room a test's decode is given: as much as there is.
@@ -148,6 +250,14 @@ pub(crate) fn decode_then_encode(message: Message, bytes: &[u8]) -> Result<Vec<u
       let read = fetch::decode_response(bytes, format, multiplexed, &mut room())?;
       fetch::encode_response(&read, format, multiplexed, &mut out)
         .expect("a decoded response encodes");
+    }
+    Message::ObjectInfoAnswer(format) => {
+      let read = object_info::decode_answer(bytes, format, &mut room())?;
+      object_info::encode_answer(&read, format, &mut out).expect("a decoded answer encodes");
+    }
+    Message::BundleUriAnswer => {
+      let read = bundle_uri::decode_answer(bytes, &mut room())?;
+      bundle_uri::encode_answer(&read, &mut out).expect("a decoded answer encodes");
     }
   }
   Ok(out)
@@ -536,6 +646,8 @@ proptest! {
       Message::LsRefsAnswer,
       Message::FetchResponse(false),
       Message::FetchResponse(true),
+      Message::ObjectInfoAnswer(ObjectFormat::Sha1),
+      Message::BundleUriAnswer,
     ] {
       match decode_then_encode(message, &stream) {
         Ok(written) => prop_assert_eq!(&written, &stream),

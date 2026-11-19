@@ -1,0 +1,25 @@
+c94903d72bd3fa1133681dc87b5977b656b57ac7
+Test <test@example.com>
+0 0
+ space
+.leading
+Capital_Under.txt
+UPPER_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ.txt
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt
+aux.txt
+colon:quest?star*.txt
+com1
+con
+directory.one/seventh.directory/third.directory/fourth.dir./fifth.directory/sixth.directory/eighth.directory/ninth.directory/deep-file-name.txt
+lpt9.x
+plain.txt
+prn.d
+quote"lt<gt>pipe|back\slash.txt
+tilde~é.txt
+trailing 
+trailing.
+x.i/inside.txt
+y.d/inside.txt
+z.hg/inside.txt
+
+every encoding

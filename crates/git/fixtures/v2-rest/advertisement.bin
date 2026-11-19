@@ -1,0 +1,9 @@
+000eversion 2
+001cagent=git/2.50.1-Darwin
+0013ls-refs=unborn
+003bfetch=shallow wait-for-done sideband-all packfile-uris
+0012server-option
+0017object-format=sha1
+0010object-info
+000fbundle-uri
+0000
