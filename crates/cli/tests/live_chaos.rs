@@ -3162,7 +3162,9 @@ fn a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover
   if !gated("client-killed-mid-write") {
     return;
   }
-  let mut fleet = Fleet::start("cut-mid-write", Supervision::Anchored);
+  // Bare daemons, as in `destroy_across_the_loss`: both candidates stay stopped through the cut, and an anchor would
+  // end a stopped daemon once its beat lapsed and start one holding no copy of the log, a second fault past `f`.
+  let mut fleet = Fleet::start("cut-mid-write", Supervision::Bare);
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let instances = fleet.instances.clone();
