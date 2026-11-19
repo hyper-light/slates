@@ -85,7 +85,8 @@ pub(super) fn join(directory: &str, name: &str) -> String {
   if directory.is_empty() {
     return name.to_owned();
   }
-  let mut path = String::with_capacity(directory.len().saturating_add(name.len()).saturating_add(1));
+  let mut path =
+    String::with_capacity(directory.len().saturating_add(name.len()).saturating_add(1));
   path.push_str(directory);
   path.push(char::from(SEPARATOR));
   path.push_str(name);
@@ -96,7 +97,10 @@ pub(super) fn join(directory: &str, name: &str) -> String {
 /// (`svn_relpath_get_longest_ancestor`): empty when they share no name.
 pub(super) fn longest_ancestor<'a>(first: &'a str, second: &str) -> &'a str {
   let mut longest = 0;
-  for (end, _) in first.match_indices(char::from(SEPARATOR)).chain([(first.len(), "")]) {
+  for (end, _) in first
+    .match_indices(char::from(SEPARATOR))
+    .chain([(first.len(), "")])
+  {
     let Some(ancestor) = first.get(..end) else {
       break;
     };
@@ -114,9 +118,9 @@ pub(super) fn is_at_or_beneath(path: &str, ancestor: &str) -> bool {
   if ancestor.is_empty() {
     return true;
   }
-  path.strip_prefix(ancestor).is_some_and(|rest| {
-    rest.is_empty() || rest.as_bytes().first() == Some(&SEPARATOR)
-  })
+  path
+    .strip_prefix(ancestor)
+    .is_some_and(|rest| rest.is_empty() || rest.as_bytes().first() == Some(&SEPARATOR))
 }
 
 /// The number of names in a relative path that is not empty (`path_driver.c` `count_components`).

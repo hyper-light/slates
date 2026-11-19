@@ -62,7 +62,10 @@ fn step() -> impl Strategy<Value = Step> {
     any::<u16>(),
     any::<u8>(),
     prop::collection::vec(any::<u8>(), 0..40),
-    prop::collection::vec((any::<u8>(), prop::collection::vec(any::<u8>(), 0..6)), 0..3),
+    prop::collection::vec(
+      (any::<u8>(), prop::collection::vec(any::<u8>(), 0..6)),
+      0..3,
+    ),
   )
     .prop_map(|(selector, first, second, name, bytes, properties)| Step {
       selector,
@@ -96,7 +99,10 @@ impl Model {
     };
     let tree = Tree::from([(String::new(), root)]);
     let mut dump = Dump::new(Format::Two, Some(VECTOR_UUID));
-    dump.revision(0, &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]));
+    dump.revision(
+      0,
+      &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+    );
     Self {
       trees: vec![tree.clone()],
       working: tree,
@@ -158,7 +164,9 @@ impl Model {
       return;
     };
     let node = new_node(kind, step);
-    self.dump.node(&written_whole(Node::add(&path, kind), &node));
+    self
+      .dump
+      .node(&written_whole(Node::add(&path, kind), &node));
     self.working.insert(path.clone(), node);
     self.touched.insert(path);
   }
@@ -188,7 +196,9 @@ impl Model {
     if list == node.properties {
       toggle(&mut list);
     }
-    self.dump.node(&Node::change(&path).properties(list.clone()));
+    self
+      .dump
+      .node(&Node::change(&path).properties(list.clone()));
     node.properties = list;
     self.touched.insert(path);
   }
@@ -228,9 +238,15 @@ impl Model {
       return;
     };
     if step.name % 2 == 0 {
-      let kind = if step.bytes.len() % 2 == 0 { NodeKind::File } else { NodeKind::Directory };
+      let kind = if step.bytes.len() % 2 == 0 {
+        NodeKind::File
+      } else {
+        NodeKind::Directory
+      };
       let node = new_node(kind, step);
-      self.dump.node(&written_whole(Node::replace(&path, kind), &node));
+      self
+        .dump
+        .node(&written_whole(Node::replace(&path, kind), &node));
       self.remove(&path);
       self.working.insert(path.clone(), node);
     } else {
@@ -253,7 +269,8 @@ impl Model {
   fn copy_source(&self, step: &Step) -> Option<(usize, (String, ModelNode))> {
     let revision = usize::from(step.second) % self.trees.len();
     let tree = &self.trees[revision];
-    let candidates: Vec<(&String, &ModelNode)> = tree.iter().filter(|(path, _)| !path.is_empty()).collect();
+    let candidates: Vec<(&String, &ModelNode)> =
+      tree.iter().filter(|(path, _)| !path.is_empty()).collect();
     let (path, node) = pick_from(&candidates, step.first.rotate_left(8))?;
     Some((revision, ((*path).clone(), (*node).clone())))
   }
@@ -276,7 +293,9 @@ impl Model {
   /// Removes `path` and everything beneath it from the working tree.
   fn remove(&mut self, path: &str) {
     let prefix = format!("{path}/");
-    self.working.retain(|child, _| child != path && !child.starts_with(&prefix));
+    self
+      .working
+      .retain(|child, _| child != path && !child.starts_with(&prefix));
   }
 }
 
@@ -311,7 +330,11 @@ fn toggle(list: &mut Properties) {
 fn new_node(kind: NodeKind, step: &Step) -> ModelNode {
   ModelNode {
     kind,
-    text: if kind == NodeKind::File { step.bytes.clone() } else { Vec::new() },
+    text: if kind == NodeKind::File {
+      step.bytes.clone()
+    } else {
+      Vec::new()
+    },
     properties: generated_properties(step),
   }
 }
@@ -365,8 +388,17 @@ fn holds_the_node(
   path: &str,
   expected: Option<&ModelNode>,
 ) -> Result<(), TestCaseError> {
-  let found = repository.index().node(&absolute(path), revision).map_err(failed)?;
-  prop_assert_eq!(found.is_some(), expected.is_some(), "r{} {}", revision, path);
+  let found = repository
+    .index()
+    .node(&absolute(path), revision)
+    .map_err(failed)?;
+  prop_assert_eq!(
+    found.is_some(),
+    expected.is_some(),
+    "r{} {}",
+    revision,
+    path
+  );
   let (Some(found), Some(expected)) = (found, expected) else {
     return Ok(());
   };
@@ -377,7 +409,11 @@ fn holds_the_node(
   let held = repository.properties(found.properties()).map_err(failed)?;
   prop_assert_eq!(
     (found.kind(), text, &held),
-    (expected.kind, expected.text.as_slice(), &expected.properties),
+    (
+      expected.kind,
+      expected.text.as_slice(),
+      &expected.properties
+    ),
     "r{} {}",
     revision,
     path
@@ -398,7 +434,11 @@ fn round_trips(repository: &Repository, piece: usize) -> Result<(), TestCaseErro
 
 /// Holds `repository`'s history exported in two parts, split after revision `split` picks, and imported part after
 /// part to be the same history.
-fn round_trips_in_parts(repository: &Repository, split: u16, piece: usize) -> Result<(), TestCaseError> {
+fn round_trips_in_parts(
+  repository: &Repository,
+  split: u16,
+  piece: usize,
+) -> Result<(), TestCaseError> {
   let youngest = repository.youngest();
   let middle = u64::from(split) % youngest;
   let first = export(repository, 0, middle).map_err(failed)?;

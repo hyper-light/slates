@@ -22,10 +22,17 @@ fn first_revision() -> Dump {
 fn first_revision_in(format: Format) -> Dump {
   let mut dump = Dump::new(format, Some(VECTOR_UUID));
   dump
-    .revision(0, &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]))
+    .revision(
+      0,
+      &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+    )
     .revision(1, &revision_properties(1))
     .node(&Node::add("d", NodeKind::Directory).properties(Properties::new()))
-    .node(&Node::add("f", NodeKind::File).properties(Properties::new()).text(TEXT));
+    .node(
+      &Node::add("f", NodeKind::File)
+        .properties(Properties::new())
+        .text(TEXT),
+    );
   dump
 }
 
@@ -59,13 +66,22 @@ fn refused_as(dump: &[u8], expected: &MigrationRefusal, code: u32) {
 fn a_revision_that_does_not_continue_the_history_is_refused() {
   let mut skipping = Dump::new(Format::Two, None);
   skipping.revision(2, &revision_properties(2));
-  let expected = MigrationRefusal::OutOfSequence { expected: 1, found: 2 };
+  let expected = MigrationRefusal::OutOfSequence {
+    expected: 1,
+    found: 2,
+  };
   refused_as(&skipping.bytes(), &expected, 160_006);
   let mut repository = created();
   import_whole(&mut repository, &first_revision().bytes()).unwrap();
   let before = history(&repository);
   let refusal = import_whole(&mut repository, &first_revision().bytes()).unwrap_err();
-  assert_eq!(refusal, MigrationRefusal::OutOfSequence { expected: 2, found: 0 });
+  assert_eq!(
+    refusal,
+    MigrationRefusal::OutOfSequence {
+      expected: 2,
+      found: 0
+    }
+  );
   assert_eq!(history(&repository), before);
 }
 
@@ -95,7 +111,9 @@ fn a_stream_of_another_repository_is_refused_once_history_is_held() {
 fn a_path_fsfs_would_not_store_is_refused() {
   for path in [b"d/../f".as_slice(), b"d/\xff"] {
     let dump = second_revision(&[Node::add("x", NodeKind::Directory).raw_path(path)]);
-    let expected = MigrationRefusal::PathSyntax { path: path.to_vec() };
+    let expected = MigrationRefusal::PathSyntax {
+      path: path.to_vec(),
+    };
     refused_as(&dump, &expected, 160_005);
   }
 }
@@ -109,7 +127,11 @@ fn the_root_is_never_added_deleted_or_replaced() {
     Node::delete(""),
     Node::replace("", NodeKind::Directory),
   ] {
-    refused_as(&second_revision(&[node]), &MigrationRefusal::RootChange, 160_021);
+    refused_as(
+      &second_revision(&[node]),
+      &MigrationRefusal::RootChange,
+      160_021,
+    );
   }
 }
 
@@ -121,8 +143,16 @@ fn a_path_absent_where_it_must_stand_is_refused() {
   let cases = [
     (Node::change("absent"), None, "/absent"),
     (Node::delete("absent"), None, "/absent"),
-    (Node::add("absent/x", NodeKind::File).text(b"x"), None, "/absent"),
-    (Node::add("x", NodeKind::File).copied(1, "absent"), Some(1), "/absent"),
+    (
+      Node::add("absent/x", NodeKind::File).text(b"x"),
+      None,
+      "/absent",
+    ),
+    (
+      Node::add("x", NodeKind::File).copied(1, "absent"),
+      Some(1),
+      "/absent",
+    ),
   ];
   for (node, revision, path) in cases {
     let expected = MigrationRefusal::NotFound {
@@ -138,10 +168,14 @@ fn a_path_absent_where_it_must_stand_is_refused() {
 #[test]
 fn an_addition_over_a_node_or_beneath_a_file_is_refused() {
   let over = second_revision(&[Node::add("f", NodeKind::File).text(b"x")]);
-  let expected = MigrationRefusal::AlreadyExists { path: "/f".to_owned() };
+  let expected = MigrationRefusal::AlreadyExists {
+    path: "/f".to_owned(),
+  };
   refused_as(&over, &expected, 160_020);
   let beneath = second_revision(&[Node::add("f/x", NodeKind::File).text(b"x")]);
-  let expected = MigrationRefusal::NotDirectory { path: "/f".to_owned() };
+  let expected = MigrationRefusal::NotDirectory {
+    path: "/f".to_owned(),
+  };
   refused_as(&beneath, &expected, 160_016);
 }
 
@@ -155,7 +189,9 @@ fn a_record_whose_kind_is_not_its_nodes_is_refused() {
     Node::change("d").text(b"a text on a directory"),
   ];
   for (node, path) in cases.into_iter().zip(["/x", "/f", "/d"]) {
-    let expected = MigrationRefusal::KindMismatch { path: path.to_owned() };
+    let expected = MigrationRefusal::KindMismatch {
+      path: path.to_owned(),
+    };
     refused_as(&second_revision(&[node]), &expected, 145_001);
   }
 }
@@ -164,7 +200,11 @@ fn a_record_whose_kind_is_not_its_nodes_is_refused() {
 #[test]
 fn a_copy_from_a_revision_not_yet_made_is_refused() {
   let dump = second_revision(&[Node::add("x", NodeKind::File).copied(5, "f")]);
-  refused_as(&dump, &MigrationRefusal::CopyFromFuture { revision: 5 }, 160_006);
+  refused_as(
+    &dump,
+    &MigrationRefusal::CopyFromFuture { revision: 5 },
+    160_006,
+  );
 }
 
 /// A-628 (refusals): do import a copy whose `Text-copy-source-md5` is not the source's, a delta whose base MD5 is not
@@ -175,19 +215,21 @@ fn every_checksum_the_stream_carries_is_checked() {
   let wrong = digests(b"not the text");
   let (md5, sha1) = digests(TEXT);
   let mut copy = first_revision();
-  copy.revision(2, &revision_properties(2)).header(NodeHeader {
-    path: b"x".to_vec(),
-    kind: Some(NodeKind::File),
-    action: NodeAction::Add,
-    copy_from: Some(CopyFrom {
-      revision: 1,
-      path: b"f".to_vec(),
-      md5: Some(wrong.0),
-      sha1: None,
-    }),
-    properties: None,
-    text: None,
-  });
+  copy
+    .revision(2, &revision_properties(2))
+    .header(NodeHeader {
+      path: b"x".to_vec(),
+      kind: Some(NodeKind::File),
+      action: NodeAction::Add,
+      copy_from: Some(CopyFrom {
+        revision: 1,
+        path: b"f".to_vec(),
+        md5: Some(wrong.0),
+        sha1: None,
+      }),
+      properties: None,
+      text: None,
+    });
   let (refusal, _) = refusal(&copy.bytes());
   let expected = MigrationRefusal::CopySourceChecksumMismatch {
     path: "/x".to_owned(),
@@ -202,10 +244,18 @@ fn every_checksum_the_stream_carries_is_checked() {
 /// The delta halves of [`every_checksum_the_stream_carries_is_checked`].
 fn delta_checksums_are_checked(wrong: ([u8; 16], [u8; 20]), base: ([u8; 16], [u8; 20])) {
   let window = whole_copy_window(TEXT.len() as u64);
-  let named_base = DeltaBase { md5: Some(base.0), sha1: Some(base.1) };
-  let wrong_base = DeltaBase { md5: Some(wrong.0), sha1: None };
+  let named_base = DeltaBase {
+    md5: Some(base.0),
+    sha1: Some(base.1),
+  };
+  let wrong_base = DeltaBase {
+    md5: Some(wrong.0),
+    sha1: None,
+  };
   let mut dump = first_revision_in(Format::Three);
-  dump.revision(2, &revision_properties(2)).delta("f", wrong_base, &[window.clone()], base);
+  dump
+    .revision(2, &revision_properties(2))
+    .delta("f", wrong_base, &[window.clone()], base);
   let expected = MigrationRefusal::BaseChecksumMismatch {
     path: "/f".to_owned(),
     expected: Digest::Md5(wrong.0),
@@ -213,7 +263,9 @@ fn delta_checksums_are_checked(wrong: ([u8; 16], [u8; 20]), base: ([u8; 16], [u8
   };
   refused_as(&dump.bytes(), &expected, 200_014);
   let mut dump = first_revision_in(Format::Three);
-  dump.revision(2, &revision_properties(2)).delta("f", named_base, &[window], wrong);
+  dump
+    .revision(2, &revision_properties(2))
+    .delta("f", named_base, &[window], wrong);
   let expected = MigrationRefusal::ChecksumMismatch {
     path: "/f".to_owned(),
     expected: Digest::Md5(wrong.0),
@@ -246,7 +298,11 @@ fn a_delta_that_reads_past_its_base_is_refused() {
     digests(b"anything"),
   );
   let expected = MigrationRefusal::Delta(SvndiffError::SourceShort);
-  refused_as(&dump.bytes(), &expected, SvndiffError::SourceShort.subversion_code());
+  refused_as(
+    &dump.bytes(),
+    &expected,
+    SvndiffError::SourceShort.subversion_code(),
+  );
 }
 
 /// A-628 (refusals): do import the first revision into a repository whose room holds revision 0 and the first
@@ -257,22 +313,37 @@ fn an_import_past_the_room_is_refused() {
   let dump = first_revision().bytes();
   let mut zero = created();
   let mut only_zero = Dump::new(Format::Two, None);
-  only_zero.revision(0, &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]));
+  only_zero.revision(
+    0,
+    &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+  );
   import_whole(&mut zero, &only_zero.bytes()).unwrap();
   let first_properties: u64 = revision_properties(1)
     .iter()
     .map(|(name, value)| (name.len() + value.len()) as u64)
     .sum();
   let bytes = zero.held() + first_properties;
-  let mut small = created_within(Room { entries: ROOMY.entries, bytes });
+  let mut small = created_within(Room {
+    entries: ROOMY.entries,
+    bytes,
+  });
   let refusal = import_whole(&mut small, &dump).unwrap_err();
-  let expected = MigrationRefusal::Room { needed: bytes + TEXT.len() as u64, room: bytes };
+  let expected = MigrationRefusal::Room {
+    needed: bytes + TEXT.len() as u64,
+    room: bytes,
+  };
   assert_eq!(refusal, expected);
   assert_eq!(refusal.subversion_code(), 160_000);
   assert_eq!(small.youngest(), 0);
-  let mut few = created_within(Room { entries: 2, bytes: ROOMY.bytes });
+  let mut few = created_within(Room {
+    entries: 2,
+    bytes: ROOMY.bytes,
+  });
   let refusal = import_whole(&mut few, &dump).unwrap_err();
-  assert!(matches!(refusal, MigrationRefusal::Index(IndexRefusal::Room { .. })), "{refusal:?}");
+  assert!(
+    matches!(refusal, MigrationRefusal::Index(IndexRefusal::Room { .. })),
+    "{refusal:?}"
+  );
   assert_eq!(few.youngest(), 0);
 }
 
@@ -303,10 +374,24 @@ fn an_export_of_a_range_the_repository_cannot_give_is_refused() {
   let mut repository = created();
   import_whole(&mut repository, &first_revision().bytes()).unwrap();
   let backward = export(&repository, 1, 0).unwrap_err();
-  assert_eq!(backward, MigrationRefusal::BadRange { first: 1, last: 0, youngest: 1 });
+  assert_eq!(
+    backward,
+    MigrationRefusal::BadRange {
+      first: 1,
+      last: 0,
+      youngest: 1
+    }
+  );
   assert_eq!(backward.subversion_code(), 165_004);
   let past = export(&repository, 0, 2).unwrap_err();
-  assert_eq!(past, MigrationRefusal::BadRange { first: 0, last: 2, youngest: 1 });
+  assert_eq!(
+    past,
+    MigrationRefusal::BadRange {
+      first: 0,
+      last: 2,
+      youngest: 1
+    }
+  );
   let deltas = Exporter::new(&repository, 0, 1, Format::Three).unwrap_err();
   assert_eq!(deltas, MigrationRefusal::DeltasOwed);
   assert_eq!(deltas.subversion_code(), 200_007);

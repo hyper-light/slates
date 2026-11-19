@@ -157,7 +157,10 @@ impl Exporter {
       .iter()
       .collect();
     rows.sort_by(|first, second| {
-      compare_paths(relative(&first.path).as_bytes(), relative(&second.path).as_bytes())
+      compare_paths(
+        relative(&first.path).as_bytes(),
+        relative(&second.path).as_bytes(),
+      )
     });
     let mut drive = Drive {
       repository,
@@ -419,7 +422,14 @@ impl Drive<'_> {
       None => self.node_at(path, self.revision.saturating_sub(1))?,
     };
     let (properties, text) = differences(kind, &before, &now);
-    let header = self.header(path, kind, NodeAction::Change, None, (properties, text), &now)?;
+    let header = self.header(
+      path,
+      kind,
+      NodeAction::Change,
+      None,
+      (properties, text),
+      &now,
+    )?;
     self.record_with_sections(&header, &now)
   }
 
@@ -481,7 +491,11 @@ impl Drive<'_> {
   }
 
   /// Writes a node record and its sections: the node's whole property list, then its whole text.
-  fn record_with_sections(&mut self, header: &NodeHeader, now: &Facts) -> Result<(), MigrationRefusal> {
+  fn record_with_sections(
+    &mut self,
+    header: &NodeHeader,
+    now: &Facts,
+  ) -> Result<(), MigrationRefusal> {
     self.record(header)?;
     if header.properties.is_some() {
       let properties = self.repository.properties(now.properties)?;

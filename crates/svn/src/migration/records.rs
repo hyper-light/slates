@@ -139,7 +139,10 @@ impl Repository {
 
   /// Sets revision 0's properties to exactly `properties`, as `svnadmin load` sets them in an empty repository
   /// (`load-fs-vtable.c` `close_revision`: every difference from the stream's applied).
-  pub(super) fn set_revision_zero(&mut self, properties: Properties) -> Result<(), MigrationRefusal> {
+  pub(super) fn set_revision_zero(
+    &mut self,
+    properties: Properties,
+  ) -> Result<(), MigrationRefusal> {
     let old = self
       .revision_properties
       .first()
@@ -164,9 +167,7 @@ impl Repository {
   /// transactions begun in base 36.
   pub(super) fn begin(&mut self) -> Result<Transaction, MigrationRefusal> {
     let sequence = self.transactions;
-    self.transactions = sequence
-      .checked_add(1)
-      .ok_or(MigrationRefusal::Corrupt)?;
+    self.transactions = sequence.checked_add(1).ok_or(MigrationRefusal::Corrupt)?;
     let base = self.youngest();
     Ok(Transaction {
       name: format!("{base}-{}", base36(sequence)),
@@ -427,7 +428,10 @@ impl Transaction {
       identity,
       has_mergeinfo: mergeinfo(properties).is_some(),
     };
-    let change = self.changes.get_mut(path).ok_or(MigrationRefusal::Corrupt)?;
+    let change = self
+      .changes
+      .get_mut(path)
+      .ok_or(MigrationRefusal::Corrupt)?;
     let now = change.now.as_mut().ok_or(MigrationRefusal::Corrupt)?;
     now.properties = list;
     change.properties_set = true;
@@ -445,7 +449,10 @@ impl Transaction {
     let size = u64::try_from(bytes.len()).map_err(|_| MigrationRefusal::Corrupt)?;
     let identity = self.store(repository, bytes)?;
     let (md5, sha1) = digests;
-    let change = self.changes.get_mut(path).ok_or(MigrationRefusal::Corrupt)?;
+    let change = self
+      .changes
+      .get_mut(path)
+      .ok_or(MigrationRefusal::Corrupt)?;
     let now = change.now.as_mut().ok_or(MigrationRefusal::Corrupt)?;
     now.text = Some(Text {
       identity,
@@ -471,7 +478,11 @@ impl Transaction {
   }
 
   /// Holds `bytes` under their content identity, once; refused when the repository's room cannot take them.
-  fn store(&mut self, repository: &Repository, bytes: Vec<u8>) -> Result<ContentIdentity, MigrationRefusal> {
+  fn store(
+    &mut self,
+    repository: &Repository,
+    bytes: Vec<u8>,
+  ) -> Result<ContentIdentity, MigrationRefusal> {
     let identity = *blake3::hash(&bytes).as_bytes();
     if self.content(repository, &identity).is_some() {
       return Ok(identity);

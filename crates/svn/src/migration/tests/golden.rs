@@ -50,7 +50,11 @@ fn vector(name: &str) -> &'static [u8] {
     })
     .unwrap_or_else(|| panic!("{name} is not in SHA256SUMS"));
   let sum = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-  let hex: String = sum.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+  let hex: String = sum
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
   assert_eq!(hex, recorded, "{name} is not the vector svnadmin wrote");
   bytes
 }
@@ -59,7 +63,8 @@ fn vector(name: &str) -> &'static [u8] {
 fn imported(dumps: &[&str]) -> Repository {
   let mut repository = created();
   for name in dumps {
-    import_whole(&mut repository, vector(name)).unwrap_or_else(|refusal| panic!("{name}: {refusal:?}"));
+    import_whole(&mut repository, vector(name))
+      .unwrap_or_else(|refusal| panic!("{name}: {refusal:?}"));
   }
   repository
 }
@@ -71,9 +76,17 @@ fn changed_account(repository: &Repository) -> String {
   let mut account = String::new();
   for revision in 1..=repository.youngest() {
     writeln!(account, "r{revision}").expect("a line");
-    let mut rows: Vec<&ChangedPath> = repository.index().changes(revision).expect("a revision").iter().collect();
+    let mut rows: Vec<&ChangedPath> = repository
+      .index()
+      .changes(revision)
+      .expect("a revision")
+      .iter()
+      .collect();
     rows.sort_by(|first, second| {
-      compare_paths(relative(&first.path).as_bytes(), relative(&second.path).as_bytes())
+      compare_paths(
+        relative(&first.path).as_bytes(),
+        relative(&second.path).as_bytes(),
+      )
     });
     for row in rows {
       account_lines(&mut account, row);
@@ -137,10 +150,16 @@ fn holds_the_full_history(name: &str, repository: &Repository, whole: &History) 
 fn every_format_two_dump_svnadmin_wrote_is_imported_and_exported_again_byte_for_byte() {
   let full = imported(&["full.dump"]);
   assert_eq!(full.uuid().as_bytes(), VECTOR_UUID);
-  assert!(export_all(&full).unwrap() == vector("full.dump"), "full.dump");
+  assert!(
+    export_all(&full).unwrap() == vector("full.dump"),
+    "full.dump"
+  );
   let part = imported(&["part1.dump"]);
   assert_eq!(part.youngest(), PART1_LAST);
-  assert!(export_all(&part).unwrap() == vector("part1.dump"), "part1.dump");
+  assert!(
+    export_all(&part).unwrap() == vector("part1.dump"),
+    "part1.dump"
+  );
 }
 
 /// A-628 (golden): do import the history from format 3 (`deltas.dump`, every text a delta and every property section
@@ -151,18 +170,31 @@ fn every_format_two_dump_svnadmin_wrote_is_imported_and_exported_again_byte_for_
 fn a_history_imported_from_deltas_in_parts_or_in_pieces_is_the_one_imported_whole() {
   let whole = history(&imported(&["full.dump"]));
   holds_the_full_history("deltas.dump", &imported(&["deltas.dump"]), &whole);
-  holds_the_full_history("part1.dump, part2.dump", &imported(&["part1.dump", "part2.dump"]), &whole);
+  holds_the_full_history(
+    "part1.dump, part2.dump",
+    &imported(&["part1.dump", "part2.dump"]),
+    &whole,
+  );
   let joined = [vector("part1.dump"), vector("part2.dump")].concat();
   for piece in [1, 7, 4096] {
-    holds_the_full_history("part1.dump and part2.dump as one stream", &imported_in_pieces(&joined, piece), &whole);
-    holds_the_full_history("deltas.dump in pieces", &imported_in_pieces(vector("deltas.dump"), piece), &whole);
+    holds_the_full_history(
+      "part1.dump and part2.dump as one stream",
+      &imported_in_pieces(&joined, piece),
+      &whole,
+    );
+    holds_the_full_history(
+      "deltas.dump in pieces",
+      &imported_in_pieces(vector("deltas.dump"), piece),
+      &whole,
+    );
   }
 }
 
 /// A created repository with `dump` imported, its bytes arriving `piece` at a time.
 fn imported_in_pieces(dump: &[u8], piece: usize) -> Repository {
   let mut repository = created();
-  import(&mut repository, dump, piece).unwrap_or_else(|refusal| panic!("pieces of {piece}: {refusal:?}"));
+  import(&mut repository, dump, piece)
+    .unwrap_or_else(|refusal| panic!("pieces of {piece}: {refusal:?}"));
   repository
 }
 

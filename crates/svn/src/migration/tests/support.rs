@@ -74,7 +74,10 @@ pub(super) fn import_with(
     }
     match importer.import(repository, &held, next == dump.len())? {
       Importing::Done => return Ok(()),
-      Importing::NeedMore { consumed, needed: more } => {
+      Importing::NeedMore {
+        consumed,
+        needed: more,
+      } => {
         held.drain(..consumed);
         needed = more.max(held.len() + 1);
       }
@@ -83,7 +86,10 @@ pub(super) fn import_with(
 }
 
 /// Imports the whole of `dump` into `repository` in one call.
-pub(super) fn import_whole(repository: &mut Repository, dump: &[u8]) -> Result<(), MigrationRefusal> {
+pub(super) fn import_whole(
+  repository: &mut Repository,
+  dump: &[u8],
+) -> Result<(), MigrationRefusal> {
   import(repository, dump, dump.len())
 }
 
@@ -132,10 +138,16 @@ pub(super) fn history(repository: &Repository) -> History {
   let mut revisions = Vec::new();
   let mut contents = BTreeMap::new();
   for revision in 0..=repository.youngest() {
-    let changes = repository.index().changes(revision).expect("a revision").to_vec();
+    let changes = repository
+      .index()
+      .changes(revision)
+      .expect("a revision")
+      .to_vec();
     for change in &changes {
       for identity in named(change) {
-        let bytes = repository.content(&identity).expect("a content the index names");
+        let bytes = repository
+          .content(&identity)
+          .expect("a content the index names");
         contents.insert(identity, bytes.to_vec());
       }
     }

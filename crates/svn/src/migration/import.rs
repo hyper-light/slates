@@ -185,10 +185,14 @@ impl Importer {
       {
         Read::Event { event, consumed } => {
           self.take(repository, event)?;
-          offset = offset.checked_add(consumed).ok_or(MigrationRefusal::Corrupt)?;
+          offset = offset
+            .checked_add(consumed)
+            .ok_or(MigrationRefusal::Corrupt)?;
         }
         Read::NeedMore { consumed, needed } => {
-          let consumed = offset.checked_add(consumed).ok_or(MigrationRefusal::Corrupt)?;
+          let consumed = offset
+            .checked_add(consumed)
+            .ok_or(MigrationRefusal::Corrupt)?;
           return Ok(Importing::NeedMore { consumed, needed });
         }
         Read::End => {
@@ -201,7 +205,11 @@ impl Importer {
   }
 
   /// Applies one event.
-  fn take(&mut self, repository: &mut Repository, event: Event<'_>) -> Result<(), MigrationRefusal> {
+  fn take(
+    &mut self,
+    repository: &mut Repository,
+    event: Event<'_>,
+  ) -> Result<(), MigrationRefusal> {
     match event {
       Event::Format(_) | Event::Delta(_) => Ok(()),
       Event::Uuid(uuid) => uuid_record(repository, uuid),
@@ -260,9 +268,7 @@ impl Importer {
     self.in_flight = 0;
     match open.transaction {
       None => repository.set_revision_zero(open.properties),
-      Some(transaction) => repository
-        .commit(transaction, open.properties)
-        .map(drop),
+      Some(transaction) => repository.commit(transaction, open.properties).map(drop),
     }
   }
 
@@ -550,18 +556,22 @@ fn copy_source(
       revision: copy.revision,
     });
   }
-  let facts = node(repository, &source, copy.revision)?.ok_or_else(|| MigrationRefusal::NotFound {
-    revision: Some(copy.revision),
-    path: source.clone(),
-  })?;
+  let facts =
+    node(repository, &source, copy.revision)?.ok_or_else(|| MigrationRefusal::NotFound {
+      revision: Some(copy.revision),
+      path: source.clone(),
+    })?;
   check_kind(Some(kind), facts.kind, path)?;
-  check_digests(copy.md5, copy.sha1, text_digests(facts.text)?, |expected, actual| {
-    MigrationRefusal::CopySourceChecksumMismatch {
+  check_digests(
+    copy.md5,
+    copy.sha1,
+    text_digests(facts.text)?,
+    |expected, actual| MigrationRefusal::CopySourceChecksumMismatch {
       path: path.to_owned(),
       expected,
       actual,
-    }
-  })?;
+    },
+  )?;
   let source = CopySource {
     path: source,
     revision: copy.revision,
@@ -579,13 +589,16 @@ fn open_text(path: &str, facts: Facts, section: TextSection) -> Result<OpenText,
   }
   let form = match section.delta {
     Some(base) => {
-      check_digests(base.md5, base.sha1, text_digests(facts.text)?, |expected, actual| {
-        MigrationRefusal::BaseChecksumMismatch {
+      check_digests(
+        base.md5,
+        base.sha1,
+        text_digests(facts.text)?,
+        |expected, actual| MigrationRefusal::BaseChecksumMismatch {
           path: path.to_owned(),
           expected,
           actual,
-        }
-      })?;
+        },
+      )?;
       TextForm::Delta {
         base: facts.text.map(|text| text.identity),
       }
@@ -615,7 +628,11 @@ fn list_of(
 }
 
 /// Refuses a record whose stated kind is not the node's.
-fn check_kind(stated: Option<NodeKind>, actual: NodeKind, path: &str) -> Result<(), MigrationRefusal> {
+fn check_kind(
+  stated: Option<NodeKind>,
+  actual: NodeKind,
+  path: &str,
+) -> Result<(), MigrationRefusal> {
   match stated {
     Some(kind) if kind != actual => Err(MigrationRefusal::KindMismatch {
       path: path.to_owned(),

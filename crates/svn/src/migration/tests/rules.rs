@@ -15,13 +15,20 @@ const TEXT: &[u8] = b"a text\n";
 fn first_revision() -> Dump {
   let mut dump = Dump::new(Format::Two, Some(VECTOR_UUID));
   dump
-    .revision(0, &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]))
+    .revision(
+      0,
+      &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+    )
     .revision(1, &revision_properties(1));
   for directory in ["d", "trunk"] {
     dump.node(&Node::add(directory, NodeKind::Directory).properties(Properties::new()));
   }
   for file in ["d/x", "f", "trunk/a", "trunk/b", "trunk/c", "z"] {
-    dump.node(&Node::add(file, NodeKind::File).properties(Properties::new()).text(TEXT));
+    dump.node(
+      &Node::add(file, NodeKind::File)
+        .properties(Properties::new())
+        .text(TEXT),
+    );
   }
   dump
 }
@@ -35,12 +42,19 @@ fn imported(dump: &Dump) -> Repository {
 
 /// The changed paths of `repository`'s youngest revision.
 fn youngest_changes(repository: &Repository) -> Vec<ChangedPath> {
-  repository.index().changes(repository.youngest()).unwrap().to_vec()
+  repository
+    .index()
+    .changes(repository.youngest())
+    .unwrap()
+    .to_vec()
 }
 
 /// The actions of `changes`, by path.
 fn actions(changes: &[ChangedPath]) -> Vec<(&str, Action)> {
-  changes.iter().map(|change| (change.path.as_str(), change.action)).collect()
+  changes
+    .iter()
+    .map(|change| (change.path.as_str(), change.action))
+    .collect()
 }
 
 /// A-628 (rules): do import a dump whose UUID record and revision 0 come first into a repository `CreateRepository`
@@ -55,12 +69,17 @@ fn an_empty_repository_takes_the_streams_uuid_and_revision_zero() {
     Some(&properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]))
   );
   let mut alone = Dump::new(Format::Two, None);
-  alone
-    .revision(1, &revision_properties(1))
-    .node(&Node::add("f", NodeKind::File).properties(Properties::new()).text(TEXT));
+  alone.revision(1, &revision_properties(1)).node(
+    &Node::add("f", NodeKind::File)
+      .properties(Properties::new())
+      .text(TEXT),
+  );
   let continued = imported(&alone);
   assert_eq!(continued.uuid(), created().uuid());
-  assert_eq!(continued.revision_properties(0), created().revision_properties(0));
+  assert_eq!(
+    continued.revision_properties(0),
+    created().revision_properties(0)
+  );
 }
 
 /// A-628 (rules): do import a revision whose records change `f` with no section and give `d`, which has no properties,
@@ -77,7 +96,11 @@ fn a_change_that_makes_no_call_records_nothing() {
   let repository = imported(&dump);
   assert_eq!(youngest_changes(&repository), Vec::new());
   let record = export(&repository, 2, 2).unwrap();
-  assert!(!record.windows(b"Node-path".len()).any(|window| window == b"Node-path"));
+  assert!(
+    !record
+      .windows(b"Node-path".len())
+      .any(|window| window == b"Node-path")
+  );
 }
 
 /// A-628 (rules): do import a revision setting `f`'s text to the bytes it holds. Expect a modification with its text
@@ -95,7 +118,11 @@ fn a_text_set_to_the_bytes_it_holds_is_a_change_written_without_its_text() {
   assert!(changes[0].text.is_some());
   let record = export(&repository, 2, 2).unwrap();
   let bare = b"Node-path: f\nNode-kind: file\nNode-action: change\n\n\n";
-  assert!(record.ends_with(bare), "{}", String::from_utf8_lossy(&record));
+  assert!(
+    record.ends_with(bare),
+    "{}",
+    String::from_utf8_lossy(&record)
+  );
 }
 
 /// A-628 (rules): do import a revision that deletes `f`, adds `g`, adds `f` again, then adds and deletes `h`. Expect
@@ -107,9 +134,17 @@ fn records_of_one_path_fold_as_fsfs_folds_them() {
   dump
     .revision(2, &revision_properties(2))
     .node(&Node::delete("f"))
-    .node(&Node::add("g", NodeKind::File).properties(Properties::new()).text(b"g"))
+    .node(
+      &Node::add("g", NodeKind::File)
+        .properties(Properties::new())
+        .text(b"g"),
+    )
     .node(&Node::add("f", NodeKind::Directory).properties(Properties::new()))
-    .node(&Node::add("h", NodeKind::File).properties(Properties::new()).text(b"h"))
+    .node(
+      &Node::add("h", NodeKind::File)
+        .properties(Properties::new())
+        .text(b"h"),
+    )
     .node(&Node::delete("h"));
   let repository = imported(&dump);
   let changes = youngest_changes(&repository);
@@ -131,7 +166,10 @@ fn what_a_revision_changed_beneath_a_path_it_deleted_is_dropped() {
     .node(&Node::change("d/x").text(b"changed"))
     .node(&Node::delete("d"));
   let repository = imported(&dump);
-  assert_eq!(actions(&youngest_changes(&repository)), vec![("/d", Action::Delete)]);
+  assert_eq!(
+    actions(&youngest_changes(&repository)),
+    vec![("/d", Action::Delete)]
+  );
   same_history_through_its_export(&repository);
 }
 
@@ -182,7 +220,11 @@ fn changes_beneath_a_copy_are_written_against_the_copy_source() {
     "Node-path: branch/b\nNode-action: delete\n",
   ]
   .iter()
-  .map(|part| record.find(part).unwrap_or_else(|| panic!("{part:?} in {record}")))
+  .map(|part| {
+    record
+      .find(part)
+      .unwrap_or_else(|| panic!("{part:?} in {record}"))
+  })
   .collect();
   assert!(order.is_sorted(), "{record}");
   same_history_through_its_export(&repository);
@@ -209,7 +251,11 @@ fn deletions_are_written_when_their_directory_closes_in_byte_order() {
     "Node-path: z\nNode-action: delete\n",
   ]
   .iter()
-  .map(|part| record.find(part).unwrap_or_else(|| panic!("{part:?} in {record}")))
+  .map(|part| {
+    record
+      .find(part)
+      .unwrap_or_else(|| panic!("{part:?} in {record}"))
+  })
   .collect();
   assert!(order.is_sorted(), "{record}");
 }
@@ -217,6 +263,10 @@ fn deletions_are_written_when_their_directory_closes_in_byte_order() {
 /// Holds `repository` to the history its own export imports to.
 fn same_history_through_its_export(repository: &Repository) {
   let mut again = created();
-  import_whole(&mut again, &export(repository, 0, repository.youngest()).unwrap()).unwrap();
+  import_whole(
+    &mut again,
+    &export(repository, 0, repository.youngest()).unwrap(),
+  )
+  .unwrap();
   assert_eq!(history(&again), history(repository));
 }
