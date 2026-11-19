@@ -32,32 +32,40 @@ trap 'rm -rf "$WORK"' EXIT
 printf '#!/bin/sh\nexec uvx --quiet --python 3.12 --from mercurial==7.2 hg "$@"\n' > "$WORK/hg72"
 chmod +x "$WORK/hg72"
 hg() { "$WORK/hg72" --config ui.username=test --config devel.default-date='0 0' "$@"; }
-# A push of nothing but a bookmark or a phase exits 1 ("no changes found"), a refused one 255; the replies are read by
-# 7.2's own debugbundle below, and the tests read what each says.
+# A push of nothing but a bookmark or a phase exits 1 ("no changes found"); any other failure stops the script.
 hgpush() {
+  local code=0
+  hg push "$@" || code=$?
+  case $code in 0 | 1) ;; *) return "$code" ;; esac
+}
+# A recorded push may also be refused (255): what the server answered is the fixture, read by 7.2's debugbundle below
+# and by the tests.
+hgpush_recorded() {
   local code=0
   hg push "$@" || code=$?
   case $code in 0 | 1 | 255) ;; *) return "$code" ;; esac
 }
 cat > "$WORK/ssh.py" <<'PY'
 import os, subprocess, sys, threading
-command, capture = sys.argv[-1], os.environ["CAPTURE"]
+# A push the script does not record names no CAPTURE (its first run's other clients died here, so no race happened).
+command, capture = sys.argv[-1], os.environ.get("CAPTURE")
 child = subprocess.Popen(command, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
 def pump(source, target, path, close):
-    with open(path, "ab") as log:
-        while True:
-            data = os.read(source, 65536)
-            if not data:
-                break
+    log = open(path, "ab") if path else None
+    while True:
+        data = os.read(source, 65536)
+        if not data:
+            break
+        if log:
             log.write(data)
             log.flush()
-            view = memoryview(data)
-            while view:
-                view = view[os.write(target, view):]
+        view = memoryview(data)
+        while view:
+            view = view[os.write(target, view):]
     if close:
         os.close(target)
-into = threading.Thread(target=pump, args=(0, child.stdin.fileno(), capture + ".client", True), daemon=True)
-out = threading.Thread(target=pump, args=(child.stdout.fileno(), 1, capture + ".server", False))
+into = threading.Thread(target=pump, args=(0, child.stdin.fileno(), capture and capture + ".client", True), daemon=True)
+out = threading.Thread(target=pump, args=(child.stdout.fileno(), 1, capture and capture + ".server", False))
 into.start(); out.start(); out.join()
 sys.exit(child.wait())
 PY
@@ -183,7 +191,7 @@ capture() {
   local name=$1 server=$2
   shift 2
   state "$server" "$name"
-  CAPTURE="$WORK/$name" hgpush "$@" "${SSH[@]}" "$(remote "$server")"
+  CAPTURE="$WORK/$name" hgpush_recorded "$@" "${SSH[@]}" "$(remote "$server")"
   python3 -I "$WORK/extract.py" "$WORK/$name" "$OUT/$name"
 }
 # replay NAME SERVER FROM: the session FROM recorded, sent again to SERVER.
