@@ -765,9 +765,20 @@ impl Run {
     let successor_holder = self.holders.remove(&successor).unwrap();
     // With `following`, the successor's holders are the set the takeover counted, less itself: what the durable
     // writes are held by. The configuration's candidates may be a set the old owner was still moving to, which holds
-    // none of them; the successor moves to it by a transition of its own.
+    // none of them; the successor moves to it by a transition of its own. Without it, they are the holders the
+    // superseded shipper committed, as the daemon's successor ships to the record's holders (`live_ship`'s
+    // `live_holders`), never a member that joined since: it holds none of the log, and named here it let a later phase
+    // one count `f + 1` holders none of which held a durable write (A-601's ReadSafety, 2026-11-19).
     let mut holders: Vec<HostId> = match self.following {
-      None => self.holders.keys().copied().collect(),
+      None => {
+        let committed = self.owners[old].shipper.holders().to_vec();
+        self
+          .holders
+          .keys()
+          .copied()
+          .filter(|host| committed.contains(host))
+          .collect()
+      }
       Some(Following::Joint) => self.owners[old].recorded.clone(),
       Some(Following::RecordAtOnce | Following::Fixed) => self.configuration.clone(),
     };
@@ -1133,15 +1144,16 @@ impl Run {
   }
 
   /// ReadSafety (A-601; `FencedLedger.tla`'s rule, §4.8 "Leases and reads"), judged now over every read phase one
-  /// could make were the current owner lost. Phase one asks the live candidates and adopts the greatest head among
-  /// their reports once `f + 1` come from the holders it counts ([`adopt`]), so a host's head can be adopted whenever
-  /// `f + 1` counted holders, the host itself if it is one, report no greater head (one with no copy reports nothing).
-  /// Every such head's state must hold every durable write, at its position, unchanged: a read adopting a stale chain
-  /// would hand the successor, and every read it then answers, a state older than a write already acknowledged. The
-  /// first violation is kept with its step, and [`Run::settle`] reports it after the run's other checks, so a history
-  /// one of those breaks is still named by it.
+  /// could make were the current owner lost within the failures the run tolerates (`lost < f`, the nemesis's own
+  /// guard for a takeover; past it phase one waits for every surviving holder, `adopt_past_tolerance`). Phase one asks
+  /// the live candidates and adopts the greatest head among their reports once `f + 1` come from the holders it counts
+  /// ([`adopt`]), so a host's head can be adopted whenever `f + 1` counted holders, the host itself if it is one,
+  /// report no greater head (one with no copy reports nothing). Every such head's state must hold every durable write,
+  /// at its position, unchanged: a read adopting a stale chain would hand the successor, and every read it then
+  /// answers, a state older than a write already acknowledged. The first violation is kept with its step, and
+  /// [`Run::settle`] reports it after the run's other checks, so a history one of those breaks is still named by it.
   fn read_safety(&mut self) {
-    if self.durable.is_empty() || self.read_safety_broken.is_some() {
+    if self.durable.is_empty() || self.read_safety_broken.is_some() || self.lost >= self.f {
       return;
     }
     let (asked, counted) = self.phase_one_now();

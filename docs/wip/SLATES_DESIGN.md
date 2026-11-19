@@ -7651,9 +7651,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > `FencedLedger.tla`'s rule as `crates/db/src/register_nemesis.rs` judges the register. After every step and every
 > settling delivery, every read phase one could make were the current owner lost adopts a state that holds every
 > durable write at its position. A read is any `f + 1` of the holders phase one counts, with any other live candidate it
-> asks, adopting the greatest head as `adopt` does. NoLoss judged only the one read each takeover made.
-> @@STATUS@@ What a superseded owner answers from its own state is the owner lease's to stop (§4.8 "Leases and reads");
-> this is the log's half: what a successor reads and then serves.
+> asks, adopting the greatest head as `adopt` does, while the run could still lose the owner within its tolerance.
+> NoLoss judged only the one read each takeover made. @@STATUS@@ Its first run found the model at fault, not the log:
+> without `following`, a successor's shipper named fresh members as holders, which the daemon's successor does not (it
+> ships to the record's holders), so a later phase one could count `f + 1` holders that held nothing; the model now
+> takes the superseded shipper's committed holders (A-601). What a superseded owner answers from its own state is the
+> owner lease's to stop (§4.8 "Leases and reads"); this is the log's half: what a successor reads and then serves.
 >
 > **Holders follow the candidates (2026-11-07, A-200's amendment of that date).** The shipper's holder set changes by a
 > joint transition (`Shipper::begin_transition`, `transferred`, `activate`); the daemon begins one whenever the
@@ -48636,8 +48639,9 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
   of each guard.
 
 ### A-601 — ReadSafety judged over the live log under its nemesis: every read phase one could make holds every durable write (2026-11-19, g229, goal 82's chaos part; §4.8 "Leases and reads", §4.10 "Live shipping"; A-200, A-240; `FencedLedger.tla`)
-Applied in the same change to: `crates/db/tests/live.rs` (the check, its two red checks, the nemesis's counters);
-§4.10's live-log status; GAPS (the register nemesis's entry: the live log's half built).
+Applied in the same change to: `crates/db/tests/live.rs` (the check, its two red checks, the nemesis's counters, and
+the model's successor holders without `following`); §4.10's live-log status; GAPS (the register nemesis's entry: the
+live log's half built).
 
 - **What was owed.** The register's nemesis checks ReadSafety by `FencedLedger.tla`'s per-position rule. The live log's
   nemesis checked Agreement, NoLoss, StaleNeverCommits and Convergence, but not ReadSafety. So a state in which some
@@ -48646,8 +48650,9 @@ Applied in the same change to: `crates/db/tests/live.rs` (the check, its two red
   candidates and adopts the greatest head, by `(epoch, position)`, once `f + 1` reports come from the holders it counts
   (A-240). So a head can be adopted whenever `f + 1` counted holders, itself among them if it is one, report no greater
   head; a holder with no copy reports nothing. ReadSafety: every such head's state holds every durable write, at its
-  position, unchanged. It is judged after every step and every settling delivery. NoLoss stays the check of the one
-  read each takeover makes.
+  position, unchanged. It is judged after every step and every settling delivery, while the run could still lose the
+  owner within the failures it tolerates (`lost < f`, the nemesis's own guard for a takeover; past it phase one waits
+  for every surviving holder, `adopt_past_tolerance`). NoLoss stays the check of the one read each takeover makes.
 - **Reported last.** The first violation is kept with its step, the read and the position, and the run reports it at
   its end, after Convergence and the final NoLoss. So the mutation tests that expect a named check (StaleNeverCommits,
   Agreement, NoLoss, Convergence) still meet it in every seed it broke.
@@ -48659,4 +48664,19 @@ Applied in the same change to: `crates/db/tests/live.rs` (the check, its two red
     the other holding a later owner's chain without it. The violation names position 0.
   - `a_read_past_a_holder_without_a_durable_write_adopts_the_head_that_holds_it`: the write on one holder, the other
     holding no copy. No violation, and the judgement is counted as one past a holder without the write.
+- **Found by its first run, in the model.** With fresh members joining at an owner's loss
+  (`phase_one_meets_the_logs_holders_when_a_fresh_member_has_joined`), 12 of the test's 400 histories failed
+  ReadSafety alone: 7 at `f = 1` and 5 at `f = 2` (macOS arm64, Mac Studio, kiln r150, the check judging every read
+  then). Every one of those reads counted a fresh member, which only a successor's holder list named. Without
+  `following`, the model gave a successor's shipper every host it knew as a holder, fresh members included. The test's
+  own doc says no shipper's holders name one, and the daemon's successor ships to the record's holders (`live_ship`'s
+  `live_holders`, the set the superseded shipper committed). So at `f = 2` a later phase one could count `f + 1`
+  holders none of which held a durable write: one read was hosts 2, 3 and 6, the last a fresh member, none holding a
+  copy, while position 0 was durable. NoLoss, judging only the read each takeover drew, never met one. The model's
+  successor now takes the holders the superseded shipper committed. Without fresh members that is the same list, so
+  every other history replays as before. The 7 at `f = 1` were past the run's tolerance besides, since only a
+  successor names a fresh member and one loss is all `f = 1` tolerates.
+- **Owed to main, a question, not changed here.** The daemon's successor falls back to the configuration's candidates
+  when its volume records no holders (`live_ship`, `live_holders` absent). Whether a live-shipped volume can be taken
+  over with none recorded decides whether the daemon can name a fresh member as this model did.
 - **Tests** @@TESTS@@
