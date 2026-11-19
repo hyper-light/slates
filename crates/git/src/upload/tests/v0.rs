@@ -53,7 +53,7 @@ const REFS: [NamedRef<'static>; 3] = [
 
 /// Format: the requests git's tests wrote and upload-pack answered statelessly, each named, its request and git's
 /// answer.
-const STATELESS: [(&str, &[u8], &[u8]); 6] = [
+const STATELESS: [(&str, &[u8], &[u8]); 7] = [
   (
     "multi-ack",
     fixture!("multi-ack.request.bin"),
@@ -83,6 +83,11 @@ const STATELESS: [(&str, &[u8], &[u8]); 6] = [
     "unknown-want",
     fixture!("unknown-want.request.bin"),
     fixture!("unknown-want.response.bin"),
+  ),
+  (
+    "sparse-v0",
+    fixture!("sparse-v0.request.bin"),
+    fixture!("sparse-v0.response.bin"),
   ),
 ];
 
@@ -497,4 +502,61 @@ fn every_cut_and_flip_of_a_v0_request_is_refused_or_answered_whole() {
     refused > 0 && answered_whole > 0,
     "{refused} {answered_whole}"
   );
+}
+
+/// A-640 part 4 (`create_pack_file` under protocol v0: `pack-objects`' error stream relayed on side-band-64k, and with
+/// no band written to upload-pack's own; git's `sparse-missing-v0` and `sparse-bare-v0`): do send a clone's request
+/// under `sparse:oid=main:missing`, a path that is not there, choosing side-band-64k and choosing no band. Expect: each
+/// answer byte for byte git's (`NAK`, then git's words on band 2 and its band-3 words, or `NAK` alone), refused as a
+/// name that names nothing.
+#[test]
+fn a_sparse_blob_that_names_nothing_is_answered_as_git_answers_it_on_a_band_and_on_none() {
+  let fixture = repository();
+  let deaths: [(&str, &[u8], &[u8]); 2] = [
+    (
+      "sparse-missing-v0",
+      fixture!("sparse-missing-v0.request.bin"),
+      fixture!("sparse-missing-v0.response.bin"),
+    ),
+    (
+      "sparse-bare-v0",
+      fixture!("sparse-bare-v0.request.bin"),
+      fixture!("sparse-bare-v0.response.bin"),
+    ),
+  ];
+  let refusal = Refusal::SparseBlob {
+    name: b"main:missing".to_vec(),
+  };
+  for (name, request, response) in deaths {
+    let (bytes, answer) = answered(&fixture, Version::V0, Asked::Request(request));
+    assert_eq!(
+      (bytes.as_slice(), answer.refusal()),
+      (response, Some(&refusal)),
+      "{name}"
+    );
+  }
+}
+
+/// A-640 part 4 (git's `pack-objects` reads a sparse filter's blob only once the pack is due): do send, under
+/// `sparse:oid=main:missing`, a round that ends with a flush, its one have one the server lacks, and the same round
+/// with no filter. Expect: the same answer, `NAK`, never refused, though the filter's blob names nothing.
+#[test]
+fn a_round_with_no_pack_due_never_reads_its_sparse_blob() {
+  let fixture = repository();
+  let round = |filter: &[u8]| {
+    let mut request =
+      pkt(format!("want {TIP} multi_ack_detailed side-band-64k filter\n").as_bytes());
+    request.extend(filter);
+    request.extend(b"0000");
+    request.extend(pkt(b"have 3333333333333333333333333333333333333333\n"));
+    request.extend(b"0000");
+    answered(&fixture, Version::V0, Asked::Request(&request))
+  };
+  let (filtered, answer) = round(&pkt(b"filter sparse:oid=main:missing\n"));
+  let (plain, _) = round(&[]);
+  assert_eq!(
+    (filtered.as_slice(), answer.refusal()),
+    (plain.as_slice(), None)
+  );
+  assert_eq!(filtered, pkt(b"NAK\n"));
 }
