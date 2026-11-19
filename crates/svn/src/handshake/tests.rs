@@ -1554,10 +1554,16 @@ fn a_call_while_the_handshake_awaits_its_caller_is_out_of_turn() {
     server.receive(&answer, &mut written),
     Ok(Progress::Opened { .. })
   ));
-  assert_eq!(server.receive(&answer, &mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    server.receive(&answer, &mut written),
+    Err(Refused::OutOfTurn)
+  );
   assert_eq!(server.key(None, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(written, greeting);
-  assert_eq!(server.open(&anon_repository(), &mut written), Ok(Access::Asked));
+  assert_eq!(
+    server.open(&anon_repository(), &mut written),
+    Ok(Access::Asked)
+  );
   assert_eq!(
     server.open(&anon_repository(), &mut written),
     Err(Refused::OutOfTurn)
@@ -1577,7 +1583,10 @@ fn every_call_after_the_handshake_is_out_of_turn() {
   ));
   assert!(server.established());
   let done = written.clone();
-  assert_eq!(server.receive(response, &mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    server.receive(response, &mut written),
+    Err(Refused::OutOfTurn)
+  );
   assert_eq!(
     server.refuse(Unserved::NoAccess, &mut written),
     Err(Refused::OutOfTurn)
