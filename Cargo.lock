@@ -1910,6 +1910,7 @@ dependencies = [
 name = "slates-svn"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "hmac",
  "lz4_flex",
  "md-5",

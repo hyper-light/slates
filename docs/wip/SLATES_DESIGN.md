@@ -13062,6 +13062,14 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
+> and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
+> writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
+> the svndiff codec, a deletion and the addition of its path read as the one replacement FSFS records. Held to four
+> dumps stock `svnadmin` 1.15.0 wrote (golden, SHA-256 checked), to `svnlook changed`, to format 3 rebuilding format
+> 2's trees, to every cut and bit flip. Owed of piece 6: the verbs over it (`svnadmin create`, `load`, `dump`,
+> `setrevprop`, `setlog`, `info`, `uuid`, `youngest`) and the dump round trip.
+>
 > **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
 > piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
 > as a value (its base path); `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s search over dates read as
@@ -13519,8 +13527,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
    must give the same accept or conflict, and the same conflicting path (built, A-592, with the drive's out-of-date
    test, the lock table's check after the merge, and `verify_locks` in the oracle).
-6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
-   `uuid`, `youngest`; the dump round trip is their gate.
+6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format; its codec built, A-593),
+   `setrevprop`, `setlog`, `info`, `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
    the plain reads; the reporter (update, switch, status, diff, checkout); commit; log, locations, segments, file
    revisions, deleted revision, replay; revision properties.
@@ -41540,9 +41548,85 @@ Part 1 applied in the same change to: `crates/git` (`refname.rs` and `tests/refn
 `v2/refname.rs`, removed; `objects/tag.rs`, `v2/fetch.rs` and `v2/ls_refs.rs` on the shared module; the `mod` line in
 `lib.rs`), GAPS (the §4.17 entry).
 
+### A-593 — Subversion's dump format: formats 2 and 3 read as the stream arrives within the caller's admission and written byte for byte as `svnadmin dump` writes them (2026-11-19, g264, UI goal 92; §4.17.4 "Pieces that follow" piece 6, its first part; A-500, A-553)
+Applied in the same change to:
+- §4.17.4 (a status block; piece 6 marks its codec built) and GAPS (the §4.17.4 entry);
+- `research/vcs-servers-subversion.md` §12 (new: the format's sources at `1.14.x` `d434dc14`, each with its sha256,
+  and the 1.15.0 tag compared);
+- `crates/svn` (`dump.rs` and `dump/` new: `header.rs`, `read.rs`, `write.rs`, `digest.rs`, `tests.rs`, `tests/`;
+  `fixtures/dump` with `make-fixtures.sh`; `lib.rs`'s module line; `Cargo.toml`), and the lock (`slates-svn` gains
+  `aws-lc-rs`, nothing re-resolved).
+- **What was there.** Piece 6 named the administration verbs and "the dump format"; nothing read or wrote it.
+- **The decision.** The codec is the format's events: a version record, a UUID record, a revision record's header, a
+  node record's header (path, kind, action, copy source with its text's checksums, a property section, a text section
+  with its checksums, whole or a delta with its base's), property entries (`K`/`V`, and `D` in a format-3 delta), the
+  section's end, a whole text's pieces, a delta's svndiff header and windows, the text's end. The reader is a parser
+  that resumes over a buffer its caller holds (`Read::Event`, `NeedMore`, `End`, each saying what it consumed); texts
+  pass in pieces and are never held, a property entry and an svndiff window are held whole, as Subversion holds them.
+  The writer takes the same events and writes `dump.c`'s bytes: the headers in `dump_node`'s order, a property
+  section's length stated before it, `"\n\n"` after content and `"\n"` after a record with none, and a replacement by
+  a copy as `svnadmin` writes it, a deletion record ended by its empty line alone and then an addition. The reader reads
+  that pair back as the one replacement: a held deletion is answered only when the next record shows it is not the
+  first half of one, so its records are FSFS's changed-path rows (§4.17.4 item 2), one per path.
+- **Stricter than `svnadmin load`, where it reads on and loads another history** (research §12): numbers are decimal
+  digits to 2^63 - 1 (`load.c` reads lengths with `apr_atoi64` and revisions with `atol`); an unknown node kind, action
+  or delta flag is refused (an unknown kind adds nothing there); a header given twice, a NUL in a header or a property
+  name, a property section that does not end exactly at its `PROPS-END` (`load.c` takes a section whose entries fill
+  its length as ended, and reads past an early `PROPS-END` as text), a header block the stream's end cuts (`load.c`
+  reads the end as its empty line, so a cut dump loaded as a shorter one with a record cut short), a version other
+  than 2 or 3, and headers that contradict each other or the stream (`Contradiction`: a copy source on a change or a
+  deletion or half of one, checksums without what they check, a delta in format 2, content on a deletion, a text on
+  a directory, a node outside a revision or in revision 0, a `Content-length` below its sections). Each refusal is
+  typed and names the Subversion error `svnadmin load` answers (`E140001`, `E140002`, `E200003`, `E200004`,
+  `E200014`, `E125008`, `E125012`, svndiff's own).
+- **No number of its own.** `Admission { buffer_bytes }` is the caller's: every line, property entry and window is
+  admitted when its length is known, before its bytes are waited for, whether or not they are already held, so a stream
+  is accepted or refused the same however its bytes arrive. A digest is checked where the stream allows: a whole
+  text's MD5 and SHA-1 as it passes (an all-zero digest names none, as `svn_checksum_parse_hex` reads it); a delta's
+  result is the applier's, with `Digests` and `check_text`.
+- **Checksums.** MD5 and SHA-1 through aws-lc-rs: the vendored copy exposes `MD5_FOR_LEGACY_USE_ONLY` (S3's ETags,
+  `vendor/UPSTREAM.md`), so the RustCrypto `md-5` crate main had approved for this was not needed. Only the fallible
+  `try_new`, `try_update` and `try_finish` are called.
+- **Golden vectors.** `fixtures/dump/make-fixtures.sh` builds one repository with the stock client over `file://`
+  (texts of every shape, a path holding `: `, a text past one svndiff window changed in both, properties set, changed,
+  deleted, empty, binary, multi-line and on the root, copies, deletions, replacements without history and by a copy
+  inside a copied branch, a tag, a merged change setting `svn:mergeinfo`, an extra revision property, an empty log),
+  fixes its UUID and every `svn:date`, and dumps it four ways with Homebrew's `svnadmin` 1.15.0 (r1937767), whose
+  `dump.c` and `hash.c` are the pinned 1.14.x's byte for byte: `full.dump` (format 2, 223,752 bytes), `deltas.dump`
+  (format 3, 118,128), `part1.dump` (revisions 0 to 3, 4,968) and `part2.dump` (4 to 13, `--deltas --incremental`,
+  112,741), with `svnlook changed --copy-info` for every revision. Run twice on the Mac Studio (2026-11-19), it wrote
+  the same bytes; the files came back through kiln as one compressed archive, and each SHA-256 was checked against the
+  Studio's `SHA256SUMS` here and is checked again by every test before it reads a vector.
+- **Tests** (`crates/svn/src/dump/tests*`, 25). Every vector, and the stream two of them make one after the other
+  (two version records, the format switching from 2 to 3), read whole and a byte, 7 and 4,096 bytes at a time to the
+  same events and written again byte for byte. Format 3's deltas and property changes, applied to their bases with
+  svndiff's reference applier in a naive filesystem, rebuild format 2's tree in every revision, every base and result
+  matching its headers' digests, with counters that fail the test if the vectors stop holding a two-window delta,
+  deleted properties, copies, four replacements by a copy or records of the root. Each revision's records equal
+  `svnlook changed`'s listing. Each vector reads within exactly the most bytes it ever needs held and is refused one
+  byte short at that length, whole or a byte at a time. Every cut of every vector is refused as truncated or ends on a
+  record boundary with the whole stream's events up to there; every bit flip of `part1.dump` and random flips of the
+  others are refused by kind or read to events that write and read back unchanged, and none inside a whole text passes.
+  Each refusal by kind and number; a length past the admission refused before its bytes are waited for; what `load.c`
+  passes over passed over; the writer's refusals with nothing appended; the record shapes the vectors lack; generated
+  streams of every shape written, read back in pieces of any size and written again to the same bytes.
+- **Evidence** (the Mac Studio M3 Ultra, kiln, fresh clones of the branch, `--locked`, 2026-11-19 UTC). Red, with a
+  reader and a writer that refused everything: `cargo test -p slates-svn --lib --locked dump` 0 of 25
+  (`~/.cache/g264-logs/a593-red.txt` there). Green: `cargo test -p slates-svn --lib --locked` 78 of 78 in 9.02 s, the
+  crate's 53 and the codec's 25 (`a593-green2.txt`); the one failure on the way was the oracle's own (it took revision
+  properties for a node's). `cargo fmt -p slates-svn` applied. The tree merged with main (475952115, 04:51 UTC, load
+  10.39): 260 of 260 in 8.83 s, main's 235 and the codec's 25 (`a593-merged2.txt`), `cargo fmt --check` clean. Clippy,
+  `xtask check` and the cross-target lint are main's (the run-request queue).
+- **Rejected.** Reading records as written and carrying their blank lines to the writer, so that a deletion ended by
+  its empty line alone could be written again: byte for byte too, but a replacement by a copy would reach `load` as two
+  records for one path, which the index refuses (two rows for one path), so every consumer would fold it again.
+  Holding a text or a property section whole to learn its length: the caller states lengths (`section_len` measures a
+  property section), as `svnadmin` learns a delta's by writing it to a temporary file first.
+- **Owed of piece 6:** the verbs over the codec (`svnadmin create`, `load`, `dump`, `setrevprop`, `setlog`, `info`,
+  `uuid`, `youngest`) and the dump round trip, their gate.
 ### A-613 — The ra_svn read commands, a sans-io handler over the index and mergeinfo, held to stock svnserve's transcripts; its first part (2026-11-19, g262, UI goal 93; §4.17.4 "4. Reads", "5. The wire" and piece 7's second part; A-531, A-553, A-599, A-605)
 Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 entry),
-`docs/wip/research/vcs-servers-subversion.md` (§12, new), `crates/svn/src/reads.rs` and `crates/svn/src/reads/tests.rs`
+`docs/wip/research/vcs-servers-subversion.md` (§13, new), `crates/svn/src/reads.rs` and `crates/svn/src/reads/tests.rs`
 (new), `crates/svn/fixtures/reads/` (new: the recorder, 28 transcripts, the repository's record, `sessions.txt`,
 `subversion-version.txt`, `SHA256SUMS`), `crates/svn/src/lib.rs` (its `mod` line).
 - **What was there.** Item 4 named the reads and item 5 the wire; the item codec (A-531), the index (A-553), the
@@ -41551,7 +41635,7 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   properties and property lists, beside A-605's `Contents`) and the session's value (its base path; A-599 hands it
   over), appending what `svnserve` writes and saying whether it answered, whether the connection ends (malformed
   parameters, which `svnserve` ends without a word) or whether another piece answers. Each command is `serve.c`'s at
-  `1.14.x` `d434dc14` (notes §12), its bytes held to stock `svnserve` 1.15.0's own: the trivial authentication request
+  `1.14.x` `d434dc14` (notes §13), its bytes held to stock `svnserve` 1.15.0's own: the trivial authentication request
   before a command's work, so a revision past the youngest is refused after it; parameters as `svn_ra_svn__parse_tuple`
   reads them (extra ones ignored, C strings to their NUL, a number past 2^63 - 1 a negative revision); paths joined to
   the base and made canonical; refusals as `( failure ( ( code message 0: 0 ) ) )`; `get-iprops` without a revision

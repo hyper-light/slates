@@ -317,9 +317,10 @@
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
 > **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index, its lock table, its
-> mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies and its authorization built
-> (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609 and A-606, D-28; UI goals 91, 92 and 93; g292,
-> g250, g262, g268, g234, g229).** A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s `commit`: the drive's
+> mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies, its authorization and its dump
+> codec built (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609, A-606 and A-593, D-28; UI goals
+> 91, 92 and 93; g292, g250, g262, g268, g234, g229, g264).** A-592 (2026-11-19, g268): the commit rule,
+> `slates-svn`'s `commit`: the drive's
 > out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's transaction as the index's
 > own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()` and `verify_locks`
 > transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real check on 4,096
@@ -381,7 +382,13 @@
 > root as one empty segment; a suffix match reversing the segment for its level's other rules; `[//x]` taken for the
 > root). Owed from it: the server's questions (piece 7), the file read from the repository and kept per file identity,
 > `force-username-case`, `mod_authz_svn`'s questions (piece 13); main's: clippy and `xtask` over the module, and the
-> three departures confirmed against stock Subversion (run request). Designed from Subversion 1.14.x's own
+> three departures confirmed against stock Subversion (run request). A-593 (2026-11-19, g264, UI goal 92): the dump
+> format's codec, formats 2 and 3, read as the stream arrives within the caller's admission and written byte for byte
+> as `svnadmin dump` writes it, golden vectors from stock `svnadmin` 1.15.0, `cargo test -p slates-svn --lib` on the
+> Mac Studio (see A-593). Owed from it: the administration verbs over it; a format-3 dump is
+> `svnadmin dump --deltas`'s bytes only given its windows, which are Subversion's deltifier's (slates' dump verb will
+> write its own, which `svnadmin load` reads alike); a version-1 (zlib) delta inside a dump is refused, which no stock
+> writer makes. Designed from Subversion 1.14.x's own
 > specifications and code: one green per repository, a transaction a work at the head, FSFS's commit-time merge as a
 > stock client's verdict (stricter than §4.16's: no identity accept, its directory property rules, a directory's last
 > change its subtree's; raised with A-497's owner), the Subversion index, revision properties and locks as register

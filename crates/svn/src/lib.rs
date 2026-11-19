@@ -25,6 +25,7 @@
 pub mod authz;
 pub mod commit;
 pub mod dav;
+pub mod dump;
 pub mod handshake;
 pub mod index;
 pub mod lock;
