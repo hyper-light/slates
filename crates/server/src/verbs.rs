@@ -2893,6 +2893,8 @@ fn status_on_channel(
     slot
       .status_pages
       .begin(request, expires, &mut state.store.metadata);
+    // The capture's deadline is the shard's keeper's to keep (A-522).
+    crate::deadlines::capture_set(state, client, expires);
     return Some(scatter_status(state, client.index(), request));
   }
   None
@@ -7852,7 +7854,11 @@ fn stage_begin(
     (state.partition, expires),
     &mut state.store.metadata,
   ) {
-    Ok(token) => ReplyBody::Staged { token },
+    Ok(token) => {
+      // Its expiry is a deadline the shard's keeper sleeps for (A-522).
+      crate::deadlines::noted(state, expires);
+      ReplyBody::Staged { token }
+    }
     Err(refusal) => refused(refusal),
   }
 }
@@ -7876,7 +7882,10 @@ fn stage_put(
     .staging
     .put((work_id, principal, token), offset, bytes, expires)
   {
-    Ok(filled) => ReplyBody::StagePutDone { filled },
+    Ok(filled) => {
+      crate::deadlines::noted(state, expires);
+      ReplyBody::StagePutDone { filled }
+    }
     Err(refusal) => refused(refusal),
   }
 }
