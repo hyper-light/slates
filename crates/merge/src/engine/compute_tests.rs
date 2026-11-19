@@ -577,7 +577,7 @@ fn owner_and_copy() -> (Green, Green) {
 /// never a rebase onto an older version.
 #[test]
 fn a_copy_behind_the_works_base_refuses_it_typed() {
-  let (owner, mut copy) = owner_and_copy();
+  let (owner, copy) = owner_and_copy();
   let ahead = work(&owner, 2, &[Edit::Write(2, b"three".to_vec())], 3);
   let refused = ComputeRefused::BaseAhead { base: 2, head: 1 };
   assert_eq!(copy.compute(&ahead).map(|computed| computed.at()), Err(refused));

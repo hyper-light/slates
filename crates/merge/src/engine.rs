@@ -50,6 +50,14 @@
 //! once at its destination and never key by key: a key in a copied tree reads by the latest copy above it while it holds
 //! what that copy gave it, and its first change after the copy records that value at the copy's version, as the one
 //! history rule records a key's first change at version 0 (`copy`, its module docs).
+//!
+//! **Computed anywhere, committed by position (A-658; A-645).** The verdict and the rebase are pure functions of the
+//! versions they are judged over (the work's base, the head and the deltas between them, none of which changes once
+//! committed) and of the work: [`Green::compute`] and [`Green::rebase`] read the green and change nothing, so the owner
+//! or any copy that holds those versions (a holder's replica, rebuilt from the chain's entries) computes the same
+//! answer. A [`Computed`] holds nothing of the green that computed it and names the head it was computed against, the
+//! position the owner checks before it appends (A-635's rule). The owner judging an increment is the owner computing it
+//! at its own head, its rejected-result cache around the computation ([`Green::judge`]).
 
 use crate::special::SpecialNode;
 
@@ -187,7 +195,8 @@ pub enum Outcome {
   /// The increment's base is below the version the green's chain was checkpointed at
   /// ([`Green::checkpoint`]): the deltas it would be mapped through are folded away, so it is never judged. No live
   /// reader is below that version (the service checkpoints at the reachable floor), so a caller meets this only with a
-  /// base no longer anyone's; the service answers it `UnknownBase`.
+  /// base no longer anyone's; the service answers it `UnknownBase`. Or the base is past the head, a version the green
+  /// never made, never judged as if the work were based at the head (A-658).
   BaseUnavailable {
     /// The increment's base.
     base: u64,
@@ -254,7 +263,8 @@ pub enum Judgment {
     /// The conflicting windows.
     windows: Vec<ConflictWindow>,
   },
-  /// The increment's base is below the version the green's chain was checkpointed at (as [`Outcome::BaseUnavailable`]).
+  /// The increment's base is below the version the green's chain was checkpointed at, or past its head (as
+  /// [`Outcome::BaseUnavailable`]).
   BaseUnavailable {
     /// The increment's base.
     base: u64,
@@ -722,7 +732,9 @@ pub struct Green {
   /// is no longer reconstructible. The service keeps the floor at the oldest version any live reader
   /// — a work's base, a pinned attachment — can still name.
   folded_below: u64,
-  fast_path_hits: u64,
+  /// The paths merged through the content fast path (the non-vacuity counter). A cell, so the verdict stays a function
+  /// of an immutable green (A-658), as `deltas_visited` is.
+  fast_path_hits: std::cell::Cell<u64>,
   /// The change index (§4.16 `changed_since`, A-264): the paths each version changed in any dimension, each version's
   /// sorted and each path once, recorded as the version commits at the cost of its own changes, so what changed since a
   /// version is read in the changes since it and never the green's whole tree. A hard link is recorded at a version that
@@ -2124,7 +2136,7 @@ impl Green {
 
   /// The number of paths merged through the content fast path (the non-vacuity counter).
   pub fn fast_path_hits(&self) -> u64 {
-    self.fast_path_hits
+    self.fast_path_hits.get()
   }
 
   /// The deltas the verdict's position mapping has consulted ([`Green::fast_path_hits`]'s companion): one per delta
@@ -3023,7 +3035,7 @@ impl Green {
   /// per range — its coordinate mapping under a conflicting neighbour is owed — so the whole-file
   /// identity check still stands for the path in that case, exactly as before (never a regression).
   fn merge_content(
-    &mut self,
+    &self,
     inc: &Increment,
     path: &str,
     ops: &[Op],
@@ -3048,7 +3060,9 @@ impl Green {
     let base_changed = self.changed_last(self.last_changed.get(path), path);
     let unchanged = base_changed <= inc.base;
     if unchanged {
-      self.fast_path_hits = self.fast_path_hits.saturating_add(1);
+      self
+        .fast_path_hits
+        .set(self.fast_path_hits.get().saturating_add(1));
     }
     let intervening = if unchanged {
       Vec::new()
@@ -3437,7 +3451,7 @@ impl Green {
   }
 
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
-  fn decide(&mut self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
+  fn decide(&self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut effects = Vec::new();
     // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
     let fixes = self.copy_fixes(r);
@@ -3502,7 +3516,7 @@ impl Green {
 
   /// The content dimension: renames, creates, unlinks and edits.
   fn decide_content(
-    &mut self,
+    &self,
     inc: &Increment,
     (r, cleared): (&Resolved, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
@@ -4215,46 +4229,89 @@ impl Green {
     }
   }
 
-  /// The verdict of `inc` at this green's head, computed anywhere (A-658). Red-first stub: refuses everything.
+  /// The verdict of `inc` at this green's head, computed as a pure function of the versions it is judged over (A-658;
+  /// A-645 "Merges computed anywhere, committed by position"): the work's base, the head and every delta between them,
+  /// none of which changes once committed, and the work. It changes nothing (no record, no cache, nothing a reader sees;
+  /// only its cost counters move), so the green's owner or any copy that holds those versions (a holder's replica,
+  /// rebuilt from the chain's entries) computes the same [`Computed`], and moves it to the owner, which commits it by
+  /// position. An increment this green accepted before is answered its version. Refused, typed, when this green lacks a
+  /// version the work is judged over: its base below the version this green was restored at, or past its head.
   pub fn compute(&self, inc: &Increment) -> Result<Computed, ComputeRefused> {
-    Err(ComputeRefused::BaseAhead {
+    let at = self.head();
+    let computed = |reached| Computed {
+      id: inc.id,
       base: inc.base,
-      head: self.head(),
-    })
+      at,
+      reached,
+    };
+    if let Some(version) = self.accepted.get(&inc.id) {
+      return Ok(computed(Reached::Before(*version)));
+    }
+    if inc.base < self.deltas_from {
+      return Err(ComputeRefused::BaseUnavailable {
+        base: inc.base,
+        floor: self.deltas_from,
+      });
+    }
+    if inc.base > at {
+      return Err(ComputeRefused::BaseAhead {
+        base: inc.base,
+        head: at,
+      });
+    }
+    let resolved = Green::resolve(inc);
+    Ok(computed(match self.decide(inc, &resolved) {
+      Ok(effects) => {
+        let applied = effects.iter().map(Effect::applied).collect();
+        Reached::Accepted { effects, applied }
+      }
+      Err(windows) => Reached::Conflict(windows),
+    }))
   }
 
   /// Judges an increment and holds the verdict (A-635): what a submit decides, nothing of it applied to the green but the
   /// rejected-result cache's entry for a conflict, which a submit keeps too. An increment accepted before is answered
-  /// its version; a conflict the cache holds, its windows; a base below the checkpoint, unavailable; anything else is
-  /// decided against the head and held in a [`Judged`] for [`Green::commit_judged`].
+  /// its version; a conflict the cache holds, its windows; a base below the checkpoint, or past the head (a version this
+  /// green never made), unavailable; anything else is the verdict this green computes at its head ([`Green::compute`],
+  /// A-658), held in a [`Judged`] for [`Green::commit_judged`]. The owner judging is the owner computing: one verdict.
   pub fn judge(&mut self, inc: &Increment) -> Judgment {
-    if let Some(version) = self.accepted.get(&inc.id) {
-      return Judgment::AcceptedBefore { version: *version };
-    }
-    if let Some(windows) = self.rejected.get(&inc.id) {
+    // The cache answers a conflict it holds before anything is judged, unless the same increment was accepted since,
+    // which the computation answers first (a submit's order since A-635).
+    if !self.accepted.contains_key(&inc.id)
+      && let Some(windows) = self.rejected.get(&inc.id)
+    {
       return Judgment::Conflict {
         windows: windows.clone(),
       };
     }
-    if inc.base < self.deltas_from {
-      return Judgment::BaseUnavailable {
-        base: inc.base,
-        floor: self.deltas_from,
-      };
-    }
-    let resolved = Green::resolve(inc);
-    match self.decide(inc, &resolved) {
-      Ok(effects) => {
-        let applied = effects.iter().map(Effect::applied).collect();
-        Judgment::Accepted(Judged {
-          id: inc.id,
-          at: self.head(),
-          effects,
-          applied,
-        })
+    match self.compute(inc) {
+      Ok(computed) => self.held(computed),
+      Err(ComputeRefused::BaseUnavailable { base, floor }) => {
+        Judgment::BaseUnavailable { base, floor }
       }
-      Err(windows) => {
-        self.retain_rejected(inc.id, &windows);
+      // A base past the head names a version this green never made: unknown to it, as one below its checkpoint is,
+      // never judged as if the work were based at the head (A-658; it was until 2026-11-19).
+      Err(ComputeRefused::BaseAhead { base, .. }) => Judgment::BaseUnavailable {
+        base,
+        floor: self.deltas_from,
+      },
+    }
+  }
+
+  /// A verdict this green computed at its head, held by its owner: a conflict kept in the rejected-result cache, as a
+  /// submit keeps one.
+  fn held(&mut self, computed: Computed) -> Judgment {
+    let Computed { id, at, reached, .. } = computed;
+    match reached {
+      Reached::Before(version) => Judgment::AcceptedBefore { version },
+      Reached::Accepted { effects, applied } => Judgment::Accepted(Judged {
+        id,
+        at,
+        effects,
+        applied,
+      }),
+      Reached::Conflict(windows) => {
+        self.retain_rejected(id, &windows);
         Judgment::Conflict { windows }
       }
     }
@@ -4801,8 +4858,10 @@ impl Green {
   /// (the head's files with the work's mapped edits re-applied), and its journal restated in head
   /// coordinates, so the agent can keep editing on a fresh base and submit without further mapping.
   /// A conflict returns the windows and changes nothing; the agent resolves each window and rebases
-  /// again. The green — content, deltas and counters — is left exactly as it was.
-  pub fn rebase(&mut self, inc: &Increment) -> Rebased {
+  /// again. The green — content, deltas and counters — is left exactly as it was: a rebase is a pure function of the
+  /// versions it maps through and the work (A-658), so any copy of the green that holds them answers it as the owner
+  /// does, and a copy that has not reached the work's base answers [`Rebased::BaseAhead`].
+  pub fn rebase(&self, inc: &Increment) -> Rebased {
     if inc.base < self.deltas_from {
       return Rebased::BaseUnavailable {
         base: inc.base,
@@ -4810,6 +4869,14 @@ impl Green {
       };
     }
     let to = self.head();
+    // A base past the head is a version this green has not reached (a copy behind the work) or never made (the owner):
+    // nothing is mapped, never onto an older version (A-658; before 2026-11-19 the work came back based at the head).
+    if inc.base > to {
+      return Rebased::BaseAhead {
+        base: inc.base,
+        head: to,
+      };
+    }
     let resolved = Green::resolve(inc);
     // A journal has no copy to restate one as (A-586; owed with the deriver's copy): each copy is named, typed, and the
     // green is not judged.
@@ -4822,11 +4889,11 @@ impl Green {
           .collect(),
       };
     }
-    // The verdict shares `submit`'s decision but must not perturb the green; the only field `decide`
-    // writes is the fast-path counter (through `merge_content`), which a rebase restores.
-    let fast_path_before = self.fast_path_hits;
+    // The verdict is `submit`'s, on an immutable green; it adds to the fast-path counter (through `merge_content`),
+    // which a rebase puts back, since it merges nothing.
+    let fast_path_before = self.fast_path_hits.get();
     let decision = self.decide(inc, &resolved);
-    self.fast_path_hits = fast_path_before;
+    self.fast_path_hits.set(fast_path_before);
     match decision {
       Err(windows) => Rebased::Conflict { windows },
       Ok(effects) => self.rebased_from(effects, to),

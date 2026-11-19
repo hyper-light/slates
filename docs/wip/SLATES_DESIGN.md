@@ -11494,7 +11494,11 @@ and answering every later reply that names the version. A green keeps its own lo
 append to it, and a push of several greens' versions is one entry appended to each green it moves only while each is
 at the position the push read, kept as one atomic record those positions point to (§4.17.1 shared piece 2; A-603,
 rebuilt by A-635 per A-642). A push is judged whole before anything is applied: `Green::judge` holds each work's verdict
-and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once.
+and `Green::commit_judged` commits it at the head it was judged at, so a submit is a judgment committed at once. Since
+A-658 the verdict is `Green::compute`, a pure function of the versions a work is judged over and of the work: the owner
+judging is the owner computing at its own head, and any copy that holds those versions (a holder's replica, rebuilt from
+the chain's entries) computes the same `Computed`, which names the head it was computed against (part 2, the owner's
+commit of a result computed elsewhere by position, is owed).
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -43994,6 +43998,10 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
     increment since that position, so the hottest green's throughput is its owner's append rate, not its verdict rate.
+    (Part 1 built, A-658: `Green::compute` and `Green::rebase` read the green and change nothing, a `Computed` holds
+    nothing of the green that computed it and names the head it was computed against, and a copy lacking the versions
+    refuses typed. Owed: part 2, the owner's commit by position, judging again only the increment since; then the
+    fleet's route, a holder computing and the owner appending.)
   - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
     Native workflows keep few long-lived greens.
   - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
@@ -45914,3 +45922,43 @@ three files; `index`: marker rows; `store`: `bookmarksinstore` read; `fixtures/s
   `crates/vcs/src/content.rs` (`Form::Derived`, `put_derived`, `derived`, `DerivedNode`, `encode_derived`, the release
   cascade, `NotNameable`, `ContentCounters::derived`); `crates/vcs/src/lib.rs`; A-645's entry; §4.17.1 "Reads"; GAPS'
   §4.17 entry.
+
+### A-658 part 1 — The verdict and the rebase computed anywhere: pure functions of the versions a work is judged over (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); A-645 "Merges computed anywhere, committed by position"; §4.16 "The verdict", "Commit" and "Rebase"; after A-635 and A-642)
+
+- **What was there.** A-635 split the owner's verdict into `Green::judge`, which held a verdict at the head, and
+  `Green::commit_judged`, which committed it as the version after that head or refused `HeadMoved`. Both took the green
+  mutably: the verdict added to a statistics counter in place (`fast_path_hits`) and kept a conflict in the owner's
+  rejected-result cache, and `Green::rebase` saved and restored the counter. Only the green's owner could judge, so a
+  hot green's merges were bounded by its owner's verdict rate.
+- **The decision.** The verdict is a pure function of the versions a work is judged over (its base, the head and the
+  deltas between them, none of which changes once committed) and of the work.
+  - `Green::compute(&self, inc) -> Result<Computed, ComputeRefused>` reads the green and changes nothing. The fast-path
+    counter is a `Cell`, as `deltas_visited` already was, so only the cost counters move.
+  - A `Computed` holds nothing of the green that computed it: the increment's identity and base, the head it was
+    computed against (the position the owner checks before it appends, A-635's rule), and the verdict: accepted before
+    as a version, accepted with its effects and what the chain records of them, or the conflict windows.
+  - Any copy that holds the versions computes the same result: the owner, or a holder's replica rebuilt from the
+    chain's entries alone (`Green::apply_recorded`).
+  - Refused, typed, and neither refusal a verdict, so the caller computes on a green that holds the versions:
+    `ComputeRefused::BaseUnavailable` (the base is below the version the copy was restored at, its deltas folded away)
+    and `ComputeRefused::BaseAhead` (the base is past the copy's head, a version it has not reached).
+  - The owner's `judge` is the owner computing at its own head, its rejected-result cache around the computation, so
+    `submit`, the server's submit and A-635's push run one verdict, unchanged.
+  - `Green::rebase(&self)` is pure too, and answers `Rebased::BaseAhead` for a base past the head.
+- **A sibling found and fixed.** A work based past the owner's head was judged as if it were based at the head (each
+  op mapped through no delta) and could commit, and its rebase came back based at the head, a version older than its
+  own base. Both are refused now: the owner answers the base unknown (`Outcome::BaseUnavailable` and
+  `Judgment::BaseUnavailable`, the service's `UnknownBase`), and the rebase `Rebased::BaseAhead` (`UnknownBase` at the
+  server's `map_rebase`). The server never sent such a work, since a work's base is a version its green made, so no
+  answer on the wire changes.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`). EVIDENCE PENDING (the Studio was offline).
+- **Owed.** Part 2, the owner's commit by position (`Green::judge_computed`): the owner's caches and floor, the
+  position check, and when the green moved, judging again only what the change index names in the versions since the
+  position, held equal to the serial verdict by an oracle over generated concurrent histories. Then the fleet's route:
+  a green's holders already rebuild its versions (§4.16 "Apply on holders"), so a holder computes and the owner
+  appends; replicas kept on the shards for the purpose were measured and rejected (A-528).
+- **Applied in the same change to:** `crates/merge/src/engine.rs` (`Computed`, `ComputeRefused`, `Green::compute`,
+  `Green::judge` on it, `Rebased::BaseAhead`, the counter a `Cell`, the module docs), `crates/merge/src/lib.rs`,
+  `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
+  `crates/server/src/verbs.rs` (`map_rebase`: `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry;
+  GAPS' A-645 entry.
