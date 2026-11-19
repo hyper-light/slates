@@ -38855,3 +38855,31 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
 
 Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
 `.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
+
+### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
+Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
+`crates/server/tests/fleet.rs` (the test and its helpers beside A-583's; `assert_the_agents_changes_landed_alone` now
+takes the target it expects).
+- **What was owed.** A-503 moved a captured clone once in its lib tests, by hand. No fleet had moved one and moved it
+  on, so nothing showed the second owner holds the capture's record, nor that an old owner never serves a stale copy.
+- **The test.** `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`. Three
+  daemons at `f = 1`. Setup on a:
+  - The clone is made over A-583's captured tree, and the agent's three changes are made in it.
+  - It is snapshotted and shared with b's and c's accounts.
+  - a's catalog record's access list is read.
+  - The clone moves to b once a counts `fleet.carry.recorded`.
+
+  After each move (a to b, then b to c, through the owner's client):
+  - The new owner serves the tree whole without `/removed`. Its catalog record carries the access list a held, and its
+    status names the volume.
+  - It takes a write that changes a file's bytes (`/changed` on b, `/made` on c) and serves it.
+  - Every previous owner is asked for that file at once and again once the old owner has let its copy go. Each answer
+    must be the new bytes (forwarded) or a refusal by kind, never the bytes its own copy held.
+  - The counters must show the move: the old owner's `fleet.move.begun` and `fleet.move.released`, the new owner's
+    `fleet.move.adopted` once and `fleet.move.adoption_reported`.
+
+  Last, c lands the clone into the captured tree with an outsider's edit to `/kept`. Its plan must be the agent's
+  changes since the capture alone, and the landing must write `/changed` as b left it and `/made` as c did, the
+  outsider's file kept.
+- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
+  helper.
