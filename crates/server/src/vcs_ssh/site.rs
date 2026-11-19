@@ -4,6 +4,10 @@
 //! runs ([`Command`]). The lookup is the one record of principals' credentials both edges read (`crate::credentials`,
 //! A-625 part 3): [`RecordKeys`] leaves every key to it, and [`ToolSite`] answers by [`key_holder`] (A-651 part 3).
 //!
+//! **Where an `exec` is decided** ([`SshSite::locate`], A-651 part 4). A command that names a repository is decided on
+//! the shard whose partition its name routes to (D-14), as the HTTP edge decides a head: the edge moves the connection
+//! there first (`super`'s module doc), so the repository's record, its policy and its store are read on their own shard.
+//!
 //! **The production site** ([`ToolSite`]) decides an `exec` in A-625 part 2's order for HTTP, each refusal written to the
 //! client's standard error with its tool's own wording and exit status, as the tool's own program would refuse it:
 //! 1. The repository, for git and Mercurial, whose commands name it: the one whose name is the path as the client sent
@@ -17,11 +21,12 @@
 //!    the session. A damaged policy is refused, never judged without it.
 //! 3. The service ([`Services`]): one the server cannot start is refused as not served ([`Unserved`]), as the HTTP edge
 //!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
-//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols), which no lender does until the
-//!    lender over A-662's map of stores on their owner shards lands (A-662's owed list). Mercurial's `serve --stdio`
-//!    (`slates_hg::serve::stdio::Stdio`, A-650 part 2) waits likewise for a lender of its store;
-//!    receive-pack (A-654) and Subversion's tunnel (A-656) wait for their entry points. Each becomes a [`Command`]
-//!    behind [`Services`] as it can run, and the not-served answer goes with the last of them.
+//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols): the daemon's lender lends each
+//!    store from A-662's map on its owner shard (`crate::vcs_store::upload::ShardStores`, A-682), which the daemon hands
+//!    this site once it starts the SSH edge. Mercurial's `serve --stdio` (`slates_hg::serve::stdio::Stdio`, A-650 part
+//!    2) waits likewise for a lender of its store; receive-pack (A-654) and Subversion's tunnel (A-656) wait for their
+//!    entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the not-served answer goes with
+//!    the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
@@ -33,8 +38,7 @@ use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 use slates_vfs::clock::Clock;
 
 use super::git::UploadCommand;
-use crate::vcs_http::git::Repositories;
-use crate::vcs_http::git::StoreLender;
+use crate::vcs_http::git::{Located, Repositories, StoreLender};
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key no credential in the record has the id of (A-651 part 3).
@@ -128,6 +132,9 @@ pub(crate) trait SshSite {
   /// Who holds `key` (its blob `blob`) for `user`, when the connection's lookup could not say yet
   /// (`Holding::Unknown`): the record's answer, looked up where the record lives (A-651 part 3).
   async fn lookup(&mut self, user: &[u8], key: &UserKey, blob: &[u8]) -> Holding<Principal>;
+  /// Where the repository `command` names lives: here, or the runtime shard its connection moves to, so the `exec` is
+  /// dispatched on the shard that holds the repository (A-651 part 4). A command that names none is decided here.
+  fn locate(&self, command: &Asked) -> Located;
   /// Dispatches `command` for `principal`, with the `GIT_PROTOCOL` value sent before it.
   fn dispatch(
     &mut self,
@@ -306,7 +313,7 @@ impl<L: StoreLender + Clone> Services for ToolServices<L> {
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
         Ok(UploadCommand::new(
           self.lender.clone(),
-          repository.id,
+          (repository.id, start.principal.clone()),
           slates_git::http::version(start.git_protocol),
           self.room,
         ))
@@ -510,6 +517,15 @@ where
         Holding::Nobody
       }
     }
+  }
+
+  /// The shard of the repository the command names (the module doc): the name its path gives, located on the partition
+  /// it routes to; a command that names none (Subversion's tunnel), or a path that is no name, is decided here.
+  fn locate(&self, command: &Asked) -> Located {
+    asked(command)
+      .1
+      .and_then(repository_name)
+      .map_or(Located::Here, |name| self.repositories.locate(name))
   }
 
   fn dispatch(

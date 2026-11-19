@@ -28,6 +28,8 @@ use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps};
 use crate::replay::{SnapshotPolicy, recover};
 
+mod replica;
+
 /// Shape: the partition the tests' repositories live on.
 const HOME: u16 = 3;
 /// Shape: another partition, whose green no entry of a repository on `HOME` may take.
@@ -1734,6 +1736,12 @@ struct Census {
   recovered_from_snapshot: u64,
   /// See [`Census::recovered_from_snapshot`].
   recovered_from_log: u64,
+  /// State-log records the database handed on, each taken by the replica (A-636 part 2b).
+  state_log_records: u64,
+  /// Operations whose state-log records name two logs or more: records a takeover keeps whole or drops.
+  several_logs: u64,
+  /// Members that left their repository, destroyed, as the names log's records carry them.
+  left: u64,
 }
 
 impl Census {
@@ -1754,8 +1762,18 @@ impl Census {
     }
   }
 
-  fn met(&self) -> [u64; 12] {
+  /// Counts what one take of state-log records met.
+  fn took(&mut self, taken: replica::Taken) {
+    self.state_log_records += taken.records;
+    self.several_logs += taken.several_logs;
+    self.left += taken.left;
+  }
+
+  fn met(&self) -> [u64; 15] {
     [
+      self.state_log_records,
+      self.several_logs,
+      self.left,
       self.several_greens,
       self.interleaved_singles,
       self.state_with_versions,
@@ -1779,6 +1797,8 @@ struct History {
   model: Model,
   repo: RepositoryId,
   now_ns: u64,
+  /// A holder's copy of the state logs, built from the records the database handed on (A-636 part 2b).
+  replica: replica::Replica,
 }
 
 /// The policy a history's database snapshots by.
@@ -1814,13 +1834,29 @@ impl History {
     prop_assert_eq!(model.advance(repo, &first), Answer::Ok);
     db.mutate(&mut seg, &Op::RepositoryAdvanced { entry: first }, 0)
       .map_err(failed)?;
+    let mut replica = replica::Replica::default();
+    replica.take(db.take_state_log_records())?;
     Ok(History {
       seg,
       db,
       model,
       repo,
       now_ns: 0,
+      replica,
     })
+  }
+
+  /// The records the database handed on since the last step, taken by the replica, which must then hold every state
+  /// log as the model does (A-636 part 2b): what a successor rebuilds from the holders' copies.
+  fn replicate(&mut self, census: &mut Census) -> Result<(), TestCaseError> {
+    let taken = self.replica.take(self.db.take_state_log_records())?;
+    census.took(taken);
+    prop_assert_eq!(
+      self.replica.view(),
+      replica::StateView::of(&self.model),
+      "the state logs' records rebuild the logs"
+    );
+    Ok(())
   }
 
   fn mutate(&mut self, op: &Op) -> Answer {
@@ -1939,6 +1975,7 @@ fn every_history_equals_the_rules_and_survives_every_crash(
       "after {:?}",
       step
     );
+    history.replicate(census)?;
   }
   Ok(())
 }
@@ -1953,8 +1990,11 @@ fn every_history_equals_the_rules_and_survives_every_crash(
 /// and what it holds; the namespace and the lineage; every atomic record and the positions pointing to it) equal the
 /// design's rules kept over plain maps, where an entry is all or none by construction (Agreement), an entry made
 /// against a position its green moved past is refused naming it and nothing of it lands (StaleNeverCommits), and every
-/// recovered partition equals the live one whole (NoLoss); the census shows each kind of record, single-green appends
-/// interleaved with records, refusals, folds, destroys and recoveries were met.
+/// recovered partition equals the live one whole (NoLoss); a holder's copy of the state logs built from the records the
+/// database handed on, each continuing its log and naming its operation alike on every log, equals the model's state
+/// logs after every step (A-636 part 2b: what a successor rebuilds from); the census shows each kind of record,
+/// single-green appends interleaved with records, refusals, folds, destroys and recoveries, state-log records, records
+/// of several logs and members leaving were met.
 #[test]
 fn every_history_of_entries_equals_the_rules_and_every_crash_recovers_it() {
   let census = RefCell::new(Census::default());
@@ -1969,8 +2009,214 @@ fn every_history_of_entries_equals_the_rules_and_every_crash_recovers_it() {
     panic!("{failure}");
   }
   let census = census.into_inner();
+  println!("entry model census {census:?}");
   assert!(
     census.met().iter().all(|&count| count > 0),
     "a kind of step never met: {census:?}"
   );
+}
+
+/// The record of `log` among `records`, if one is.
+fn record_of(
+  records: &[crate::catalog::StateLogRecord],
+  log: StateLog,
+) -> Option<&crate::catalog::StateLogRecord> {
+  records.iter().find(|record| record.log == log)
+}
+
+/// `record`'s log, span and changes, as the test names them.
+fn spanned(record: &crate::catalog::StateLogRecord) -> (StateLog, u64, u64, usize) {
+  (record.log, record.from, record.to, record.changes.len())
+}
+
+/// A-636 part 2b (§4.17.1 shared piece 2, the fleet half). Do: on a repository whose first entry joined three greens and
+/// bound three names, take the records each operation made: that entry's; a push of two greens' versions with a name
+/// retired, a phase root, a marker and a lock; a name bound alone; the default moved alone; a member's version alone; a
+/// member destroyed; and a lock released alone. Expect: the first entry one record of the names log, 0 to 6, its joins
+/// then its binds; the push one record of each state log it moved, in log order, each continuing its log, all naming
+/// one identity and every span the push moved, its two greens' included; each change alone one record of its log naming
+/// that operation alone; the version alone none; the destroy one record of the names log, the member leaving; and no
+/// two operations naming one identity.
+#[test]
+fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
+  use crate::catalog::LoggedChange;
+  let (mut partition, repo, [a, b, c, ..]) = three_branches(caps(ROOMY));
+  let first = partition.take_state_log_records();
+  assert_eq!(
+    first.iter().map(spanned).collect::<Vec<_>>(),
+    vec![(StateLog::Names, 0, 6, 6)]
+  );
+  assert_eq!(
+    first[0].spans,
+    vec![span(state_log(repo, StateLog::Names), 0, 6)]
+  );
+  assert!(matches!(
+    first[0].changes.as_slice(),
+    [
+      LoggedChange::Joined { .. },
+      _,
+      _,
+      LoggedChange::Named { .. },
+      _,
+      _
+    ]
+  ));
+  let mut push = at(repo);
+  push.versions = vec![version(a, 1, b"a1"), version(b, 1, b"b1")];
+  push.names = vec![retire("other")];
+  push.state = vec![root_added(1, 7), marker(b"m"), locked("p", b"l")];
+  advance(&mut partition, push).unwrap();
+  let pushed = partition.take_state_log_records();
+  assert_a_push_names_itself_on_every_log_it_moved(&pushed, repo, [a, b]);
+  let mut identities: BTreeSet<[u8; 32]> = [first[0].identity, pushed[0].identity].into();
+  let bound = Op::RepositoryBranchAdded {
+    record: crate::catalog::BranchRecord {
+      repository: repo,
+      name: "other".to_owned(),
+      green: c,
+    },
+  };
+  let default = Op::RepositoryDefaultSet {
+    repository: repo,
+    branch: Some("topic".to_owned()),
+  };
+  for (op, expected) in [
+    (bound, (StateLog::Names, 7, 8, 1)),
+    (default, (StateLog::Names, 8, 9, 1)),
+    (Op::VolumeDestroyed { id: c }, (StateLog::Names, 9, 10, 1)),
+  ] {
+    run(&mut partition, &op).unwrap();
+    let records = partition.take_state_log_records();
+    assert_eq!(
+      records.iter().map(spanned).collect::<Vec<_>>(),
+      vec![expected]
+    );
+    assert!(identities.insert(records[0].identity), "{op:?}");
+  }
+  run(
+    &mut partition,
+    &Op::GreenAdvanced {
+      green: a,
+      increment: b"a2".to_vec(),
+    },
+  )
+  .unwrap();
+  assert!(
+    partition.take_state_log_records().is_empty(),
+    "a version alone moves no state log"
+  );
+  let mut release = at(repo);
+  release.state = vec![unlocked("p", b"l")];
+  advance(&mut partition, release).unwrap();
+  let released = partition.take_state_log_records();
+  assert_eq!(
+    released.iter().map(spanned).collect::<Vec<_>>(),
+    vec![(StateLog::Locks, 1, 2, 1)]
+  );
+  assert!(identities.insert(released[0].identity));
+}
+
+/// The push of [`each_operation_records_what_it_moved_of_each_state_log_named_alike`]: one record of each state log it
+/// moved, in log order, each its log's changes alone, all naming the push's identity and its every span.
+fn assert_a_push_names_itself_on_every_log_it_moved(
+  pushed: &[crate::catalog::StateLogRecord],
+  repo: RepositoryId,
+  [a, b]: [VolumeId; 2],
+) {
+  assert_eq!(
+    pushed.iter().map(spanned).collect::<Vec<_>>(),
+    vec![
+      (StateLog::Names, 6, 7, 1),
+      (StateLog::Phases, 0, 1, 1),
+      (StateLog::Markers, 0, 1, 1),
+      (StateLog::Locks, 0, 1, 1),
+    ]
+  );
+  let spans = vec![
+    span(green_log(a), 0, 1),
+    span(green_log(b), 0, 1),
+    span(state_log(repo, StateLog::Names), 6, 7),
+    span(state_log(repo, StateLog::Phases), 0, 1),
+    span(state_log(repo, StateLog::Markers), 0, 1),
+    span(state_log(repo, StateLog::Locks), 0, 1),
+  ];
+  for record in pushed {
+    assert_eq!(record.spans, spans, "{record:?}");
+    assert_eq!(record.identity, pushed[0].identity, "{record:?}");
+  }
+  assert_eq!(
+    record_of(pushed, StateLog::Phases).map(|record| record.changes.clone()),
+    Some(vec![crate::catalog::LoggedChange::Changed {
+      change: root_added(1, 7)
+    }])
+  );
+}
+
+/// A-636 part 2b with AC-2.3's two failure classes. Do: through a database over a real segment, record a name bound
+/// alone; then in a transaction a name retired whose record the segment refuses (it rolls back); then the same in a
+/// transaction that commits. Expect: the database hands on the lone change's record once; nothing of the rolled-back
+/// transaction, ever; and the committed transaction's record once, after its commit, none before it.
+#[test]
+fn a_transactions_state_log_records_go_on_only_once_it_is_durable() {
+  let mut seg = segment(&format!("slates-db-a636-{}", std::process::id()));
+  let (mut db, _) = recover(&mut seg, 0, caps(ROOMY), 0).unwrap();
+  let [a, b] = [volume_of(0), volume_of(1)];
+  for id in [a, b] {
+    let record = volume(id, true);
+    db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+  }
+  let record = repository(9, "linux");
+  let repo = record.id;
+  db.mutate(&mut seg, &Op::RepositoryCreated { record }, 0)
+    .unwrap();
+  let mut first = at(repo);
+  first.joined = vec![
+    member(repo, a, MemberOrigin::Root),
+    member(
+      repo,
+      b,
+      MemberOrigin::Branch {
+        from: a,
+        version: 0,
+      },
+    ),
+  ];
+  first.names = vec![bind("main", a), bind("topic", b)];
+  db.mutate(&mut seg, &Op::RepositoryAdvanced { entry: first }, 0)
+    .unwrap();
+  let alone = db.take_state_log_records();
+  assert_eq!(
+    alone.iter().map(spanned).collect::<Vec<_>>(),
+    vec![(StateLog::Names, 0, 4, 4)]
+  );
+  assert!(db.take_state_log_records().is_empty(), "handed on once");
+  let retired = Op::RepositoryBranchRetired {
+    repository: repo,
+    name: "topic".to_owned(),
+  };
+  db.begin();
+  db.mutate(&mut seg, &retired, 0).unwrap();
+  db.inject_publication_fault(Some(crate::replay::PublicationFault::BeforeAppend));
+  assert!(
+    db.commit(&mut seg).is_err(),
+    "the segment refused the record"
+  );
+  assert!(
+    db.take_state_log_records().is_empty(),
+    "nothing of a rolled-back transaction"
+  );
+  db.begin();
+  db.mutate(&mut seg, &retired, 0).unwrap();
+  assert!(
+    db.take_state_log_records().is_empty(),
+    "nothing before the commit"
+  );
+  db.commit(&mut seg).unwrap();
+  let committed = db.take_state_log_records();
+  assert_eq!(
+    committed.iter().map(spanned).collect::<Vec<_>>(),
+    vec![(StateLog::Names, 4, 5, 1)]
+  );
+  assert!(db.take_state_log_records().is_empty(), "handed on once");
 }

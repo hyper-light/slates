@@ -139,7 +139,7 @@ const AGENT: &[u8] = slates_git::upload::AGENT.as_bytes();
 const PUSH_NAME_CONTEXT: &str = "slates 2026-11-19 git push name (A-654)";
 
 /// Format: a branch's ref is this and its namespace name (module docs).
-const HEADS: &str = "refs/heads/";
+pub(crate) const HEADS: &str = "refs/heads/";
 
 /// Format: every other ref a namespace name can be begins with this (git's `check_refname_format` for a pushed ref).
 const REFS: &str = "refs/";
@@ -572,8 +572,10 @@ fn advertised_refs(state: &ShardState, repository: RepositoryId) -> Vec<(ObjectI
   refs
 }
 
-/// The ref the namespace name `name` is (module docs): none for a name that is no git ref.
-fn ref_of(name: &str) -> Option<Vec<u8>> {
+/// The ref the namespace name `name` is (module docs): none for a name that is no git ref. A new repository's default
+/// branch is held to it too (`repository::root_binding`, A-685), and upload-pack's lender names the refs it lends by
+/// the same rule (`crate::vcs_store::upload`, A-682), so both services see one ref a name.
+pub(crate) fn ref_of(name: &str) -> Option<Vec<u8>> {
   if name.starts_with(HEADS) {
     return None;
   }
@@ -639,8 +641,10 @@ fn keyed(state: &ShardState, repository: RepositoryId, key: u64) -> Option<DbVol
 }
 
 /// The refs a pusher may not read under its repository's policy (module docs, "What is advertised"; A-622's Read).
+/// upload-pack's lender hides the same refs from its reader by it (`crate::vcs_store::upload`, A-682), so a ref is
+/// hidden alike from both services.
 #[derive(Clone, Debug)]
-struct PolicyHidden {
+pub(crate) struct PolicyHidden {
   /// The policy the push started under, compiled.
   policy: Compiled,
   /// The repository's record it was read from: its owner holds what no rule grants.
@@ -651,7 +655,10 @@ struct PolicyHidden {
 
 impl PolicyHidden {
   /// What `record`'s policy hides from `principal`; refused for a policy git's matcher cannot read.
-  fn of(record: &RepositoryRecord, principal: &Principal) -> Result<PolicyHidden, PushRefusal> {
+  pub(crate) fn of(
+    record: &RepositoryRecord,
+    principal: &Principal,
+  ) -> Result<PolicyHidden, PushRefusal> {
     Ok(PolicyHidden {
       policy: Compiled::of(record)?,
       record: record.clone(),

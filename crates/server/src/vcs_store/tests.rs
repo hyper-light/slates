@@ -49,7 +49,7 @@ const DEEP: u64 = 2;
 const FORMAT: ObjectFormat = ObjectFormat::Sha1;
 
 /// Format: the first committer date the histories use, seconds since the epoch.
-const FIRST_DATE: u64 = 1_700_000_000;
+pub(super) const FIRST_DATE: u64 = 1_700_000_000;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Objects as git writes them.
@@ -1511,5 +1511,59 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).expect("a record");
     assert_eq!(read.moves, vec![(key, 1, Some(head))]);
+  });
+}
+
+/// The files of the map the store holds for `green`, a green of `repository`, when it is of `version` (A-664 part 3).
+fn kept_files(
+  state: &ShardState,
+  repository: RepositoryId,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<BTreeMap<Vec<u8>, slates_vcs::derived::paths::Entry>> {
+  let (content, git) = state.vcs_stores.git_ref(repository)?;
+  let paths = git.paths.as_ref()?;
+  let head = git
+    .heads
+    .get(&green_key(green))
+    .filter(|head| head.version == version)?;
+  paths.files(content, head.root).ok()
+}
+
+/// A-664 part 3 (its first piece: a push's version keeps its map of paths to git's files, as a submit's does). Do: push
+/// a commit of two files to a git repository's root green through A-635's append. Expect: the green's new version keeps
+/// a map holding both, each a regular file whose content is its blob's bytes as an object, built whole (the green's
+/// first version) and none refused.
+#[test]
+fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = repository(state, "pushed", VcsTool::Git);
+    let (a, a_bytes) = blob(b"alpha\n");
+    let (b, b_bytes) = blob(b"beta\n");
+    let (tree_id, tree_bytes) = tree(&[(b"a".to_vec(), a), (b"b".to_vec(), b)]);
+    let (head, commit_bytes) = commit(tree_id, &[], FIRST_DATE);
+    let objects: Vec<Brought> = vec![
+      (Kind::Blob, a, a_bytes.clone()),
+      (Kind::Blob, b, b_bytes.clone()),
+      (Kind::Tree, tree_id, tree_bytes),
+      (Kind::Commit, head, commit_bytes),
+    ];
+    let version = push_through(state, (repository, green), &objects, (None, head, tree_id));
+    let files = kept_files(state, repository, green, version).expect("the version's map");
+    let content = state.vcs_stores.content().expect("the content store");
+    let file = |bytes: &[u8]| slates_vcs::derived::paths::Entry {
+      class: slates_git::derived::FileClass::File.class(),
+      content: content.object_id(bytes),
+    };
+    let expected = BTreeMap::from([
+      (b"a".to_vec(), file(&a_bytes)),
+      (b"b".to_vec(), file(&b_bytes)),
+    ]);
+    assert_eq!(files, expected);
+    let counted = |name: &str| state.refusals.get(name).copied();
+    assert_eq!(
+      (counted(super::paths::BUILT), counted(super::paths::REFUSED)),
+      (Some(1), None)
+    );
   });
 }
