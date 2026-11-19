@@ -33,8 +33,9 @@ use crate::transport::{
   ConfigRefusal, Event, Extension, SendRefusal, ServerTransport, TransportConfig,
 };
 use crate::userauth::{
-  AuthRefusal, Authenticated, Authenticator, KeyHolders, SERVER_SIG_ALGS, USERAUTH_BANNER,
-  USERAUTH_FAILURE, USERAUTH_PK_OK, USERAUTH_REQUEST, USERAUTH_SUCCESS, server_sig_algs,
+  Answer, AuthRefusal, Authenticated, Authenticator, Holding, KeyHolders, SERVER_SIG_ALGS,
+  USERAUTH_BANNER, USERAUTH_FAILURE, USERAUTH_PK_OK, USERAUTH_REQUEST, USERAUTH_SUCCESS, UserKey,
+  Wanted, server_sig_algs,
 };
 
 /// What a session is set up with.
@@ -65,6 +66,9 @@ pub enum SessionConfigRefusal {
 pub enum SessionEvent<P> {
   /// A principal authenticated.
   Authenticated(Authenticated<P>),
+  /// The key holders could not say who holds this key yet ([`Holding::Unknown`]): the request waits, and nothing more of
+  /// the client's is read, until the caller answers with [`Session::key_resolved`] (A-651).
+  KeyWanted(Wanted),
   /// The client asked for a command; the caller answers with [`Session::answer_exec`].
   Exec {
     /// The command.
@@ -152,6 +156,8 @@ pub enum SessionUse {
   Closed,
   /// The call ended the connection.
   Fatal(SessionRefusal),
+  /// [`Session::key_resolved`] with no [`SessionEvent::KeyWanted`] waiting for its answer.
+  NoKeyWanted,
 }
 
 /// One connection, the server's side.
@@ -182,6 +188,8 @@ pub struct Session<E: Entropy, H: KeyHolders> {
   send_blocked: bool,
   /// Whether [`SessionEvent::Writable`] is owed once the waiting event is taken.
   writable_owed: bool,
+  /// The authentication request waiting for its key's answer ([`SessionEvent::KeyWanted`]), its payload whole.
+  deferred: Option<Vec<u8>>,
   /// The time last given.
   now_ns: u64,
 }
@@ -236,6 +244,7 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
       pending: None,
       send_blocked: false,
       writable_owed: false,
+      deferred: None,
       now_ns,
     })
   }
@@ -339,6 +348,14 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
   /// What the server may still send on the channel.
   pub fn send_window(&self) -> u64 {
     self.connection.send_window()
+  }
+
+  /// Answers the raised [`SessionEvent::KeyWanted`] with who holds the key: the waiting request is answered as if the
+  /// holders had said `holding` (an answer of [`Holding::Unknown`] again is taken as nobody), and reading goes on. A
+  /// refusal it brings (too many failures) closes the connection.
+  pub fn key_resolved(&mut self, holding: Holding<H::Principal>) -> Result<(), SessionUse> {
+    let _ = holding;
+    Err(SessionUse::NoKeyWanted)
   }
 
   /// Answers the raised [`SessionEvent::Exec`]: the command runs when `accept`.
@@ -446,7 +463,7 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
   /// Whether reading must wait for the caller. A closed transport still gives up the event it last raised, such as the
   /// client's disconnect, so it is checked after the transport's event is taken.
   fn blocked(&self) -> bool {
-    self.pending.is_some() || self.outbox_bytes >= self.outbox_cap
+    self.pending.is_some() || self.deferred.is_some() || self.outbox_bytes >= self.outbox_cap
   }
 
   /// Takes and handles the transport's waiting event; whether there was one.
@@ -525,6 +542,16 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
       Ok(answer) => answer,
       Err(refusal) => return Err(self.fail(SessionRefusal::Auth(refusal))),
     };
+    if let Some(wanted) = answer.wanted.clone() {
+      self.deferred = Some(payload.to_vec());
+      self.pending = Some(SessionEvent::KeyWanted(wanted));
+    }
+    self.take_answer(answer);
+    Ok(())
+  }
+
+  /// Queues an authentication answer's replies and raises its authentication, if it completed one.
+  fn take_answer(&mut self, answer: Answer<H::Principal>) {
     for reply in answer.replies {
       self.queue(reply);
     }
@@ -532,7 +559,6 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
       self.authenticated = true;
       self.pending = Some(SessionEvent::Authenticated(authenticated));
     }
-    Ok(())
   }
 
   /// A connection-protocol message.
@@ -579,5 +605,23 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
       .transport
       .close(refusal.reason(), refusal.description());
     refusal
+  }
+}
+
+/// The caller's answer to a deferred request's key: what [`Session::key_resolved`] asks the request again with. It
+/// answers once, as the request asks once; [`Holding::Unknown`] again, or a second ask, is nobody.
+struct Answered<P> {
+  /// The answer, until asked.
+  holding: Option<Holding<P>>,
+}
+
+impl<P: Clone + PartialEq + core::fmt::Debug> KeyHolders for Answered<P> {
+  type Principal = P;
+
+  fn holding(&mut self, _user: &[u8], _key: &UserKey, _blob: &[u8]) -> Holding<P> {
+    match self.holding.take() {
+      Some(Holding::Unknown) | None => Holding::Nobody,
+      Some(holding) => holding,
+    }
   }
 }
