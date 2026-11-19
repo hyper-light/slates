@@ -36,12 +36,12 @@ pub(crate) trait StoreLender {
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
 
-  /// Runs `step` over repository `id`'s store as upload-pack answers a request of `reader`, with the pack source: the refs
-  /// `reader` may read, in name order and each once, and the branch `HEAD` names, read as the step runs; none when the
-  /// store is not held here.
+  /// Runs `step` over the store of the repository `asked` names as upload-pack answers a request of the principal it
+  /// names, with the pack source: the refs that principal may read, in name order and each once, and the branch `HEAD`
+  /// names, read as the step runs; none when the store is not held here.
   fn lend<R>(
     &mut self,
-    (id, reader): (RepositoryId, &Principal),
+    asked: (RepositoryId, &Principal),
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
 
