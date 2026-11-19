@@ -36546,6 +36546,7 @@ Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-
 - **Test.** `a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one` (`base.rs`' unit tests):
   a base file opened as a mount's `OPEN` does, then its path digested with an outsider's replacement landing at each
   seam call of the digest in turn, a scene each, until one lands after the digest. Each landing must leave the handle
-  reading the file it opened, the digest naming the outsider's file or refused `DigestUnverified`, the name a new inode,
-  and at least one landing must reach `verify_current`'s identity check (`replaced` moved).
+  reading the file it opened, the digest naming the outsider's file (or the opened one where the replacement landed
+  after the digest's last check) or refused `DigestUnverified`, never torn bytes, the name a new inode, and at least one
+  landing must reach `verify_current`'s identity check (`replaced` moved).
 

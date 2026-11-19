@@ -4786,14 +4786,15 @@ mod tests {
   /// digest that finds another file at its name leaves the inode on its file and digests the name's new entry. Do: open a
   /// base file, then digest its path with an outsider's replacement of the file landing at each seam call of the digest
   /// in turn, each in a scene of its own, until one lands after the digest. Expect, wherever it landed: the open handle
-  /// still reading the file it opened; the digest naming the outsider's file, or refused `DigestUnverified` when the
-  /// file changed under the hash, never the file it replaced; the name a new inode; and at least one landing between the
-  /// listing's check and the fresh open, the race only `verify_current` sees (its count, `replaced`, moved). Before, that
-  /// race pointed the inode at the outsider's file, so the handle read bytes it never opened and the name kept the old
-  /// number.
+  /// still reading the file it opened; the digest naming the outsider's file, or the opened one where the replacement
+  /// landed after the digest's last check, or refused `DigestUnverified` when the file changed under the hash, never
+  /// torn bytes; the name a new inode; and at least one landing between the listing's check and the fresh open, the race
+  /// only `verify_current` sees (its count, `replaced`, moved). Before, that race pointed the inode at the outsider's
+  /// file, so the handle read bytes it never opened and the name kept the old number.
   #[test]
   fn a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one() {
     let outsider = *blake3::hash(OUTSIDER).as_bytes();
+    let opened = *blake3::hash(OPENED).as_bytes();
     let mut raced = 0u64;
     let mut reached = 0u64;
     for call in 0..CALLS {
@@ -4809,8 +4810,11 @@ mod tests {
         "landing at call {call}: the open handle reads the file it opened: {seen:?}"
       );
       assert!(
-        seen.digest == Ok(outsider) || seen.digest == Err(VfsError::DigestUnverified),
-        "landing at call {call}: the digest names the name's file now, or is refused: {seen:?}"
+        seen.digest == Ok(outsider)
+          || seen.digest == Ok(opened)
+          || seen.digest == Err(VfsError::DigestUnverified),
+        "landing at call {call}: the digest names the file at the name before or after the replacement, never \
+         torn bytes, or is refused: {seen:?}"
       );
       assert!(
         seen.renamed,
