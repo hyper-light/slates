@@ -920,6 +920,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
+> - **Fixed (2026-11-18, A-490): a Windows runner can read its nameservers.** Its manifest trusts kiln's CA as a root,
+>   so its start reads the host's nameservers (a peer enrolled under the root may announce a name), and the reader
+>   knew only `/etc/resolv.conf`, which Windows lacks: every Windows runner was refused at `check_fleet`. Windows now
+>   reads the DNS servers of its network adapters that are up and have a gateway (`role/fleet/windows_dns.rs`, Go's
+>   rule), judged by a cfg-free function unit-tested on every host (the bug record of 2026-11-18). Owed: a Windows
+>   node's live start on a manifest with a root (filed for main's Windows lanes).
 > - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
 >   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
 >   target's runner mounting the moved volume under its own place once its new owner serves it. The live move across
@@ -2244,11 +2250,18 @@
 >   `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (`crates/server/src/daemon.rs`);
 >   kiln r41 (Mac Studio), each red: the model with the tolerance unjudged, the server with every or no unasked copy
 >   covered.
->   **Still owed:** a copy first judged on a completion record (the last successor to confirm completes the takeover
->   in the version that records it) or past tolerance is kept, `fleet.takeover.kept_unasked`: the completion record
->   keeps no neighbourhood to judge by. Owed: the completion record keeps the retired host's settled neighbourhood (and
->   its carried retirements'), so a holder judges its object's cohorts there too; and the settle-based rule above for a
->   live owner.
+>   **Fixed (A-484, g250, 2026-11-18): a copy first judged on a completion record, and a hole in A-341's rule.** The
+>   record keeps the settled neighbourhoods its takeover recovered through and the hosts that stayed members through it
+>   (regional layout 5), so a copy first judged once the takeover completed is judged as on the retirement. And the
+>   takeover judged is the first since the copy was written, its writer's (`Acceptor::written_by`,
+>   `RegionalConfiguration::copy_stale`), not the last in its line: A-341 let a copy go at a later takeover within
+>   tolerance though the writer's had been past tolerance and its successor confirmed without learning the object,
+>   possibly the object's last copy (found by reading; bug record of 2026-11-18). Only survivors still members count,
+>   so a cohort host admitted again under its id no longer makes a cohort look within tolerance. Tests:
+>   `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover` (red before) and the A-341 test
+>   (`crates/server/src/daemon.rs`), four register tests, the lineage model. Kept still, counted: a copy whose writer
+>   this process cannot know (its acceptor rebuilt from an image after an install moved it) and an unasked copy of a
+>   moved object. **Still owed:** the settle-based rule above for a live owner.
 > - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
 >   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
 >   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
@@ -3926,7 +3939,14 @@
 >   client while the client's connection lives (`an_offer_waits_for_its_live_clients_claim_past_any_fixed_life`,
 >   `an_exchange_serves_a_live_client_slower_than_any_fixed_bound`,
 >   `a_retired_clients_offers_are_let_go_and_their_ends_closed`); owed: a cross-process test of a client killed before
->   its claim. Class B (the
+>   its claim. C-c's second part since A-493 (2026-11-19, g232): a `UMNT`'s watch of the kernel's mount table gave up
+>   after a fixed second (`UNMOUNT_CONFIRM_NS`); it now waits the pace its shard learned of the kernel's unmounts (the
+>   told waits' learner: the completed confirmations' tail plus the liveness window, backed off after one that ran out,
+>   never past the failover delay), so a loaded host's genuine unmount is confirmed and a forged `UMNT` backs the bound
+>   off (`a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace`,
+>   `a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off`); `nfs::routed` already waited in the
+>   name shard's own time (A-408); owed: a confirmation that ran out keeps its attachment though the mount leaves later
+>   (a watch of the kernel's unmount events would end it then). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -4554,9 +4574,11 @@
 > that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
 > learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
 > `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
-> fleet test's runs are filed for main. **Open:** the converse. An asker behind its peers' root is refused with an empty
-> reply that tells it nothing, so it needs a refusal that names the peer's version: a reply format change (SLATES_DESIGN
-> A-489, owed). Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
+> fleet test's runs are filed for main. **The converse, closed the same day (A-504):** an asker behind its peers' root was
+> refused with an empty reply that told it nothing. A refusal now names the root its peer holds, so the asker counts
+> itself behind (`fleet.owner_location.asker_behind`), its root learner fetches from that peer, and each look asks under
+> the root the asker holds then. Regression: `a_behind_askers_round_is_answered_after_one_fetch`, red with the refusal
+> sent empty as before. Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
