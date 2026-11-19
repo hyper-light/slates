@@ -406,6 +406,7 @@ fn an_edit_and_submit_retried_across_a_restart_answers_its_record_once() {
       bytes: b"XY".to_vec(),
     },
     evidence: Vec::new(),
+    authorship: Default::default(),
   };
   let id = client.begin(&request).unwrap();
   committed_unread(&mut client, &instance, (green, 2), id);

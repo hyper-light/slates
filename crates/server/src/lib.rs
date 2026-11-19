@@ -84,6 +84,7 @@ mod held_copy;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
+mod identities;
 mod image;
 pub mod landing;
 mod landing_entries;

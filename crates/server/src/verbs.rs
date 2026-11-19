@@ -278,9 +278,16 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// partition's to keep (§4.8 "Lookup": ids route to owners; no global index). The same
 /// function on every restart, so a recovered partition still owns its names.
 pub fn owner_of_name(name: &str, partitions: usize) -> u16 {
+  owner_of_key(name.as_bytes(), partitions)
+}
+
+/// The partition that owns a record keyed by `key`'s bytes, as [`owner_of_name`] places a name: the same stable hash
+/// over the same partitions, read from the bytes themselves, so a binary key (a principal's, A-664) routes without
+/// being made text first.
+pub(crate) fn owner_of_key(key: &[u8], partitions: usize) -> u16 {
   let mut hash = FNV_OFFSET;
-  for byte in name.bytes() {
-    hash ^= u64::from(byte);
+  for byte in key {
+    hash ^= u64::from(*byte);
     hash = hash.wrapping_mul(FNV_PRIME);
   }
   let count = u64::try_from(partitions.max(1)).unwrap_or(u64::MAX);
@@ -2384,6 +2391,21 @@ fn serve_on_channel(
       proof,
     ));
   }
+  if let RequestBody::SetIdentities {
+    principal: subject,
+    identities,
+    read,
+    proof,
+  } = body
+  {
+    return Break(crate::identities::set_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      (subject, identities, read),
+      proof,
+    ));
+  }
   if let RequestBody::Policy {
     subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
   } = body
@@ -2504,35 +2526,49 @@ pub fn serve(
     Ok(body) => body,
     Err(refusal) => return Served::Reply(record_completion(state, origin, id, refused(refusal))),
   };
+  let key = (origin, id, client_id);
+  // A-664: a submit carries its session's identities, read once, at the session's first submit (`crate::identities`).
+  let body = match crate::identities::with_session(
+    state,
+    client,
+    (request.request, key),
+    &principal,
+    body,
+  ) {
+    std::ops::ControlFlow::Continue(body) => body,
+    std::ops::ControlFlow::Break(served) => return served,
+  };
+  route_gated(state, client, request.request, key, principal, body)
+}
+
+/// Routes a request that passed its channel's gates (`serve`): the scatters and the consensus verbs on their own, an
+/// attach of another host's volume remembered, a foreign-home verb forwarded, a verb another partition owns forwarded
+/// to its shard, and the rest served here. A submit that waited for its session's identities resumes here (A-664).
+pub(crate) fn route_gated(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  request: u64,
+  (origin, id, client_id): (u64, RequestId, u32),
+  principal: Principal,
+  body: RequestBody,
+) -> Served {
   if let RequestBody::List { after } = body {
-    return scatter_list(state, client.index(), request.request, principal, after);
+    return scatter_list(state, client.index(), request, principal, after);
   }
   if let RequestBody::Grants { after } = body {
-    return scatter_grants(state, client.index(), request.request, principal, after);
+    return scatter_grants(state, client.index(), request, principal, after);
   }
   if matches!(
     &body,
     RequestBody::Bootstrap { .. } | RequestBody::RecoveryPlan { .. } | RequestBody::Recover { .. }
   ) {
-    return serve_consensus_control(state, client.index(), request.request, principal, body);
+    return serve_consensus_control(state, client.index(), request, principal, body);
   }
   if let RequestBody::PromoteRegion { region } = body {
-    return promote_region_on_root(
-      state,
-      client.index(),
-      request.request,
-      region,
-      principal.clone(),
-    );
+    return promote_region_on_root(state, client.index(), request, region, principal.clone());
   }
   if let RequestBody::Acknowledge { up_to, owed } = body {
-    return scatter_acknowledge(
-      state,
-      client.index(),
-      request.request,
-      client_id,
-      (up_to, owed),
-    );
+    return scatter_acknowledge(state, client.index(), request, client_id, (up_to, owed));
   }
   // An attach of another host's volume is remembered with its client here, on the client's own shard, before it is
   // sent anywhere, so the client's reap reaches the owner (A-222).
@@ -2549,15 +2585,7 @@ pub fn serve(
     && let Some(region) = homed_elsewhere(state, volume)
   {
     if is_forwardable_read(&body) || is_forwardable_write(&body) {
-      return forward_to_owner(
-        state,
-        client,
-        request.request,
-        principal,
-        region,
-        volume,
-        body,
-      );
+      return forward_to_owner(state, client, request, principal, region, volume, body);
     }
     return Served::Reply(record_completion(
       state,
@@ -2609,7 +2637,7 @@ pub fn serve(
     return forward(
       state,
       client.index(),
-      request.request,
+      request,
       client_id,
       principal,
       body,
@@ -2619,7 +2647,7 @@ pub fn serve(
   serve_here(
     state,
     client,
-    request.request,
+    request,
     (origin, id, client_id),
     principal,
     body,
@@ -4594,6 +4622,8 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::StaleEpoch { .. } => "stale_epoch",
     Refusal::AttachmentUnsupported { .. } => "attachment_unsupported",
     Refusal::ChosenPathUnavailable { .. } => "chosen_path_unavailable",
+    Refusal::MessageRequired => "message_required",
+    Refusal::IdentityRequired { .. } => "identity_required",
   }
 }
 
@@ -4856,18 +4886,27 @@ fn dispatch_inner(
       bytes,
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
-    RequestBody::Submit { work, evidence } => {
-      submit(state, principal, work, (evidence, None), Approval::None)
-    }
-    RequestBody::SubmitSigned {
+    RequestBody::Submit {
       work,
       evidence,
-      signature,
+      authorship,
     } => submit(
       state,
       principal,
       work,
-      (evidence, Some(signature)),
+      (evidence, None, authorship),
+      Approval::None,
+    ),
+    RequestBody::SubmitSigned {
+      work,
+      evidence,
+      signature,
+      authorship,
+    } => submit(
+      state,
+      principal,
+      work,
+      (evidence, Some(signature), authorship),
       Approval::None,
     ),
     RequestBody::SubmitApproved {
@@ -4876,10 +4915,11 @@ fn dispatch_inner(
       identity,
       proof,
       signature,
+      authorship,
     } => submit_approved(
       state,
       principal,
-      (work, evidence, signature),
+      (work, evidence, signature, authorship),
       identity,
       proof,
     ),
@@ -4890,6 +4930,7 @@ fn dispatch_inner(
       delete_len,
       insert,
       evidence,
+      authorship,
     } => edit_and_submit(
       state,
       principal,
@@ -4900,7 +4941,7 @@ fn dispatch_inner(
         delete_len,
         insert,
       },
-      (evidence, false),
+      (evidence, false, authorship),
     ),
     RequestBody::EditSubmitHeld {
       work,
@@ -4909,6 +4950,7 @@ fn dispatch_inner(
       delete_len,
       insert,
       evidence,
+      authorship,
     } => edit_and_submit(
       state,
       principal,
@@ -4919,17 +4961,18 @@ fn dispatch_inner(
         delete_len,
         insert,
       },
-      (evidence, true),
+      (evidence, true, authorship),
     ),
     RequestBody::SubmitHeld {
       work,
       evidence,
       signature,
+      authorship,
     } => submit(
       state,
       principal,
       work,
-      (evidence, signature),
+      (evidence, signature, authorship),
       Approval::Held,
     ),
     RequestBody::SetSigners {
@@ -5278,6 +5321,9 @@ fn dispatch_inner(
     RequestBody::Attest { .. } | RequestBody::Revoke { .. } => refused(Refusal::BadRequest {
       reason: "attest and revoke are served on the channel".to_owned(),
     }),
+    RequestBody::SetIdentities { .. } => refused(Refusal::BadRequest {
+      reason: "set identities is served on the channel".to_owned(),
+    }),
   }
 }
 
@@ -5399,22 +5445,27 @@ fn consumer_gate(
       state.count("policy_forbids.merge", 1);
       Err(forbids(WriteAct::Merge))
     }
-    RequestBody::Submit { work, evidence } if policy.merge == WriteMode::Ask => {
-      Ok(RequestBody::SubmitHeld {
-        work,
-        evidence,
-        signature: None,
-      })
-    }
+    RequestBody::Submit {
+      work,
+      evidence,
+      authorship,
+    } if policy.merge == WriteMode::Ask => Ok(RequestBody::SubmitHeld {
+      work,
+      evidence,
+      signature: None,
+      authorship,
+    }),
     // A signed merge is held as an unsigned one is, its signature kept for the approval request (A-321).
     RequestBody::SubmitSigned {
       work,
       evidence,
       signature,
+      authorship,
     } if policy.merge == WriteMode::Ask => Ok(RequestBody::SubmitHeld {
       work,
       evidence,
       signature: Some(signature),
+      authorship,
     }),
     RequestBody::EditSubmit {
       work,
@@ -5423,6 +5474,7 @@ fn consumer_gate(
       delete_len,
       insert,
       evidence,
+      authorship,
     } if policy.merge == WriteMode::Ask => Ok(RequestBody::EditSubmitHeld {
       work,
       path,
@@ -5430,6 +5482,7 @@ fn consumer_gate(
       delete_len,
       insert,
       evidence,
+      authorship,
     }),
     other => Ok(other),
   }
@@ -8091,7 +8144,7 @@ fn edit_and_submit(
   principal: &Principal,
   work: VolumeId,
   splice: Splice<'_>,
-  (evidence, held): (Vec<[u8; 32]>, bool),
+  (evidence, held, authorship): (Vec<[u8; 32]>, bool, slates_ipc::protocol::Authorship),
 ) -> ReplyBody {
   // The green's owner already judged what the edit would leave (A-247; `crate::work_home`). The edit was never applied
   // to the work: an accept moves past it and a conflict applies it now, so the work holds it as a client's two verbs
@@ -8113,7 +8166,7 @@ fn edit_and_submit(
       state,
       principal,
       work,
-      (evidence, None),
+      (evidence, None, authorship),
       if held { Approval::Held } else { Approval::None },
     ),
     refused_edit => refused_edit,
@@ -8836,7 +8889,12 @@ pub(crate) fn reset_would_fit(
 fn submit_approved(
   state: &mut ShardState,
   principal: &Principal,
-  (work, evidence, signature): (VolumeId, Vec<[u8; 32]>, Option<Vec<u8>>),
+  (work, evidence, signature, authorship): (
+    VolumeId,
+    Vec<[u8; 32]>,
+    Option<Vec<u8>>,
+    slates_ipc::protocol::Authorship,
+  ),
   identity: [u8; 32],
   proof: [u8; 32],
 ) -> ReplyBody {
@@ -8852,7 +8910,7 @@ fn submit_approved(
     state,
     principal,
     work,
-    (evidence, signature),
+    (evidence, signature, authorship),
     Approval::Of(identity),
   )
 }
@@ -9134,6 +9192,9 @@ pub(crate) struct SubmitPolicy {
   pub(crate) signature: Option<Vec<u8>>,
   /// The work's signed-work rules ([`requires_signed_merges`], [`signers_of`]).
   pub(crate) work_signed: SignedRules,
+  /// What the submit carries for the commit the server makes of the work (A-664): its message and its session's
+  /// identities, judged at the green's owner before the increment is built (`crate::identities`).
+  pub(crate) authorship: slates_ipc::protocol::Authorship,
 }
 
 impl SubmitPolicy {
@@ -9141,7 +9202,11 @@ impl SubmitPolicy {
   pub(crate) fn of_work(
     state: &ShardState,
     work: DbVolumeId,
-    (approval, signature): (Approval, Option<Vec<u8>>),
+    (approval, signature, authorship): (
+      Approval,
+      Option<Vec<u8>>,
+      slates_ipc::protocol::Authorship,
+    ),
   ) -> SubmitPolicy {
     SubmitPolicy {
       work_mode: merge_mode_of(state, work),
@@ -9155,6 +9220,7 @@ impl SubmitPolicy {
         required: requires_signed_merges(state, work),
       },
       signature,
+      authorship,
     }
   }
 }
@@ -9169,7 +9235,11 @@ fn submit(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
-  (evidence, signature): (Vec<[u8; 32]>, Option<Vec<u8>>),
+  (evidence, signature, authorship): (
+    Vec<[u8; 32]>,
+    Option<Vec<u8>>,
+    slates_ipc::protocol::Authorship,
+  ),
   approval: Approval,
 ) -> ReplyBody {
   let (work_id, green_id) =
@@ -9195,7 +9265,7 @@ fn submit(
       let Some(sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
-      let policy = SubmitPolicy::of_work(state, work_id, (approval, signature));
+      let policy = SubmitPolicy::of_work(state, work_id, (approval, signature, authorship));
       let reply = judge_submission(state, &sealed, evidence, policy);
       put_back_sealed(state, sealed);
       reply
@@ -9291,6 +9361,13 @@ fn judge_submission(
     (merge_mode_of(state, green_id), green_id),
   );
   if let Some(refusal) = refused_before_the_seal(state, (mode, by), green_id, &evidence) {
+    return refusal;
+  }
+  // A green of a repository makes its tool's commit of the work (A-664): the submit carries a message and its session's
+  // identity in the repository's tool, refused here, before the increment is built.
+  if let Some(refusal) =
+    crate::identities::refused_for_its_commit(state, green_id, &policy.authorship)
+  {
     return refusal;
   }
   // The submission barrier (§4.16 "Submission": "seal the work volume"): the seal is taken here, in
@@ -9869,10 +9946,7 @@ pub(crate) fn owner_judge(
       state.reply_route = None;
     }
   }
-  let verb = RequestBody::Submit {
-    work: to_wire_volume(sealed.work),
-    evidence: Vec::new(),
-  };
+  let verb = RequestBody::submit(to_wire_volume(sealed.work), Vec::new());
   if let Some(owed) = acknowledgement_owed(state, origin, id.client, &verb) {
     return Some(owed);
   }
@@ -20765,10 +20839,7 @@ mod tests {
         state,
         1,
         &owner,
-        super::RequestBody::Submit {
-          work,
-          evidence: Vec::new(),
-        },
+        super::RequestBody::submit(work, Vec::new()),
       );
       assert!(
         matches!(
@@ -20900,10 +20971,7 @@ mod tests {
       state,
       1,
       &owner,
-      super::RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
+      super::RequestBody::submit(work, Vec::new()),
     );
     assert!(
       matches!(
@@ -22947,6 +23015,7 @@ mod tests {
         control: None,
         revoked: false,
         consumer_policy: None,
+        identities: None,
         owner_route: None,
         read_ahead: None,
         read_ahead_pending: 0,
