@@ -50,6 +50,12 @@ Apache Subversion's `1.14.x` branch (the release line stock clients run; 1.14 is
 | httpd 2.4.66 `modules/dav/main/mod_dav.h`, `mod_dav.c` (A-609) | `ad8361ef4e7e311c`, `2cab686b045e2237` | C |
 | `subversion/mod_dav_svn/reports/list.c`, `file-revs.c`, `mod_dav_svn/lock.c` (A-627) | `9c852cb6ba67f446`, `6efa4630426dabd0`, `c5bc4498df507c4f` | C |
 | httpd 2.4.66 `modules/dav/main/util_lock.c`, `props.c` (A-627) | `6b26b0425b33ea20`, `92a3201fa69632e6` | C |
+| `subversion/libsvn_repos/replay.c`, `libsvn_delta/path_driver.c` (A-627, the replay's calls) | `eb42d8bd06a5eb07`, `1139deea567fcfe8` | C |
+| `subversion/libsvn_ra_serf/replay.c`, `lock.c`, `get_lock.c` (A-627, what the client reads) | `6d30fbb7ecc59f10`, `d680419957383888`, `33123342971c83c9` | C |
+| `subversion/include/svn_error.h`, `include/private/svn_fs_util.h`, `include/private/svn_fspath.h` (A-627) | `3c0818af46aaf0b1`, `b1f1221b87609113`, `e549235c83765458` | B |
+| `subversion/libsvn_subr/checksum.c` (A-627, `svn__digest_to_cstring`) | `907299438410f21b` | C |
+| httpd 2.4.66 `modules/dav/main/util.c` (A-627, `dav_get_timeout`, `dav_validate_resource_state`) | `175813443fc6fb35` | C |
+| apr-util 1.6.3 `xml/apr_xml.c` (A-627, `start_handler`, `write_elem`), from `raw.githubusercontent.com/apache/apr-util/1.6.3/` | `2611d4992c9ce92d` | C |
 | `subversion/libsvn_delta/svndiff.c` | `0ae17243dc9ab11b` | C |
 | `subversion/libsvn_delta/delta.h` | `31ea1b30e27321f8` | C |
 | `subversion/libsvn_subr/encode.c` | `3e5752e741f7aacd` | C |
@@ -200,6 +206,26 @@ and `libsvn_subr/dirent_uri.c` `fe05687a2dedb22c`, `path.c` `413c3a8a740ae18c` a
     - Base64 lines are 76 characters, the last line ended by a line feed too (`base64.c` 47, 171-204).
     - `svn_xml_fuzzy_escape` writes `?\NNN`.
     - `apr_xml_quote_string` escapes `&`, `<`, `>`, and `"` only when asked.
+- **The lock verbs and the editor drives' answers** (read 2026-11-19 for A-627's rest; §4.17.4 piece 13).
+  - **Recorded requests** [M: svn 1.15.0, Homebrew, the Mac Studio, 2026-11-19, against a recorded responder that
+    reports a lock to a lockdiscovery PROPFIND]. `svn lock` sends LOCK with no `Depth`, `Timeout` or
+    `X-SVN-Version-Name` for a URL, `X-SVN-Options: lock-steal` with `--force`, and the comment XML-escaped in
+    `owner`; `svn unlock` and `svn unlock --force` first PROPFIND `lockdiscovery` at `Depth: 0`, then UNLOCK with
+    `Lock-Token: <opaquelocktoken:…>`, `X-SVN-Options: lock-break` with `--force`; `svn info` PROPFINDs
+    `lockdiscovery`. The LOCK and PROPFIND bodies equal the earlier fixtures byte for byte.
+  - **What the client reads** [C: `libsvn_ra_serf/lock.c` 88-212, 216-403; `get_lock.c` 81-337]: from LOCK's answer
+    `D:timeout`, `D:locktoken/D:href` (spaces collapsed) and `D:owner`'s text, and the headers `X-SVN-Lock-Owner` and
+    `X-SVN-Creation-Date`; a status as an error: 400 `E160040`, 403 `E160039`, 405 `E160042`, 423 the server's
+    filesystem error or `E160035`, 404, 409 and 500 the server's error. A PROPFIND's lockdiscovery at 207 alone.
+  - **What `mod_dav` and `mod_dav_svn` write** [C: httpd `mod_dav.c` 3178-3460, `util_lock.c` 42-251, `util.c`
+    542-574 and 899-1420, `props.c` 355-451; `mod_dav_svn/lock.c`, `util.c` 100-170 and 765-801]: as the module
+    documentation of `slates-svn`'s `dav::locking` states, line by line; DAV:'s owner element echoed through
+    `apr_xml_to_text` with `APR_XML_X2T_FULL_NS_LANG` (`apr_xml.c` 795-905), declaring every namespace of the body,
+    `DAV:` first and an element's own declarations last to first (162-169, 200-225, 399).
+  - **The replay's calls** [C: `libsvn_repos/replay.c` 452-795, 918-990; `path_driver.c` 66-117, 234-300]: the root,
+    every directory and file opened, and every deletion, with `SVN_INVALID_REVNUM`; `set_target_revision` always
+    first; revision 0 that call alone; no `close_edit`; with deltas off, a nameless property removal and a delta of the
+    window handler's end alone.
 - **svndiff over HTTP** [C: `mod_dav_svn/repos.c` 1784-1851]: the response's version follows the request's
   `Accept-Encoding` and the server's compression level (svndiff2 when the client lists it and the level is 1, else the
   client's preference, else 0). What a client sends in PUT bodies follows the server's advertised capabilities

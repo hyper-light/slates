@@ -13434,6 +13434,26 @@ and export by landing).
 > LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
 > `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
 > answers to `close-edit` and `abort-edit`.
+>
+> **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
+> (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
+> writes too, and writes the update-report's answer as `reports/update.c` writes it, in send-all mode and outside it,
+> and the replay report's as `reports/replay.c` writes it, byte for byte against their format strings: the
+> update-report names an entry by its basename and builds the checked-in href and an added directory's `bc-url` from
+> the drive's facts (`dav_svn__build_uri`, the path encoded as `svn_path_uri_encode` encodes it); the replay names
+> whole paths, sends every property value in base64 and the -1 its path driver passes as each base revision; a delta's
+> windows stream into base64 a group at a time; a call out of the drive's order is refused typed; an aborted drive
+> sends nothing. LOCK and UNLOCK are read into A-602's guards in `mod_dav`'s and `mod_dav_svn`'s order (stealing by
+> `X-SVN-Options: lock-steal`, breaking by `lock-break`), each refusal before the guard at their status (400, 403, 405,
+> 409, 412, 501), and answered as they answer: LOCK's `D:lockdiscovery` with the owner element `mod_dav` keeps (every
+> namespace the body declared, in APR's order), `Lock-Token`, `X-SVN-Creation-Date` and `X-SVN-Lock-Owner`; each
+> guard refusal as `append_locks` and `remove_lock` map it (423 with FSFS's message for a lock held or another's, 404
+> for no such revision, 501 for no principal, else 500 with FSFS's message or "Failed to create new lock." and "Failed
+> to remove a lock."); and the PROPFIND's `DAV:lockdiscovery` that `svn unlock` and `svn info` read. Held to stock svn
+> 1.15.0's own LOCK and UNLOCK heads and bodies, recorded on the Mac Studio. Owed: the resource walk a pre-1.2 client
+> asks for; the facts' revision as `dav_svn__get_safe_cr` gives it (A-616's facts carry `svn_fs_node_created_rev`'s,
+> which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
+> Apache with `mod_dav_svn`.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13892,8 +13912,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `get-mergeinfo`, `log` and segments). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
-    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
-    built (A-627), and the replay drive, LOCK's answer and LOCK and UNLOCK onto the lock table are owed.
+    (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
+    report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
+    `DAV:lockdiscovery` property.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -43418,3 +43439,60 @@ read, taken out of `report/tests.rs`).
 - **Owed** (GAPS): the drive over the index (A-553) and the green, with `svn_repos_deleted_rev` and
   `svn_fs_closest_copy`; the deltas of changed texts; the handler that answers the client's early answer and its
   answers to `close-edit` and `abort-edit`.
+
+### A-627, completed — The replay answer and the update-report's from A-616's one drive, and LOCK and UNLOCK onto A-602's guards, each answered as mod_dav and mod_dav_svn answer it (2026-11-19, g298, UI goal 93; §4.17.4 piece 13's second part; with A-616 part 2 and A-602)
+Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§1's sources,
+§3); `crates/svn` (`dav/drive.rs` and its tests, rewritten; `dav/locking.rs` and its tests, rewritten; `dav/xml.rs`'s
+`Document`, `parse_document` and `Base64Stream`; `dav/response.rs`'s `Body::left`; `dav.rs`'s three refusals; the
+fixtures `lock-steal.xml` and five request heads).
+
+- **One drive, two answers.** `dav::Drive` takes A-616's `report::drive::Call`s (`Drive::call`, a `match` onto one
+  method a call), so the drive ra_svn's editor writes feeds both HTTP answers. Agreed with g234 through main: a call
+  carries the editor's own arguments and its node's raw facts; the svndiff version is the answer's.
+  - The update-report (`reports/update.c` at `d434dc14`): an entry's basename (`make_child_baton`); its checked-in href
+    and an added directory's `bc-url` built by `dav_svn__build_uri` from the facts, the path encoded as
+    `svn_path_uri_encode` encodes it, `rvr` by HTTPv2's me resource, `ver` otherwise; a deletion with no revision
+    written -1, as `reporter.c` passes one (1015-1029), which the drive's earlier `u64` could not write; outside
+    send-all mode, an addition's properties held unless inline, a copied addition's removals kept for its close (their
+    bytes held against the room as they are kept), no delta, and a changed file fetched with its base and SHA-1.
+  - The replay report (`reports/replay.c`): its header at the first call; each call an empty element with its whole
+    path; the -1 `svn_repos_replay2`'s path driver passes as every base revision; every property value in base64 with
+    line breaks, a removal `del`; `S:apply-textdelta` with its base checksum, ended where `replay.c` ends it in every
+    order a drive may make; nothing for an absent entry; `S:close-file` with the MD5.
+  - A delta streams: each window encoded as it comes (each version-2 section LZ4 when shorter, `svndiff.c` 196-233),
+    its base64 written a whole group at a time and the rest carried (`Base64Stream`), the same text however the
+    windows split. An all-zero digest is none, as `svn_checksum_to_cstring` reads it.
+  - Stricter, stated: a call out of the drive's order refused typed before a byte is written; an aborted drive's
+    answer refused whole, so the server answers the drive's refusal, as `mod_dav` answers an error met before it has
+    sent a byte; a root path or special URI that is not canonical and URI-safe refused.
+- **LOCK and UNLOCK onto the guards** (`dav_method_lock`, `dav_lock_parse_lockinfo`, `dav_get_timeout`,
+  `dav_validate_resource_state`, `dav_method_unlock` in httpd 2.4.66; `open_lockdb`, `get_locks`, `append_locks`,
+  `remove_lock`, `remove_lock_svn_output` in `mod_dav_svn`'s `lock.c`):
+  - `lock_request` reads in their order: the body's XML; `Depth` 0 or `infinity`; the parent a directory (409);
+    `X-SVN-Version-Name`; a refresh (no body) refused 400; `D:lockinfo`'s children by local name, anything it does not
+    take 412; `Timeout`'s first understood word, `atol`'s seconds after the clock's whole second, never before it
+    (`DAVMinTimeout` 0); no principal 501; nothing at the path 405; not write, not exclusive 400. Then A-602's
+    `LockRequest`: the path, the comment, the expiry, `steal` from `lock-steal`.
+  - `lock_answer`: 200 with the activelock (the request's depth, its owner element as `apr_xml_to_text` writes it with
+    every namespace the body declared, in APR's order, the seconds left, the token escaped) after the header and a
+    blank line, no line feed after `D:prop`; `X-SVN-Creation-Date`, `X-SVN-Lock-Owner`, `Lock-Token`. A guard refusal:
+    no principal 501 with no body; a lock error in `D:error` with FSFS's message (`svn_fs_util.h`, `lock.c`,
+    `fs-loader.c`), any other as "Failed to create new lock.", each at `dav_svn__convert_err`'s status.
+  - `unlock_request`: `Lock-Token` present and bracketed; the path's unexpired lock with that token (400 otherwise);
+    an anonymous request that does not break it 403. `unlock_answer`: 204; another's lock 423 with FSFS's message; no
+    principal 501 with `mod_dav`'s error id 405; any other "Failed to remove a lock.".
+  - `lockdiscovery`: the PROPFIND's property with depth 0 and the comment quoted in `D:owner`, and the two headers.
+  - Stricter, stated: an owner holding markup, a `Timeout` past `apr_time_t`, an `X-SVN-Version-Name` that is no
+    revision, each 400; a header value with a control character refused as httpd refuses one.
+- **Evidence.** Stock svn 1.15.0 (Homebrew, the Mac Studio, 2026-11-19) recorded against a responder: `svn lock`,
+  `svn lock --force` with markup in its comment, `svn unlock` and `svn unlock --force` (each after the PROPFIND that
+  finds the token), `svn info`; the bodies equal the earlier fixtures byte for byte, and the heads are the fixtures.
+  Every source read is in the notes' §1 with its hash.
+- **Tests and the run.** 34 tests in `dav::drive` and `dav::locking`. `cargo test --locked -p slates-svn --lib` passed
+  351 of 351 on the Mac Studio (2026-11-19), fmt clean. Red on a copy with six mutations (replay's `dir` named
+  `directory`, no revision written 0, LOCK's blank line dropped, a held lock not 423, the clamp under `Timeout` gone,
+  a body's namespaces in tag order): seven tests failed; the namespace mutation passed until its test declared two
+  namespaces on one element, which a red run then showed failing.
+- **Owed.** The update-report's resource walk (`S:resource-walk`, a pre-1.2 client's); the facts' revision as
+  `dav_svn__get_safe_cr` gives it, since `svn_fs_node_created_rev` names a path that did not exist yet for a node
+  beneath a copy not changed since (A-616's facts); main's live capture against Apache with `mod_dav_svn`.

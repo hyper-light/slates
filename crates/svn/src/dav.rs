@@ -34,9 +34,14 @@
 //! - **A path holds no `.` or `..` name, and is no URL**: `dav_svn__test_canonical` passes both, and a filesystem path
 //!   with either is refused later by `svn_fs__path_valid`; a URL is never what ra_serf sends in a body.
 //!
-//! The second part of piece 13 (A-627): `list-report` and `file-revs-report` read and answered ([`listing`]), and
-//! PROPPATCH, LOCK's `lockinfo`, `Timeout` and `Lock-Token` read ([`locking`]). The update-report's answer is
-//! [`drive`]. Owed: the replay answer and LOCK's answer (`util_lock.c`'s `activelock`).
+//! The second part of piece 13 (A-627): `list-report` and `file-revs-report` read and answered ([`listing`]); the two
+//! answers that are an editor drive, the update-report's and the replay report's, written by one [`drive::Drive`]
+//! from the one drive A-616's reporter yields (`report::drive::Call`), which ra_svn's editor writes too; and
+//! PROPPATCH read, LOCK and UNLOCK read into the lock table's guards (A-602) and answered, with the
+//! `DAV:lockdiscovery` property a PROPFIND reports ([`locking`]). The request heads and bodies are stock svn 1.15.0's
+//! own, recorded on the Mac Studio on 2026-11-19. Not written (GAPS): the update-report's resource walk, a pre-1.2
+//! client's; a LOCK's refresh, which a stock client never sends; and a generic DAV client's owner element, since every
+//! client is read as an svn client.
 //!
 //! No I/O, no clock, no randomness, no panic.
 

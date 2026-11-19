@@ -186,16 +186,17 @@ fn the_captured_locks_are_exclusive_write_locks_with_their_comments() {
   );
 }
 
-/// A-627 (`apr_xml.c` 162-169, 200-263, 795-905): do decode an owner under a root declaring a second namespace and a
-/// language, the owner declaring a third whose URI holds `&`, and an empty owner; expect the echo to declare all three
-/// from the last, quoted, with the inherited `xml:lang`, and the empty owner closed as an empty element.
+/// A-627 (`apr_xml.c` 162-169, 200-263, 795-905): do decode an owner under a root declaring two more namespaces and a
+/// language, the owner declaring a fourth whose URI holds `&`, and an empty owner; expect the echo to declare all four
+/// from the last, quoted, the root's two in the reverse of their order in its tag (APR builds an element's attribute
+/// list backwards), with the inherited `xml:lang`, and the empty owner closed as an empty element.
 #[test]
 fn an_owner_is_echoed_with_every_declared_namespace_and_its_language() {
-  let body = b"<D:lockinfo xmlns:D=\"DAV:\" xmlns:Z=\"urn:z\" xml:lang=\"en\"><D:lockscope><D:exclusive/>\
+  let body = b"<D:lockinfo xmlns:D=\"DAV:\" xmlns:Z=\"urn:z\" xmlns:W=\"urn:w\" xml:lang=\"en\"><D:lockscope><D:exclusive/>\
     </D:lockscope><D:locktype><D:write/></D:locktype><D:owner xmlns:Y=\"urn:y&amp;\">a&amp;b</D:owner></D:lockinfo>";
   let owner = lockinfo(body, &ROOMY).unwrap().owner.unwrap();
-  let element = "<ns0:owner xml:lang=\"en\" xmlns:ns2=\"urn:y&amp;\" xmlns:ns1=\"urn:z\" xmlns:ns0=\"DAV:\">\
-    a&amp;b</ns0:owner>";
+  let element = "<ns0:owner xml:lang=\"en\" xmlns:ns3=\"urn:y&amp;\" xmlns:ns2=\"urn:z\" xmlns:ns1=\"urn:w\" \
+    xmlns:ns0=\"DAV:\">a&amp;b</ns0:owner>";
   assert_eq!(
     (owner.text.as_str(), owner.element.as_str()),
     ("a&b", element)

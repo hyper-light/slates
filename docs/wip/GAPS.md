@@ -509,8 +509,15 @@
 > the Mac Studio (see A-609). Owed from it: the update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK,
 > `list-report` and `file-revs-report`, and main's live capture against `mod_dav_svn`. A-627 (2026-11-19, g250):
 > `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token`
-> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued); owed: the
-> replay drive, LOCK's answer, and LOCK and UNLOCK onto the A-602 guards. A-531 (2026-11-19): the ra_svn item codec, its
+> read; the update-report drive written as `update.c` writes it in send-all mode (A-627, continued). A-627's rest
+> (2026-11-19, g298): one `dav::Drive` writes the update-report's answer (send-all mode and outside it) and the replay
+> report's from A-616's `Call`s, byte for byte against `update.c`'s and `replay.c`'s format strings; LOCK and UNLOCK read
+> into A-602's guards in `mod_dav`'s and `mod_dav_svn`'s order and answered as they answer, with the PROPFIND's
+> `DAV:lockdiscovery`, held to stock svn 1.15.0's recorded LOCK and UNLOCK heads; `cargo test -p slates-svn --lib` on
+> the Mac Studio, red on a mutated copy (see A-627, completed). Owed from it: (1) the update-report's resource walk, a
+> pre-1.2 client's; (2) the drive's facts carrying `dav_svn__get_safe_cr`'s revision, not `svn_fs_node_created_rev`'s,
+> for a node beneath a copy not changed since (A-616's drive over the index); (3) main's live capture against Apache
+> with `mod_dav_svn`. A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
