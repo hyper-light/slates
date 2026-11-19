@@ -15,6 +15,8 @@
 //! [`compression`] (A-598): its zlib, bzip2 or zstd stream inflated within the caller's admission, a compression bomb
 //! refused by kind; and a plain bundle is compressed as 7.2 compresses one. [`serve`] holds read serving's logic
 //! (A-619): discovery's answers, `listkeys`, and which changesets a `getbundle` sends, over the served view's graph.
+//! [`import`] takes an existing repository's store into the [`index`] through a read-only seam (A-630): its
+//! requirements, its fncache or [`file_index`], and every revlog, version 1 or behind a docket, in 7.2's order.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
 //! `internals.bundle2`, `internals.bundles` and `internals.changegroups` \[B\], and its code \[C\], which is what clients
@@ -76,9 +78,11 @@ pub mod changeset;
 pub mod compression;
 mod decimal;
 pub mod delta;
+pub mod file_index;
 pub mod filerev;
 pub mod heads;
 pub mod http;
+pub mod import;
 pub mod index;
 mod lines;
 pub mod manifest;
@@ -147,3 +151,7 @@ mod index_tests;
 #[cfg(test)]
 #[path = "tests/store.rs"]
 mod store_tests;
+
+#[cfg(test)]
+#[path = "tests/import.rs"]
+mod import_tests;
