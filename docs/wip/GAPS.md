@@ -188,6 +188,13 @@
 > driver that starts them; each tool's words for the outcomes; review events' hooks; a repository-owned queue for
 > observing hooks that must outlive their push. Main's: clippy, `xtask` and the lint matrix over the three modules (no
 > platform code in them).
+> **A-622 part 1 (2026-11-19, g255; the policy held in the repository record):** a repository's record holds its
+> policy (rules and hooks), empty at creation, set whole by its owner with `SetRepositoryPolicy` from the version read
+> (`Op::RepositoryPolicySet`, tag 97; `RequestBody` 86): a stale read refused `PolicyChanged`, a rule or hook its tool
+> cannot hold refused by index (`DatabaseRefusal` 8 and 9), its bytes charged to the merge budget and charged again
+> after a snapshot. Lib tests on the Mac Studio: db `repository::` 15 of 15, server `repository::` 5 of 5, ipc's lib,
+> both wire-order tests; red first on a mutated copy. Owed: the push paths' check (part 2) and the hook driver (part 3);
+> the verb's client and CLI forms.
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the

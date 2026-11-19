@@ -11953,6 +11953,17 @@ is one more version, and the chain itself is never rewritten.
 > for its hooks and the driver that starts a hook over it in its own process group; each tool's words for the
 > outcomes; the hooks of review events; and a repository-owned queue for observing hooks that must outlive their push
 > (§4.17.3).
+>
+> **Status (2026-11-19, A-622 part 1: the policy held in the repository record).** A repository's policy is part of its
+> record (`slates_db::catalog::RepositoryPolicy`): its rules (what each names, its pattern, the right, allow or deny,
+> and whom it speaks to) and its hooks (the point, the name, the program by absolute path), empty at creation. Its
+> owner sets it whole with `SetRepositoryPolicy`, from the version the owner read: `Op::RepositoryPolicySet` (tag 97),
+> guarded then applied on the repository's partition, an entry of its register of that one change. The guard refuses a
+> stale read (`PolicyChanged`, naming the version now), a rule naming what the repository's tool does not have or a
+> pattern its matcher would refuse, and a hook at another tool's point, named other than its point allows (one hook a
+> git or Subversion point; Mercurial's `point.suffix` names, each once), or running a program that is not an absolute
+> path. Its rules' and hooks' encoded bytes are charged to the partition's merge budget, given back when it is
+> replaced or its repository leaves, and charged again by a partition rebuilt from its snapshot.
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12060,7 +12071,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines (A-597 built the matcher with each tool's precedence, the hooks' inputs, their
-   learned deadlines and the runner; the policy's place in the record, the views and the driver are owed).
+   learned deadlines and the runner; A-622 part 1 the policy in the repository record and its verb; the push paths'
+   check and the hook driver are owed, A-622's next parts).
 
 Each server's pieces follow these, in its own section.
 
@@ -41141,3 +41153,55 @@ Applied in the same change to:
   challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
   in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
   DAV reading their requests through it.
+
+### A-622 — A repository's policy held in its record, set whole by its owner from the version read (2026-11-19, g255, UI goal 93; §4.17.1 "Policy: protected branches, access and hooks" and shared piece 7's rest, part 1; after A-597 and A-603)
+Applied in the same change to:
+- §4.17.1's policy paragraph (a status) and its pieces list (piece 7);
+- GAPS (the §4.17 entry);
+- `crates/db` (`catalog.rs`: `RepositoryPolicy` and its rule and hook types, and `RepositoryRecord::policy`, appended;
+  `op.rs`: `Op::RepositoryPolicySet`, tag 97, appended; `error.rs`; `repository.rs` with `repository/policy.rs`, new;
+  `partition.rs`; the test helpers' records; `tests/wire_order.rs` and `.txt`, the appended tag and six new enums);
+- `crates/ipc` (`protocol.rs`: `RequestBody::SetRepositoryPolicy`, tag 86, `DatabaseRefusal` 8 and 9, the policy's wire
+  types, `Refusal::PolicyChanged`'s doc; `tests/wire_order.rs` and `.txt`);
+- `crates/server` (`repository.rs`: `set_policy`; `verbs.rs`: its route and dispatch; `error.rs`: the refusals).
+
+- **The record.** A repository's policy is part of its record, so a partition's snapshot carries it and a replay sets it
+  again, as the record's other fields. It holds a version (how many times it was set), its rules in order, and its hooks
+  in order. A rule names what its pattern covers (git's refs; Mercurial's branches, bookmarks or topics; Subversion's
+  paths), the pattern in its tool's form, the right (read, submit, rewrite, delete), allow or deny, and whom it speaks
+  to (everyone, or entries naming a principal or every principal but one). A hook names its point, its name and its
+  program. A repository is created with an empty policy at version 0, and a create that carries one is refused.
+- **The verb.** `SetRepositoryPolicy { repository, read, rules, hooks }`, its owner's (another principal is refused
+  `Forbidden`, as the branch verbs are), routed to the partition the repository's name hashes to. It records
+  `Op::RepositoryPolicySet` with version `read + 1`, which the guard accepts only when the policy's version is `read`:
+  a raced or replayed setting is refused `PolicyChanged` with the version now, as A-285's volume policy is, so the
+  setter reads again. Answered `Acknowledged`. The op is an entry of the repository's register of that one change, so
+  it takes the next position (A-603).
+- **What the guard refuses** (`repository/policy.rs`): a rule whose names the repository's tool has not, or whose
+  pattern is empty, holds a NUL, or is a Subversion path that does not start at the root (`/path` or `:glob:/path`),
+  which are the rules the server's matcher reads a pattern by (A-597), so a recorded policy always compiles; a hook at
+  another tool's point; one named other than its point allows (git and Subversion keep one hook file a point, so their
+  hooks take the point's own name, once; Mercurial's take the point's name alone or with a `.suffix`, each name once);
+  and a program that is not an absolute path or holds a NUL. Each refusal is typed on the wire
+  (`DatabaseRefusal::PolicyRuleMalformed` or `PolicyHookMalformed`, naming the item by index).
+- **The bound.** A policy's rules' and hooks' encoded bytes are charged to the partition's merge byte budget, the bound
+  every repository's own state shares (A-603, A-596), with `Capacity` past it; a setting gives back the policy it
+  replaces, a destroyed repository gives back its policy, and a partition rebuilt from its snapshot charges the
+  policies again (`Repositories::state_bytes`). One policy is also bounded by one log record, since it is set whole.
+- **Tests** (Mac Studio M3 Ultra, kiln, debug, 2026-11-19; `cargo fmt --all` applied from the Studio's run):
+  `cargo test --locked -p slates-db --lib -- repository::` 15 of 15, `-p slates-server --lib -- repository::` 5 of 5,
+  `-p slates-ipc --lib` all passing, and both crates' `--test wire_order` 2 of 2 (the appended tags published by hand
+  and checked by the test). Red first, on a copy with the version check, the rule and hook checks, the create's check,
+  the snapshot's charge and the guard's release taken out: the four tests that guard them failed, nothing else.
+  - The guard's own tests: each tool's names, each kind of malformed pattern, the hooks' points and names, the charge.
+  - The partition's: a policy set from version 0 and held at 1 with the register a position on; a stale setting, a
+    branch rule in a git repository, a relative program and a create carrying a policy each refused by kind, nothing
+    changed; the rebuilt and the replayed partitions answering as the live one.
+  - The budget's, by use: a replacement fits because the old policy is given back; a second repository's policy
+    refused `Capacity` on the live partition and on the rebuilt one alike; and admitted once the first repository has
+    left.
+  - The server's: the verb end to end, the owner's principal mapped to the catalog's, each refusal on the wire.
+- **Owed (A-622's next parts):** the push paths' check against the policy (one function the git, Mercurial and
+  Subversion push pieces call, with a typed refusal), and the hook driver (an owned hook process over a read-only
+  attachment of the work, its learned deadline from A-597's runner). A client and CLI form of the verb are owed with
+  the servers' administration.

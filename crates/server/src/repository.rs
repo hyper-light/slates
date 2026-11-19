@@ -567,7 +567,10 @@ pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks): (&[slates_ipc::protocol::PolicyRule], &[slates_ipc::protocol::HookConfig]),
+  (rules, hooks): (
+    &[slates_ipc::protocol::PolicyRule],
+    &[slates_ipc::protocol::HookConfig],
+  ),
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "set_repository_policy") {
     Ok(record) => record,
@@ -1194,8 +1197,8 @@ mod tests {
   fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
     use slates_db::catalog::RepositoryPolicy;
     use slates_ipc::protocol::{
-      DatabaseRefusal, HookConfig, HookPointName, PolicyEffect, PolicyEntry, PolicyNames, PolicyRight,
-      PolicyRule, PolicyWho,
+      DatabaseRefusal, HookConfig, HookPointName, PolicyEffect, PolicyEntry, PolicyNames,
+      PolicyRight, PolicyRule, PolicyWho,
     };
     crate::daemon::audit_on_shard(|state| {
       green_of(create(state, "linux", "main"));
@@ -1276,7 +1279,12 @@ mod tests {
         }
       );
       assert_eq!(
-        refusal(set(state, &owner(), 1, (Vec::new(), vec![hook("hooks/pre-receive")]))),
+        refusal(set(
+          state,
+          &owner(),
+          1,
+          (Vec::new(), vec![hook("hooks/pre-receive")])
+        )),
         Refusal::Database {
           refusal: DatabaseRefusal::PolicyHookMalformed { index: 0 }
         }
