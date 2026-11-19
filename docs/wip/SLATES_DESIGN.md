@@ -12018,6 +12018,13 @@ is one more version, and the chain itself is never rewritten.
 > links; kind transitions; one copy of a pushed blob's bytes shared by the store and the green (A-581's owed content
 > index); the post-state assembly shared with the server's (`verbs::assemble_post_state`), so the two never lay a
 > document out apart.
+>
+> **Status (2026-11-19, A-664 part 2: item 3's commit the server makes, as derived data).** A version a work with no head
+> operation made has its git objects derived from the history alone (`slates_git::derived`, §4.17.2's status): its
+> trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
+> and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
+> client pushed keeps the client's commit. Owed: item 4's identities in the principal's record and the refusals at
+> submit (A-664 part 1), the commit recorded with the version and admitted (part 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12553,6 +12560,21 @@ engine: the verdict, rebase, position mapping, the register).
 > keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). The store's outputs
 > are unchanged.
 >
+> **Status (2026-11-19, A-664 part 2: a version's trees and commit as derived data, piece 13's first part).**
+> `crates/git` (`derived`) makes the git objects of a version the server turns into git's (§4.17.1 "A push is a work"
+> items 3 and 4) as two types of A-647's derived data. `Trees` is derived from the change a version's path map reads:
+> each file's mode from its class (`FileClass`: `100644`, `100755`, `120000`, and `160000` for the special node, whose
+> content is the commit's id), git's entry order, and only the directories the change touched made again, every other
+> subtree taken from the parent's value by identity; a directory with more subtrees than one node names holds them
+> through lists, as the store holds an object past a window. `Commits` is a pushed version's own client commit, or the
+> commit the server makes of the version's tree, its parents' commits, the merging principal's identity (`Identity`,
+> refused where git would change it) at the merge record's time in UTC and the submit's message, written as `git
+> commit-tree -m` writes it. Every tree and commit made passes git's strict fsck. Held to stock git 2.50.1's own
+> objects, to the trees built from each version's whole path map over generated histories, and to themselves derived
+> again lazily in another store, node for node. Owed: the green's state as the path map (A-647's owed map), the
+> principal's identities and the submit's message (part 1), and the made commit recorded with the version and admitted
+> to the git store (part 3, over A-662).
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -13014,7 +13036,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 10. Hooks over a read-only bare-repository view; push options; push to review with report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
-13. Server-side merge and rebase of review requests; `log` and `blame` through the API.
+13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
+    A-664: part 2 built, a version's trees and commit as derived types; part 1, the principal's identities and
+    `MessageRequired` and `IdentityRequired` at submit, and part 3, the made commit recorded and admitted, owed.)
 14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
 15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
     landing.
@@ -44103,7 +44127,8 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     (Built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type, version) in
     an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
     step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
-    the store's outputs unchanged (part 2). Owed: A-553's and A-588's stores as types.)
+    the store's outputs unchanged (part 2). A version's git trees and commit as types, the commit the server makes
+    (A-664 part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
