@@ -263,7 +263,7 @@ pub(crate) enum ReplayRefused {
   /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
   /// step.
   Mercurial(slates_hg::import::record::Refused),
-  /// Giving back the empty index a replayed one took the place of was refused: the content store's count of holds is off.
+  /// The index a replayed one took the place of was not given back whole: the content store's count of holds is off.
   Released,
 }
 
@@ -1223,26 +1223,24 @@ fn replay_into(
   }
 }
 
-/// Replays a Mercurial import's record into `store` (A-687; module docs): the record's index made through the import's
-/// own steps (`slates_hg::import::record::replay`) and put in the place of the empty index the store was made with, as
-/// the live import's landing puts it (`hg_import::place_imported`). A store holding a history refuses, as the live
-/// landing does, so an import's record replays only into an empty store. Refused, the store is as it was. No derived
+/// Replays a Mercurial record into `store` (A-687; module docs): its revisions appended to the store's index through
+/// the import's own steps, in a fork that takes the index's place once the whole record is in
+/// (`slates_hg::import::record::replay`, the one entry point for an import's record and a push's); an import's record
+/// replays only into an empty index, as the live landing takes only an empty store. Refused, the store is as it was;
+/// the index replaced not given back whole is refused too, the content store's count of holds being off. No derived
 /// value is kept with it.
 fn replay_hg(
   content: &mut ContentStore,
   store: &mut HgStore,
   bytes: &[u8],
 ) -> Result<u64, ReplayRefused> {
-  if !hg_import::holds_none(&mut store.index) {
-    return Err(ReplayRefused::Diverged);
+  let replayed = slates_hg::import::record::replay(bytes, &mut store.index, content)
+    .map_err(ReplayRefused::Mercurial)?;
+  if replayed.whole {
+    Ok(0)
+  } else {
+    Err(ReplayRefused::Released)
   }
-  let replayed =
-    slates_hg::import::record::replay(bytes, content).map_err(ReplayRefused::Mercurial)?;
-  let empty = core::mem::replace(&mut store.index, replayed.index);
-  empty
-    .release(content)
-    .map(|()| 0)
-    .map_err(|_| ReplayRefused::Released)
 }
 
 /// Replays one Subversion record (A-655 part 2b; module docs, "Subversion") within `room`: a creation makes the

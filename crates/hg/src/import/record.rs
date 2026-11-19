@@ -1,38 +1,35 @@
-//! An import's record (A-687; §4.17.3 piece 3; §4.17.1 "Durability and residency"; R8): what the register's entry of an
-//! imported store holds, so a recovery makes the same index again, on this node or on a successor, which cannot read
-//! the importing host's directory.
+//! A Mercurial record (A-687; §4.17.3 piece 3; §4.17.1 "Durability and residency"; R8): what a repository's entry holds
+//! of the revisions it added to the index, an import's or a push's, so a recovery makes the same index again, on this
+//! node or on a successor, which cannot read the importing host's directory.
 //!
-//! **What it holds.** Every revision the import kept, in the order it kept them: the changelog, the manifest log, then
-//! each file log in its path's order; each by its node, its parents' nodes, a manifest's or file revision's link (the
-//! node of the changeset that brought it), 7.2's index flags and its whole text as 7.2 stores it (a file revision's
-//! metadata block between its markers, then its bytes). Then the obsolescence markers in the order the index numbers
-//! them, each alone in its obsstore's format. And the room the import ran within. The revisions themselves, never a
-//! revlog's deltas or the index's rows: a revlog's encoding is the importing host's, and the rows are made from the
-//! revisions again.
+//! **One kind for imports and pushes** (main's ruling, 2026-11-19): the record holds revisions to append to a
+//! repository's index, in groups, each one log's revisions in the order they were appended, and the markers after them.
+//! An import's record ([`write`], [`Source::Import`]) is every revision its index holds: the changelog's group, the
+//! manifest log's, then each file log's in its path's order. A push's ([`write_revisions`], [`Source::Push`]) is the
+//! revisions it brought that the repository lacked, in the order its landing appended them (`push::commit`), so a
+//! recovery appends them where the live push did. [`replay`] is the one entry point for both.
 //!
-//! **Written from the import's index** ([`write`]) once the import is done, as git's record is written when its append
-//! commits (A-662): its length measured first and its room reserved whole, then each text read back from the content
-//! store by the row that names it, refused where the store no longer holds one whole.
+//! **What a revision holds.** Its node, its parents' nodes, a manifest's or file revision's link (the node of the
+//! changeset that brought it), 7.2's index flags and its whole text as 7.2 stores it (a file revision's metadata block
+//! between its markers, then its bytes): the revisions themselves, never a revlog's deltas or the index's rows, which
+//! are made from them again. And the room the writer ran within, which bounds what a changeset's extras take at the
+//! replay as it bounded the live path, on every node alike (R8).
 //!
-//! **Replayed through the import's own steps** ([`replay`]): each revision's flags held to what 7.2 knows and its text
-//! to its node, as the revlog reader holds them (sha1dc, so a known collision attack is refused); a changeset's
-//! manifest, branch and closing read from its text as the import reads them; a file revision's block split from its
-//! bytes; each kept as content and appended at once, numbered its log's own, the tail sealed when due; each changeset's
+//! **Replayed through the import's own steps**, into a fork of the index ([`replay`]): each revision's flags held to
+//! what 7.2 knows and its text to its node (sha1dc, so a known collision attack is refused); a changeset's manifest,
+//! branch and closing read from its text as the import reads them; a file revision's block split from its bytes; each
+//! kept as content and appended at once, numbered its log's next, the tail sealed when due; each new changeset's
 //! manifest held to the manifest log; the markers, each read as the obsstore's format reads it, appended in one batch.
-//! So the replayed index is the import's row for row, and a recomputation that differs is refused (§4.16). The room
-//! recorded bounds what a changeset's extras take as it bounded the import, so every node replays within the same
-//! bound (R8). A refused replay releases its index and gives back every hold, leaving the content store as it found
-//! it.
+//! The fork takes the index's place once the whole record is in, so a refused replay leaves the index and the content
+//! store as they were. An import's record replays only into an empty index, as the live landing takes only an empty
+//! store. Not checked again: that each path a changeset names has a file log, which the import held its listing to.
 //!
-//! **Not checked again:** that each path a changeset names has a file log. The import held its listing to that; the
-//! record is the listing now, and a changeset's paths are its text's, which its node holds.
-//!
-//! **The encoding**, little-endian as git's record is: the magic and the version; the room; the changesets' count, then
-//! each changeset's node, parents, flags, text length and text; the manifests' count, then each manifest's node,
-//! parents, link, flags, text length and text; the file logs' count, then each log's path length, path, revisions'
-//! count and each revision as a manifest's; the markers' count, then each marker's length and bytes. Every count is
-//! checked against the bytes that remain before anything is allocated, and bytes after the last marker are refused,
-//! each by kind ([`Refused`]), never a panic.
+//! **The encoding**, little-endian as git's record is: the magic `SHGR` (a slates Mercurial record) and the version; the
+//! source (0 an import, 1 a push); the room; the groups' count, then each group's log (0 the changelog, 1 the manifest
+//! log, 2 a file log, its path's length and path after it), its revisions' count and each revision: node, parents, link
+//! (not a changeset's), flags, text length and text; the markers' count, then each marker's length and bytes. Every
+//! count is checked against the bytes that remain before anything is allocated, and bytes after the last marker are
+//! refused, each by kind ([`Refused`]), never a panic.
 
 use std::convert::Infallible;
 
@@ -47,9 +44,9 @@ use crate::index::{HgIndex, Log, NONE, NewRevision};
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, NULL_NODE, Node, changeset, node, obsmarkers};
 
-/// Format: the record's magic, "SHIR" (a slates Mercurial import's record) little-endian, so bytes of another kind are
-/// refused at the first word.
-const MAGIC: u32 = u32::from_le_bytes(*b"SHIR");
+/// Format: the record's magic, "SHGR" (a slates Mercurial record) little-endian, so bytes of another kind are refused at
+/// the first word.
+const MAGIC: u32 = u32::from_le_bytes(*b"SHGR");
 
 /// Format: the record's version; a replay refuses any other.
 const VERSION: u32 = 1;
@@ -69,14 +66,43 @@ const CHANGESET_MIN_BYTES: usize = NODE_LEN + NODE_LEN + NODE_LEN + FLAGS_BYTES 
 /// Format: the fewest bytes a manifest or file revision takes: a changeset's, and its link.
 const REVISION_MIN_BYTES: usize = CHANGESET_MIN_BYTES + NODE_LEN;
 
-/// Format: the fewest bytes a file log takes: its path's length and its revisions' count.
-const FILE_LOG_MIN_BYTES: usize = LONG_BYTES + LONG_BYTES;
+/// Format: the bytes of a group's log tag and of the source.
+const TAG_BYTES: usize = size_of::<u8>();
+
+/// Format: the fewest bytes a group takes: its log's tag and its revisions' count.
+const GROUP_MIN_BYTES: usize = TAG_BYTES + LONG_BYTES;
+
+/// Format: each log's tag in a group: the changelog's, the manifest log's, a file log's (its path follows).
+const CHANGELOG_TAG: u8 = 0;
+/// Format: see [`CHANGELOG_TAG`].
+const MANIFEST_TAG: u8 = 1;
+/// Format: see [`CHANGELOG_TAG`].
+const FILE_TAG: u8 = 2;
 
 /// Format: the fewest bytes a marker takes: its length.
 const MARKER_MIN_BYTES: usize = LONG_BYTES;
 
-/// Format: the bytes before the changesets: the magic, the version and the room.
-const HEAD_BYTES: usize = WORD_BYTES + WORD_BYTES + LONG_BYTES;
+/// Format: the bytes before the groups: the magic, the version, the source and the room.
+const HEAD_BYTES: usize = WORD_BYTES + WORD_BYTES + TAG_BYTES + LONG_BYTES;
+
+/// Whose revisions a record holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+  /// An import's: every revision of an index made from a store; it replays only into an empty index.
+  Import,
+  /// A push's: the revisions it brought that the repository lacked, appended after what the index holds.
+  Push,
+}
+
+impl Source {
+  /// Format: the source's byte.
+  fn byte(self) -> u8 {
+    match self {
+      Source::Import => 0,
+      Source::Push => 1,
+    }
+  }
+}
 
 /// Why a record was refused. A refused replay leaves the content store as it found it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +120,14 @@ pub enum Refused {
   Count,
   /// Bytes after the last marker.
   Trailing,
+  /// A source byte or a group's log tag the format does not name.
+  Tag {
+    /// The byte read.
+    tag: u8,
+  },
+  /// An import's record met an index that holds rows: an import's revisions replay only into an empty index, as its
+  /// live landing takes only an empty store.
+  NotEmpty,
   /// A revision whose text is not what its node names, or whose hashing shows a known collision attack.
   Node {
     /// Its revlog's radix, as the import names it (`00changelog`, `data/a.txt`).
@@ -147,22 +181,44 @@ pub enum WriteRefused {
   Allocation,
 }
 
-/// An index replayed from its record, and what it holds.
-#[derive(Debug)]
+/// What a replay appended, and whether the index it took the place of was given back whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Replayed {
-  /// The index.
-  pub index: HgIndex,
   /// The changesets.
   pub changesets: u32,
   /// The manifest revisions.
   pub manifests: u32,
-  /// The file logs.
+  /// The file logs it appended to.
   pub file_logs: u64,
   /// The file revisions, over every file log.
   pub file_revisions: u64,
   /// The obsolescence markers.
   pub markers: u64,
+  /// Whether the index the replayed one took the place of was given back whole; not, the content store's count of
+  /// holds is off, which its caller counts.
+  pub whole: bool,
 }
+
+/// One revision a push's record holds ([`write_revisions`]): its node, parents, link (the null node for a changeset,
+/// which has none), 7.2's index flags, and its whole text as 7.2 stores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Revision<'t> {
+  /// The node.
+  pub node: Node,
+  /// The first parent's node.
+  pub p1: Node,
+  /// The second parent's node.
+  pub p2: Node,
+  /// The link's node.
+  pub link: Node,
+  /// 7.2's index flags.
+  pub flags: u16,
+  /// The whole text.
+  pub text: &'t [u8],
+}
+
+/// One group of a push's record: a log, and its revisions in the order they were appended.
+pub type Group<'g> = (Log<'g>, &'g [Revision<'g>]);
 
 /// One revision as the record holds it, read from the index: its node, parents, link (none for a changeset), flags,
 /// text length, and the contents its text is made of.
@@ -188,34 +244,127 @@ struct Kept {
 /// One log being written: which, and its radix as the import names it.
 type Written<'p> = (Log<'p>, Vec<u8>);
 
-/// The record of the index an import made (module docs), `room` the room it ran within. Refused, nothing is written.
+/// The record of the index an import made (module docs), `room` the room it ran within: every revision it holds, the
+/// changelog's group, the manifest log's, then each file log's in its path's order, and its markers. Refused, nothing
+/// is written.
 pub fn write(index: &HgIndex, store: &ContentStore, room: u64) -> Result<Vec<u8>, WriteRefused> {
-  let paths: Vec<&[u8]> = index.file_logs(store).collect();
-  let logs: Vec<Written<'_>> = paths
-    .iter()
-    .map(|path| (Log::File(*path), [DATA, *path].concat()))
-    .collect();
+  let mut logs: Vec<Written<'_>> = vec![
+    (Log::Changelog, CHANGELOG.to_vec()),
+    (Log::Manifest, MANIFEST.to_vec()),
+  ];
+  logs.extend(
+    index
+      .file_logs(store)
+      .map(|path| (Log::File(path), [DATA, path].concat())),
+  );
   let len = record_len(index, store, &logs)?;
   let mut out = Vec::new();
   out
     .try_reserve_exact(len)
     .map_err(|_| WriteRefused::Allocation)?;
-  out.extend_from_slice(&MAGIC.to_le_bytes());
-  out.extend_from_slice(&VERSION.to_le_bytes());
-  out.extend_from_slice(&room.to_le_bytes());
-  write_log(&mut out, index, store, &(Log::Changelog, CHANGELOG.to_vec()))?;
-  write_log(&mut out, index, store, &(Log::Manifest, MANIFEST.to_vec()))?;
-  out.extend_from_slice(&to_u64(logs.len()).to_le_bytes());
+  write_head(&mut out, (Source::Import, room), to_u64(logs.len()));
   for log in &logs {
-    if let Log::File(path) = log.0 {
-      out.extend_from_slice(&to_u64(path.len()).to_le_bytes());
-      out.extend_from_slice(path);
-    }
+    write_group_head(&mut out, log.0, u64::from(index.len(store, log.0)));
     write_log(&mut out, index, store, log)?;
   }
   write_markers(&mut out, index, store)
     .map(|()| out)
     .map_err(|number| WriteRefused::UnreadableMarker { number })
+}
+
+/// The record of revisions given whole (module docs): a push's, the revisions it appended in `groups`, in their order,
+/// then its `markers` each alone in its obsstore's format; `room` the room its landing ran within. Refused, nothing is
+/// written.
+pub fn write_revisions(
+  (source, room): (Source, u64),
+  groups: &[Group<'_>],
+  markers: &[&[u8]],
+) -> Result<Vec<u8>, WriteRefused> {
+  let mut len = to_u64(HEAD_BYTES).saturating_add(to_u64(LONG_BYTES));
+  for (log, revisions) in groups {
+    len = len.saturating_add(group_head_len(*log));
+    for revision in *revisions {
+      len = len
+        .saturating_add(fixed_len(*log))
+        .saturating_add(to_u64(revision.text.len()));
+    }
+  }
+  len = len.saturating_add(to_u64(LONG_BYTES));
+  for marker in markers {
+    len = len
+      .saturating_add(to_u64(MARKER_MIN_BYTES))
+      .saturating_add(to_u64(marker.len()));
+  }
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(usize::try_from(len).map_err(|_| WriteRefused::Allocation)?)
+    .map_err(|_| WriteRefused::Allocation)?;
+  write_head(&mut out, (source, room), to_u64(groups.len()));
+  for (log, revisions) in groups {
+    write_group_head(&mut out, *log, to_u64(revisions.len()));
+    for revision in *revisions {
+      write_revision_head(&mut out, *log, revision);
+      out.extend_from_slice(revision.text);
+    }
+  }
+  out.extend_from_slice(&to_u64(markers.len()).to_le_bytes());
+  for marker in markers {
+    out.extend_from_slice(&to_u64(marker.len()).to_le_bytes());
+    out.extend_from_slice(marker);
+  }
+  Ok(out)
+}
+
+/// Writes the head: the magic, the version, the source, the room, and the groups' count.
+fn write_head(out: &mut Vec<u8>, (source, room): (Source, u64), groups: u64) {
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&VERSION.to_le_bytes());
+  out.push(source.byte());
+  out.extend_from_slice(&room.to_le_bytes());
+  out.extend_from_slice(&groups.to_le_bytes());
+}
+
+/// The bytes a group's head takes: its tag, a file log's path, and its revisions' count.
+fn group_head_len(log: Log<'_>) -> u64 {
+  let path = match log {
+    Log::File(path) => to_u64(LONG_BYTES).saturating_add(to_u64(path.len())),
+    Log::Changelog | Log::Manifest => 0,
+  };
+  to_u64(GROUP_MIN_BYTES).saturating_add(path)
+}
+
+/// The fixed bytes a revision of `log` takes before its text.
+fn fixed_len(log: Log<'_>) -> u64 {
+  to_u64(match log {
+    Log::Changelog => CHANGESET_MIN_BYTES,
+    Log::Manifest | Log::File(_) => REVISION_MIN_BYTES,
+  })
+}
+
+/// Writes a group's head: its log's tag (a file log's path after it) and its revisions' count.
+fn write_group_head(out: &mut Vec<u8>, log: Log<'_>, count: u64) {
+  match log {
+    Log::Changelog => out.push(CHANGELOG_TAG),
+    Log::Manifest => out.push(MANIFEST_TAG),
+    Log::File(path) => {
+      out.push(FILE_TAG);
+      out.extend_from_slice(&to_u64(path.len()).to_le_bytes());
+      out.extend_from_slice(path);
+    }
+  }
+  out.extend_from_slice(&count.to_le_bytes());
+}
+
+/// Writes a revision's fixed part: node, parents, link (not a changeset's), flags and text length.
+fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>) {
+  out.extend_from_slice(&revision.node);
+  out.extend_from_slice(&revision.p1);
+  out.extend_from_slice(&revision.p2);
+  if log != Log::Changelog {
+    out.extend_from_slice(&revision.link);
+  }
+  out.extend_from_slice(&revision.flags.to_le_bytes());
+  out.extend_from_slice(&to_u64(revision.text.len()).to_le_bytes());
 }
 
 /// The bytes the record takes; refused past what an address can hold, or where a row or a marker is unreadable.
@@ -224,33 +373,21 @@ fn record_len(
   store: &ContentStore,
   logs: &[Written<'_>],
 ) -> Result<usize, WriteRefused> {
-  let mut len = to_u64(HEAD_BYTES);
-  let mut add = |bytes: u64| -> Result<(), WriteRefused> {
-    len = len.checked_add(bytes).ok_or(WriteRefused::Allocation)?;
-    Ok(())
-  };
-  let core = [
-    (Log::Changelog, CHANGELOG.to_vec()),
-    (Log::Manifest, MANIFEST.to_vec()),
-  ];
-  for log in &core {
-    add(log_len(index, store, log)?)?;
-  }
-  add(to_u64(LONG_BYTES))?;
+  let mut len = to_u64(HEAD_BYTES).saturating_add(to_u64(LONG_BYTES));
   for log in logs {
-    let path = match log.0 {
-      Log::File(path) => to_u64(path.len()),
-      Log::Changelog | Log::Manifest => 0,
-    };
-    add(to_u64(LONG_BYTES).saturating_add(path))?;
-    add(log_len(index, store, log)?)?;
+    let revisions = log_len(index, store, log)?;
+    len = len
+      .checked_add(group_head_len(log.0))
+      .and_then(|len| len.checked_add(revisions))
+      .ok_or(WriteRefused::Allocation)?;
   }
-  let markers = markers_len(index, store).map_err(|number| WriteRefused::UnreadableMarker { number })?;
-  add(markers)?;
+  let markers =
+    markers_len(index, store).map_err(|number| WriteRefused::UnreadableMarker { number })?;
+  len = len.checked_add(markers).ok_or(WriteRefused::Allocation)?;
   usize::try_from(len).map_err(|_| WriteRefused::Allocation)
 }
 
-/// The bytes one log takes: its count, then each revision's fixed part and text.
+/// The bytes one log's revisions take: each revision's fixed part and text (its group's head counts the rest).
 fn log_len(
   index: &HgIndex,
   store: &ContentStore,
@@ -260,7 +397,7 @@ fn log_len(
     Log::Changelog => CHANGESET_MIN_BYTES,
     Log::Manifest | Log::File(_) => REVISION_MIN_BYTES,
   });
-  let mut len = to_u64(LONG_BYTES);
+  let mut len = 0u64;
   for rev in 0..index.len(store, *log) {
     let kept = kept(index, store, *log, rev).ok_or_else(|| unreadable(radix, rev))?;
     len = len
@@ -343,16 +480,14 @@ fn changeset_node(index: &HgIndex, store: &ContentStore, number: u32) -> Option<
   index.changeset(store, number).map(|row| row.node)
 }
 
-/// Writes one log: its count, then each revision's node, parents, link (not a changeset's), flags, text length and text.
+/// Writes one log's revisions: each one's node, parents, link (not a changeset's), flags, text length and text.
 fn write_log(
   out: &mut Vec<u8>,
   index: &HgIndex,
   store: &ContentStore,
   (log, radix): &Written<'_>,
 ) -> Result<(), WriteRefused> {
-  let count = index.len(store, *log);
-  out.extend_from_slice(&u64::from(count).to_le_bytes());
-  for rev in 0..count {
+  for rev in 0..index.len(store, *log) {
     let kept = kept(index, store, *log, rev).ok_or_else(|| unreadable(radix, rev))?;
     out.extend_from_slice(&kept.node);
     out.extend_from_slice(&kept.p1);
@@ -434,6 +569,15 @@ impl<'a> Reader<'a> {
     Ok(taken)
   }
 
+  /// The next byte.
+  fn byte(&mut self) -> Result<u8, Refused> {
+    self
+      .take(TAG_BYTES)?
+      .first()
+      .copied()
+      .ok_or(Refused::Truncated)
+  }
+
   /// The next word.
   fn word(&mut self) -> Result<u32, Refused> {
     let bytes =
@@ -501,35 +645,24 @@ impl<'a> Reader<'a> {
   }
 }
 
-/// What a replay kept: the changesets, the manifests, the file logs, the file revisions over them, the markers.
-#[derive(Clone, Copy, Debug, Default)]
-struct Counts {
-  /// The changesets.
-  changesets: u32,
-  /// The manifest revisions.
-  manifests: u32,
-  /// The file logs.
-  file_logs: u64,
-  /// The file revisions, over every file log.
-  file_revisions: u64,
-  /// The obsolescence markers.
-  markers: u64,
-}
-
-/// The index a record makes, through the import's own steps, its texts kept in `store` (module docs). Refused, the
-/// index is released and every hold given back.
-pub fn replay(bytes: &[u8], store: &mut ContentStore) -> Result<Replayed, Refused> {
-  let mut index = HgIndex::new();
-  match replay_into(bytes, &mut index, store) {
-    Ok(counts) => Ok(Replayed {
-      index,
-      changesets: counts.changesets,
-      manifests: counts.manifests,
-      file_logs: counts.file_logs,
-      file_revisions: counts.file_revisions,
-      markers: counts.markers,
-    }),
-    Err(refused) => Err(match index.release(store) {
+/// The index with a record's revisions appended (module docs), through the import's own steps, into a fork of `index`
+/// that takes its place once the whole record is in; its texts kept in `store`. Refused, `index` and `store` are as they
+/// were: the fork is released and every hold given back. The one entry point for an import's record and a push's.
+pub fn replay(
+  bytes: &[u8],
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+) -> Result<Replayed, Refused> {
+  let mut fork = index
+    .fork(store)
+    .map_err(|refused| ImportRefused::<Infallible>::Index(refused.into()))?;
+  match replay_into(bytes, &mut fork, store) {
+    Ok(mut replayed) => {
+      let replaced = core::mem::replace(index, fork);
+      replayed.whole = replaced.release(store).is_ok();
+      Ok(replayed)
+    }
+    Err(refused) => Err(match fork.release(store) {
       Ok(()) => refused,
       Err(release) => Refused::Unreleased {
         cause: Box::new(refused),
@@ -539,31 +672,36 @@ pub fn replay(bytes: &[u8], store: &mut ContentStore) -> Result<Replayed, Refuse
   }
 }
 
-/// [`replay`]'s steps into `index`, in the import's order: the head, the changelog, the manifest log and each
-/// changeset's manifest held to it, the file logs, the markers, and nothing after them.
+/// [`replay`]'s steps into the fork: the head, each group in turn, each new changeset's manifest held to the manifest
+/// log, the markers, and nothing after them.
 fn replay_into(
   bytes: &[u8],
   index: &mut HgIndex,
   store: &mut ContentStore,
-) -> Result<Counts, Refused> {
+) -> Result<Replayed, Refused> {
   let mut reader = Reader { rest: bytes };
-  let room = head(&mut reader)?;
-  let mut counts = Counts {
-    changesets: replay_changesets(&mut reader, index, store, room)?,
-    manifests: replay_manifests(&mut reader, index, store)?,
-    ..Counts::default()
-  };
-  (counts.file_logs, counts.file_revisions) = replay_files(&mut reader, index, store)?;
-  counts.markers = replay_markers(&mut reader, index, store)?;
+  let (source, room) = head(&mut reader)?;
+  if source == Source::Import && index.rows().rows() != 0 {
+    return Err(Refused::NotEmpty);
+  }
+  let first = index.len(store, Log::Changelog);
+  let mut replayed = Replayed::default();
+  for _ in 0..reader.count(GROUP_MIN_BYTES)? {
+    replay_group(&mut reader, (index, store), room, &mut replayed)?;
+  }
+  for rev in first..index.len(store, Log::Changelog) {
+    check_manifest(index, store, rev)?;
+  }
+  replayed.markers = replay_markers(&mut reader, index, store)?;
   if reader.rest.is_empty() {
-    Ok(counts)
+    Ok(replayed)
   } else {
     Err(Refused::Trailing)
   }
 }
 
-/// The record's head read: its magic and version held to this build's, and the room the import ran within.
-fn head(reader: &mut Reader<'_>) -> Result<Admission, Refused> {
+/// The record's head read: its magic and version held to this build's, its source, and the room it was written within.
+fn head(reader: &mut Reader<'_>) -> Result<(Source, Admission), Refused> {
   if reader.word()? != MAGIC {
     return Err(Refused::Magic);
   }
@@ -571,39 +709,59 @@ fn head(reader: &mut Reader<'_>) -> Result<Admission, Refused> {
   if version != VERSION {
     return Err(Refused::Version { version });
   }
-  Ok(Admission::new(reader.long()?))
+  let source = match reader.byte()? {
+    tag if tag == Source::Import.byte() => Source::Import,
+    tag if tag == Source::Push.byte() => Source::Push,
+    tag => return Err(Refused::Tag { tag }),
+  };
+  Ok((source, Admission::new(reader.long()?)))
 }
 
-/// The changelog, each changeset kept and appended in turn within `room`: how many.
-fn replay_changesets(
+/// One group: its log read from its tag, then each revision kept and appended in turn, numbered its log's next, a
+/// changeset's within `room`; counted into `replayed`.
+fn replay_group(
   reader: &mut Reader<'_>,
-  index: &mut HgIndex,
-  store: &mut ContentStore,
+  (index, store): (&mut HgIndex, &mut ContentStore),
   room: Admission,
-) -> Result<u32, Refused> {
-  let changesets = reader.revisions(CHANGESET_MIN_BYTES)?;
-  for rev in 0..changesets {
-    let read = reader.revision(false)?;
-    replay_changeset(index, store, (rev, &read), room)?;
+  replayed: &mut Replayed,
+) -> Result<(), Refused> {
+  let tag = reader.byte()?;
+  let (log, radix) = match tag {
+    CHANGELOG_TAG => (Log::Changelog, CHANGELOG.to_vec()),
+    MANIFEST_TAG => (Log::Manifest, MANIFEST.to_vec()),
+    FILE_TAG => {
+      let path = reader.bytes()?;
+      (Log::File(path), [DATA, path].concat())
+    }
+    tag => return Err(Refused::Tag { tag }),
+  };
+  let linked = log != Log::Changelog;
+  let least = if linked {
+    REVISION_MIN_BYTES
+  } else {
+    CHANGESET_MIN_BYTES
+  };
+  let revisions = reader.revisions(least)?;
+  for _ in 0..revisions {
+    let read = reader.revision(linked)?;
+    let rev = index.len(store, log);
+    if linked {
+      replay_revision(index, store, (log, radix.as_slice()), (rev, &read))?;
+    } else {
+      replay_changeset(index, store, (rev, &read), room)?;
+    }
   }
-  Ok(changesets)
-}
-
-/// The manifest log, each manifest kept and appended in turn, then each changeset's manifest held to it: how many.
-fn replay_manifests(
-  reader: &mut Reader<'_>,
-  index: &mut HgIndex,
-  store: &mut ContentStore,
-) -> Result<u32, Refused> {
-  let manifests = reader.revisions(REVISION_MIN_BYTES)?;
-  for rev in 0..manifests {
-    let read = reader.revision(true)?;
-    replay_revision(index, store, (Log::Manifest, MANIFEST), (rev, &read))?;
+  match log {
+    Log::Changelog => replayed.changesets = replayed.changesets.saturating_add(revisions),
+    Log::Manifest => replayed.manifests = replayed.manifests.saturating_add(revisions),
+    Log::File(_) => {
+      replayed.file_logs = replayed.file_logs.saturating_add(1);
+      replayed.file_revisions = replayed
+        .file_revisions
+        .saturating_add(u64::from(revisions));
+    }
   }
-  for rev in 0..index.len(store, Log::Changelog) {
-    check_manifest(index, store, rev)?;
-  }
-  Ok(manifests)
+  Ok(())
 }
 
 /// Holds `read`'s flags to what 7.2 knows and its text to its node, as the import's revlog reader holds them.
@@ -699,27 +857,6 @@ fn check_manifest(index: &HgIndex, store: &ContentStore, rev: u32) -> Result<(),
     rev,
     node: row.manifest,
   }))
-}
-
-/// Every file log the record holds, each revision kept and appended in turn: how many logs, and revisions over them.
-fn replay_files(
-  reader: &mut Reader<'_>,
-  index: &mut HgIndex,
-  store: &mut ContentStore,
-) -> Result<(u64, u64), Refused> {
-  let logs = reader.count(FILE_LOG_MIN_BYTES)?;
-  let mut revisions_over_logs = 0u64;
-  for _ in 0..logs {
-    let path = reader.bytes()?;
-    let radix = [DATA, path].concat();
-    let revisions = reader.revisions(REVISION_MIN_BYTES)?;
-    for rev in 0..revisions {
-      let read = reader.revision(true)?;
-      replay_revision(index, store, (Log::File(path), &radix), (rev, &read))?;
-    }
-    revisions_over_logs = revisions_over_logs.saturating_add(u64::from(revisions));
-  }
-  Ok((logs, revisions_over_logs))
 }
 
 /// The markers, each read as the obsstore's format reads it and alone in it, kept as content and appended in one
