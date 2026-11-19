@@ -13296,6 +13296,22 @@ and export by landing).
 > source, the same line at the same path), with `svn info` of a file and `svn proplist --show-inherited-props` replayed
 > whole. Owed: `get-file`, `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
 > `get-deleted-rev`, then `svn mergeinfo --show-revs`; read access by the authorization rules (A-606).
+>
+> **Status (2026-11-19, A-617, part 2a).** Built: the commit's request and its editor commands, read as `svnserve` reads
+> them (`slates-svn`'s `commit::edit`, piece 7's commit, its first part). `commit`'s parameters are read as `serve.c`
+> reads them, `"clb?l"` or a client before 1.2's one item, and its lock tokens after the authentication request as
+> `add_lock_tokens` reads them; each editor command by its handler's prototype in `editorp.c`, as `marshal.c`'s
+> `vparse_tuple` reads one: items past the prototype ignored, an optional rest absent, another kind than the prototype's
+> malformed. The refusals carry `svnserve`'s numbers: malformed data (`E210004`) ends the connection, an unknown command
+> (`E210001`) is a command failure; a NUL inside a C string and a revision past `svn_revnum_t`, which `svnserve` reads
+> through C, are refused. Each command writes itself back as a stock client writes it. Held to seventeen commits
+> recorded on the Mac Studio, four of them refused by `svnserve`: stock `svn` 1.15.0 against stock `svnserve` 1.15.0
+> through a relay (`crates/svn/fixtures/commit`, its `make-fixtures.py`, each file's SHA-256 in `SHA256SUMS`), every
+> command read and written back byte for byte, every text delta decoded whole and applied to its file's text; and to
+> `vparse_tuple` transcribed over generated items for every prototype. Owed (part 2b): the drive, each command checked
+> as it arrives (the tokens, the paths, the out-of-date test, the lock check) and declared on a trial built a command at
+> a time, the texts through the svndiff codec with their MD5 checked, `close-edit`'s verdict, and the answers `svnserve`
+> writes: after a failure, the commands read and dropped until `abort-edit` (`editorp.c` 1149-1208).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -42714,3 +42730,40 @@ Applied in the same change to: §4.17.2 (a status block; piece 5's line), GAPS (
   bounded today by the versions a pack spans and reset by each rebuild. The encoding and the rebuild sliced under the
   shard's budget. One base pack shared by greens that reach alike. Main's runs are filed: `git verify-pack` over the
   sample pack, the double hashing, clippy, `xtask` and the docs.
+
+### A-617 part 2a — The commit's request and its editor commands read as `svnserve` reads them, held to stock `svn` 1.15.0's own commits recorded through a relay (2026-11-19, g268 for UI goal 93; §4.17.4 "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-617, part 2a), GAPS (the §4.17.4 entry), the research notes
+(`vcs-servers-subversion.md`: §1's `editorp.c` row; §14, new), `crates/svn/src/commit.rs` (`pub mod edit`, its doc
+sentence, one line rewrapped), `crates/svn/src/commit/edit.rs` and `crates/svn/src/commit/edit/tests.rs` (new),
+`crates/svn/fixtures/commit/` (new: the recording script, 52 streams of 26 connections, `sessions.txt`, the tools'
+versions, `SHA256SUMS`), `crates/svn/src/commit/tests.rs` (main's two clippy findings: A-592's oracle `merge`, which
+returns a `Result`, answers a node that is not a directory with a typed stop where it asserted, and the generator's
+anonymous share reads `is_multiple_of`; the case checker's revision lookup returns its miss rather than unwrapping it).
+- **What was there.** Nothing read `commit` or the editor commands after it: the item codec (A-531) parses items, and
+  the handshake (A-599) and the read commands (A-613) answer their own. A-592's out-of-date test and verdict waited for
+  a drive.
+- **The decision.** One typed value per command, `EditCommand`: a variant for each name `editorp.c`'s table dispatches
+  and for `failure`, its fields borrowed from the parsed item. `EditCommand::read` reads one as `vparse_tuple` reads its
+  handler's prototype; `to_value` writes it back as `marshal.c`'s `svn_ra_svn__write_cmd_*` write it.
+  `CommitRequest::read` reads `commit`'s parameters as `serve.c` does, and `lock_tokens` reads the tokens as
+  `add_lock_tokens` does, later and as a command failure. The refusals are typed: `EditRefusal::Malformed` with its
+  `Malformation` (`E210004`, the connection ends), `EditRefusal::UnknownCommand` (`E210001`, a command failure) and
+  `LockTokensRefusal` (`E210004`, a command failure). Two are stricter than `svnserve`, each for an input no stock
+  client sends: a NUL inside a C string (`svnserve` reads `a\0b` as `a`) and a revision past `svn_revnum_t` (`svnserve`
+  casts it to a negative number, which reads as no revision). Which command may come when, and every check of the commit
+  editor, are the drive's (part 2b).
+- **The recordings.** On the Mac Studio, stock `svn`, `svnserve` and `svnadmin` 1.15.0 (r1937767): `make-fixtures.py`
+  makes a repository and its working copies in a directory of its own, runs 34 steps as two users, and its `--tunnel`
+  role relays each `svn+fixture://` connection to `svnserve -t`, logging every byte each way. 25 sessions reached the
+  server over 26 connections, 17 of them commits. Four commits were refused as stock refuses them: `E160028` twice (a
+  file out of date, and a property change on a stale root), `E160039` (another user's lock) and `E160024` (a conflict,
+  made by holding the client's stream at `close-edit` while another commit landed). `sessions.txt` keeps each step's
+  command, user and exit, and the refusals' messages; `SHA256SUMS` each file's digest.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). Failing first (05:17 UTC): with the readers stubbed, 9 of the new tests failed. Green (05:18 UTC,
+  eee90bd82): `cargo test --locked -p slates-svn --lib` 245 of 245 in 2.08 s; the prototype oracle's census: 136
+  generated items read alike, 93 refused alike, 27 refused by the stricter rules alone. The module's line citations were
+  checked against the sources at `d434dc14` before landing, and 23 of them corrected. On the tree merged with main
+  (8ef924a7b, 05:39 UTC): 295 of 295 in 8.53 s, the census 141, 98 and 17; `cargo fmt -p slates-svn -- --check` clean.
+  Clippy, `xtask check` and the doc gate are main's (the run-request queue).
+- **Owed.** Part 2b, the drive (§4.17.4's status).

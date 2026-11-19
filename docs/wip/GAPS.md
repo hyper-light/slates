@@ -429,7 +429,8 @@
 
 > **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index, its lock table, its
 > mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies, its authorization and its dump
-> codec built (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609, A-606 and A-593, D-28; UI goals 91,
+> codec built, and its commit's editor commands read (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599,
+> A-609, A-606, A-593 and A-617, D-28; UI goals 91,
 > 92 and 93; g292, g250, g262, g268, g234, g229, g264).** A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s
 > `commit`: the drive's out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's
 > transaction as the index's own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()`
@@ -441,7 +442,15 @@
 > paths in `svn_path_compare_paths` order and returns at the first that fails (`transaction.c` 3537-3539, 3578), so a
 > commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at `/t/a-b` where `svnserve` answers `/t/a/b`; it
 > now meets them in FSFS's order, and A-602's oracle accepts only the first failing path's locks (it had accepted any
-> lock in the commit). A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock` (with
+> lock in the commit). A-617 part 2a (2026-11-19, g268, UI goal 93): the commit's request and its editor commands read
+> as `svnserve` reads them (`commit::edit`), malformed data (`E210004`, the connection's end) and an unknown command
+> (`E210001`) refused as it refuses them; held to seventeen commits of stock `svn` 1.15.0 against stock `svnserve`
+> 1.15.0 recorded through a relay (`crates/svn/fixtures/commit`, SHA-256 checked), each command read and written back
+> byte for byte and each text delta applied, and to `vparse_tuple` transcribed over generated items; `cargo test
+> --locked -p slates-svn --lib` on the Mac Studio, red first (see A-617 part 2a). Owed from it (part 2b): the drive,
+> each command checked as it arrives and declared on a trial built a command at a time, `close-edit`'s verdict and the
+> answers `svnserve` writes. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
+> (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
 > applied unconditionally; its oracle FSFS's lock rules transcribed, equal on generated histories; `cargo test -p
 > slates-svn --lib` 74 of 74 on the Mac Studio (see A-602). Owed from it: the verbs on the wire, the lock hooks, DAV's
