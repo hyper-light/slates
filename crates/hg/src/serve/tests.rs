@@ -131,7 +131,7 @@ pub(super) fn node_for(seed: u64) -> Node {
 const BRANCHES: [&[u8]; 4] = [b"default", b"stable", b"old feature/x", b"default"];
 
 /// A history from per-revision choices: a first parent among the four before it (or none), a second now and then, a
-/// branch, a close, a bookmark, and draft where asked or where a parent is draft.
+/// branch, a close, a bookmark (its name divergent now and then), and draft where asked or where a parent is draft.
 fn build(choices: &[(u32, u32, u8, bool, bool, bool)], seed: u64, publishing: bool) -> History {
   let mut history = History {
     publishing,
@@ -162,9 +162,13 @@ fn build(choices: &[(u32, u32, u8, bool, bool, bool)], seed: u64, publishing: bo
       phase,
     });
     if *mark {
-      history
-        .bookmarks
-        .push((format!("mark {rev}").into_bytes(), node));
+      // A-690: every third name divergent (an `@` inside it), every third ending with `@` (no divergent name).
+      let name = match rev % 3 {
+        0 => format!("mark {rev}"),
+        1 => format!("mark {rev}@1"),
+        _ => format!("mark {rev}@"),
+      };
+      history.bookmarks.push((name.into_bytes(), node));
     }
   }
   history
@@ -341,6 +345,11 @@ fn oracle_phase_heads(history: &History, heads: &[Rev]) -> Vec<PhaseHead> {
     .collect()
 }
 
+/// 7.2's `bookmarks.isdivergent`, as its source states it: `b'@' in b and not b.endswith(b'@')`.
+fn oracle_divergent(name: &[u8]) -> bool {
+  name.contains(&b'@') && !name.ends_with(b"@")
+}
+
 fn oracle_listkeys(history: &History, namespace: &[u8]) -> Vec<u8> {
   let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
   match namespace {
@@ -351,7 +360,7 @@ fn oracle_listkeys(history: &History, namespace: &[u8]) -> Vec<u8> {
     }
     b"bookmarks" => {
       for (name, node) in &history.bookmarks {
-        if history.rev(node).is_some() {
+        if history.rev(node).is_some() && !oracle_divergent(name) {
           entries.push((name.clone(), hex(node)));
         }
       }
@@ -416,7 +425,7 @@ proptest! {
   /// AC-HG.1, A-619 (oracle): do answer `heads`, `branchmap` and every `listkeys` namespace over generated histories.
   /// Expect each answer byte for byte as the naive oracle writes it: heads newest first (the null node for an empty
   /// history), each branch's heads oldest first with closed ones kept, branches by name and quoted, bookmarks naming
-  /// a changeset held, draft roots and `publishing`.
+  /// a changeset held but a divergent one (A-690), draft roots and `publishing`.
   #[test]
   fn heads_branchmap_and_listkeys_answer_as_the_oracle(history in history()) {
     prop_assert_eq!(answer(|room, out| discovery::heads(&history, room, out)), oracle_heads_answer(&history));
@@ -476,8 +485,8 @@ proptest! {
 
   /// AC-HG.1, A-619 (oracle): do choose a `getbundle`'s changesets for generated heads and common sets, an unknown
   /// common node among them, and its phase heads. Expect the missing changesets exactly the naive difference of the
-  /// two ancestor sets, oldest first; no heads asked meaning every head; and the phase heads as 7.2's
-  /// `_getbundlephasespart` computes them over whole sets.
+  /// two ancestor sets, oldest first; no heads asked meaning every head; the phase heads as 7.2's
+  /// `_getbundlephasespart` computes them over whole sets; and the bookmarks part's held bookmarks but divergent ones.
   #[test]
   fn getbundles_choice_and_phase_heads_are_the_oracles(
     history in history(),
@@ -499,7 +508,8 @@ proptest! {
     prop_assert_eq!(&chosen.missing, &naive_missing(&history, &asked, &common));
     prop_assert_eq!(phase_heads_of(&history, &chosen.heads), oracle_phase_heads(&history, &chosen.heads));
     let marks = marks_of(&history);
-    let mut expected: Vec<(&[u8], Node)> = history.bookmarks().filter(|(_, node)| history.rev(node).is_some()).collect();
+    let mut expected: Vec<(&[u8], Node)> =
+      history.bookmarks().filter(|(name, node)| history.rev(node).is_some() && !oracle_divergent(name)).collect();
     expected.sort();
     prop_assert_eq!(marks, expected);
   }

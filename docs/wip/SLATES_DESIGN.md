@@ -13917,6 +13917,19 @@ signature verification).
 > generated histories to 7.2's filter stated literally, and pins, reveals, a dropped root, an unreadable marker and
 > every room up to the least to their answers. Owed: the view handed to the daemon's sites over A-662's stores (A-680
 > part 2).
+>
+> **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
+> `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
+> a divergent name, one with an `@` before its end, as 7.2's `listbinbookmarks` leaves it out (`bookmarks.py` 475-484:
+> `hasnode(v) and not isdivergent(k)`); the rule is `crate::bookmarks::divergent`, which the push's refusal of a
+> divergent name now shares.
+> Before, every bookmark naming a held changeset was listed, and A-619's oracle stated the same over names that never
+> held an `@`. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19): `fixtures/state`'s `divergent`,
+> where `feature` moved apart in a clone and the clone was pulled back so 7.2 kept the clone's as `feature@1`, answers
+> `@` and `feature` to `hg debugpushkey` over `hg serve`, and a clone over it holds those two, where slates' view of it
+> answered `feature@1` too. Proven on macOS arm64 (Mac Studio, kiln r340 red and r356 green, 2026-11-19; the other
+> platforms owed): `slates-hg --lib serve:: push:: bookmarks::` 93 passed and 0 failed, fmt clean
+> (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -51539,3 +51552,34 @@ Applied in the same change to:
   `EdgeState::new` on the listener's shard and `EdgeState::arrivals` on the others); Subversion's tunnel moved to the
   shard of the repository its greeting names (A-688); a test of an arrival that waits for a full shard's seat and of
   one refused past the bound; main's live OpenSSH `git clone` over SSH and the other platforms' runs.
+
+### A-690 — Divergent bookmarks left out where bookmarks are served, as 7.2's `listbinbookmarks` leaves them out (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" items 1 and 3; A-619, A-680 part 1)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::divergent`, `push::classify`,
+`serve::pull::bookmark_entries`, `serve::Repository::bookmarks`' doc, `serve::tests`' generator and oracle,
+`serve/indexed_tests.rs`, `tests/fixtures.rs`), `crates/hg/fixtures/state` (both scripts by repository name;
+`divergent`), GAPS (a fixed entry), `docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`.
+- **What was wrong.** `bookmark_entries` listed every bookmark naming a changeset the served view holds; 7.2 lists those
+  whose name is not divergent (`bookmarks.py` 471-472, `isdivergent`: an `@` in the name and not as its last byte;
+  475-484, `listbinbookmarks`), for `listkeys bookmarks` (`pushkey.py` 27-32, through `listbookmarks`, 487-491) and
+  the `bookmarks` part (`exchange.py` 2638-2649). A-619's oracle stated the implementation's rule over generated names
+  that never held an `@`, so it certified it.
+- **The decision.** One rule, 7.2's, in `crate::bookmarks::divergent`: the pull's listing leaves a divergent name out
+  and the push's classification refuses one (`push/classify.rs`, unchanged in behaviour, now sharing it). `@` alone and
+  any name ending with `@` stay listed.
+- **Reproduced by use first** (Mac Studio, macOS arm64, stock Mercurial 7.2 from PyPI through uv, 2026-11-19).
+  `make-state-fixtures.sh . divergent` makes the repository as a divergent bookmark is made (a root bookmarked
+  `feature`, a changeset on it in a clone and another here, the clone pulled back: "divergent bookmark feature stored
+  as feature@1"; `@` on the root), and `make-served-fixtures.sh . divergent` records 7.2's served answers. The
+  repository rebuilt from those files: `hg bookmarks` lists `@`, `feature` and `feature@1`; under `hg serve`,
+  `hg debugpushkey http://127.0.0.1:54846/ bookmarks` answers `@` and `feature`, and a clone over it holds `@` and
+  `feature`. Before the fix slates' view of the same repository answered `feature@1` too (r340, below).
+- **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r340 over ab23dd3e0 (the fixture and the golden alone):
+  `cargo test --locked -p slates-hg --lib serve::` 52 passed and 1 failed, the golden, at `listkeys bookmarks`
+  (`feature@1` answered). Green: kiln r356 over 15342a05f: `cargo test --locked -p slates-hg --lib -- serve:: push::
+  bookmarks::` 93 passed and 0 failed; `cargo fmt -p slates-hg -- --check` clean. The golden holds `divergent`'s three changesets,
+  none left out, `heads` (two), `branchmap` (`default`'s two heads), `listkeys` of `bookmarks` and `phases`, and the
+  `bookmarks` part's entries to stock 7.2's, the view holding all three bookmarks. The serve oracle now generates names
+  with an `@` inside them and at their end, and states `isdivergent` as 7.2's source states it.
+- **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
+  draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
+- **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
