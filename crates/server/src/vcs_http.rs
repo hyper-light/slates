@@ -44,8 +44,8 @@
 //! upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land; Mercurial's and
 //! Subversion's sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run).
 
-mod git;
-mod waits;
+pub(crate) mod git;
+pub(crate) mod waits;
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -125,7 +125,7 @@ impl Bounds {
   /// The clock granularity `G` a wait starting now is floored by: the timer's tick, or the lateness the shard's scheduler
   /// has shown when that is longer (`slates_rt::futures::scheduler_overrun_ns`, the floor the fleet's detector and the MCP
   /// edge put under their windows).
-  fn granularity_ns(self) -> u64 {
+  pub(crate) fn granularity_ns(self) -> u64 {
     self.tick_ns.max(scheduler_overrun_ns())
   }
 }

@@ -3177,10 +3177,13 @@ impl Green {
     Ok(Some(Effect::Symlink(path.to_owned(), target.to_owned())))
   }
 
-  /// Merges a hard link (a namespace edge; a differing intervening link is a conflict). The link
-  /// names a node, never a path (A-646): its target is the home of the node the work named, the
-  /// one it makes (`made`), or the one at the target at the work's base, while that has not
-  /// changed since (`Green::node_home`; A-643 refused a target removed after the base).
+  /// Merges a hard link (a differing intervening link is a conflict). The link names a node, never
+  /// a path (A-646): its target is the home of the node the work named, the one it makes (`made`),
+  /// or the one at the target at the work's base, while that has not changed since
+  /// (`Green::node_home`; A-643 refused a target removed after the base). The node is resolved
+  /// before the link's own path is judged, since that judgement compares the node's home with the
+  /// link the head holds there: a link naming no node is refused for that, whatever changed its
+  /// path.
   fn merge_hardlink(
     &self,
     path: &str,
@@ -3214,7 +3217,9 @@ impl Green {
   /// The home now of the node at `path` at version `base`: the file or IPC node a hard link there
   /// names, or the one there, while it has not changed since the base (A-646). A node changed or
   /// removed since, or moved away (its link changed, its file removed), is gone for a work based
-  /// before: delete against modify. A path holding no file or IPC node is a type change.
+  /// before: delete against modify. A path holding a directory or a symlink is a type change, and
+  /// a path holding nothing is delete against modify, whether its node was removed since or none
+  /// stood there at the base (a link no work can make: `link(2)` answers `ENOENT`).
   fn node_home(&self, path: &str, base: u64) -> Result<String, MergeConflictClass> {
     if let Some(home) = self.hardlinks.get(path) {
       if self.changed_after(path, base) {
