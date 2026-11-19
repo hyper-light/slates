@@ -40552,9 +40552,11 @@ cannot hold, refused.
   and a property test holding both questions to refs.c's own check transcribed in the test (its `refname_disposition`
   table and its component loop) over names built from pieces that reach every rule (`.lock`, `..`, `@{`, a leading dot,
   every disposition).
-- **Checks** (Mac Studio, `cargo test -p slates-git --lib`, 2026-11-19): 144 of 144 (kiln r636), `cargo fmt --check`
-  clean. Red twice in the Studio's clone: without the `.lock` rule 3 tests failed, A-590's golden fsck test among them;
-  with the tag question always answering yes, 4 failed, A-590's tag and golden tests among them.
+- **Checks** (Mac Studio, `cargo test -p slates-git --lib`, 2026-11-19): 144 of 144 (kiln r636 and the runs after it),
+  `cargo fmt --check` clean. Red in the Studio's clone: without the `.lock` rule 3 tests failed, A-590's golden fsck
+  test among them; with the tag question always answering yes, 4 failed, A-590's tag and golden tests among them; and
+  the property test alone failed without the `.lock` rule and without the leading-dot rule, once its names were drawn
+  near valid (its first generator, of single bytes, missed the `.lock` rule).
 
 Part 1 applied in the same change to: `crates/git` (`refname.rs` and `tests/refname.rs`, new; `objects/refname.rs` and
 `v2/refname.rs`, removed; `objects/tag.rs`, `v2/fetch.rs` and `v2/ls_refs.rs` on the shared module; the `mod` line in
