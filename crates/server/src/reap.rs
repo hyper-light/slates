@@ -190,6 +190,10 @@ pub(crate) async fn reaper() {
     if departures {
       crate::remote_attach::sweep_departed().await;
     }
+    // A taken-back map no holder claimed within the reconnect budget is reclaimed as a dead client's maps are (A-197),
+    // owed by the keeper at its claim's deadline (A-554). Linux alone takes such maps back.
+    #[cfg(target_os = "linux")]
+    let _reclaimed = crate::held_copy::reclaim_owed().await;
     let Some(round) = state::with_state(take_round) else {
       return;
     };

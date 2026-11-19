@@ -4923,24 +4923,27 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
-> **Status (2026-11-19, A-554: grants, the owed audit and departed hosts leave the tick; the retry window named).** A
-> grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants table keeps its
-> issued grants in an index by the end of their term (`slates_land::grant::Grants`, one entry an issued grant, taken out
-> at its consumption, revocation or end), so the keeper sleeps to the next grant due and its sweep reads the due alone,
-> where the tick walked every grant once a window. An issue or a restore notes the earliest it entered, and each state
-> borrow hands that to the keeper. A deadline its job could not end (a grant whose expiry record the catalog refused, a
-> refused destroy record) is tried again the retry window on (`deadlines::retry_window_ns`, counted `deadline.stuck`):
-> the shard's window of A-455, the liveness window `W` (the recovery budget by rent or buy, A-359) raised to the
-> scheduler overrun the shard measured, never past the observation budget. What a shard owes the audit (A-265) is looked
-> at by the keeper a retry window after the record that armed the look was owed (`landing::arm_owed_audit_look`, armed
-> in `write_audit` and at the shard's start for a recovered outbox): a front where the look was armed is sent again
-> (`landing.audit_resent`), and the look is armed again a window on while anything is owed, never while nothing is. A
-> host the fleet let go has its clients' attachments ended (A-222) by the control shard's reaper, which looks when the
-> look's inputs change: an install that changed the fleet's members (`FleetNode::take_members_changed`, read as each
-> state borrow closes), an anchor learned or restarted, a peer's plane started (`remote_attach::look_for_departures`); a
-> look some shard did not answer is asked for again a retry window on, by the keeper. Off the tick so far: dead clients
-> (A-475), staging buffers and status captures (A-522), leases, CLI attachments and destroys (A-536), grants, the owed
-> audit and departed hosts (A-554); held copies are next.
+> **Status (2026-11-19, A-554: grants, the owed audit, departed hosts and held copies leave the tick; the retry window
+> named).** A grant past its term ends at the first instant past it, kept by the shard's deadline keeper: the grants
+> table keeps its issued grants in an index by the end of their term (`slates_land::grant::Grants`, one entry an issued
+> grant, taken out at its consumption, revocation or end), so the keeper sleeps to the next grant due and its sweep
+> reads the due alone, where the tick walked every grant once a window. An issue or a restore notes the earliest it
+> entered, and each state borrow hands that to the keeper. A deadline its job could not end (a grant whose expiry record
+> the catalog refused, a refused destroy record) is tried again the retry window on (`deadlines::retry_window_ns`,
+> counted `deadline.stuck`): the shard's window of A-455, the liveness window `W` (the recovery budget by rent or buy,
+> A-359) raised to the scheduler overrun the shard measured, never past the observation budget. What a shard owes the
+> audit (A-265) is looked at by the keeper a retry window after the record that armed the look was owed
+> (`landing::arm_owed_audit_look`, armed in `write_audit` and at the shard's start for a recovered outbox): a front
+> where the look was armed is sent again (`landing.audit_resent`), and the look is armed again a window on while
+> anything is owed, never while nothing is. A host the fleet let go has its clients' attachments ended (A-222) by the
+> control shard's reaper, which looks when the look's inputs change: an install that changed the fleet's members
+> (`FleetNode::take_members_changed`, read as each state borrow closes), an anchor learned or restarted, a peer's plane
+> started (`remote_attach::look_for_departures`); a look some shard did not answer is asked for again a retry window on,
+> by the keeper. A writable copy taken back after a takeover that no holder claimed (Linux, A-197) is reclaimed at its
+> claim's deadline: the keeper sleeps to it (`held_copy::next_claim_deadline`) and hands the reclaim to the reaper,
+> which writes the copies back. Off the tick so far: dead clients (A-475), staging buffers and status captures (A-522),
+> leases, CLI attachments and destroys (A-536), grants, the owed audit, departed hosts and held copies (A-554); the
+> pressure hold is next.
 
 > **Status (2026-11-19, A-536: leases, CLI attachments and destroys leave the tick).** The shard's deadline keeper
 > (`crate::deadlines`) also sleeps to the lease wheel's next deadline, releasing or renewing a lapsed write lease at its
@@ -36604,7 +36607,20 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   one-shard daemon, two learned peers configured members, a remote attachment of the leaving peer's client; once the
   control shard counts the peer, a configuration without it is installed: the attachment ended within half a window).
   The server test failed first on c718509 (the Mac Studio): the tick counted the peer, then the attachment was not
-  ended within half a window of the install.
+  ended within half a window of the install. Green on 80c9aa2 (the Mac Studio, 2026-11-19 17:47 local, load 14.2,
+  debug): `slates-cluster --lib fleet::` 10 of 10, `slates-server --lib` 15 of 15 (`deadlines::`, `reap::`,
+  `remote_attach::` and the three tests of the learn paths); the attachment ended 107 µs after the install.
+- **Held copies (job 4, Linux).** A writable copy a successor took back from its anchor and no holder claimed within
+  the reconnect budget (A-197) is reclaimed at its claim's deadline, no longer at the tick: the keeper sleeps to the
+  earliest claim due (`held_copy::next_claim_deadline`, a walk of the maps not yet claimed, which the anchor's held-copy
+  bound bounds; paired with a `None` where no copy is taken back, `deadlines::claim_due`) and at it hands the reclaim to
+  the reaper (`held_copy::owe_reclaim_if_due`, `ShardState::held_copies_owed`), since the reclaim writes copies back a
+  slice a turn; the reaper runs it (`held_copy::reclaim_owed`). The code is Linux's alone, as the copies are, so this
+  agent could neither build nor run it on its macOS host (§8): the test, `crates/server/src/held_copy.rs`
+  `an_unclaimed_map_is_reclaimed_at_its_claims_deadline_without_a_tick` (a map entered unclaimed with its claim due a
+  tenth of a window ahead: reclaimed within half a window and counted once), is filed for main's Linux build, red on
+  80c9aa2 with the test alone and green on this change.
 
 Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
-`crates/cluster/src/fleet.rs`, `crates/server/src/{deadlines,landing,verbs,daemon,reap,remote_attach,fleet,state}.rs`.
+`crates/cluster/src/fleet.rs`,
+`crates/server/src/{deadlines,landing,verbs,daemon,reap,remote_attach,fleet,state,held_copy}.rs`.

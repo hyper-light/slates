@@ -90,6 +90,9 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.departures_retry_at = None;
     crate::remote_attach::look_for_departures(state);
   }
+  // A taken-back map no holder claimed by its claim's deadline is reclaimed by the reaper (A-197, A-554; Linux).
+  #[cfg(target_os = "linux")]
+  crate::held_copy::owe_reclaim_if_due(state, now);
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -116,6 +119,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.landing.grants.next_due_ns(),
     state.landing.audit_look_at,
     state.departures_retry_at,
+    claim_due(state),
   ]
   .into_iter()
   .flatten()
@@ -137,6 +141,19 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
 /// the shard off its CPU longer than `W` lengthens it as much.
 pub(crate) fn retry_window_ns() -> u64 {
   crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns())
+}
+
+/// When the next taken-back map's claim is due (A-197, A-554; `crate::held_copy::next_claim_deadline`): Linux alone
+/// takes writable copies back from its anchor.
+#[cfg(target_os = "linux")]
+fn claim_due(state: &ShardState) -> Option<u64> {
+  crate::held_copy::next_claim_deadline(state)
+}
+
+/// When the next taken-back map's claim is due: never, where no copy is taken back (macOS and Windows, A-197).
+#[cfg(not(target_os = "linux"))]
+fn claim_due(_state: &ShardState) -> Option<u64> {
+  None
 }
 
 /// When the keeper sleeps until, given the earliest deadline its pass left: that deadline, or, for one still past after

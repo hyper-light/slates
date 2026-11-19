@@ -491,6 +491,11 @@ pub struct ShardState {
   /// When the control shard looks at departures again after a look some shard did not answer (A-554): a retry window
   /// on (`crate::deadlines::retry_window_ns`), kept by the deadline keeper; `None` while none is owed.
   pub(crate) departures_retry_at: Option<u64>,
+  /// Whether the shard's reaper owes the reclaim of the taken-back maps whose claim is past its deadline (A-197,
+  /// A-554): set by the deadline keeper at that deadline, taken by the reaper (`crate::held_copy::reclaim_owed`). Linux
+  /// alone takes such maps back.
+  #[cfg(target_os = "linux")]
+  pub(crate) held_copies_owed: bool,
   /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
   pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.
