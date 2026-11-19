@@ -4308,7 +4308,18 @@
 >   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
 >   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
 >   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
->   seconds on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   seconds on the wall. The same two waits in `ack_release.rs`, `attach_forms.rs` and `shards.rs` since A-571
+>   (2026-11-19, g251b): a connect is one claim, which waits while the rendezvous's holder lives (A-468), so a refusal
+>   fails the test at once; a full request ring is waited out while the daemon lives by the product's own rule, now
+>   every client end's (`ClientEnd::send_when_room`, `slates_ipc::room`, the SDK's since A-523), where the fleet suite
+>   keeps A-454's shard steps for the daemons it freezes on purpose; and a hold's start is waited on its observation,
+>   which ends by its answer or its typed refusal past the observe budget
+>   (`a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`,
+>   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). Owed (A-571's next part):
+>   `shards.rs`'s guest windows (`Guest::await_answer`, A-65 and A-228's rule sized by `CREDIT_WAIT`), its condition
+>   polls (`wait_until`, `wait_for_count`), its attach's answer and its stream reads, each still five seconds on the
+>   wall; `daemon.rs`'s raw client, the same constant and the same two waits; and `common/client.rs`'s `START_WAIT`, a
+>   connect retried five seconds while a daemon starts. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
@@ -4353,7 +4364,8 @@
 >   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
 >   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
 >   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling
->   (`RoomWait`, `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`). Owed: a slot that
+>   (`RoomWait`, `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; every client end's
+>   since A-571, `ClientEnd::send_when_room`). Owed: a slot that
 >   frees still wakes nothing, so a wait finds it within the time already waited; the daemon waking a client that
 >   waits for room, as it wakes one that waits for a reply, would end the wait at the slot. The async driver's tick since A-523 (2026-11-18, g251b; the rest of class
 >   C): each call asked the daemon's liveness at every reply deadline (a second); it now asks on A-443's doubling
@@ -18141,9 +18153,19 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
   mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but
   cannot bump the epoch.
-- **Two rounds are built whole in one turn (open, from A-158).** A-141's `everything_told` and the journal gather each
-  build a round over everything they name on the serving thread, against the bounded-work rule the takeover round now
-  follows. Not measured.
+- **Two rounds are built whole in one turn (closed 2026-11-18 by A-562; open from A-158).** A-141's `everything_told`
+  and the journal gather each built a round over everything they named on the serving thread, against the bounded-work
+  rule the takeover round follows. Now one budget a turn, half the shard's live step quantum, bounds the takeover round,
+  the gather (by record) and the overrun round (`OverrunRound`, by node, then name) together, each resuming where its
+  last slice stopped; counted `fuse.rounds_outgrown` and `fuse.slices_resumed` (WinFsp's gather too, `winfsp.*`).
+  Red first: `a_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing` (bridge-core) and
+  `an_overrun_round_over_more_names_than_a_slice_allows_takes_several_turns_and_loses_nothing` (bridge-fuse).
+- **Two walks of a backlog still run whole in one turn (open, from A-562).** The gather's base-plane half lists the
+  loaded entries of every hinted directory in the slice whose journal half reaches the head, all loaded directories
+  after a watcher overflow. Slicing it needs a resume point a hint sequence shares between directories, and one within a
+  directory's hash order. And the byte states take every record through the head at a round's first slice
+  (`feed_states`), tens of nanoseconds a record against the gather's microseconds, so a write-back's pending records
+  stay few; slicing it would leave a write-back to judge the rest of the backlog. Not measured.
 - **A CLI attachment dies about a second after its `attach` exits (open, found 2026-10-23; fixed 2026-11-06 by A-230,
   bug-sweep).** A CLI attachment now holds a term, the failover SLO as the write lease's, renewed by each verb that names
   it. It ends at the lapse with its lease, and a later use is refused `AttachmentExpired`. Red first:
@@ -19571,8 +19593,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
   owed with it: a Windows base reading a link back in A-275's `/` form rather than its print name's `\` (the base
-  plane's own map, its own piece), and the Developer Mode route for an account without the privilege, measured; a
-  directory link's type, which the seam did not carry, **built by A-451**); a reflink
+  plane's own map, its own piece), and the Developer Mode route for an account without the privilege, measured,
+  **closed by A-568 the same day** (no route a handle-relative writer may take: Developer Mode's allowance comes only to
+  `CreateSymbolicLinkW` asked with its unprivileged flag, a call that names its link by path, and the writer's own set
+  is refused there, `ERROR_PRIVILEGE_NOT_HELD`, jupiter r143 and r212; so such a link fails its entry alone,
+  `HostError::Unprivileged`, the landing going on, and the Windows link tests take the writer as their probe; the
+  privilege is enabled around the object's open as well as its set, which slates' own drive asks; its Windows tests
+  filed for main; still owed with it: on Linux a link on a file system that holds none, `symlink(2)`'s `EPERM` (FAT),
+  still ends the landing, the same question for that kind); a directory link's type, which the seam did not carry,
+  **built by A-451**); a reflink
   (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
   own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
   under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:

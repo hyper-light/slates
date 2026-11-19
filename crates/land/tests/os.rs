@@ -20,9 +20,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use slates_land::engine::LandingReport;
 use slates_land::engine::{Degradation, LandingState, Outcome};
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::base::BaseConfig;
+#[cfg(windows)]
+use slates_vfs::host::OsCode;
 use slates_vfs::host::{HostError, HostFs, LandFs};
 use slates_vfs::volume::{Store, Volume};
 #[cfg(unix)]
@@ -462,36 +466,67 @@ fn a_file_a_landing_placed_is_replaced_by_the_next_landing() {
   assert_eq!(read(&ws.path.join("out/f")).unwrap(), b"second landing");
 }
 
-/// Format: `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): the probe link refused for want of the privilege and of Developer
-/// Mode.
+/// Format: `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): what the writer's link set answers on an account without
+/// `SeCreateSymbolicLinkPrivilege` (A-568).
 #[cfg(windows)]
-const PRIVILEGE_NOT_HELD: i32 = 1314;
+const PRIVILEGE_NOT_HELD: u32 = 1314;
 
-/// A-438 (a volume link in A-275's form, landed). Do: land a scratch volume holding `/src/lib.rs` and the relative link
-/// `/lib/link` to `../src/lib.rs` into an empty real directory, where this account may make symbolic links (skipped
-/// loudly where it may not: the probe `CreateSymbolicLinkW` refused `ERROR_PRIVILEGE_NOT_HELD`, no privilege and no
-/// Developer Mode). Expect the landing `Done` with every entry written; the link a Windows file symbolic link whose
-/// target reads `..\src\lib.rs` (the volume's `/` as `\`); the file's bytes read through it; and no hidden name left
-/// where the link was staged. Before A-438 the link's entry failed `EPERM` on every machine.
+/// Whether `path`'s entry in `report` failed for the link privilege this account does not hold (A-568): the writer is
+/// its own probe, so a test's expectation and the landing never disagree about whether a link may be made.
+#[cfg(windows)]
+fn failed_for_the_link_privilege(report: &LandingReport, path: &str) -> bool {
+  report.entries.iter().any(|entry| {
+    &*entry.path == path
+      && entry.outcome
+        == Some(Outcome::Failed {
+          code: Some(OsCode::Win32(PRIVILEGE_NOT_HELD)),
+        })
+  })
+}
+
+/// A landing whose link `path` failed alone for the link privilege (A-568): every other entry written, the landing
+/// `Partial` and never crashed.
+#[cfg(windows)]
+fn assert_only_the_link_failed(report: &LandingReport, path: &str) {
+  eprintln!(
+    "the link {path} failed alone: this account may not make a symbolic link through the writer's route (A-568)"
+  );
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert!(
+    !report
+      .degraded
+      .iter()
+      .any(|degraded| matches!(degraded, Degradation::Crashed { .. })),
+    "{report:?}"
+  );
+  assert!(
+    report
+      .entries
+      .iter()
+      .filter(|entry| &*entry.path != path)
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+}
+
+/// A-438, A-568 (a volume link in A-275's form, landed, or failed alone where this account may not make one). Do: land a
+/// scratch volume holding `/src/lib.rs` and the relative link `/lib/link` to `../src/lib.rs` into an empty real
+/// directory. Expect, where the writer may make the link (the privilege held: an administrator, CI's runner): the
+/// landing `Done` with every entry written; the link a Windows file symbolic link whose target reads `..\src\lib.rs`
+/// (the volume's `/` as `\`); the file's bytes read through it; and no hidden name left where the link was staged.
+/// Where it may not (a standard account, in Developer Mode or not: `CreateSymbolicLinkW`'s unprivileged flag is no route
+/// a handle-relative writer may take, measured on jupiter): the link's entry failed alone by `ERROR_PRIVILEGE_NOT_HELD`,
+/// the rest written, nothing at the link's name and no hidden name left; the branch taken is printed. Before A-568 a
+/// `CreateSymbolicLinkW` probe decided, which Developer Mode lets where the writer may not, and the landing ended
+/// `Aborted` there.
 #[cfg(windows)]
 #[test]
 #[allow(clippy::disallowed_methods)]
-fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
+fn a_symlink_in_a_landing_is_a_windows_symbolic_link_or_fails_alone() {
   use std::os::windows::fs::FileTypeExt;
   let ram = build_output();
   let ws = Workspace::new(&ram, "link");
   seed_dir(&ws.path.join("out"));
-  let probe = ws.path.join("probe");
-  match std::os::windows::fs::symlink_file("out", &probe) {
-    Ok(()) => std::fs::remove_file(&probe).unwrap(),
-    Err(refused) if refused.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
-      eprintln!(
-        "skipped: this account may not make a symbolic link (no SeCreateSymbolicLinkPrivilege, no Developer Mode)"
-      );
-      return;
-    }
-    Err(refused) => panic!("the probe link: {refused}"),
-  }
   let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
   let mut store = store();
   let mut vol = scratch(&mut store);
@@ -514,6 +549,15 @@ fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
     session: &mut session,
   };
   let report = setup.land(request(1)).unwrap();
+  let lib = ws.path.join("out").join("lib");
+  if failed_for_the_link_privilege(&report, "/lib/link") {
+    assert_only_the_link_failed(&report, "/lib/link");
+    assert!(
+      names_in(&lib).is_empty(),
+      "nothing at the link's name, no hidden name left"
+    );
+    return;
+  }
   assert_eq!(report.state, LandingState::Done, "{report:?}");
   assert!(
     report
@@ -522,7 +566,6 @@ fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
       .all(|entry| entry.outcome == Some(Outcome::Written)),
     "{report:?}"
   );
-  let lib = ws.path.join("out").join("lib");
   let kind = std::fs::symlink_metadata(lib.join("link"))
     .unwrap()
     .file_type();
@@ -702,38 +745,13 @@ const HIDDEN: u32 = 0x2;
 #[cfg(windows)]
 const SYSTEM: u32 = 0x4;
 
-/// A-451 (the volume's Windows bits land, and a directory link as a directory link). Do: land into an empty real
-/// directory on NTFS a scratch volume holding a directory the drive made read-only and hidden, a file in it the drive
-/// made system and hidden, and the relative link `/to_d` to `d` that Windows made as a directory link (the link skipped
-/// loudly where this account may not make one: no privilege and no Developer Mode). Expect the landing `Done` with
-/// every entry written; the directory holding `READONLY | HIDDEN`; the file `SYSTEM | HIDDEN` and `ARCHIVE` (the rename
-/// that places it sets that bit) and not `READONLY` (its mode can write); the link a Windows directory symbolic link
-/// whose target reads `d`, the file listed through it; and no hidden name left. Before A-451 the bits stayed in the
-/// volume and a directory link landed as a file link.
+/// Lands into the empty real directory `out` a scratch volume holding a directory `/d` the drive made read-only and
+/// hidden, a file in it the drive made system and hidden, and the relative link `/to_d` to `d` that Windows made as a
+/// directory link (A-451).
 #[cfg(windows)]
-#[test]
-#[allow(clippy::disallowed_methods)]
-fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
+fn land_bits_and_a_directory_link(out: &Path) -> LandingReport {
   use slates_vfs::inode::{Kind, WindowsAttributes};
-  use std::os::windows::fs::FileTypeExt;
-  let ram = build_output();
-  let ws = Workspace::new(&ram, "windows-bits");
-  seed_dir(&ws.path.join("out"));
-  let probe = ws.path.join("probe");
-  let links = match std::os::windows::fs::symlink_dir("out", &probe) {
-    Ok(()) => {
-      std::fs::remove_dir(&probe).unwrap();
-      true
-    }
-    Err(refused) if refused.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
-      eprintln!(
-        "skipped, the link part: this account may not make a symbolic link (no SeCreateSymbolicLinkPrivilege, no Developer Mode)"
-      );
-      false
-    }
-    Err(refused) => panic!("the probe link: {refused}"),
-  };
-  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let (mut host, target) = OsLand::open_target(out).unwrap();
   let mut store = store();
   let mut vol = scratch(&mut store);
   mkdir(&mut vol, &mut host, &mut store, "/d");
@@ -744,19 +762,16 @@ fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
     "/d/f.rs",
     b"in a hidden directory",
   );
-  let mut marks = vec![
+  symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
+  for (path, bits, kind) in [
     ("/d", READONLY | HIDDEN, Kind::Dir),
     ("/d/f.rs", SYSTEM | HIDDEN, Kind::File),
-  ];
-  if links {
-    symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
-    marks.push((
+    (
       "/to_d",
       u32::from(WindowsAttributes::LINK_DIRECTORY),
       Kind::Symlink,
-    ));
-  }
-  for (path, bits, kind) in marks {
+    ),
+  ] {
     common::set_windows_bits(&mut vol, &mut host, &mut store, path, bits, kind);
   }
   let mut session = Session::new();
@@ -767,16 +782,13 @@ fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
     store: &mut store,
     session: &mut session,
   };
-  let report = setup.land(request(1)).unwrap();
-  assert_eq!(report.state, LandingState::Done, "{report:?}");
-  assert!(
-    report
-      .entries
-      .iter()
-      .all(|entry| entry.outcome == Some(Outcome::Written)),
-    "{report:?}"
-  );
-  let out = ws.path.join("out");
+  setup.land(request(1)).unwrap()
+}
+
+/// The directory `out/d` holding `READONLY | HIDDEN`, and its file `SYSTEM | HIDDEN` and `ARCHIVE` (the rename that
+/// places it sets that bit) and not `READONLY` (its mode can write) (A-451).
+#[cfg(windows)]
+fn assert_the_bits_landed(out: &Path) {
   let directory = attributes_of(&out.join("d"));
   assert_eq!(
     directory & (READONLY | HIDDEN | SYSTEM),
@@ -789,26 +801,61 @@ fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
     SYSTEM | HIDDEN | ARCHIVE,
     "the file's attributes: {file:#x}"
   );
-  if links {
-    let kind = std::fs::symlink_metadata(out.join("to_d"))
-      .unwrap()
-      .file_type();
-    assert!(kind.is_symlink_dir(), "a directory symbolic link: {kind:?}");
-    assert_eq!(
-      std::fs::read_link(out.join("to_d")).unwrap(),
-      Path::new("d")
-    );
-    assert_eq!(
-      names_in(&out.join("to_d")),
-      ["f.rs"],
-      "the directory listed through the link"
-    );
+}
+
+/// `out/to_d` a Windows directory symbolic link whose target reads `d`, the file listed through it (A-451).
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+fn assert_the_directory_link_landed(out: &Path) {
+  use std::os::windows::fs::FileTypeExt;
+  let kind = std::fs::symlink_metadata(out.join("to_d"))
+    .unwrap()
+    .file_type();
+  assert!(kind.is_symlink_dir(), "a directory symbolic link: {kind:?}");
+  assert_eq!(
+    std::fs::read_link(out.join("to_d")).unwrap(),
+    Path::new("d")
+  );
+  assert_eq!(
+    names_in(&out.join("to_d")),
+    ["f.rs"],
+    "the directory listed through the link"
+  );
+}
+
+/// A-451, A-568 (the volume's Windows bits land, and a directory link as a directory link, or failed alone where this
+/// account may not make one). Do: land [`land_bits_and_a_directory_link`]'s volume into an empty real directory on NTFS.
+/// Expect the directory and its file to hold their bits ([`assert_the_bits_landed`]) either way. Where the writer may
+/// make the link: the landing `Done` with every entry written, the link a Windows directory symbolic link
+/// ([`assert_the_directory_link_landed`]), and no hidden name left. Where it may not (a standard account, in Developer
+/// Mode or not, A-568): the link's entry failed alone by `ERROR_PRIVILEGE_NOT_HELD`, the rest written, nothing at the
+/// link's name and no hidden name left; the branch taken is printed. Before A-451 the bits stayed in the volume and a
+/// directory link landed as a file link; before A-568 a `CreateSymbolicLinkW` probe decided, which Developer Mode lets
+/// where the writer may not.
+#[cfg(windows)]
+#[test]
+fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "windows-bits");
+  let out = ws.path.join("out");
+  seed_dir(&out);
+  let report = land_bits_and_a_directory_link(&out);
+  assert_the_bits_landed(&out);
+  if failed_for_the_link_privilege(&report, "/to_d") {
+    assert_only_the_link_failed(&report, "/to_d");
+    assert_eq!(names_in(&out), ["d"], "no link and no hidden name left");
+    return;
   }
-  let mut landed = vec!["d"];
-  if links {
-    landed.push("to_d");
-  }
-  assert_eq!(names_in(&out), landed, "no hidden name left");
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  assert_the_directory_link_landed(&out);
+  assert_eq!(names_in(&out), ["d", "to_d"], "no hidden name left");
 }
 
 /// A-185. Do: on NTFS, seed a file and clear its `ARCHIVE` bit as a backup does; over the directory, write new bytes to

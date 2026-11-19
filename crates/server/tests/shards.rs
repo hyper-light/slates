@@ -126,23 +126,16 @@ struct Client {
 }
 
 impl Client {
+  /// A client of `instance`, whose daemon started before this, its rendezvous held and published by then: the claim
+  /// waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (A-571; until
+  /// then a five-second retry, `CREDIT_WAIT`).
   fn connect(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
+    let connected = connect(instance).unwrap_or_else(|e| panic!("{e}"));
+    let client = connected.region.client_id();
+    Client {
+      end: ClientEnd::connected(connected),
+      client,
+      sequence: 0,
     }
   }
 
@@ -161,14 +154,16 @@ impl Client {
       body,
     )
     .unwrap();
-    let started = Instant::now();
-    loop {
-      match self.end.send(&slot) {
-        Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
-        Err(e) => panic!("{e}"),
-      }
-    }
+    // A full ring is waited out while the daemon lives, as every client end waits (A-571).
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+      roomed,
+      slates_ipc::room::Roomed::Sent,
+      "the daemon went away while its ring was full"
+    );
     let reply = self.end.wait(Some(DEADLINE_NS)).unwrap();
     unpack(self.end.region(), reply.kind, &reply.payload).unwrap()
   }
@@ -1637,9 +1632,17 @@ fn hold_starved(daemon: &Daemon, span: Duration) -> std::thread::JoinHandle<()> 
   let waiter = std::thread::spawn(move || {
     let _ = observation.wait();
   });
-  let started = Instant::now();
+  // The hold begins when the shard runs the observation, which ends otherwise by its own answer or its typed refusal past
+  // the daemon's observe budget (A-571; until then a fixed five seconds, `CREDIT_WAIT`).
   while !began.load(std::sync::atomic::Ordering::Acquire) {
-    assert!(started.elapsed() < CREDIT_WAIT, "the hold began");
+    if waiter.is_finished() {
+      // The flag is set before the observation ends, so a hold that began and ended since the first read shows here.
+      assert!(
+        began.load(std::sync::atomic::Ordering::Acquire),
+        "the hold's observation ended before the hold began"
+      );
+      break;
+    }
     std::thread::yield_now();
   }
   waiter
