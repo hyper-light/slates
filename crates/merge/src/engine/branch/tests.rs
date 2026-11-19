@@ -373,7 +373,8 @@ fn differ<K: Ord + Clone, V: PartialEq + Clone>(before: &[(K, V)], after: &[(K, 
 fn differing_keys(green: &Green, version: u64) -> u64 {
   let then = copy_at(green, version);
   let now = copy_at(green, green.head());
-  let present = |dirs: &[String]| -> Vec<(String, ())> { dirs.iter().map(|dir| (dir.clone(), ())).collect() };
+  let present =
+    |dirs: &[String]| -> Vec<(String, ())> { dirs.iter().map(|dir| (dir.clone(), ())).collect() };
   let paired = |xattrs: &[(String, String, Vec<u8>)]| -> Vec<((String, String), Vec<u8>)> {
     xattrs
       .iter()
@@ -465,7 +466,8 @@ fn edit() -> impl Strategy<Value = Edit> {
     (path(), 0u16..0o1000).prop_map(|(path, mode)| Edit::Mode(path, mode)),
     (path(), path()).prop_map(|(path, target)| Edit::Symlink(path, target)),
     (path(), path()).prop_map(|(path, target)| Edit::Link(path, target)),
-    (path(), 0..NAMES.len(), bytes()).prop_map(|(path, name, value)| Edit::SetXattr(path, name, value)),
+    (path(), 0..NAMES.len(), bytes())
+      .prop_map(|(path, name, value)| Edit::SetXattr(path, name, value)),
     (path(), 0..NAMES.len()).prop_map(|(path, name)| Edit::RemoveXattr(path, name)),
     (path(), any::<u8>()).prop_map(|(path, uid)| Edit::Mknod(path, uid)),
   ]
@@ -617,9 +619,7 @@ fn tree() -> Origin {
     ));
   }
   origin.dirs = (0..97).map(|n| format!("src/dir{n}")).collect();
-  origin
-    .modes
-    .push(("src/dir1/file1.rs".to_owned(), 0o644));
+  origin.modes.push(("src/dir1/file1.rs".to_owned(), 0o644));
   origin.xattrs.push((
     "src/dir2/file2.rs".to_owned(),
     "user.x".to_owned(),
@@ -708,7 +708,11 @@ fn a_branch_walks_no_map_and_sets_back_only_what_changed_after_its_version() {
     "the branch made {made} nodes, its keys bound it at {bound}"
   );
   let head = lineage.branch(root, 3).unwrap();
-  assert_eq!(lineage.walked(), walked, "the branch at the head walked a map");
+  assert_eq!(
+    lineage.walked(),
+    walked,
+    "the branch at the head walked a map"
+  );
   assert_eq!(
     lineage.reverted(),
     4,
@@ -730,7 +734,9 @@ fn a_branch_walks_no_map_and_sets_back_only_what_changed_after_its_version() {
 fn changes_to_a_branch_and_its_source_never_cross() {
   let mut origin = Origin::default();
   for name in ["a", "a.b", "d/e", "d/f"] {
-    origin.files.push((name.to_owned(), name.as_bytes().to_vec()));
+    origin
+      .files
+      .push((name.to_owned(), name.as_bytes().to_vec()));
   }
   let mut alone = Green::with_origin(origin.clone());
   let (mut lineage, source) = Lineage::new(Green::with_origin(origin));
@@ -738,7 +744,9 @@ fn changes_to_a_branch_and_its_source_never_cross() {
   let copied = lineage.copied();
   let into_source = at_head(&alone, &[Edit::Overwrite(2, 0, b"SS".to_vec())], 1);
   assert_eq!(
-    lineage.with(source, |green| green.submit(&into_source)).unwrap(),
+    lineage
+      .with(source, |green| green.submit(&into_source))
+      .unwrap(),
     Outcome::Accepted { version: 1 }
   );
   assert_eq!(alone.submit(&into_source), Outcome::Accepted { version: 1 });
@@ -752,10 +760,15 @@ fn changes_to_a_branch_and_its_source_never_cross() {
     ..into_branch
   };
   assert_eq!(
-    lineage.with(branch, |green| green.submit(&into_branch)).unwrap(),
+    lineage
+      .with(branch, |green| green.submit(&into_branch))
+      .unwrap(),
     Outcome::Accepted { version: 1 }
   );
-  assert!(lineage.copied() > copied, "the writes copied no shared node");
+  assert!(
+    lineage.copied() > copied,
+    "the writes copied no shared node"
+  );
   let read = |lineage: &mut Lineage, green: LineageGreen, path: &str| {
     lineage
       .with(green, |green| green.content(path).map(<[u8]>::to_vec))
@@ -782,7 +795,15 @@ fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_it
   for id in 1..=3u64 {
     let inc = lineage
       .with(root, |green| {
-        at_head(green, &[Edit::Overwrite(0, 0, vec![b'0' + u8::try_from(id).unwrap()])], id)
+        at_head(
+          green,
+          &[Edit::Overwrite(
+            0,
+            0,
+            vec![b'0' + u8::try_from(id).unwrap()],
+          )],
+          id,
+        )
       })
       .unwrap();
     assert_eq!(
@@ -917,15 +938,26 @@ fn a_branch_sets_back_every_dimension() {
     .map(|version| view(&mut Green::with_origin(copy_at(&source, version))))
     .collect();
   let (mut lineage, root) = Lineage::new(source);
-  for ((version, reverts), expected) in [(1, 10), (2, 5), (4, 0)].into_iter().zip(expected.drain(..)) {
+  for ((version, reverts), expected) in [(1, 10), (2, 5), (4, 0)]
+    .into_iter()
+    .zip(expected.drain(..))
+  {
     let (walked, before) = (lineage.walked(), lineage.reverted());
     let branch = lineage.branch(root, version).unwrap();
-    assert_eq!(lineage.walked(), walked, "the branch at {version} walked a map");
+    assert_eq!(
+      lineage.walked(),
+      walked,
+      "the branch at {version} walked a map"
+    );
     assert_eq!(
       lineage.reverted() - before,
       reverts,
       "the keys changed after {version}"
     );
-    assert_eq!(lineage.with(branch, view).unwrap(), expected, "the branch at {version}");
+    assert_eq!(
+      lineage.with(branch, view).unwrap(),
+      expected,
+      "the branch at {version}"
+    );
   }
 }

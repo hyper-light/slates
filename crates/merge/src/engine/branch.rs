@@ -304,9 +304,7 @@ impl Green {
         exchange(
           identity,
           now.map(|value| xattr_entry(path, name, value)),
-          then
-            .as_deref()
-            .map(|value| xattr_entry(path, name, value)),
+          then.as_deref().map(|value| xattr_entry(path, name, value)),
         );
         reverts.push(Revert::Xattr(path.to_owned(), name.clone(), then));
       }

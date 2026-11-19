@@ -651,12 +651,7 @@ fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
 }
 
 /// Moves hard link `alias` from naming `old` to naming `new` in the reverse map of the links naming each target.
-fn relink(
-  links_to: &mut Dim<BTreeSet<String>>,
-  alias: &str,
-  old: Option<&str>,
-  new: Option<&str>,
-) {
+fn relink(links_to: &mut Dim<BTreeSet<String>>, alias: &str, old: Option<&str>, new: Option<&str>) {
   if let Some(old) = old
     && let Some(aliases) = links_to.get(old)
   {
@@ -1360,9 +1355,7 @@ impl Green {
         self.dirs.contains_key(path).then(|| dir_entry(path)),
       ),
       IdentityKey::Mode(path) => (
-        self
-          .mode_at(path, since)
-          .map(|mode| mode_entry(path, mode)),
+        self.mode_at(path, since).map(|mode| mode_entry(path, mode)),
         self.modes.get(path).map(|mode| mode_entry(path, *mode)),
       ),
       IdentityKey::Symlink(path) => (
@@ -1438,9 +1431,7 @@ impl Green {
   /// An attribute's value at `version`, by the module's one history rule (A-534).
   fn xattr_at(&self, path: &str, name: &str, version: u64) -> Option<Vec<u8>> {
     value_at(
-      self
-        .xattr_history
-        .get(&(path.to_owned(), name.to_owned())),
+      self.xattr_history.get(&(path.to_owned(), name.to_owned())),
       self.xattrs.get(path, name),
       version,
     )
@@ -1518,16 +1509,10 @@ impl Green {
         .map(|((path, _), _)| path.clone()),
     );
     // Every link at either end: by the one history rule a link unchanged since version 0 has no history (A-534).
-    let aliases: Vec<String> = union_keys(
-      self.hardlinks.keys(),
-      self.hardlink_history.keys().cloned(),
-    )
-    .collect();
+    let aliases: Vec<String> =
+      union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned()).collect();
     for alias in aliases {
-      let targets = [
-        self.hardlink_at(&alias, from),
-        self.hardlink_at(&alias, to),
-      ];
+      let targets = [self.hardlink_at(&alias, from), self.hardlink_at(&alias, to)];
       if targets
         .iter()
         .flatten()
@@ -1732,22 +1717,15 @@ impl Green {
       .filter_map(|path| self.mode_at(&path, version).map(|mode| (path, mode)))
       .collect();
     let symlinks = union_keys(self.symlinks.keys(), self.symlink_history.keys().cloned())
+      .filter_map(|path| self.symlink_at(&path, version).map(|target| (path, target)))
+      .collect();
+    let hardlinks = union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned())
       .filter_map(|path| {
         self
-          .symlink_at(&path, version)
+          .hardlink_at(&path, version)
           .map(|target| (path, target))
       })
       .collect();
-    let hardlinks = union_keys(
-      self.hardlinks.keys(),
-      self.hardlink_history.keys().cloned(),
-    )
-    .filter_map(|path| {
-      self
-        .hardlink_at(&path, version)
-        .map(|target| (path, target))
-    })
-    .collect();
     let xattrs = union_keys(
       self.xattrs.iter().map(|(key, _)| key),
       self.xattr_history.keys().cloned(),
@@ -1815,16 +1793,13 @@ impl Green {
         .map(|(link, target)| (link, target.clone()))
         .collect();
     }
-    union_keys(
-      self.hardlinks.keys(),
-      self.hardlink_history.keys().cloned(),
-    )
-    .filter_map(|link| {
-      self
-        .hardlink_at(&link, version)
-        .map(|target| (link, target))
-    })
-    .collect()
+    union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned())
+      .filter_map(|link| {
+        self
+          .hardlink_at(&link, version)
+          .map(|target| (link, target))
+      })
+      .collect()
   }
 
   /// The entries one path contributes to a restricted base at `version` ([`Green::base_for`]): every dimension's entry

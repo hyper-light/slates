@@ -36,7 +36,8 @@ use crate::special::SpecialNode;
 /// A path's key bytes as the string they were made from. Keys enter only as strings and a walk reassembles one whole,
 /// so the lossy arm never runs; it keeps the conversion total, as the no-panic rule asks.
 fn text(key: Vec<u8>) -> String {
-  String::from_utf8(key).unwrap_or_else(|refused| String::from_utf8_lossy(refused.as_bytes()).into_owned())
+  String::from_utf8(key)
+    .unwrap_or_else(|refused| String::from_utf8_lossy(refused.as_bytes()).into_owned())
 }
 
 /// One dimension's map: its root, and the arena its nodes live in (module docs, "Arenas are lent").
@@ -242,10 +243,7 @@ pub(crate) struct Files {
 impl Files {
   /// A file's bytes.
   pub(crate) fn get(&self, path: impl AsRef<[u8]>) -> Option<&[u8]> {
-    self
-      .map
-      .get(path)
-      .map(|block| self.blocks.bytes(*block))
+    self.map.get(path).map(|block| self.blocks.bytes(*block))
   }
 
   /// Whether `path` is a file.
@@ -256,10 +254,11 @@ impl Files {
   /// Sets `path`'s bytes; the bytes it replaced are let go.
   pub(crate) fn insert(&mut self, path: impl AsRef<[u8]>, bytes: Vec<u8>) {
     let block = self.blocks.add(bytes);
-    let replaced = self
-      .map
-      .root
-      .insert(&mut self.map.nodes, path.as_ref(), block, &mut self.blocks);
+    let replaced =
+      self
+        .map
+        .root
+        .insert(&mut self.map.nodes, path.as_ref(), block, &mut self.blocks);
     if let Some(replaced) = replaced {
       self.blocks.release(replaced);
     }
@@ -289,10 +288,7 @@ impl Files {
 
   /// Every file's bytes, in path order.
   pub(crate) fn values(&self) -> impl Iterator<Item = &[u8]> + '_ {
-    self
-      .map
-      .values()
-      .map(|block| self.blocks.bytes(*block))
+    self.map.values().map(|block| self.blocks.bytes(*block))
   }
 
   /// The files under `prefix` and their bytes, in path order.

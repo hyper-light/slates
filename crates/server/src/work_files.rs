@@ -189,10 +189,7 @@ impl WorkFiles {
     for (path, entry) in &self.changed {
       match entry {
         Some(bytes) => {
-          sizes.insert(
-            path.clone(),
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-          );
+          sizes.insert(path.clone(), u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         }
         None => {
           sizes.remove(path.as_str());
