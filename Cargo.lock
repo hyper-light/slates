@@ -1657,9 +1657,11 @@ dependencies = [
 name = "slates-hg"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "proptest",
  "sha1-checked",
  "slates-test-seeds",
+ "zstd",
 ]
 
 [[package]]

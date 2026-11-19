@@ -12,6 +12,10 @@ description = "Mercurial's exchange formats and objects (§4.17.3, A-514, A-545,
 # The SHA-1 of a Mercurial node with collision detection, as 7.2's sha1dc computes it (A-588): the workspace's port of
 # sha1collisiondetection, which git's object names use (A-600; the workspace manifest says why this crate).
 sha1-checked = { workspace = true }
+# A revlog's zlib chunks (A-611), through the workspace's one deflate engine, zlib-rs (A-607).
+flate2 = { workspace = true }
+# A revlog's zstd chunks (A-611), through the workspace's zstd crate (A-607).
+zstd = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }

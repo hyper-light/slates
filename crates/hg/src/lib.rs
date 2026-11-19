@@ -79,6 +79,7 @@ pub mod obsmarkers;
 mod out;
 pub mod phases;
 pub mod pushkey;
+pub mod revlog;
 mod quote;
 mod read;
 pub mod ssh;
@@ -124,3 +125,7 @@ mod wire_tests;
 #[cfg(test)]
 #[path = "tests/objects.rs"]
 mod object_tests;
+
+#[cfg(test)]
+#[path = "tests/revlogs.rs"]
+mod revlog_tests;
