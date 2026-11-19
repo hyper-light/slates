@@ -7989,7 +7989,7 @@ mod tests {
       let _ = crate::verbs::publish_shard(state);
       state.journal.forget_what_was_given_back();
       state.give_back_rate = super::GiveBackRate::default();
-      let quantum = futures::step_budget_ns()
+      let quantum = slates_rt::futures::step_budget_ns()
         .unwrap_or(state.config.runtime.step_budget_ns)
         .max(2);
       let page = usize::try_from(state.config.geometry.page)
