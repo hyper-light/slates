@@ -53,6 +53,19 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
+> database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
+> greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
+> markers, with a push or alone) as one durable step, all or none, its checks (a green's head; the exact names under a
+> prefix) read at its position before its own changes; every change of a repository takes one position; the state is
+> charged to the merge budget, carried by the snapshot and replayed by a recovery. The server's repository verbs and
+> every member's version record entries. Tests on the Mac Studio: `slates-db --lib` 127 of 127 (a model test through a
+> database over a real segment with crashes at random points, its census meeting every kind of entry and refusal; red
+> ten ways), `slates-server --lib repository` (four tests; red two ways). Owed: the push that judges several works
+> before any commits and makes one entry of them (with piece 4); the fleet half (the register as one ledger object of
+> the repository's candidates, holders recomputing every version of an entry before acknowledging, all or none,
+> takeovers adopting whole entries, the repository record replicated with it). Until then an entry of several greens is
+> atomic on its owner and not across a takeover.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's

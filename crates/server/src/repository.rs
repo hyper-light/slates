@@ -854,10 +854,10 @@ mod tests {
   }
 
   /// A-603 (§4.17.1 shared piece 2: every change of a repository is one entry of its register). Do: create a repository,
-  /// write its root twice, branch it, retire the branch's name and bind it again, write the branch; then write a green
-  /// no repository holds, and send a bind the register refuses. Expect: the create is one entry, and each verb and each
-  /// member's version takes exactly one position more, its chain entry recorded under the green; the lone green's
-  /// version and the refused bind take none.
+  /// write its root twice, branch it at a version it folded and then at its head, retire the branch's name and bind it
+  /// again, write the branch; then write a green no repository holds, and send a bind the register refuses. Expect: the
+  /// create is one entry, and each verb and each member's version takes exactly one position more, its chain entry
+  /// recorded under the green; the refused branch, the lone green's version and the refused bind take none.
   #[test]
   fn every_verb_and_every_members_version_is_one_entry_of_the_register() {
     crate::daemon::audit_on_shard(|state| {
@@ -869,7 +869,14 @@ mod tests {
       write(state, root, b"v2", 2);
       assert_eq!(position(state), Some(3));
       assert_eq!(state.db.partition().green_head(to_db_volume(root)), 2);
-      let topic = green_of(branch(state, ("tree", "topic", "main"), Some(1)));
+      // No reader held version 1, so the root folded it: a branch there is refused before any record, and takes no
+      // position.
+      assert!(matches!(
+        refusal(branch(state, ("tree", "early", "main"), Some(1))),
+        Refusal::UnknownBase { .. }
+      ));
+      assert_eq!(position(state), Some(3));
+      let topic = green_of(branch(state, ("tree", "topic", "main"), None));
       assert_eq!(position(state), Some(4));
       let retired = ask(
         state,

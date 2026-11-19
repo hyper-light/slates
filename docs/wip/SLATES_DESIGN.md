@@ -11364,7 +11364,9 @@ that host, and issued only when every identity the version references is placed.
 increment id already in `seen` returns its original result (the completion record holds the
 reply); retries are always safe. A signed submit's verdict rides the version's chain entry and the green's accepted
 record, a checkpoint keeping it once it folds the entry (A-321): the version's provenance, read back by `MergeRecord`
-and answering every later reply that names the version.
+and answering every later reply that names the version. A green that is a member of a repository commits each version
+as an entry of the repository's register, which one step can share with the repository's other greens' versions, its
+namespace and its own state (§4.17.1 shared piece 2, A-603).
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -11637,6 +11639,30 @@ decides the details.
 > branch keeps its source's checkpoint and history from passing that version (`merge_service::reachable_floor`): what a
 > long-lived branch costs its source is that history, bounded by the source's retention budget. Owed: a branch's base
 > recorded as a delta against its source's checkpoint, which ends both.
+>
+> **Status (2026-11-19, A-603: shared piece 2 built on the owner).** A repository's register is built in the metadata
+> database (`crates/db/src/repository.rs`, the entry's guard in `crates/db/src/repository/entry.rs`;
+> `Op::RepositoryAdvanced`). One entry commits, as one durable step, any of: several of the repository's greens'
+> versions (several of one green too, a stack landed whole), greens joining its lineage, its namespace's changes, and its
+> own state (Mercurial's phase roots and obsolescence markers, §4.17.3 decisions 3 and 4), with that state moved beside a
+> push or alone. Its checks are read at its position, before any of its own changes: a green's head (`check:heads` and
+> `unbundle`'s heads), and the exact names under a prefix (so no head was added or retired). The entry commits all of
+> it or none: each item is judged against what the items before it left, guard then apply, and a refusal is typed
+> (`OutOfOrder`, `CheckFailed` and `StateChanged` naming the item, or the namespace's and the lineage's own). Every
+> change of a repository takes the register's next position, whichever operation records it (A-515's and A-575's
+> operations, a member's version recorded alone, a member's destroy), so one position names one state of the
+> repository. The server's verbs and every member's version now record entries (`crates/server/src/repository.rs`,
+> `version_record`). The state is charged to the partition's merge budget; a partition snapshot carries the register;
+> a recovery rebuilds it, and the entries' versions replay into each green's chain as any version does. A model test
+> runs generated histories through a database over a real anchor segment, crashing it at random points, against the
+> rules kept over plain maps; its census meets every kind of entry, refusal and recovery. Owed: (1) the push that makes
+> an entry of several greens: its works are judged all before any commits (§4.16's verdict split into a judgment and its
+> commit), then one entry carries them, with piece 4's works from a client's push. (2) The fleet half: the register as
+> one ledger object of the repository's candidates (§4.8), its record the entry with each version's merge record value,
+> committed at f + 1; every holder recomputes every version of an entry before it acknowledges, all or none, and a
+> mismatch refuses the repository on that holder; a takeover adopts whole entries; and the repository record's own
+> replication rides it (A-515's owed half). Until then each member's version still ships on its green's own register,
+> so in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -11648,9 +11674,10 @@ decides the details.
    changesets and moves bookmarks are each one durable step, with no coordination call on the write path (§2 ban 10).
    Repositories spread across the fleet; one repository's greens serialize on its owner shard. §4.16 gives each green a
    register of its own; a register shared by a repository's greens, whose entry carries one or more of their merge
-   records, is the change this needs (a piece below).
+   records, is the change this needs (shared piece 2; built on the owner by A-603, its fleet half owed: status above).
 3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
-   of it, so two clients creating one name race on one append and one of them is refused.
+   of it, so two clients creating one name race on one append and one of them is refused (built, A-603: every change of
+   a repository takes one position of its register).
 4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
    identity, so creating it costs no walk of the tree. (The engine makes a green at another green's version without a
    walk since A-534, §4.16; the verb, `CreateGreen { base }`, still walks its base until piece 1's repository verbs use
@@ -11894,7 +11921,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
-   `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3).
+   `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3). Built on the owner, its recovery included
+   (A-603); owed: the push that judges several works before any commits, and the fleet half (the register as one ledger
+   object, holders recomputing whole entries, takeovers adopting them).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival.
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
@@ -39288,3 +39317,74 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-603 — A repository's register: one entry commits several greens' versions, members, names and the repository's own state as one step, its checks read at its position (2026-11-19, g261 for UI goal 92; §4.17.1 items 2 and 3 and shared piece 2; §4.17.3 decisions 3, 4 and 6; §4.16 "Commit"; D-28; after A-515, A-575)
+Applied in the same change to: §4.16 ("Commit"), §4.17.1 (a status block, items 2 and 3, the pieces list's item 2),
+GAPS (the §4.17 entry), `crates/db/src/{catalog,op,error,partition,repository}.rs` (`RepositoryEntry`, `RepositoryCheck`,
+`NameBinding`, `GreenVersion`, `NameChange`, `StateChange`, `PhaseRoot`, `RegisterRecord`; `Op::RepositoryAdvanced`;
+`DbError::{OutOfOrder, CheckFailed, StateChanged}`; the snapshot's `repository_registers`), `crates/db/src/repository/entry.rs`
+and its tests (new), `crates/db/tests/wire_order.{rs,txt}`, `crates/ipc/src/protocol.rs`
+(`DatabaseRefusal::{OutOfOrder, CheckFailed, StateChanged}`), `crates/ipc/tests/wire_order.txt`, and
+`crates/server/src/{error,repository,verbs}.rs`.
+- **What was there.** Each green's version was its own log record (`Op::GreenAdvanced`) and its own register in a fleet;
+  a repository's namespace changes were records of their own (A-515), one verb's several records one transaction
+  (A-575). Nothing committed several greens' versions as one step of the repository, nothing held a repository's own
+  state, and nothing could check a green a push does not move in the step that commits the push.
+- **The entry.** `Op::RepositoryAdvanced` carries one `RepositoryEntry`: the repository, the position it takes, its
+  checks, the greens joining the lineage, the greens' versions (each green's chain entry, opaque here, as
+  `GreenAdvanced`'s is), the namespace's changes (bind, retire, default) and the state's (a phase root added or
+  removed, a marker added). Git's atomic push is one entry of several greens' versions; a stack landed whole is one
+  entry of several versions of one green; a Mercurial push that adds changesets, moves bookmarks, phases and markers is
+  one entry; a phase move with no new changesets is an entry of state alone.
+- **The rule.** The entry takes the register's next position. Its checks read the register there, before any of its own
+  changes: a green's head is the version named (Mercurial's `check:heads` and `unbundle`'s heads, a head the push does
+  not move), and the names under a prefix are exactly the ones listed (no head added or retired where a range of names
+  holds the heads). Then its members join, its versions commit, its names change and its state moves, each item judged
+  against what the items before it left, by the lineage's and the namespace's own rules (A-515, A-575), a bind now
+  taking a member of the repository only; a version is the one after its green's head; a root added is not one, a root
+  removed is one, a marker added is not held. Anything that does not hold refuses the whole entry before the log records
+  any of it, typed: `OutOfOrder { named, expected }`, `CheckFailed { index }`, `StateChanged { index }`, or the
+  namespace's and the lineage's refusals; the apply is unconditional, so a replay rebuilds the same register. The guard
+  keeps what the entry's earlier items changed in an overlay of small maps keyed by borrows of the entry, so judging an
+  entry costs its own items, each a lookup; applying the entry to a clone of the tables was rejected on the design
+  ground that it costs the repository's size for every entry (not measured).
+- **One position, one state.** Every operation that changes a repository takes one position of its register: an entry,
+  each of A-515's and A-575's single operations, a member's version recorded alone (`GreenAdvanced`), and a member's
+  destroy (the repository it leaves). So a position names one state of the repository, whatever wrote the log, and a
+  register created with its repository goes with it. The server's verbs record one entry each (a repository's root
+  joining with its default branch's binding; a branch's member joining with its name's binding; a bind; a retire), and
+  `verbs::record_accepted` records every member's version as an entry (`repository::version_record`), so the server
+  makes one kind of record for every change of a repository; the single operations stay in the log's format for the
+  logs that hold them.
+- **The state, bounded.** Phase roots (each phase's nodes) and markers (in the order received, each found by its BLAKE3
+  identity, as Mercurial's obsstore skips a known marker) are the repository's own state. An entry's versions and the
+  state it adds are charged to the partition's merge budget with the chains and logs, refused `Capacity` past it; a
+  removed root and a destroyed repository give their bytes back; a snapshot's register is charged again when restored.
+- **Recovery.** The partition snapshot carries every register (`repository_registers`; a register naming no repository,
+  a second one for a repository, a repository without one, or a root or marker listed twice is a corrupt snapshot); the
+  log's entries replay through the same apply; an entry's versions are the greens' chain entries, so the server's
+  recovery replays them into each green as it replays every version.
+- **Tests** (Mac Studio, 2026-11-19; `cargo test -p slates-db --lib`, 127 of 127; `cargo test -p slates-server --lib
+  repository`; `cargo fmt --all` clean). Five unit tests drive the partition: several greens' versions together or none
+  (a skipped version, a stale position and a green outside the lineage each refused with nothing applied; a stack of
+  two versions of one green); checks at the position (a moved head, a retired and an added name under a prefix, a check
+  of the version the entry itself makes, heads outside the repository); the state with a push or alone and only from
+  the state it was made against; the budget (a marker, and two versions that fit one at a time and not together); one
+  position for every change. A model test runs 128 generated histories through a database over a real anchor segment,
+  crashing it at random points and comparing the recovered partition whole with the live one, and every answer and the
+  whole repository after every step with the rules kept over plain maps, where an entry is all or none by construction;
+  its census across the cases met 319 accepted entries of several greens, 625 stacks, 523 state moves with versions and
+  223 alone, 862 entries whose checks held, 179 refused by a check, 58 by a state change, 296 out of order, 435 by a
+  rule of the lineage or the namespace, 38 members destroyed, and 314 recoveries from a snapshot and 90 from the log
+  alone. Red ten ways in the database (the position, the checks, a version's order, the state's preconditions, a member
+  joined earlier in the entry, the positions, the versions' bytes in the budget, a names check's last name, the
+  registers in the snapshot, the restored state's charge) and two in the server (a member's version and a verb's entry
+  at a wrong position each refused, so both go through the entry). The server test: a repository's create is one entry,
+  each verb and each member's version one more, and a refused branch, a lone green's version and a refused bind none.
+- **Owed.** (1) The push that makes an entry of several greens: its works judged all before any commits, the engine's
+  verdict split into a judgment and its commit (§4.16), with piece 4's works from a client's push. (2) The fleet half:
+  the register as one ledger object of the repository's candidates (§4.8), its record the entry with each version's
+  merge record value, committed at f + 1; every holder recomputes every version of an entry before acknowledging it,
+  all or none, a mismatch refusing the repository on that holder; a takeover adopts whole entries; and the repository
+  record replicated with it (A-515's owed half). Until then each member's version ships on its green's own register, so
+  in a fleet an entry of several greens is atomic on its owner and not across a takeover of it.
