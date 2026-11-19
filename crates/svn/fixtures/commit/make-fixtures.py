@@ -241,6 +241,9 @@ def record(fixture):
     fixture.svn("propdel-file", ALICE, ["propdel", "flavour", os.path.join(wc_alice, "a.txt")])
     fixture.svn("propdel", ALICE, ["commit", "-m", "a property deleted", wc_alice])
     fixture.svn("propset-root", ALICE, ["propset", "rootprop", "on the session root", wc_alice])
+    # The working copy's root is older than its children's commits made it: a property change needs it up to date.
+    fixture.svn("root-prop-stale", ALICE, ["commit", "-m", "a property of a stale root", wc_alice], expect_failure=True)
+    fixture.svn("update-for-root", ALICE, ["update", wc_alice])
     fixture.svn("root-prop", ALICE, ["commit", "-m", "a property of the root", wc_alice])
 
     write_file(os.path.join(wc_alice, "new.txt"), b"a new file\n")
