@@ -1,7 +1,8 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **§4.17 version-control servers: the shared mapping and the git server are designed, and the repository record is
-> built (2026-11-18, A-497, D-28, A-515; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record and greens
+> made at another green's version are built (2026-11-18, A-497, D-28, A-515; 2026-11-19, A-534; UI goal 91; owners g261
+> git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
 > pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
 > §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
 > of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
@@ -9,9 +10,21 @@
 > over works and bases given as trees; review records; policy and hooks), then each tool's pieces (§4.17.2's fifteen for
 > git, starting with the pkt-line codec). No speed is claimed until main measures it by §4.17.1's and §4.17.2's method.
 > **A-515 (2026-11-18):** shared piece 1's first half is built: the repository record and its namespace in the metadata
-> database (`crates/db/src/repository.rs`), with its rules model-tested. Owed from piece 1: a green made at another
-> green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
-> greens; the record's replication in a fleet (with piece 2).
+> database (`crates/db/src/repository.rs`), with its rules model-tested.
+> **A-534 (2026-11-19):** shared piece 1's second half is built in the engine. A green's eight current-value maps are
+> persistent radix trees (`crates/merge/src/dims.rs` over `ptrie.rs`); one history rule replaces the version-0 history
+> entries (a key with no history has held its current value since version 0, so a green seeded from its origin no
+> longer holds a second copy of the origin's files); and `Lineage::branch` (`crates/merge/src/engine/branch.rs`) makes a
+> green at another green's version in O(what changed since that version), O(1) at the head, never a walk. Its oracle
+> holds every branch to a green seeded from a copy of its source, over generated histories of every operation kind,
+> branches of branches, folds and retires; its walk counter stays still across every branch; red with the reverts, the
+> walk or the version-0 entry taken out (`cargo test -p slates-merge --lib`, 22 of 22, Mac Studio). Owed from piece 1:
+> the verbs that create repositories and their greens (a repository's greens in one lineage on their owner shard, a
+> branch made through the register with shared piece 2 and replayed by holders from the same record, a branch
+> recovered over its source at its version rather than over an origin); the record's replication in a fleet (with
+> piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (g292, A-542's second half) grafts
+> on these maps and needs a per-prefix appearance record under the one history rule. The integration suites, clippy
+> and `xtask` over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1's framings built (2026-11-19, A-514; UI goal 91; owner
 > g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move

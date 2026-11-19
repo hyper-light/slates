@@ -11155,6 +11155,56 @@ without `advance`; `status(green)` reports the head, the attachment's version, a
 `changed_since(version)` from the change index (the paths each version changed, A-264) so a work volume learns early
 which of its pending paths green has moved under (awareness, never load-bearing).
 
+**The state's maps, and a green made at another green's version (A-534; §4.17.1 item 4).**
+
+> **Status (2026-11-19, A-534).** Built in the engine: `crates/merge/src/ptrie.rs` (the tree), `crates/merge/src/dims.rs`
+> (the eight maps), `crates/merge/src/engine/branch.rs` (`Lineage`). The server does not yet hold greens in lineages;
+> its repository verbs (§4.17.1 piece 1) are owed, so `CreateGreen { base }` still walks its base.
+
+- **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
+  and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
+  JACM 1968). Each tree's nodes live in an arena and count their holders. A change copies the nodes on its key's path
+  that another holder names (path copying, Driscoll, Sarnak, Sleator and Tarjan, JCSS 1989), at most one a byte of the
+  key, and changes in place the ones only its own map names, so a green no other green shares pays what an ordered map
+  paid. A prefix is one node, so a subtree grafts under another prefix by reference, which §4.17.4's `Copy` builds on;
+  a tree's byte order is the string order every encoding relies on. A file's bytes are a block counted by the nodes
+  naming it, so copying a node never copies a file. A walk assembles each key from its edges, so readers that list paths
+  hand out owned strings. An attribute's key is its path with each NUL escaped, two NULs, then its name, which keeps
+  the order of `(path, name)` pairs and makes one path's attributes one prefix.
+- **One history rule.** A key with no history has held its current value since version 0. A key's first recorded change
+  first records, at version 0, the value it held, when it held one; a key that appears records only its appearance.
+  Every reader of a key at a version answers from its history when it has one and from its current value when it has
+  none, and the readers that list a version list the current keys and the history's together. A green seeded from its
+  origin therefore records no history for the origin's keys (until 2026-11-19 each had a version-0 entry, which held
+  every origin file's bytes a second time), and a green made at another's version starts with none.
+- **A lineage.** Greens made from one another's versions share their maps' arenas through a `Lineage`, which owns the
+  arenas and lends them to one green for the length of one call, so every node has one owner and nothing is shared by
+  pointer (R2). `branch(from, v)` forks `from`'s eight roots (one count each), sets back in the new green every key whose
+  value at `v` differs from the head's (the paths named by the change index in `(v, head]`, each value read from its
+  history), and moves the head identity to `v` by the same keys, an entry out and an entry in (A-202's set hash). The
+  new green's version 0 is `from`'s `v`; its histories, last-change indexes and change index start empty. A retire gives
+  the green's holds back and frees what no other green names; a retired green's handle is a typed miss.
+- **The bound.** With E the change index's entries in `(v, head]`, c the paths they name, L the longest of them in
+  bytes, n the keys a history map holds and B the bytes of the changed files at `v` and at the head, a branch costs
+  O(E + c·(L + log n) + B), plus bringing `from`'s identity to its head (the keys changed since it was last read, which
+  any read pays): O(1) at the head, O(the changed paths) behind it, never a walk of the tree. Refusals: a version past
+  the head is `PastHead`, one below the fold floor or the checkpoint the green was restored at is `Folded` (its values
+  are no longer reconstructible), a retired handle is `Stale`.
+- **Evidence** (`cargo test -p slates-merge --lib`, the Mac Studio, 2026-11-19, 22 of 22). The oracle,
+  `every_branch_reads_as_its_copy_over_every_history`: generated histories over a lineage (works of every operation
+  kind at the head and behind it, branches of any green at any version it reconstructs, branches of branches, folds,
+  retires), each green fed with a copying reference, a green seeded from a copy of its source's whole state at the
+  branch's version; after every step every green reads as its reference at every version it reconstructs (bases, files,
+  lengths, pages, path bases, metadata, the change index against its model, the checkpoint, the identity against its
+  recount, the retained figures) and as it read when each version was its head; each branch visits no node of any map
+  (the walk counter, the non-vacuity count) and sets back exactly the keys whose value at its version differs from the
+  head's; and a lineage with every green retired holds no node and no block. The cost test: a green of 10,000 files
+  branched at version 1 of 3 visits no node, sets back the 4 keys changed after it, and makes fewer nodes than those
+  keys have bytes and three each; branched at its head it sets back and makes nothing. Every dimension is set back
+  once in its own test (10 keys at version 1, 5 at version 2, none at the head). Red on a copy of the tree with the
+  reverts taken out, with a walk added, and with the version-0 entry of the one history rule taken out: three of the
+  five branch tests fail each time.
+
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
 in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
 and the inputs it held, and rebuilds its replica from them a slice at a time before it recomputes the next version,
@@ -11268,9 +11318,16 @@ decides the details.
 > branch; destroying a repository leaves its greens; a destroyed green leaves its name; a partition rebuilt from its
 > snapshot answers the same. A model test holds the namespace to these rules over generated histories. Owed: the
 > verbs that create repositories and their greens (with the namespace riding one register with the greens, item 3,
-> shared piece 2), the record's replication in a fleet (shared piece 2), and a green made at another green's version
-> without a walk (item 4: the engine holds a green's state in ordered maps, so making one at a version copies them; it
-> needs maps shared by identity, shared piece 1's second half).
+> shared piece 2) and the record's replication in a fleet (shared piece 2). A green made at another green's version
+> without a walk is built in the engine (A-534, below).
+>
+> **Status (2026-11-19, A-534).** Item 4's engine half is built (§4.16 "The state's maps, and a green made at another
+> green's version"): a green's current values are persistent radix trees, and `Lineage::branch` makes a green whose
+> version 0 is another green's version `v` by forking them and setting back what changed after `v`, O(the changed
+> paths), never a walk. Owed: a repository's greens held in one lineage on their owner shard, a branch made through the
+> register (shared piece 2) and recovered over its source at `v`; a green at a commit that is no version's head (that
+> commit's tree has no state to fork until the object store of piece 3 holds trees); and Subversion's `Copy` on the same
+> maps (§4.17.4, A-542).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -11286,8 +11343,9 @@ decides the details.
 3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
    of it, so two clients creating one name race on one append and one of them is refused.
 4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
-   identity, so creating it costs no walk of the tree. (Today `CreateGreen { base }` walks its base; this is a piece
-   below.) The new green records where it started (the green and version, or the tool's commit), which is the base a
+   identity, so creating it costs no walk of the tree. (The engine makes a green at another green's version without a
+   walk since A-534, §4.16; the verb, `CreateGreen { base }`, still walks its base until piece 1's repository verbs use
+   it.) The new green records where it started (the green and version, or the tool's commit), which is the base a
    review request between the two branches later uses.
 5. Deleting a branch retires its green: the name leaves the namespace, and the chain is kept for the retention the
    policy names, so a deleted branch can be restored as a server's reflog allows.
@@ -11520,7 +11578,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 **Pieces that follow (shared, in order).** Each is one piece with its own tests.
 1. The repository record and its namespace; green ids carrying the repository's partition (built, A-515: the
    record, the namespace and their rules in the metadata database); a green made at another green's version, or at one
-   commit's tree, without walking it (owed: maps shared by identity in the engine).
+   commit's tree, without walking it (built in the engine at another green's version, A-534: persistent maps and
+   `Lineage::branch`, §4.16; at a commit that is no version's head, owed with piece 3's trees; the verbs, owed).
 2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
    recomputation on holders. The entry also carries the repository's own state beside its greens' versions and
    namespace changes (Mercurial's phase roots and obsolescence markers, moved in the same step as the push that moves
@@ -36527,3 +36586,42 @@ Applied in the same change to: GAPS (A-113's open Linux line: part 1 built, part
   host): the two boundaries serve on; part of a send, fewer bytes than committed, more than the send, bytes with nothing
   in flight, and an overflowing sum are torn. Red with today's rule (never served on) on the Mac Studio; green with the
   judgment.
+
+### A-534 — A green's state is persistent maps under one history rule, and a green is made at another green's version without a walk (2026-11-19, g261 for UI goal 91; §4.16 "The state's maps, and a green made at another green's version"; §4.17.1 item 4 and shared piece 1's second half; D-27, D-28; A-202, A-264, A-497, A-515, A-542)
+Applied in the same change to: §4.16 (the new subsection, its status block), §4.17.1 (a status block, item 4, the pieces
+list's item 1), GAPS (the §4.17 entry), `crates/merge/src/ptrie.rs` (new: the persistent radix tree),
+`crates/merge/src/dims.rs` (new: `Dim`, `Files` and its counted `Blocks`, `Xattrs`, `Arenas`), `crates/merge/src/engine.rs` (the eight
+maps, the one history rule's readers and writers: `value_at`, `seed`, `seed_content`, `union_keys`, the `*_at` readers,
+`was_special`, `links_at`; `OriginLoad` without version-0 history; `files`, `files_at` and `file_lens_at` hand out owned
+paths), `crates/merge/src/engine/branch.rs` and `branch/tests.rs` (new: `Lineage`, `LineageGreen`, `LineageRefused`),
+`crates/merge/src/history.rs` (`Value::whole_cost`), `crates/merge/src/lib.rs`, and the server's readers of owned paths
+(`crates/server/src/{work_files,listing,checkout,verbs,work_charge}.rs`).
+- **What was there.** A green held each dimension's current values in an ordered map keyed by the path string, and
+  every origin key a version-0 history entry and a last-change entry of 0. Making a green at another green's version
+  meant copying all of it: the server's `CreateGreen { base }` walks the base volume into an origin, hashes it and seeds
+  the engine, O(the tree) for every branch, which §4.17.1 item 4 forbids.
+- **The decision.** (1) The eight current-value maps are persistent radix trees in arenas with holder counts; a file's
+  bytes are a block counted by its nodes. A radix tree, not a persistent ordered map keyed by whole paths: Subversion's
+  copy grafts a subtree under another path, and a map keyed by whole paths must re-key every entry for that, while a
+  radix tree's prefix is one node (g292's ask). (2) One history rule: a key with no history has held its current value
+  since version 0; its first recorded change first records the value it held. Every green follows it, so there is one
+  representation (no second path for branches), and a green seeded from its origin stops holding each origin file's
+  bytes twice. The readers that read a key at a version take the history when there is one and the current value when
+  not, and those that list a version take the current keys and the history's together; `special_history`'s presence no
+  longer says a path is a special, so `was_special` asks the current map too. (3) `Lineage` owns the shared arenas and
+  lends them to one green a call (R2), and `branch(from, v)` forks the roots and sets back what changed after `v` from
+  the change index and the histories, moving the identity by the same keys.
+- **The bound.** O(E + c·(L + log n) + B) (§4.16): O(1) at the head, O(the changed paths) behind it, never a walk.
+- **Tests and evidence** (§4.16, "Evidence"): `cargo test -p slates-merge --lib` 22 of 22 on the Mac Studio
+  (2026-11-19, debug, fresh clones of the branch), and `cargo fmt --all` clean. Failing first: on copies of the tree the
+  reverts taken out, a walk added to the branch, and the version-0 entry taken out of the one history rule each turned
+  three of the five branch tests red (the oracle, the cost test, the every-dimension test). `cargo test -p slates-server
+  --lib` over the touched modules' tests (the charge recount, the checkout plan, the listing pages) compiles the server's
+  readers of owned paths. The merge crate's integration suites, the server's, clippy, `xtask` and the other targets are
+  main's (run requests filed).
+- **Owed.** The server's repository verbs holding a repository's greens in one lineage on their owner shard; a branch
+  made through the register (shared piece 2), replayed by holders from the same record and recovered over its source at
+  `v` rather than over an origin; a retire's release, O(the nodes only that green held), sliced under the shard's budget;
+  a green at a commit that is no version's head (piece 3's trees); and §4.17.4's `Copy` (g292, A-542's second half),
+  which grafts with `subtree` and `graft` on these maps and needs a per-prefix appearance record under the one history
+  rule (a grafted key has no history, and must not read as present before the copy).
