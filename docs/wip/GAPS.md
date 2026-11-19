@@ -2641,7 +2641,9 @@
 > passing), fmt clean; the one failure, A-626's copy oracle census meeting no nested copy whose inner copy replaced a
 > tree (0 of 30 nested pairs), is not A-668's, since that oracle bases every work at the head and so never reaches the
 > walk A-668 changed, and it passed alone again (r131, 3 of 37); its owner's, filed. Bug record:
-> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`.
+> `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`. That census failure is fixed
+> (2026-11-19, A-672, g307): one fixed history, run first, meets every case the copy oracle's census counts, whatever
+> the seed, and the generated histories add to the counts.
 
 > **A work naming more than 65,535 paths aliased them: fixed (2026-11-19, A-621, g267; found on the push path by g225,
 > A-618; §4.16 "Data model").** An op named its path by a 16-bit index, and interning answered `u16::MAX` for every name
