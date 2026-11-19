@@ -60,6 +60,10 @@ fn main() -> ExitCode {
   and the node's deployment planned exactly as its anchor and daemon do at their start, answering the
   fleet's name, `f`, the node's peers and roots (`role::FleetCheck`), or the refusal that start would end
   with (kiln writes each runner's manifest and checks it so; kiln goal 95101ef3).
+- `StartSpec.vcs_http = Some(address)` starts the version-control servers' shared HTTP edge at `address`
+  (`--vcs-http`, contract 53): HTTPS with the node's own identity on a fleet node, else plain HTTP on a
+  loopback address alone. The anchor binds the address once and holds it for every daemon it starts, so a
+  restart never drops the port; an address it cannot bind ends its start.
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
   on Windows. The instance's volumes live in its memory, so they go with it.
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can
