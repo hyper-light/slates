@@ -53,8 +53,11 @@
 //! into, which the one commit step commits ([`crate::migration::Repository::check`] and
 //! [`crate::migration::Repository::apply`]).
 //!
-//! Not here: running the hooks (item 9, A-623's and A-661's glue); the lock table (A-602); the green's version and its
-//! durable record (the owner's, A-655 part 2's server half).
+//! What the owner's log holds of a version is [`record`] (A-655 part 2b): a repository's creation and each revision,
+//! which a recovery commits again through the same step.
+//!
+//! Not here: running the hooks (item 9, A-623's and A-661's glue); the lock table (A-602); the green's version and the
+//! step's place in the owner's turn (`slates-server`'s `repository::svn_commit`, A-655 part 2b).
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -69,6 +72,7 @@ use crate::lock::LockRefusal;
 
 pub mod drive;
 pub mod edit;
+pub mod record;
 pub mod revision;
 
 /// `SVN_ERR_FS_NO_SUCH_REVISION`, "No such revision %ld": a client's revision past the transaction's base.
