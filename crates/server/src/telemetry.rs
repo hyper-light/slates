@@ -44,7 +44,10 @@ pub(crate) fn emit(state: &mut ShardState, span: Span) {
 /// The `Telemetry` verb on the shard it names (§4.14): drains up to the reply quota of the ring, marks
 /// the batch with the loss before it, and judges every chokepoint's freshness against the horizon. The
 /// window a batch covers is the time since the previous drain (since boot for the first), so a reader
-/// draining on a cadence sees exactly the spans of each interval, each once.
+/// draining on a cadence sees exactly the spans of each interval, each once. The horizon is the failover delay the
+/// fleet measures (A-525; `F = D + E + R`, A-363, fanned to every shard as `ShardState::failover_ns`): a producer silent
+/// longer than the fleet takes to replace a dead owner is reported absent. Until A-525 it was the operator's ten-second
+/// placeholder.
 pub fn drain_verb(state: &mut ShardState, partition: u16) -> ReplyBody {
   if partition != state.partition {
     // `serve` routes a drain to the shard it names; reaching another shard is a routing bug, refused
@@ -55,7 +58,7 @@ pub fn drain_verb(state: &mut ShardState, partition: u16) -> ReplyBody {
   let drained = state.telemetry.drain_up_to(state.telemetry_quota);
   let window_ns = now_ns.saturating_sub(state.last_drain_ns);
   state.last_drain_ns = now_ns;
-  let horizon_ns = state.config.failover_slo_ns;
+  let horizon_ns = state.failover_ns;
   let dropped_total = state.telemetry.dropped();
   let report = summarize(
     partition,

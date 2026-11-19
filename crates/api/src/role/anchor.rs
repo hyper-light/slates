@@ -976,9 +976,9 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, (budget_ns, gap_ns): (u64
 }
 
 /// The policy this anchor restarts its daemon by (A-311): a crash loop's backoff doubles from the failed start's own life
-/// to the cap `config` derives.
+/// to the NFSv4 lease the daemon `config` derives grants its clients (A-525, `RestartPolicy::derive`).
 fn restart_policy(config: &DaemonConfig) -> slates_machine::Derived<RestartPolicy> {
-  RestartPolicy::derive(config.failover_slo_ns)
+  RestartPolicy::derive(config.nfs_v4.lease_ns)
 }
 
 #[cfg(test)]

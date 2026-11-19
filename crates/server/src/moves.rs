@@ -26,9 +26,11 @@
 //!   the records sit in, each period until the configuration shows the switch. The target's neighbourhood must cover
 //!   that cohort, so that the target's takeover, should it die before adopting, recovers the volume from it
 //!   (`MoveRefusal::Neighbourhood` otherwise, before anything is reported). An unreported move whose records are not
-//!   placed within the failover SLO is refused `MoveRefusal::Unplaced` and thaws. From the first report the move is irrevocable,
-//!   since a reported move can commit later, unless the target leaves the region first: no entry can then apply it (a
-//!   move's target must be a member, and a retired id never returns), and the volume thaws.
+//!   placed within the failover delay the fleet measures (A-363, read live on the shard; A-525) is refused
+//!   `MoveRefusal::Unplaced` and thaws: a frozen volume takes no write, and the delay is the bound the fleet holds a
+//!   dead owner's volumes to. From the first report the move is irrevocable, since a reported move can commit later,
+//!   unless the target leaves the region first: no entry can then apply it (a move's target must be a member, and a
+//!   retired id never returns), and the volume thaws.
 //! - **The switch.** The council commits the exception naming the new owner, the member it left and the cohort. Every
 //!   node routes the volume to the new owner from then on ([`crate::owner_location`], the forward); every holder of
 //!   its copies follows as the install's walk reaches each copy ([`follow_moved_object`], whatever the copy's route
@@ -487,17 +489,21 @@ pub(crate) struct Outgoing {
   pub(crate) switched: bool,
   /// Whether its head and catalog are placed (and a live log durable at its head), so it may be reported.
   pub(crate) ready: bool,
-  /// Whether it has waited past the failover SLO unreported.
+  /// Whether it has waited unreported past the failover delay the shard reads live (A-525, [`outgoing`]).
   pub(crate) overdue: bool,
   /// The cohort its records are placed at `f + 1` of: this owner's current cohort for it, in id order.
   pub(crate) cohort: Vec<HostId>,
 }
 
-/// The moves this shard has begun and not ended, for the control shard's period ([`drive_outgoing`]).
+/// The moves this shard has begun and not ended, for the control shard's period ([`drive_outgoing`]). An unreported one
+/// is overdue past the failover delay (A-525): a frozen volume takes no write, so it is held to the bound the fleet holds
+/// a dead owner's volumes to, the delay the fleet measures (`F = D + E + R`, A-363: its detector's periods, the council's
+/// confirmation window and the recoveries it timed), fanned to every shard (`ShardState::failover_ns`). Until A-525 it
+/// was the operator's ten-second placeholder, five times a quiet fleet's delay.
 fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
-  let bound = state.config.failover_slo_ns;
+  let bound = state.failover_ns;
   let begun: Vec<(DbVolumeId, MoveOut)> = state
     .moves_out
     .iter()
