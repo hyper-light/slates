@@ -619,7 +619,10 @@ fn an_established_handshake_hands_on_its_session() {
     Ok(Progress::Opened { .. })
   ));
   assert_eq!(server.session(), None);
-  assert_eq!(server.open(&anon_repository(), &mut written), Ok(Access::Asked));
+  assert_eq!(
+    server.open(&anon_repository(), &mut written),
+    Ok(Access::Asked)
+  );
   let rest = &client[answer_end..];
   assert!(matches!(
     server.receive(rest, &mut written),
@@ -1187,7 +1190,14 @@ fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
     client: client.map(|client| client.as_bytes().to_vec()),
   };
   let table: [(&[u8], AnswerRead); 18] = [
-    (b"( 2 ( edit-pipeline ) 3:url ) ", AnswerRead::Opened { url: url(), ra_client: None, client: None }),
+    (
+      b"( 2 ( edit-pipeline ) 3:url ) ",
+      AnswerRead::Opened {
+        url: url(),
+        ra_client: None,
+        client: None,
+      },
+    ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) ) ",
       named("abc", None),
@@ -1220,21 +1230,39 @@ fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
       b"( 2 ( edit-pipeline ) 3:url 7 ( ) ) ",
       AnswerRead::Refused(Refused::NotAnswer),
     ),
-    (b"( 2 ( edit-pipeline ) url ) ", AnswerRead::Refused(Refused::NotAnswer)),
-    (b"( 2 edit-pipeline 3:url ) ", AnswerRead::Refused(Refused::NotAnswer)),
-    (b"( two ( edit-pipeline ) 3:url ) ", AnswerRead::Refused(Refused::NotAnswer)),
+    (
+      b"( 2 ( edit-pipeline ) url ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
+    (
+      b"( 2 edit-pipeline 3:url ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
+    (
+      b"( two ( edit-pipeline ) 3:url ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
     (b"2 ", AnswerRead::Refused(Refused::NotAnswer)),
-    (b"( 2 ( 7 ) 3:url 3:abc ) ", AnswerRead::Refused(Refused::NotAnswer)),
+    (
+      b"( 2 ( 7 ) 3:url 3:abc ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
     (
       b"( 1 ( edit-pipeline ) 3:url ) ",
       AnswerRead::Refused(Refused::UnsupportedVersion(1)),
     ),
-    (b"( 3 ( 7 ) 3:url ) ", AnswerRead::Refused(Refused::UnsupportedVersion(3))),
+    (
+      b"( 3 ( 7 ) 3:url ) ",
+      AnswerRead::Refused(Refused::UnsupportedVersion(3)),
+    ),
     (
       b"( 2 ( 7 edit-pipeline ) 3:url ) ",
       AnswerRead::Refused(Refused::CapabilityNotWord),
     ),
-    (b"( 2 ( ) 3:url ) ", AnswerRead::Refused(Refused::NoEditPipeline)),
+    (
+      b"( 2 ( ) 3:url ) ",
+      AnswerRead::Refused(Refused::NoEditPipeline),
+    ),
   ];
   for (answer, expected) in table {
     assert_eq!(

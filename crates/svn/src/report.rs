@@ -394,7 +394,15 @@ fn read_status(params: &[Value<'_>]) -> Result<Request, Refused> {
 
 /// `diff`'s fields: revision, target, recurse, ancestry, URL, texts and depth word; a client before
 /// 1.4 sends no texts flag (texts are sent) and no depth word.
-type DiffFields<'a> = (Option<Revision>, &'a [u8], bool, bool, &'a [u8], bool, Option<&'a str>);
+type DiffFields<'a> = (
+  Option<Revision>,
+  &'a [u8],
+  bool,
+  bool,
+  &'a [u8],
+  bool,
+  Option<&'a str>,
+);
 
 /// `diff`'s parameters: five from a client before 1.4 (`(?r)cbbc`), else `(?r)cbbcb?w`.
 fn read_diff(params: &[Value<'_>]) -> Result<Request, Refused> {
@@ -433,7 +441,15 @@ fn diff_fields<'a>(fields: &[Field<'a>]) -> Option<DiffFields<'a>> {
       Field::String(Some(url)),
       Field::Boolean(text_deltas),
       Field::Word(depth),
-    ] => Some((*revision, target, *recurse, *ancestry, url, *text_deltas, *depth)),
+    ] => Some((
+      *revision,
+      target,
+      *recurse,
+      *ancestry,
+      url,
+      *text_deltas,
+      *depth,
+    )),
     _ => None,
   }
 }
@@ -497,7 +513,11 @@ fn uri_decode(url: &str) -> Vec<u8> {
   let mut query = false;
   let mut at = 0usize;
   while let Some(&byte) = bytes.get(at) {
-    let escaped = match (byte, bytes.get(at.saturating_add(1)), bytes.get(at.saturating_add(2))) {
+    let escaped = match (
+      byte,
+      bytes.get(at.saturating_add(1)),
+      bytes.get(at.saturating_add(2)),
+    ) {
       (ESCAPE, Some(&high), Some(&low)) => hex_pair(high, low),
       _ => None,
     };
@@ -607,7 +627,9 @@ impl ReportFailure {
   pub fn subversion_code(&self) -> u32 {
     match self {
       Self::NotAuthorized => SVN_ERR_RA_NOT_AUTHORIZED,
-      Self::RequestDepthExclude | Self::UnsupportedDepth | Self::ExcludeLink => SVN_ERR_REPOS_BAD_ARGS,
+      Self::RequestDepthExclude | Self::UnsupportedDepth | Self::ExcludeLink => {
+        SVN_ERR_REPOS_BAD_ARGS
+      }
       Self::NotSameRepository { .. } => SVN_ERR_RA_ILLEGAL_URL,
       Self::InvalidTopLevel | Self::TwoTopLevelReports => SVN_ERR_REPOS_BAD_REVISION_REPORT,
       Self::UnknownCommand { .. } => SVN_ERR_RA_SVN_UNKNOWN_CMD,
@@ -784,7 +806,11 @@ impl Reporter {
   ///
   /// # Errors
   /// None in practice: the answers' words are the grammar's.
-  pub fn begin(context: &Context<'_>, request: Request, out: &mut Vec<u8>) -> Result<Begun, Refused> {
+  pub fn begin(
+    context: &Context<'_>,
+    request: Request,
+    out: &mut Vec<u8>,
+  ) -> Result<Begun, Refused> {
     if request.kind == RequestKind::Update && !context.readable {
       ReportFailure::NotAuthorized.write(out)?;
       return Ok(Begun::Failed(ReportFailure::NotAuthorized));
@@ -849,7 +875,12 @@ impl Reporter {
   }
 
   /// One report command, `( word ( params ) )`.
-  fn command(&mut self, value: &Value<'_>, consumed: usize, out: &mut Vec<u8>) -> Result<Progress, Refused> {
+  fn command(
+    &mut self,
+    value: &Value<'_>,
+    consumed: usize,
+    out: &mut Vec<u8>,
+  ) -> Result<Progress, Refused> {
     let Value::List(items) = value else {
       return Err(Refused::Malformed);
     };
@@ -884,7 +915,10 @@ impl Reporter {
     if reported.depth == Depth::Unknown {
       return self.keep(ReportFailure::UnsupportedDepth);
     }
-    let info = reported.at(join_relpath(&self.operand, &canonical_relpath(text(path)?)), None);
+    let info = reported.at(
+      join_relpath(&self.operand, &canonical_relpath(text(path)?)),
+      None,
+    );
     self.record(info)
   }
 
@@ -909,7 +943,12 @@ impl Reporter {
   /// kept.
   fn link_path(&mut self, params: &[Value<'_>]) -> Result<(), Refused> {
     let fields = tuple::read(params, LINK_PATH_FORMAT).map_err(|_| Refused::Malformed)?;
-    let [Field::String(Some(path)), Field::String(Some(url)), rest @ ..] = fields.as_slice() else {
+    let [
+      Field::String(Some(path)),
+      Field::String(Some(url)),
+      rest @ ..,
+    ] = fields.as_slice()
+    else {
       return Err(Refused::Malformed);
     };
     let path = join_relpath(&self.operand, &canonical_relpath(text(path)?));
@@ -988,7 +1027,12 @@ impl Reporter {
   }
 
   /// The finished report.
-  fn report(&self, source_revision: Revision, target_info: PathInfo, paths: Vec<PathInfo>) -> Report {
+  fn report(
+    &self,
+    source_revision: Revision,
+    target_info: PathInfo,
+    paths: Vec<PathInfo>,
+  ) -> Report {
     Report {
       kind: self.kind,
       anchor: self.anchor.clone(),
@@ -1073,13 +1117,15 @@ fn refused_with(failure: ReportFailure, out: &mut Vec<u8>) -> Result<Begun, Refu
 /// (`serve.c` `trivial_auth_request`).
 fn write_trivial_auth(out: &mut Vec<u8>) -> Result<(), Refused> {
   let params = Value::List(vec![Value::List(Vec::new()), Value::String(&[])]);
-  ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out).map_err(|_| Refused::Malformed)
+  ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out)
+    .map_err(|_| Refused::Malformed)
 }
 
 /// Appends an empty command response, `( success ( ) )`.
 fn write_empty_success(out: &mut Vec<u8>) -> Result<(), Refused> {
   let params = Value::List(Vec::new());
-  ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out).map_err(|_| Refused::Malformed)
+  ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out)
+    .map_err(|_| Refused::Malformed)
 }
 
 #[cfg(test)]

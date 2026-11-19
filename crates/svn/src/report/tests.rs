@@ -140,7 +140,9 @@ fn report_command(recorded: Recorded) -> (String, usize, Request) {
       continue;
     };
     if name == "reparent" {
-      let Value::String(url) = params[0] else { panic!("a reparent's URL") };
+      let Value::String(url) = params[0] else {
+        panic!("a reparent's URL")
+      };
       session_path = path_of(url);
     }
     if let Some(kind) = RequestKind::of(&name) {
@@ -208,14 +210,26 @@ fn replay(context: &Context<'_>, request: Request, report_bytes: &[u8], cuts: &[
     match reporter.receive(&held, &mut written) {
       Ok(Progress::NeedMore { .. }) => match pieces.next() {
         Some(piece) => held.extend_from_slice(piece),
-        None => return Replay { written, ending: Ending::Waiting, taken },
+        None => {
+          return Replay {
+            written,
+            ending: Ending::Waiting,
+            taken,
+          };
+        }
       },
       Ok(Progress::Took { consumed }) => {
         held.drain(..consumed);
         taken += consumed;
       }
       Ok(progress) => return finished(written, progress, taken),
-      Err(refused) => return Replay { written, ending: Ending::Ended(refused), taken },
+      Err(refused) => {
+        return Replay {
+          written,
+          ending: Ending::Ended(refused),
+          taken,
+        };
+      }
     }
   }
 }
@@ -263,7 +277,9 @@ fn replay_recorded(recorded: Recorded) -> (String, Replay, Vec<u8>) {
 /// Asserts `needle` occurs in `haystack`, shown as text when it does not.
 fn assert_contains(haystack: &[u8], needle: &[u8], what: &str) {
   assert!(
-    haystack.windows(needle.len()).any(|window| window == needle),
+    haystack
+      .windows(needle.len())
+      .any(|window| window == needle),
     "{what}: {:?} not in {:?}",
     String::from_utf8_lossy(needle),
     String::from_utf8_lossy(haystack)
@@ -283,7 +299,11 @@ fn path(path: &str, revision: Option<Revision>, depth: Depth, start_empty: bool)
 }
 
 /// The report of `/trunk`'s working copy updated to `target_revision` from `source_revision`.
-fn trunk_update(target_revision: Revision, source_revision: Revision, target_info: PathInfo) -> Report {
+fn trunk_update(
+  target_revision: Revision,
+  source_revision: Revision,
+  target_info: PathInfo,
+) -> Report {
   Report {
     kind: RequestKind::Update,
     anchor: "/trunk".to_owned(),
@@ -310,10 +330,27 @@ fn secret() -> PathInfo {
 /// wrote just before its drive: a trivial auth request for the command and one for `finish-report`.
 fn assert_finished(recorded: Recorded, expected: Report) {
   let (_, replay, report_bytes) = replay_recorded(recorded);
-  assert_eq!(replay.ending, Ending::Finished(Box::new(expected)), "{}", recorded.name);
-  assert_eq!(replay.taken, report_bytes.len() - items(&report_bytes).last().unwrap().len());
-  assert_eq!(replay.written, [TRIVIAL_AUTH, TRIVIAL_AUTH].concat(), "{}", recorded.name);
-  assert_contains(recorded.server, &[&replay.written, TARGET_REV].concat(), recorded.name);
+  assert_eq!(
+    replay.ending,
+    Ending::Finished(Box::new(expected)),
+    "{}",
+    recorded.name
+  );
+  assert_eq!(
+    replay.taken,
+    report_bytes.len() - items(&report_bytes).last().unwrap().len()
+  );
+  assert_eq!(
+    replay.written,
+    [TRIVIAL_AUTH, TRIVIAL_AUTH].concat(),
+    "{}",
+    recorded.name
+  );
+  assert_contains(
+    recorded.server,
+    &[&replay.written, TARGET_REV].concat(),
+    recorded.name,
+  );
 }
 
 /// A-616 (stock checkouts: `svn checkout -r1`, at depth empty and at depth immediates; protocol
@@ -379,8 +416,14 @@ fn a_stock_reports_deletions_locks_and_links_are_kept() {
   not_present.paths = vec![path("dir/sub", None, Depth::Infinity, false), secret()];
   assert_finished(recorded!("update-with-not-present.1"), not_present);
   let (_, replay, _) = replay_recorded(recorded!("update-with-lock.1"));
-  let Ending::Finished(report) = replay.ending else { panic!("{:?}", replay.ending) };
-  let reported = report.paths.iter().find(|info| info.path == "a.txt").unwrap();
+  let Ending::Finished(report) = replay.ending else {
+    panic!("{:?}", replay.ending)
+  };
+  let reported = report
+    .paths
+    .iter()
+    .find(|info| info.path == "a.txt")
+    .unwrap();
   let token = reported.lock_token.clone().unwrap();
   assert!(token.starts_with(b"opaquelocktoken:"), "{token:?}");
   let mut locked = trunk_update(6, 6, path("", Some(6), Depth::Infinity, false));
@@ -453,14 +496,36 @@ fn replay_hostile(recorded: Recorded) -> Replay {
 #[test]
 fn a_report_svnserve_refuses_at_its_end_is_refused_in_its_words() {
   let cases = [
-    (recorded!("hostile-report-first-not-root.1"), ReportFailure::InvalidTopLevel, 165_004),
-    (recorded!("hostile-report-bad-depth.1"), ReportFailure::UnsupportedDepth, 165_002),
-    (recorded!("hostile-report-delete-root.1"), ReportFailure::TwoTopLevelReports, 165_004),
+    (
+      recorded!("hostile-report-first-not-root.1"),
+      ReportFailure::InvalidTopLevel,
+      165_004,
+    ),
+    (
+      recorded!("hostile-report-bad-depth.1"),
+      ReportFailure::UnsupportedDepth,
+      165_002,
+    ),
+    (
+      recorded!("hostile-report-delete-root.1"),
+      ReportFailure::TwoTopLevelReports,
+      165_004,
+    ),
   ];
   for (recorded, failure, code) in cases {
     let replay = replay_hostile(recorded);
-    assert_eq!(replay.ending, Ending::Failed(failure.clone()), "{}", recorded.name);
-    assert_eq!(replay.written, after_handshake(recorded.server), "{}", recorded.name);
+    assert_eq!(
+      replay.ending,
+      Ending::Failed(failure.clone()),
+      "{}",
+      recorded.name
+    );
+    assert_eq!(
+      replay.written,
+      after_handshake(recorded.server),
+      "{}",
+      recorded.name
+    );
     assert_eq!(failure.subversion_code(), code);
   }
   let elsewhere = recorded!("hostile-report-link-elsewhere.1");
@@ -486,8 +551,12 @@ fn an_abandoned_report_and_an_excluded_request_are_answered_as_svnserve_answers_
   assert_eq!(replay.written, after_handshake(aborted.server));
   let excluded = recorded!("hostile-update-depth-exclude.1");
   let replay = replay_hostile(excluded);
-  assert_eq!(replay.ending, Ending::Refused(ReportFailure::RequestDepthExclude));
-  let first_two = items(excluded.server)[SERVER_HANDSHAKE_ITEMS..SERVER_HANDSHAKE_ITEMS + 2].concat();
+  assert_eq!(
+    replay.ending,
+    Ending::Refused(ReportFailure::RequestDepthExclude)
+  );
+  let first_two =
+    items(excluded.server)[SERVER_HANDSHAKE_ITEMS..SERVER_HANDSHAKE_ITEMS + 2].concat();
   assert_eq!(replay.written, first_two);
 }
 
@@ -504,16 +573,33 @@ fn a_report_that_reaches_the_drive_is_answered_as_svnserve_answered_it_before() 
     recorded!("hostile-report-client-refuses-the-edit.1"),
   ] {
     let replay = replay_hostile(recorded);
-    assert!(matches!(replay.ending, Ending::Finished(_)), "{}", recorded.name);
-    assert_eq!(replay.written, before_drive(recorded.server), "{}", recorded.name);
+    assert!(
+      matches!(replay.ending, Ending::Finished(_)),
+      "{}",
+      recorded.name
+    );
+    assert_eq!(
+      replay.written,
+      before_drive(recorded.server),
+      "{}",
+      recorded.name
+    );
   }
   for recorded in [
     recorded!("hostile-report-revision-past-head.1"),
     recorded!("hostile-report-early-edit-response.1"),
   ] {
     let replay = replay_hostile(recorded);
-    assert!(matches!(replay.ending, Ending::Finished(_)), "{}", recorded.name);
-    assert_contains(recorded.server, &[&replay.written, b"( abort-edit ".as_slice()].concat(), recorded.name);
+    assert!(
+      matches!(replay.ending, Ending::Finished(_)),
+      "{}",
+      recorded.name
+    );
+    assert_contains(
+      recorded.server,
+      &[&replay.written, b"( abort-edit ".as_slice()].concat(),
+      recorded.name,
+    );
   }
 }
 
@@ -529,7 +615,11 @@ fn a_malformed_report_command_ends_the_connection() {
 }
 
 /// One `vparse_tuple` case: the items, the format, and the fields or the refusal.
-type TupleCase = (&'static [u8], &'static [u8], Result<Vec<Field<'static>>, tuple::Malformed>);
+type TupleCase = (
+  &'static [u8],
+  &'static [u8],
+  Result<Vec<Field<'static>>, tuple::Malformed>,
+);
 
 /// The items of a written list, `( ... )`, as a slice of values.
 fn list_items(written: &'static [u8]) -> Vec<Value<'static>> {
@@ -546,49 +636,81 @@ fn list_items(written: &'static [u8]) -> Vec<Value<'static>> {
 #[test]
 fn a_tuple_is_read_as_vparse_tuple_reads_it() {
   let cases: [TupleCase; 10] = [
-    (b"( ( 6 ) 0: true unknown false false ) ", UPDATE_FORMAT, Ok(vec![
-      Field::Revision(Some(6)),
-      Field::String(Some(b"")),
-      Field::Boolean(true),
-      Field::Word(Some("unknown")),
-      Field::Tristate(Some(false)),
-      Field::Tristate(Some(false)),
-    ])),
-    (b"( ( ) 0: true ) ", UPDATE_FORMAT, Ok(vec![
-      Field::Revision(None),
-      Field::String(Some(b"")),
-      Field::Boolean(true),
-      Field::Word(None),
-      Field::Tristate(None),
-      Field::Tristate(None),
-    ])),
-    (b"( ( ) 0: true infinity ) ", UPDATE_FORMAT, Err(tuple::Malformed)),
+    (
+      b"( ( 6 ) 0: true unknown false false ) ",
+      UPDATE_FORMAT,
+      Ok(vec![
+        Field::Revision(Some(6)),
+        Field::String(Some(b"")),
+        Field::Boolean(true),
+        Field::Word(Some("unknown")),
+        Field::Tristate(Some(false)),
+        Field::Tristate(Some(false)),
+      ]),
+    ),
+    (
+      b"( ( ) 0: true ) ",
+      UPDATE_FORMAT,
+      Ok(vec![
+        Field::Revision(None),
+        Field::String(Some(b"")),
+        Field::Boolean(true),
+        Field::Word(None),
+        Field::Tristate(None),
+        Field::Tristate(None),
+      ]),
+    ),
+    (
+      b"( ( ) 0: true infinity ) ",
+      UPDATE_FORMAT,
+      Err(tuple::Malformed),
+    ),
     (b"( ( 6 ) 0: maybe ) ", UPDATE_FORMAT, Err(tuple::Malformed)),
-    (b"( ( 18446744073709551615 ) 0: true ) ", UPDATE_FORMAT, Ok(vec![
-      Field::Revision(None),
-      Field::String(Some(b"")),
-      Field::Boolean(true),
-      Field::Word(None),
-      Field::Tristate(None),
-      Field::Tristate(None),
-    ])),
-    (b"( 0: 6 false ) ", SET_PATH_FORMAT, Ok(vec![
-      Field::String(Some(b"")),
-      Field::Revision(Some(6)),
-      Field::Boolean(false),
-      Field::String(None),
-      Field::Word(None),
-    ])),
-    (b"( 1:a 6 false ( 3:tok ) files extra 7 ) ", SET_PATH_FORMAT, Ok(vec![
-      Field::String(Some(b"a")),
-      Field::Revision(Some(6)),
-      Field::Boolean(false),
-      Field::String(Some(b"tok")),
-      Field::Word(Some("files")),
-    ])),
-    (b"( 1:a 6 false ( 7 ) ) ", SET_PATH_FORMAT, Err(tuple::Malformed)),
+    (
+      b"( ( 18446744073709551615 ) 0: true ) ",
+      UPDATE_FORMAT,
+      Ok(vec![
+        Field::Revision(None),
+        Field::String(Some(b"")),
+        Field::Boolean(true),
+        Field::Word(None),
+        Field::Tristate(None),
+        Field::Tristate(None),
+      ]),
+    ),
+    (
+      b"( 0: 6 false ) ",
+      SET_PATH_FORMAT,
+      Ok(vec![
+        Field::String(Some(b"")),
+        Field::Revision(Some(6)),
+        Field::Boolean(false),
+        Field::String(None),
+        Field::Word(None),
+      ]),
+    ),
+    (
+      b"( 1:a 6 false ( 3:tok ) files extra 7 ) ",
+      SET_PATH_FORMAT,
+      Ok(vec![
+        Field::String(Some(b"a")),
+        Field::Revision(Some(6)),
+        Field::Boolean(false),
+        Field::String(Some(b"tok")),
+        Field::Word(Some("files")),
+      ]),
+    ),
+    (
+      b"( 1:a 6 false ( 7 ) ) ",
+      SET_PATH_FORMAT,
+      Err(tuple::Malformed),
+    ),
     (b"( 1:a 6 ) ", SET_PATH_FORMAT, Err(tuple::Malformed)),
-    (b"( 1:a ) ", DELETE_PATH_FORMAT, Ok(vec![Field::String(Some(b"a"))])),
+    (
+      b"( 1:a ) ",
+      DELETE_PATH_FORMAT,
+      Ok(vec![Field::String(Some(b"a"))]),
+    ),
   ];
   for (written, format, expected) in cases {
     let items = list_items(written);
@@ -637,17 +759,31 @@ fn urls_decode_as_subversion_decodes_them_and_name_paths_in_the_repository() {
   ] {
     assert_eq!(uri_decode(url), decoded, "{url}");
   }
-  assert_eq!(repository_path(ROOT_URL, "svn://127.0.0.1/repo"), Ok("/".to_owned()));
-  assert_eq!(repository_path(ROOT_URL, "svn://127.0.0.1/repo/"), Ok("/".to_owned()));
+  assert_eq!(
+    repository_path(ROOT_URL, "svn://127.0.0.1/repo"),
+    Ok("/".to_owned())
+  );
+  assert_eq!(
+    repository_path(ROOT_URL, "svn://127.0.0.1/repo/"),
+    Ok("/".to_owned())
+  );
   assert_eq!(
     repository_path(ROOT_URL, "svn://127.0.0.1/repo/branches/b1%2Fx"),
     Ok("/branches/b1/x".to_owned())
   );
-  for beside in ["svn://127.0.0.1/repo2", "svn://127.0.0.1/rep", "svn://other/repo", "svn://127.0.0.1/repo/%ff"] {
-    assert!(matches!(
-      repository_path(ROOT_URL, beside),
-      Err(ReportFailure::NotSameRepository { .. })
-    ), "{beside}");
+  for beside in [
+    "svn://127.0.0.1/repo2",
+    "svn://127.0.0.1/rep",
+    "svn://other/repo",
+    "svn://127.0.0.1/repo/%ff",
+  ] {
+    assert!(
+      matches!(
+        repository_path(ROOT_URL, beside),
+        Err(ReportFailure::NotSameRepository { .. })
+      ),
+      "{beside}"
+    );
   }
 }
 
@@ -689,21 +825,33 @@ fn update_head() -> Request {
 fn a_reports_first_refusal_is_the_one_answered() {
   let session = session();
   let report = [
-    b"( set-path ( 0: 6 false ( ) infinity ) ) ( set-path ( 1:a 6 false ( ) sideways ) ) ".as_slice(),
+    b"( set-path ( 0: 6 false ( ) infinity ) ) ( set-path ( 1:a 6 false ( ) sideways ) ) "
+      .as_slice(),
     b"( link-path ( 1:b ",
     &string(b"svn://elsewhere/r/b"),
     b"6 false ( ) infinity ) ) ( set-path ( 1:c 6 false ) ) ( finish-report ( ) ) ",
   ]
   .concat();
-  let replay = replay(&trunk_context(&session, 1 << 16), update_head(), &report, &[]);
-  assert_eq!(replay.ending, Ending::Failed(ReportFailure::UnsupportedDepth));
+  let replay = replay(
+    &trunk_context(&session, 1 << 16),
+    update_head(),
+    &report,
+    &[],
+  );
+  assert_eq!(
+    replay.ending,
+    Ending::Failed(ReportFailure::UnsupportedDepth)
+  );
   let failure = [
     b"( failure ( ( 165002 ".as_slice(),
     &string(b"Unsupported report depth 'unknown'"),
     b"0: 0 ) ) ) ",
   ]
   .concat();
-  assert_eq!(replay.written, [TRIVIAL_AUTH, TRIVIAL_AUTH, &failure].concat());
+  assert_eq!(
+    replay.written,
+    [TRIVIAL_AUTH, TRIVIAL_AUTH, &failure].concat()
+  );
 }
 
 /// A-616 (a link at depth `exclude`, `svn_repos_link_path3`; a second report of a target beneath
@@ -719,14 +867,25 @@ fn a_link_at_depth_exclude_is_refused_and_a_deleted_target_keeps_its_depth() {
     b"6 false ( ) exclude ) ) ( finish-report ( ) ) ",
   ]
   .concat();
-  let excluded = replay(&trunk_context(&session, 1 << 16), update_head(), &report, &[]);
+  let excluded = replay(
+    &trunk_context(&session, 1 << 16),
+    update_head(),
+    &report,
+    &[],
+  );
   assert_eq!(excluded.ending, Ending::Failed(ReportFailure::ExcludeLink));
   let mut request = update_head();
   request.target = "a.txt".to_owned();
-  let report = b"( set-path ( 0: 6 false ( ) files ) ) ( delete-path ( 0: ) ) ( finish-report ( ) ) ";
+  let report =
+    b"( set-path ( 0: 6 false ( ) files ) ) ( delete-path ( 0: ) ) ( finish-report ( ) ) ";
   let deleted = replay(&trunk_context(&session, 1 << 16), request, report, &[]);
-  let Ending::Finished(finished) = deleted.ending else { panic!("{:?}", deleted.ending) };
-  assert_eq!(finished.target_info, path("a.txt", None, Depth::Files, false));
+  let Ending::Finished(finished) = deleted.ending else {
+    panic!("{:?}", deleted.ending)
+  };
+  assert_eq!(
+    finished.target_info,
+    path("a.txt", None, Depth::Files, false)
+  );
   assert_eq!(finished.source_revision, 6);
 }
 
@@ -741,13 +900,19 @@ fn an_unreadable_update_and_a_foreign_switch_are_refused_before_their_report() {
   let mut written = Vec::new();
   let begun = Reporter::begin(&context, update_head(), &mut written).unwrap();
   assert!(matches!(begun, Begun::Failed(ReportFailure::NotAuthorized)));
-  assert_eq!(written, b"( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) ");
+  assert_eq!(
+    written,
+    b"( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) "
+  );
   let mut switch = update_head();
   switch.kind = RequestKind::Switch;
   switch.url = Some("svn://elsewhere/repo/branches".to_owned());
   let mut written = Vec::new();
   let begun = Reporter::begin(&trunk_context(&session, 1 << 16), switch, &mut written).unwrap();
-  assert!(matches!(begun, Begun::Failed(ReportFailure::NotSameRepository { .. })));
+  assert!(matches!(
+    begun,
+    Begun::Failed(ReportFailure::NotSameRepository { .. })
+  ));
   assert!(written.starts_with(TRIVIAL_AUTH));
 }
 
@@ -758,17 +923,26 @@ fn an_unreadable_update_and_a_foreign_switch_are_refused_before_their_report() {
 #[test]
 fn a_report_past_its_room_or_nested_too_deep_ends_the_connection() {
   let session = session();
-  let report = b"( set-path ( 0: 6 false ( ) infinity ) ) ( set-path ( 1:a 6 false ( ) infinity ) ) \
+  let report =
+    b"( set-path ( 0: 6 false ( ) infinity ) ) ( set-path ( 1:a 6 false ( ) infinity ) ) \
 ( finish-report ( ) ) ";
   let needed = 2 * PATH_INFO_BYTES + 1;
   let tight = replay(&trunk_context(&session, needed), update_head(), report, &[]);
   assert!(matches!(tight.ending, Ending::Finished(_)));
-  let short = replay(&trunk_context(&session, needed - 1), update_head(), report, &[]);
+  let short = replay(
+    &trunk_context(&session, needed - 1),
+    update_head(),
+    report,
+    &[],
+  );
   assert_eq!(short.ending, Ending::Ended(Refused::ReportTooLarge));
   assert_eq!(Refused::ReportTooLarge.subversion_code(), Some(210_009));
   let deep = b"( set-path ( 0: 6 false ( ( 3:tok ) ) infinity ) ) ";
   let replay = replay(&trunk_context(&session, 1 << 16), update_head(), deep, &[]);
-  assert!(matches!(replay.ending, Ending::Ended(Refused::Item(ItemError::NestedTooDeep { .. }))));
+  assert!(matches!(
+    replay.ending,
+    Ending::Ended(Refused::Item(ItemError::NestedTooDeep { .. }))
+  ));
 }
 
 /// A-616 (hostile bytes in a report: a path or token holding a NUL byte, which `svnserve` cuts at
@@ -782,8 +956,17 @@ fn a_report_path_or_token_holding_a_nul_or_no_utf8_is_refused() {
     b"( set-path ( 0: 6 false ( 3:t\x00k ) infinity ) ) ",
     b"( delete-path ( 2:\xff\xfe ) ) ",
   ] {
-    let replay = replay(&trunk_context(&session, 1 << 16), update_head(), report, &[]);
-    assert_eq!(replay.ending, Ending::Ended(Refused::Malformed), "{report:?}");
+    let replay = replay(
+      &trunk_context(&session, 1 << 16),
+      update_head(),
+      report,
+      &[],
+    );
+    assert_eq!(
+      replay.ending,
+      Ending::Ended(Refused::Malformed),
+      "{report:?}"
+    );
   }
 }
 
@@ -793,17 +976,31 @@ fn a_report_path_or_token_holding_a_nul_or_no_utf8_is_refused() {
 fn a_call_after_the_report_is_out_of_turn() {
   let session = session();
   let mut written = Vec::new();
-  let Begun::Reporting(mut reporter) =
-    Reporter::begin(&trunk_context(&session, 1 << 16), update_head(), &mut written).unwrap()
-  else {
+  let Begun::Reporting(mut reporter) = Reporter::begin(
+    &trunk_context(&session, 1 << 16),
+    update_head(),
+    &mut written,
+  )
+  .unwrap() else {
     panic!("an update begins a report");
   };
   let report = b"( set-path ( 0: 6 false ( ) infinity ) ) ";
-  assert_eq!(reporter.receive(report, &mut written), Ok(Progress::Took { consumed: report.len() }));
+  assert_eq!(
+    reporter.receive(report, &mut written),
+    Ok(Progress::Took {
+      consumed: report.len()
+    })
+  );
   let finish = b"( finish-report ( ) ) ";
-  assert!(matches!(reporter.receive(finish, &mut written), Ok(Progress::Finished { .. })));
+  assert!(matches!(
+    reporter.receive(finish, &mut written),
+    Ok(Progress::Finished { .. })
+  ));
   let before = written.clone();
-  assert_eq!(reporter.receive(finish, &mut written), Err(Refused::OutOfTurn));
+  assert_eq!(
+    reporter.receive(finish, &mut written),
+    Err(Refused::OutOfTurn)
+  );
   assert_eq!(written, before);
   assert_eq!(Refused::OutOfTurn.subversion_code(), None);
 }

@@ -13069,6 +13069,17 @@ and export by landing).
 > dumps stock `svnadmin` 1.15.0 wrote (golden, SHA-256 checked), to `svnlook changed`, to format 3 rebuilding format
 > 2's trees, to every cut and bit flip. Owed of piece 6: the verbs over it (`svnadmin create`, `load`, `dump`,
 > `setrevprop`, `setlog`, `info`, `uuid`, `youngest`) and the dump round trip.
+>
+> **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
+> piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
+> through a port of `marshal.c`'s `vparse_tuple`; `set-path`, `delete-path`, `link-path`, `finish-report` and
+> `abort-report` are kept and checked as `reporter.c` keeps and checks them, each refusal in `svnserve`'s words and
+> number (165002, 165004, 170000, 170001, 210001), the report held within the caller's room (210009 past it); the
+> handshake's `Session` is the input. Held to stock Subversion 1.15.0's own sessions over one recorded history
+> (`crates/svn/fixtures/report/`, relayed both ways, SHA-256 checked): checkouts, updates at every depth, of one target,
+> of mixed revisions, holding a lock, over a switched and a not-present path, switches, `status -u`, a diff, and
+> thirteen hand-made reports. Owed, part 2: the editor drive that answers a finished report over the index (A-553),
+> its texts as svndiff, its entry properties, absent entries, copy sources and its early-error abort.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13517,7 +13528,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format; its codec built, A-593),
    `setrevprop`, `setlog`, `info`, `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
-   the plain reads; the reporter (update, switch, status, diff, checkout); commit; log, locations, segments, file
+   the plain reads; the reporter (update, switch, status, diff, checkout; its commands and report built, A-616
+   part 1, its editor drive owed); commit; log, locations, segments, file
    revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
    oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
@@ -41611,3 +41623,47 @@ Applied in the same change to:
   property section), as `svnadmin` learns a delta's by writing it to a temporary file first.
 - **Owed of piece 6:** the verbs over the codec (`svnadmin create`, `load`, `dump`, `setrevprop`, `setlog`, `info`,
   `uuid`, `youngest`) and the dump round trip, their gate.
+
+### A-616 — ra_svn's reporter, part 1: the commands that begin a report and the report, kept and refused as `svnserve` keeps and refuses them (2026-11-19, g234, UI goal 93; §4.17.4 "4. Reads", the reporter, and piece 7's third part; after A-599)
+Applied in the same change to:
+- §4.17.4's status and piece 7; GAPS (the §4.17.4 entry); the research notes (`vcs-servers-subversion.md` §1 and §2);
+- `crates/svn` (`report.rs`, `report/tuple.rs` and `report/tests.rs`, new; `fixtures/report` with `history.txt`,
+  `make-fixtures.py`, `changed.txt`, `tree.txt` and `SHA256SUMS`; `handshake.rs` hands on its `Session`; `lib.rs`).
+- **The commands** (`serve.c` at `d434dc14`: `update` 1948, `switch_cmd` 2008, `status` 2064, `diff` 2105). Each is
+  read through a port of `marshal.c`'s `vparse_tuple`: items past the format ignored, a stop at a `?` leaving the rest
+  absent, a stop elsewhere or an item of another kind refused, a number past 2^63 - 1 no revision, as `svn_revnum_t`
+  casts it. A depth word Subversion does not know is `unknown`, and with none `recurse` decides. `update` asks first
+  whether the principal may read its target ("Authorization failed", 170001, with no auth request before it); the
+  others answer a trivial auth request at once. A `switch` or `diff` URL outside the session's repository is refused
+  170000, and a requested depth of `exclude` 165002.
+- **The report** (`serve.c` `set_path`, `delete_path`, `link_path`, `finish_report`, `abort_report`; `reporter.c`
+  `write_path_info`, `finish_report`). Each path is joined to the command's target. The first refusal is kept and the
+  rest read and dropped: a reported depth `unknown`, a link at `exclude` (165002), a link URL elsewhere (170000). An
+  unknown command is answered 210001 at once and the report goes on; a malformed one ends the connection.
+  `finish-report` answers a trivial auth request, then the kept refusal or the top level checked: the first path a
+  `set-path` of the target (165004 "Invalid report for top level of working copy"), a second report of the target
+  allowed only below the anchor (165004 "Two top-level reports with no target"), a deletion there taking the first's
+  depth. `abort-report` answers `( success ( ) )`. The report is held within the caller's room, 210009 past it.
+- **The session.** The handshake hands every command a `Session`: the principal, the capabilities the client's answer
+  listed, and the repository's UUID and root URL.
+- **Evidence.** `history.txt` is one repository's history, built by `make-fixtures.py` with stock `svnmucc` over
+  `file://` (one commit a revision, each date set), whose `svnlook changed` and `svnlook tree --show-ids` are kept. The
+  same script recorded stock `svn` 1.15.0 against `svnserve -d` through a relay that logs every connection each way
+  (four runs on the Mac Studio, 2026-11-19; the last at `d3a4696be`, 80 files, SHA-256 checked there and here).
+  Sessions: checkouts at r1, r2 and the head, at depths empty and immediates; updates to the head, of a file to r2, of
+  mixed revisions, to depth infinity and at depth files, of a subtree to a revision without it and of its parent, of a
+  working copy holding a lock and after the lock was broken; switches of the whole and of a subtree, then an update
+  over the switched subtree; `status -u`; a two-connection diff; and thirteen hand-made reports. A stock client's
+  crawl reports siblings in no fixed order between runs. Each hand-made client answers the drive only once it has
+  ended, since `svnserve` looks for input before every editor command and aborts on any (`editorp.c`
+  `check_for_error`); one session keeps that early answer, 210004 "Successful edit status returned too soon".
+- **Stricter than `svnserve`**, on hostile input alone: a path, URL or token holding a NUL byte refuses the command,
+  where a C string cuts it; a path or decoded URL that is no UTF-8 refuses it; a URL with the repository's URL as a
+  prefix and no `/` after it is not the repository's, where `get_fs_path`'s plain prefix test takes it.
+- **Tests.** `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: the report's and the handshake's
+  48 of 48, red four ways first (the last refusal kept instead of the first; no `/` after the repository's URL; an auth
+  request before `update`'s "Authorization failed"; two top-level reports at the anchor taken), then the crate whole
+  281 of 281 on the formatted tree. Main's clippy findings in A-599's tests are taken here: no string slicing, and no
+  `unwrap`, `assert` or `panic` in a function returning `Option` or `Result`.
+- **Owed** (GAPS): part 2, the editor drive answering a finished report; URLs read as `svn_uri_canonicalize` reads
+  them; and the authentication `svnserve` asks for mid-session when an anonymous `update` may not read.
