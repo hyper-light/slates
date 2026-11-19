@@ -278,12 +278,27 @@
 > (A-603) with A-614's store as the repository; then the fsck checks of new objects, the server loop over one
 > connection, review requests over `refs/for/`, hidden refs and signed pushes. Clippy, `xtask` and the lint matrix
 > over the change are main's (run requests).
+> **A-618 (2026-11-19, g225; shared piece 4, works from a client's push):** built in the engine
+> (`slates_merge::push`). A push's base tree and pushed tree are compared by the tool's ids through `PushObjects`, never
+> reading a subtree whose id stayed, and become the work §4.17.1 items 2 and 3 name, the head as `slates.vcs.head` on
+> the root; composed against the green, the post-state the pushed blobs, every operation and byte charged to the
+> caller's room, every refusal typed. An oracle comparing the whole trees key by key matched every build byte for byte
+> with the exact reads a walk by identity makes, over 256 generated histories whose census met skipped subtrees, refused
+> kind changes, removed directories, modes, links and whole-file replacements; the client-fidelity test after every
+> accepted push found, and the engine now fixes, a removed file's or directory's mode and attributes outliving it (bug
+> record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
+> --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
+> mutation. Owed: git's store
+> implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6); submodule links (§4.17.2
+> item 5's special node kind); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
+> 64-bit path indices ended the 65,535-name cap this piece first refused past).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588), its revlog reader (A-611) and its index's tables (A-588 part 2) (2026-11-19; UI goals 91 to 93; owners
-> g291, and g079 for A-598).** Built
-> on §4.17.1: a named branch's
+> built (A-588), its revlog reader (A-611) and its index's tables (A-588 part 2); piece 4's read-serving logic, part 1
+> (A-619) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598 and A-619).** Built on §4.17.1: a named
+> branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -338,16 +353,25 @@
 > as 7.2's `addgroup` numbers them and refused whole on a missing parent or link, Mercurial's node rule as the shared
 > store's `Naming`; the revlog reader's chunks now inflated by A-598's `compression::inflate`, the crate's one inflater;
 > proven by `cargo test -p slates-hg --lib` on the Mac Studio against A-588's fixtures' numbers and a model of
-> `addgroup` (see the amendment). Owed, in order, after §4.17.1's seven pieces: (3, rest) the import's walk of a store
-> (the fncache, the path encodings, a version 2 store's file index) and censored, ellipsis and externally stored
-> revisions; (4) read serving, the `0.2` answers compressed by A-598's engines at the learned level; (5) pushes, a
-> compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
-> bounded by the admission); (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access
-> and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and
-> remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through
-> a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's
-> changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks
-> it). No speed is claimed until main measures it.
+> `addgroup` (see the amendment). **Built (A-619 part 1):** read serving's logic over a `Repository` trait (the served
+> view's graph and names): `heads`, `known`, `between`, `branches`, `branchmap`, `listkeys` (namespaces, bookmarks,
+> phases) and a `getbundle`'s choice with its phase heads and bookmarks, node lists and walks charged to the admission,
+> a graph naming a parent after its child refused; proven by `cargo test --locked -p slates-hg --lib`, 182 of 182 on the
+> Mac Studio (2026-11-19, debug, load 6.5), red first against stubs (7 of 7 failed), against a naive oracle on generated
+> histories, 7.2's set discovery driven to the shared set (its rounds counted), and a probe of stock `hg serve --stdio`
+> 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight answers byte for byte. Owed, in order, after §4.17.1's
+> seven pieces: (3, rest) the import's walk of a store (the fncache, the path encodings, a version 2 store's file index)
+> and censored, ellipsis and externally stored revisions; (4, rest) read serving: the changegroup and the bundle2 a
+> `getbundle` answers (A-619 part 2), `obsolete`'s `listkeys` dump and the `obsmarkers` part, `slates hg serve
+> --stdio`'s loop, HTTP version 1, the `0.2` answers compressed by A-598's engines at the learned level, and the index's
+> kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated in slices within the
+> shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the changesets
+> the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream
+> clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
+> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
+> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
+> main measures it.
 
 > **Fixed (g267, 2026-11-19, A-577; found settling A-565): a live clone was answered before any of it was durable.** A
 > clone of a live-shipped volume is live-shipped too, but its `Clone` reply waited on its origin's log, and its record,
@@ -9503,6 +9527,11 @@ The merge engine on one node landed the same day (`engine.rs`), composing the pu
 
 Owed (the rest of Phase 6): the deriver's interaction edges (a file/directory/symlink/link transition at one path, a metadata or link then a rename of that path, symlink rename, a write through a hard link, and the rare reused-base-path rename combination above), each a typed refusal today; the engine now consumes the whole ops document (`6164ef9`), so every namespace kind merges through it — directory creation, mode, symlink, file rename, directory removal, hard link and xattr — and several dimensions on one path in one increment merge together; the fully general intra-increment coordination (a path both renamed away and recreated in one increment) remains; per-range identity in the engine's verdict; the checkpoint folding above; the fenced ledger-register commit and holder recomputation in a fleet (the single-node commit is an in-memory chain append; the fleet register, mirror and reconfiguration protocols are now simulated, §8h); these build on the
 green-volume data model (§4.5's journal is in place; the fleet version chain is not yet).
+
+**Found by A-618 (2026-11-19), fixed by A-621:** an ops document's `u16` path table aliased every name past the
+65,535th; A-621's entry above records the fix, and A-618's push refuses nothing for its size. **Closed by A-618:** a
+removed file's or directory's mode and attributes stayed in the green, so a path made again took them; they now go with
+it, as a special node's did (`docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`).
 
 ## 8g. Phase 7 groundwork (2026-09-05)
 
