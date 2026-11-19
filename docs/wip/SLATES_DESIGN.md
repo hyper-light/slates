@@ -12419,6 +12419,13 @@ engine: the verdict, rebase, position mapping, the register).
 > is the server's: the lock log in slates-db, guarded then applied; `Access` over vcs_policy and the owner rule; each
 > repository's LFS index beside the shared store; the call A-625's edge makes.
 >
+> **Status (2026-11-19, A-629 part 2a: the lock log built).** `crates/db` (`lfs_locks`) keeps each repository's
+> Git LFS locks in a lock log of its own (A-642): `Op::LfsLockTaken` at the place its taker read and
+> `Op::LfsLockReleased`, guarded then applied, each refusal typed (`Moved`, `Held`, `NotHeld`, `Path`,
+> `Exhausted`); a lock's place is its id, never taken twice. The locks are charged to the merge byte budget, leave
+> with their repository, and are carried by the partition snapshot. Part 2b is the server's: `Access` over
+> vcs_policy and the owner rule, `Locks` recording into this log, and the call A-625's edge makes.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -43777,3 +43784,37 @@ twenty lines), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§19).
 - **Owed.** `slates hg serve --stdio`'s loop over the SSH version 1 codec (`hello`, `between`, `protocaps`, `batch` and
   the commands built, a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas,
   `obsolete`'s `listkeys` dump, and the index's kept heads in place of the walks.
+
+### A-629 part 2a — Git LFS locks in each repository's own lock log, guarded then applied, snapshotted (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files"; §4.17.1 shared piece 2 as A-642 has it; after A-629 part 1, A-596, A-642)
+Applied in the same change to:
+- §4.17.2's status; GAPS (the §4.17 entry);
+- `crates/db` (`lfs_locks.rs`, new, with `tests/lfs_locks.rs`; `catalog.rs`, `LfsLockRecord` and `LfsLockLogRecord`;
+  `op.rs`, `Op::LfsLockTaken` and `Op::LfsLockReleased`, appended and published as `Op 98` and `Op 99` in
+  `tests/wire_order.txt`; `error.rs`, `DbError::LfsLock(LfsLockRefusal)`; `partition.rs`, the log's check, apply,
+  removal with its repository, and two appended snapshot fields; `lib.rs`);
+- `crates/server` (`error.rs`, the refusal's arm in `refusal_of_db`).
+- **A log of its own** (A-642). A repository that has taken a lock has a lock log: the place its next lock takes and
+  the locks that stand, each at the place it took. A lock is never an entry of the repository's register, so taking
+  one never waits behind a push. A lock is taken only at the place its taker read; a taker that read a log moved since
+  is refused `Moved` and reads again. A place is never taken twice: the log outlives its last lock and leaves only with
+  its repository, so a lock's place is its id for good and a cursor naming a released lock still names a place.
+- **The guard's rules, in order** (form before timing): a repository the partition holds (`NotFound`); a path not
+  empty and without a NUL byte (`Path`); the place the log stands at (`Moved`, naming it); a place after it
+  (`Exhausted` at `u64::MAX`); no lock already on the path (`Held`, naming it; git-lfs locks per path [B: git-lfs
+  `docs/api/locking.md`]); and a release of a standing lock (`NotHeld`). Who may release which lock is the server's
+  judgment, made before the release is recorded (part 2b).
+- **Bounds and recovery.** A lock's bytes (its record, its path, its owner's key) and a log's place are charged to the
+  partition's merge byte budget, as the review records are (A-596), refused `Capacity` at it. A snapshot carries every
+  log's place and every standing lock; a restore rebuilds the path index and refuses a snapshot it cannot restore
+  whole (a lock past its log, a place or path taken twice, a repository not held) as corrupt.
+- **Tests** (`tests/lfs_locks.rs`, 7): places taken as read and never twice; each refusal by kind; a snapshot round
+  trip continuing at the same place; a destroyed repository's locks leaving with it; the merge budget's `Capacity`;
+  five hostile snapshots refused and the last place never passed; and a proptest of generated histories against a
+  model of the rules (every answer, the standing locks, the place and the bytes equal at every step, the restore
+  equal). On the Mac Studio (2026-11-19): red at 06:23Z with `check`, `apply` and `restore` stubbed on the clone, the 7
+  new tests failing and 136 others passing; green at 06:23Z on f373d9353, `cargo test -p slates-db --lib` 143 of 143;
+  `cargo test -p slates-server --lib` 573 passed and one failed,
+  `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`, which fails the
+  same way on main ef3fd18a0 without this change (3 of 3 alone, and in a whole run); fmt clean for both crates.
+- **Owed.** Part 2b, the server's: `Access` over vcs_policy and the owner rule; `Locks` recording into this log; the
+  call A-625's edge makes.

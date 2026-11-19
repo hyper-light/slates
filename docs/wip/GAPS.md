@@ -317,6 +317,12 @@
 > Owed (part 2): the lock log in slates-db, guarded then applied (A-642); `Access` over vcs_policy and the lock owner
 > rule in slates-server; each repository's LFS index; the call A-625's edge makes. Then a streaming put in
 > `slates-vcs`, so an upload is not held whole; the stock client end to end against slates (main's run).
+> **A-629 part 2a (2026-11-19, g293; the Git LFS lock log):** `slates-db` (`lfs_locks`) keeps each repository's
+> locks in a lock log of its own (A-642): taken at the place the taker read, released, guarded then applied with
+> typed refusals (`Moved`, `Held`, `NotHeld`, `Path`, `Exhausted`), charged to the merge byte budget, gone with the
+> repository, carried by the partition snapshot; ops published as `Op 98` and `Op 99`. `cargo test -p slates-db
+> --lib` on the Mac Studio: 143 of 143, the 7 new failing first against stubs. Owed: part 2b (the server's `Access`,
+> `Locks` over this log, the edge's call).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
