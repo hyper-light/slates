@@ -6,7 +6,10 @@ use super::{
   scenario, scenarios, unbounded,
 };
 use crate::pktline;
-use crate::receive::{Received, Refusal, Session, receive};
+use crate::receive::{
+  Received, Refusal, Requested, Session, receive, write_hook_words, write_report_end,
+  write_report_held,
+};
 
 /// The sizes of the pieces a session is fed a whole push in: a byte, a few, more than a packet's
 /// header, and all at once.
@@ -279,4 +282,57 @@ fn a_session_owning_its_parts_is_kept_by_its_caller_across_calls() {
     .answer(&mut policy, &mut written, &mut unbounded());
   assert_eq!(answered, borrowed.result);
   assert_eq!(written, borrowed.written);
+}
+
+/// A-665 part 3 (git's `cmd_receive_pack`: its report, then `post-receive`, then its last flush).
+/// Do: decide each scenario's push with `Session::decide`, then write its report held and its end.
+/// Expect: the very bytes `Session::answer` writes for it.
+#[test]
+fn a_held_report_and_its_end_are_the_answer_written_whole() {
+  for scenario in scenarios() {
+    let repository = Repo::from_pack(scenario.before_pack);
+    let whole = fed_in_pieces(scenario.request, usize::MAX, &repository).written;
+    let mut session = Session::new(&ADVERTISED, &HIDDEN);
+    let checked = session.input(scenario.request, &repository, &mut unbounded());
+    if checked == Ok(false) {
+      let _ = session.end(&repository, &mut unbounded());
+    }
+    let mut policy = git_policy(&repository);
+    let mut written = Vec::new();
+    if let Ok(Some(received)) = session.decide(&mut policy, &mut unbounded()) {
+      write_report_held(&received, &mut written).unwrap();
+      write_report_end(&received, &mut written).unwrap();
+    }
+    assert_eq!(written, whole, "{}", scenario.name);
+  }
+}
+
+/// A-665 part 3 (git's `copy_to_sideband`). Do: write 300 bytes of a hook's words for a push that
+/// asked for side-band-64k, and for one that did not. Expect: three band-2 packets of 128, 128 and
+/// 44 bytes, the words in order; nothing for the push not multiplexed, whose words git sends to
+/// its own standard error.
+#[test]
+fn a_hooks_words_go_to_band_two_in_gits_pieces_only_when_multiplexed() {
+  let words: Vec<u8> = (0..300_u32).map(|at| b'a' + u8::try_from(at % 26).unwrap()).collect();
+  let multiplexed = Requested {
+    side_band_64k: true,
+    ..Requested::default()
+  };
+  let mut out = Vec::new();
+  write_hook_words(&multiplexed, &words, &mut out);
+  let mut rest = out.as_slice();
+  let mut pieces = Vec::new();
+  let mut relayed = Vec::new();
+  while !rest.is_empty() {
+    let len = usize::from_str_radix(std::str::from_utf8(&rest[..4]).unwrap(), 16).unwrap();
+    assert_eq!(rest[4], 2, "band 2");
+    pieces.push(len - 5);
+    relayed.extend_from_slice(&rest[5..len]);
+    rest = &rest[len..];
+  }
+  assert_eq!(pieces, [128, 128, 44]);
+  assert_eq!(relayed, words);
+  let mut none = Vec::new();
+  write_hook_words(&Requested::default(), &words, &mut none);
+  assert!(none.is_empty());
 }
