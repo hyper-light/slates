@@ -11,10 +11,12 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::copy::{appearance_bytes, in_tree, joined, relative};
-use super::{Green, Increment, Lineage, Outcome, Rebased, change_bytes};
+use super::{Green, Increment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
 use crate::chain_entry;
 use crate::increment::Base;
 use crate::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc};
+use crate::range::Range;
+use crate::review::OutdatedBy;
 use crate::verdict::MergeConflictClass;
 
 /// The property list a Subversion repository green keeps as one attribute of each node (§4.17.4 item 1).
@@ -452,6 +454,33 @@ fn an_edit_declared_before_a_copy_replaced_its_file_conflicts() {
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
 }
 
+/// A-586 with A-596 (a review comment on a copied file). Do: hold `d/x`, remove it, copy a tree holding `x` to `d`,
+/// commit another file, then follow a comment on the copied file's first line from the copy's version to the head, and
+/// one on the removed file's line from version 1. Expect: the first moves, its lines unchanged, though the path's own
+/// history ends in the removal; the second is outdated by the removal at version 2.
+#[test]
+fn a_comment_on_a_copied_file_moves_with_it() {
+  let mut green = Green::new();
+  let mut first = Work::default();
+  first.create("d/x", b"old\n").create("t/x", b"one\ntwo\n");
+  accept(&mut green, &first, 1);
+  accept(&mut green, Work::default().unlink("d/x"), 2);
+  accept(&mut green, Work::exclusive().copy("t", "d", 2), 3);
+  accept(&mut green, Work::default().create("e", b"e"), 4);
+  let line = Range::new(0, 4);
+  assert_eq!(
+    green.reanchor("d/x", line, (3, 4)),
+    Ok(Reanchored::Moved(line))
+  );
+  assert_eq!(
+    green.reanchor("d/x", line, (1, 4)),
+    Ok(Reanchored::Outdated {
+      at: 2,
+      by: OutdatedBy::FileReplaced
+    })
+  );
+}
+
 /// A-586 (a green made at another's version, before and after a copy). Do: copy the trunk at version 2, edit a copied
 /// file at 3, and branch the green at 1, 2 and 3. Expect: each branch reads as the green read at its version (no copied
 /// tree at 1, the copy's bytes at 2, the edit at 3) and hashes as a green that applied the same versions up to it; no
@@ -524,7 +553,7 @@ fn a_rebase_of_a_work_with_a_copy_is_refused_typed() {
     Rebased::Conflict {
       windows: vec![super::ConflictWindow {
         path: "b".to_owned(),
-        range: crate::range::Range::new(0, 0),
+        range: Range::new(0, 0),
         class: MergeConflictClass::TypeChanged,
       }],
     }
