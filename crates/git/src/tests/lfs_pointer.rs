@@ -166,7 +166,7 @@ fn invalid_examples() -> Vec<(String, Refusal, bool)> {
     ),
     (
       format!("oid sha256:{OID}\nsize 12345"),
-      unexpected(0, Key::Version),
+      Refusal::NoMarker,
       true,
     ),
     (
