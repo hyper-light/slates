@@ -1,17 +1,19 @@
 //! The `phase-heads` and `check:phases` payloads (A-545; `internals.bundle2` [B]; `phases.py` `binaryencode` and
 //! `binarydecode` [C]): entries of 24 bytes, a big-endian signed 32-bit phase then a node. `phase-heads` gives the heads
-//! of each phase (a getbundle's part, and a push's toward a server with `phases=heads`); `check:phases` gives the public
-//! heads and draft roots the pushing client saw. 7.2 reads 24 bytes at a time and refuses a short last entry ("bad
-//! phase-heads stream"); a phase it does not define fails it with a `KeyError` in `binarydecode`, and is refused here
-//! by kind.
+//! of each phase (a getbundle's part, and a push's toward a server with `phases=heads` when the push publishes
+//! changesets); `check:phases` gives the public heads and draft roots the pushing client saw. 7.2 reads 24 bytes at a
+//! time and refuses a short last entry ("bad phase-heads stream"); a phase it does not define fails it with a
+//! `KeyError` in `binarydecode`, and is refused here by kind.
 //!
-//! Nothing is allocated: the payload is checked whole, then its entries are read in place, so the payload itself is the
-//! only cap.
+//! Nothing is allocated in decoding: the payload is checked whole, then its entries are read in place, so the payload
+//! itself is the only cap. An encode's exact length is known before it is made ([`encoded_len`]), so a caller charges
+//! its admission first.
 
-use core::slice::ChunksExact;
+use core::slice::Iter;
 
 use crate::Node;
-use crate::read::{Cursor, to_u64};
+use crate::out::{Measure, Out};
+use crate::read::to_u64;
 
 /// Format: one entry: a phase as a big-endian signed 32-bit integer, then a node (`_fphasesentry = '>i20s'`).
 pub const ENTRY_LEN: usize = 24;
@@ -111,48 +113,43 @@ pub enum Refusal {
 /// The entries of a payload, in order.
 #[derive(Clone)]
 pub struct Entries<'a> {
-  /// The payload's entries.
-  entries: ChunksExact<'a, u8>,
+  /// The payload's entries, each checked by [`decode`].
+  entries: Iter<'a, [u8; ENTRY_LEN]>,
 }
 
 /// The entries of a `phase-heads` or `check:phases` payload, the payload checked whole first.
 pub fn decode(payload: &[u8]) -> Result<Entries<'_>, Refusal> {
-  let entries = payload.chunks_exact(ENTRY_LEN);
-  if !entries.remainder().is_empty() {
+  let (entries, partial) = payload.as_chunks::<ENTRY_LEN>();
+  if !partial.is_empty() {
     return Err(Refusal::PartialEntry {
       len: to_u64(payload.len()),
     });
   }
-  for (index, entry) in entries.clone().enumerate() {
-    let at = to_u64(index.saturating_mul(ENTRY_LEN));
-    match split(entry) {
-      Some((number, _)) if Phase::from_number(number).is_none() => {
-        return Err(Refusal::UnknownPhase { number, at });
-      }
-      Some(_) => {}
-      None => {
-        return Err(Refusal::PartialEntry {
-          len: to_u64(payload.len()),
-        });
-      }
+  for (index, entry) in entries.iter().enumerate() {
+    let (number, _) = split(entry);
+    if Phase::from_number(number).is_none() {
+      return Err(Refusal::UnknownPhase {
+        number,
+        at: to_u64(index.saturating_mul(ENTRY_LEN)),
+      });
     }
   }
-  Ok(Entries { entries })
+  Ok(Entries {
+    entries: entries.iter(),
+  })
 }
 
 /// One entry's phase number and node.
-fn split(entry: &[u8]) -> Option<(i32, Node)> {
-  let mut cursor = Cursor::new(entry);
-  let number = cursor.i32("phase").ok()?;
-  let node = cursor.node("node").ok()?;
-  Some((number, node))
+fn split(entry: &[u8; ENTRY_LEN]) -> (i32, Node) {
+  let [first, second, third, fourth, node @ ..] = *entry;
+  (i32::from_be_bytes([first, second, third, fourth]), node)
 }
 
 impl Iterator for Entries<'_> {
   type Item = PhaseHead;
 
   fn next(&mut self) -> Option<PhaseHead> {
-    let (number, node) = split(self.entries.next()?)?;
+    let (number, node) = split(self.entries.next()?);
     Some(PhaseHead {
       phase: Phase::from_number(number)?,
       node,
@@ -164,21 +161,33 @@ impl Iterator for Entries<'_> {
   }
 }
 
+/// The length of the payload of `entries`, for a caller that charges it before encoding.
+pub fn encoded_len(entries: &[PhaseHead]) -> u64 {
+  let mut measure = Measure(0);
+  write(entries, &mut measure);
+  measure.0
+}
+
 /// Appends the payload of `entries`, in order.
 pub fn encode(entries: &[PhaseHead], out: &mut Vec<u8>) {
+  write(entries, out);
+}
+
+/// Writes each entry: its phase's number, then its node.
+fn write(entries: &[PhaseHead], out: &mut impl Out) {
   for entry in entries {
-    out.extend_from_slice(&entry.phase.number().to_be_bytes());
-    out.extend_from_slice(&entry.node);
+    out.put(&entry.phase.number().to_be_bytes());
+    out.put(&entry.node);
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{Phase, PhaseHead, Refusal, decode, encode};
+  use super::{Phase, PhaseHead, Refusal, decode, encode, encoded_len};
   use proptest::prelude::*;
 
   /// A-545: do encode one entry of every phase and decode it. Expect each phase back with its node, 7.2's numbers
-  /// (0, 1, 2, 32, 96) on the wire, and its names.
+  /// (0, 1, 2, 32, 96) on the wire, its names, and the length `encoded_len` gave before the encode.
   #[test]
   fn every_phase_mercurial_defines_round_trips() {
     let all = [
@@ -191,13 +200,14 @@ mod tests {
     let entries: Vec<PhaseHead> = all
       .iter()
       .enumerate()
-      .map(|(i, phase)| PhaseHead {
+      .map(|(position, phase)| PhaseHead {
         phase: *phase,
-        node: [u8::try_from(i).unwrap(); 20],
+        node: [u8::try_from(position).unwrap(); 20],
       })
       .collect();
     let mut payload = Vec::new();
     encode(&entries, &mut payload);
+    assert_eq!(encoded_len(&entries), u64::try_from(payload.len()).unwrap());
     assert_eq!(decode(&payload).unwrap().collect::<Vec<_>>(), entries);
     assert_eq!(all.map(Phase::number), [0, 1, 2, 32, 96]);
     assert_eq!(

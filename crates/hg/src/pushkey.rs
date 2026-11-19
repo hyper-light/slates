@@ -4,26 +4,35 @@
 //!
 //! - A `pushkey` part asks for one key of one namespace to move from an old value to a new one, in four mandatory
 //!   parameters and no payload; 7.2's client writes them in the order `namespace`, `key`, `old`, `new`
-//!   (`_pushb2bookmarkspushkey`, `_pushb2phasespushkey`). Its answer is a `reply:pushkey` part with `in-reply-to` and
-//!   `return`, decimal (`'%d'`, `'%i'`), which 7.2 reads with `int()`.
+//!   (`_pushb2bookmarkspushkey`, `_pushb2phasespushkey`). Its answer is a mandatory `reply:pushkey` part with two
+//!   advisory parameters, `in-reply-to` and `return`, decimal (`'%d'`, `'%i'`), which 7.2 reads with `int()`; a
+//!   number is read here as Rust reads a decimal, a subset of what `int()` takes (no spaces, no `_`), which is every
+//!   number 7.2 writes.
 //! - `listkeys` answers, and a `listkeys` part holds, `key\tvalue` lines joined by newlines (`encodekeys`); 7.2 splits
 //!   them with `splitlines()` (a line ends at `\n`, `\r` or `\r\n`) and each at its tab, one tab exactly or `split`
 //!   fails (`decodekeys`). So a line here must hold exactly one tab, and a key or value to be written must hold no tab
 //!   and no line end.
 //! - The bookmarks namespace's values are a node's 40 hexadecimal digits, or empty for a bookmark absent or deleted; the
-//!   phases namespace's keys are nodes the same way (`listphases`, `pushphase`).
+//!   phases namespace's keys are nodes the same way (its draft roots, `listphases`, `pushphase`), beside `publishing`,
+//!   which a publishing repository lists with the value `True`.
 //!
-//! Nothing is allocated in decoding: a payload is checked whole, then read in place.
+//! Nothing is allocated in decoding: a payload is checked whole, then read in place. A listkeys encode is checked
+//! whole before a byte is written, and its exact length is known before it is made ([`listkeys_encoded_len`]); a
+//! reply's numbers are written into a fixed buffer its part borrows ([`ReplyText`]).
+
+use core::fmt::Write as _;
 
 use crate::bundle2::{Param, Part};
+use crate::out::{Measure, Out};
 use crate::read::to_u64;
 use crate::{NODE_LEN, Node};
 
 /// Format: the pushkey part's type, mandatory as 7.2's client sends it (`bundler.newpart(b'pushkey')`).
 pub const PART: &[u8] = b"PUSHKEY";
 
-/// Format: the reply's type (`reply:pushkey`), routed without regard to case.
-pub const REPLY_PART: &[u8] = b"reply:pushkey";
+/// Format: the reply's type, mandatory as 7.2's server sends it (`op.reply.newpart(b'reply:pushkey')`); a reader
+/// routes it without regard to case.
+pub const REPLY_PART: &[u8] = b"REPLY:PUSHKEY";
 
 /// Format: the pushkey part's parameters, in the order 7.2's client adds them.
 pub const PARAMETERS: [&[u8]; 4] = [b"namespace", b"key", b"old", b"new"];
@@ -34,14 +43,23 @@ pub const IN_REPLY_TO: &[u8] = b"in-reply-to";
 /// Format: the reply's parameter carrying the result (`return`).
 pub const RETURN: &[u8] = b"return";
 
-/// Format: the bytes between a listkeys line's key and value, and between lines (`encodekeys`).
+/// Format: the byte between a listkeys line's key and value (`encodekeys`).
 const TAB: u8 = b'\t';
 
+/// Format: the byte between listkeys lines (`b'\n'.join`).
+const NEWLINE: u8 = b'\n';
+
 /// Format: the line ends Python's `bytes.splitlines()` splits at: `\n`, `\r`, and `\r\n` as one.
-const LINE_ENDS: [u8; 2] = [b'\n', b'\r'];
+const LINE_ENDS: [u8; 2] = [NEWLINE, b'\r'];
 
 /// Format: hexadecimal, the base of a node's digits (`node.hex`).
 const HEX_RADIX: u32 = 16;
+
+/// Format: the hexadecimal digits that write one byte.
+const HEX_DIGITS_PER_BYTE: usize = 2;
+
+/// Format: the most bytes a decimal `i64` takes as text: the 19 digits of `i64::MIN`'s magnitude and its sign.
+const DECIMAL_MAX_LEN: usize = 20;
 
 /// A pushkey request: one key of one namespace, from an old value to a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,7 +113,7 @@ pub enum Refusal {
   },
 }
 
-/// Why listkeys entries could not be encoded.
+/// Why listkeys entries or a reply could not be encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeRefusal {
   /// A key or value holding a tab or a line end, which would read back as another entry.
@@ -103,6 +121,8 @@ pub enum EncodeRefusal {
     /// The entry's index.
     entry: usize,
   },
+  /// A number whose decimal text did not fit its buffer, which is sized for every `i64`'s.
+  NumberText,
 }
 
 /// The request a `pushkey` part carries.
@@ -165,6 +185,87 @@ fn number<T: core::str::FromStr>(part: &Part<'_>, key: &'static [u8]) -> Result<
     .ok_or(Refusal::NotANumber { key })
 }
 
+/// A number's decimal text, as Python's `'%d'` writes it, held in place so a part can borrow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Decimal {
+  /// The text's bytes, from the first.
+  bytes: [u8; DECIMAL_MAX_LEN],
+  /// How many of them hold the text.
+  len: usize,
+}
+
+impl Decimal {
+  /// The text of `value`.
+  fn new(value: i64) -> Result<Self, EncodeRefusal> {
+    let mut decimal = Self {
+      bytes: [0; DECIMAL_MAX_LEN],
+      len: 0,
+    };
+    write!(decimal, "{value}").map_err(|_| EncodeRefusal::NumberText)?;
+    Ok(decimal)
+  }
+
+  /// The text.
+  fn as_bytes(&self) -> &[u8] {
+    self.bytes.get(..self.len).unwrap_or_default()
+  }
+}
+
+impl core::fmt::Write for Decimal {
+  fn write_str(&mut self, text: &str) -> core::fmt::Result {
+    let end = self
+      .len
+      .checked_add(text.len())
+      .ok_or(core::fmt::Error)?;
+    let room = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+    for (slot, byte) in room.iter_mut().zip(text.as_bytes()) {
+      *slot = *byte;
+    }
+    self.len = end;
+    Ok(())
+  }
+}
+
+/// The text of a `reply:pushkey` part's two numbers, held for [`reply_part`] to borrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplyText {
+  /// `in-reply-to`'s text.
+  in_reply_to: Decimal,
+  /// `return`'s text.
+  result: Decimal,
+}
+
+impl ReplyText {
+  /// The text of `reply`'s numbers.
+  pub fn new(reply: &Reply) -> Result<Self, EncodeRefusal> {
+    Ok(Self {
+      in_reply_to: Decimal::new(i64::from(reply.in_reply_to))?,
+      result: Decimal::new(reply.result)?,
+    })
+  }
+}
+
+/// The `reply:pushkey` part 7.2's server writes, numbered `id` in its reply stream: its type in capitals, then
+/// `in-reply-to` and `return`, both advisory (`handlepushkey`).
+pub fn reply_part(id: u32, text: &ReplyText) -> Part<'_> {
+  Part {
+    kind: REPLY_PART,
+    id,
+    params: vec![
+      Param {
+        key: IN_REPLY_TO,
+        value: text.in_reply_to.as_bytes(),
+      },
+      Param {
+        key: RETURN,
+        value: text.result.as_bytes(),
+      },
+    ],
+    mandatory_params: 0,
+    depth: 0,
+  }
+}
+
 /// The entries of a listkeys payload, in order.
 #[derive(Clone)]
 pub struct Keys<'a> {
@@ -198,7 +299,7 @@ impl<'a> Keys<'a> {
       .unwrap_or(self.rest.len());
     let line = self.rest.get(..end)?;
     let skip = match (self.rest.get(end), self.rest.get(end.saturating_add(1))) {
-      (Some(b'\r'), Some(b'\n')) => 2,
+      (Some(&b'\r'), Some(&NEWLINE)) => 2,
       (Some(_), _) => 1,
       (None, _) => 0,
     };
@@ -220,24 +321,44 @@ impl<'a> Iterator for Keys<'a> {
   }
 }
 
+/// The length of the listkeys payload of `entries`, for a caller that charges it before encoding; refused as
+/// [`encode_listkeys`] refuses.
+pub fn listkeys_encoded_len(entries: &[(&[u8], &[u8])]) -> Result<u64, EncodeRefusal> {
+  check_listkeys(entries)?;
+  let mut measure = Measure(0);
+  write_listkeys(entries, &mut measure);
+  Ok(measure.0)
+}
+
 /// Appends a listkeys payload of `entries`: `key\tvalue` lines joined by newlines, after checking no key or value
-/// holds a tab or a line end.
+/// holds a tab or a line end; nothing is written on a refusal.
 pub fn encode_listkeys(entries: &[(&[u8], &[u8])], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+  check_listkeys(entries)?;
+  write_listkeys(entries, out);
+  Ok(())
+}
+
+/// Refuses the first entry whose key or value holds a tab or a line end.
+fn check_listkeys(entries: &[(&[u8], &[u8])]) -> Result<(), EncodeRefusal> {
   let separator = |byte: &u8| *byte == TAB || LINE_ENDS.contains(byte);
   for (entry, (key, value)) in entries.iter().enumerate() {
     if key.iter().any(separator) || value.iter().any(separator) {
       return Err(EncodeRefusal::Separator { entry });
     }
   }
+  Ok(())
+}
+
+/// Writes entries [`check_listkeys`] passed, a newline between each two and none after the last (`b'\n'.join`).
+fn write_listkeys(entries: &[(&[u8], &[u8])], out: &mut impl Out) {
   for (position, (key, value)) in entries.iter().enumerate() {
     if position > 0 {
-      out.push(b'\n');
+      out.put(&[NEWLINE]);
     }
-    out.extend_from_slice(key);
-    out.push(TAB);
-    out.extend_from_slice(value);
+    out.put(key);
+    out.put(&[TAB]);
+    out.put(value);
   }
-  Ok(())
 }
 
 /// A namespace value as a node: its 40 hexadecimal digits, in either case as 7.2's `bin()` reads them, or `None` for
@@ -249,8 +370,8 @@ pub fn hex_node(value: &[u8]) -> Result<Option<Node>, Refusal> {
   let not_a_node = Refusal::NotANode {
     len: to_u64(value.len()),
   };
-  let pairs = value.chunks_exact(2);
-  if !pairs.remainder().is_empty() || pairs.len() != NODE_LEN {
+  let (pairs, odd) = value.as_chunks::<HEX_DIGITS_PER_BYTE>();
+  if !odd.is_empty() || pairs.len() != NODE_LEN {
     return Err(not_a_node);
   }
   let mut node = [0; NODE_LEN];
@@ -261,7 +382,7 @@ pub fn hex_node(value: &[u8]) -> Result<Option<Node>, Refusal> {
 }
 
 /// Two hexadecimal digits as the byte they name.
-fn hex_pair(pair: &[u8]) -> Option<u8> {
+fn hex_pair(pair: &[u8; HEX_DIGITS_PER_BYTE]) -> Option<u8> {
   let mut value: u32 = 0;
   for digit in pair {
     value = value
@@ -284,8 +405,8 @@ pub fn encode_hex(node: &Node, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
   use super::{
-    EncodeRefusal, Refusal, Request, encode_hex, encode_listkeys, hex_node, listkeys, part, reply,
-    request,
+    EncodeRefusal, Refusal, Reply, ReplyText, Request, encode_hex, encode_listkeys, hex_node,
+    listkeys, listkeys_encoded_len, part, reply, reply_part, request,
   };
   use crate::bundle2::{Param, Part};
   use proptest::prelude::*;
@@ -368,13 +489,15 @@ mod tests {
   }
 
   /// A-545: do encode listkeys entries and read them back, and read lines ended by `\r\n` and `\r` as
-  /// `splitlines()` cuts them. Expect the entries back in order, and no trailing newline written.
+  /// `splitlines()` cuts them. Expect the entries back in order, no trailing newline written, and the length
+  /// `listkeys_encoded_len` gave.
   #[test]
   fn listkeys_entries_round_trip_and_lines_end_as_python_ends_them() {
     let entries: [(&[u8], &[u8]); 2] = [(b"main", b"ab"), (b"publishing", b"True")];
     let mut payload = Vec::new();
     encode_listkeys(&entries, &mut payload).unwrap();
     assert_eq!(payload, b"main\tab\npublishing\tTrue");
+    assert_eq!(listkeys_encoded_len(&entries), Ok(23));
     assert_eq!(listkeys(&payload).unwrap().collect::<Vec<_>>(), entries);
     let crlf: Vec<_> = listkeys(b"a\t1\r\nb\t2\rc\t3\n").unwrap().collect();
     let expected: [(&[u8], &[u8]); 3] = [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
@@ -417,6 +540,29 @@ mod tests {
     assert_eq!(hex_node(&bad), Err(Refusal::NotANode { len: 40 }));
   }
 
+  /// A-545: do write the replies 7.2's server writes, and one at the widest numbers each field holds. Expect the type
+  /// in capitals, `in-reply-to` then `return`, both advisory, as decimal text, and each reply read back as written.
+  #[test]
+  fn a_reply_is_written_as_mercurials_server_writes_it() {
+    let text = ReplyText::new(&Reply {
+      in_reply_to: 3,
+      result: 1,
+    })
+    .unwrap();
+    let built = reply_part(0, &text);
+    assert_eq!(built.kind, b"REPLY:PUSHKEY");
+    assert!(built.is_mandatory() && built.mandatory().is_empty());
+    let params: Vec<(&[u8], &[u8])> = built.params.iter().map(|p| (p.key, p.value)).collect();
+    let expected: [(&[u8], &[u8]); 2] = [(b"in-reply-to", b"3"), (b"return", b"1")];
+    assert_eq!(params, expected);
+    let widest = Reply {
+      in_reply_to: u32::MAX,
+      result: i64::MIN,
+    };
+    let text = ReplyText::new(&widest).unwrap();
+    assert_eq!(reply(&reply_part(1, &text)), Ok(widest));
+  }
+
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
@@ -432,6 +578,14 @@ mod tests {
         encode_hex(&node, &mut out);
         prop_assert!(out.eq_ignore_ascii_case(&bytes));
       }
+    }
+
+    /// A-545: do write a reply of any id and any result, and read it back. Expect the same reply.
+    #[test]
+    fn any_reply_reads_back_as_written(in_reply_to in any::<u32>(), result in any::<i64>()) {
+      let written = Reply { in_reply_to, result };
+      let text = ReplyText::new(&written).unwrap();
+      prop_assert_eq!(reply(&reply_part(0, &text)), Ok(written));
     }
   }
 }

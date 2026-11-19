@@ -53,9 +53,11 @@ pub(crate) struct Row {
 /// A node from its 40 hexadecimal digits.
 pub(crate) fn node(hex: &str) -> Node {
   assert_eq!(hex.len(), 40, "a node is 40 hex digits: {hex}");
+  let (pairs, _) = hex.as_bytes().as_chunks::<2>();
   let mut out = [0u8; 20];
-  for (position, byte) in out.iter_mut().enumerate() {
-    *byte = u8::from_str_radix(&hex[position * 2..position * 2 + 2], 16).unwrap();
+  for (byte, pair) in out.iter_mut().zip(pairs) {
+    let digits = core::str::from_utf8(pair).unwrap();
+    *byte = u8::from_str_radix(digits, 16).unwrap();
   }
   out
 }
@@ -146,6 +148,9 @@ pub(crate) mod payloads {
     include_bytes!("../../fixtures/payloads/push-legacy-reply.hg");
   /// The push to the strict server: check:heads.
   pub(crate) const PUSH_STRICT: &[u8] = include_bytes!("../../fixtures/payloads/push-strict.hg");
+  /// The server's reply to it.
+  pub(crate) const PUSH_STRICT_REPLY: &[u8] =
+    include_bytes!("../../fixtures/payloads/push-strict-reply.hg");
   /// 7.2's `debugbundle --all` of the legacy push.
   pub(crate) const PUSH_LEGACY_LISTING: &str =
     include_str!("../../fixtures/payloads/push-legacy.hg.debug");

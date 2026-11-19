@@ -4,11 +4,13 @@
 //! `check:bookmarks`, a bookmark the pushing client saw absent. 7.2 refuses an entry cut short ("bad bookmark
 //! stream"), as this module does.
 //!
-//! Nothing is allocated: the payload is checked whole, then its entries are read in place, so the payload itself is the
-//! only cap. A bookmark's name is returned as sent; whether it is a name Mercurial allows is its handler's to judge
-//! (piece 5).
+//! Nothing is allocated in decoding: the payload is checked whole, then its entries are read in place, so the payload
+//! itself is the only cap. A bookmark's name is returned as sent; whether it is a name Mercurial allows is its
+//! handler's to judge (piece 5). An encode is checked whole before a byte is written, and its exact length is known
+//! before it is made ([`encoded_len`]).
 
-use crate::read::Cursor;
+use crate::out::{Measure, Out};
+use crate::read::{Cursor, to_u64};
 use crate::{NODE_LEN, Node, Truncated};
 
 /// Format: an entry's fixed part: the node, then the name's length as a big-endian unsigned 16-bit integer
@@ -40,7 +42,7 @@ pub enum EncodeRefusal {
   /// A name longer than an unsigned 16-bit length holds.
   NameTooLong {
     /// Its length.
-    len: usize,
+    len: u64,
   },
   /// A node equal to [`MISSING`], which would read back as "no bookmark".
   AmbiguousNode,
@@ -86,32 +88,58 @@ impl<'a> Iterator for Bookmarks<'a> {
   }
 }
 
-/// Appends the payload of `bookmarks`, in order, after checking every entry can be written.
+/// The length of the payload of `bookmarks`, for a caller that charges it before encoding; refused as [`encode`]
+/// refuses.
+pub fn encoded_len(bookmarks: &[Bookmark<'_>]) -> Result<u64, EncodeRefusal> {
+  check(bookmarks)?;
+  let mut measure = Measure(0);
+  write(bookmarks, &mut measure);
+  Ok(measure.0)
+}
+
+/// Appends the payload of `bookmarks`, in order, after checking every entry can be written; nothing is written on a
+/// refusal.
 pub fn encode(bookmarks: &[Bookmark<'_>], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+  check(bookmarks)?;
+  write(bookmarks, out);
+  Ok(())
+}
+
+/// Refuses an entry 7.2 would read back as something else: a name past a 16-bit length, a node that says "no
+/// bookmark".
+fn check(bookmarks: &[Bookmark<'_>]) -> Result<(), EncodeRefusal> {
   for bookmark in bookmarks {
-    u16::try_from(bookmark.name.len()).map_err(|_| EncodeRefusal::NameTooLong {
-      len: bookmark.name.len(),
-    })?;
+    name_len(bookmark)?;
     if bookmark.node == Some(MISSING) {
       return Err(EncodeRefusal::AmbiguousNode);
     }
   }
-  for bookmark in bookmarks {
-    out.extend_from_slice(&bookmark.node.unwrap_or(MISSING));
-    let len = u16::try_from(bookmark.name.len()).unwrap_or(u16::MAX);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(bookmark.name);
-  }
   Ok(())
+}
+
+/// A name's length as its 16-bit field.
+fn name_len(bookmark: &Bookmark<'_>) -> Result<u16, EncodeRefusal> {
+  u16::try_from(bookmark.name.len()).map_err(|_| EncodeRefusal::NameTooLong {
+    len: to_u64(bookmark.name.len()),
+  })
+}
+
+/// Writes entries [`check`] passed: the node (or [`MISSING`]), the name's length, the name.
+fn write(bookmarks: &[Bookmark<'_>], out: &mut impl Out) {
+  for bookmark in bookmarks {
+    out.put(&bookmark.node.unwrap_or(MISSING));
+    out.put(&name_len(bookmark).unwrap_or(u16::MAX).to_be_bytes());
+    out.put(bookmark.name);
+  }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{Bookmark, EncodeRefusal, MISSING, Refusal, decode, encode};
+  use super::{Bookmark, EncodeRefusal, MISSING, Refusal, decode, encode, encoded_len};
   use proptest::prelude::*;
 
   /// A-545: do encode a bookmark with a node and one without, and decode them. Expect both back, the second written
-  /// with every bit of its node set, as 7.2 writes "no bookmark".
+  /// with every bit of its node set, as 7.2 writes "no bookmark", at the length `encoded_len` gave.
   #[test]
   fn a_bookmark_and_a_missing_one_round_trip() {
     let entries = [
@@ -126,6 +154,8 @@ mod tests {
     ];
     let mut payload = Vec::new();
     encode(&entries, &mut payload).unwrap();
+    assert_eq!(encoded_len(&entries), Ok(55));
+    assert_eq!(payload.len(), 55);
     assert_eq!(&payload[29..49], &MISSING[..]);
     assert_eq!(decode(&payload).unwrap().collect::<Vec<_>>(), entries);
   }
@@ -179,7 +209,9 @@ mod tests {
         }],
         &mut out
       ),
-      Err(EncodeRefusal::NameTooLong { len: name.len() })
+      Err(EncodeRefusal::NameTooLong {
+        len: u64::try_from(name.len()).unwrap()
+      })
     );
     assert!(out.is_empty());
   }
