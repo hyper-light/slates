@@ -1322,13 +1322,14 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+    #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("archive.proptest-regressions")).unwrap())]
 
     /// A-494 (the oracle): do encode a generated archive (zero to three files of noisy or repeated bytes, raw and LZ4
     /// records) and feed its stream to a decoding in slices of generated sizes, whole, or cut short, or with one byte
     /// flipped; then check it a piece a step. Expect the whole stream to give the archive encoded, a cut or flipped
     /// one the very refusal the stream fed at once gives (typed, never the original), the stage within one field after
-    /// every slice, and at least as many feeds as the largest slice cuts the stream into (the sliced path ran).
+    /// every slice, and the whole stream fed in at least as many slices as the largest cuts it into (the sliced path
+    /// ran; a refused stream stops feeding at its refusal, a header too short for its frame at the header's end).
     #[test]
     fn an_archive_fed_in_any_slices_decodes_as_its_whole_stream(
       files in prop::collection::vec((any::<bool>(), any::<u64>(), 0usize..1_500), 0..4),
@@ -1357,8 +1358,10 @@ mod tests {
       } else {
         prop_assert_ne!(&sliced, &Ok(archive));
       }
-      let largest = *sizes.iter().max().unwrap();
-      prop_assert!(feeds >= stream.len().div_ceil(largest), "{feeds} feeds for {} bytes", stream.len());
+      if hostile.is_none() {
+        let largest = *sizes.iter().max().unwrap();
+        prop_assert!(feeds >= stream.len().div_ceil(largest), "{feeds} feeds for {} bytes", stream.len());
+      }
     }
   }
 
