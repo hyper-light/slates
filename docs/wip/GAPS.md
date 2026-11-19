@@ -200,6 +200,11 @@
 > after a snapshot. Lib tests on the Mac Studio: db `repository::` 15 of 15, server `repository::` 5 of 5, ipc's lib,
 > both wire-order tests; red first on a mutated copy. Owed: the push paths' check (part 2) and the hook driver (part 3);
 > the verb's client and CLI forms.
+> **A-622 part 2 (2026-11-19, g255; the push's check point):** `vcs_policy::admit(record, principal, asked)` judges
+> each change a push asks for (a name and the right its change needs) by the record's policy compiled for its tool, the
+> first refused the push's typed `PushRefusal` (denied by rule n, not listed, not permitted, another tool's name, an
+> unreadable rule); unruled changes are the owner's alone. Server lib `vcs_policy::` on the Mac Studio, red first.
+> Owed: the git, Mercurial and Subversion push pieces calling it, each with its tool's words; the hook driver (part 3).
 > **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
 > (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
 > arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the
