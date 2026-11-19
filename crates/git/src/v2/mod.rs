@@ -9,10 +9,10 @@
 //! acknowledgments, shallow-info, wanted-refs, packfile-uris, then the packfile, multiplexed on side-band-64k's bands,
 //! and a flush.
 //!
-//! **Sources** (read 2026-11-19, the revision stock git 2.50.1 shipped, the golden vectors' git). The documents [B]:
+//! **Sources** (read 2026-11-19, the revision stock git 2.50.1 shipped, the golden vectors' git). The documents \[B\]:
 //! `Documentation/gitprotocol-v2.adoc` at v2.50.1 (SHA-256 `2e739965…`; master at `e1ec09b2`, which
 //! `research/vcs-servers.md` cites as `64ef6a81…`, differs only in `object-info` and `promisor-remote`, neither read
-//! here) and `gitprotocol-common.adoc` (`bcb00e39…`). The code [C], v2.50.1: `serve.c` (the request and its
+//! here) and `gitprotocol-common.adoc` (`bcb00e39…`). The code \[C\], v2.50.1: `serve.c` (the request and its
 //! capabilities), `ls-refs.c`, `upload-pack.c` (`process_args`, the sections), `fetch-pack.c` and `connect.c` (what
 //! git's own client writes and how it reads each answer), `pkt-line.c` and `sideband.c` (lines and bands), `refs.c`
 //! (`check_refname_format`).
@@ -24,13 +24,15 @@
 //! read here records how it ended ([`Line`], [`Ending`]), and a decoded message is written back to its exact bytes. A
 //! text line holds no NUL, where git's C readers would end the line's string, and no LF but its last byte.
 //!
-//! **Strict where git's reader is lax, so a decode loses nothing.** An object id is read only as the grammar writes it,
-//! its digits lower-case hexadecimal (gitprotocol-common redefines `HEXDIG` as `DIGIT / "a" / ... / "f"`), exactly the
-//! object format's length, nothing after it; git's `get_oid_hex` also takes upper case and ignores what follows, which
-//! no client writes (git's `oid_to_hex`, JGit, libgit2 and go-git all write lower case). A number is canonical decimal
-//! (git's `strtol` with base 0 also takes octal and `0x`). So every message this module accepts is written back byte
-//! for byte, the pkt-line lengths aside, whose digits part 1 reads in either case as git's `hexval` does and writes in
-//! lower case as git does. A ref name is `HEAD` or under `refs/` and passes `check_refname_format`
+//! **Read as git's server reads, written as git writes (A-624).** An object id is the object format's hexadecimal
+//! digits, exactly its length and nothing after it, its digits of either case: git's server reads an id with
+//! `get_oid_hex`, which takes both (`hex.c`'s `hexval`), and gitprotocol-pack asks it of every receiver ("both MUST
+//! treat obj-id as case-insensitive"); an encode writes the id in lower case, as `oid_to_hex` does. A line's LF is
+//! optional, as above, and recorded. So every stream stock git wrote encodes back byte for byte, and one with an
+//! upper-case id encodes back in git's form. Where git's reader takes what no git writes, the reader here refuses
+//! it: bytes after an id (`get_oid_hex` ignores what follows) and a number not in canonical decimal (git's `strtol`
+//! with base 0 also takes octal and `0x`). The pkt-line lengths' digits are read in either case, as part 1 reads them
+//! (`hexval`), and written in lower case. A ref name is `HEAD` or under `refs/` and passes `check_refname_format`
 //! ([`crate::refname`]).
 //!
 //! **Order is the grammar's.** `fetch`'s sections come in the document's order. git 2.50.1's `upload_pack_v2` wrote
@@ -197,7 +199,8 @@ pub enum Refusal {
     /// Where its line begins.
     at: u64,
   },
-  /// An object id not written as the object format's lower-case hexadecimal.
+  /// An object id that is not the object format's hexadecimal digits: of another length, or with a byte that is no
+  /// digit.
   ObjectId {
     /// Where its line begins.
     at: u64,

@@ -124,8 +124,10 @@ impl<'a> RowRef<'a> {
   pub fn contents(&self) -> impl Iterator<Item = ContentId> + use<'a> {
     self
       .contents
-      .chunks_exact(IDENTITY_BYTES)
-      .filter_map(ContentId::from_slice)
+      .as_chunks::<IDENTITY_BYTES>()
+      .0
+      .iter()
+      .filter_map(|identity| ContentId::from_slice(identity))
   }
 
   /// The payload.

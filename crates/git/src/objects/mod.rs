@@ -14,13 +14,13 @@
 //! - [`fsck`]: every message id of git's `fsck.h` at its default severity, and a check's [`Report`]: each finding a
 //!   typed refusal or a typed warning, in the order git reports it.
 //!
-//! **Sources** (git v2.50.1, read 2026-11-19). The code [C]: `fsck.h` (`FOREACH_FSCK_MSG_ID` and each id's
+//! **Sources** (git v2.50.1, read 2026-11-19). The code \[C\]: `fsck.h` (`FOREACH_FSCK_MSG_ID` and each id's
 //! severity), `fsck.c` (`fsck_tree`, `verify_ordered`, `verify_headers`, `fsck_ident`, `fsck_commit`,
 //! `fsck_tag_standalone`, `report`), `tree-walk.c` (`decode_tree_entry`), `object.h` (`parse_mode`), `utf8.c`
 //! (`is_hfs_dot_generic`), `path.c` (`is_ntfs_dotgit`, `is_ntfs_dot_generic`), `refs.c` (`check_refname_format`),
 //! `date.c` (`date_overflows`), `commit.c` (`parse_buffer_signed_by_header`), `gpg-interface.c`
 //! (`parse_signed_buffer`), and `builtin/index-pack.c` and `builtin/receive-pack.c` for how a push is checked; the
-//! documents [B]: `gitformat-signature` (signed commits and tags, `mergetag`).
+//! documents \[B\]: `gitformat-signature` (signed commits and tags, `mergetag`).
 //!
 //! **Strictness.** `git fsck` checks with warnings as warnings ([`Strictness::Default`]). A push that git checks
 //! (`receive.fsckObjects`, or `transfer.fsckObjects`) runs `index-pack --strict`, whose options are

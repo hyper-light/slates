@@ -174,7 +174,7 @@ pub fn mount_identity_at(_path: &str) -> Result<MountIdentity, MountTableError> 
 ///   (`bsd/kern/kern_event.c`, `filt_kqueue`), and that is the edge a shard's own kqueue waits for.
 /// - **Linux.** An epoll instance holding `/proc/self/mountinfo` (proc_pid_mountinfo(5)) for `EPOLLPRI`. The file
 ///   is pollable as `/proc/pid/mounts` is: "a change in this file (i.e., a filesystem mount or unmount) causes …
-///   poll(2) and epoll_wait(2) [to] mark the file as having a priority event (POLLPRI)" (proc_pid_mounts(5)); the
+///   poll(2) and epoll_wait(2) \[to\] mark the file as having a priority event (POLLPRI)" (proc_pid_mounts(5)); the
 ///   two files share one poll function (`fs/proc_namespace.c`, `mounts_poll`, read 2026-11-18). That function reports
 ///   the file readable always, so a readable wait on the file itself would fire at once, every time; it adds
 ///   `EPOLLPRI | EPOLLERR` once per change of the mount namespace since the open file was last polled, and the poll

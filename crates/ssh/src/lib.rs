@@ -18,9 +18,9 @@
 //! and send through [`transport::ServerTransport::send`].
 //!
 //! **Sources** (read 2026-11-19; research notes §5.5 pin each by hash). RFC 4250, 4251, 4253, 4344, 5647, 5656, 7748,
-//! 8032, 8308, 8709 and 8731 [B]; OpenSSH's `PROTOCOL` at `fa4b2a82` [B], which since moved its three transport
+//! 8032, 8308, 8709 and 8731 \[B\]; OpenSSH's `PROTOCOL` at `fa4b2a82` \[B\], which since moved its three transport
 //! extensions into the SSHM working group's drafts: `draft-ietf-sshm-strict-kex-03`, `draft-ietf-sshm-chacha20-poly1305-04`
-//! and `draft-miller-sshm-aes-gcm-01` [B]; OpenSSH's `kex.c` and `packet.c` at the same commit [C], followed where the
+//! and `draft-miller-sshm-aes-gcm-01` \[B\]; OpenSSH's `kex.c` and `packet.c` at the same commit \[C\], followed where the
 //! documents leave room, each place saying so.
 //!
 //! **Bounds, none of them a tuning literal.** A packet is held to the caller's cap, which RFC 4253 §6.1 floors at 35000

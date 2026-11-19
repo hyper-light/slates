@@ -13,7 +13,7 @@
 //! its holds' alike: it keeps learning while it declines holds, and holds again if its turns become cheap.
 //!
 //! A request meets a turn with probability in proportion to the turn's length, so whenever turns vary, the turn it
-//! lands in is longer than the mean turn: its expected length is E[T²] / E[T], the length-biased mean (the inspection
+//! lands in is longer than the mean turn: its expected length is E\[T²\] / E\[T\], the length-biased mean (the inspection
 //! paradox). A preemption that takes one turn in a hundred to a millisecond leaves the mean turn near its usual length
 //! but makes most requests meet the long turn, and the length-biased mean says so. Both moments are learned over the
 //! number of samples the shard's wake estimate weights (`2^shift`, derived from the boot probe's spread, §4.1), so both
@@ -107,7 +107,7 @@ impl HeldTurn {
     };
   }
 
-  /// The expected length of the turn a request lands in, nanoseconds: E[T²] / E[T] over the turns learned. `None`
+  /// The expected length of the turn a request lands in, nanoseconds: E\[T²\] / E\[T\] over the turns learned. `None`
   /// before the first turn; 0 while every turn measured took no time (a clock that does not move between reads).
   pub fn met_ns(&self) -> Option<u64> {
     let (length, square) = match self.learned {
@@ -186,7 +186,7 @@ mod tests {
   }
 
   /// A-387. Do: learn ninety-nine short turns and one a quantum preempted, in each order. Expect: the turn a request
-  /// meets is the length-biased mean, E[T²] / E[T], exactly while the plain mean covers the turns (the preempted turn
+  /// meets is the length-biased mean, E\[T²\] / E\[T\], exactly while the plain mean covers the turns (the preempted turn
   /// takes 96% of the time, so most requests meet it), far above the mean turn; and the order of the turns does not
   /// change it.
   #[test]

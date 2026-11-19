@@ -16,7 +16,7 @@
 //! refused by kind; and a plain bundle is compressed as 7.2 compresses one.
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
-//! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
+//! `internals.bundle2`, `internals.bundles` and `internals.changegroups` \[B\], and its code \[C\], which is what clients
 //! run and is followed where the two disagree: `bundle2.py` (every size a signed 32-bit integer; a part type of
 //! `[a-zA-Z0-9_:-]`, mandatory when it holds an upper-case letter; the interrupt), `changegroup.py` (the delta headers
 //! of versions `01` to `05`; a chunk length of 1 to 4 refused as a negative one is; the tree-manifest list every

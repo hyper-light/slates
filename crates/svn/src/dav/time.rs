@@ -140,6 +140,21 @@ pub(crate) fn civil_from_days(days: u64) -> Option<(u64, u64, u64)> {
   let shifted = days.checked_add(EPOCH_OFFSET)?;
   let era = shifted / ERA_DAYS;
   let day_of_era = shifted.checked_sub(era.checked_mul(ERA_DAYS)?)?;
+  let (year_of_era, day_of_year) = year_of_era(day_of_era)?;
+  let (month, day) = month_and_day(day_of_year)?;
+  let year = year_of_era.checked_add(era.checked_mul(ERA_YEARS)?)?;
+  let year = if month < MARCH {
+    year.checked_add(FIRST)?
+  } else {
+    year
+  };
+  (FIRST_YEAR..=LAST_YEAR)
+    .contains(&year)
+    .then_some((year, month, day))
+}
+
+/// The year of its 400-year era a day of that era falls in, and the day's place in that year counted from March 1.
+fn year_of_era(day_of_era: u64) -> Option<(u64, u64)> {
   let year_of_era = day_of_era
     .checked_sub(day_of_era / CORRECTION_FOUR)?
     .checked_add(day_of_era / CORRECTION_HUNDRED)?
@@ -149,7 +164,11 @@ pub(crate) fn civil_from_days(days: u64) -> Option<(u64, u64, u64)> {
     .checked_mul(year_of_era)?
     .checked_add(year_of_era / LEAP_EVERY)?
     .checked_sub(year_of_era / CENTURY)?;
-  let day_of_year = day_of_era.checked_sub(year_start)?;
+  Some((year_of_era, day_of_era.checked_sub(year_start)?))
+}
+
+/// The month (January 1) and day of the month of a day counted from March 1.
+fn month_and_day(day_of_year: u64) -> Option<(u64, u64)> {
   let month_from_march = MONTH_DIVISOR
     .checked_mul(day_of_year)?
     .checked_add(MONTH_ADDEND)?
@@ -164,15 +183,7 @@ pub(crate) fn civil_from_days(days: u64) -> Option<(u64, u64, u64)> {
   } else {
     month_from_march.checked_sub(MARCH_SHIFT)?
   };
-  let year = year_of_era.checked_add(era.checked_mul(ERA_YEARS)?)?;
-  let year = if month < MARCH {
-    year.checked_add(FIRST)?
-  } else {
-    year
-  };
-  (FIRST_YEAR..=LAST_YEAR)
-    .contains(&year)
-    .then_some((year, month, day))
+  Some((month, day))
 }
 
 /// Seconds since midnight of a time of day, `None` for a field past its range.
@@ -198,7 +209,8 @@ pub(crate) fn time_of_day(seconds: u64) -> (u64, u64, u64) {
 /// The days in `month` of `year`.
 fn days_in_month(year: u64, month: u64) -> Option<u64> {
   let common = MONTH_LENGTHS.get(usize::try_from(month.checked_sub(FIRST)?).ok()?)?;
-  let leap = year % LEAP_EVERY == 0 && (year % CENTURY != 0 || year % ERA_YEARS == 0);
+  let leap = year.is_multiple_of(LEAP_EVERY)
+    && (!year.is_multiple_of(CENTURY) || year.is_multiple_of(ERA_YEARS));
   Some(if month == FEBRUARY && leap {
     common.checked_add(FIRST)?
   } else {

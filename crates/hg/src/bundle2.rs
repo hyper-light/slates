@@ -1,4 +1,4 @@
-//! Bundle2 (`HG20`), decoded and encoded (A-514; `internals.bundle2` [B]; `mercurial/bundle2.py` [C]).
+//! Bundle2 (`HG20`), decoded and encoded (A-514; `internals.bundle2` \[B\]; `mercurial/bundle2.py` \[C\]).
 //!
 //! A stream is the magic `HG20`; a signed 32-bit length and that many bytes of stream parameters, space-separated,
 //! each `name` or `name=value`, URL-quoted, mandatory when its first letter is upper-case; then parts. A part is a

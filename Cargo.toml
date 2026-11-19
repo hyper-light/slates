@@ -24,6 +24,8 @@ slates-rt = { path = "crates/rt", version = "0.1.0" }
 slates-wire = { path = "crates/wire", version = "0.1.0" }
 slates-vfs = { path = "crates/vfs", version = "0.1.0" }
 slates-test-seeds = { path = "crates/test-seeds" }
+# The version-control servers' one object store (§4.17.1 shared piece 3, A-581), which each server's store builds on.
+slates-vcs = { path = "crates/vcs", version = "0.1.0" }
 slates-guest-probe = { path = "crates/guest-probe" }
 slates-base = { path = "crates/base", version = "0.1.0" }
 slates-land = { path = "crates/land", version = "0.1.0" }
@@ -49,7 +51,6 @@ slates-cluster = { path = "crates/cluster", version = "0.1.0" }
 slates-archive = { path = "crates/archive", version = "0.1.0" }
 slates-image = { path = "crates/image", version = "0.1.0" }
 slates-conformance = { path = "crates/conformance", version = "0.1.0" }
-slates-vcs = { path = "crates/vcs", version = "0.1.0" }
 # HTTP/1.1's request codec, shared by the git, Mercurial and Subversion servers (A-595, §4.17.2 "Transports" 1).
 slates-http = { path = "crates/http", version = "0.1.0" }
 

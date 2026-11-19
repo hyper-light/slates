@@ -641,10 +641,10 @@ fn global_rights_with(
 }
 
 /// The rules' repositories and the access each gives, where `pick` finds one.
-fn picked<'m>(
-  model: &'m Model,
+fn picked(
+  model: &Model,
   pick: impl Fn(&Acl) -> Option<Access>,
-) -> impl Iterator<Item = (&'m [u8], Access)> {
+) -> impl Iterator<Item = (&[u8], Access)> {
   model
     .acls()
     .iter()
