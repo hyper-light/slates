@@ -475,6 +475,8 @@ mod tests {
   const CLIENT_NONCE: [u8; NONCE_BYTES] = [1; NONCE_BYTES];
   /// Shape: the daemon's nonce, a byte repeated: any value does, since the test hands it to the take itself.
   const DAEMON_NONCE: [u8; NONCE_BYTES] = [2; NONCE_BYTES];
+  /// Shape: another exchange's daemon nonce, another byte repeated: any value but [`DAEMON_NONCE`]'s does.
+  const OTHER_NONCE: [u8; NONCE_BYTES] = [3; NONCE_BYTES];
 
   /// Keeps `descriptor` as the `key` offer for `client` under [`SECRET`], as an attach or a map does.
   fn offered(s: &mut ShardState, key: (OfferKind, u64), client: u32, descriptor: OwnedFd) {
@@ -585,6 +587,101 @@ mod tests {
       "the take ended within one window ({waited:?}), before its owner shard's busy poll did"
     );
     assert_eq!(left, Some(false), "the take retired the offer");
+  }
+
+  /// What the lost-answer take test saw: the first ask's confirmation, whether the stream's other side was still open
+  /// after that answer was lost, the second ask's confirmation, the byte read through the end the second ask answered,
+  /// and another exchange's take.
+  struct TakenTwice {
+    first: Result<[u8; SEALED_BYTES], String>,
+    peer_open: bool,
+    again: Result<[u8; SEALED_BYTES], String>,
+    through: Option<u8>,
+    other: Result<(), String>,
+  }
+
+  /// A-512 (A-488's sibling, goal 85). Do: on a daemon, offer a stream end for a client; take it with a claim's proof, as
+  /// an exchange's first ask, and drop what the take answered, as a lost answer is dropped when its owner shard stopped
+  /// for a window (`xshard::call_in_shard_time` forgets the call, and the shard runs it once it resumes); take it again
+  /// with the same claim, as the exchange's second ask; write a byte on the stream's other side and read it through the
+  /// end the second ask answered; then take the offer with another exchange's nonce and proof. Expect: the stream's other
+  /// side still open after the lost answer; the second ask answered the same confirmation and an end of the same stream
+  /// (the byte comes through); the other exchange refused `NoOffer`, so the ends are handed once. Before, the first take
+  /// retired the offer and moved its ends into the answer, whose loss closed them: the stream's other side read its end,
+  /// the second ask found no offer, and the client nothing to claim again.
+  #[test]
+  fn a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice() {
+    let daemon = crate::daemon::audit_daemon();
+    let saw = crate::daemon::observe_first(&daemon, |s| {
+      let (end, peer) = slates_ipc::stream::pair().unwrap();
+      offered(s, (OfferKind::Stream, FIRST_ID), CLIENT, end);
+      let hello = hello_for(OfferKind::Stream, FIRST_ID);
+      let proof = proof_of(OfferKind::Stream, FIRST_ID, &DAEMON_NONCE);
+      let first = take(s, hello, DAEMON_NONCE, proof)
+        .map(|(confirmation, _lost)| confirmation)
+        .map_err(|refusal| format!("{refusal:?}"));
+      rustix::io::ioctl_fionbio(&peer, true).unwrap();
+      let mut byte = [0u8; 1];
+      let peer_open = matches!(
+        rustix::net::recv(&peer, &mut byte, rustix::net::RecvFlags::empty()),
+        Err(rustix::io::Errno::AGAIN)
+      );
+      let again = take(s, hello, DAEMON_NONCE, proof);
+      let through = again.as_ref().ok().and_then(|(_, taken)| {
+        rustix::net::send(&peer, b"x", rustix::net::SendFlags::empty()).ok()?;
+        let mut read = [0u8; 1];
+        match rustix::net::recv(&taken.descriptor, &mut read, rustix::net::RecvFlags::empty()) {
+          Ok((1, _)) => Some(read[0]),
+          _ => None,
+        }
+      });
+      let other = take(
+        s,
+        hello,
+        OTHER_NONCE,
+        proof_of(OfferKind::Stream, FIRST_ID, &OTHER_NONCE),
+      )
+      .map(|_| ())
+      .map_err(|refusal| format!("{refusal:?}"));
+      TakenTwice {
+        first,
+        peer_open,
+        again: again
+          .map(|(confirmation, _)| confirmation)
+          .map_err(|refusal| format!("{refusal:?}")),
+        through,
+        other,
+      }
+    });
+    daemon.stop();
+    println!(
+      "a take asked again after a lost answer: first {}, the stream's other side open {}, again {}, through {:?}, \
+       another exchange {:?}",
+      saw.first.is_ok(),
+      saw.peer_open,
+      saw.again.is_ok(),
+      saw.through,
+      saw.other
+    );
+    assert!(saw.first.is_ok(), "the first ask took the offer: {:?}", saw.first);
+    assert!(
+      saw.peer_open,
+      "the lost answer closed the stream's end: the ends were lost with it"
+    );
+    assert_eq!(
+      saw.again, saw.first,
+      "the second ask of the same claim was not answered that claim"
+    );
+    assert_eq!(
+      saw.through,
+      Some(b'x'),
+      "the second ask's end is not the offered stream's"
+    );
+    assert_eq!(
+      saw.other,
+      Err("NoOffer".to_owned()),
+      "another exchange took an offer this exchange holds: its ends handed twice"
+    );
   }
 
   /// A-492 (R3's class C; §4.6 the socket route): an offer waits for its claim while its client lives, never for a fixed
