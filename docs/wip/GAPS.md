@@ -8033,12 +8033,33 @@ its origin's count at the moment of the clone, not its snapshot's, so every file
 counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
 tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
 and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
-every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
-clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
-a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
-the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
-from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
-names the effects of each).
+every step, but no step cloned a snapshot its origin had changed since. **Found by the sweep, fixed since by A-549
+(below):** the server's clone admission read the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s
+`inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it
+should read the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension,
+`entry_allowance`) started from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart
+recounted it (the bug record names the effects of each).
+
+**Fixed 2026-11-19 (A-549, goal 85, g234): a clone's admission and its entry count read its origin's head.** A
+snapshot now records its live entries beside its inodes (a recovered one's from its image: its own directories' named
+entries and the live entries of the head's directories it shares), a clone starts from them, and the server admits a
+clone by its snapshot's inodes (`Volume::snapshot_inodes`): a bounded clone's reservation and its allowance's floor, a
+dynamic clone's version hold. Measured before: a bounded clone of an origin floored 8 past its share of 28 ran with no
+inode cap (its allowance of 28 refused below its 36), a dynamic clone held 2 slots for 13 inodes, and a clone counted 13
+entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`).
+**Open, found by the sweep:**
+- A restart refused any clone holding a snapshot while it still shared a file with its origin, `RecoveryIncomplete`
+  from `Volume::clone_from_image` (A-561, the next piece): the clone's snapshot marks such a file shared with the head,
+  and recovery looks a head-shared entry up only among the images of the head's own inodes, which a clone's
+  origin-shared files are not. No test recovered a clone with a snapshot of its own; A-549's restart test recovers one
+  without.
+- A clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
+  restart set both), so its namespace dimension is unbounded until a restart.
+- A resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume was made
+  with (`verbs::resize`).
+- Recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts it;
+  the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor at
+  the restart are raised by its whiteouts. Found by reading, not tested.
 
 ## 8d. Phase 2 record (2026-09-05)
 

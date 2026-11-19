@@ -36307,7 +36307,7 @@ the bug record `docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origi
   at the first clone, `left: 9, right: 5`. Green with the change, the same machine: `cargo test --locked -p slates-vfs
   --lib` 79 passed, 1 ignored.
 - **The sweep for siblings** (every counter a clone, a restore or an adoption takes from the live origin rather than
-  the frozen state), reported and not changed, with their effects in the bug record:
+  the frozen state), reported and not changed, with their effects in the bug record (both fixed since by A-549):
   - the server's clone admission reads the clone's inherited inodes from the origin's head count
     (`verbs::admit_clone`'s `inherited`: a bounded clone's version reservation and its allowance's floor, a dynamic
     clone's version hold), where it should read the snapshot's, now recorded;
@@ -36849,6 +36849,52 @@ Applied in the same change to: §4.15's status (A-503's paragraph), §4.10's sta
 (g267), `crates/db` (`catalog.rs`: `CarriedRecord::NO_HEAD`), `crates/server` (`carry.rs`, new; `moves.rs`: the
 move-time carry gone, the move waiting for its head's record; `fleet.rs`, `verbs.rs`, `state.rs`, `daemon.rs`,
 `lib.rs`).
+
+### A-549 — A clone is admitted by its snapshot's inodes and counts its snapshot's entries, whatever its origin did since (2026-11-19, goal 85, g234; A-541's sweep; §4.2's inode and namespace dimensions, §4.4 snapshots and clones, D-5)
+Applied in the same change to: A-541's entry and its bug record (both of its siblings marked fixed); GAPS, §8c (the fix
+and the siblings left open); the bug record `docs/bugs/2026-11-19-a-clones-admission-and-entry-count-read-its-origins-head.md`;
+and:
+- `crates/vfs`: `snapshot.rs` (`Snapshot::live_entries`); `volume.rs` (`Volume::snapshot` records the head's entry
+  count, `clone_inner` starts the clone from it, `Volume::snapshot_inodes`, `clone_of`'s notes; two lib tests in
+  `clone_count_tests`); `recover.rs` (`rebuild_snapshot_tree` returns its tree's entries, `named_entries`,
+  `rebuild_snapshot` records them).
+- `crates/server`: `verbs.rs` (`admit_clone` reads the clone's inherited inodes from its snapshot; the lib test module
+  `clone_admission_tests`, new).
+
+- **What was there.** The server admitted a clone by its origin's inode count at the moment of the clone (`admit_clone`'s
+  `inherited`): a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold. Since
+  A-541 the clone counts its snapshot's inodes, so where the origin had removed files the allowance fell below the
+  clone's count, was refused, and left the clone with no inode cap, and a dynamic clone held fewer slots than it holds
+  inodes. A clone's entry count was its origin's head count at the clone, as its inode count had been.
+- **The rule.** A snapshot carries the counts a clone of it is admitted and counted by, as §4.2 has complete snapshot
+  roots carry their referenced counts for O(1) clone admission: its live inodes (A-541) and its live entries, each the
+  head's when the snapshot is taken. The owner admits a clone by the snapshot's inodes: a bounded clone reserves its fair
+  share but never fewer than them, and that is its allowance; a dynamic clone holds a slot for each. A clone's entry
+  count starts from the snapshot's. A recovered snapshot's entries are its tree's, by the rule the live count keeps (a
+  whiteout is no entry): the named entries of its own directories' images and the live entries of the head's
+  directories it shares (A-395), so the image's layout does not change. A stale snapshot is refused at admission, before
+  any slot is taken, with the refusal the clone would give.
+- **Tests.** In `crates/vfs/src/volume.rs`, `clone_count_tests`: the entry count of the origin, the clone and a clone of
+  the clone's snapshot against a walk of each namespace after every step, then an entry allowance of one past the tree
+  admitting exactly one file; and across a restart, the rebuilt clone and a clone of the recovered snapshot, whose tree
+  shares an untouched directory with its origin's head (the test first checks the image shares it, so the count's shared
+  arm is exercised). In `crates/server/src/verbs.rs`, `clone_admission_tests`: a bounded clone of an origin floored 8
+  past its fair share and left under it is admitted with its snapshot's inodes as its allowance, none refused; a dynamic
+  clone holds a slot for each inode its snapshot holds.
+- **Evidence.** All on the Mac Studio, 2026-11-19.
+  - Red first, with the tests alone on main `a613562eb`. The bounded clone's allowance was `u64::MAX` against its
+    snapshot's 36: the share, 28, was refused below 36. The dynamic clone held 2 slots for 13 inodes. The live entries
+    test counted 13 where the tree holds 9, and the restart test 14 where it holds 10.
+  - Green with the change: `cargo test --locked -p slates-vfs --lib` passed 81 with 1 ignored, and `cargo test --locked
+    -p slates-server --lib clone` passed 3 of 3.
+  - Each arm of the recovered count, removed on a copy, failed the restart test at the later clone: without the shared
+    directories it counted 7 of 9; recording zero, 0 of 9.
+- **Found by the sweep, left open** (GAPS, with the bug record):
+  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, the next piece).
+    This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
+  - A clone is admitted with no entry allowance.
+  - A resize leaves the entry allowance at the size the volume was made with.
+  - Recovery counts a whiteout as a live entry (found by reading).
 
 ### A-548 — The rest of C-c: the journal's readers and a verb held for a materialization wait on what they wait for, never a fixed second (2026-11-19, g232; UI goal 86, R3's class C, C-c's rest; §4.5 the journal's readers, §4.6 "NFS v3"; A-157, A-192, A-359, A-492, A-493)
 Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192's keeper), GAPS (the R3 debt's class C),
