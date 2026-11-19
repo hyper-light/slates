@@ -43,6 +43,7 @@
 mod admission;
 pub mod object_name;
 pub mod out;
+pub mod pack;
 pub mod pktline;
 pub mod sideband;
 

@@ -118,6 +118,13 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 # and refusing git's own t0013 SHAttered vector (`crates/git/src/tests/object_name.rs`). No default features: neither
 # `std` nor the OID tables are used.
 sha1-checked = { version = "0.10.0", default-features = false }
+# zlib's CRC32 (the IEEE polynomial, reflected), which git's pack index keeps of each packed object and `git
+# verify-pack` checks (§4.17.2, A-591): the crate flate2 itself computes zlib's CRC32 with, so it costs no code beyond
+# what flate2 brings when deflate enters the workspace (§4.17.2 piece 3; approved by main, 2026-11-19, on that reason).
+# slates' own CRC is CRC32C (`slates_wire::crc32c`), another polynomial. Default features: `std` lets it pick ARMv8's
+# CRC instructions or x86-64's carry-less multiply at run time, with a table for the rest, and slates-git keeps no
+# `unsafe` of its own.
+crc32fast = "1"
 # The shared crates from ../hyper-raft, vendored at the revision in vendor/hyper-raft/SNAPSHOT (A-67).
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }
