@@ -12150,6 +12150,19 @@ engine: the verdict, rebase, position mapping, the register).
 > holds an index's names to the objects read. Proven against the three packs stock git 2.50.1 wrote: every object's
 > type, size, name, base and depth as `verify-pack -v` lists them, read whole, a byte at a time and through git's own
 > index.
+>
+> **Status (2026-11-19, A-595: piece 8's first part built, the request codec and git's routes).** HTTP/1.1's request
+> codec is a crate of its own, `crates/http` (`slates-http`), so §4.17.3's and §4.17.4's HTTP read requests with it
+> without depending on git's crate. A head is read as its bytes arrive, each byte scanned once, every line held to RFC
+> 9112 §3's 8000 octets, its bytes and field index charged to the request's admission, and every framing two readers
+> could disagree on refused by kind. A body's framing (`Content-Length` or chunked) is removed as it streams, its data
+> handed back as slices of the input, so a push's pack passes in constant memory; a gzip body is inflated through
+> flate2's streaming decoder over A-607's zlib-rs, every inflated byte charged, so a bomb stops at the room. `crates/git`
+> (`http`) routes as `git http-backend` routes, with its statuses and its three cache fields, takes `Git-Protocol`'s
+> greatest version as `protocol.c` does, and writes the `# service=` line and flush for v0 and v1 alone. Proven against
+> stock git 2.50.1's own HTTP traffic with `http-backend` (its heads and inflated bodies, SHA-256 checked) and hostile
+> input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
+> streamed through, the staged close).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12169,9 +12182,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    respond with the `403 Forbidden` HTTP status code"); a request without credentials is `401` with its challenge (HTTP
    semantics, RFC 9110). TLS is rustls over aws-lc-rs, already in the workspace. Every request is a future on a shard
    (R6): no process starts per request, where `git-http-backend` is "A simple CGI program" [B: git-http-backend] whose
-   fetch runs `upload-pack` and `pack-objects` as further processes. The MCP edge's HTTP/1.1 server
-   (`crates/mcp/src/http.rs`) is the starting point; the git edge adds TLS, chunked and gzip bodies, and streaming
-   responses.
+   fetch runs `upload-pack` and `pack-objects` as further processes. Requests are read by `slates-http` (A-595), a
+   sans-I/O HTTP/1.1 codec the Mercurial and Subversion servers share; the MCP edge's server (`crates/mcp/src/http.rs`),
+   bound to its one endpoint and refusing every transfer coding, lent its line bound and its staged close, and moving it
+   onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
    one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
    [B: RFC 8709], with the RSA and ECDSA key forms users already hold as owed reading; ciphers `aes256-gcm@openssh.com`
@@ -13130,7 +13144,9 @@ for Subversion.)
    lock at or beneath it, as FSFS's `verify_locks` checks: a lock kept through its file's deletion can stand beneath a
    path added later. A lock held by another principal is `E160039`, checked first. A lock whose token the commit did
    not present is `E160037`, wherever in the commit the token was presented. A commit with no principal that meets a
-   lock is `E160034`. An accept releases every presented lock whose token and owner match, paths it did not change
+   lock is `E160034`. The first lock that fails answers, in the order FSFS's `verify_locks` meets them: the changed
+   paths in Subversion's path order, a path's children right after it, so `/t/a/b` before `/t/a-b` (A-617). An accept
+   releases every presented lock whose token and owner match, paths it did not change
    among them, unless the client asked to keep them. The check and the release are in the verdict's one step on the
    owner, so no lock changes between them (A-602).
 5. **What the version records.** The revision's changed-path rows as the drive declared them (add; delete; replace, a
@@ -41063,3 +41079,88 @@ Applied in the same change to:
 - **Owed:** the server's questions (piece 7); the file read from the repository and compiled per file identity;
   `svnserve`'s `force-username-case`; `mod_authz_svn`'s questions (piece 13). Main's: clippy and `xtask` over the
   module, and the three departures confirmed against stock Subversion (run request).
+
+### A-595 — HTTP/1.1's request codec as a crate the version-control servers share, and git's smart HTTP routes over it (2026-11-19, g076b, UI goal 92; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's first part)
+Applied in the same change to:
+- §4.17.2's status and its "Transports" item 1; GAPS (the §4.17 entry);
+- `crates/http` (`slates-http`, new: `head`, `body`, `gzip`, `percent`, `reply`, `admission`, `grammar`, their tests);
+- `crates/git` (`http.rs` and its tests; `tests/http_golden.rs`; `fixtures/http` with `make-http-fixtures.sh` and
+  `cgi-host.py`; `Cargo.toml`: `slates-http`; the golden test gzips with flate2, a dependency since A-608);
+- the workspace manifest (`slates-http`) and lock (A-607's flate2 resolved: zlib-rs alone).
+- **Why a crate.** Mercurial's HTTP (A-569) already takes a request whose head and body are read, and Subversion's
+  WebDAV will; a module of `slates-git` would make both depend on git's crate and its hashes. `slates-http` holds no
+  tool's rule: it reads a request and frames a reply, and each tool routes.
+- **The head** (RFC 9112 §2 to §6). `HeadReader` scans each byte once across reads, keeping three offsets, and skips
+  empty lines before the request line. A line past 8000 octets (RFC 9112 §3's recommended minimum, the MCP edge's
+  bound) is refused, 414 for the request line and 431 after, whole or still open; a head that fills the admission's
+  room unended is refused the same way. A whole head is charged its bytes and its field index before the index is
+  built, and borrows the caller's bytes. The origin, absolute (`http` or `https`, no userinfo, its authority over
+  `Host`) and asterisk (`OPTIONS`) forms are read; a bare CR or LF, a fold, whitespace before a colon, a control byte
+  in a value, a target byte no URI holds, a second `Host` or none in HTTP/1.1 are refused 400 by kind. The framing is
+  RFC 9112 §6.3's with every case two readers could disagree on refused: `Content-Length` with `Transfer-Encoding`, a
+  transfer coding in HTTP/1.0, chunked not last or twice (400), another transfer coding (501), `Content-Length` values
+  that disagree or are not digits (400) or pass 64 bits (413). gzip once is the one content coding read (415 with
+  `Accept-Encoding: gzip` otherwise); `Expect: 100-continue` is honoured in HTTP/1.1 and ignored in HTTP/1.0, another
+  expectation 417. The refusals are judged in one order whatever the fields' order: the grammar, `Host`, the length,
+  the framing, the coding, the expectation.
+- **The body** (RFC 9112 §7.1). `BodyReader` keeps only the state of the line it is in; a step returns a run of data as
+  a slice of its input, or takes all its input and asks for more, or ends exactly at the body's last byte. Chunk sizes
+  are hexadecimal within 64 bits; extensions are skipped but hold no control byte; trailers are read to the field
+  grammar, dropped, and charged to the admission as a head is; every line is held to the same 8000 octets.
+- **gzip** (RFC 1952). `Gunzip` writes into flate2's `write::MultiGzDecoder` (A-607's zlib-rs; no backend named): every
+  inflated byte is charged as it is made, a write past the room is refused with the sink never grown past it, every
+  member's CRC-32 and length are checked, and the decoder is never written after its end (flate2 may panic there).
+- **git's routes**, as `http-backend.c` answers: `info/refs?service=` for `GET` and `HEAD`; `POST` to a service of its
+  request type (415) with a body (411); the dumb protocol's paths and `info/refs` with no service 403 (git with
+  `http.getanyfile` off), an unknown service 403, `git-upload-archive` 403; 405 naming `GET, HEAD` or `POST`, or 400 to
+  HTTP/1.0 (`bad_request`); 404 for a repository path with an empty, `.` or `..` segment (`daemon_avoid_alias`); paths
+  routed decoded and queries read as forms, the last `service` winning (`get_parameter`), an escaped slash or NUL 400.
+  `Git-Protocol`'s greatest `version=` is the version (`determine_protocol_version_server`; the codec before this
+  change took the last, which git does not). Replies carry `http-backend`'s `Expires`, `Pragma` and `Cache-Control`
+  in its order, then the content type; the `# service=` pkt-line and flush precede a v0 or v1 advertisement only.
+- **Golden vectors.** `make-http-fixtures.sh` (the MacBook, git 2.50.1 Apple Git-155, Python 3.9.6, 2026-11-19) serves
+  two repositories through `cgi-host.py`, a loopback CGI host running `git http-backend`, and records twelve exchanges:
+  `ls-remote` at v0 and v1, a v2 clone whose fetch is gzipped (git gzips a request past 1024 bytes), a push, and a v2
+  clone with a 64 KiB post buffer whose `ls-refs` and fetch go chunked after git's probe of a lone flush. As main ruled
+  with A-607 the fixtures hold inflated bytes alone: heads, plain pkt-line bodies, the gzip body inflated by Python and
+  gzipped again by the test, the chunked fetch's framing with the SHA-256 of its data, `http-backend`'s CGI heads and
+  its advertisements; no pack. git 2.50.1 refuses a post buffer of LARGE_PACKET_MAX or less over a stateless
+  connection (`BUG: ... rpc->buf should be larger than LARGE_PACKET_MAX`), hence 64 KiB.
+- **Not reused: the MCP edge's parser** (`crates/mcp/src/http.rs`). It reads MCP's fields alone, takes `POST` alone,
+  requires `Content-Length`, refuses every transfer coding, and lives in a crate on the runtime and the client. Its
+  line bound and its citations were taken; moving it onto `slates-http` is owed.
+- **Tests** (Mac Studio M3 Ultra, debug, 2026-11-19): red first, kiln r513 (load 6.5): 49 of 51 `slates-http` tests
+  and 11 of 11 git route tests failed on stubs; green `cargo test -p slates-http --lib` 51 of 51 and
+  `cargo test -p slates-git --lib` 87 of 87 at 7ece429be (load 7.6); with the golden vectors, 92 of 92 at 2dcc07210
+  (load 8.7; the first golden run's one failure was the test's own count, 1400 wants where git sent 1401, HEAD's
+  tip wanted twice); `cargo fmt --check` clean.
+- **Owed.** The edge that reads sockets (piece 8's next part): listeners on a shard, TLS, authentication (401 with its
+  challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
+  in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
+  DAV reading their requests through it.
+
+### A-617 part 1 — A-602's lock check answers the first failing lock in Subversion's path order, as FSFS's `verify_locks` does (2026-11-19, g268 for UI goal 93; §4.17.4 item 3.4; A-592's finding, A-602)
+Applied in the same change to: §4.17.4 item 3.4 (the order the first failing lock answers in), GAPS (the §4.17.4
+entry: A-592's finding fixed), `crates/svn/src/lock.rs` (`LockTable::verdict` through `met`, `in_path_order` and
+`path_order`), `crates/svn/src/lock/tests.rs` (the model returns at the first failing check; the census counts the
+commits the order decided), `crates/svn/src/commit/tests.rs` (A-592's scratch case, committed; the transcription's
+order beneath a path read whole).
+- **What was there.** `LockTable::verdict` gathered the locks a commit's changes meet into a map by the locks' paths and
+  verified them in its byte order. FSFS's `verify_locks` sorts the changed paths with `svn_sort_compare_items_as_paths`
+  (`path.c` `svn_path_compare_paths`: a path's children right after it, before its later siblings) and returns at the
+  first path whose check fails (`transaction.c` 3537-3539, 3578). So a commit refused by locks at both `/t/a/b` and
+  `/t/a-b` was answered at `/t/a-b`, where `svnserve` answers `/t/a/b` (A-592's finding). A-602's oracle let it pass:
+  it accepted any lock that could refuse the commit anywhere, though only the order beneath one path read whole, a
+  hash table's in FSFS, is free.
+- **The decision.** `met` gives the locks in `verify_locks`' order: the changed paths in that path order, a modified
+  path's own lock and every lock at or beneath a path added, deleted or replaced, a path beneath one so read skipped,
+  each lock once; beneath a path read whole the same path order, the path's own lock first, as FSFS's walk sends it.
+  `path_order` compares names one by one, which equals `svn_path_compare_paths` on canonical paths (A-592's oracle held
+  the two equal over prefixes and bytes either side of `/`). The model of A-602's oracle returns at the first failing
+  path, so the table must answer one of that path's locks.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the branch). Failing first (04:39
+  UTC, load 8.7): with the tests and lock.rs before the fix, `cargo test --locked -p slates-svn --lib` failed 2 of 155:
+  A-592's case answered `/t/a-b`, and A-602's oracle met a commit modifying `/a-b` and `/a/f` refused at `/a-b`, none
+  of the first failing path's `{/a/f}`. Green (04:39 UTC): 155 of 155 in 1.14 s; A-602's census: 408 refused commits,
+  38 of them decided by the order; A-592's census unchanged in kind. `cargo fmt` clean. Clippy, `xtask check` and the
+  doc gate are main's (the run-request queue).

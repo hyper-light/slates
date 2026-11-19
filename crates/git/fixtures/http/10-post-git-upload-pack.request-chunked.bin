@@ -1,0 +1,31 @@
+14
+0014command=ls-refs
+
+1b
+001bagent=git/2.50.1-Darwin
+16
+0016object-format=sha1
+4
+0001
+9
+0009peel
+
+c
+000csymrefs
+
+b
+000bunborn
+
+1b
+001bref-prefix refs/heads/
+
+1a
+001aref-prefix refs/tags/
+
+14
+0014ref-prefix HEAD
+
+4
+0000
+0
+

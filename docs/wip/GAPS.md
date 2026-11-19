@@ -188,6 +188,20 @@
 > driver that starts them; each tool's words for the outcomes; review events' hooks; a repository-owned queue for
 > observing hooks that must outlive their push. Main's: clippy, `xtask` and the lint matrix over the three modules (no
 > platform code in them).
+> **A-595 (2026-11-19, g076b; piece 8's first part):** HTTP/1.1's request codec is its own crate, `crates/http`
+> (`slates-http`), which the Mercurial and Subversion servers share without depending on git's: a head read as it
+> arrives, each byte scanned once, lines held to RFC 9112 §3's 8000 octets, its bytes and field index charged to the
+> admission, every framing two readers could disagree on refused by kind; bodies (`Content-Length`, chunked) streamed as
+> slices of their input, trailers dropped and charged; gzip through flate2's streaming decoder over A-607's zlib-rs,
+> every inflated byte charged (a 16 MiB bomb stops at a 1 MiB room); percent-decoding; reply framing. `slates-git`'s
+> `http` routes as `git http-backend` routes (its table, statuses, cache fields and order of checks), takes
+> `Git-Protocol`'s greatest version as `protocol.c` does, and writes the `# service=` prelude for v0 and v1 alone.
+> Golden vectors: stock git 2.50.1's own HTTP traffic with `http-backend` behind a loopback CGI host (`fixtures/http`,
+> `make-http-fixtures.sh`), heads and inflated bodies only, SHA-256 checked. `cargo test -p slates-http --lib` 51 of 51
+> and `-p slates-git --lib` 92 of 92 on the Mac Studio, red first on stubs (49 and 11 failing). Owed: the edge itself
+> (piece 8's next part: listeners on a shard, TLS, authentication, `100 Continue`, the services' bodies streamed
+> through, the staged close); the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's DAV through it.
+> Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
@@ -288,11 +302,12 @@
 > transcribed over the index tests' naive filesystem, equal to the verdict with the lock table's real check on 4,096
 > generated histories a run; `cargo test -p slates-svn --lib` on the Mac Studio (see A-592). Owed from it: the drive
 > asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each command arrives, over a
-> transaction built a command at a time (piece 7). Found by it, owed to A-602's lock check: `LockTable::verdict`
-> verifies the locks a commit meets in the byte order of their paths, where FSFS checks the changed paths in
-> `svn_path_compare_paths` order (a path's children before its later siblings, `transaction.c` 3537-3539), so a commit
-> refused by locks at both `/t/a/b` and `/t/a-b` is answered at `/t/a-b` where `svnserve` answers `/t/a/b`; the
-> verdict's refusal is the lock check's, so it follows when that order does. A-602 (2026-11-19, g250): the lock table,
+> transaction built a command at a time (piece 7). Found by it and fixed by A-617 (2026-11-19, g268):
+> `LockTable::verdict` verified the locks a commit meets in the byte order of their paths, where FSFS checks the changed
+> paths in `svn_path_compare_paths` order and returns at the first that fails (`transaction.c` 3537-3539, 3578), so a
+> commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at `/t/a-b` where `svnserve` answers `/t/a/b`; it
+> now meets them in FSFS's order, and A-602's oracle accepts only the first failing path's locks (it had accepted any
+> lock in the commit). A-602 (2026-11-19, g250): the lock table,
 > the guards of `lock` (with stealing) and `unlock` (with breaking), and the verdict's lock check (with release or
 > keep), each returning the register entries it decided, applied unconditionally; its oracle FSFS's lock rules
 > transcribed, equal on generated histories; `cargo test -p slates-svn --lib` 74 of 74 on the Mac Studio (see A-602).
