@@ -1,0 +1,980 @@
+//! A rebased work's journal is restated so a volume with real inodes replays it as the green reads the work (A-663;
+//! §4.16 "Rebase, the only corrective path"; A-646's decision, a hard link names its node; POSIX `link`, `unlink` and
+//! `rename`). A clean rebase hands the work its declared operations restated over the head (`Rebased::journal`): the
+//! work keeps them as its journal, a volume with real inodes would replay them, and the work's next submit composes
+//! them again (`crate::increment`). A hard link names the node standing at its target when it is made, so a restated
+//! link must still meet that node where the restatement makes it: after the work made the node, and before any rename
+//! or removal of the work moves the node away from the name the link names it by, or removes it there.
+//!
+//! The oracle reads a state as a reader of a volume does: each name's bytes and every name of its node. The work's own
+//! operations, applied in their own order over the head to a model with real inodes (every name names a node, every
+//! name of a node reads its bytes, a node goes with its last name), give what three other readings must equal: the
+//! green that accepts the work, the restated journal replayed over the head into the same model, and the green that
+//! accepts that journal composed again (the rebased work's next submit, as the server makes it).
+//!
+//! The works keep to what the deriver composes as a volume with real inodes replays it. That leaves out two kinds of
+//! composition, each filed open in GAPS with this change. A name freed and then made a file again, and a file the work
+//! made renamed over a name that holds something, compose to an edit of that name's node in place, so a hard link
+//! naming the node reads the new bytes. And a file the work wrote to, then removed or renamed over while a hard link
+//! names its node, composes to the removal alone, so the link reads the head's bytes and the write is lost: the
+//! oracle's first run found it (Windows x86_64, jupiter, 2026-11-19: `[(31, 13, 0), (22, 88, 0)]`, an append to
+//! `TARGET` and its removal, `LINK` read without the append in all three readings). The works make no rename onto a
+//! hard link the work made either, which the deriver refuses (`PathKindConflict`).
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+
+use proptest::prelude::*;
+use proptest::test_runner::{Config, TestCaseError, TestRunner};
+
+use super::{Green, Increment, Outcome, Rebased};
+use crate::increment::{DeriveError, VolumeOp, compose_volume_planned};
+use crate::ops_doc::OpKind;
+use crate::origin::Origin;
+
+/// Shape: the fixture's files the works change, the base's hard link naming `TARGET`, and the file only the head
+/// changes.
+const FILE: &str = "f";
+/// Shape: see `FILE`.
+const TARGET: &str = "g";
+/// Shape: see `FILE`.
+const LINK: &str = "h";
+/// Shape: see `FILE`.
+const ELSEWHERE: &str = "z";
+/// Shape: the names the generated works use: the base's `FILE`, `TARGET` and `LINK`, and three free at the base.
+const NAMES: [&str; 6] = [FILE, TARGET, LINK, "l", "m", "n"];
+/// Shape: the increment identities of the head's version, a work, and a work's restated journal composed again.
+const HEAD_WORK: u8 = 0xEE;
+/// Shape: see `HEAD_WORK`.
+const WORK: u8 = 0x01;
+/// Shape: see `HEAD_WORK`.
+const RESTATED: u8 = 0x02;
+
+/// What a reader of a volume sees: each name's bytes (`None` for a hard link whose home holds no file) and every name
+/// of its node.
+type Seen = BTreeMap<String, (Option<Vec<u8>>, BTreeSet<String>)>;
+
+/// What `seen` holds at one name.
+type Reading = (Option<Vec<u8>>, BTreeSet<String>);
+
+/// A volume with real inodes, as POSIX names files: each name names a node, every name of a node reads its bytes, and
+/// a node goes with its last name.
+#[derive(Clone, Debug, Default)]
+struct Inodes {
+  /// Each name and the number of the node it names.
+  names: BTreeMap<String, usize>,
+  /// Each node's bytes, by number.
+  nodes: Vec<Vec<u8>>,
+}
+
+impl Inodes {
+  /// `green`'s head as a volume: each file a node, each hard link a name of its home's node.
+  fn of(green: &Green) -> Inodes {
+    let mut volume = Inodes::default();
+    for (path, bytes) in green.files() {
+      let node = volume.nodes.len();
+      volume.names.insert(path, node);
+      volume.nodes.push(bytes.to_vec());
+    }
+    for (link, home) in green.hardlinks.iter() {
+      if let Some(node) = volume.names.get(home.as_str()).copied() {
+        volume.names.insert(link, node);
+      }
+    }
+    volume
+  }
+
+  /// The node `path` names.
+  fn node(&self, path: &str) -> Result<usize, String> {
+    self
+      .names
+      .get(path)
+      .copied()
+      .ok_or_else(|| format!("{path} names nothing"))
+  }
+
+  /// The bytes of the node `path` names.
+  fn bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+    let node = self.node(path)?;
+    self
+      .nodes
+      .get(node)
+      .cloned()
+      .ok_or_else(|| format!("{path}'s node is not held"))
+  }
+
+  /// Refuses a name already held, as `link` and `creat` with `O_EXCL` refuse one (`EEXIST`).
+  fn free(&self, path: &str) -> Result<(), String> {
+    if self.names.contains_key(path) {
+      return Err(format!("{path} is held"));
+    }
+    Ok(())
+  }
+
+  /// A new node at the free name `path`, holding `bytes`.
+  fn create(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+    self.free(path)?;
+    let node = self.nodes.len();
+    self.names.insert(path.to_owned(), node);
+    self.nodes.push(bytes.to_vec());
+    Ok(())
+  }
+
+  /// Node `node`'s bytes made `bytes`.
+  fn write(&mut self, node: usize, bytes: Vec<u8>) -> Result<(), String> {
+    *self
+      .nodes
+      .get_mut(node)
+      .ok_or("a written node is not held")? = bytes;
+    Ok(())
+  }
+
+  /// `bytes` written at the end of the node `path` names.
+  fn append(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let node = self.node(path)?;
+    let mut grown = self.bytes(path)?;
+    grown.extend_from_slice(bytes);
+    self.write(node, grown)
+  }
+
+  /// The free name `path` made a name of the node `target` names (`link`).
+  fn link(&mut self, path: &str, target: &str) -> Result<(), String> {
+    let node = self.node(target)?;
+    self.free(path)?;
+    self.names.insert(path.to_owned(), node);
+    Ok(())
+  }
+
+  /// The name `path` removed (`unlink`): its node goes with its last name.
+  fn unlink(&mut self, path: &str) -> Result<(), String> {
+    match self.names.remove(path) {
+      Some(_) => Ok(()),
+      None => Err(format!("{path} names nothing to unlink")),
+    }
+  }
+
+  /// The name `from` moved to `to`, replacing what `to` names (`rename`); nothing changes when both name one node.
+  fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+    let node = self.node(from)?;
+    if self.names.get(to) != Some(&node) {
+      self.names.remove(from);
+      self.names.insert(to.to_owned(), node);
+    }
+    Ok(())
+  }
+
+  /// A namespace operation of a restated journal, applied (its content operations are `replay`'s).
+  fn apply(&mut self, op: &VolumeOp) -> Result<(), String> {
+    match op {
+      VolumeOp::Create { path } => self.create(path, &[]),
+      VolumeOp::Unlink { path } => self.unlink(path),
+      VolumeOp::Rename { from, to } => self.rename(from, to),
+      VolumeOp::Link { path, target } => self.link(path, target),
+      other => Err(format!("a restatement these works never need: {other:?}")),
+    }
+  }
+
+  /// Each name's bytes, owned: the files a seal reads.
+  fn files(&self) -> BTreeMap<String, Vec<u8>> {
+    self
+      .names
+      .iter()
+      .filter_map(|(name, node)| Some((name.clone(), self.nodes.get(*node)?.clone())))
+      .collect()
+  }
+
+  /// What a reader sees.
+  fn seen(&self) -> Seen {
+    let mut names: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+    for (name, node) in &self.names {
+      names.entry(*node).or_default().insert(name.clone());
+    }
+    let mut seen = Seen::new();
+    for (node, all) in names {
+      let bytes = self.nodes.get(node).cloned();
+      for name in &all {
+        seen.insert(name.clone(), (bytes.clone(), all.clone()));
+      }
+    }
+    seen
+  }
+}
+
+/// What a reader of `green`'s head sees (A-646: a node is its home, the path holding its bytes, and the hard links
+/// naming it there).
+fn seen_in(green: &Green) -> Seen {
+  let mut names: BTreeMap<String, BTreeSet<String>> = green
+    .files()
+    .map(|(path, _)| (path.clone(), BTreeSet::from([path])))
+    .collect();
+  for (link, home) in green.hardlinks.iter() {
+    names.entry(home.clone()).or_default().insert(link);
+  }
+  let mut seen = Seen::new();
+  for (home, all) in names {
+    let bytes = green.content(&home).map(<[u8]>::to_vec);
+    for name in &all {
+      seen.insert(name.clone(), (bytes.clone(), all.clone()));
+    }
+  }
+  seen
+}
+
+/// One operation of a work, as its agent made it in its own volume.
+#[derive(Clone, Debug)]
+enum Step {
+  /// A new file at a free name, holding the bytes.
+  Create(String, Vec<u8>),
+  /// The bytes written at the end of the file a name names.
+  Append(String, Vec<u8>),
+  /// The name removed.
+  Unlink(String),
+  /// The first name moved to the second.
+  Rename(String, String),
+  /// The first name, free, made a hard link to the node the second names.
+  Link(String, String),
+}
+
+impl Step {
+  /// The step applied to `volume`.
+  fn apply(&self, volume: &mut Inodes) -> Result<(), String> {
+    match self {
+      Step::Create(path, bytes) => volume.create(path, bytes),
+      Step::Append(path, bytes) => volume.append(path, bytes),
+      Step::Unlink(path) => volume.unlink(path),
+      Step::Rename(from, to) => volume.rename(from, to),
+      Step::Link(path, target) => volume.link(path, target),
+    }
+  }
+
+  /// The operations the work's journal declares for the step over `volume` as it stands before it (§4.5): a write past
+  /// a file's end is `Extend` at its length then.
+  fn declared(&self, volume: &Inodes) -> Result<Vec<VolumeOp>, String> {
+    Ok(match self {
+      Step::Create(path, bytes) => vec![
+        VolumeOp::Create { path: path.clone() },
+        VolumeOp::Extend {
+          path: path.clone(),
+          at: 0,
+          len: length(bytes)?,
+        },
+      ],
+      Step::Append(path, bytes) => vec![VolumeOp::Extend {
+        path: path.clone(),
+        at: length(&volume.bytes(path)?)?,
+        len: length(bytes)?,
+      }],
+      Step::Unlink(path) => vec![VolumeOp::Unlink { path: path.clone() }],
+      Step::Rename(from, to) => vec![VolumeOp::Rename {
+        from: from.clone(),
+        to: to.clone(),
+      }],
+      Step::Link(path, target) => vec![VolumeOp::Link {
+        path: path.clone(),
+        target: target.clone(),
+      }],
+    })
+  }
+}
+
+/// A length as a journal counts it.
+fn length(bytes: &[u8]) -> Result<u64, String> {
+  u64::try_from(bytes.len()).map_err(|error| error.to_string())
+}
+
+/// A work's steps applied in its own volume over `base`, and the journal they declare.
+fn declare(base: &Inodes, steps: &[Step]) -> Result<(Inodes, Vec<VolumeOp>), String> {
+  let mut volume = base.clone();
+  let mut journal = Vec::new();
+  for step in steps {
+    journal.extend(step.declared(&volume)?);
+    step.apply(&mut volume)?;
+  }
+  Ok((volume, journal))
+}
+
+/// The increment `id` composing `journal` over `green`'s version `base` (its restricted base, `Green::base_for`), each
+/// run of its post-state read from `files` (each name's bytes at the seal) where the deriver's plan puts it, as the
+/// server's seal assembles one; the deriver's refusal when it refuses the journal.
+fn compose(
+  green: &Green,
+  (base, id): (u64, u8),
+  journal: &[VolumeOp],
+  files: &BTreeMap<String, Vec<u8>>,
+) -> Result<Result<Increment, DeriveError>, String> {
+  let (doc, plan) = match compose_volume_planned(&green.base_for(base, journal), journal) {
+    Ok(planned) => planned,
+    Err(refused) => return Ok(Err(refused)),
+  };
+  let mut post_state = Vec::new();
+  for op in doc.ops.iter().filter(|op| adds_bytes(op.kind)) {
+    let path = doc
+      .paths
+      .path(op.path)
+      .ok_or("an operation names no path")?;
+    let run = run_of(files.get(path), plan.get(&op.src), op.len)
+      .ok_or_else(|| format!("{path}'s run is not in its file"))?;
+    lay(&mut post_state, op.src, run)?;
+  }
+  Ok(Ok(Increment {
+    id: [id; 32],
+    base,
+    doc,
+    post_state,
+    evidence: Vec::new(),
+  }))
+}
+
+/// Whether an operation of `kind` adds bytes from the post-state.
+fn adds_bytes(kind: OpKind) -> bool {
+  matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend)
+}
+
+/// The `len` bytes at `from` in `file`: a run as a seal reads it.
+fn run_of<'a>(file: Option<&'a Vec<u8>>, from: Option<&u64>, len: u64) -> Option<&'a [u8]> {
+  let start = usize::try_from(*from?).ok()?;
+  let end = start.checked_add(usize::try_from(len).ok()?)?;
+  file?.get(start..end)
+}
+
+/// `run` laid into `post_state` at `at`, the post-state grown to hold it.
+fn lay(post_state: &mut Vec<u8>, at: u64, run: &[u8]) -> Result<(), String> {
+  let start = usize::try_from(at).map_err(|error| error.to_string())?;
+  let end = start
+    .checked_add(run.len())
+    .ok_or("a run past the address space")?;
+  if post_state.len() < end {
+    post_state.resize(end, 0);
+  }
+  post_state
+    .get_mut(start..end)
+    .ok_or("a run outside the post-state")?
+    .copy_from_slice(run);
+  Ok(())
+}
+
+/// The fixture at version 0, the works' base: `FILE`, `TARGET` and `ELSEWHERE`, each holding its own name, and `LINK`
+/// a hard link to `TARGET`.
+fn base_green() -> Green {
+  let mut origin = Origin::default();
+  for path in [FILE, TARGET, ELSEWHERE] {
+    origin
+      .files
+      .push((path.to_owned(), format!("<{path}>\n").into_bytes()));
+  }
+  origin.hardlinks.push((LINK.to_owned(), TARGET.to_owned()));
+  Green::with_origin(origin)
+}
+
+/// The fixture at its head, version 1, where `ELSEWHERE` was appended to, so a work based at 0 is rebased past a
+/// version it did not see; with the volume at version 0, where the works start.
+fn fixture() -> Result<(Green, Inodes), String> {
+  let mut green = base_green();
+  let base = Inodes::of(&green);
+  let appended = Step::Append(ELSEWHERE.to_owned(), b"<z+>\n".to_vec());
+  let (volume, journal) = declare(&base, &[appended])?;
+  let increment = compose(&green, (0, HEAD_WORK), &journal, &volume.files())?
+    .map_err(|refused| format!("the head's work does not compose: {refused:?}"))?;
+  match green.submit(&increment) {
+    Outcome::Accepted { version: 1 } => Ok((green, base)),
+    other => Err(format!("the head's work was answered {other:?}")),
+  }
+}
+
+/// What a clean rebase hands the work: its new base, the files it holds over it, and its journal restated.
+struct Restatement {
+  version: u64,
+  changed: BTreeMap<String, Option<Vec<u8>>>,
+  journal: Vec<VolumeOp>,
+}
+
+impl Restatement {
+  /// The bytes the rebased work holds at `path`: its own where it changed them, else the head's.
+  fn bytes(&self, head: &Inodes, path: &str) -> Result<Vec<u8>, String> {
+    match self.changed.get(path) {
+      Some(Some(bytes)) => Ok(bytes.clone()),
+      Some(None) => Err(format!("{path} is written and removed")),
+      None => head.bytes(path),
+    }
+  }
+
+  /// The rebased work's files: the head's, with its changes over them.
+  fn files(&self, head: &Inodes) -> BTreeMap<String, Vec<u8>> {
+    let mut files = head.files();
+    for (path, after) in &self.changed {
+      match after {
+        Some(bytes) => files.insert(path.clone(), bytes.clone()),
+        None => files.remove(path),
+      };
+    }
+    files
+  }
+}
+
+/// The name a content operation writes; `None` for a namespace operation.
+fn written_name(op: &VolumeOp) -> Option<&str> {
+  match op {
+    VolumeOp::Overwrite { path, .. }
+    | VolumeOp::Extend { path, .. }
+    | VolumeOp::Truncate { path, .. }
+    | VolumeOp::Insert { path, .. }
+    | VolumeOp::Delete { path, .. } => Some(path),
+    _ => None,
+  }
+}
+
+/// The restated journal replayed over the head's volume `head`, as a volume with real inodes replays it, each node a
+/// content operation writes taking the bytes the rebased work holds at the name written.
+fn replay(head: &Inodes, restated: &Restatement) -> Result<Inodes, String> {
+  let mut volume = head.clone();
+  let mut written = Vec::new();
+  for op in &restated.journal {
+    match written_name(op) {
+      Some(path) => written.push((volume.node(path)?, path)),
+      None => volume.apply(op)?,
+    }
+  }
+  for (node, path) in written {
+    volume.write(node, restated.bytes(head, path)?)?;
+  }
+  Ok(volume)
+}
+
+/// What a reader sees of a second fixture's green once it accepts the restated journal composed again over the head,
+/// its post-state read from the rebased work's files: the rebased work's next submit, as the server makes it.
+fn resubmitted(head: &Inodes, restated: &Restatement) -> Result<Seen, String> {
+  let (mut green, _) = fixture()?;
+  let files = restated.files(head);
+  let increment = compose(
+    &green,
+    (restated.version, RESTATED),
+    &restated.journal,
+    &files,
+  )?
+  .map_err(|refused| format!("the restated journal does not compose: {refused:?}"))?;
+  match green.submit(&increment) {
+    Outcome::Accepted { .. } => Ok(seen_in(&green)),
+    other => Err(format!("the restated journal was answered {other:?}")),
+  }
+}
+
+/// The work's own operations applied in their own order over the head's volume `head`, as a reader sees the result.
+fn own_order(head: &Inodes, steps: &[Step]) -> Result<Seen, String> {
+  let mut volume = head.clone();
+  for step in steps {
+    step.apply(&mut volume)?;
+  }
+  Ok(volume.seen())
+}
+
+/// One reading of a rebased work: what it is, and what a reader saw there or why nothing could be read.
+type Found<'a> = (&'a str, Result<Seen, String>);
+
+/// Holds every reading to what the work's own order gives, naming each that differs or could not be read, so a red
+/// run shows every reading a defect reaches.
+fn agree(own: &Seen, readings: [Found<'_>; 3]) -> Result<(), String> {
+  let differing: Vec<String> = readings
+    .into_iter()
+    .filter_map(|(reading, seen)| match seen {
+      Ok(seen) if seen == *own => None,
+      Ok(seen) => Some(format!("{reading} reads {seen:?}")),
+      Err(error) => Some(format!("{reading}: {error}")),
+    })
+    .collect();
+  if differing.is_empty() {
+    return Ok(());
+  }
+  Err(format!(
+    "{}; the work's own order reads {own:?}",
+    differing.join("; ")
+  ))
+}
+
+/// How one work came out of the oracle.
+#[derive(Debug)]
+enum Restated {
+  /// The deriver refused its journal: a composition owed, typed (`DeriveError`).
+  Refused,
+  /// The verdict refused its rebase, and its submit alike.
+  Conflict,
+  /// It rebased, and the four readings agreed on what a reader sees, given here.
+  Agreed(Seen),
+}
+
+/// The oracle on one work, its `steps` based at the fixture's version 0 and rebased past version 1: the green that
+/// accepts it, its restated journal replayed over the head, and the green that accepts that journal composed again
+/// must each read as the work's own operations in their own order over the head.
+fn restate(steps: &[Step]) -> Result<Restated, String> {
+  let (mut green, base) = fixture()?;
+  let head = Inodes::of(&green);
+  let (volume, journal) = declare(&base, steps)?;
+  let Ok(increment) = compose(&green, (0, WORK), &journal, &volume.files())? else {
+    return Ok(Restated::Refused);
+  };
+  let own = own_order(&head, steps)?;
+  let rebased = green.rebase(&increment);
+  match (rebased, green.submit(&increment)) {
+    (
+      Rebased::Rebased {
+        version,
+        changed,
+        journal,
+      },
+      Outcome::Accepted { .. },
+    ) => {
+      let restated = Restatement {
+        version,
+        changed,
+        journal,
+      };
+      agree(
+        &own,
+        [
+          ("the green that accepts the work", Ok(seen_in(&green))),
+          (
+            "the restated journal replayed",
+            replay(&head, &restated).map(|volume| volume.seen()),
+          ),
+          (
+            "the green that accepts it composed again",
+            resubmitted(&head, &restated),
+          ),
+        ],
+      )?;
+      Ok(Restated::Agreed(own))
+    }
+    (Rebased::Conflict { .. }, Outcome::Conflict { .. }) => Ok(Restated::Conflict),
+    (rebased, submitted) => Err(format!(
+      "the rebase answered {rebased:?} and the submit {submitted:?}"
+    )),
+  }
+}
+
+/// A link step.
+fn link(path: &str, target: &str) -> Step {
+  Step::Link(path.to_owned(), target.to_owned())
+}
+
+/// A rename step.
+fn rename(from: &str, to: &str) -> Step {
+  Step::Rename(from.to_owned(), to.to_owned())
+}
+
+/// A removal step.
+fn unlink(path: &str) -> Step {
+  Step::Unlink(path.to_owned())
+}
+
+/// The four readings of `steps`, agreed.
+fn agreed(steps: &[Step]) -> Result<Seen, String> {
+  match restate(steps)? {
+    Restated::Agreed(seen) => Ok(seen),
+    other => Err(format!("{other:?}")),
+  }
+}
+
+/// Holds what `seen` reads at `name`: `bytes`, on a node `names` alone name.
+fn reads(seen: &Seen, name: &str, (bytes, names): (&[u8], &[&str])) -> Result<(), String> {
+  let expected: Reading = (
+    Some(bytes.to_vec()),
+    names.iter().map(|other| (*other).to_owned()).collect(),
+  );
+  match seen.get(name) {
+    Some(found) if *found == expected => Ok(()),
+    found => Err(format!("{name} reads {found:?}, not {expected:?}")),
+  }
+}
+
+/// Holds that nothing stands at `name`.
+fn absent(seen: &Seen, name: &str) -> Result<(), String> {
+  match seen.get(name) {
+    None => Ok(()),
+    Some(found) => Err(format!("{name} reads {found:?}, not nothing")),
+  }
+}
+
+/// A-663, the first case (POSIX: `ln g l; mv f g` keeps `l` on `g`'s old file). Do: rebase a work, based behind the
+/// head, that links `l` to `TARGET` and then renames `FILE` over `TARGET`. Expect the four readings to agree: `l` on
+/// `TARGET`'s old node with `LINK`, its bytes `<g>`, and `TARGET` holding `FILE`'s bytes alone. Before, the link was
+/// restated after the rename: the replay put `l` on `FILE`'s node, and the journal composed again named it too.
+#[test]
+fn a_link_made_before_a_rename_onto_its_target_stays_on_the_old_node() -> Result<(), String> {
+  let seen = agreed(&[link("l", TARGET), rename(FILE, TARGET)])?;
+  reads(&seen, "l", (b"<g>\n", &[LINK, "l"]))?;
+  reads(&seen, TARGET, (b"<f>\n", &[TARGET]))
+}
+
+/// A-663, the second case (A-646: a link to the node a work renamed there names the rename's source). Do: rebase a
+/// work that renames `FILE` to `m` and then links `l` to `m`. Expect the four readings to agree: `l` and `m` one node
+/// holding `FILE`'s bytes, and nothing at `FILE`. Before, the link was restated after the rename, naming `FILE`, which
+/// the rename had emptied, so a volume refused it.
+#[test]
+fn a_link_to_a_node_the_work_renamed_is_restated_before_the_rename() -> Result<(), String> {
+  let seen = agreed(&[rename(FILE, "m"), link("l", "m")])?;
+  reads(&seen, "l", (b"<f>\n", &["l", "m"]))?;
+  absent(&seen, FILE)
+}
+
+/// A-663, the second case's other order (`ln f l; mv f m`: a link names the node, which the rename moves). Do: rebase a
+/// work that links `l` to `FILE` and then renames `FILE` to `m`. Expect the four readings to agree: `l` and `m` one
+/// node holding `FILE`'s bytes, and nothing at `FILE`. Before, the link was restated after the rename, naming the
+/// emptied `FILE`.
+#[test]
+fn a_link_made_before_its_node_is_renamed_follows_it() -> Result<(), String> {
+  let seen = agreed(&[link("l", FILE), rename(FILE, "m")])?;
+  reads(&seen, "m", (b"<f>\n", &["l", "m"]))?;
+  absent(&seen, FILE)
+}
+
+/// A-663, the third case (`ln f l; rm f`: a node stays with its last name). Do: rebase a work that links `l` to `FILE`
+/// and then removes `FILE`. Expect the four readings to agree: `l` alone holding `FILE`'s bytes, and nothing at
+/// `FILE`. Before, the link was restated after the removal, naming an emptied name.
+#[test]
+fn a_link_to_a_node_the_work_removes_keeps_the_node() -> Result<(), String> {
+  let seen = agreed(&[link("l", FILE), unlink(FILE)])?;
+  reads(&seen, "l", (b"<f>\n", &["l"]))?;
+  absent(&seen, FILE)
+}
+
+/// A-663, a fourth case found with it (POSIX `link` refuses a name already held). Do: rebase a work that removes the
+/// base's link `LINK` and links `LINK` to `FILE`. Expect the four readings to agree: `LINK` and `FILE` one node holding
+/// `FILE`'s bytes, and `TARGET` alone with its own. Before, the link was restated with no removal of the head's
+/// `LINK`: a volume refused the name, and the deriver refused the journal (`LinkOverExisting`), so the rebased work
+/// could not submit again.
+#[test]
+fn a_link_made_again_over_the_heads_link_is_restated_with_its_removal() -> Result<(), String> {
+  let seen = agreed(&[unlink(LINK), link(LINK, FILE)])?;
+  reads(&seen, LINK, (b"<f>\n", &[FILE, LINK]))?;
+  reads(&seen, TARGET, (b"<g>\n", &[TARGET]))
+}
+
+/// What the works' links met, counted over the works the oracle checked: the census that shows each case ran.
+#[derive(Clone, Copy, Debug, Default)]
+struct Census {
+  /// A link to a node, then a rename over the name it was linked by (`ln g l; mv f g`).
+  replaced: u64,
+  /// A node renamed, then a link to it (`mv f m; ln m l`).
+  renamed_then_linked: u64,
+  /// A link to a node, then a rename of it (`ln f l; mv f m`).
+  linked_then_renamed: u64,
+  /// A link to a node, then a removal of its file's name (`ln f l; rm f`).
+  removed: u64,
+  /// The base's link removed and made again (`rm h; ln f h`).
+  made_again: u64,
+  /// A link to a file the work made.
+  to_made: u64,
+  /// Works whose four readings agreed (shown, not required).
+  agreed: u64,
+  /// Works the deriver refused: compositions owed, typed (shown, not required).
+  refused: u64,
+  /// Works the verdict refused, rebased and submitted alike (shown, not required).
+  conflicts: u64,
+}
+
+impl Census {
+  /// Counts what the oracle found of one work: its own census when it agreed.
+  fn count(&mut self, found: &Restated, work: &Census) {
+    match found {
+      Restated::Agreed(_) => {
+        self.agreed += 1;
+        self.replaced += work.replaced;
+        self.renamed_then_linked += work.renamed_then_linked;
+        self.linked_then_renamed += work.linked_then_renamed;
+        self.removed += work.removed;
+        self.made_again += work.made_again;
+        self.to_made += work.to_made;
+      }
+      Restated::Refused => self.refused += 1,
+      Restated::Conflict => self.conflicts += 1,
+    }
+  }
+
+  /// Whether every case was met.
+  fn met(&self) -> bool {
+    [
+      self.replaced,
+      self.renamed_then_linked,
+      self.linked_then_renamed,
+      self.removed,
+      self.made_again,
+      self.to_made,
+    ]
+    .iter()
+    .all(|&count| count > 0)
+  }
+}
+
+/// Shape: a generated step, a selector (weighted in `Draft::take`) and two choices among the names the step may use.
+type Raw = (u8, u8, u8);
+
+/// The name `choice` picks among `names`.
+fn pick(names: &[&'static str], choice: u8) -> Option<&'static str> {
+  let count = names.len().max(1);
+  names.get(usize::from(choice) % count).copied()
+}
+
+/// A work being generated: its own volume over the base, its steps, and what each name has held, so the work keeps to
+/// what the deriver composes as a volume with real inodes replays it (the module docs say what that leaves out).
+struct Draft {
+  volume: Inodes,
+  steps: Vec<Step>,
+  /// Every name that has held something, at the base or in the work.
+  used: BTreeSet<String>,
+  /// The names holding a file the deriver tracks as one: a base file, one the work made, one renamed there.
+  files: BTreeSet<String>,
+  /// The names holding a hard link: the base's, or one the work made.
+  links: BTreeSet<String>,
+  /// Every name the work made a hard link at.
+  made_links: BTreeSet<String>,
+  /// The names free now whose last occupant was a hard link, where a link may be made again.
+  link_freed: BTreeSet<String>,
+  /// The nodes the work made.
+  created: BTreeSet<usize>,
+  /// The nodes the work appended to.
+  edited: BTreeSet<usize>,
+  /// The nodes the work linked to, and those it renamed, for the census.
+  linked: BTreeSet<usize>,
+  moved: BTreeSet<usize>,
+  census: Census,
+}
+
+impl Draft {
+  /// The work `raws` generate over the fixture's base.
+  fn of(raws: &[Raw]) -> Result<Draft, String> {
+    let owned = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+    let mut draft = Draft {
+      volume: Inodes::of(&base_green()),
+      steps: Vec::new(),
+      used: owned(&[FILE, TARGET, LINK]),
+      files: owned(&[FILE, TARGET]),
+      links: owned(&[LINK]),
+      made_links: BTreeSet::new(),
+      link_freed: BTreeSet::new(),
+      created: BTreeSet::new(),
+      edited: BTreeSet::new(),
+      linked: BTreeSet::new(),
+      moved: BTreeSet::new(),
+      census: Census::default(),
+    };
+    for raw in raws {
+      draft.take(*raw)?;
+    }
+    Ok(draft)
+  }
+
+  /// The names of `NAMES` that `keep` keeps.
+  fn names(&self, keep: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    NAMES.into_iter().filter(|name| keep(name)).collect()
+  }
+
+  /// Whether `name` holds something in the work's volume.
+  fn holds(&self, name: &str) -> bool {
+    self.volume.names.contains_key(name)
+  }
+
+  /// The step `raw` names, when the work has names it may use: counted, tracked, applied and kept.
+  fn take(&mut self, (selector, first, second): Raw) -> Result<(), String> {
+    let index = self.steps.len();
+    let step = match selector % 10 {
+      0 => self.create(first, index),
+      1 => self.append(first, index),
+      2 | 3 => self.unlink(first),
+      4..=6 => self.rename(first, second),
+      _ => self.link(first, second),
+    };
+    let Some(step) = step else {
+      return Ok(());
+    };
+    self.meet(&step);
+    self.track(&step);
+    step.apply(&mut self.volume)?;
+    self.steps.push(step);
+    Ok(())
+  }
+
+  /// A new file at a name never used.
+  fn create(&self, choice: u8, index: usize) -> Option<Step> {
+    let path = pick(&self.names(|name| !self.used.contains(name)), choice)?;
+    let bytes = format!("<{path} {index}>\n").into_bytes();
+    Some(Step::Create(path.to_owned(), bytes))
+  }
+
+  /// Bytes appended to a file (a write through a hard link is a composition owed, `ContentOnMissing`).
+  fn append(&self, choice: u8, index: usize) -> Option<Step> {
+    let path = pick(&self.names(|name| self.files.contains(name)), choice)?;
+    Some(Step::Append(
+      path.to_owned(),
+      format!("<+{index}>\n").into_bytes(),
+    ))
+  }
+
+  /// A name that holds something removed; never the file of a node the work wrote to while another name names it
+  /// ([`Draft::strands_an_edit`]).
+  fn unlink(&self, choice: u8) -> Option<Step> {
+    let path = pick(
+      &self.names(|name| self.holds(name) && !self.strands_an_edit(name)),
+      choice,
+    )?;
+    Some(Step::Unlink(path.to_owned()))
+  }
+
+  /// A file renamed (a link's rename is a composition owed, `RenameMissingSource`).
+  fn rename(&self, first: u8, second: u8) -> Option<Step> {
+    let from = pick(&self.names(|name| self.files.contains(name)), first)?;
+    let to = pick(&self.names(|name| self.may_rename(from, name)), second)?;
+    Some(Step::Rename(from.to_owned(), to.to_owned()))
+  }
+
+  /// A hard link made to what a name holds.
+  fn link(&self, first: u8, second: u8) -> Option<Step> {
+    let path = pick(&self.names(|name| self.may_link_at(name)), first)?;
+    let target = pick(&self.names(|name| self.holds(name)), second)?;
+    Some(Step::Link(path.to_owned(), target.to_owned()))
+  }
+
+  /// Whether the file at `from` may be renamed onto `to` as the deriver composes a volume's rename: onto a name never
+  /// used, or onto a file or the base's link from a node the work did not make; never onto a link the work made, nor
+  /// over the file of a node the work wrote to while another name names it ([`Draft::strands_an_edit`]). (A file the
+  /// work made renamed over a name composes to an edit of that name's node in place, filed open; the deriver refuses a
+  /// rename onto a link the work made, `PathKindConflict`, so such works would only be counted refused.)
+  fn may_rename(&self, from: &str, to: &str) -> bool {
+    if to == from || self.made_links.contains(to) || self.strands_an_edit(to) {
+      return false;
+    }
+    if !self.holds(to) {
+      return !self.used.contains(to);
+    }
+    let made = self
+      .volume
+      .names
+      .get(from)
+      .is_some_and(|node| self.created.contains(node));
+    !made && (self.files.contains(to) || self.links.contains(to))
+  }
+
+  /// Whether a hard link may be made at `name`: free, and never used or last a link's (a link at a name a file left
+  /// is refused by the deriver, `UnlinkMissing`).
+  fn may_link_at(&self, name: &str) -> bool {
+    !self.holds(name) && (!self.used.contains(name) || self.link_freed.contains(name))
+  }
+
+  /// Whether removing or replacing what `name` holds would leave a node the work wrote to at another name: `name` holds
+  /// the node's file, the work appended to the node, and a hard link names it too. The deriver composes that removal
+  /// alone, dropping the node's writes, and the green hands the link the head's bytes (`Green::hand_over`), so the
+  /// writes are lost: filed open with this change (the module docs), and left out of the works until composed.
+  fn strands_an_edit(&self, name: &str) -> bool {
+    let Some(&node) = self.volume.names.get(name) else {
+      return false;
+    };
+    let named_elsewhere = self
+      .volume
+      .names
+      .iter()
+      .any(|(other, &named)| other != name && named == node);
+    self.files.contains(name) && self.edited.contains(&node) && named_elsewhere
+  }
+
+  /// What `step` makes of each name's kind, as the deriver reads them; before it applies.
+  fn track(&mut self, step: &Step) {
+    match step {
+      Step::Create(path, _) => {
+        self.created.insert(self.volume.nodes.len());
+        self.used.insert(path.clone());
+        self.files.insert(path.clone());
+      }
+      Step::Append(path, _) => self.edited.extend(self.volume.names.get(path).copied()),
+      Step::Unlink(path) => {
+        self.files.remove(path);
+        if self.links.remove(path) {
+          self.link_freed.insert(path.clone());
+        }
+      }
+      Step::Rename(from, to) => self.track_rename(from, to),
+      Step::Link(path, _) => {
+        self.used.insert(path.clone());
+        self.links.insert(path.clone());
+        self.made_links.insert(path.clone());
+        self.link_freed.remove(path);
+      }
+    }
+  }
+
+  /// A rename's kinds: the file moves to `to`, replacing what it held; nothing changes when both name one node.
+  fn track_rename(&mut self, from: &str, to: &str) {
+    if self.volume.names.get(from) == self.volume.names.get(to) {
+      return;
+    }
+    self.files.remove(from);
+    self.links.remove(to);
+    self.files.insert(to.to_owned());
+    self.used.insert(to.to_owned());
+  }
+
+  /// Counts what `step` meets of the work's links; before it applies.
+  fn meet(&mut self, step: &Step) {
+    let node = |name: &str| self.volume.names.get(name).copied();
+    match step {
+      Step::Link(path, target) => {
+        let target = node(target);
+        let again = path == LINK && self.link_freed.contains(LINK);
+        self.meet_link(target, again);
+      }
+      Step::Rename(from, to) => {
+        let (from, to) = (node(from), node(to));
+        self.meet_rename(from, to);
+      }
+      Step::Unlink(path) => {
+        let removed =
+          self.files.contains(path) && node(path).is_some_and(|n| self.linked.contains(&n));
+        self.census.removed += u64::from(removed);
+      }
+      Step::Create(..) | Step::Append(..) => {}
+    }
+  }
+
+  /// A link to `target`'s node; `again` where the base's link stood.
+  fn meet_link(&mut self, target: Option<usize>, again: bool) {
+    let moved = target.is_some_and(|n| self.moved.contains(&n));
+    let made = target.is_some_and(|n| self.created.contains(&n));
+    self.census.renamed_then_linked += u64::from(moved);
+    self.census.to_made += u64::from(made);
+    self.census.made_again += u64::from(again);
+    self.linked.extend(target);
+  }
+
+  /// A rename of `from`'s node over `to`'s.
+  fn meet_rename(&mut self, from: Option<usize>, to: Option<usize>) {
+    let renamed = from.is_some_and(|n| self.linked.contains(&n));
+    let replaced = to.is_some_and(|n| Some(n) != from && self.linked.contains(&n));
+    self.census.linked_then_renamed += u64::from(renamed);
+    self.census.replaced += u64::from(replaced);
+    self.moved.extend(from);
+  }
+}
+
+/// A-663's oracle. Do: generate works of up to eleven steps over the fixture's names (files made, appended to, removed
+/// and renamed, over files and over the base's link; hard links made to files and to links, before and after their
+/// nodes are renamed, renamed over or removed; the base's link removed and made again), each based at version 0 and
+/// rebased past the head's version 1. Expect each work the deriver composes to rebase as it submits, and, when clean,
+/// the four readings to agree: its own operations in their own order over the head, the green that accepts it, its
+/// restated journal replayed over the head, and the green that accepts that journal composed again; and the census to
+/// show every case met: a link before a rename over its name, before and after its node's rename, before its node's
+/// removal, made again where the base's stood, and to a file the work made.
+#[test]
+fn every_restated_work_reads_as_its_own_order() {
+  let census = RefCell::new(Census::default());
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config::default()));
+  let result = runner.run(&prop::collection::vec(any::<Raw>(), 1..12), |raws| {
+    let draft = Draft::of(&raws).map_err(TestCaseError::fail)?;
+    let found = restate(&draft.steps).map_err(TestCaseError::fail)?;
+    census.borrow_mut().count(&found, &draft.census);
+    Ok(())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  let census = census.into_inner();
+  // The figures the evidence quotes (`-- --nocapture`).
+  eprintln!("restate oracle census: {census:?}");
+  assert!(census.met(), "a case never met: {census:?}");
+}

@@ -11570,6 +11570,20 @@ The agent reads green's bytes for each window (a read of the named version), rew
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 
+> **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
+> restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
+> does the deriver composing the work's next submit. A hard link names the node at its target when it is made
+> (A-646), so each link is restated just before the first restated operation that moves its node away from the name
+> it names it by or removes it there (a rename from it or over it, a removal), after the operation that made its
+> node; every other operation keeps the verdict's order. A link made where the head holds another link is restated
+> after that link's removal, since a volume refuses a held name. Before, every link was restated after the renames
+> and removals: `ln g l; mv f g` replayed put `l` on `f`'s file, a link to a node the work renamed or removed named an
+> emptied name, and a link made again over the head's was refused when the rebased work composed its next submit
+> (`LinkOverExisting`). Tests: `crates/merge/src/engine/restate_tests.rs`, each case red first, and an oracle over
+> generated works holding four readings equal (the work's own order over the head with real inodes, the green that
+> accepts it, the restated journal replayed, and the green that accepts that journal composed again) with a census
+> of every case (`docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`).
+
 **Rebase off the owner (A-273): measured and rejected (A-528).** A work's rebase and its base reads at a named
 version are the green's owner's: a work's shard asks them of the owner's shard (A-247, A-388), which answers them on
 its one thread beside the verdicts. A-273 tried keeping a replica of the green on each shard that holds its works (the
@@ -46684,3 +46698,45 @@ Applied in the same change to:
   indexes; the open sliced where the rest or the refs are large; main's runs (filed): stock git over the view
   (`a_view_for_stock_git` prints a sealed view and its environment), the macOS unit run, the fixtures made again on the
   Studio, clippy, `xtask` and the docs.
+
+### A-663 — a rebased work restates each hard link where the node it names still stands (2026-11-19, g307, UI goal 93 (kiln 51cef9f7); §4.16 "Rebase, the only corrective path"; A-646's decision; found by A-646's sweep, g267)
+Applied in the same change to:
+- §4.16's rebase status; GAPS (the entry closed; three entries of siblings filed open);
+- `crates/merge/src/engine.rs`: `in_replay_order`, `link_places`, `removed_links`, `Effect::unhomes` and
+  `Effect::frees`; `Green::rebased_from` restating the effects in that order, and a link made where the head holds
+  another after that link's removal;
+- `crates/merge/src/engine/restate_tests.rs`, new;
+- `docs/bugs/2026-11-19-a-rebased-work-restated-its-links-after-moving-their-nodes.md`.
+- **The defect.** A clean rebase restated the verdict's effects in the verdict's order, renames, creates and removals
+  first and hard links last. The restated journal is the work's: a volume with real inodes replays it in order, and the
+  work's next submit composes it again. A link names the node at its target when it is made (A-646), so a link restated
+  after a rename or removal of its node met the name afterwards: `ln g l; mv f g` put `l` on `f`'s file, and the
+  journal composed again did too; a link to a node the work renamed (`mv f m; ln m l`, `ln f l; mv f m`) or removed
+  (`ln f l; rm f`) named an emptied name. Found with them: a link made where the head holds another (`rm h; ln f h`)
+  was restated with no removal of the head's, so the rebased work's next submit was refused `LinkOverExisting`.
+- **The rule.** The restatement is the work's own operations in an order a volume replays to the state the green
+  reads. Each link goes just before the first operation that moves its node away from the name it names it by or
+  removes it there (a rename from it or over it, a removal), and never before an operation that frees the link's own
+  name. Every other operation keeps the verdict's order, which makes a node before a link to it. A link made where the
+  head holds another follows that link's removal. The commit's node moves (`Green::node_moves`) stay the commit's: the
+  restated journal names no node by its home after the commit, only where it stands as the journal reaches it.
+- **Tests.** Each case is held to four readings of what a reader sees (each name's bytes and every name of its node),
+  which must agree: the work's own operations in their own order over the head in a model with real inodes, the green
+  that accepts the work, the restated journal replayed over the head in that model, and the green that accepts the
+  restated journal composed again (the server's next submit). Five cases, red first: the three of the GAPS entry, the
+  second in both orders, and the link made again over the head's. The oracle generates works over the same readings,
+  kept to what the deriver composes as a volume replays it, with a census requiring each case: a link before a rename
+  over its name, before and after its node's rename, before its node's removal, made again where the base's stood, and
+  to a file the work made.
+- **Evidence** (Windows x86_64, jupiter, 2026-11-19, debug; the Mac Studio offline, the macOS run owed). Red over
+  main's engine (`cargo test --locked -p slates-merge --lib restate_tests` at 91d14b44d): 6 of 6 failing, as the
+  defect says, and the oracle at `[(31, 13, 0), (22, 88, 0)]` on the lost write below, which its works now leave out.
+  Green over main at 78a670256 (`cargo test --locked -p slates-merge --lib`): 147 of 147, main's 141 and the 6 new; the
+  oracle's census over 256 works 153 agreed, 102 refused by the deriver, typed, 1 conflict, every case met (5, 32, 30,
+  13, 26 and 8 in the order above); `cargo fmt -p slates-merge -- --check` clean.
+- **Siblings found, not changed** (GAPS): the deriver composes a name's node replaced by a new file (unlinked and made
+  again, or a new file renamed over it) as an edit of that node in place, so a link naming it reads the new bytes; a
+  write to a file a hard link also names is lost when the work then removes the file or renames another over it (the
+  deriver composes the removal alone and the green hands the link the head's bytes; the oracle's first run found it,
+  so its works now leave it out); the restatement makes a symbolic link over the head's with no removal of it
+  (`SymlinkOverExisting` on the next submit), and directories after the files made in them.
