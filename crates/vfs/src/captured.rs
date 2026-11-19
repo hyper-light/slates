@@ -23,10 +23,23 @@
 //! Evidence: `crates/vfs/src/captured.rs`'s tests compare the candidates with a walk of both whole trees after every
 //! kind of change, and hold that a file in place in a touched directory and a file in an untouched one are never
 //! candidates (the bound is the change, not the tree).
+//!
+//! **A clone that moved (A-503, stage 2).** A move hands another member the clone's head alone, and the capture stays
+//! with the node that made it. So the move carries the part of the capture its clone changed: the captured state of
+//! every path where the capture and the head it hands over differ ([`CarryWalk`], [`CarriedCapture`]: each file's
+//! BLAKE3, mode and Windows bits, each link's target, each directory's kind, each name the capture did not hold). The
+//! rest of the capture is that head itself, which the new owner keeps as a snapshot, its **mark**. A landing there is
+//! judged against [`CaptureBase::Carried`]: the paths where its source parts from the mark (found as above, in one
+//! store) and the carried paths are its candidates, and what the capture held at a path is the carried state, else the
+//! mark's. That is the stage-1 judgement exactly, since every path the carried list leaves out held at the move what the
+//! capture held. A move from the new owner carries again from its mark and its carried list ([`CaptureBase::state_at`]).
+//! The carried list is bounded by what the clone changed, never by the tree, and the mark costs what the clone changes
+//! after the move (it shares every node with the head until then, D-5).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_mem::Handle;
+use slates_wire::Wire;
 
 use crate::dir::{Child, DirNode};
 use crate::error::VfsError;
@@ -426,6 +439,347 @@ impl ChangedPaths {
   }
 }
 
+/// What a capture held at one path, as a landing judged by content reads it (§4.15 "Plan"; A-291's landing, A-503): the
+/// kind of entry, the BLAKE3 of a file's bytes or a link's target, and the metadata a landing carries (a file's mode and
+/// Windows bits, A-451 and A-466). Read from a tree ([`state_in`]), or carried by a move ([`CarriedCapture`]).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum CapturedState {
+  /// Nothing (a whiteout counts as nothing).
+  Absent,
+  /// A regular file.
+  File {
+    /// The BLAKE3 of its bytes.
+    identity: [u8; 32],
+    /// Its size in bytes.
+    size: u64,
+    /// Its mode bits.
+    mode: u32,
+    /// Its Windows attribute bits ([`WindowsAttributes::bits`]).
+    windows: u16,
+  },
+  /// A symlink.
+  Symlink {
+    /// Its target.
+    target: String,
+    /// Its Windows attribute bits, a directory link's kind among them (A-275).
+    windows: u16,
+  },
+  /// A directory.
+  Dir {
+    /// Its mode bits.
+    mode: u32,
+    /// Its Windows attribute bits.
+    windows: u16,
+  },
+  /// A FIFO, socket or device node: a name with no bytes, which no landing writes.
+  Special,
+}
+
+impl CapturedState {
+  /// The identity a landing judges this state by: a file's bytes', a link's target's, and zero for anything else (a
+  /// content witness's identity, `slates_land::manifest`).
+  pub fn identity(&self) -> [u8; 32] {
+    match self {
+      CapturedState::File { identity, .. } => *identity,
+      CapturedState::Symlink { target, .. } => *blake3::hash(target.as_bytes()).as_bytes(),
+      CapturedState::Absent | CapturedState::Dir { .. } | CapturedState::Special => [0; 32],
+    }
+  }
+}
+
+/// The BLAKE3 of file `no`'s bytes in `tree` (`size` of them), read whole as a landing's plan reads a file.
+pub fn file_identity(
+  store: &Store,
+  tree: FrozenTree,
+  no: InodeNo,
+  size: u64,
+) -> Result<[u8; 32], VfsError> {
+  let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
+  let read = read_file(store, tree, no, 0, &mut bytes)?;
+  bytes.truncate(read);
+  Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// What `tree` holds at `path` as a [`CapturedState`], names compared under `policy`: [`held_at`] with a file's bytes
+/// hashed.
+pub fn state_in(
+  store: &Store,
+  tree: FrozenTree,
+  policy: NameEquivalence,
+  path: &str,
+) -> Result<CapturedState, VfsError> {
+  Ok(match held_at(store, tree, policy, path)? {
+    Held::Absent => CapturedState::Absent,
+    Held::File {
+      no,
+      size,
+      mode,
+      windows,
+      ..
+    } => CapturedState::File {
+      identity: file_identity(store, tree, no, size)?,
+      size,
+      mode,
+      windows: windows.bits(),
+    },
+    Held::Symlink { target, windows } => CapturedState::Symlink {
+      target: target.into(),
+      windows: windows.bits(),
+    },
+    Held::Dir { mode, windows, .. } => CapturedState::Dir {
+      mode,
+      windows: windows.bits(),
+    },
+    Held::Special => CapturedState::Special,
+  })
+}
+
+/// Whether `tree` holds at `path` what `was` says, a file's bytes hashed only where its kind and size already agree.
+fn holds(
+  store: &Store,
+  tree: FrozenTree,
+  policy: NameEquivalence,
+  path: &str,
+  was: &CapturedState,
+) -> Result<bool, VfsError> {
+  let now = held_at(store, tree, policy, path)?;
+  Ok(match (was, &now) {
+    (
+      CapturedState::File {
+        identity,
+        size,
+        mode,
+        windows,
+      },
+      Held::File {
+        no,
+        size: now_size,
+        mode: now_mode,
+        windows: now_windows,
+        ..
+      },
+    ) => {
+      size == now_size
+        && mode == now_mode
+        && *windows == now_windows.bits()
+        && *identity == file_identity(store, tree, *no, *now_size)?
+    }
+    (CapturedState::Absent, Held::Absent) | (CapturedState::Special, Held::Special) => true,
+    (
+      CapturedState::Symlink { target, windows },
+      Held::Symlink {
+        target: now_target,
+        windows: now_windows,
+      },
+    ) => target.as_str() == now_target.as_ref() && *windows == now_windows.bits(),
+    (
+      CapturedState::Dir { mode, windows },
+      Held::Dir {
+        mode: now_mode,
+        windows: now_windows,
+        ..
+      },
+    ) => mode == now_mode && *windows == now_windows.bits(),
+    _ => false,
+  })
+}
+
+/// One path a move carries: what the capture held there.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CarriedPath {
+  /// The path, absolute from the volume's root.
+  pub path: String,
+  /// What the capture held there.
+  pub state: CapturedState,
+}
+
+/// The part of a clone's capture its move carries (A-503): the captured state of every path where the capture and the
+/// head the move hands over differ, in path order, each path once. The rest of the capture is that head, which the new
+/// owner keeps as its mark ([`CaptureBase::Carried`]). Bounded by what the clone changed, never by the tree.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CarriedCapture {
+  /// The paths, in path order.
+  pub entries: Vec<CarriedPath>,
+}
+
+impl CarriedCapture {
+  /// What the capture held at `path`, when the move carried it.
+  pub fn get(&self, path: &str) -> Option<&CapturedState> {
+    self
+      .entries
+      .binary_search_by(|entry| entry.path.as_str().cmp(path))
+      .ok()
+      .and_then(|at| self.entries.get(at))
+      .map(|entry| &entry.state)
+  }
+
+  /// A carried capture from the bytes another node's catalog carried (its canonical encoding, [`Wire::to_bytes`]):
+  /// exactly one value, its paths absolute, made of plain names (no empty, `.` or `..` component, no NUL) and in
+  /// strictly rising order; anything else is refused [`VfsError::Invalid`], since a landing writes and removes at these
+  /// paths beneath its target.
+  pub fn parse(bytes: &[u8]) -> Result<CarriedCapture, VfsError> {
+    let carried = <CarriedCapture as Wire>::from_bytes(bytes).map_err(|_| VfsError::Invalid)?;
+    let plain = |path: &str| {
+      path.strip_prefix('/').is_some_and(|rest| {
+        !rest.contains('\0')
+          && rest
+            .split('/')
+            .all(|name| !name.is_empty() && name != "." && name != "..")
+      })
+    };
+    let rising = carried
+      .entries
+      .windows(2)
+      .all(|pair| matches!(pair, [a, b] if a.path < b.path));
+    if !rising || !carried.entries.iter().all(|entry| plain(&entry.path)) {
+      return Err(VfsError::Invalid);
+    }
+    Ok(carried)
+  }
+}
+
+/// What a captured clone's landing is judged against (§4.15 "Plan"; A-291's landing): its capture, on the node that made
+/// the clone (stage 1), or what a move carried of it, on the node the clone moved to (stage 2, A-503).
+#[derive(Clone, Debug)]
+pub enum CaptureBase {
+  /// The capture itself: a snapshot's tree in the clone's own store, sharing its nodes.
+  Tree(FrozenTree),
+  /// A capture a move carried: the head it handed over, kept as the mark, and the captured state of every path where
+  /// the capture and that head differ.
+  Carried {
+    /// The mark's tree: a snapshot of the clone itself.
+    mark: FrozenTree,
+    /// What the move carried.
+    carried: CarriedCapture,
+  },
+}
+
+impl From<FrozenTree> for CaptureBase {
+  fn from(tree: FrozenTree) -> CaptureBase {
+    CaptureBase::Tree(tree)
+  }
+}
+
+impl CaptureBase {
+  /// What the capture held at `path`: read from its tree, or the carried state where the move carried one, else the
+  /// mark's (the head at the move held what the capture held at every path the move did not carry).
+  pub fn state_at(
+    &self,
+    store: &Store,
+    policy: NameEquivalence,
+    path: &str,
+  ) -> Result<CapturedState, VfsError> {
+    match self {
+      CaptureBase::Tree(tree) => state_in(store, *tree, policy, path),
+      CaptureBase::Carried { mark, carried } => match carried.get(path) {
+        Some(state) => Ok(state.clone()),
+        None => state_in(store, *mark, policy, path),
+      },
+    }
+  }
+
+  /// The search for the paths where `source` may part from the capture: where it parts from the capture's tree, or
+  /// from the mark and at every carried path.
+  pub fn search(&self, source: FrozenTree) -> CaptureSearch {
+    let (tree, carried) = match self {
+      CaptureBase::Tree(tree) => (*tree, Vec::new()),
+      CaptureBase::Carried { mark, carried } => (
+        *mark,
+        carried
+          .entries
+          .iter()
+          .map(|entry| entry.path.clone())
+          .collect(),
+      ),
+    };
+    CaptureSearch {
+      changed: ChangedPaths::new(tree, source),
+      carried,
+    }
+  }
+}
+
+/// The paths where a source may part from its capture ([`CaptureBase::search`]), found a unit at a time.
+#[derive(Debug)]
+pub struct CaptureSearch {
+  changed: ChangedPaths,
+  /// The carried paths, in path order, merged in at the end.
+  carried: Vec<String>,
+}
+
+impl CaptureSearch {
+  /// One unit of [`ChangedPaths::unit`]; once it ends, its candidates and the carried paths, sorted, each once.
+  pub fn unit(&mut self, store: &Store) -> Result<Option<Vec<String>>, VfsError> {
+    let Some(found) = self.changed.unit(store)? else {
+      return Ok(None);
+    };
+    if self.carried.is_empty() {
+      return Ok(Some(found));
+    }
+    let mut paths: BTreeSet<String> = found.into_iter().collect();
+    paths.extend(std::mem::take(&mut self.carried));
+    Ok(Some(paths.into_iter().collect()))
+  }
+}
+
+/// The capture a move carries for a clone (A-503): every path where `base` (the clone's capture, or what an earlier move
+/// carried of it) and `head` (the head the move hands over) differ, with what the capture held there, found a unit at a
+/// time: a unit of the search, then one candidate a unit (a file the capture held hashed in that unit, as a landing's
+/// plan hashes one).
+#[derive(Debug)]
+pub struct CarryWalk {
+  base: CaptureBase,
+  head: FrozenTree,
+  search: CaptureSearch,
+  /// The candidates, once found.
+  paths: Option<Vec<String>>,
+  /// The next candidate.
+  next: usize,
+  /// What is carried so far.
+  entries: Vec<CarriedPath>,
+}
+
+impl CarryWalk {
+  /// A carry of `base` against `head`, from its start.
+  pub fn new(base: CaptureBase, head: FrozenTree) -> CarryWalk {
+    let search = base.search(head);
+    CarryWalk {
+      base,
+      head,
+      search,
+      paths: None,
+      next: 0,
+      entries: Vec::new(),
+    }
+  }
+
+  /// One unit; the carried capture once the last candidate is judged.
+  pub fn unit(
+    &mut self,
+    store: &Store,
+    policy: NameEquivalence,
+  ) -> Result<Option<CarriedCapture>, VfsError> {
+    let Some(paths) = self.paths.as_ref() else {
+      self.paths = self.search.unit(store)?;
+      return Ok(None);
+    };
+    let Some(path) = paths.get(self.next) else {
+      return Ok(Some(CarriedCapture {
+        entries: std::mem::take(&mut self.entries),
+      }));
+    };
+    let was = self.base.state_at(store, policy, path)?;
+    if !holds(store, self.head, policy, path, &was)? {
+      self.entries.push(CarriedPath {
+        path: path.clone(),
+        state: was,
+      });
+    }
+    self.next = self.next.saturating_add(1);
+    Ok(None)
+  }
+}
+
 /// Whether `across` (the other tree's entry at the same name) is directory `node` itself, changed in place: then its
 /// own changed record compares its entries, and nothing beneath it needs walking whole.
 fn same_directory(store: &Store, across: Option<Child>, node: Handle<DirNode>) -> bool {
@@ -728,5 +1082,372 @@ mod tests {
       journal_bytes: 1 << 16,
       clock: Box::new(StepClock::new(1_000, 1)),
     }
+  }
+
+  /// Shape: the inode-number prefix of the volume a test's move makes on its new owner.
+  const MOVED_PREFIX: u16 = 3;
+
+  /// `from`'s whole tree made again in `to`, every directory, file and link with its mode and bytes, none of its nodes
+  /// shared: the volume a move's new owner materializes from the head it was handed (A-291).
+  fn copy_tree(store: &mut Store, from: FrozenTree, to: &mut Volume) {
+    let mut stack = vec![(String::from("/"), from.root)];
+    while let Some((at, node)) = stack.pop() {
+      let entries: Vec<(String, Child)> = store
+        .dirs
+        .get(node)
+        .unwrap()
+        .iter(&store.blocks)
+        .map(|entry| (entry.name.to_owned(), entry.child))
+        .collect();
+      for (name, child) in entries {
+        let path = join(&at, &name);
+        let parent = dir(to, store, &at);
+        match held_at(store, from, NameEquivalence::Exact, &path).unwrap() {
+          Held::Dir { mode, .. } => {
+            to.mkdir(store, parent, &name, mode).unwrap();
+            if let Child::Dir(child) = child {
+              stack.push((path, child));
+            }
+          }
+          Held::File { no, size, mode, .. } => {
+            let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+            let read = read_file(store, from, no, 0, &mut bytes).unwrap();
+            bytes.truncate(read);
+            let made = to.create_file(store, parent, &name, mode).unwrap();
+            to.write(store, made, 0, &bytes).unwrap();
+          }
+          Held::Symlink { target, .. } => {
+            to.symlink(store, parent, &name, &target).unwrap();
+          }
+          other => panic!("{path} holds {other:?}, which no test tree has"),
+        }
+      }
+    }
+  }
+
+  /// The same change made in two volumes by path: `bytes` written over `path` (made where it is absent), or `path`
+  /// removed with none.
+  fn change(store: &mut Store, vols: [&mut Volume; 2], path: &str, bytes: Option<&[u8]>) {
+    let (parent, name) = path.rsplit_once('/').unwrap();
+    let parent = if parent.is_empty() { "/" } else { parent };
+    for vol in vols {
+      let at = dir(vol, store, parent);
+      match bytes {
+        Some(bytes) => {
+          let no = match vol.resolve(store, path) {
+            Ok(found) => found.inode,
+            Err(_) => vol.create_file(store, at, name, FILE_MODE).unwrap(),
+          };
+          vol.truncate(store, no, 0).unwrap();
+          vol.write(store, no, 0, bytes).unwrap();
+        }
+        None => vol.unlink(store, at, name).unwrap(),
+      }
+    }
+  }
+
+  /// A-503 (stage 2: a captured clone that moved lands as on its first runner). Do: capture a tree; in its clone write a
+  /// file, make one, remove one, remove a directory with its file and point a link elsewhere; carry the capture against
+  /// that head ([`CarryWalk`]); make the head again in a volume of its own (the new owner's, no node shared) and keep a
+  /// snapshot of it as the mark; then make the same later changes in the clone and the moved volume: a file the capture
+  /// held written, one made, a captured file removed, an earlier change undone and a file made before the move removed.
+  /// Expect: what the carried capture and the mark say the capture held equals what the capture itself holds at every
+  /// path of every tree; the carried list names only paths changed before the move; and the moved volume's candidates
+  /// hold every path where it now parts from the capture, as the clone's do.
+  #[test]
+  fn a_moved_clones_carried_capture_and_mark_hold_what_its_capture_held_at_every_path() {
+    let mut store = store();
+    let mut origin = volume(&mut store);
+    for d in ["src", "olddir"] {
+      mkdir(&mut origin, &mut store, "/", d);
+    }
+    file(&mut origin, &mut store, "/src", "edit.rs", b"captured body");
+    file(&mut origin, &mut store, "/src", "keep.rs", b"kept");
+    file(
+      &mut origin,
+      &mut store,
+      "/src",
+      "later.rs",
+      b"written after the move",
+    );
+    file(
+      &mut origin,
+      &mut store,
+      "/src",
+      "undone.rs",
+      b"changed, then back",
+    );
+    file(
+      &mut origin,
+      &mut store,
+      "/",
+      "gone.rs",
+      b"removed before the move",
+    );
+    file(
+      &mut origin,
+      &mut store,
+      "/",
+      "lost.rs",
+      b"removed after the move",
+    );
+    file(
+      &mut origin,
+      &mut store,
+      "/olddir",
+      "f.rs",
+      b"removed with its dir",
+    );
+    let root = dir(&origin, &store, "/");
+    origin
+      .symlink(&mut store, root, "link", "src/keep.rs")
+      .unwrap();
+    let captured = origin.snapshot(&mut store).unwrap();
+    let mut clone =
+      Volume::clone_without_base(&store, &mut origin, captured, volume_config()).unwrap();
+    let capture_tree = origin.frozen_tree(captured).unwrap();
+    let capture = CaptureBase::Tree(capture_tree);
+
+    // Before the move.
+    let edit = leaf(&clone, &store, "/src/edit.rs");
+    clone.truncate(&mut store, edit, 0).unwrap();
+    clone
+      .write(&mut store, edit, 0, b"the agent's body")
+      .unwrap();
+    let undone = leaf(&clone, &store, "/src/undone.rs");
+    clone.write(&mut store, undone, 0, b"CHANGED").unwrap();
+    file(
+      &mut clone,
+      &mut store,
+      "/src",
+      "made.rs",
+      b"made before the move",
+    );
+    file(
+      &mut clone,
+      &mut store,
+      "/src",
+      "temp.rs",
+      b"made, then removed after",
+    );
+    let root = dir(&clone, &store, "/");
+    clone.unlink(&mut store, root, "gone.rs").unwrap();
+    let olddir = dir(&clone, &store, "/olddir");
+    clone.unlink(&mut store, olddir, "f.rs").unwrap();
+    let root = dir(&clone, &store, "/");
+    clone.rmdir(&mut store, root, "olddir").unwrap();
+    let root = dir(&clone, &store, "/");
+    clone.unlink(&mut store, root, "link").unwrap();
+    let root = dir(&clone, &store, "/");
+    clone
+      .symlink(&mut store, root, "link", "src/edit.rs")
+      .unwrap();
+    let handed = clone.snapshot(&mut store).unwrap();
+    let handed_tree = clone.frozen_tree(handed).unwrap();
+
+    // The move: the capture carried against the head handed over, the head made again on the new owner, its mark kept.
+    let mut walk = CarryWalk::new(capture.clone(), handed_tree);
+    let mut units = 0usize;
+    let carried = loop {
+      units += 1;
+      if let Some(carried) = walk.unit(&store, NameEquivalence::Exact).unwrap() {
+        break carried;
+      }
+    };
+    let carried_paths: Vec<&str> = carried.entries.iter().map(|e| e.path.as_str()).collect();
+    for path in [
+      "/src/edit.rs",
+      "/src/undone.rs",
+      "/src/made.rs",
+      "/src/temp.rs",
+      "/gone.rs",
+      "/olddir",
+      "/olddir/f.rs",
+      "/link",
+    ] {
+      assert!(
+        carried_paths.contains(&path),
+        "{path} changed before the move but was not carried: {carried_paths:?}"
+      );
+    }
+    for path in ["/src/keep.rs", "/src/later.rs", "/lost.rs", "/src"] {
+      assert!(
+        !carried_paths.contains(&path),
+        "{path} was carried, unchanged at the move"
+      );
+    }
+    assert_eq!(carried.get("/src/made.rs"), Some(&CapturedState::Absent));
+    assert!(
+      units > carried.entries.len(),
+      "{units} units for {} carried paths",
+      carried.entries.len()
+    );
+    let mut moved = Volume::create(
+      &mut store,
+      VolumeConfig {
+        prefix: MOVED_PREFIX,
+        ..volume_config()
+      },
+    )
+    .unwrap();
+    copy_tree(&mut store, handed_tree, &mut moved);
+    let mark = moved.snapshot(&mut store).unwrap();
+    let carried_base = CaptureBase::Carried {
+      mark: moved.frozen_tree(mark).unwrap(),
+      carried,
+    };
+
+    // After the move, in both.
+    change(
+      &mut store,
+      [&mut clone, &mut moved],
+      "/src/later.rs",
+      Some(b"written on the new runner"),
+    );
+    change(
+      &mut store,
+      [&mut clone, &mut moved],
+      "/src/new.rs",
+      Some(b"made on the new runner"),
+    );
+    change(&mut store, [&mut clone, &mut moved], "/lost.rs", None);
+    change(
+      &mut store,
+      [&mut clone, &mut moved],
+      "/src/undone.rs",
+      Some(b"changed, then back"),
+    );
+    change(&mut store, [&mut clone, &mut moved], "/src/temp.rs", None);
+    let clone_head = clone.snapshot(&mut store).unwrap();
+    let moved_head = moved.snapshot(&mut store).unwrap();
+    let (clone_tree, moved_tree) = (
+      clone.frozen_tree(clone_head).unwrap(),
+      moved.frozen_tree(moved_head).unwrap(),
+    );
+
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for tree in [capture_tree, handed_tree, clone_tree, moved_tree] {
+      paths.extend(whole(&store, tree).into_keys());
+    }
+    for path in &paths {
+      assert_eq!(
+        carried_base
+          .state_at(&store, NameEquivalence::Exact, path)
+          .unwrap(),
+        capture
+          .state_at(&store, NameEquivalence::Exact, path)
+          .unwrap(),
+        "{path}: the carried capture and its mark say otherwise than the capture"
+      );
+    }
+
+    let search = |base: &CaptureBase, source: FrozenTree| {
+      let mut search = base.search(source);
+      loop {
+        if let Some(found) = search.unit(&store).unwrap() {
+          return found.into_iter().collect::<BTreeSet<String>>();
+        }
+      }
+    };
+    let (was, now) = (whole(&store, capture_tree), whole(&store, moved_tree));
+    let parted: BTreeSet<String> = was
+      .keys()
+      .chain(now.keys())
+      .filter(|path| was.get(*path) != now.get(*path))
+      .cloned()
+      .collect();
+    let moved_candidates = search(&carried_base, moved_tree);
+    for path in &parted {
+      assert!(
+        moved_candidates.contains(path),
+        "{path} parts from the capture but is no candidate: {moved_candidates:?}"
+      );
+    }
+    assert!(
+      !moved_candidates.contains("/src/keep.rs"),
+      "a file nothing touched is a candidate"
+    );
+    assert_eq!(
+      parted,
+      search(&capture, clone_tree)
+        .into_iter()
+        .filter(|path| was.get(path) != whole(&store, clone_tree).get(path))
+        .collect::<BTreeSet<String>>(),
+      "the moved volume parts from the capture where the clone does"
+    );
+  }
+
+  /// A-503, hostile input (CLAUDE.md §4): do: parse a carried capture's bytes as another node's catalog would bring them,
+  /// well formed and then with each fault. Expect: the well-formed one back as it was; a relative path, an empty, `.` or
+  /// `..` component, a NUL, paths out of order or twice, a trailing byte and a cut encoding each refused `Invalid`.
+  #[test]
+  fn a_carried_capture_from_another_node_is_refused_unless_well_formed() {
+    let entry = |path: &str| CarriedPath {
+      path: path.to_owned(),
+      state: CapturedState::Absent,
+    };
+    let carried = CarriedCapture {
+      entries: vec![entry("/a"), entry("/a/b"), entry("/c")],
+    };
+    let bytes = carried.to_bytes();
+    assert_eq!(CarriedCapture::parse(&bytes), Ok(carried));
+    for bad in [
+      vec![entry("a")],
+      vec![entry("/a//b")],
+      vec![entry("/a/./b")],
+      vec![entry("/a/../b")],
+      vec![entry("/a\0b")],
+      vec![entry("/b"), entry("/a")],
+      vec![entry("/a"), entry("/a")],
+    ] {
+      let bytes = CarriedCapture {
+        entries: bad.clone(),
+      }
+      .to_bytes();
+      assert_eq!(
+        CarriedCapture::parse(&bytes),
+        Err(VfsError::Invalid),
+        "{bad:?}"
+      );
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(CarriedCapture::parse(&trailing), Err(VfsError::Invalid));
+    let cut = bytes.get(..bytes.len().saturating_sub(1)).unwrap();
+    assert_eq!(CarriedCapture::parse(cut), Err(VfsError::Invalid));
+  }
+
+  /// A-503, a golden vector (CLAUDE.md §4): the carried capture is kept in partitions and shipped in catalogs, so its
+  /// encoding is a format. Do: encode a carried capture of a name the capture did not hold and a link. Expect: the
+  /// published bytes (each variant's tag its place in the enum, lengths `u32`, all little-endian), and the bytes back
+  /// as the same value.
+  #[test]
+  fn a_carried_captures_encoding_is_its_golden_bytes() {
+    let carried = CarriedCapture {
+      entries: vec![
+        CarriedPath {
+          path: "/a".to_owned(),
+          state: CapturedState::Absent,
+        },
+        CarriedPath {
+          path: "/b".to_owned(),
+          state: CapturedState::Symlink {
+            target: "c".to_owned(),
+            windows: WindowsAttributes::LINK_DIRECTORY,
+          },
+        },
+      ],
+    };
+    let golden: &[u8] = &[
+      2, 0, 0, 0, // two paths
+      2, 0, 0, 0, b'/', b'a', // "/a"
+      0, 0, 0, 0, // Absent
+      2, 0, 0, 0, b'/', b'b', // "/b"
+      2, 0, 0, 0, // Symlink
+      1, 0, 0, 0, b'c', // its target
+      0x10, 0, // its directory-link bit
+    ];
+    assert_eq!(carried.to_bytes(), golden);
+    assert_eq!(CarriedCapture::parse(golden), Ok(carried));
   }
 }

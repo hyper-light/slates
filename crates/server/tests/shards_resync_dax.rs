@@ -1,8 +1,8 @@
 //! A Shards stream whose guest maps a file with DAX outlives its daemon's death (§4.6, the Shards form; A-365), with this
 //! test as the anchor and as the device. The test makes the anchor's hold channel and hands it to each daemon as the
-//! anchor does, the held resync ends and the held DAX object to the second (`SLATES_ANCHOR_DEVICES`,
-//! `SLATES_ANCHOR_COPIES`), which a daemon adopts once per process into a process-wide cell: hence a binary of its own
-//! with one test. A daemon's death is a fenced stop, which ends no record and releases no hold, as a killed process
+//! anchor does, the held resync ends and the held DAX object to the second (the handoff table `SLATES_ANCHOR_HELD`
+//! names, A-462), which a daemon adopts once per process into a process-wide cell: hence a binary of its own with one
+//! test. A daemon's death is a fenced stop, which ends no record and releases no hold, as a killed process
 //! does.
 
 #![cfg(unix)]
@@ -353,8 +353,8 @@ fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Hands the next daemon what the anchor holds, as the anchor does: `SLATES_ANCHOR_DEVICES` (its channel end, then each
-/// held resync end with its session) and `SLATES_ANCHOR_COPIES` (each held object with its record).
+/// Hands the next daemon what the anchor holds, as the anchor does (A-462): a table whose devices part is its channel
+/// end, then each held resync end with its session, and whose copies part is each held object with its record.
 fn hand_to_next_daemon(channel: &OwnedFd, holds: &[&Hold], objects: &[&HeldObject]) {
   let mut devices = copy(channel).to_string();
   for hold in holds {
@@ -379,8 +379,15 @@ fn hand_to_next_daemon(channel: &OwnedFd, holds: &[&Hold], objects: &[&HeldObjec
   // SAFETY: this binary holds this one test; it sets the variables only between daemons, each of which reads them once
   // at its start, and no other thread of this process reads the environment meanwhile.
   unsafe {
-    std::env::set_var(held::ENV_DEVICES, devices);
-    std::env::set_var(held::ENV_COPIES, copies.join(";"));
+    std::env::set_var(
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices,
+        connections: String::new(),
+        copies: copies.join(";"),
+      })
+      .unwrap(),
+    );
   }
 }
 
@@ -530,13 +537,17 @@ fn a_streams_dax_map_outlives_its_daemon_with_its_unsynced_stores() {
   // SAFETY: this binary holds this one test; the variable is set before any daemon starts.
   unsafe {
     std::env::set_var(
-      held::ENV_DEVICES,
-      daemon_end
-        .as_fd()
-        .try_clone_to_owned()
-        .unwrap()
-        .into_raw_fd()
-        .to_string(),
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices: daemon_end
+          .as_fd()
+          .try_clone_to_owned()
+          .unwrap()
+          .into_raw_fd()
+          .to_string(),
+        ..held::Table::default()
+      })
+      .unwrap(),
     );
   }
   let profile = common::machine_profile();

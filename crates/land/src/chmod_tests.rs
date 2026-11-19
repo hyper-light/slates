@@ -40,12 +40,29 @@ const EXECUTABLE_MODE: u32 = 0o100_755;
 const PRIVATE_MODE: u32 = 0o100_600;
 /// Shape: the script's bytes.
 const SCRIPT: &[u8] = b"#!/bin/sh\necho landed\n";
+/// Shape: a base directory as the disk holds it (`S_IFDIR | 0755`).
+const DIR_MODE: u32 = 0o040_755;
+/// Shape: the same directory made private to its owner.
+const PRIVATE_DIR_MODE: u32 = 0o040_700;
+/// Shape: a modification time a `touch` gives the script, past every time the fixture's disk holds.
+const TOUCHED_NS: i64 = 5_000_000_000;
+/// Shape: the base directory opened to its group again, the head's later mode past a snapshot.
+const GROUP_DIR_MODE: u32 = 0o040_750;
+/// Shape: the landing ids of a head's landing and of a snapshot's, distinct so the two landings of one test never share
+/// a hidden name.
+const HEAD_LANDING: u64 = 1;
+/// Shape: see `HEAD_LANDING`.
+const SNAPSHOT_LANDING: u64 = 2;
 
-/// A disk holding `/run.sh` (the script, at `SCRIPT_MODE`) and an overlay of it, the disk settled before the mount.
+/// A disk holding `/run.sh` (the script, at `SCRIPT_MODE`) and the directory `/lib` (at `DIR_MODE`) with a file in it, and
+/// an overlay of it, the disk settled before the mount.
 fn overlay_of_a_script(store: &mut Store) -> (SimHost, Volume) {
   let mut host = SimHost::new();
   host.replace_file("/run.sh", SCRIPT);
   host.chmod("/run.sh", SCRIPT_MODE);
+  host.mkdir("/lib");
+  host.chmod("/lib", DIR_MODE);
+  host.replace_file("/lib/mod.rs", SCRIPT);
   host.close_files();
   host.advance_ns(SETTLED_NS);
   let root = host.root();
@@ -68,13 +85,17 @@ fn script(vol: &mut Volume, host: &mut SimHost, store: &mut Store) -> slates_vfs
   vol.with_host(host).resolve(store, "/run.sh").unwrap().inode
 }
 
-fn request(grant: Option<crate::grant::GrantId>) -> LandingRequest {
+fn request(
+  grant: Option<crate::grant::GrantId>,
+  source: Source,
+  landing_id: u64,
+) -> LandingRequest {
   LandingRequest {
-    landing_id: 1,
+    landing_id,
     consumer: b"consumer".to_vec().into_boxed_slice(),
     volume: [3; 16],
     snapshot: 1,
-    source: Source::Head,
+    source,
     grant,
     filter: Filter::default(),
     now_ns: 1,
@@ -92,6 +113,17 @@ type Landed = (
 
 /// Presents the overlay's landing into the disk's root, grants what was presented, and lands it.
 fn land_granted(host: &mut SimHost, vol: &mut Volume, store: &mut Store) -> Landed {
+  land_granted_from(host, vol, store, Source::Head, HEAD_LANDING)
+}
+
+/// [`land_granted`] of `source` (the head, or a snapshot of the volume) as landing `landing_id`.
+fn land_granted_from(
+  host: &mut SimHost,
+  vol: &mut Volume,
+  store: &mut Store,
+  source: Source,
+  landing_id: u64,
+) -> Landed {
   let target = LandingTarget {
     dir: host.root(),
     key: "/".into(),
@@ -106,7 +138,7 @@ fn land_granted(host: &mut SimHost, vol: &mut Volume, store: &mut Store) -> Land
     &mut grants,
     None,
     &mut audit,
-    &request(None),
+    &request(None, source, landing_id),
     &mut Unobserved,
   ) {
     Err(LandingRefusal::GrantRequired(presented)) => presented,
@@ -140,7 +172,7 @@ fn land_granted(host: &mut SimHost, vol: &mut Volume, store: &mut Store) -> Land
     &mut grants,
     Some(&lease),
     &mut audit,
-    &request(grant),
+    &request(grant, source, landing_id),
     &mut Unobserved,
   );
   (preliminary, landed)
@@ -206,6 +238,110 @@ fn a_metadata_entry_is_synced_by_its_batchs_barrier_before_it_is_reported() {
     !host.holds_unsynced_metadata("/run.sh"),
     "the mode a power loss could take back"
   );
+}
+
+/// A-501 (a `touch` alone). Do: give `/run.sh` a new modification time through the overlay, its bytes and mode untouched,
+/// and land. Expect the entry written in a batch whose barrier synced it, the disk's file holding the new time under the
+/// same inode. Before A-501 the entry was a replacement its verdict passed by (its bytes unchanged), and the time never
+/// landed.
+#[test]
+fn a_touch_alone_lands_and_is_synced() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let no = script(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .set_times(&mut store, no, None, Some(TOUCHED_NS), None, None)
+    .unwrap();
+  let before = host.fingerprint("/run.sh").unwrap();
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/run.sh", Some(Outcome::Written))]);
+  let after = host.fingerprint("/run.sh").unwrap();
+  assert_eq!(after.mtime_ns, TOUCHED_NS);
+  assert_eq!(
+    after.ino, before.ino,
+    "the same file: its bytes never rewritten"
+  );
+  assert_eq!(after.mode & PERMISSIONS, SCRIPT_MODE & PERMISSIONS);
+  assert!(!host.holds_unsynced_metadata("/run.sh"));
+}
+
+/// A-501 (a base directory's mode alone). Do: `chmod` the base directory `/lib` to 0700 through the overlay, nothing else
+/// changed, and land. Expect its entry written in a batch whose barrier synced it, the disk's directory at 0700 under the
+/// same inode, its file untouched. Before A-501 a base directory whose mode alone changed was in no diverged set, and the
+/// mode never landed.
+#[test]
+fn a_base_directorys_mode_alone_lands_and_is_synced() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let lib = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/lib")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, lib, PRIVATE_DIR_MODE)
+    .unwrap();
+  let before = host.fingerprint("/lib").unwrap();
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/lib", Some(Outcome::Written))]);
+  let after = host.fingerprint("/lib").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, PRIVATE_DIR_MODE & PERMISSIONS);
+  assert_eq!(after.ino, before.ino, "the same directory");
+  assert!(!host.holds_unsynced_metadata("/lib"));
+  assert_eq!(host.bytes("/lib/mod.rs").as_deref(), Some(SCRIPT));
+}
+
+/// A-501 (a directory's later mode survives a snapshot's landing). Do: `chmod` the base directory `/lib` to 0700 through
+/// the overlay, snapshot the volume, `chmod` `/lib` to 0750 at the head; land the snapshot, then the head. Expect the
+/// snapshot's landing to leave `/lib` at 0700 with the head still diverged there, and the head's landing to leave it at
+/// 0750: the head's later mode rebased onto what landed. Forgotten with the landed entry, it would never land.
+#[test]
+fn a_directorys_mode_the_head_changed_past_a_landed_snapshot_lands_next() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let lib = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/lib")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, lib, PRIVATE_DIR_MODE)
+    .unwrap();
+  let snapshot = vol.snapshot(&mut store).unwrap();
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, lib, GROUP_DIR_MODE)
+    .unwrap();
+  let (_, landed) = land_granted_from(
+    &mut host,
+    &mut vol,
+    &mut store,
+    Source::Snapshot(snapshot),
+    SNAPSHOT_LANDING,
+  );
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/lib", Some(Outcome::Written))]);
+  let mode = |host: &SimHost| host.fingerprint("/lib").unwrap().mode & PERMISSIONS;
+  assert_eq!(mode(&host), PRIVATE_DIR_MODE & PERMISSIONS);
+  let diverged: Vec<String> = vol.diverged(&store).into_iter().map(|d| d.path).collect();
+  assert_eq!(
+    diverged,
+    vec!["/lib"],
+    "the head's later mode, still to land"
+  );
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(outcomes(&report), vec![("/lib", Some(Outcome::Written))]);
+  assert_eq!(mode(&host), GROUP_DIR_MODE & PERMISSIONS);
 }
 
 /// A-458 (a field the volume kept is the disk's, as bytes are). Do: mark `/run.sh` hidden through the overlay (its Windows

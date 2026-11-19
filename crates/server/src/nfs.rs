@@ -879,8 +879,8 @@ fn is_mount_request(program: u32, procedure: u32) -> bool {
 /// name's owner shard every host mount (`Consumer::Bridge`) of the named volume bound to a mount point is
 /// watched by [`confirm_unmount`]: an attachment ends (as a `detach` would, `verbs::end_attachment`) when
 /// its mount point no longer holds this volume's mount, and one whose mount is still there when the
-/// deadline passes is a mount nobody unmounted, left as it is. `UMNT` has no status (RFC 1813 §5.2.3),
-/// so the reply is void; `args` is `/<name>`.
+/// confirmation's learned bound passes ([`unmount_bound_ns`], A-493) is a mount nobody unmounted, left as it is.
+/// `UMNT` has no status (RFC 1813 §5.2.3), so the reply is void; `args` is `/<name>`.
 fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
   let Ok(path) = XdrReader::new(args).string(MNT_PATH_MAX) else {
     return;
@@ -929,25 +929,71 @@ fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
   }
 }
 
-/// Derived: how long a `UMNT` waits for its mount to leave the kernel's mount table: one liveness
-/// budget ([`crate::daemon::LIVENESS_BUDGET_NS`]). The kernel sends `UMNT` while it unmounts, so the
-/// mount leaves the table within the unmount's own few steps; one still there after the budget the
-/// anchor gives the daemon to beat was not being unmounted.
-const UNMOUNT_CONFIRM_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+/// Derived: how long a `UMNT` waits for its mount to leave the kernel's mount table (A-493): the pace this shard
+/// learned of the kernel's unmounts (`ShardState::unmount_times`, the learner the told waits use,
+/// `crate::learned_wait::LearnedWait`: the tail of the confirmations that completed plus the liveness window a live party
+/// may be late by, backed off after each that ran out), never further than the node's failover delay
+/// (`ShardState::failover_ns`). A `UMNT` is a hint, never proof: it removes an entry from a server's mount list, which
+/// goes stale when a client never sends one (RFC 1813 §5.2.2, §5.2.3), and any local process may send one. The kernel
+/// sends it while it unmounts, so a genuine one's mount leaves the table within the kernel's own remaining steps, as long
+/// as this host's kernel takes under its load; a mount still there past the learned pace was not being unmounted. Until
+/// A-493 the bound was one liveness budget, fixed, so a genuine unmount slower than that on a loaded host was left as a
+/// mount nobody unmounted, its attachment kept.
+pub(crate) fn unmount_bound_ns(s: &ShardState) -> u64 {
+  s.unmount_times.bound_ns(s.failover_ns)
+}
 
-/// Ends each of `mounts` (attachment, mount point) whose point no longer holds `name`'s mount, checking at
-/// the fleet's poll interval for at most [`UNMOUNT_CONFIRM_NS`] ([`unmount_capability`]). The check stops
-/// early once one mount has gone: a `UMNT` is one unmount.
-async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
+/// What a `UMNT`'s wait found ([`wait_for_unmount`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Unmounted {
+  /// These attachments' mount points no longer hold the volume's mount.
+  Gone(Vec<u64>),
+  /// Every mount was still there at the learned bound: a mount nobody unmounted.
+  Unconfirmed,
+  /// No poll could be timed (off a shard): given up, never spun on.
+  Unpolled,
+}
+
+/// Waits for one of `mounts` (attachment, mount point) to stop holding `name`'s mount, `still_mounted` asked at the
+/// fleet's poll interval, for at most this shard's learned bound ([`unmount_bound_ns`]), folding what it measured into
+/// that learning: a confirmation that completed is a sample, one that ran out backs the bound off. It stops at the
+/// first mount gone: a `UMNT` is one unmount.
+async fn wait_for_unmount(
+  name: &str,
+  mounts: &[(u64, String)],
+  still_mounted: impl Fn(&str, &str) -> bool,
+) -> Unmounted {
   let began = futures::now_ns();
+  let bound =
+    state::with_state(|s| unmount_bound_ns(s)).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   let poll = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   loop {
     let gone: Vec<u64> = mounts
       .iter()
-      .filter(|(_, point)| !holds_mount_of(point, &name))
+      .filter(|(_, point)| !still_mounted(point, name))
       .map(|(attachment, _)| *attachment)
       .collect();
+    let waited_ns = futures::now_ns().saturating_sub(began);
     if !gone.is_empty() {
+      let _ = state::with_state_counted(|s| s.unmount_times.completed(waited_ns));
+      return Unmounted::Gone(gone);
+    }
+    if waited_ns >= bound {
+      let _ = state::with_state_counted(|s| s.unmount_times.ran_out());
+      return Unmounted::Unconfirmed;
+    }
+    if futures::sleep(poll).await.is_err() {
+      return Unmounted::Unpolled;
+    }
+  }
+}
+
+/// Ends each of `mounts` (attachment, mount point) whose point no longer holds `name`'s mount once the kernel's mount
+/// table shows it gone ([`wait_for_unmount`] over [`holds_mount_of`], [`unmount_capability`]), as a `detach` would; a
+/// confirmation that found none gone is counted.
+async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
+  match wait_for_unmount(&name, &mounts, holds_mount_of).await {
+    Unmounted::Gone(gone) => {
       let _ = state::with_state_counted(|s| {
         for attachment in gone {
           let ended = s
@@ -963,16 +1009,9 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
           }
         }
       });
-      return;
     }
-    if futures::now_ns().saturating_sub(began) >= UNMOUNT_CONFIRM_NS {
+    Unmounted::Unconfirmed | Unmounted::Unpolled => {
       let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-      return;
-    }
-    if futures::sleep(poll).await.is_err() {
-      // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
-      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-      return;
     }
   }
 }
@@ -3869,5 +3908,95 @@ mod tests {
       "a client silent a whole lease makes room"
     );
     assert!(!table.holds_client(idle.clientid));
+  }
+
+  /// Shape: a confirmation's first bound on a shard that measured nothing: the liveness window the learner adds to the
+  /// tail it learned (`crate::learned_wait::LearnedWait`), and the fixed bound every `UMNT` had until A-493.
+  const FIRST_UNMOUNT_BOUND_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: how long a loaded host's kernel took, after its `UMNT`, to take its mount out of the table, as this shard
+  /// measured it: a window and a half.
+  const SLOW_UNMOUNT_NS: u64 = FIRST_UNMOUNT_BOUND_NS + FIRST_UNMOUNT_BOUND_NS / 2;
+  /// Shape: when the slow test's mount leaves the table: a window and a fifth after its `UMNT`, past the old fixed bound.
+  const LEAVES_AFTER_NS: u64 = FIRST_UNMOUNT_BOUND_NS + FIRST_UNMOUNT_BOUND_NS / 5;
+  /// Shape: how long the test thread waits for a confirmation's outcome: four slow unmounts.
+  const OUTCOME_WAIT_NS: u64 = 4 * SLOW_UNMOUNT_NS;
+  /// Shape: the attachment the tests' mount stands for.
+  const MOUNTED: u64 = 9;
+  /// Shape: the tests' mount point; nothing is read there (the tests stand in for the kernel's table).
+  const POINT: &str = "/Volumes/unmount-test";
+
+  /// A-493 (R3's class C; §4.6 A-34, RFC 1813 §5.2.3): a `UMNT`'s confirmation waits at the pace this shard learned of
+  /// its kernel's unmounts, never a fixed second. Do: on a shard that measured an unmount as slow as a window and a
+  /// half, wait for a `UMNT` whose mount leaves the kernel's table (stood in for) a window and a fifth after it. Expect
+  /// the mount confirmed gone. Before, the confirmation gave up at one liveness budget, so a genuine unmount slower than
+  /// that on a loaded host left its attachment kept as a mount nobody unmounted.
+  #[test]
+  fn a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace() {
+    let daemon = crate::daemon::audit_daemon();
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |s| {
+      s.unmount_times.completed(SLOW_UNMOUNT_NS);
+      let task = futures::spawn(async move {
+        let leaves_at = futures::now_ns().saturating_add(LEAVES_AFTER_NS);
+        let mounts = vec![(MOUNTED, POINT.to_owned())];
+        let outcome =
+          wait_for_unmount("unmounted", &mounts, |_, _| futures::now_ns() < leaves_at).await;
+        let _ = sent.send(outcome);
+      })
+      .unwrap();
+      futures::detach(task).unwrap();
+    });
+    let outcome = answered.recv_timeout(std::time::Duration::from_nanos(OUTCOME_WAIT_NS));
+    daemon.stop();
+    assert_eq!(
+      outcome,
+      Ok(Unmounted::Gone(vec![MOUNTED])),
+      "a genuine unmount slower than the old fixed bound was not confirmed at the learned pace"
+    );
+  }
+
+  /// A-493 (R3's class C; RFC 1813 §5.2.2: a mount list goes stale): a `UMNT` whose mount never leaves the table, a
+  /// forged one, is given up at the learned bound, and the next confirmation waits longer (RFC 6298 §5.5's back-off). Do:
+  /// on a shard that measured nothing, wait for a `UMNT` whose mount stays. Expect it unconfirmed after the first bound
+  /// at the earliest, and the shard's next bound past the first. Before, every confirmation gave up at the same fixed
+  /// second whatever the ones before it had found.
+  #[test]
+  fn a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off() {
+    let daemon = crate::daemon::audit_daemon();
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |s| {
+      let first = unmount_bound_ns(s);
+      let task = futures::spawn(async move {
+        let began = futures::now_ns();
+        let mounts = vec![(MOUNTED, POINT.to_owned())];
+        let outcome = wait_for_unmount("stays", &mounts, |_, _| true).await;
+        let waited = futures::now_ns().saturating_sub(began);
+        let next = state::with_state(|s| unmount_bound_ns(s));
+        let _ = sent.send((first, outcome, waited, next));
+      })
+      .unwrap();
+      futures::detach(task).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_nanos(OUTCOME_WAIT_NS));
+    daemon.stop();
+    let (first, outcome, waited, next) = answer.expect("the confirmation ended");
+    println!("a mount that stays: {outcome:?} after {waited} ns; bound {first} ns, then {next:?}");
+    assert_eq!(
+      first, FIRST_UNMOUNT_BOUND_NS,
+      "a shard that measured nothing waits one window first"
+    );
+    assert_eq!(
+      outcome,
+      Unmounted::Unconfirmed,
+      "a mount that stays is not taken as unmounted"
+    );
+    assert!(
+      waited >= first,
+      "given up before its bound ({waited} ns of {first})"
+    );
+    assert!(
+      next.is_some_and(|next| next > first),
+      "the next confirmation's bound did not back off: {next:?} after {first}"
+    );
   }
 }

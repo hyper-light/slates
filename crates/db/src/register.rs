@@ -3596,6 +3596,36 @@ impl RegionalConfiguration {
       && self.within_tolerance(writer, object)
   }
 
+  /// Whether `holder`'s copy of `object`, which its live owner `owner` wrote, adds nothing the design counts on (A-508):
+  /// `holder` is in none of `owner`'s neighbourhoods, so no takeover of `owner` would ask it (a round asks the members of
+  /// the settled and current neighbourhoods, [`recovery_hosts`]), and `owner`'s settled cohort for the object is whole
+  /// and at least `f + 1` wide: every one of its hosts is a member, and there are `f + 1` or more. Every record `owner`
+  /// committed is on `f + 1` of its settled cohort, since its settle report placed the newest there and each joint write
+  /// since placed it there too ([`Configuration::place`]), so with that cohort whole the copy's record, or a newer one, is
+  /// on `f + 1` live hosts without it.
+  ///
+  /// Not so for a settled cohort narrower than `f + 1`, a bootstrap's (the owner alone): a joint write is on all of it,
+  /// but its `f + 1` came from the current cohort, which may have moved off `holder` since, so the copy may be one of the
+  /// `f + 1` (the bootstrap history `crates/db/tests/lineage_model.rs` holds). Nor for a cohort a member has left: the
+  /// record may be on fewer than `f + 1` live hosts, so the copy is kept until `owner` settles a whole neighbourhood
+  /// again. False for an owner that is no member and for an object an explicit move took off its creator's line
+  /// ([`moved`]), whose copies a restored holder cannot tell from the move's owner's.
+  ///
+  /// [`recovery_hosts`]: RegionalConfiguration::recovery_hosts
+  /// [`moved`]: RegionalConfiguration::moved
+  pub fn settled_away(&self, owner: HostId, holder: HostId, object: ObjectId) -> bool {
+    if !self.members.contains(&owner)
+      || self.moved.contains_key(&object.placement_key())
+      || self.holds_for(owner, holder)
+    {
+      return false;
+    }
+    self.settled.get(&owner).is_some_and(|settled| {
+      let cohort = settled.cohort(owner, object, self.quorum);
+      cohort.len() >= self.quorum.commit() && cohort.iter().all(|host| self.members.contains(host))
+    })
+  }
+
   /// The member that takes `object` of the retired `departed` over: the one rendezvous ranks first among the
   /// survivors of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)), or, when no
   /// survivor is in any of them, among all the retirement's survivors (A-309): every object then ranks one, so the
@@ -6507,6 +6537,90 @@ mod tests {
     assert!(
       regional.copy_stale(successor, object),
       "a copy the successor wrote is stale: its takeover recovered the object within tolerance"
+    );
+  }
+
+  /// A-508: a live owner's copy held outside all of the owner's neighbourhoods is settled away only from a whole settled
+  /// cohort at least `f + 1` wide, and never for a moved object. Do: in an eight-member `f = 1` region take over one of
+  /// a member's neighbours, judge a host outside the member's neighbourhoods; have the member settle its new
+  /// neighbourhood and judge it again, and judge a host inside; move the object and judge once more. Then form a region
+  /// on one host, admit six more and judge a host outside that host's neighbourhoods while its settled cohort is still
+  /// itself alone. Expect not away while a cohort host is gone, away once the member settled a whole neighbourhood, never
+  /// for the host inside, never once the object moved, and never from the bootstrap's one-host settled cohort.
+  #[test]
+  fn a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one() {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=8).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    let owner = HostId(1);
+    let object = ObjectId::new(owner, 0);
+    let neighbour = regional.neighbourhoods[&owner]
+      .hosts
+      .iter()
+      .copied()
+      .find(|host| *host != owner)
+      .expect("a neighbour");
+    regional.take_over(neighbour, scatter);
+    let outside = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != owner && !regional.holds_for(owner, *host))
+      .expect("a member outside the owner's neighbourhoods");
+    let while_short = regional.settled_away(owner, outside, object);
+    let generation = regional.neighbourhoods[&owner].generation;
+    assert!(
+      regional.settle(owner, generation),
+      "the owner settles its new neighbourhood"
+    );
+    let once_whole = regional.settled_away(owner, outside, object);
+    let inside = regional.neighbourhoods[&owner]
+      .hosts
+      .iter()
+      .copied()
+      .find(|host| *host != owner)
+      .expect("a neighbour");
+    let for_the_inside = regional.settled_away(owner, inside, object);
+    let cohort = regional.settled[&owner].cohort(owner, object, regional.quorum);
+    assert!(
+      regional.move_object(object, owner, inside, &cohort),
+      "the move commits"
+    );
+    let once_moved = regional.settled_away(owner, outside, object);
+    assert_eq!(
+      (while_short, once_whole, for_the_inside, once_moved),
+      (false, true, false, false),
+      "away only from a whole cohort, for a host outside, of an object never moved"
+    );
+    let mut bootstrap = RegionalConfiguration::formed(
+      vec![owner],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    for host in 2..=7 {
+      bootstrap.admit(HostId(host), None, scatter);
+    }
+    let outside = bootstrap
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != owner && !bootstrap.holds_for(owner, *host))
+      .expect("a member outside the bootstrap's neighbourhoods");
+    assert_eq!(
+      bootstrap.settled[&owner].cohort(owner, object, bootstrap.quorum),
+      vec![owner],
+      "the bootstrap's settled cohort is itself alone"
+    );
+    assert!(
+      !bootstrap.settled_away(owner, outside, object),
+      "a settled cohort narrower than f + 1 settles nothing away"
     );
   }
 

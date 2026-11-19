@@ -1221,6 +1221,36 @@ impl LandFs for SimHost {
     HostFs::open_file(self, dir, name)
   }
 
+  /// The directory opened as a file is (A-501): its mode and bits set in place, unsynced until a barrier names it, as a
+  /// file's are. The handle keeps the directory's own record, never a copy of the tree beneath it.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.tick();
+    let mut parts = self.dir_parts(dir)?;
+    parts.push(name.into());
+    self.fault(SimVerb::OpenDir, &format!("/{}", parts.join("/")))?;
+    let node = match self.node(&parts) {
+      Some(n) if n.kind == HostKind::Dir => SimNode {
+        children: BTreeMap::new(),
+        bytes: Vec::new(),
+        target: n.target.clone(),
+        ..*n
+      },
+      Some(_) => return Err(HostError::NotDirectory),
+      None => return Err(HostError::NotFound),
+    };
+    let h = self.next_handle;
+    self.next_handle = self.next_handle.saturating_add(1);
+    self.opens.insert(
+      h,
+      Open::File {
+        ino: node.ino,
+        snapshot: node,
+        path: parts,
+      },
+    );
+    Ok(HostFile(h))
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     self.write_step()?;
     let now = self.now_ns;
@@ -1304,9 +1334,13 @@ impl LandFs for SimHost {
       }
       Some(Open::File { ino, .. }) => {
         let ino = *ino;
+        let now = self.now_ns;
         if let Some(n) = self.node_by_ino_mut(ino) {
           n.mtime_ns = mtime_ns;
+          n.ctime_ns = now;
         }
+        // Set in place, as a landing's metadata entry sets a `touch` (A-501): unsynced until a barrier names the file.
+        self.meta_set.insert(ino);
         Ok(())
       }
       _ => Err(HostError::StaleHandle),
