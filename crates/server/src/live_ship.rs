@@ -1864,6 +1864,30 @@ pub(crate) fn inject_superseded(
   }
 }
 
+/// Test support (A-516; never reachable from the wire): `volume`, made and set live-shipped on this shard, ships from
+/// now on to two holders at `f = 1` that never answer, as an owner whose candidates are lost or cut off does: nothing
+/// published from now on becomes durable, so a reply held for its durability waits out its bound
+/// ([`wait_durable`]). The holders are the two hosts after this one's id, which no audit daemon's fleet has.
+#[cfg(test)]
+pub(crate) fn ship_to_silent_holders(state: &mut ShardState, volume: slates_db::catalog::VolumeId) {
+  let local = state.fleet.configuration().owner;
+  let holders = [
+    HostId(local.0.wrapping_add(1)),
+    HostId(local.0.wrapping_add(2)),
+  ];
+  let shipper = Shipper::new(
+    (local, ObjectId(volume.bytes), HostEpoch(1)),
+    slates_db::register::Quorum { f: 1 },
+    &holders,
+    None,
+    Bounds::default(),
+  );
+  state
+    .live
+    .shipping
+    .insert(volume.bytes, new_live_volume(shipper));
+}
+
 /// Counter: a superseded owner's fence that its learning could not publish at once (A-344); the next publication keeps
 /// it.
 /// Format: a counter name in the daemon's status report.
