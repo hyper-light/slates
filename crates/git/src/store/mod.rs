@@ -55,6 +55,11 @@
 //! work up to the owner's quantum and holds nothing borrowed between turns; every answered pack holds exactly the
 //! answer's objects, each once.
 //!
+//! **A hook's repository (A-665, [`hook_view`]).** A git hook runs in a read-only bare repository
+//! made from what the store keeps: `HEAD`, `config` and `packed-refs` from the refs a push read,
+//! and packs from the base packs and fragments, each whole by itself, with the push's objects in
+//! git's quarantine; every file's bytes made when a read reaches them.
+//!
 //! **Owed (A-614's part 3, and later pieces):** the changed-path Bloom filters of the commit rows (part 3); the walks,
 //! a commit and a fragment's encoding sliced under the shard's budget, and their transient sets charged; a part partly
 //! wanted (a `blob:limit` fetch's blobs) read entry by entry rather than encoded afresh; a delta search for an object
@@ -62,6 +67,7 @@
 
 mod deltas;
 mod fragment;
+pub mod hook_view;
 pub mod learn;
 mod naming;
 mod positions;
