@@ -4464,8 +4464,15 @@ impl Green {
     (at, floor): (u64, u64),
     units: Vec<position::Unit>,
   ) -> Vec<position::Unit> {
-    // Red-first stub (A-658 part 2): every unit taken as computed, whatever changed since.
-    let _ = (inc, self.since(at, floor));
+    let since = self.since(at, floor);
+    if since.is_nothing() {
+      return units;
+    }
+    let resolved = Green::resolve(inc);
+    let mut again = position::Units::again(units, since);
+    self.decide_units(inc, &resolved, &mut again);
+    let (units, judged) = again.into_units();
+    self.judged_again = self.judged_again.saturating_add(judged);
     units
   }
 
