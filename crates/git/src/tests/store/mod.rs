@@ -6,6 +6,7 @@ use std::convert::Infallible;
 
 use slates_vcs::{ContentStore, Naming};
 
+use crate::Admission;
 use crate::negotiation::Filter;
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
 use crate::objects::tree::{Entry, Mode, compare, write_entries};
@@ -216,6 +217,24 @@ fn streamed(
   answer: Answer,
   quantum: u64,
 ) -> (Vec<u8>, UploadCounters) {
+  streamed_within(
+    repository,
+    store,
+    answer,
+    quantum,
+    &mut Admission::new(u64::MAX),
+  )
+}
+
+/// The pack that answers `answer` within the request's `admission`, streamed in turns of `quantum` nanoseconds of the
+/// tests' clock, and what the stream did; a refusal fails the test.
+fn streamed_within(
+  repository: &Repository,
+  store: &ContentStore,
+  answer: Answer,
+  quantum: u64,
+  admission: &mut Admission,
+) -> (Vec<u8>, UploadCounters) {
   let mut upload = Upload::new(answer, repository);
   let mut clock = Ticks(0);
   let mut pack = Vec::new();
@@ -225,7 +244,11 @@ fn streamed(
       exchange: EXCHANGE,
       quantum_ns: quantum,
     };
-    if upload.advance(repository, store, turn, &mut pack).unwrap() == Progress::Done {
+    if upload
+      .advance(repository, store, turn, admission, &mut pack)
+      .unwrap()
+      == Progress::Done
+    {
       return (pack, upload.counters());
     }
   }

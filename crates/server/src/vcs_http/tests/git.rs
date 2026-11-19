@@ -537,6 +537,7 @@ impl PackSource for NoPacks {
     &mut self,
     _served: &UploadServed<'_>,
     _pack: &mut (),
+    _admission: &mut slates_git::Admission,
     _out: &mut Vec<u8>,
     _room: usize,
   ) -> Result<bool, PackRefused> {
