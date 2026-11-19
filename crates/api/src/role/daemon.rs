@@ -7,6 +7,7 @@ use std::time::Duration;
 use slates_anchor::{AnchorSegment, RegionKind};
 use slates_machine::facts::Facts;
 use slates_machine::{MachineProfile, ProfileOptions};
+use slates_server::config::VcsHttpConfig;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 use super::parent::ParentWatch;
@@ -181,6 +182,7 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   // A fleet node (§2.6 boot step 6): the shared manifest gives the membership the placement authority is
   // built over and the transport the membership loop drives; a laptop passes neither and runs the same
   // placement path, degenerate (R8).
+  let mut edge_identity = None;
   let transport = match &options.fleet {
     Some(selection) => {
       let plan = super::fleet::load(selection)?;
@@ -193,6 +195,8 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
         plan.membership.quorum.f
       );
       config = config.with_fleet(plan.membership);
+      // The node's own identity, which the version-control edge presents when one is asked for below.
+      edge_identity = Some(plan.edge_identity);
       // The serve sockets are bound here, before the daemon starts: an address in use refuses the start
       // by name instead of leaving a daemon that can never be probed.
       Some(
@@ -204,6 +208,17 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     }
     None => None,
   };
+  // The version-control servers' shared HTTP edge, when the operator asked for one (`--vcs-http`; §4.17.2 "Transports"
+  // item 1, A-625 part 3): a fleet node's presents the node's own identity over HTTPS; a daemon that is no fleet node
+  // serves cleartext, on a loopback address alone, which the flag's reading held it to (`super::vcs_http_address`).
+  config.vcs_http = options.vcs_http.map(|address| VcsHttpConfig {
+    address,
+    identity: edge_identity,
+  });
+  let edge = config
+    .vcs_http
+    .as_ref()
+    .map(|edge| (edge.address, edge.identity.is_some()));
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
   }
@@ -215,6 +230,18 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     supervision.mark_serving(slates_vfs::clock::Clock::monotonic_ns(
       &mut slates_vfs::clock::HostClock::new(),
     ));
+  }
+  // Where the edge serves, before the line that says the daemon serves, so whoever reads the one has read the other (a
+  // port 0 asked for is the system's pick). An edge asked for that did not start was logged with its reason by the
+  // daemon, which serves everything else.
+  if let Some((address, https)) = edge
+    && let Some(port) = daemon.vcs_http_port()
+  {
+    slates_machine::log_line!(
+      "slates daemon: the version-control HTTP edge serves {} on {}:{port}",
+      if https { "HTTPS" } else { "cleartext" },
+      address.ip()
+    );
   }
   slates_machine::log_line!(
     "slates daemon: instance {} serving on {} shards{}",
