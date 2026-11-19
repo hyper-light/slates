@@ -65,6 +65,8 @@ path or a prefix by; past 1,024 units the driver's upper-cased name; a lost surr
 open node's name), `notify::tests::the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`,
 `inflight::tests::a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response` and
 `held::tests::the_mount_record_keeps_how_its_drive_compares_names`. Command:
-`cargo test -p slates-bridge-winfsp --lib -- normalized:: notify:: inflight:: held::`. Windows (main's): the drive
+`cargo test -p slates-bridge-winfsp --lib -- normalized:: notify:: inflight:: held::` on the Mac Studio (d1323898,
+debug, 2026-11-19): 9 of 43 red with today's rules restored in a copy, 43 of 43 green, the whole lib suite 96 of 96.
+Windows (main's): the drive
 tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
 `an_exact_drive_keeps_two_spellings_two_files` in `crates/cli/tests/winfsp_semantics.rs`.

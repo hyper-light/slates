@@ -936,24 +936,48 @@ mod tests {
   fn a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response() {
     let mut packet = opened_response(10, 20);
     assert_eq!(finish_response(&mut packet, 0), Ok(176));
-    assert!(packet[RESPONSE_BASE..RESPONSE_BASE + 10].iter().all(|byte| *byte == 0x11));
     assert!(
-      packet[RESPONSE_BASE + 10..RESPONSE_BASE + 16].iter().all(|byte| *byte == 0),
+      packet[RESPONSE_BASE..RESPONSE_BASE + 10]
+        .iter()
+        .all(|byte| *byte == 0x11)
+    );
+    assert!(
+      packet[RESPONSE_BASE + 10..RESPONSE_BASE + 16]
+        .iter()
+        .all(|byte| *byte == 0),
       "the alignment between the name and the descriptor"
     );
-    assert!(packet[RESPONSE_BASE + 16..RESPONSE_BASE + 36].iter().all(|byte| *byte == 0x22));
     assert!(
-      packet[RESPONSE_BASE + 36..176].iter().all(|byte| *byte == 0),
+      packet[RESPONSE_BASE + 16..RESPONSE_BASE + 36]
+        .iter()
+        .all(|byte| *byte == 0x22)
+    );
+    assert!(
+      packet[RESPONSE_BASE + 36..176]
+        .iter()
+        .all(|byte| *byte == 0),
       "the span the DLL counted twice"
     );
     assert!(packet[176..].iter().all(|byte| *byte == 0xAB));
     let mut packet = opened_response(0, 20);
     assert_eq!(finish_response(&mut packet, 0), Ok(152));
-    assert!(packet[RESPONSE_BASE..RESPONSE_BASE + 20].iter().all(|byte| *byte == 0x22));
+    assert!(
+      packet[RESPONSE_BASE..RESPONSE_BASE + 20]
+        .iter()
+        .all(|byte| *byte == 0x22)
+    );
     let mut packet = opened_response(10, 0);
     assert_eq!(finish_response(&mut packet, 0), Ok(144));
-    assert!(packet[RESPONSE_BASE..RESPONSE_BASE + 10].iter().all(|byte| *byte == 0x11));
-    assert!(packet[RESPONSE_BASE + 10..144].iter().all(|byte| *byte == 0));
+    assert!(
+      packet[RESPONSE_BASE..RESPONSE_BASE + 10]
+        .iter()
+        .all(|byte| *byte == 0x11)
+    );
+    assert!(
+      packet[RESPONSE_BASE + 10..144]
+        .iter()
+        .all(|byte| *byte == 0)
+    );
   }
 
   /// A-198 Step 9.4. Do: settle two captured reads. Expect: each original caller gets cancellation, and a request not

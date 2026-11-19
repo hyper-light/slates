@@ -36585,3 +36585,16 @@ folding-drive entry: part 2 built, the Windows build owed, three cases out of re
 - **Out of reach (GAPS).** Spellings the volume folds alike and the table does not (normalization, the Kelvin sign) are a
   node each; a path past 1,024 units is upper-cased by the driver, so a rename above it that the records spell otherwise
   leaves its record; names the table folds alike and the volume keeps apart (`ς`, `σ`) share one node.
+- **Tests.** Every host: `normalized::tests` (seven: each spelling names one node by its made spelling; a case-sensitive
+  drive answers nothing; a stored spelling answered only where the driver takes it; the spelling Windows holds a path or
+  a prefix by; past 1,024 units the driver's upper-cased name; a lost surrogate unanswered; final sigma takes the open
+  node's name), `notify::tests::the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`,
+  `inflight::tests::a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response` and
+  `held::tests::the_mount_record_keeps_how_its_drive_compares_names`. On the Mac Studio (d1323898, debug, load average
+  20.6 to 25.7, 2026-11-19 02:02 UTC), `cargo test -p slates-bridge-winfsp --lib -- normalized:: notify:: inflight::
+  held::`: red with today's rules restored in a copy (each open named as asked, no index, no clear, no posture bit), 9
+  of 43 failed (5 `normalized`, 2 `held`, 1 `inflight`, 1 `notify`; the two `normalized` tests that passed hold today's
+  answer where it stays right); green 43 of 43; the crate's whole lib suite 96 of 96. Windows (main's): the build of
+  `host.rs` and the server's `winfsp.rs`, and the drive tests
+  `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` and
+  `an_exact_drive_keeps_two_spellings_two_files` (`crates/cli/tests/winfsp_semantics.rs`).

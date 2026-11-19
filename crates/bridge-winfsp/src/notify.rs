@@ -277,7 +277,12 @@ fn indexed(search: NameSearch, name: &str) -> Option<Vec<u16>> {
 }
 
 /// Indexes `name` as open by `handle` ([`indexed`]).
-fn key(by_key: &mut BTreeMap<Vec<u16>, BTreeSet<u64>>, search: NameSearch, name: &str, handle: u64) {
+fn key(
+  by_key: &mut BTreeMap<Vec<u16>, BTreeSet<u64>>,
+  search: NameSearch,
+  name: &str,
+  handle: u64,
+) {
   if let Some(units) = indexed(search, name) {
     by_key.entry(units).or_default().insert(handle);
   }
@@ -798,6 +803,9 @@ mod tests {
     let mut exact = OpenNames::new();
     exact.opened(1, 7, "\\Src\\a.txt");
     assert_eq!(exact.spelled_at(&key("\\SRC")), None);
-    assert_eq!(exact.spelled_at(&"\\Src".encode_utf16().collect::<Vec<_>>()), None);
+    assert_eq!(
+      exact.spelled_at(&"\\Src".encode_utf16().collect::<Vec<_>>()),
+      None
+    );
   }
 }

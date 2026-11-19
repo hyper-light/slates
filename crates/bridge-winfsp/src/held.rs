@@ -279,7 +279,10 @@ mod tests {
         case_insensitive,
         ..mount()
       };
-      assert_eq!(Record::decode(&expected.encode().unwrap()).unwrap(), expected);
+      assert_eq!(
+        Record::decode(&expected.encode().unwrap()).unwrap(),
+        expected
+      );
     }
     let mut before = mount().encode().unwrap();
     for read_only in [0u8, 1] {

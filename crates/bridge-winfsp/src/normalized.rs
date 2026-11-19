@@ -328,8 +328,14 @@ mod tests {
   #[test]
   fn an_open_takes_the_spelling_windows_already_holds_its_path_or_a_prefix_by() {
     let names = folding(&["\\src\\a.txt"]);
-    assert_eq!(answered(&names, "\\SRC\\A.TXT", "\\Src\\A.txt"), "\\src\\a.txt");
-    assert_eq!(answered(&names, "\\SRC\\b.txt", "\\Src\\b.txt"), "\\src\\b.txt");
+    assert_eq!(
+      answered(&names, "\\SRC\\A.TXT", "\\Src\\A.txt"),
+      "\\src\\a.txt"
+    );
+    assert_eq!(
+      answered(&names, "\\SRC\\b.txt", "\\Src\\b.txt"),
+      "\\src\\b.txt"
+    );
     assert_eq!(
       answered(&names, "\\SRCS\\c.txt", "\\Srcs\\c.txt"),
       "\\Srcs\\c.txt",

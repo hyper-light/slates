@@ -1417,19 +1417,19 @@
 >   - the 60-round race three times with Defender's real-time protection off, against three times with it on;
 >   - the same race on WinFsp's own driver, with an outside writer in place of the link.
 
-> **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
-> A-300; built 2026-11-19 in two parts, A-543 and A-551; the Windows half compiled and run by main, owed).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
-> every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`
-> (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's driver keys its open files by name and compares
-> case-sensitively when that bit is set (`src/sys/device.c` 676 and 750, `src/sys/create.c` 316-318). So a file opened
-> as `A.TXT` and as `a.txt` on a folding volume gets two of the driver's file nodes: two share-access records (an
-> exclusive open does not exclude the other spelling, where NTFS answers a sharing violation) and two caches over one
-> file. T-4.6 ("case-insensitive lookup on a case-fold volume; expect one entry and `EEXIST` on a folded duplicate")
-> has no test through the drive. The fix: declare `CaseSensitiveSearch` for an exact volume only, and answer each open
-> of a folding volume with its normalized name (each component as stored), which WinFsp otherwise upper-cases
-> (`create.c` 1036-1043), failing test first (an exclusive open under one spelling, then the other: NTFS's
-> `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the Windows workloads cell,
-> which runs on a folding volume to match NTFS (A-300), does not meet it.
+> **The WinFsp drive declared a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for A-300;
+> built 2026-11-19 in two parts, A-543 and A-551; the Windows half compiled and run by main, owed).** The mount set
+> `CaseSensitiveSearch` (and `CasePreservedNames`) for every volume (`crates/bridge-winfsp/src/host.rs`, the mount's
+> `params.flags`), while a volume made with `--fold` (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's
+> driver keys its open files by name and compares case-sensitively when that bit is set (`src/sys/device.c` 676 and 750,
+> `src/sys/create.c` 316-318). So a file opened as `A.TXT` and as `a.txt` on a folding volume got two of the driver's
+> file nodes: two share-access records (an exclusive open does not exclude the other spelling, where NTFS answers a
+> sharing violation) and two caches over one file. T-4.6 ("case-insensitive lookup on a case-fold volume; expect one
+> entry and `EEXIST` on a folded duplicate") had no test through the drive. The fix: declare `CaseSensitiveSearch` for
+> an exact volume only, and answer each open of a folding volume with its normalized name (each component as stored),
+> which WinFsp otherwise upper-cases (`create.c` 1036-1043), failing test first (an exclusive open under one spelling,
+> then the other: NTFS's `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the
+> Windows workloads cell, which runs on a folding volume to match NTFS (A-300), does not meet it.
 > - **Built, part 1 of 2 (2026-11-18, A-543, goal 85, g079): the path an open names as the volume stores it.**
 >   `slates_bridge_core::stored_path` walks a `\`-separated path from the root and names each component as its
 >   directory stores it (`Bridge::stored_entry`, over `Volume::stored_name_no`): on a folding volume every spelling of a
@@ -1439,8 +1439,8 @@
 > - **Built, part 2 of 2 (2026-11-19, A-551, goal 85, g258): the drive's half.** The drive declares
 >   `CaseSensitiveSearch` for an exact volume only (`Mounted::new`, given the volume's policy by
 >   `crates/server/src/winfsp.rs` `name_search`); the held record keeps the posture, so a successor serves a drive as it
->   was mounted, and a record made before A-551 reads as case-sensitive, as every drive then was. Each open and create on
->   a folding drive answers its node's name as WinFsp's normalized name (`FSP_FSCTL_OPEN_FILE_INFO`, `finish_open`):
+>   was mounted, and a record made before A-551 reads as case-sensitive, as every drive then was. Each open and create
+>   on a folding drive answers its node's name as WinFsp's normalized name (`FSP_FSCTL_OPEN_FILE_INFO`, `finish_open`):
 >   each prefix as Windows already holds it, else the stored spelling where the driver takes it for the asked one (the
 >   system's upcase table, ntdll's `RtlUpcaseUnicodeChar`), else as asked (`crates/bridge-winfsp/src/normalized.rs`);
 >   the open's ledger record and `OpenNames` keep that name byte for byte, as the driver renames and notifications need
