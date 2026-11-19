@@ -920,6 +920,7 @@ impl Census {
 /// 2026-11-19 04:18 UTC, this count): the rarest, a file both sides changed, 49 times in 4,096 cases (a double delete
 /// 74, a lock met beneath every changed path 77), so a run expects it about 49 times and misses it with probability
 /// about e^-49; the whole crate's suite ran in 1.03 s.
+const CASES: u32 = 4096;
 
 /// How many of the last revisions a near base is drawn from. A work on an old base meets every revision since, and a
 /// change of the root's properties among them refuses it at the root before any other check (the first census, at
