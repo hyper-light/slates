@@ -229,11 +229,9 @@ fn a_copy_costs_its_paths_whatever_its_tree_holds() {
     work.create(&format!("src/{}/{index}", index % 64), &index.to_le_bytes());
   }
   accept(&mut green, &work, 1);
-  let (walked, history, changes) = (
-    green.walked(),
-    green.retained_bytes().history,
-    green.changes_bytes(),
-  );
+  // The retained figures walk the current files for their sizes, so they are read before the walk counter.
+  let (history, changes) = (green.retained_bytes().history, green.changes_bytes());
+  let walked = green.walked();
   accept(&mut green, Work::exclusive().copy("src", "dst", 1), 2);
   assert_eq!(green.walked(), walked, "the copy walked a map");
   assert_eq!(
@@ -879,6 +877,8 @@ fn every_copy_reads_as_its_key_by_key_reference_over_every_history() {
     panic!("{failure}");
   }
   let census = census.into_inner();
+  // The figures the evidence quotes (`-- --nocapture`).
+  eprintln!("copy oracle census: {census:?}");
   let met = [
     census.accepted,
     census.refused,
