@@ -220,14 +220,15 @@ const CLIENT_HANDSHAKE_ITEMS: usize = 2;
 fn assert_as_svnserve(recorded: Recorded, ours: &[u8], texts: &BTreeMap<[u8; 16], Vec<u8>>) {
   let name = recorded.name;
   let (ours, theirs) = (items(ours), items(recorded.server));
-  let ((our_start, our_end), (their_start, their_end)) = (drive_span(&ours), drive_span(&theirs));
-  let before = if our_start == ours.len() {
+  let (our_start, our_end) = drive_span(&ours);
+  let (their_start, their_end) = if our_start == ours.len() {
     assert_eq!(report_command(recorded).1, CLIENT_HANDSHAKE_ITEMS, "{name}: the first command");
-    SERVER_HANDSHAKE_ITEMS
+    let answered = SERVER_HANDSHAKE_ITEMS + our_start;
+    (answered, answered)
   } else {
-    their_start.checked_sub(our_start).unwrap()
+    drive_span(&theirs)
   };
-  let their_start = before + our_start;
+  let before = their_start.checked_sub(our_start).unwrap();
   assert_eq!(ours[..our_start], theirs[before..their_start], "{name}: before the drive");
   let our_drive = read_drive(&ours[our_start..our_end]).calls;
   let their_drive = read_drive(&theirs[their_start..their_end]).calls;
