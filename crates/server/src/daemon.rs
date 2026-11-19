@@ -6370,6 +6370,7 @@ async fn control_loop(
                 control,
                 revoked: false,
                 consumer_policy: None,
+                identities: None,
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,

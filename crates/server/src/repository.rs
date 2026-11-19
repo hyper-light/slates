@@ -810,14 +810,7 @@ mod tests {
       },
     );
     assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-    let submitted = ask(
-      state,
-      &owner(),
-      RequestBody::Submit {
-        work,
-        evidence: Vec::new(),
-      },
-    );
+    let submitted = ask(state, &owner(), RequestBody::submit(work, Vec::new()));
     let ReplyBody::Submitted {
       version: Some(version),
       ..

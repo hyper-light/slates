@@ -488,6 +488,12 @@ pub enum Invalid {
   Kind(KindMismatch),
   /// The green requires evidence on every increment, and the merge carried none.
   EvidenceRequired,
+  /// A submit to a green of a repository carried no message, which the commit the server makes of its work needs (A-664;
+  /// `slates_client::Client::submit_with_message` carries one).
+  MessageRequired,
+  /// A submit to a green of a repository was made by a principal with no identity in the repository's tool (A-664): its
+  /// owner sets the principal's identities (`SetIdentities`), and a session reads them at its first submit.
+  IdentityRequired(slates_ipc::protocol::VcsTool),
   /// A green's base must be a complete immutable snapshot, and this one still serves entries from a host folder: pin the
   /// whole base and snapshot again. Or a capture's folder moved under it (`Instance::capture_base`, A-291): capture it
   /// again once nothing writes it.
@@ -936,6 +942,8 @@ impl Error {
       Refusal::NotGreen => Error::Invalid(Invalid::Kind(KindMismatch::NotGreen)),
       Refusal::NotWork => Error::Invalid(Invalid::Kind(KindMismatch::NotWork)),
       Refusal::EvidenceRequired => Error::Invalid(Invalid::EvidenceRequired),
+      Refusal::MessageRequired => Error::Invalid(Invalid::MessageRequired),
+      Refusal::IdentityRequired { tool } => Error::Invalid(Invalid::IdentityRequired(tool)),
       Refusal::ConsistentBaseUnavailable => Error::Invalid(Invalid::LiveBase),
       Refusal::DigestNotClean => Error::Invalid(Invalid::NoCleanDigest),
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),

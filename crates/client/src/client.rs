@@ -3326,10 +3326,7 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<RequestId, ClientError> {
-    let id = self.begin(&RequestBody::Submit {
-      work,
-      evidence: evidence.to_vec(),
-    })?;
+    let id = self.begin(&RequestBody::submit(work, evidence.to_vec()))?;
     // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
     self
       .verdict_chains
@@ -4165,10 +4162,23 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<Submitted, ClientError> {
-    let reply = self.call(&RequestBody::Submit {
-      work,
-      evidence: evidence.to_vec(),
-    })?;
+    let reply = self.call(&RequestBody::submit(work, evidence.to_vec()))?;
+    self
+      .verdict_of(work, VerdictKind::Submit, reply)?
+      .submitted()
+  }
+
+  /// Submits a work volume's declared operations with `message`, the message of the commit the server makes of them when
+  /// the work's green is a repository's branch (§4.17.1 "A push is a work" item 4; A-664): such a green refuses a submit
+  /// without one `MessageRequired`, and one by a principal with no identity in its tool `IdentityRequired`, before any
+  /// work is built. A plain green takes it and makes no commit.
+  pub fn submit_with_message(
+    &mut self,
+    work: VolumeId,
+    message: &str,
+  ) -> Result<Submitted, ClientError> {
+    let request = RequestBody::submit(work, Vec::new()).with_message(message.to_owned());
+    let reply = self.call(&request)?;
     self
       .verdict_of(work, VerdictKind::Submit, reply)?
       .submitted()
@@ -4234,8 +4244,9 @@ impl Client {
         work,
         evidence,
         signature: signature.to_vec(),
+        authorship: Default::default(),
       },
-      None => RequestBody::Submit { work, evidence },
+      None => RequestBody::submit(work, evidence),
     })?;
     self.judged_of(work, reply)
   }
@@ -4254,6 +4265,7 @@ impl Client {
       work,
       evidence: evidence.to_vec(),
       signature: None,
+      authorship: Default::default(),
     })? {
       ReplyBody::MergeApprovalRequired {
         identity,
@@ -4299,6 +4311,7 @@ impl Client {
       identity,
       proof,
       signature: signature.map(<[u8]>::to_vec),
+      authorship: Default::default(),
     })?;
     self.judged_of(work, reply)
   }
@@ -4380,6 +4393,7 @@ impl Client {
       delete_len,
       insert,
       evidence: evidence.to_vec(),
+      authorship: Default::default(),
     };
     let inline = request(slates_ipc::protocol::EditBytes::Inline {
       bytes: bytes.to_vec(),
