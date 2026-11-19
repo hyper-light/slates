@@ -390,7 +390,19 @@ impl EdgeState {
   /// Marks seat `slot`'s connection overdue as `overdue` says, or clears its mark (`None`); a mark wakes the listener,
   /// which may hold a connection waiting for a seat.
   fn mark(&self, slot: usize, overdue: Option<Overdue>) {
-    let _ = (slot, overdue);
+    let marked = self
+      .with_seats(|seats| match seats.get_mut(slot) {
+        Some(Some(taken)) if !taken.reaping => {
+          taken.overdue = overdue;
+          true
+        }
+        _ => false,
+      })
+      .unwrap_or(false);
+    if marked && overdue.is_some() {
+      self.count(|counts| counts.overdue = counts.overdue.saturating_add(1));
+      self.wake_listener();
+    }
   }
 
   /// Gives seat `slot` back, waking the listener if it waits for one.
@@ -423,8 +435,20 @@ fn choose_seat(seats: &mut [Option<Taken>]) -> (Seating, Option<Overdue>) {
   if let Some(free) = seats.iter().position(Option::is_none) {
     return (Seating::Free(free), None);
   }
-  let _ = seats.iter_mut().flatten().map(|taken| (taken.task, taken.reaping, taken.overdue)).count();
-  (Seating::Wait, None)
+  let most_overdue = seats
+    .iter_mut()
+    .flatten()
+    .filter(|taken| !taken.reaping)
+    .filter_map(|taken| taken.overdue.map(|overdue| (overdue, taken)))
+    .min_by_key(|(overdue, _)| overdue.since_ns);
+  match most_overdue {
+    Some((overdue, taken)) => {
+      taken.reaping = true;
+      taken.overdue = None;
+      (Seating::Reap(taken.task), Some(overdue))
+    }
+    None => (Seating::Wait, None),
+  }
 }
 
 /// A connection's seat among those its edge serves at once: taken as it is given a seat and given back when this drops,

@@ -172,7 +172,14 @@ impl PhaseWaits {
   /// unknown), it is counted, and its phase backs off when its credentials proved a principal and its wait was armed
   /// under the bound now in force (the module doc).
   pub(crate) fn reap(&mut self, overdue: &Overdue) {
-    let _ = (overdue.phase, overdue.armed_generation, overdue.proven, BACKOFF_FACTOR);
+    let Some(learned) = self.learned.get_mut(overdue.phase) else {
+      return;
+    };
+    learned.reaps = learned.reaps.saturating_add(1);
+    if overdue.proven && overdue.armed_generation == learned.generation {
+      learned.waits.ran_out();
+      learned.generation = learned.generation.saturating_add(1);
+    }
   }
 
   /// How many back-offs `phase` has taken: what a wait armed now is armed under.
