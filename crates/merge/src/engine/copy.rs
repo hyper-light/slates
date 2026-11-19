@@ -949,23 +949,19 @@ impl Green {
     Ok(())
   }
 
-  /// [`Green::copy_fix`] of the attributes at `path`: every name it carries now or carried, each recorded at `version`
-  /// where it differs from what the head's graft brings.
+  /// [`Green::copy_fix`] of the attributes at `path`: each name with a history of its own, recorded at `version` where it
+  /// differs from what the head's graft brings. A name with none is unchanged since version 0 or the copy that gave it,
+  /// so it reads alike at both ends; one the tree held at the version and lost since has a history (its removal), so
+  /// the head's names are never listed, a walk the copy does not take.
   fn fix_attributes(&self, source: &str, (path, version): (&str, u64), fix: &mut CopyFix) {
     let rel = relative(path, source).unwrap_or_default().to_owned();
     let grafted = grafted_in(fix, &rel);
     let from = (path.to_owned(), String::new());
-    let names: BTreeSet<String> = self
-      .xattrs
-      .of(path)
-      .map(|(name, _)| name)
-      .chain(
-        self
-          .xattr_history
-          .range(from..)
-          .take_while(|((at, _), _)| at == path)
-          .map(|((_, name), _)| name.clone()),
-      )
+    let names: Vec<String> = self
+      .xattr_history
+      .range(from..)
+      .take_while(|((at, _), _)| at == path)
+      .map(|((_, name), _)| name.clone())
       .collect();
     for name in names {
       let then = self.xattr_at(path, &name, version);
