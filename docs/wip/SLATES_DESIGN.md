@@ -43163,3 +43163,38 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
   `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
 - **Owed.** receive-pack's part 2 submitting each ref's work through these views (A-620's part 2). The submodule link's
   special-node kind (A-637). Charging the transient tables A-618's walk holds, beside the store's room.
+
+### A-645 — the version-control servers at agentic Meta scale, held to Anthropic's Scion (2026-11-19, Ada; main; UI goal 93 (kiln 51cef9f7); §4.17.1; with A-642)
+
+- **Source.** Anthropic, "Redesigning source control" (anthropic.com/research/redesigning-source-control, read
+  2026-11-19) describes Scion. Its numbers: about 30,000 merges a day by September 2026, growing about 10x in five
+  months; a main-branch history of almost 100 GB and a compressed working copy over 25 GB; about 25 million CI
+  checkouts a day. Ada: slates works "not just on local laptop but at agentic Meta scale. Absolute extremes."
+- **Targets.** slates is designed and tested at no less than ten times those numbers: a history of 1 TB, a working copy of
+  250 GB, 300,000 merges a day with peaks at many times the mean, and 250 million checkouts a day. The laptop is the
+  degenerate case of the same code (R8).
+- **What slates already shares with Scion.**
+  - A change is an entry in a write-ahead log, created and merged on the server (works, the verdict), with nothing
+    pushed by a native client.
+  - Content is addressed by its identity and immutable, so any tier may cache it.
+  - A checkout is a volume made in microseconds that materializes only what is read (R9).
+  - Branches have no global lock (A-642).
+- **What this amendment adds, each one a piece owed under goal 93.**
+  - **Derived data, one mechanism.** Every structure that is not a change is derived data: git's trees, commits and pack
+    fragments, Mercurial's manifests and changelog entries, Subversion's node revisions, blame, path history, merge
+    bases and skip lists, copy detection, file search. Each type for a version is computed from its parents' values,
+    eagerly or lazily, and stored immutable by identity, so any server or tier computes, caches and serves it without
+    coordination. The tool stores built so far (A-553, A-588, A-614) become types under it, not sources of truth.
+  - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
+    its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
+    at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
+    increment since that position, so the hottest green's throughput is its owner's append rate, not its verdict rate.
+  - **Refs are cheap and separate.** Making a change never moves a ref, and moving one is one append at its position.
+    Native workflows keep few long-lived greens.
+  - **Queries by API.** Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+    client.
+  - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
+    request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
+    above it (with goal 91's federation).
+- **Applied in the same change to:** this entry; GAPS' §4.17 entry.
+
