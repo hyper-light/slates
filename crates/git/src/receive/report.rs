@@ -6,11 +6,10 @@
 //! report after the first repeating the `ok` line. Under side-band-64k the report goes out whole on band 1, after the
 //! `rp_error` lines git sent on band 2 as it worked, and the answer ends with a flush of its own.
 
-use super::advertisement::write_line;
 use super::{Outcome, Received, Refusal, Reported, unpack_words};
 use crate::object_name::ObjectId;
 use crate::out::Out;
-use crate::pktline::Packet;
+use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band};
 
 /// Format: `report_message`'s buffer, the most bytes an `rp_error` line takes, its LF included.
@@ -132,4 +131,9 @@ fn write_text(parts: &[&[u8]], out: &mut impl Out) -> Result<(), Refusal> {
 /// `id` in lower-case hexadecimal, as git writes it.
 fn hex(id: &ObjectId) -> Vec<u8> {
   id.to_string().into_bytes()
+}
+
+/// Writes `packet`, or refuses a data packet too long for one.
+fn write_line(packet: Packet<'_>, out: &mut impl Out) -> Result<(), Refusal> {
+  pktline::write(packet, out).map_err(|too_long| Refusal::LineTooLong { len: too_long.len })
 }

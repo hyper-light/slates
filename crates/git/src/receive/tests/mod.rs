@@ -406,6 +406,7 @@ fn kind_of(refusal: &Refusal) -> &'static str {
     Refusal::Capabilities { .. } => "Capabilities",
     Refusal::ObjectFormat { .. } => "ObjectFormat",
     Refusal::PushCert { .. } => "PushCert",
+    Refusal::Advertisement(_) => "Advertisement",
     Refusal::LineTooLong { .. } => "LineTooLong",
     Refusal::PastAdmission(_) => "PastAdmission",
     Refusal::AllocationRefused { .. } => "AllocationRefused",

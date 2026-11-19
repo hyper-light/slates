@@ -9,6 +9,7 @@
 use super::{Advertised, Refusal, reserve};
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::pktline::{self, Packet};
+use crate::refname;
 use crate::{Admission, to_u64};
 
 /// Format: what a shallow line begins with (`read_head_info`: `starts_with(reader->line, "shallow ")`).
@@ -31,27 +32,6 @@ const REFS: &[u8] = b"refs/";
 
 /// Format: the byte between a ref name's components.
 const SLASH: u8 = b'/';
-
-/// Format: no component of a ref name begins with it, and no name ends with it (`check_refname_component`).
-const DOT: u8 = b'.';
-
-/// Format: no component of a ref name ends with it (`LOCK_SUFFIX`).
-const LOCK: &[u8] = b".lock";
-
-/// Format: the pairs no component of a ref name holds: `..` and `@{` (`refname_disposition` 2 and 3).
-const PAIRS: [&[u8]; 2] = [b"..", b"@{"];
-
-/// Format: the length of a pair [`PAIRS`] holds.
-const PAIR_LEN: usize = 2;
-
-/// Format: the printable bytes no ref name holds (`refname_disposition` 4 and 5, `*` a pattern's, never a name's).
-const FORBIDDEN: &[u8] = b" :?[\\^~*";
-
-/// Format: the last ASCII control byte; every byte up to it is one.
-const LAST_CONTROL: u8 = 0x1f;
-
-/// Format: DEL, ASCII's other control byte.
-const DEL: u8 = 0x7f;
 
 /// Format: the capability asking for a report (gitprotocol-capabilities; `read_head_info`'s `parse_feature_request`).
 const REPORT_STATUS: &[u8] = b"report-status";
@@ -426,30 +406,11 @@ pub(super) fn push_charged<T>(
 }
 
 /// Whether receive-pack updates a ref of this name (`update`): it begins `refs/`, passes git's `check_refname_format`
-/// (the rule A-615 makes one for the crate: no empty component, none beginning with `.` or ending with `.lock`, no `..`,
-/// `@{`, control byte, DEL, space, `:`, `?`, `[`, `\`, `^`, `~` or `*`, and not ending with `.`), and names two
-/// components after `refs/` unless the command deletes it (`REFNAME_ALLOW_ONELEVEL` for a delete alone).
+/// (A-615's [`refname::is_valid`]), and names two components after `refs/` unless the command deletes it
+/// (`REFNAME_ALLOW_ONELEVEL` for a delete alone).
 pub(crate) fn refname_ok(name: &[u8], delete: bool) -> bool {
   let Some(rest) = name.strip_prefix(REFS) else {
     return false;
   };
-  let components_ok = rest.split(|byte| *byte == SLASH).all(component_ok);
-  let levels_ok = delete || rest.contains(&SLASH);
-  components_ok && levels_ok && name.last() != Some(&DOT)
-}
-
-/// Whether one component of a ref name passes git's rule.
-fn component_ok(component: &[u8]) -> bool {
-  !component.is_empty()
-    && component.first() != Some(&DOT)
-    && !component.ends_with(LOCK)
-    && !component
-      .windows(PAIR_LEN)
-      .any(|pair| PAIRS.contains(&pair))
-    && !component.iter().any(|byte| forbidden(*byte))
-}
-
-/// Whether `byte` is one no ref name holds: a control byte, DEL, or `refname_disposition`'s forbidden printable ones.
-fn forbidden(byte: u8) -> bool {
-  byte <= LAST_CONTROL || byte == DEL || FORBIDDEN.contains(&byte)
+  refname::is_valid(name) && (delete || rest.contains(&SLASH))
 }

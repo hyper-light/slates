@@ -214,7 +214,10 @@ pub enum Refusal {
     /// Where its packet begins.
     at: u64,
   },
-  /// A line of the advertisement or the report past a pkt-line's room (git's "impossibly long line").
+  /// A part of the advertisement A-604's writer refuses: a capability or a ref name a reader would refuse, an id of
+  /// another format, or a line past a pkt-line's room.
+  Advertisement(crate::v0::WriteRefusal),
+  /// A line of the report past a pkt-line's room (git's "impossibly long line").
   LineTooLong {
     /// The line's length.
     len: u64,
