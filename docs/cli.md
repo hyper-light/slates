@@ -323,6 +323,7 @@ slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
 slates audit [--since N] [--json]
 slates enroll [--account UID] [--json]
 slates revoke CONSUMER [--json]
+slates repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN] [--json]
 slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
 slates move ID --to HOST [--json]
 slates run [--keep] [--json] -- CMD [ARG ...]
@@ -367,6 +368,16 @@ between fleet members with `slates move`. Capture only a directory nothing write
 for it): a file that changes while it is read is refused `DigestUnverified` (ask again), and a capture the directory
 moved under `ConsistentBaseUnavailable`. A volume with no base directory is refused. It needs `write` on the volume and
 holds the whole directory in memory.
+
+`slates repository create NAME --tool git|hg|svn` creates a version-control repository and its root green, the green
+its default branch is bound to (design §4.17.1, A-685), and prints `repository: NAME` and `id: ROOT` (`{"repository",
+"id"}` with `--json`). A git repository names its objects by SHA-1 unless `--format sha256`, a Mercurial one by SHA-1,
+a Subversion one by revision numbers. `--default-branch BRANCH` names git's default branch (`main` when not given; a
+branch name as `git init --initial-branch` takes it, never `refs/heads/...`) or Mercurial's (`default`); a Subversion
+repository takes none, its branches being directories in it. `--root GREEN` makes a green you administer the root as it
+stands, instead of a new empty one. A name another repository holds is refused `AlreadyExists` (exit 1), whatever its
+tool; a format or a branch the tool cannot have is a usage error (exit 2). The `--vcs-http` edge serves a git
+repository named `NAME` at `/NAME/info/refs`.
 
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
 Ids are 32 hexadecimal characters as `create` prints them.
