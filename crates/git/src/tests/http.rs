@@ -193,7 +193,7 @@ fn every_refusal_is_typed_with_http_backends_status() {
       "POST",
       "/r/git-upload-pack",
       vec!["Content-Type: application/x-git-receive-pack-request", upload_length.as_str()],
-      UnsupportedMediaType,
+      RouteRefused::UnsupportedMediaType,
       415,
     ),
     ("POST", "/r/git-upload-pack", vec![upload_type.as_str()], RouteRefused::LengthRequired, 411),

@@ -124,7 +124,8 @@ fn the_connection_is_kept_as_each_version_and_its_connection_field_say() {
 /// version refused 505.
 #[test]
 fn a_later_minor_version_reads_as_1_1_and_another_major_is_refused() {
-  let (head, _) = whole(&request("GET / HTTP/1.2", &["Host: h"]));
+  let input = request("GET / HTTP/1.2", &["Host: h"]);
+  let (head, _) = whole(&input);
   assert_eq!(head.version, Version::Http11);
   assert_eq!(
     refused(&request("GET / HTTP/2.0", &["Host: h"])),
@@ -154,10 +155,11 @@ fn a_head_skips_empty_lines_before_it_and_ends_at_its_own() {
 /// `Host`'s; a userinfo, another scheme or no authority refused.
 #[test]
 fn an_absolute_form_target_gives_its_path_its_query_and_its_authority() {
-  let (head, _) = whole(&request(
+  let input = request(
     "GET http://Example.com:8080/r.git/info/refs?service=git-upload-pack HTTP/1.1",
     &["Host: other"],
-  ));
+  );
+  let (head, _) = whole(&input);
   assert_eq!(
     head.target,
     Target::Path {
@@ -166,7 +168,8 @@ fn an_absolute_form_target_gives_its_path_its_query_and_its_authority() {
     }
   );
   assert_eq!(head.authority, Some(&b"Example.com:8080"[..]));
-  let (head, _) = whole(&request("GET HTTPS://h HTTP/1.1", &["Host: h"]));
+  let input = request("GET HTTPS://h HTTP/1.1", &["Host: h"]);
+  let (head, _) = whole(&input);
   assert_eq!(
     head.target,
     Target::Path {
@@ -174,7 +177,8 @@ fn an_absolute_form_target_gives_its_path_its_query_and_its_authority() {
       query: None
     }
   );
-  let (head, _) = whole(&request("GET http://h?a=b HTTP/1.1", &["Host: h"]));
+  let input = request("GET http://h?a=b HTTP/1.1", &["Host: h"]);
+  let (head, _) = whole(&input);
   assert_eq!(
     head.target,
     Target::Path {
@@ -199,7 +203,8 @@ fn an_absolute_form_target_gives_its_path_its_query_and_its_authority() {
 /// A-595: do ask `OPTIONS *` and `GET *`. Expect the asterisk form for `OPTIONS` alone.
 #[test]
 fn the_asterisk_form_is_options_alone() {
-  let (head, _) = whole(&request("OPTIONS * HTTP/1.1", &["Host: h"]));
+  let input = request("OPTIONS * HTTP/1.1", &["Host: h"]);
+  let (head, _) = whole(&input);
   assert_eq!(head.target, Target::Asterisk);
   assert_eq!(
     refused(&request("GET * HTTP/1.1", &["Host: h"])),
@@ -211,15 +216,17 @@ fn the_asterisk_form_is_options_alone() {
 /// in any case, HTTP/1.0's ignored, and another refused 417.
 #[test]
 fn expect_100_continue_is_honoured_for_1_1_ignored_for_1_0_and_another_is_417() {
-  let (head, _) = whole(&request(
+  let input = request(
     "POST /r/git-upload-pack HTTP/1.1",
     &["Host: h", "Expect: 100-Continue", "Content-Length: 3"],
-  ));
+  );
+  let (head, _) = whole(&input);
   assert!(head.expect_continue);
-  let (head, _) = whole(&request(
+  let input = request(
     "POST /r/git-upload-pack HTTP/1.0",
     &["Expect: 100-continue", "Content-Length: 3"],
-  ));
+  );
+  let (head, _) = whole(&input);
   assert!(!head.expect_continue);
   assert_eq!(
     refused(&request("GET / HTTP/1.1", &["Host: h", "Expect: 200-ok"])),
@@ -415,7 +422,8 @@ fn content_length_is_digits_and_its_values_agree() {
   for (fields, length) in good {
     let mut all = vec!["Host: h"];
     all.extend_from_slice(fields);
-    let (head, _) = whole(&request(line, &all));
+    let input = request(line, &all);
+    let (head, _) = whole(&input);
     assert_eq!(head.framing, Framing::Length(length), "{fields:?}");
   }
   let bad: [&[&str]; 7] = [
@@ -480,10 +488,11 @@ fn content_codings_other_than_one_gzip_are_refused_415() {
     let input = request(line, &["Host: h", "Content-Length: 1", &format!("Content-Encoding: {coding}")]);
     assert_eq!(refused(&input), HeadRefused::UnsupportedCoding, "{coding}");
   }
-  let (head, _) = whole(&request(
+  let input = request(
     line,
     &["Host: h", "Content-Length: 1", "Content-Encoding: gzip, identity"],
-  ));
+  );
+  let (head, _) = whole(&input);
   assert_eq!(head.coding, Coding::Gzip);
 }
 
