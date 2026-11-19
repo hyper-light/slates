@@ -325,18 +325,23 @@
 > answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
 > **A-620 part 1 (2026-11-19, g258; piece 6's exchange, receive-pack):** `slates-git` (`receive`) speaks
 > receive-pack's exchange as git 2.50.1 does: the advertisement (A-604's v0 writer, receive-pack's capabilities in
-> git's order), the update request read as it arrives (shallow lines, commands with the first one's capabilities, push
-> options), the pack through A-608's reader with a thin pack's bases from the repository (`unpack::Outside`,
-> `Reader::finish_with`), the connectivity check over the pushed objects alone (`missing necessary objects`, `shallow
-> update not allowed`), each remaining command's ref name (A-615's rule) and the caller's verdict (`Judge`), every ref
-> or none under `atomic` (stricter than git's code, by the capability's own words), and report-status and
-> report-status-v2 with option lines, multiplexed after git's band-2 lines. Golden vectors: nine pushes stock git
-> 2.50.1 made to stock `git receive-pack` (`fixtures/push/make-push-fixtures.sh`), answered byte for byte.
-> `cargo test -p slates-git --lib`: 16 new failing first against stubs, then 194 of 194, red five ways; 287 of 287 on
-> the tree merged with main. Owed: part 2, each ref a work the engine judges (A-618) recorded as one register entry
-> (A-603) with A-614's store as the repository; then the fsck checks of new objects, the server loop over one
-> connection, review requests over `refs/for/`, hidden refs and signed pushes. Clippy, `xtask` and the lint matrix
-> over the change are main's (run requests).
+> git's order, hidden refs left out), the update request read as it arrives (shallow lines, commands with the first
+> one's capabilities, push options), the pack through A-608's reader with a thin pack's bases from the repository
+> (`unpack::Outside`, `Reader::finish_with`; A-638's `IndexedObjects`), every pushed object through A-590's checks
+> under a push's strictness before any ref moves, the connectivity check over the pushed objects alone (`missing
+> necessary objects`, `shallow update not allowed`), hidden refs refused (`HiddenRefs`, A-597's policy in the server),
+> each remaining command's ref name (A-615's rule), then the caller's verdict (`Judge::judge`, moving nothing) and its
+> append (`Judge::append`: one entry on that ref's own log at the position read, A-642; `append_atomic`, every ref or
+> none under `atomic`, stricter than git's code by the capability's own words), and report-status and
+> report-status-v2 with option lines, multiplexed after git's band-2 lines. `Session` runs it over one connection,
+> sans-io. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
+> (`fixtures/push/make-push-fixtures.sh`), answered byte for byte, the fsck push's band 2 but for git's prose. `cargo
+> test -p slates-git --lib` on the Mac Studio: part 1's 194 of 194, 287 merged; the continuation's 349 of 349 merged
+> with main, 17 failing first against stubs, red ten ways by mutation. Owed: part 2, `Judge` over the engine (each
+> ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable versions, A-645; several
+> together under `atomic`, A-635; appended per A-642 through a trait until g261's append lands); then review requests
+> over `refs/for/`, signed pushes, `.have` lines, the warnings git's strict check writes on band 2, and A-590's blob
+> checks. Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 > **A-618 (2026-11-19, g225; shared piece 4, works from a client's push):** built in the engine
 > (`slates_merge::push`). A push's base tree and pushed tree are compared by the tool's ids through `PushObjects`, never
 > reading a subtree whose id stayed, and become the work §4.17.1 items 2 and 3 name, the head as `slates.vcs.head` on
@@ -450,12 +455,18 @@
 > histories, 7.2's set discovery driven to the shared set (its rounds counted), and a probe of stock `hg serve --stdio`
 > 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight answers byte for byte. **Built (A-630 part 1):** a
 > store's names (both of 7.2's encodings, hashed long names) > and its fncache, every entry of two stores 7.2 wrote
-> encoded to exactly its files. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index,
-> version 2's file index, and censored, ellipsis and externally stored revisions; (4, rest) read serving: the
-> changegroup and the bundle2 a `getbundle` answers (A-619 part 2), `obsolete`'s `listkeys` dump and the `obsmarkers`
-> part, `slates hg serve --stdio`'s loop, HTTP version 1, the `0.2` answers compressed by A-598's engines at the learned
-> level, and the index's kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated
-> in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission);
+> encoded to exactly its files. **Built (A-619 part 2):** a `getbundle`'s answer over a `Store` (changeset texts,
+> manifest and file logs, markers): the bundle2 parts in 7.2's order through the built codecs, the changegroup of full
+> texts (every manifest the missing changesets name, file revisions left out where their log's link is common), markers
+> in `sortedmarkers`' order, a part the client cannot read refused by kind; proven by `cargo test --locked -p slates-hg
+> --lib`, 208 of 208 on the Mac Studio (2026-11-19, debug, load 8.4), red first against stubs (9 of 9 failed), against
+> three captured sessions of stock 7.2 (a clone, a pull, an incoming) by meaning, a model of 7.2's packer on generated
+> histories, and hostile requests. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index,
+> version 2's file index, and censored, ellipsis and externally stored revisions; (4, rest) read serving: `obsolete`'s
+> `listkeys` dump, `slates hg serve --stdio`'s loop (a bundle2 request's abort answered as an `error:abort` part), HTTP
+> version 1, held deltas in place of full texts, the `0.2` answers compressed by A-598's engines at the learned level,
+> and the index's kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated in
+> slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -549,9 +560,10 @@
 > `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac
 > Studio, red-checked six ways (see A-613); its second part's first slice, `get-dir` and `get-locations`, the two stock
 > sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
-> the caller's room, red-checked six ways, the fixtures recorded again for every command still owed. Owed from it:
-> `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by
-> A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
+> the caller's room, red-checked six ways, the fixtures recorded again for every command still owed; its third slice
+> (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways. Owed from it: `log` with merged revisions,
+> `get-location-segments`, `get-file-revs`, `get-deleted-rev`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
 > greeting's `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's
