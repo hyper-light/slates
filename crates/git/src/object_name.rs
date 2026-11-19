@@ -182,23 +182,44 @@ pub fn read_header(
 /// The value of `digits`, a size in canonical decimal: at least one digit, no zero before another, nothing else. `from`
 /// is where the digits begin in their header, for a refusal's place.
 fn canonical_decimal(digits: &[u8], from: usize) -> Result<u64, HeaderRefusal> {
-  let not_decimal = |offset: usize| HeaderRefusal::NotDecimal {
-    at: to_u64(from.saturating_add(offset)),
-  };
+  decimal(digits).map_err(|refusal| match refusal {
+    DecimalRefusal::NotDecimal { offset } => HeaderRefusal::NotDecimal {
+      at: to_u64(from.saturating_add(offset)),
+    },
+    DecimalRefusal::Overflow => HeaderRefusal::SizeOverflow,
+  })
+}
+
+/// Why digits are not a number in canonical decimal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecimalRefusal {
+  /// No digit, a zero before another digit, or a byte that is not a digit.
+  NotDecimal {
+    /// Where, from the digits' start (0 when there are none).
+    offset: usize,
+  },
+  /// The number does not fit 64 bits.
+  Overflow,
+}
+
+/// The value of `digits` in canonical decimal, as git writes a number (`%d`, `%"PRIuMAX`, `%"PRItime`): at least one
+/// digit, no zero before another, no sign, nothing else. A header's size reads so (A-600), and so do protocol v0's
+/// depth and time (A-604).
+pub(crate) fn decimal(digits: &[u8]) -> Result<u64, DecimalRefusal> {
   match digits {
-    [] => return Err(not_decimal(0)),
-    [b'0', _, ..] => return Err(not_decimal(1)),
+    [] => return Err(DecimalRefusal::NotDecimal { offset: 0 }),
+    [b'0', _, ..] => return Err(DecimalRefusal::NotDecimal { offset: 1 }),
     _ => {}
   }
   let mut value: u64 = 0;
   for (offset, byte) in digits.iter().enumerate() {
     let Some(digit) = DECIMAL_DIGITS.iter().position(|known| known == byte) else {
-      return Err(not_decimal(offset));
+      return Err(DecimalRefusal::NotDecimal { offset });
     };
     value = value
       .checked_mul(DECIMAL)
       .and_then(|tens| tens.checked_add(to_u64(digit)))
-      .ok_or(HeaderRefusal::SizeOverflow)?;
+      .ok_or(DecimalRefusal::Overflow)?;
   }
   Ok(value)
 }
@@ -208,9 +229,15 @@ fn canonical_decimal(digits: &[u8], from: usize) -> Result<u64, HeaderRefusal> {
 pub fn write_header(header: Header, out: &mut impl Out) {
   out.put(header.kind.name());
   out.put(&[SPACE]);
+  write_decimal(header.size, out);
+  out.put(&[NUL]);
+}
+
+/// Writes `value` in decimal as git writes a number: no sign, no zero first, one `0` for zero.
+pub(crate) fn write_decimal(value: u64, out: &mut (impl Out + ?Sized)) {
   let mut digits = [0u8; MAX_SIZE_DIGITS];
   let mut start = digits.len();
-  let mut left = header.size;
+  let mut left = value;
   loop {
     let digit = left.checked_rem(DECIMAL).unwrap_or(0);
     left = left.checked_div(DECIMAL).unwrap_or(0);
@@ -231,7 +258,6 @@ pub fn write_header(header: Header, out: &mut impl Out) {
     }
   }
   out.put(digits.get(start..).unwrap_or_default());
-  out.put(&[NUL]);
 }
 
 /// The hash a repository names its objects with: what protocol v2's `object-format` capability names
@@ -370,6 +396,28 @@ impl ObjectId {
       .get(..self.format.raw_len())
       .unwrap_or(&self.bytes)
   }
+
+  /// The null name of `format`, every byte zero (git's `null_oid`): the name no object has, which the advertisement of a
+  /// repository with no refs carries (A-604).
+  pub fn null(format: ObjectFormat) -> ObjectId {
+    ObjectId {
+      format,
+      bytes: [0; MAX_RAW_LEN],
+    }
+  }
+
+  /// Whether this is its format's null name.
+  pub fn is_null(&self) -> bool {
+    self.as_bytes().iter().all(|byte| *byte == 0)
+  }
+
+  /// Writes the name in lower-case hexadecimal, as git writes it (`hex.c`'s `hash_to_hex`): the format's
+  /// [`ObjectFormat::hex_len`] digits.
+  pub fn write_hex(&self, out: &mut (impl Out + ?Sized)) {
+    for byte in self.as_bytes() {
+      out.put(&hex_pair(*byte));
+    }
+  }
 }
 
 /// The value of one hexadecimal digit of either case.
@@ -381,14 +429,28 @@ fn hex_value(digit: Option<u8>) -> Option<u8> {
     .and_then(|value| u8::try_from(value).ok())
 }
 
+/// The name's bytes, as the object store keys and compares names (A-614: `slates_vcs::Naming::Id`).
+impl AsRef<[u8]> for ObjectId {
+  fn as_ref(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
+/// The two lower-case hexadecimal digits of `byte`, high first.
+fn hex_pair(byte: u8) -> [u8; 2] {
+  let digit = |value: u8| HEX_DIGITS.get(usize::from(value)).copied().unwrap_or(b'0');
+  [
+    digit(byte.checked_shr(HEX_DIGIT_BITS).unwrap_or(0)),
+    digit(byte & LOW_DIGIT),
+  ]
+}
+
 impl core::fmt::Display for ObjectId {
   /// The name in lower-case hexadecimal, as git writes it.
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     for byte in self.as_bytes() {
-      let high = HEX_DIGITS.get(usize::from(byte.checked_shr(HEX_DIGIT_BITS).unwrap_or(0)));
-      let low = HEX_DIGITS.get(usize::from(byte & LOW_DIGIT));
-      for digit in [high, low].into_iter().flatten() {
-        core::fmt::Write::write_char(f, char::from(*digit))?;
+      for digit in hex_pair(*byte) {
+        core::fmt::Write::write_char(f, char::from(digit))?;
       }
     }
     Ok(())
