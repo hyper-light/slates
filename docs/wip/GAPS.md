@@ -18033,15 +18033,26 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   same. The precise fix marks as stale, in adopted files' states, the ranges the last publications and the replayed
   writes changed. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not
   reproduced.
-- **An effect served before its publication (open, from A-158).** A mutation is applied, then published before its
-  reply. A mount that reads the new bytes in between, followed by the daemon dying before the publication, holds bytes
-  the successor never had. If its kernel looked the inode up after the last publication, no restored reference names it,
-  and the takeover round leaves it cached. The change was never acknowledged, so this is a dirty read surviving a crash,
-  not a lost acknowledgement. Not reproduced.
-- **An outsider's change beneath a base during a takeover's gap (open, from A-158).** A base file the kernel looked up
-  after the last publication is in no restored reference, and the successor's watcher did not run while no daemon did.
-  Its names and attributes revalidate within the base's timestamp granularity, but its cached pages stay. Not
-  reproduced.
+- **An effect served before its publication (from A-158) — fixed 2026-11-19 (A-573, B10 (a)) for every inode the
+  successor holds.** A mutation is applied, then published before its reply. A mount that reads the new bytes in
+  between, followed by the daemon dying before the publication, holds bytes the successor never had. If its kernel
+  looked the inode up after the last publication, no restored reference names it, and the takeover round left it
+  cached. The change was never acknowledged, so this is a dirty read surviving a crash, not a lost acknowledgement. Not
+  reproduced. Now a mount of the head is sent every inode of the head (`Volume::visit_head_inodes`;
+  `a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover`, red with the old set). **Still
+  open:** a number the dead daemon issued after its last publication (an unpublished create a listing showed) is in no
+  image and no head; the successor refuses it (`NotFound`), never serving it, but a descriptor opened before the death
+  keeps its cached pages until each publication records the volume's live counter beside its reserved ceiling (the
+  image and the delta, both encodings, the publication oracle), so the round can name the numbers between the two.
+- **An outsider's change beneath a base during a takeover's gap (from A-158) — fixed 2026-11-19 (A-573, B10 (b)) for
+  every base file the successor holds.** A base file the kernel looked up after the last publication is in no restored
+  reference, and the successor's watcher did not run while no daemon did. Its names and attributes revalidate within
+  the base's timestamp granularity, but its cached pages stayed (a FUSE mount asks no `FUSE_AUTO_INVAL_DATA`). Not
+  reproduced. Now every inode of the head is named, base files loaded before the last publication among them
+  (`a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit`, red with the
+  old set). **Still open:** a base directory first loaded after the last publication gave its files numbers no image
+  holds, so they are the numbers above: refused, never served, their pages kept by a descriptor opened before the
+  death until publications record the live counter.
 - **Kernels before FUSE 7.44 keep renamed-away names across a takeover (open, from A-158).** They take no
   `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
   mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but

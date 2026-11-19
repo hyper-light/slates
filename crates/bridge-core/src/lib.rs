@@ -877,12 +877,15 @@ pub trait Bridge {
   fn restored_open_files(&mut self, _cx: &OpContext) -> Vec<u64> {
     Vec::new()
   }
-  /// Visits the inodes whose cached state this attachment's kernel may hold older than the volume's after a takeover
-  /// (A-158), in inode order and each once, starting after `after`, until `visit` breaks; whether every one was
-  /// visited. The set is the references the recovery gave back to the attachment, with any taken since, and the inodes
-  /// the write-log replay wrote. A mount taken over by this daemon invalidates them in slices from its first turn, so
-  /// nothing the dead daemon changed and never told the kernel of outlives the takeover. The default, none, is a bridge
-  /// with nothing restored.
+  /// Visits the inodes whose cached state this attachment's kernel may hold otherwise than the volume does after a
+  /// takeover (A-158, A-573), each once, starting after `after`, until `visit` breaks; whether every one was visited.
+  /// For a view of the head the set is every inode of the head, in the table's order: a lookup made after the last
+  /// publication is in no image, and such a kernel can hold bytes a mutation showed before the publication the death
+  /// lost, or a base file's pages an outsider changed while no daemon ran. For a pinned view it is the references the
+  /// recovery gave back to the attachment, with any taken since, and the inodes the write-log replay wrote, in inode
+  /// order. A mount taken over by this daemon invalidates them in slices from its first turn, so nothing the dead
+  /// daemon showed or changed and never told the kernel of outlives the takeover. The default, none, is a bridge with
+  /// nothing restored.
   fn takeover_inodes(
     &mut self,
     _cx: &OpContext,
