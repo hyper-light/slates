@@ -34,8 +34,11 @@
 //!   revision as `detect_changed` finds it; `get-file-revs` ends at a hidden location, and ends the connection with
 //!   nothing written for the command where `svnserve`'s assertion aborts its process (its authentication request still
 //!   in the unflushed buffer, as the recording shows). `get-latest-rev`, `get-dated-rev` and `get-deleted-rev` check
-//!   nothing.
-//!   Owed: a session that could authenticate, which `svnserve` asks to, mid-command, before it refuses.
+//!   nothing. Where the session is anonymous and the client could authenticate for read access
+//!   ([`Authentication::Available`]), a path check that fails asks it to instead of refusing, as `must_have_access`
+//!   does: nothing is written ([`Outcome::Authenticate`]), the connection asks, and the command runs again with the
+//!   principal the client proved ([`Authentication::Done`]), its answer with no trivial request before it, or refused
+//!   "Authorization failed" where that principal may not read the path either.
 //! - **Property lists in name order.** `svnserve` writes a property list in its hash table's order, which APR seeds per
 //!   table (`apr_hash_make` since APR 1.5), so three recordings of one repository gave three orders; a client reads the
 //!   list into a hash. The handler writes them in byte order of their names, and the tests compare them as sets.
@@ -339,6 +342,25 @@ pub struct Session<'session> {
   /// rules for the repository's name and the session's user, compiled once); `None` when the repository names no
   /// authorization file, and then every path is readable (`authz_check_access` grants every path without one).
   pub authz: Option<&'session PrincipalRules>,
+  /// Where the session's authentication stands for the command's path check (`must_have_access`).
+  pub authentication: Authentication,
+}
+
+/// Where a session's authentication stands for the command a path check is made in (`serve.c` `must_have_access`,
+/// 809-850).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Authentication {
+  /// No authentication can be asked for: a path the session may not read is refused "Authorization failed" (170001)
+  /// with nothing before it, and a readable one is answered after the trivial authentication request.
+  Settled,
+  /// The session is anonymous and the client could authenticate for read access (`must_have_access`' condition: no
+  /// user yet, authenticated users granted read access, and a way to authenticate): a path the session may not read is
+  /// answered with nothing written, [`Outcome::Authenticate`], for the connection to ask the client.
+  Available,
+  /// The command runs again once the client has authenticated for it: its answer has no trivial authentication request
+  /// before it, the authentication's own success standing for it, and a path the new principal may not read either is
+  /// refused "Authorization failed" with nothing before it.
+  Done,
 }
 
 /// How much of a revision the session may read (`svn_repos_revision_access_level_t`), judged from its changed paths
@@ -401,6 +423,10 @@ pub enum Outcome {
   Close,
   /// A command of the main set another piece answers. Nothing is appended.
   Elsewhere,
+  /// The path the command names is one the anonymous session may not read, and the client could authenticate
+  /// ([`Authentication::Available`]): nothing is appended. The caller asks the client to authenticate, as
+  /// `must_have_access` does with a username needed, then runs the command again with [`Authentication::Done`].
+  Authenticate,
 }
 
 /// Answers one command of a session: appends its answer to `out` and says what it made of it.
@@ -427,6 +453,7 @@ pub fn answer<R: Repository + ?Sized>(
     base: session.base,
     uuid: session.uuid,
     authz: session.authz,
+    authentication: session.authentication,
     out,
   };
   match *name {
@@ -569,6 +596,8 @@ struct Reads<'reads, R: ?Sized> {
   uuid: &'reads str,
   /// The session's read rules, `None` reading every path.
   authz: Option<&'reads PrincipalRules>,
+  /// Where the session's authentication stands for the command's path check.
+  authentication: Authentication,
   /// The output.
   out: &'reads mut Vec<u8>,
 }
@@ -713,8 +742,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let Some((path, revision)) = path_and_revision(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    if !self.must_read(&path)? {
-      return Ok(Outcome::Answered);
+    if let Some(outcome) = self.must_read(&path)? {
+      return Ok(outcome);
     }
     let found = self
       .at_or_youngest(revision)
@@ -734,8 +763,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let Some((path, revision)) = path_and_revision(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    if !self.must_read(&path)? {
-      return Ok(Outcome::Answered);
+    if let Some(outcome) = self.must_read(&path)? {
+      return Ok(outcome);
     }
     let found = self
       .at_or_youngest(revision)
@@ -828,8 +857,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let Some((path, revision)) = path_and_revision(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    if !self.must_read(&path)? {
-      return Ok(Outcome::Answered);
+    if let Some(outcome) = self.must_read(&path)? {
+      return Ok(outcome);
     }
     let found = self
       .existing(revision.unwrap_or(-1))
@@ -913,8 +942,8 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     let Some(request) = DirectoryRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    if !self.must_read(&request.path)? {
-      return Ok(Outcome::Answered);
+    if let Some(outcome) = self.must_read(&request.path)? {
+      return Ok(outcome);
     }
     match self.directory_answer(&request) {
       Ok(answer) => {
@@ -1268,16 +1297,22 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     may_read(self.authz, path)
   }
 
-  /// `must_have_access` for reading `path` (`serve.c`): the trivial authentication request when the session may read
-  /// it, answering `true`; else the refusal "Authorization failed" with nothing before it, answering `false`. (Where
-  /// the session is anonymous and could authenticate, `svnserve` asks it to first: owed, GAPS.)
-  fn must_read(&mut self, path: &str) -> Result<bool, ItemError> {
+  /// `must_have_access` for reading `path` (`serve.c` 809-850): `None` when the session may read it, the command going
+  /// on after the trivial authentication request (none once the client has just authenticated for it); else the
+  /// command's outcome: [`Outcome::Authenticate`], nothing written, where the client could authenticate, or the
+  /// refusal "Authorization failed" with nothing before it.
+  fn must_read(&mut self, path: &str) -> Result<Option<Outcome>, ItemError> {
     if self.readable(path) {
-      self.trivial_auth()?;
-      return Ok(true);
+      if self.authentication != Authentication::Done {
+        self.trivial_auth()?;
+      }
+      return Ok(None);
+    }
+    if self.authentication == Authentication::Available {
+      return Ok(Some(Outcome::Authenticate));
     }
     self.failure(&Failure::not_authorized())?;
-    Ok(false)
+    Ok(Some(Outcome::Answered))
   }
 
   /// `svn_repos_check_revision_access`: how much of `revision` the session may read. Without rules, or for a
@@ -1881,6 +1916,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 mod deleted;
 mod file;
 mod file_revs;
+mod fold;
 mod history;
 mod list;
 mod log;
