@@ -309,7 +309,7 @@ fn read_node(store: &ContentStore, id: ContentId) -> Result<Node, BlameRefused> 
     return Err(malformed);
   };
   let mut names = node.names();
-  let (Some(content), Some(spans), None) = (names.next(), names.next(), names.next()) else {
+  let (Some(content), Some(spans), _) = (names.next(), names.next(), names.next()) else {
     return Err(malformed);
   };
   let Some((&BLAME, rest)) = node.payload().split_first() else {
@@ -399,8 +399,7 @@ fn decode_spans(bytes: &[u8], lines: u64) -> Option<Vec<Span>> {
     spans.push(span);
     rest = after;
   }
-  let _ = (total, lines);
-  Some(spans)
+  (total == lines).then_some(spans)
 }
 
 /// The blame of the file at `path` in the version whose value (its blame tree) is `value`: its spans in line order, or
