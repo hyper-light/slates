@@ -322,7 +322,6 @@
 > `PushObjects` is A-638's, below); submodule links (§4.17.2 item 5's special node kind, A-637); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
 > post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
 > 64-bit path indices ended the 65,535-name cap this piece first refused past).
-<<<<<<< HEAD
 >
 > **A-638 (2026-11-19, g225; §4.17.2 pieces 5 and 6, the store as the push path reads it):** built in `crates/git`
 > (`store::views`). receive-pack's `Repository` is the index alone (`IndexedObjects`), and A-618's `PushObjects` is the
@@ -333,7 +332,6 @@
 > store, and two pushes made works through it, are among the tests. Owed: receive-pack's part 2 submitting each ref's
 > work through these views. A `Cow` return on `unpack::Outside` and `receive::Repository` would let a view lend an
 > assembled base without keeping it (those traits are A-608's and A-620's).
-=======
 > **A-624 part 2 (2026-11-19, g230; piece 14's rest):** `slates-git` (`v2`) reads `object-info` and `bundle-uri`
 > requests and answers them over traits: `object-info` as git 2.50.1 answers (`size` only when asked, an unknown
 > object's space alone, ids alone without `size`, no LF) from `ObjectSizes`, which A-614's store answers by its rows
@@ -347,7 +345,6 @@
 > red ten ways by mutation. Owed: the store's own bundle
 > list and URI packs (each a run of A-614 part 2's fragments, its hash and URI) and the fetch path that asks for them
 > (piece 7); `object-info`'s `type`, which git's master adds, when a release ships it.
->>>>>>> origin/main
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
