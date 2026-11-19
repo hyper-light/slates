@@ -48,6 +48,7 @@
 //! as not served until it lands (git's upload-pack, A-640; receive-pack, A-620; Mercurial's `serve --stdio`, A-650;
 //! Subversion's tunnel, §4.17.4 piece 12); the live `git clone` over SSH (main's run).
 
+mod git;
 pub(crate) mod site;
 mod waits;
 
