@@ -6,15 +6,15 @@
 //! against hold one history, which the tests check against `changed.txt` (`svnlook changed`).
 
 use super::Guards;
-use crate::report::Report;
-use crate::report::recorded::Written;
-use crate::svndiff::{Window, apply_all};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, Revision,
   RevisionRecord, Text,
 };
 use crate::mergeinfo::Contents;
 use crate::reads::Repository;
+use crate::report::Report;
+use crate::report::recorded::Written;
+use crate::svndiff::{Window, apply_all};
 use aws_lc_rs::digest::{MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest};
 use std::collections::BTreeMap;
 
@@ -531,7 +531,10 @@ pub(in crate::report) enum Normal {
 }
 
 /// The calls in their shared form, every delta applied to the text whose MD5 it names.
-pub(in crate::report) fn normalize(calls: Vec<Written>, texts: &BTreeMap<[u8; 16], Vec<u8>>) -> Vec<Normal> {
+pub(in crate::report) fn normalize(
+  calls: Vec<Written>,
+  texts: &BTreeMap<[u8; 16], Vec<u8>>,
+) -> Vec<Normal> {
   let mut normal = Vec::new();
   for call in calls {
     match call {

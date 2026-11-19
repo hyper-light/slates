@@ -13680,6 +13680,17 @@ and export by landing).
 > `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
 > delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
 > sent today as new data; and the handler.
+>
+> **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
+> connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
+> `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
+> before every call (`abort-edit`, then 210004 "Successful edit status returned too soon" or the client's errors);
+> `close-edit`'s answer read (`( success ( ) )`, or `abort-edit` and the client's errors written back as
+> `svn_ra_svn__handle_failure_status` reads them); a drive's refusal answered with its error and the client's after
+> it. Held to every recorded report command replayed whole against `svnserve`'s bytes (34 sessions), an early answer
+> before each of a checkout's calls, fourteen answers to `close-edit`, any budget and any cut; red six ways. Owed: the
+> server's connection task that runs it (piece 7's), the deltas of changed texts (A-652's generator), and a recorded
+> session of copy sources.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -44717,3 +44728,38 @@ sources); `crates/svn` (`report/drive.rs`'s `Drive`, `Guards`, `DriveFailure` an
 - **Owed** (GAPS): the deltas of changed texts against their base, `xdelta.c` ported; the handler that writes the
   drive, reads the client's early answer and its answers to `close-edit` and `abort-edit`, and answers the command;
   one copy-root walk for `reads` and the drive.
+
+### A-616, continued (3) — One report command's exchange on an ra_svn connection (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/exchange.rs` and its
+tests, new; `report.rs`'s `Context` gains the caller's `most_open` and `Refused` an `Editor` refusal;
+`report/drive.rs`'s `Sources` public; the fixtures' green and the drives' shared form in `report/drive/green.rs`).
+
+- **The exchange** (`report::exchange`; `serve.c` `accept_report`, `editorp.c`, `marshal.c` at `d434dc14`, 1.15.0
+  alike): `Exchange::begin` answers the command (part 1's `Reporter`), `receive` reads the report, then writes the
+  drive's calls through the editor writer until the caller's room is used or the drive's steps are spent
+  (`Turn::Wrote`), at least one call a turn. Before every call but `close-edit` and `abort-edit` (and an absent entry
+  not sent) it looks for the client's answer, as `check_for_error` does: one there is answered `abort-edit`, read, and
+  the command fails with 210004 "Successful edit status returned too soon" after a success, else with the client's
+  errors. `close-edit`'s answer ends the command with `( success ( ) )`, or with `abort-edit` and the client's errors
+  written back; a drive's refusal is answered with its own error and the client's after it
+  (`svn_error_compose_create`).
+- **The client's errors** as `svn_ra_svn__read_cmd_response` and `svn_ra_svn__handle_failure_status` read them: read
+  from the last back, a command-error wrapper (210000) dropped, the number kept as an `apr_status_t` (its low 32 bits,
+  sign-extended when written back), message and file read as C strings; "Empty error list", "Malformed error list",
+  "Malformed network data" and "Unknown status '…' in command response" (210004 each) for the shapes it refuses.
+- **Where it differs from `svnserve`**, in when and what, never in what a stock client reads: it looks for an early
+  answer before every command, where `svnserve` looks after 4,096 bytes written or a flush (`error_check_interval`,
+  `svnserve.c` 801), so it notices one no later; an answer that is no item, or nested past three lists, ends the
+  connection, where `svnserve` reads 64 levels and refuses the command; an error the client sent without a message is
+  written back without one, where `svnserve` writes `svn_strerror`'s text.
+- **Tests.** Every recorded session with a report command (34; the malformed one's connection ends unflushed) replayed
+  from its command, the client's answer handed over only once asked, as a stock client sends it: `svnserve`'s items
+  before and after the drive byte for byte, its drive call for call in the shared form; an early success and an early
+  failure after each of a checkout's calls; fourteen answers to `close-edit`; a drive's refusal with and without the
+  client's errors; answers past the bounds; one byte and one step a turn, and the report cut at every byte, writing
+  alike. `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: red first (`receive` refusing at
+  once: 6 of 6 failed), then 371 of 371; red five more ways by mutation (the early check dropped, wrappers kept, the
+  client's errors dropped after a refusal, C strings uncut, the list read from the front), each caught; rustfmt's
+  layout from the Studio.
+- **Owed** (GAPS): the server's connection task that runs an exchange (piece 7's, with `get-latest-rev` and the other
+  reads); the deltas of changed texts through A-652's generator; a recorded session asking for copy sources.

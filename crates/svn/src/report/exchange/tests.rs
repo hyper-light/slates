@@ -16,8 +16,8 @@ use crate::report::drive::green::{
   FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5,
 };
 use crate::report::recorded::{
-  Recorded, SESSIONS, command, context, drive_items, finished_report, items, read_drive,
-  recorded, report_command, session,
+  Recorded, SESSIONS, command, context, drive_items, finished_report, items, read_drive, recorded,
+  report_command, session,
 };
 use std::collections::BTreeMap;
 
@@ -135,7 +135,9 @@ fn client_parts(recorded: Recorded, index: usize) -> (Vec<u8>, Vec<u8>) {
     .find(|(_, item)| command(item).is_some_and(|(name, _)| name == "finish-report"))
     .map_or(items.len() - 1, |(at, _)| at);
   let report = items[index + 1..=finish].concat();
-  let answer = items.get(finish + 1).map_or_else(Vec::new, |item| item.to_vec());
+  let answer = items
+    .get(finish + 1)
+    .map_or_else(Vec::new, |item| item.to_vec());
   if recorded.name == "hostile-report-early-edit-response.1" {
     ([report, answer].concat(), Vec::new())
   } else {
@@ -161,7 +163,12 @@ fn session_guards(recorded: Recorded) -> FixtureGuards {
 
 /// Replays a recorded session's report command through an exchange with `budget`, the report in
 /// `cuts`' pieces.
-fn replay_session(fixture: &Fixture, recorded: Recorded, budget: Budget, cuts: &[usize]) -> Replayed {
+fn replay_session(
+  fixture: &Fixture,
+  recorded: Recorded,
+  budget: Budget,
+  cuts: &[usize],
+) -> Replayed {
   let (session_path, index, request) = report_command(recorded);
   let established = session();
   let context = context(&established, &session_path, recorded.client);
@@ -173,7 +180,13 @@ fn replay_session(fixture: &Fixture, recorded: Recorded, budget: Budget, cuts: &
     budget,
     early_after: None,
   };
-  replay(fixture, &session_guards(recorded), &context, request, replay_of)
+  replay(
+    fixture,
+    &session_guards(recorded),
+    &context,
+    request,
+    replay_of,
+  )
 }
 
 /// `bytes` in the pieces `cuts` makes.
@@ -214,54 +227,81 @@ const SERVER_HANDSHAKE_ITEMS: usize = 4;
 /// authentication's.
 const CLIENT_HANDSHAKE_ITEMS: usize = 2;
 
-/// Asserts that an exchange wrote what `svnserve` wrote in its session: the items before the
-/// drive and after it byte for byte, the drive call for call in the shared form. A session without a
+/// Asserts that an exchange wrote what `svnserve` wrote in its session: the items before the drive
+/// and after it byte for byte, the drive call for call in the shared form. A session without a
 /// drive is a hand-made one whose report command came first, answered right after the handshake.
 fn assert_as_svnserve(recorded: Recorded, ours: &[u8], texts: &BTreeMap<[u8; 16], Vec<u8>>) {
   let name = recorded.name;
   let (ours, theirs) = (items(ours), items(recorded.server));
   let (our_start, our_end) = drive_span(&ours);
   let (their_start, their_end) = if our_start == ours.len() {
-    assert_eq!(report_command(recorded).1, CLIENT_HANDSHAKE_ITEMS, "{name}: the first command");
+    assert_eq!(
+      report_command(recorded).1,
+      CLIENT_HANDSHAKE_ITEMS,
+      "{name}: the first command"
+    );
     let answered = SERVER_HANDSHAKE_ITEMS + our_start;
     (answered, answered)
   } else {
     drive_span(&theirs)
   };
   let before = their_start.checked_sub(our_start).unwrap();
-  assert_eq!(ours[..our_start], theirs[before..their_start], "{name}: before the drive");
+  assert_eq!(
+    ours[..our_start],
+    theirs[before..their_start],
+    "{name}: before the drive"
+  );
   let our_drive = read_drive(&ours[our_start..our_end]).calls;
   let their_drive = read_drive(&theirs[their_start..their_end]).calls;
-  assert_eq!(normalize(our_drive, texts), normalize(their_drive, texts), "{name}: the drive");
+  assert_eq!(
+    normalize(our_drive, texts),
+    normalize(their_drive, texts),
+    "{name}: the drive"
+  );
   let after = &ours[our_end..];
-  assert_eq!(after, &theirs[their_end..their_end + after.len()], "{name}: after the drive");
+  assert_eq!(
+    after,
+    &theirs[their_end..their_end + after.len()],
+    "{name}: after the drive"
+  );
 }
 
 /// A-616 part 2 (`accept_report`, `editorp.c` against stock `svnserve` 1.15.0): replay every
 /// recorded report command and what follows it through an exchange, the client's answer handed over
-/// once asked; expect `svnserve`'s items before and after the drive byte for byte and its drive call
-/// for call, every replayed session met.
+/// once asked; expect `svnserve`'s items before and after the drive byte for byte and its drive
+/// call for call, every replayed session met.
 #[test]
 fn every_recorded_exchange_is_answered_as_svnserve_answered_it() {
   let fixture = fixture();
   let texts = texts_by_md5(&fixture.green);
   let mut replayed = 0;
-  for recorded in SESSIONS.iter().copied().filter(|recorded| has_report(*recorded)) {
+  for recorded in SESSIONS
+    .iter()
+    .copied()
+    .filter(|recorded| has_report(*recorded))
+  {
     let (out, ending, _) = replay_session(&fixture, recorded, PLENTY, &[]);
     if let Ending::Refused(refused) = ending {
-      assert_eq!(recorded.name, "hostile-report-malformed-set-path.1", "{refused:?}");
+      assert_eq!(
+        recorded.name, "hostile-report-malformed-set-path.1",
+        "{refused:?}"
+      );
       continue;
     }
     replayed += 1;
-    assert!(matches!(ending, Ending::Answered | Ending::Failed(_)), "{}: {ending:?}", recorded.name);
+    assert!(
+      matches!(ending, Ending::Answered | Ending::Failed(_)),
+      "{}: {ending:?}",
+      recorded.name
+    );
     assert_as_svnserve(recorded, &out, &texts);
   }
   assert_eq!(replayed, REPLAYED);
 }
 
-/// A-616 part 2 (bounded turns): replay a recorded checkout and an update with one byte and one step
-/// a turn, then with the report cut at every byte; expect what the whole budget and the whole report
-/// wrote, every time.
+/// A-616 part 2 (bounded turns): replay a recorded checkout and an update with one byte and one
+/// step a turn, then with the report cut at every byte; expect what the whole budget and the whole
+/// report wrote, every time.
 #[test]
 fn an_exchange_writes_alike_under_any_budget_and_any_cut() {
   let fixture = fixture();
@@ -269,11 +309,19 @@ fn an_exchange_writes_alike_under_any_budget_and_any_cut() {
     let source = recorded(name);
     let (whole, ending, _) = replay_session(&fixture, source, PLENTY, &[]);
     assert_eq!(ending, Ending::Answered, "{name}");
-    assert_eq!(replay_session(&fixture, source, SMALLEST, &[]).0, whole, "{name}: smallest budget");
+    assert_eq!(
+      replay_session(&fixture, source, SMALLEST, &[]).0,
+      whole,
+      "{name}: smallest budget"
+    );
     let (_, index, _) = report_command(source);
     let report_length = client_parts(source, index).0.len();
     for at in 0..report_length {
-      assert_eq!(replay_session(&fixture, source, PLENTY, &[at]).0, whole, "{name}: cut at {at}");
+      assert_eq!(
+        replay_session(&fixture, source, PLENTY, &[at]).0,
+        whole,
+        "{name}: cut at {at}"
+      );
     }
   }
 }
@@ -297,7 +345,13 @@ fn early(fixture: &Fixture, turns: usize, answer: &[u8]) -> Replayed {
     budget: SMALLEST,
     early_after: Some((turns, answer.to_vec())),
   };
-  replay(fixture, &FixtureGuards::anonymous(), &context, request, replay_of)
+  replay(
+    fixture,
+    &FixtureGuards::anonymous(),
+    &context,
+    request,
+    replay_of,
+  )
 }
 
 /// A-616 part 2 (`check_for_error_internal`): answer the recorded checkout's drive early, after
@@ -315,7 +369,11 @@ fn an_early_answer_aborts_the_edit_wherever_it_comes() {
       let (out, ending, _) = early(&fixture, after, answer);
       assert_eq!(ending, Ending::Answered, "after {after}");
       let ends = [&b"( abort-edit ( ) ) "[..], written].concat();
-      assert!(out.ends_with(&ends), "after {after}: {}", String::from_utf8_lossy(&out));
+      assert!(
+        out.ends_with(&ends),
+        "after {after}: {}",
+        String::from_utf8_lossy(&out)
+      );
     }
   }
   let (out, ending, _) = early(&fixture, turns, SUCCESS_ANSWER);
@@ -337,8 +395,19 @@ fn answered(fixture: &Fixture, name: &str, answer: &[u8]) -> Vec<u8> {
     budget: PLENTY,
     early_after: None,
   };
-  let (out, ending, _) = replay(fixture, &FixtureGuards::anonymous(), &context, request, replay_of);
-  assert_eq!(ending, Ending::Answered, "{}", String::from_utf8_lossy(answer));
+  let (out, ending, _) = replay(
+    fixture,
+    &FixtureGuards::anonymous(),
+    &context,
+    request,
+    replay_of,
+  );
+  assert_eq!(
+    ending,
+    Ending::Answered,
+    "{}",
+    String::from_utf8_lossy(answer)
+  );
   out
 }
 
@@ -392,7 +461,8 @@ const CLOSE_ANSWERS: [AnswerCase; 14] = [
   ),
   (
     b"( maybe ( ) ) ",
-    b"( abort-edit ( ) ) ( failure ( ( 210004 42:Unknown status 'maybe' in command response 0: 0 ) ) ) ",
+    b"( abort-edit ( ) ) ( failure ( ( 210004 42:Unknown status 'maybe' in command \
+      response 0: 0 ) ) ) ",
   ),
   (
     b"( success ) ",
@@ -429,7 +499,11 @@ fn a_drives_refusal_is_written_with_the_clients_answer_after_it() {
   let missing = format!("( 160013 {}:{message} 0: 0 ) ", message.len()).into_bytes();
   let alone = answered(&fixture, "hostile-report-missing-path.1", SUCCESS_ANSWER);
   let expected = [&b"( abort-edit ( ) ) ( failure ( "[..], &missing, b") ) "].concat();
-  assert!(alone.ends_with(&expected), "{}", String::from_utf8_lossy(&alone));
+  assert!(
+    alone.ends_with(&expected),
+    "{}",
+    String::from_utf8_lossy(&alone)
+  );
   let theirs = b"( failure ( ( 155000 4:mine 0: 0 ) ) ) ";
   let both = answered(&fixture, "hostile-report-missing-path.1", theirs);
   let expected = [
@@ -438,7 +512,11 @@ fn a_drives_refusal_is_written_with_the_clients_answer_after_it() {
     b"( 155000 4:mine 0: 0 ) ) ) ",
   ]
   .concat();
-  assert!(both.ends_with(&expected), "{}", String::from_utf8_lossy(&both));
+  assert!(
+    both.ends_with(&expected),
+    "{}",
+    String::from_utf8_lossy(&both)
+  );
 }
 
 /// A-616 part 2 (bounds): answer `close-edit` with an item nested four lists deep and with bytes
@@ -458,9 +536,17 @@ fn an_answer_past_its_bounds_ends_the_connection() {
       budget: PLENTY,
       early_after: None,
     };
-    let (out, ending, _) =
-      replay(&fixture, &FixtureGuards::anonymous(), &context, request, replay_of);
-    assert!(matches!(ending, Ending::Refused(Refused::Item(_))), "{ending:?}");
+    let (out, ending, _) = replay(
+      &fixture,
+      &FixtureGuards::anonymous(),
+      &context,
+      request,
+      replay_of,
+    );
+    assert!(
+      matches!(ending, Ending::Refused(Refused::Item(_))),
+      "{ending:?}"
+    );
     assert!(out.ends_with(b"( close-edit ( ) ) "));
   }
 }

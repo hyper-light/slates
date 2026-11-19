@@ -47,8 +47,8 @@ use super::{
   Request, SVN_ERR_RA_SVN_MALFORMED_DATA, write_empty_success,
 };
 use crate::handshake::ClientCapabilities;
-use crate::reads::Repository;
 use crate::ra_svn::{self, Bounds, Parsed, Parser, Value};
+use crate::reads::Repository;
 
 /// The deepest list a client's answer holds: `( failure ( ( apr-err message file line ) ) )`.
 /// Format: `marshal.c` `svn_ra_svn__handle_failure_status`, three lists deep.
@@ -340,9 +340,10 @@ impl Exchange {
       match call {
         Call::CloseEdit => return self.closing(writer, input, out),
         Call::AbortEdit => {
-          let failure = drive.failure().cloned().ok_or(Refused::Editor(
-            EditorRefused::OutOfOrder,
-          ))?;
+          let failure = drive
+            .failure()
+            .cloned()
+            .ok_or(Refused::Editor(EditorRefused::OutOfOrder))?;
           return self.aborting(Abort::Refused(failure), input, out);
         }
         _ => {}
@@ -432,13 +433,22 @@ impl Exchange {
 }
 
 /// A call written, a refusal of the writer's made the connection's end.
-fn write_call(writer: &mut EditorWriter, call: &Call<'_>, out: &mut Vec<u8>) -> Result<(), Refused> {
+fn write_call(
+  writer: &mut EditorWriter,
+  call: &Call<'_>,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
   writer.write(call, out).map_err(Refused::Editor)
 }
 
 /// An item read as `svn_ra_svn__read_cmd_response` reads it.
 fn answer_of(value: &Value<'_>) -> Answer {
-  let malformed = || Answer::Failure(vec![Error::own(SVN_ERR_RA_SVN_MALFORMED_DATA, MALFORMED_DATA)]);
+  let malformed = || {
+    Answer::Failure(vec![Error::own(
+      SVN_ERR_RA_SVN_MALFORMED_DATA,
+      MALFORMED_DATA,
+    )])
+  };
   let Value::List(items) = value else {
     return malformed();
   };
@@ -471,7 +481,10 @@ fn errors_of(items: &[Value<'_>]) -> Vec<Error> {
     }
   }
   if errors.is_empty() {
-    return vec![Error::own(SVN_ERR_RA_SVN_MALFORMED_DATA, MALFORMED_ERROR_LIST)];
+    return vec![Error::own(
+      SVN_ERR_RA_SVN_MALFORMED_DATA,
+      MALFORMED_ERROR_LIST,
+    )];
   }
   errors.reverse();
   errors
@@ -480,7 +493,10 @@ fn errors_of(items: &[Value<'_>]) -> Vec<Error> {
 /// One error of a failure; none for a wrapper; the refusal of one of another shape.
 fn error_of(item: &Value<'_>) -> Result<Option<Error>, Error> {
   let Value::List(fields) = item else {
-    return Err(Error::own(SVN_ERR_RA_SVN_MALFORMED_DATA, MALFORMED_ERROR_LIST));
+    return Err(Error::own(
+      SVN_ERR_RA_SVN_MALFORMED_DATA,
+      MALFORMED_ERROR_LIST,
+    ));
   };
   let malformed = || Error::own(SVN_ERR_RA_SVN_MALFORMED_DATA, MALFORMED_DATA);
   let fields = tuple::read(fields, ERROR_FORMAT).map_err(|_| malformed())?;

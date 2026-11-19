@@ -701,12 +701,12 @@
 > chain entry and reserved before the verdict, with room in the server's entry bound), a checkpoint of a green holding
 > a copy (part 3), a rebase restating a copy (part 4); the replaced tree held by reference rather than removed key by
 > key, if a measured re-tag's removal outweighs its copy (the A-626 entry).
-> Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
-> ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616
-> part 1, and its drive's calls, their ra_svn writer and the drive itself, A-616 part 2's first two slices), with the
-> lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over
-> `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed
-> is claimed until measured.
+> Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the ra_svn server's commands (its
+> greeting and authentication built, A-599; its reporter's commands and report, A-616 part 1, and its drive's calls,
+> their ra_svn writer, the drive and the command's whole exchange, A-616 part 2), with the lock verbs; hooks and
+> `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`,
+> the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed is claimed until
+> measured.
 > A-616 part 1 (2026-11-19, g234): the reporter's commands and its report (`report`): `update`, `switch`, `status`
 > and `diff` read through a port of `vparse_tuple`, the report kept and checked as `reporter.c` keeps and checks it,
 > every refusal in `svnserve`'s words, held to stock 1.15.0's sessions over one recorded history; `cargo test --locked
@@ -725,6 +725,11 @@
 > the deltas of changed texts (`xdelta.c`), sent as new data today; the handler that writes the drive and reads the
 > client's early answer and its answers to `close-edit` and `abort-edit`; one copy-root walk for `reads` and the
 > drive.
+> A-616 part 2, its third slice (2026-11-19, g234): one report command's exchange on ra_svn (`report::exchange`), the
+> reporter, drive and writer joined as `accept_report` and `editorp.c` join them, the early answer, `close-edit`'s and
+> `abort-edit`'s answers and the client's errors read as `svnserve` reads them; all 34 recorded report commands
+> replayed against `svnserve`'s bytes; red six ways. Owed of A-616 now: the server's connection task that runs it
+> (piece 7's); the deltas of changed texts through A-652's generator; a recorded session of copy sources.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
