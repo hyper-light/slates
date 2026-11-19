@@ -6,7 +6,9 @@
 # (`format.revlog-compression=zlib`), `split` (zstd, with an extension lowering 7.2's `revlog._maxinline` to 256 bytes,
 # so every revlog keeps its data in a `.d` file beside its index), `v2` (`experimental.revlogv2`: a docket, a `.idx`
 # index of 96-byte entries and a `.dat` data file) and `clv2` (also `format.exp-use-changelog-v2`). Every repository
-# uses generaldelta and sparse-revlog (7.2's defaults) with `format.maxchainlen=3`, so chains end at snapshots. The
+# uses generaldelta and sparse-revlog (7.2's defaults) with `format.maxchainlen=3`, so chains end at snapshots, and
+# `storage.fileindex.slow-path=allow`, since revlog v2 brings a `fileindex` store whose Rust implementation the PyPI
+# build lacks (7.2 aborts without it: "accessing `fileindex` repository without associated fast implementation"). The
 # history: a file that grows a line a changeset (compressible), a pseudo-random file (stored raw), an empty file, a
 # second head and a merge.
 # For each repository R and each revlog L (`00changelog`, `00manifest`, the files `grow`, `rand`, `empty`):
@@ -22,7 +24,8 @@ WORK=$(mktemp -d "$HOME/.cache/g291-revfix.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 EXTRA=()
 hg() { uvx --quiet --python 3.12 --from mercurial==7.2 hg --config ui.username='Test <test@example.com>' \
-  --config devel.default-date='0 0' --config format.maxchainlen=3 ${EXTRA[@]+"${EXTRA[@]}"} "$@"; }
+  --config devel.default-date='0 0' --config format.maxchainlen=3 --config storage.fileindex.slow-path=allow \
+  ${EXTRA[@]+"${EXTRA[@]}"} "$@"; }
 py() { uvx --quiet --python 3.12 --from mercurial==7.2 python -I "$@"; }
 cat > "$WORK/tinyinline.py" <<'PY'
 from mercurial import revlog
