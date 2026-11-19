@@ -50416,22 +50416,30 @@ at start).
     unit standing as computed names a file no version since changed, so the file made over the owner's head is the one
     the computing copy would have made; one judged again places its ops at the owner's head first. The deferral needs no
     rule of its own here.
+  - **Merged with A-677 and A-626 part 4** (main 3612d1ef9). The commit hands a removed home's node to the links
+    naming it at its own head (`Green::commit` derives `Green::node_moves` from the held effects), and a `Computed`
+    holds no node move, so a verdict taken by position hands the node to the links that name its home at the owner's
+    head; a unit handing a node on with the work's writes (`Green::merge_handed`) reads only the link's change and its
+    home's change, bytes, mode and attributes, which its footprint names. A rebase's heirs (`Green::heirs_of`, A-677)
+    are derived at the head of the green computing it, and a rebase is never taken by position. A rebase restating a
+    copy (A-626 part 4) reaches the verdict through `Green::decide`, the units' wrapper, so its copies are the copies'
+    unit.
   - **Typed refusals** (`PositionRefused`), nothing judged or applied: `OtherWork` (computed for another increment or
     base); `Ahead { at, head }` (computed at a head past the owner's: no copy is ahead of its owner); `NotRecorded {
     version }` (the computing copy had accepted the increment at a version this green's record does not hold, so it was
     no copy of this green).
   - **Counter.** `Green::judged_again`: the units judged again because the green moved.
-- **Tests** (`crates/merge/src/engine/compute_tests.rs`, `copy_tests.rs`). Run on Windows x86_64, jupiter (kiln,
-  2026-11-19, debug, a fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`): the Mac
-  Studio was offline, so the macOS run is owed to main's lanes.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`, `copy_tests.rs`). Run first on Windows x86_64, jupiter (kiln,
+  2026-11-19, debug, a fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`) while the Mac
+  Studio was offline; the tree as it lands on macOS arm64, Mac Studio (kiln r91 and r115, below).
   - The oracle: generated concurrent histories on three greens, one judging every work serially at its head as a
     submit does, an owner taking by position the verdicts a copy computed, and the copy, rebuilt from the owner's chain
     entries alone and lagging behind it. A work is computed at one head and held; other works land or commit meanwhile;
     held verdicts commit in any order; works are sent again. Every verdict taken by position equals the serial one (the
     head and what the chain records, the windows, a version accepted before), and both greens read the same after every
-    event. Census of one run of 256 histories: 393 commits at their position and 892 after the green moved, 320 of
-    those judging units again and 572 none; 569 accepts, 556 conflicts, 160 works sent again; 262 answered another kind
-    than computed.
+    event. Census of one run of 256 histories (kiln r91): 410 commits at their position and 1,058 after the green
+    moved, 391 of those judging units again and 667 none; 713 accepts, 516 conflicts, 239 works sent again; 352
+    answered another kind than computed.
   - The counter: a work based at version 0 that edits a hot file (changed at each of versions 1 to 50) and 100 cold
     files, computed at version 50 and taken at version 51, after one more change to the hot file. One unit of 102 is
     judged again, through one delta; the serial verdict at 51 maps the hot file through all 51. Both accept, recording
@@ -50444,7 +50452,16 @@ at start).
     the file it named (refused on the copy, accepted at the owner); and writes handed on to a link removed after the
     position fit no file there (accepted on the copy; at the owner `TypeChanged`, then delete against modify, in that
     order).
-  - MERGED-TREE RUN PENDING (A-669 and A-670 merged): red with each link guard taken out, green over the merged tree.
+  - A link a test's work makes names the node at the work's base in the document's node table (A-646), as the
+    deriver's does. Until kiln r34 (Mac Studio, f1f3e7532) the file's helper named the target's path, which since
+    A-646 part 2b is a link naming no node, refused `TypeChanged`: the four link tests failed at their setup, and the
+    oracles' generated links (part 1's on main too) were refused alike, so no history held an accepted link.
+  - Red on the merged tree (kiln r91, d0d2a5231; a copy with its own target directory; `cargo test --locked -p
+    slates-merge --lib engine::compute_tests::`), one link guard taken out at a time, each failing what reads it: the
+    removal's footprint without the links naming its file, the made-link and removed-link removals and the oracle (11
+    passed, 3 failed); the replacement's, the rename and the oracle (12, 2); the first unit's, the writes' fit (13, 1);
+    `Since` without each changed link's file at the position, the removed-link removal and the fit (12, 2); without
+    its file at the head, the made-link removal, the rename and the oracle (11, 3).
   - Red first at 5bd844b4d, with `at_head` a stub that took every unit as computed: the oracle (shrunk to a work taken
     accepted where the serial verdict answered delete against modify), the counter (0 and 0 for 1 and 1) and the copies'
     test (no fix) failed; the 8 others passed.
@@ -50452,6 +50469,19 @@ at start).
     in 32 s; with rustfmt's layout and the census lines (58c8ab018), 152 of 152 in 35 s and `cargo fmt -p slates-merge
     -- --check` clean. Part 1's oracle in the same run: 2,493 accepts, 319 works sent again, 1,338 conflicts, 2,997
     works behind the head and 1,731 rebases of them.
+  - Green as it lands (kiln r91, d0d2a5231: part 2 over main b5231f0ff; macOS arm64, Mac Studio, debug,
+    `CARGO_BUILD_JOBS=2`): `cargo fmt -p slates-merge -- --check` clean; `cargo test --locked -p slates-merge --lib`
+    210 of 210 in 25 s (part 1's oracle: 2,699 accepts, 373 works sent again, 925 conflicts, 2,922 works behind the
+    head and 1,939 rebases of them); the crate's integration targets that reach the verdict (`--test rebase`,
+    `engine`, `checkpoint`, `special`, `base_for`, `chain_replay`, `changed_since_cost`, `identity`, `origin`,
+    `splice`, `shuttle_green`) 105 passed and 1 ignored; `cargo test --locked -p slates-server --lib` filtered to
+    `repository::push::`, `repository::hg_push::`, `merge_origin::` and `merge_service::` 48 of 48 at 4 threads; and
+    the server's integration tests that reach the verdict 13 of 13 (`daemon`'s lifecycle test, `merge_load` 2,
+    `verdict_pages` 2, `works_off_owner` 5, `green_post_state`'s rebased 3). Over main 0577ab0bd, whose git push
+    driver appends through `push_sealed` and so `Green::judge` (A-654 part 2; kiln r115, f7219c7f9): `cargo fmt -p
+    slates-merge -p slates-server -- --check` clean, and the server lib filtered as above with `git_push::` and
+    `git_protect::` 54 of 54 at 4 threads (`git_push::` 3, `git_protect::` 3, `merge_origin::` 17, `merge_service::`
+    14, `repository::hg_push::` 13, `repository::push::` 4).
 - **Owed.** The fleet's route: a green's holders rebuild every version already (§4.16 "Apply on holders"), so a holder
   computes and the owner takes by position; then the server's submit and push taking verdicts computed elsewhere. A
   rename's edits placed as a content edit's are (a rename unit judged again maps its edits from the work's base, at the
@@ -50460,7 +50490,7 @@ at start).
 - **Applied in the same change to:** `crates/merge/src/engine/position.rs` (new), `crates/merge/src/engine.rs` (the
   verdict as units, `Green::judge_computed`, `Green::judged_again`, `Computed`'s floor, `merge_content` split around
   placements), `crates/merge/src/lib.rs` (`PositionRefused`), `crates/merge/src/engine/compute_tests.rs` (the oracle,
-  the counter, the refusals, the four link tests), `crates/merge/src/engine/copy_tests.rs` (copies judged again); with
-  the merge of A-669 and A-670, `position.rs`'s footprints naming links and `Since`'s files whose links changed, and
-  `engine.rs`'s `decide_handed` and `decide_moves` as units and `Resolved::declares_more_than_writes`; §4.16 "Commit";
-  A-645's entry; GAPS' A-645 entry.
+  the counter, the refusals, the four link tests, a link naming the node at the work's base),
+  `crates/merge/src/engine/copy_tests.rs` (copies judged again); with the merge of A-669 and A-670, `position.rs`'s
+  footprints naming links and `Since`'s files whose links changed, and `engine.rs`'s `decide_handed` and
+  `decide_moves` as units and `Resolved::declares_more_than_writes`; §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.
