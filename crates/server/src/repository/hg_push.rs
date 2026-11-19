@@ -62,9 +62,9 @@ use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::{ContentStore, IndexRefused};
 
 use super::push::{AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
-use crate::state::ShardState;
 #[cfg(unix)]
 use crate::hook_driver::{self, Launch};
+use crate::state::ShardState;
 #[cfg(unix)]
 use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
@@ -125,14 +125,19 @@ fn escape(byte: u8, out: &mut String) {
   out.push(char::from(ESCAPE));
   let high = byte.checked_shr(NIBBLE).unwrap_or_default();
   out.extend(HEX.get(usize::from(high)).map(|digit| char::from(*digit)));
-  out.extend(HEX.get(usize::from(byte & LOW_NIBBLE)).map(|digit| char::from(*digit)));
+  out.extend(
+    HEX
+      .get(usize::from(byte & LOW_NIBBLE))
+      .map(|digit| char::from(*digit)),
+  );
 }
 
 /// Appends the label of a Mercurial name (module docs).
 fn label(bytes: &[u8], out: &mut String) {
   for chunk in bytes.utf8_chunks() {
     for character in chunk.valid().chars() {
-      let escaped = character == char::from(END) || character == char::from(ESCAPE) || character.is_control();
+      let escaped =
+        character == char::from(END) || character == char::from(ESCAPE) || character.is_control();
       if !escaped {
         out.push(character);
         continue;
@@ -291,7 +296,11 @@ impl Read {
         (mark, bound.map(|green| named(state, (&name, green))))
       })
       .collect();
-    let position = |log| repositories.log_position(repository, log).unwrap_or_default();
+    let position = |log| {
+      repositories
+        .log_position(repository, log)
+        .unwrap_or_default()
+    };
     Read {
       names,
       lines,
@@ -525,7 +534,10 @@ pub(crate) fn transaction_id(name: &[u8; 32]) -> String {
   hasher.update(name);
   let digest = hasher.finalize();
   let mut hex = TRANSACTION_TAG.as_bytes().to_vec();
-  if let Some(node) = digest.as_bytes().first_chunk::<{ core::mem::size_of::<Node>() }>() {
+  if let Some(node) = digest
+    .as_bytes()
+    .first_chunk::<{ core::mem::size_of::<Node>() }>()
+  {
     slates_hg::node::write_hex(node, &mut hex);
   }
   String::from_utf8(hex).unwrap_or_default()
@@ -592,11 +604,23 @@ fn changes<H: Held>(
       name: line_name(&made.branch, made.number),
       from: base.green,
       version: base.version,
-      work: Some(work(state, (base, &made.head), revisions, terms, admission)?),
+      work: Some(work(
+        state,
+        (base, &made.head),
+        revisions,
+        terms,
+        admission,
+      )?),
     });
   }
   for moved in &plan.bookmarks {
-    changes.push(mark_change(state, (moved, read), revisions, terms, admission)?);
+    changes.push(mark_change(
+      state,
+      (moved, read),
+      revisions,
+      terms,
+      admission,
+    )?);
   }
   Ok(changes)
 }
@@ -663,13 +687,20 @@ fn client_checks(unbundle: &Unbundle, read: &Read, checks: &mut Vec<RepositoryCh
           check_once(checks, head_of(named));
         }
         let (_, markers) = read.logs;
-        check_once(checks, RepositoryCheck::Log {
-          log: StateLog::Markers,
-          position: markers,
-        });
+        check_once(
+          checks,
+          RepositoryCheck::Log {
+            log: StateLog::Markers,
+            position: markers,
+          },
+        );
       }
       Asks::CheckUpdatedHeads(nodes) => {
-        for (named, branch, _) in read.lines.iter().filter(|(named, ..)| named.head.is_some_and(|head| nodes.contains(&head))) {
+        for (named, branch, _) in read
+          .lines
+          .iter()
+          .filter(|(named, ..)| named.head.is_some_and(|head| nodes.contains(&head)))
+        {
           check_once(checks, head_of(named));
           check_once(checks, read.names_under(branch_prefix(branch)));
         }
@@ -684,10 +715,13 @@ fn client_checks(unbundle: &Unbundle, read: &Read, checks: &mut Vec<RepositoryCh
       }
       Asks::CheckPhases(_) => {
         let (phases, _) = read.logs;
-        check_once(checks, RepositoryCheck::Log {
-          log: StateLog::Phases,
-          position: phases,
-        });
+        check_once(
+          checks,
+          RepositoryCheck::Log {
+            log: StateLog::Phases,
+            position: phases,
+          },
+        );
       }
       _ => {}
     }
@@ -710,10 +744,13 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
   }
   if !plan.roots.is_empty() {
     let (phases, _) = read.logs;
-    check_once(&mut checks, RepositoryCheck::Log {
-      log: StateLog::Phases,
-      position: phases,
-    });
+    check_once(
+      &mut checks,
+      RepositoryCheck::Log {
+        log: StateLog::Phases,
+        position: phases,
+      },
+    );
   }
   let state = plan
     .roots
@@ -769,7 +806,12 @@ fn asked(plan: &Plan, read: &Read) -> Vec<Ask> {
   for moved in &plan.lines {
     let (LineMove::Moved { line, .. } | LineMove::Retired { line }) = moved;
     if let Some((_, branch, _)) = read.lines.get(*line) {
-      ask(Namespace::Branch, branch.as_slice(), Right::Submit, first_on(branch));
+      ask(
+        Namespace::Branch,
+        branch.as_slice(),
+        Right::Submit,
+        first_on(branch),
+      );
     }
   }
   for made in &plan.created {
@@ -777,22 +819,45 @@ fn asked(plan: &Plan, read: &Read) -> Vec<Ask> {
       .lines
       .iter()
       .any(|(named, branch, _)| *branch == made.branch && named.head.is_some());
-    let right = if headed { Right::Rewrite } else { Right::Submit };
-    ask(Namespace::Branch, made.branch.as_slice(), right, first_on(&made.branch));
+    let right = if headed {
+      Right::Rewrite
+    } else {
+      Right::Submit
+    };
+    ask(
+      Namespace::Branch,
+      made.branch.as_slice(),
+      right,
+      first_on(&made.branch),
+    );
   }
   for moved in &plan.bookmarks {
     match moved {
       BookmarkMove::Moved {
         name, to, forward, ..
       } => {
-        let right = if *forward { Right::Submit } else { Right::Rewrite };
+        let right = if *forward {
+          Right::Submit
+        } else {
+          Right::Rewrite
+        };
         ask(Namespace::Bookmark, name.as_slice(), right, Some(*to));
       }
       BookmarkMove::Created { name, to, .. } => {
-        ask(Namespace::Bookmark, name.as_slice(), Right::Submit, Some(*to));
+        ask(
+          Namespace::Bookmark,
+          name.as_slice(),
+          Right::Submit,
+          Some(*to),
+        );
       }
       BookmarkMove::Deleted { name, from } => {
-        ask(Namespace::Bookmark, name.as_slice(), Right::Delete, Some(*from));
+        ask(
+          Namespace::Bookmark,
+          name.as_slice(),
+          Right::Delete,
+          Some(*from),
+        );
       }
     }
   }
@@ -821,7 +886,9 @@ pub(crate) fn admitted(
 fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) -> Refused {
   let named = |index: u32| usize::try_from(index).ok().and_then(|at| asked.get(at));
   let words = match refusal {
-    PushRefusal::Denied { index, .. } => named(index).map(|ask| acl_words(principal, ask, ACL_DENIED)),
+    PushRefusal::Denied { index, .. } => {
+      named(index).map(|ask| acl_words(principal, ask, ACL_DENIED))
+    }
     PushRefusal::NotListed { index } => {
       named(index).map(|ask| acl_words(principal, ask, ACL_NOT_ALLOWED))
     }
@@ -920,9 +987,12 @@ pub(crate) fn admission_hooks(
   added: Added<'_>,
   (view, url): (PendingView, &str),
 ) -> Vec<Hook> {
-  configured(policy, (HookPointName::HgPretxnchangegroup, added), url, |name, changes| {
-    vcs_hooks::hg_pretxnchangegroup(view, name, changes)
-  })
+  configured(
+    policy,
+    (HookPointName::HgPretxnchangegroup, added),
+    url,
+    |name, changes| vcs_hooks::hg_pretxnchangegroup(view, name, changes),
+  )
 }
 
 /// The `changegroup` hooks a landed push runs after its commit (§4.17.3 "Hooks": observing), over the committed view,
@@ -933,9 +1003,12 @@ pub(crate) fn observing_hooks(
   added: Added<'_>,
   (view, url): (CommittedView, &str),
 ) -> Vec<Hook> {
-  configured(policy, (HookPointName::HgChangegroup, added), url, |name, changes| {
-    vcs_hooks::hg_changegroup(view, name, changes)
-  })
+  configured(
+    policy,
+    (HookPointName::HgChangegroup, added),
+    url,
+    |name, changes| vcs_hooks::hg_changegroup(view, name, changes),
+  )
 }
 
 /// What running a push's hooks answered: the `output` parts their words make, the first refusal's answer, and each

@@ -7,8 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use super::{
-  BookmarkMove, BookmarkRead, LineMove, LineRead, NewLine, Plan, RootChange, Unclassified,
-  classify,
+  BookmarkMove, BookmarkRead, LineMove, LineRead, NewLine, Plan, RootChange, Unclassified, classify,
 };
 use crate::bundle2::Bundle2;
 use crate::changegroup::Version;
@@ -184,9 +183,15 @@ fn a_stock_history_lands_on_an_empty_repository_as_7_2_lists_it() {
     head: None,
   }];
   let view = View::default();
-  let brought = (verified.changesets.as_slice(), verified.held_changesets.as_slice());
+  let brought = (
+    verified.changesets.as_slice(),
+    verified.held_changesets.as_slice(),
+  );
   let refused = classify(&unbundle, brought, &view, (&lines, &[]), false, &mut room());
-  assert!(matches!(refused, Err(Unclassified::Markers { .. })), "{refused:?}");
+  assert!(
+    matches!(refused, Err(Unclassified::Markers { .. })),
+    "{refused:?}"
+  );
   unbundle
     .parts
     .retain(|taken| !matches!(taken.asks, Asks::Obsmarkers(_)));
@@ -224,7 +229,10 @@ fn assert_stock_placement(plan: &Plan, unbundle: &Unbundle) {
   assert_eq!(plan.added, Some((logged(0), logged(7))));
   assert_eq!(
     plan.firsts,
-    vec![(b"default".to_vec(), logged(0)), (b"stable".to_vec(), logged(2))]
+    vec![
+      (b"default".to_vec(), logged(0)),
+      (b"stable".to_vec(), logged(2))
+    ]
   );
 }
 
@@ -262,10 +270,16 @@ impl Whole {
   fn branch_heads(&self, upto: usize) -> BTreeMap<Vec<u8>, BTreeSet<Node>> {
     let mut heads: BTreeMap<Vec<u8>, BTreeSet<Node>> = BTreeMap::new();
     for at in 0..upto {
-      let continued = (0..upto)
-        .any(|other| other != at && self.branches[other] == self.branches[at] && self.ancestors(other).contains(&at));
+      let continued = (0..upto).any(|other| {
+        other != at
+          && self.branches[other] == self.branches[at]
+          && self.ancestors(other).contains(&at)
+      });
       if !continued {
-        heads.entry(self.branches[at].clone()).or_default().insert(self.nodes[at]);
+        heads
+          .entry(self.branches[at].clone())
+          .or_default()
+          .insert(self.nodes[at]);
       }
     }
     heads
@@ -295,7 +309,9 @@ fn generated(old: &[Shape], brought: &[Shape]) -> (Whole, View) {
     let p2 = pick(*second).filter(|p2| p1.is_some() && Some(*p2) != p1);
     whole.nodes.push([u8::try_from(index + 1).unwrap(); 20]);
     whole.parents.push([p1, p2]);
-    whole.branches.push(BRANCHES[usize::from(*branch) % BRANCHES.len()].to_vec());
+    whole
+      .branches
+      .push(BRANCHES[usize::from(*branch) % BRANCHES.len()].to_vec());
     whole.closes.push(*closes);
   }
   let mut view = View::default();
@@ -309,7 +325,11 @@ fn generated(old: &[Shape], brought: &[Shape]) -> (Whole, View) {
       parents: whole.parents[index].map(|parent| parent.map(|at| Rev::try_from(at).unwrap())),
       branch: whole.branches[index].clone(),
       closes: whole.closes[index],
-      phase: if *draft || inherited { Phase::Draft } else { Phase::Public },
+      phase: if *draft || inherited {
+        Phase::Draft
+      } else {
+        Phase::Public
+      },
     });
   }
   (whole, view)
@@ -321,7 +341,9 @@ fn lines_of(whole: &Whole) -> Vec<LineRead> {
   let mut lines = Vec::new();
   let heads = whole.branch_heads(whole.old);
   for (branch, nodes) in &heads {
-    let mut ordered: Vec<usize> = (0..whole.old).filter(|at| nodes.contains(&whole.nodes[*at])).collect();
+    let mut ordered: Vec<usize> = (0..whole.old)
+      .filter(|at| nodes.contains(&whole.nodes[*at]))
+      .collect();
     ordered.sort_unstable();
     for (number, at) in ordered.iter().enumerate() {
       lines.push(LineRead {
@@ -342,7 +364,10 @@ fn lines_of(whole: &Whole) -> Vec<LineRead> {
 }
 
 /// Each branch's heads afterwards, and each branch's numbers.
-type Applied = (BTreeMap<Vec<u8>, BTreeSet<Node>>, BTreeMap<Vec<u8>, Vec<u32>>);
+type Applied = (
+  BTreeMap<Vec<u8>, BTreeSet<Node>>,
+  BTreeMap<Vec<u8>, Vec<u32>>,
+);
 
 /// A line afterwards: its branch, number and head; none once retired.
 type Slot = Option<(Vec<u8>, u32, Option<Node>)>;
@@ -359,7 +384,12 @@ fn applied(lines: &[LineRead], plan: &Plan) -> Applied {
       LineMove::Retired { line } => after[*line] = None,
     }
   }
-  after.extend(plan.created.iter().map(|made| Some((made.branch.clone(), made.number, Some(made.head)))));
+  after.extend(
+    plan
+      .created
+      .iter()
+      .map(|made| Some((made.branch.clone(), made.number, Some(made.head)))),
+  );
   let mut heads: BTreeMap<Vec<u8>, BTreeSet<Node>> = BTreeMap::new();
   let mut numbers: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
   for (branch, number, head) in after.into_iter().flatten() {
@@ -399,7 +429,9 @@ fn most_moves(whole: &Whole, lines: &[LineRead], branch: &[u8]) -> usize {
       (0..lines.len())
         .filter(|line| {
           lines[*line].branch == branch
-            && lines[*line].head.is_none_or(|node| ancestors.iter().any(|at| whole.nodes[*at] == node))
+            && lines[*line]
+              .head
+              .is_none_or(|node| ancestors.iter().any(|at| whole.nodes[*at] == node))
         })
         .collect()
     })
@@ -413,7 +445,10 @@ fn draft_roots(whole: &Whole, phases: &[Phase]) -> BTreeSet<Node> {
   (0..phases.len())
     .filter(|at| {
       phases[*at] == Phase::Draft
-        && whole.parents[*at].iter().flatten().all(|parent| phases[*parent] == Phase::Public)
+        && whole.parents[*at]
+          .iter()
+          .flatten()
+          .all(|parent| phases[*parent] == Phase::Public)
     })
     .map(|at| whole.nodes[at])
     .collect()
@@ -473,8 +508,14 @@ fn pushed(whole: &Whole, brought: &[Shape]) -> (Unbundle, Vec<usize>) {
 fn brought_of(whole: &Whole) -> Vec<Arrived> {
   (whole.old..whole.nodes.len())
     .map(|at| {
-      let parent = |index: usize| whole.parents[at][index].map_or(NULL_NODE, |parent| whole.nodes[parent]);
-      arrived(whole.nodes[at], (parent(0), parent(1)), &whole.branches[at], whole.closes[at])
+      let parent =
+        |index: usize| whole.parents[at][index].map_or(NULL_NODE, |parent| whole.nodes[parent]);
+      arrived(
+        whole.nodes[at],
+        (parent(0), parent(1)),
+        &whole.branches[at],
+        whole.closes[at],
+      )
     })
     .collect()
 }
@@ -630,10 +671,27 @@ fn bookmarks_move_as_7_2_moves_them() {
       part(2, pushkey(b"bookmarks", b"n", (&hex([2; 20]), b""))),
     ],
   };
-  let plan = classify(&unbundle, (&[], &[]), &view, (&line_at_b(), &marks), false, &mut room()).unwrap();
+  let plan = classify(
+    &unbundle,
+    (&[], &[]),
+    &view,
+    (&line_at_b(), &marks),
+    false,
+    &mut room(),
+  )
+  .unwrap();
   assert_bookmarks_moved(&plan);
-  unbundle.parts.push(part(3, pushkey(b"bookmarks", b"m", (&hex([1; 20]), b""))));
-  let refused = classify(&unbundle, (&[], &[]), &view, (&line_at_b(), &marks), false, &mut room());
+  unbundle
+    .parts
+    .push(part(3, pushkey(b"bookmarks", b"m", (&hex([1; 20]), b""))));
+  let refused = classify(
+    &unbundle,
+    (&[], &[]),
+    &view,
+    (&line_at_b(), &marks),
+    false,
+    &mut room(),
+  );
   assert_eq!(
     refused.map_err(|refused| refused.refused()),
     Err(Refused::Pushkey {
@@ -692,7 +750,15 @@ fn phases_move_only_toward_public_as_7_2_moves_them() {
       part(2, pushkey(b"phases", &hex([2; 20]), (b"0", b"0"))),
     ],
   };
-  let plan = classify(&unbundle, (&[], &[]), &view, (&line_at_b(), &[]), false, &mut room()).unwrap();
+  let plan = classify(
+    &unbundle,
+    (&[], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  )
+  .unwrap();
   assert_eq!(plan.roots, vec![RootChange::Removed([2; 20])]);
   let moved: Vec<bool> = plan
     .replied
@@ -709,7 +775,14 @@ fn phases_move_only_toward_public_as_7_2_moves_them() {
       }]),
     )],
   };
-  let refused = classify(&unknown, (&[], &[]), &view, (&line_at_b(), &[]), false, &mut room());
+  let refused = classify(
+    &unknown,
+    (&[], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  );
   let words = b"unknown revision '0909090909090909090909090909090909090909'".to_vec();
   assert_eq!(
     refused.map_err(|refused| refused.refused()),
@@ -735,7 +808,14 @@ fn a_divergent_bookmark_is_refused_in_7_2s_words() {
       }]),
     )],
   };
-  let divergent = classify(&named(b"a@b", [2; 20]), (&[], &[]), &view, (&line_at_b(), &[]), false, &mut room());
+  let divergent = classify(
+    &named(b"a@b", [2; 20]),
+    (&[], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  );
   assert_eq!(
     divergent.map_err(|refused| refused.refused()),
     Err(Refused::Abort {
@@ -743,7 +823,14 @@ fn a_divergent_bookmark_is_refused_in_7_2s_words() {
       hint: None
     })
   );
-  let unknown = classify(&named(b"a@", [7; 20]), (&[], &[]), &view, (&line_at_b(), &[]), false, &mut room());
+  let unknown = classify(
+    &named(b"a@", [7; 20]),
+    (&[], &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  );
   assert_eq!(unknown, Err(Unclassified::UnknownNode { node: [7; 20] }));
 }
 
@@ -761,8 +848,22 @@ fn a_fork_makes_a_line_and_a_merge_retires_one() {
   let unbundle = Unbundle {
     parts: vec![part(0, changegroup())],
   };
-  let plan = classify(&unbundle, (&forked, &[]), &view, (&line_at_b(), &[]), false, &mut room()).unwrap();
-  assert_eq!(plan.lines, vec![LineMove::Moved { line: 0, head: [3; 20] }]);
+  let plan = classify(
+    &unbundle,
+    (&forked, &[]),
+    &view,
+    (&line_at_b(), &[]),
+    false,
+    &mut room(),
+  )
+  .unwrap();
+  assert_eq!(
+    plan.lines,
+    vec![LineMove::Moved {
+      line: 0,
+      head: [3; 20]
+    }]
+  );
   assert_eq!(
     plan.created,
     vec![NewLine {
@@ -772,7 +873,13 @@ fn a_fork_makes_a_line_and_a_merge_retires_one() {
       base: 0
     }]
   );
-  assert_eq!(plan.replied, vec![Replied::Changegroup { in_reply_to: 0, heads: 2 }]);
+  assert_eq!(
+    plan.replied,
+    vec![Replied::Changegroup {
+      in_reply_to: 0,
+      heads: 2
+    }]
+  );
   assert_a_merge_retires_a_line(&unbundle);
 }
 
@@ -800,10 +907,30 @@ fn assert_a_merge_retires_a_line(unbundle: &Unbundle) {
     },
   ];
   let merge = [arrived([5; 20], ([3; 20], [4; 20]), b"default", false)];
-  let plan = classify(unbundle, (&merge, &[]), &view, (&lines, &[]), false, &mut room()).unwrap();
+  let plan = classify(
+    unbundle,
+    (&merge, &[]),
+    &view,
+    (&lines, &[]),
+    false,
+    &mut room(),
+  )
+  .unwrap();
   assert_eq!(
     plan.lines,
-    vec![LineMove::Moved { line: 0, head: [5; 20] }, LineMove::Retired { line: 1 }]
+    vec![
+      LineMove::Moved {
+        line: 0,
+        head: [5; 20]
+      },
+      LineMove::Retired { line: 1 }
+    ]
   );
-  assert_eq!(plan.replied, vec![Replied::Changegroup { in_reply_to: 0, heads: -2 }]);
+  assert_eq!(
+    plan.replied,
+    vec![Replied::Changegroup {
+      in_reply_to: 0,
+      heads: -2
+    }]
+  );
 }

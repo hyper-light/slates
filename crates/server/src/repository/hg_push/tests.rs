@@ -92,7 +92,12 @@ impl View {
       } else {
         Phase::Draft
       };
-      view.changesets.push((parsed(fields[1]), parents, fields[5].as_bytes().to_vec(), phase));
+      view.changesets.push((
+        parsed(fields[1]),
+        parents,
+        fields[5].as_bytes().to_vec(),
+        phase,
+      ));
     }
     for line in bookmarks.lines() {
       let (name, hex) = line.split_once(' ').unwrap();
@@ -112,7 +117,10 @@ impl Repository for View {
   }
 
   fn node(&self, rev: Rev) -> Option<Node> {
-    self.changesets.get(usize::try_from(rev).ok()?).map(|held| held.0)
+    self
+      .changesets
+      .get(usize::try_from(rev).ok()?)
+      .map(|held| held.0)
   }
 
   fn rev(&self, node: &Node) -> Option<Rev> {
@@ -151,7 +159,13 @@ impl Repository for View {
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0
 /// 0`): its description, the one file it adds and that file's bytes, its parent among those made before it, and its
 /// branch.
-type Commit = (&'static str, &'static str, &'static [u8], Option<usize>, &'static str);
+type Commit = (
+  &'static str,
+  &'static str,
+  &'static [u8],
+  Option<usize>,
+  &'static str,
+);
 
 /// `base`, `second`, then another client's `other` and the stock push's `plain`, each on `second`; then two changesets
 /// of a `stable` branch this repository's tests add, the first on `second`.
@@ -196,8 +210,11 @@ fn history() -> Vec<Made> {
     } else {
       format!(" branch:{branch}")
     };
-    let changeset =
-      format!("{}\ntest\n0 0{extras}\n{path}\n\n{description}", hex(&manifest)).into_bytes();
+    let changeset = format!(
+      "{}\ntest\n0 0{extras}\n{path}\n\n{description}",
+      hex(&manifest)
+    )
+    .into_bytes();
     made.push(Made {
       node: node::compute(&p1, &NULL_NODE, &changeset).unwrap(),
       p1,
@@ -243,13 +260,23 @@ fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
   }
   for (index, at) in which.iter().enumerate() {
     let made = &made[*at];
-    revisions.push(full_text(made.manifest.0, made.manifest.1, made.node, &deltas[3 * index + 1]));
+    revisions.push(full_text(
+      made.manifest.0,
+      made.manifest.1,
+      made.node,
+      &deltas[3 * index + 1],
+    ));
   }
   let mut files = Vec::new();
   for (index, at) in which.iter().enumerate() {
     let made = &made[*at];
     let start = revisions.len();
-    revisions.push(full_text(made.file.1, NULL_NODE, made.node, &deltas[3 * index + 2]));
+    revisions.push(full_text(
+      made.file.1,
+      NULL_NODE,
+      made.node,
+      &deltas[3 * index + 2],
+    ));
     files.push(Group {
       name: made.file.0.as_slice(),
       revisions: start..start + 1,
@@ -363,7 +390,11 @@ impl Hg {
       (&mut self.index, &mut self.store),
       &mut room(),
     );
-    assert_eq!(landed.released, Ok(()), "the index let go of was not given back");
+    assert_eq!(
+      landed.released,
+      Ok(()),
+      "the index let go of was not given back"
+    );
     landed
   }
 
@@ -464,10 +495,22 @@ fn rebuild(state: &mut ShardState, hg: &mut Hg, (public, mark): (&[usize], usize
 /// The rebuilt repository against 7.2's: every node 7.2's, `default`'s first line at `second` holding both files, and
 /// the index holding both changesets.
 fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
-  assert_eq!(hex(&made[0].node), "ad120869acf0c6c266f1293ca5da567d8b382f1d");
-  assert_eq!(hex(&made[1].node), "59d5dc23f8786c06d0fae53e625be1cdd640a783");
-  assert_eq!(hex(&made[1].manifest.0), "a539ce0c1a22b0ecf34498f9f5ce8ea56df9ecb7");
-  assert_eq!(hex(&made[2].node), "f2563910228049a7bcbc2f7ea79337803edcbcaa");
+  assert_eq!(
+    hex(&made[0].node),
+    "ad120869acf0c6c266f1293ca5da567d8b382f1d"
+  );
+  assert_eq!(
+    hex(&made[1].node),
+    "59d5dc23f8786c06d0fae53e625be1cdd640a783"
+  );
+  assert_eq!(
+    hex(&made[1].manifest.0),
+    "a539ce0c1a22b0ecf34498f9f5ce8ea56df9ecb7"
+  );
+  assert_eq!(
+    hex(&made[2].node),
+    "f2563910228049a7bcbc2f7ea79337803edcbcaa"
+  );
   assert_eq!(hg.bound(state, &line_name(b"default", 0)), Some(hg.root));
   assert_eq!(head(state, hg.root), Some(made[1].node));
   assert_eq!(file(state, hg.root, "b").as_deref(), Some(&b"b\n"[..]));
@@ -489,25 +532,46 @@ fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
     let main = hg.bound(state, &bookmark_name(b"main")).unwrap();
     assert_eq!(head(state, main), Some(made[1].node));
     assert!(hg.roots(state).is_empty());
-    let view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
     let mut unbundle = stock(fixture!("push-plain.hg"));
     let answer = hg.push(state, &unbundle, &view);
-    assert_eq!(answer.map(|reply| encoded(&reply)), Ok(fixture!("push-plain-reply.hg").to_vec()));
+    assert_eq!(
+      answer.map(|reply| encoded(&reply)),
+      Ok(fixture!("push-plain-reply.hg").to_vec())
+    );
     assert_plain_landed(state, &hg, &made);
     let version = state.db.partition().green_head(hg.root);
     unbundle
       .parts
       .retain(|part| !matches!(part.asks, Asks::CheckUpdatedHeads(_) | Asks::CheckPhases(_)));
     let mut after = view;
-    after.changesets.push((made[3].node, [Some(1), None], b"default".to_vec(), Phase::Draft));
+    after.changesets.push((
+      made[3].node,
+      [Some(1), None],
+      b"default".to_vec(),
+      Phase::Draft,
+    ));
     let again = hg.push(state, &unbundle, &after);
-    assert_eq!(again.map(|reply| encoded(&reply)), Ok(fixture!("push-plain-reply.hg").to_vec()));
-    assert_eq!(state.db.partition().green_head(hg.root), version, "a push sent again recorded");
+    assert_eq!(
+      again.map(|reply| encoded(&reply)),
+      Ok(fixture!("push-plain-reply.hg").to_vec())
+    );
+    assert_eq!(
+      state.db.partition().green_head(hg.root),
+      version,
+      "a push sent again recorded"
+    );
   });
 }
 
 fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
-  assert_eq!(hex(&made[3].node), "048741fabe422ed31728cd666c1e36b6c3f0a96d");
+  assert_eq!(
+    hex(&made[3].node),
+    "048741fabe422ed31728cd666c1e36b6c3f0a96d"
+  );
   assert_eq!(head(state, hg.root), Some(made[3].node));
   assert_eq!(file(state, hg.root, "d").as_deref(), Some(&b"d\n"[..]));
   assert_eq!(hg.roots(state), BTreeSet::from([made[3].node]));
@@ -522,12 +586,21 @@ fn a_push_names_its_transaction_as_7_2_does() {
   crate::daemon::audit_on_shard(|state| {
     let mut hg = Hg::new(state, "transaction");
     rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
-    let prepared = hg.prepare(state, &stock(fixture!("push-plain.hg")), &view).unwrap();
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let prepared = hg
+      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
+      .unwrap();
     assert_eq!(prepared.transaction, transaction_id(&NAME));
     let digits = prepared.transaction.strip_prefix("TXN:").unwrap();
     assert_eq!(digits.len(), 40);
-    assert!(digits.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f')));
+    assert!(
+      digits
+        .bytes()
+        .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+    );
     assert_eq!(transaction_id(&NAME), transaction_id(&[7; 32]));
     assert_ne!(transaction_id(&NAME), transaction_id(&[8; 32]));
   });
@@ -542,8 +615,13 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
   crate::daemon::audit_on_shard(|state| {
     let mut hg = Hg::new(state, "race");
     let made = rebuild(state, &mut hg, (&[1], 1));
-    let view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
-    let prepared = hg.prepare(state, &stock(fixture!("push-plain.hg")), &view).unwrap();
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let prepared = hg
+      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
+      .unwrap();
     let other = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[2])))],
     };
@@ -561,11 +639,18 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
 /// A view of the rebuilt repository's `base` and `second`, public, and the changesets `drafts` names after them, each
 /// a draft on its commit's parent and branch.
 fn view_with(made: &[Made], drafts: &[usize]) -> View {
-  let mut view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
+  let mut view = View::of(
+    listing!("push-plain-server.txt"),
+    listing!("push-plain-bookmarks.txt"),
+  );
   for at in drafts {
-    let parent = COMMITS[*at].3.and_then(|parent| view.rev(&made[parent].node));
+    let parent = COMMITS[*at]
+      .3
+      .and_then(|parent| view.rev(&made[parent].node));
     let branch = COMMITS[*at].4.as_bytes().to_vec();
-    view.changesets.push((made[*at].node, [parent, None], branch, Phase::Draft));
+    view
+      .changesets
+      .push((made[*at].node, [parent, None], branch, Phase::Draft));
   }
   view
 }
@@ -593,7 +678,9 @@ fn a_push_is_refused_when_a_green_it_only_checked_moved() {
         taken(1, Asks::Changegroup(changegroup(&made, &[3]))),
       ],
     };
-    let prepared = hg.prepare(state, &checked, &view_with(&made, &[4])).unwrap();
+    let prepared = hg
+      .prepare(state, &checked, &view_with(&made, &[4]))
+      .unwrap();
     let again = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[5])))],
     };
@@ -618,9 +705,15 @@ fn a_published_draft_leaves_the_roots_in_the_same_entry() {
     let made = rebuild(state, &mut hg, (&[0], 1));
     assert_eq!(hg.roots(state), BTreeSet::from([made[1].node]));
     let position = hg.phases(state);
-    let view = View::of(listing!("push-phase-server.txt"), listing!("push-phase-bookmarks.txt"));
+    let view = View::of(
+      listing!("push-phase-server.txt"),
+      listing!("push-phase-bookmarks.txt"),
+    );
     let answer = hg.push(state, &stock(fixture!("push-phase.hg")), &view);
-    assert_eq!(answer.map(|reply| encoded(&reply)), Ok(fixture!("push-phase-reply.hg").to_vec()));
+    assert_eq!(
+      answer.map(|reply| encoded(&reply)),
+      Ok(fixture!("push-phase-reply.hg").to_vec())
+    );
     assert!(hg.roots(state).is_empty());
     assert_eq!(hg.phases(state), position + 1);
   });
@@ -644,7 +737,10 @@ fn a_bookmark_moves_on_its_own_green() {
       listing!("push-bookmark-bookmarks.txt"),
     );
     let answer = hg.push(state, &stock(fixture!("push-bookmark.hg")), &view);
-    assert_eq!(answer.map(|reply| encoded(&reply)), Ok(fixture!("push-bookmark-reply.hg").to_vec()));
+    assert_eq!(
+      answer.map(|reply| encoded(&reply)),
+      Ok(fixture!("push-bookmark-reply.hg").to_vec())
+    );
     assert_eq!(head(state, main), Some(made[1].node));
     assert_eq!(file(state, main, "b").as_deref(), Some(&b"b\n"[..]));
     assert_eq!(state.db.partition().green_head(hg.root), version);
@@ -661,7 +757,11 @@ fn names_read_as_themselves_and_escape_what_would_meet() {
   assert_eq!(line_name(b"a:b%c\n", 1), "branch:a%3Ab%25c%0A:1");
   assert_eq!(bookmark_name(b"caf\xc3\xa9\xff"), "bookmark:caf\u{e9}%FF:");
   assert_eq!(line_of("branch:a%3Ab:01"), None);
-  assert_eq!(line_of("branch:%41:0"), None, "a second spelling of `A` read as a line");
+  assert_eq!(
+    line_of("branch:%41:0"),
+    None,
+    "a second spelling of `A` read as a line"
+  );
   assert_eq!(line_of("branch:a%3Ab:1"), Some((b"a:b".to_vec(), 1)));
 }
 
@@ -721,7 +821,10 @@ fn set_policy(
 fn rule(
   names: slates_ipc::protocol::PolicyNames,
   pattern: &str,
-  (effect, who): (slates_ipc::protocol::PolicyEffect, slates_ipc::protocol::PolicyWho),
+  (effect, who): (
+    slates_ipc::protocol::PolicyEffect,
+    slates_ipc::protocol::PolicyWho,
+  ),
 ) -> slates_ipc::protocol::PolicyRule {
   slates_ipc::protocol::PolicyRule {
     names,
@@ -744,26 +847,71 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
   crate::daemon::audit_on_shard(|state| {
     let mut plain = Hg::new(state, "acl-plain");
     rebuild(state, &mut plain, (&[1], 1));
-    set_policy(state, ("acl-plain", 0), vec![rule(PolicyNames::Branches, "default", (PolicyEffect::Deny, PolicyWho::Anyone))]);
-    let view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
-    let prepared = plain.prepare(state, &stock(fixture!("push-plain.hg")), &view).unwrap();
-    let denied = format!("acl: user \"{:?}\" denied on branch \"default\" (changeset \"048741fabe42\")", owner());
+    set_policy(
+      state,
+      ("acl-plain", 0),
+      vec![rule(
+        PolicyNames::Branches,
+        "default",
+        (PolicyEffect::Deny, PolicyWho::Anyone),
+      )],
+    );
+    let view = View::of(
+      listing!("push-plain-server.txt"),
+      listing!("push-plain-bookmarks.txt"),
+    );
+    let prepared = plain
+      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
+      .unwrap();
+    let denied = format!(
+      "acl: user \"{:?}\" denied on branch \"default\" (changeset \"048741fabe42\")",
+      owner()
+    );
     assert_eq!(
       super::admitted(state, (&owner(), plain.repository), &prepared),
-      Err(Refused::Abort { message: denied.into_bytes(), hint: None })
+      Err(Refused::Abort {
+        message: denied.into_bytes(),
+        hint: None
+      })
     );
     set_policy(state, ("acl-plain", 1), Vec::new());
-    assert_eq!(super::admitted(state, (&owner(), plain.repository), &prepared), Ok(()));
+    assert_eq!(
+      super::admitted(state, (&owner(), plain.repository), &prepared),
+      Ok(())
+    );
     let mut marks = Hg::new(state, "acl-mark");
     rebuild(state, &mut marks, (&[0], 0));
-    let only = PolicyWho::AnyOf { entries: vec![PolicyEntry::Is { principal: stranger() }] };
-    set_policy(state, ("acl-mark", 0), vec![rule(PolicyNames::Bookmarks, "*", (PolicyEffect::Allow, only))]);
-    let view = View::of(listing!("push-bookmark-server.txt"), listing!("push-bookmark-bookmarks.txt"));
-    let prepared = marks.prepare(state, &stock(fixture!("push-bookmark.hg")), &view).unwrap();
-    let listed = format!("acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"59d5dc23f878\")", owner());
+    let only = PolicyWho::AnyOf {
+      entries: vec![PolicyEntry::Is {
+        principal: stranger(),
+      }],
+    };
+    set_policy(
+      state,
+      ("acl-mark", 0),
+      vec![rule(
+        PolicyNames::Bookmarks,
+        "*",
+        (PolicyEffect::Allow, only),
+      )],
+    );
+    let view = View::of(
+      listing!("push-bookmark-server.txt"),
+      listing!("push-bookmark-bookmarks.txt"),
+    );
+    let prepared = marks
+      .prepare(state, &stock(fixture!("push-bookmark.hg")), &view)
+      .unwrap();
+    let listed = format!(
+      "acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"59d5dc23f878\")",
+      owner()
+    );
     assert_eq!(
       super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Refused::Abort { message: listed.into_bytes(), hint: None })
+      Err(Refused::Abort {
+        message: listed.into_bytes(),
+        hint: None
+      })
     );
   });
 }
@@ -778,9 +926,7 @@ mod hooks {
   use slates_hg::push::reply::{Refused, Replied};
   use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 
-  use super::super::{
-    Hook, HooksRan, admission_hooks, observing_hooks, run_hooks, transaction_id,
-  };
+  use super::super::{Hook, HooksRan, admission_hooks, observing_hooks, run_hooks, transaction_id};
   use super::NAME;
   use crate::vcs_hooks::{CommittedView, EnvValue, PendingView};
 
@@ -847,7 +993,11 @@ mod hooks {
   fn drive(hooks: Vec<Hook>) -> HooksRan {
     let runtime = runtime();
     let (sent, got) = channel();
-    let view = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let view = std::env::current_exe()
+      .unwrap()
+      .parent()
+      .unwrap()
+      .to_path_buf();
     runtime
       .spawn(async move {
         let mut gone = core::future::pending::<()>();
@@ -880,10 +1030,19 @@ mod hooks {
   #[test]
   fn admission_hooks_run_in_order_and_the_first_refusal_answers_in_7_2s_words() {
     let policy = policy(&[
-      (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.first"),
+      (
+        HookPointName::HgPretxnchangegroup,
+        "pretxnchangegroup.first",
+      ),
       (HookPointName::HgChangegroup, "changegroup.after"),
-      (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.second"),
-      (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.third"),
+      (
+        HookPointName::HgPretxnchangegroup,
+        "pretxnchangegroup.second",
+      ),
+      (
+        HookPointName::HgPretxnchangegroup,
+        "pretxnchangegroup.third",
+      ),
     ]);
     let added = Some(([1; 20], [2; 20]));
     let transaction = transaction_id(&NAME);
@@ -894,27 +1053,60 @@ mod hooks {
     let observing = observing_hooks(&policy, (added, &transaction), (CommittedView(7), url));
     assert_eq!(observing.len(), 1);
     let in_transaction = Some(EnvValue::Bytes(transaction.as_bytes().to_vec()));
-    assert!(hooks.iter().chain(&observing).all(|hook| env(hook, "HG_TXNID") == in_transaction));
+    assert!(
+      hooks
+        .iter()
+        .chain(&observing)
+        .all(|hook| env(hook, "HG_TXNID") == in_transaction)
+    );
     let roles = ["accept", "refuse", "accept"];
-    let ran = drive(hooks.into_iter().zip(roles).map(|(hook, role)| playing(hook, role)).collect());
+    let ran = drive(
+      hooks
+        .into_iter()
+        .zip(roles)
+        .map(|(hook, role)| playing(hook, role))
+        .collect(),
+    );
     assert_ran(&ran);
   }
 
   /// The three admission hooks in order, the first's changesets, view and url as 7.2 names them.
   fn assert_inputs(hooks: &[Hook], url: &str) {
     let names: Vec<&str> = hooks.iter().map(|hook| hook.name.as_str()).collect();
-    assert_eq!(names, ["pretxnchangegroup.first", "pretxnchangegroup.second", "pretxnchangegroup.third"]);
+    assert_eq!(
+      names,
+      [
+        "pretxnchangegroup.first",
+        "pretxnchangegroup.second",
+        "pretxnchangegroup.third"
+      ]
+    );
     let first = hooks.first().unwrap();
-    assert_eq!(env(first, "HG_NODE"), Some(EnvValue::Bytes(b"01".repeat(20))));
-    assert_eq!(env(first, "HG_NODE_LAST"), Some(EnvValue::Bytes(b"02".repeat(20))));
+    assert_eq!(
+      env(first, "HG_NODE"),
+      Some(EnvValue::Bytes(b"01".repeat(20)))
+    );
+    assert_eq!(
+      env(first, "HG_NODE_LAST"),
+      Some(EnvValue::Bytes(b"02".repeat(20)))
+    );
     assert_eq!(env(first, "HG_PENDING"), Some(EnvValue::ViewRoot));
-    assert_eq!(env(first, "HG_URL"), Some(EnvValue::Bytes(url.as_bytes().to_vec())));
+    assert_eq!(
+      env(first, "HG_URL"),
+      Some(EnvValue::Bytes(url.as_bytes().to_vec()))
+    );
   }
 
   /// The run stopped at the second hook, in 7.2's words, both hooks' words salvaged naming the changegroup part.
   fn assert_ran(ran: &HooksRan) {
     let message = b"pretxnchangegroup.second hook exited with status 3".to_vec();
-    assert_eq!(ran.refused, Some(Refused::Abort { message, hint: None }));
+    assert_eq!(
+      ran.refused,
+      Some(Refused::Abort {
+        message,
+        hint: None
+      })
+    );
     assert_eq!(ran.lessons.len(), 2);
     let named: Vec<Option<u32>> = ran
       .output

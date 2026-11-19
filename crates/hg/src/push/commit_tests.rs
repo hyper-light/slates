@@ -97,7 +97,11 @@ fn assert_brings_nothing(again: &Verified, verified: &Verified) {
       .map(|(_, revisions)| revisions.len())
       .sum::<usize>();
   assert_eq!(again.passed_over, u64::try_from(total).unwrap());
-  let nodes: Vec<Node> = verified.changesets.iter().map(|arrived| arrived.node).collect();
+  let nodes: Vec<Node> = verified
+    .changesets
+    .iter()
+    .map(|arrived| arrived.node)
+    .collect();
   assert_eq!(again.held_changesets, nodes);
 }
 

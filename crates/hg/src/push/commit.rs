@@ -166,17 +166,19 @@ fn changesets(
   let group: Vec<NewChangeset<'_>> = arrived
     .iter()
     .zip(&fields)
-    .map(|(changeset, ((manifest, branch, closed), text))| NewChangeset {
-      node: changeset.node,
-      p1: changeset.p1,
-      p2: changeset.p2,
-      flags: 0,
-      len: to_u64(changeset.text.len()),
-      text: *text,
-      manifest: *manifest,
-      closed: *closed,
-      branch,
-    })
+    .map(
+      |(changeset, ((manifest, branch, closed), text))| NewChangeset {
+        node: changeset.node,
+        p1: changeset.p1,
+        p2: changeset.p2,
+        flags: 0,
+        len: to_u64(changeset.text.len()),
+        text: *text,
+        manifest: *manifest,
+        closed: *closed,
+        branch,
+      },
+    )
     .collect();
   fork.append_changesets(store, &group)?;
   Ok(())
