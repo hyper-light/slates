@@ -968,7 +968,11 @@ mod tests {
       assert_eq!(refusal(full), HostError::NoSpace(code(full)), "{full:?}");
     }
     for lacking in [Errno::OPNOTSUPP, Errno::NOTSUP] {
-      assert_eq!(refusal(lacking), HostError::Unsupported(code(lacking)), "{lacking:?}");
+      assert_eq!(
+        refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
     }
     for lacking in [Errno::INVAL, Errno::NOTSUP] {
       assert_eq!(
@@ -978,7 +982,11 @@ mod tests {
       );
     }
     for other in [Errno::INVAL, Errno::IO, Errno::ACCESS] {
-      assert_eq!(refusal(other), HostError::Unavailable(code(other)), "{other:?}");
+      assert_eq!(
+        refusal(other),
+        HostError::Unavailable(code(other)),
+        "{other:?}"
+      );
     }
     assert_eq!(refusal(Errno::NOENT), HostError::NotFound);
   }

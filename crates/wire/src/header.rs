@@ -226,7 +226,7 @@ mod tests {
       Header::decode(&bytes),
       Err(WireError::UnsupportedMajor {
         got: 1,
-        supported: 2
+        supported: MAJOR
       })
     ));
     let mut bytes = sample().encode();
@@ -239,6 +239,32 @@ mod tests {
       Header::decode(&bytes[..10]),
       Err(WireError::Truncated { needed: 22 })
     ));
+  }
+
+  /// A-539 (a host's refusal code typed by its numbering; D-15, append-only within a major). Do: present a header of
+  /// major 2, whose peer put a Windows host's Win32 error code in an errno field (`HostAnswer::Errno`,
+  /// `LandingDegradation::Crashed`, `TargetRefusal::Host`, `Refusal::BaseUnavailable`), its class unknown too. Expect it
+  /// refused before anything else is read: an errno field now carries an errno alone and a Win32 code rides in its own
+  /// variant, which no append-only change can say of the codes a major-2 peer sent, so no reader here takes one of them
+  /// for an errno. Before A-539, major 2 was this build's and the header was read.
+  #[test]
+  fn a_peer_of_the_major_before_typed_codes_is_refused_before_its_body_is_read() {
+    /// Shape: the protocol major before A-539.
+    const BEFORE_TYPED_CODES: u16 = 2;
+    let mut bytes = sample().encode();
+    bytes[4..6].copy_from_slice(&BEFORE_TYPED_CODES.to_le_bytes());
+    bytes[12] = 200; // an unknown class too, which must not be reached
+    assert!(
+      matches!(
+        Header::decode(&bytes),
+        Err(WireError::UnsupportedMajor {
+          got: BEFORE_TYPED_CODES,
+          ..
+        })
+      ),
+      "{:?}",
+      Header::decode(&bytes)
+    );
   }
 
   #[test]

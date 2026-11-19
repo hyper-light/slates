@@ -874,7 +874,9 @@ fn host_refusal(e: HostError) -> VfsError {
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code) => VfsError::BaseUnavailable(Some(code)),
-    HostError::OwnMount(errno) => VfsError::BaseUnavailable(Some(crate::host::OsCode::Errno(errno))),
+    HostError::OwnMount(errno) => {
+      VfsError::BaseUnavailable(Some(crate::host::OsCode::Errno(errno)))
+    }
     HostError::Pending => VfsError::BasePending,
   }
 }

@@ -2915,7 +2915,9 @@ impl<H: LandFs> Landing<'_, H> {
   /// answering — the simulated crash, an `EIO`, a Win32 code) aborts the landing so nothing is advanced; no room and the
   /// typed refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
   fn note_crash(&mut self, error: HostError) {
-    if let HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code) = error {
+    if let HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code) =
+      error
+    {
       self.crashed = Some(code);
     }
   }

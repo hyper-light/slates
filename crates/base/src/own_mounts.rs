@@ -283,10 +283,12 @@ fn fresh_tag() -> Result<u64, HostError> {
   )
   .map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
   let mut bytes = [0u8; TAG_BYTES];
-  let read =
-    rustix::io::read(&source, &mut bytes).map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
+  let read = rustix::io::read(&source, &mut bytes)
+    .map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
   if read != TAG_BYTES {
-    return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(rustix::io::Errno::IO.raw_os_error())));
+    return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+      rustix::io::Errno::IO.raw_os_error(),
+    )));
   }
   Ok(u64::from_le_bytes(bytes))
 }

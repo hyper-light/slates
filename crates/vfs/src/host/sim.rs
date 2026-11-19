@@ -9,7 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, LandCapabilities, LandFs, OsCode, WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind,
+  LandCapabilities, LandFs, OsCode, WatchState,
 };
 use crate::inode::Fingerprint;
 
@@ -178,6 +179,11 @@ pub enum SimVerb {
   Unlink,
   /// `open_file`, by the file's path: a read the host refuses (an I/O error on the disk the volume overlays).
   OpenFile,
+  /// `rmdir`, by the directory's path: a removal the host refuses (A-539: POSIX lets `rmdir` answer a directory that
+  /// is not empty `EEXIST` as well as `ENOTEMPTY`).
+  Rmdir,
+  /// `open_to_chmod` and `open_dir_to_chmod`, by the object's path: a metadata entry's open the host refuses (A-539).
+  OpenToChmod,
 }
 
 /// A barrier the simulated host took (A-132): running it changes nothing — the host applies its durability when the
@@ -1100,7 +1106,8 @@ impl LandFs for SimHost {
       self.dir_parts(dir)?;
       return Err(HostError::Unsupported(OsCode::Errno(SIM_EOPNOTSUPP)));
     }
-    let len = usize::try_from(len).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
+    let len =
+      usize::try_from(len).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
     let shared = match self.opens.get(&from.0) {
       Some(Open::Temp { node, .. }) => node
         .bytes
@@ -1149,7 +1156,8 @@ impl LandFs for SimHost {
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError> {
     self.write_step()?;
     let now = self.now_ns;
-    let off = usize::try_from(off).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
+    let off =
+      usize::try_from(off).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
     let (node_ino, placed) = match self.opens.get_mut(&file.0) {
       Some(Open::Temp { node, placed }) => {
         write_into(&mut node.bytes, off, bytes)?;
@@ -1217,6 +1225,9 @@ impl LandFs for SimHost {
 
   /// The file as [`HostFs::open_file`] opens it: the simulated disk keeps no access modes (A-458).
   fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let mut parts = self.dir_parts(dir)?;
+    parts.push(name.into());
+    self.fault(SimVerb::OpenToChmod, &format!("/{}", parts.join("/")))?;
     HostFs::open_file(self, dir, name)
   }
 
@@ -1227,6 +1238,7 @@ impl LandFs for SimHost {
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
     self.fault(SimVerb::OpenDir, &format!("/{}", parts.join("/")))?;
+    self.fault(SimVerb::OpenToChmod, &format!("/{}", parts.join("/")))?;
     let node = match self.node(&parts) {
       Some(n) if n.kind == HostKind::Dir => SimNode {
         children: BTreeMap::new(),
@@ -1497,10 +1509,13 @@ impl LandFs for SimHost {
     match self.node(&parts) {
       None => return Err(HostError::NotFound),
       Some(n) if n.kind != HostKind::Dir => return Err(HostError::NotDirectory),
-      Some(n) if !n.children.is_empty() => return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL))),
+      Some(n) if !n.children.is_empty() => {
+        return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)));
+      }
       Some(_) => {}
     }
     let path = format!("/{}", parts.join("/"));
+    self.fault(SimVerb::Rmdir, &path)?;
     self.remove(&path);
     Ok(())
   }

@@ -174,9 +174,12 @@ fn assert_resume_reaches_the_reference(
 #[test]
 fn an_unsynced_directory_holds_its_entries_until_a_resume_syncs_it() {
   let mut history = History::new(two_directories());
-  history
-    .host
-    .fail(SimVerb::SyncDir, "/a", HostError::NoSpace(OsCode::Errno(ENOSPC)), 1);
+  history.host.fail(
+    SimVerb::SyncDir,
+    "/a",
+    HostError::NoSpace(OsCode::Errno(ENOSPC)),
+    1,
+  );
   let report = history.land(request(1));
   assert_eq!(report.state, LandingState::Partial, "{report:?}");
   assert!(!report.durability.dirs_synced, "{report:?}");
@@ -274,9 +277,12 @@ fn the_leftover(report: &LandingReport) -> (Box<str>, HostError) {
 fn a_full_disk_mid_write_and_a_temporary_left_behind_are_reported_and_the_resume_recovers() {
   let mut history = History::new(two_directories());
   history.host.set_unnamed_temporaries(false);
-  history
-    .host
-    .fail(SimVerb::WriteOut, "", HostError::NoSpace(OsCode::Errno(ENOSPC)), 1);
+  history.host.fail(
+    SimVerb::WriteOut,
+    "",
+    HostError::NoSpace(OsCode::Errno(ENOSPC)),
+    1,
+  );
   history.host.fail(
     SimVerb::Unlink,
     "/a/.slates-",
@@ -321,13 +327,19 @@ fn a_sibling_the_sweep_cannot_remove_is_reported_and_a_later_resume_removes_it()
     HostError::Unavailable(OsCode::Errno(EACCES)),
     1,
   );
-  history
-    .host
-    .fail(SimVerb::SyncDir, "/a", HostError::NoSpace(OsCode::Errno(ENOSPC)), 1);
+  history.host.fail(
+    SimVerb::SyncDir,
+    "/a",
+    HostError::NoSpace(OsCode::Errno(ENOSPC)),
+    1,
+  );
   let report = history.land(request(1));
   assert_eq!(
     the_leftover(&report),
-    (sibling.clone().into(), HostError::Unavailable(OsCode::Errno(EACCES)))
+    (
+      sibling.clone().into(),
+      HostError::Unavailable(OsCode::Errno(EACCES))
+    )
   );
   assert_eq!(report.swept, 0);
   assert_eq!(report.held, 1);
@@ -345,9 +357,12 @@ fn a_sibling_the_sweep_cannot_remove_is_reported_and_a_later_resume_removes_it()
 #[test]
 fn a_failed_media_barrier_holds_every_entry_until_a_resume_reaches_the_media() {
   let mut history = History::new(two_directories());
-  history
-    .host
-    .fail(SimVerb::SyncMedia, "", HostError::NoSpace(OsCode::Errno(ENOSPC)), 1);
+  history.host.fail(
+    SimVerb::SyncMedia,
+    "",
+    HostError::NoSpace(OsCode::Errno(ENOSPC)),
+    1,
+  );
   let media = LandingRequest {
     media_durability: true,
     ..request(1)
@@ -384,9 +399,12 @@ fn a_failed_media_barrier_holds_every_entry_until_a_resume_reaches_the_media() {
 #[test]
 fn a_refused_barrier_fails_its_whole_batch_and_shows_none_of_it() {
   let mut history = History::new(two_directories());
-  history
-    .host
-    .fail(SimVerb::Barrier, "", HostError::NoSpace(OsCode::Errno(ENOSPC)), 1);
+  history.host.fail(
+    SimVerb::Barrier,
+    "",
+    HostError::NoSpace(OsCode::Errno(ENOSPC)),
+    1,
+  );
   let report = history.land(request(1));
   assert_the_batch_failed_unseen(&mut history, &report);
   let resumed = assert_resume_reaches_the_reference(&mut history, request(1));
@@ -402,9 +420,12 @@ fn a_refused_barrier_fails_its_whole_batch_and_shows_none_of_it() {
 fn a_barrier_refused_while_it_runs_away_fails_its_whole_batch_and_shows_none_of_it() {
   let mut history = History::new(two_directories());
   history.session = Session::sliced_holding_barriers(3);
-  history
-    .host
-    .fail(SimVerb::BarrierRun, "", HostError::NoSpace(OsCode::Errno(ENOSPC)), 1);
+  history.host.fail(
+    SimVerb::BarrierRun,
+    "",
+    HostError::NoSpace(OsCode::Errno(ENOSPC)),
+    1,
+  );
   let report = history.land(request(1));
   assert_eq!(history.session.barriers_away, 1);
   assert_the_batch_failed_unseen(&mut history, &report);
@@ -419,8 +440,8 @@ fn assert_the_batch_failed_unseen(history: &mut History, report: &LandingReport)
     assert_eq!(
       outcome_of(report, path),
       Some(&Outcome::Failed {
-      code: Some(OsCode::Errno(ENOSPC))
-    }),
+        code: Some(OsCode::Errno(ENOSPC))
+      }),
       "{report:?}"
     );
   }

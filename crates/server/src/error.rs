@@ -283,10 +283,12 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     H::NotFile => TargetRefusal::NotFile,
     H::StaleHandle => TargetRefusal::Stale,
     // The code in the variant of its numbering (A-539): an errno in `Host`, a Win32 code in `HostWin32`.
-    H::Exists(code) | H::NoSpace(code) | H::Unsupported(code) | H::Unavailable(code) => match code {
-      slates_vfs::host::OsCode::Win32(code) => TargetRefusal::HostWin32 { code: *code },
-      slates_vfs::host::OsCode::Errno(errno) => TargetRefusal::Host { errno: *errno },
-    },
+    H::Exists(code) | H::NoSpace(code) | H::Unsupported(code) | H::Unavailable(code) => {
+      match code {
+        slates_vfs::host::OsCode::Win32(code) => TargetRefusal::HostWin32 { code: *code },
+        slates_vfs::host::OsCode::Errno(errno) => TargetRefusal::Host { errno: *errno },
+      }
+    }
     H::OwnMount(errno) => TargetRefusal::Host { errno: *errno },
     // A target is a directory host's, which never answers a pending fetch (an S3 base's, A-524); were one to, it is a
     // refusal no code names.

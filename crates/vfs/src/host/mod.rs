@@ -181,9 +181,14 @@ impl HostError {
   /// the errno its platform names a deadlock avoided by.
   pub fn code(&self) -> Option<OsCode> {
     match self {
-      Self::Exists(code) | Self::NoSpace(code) | Self::Unsupported(code) | Self::Unavailable(code) => Some(*code),
+      Self::Exists(code)
+      | Self::NoSpace(code)
+      | Self::Unsupported(code)
+      | Self::Unavailable(code) => Some(*code),
       Self::OwnMount(errno) => Some(OsCode::Errno(*errno)),
-      Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle | Self::Pending => None,
+      Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle | Self::Pending => {
+        None
+      }
     }
   }
 }
