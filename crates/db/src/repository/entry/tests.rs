@@ -501,14 +501,16 @@ fn the_repositorys_state_moves_with_its_push_or_alone_and_only_from_the_state_it
   assert_snapshot_rebuilds(&partition, caps(ROOMY));
 }
 
-/// A-603 (bounded growth: the repository's state is charged to the partition's merge budget). Do: on a partition whose
-/// merge budget holds 256 bytes, add a marker of 100 bytes, then one of 200; destroy the repository; then add the larger
-/// to a new repository. Expect: the larger is refused `Capacity` while the first is held, nothing applied; the destroy
-/// gives the first's bytes back, so the larger fits after it; a partition rebuilt from its snapshot charges the same.
+/// A-603 (bounded growth: an entry's versions and the repository's state are charged to the partition's merge budget).
+/// Do: on a partition whose merge budget holds 256 bytes, add a marker of 100 bytes, then one of 200; send an entry of two
+/// versions of 100 bytes each, which fit one at a time and not together; destroy the repository; then add the larger
+/// marker to a new repository. Expect: the larger marker and the two versions are each refused `Capacity` while the
+/// first marker is held, nothing applied; the destroy gives the first's bytes back, so the larger fits after it; a
+/// partition rebuilt from its snapshot charges the same.
 #[test]
 fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it() {
   let budget = caps(256);
-  let (mut partition, repo, _) = three_branches(budget);
+  let (mut partition, repo, [a, b, ..]) = three_branches(budget);
   let mut small = at(repo, 1);
   small.state = vec![marker(&[1; 100])];
   advance(&mut partition, small).unwrap();
@@ -517,6 +519,14 @@ fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it()
   large.state = vec![marker(&[2; 200])];
   assert_eq!(
     advance(&mut partition, large.clone()),
+    Err(DbError::Capacity {
+      table: "green_chains"
+    })
+  );
+  let mut together = at(repo, 2);
+  together.versions = vec![version(a, 1, &[3; 100]), version(b, 1, &[4; 100])];
+  assert_eq!(
+    advance(&mut partition, together),
     Err(DbError::Capacity {
       table: "green_chains"
     })
@@ -772,6 +782,10 @@ enum StateStep {
 
 #[derive(Clone, Debug)]
 struct EntryStep {
+  /// Whether the entry keeps only its items that hold, judged in order on the model, at the right position and
+  /// versions: an entry the rules accept whole, so histories reach entries of several greens, stacks and state moves
+  /// often, and not refusals alone.
+  clean: bool,
   skew: Skew,
   checks: Vec<CheckStep>,
   joins: Vec<JoinStep>,
@@ -824,21 +838,25 @@ fn entry_step() -> impl Strategy<Value = EntryStep> {
     (0..MARKERS).prop_map(|marker| StateStep::Marker { marker }),
   ];
   (
+    proptest::bool::weighted(0.6),
     skew(),
     proptest::collection::vec(check, 0..3),
     proptest::collection::vec(join, 0..2),
-    proptest::collection::vec((pick(), skew()), 0..4),
+    proptest::collection::vec((pick(), skew()), 0..5),
     proptest::collection::vec(name, 0..3),
     proptest::collection::vec(state, 0..4),
   )
-    .prop_map(|(skew, checks, joins, versions, names, state)| EntryStep {
-      skew,
-      checks,
-      joins,
-      versions,
-      names,
-      state,
-    })
+    .prop_map(
+      |(clean, skew, checks, joins, versions, names, state)| EntryStep {
+        clean,
+        skew,
+        checks,
+        joins,
+        versions,
+        names,
+        state,
+      },
+    )
 }
 
 fn step() -> impl Strategy<Value = Step> {
@@ -965,13 +983,7 @@ impl Model {
       };
     }
     for (index, check) in entry.checks.iter().enumerate() {
-      let holds = match check {
-        RepositoryCheck::Head { green, version } => {
-          self.is_member(index_of(*green)) && self.head(index_of(*green)) == *version
-        }
-        RepositoryCheck::Names { prefix, bound } => self.under(prefix) == *bound,
-      };
-      if !holds {
+      if !self.holds(check) {
         return Answer::CheckFailed(u32::try_from(index).unwrap());
       }
     }
@@ -999,6 +1011,51 @@ impl Model {
     next.position += 1;
     *self = next;
     Answer::Ok
+  }
+
+  /// Whether `check` holds at this state.
+  fn holds(&self, check: &RepositoryCheck) -> bool {
+    match check {
+      RepositoryCheck::Head { green, version } => {
+        self.is_member(index_of(*green)) && self.head(index_of(*green)) == *version
+      }
+      RepositoryCheck::Names { prefix, bound } => self.under(prefix) == *bound,
+    }
+  }
+
+  /// `entry` with only its items that hold, judged in order on a copy of this state, at this position and with each
+  /// version the one after its green's head: an entry the rules accept whole.
+  fn cleaned(&self, entry: RepositoryEntry) -> RepositoryEntry {
+    let mut scratch = self.clone();
+    let mut kept = at(entry.repository, self.position);
+    kept.checks = entry
+      .checks
+      .into_iter()
+      .filter(|check| self.holds(check))
+      .collect();
+    for joined in entry.joined {
+      if scratch.join(&joined).is_ok() {
+        kept.joined.push(joined);
+      }
+    }
+    for made in entry.versions {
+      let green = index_of(made.green);
+      let next = version(made.green, scratch.head(green) + 1, &made.entry);
+      if scratch.version(&next).is_ok() {
+        kept.versions.push(next);
+      }
+    }
+    for change in entry.names {
+      if scratch.name(&change).is_ok() {
+        kept.names.push(change);
+      }
+    }
+    for change in entry.state {
+      if scratch.state(&change) {
+        kept.state.push(change);
+      }
+    }
+    kept
   }
 
   fn join(&mut self, joined: &MemberRecord) -> Result<(), Answer> {
@@ -1113,8 +1170,18 @@ impl Model {
     Answer::Ok
   }
 
-  /// The entry a step makes, its values read from this state and departing from it as the step's skews say.
+  /// The entry a step makes, its values read from this state and departing from it as the step's skews say, or, for a
+  /// clean step, only its items that hold.
   fn build(&self, repository: RepositoryId, step: &EntryStep) -> RepositoryEntry {
+    let made = self.made(repository, step);
+    if step.clean {
+      return self.cleaned(made);
+    }
+    made
+  }
+
+  /// The entry a step makes as it stands.
+  fn made(&self, repository: RepositoryId, step: &EntryStep) -> RepositoryEntry {
     let mut heads = self.heads.clone();
     RepositoryEntry {
       repository,
