@@ -60,7 +60,7 @@ pub const EXIT_NEVER_SERVED: u8 = 5;
 
 /// Format: the role arguments [`Role::parse`] takes, for its usage message.
 pub const ROLE_USAGE: &str = "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME] \
-   [--vcs-http ADDRESS]";
+   [--vcs-http ADDRESS] [--vcs-ssh ADDRESS]";
 
 /// Options of the anchor and the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +77,10 @@ pub struct ProcessOptions {
   /// §4.17.2 "Transports" item 1; A-625 part 3): HTTPS presenting a fleet node's own identity, or cleartext on a
   /// loopback address for a daemon that is no fleet node ([`vcs_http_address`]). None starts no edge.
   pub vcs_http: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the version-control servers' SSH edge listens, when the operator starts one (`--vcs-ssh ADDRESS`, §4.17.2
+  /// "Transports" item 2; A-684): its host key the fleet node's own, or one the anchor makes at its start and keeps
+  /// across its daemons' restarts ([`vcs_ssh_address`]). None starts no edge.
+  pub vcs_ssh: Option<slates_rt::tcp::SocketAddrV4>,
 }
 
 /// Which fleet node this process is: the operator's shared manifest and this node's name in it
@@ -185,6 +189,7 @@ struct Given {
   fleet: Option<String>,
   node: Option<String>,
   vcs_http: Option<String>,
+  vcs_ssh: Option<String>,
   quick: bool,
   word: Option<String>,
 }
@@ -229,12 +234,22 @@ impl Given {
         })
       })
       .transpose()?;
+    let vcs_ssh = self
+      .vcs_ssh
+      .map(|text| {
+        vcs_ssh_address(&text).map_err(|reason| RoleArgsError::BadValue {
+          flag: "--vcs-ssh",
+          reason,
+        })
+      })
+      .transpose()?;
     Ok(ProcessOptions {
       instance: self.instance.unwrap_or_else(slates_ipc::instance_from_env),
       quick: self.quick,
       shards,
       fleet,
       vcs_http,
+      vcs_ssh,
     })
   }
 }
@@ -282,11 +297,25 @@ pub fn vcs_http_address(
   Ok(address)
 }
 
+/// Reads a `--vcs-ssh` address, the version-control servers' SSH edge's (§4.17.2 "Transports" item 2; A-684): an IPv4
+/// address and port, `127.0.0.1:2222`, port 0 taking one the system picks, which the daemon logs with its host key's
+/// fingerprint; or why it is not one. Any address is taken, on a fleet node or not: SSH encrypts every connection and
+/// proves the server by its host key before a client sends anything of its own (RFC 4253 §7-§8), and authenticates a
+/// client by a signature, never a secret sent (RFC 4252 §7), so no address is left to cleartext as `--vcs-http`'s
+/// off loopback would be. The edge listens on an unprivileged port (R10): a privileged one is refused by the system
+/// where it is privileged, which ends the anchor's start by name. The roles here and the `slates` command read the flag
+/// with this.
+pub fn vcs_ssh_address(text: &str) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+  text
+    .parse::<slates_rt::tcp::SocketAddrV4>()
+    .map_err(|error| format!("{text}: {error}; an IPv4 address and port, such as 127.0.0.1:2222"))
+}
+
 /// Whether `flag` takes a value.
 fn takes_value(flag: &str) -> bool {
   matches!(
     flag,
-    "--instance" | "--shards" | "--fleet" | "--node" | "--vcs-http"
+    "--instance" | "--shards" | "--fleet" | "--node" | "--vcs-http" | "--vcs-ssh"
   )
 }
 
@@ -361,6 +390,11 @@ impl Role {
     // The shared HTTP edge is the daemon's; the anchor passes the address through to the daemon it starts.
     if let Some(address) = options.vcs_http {
       args.push("--vcs-http".to_owned());
+      args.push(address.to_string());
+    }
+    // So is the SSH edge (A-684): the anchor holds its listener and host key, and passes the address on.
+    if let Some(address) = options.vcs_ssh {
+      args.push("--vcs-ssh".to_owned());
       args.push(address.to_string());
     }
     args
@@ -469,6 +503,7 @@ mod tests {
         shards: Some(2),
         fleet: None,
         vcs_http: None,
+        vcs_ssh: None,
       })
     );
     let daemon = Role::parse(&words("daemon --instance a --fleet /f.json --node a")).unwrap();
@@ -483,6 +518,7 @@ mod tests {
           node: "a".into(),
         }),
         vcs_http: None,
+        vcs_ssh: None,
       })
     );
     for role in [anchor, daemon] {
@@ -523,6 +559,49 @@ mod tests {
       Role::parse(&words("daemon --node a")),
       Err(RoleArgsError::HalfAFleet)
     );
+  }
+
+  /// A-684 (§4.17.2 "Transports" item 2). Do: parse a daemon asked for the version-control SSH edge on a loopback
+  /// address (its value joined by `=`), and an anchor that is no fleet node asked for one on an address any interface
+  /// reaches, beside the HTTP edge; make each role's arguments and parse them back. Then give the flag a name where an
+  /// address belongs, and an address with no port. Expect: each address read, and carried back whole through the
+  /// arguments an anchor starts its daemon with (SSH encrypts every connection, so any address is taken without a
+  /// fleet); the name and the bare address refused as a bad `--vcs-ssh` that says what an address is, before anything
+  /// starts.
+  #[test]
+  fn a_roles_vcs_ssh_edge_reads_back_on_any_address_and_a_name_is_refused() {
+    let daemon = Role::parse(&words("daemon --vcs-ssh=127.0.0.1:2222")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_ssh,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::LOCALHOST,
+        2222
+      ))
+    );
+    let anchor = Role::parse(&words(
+      "anchor --vcs-http 127.0.0.1:8080 --vcs-ssh 0.0.0.0:2222",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_ssh,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::UNSPECIFIED,
+        2222
+      ))
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    for refused in [
+      "daemon --vcs-ssh localhost:2222",
+      "anchor --vcs-ssh 127.0.0.1",
+    ] {
+      let parsed = Role::parse(&words(refused));
+      assert!(
+        matches!(&parsed, Err(RoleArgsError::BadValue { flag: "--vcs-ssh", reason }) if reason.contains("IPv4 address and port")),
+        "{refused}: {parsed:?}"
+      );
+    }
   }
 
   /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: parse a daemon asked for the version-control HTTP edge on a

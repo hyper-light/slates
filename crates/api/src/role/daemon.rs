@@ -7,7 +7,7 @@ use std::time::Duration;
 use slates_anchor::{AnchorSegment, RegionKind};
 use slates_machine::facts::Facts;
 use slates_machine::{MachineProfile, ProfileOptions};
-use slates_server::config::VcsHttpConfig;
+use slates_server::config::{VcsHttpConfig, VcsSshConfig};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 use super::parent::ParentWatch;
@@ -213,6 +213,13 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   // serves cleartext, on a loopback address alone, which the flag's reading held it to (`super::vcs_http_address`).
   config.vcs_http = options.vcs_http.map(|address| VcsHttpConfig {
     address,
+    identity: edge_identity.clone(),
+  });
+  // The SSH edge, when asked for (`--vcs-ssh`; §4.17.2 "Transports" item 2, A-684): a fleet node's presents the node's
+  // own key from the same identity; any other daemon serves with the key its anchor made at its start and published in
+  // the segment, or, run alone, one it makes for its own life.
+  config.vcs_ssh = options.vcs_ssh.map(|address| VcsSshConfig {
+    address,
     identity: edge_identity,
   });
   let edge = config
@@ -241,6 +248,18 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
       "slates daemon: the version-control HTTP edge serves {} on {}:{port}",
       if https { "HTTPS" } else { "cleartext" },
       address.ip()
+    );
+  }
+  // The SSH edge's address and its host key's fingerprint, as `ssh` shows a key it has not seen ("ED25519 key fingerprint
+  // is SHA256:..."), so a person compares the two before trusting the key (A-684); before the serving line, as above.
+  if let Some(address) = options.vcs_ssh
+    && let Some(edge) = daemon.vcs_ssh()
+  {
+    slates_machine::log_line!(
+      "slates daemon: the version-control SSH edge serves on {}:{} with the ED25519 host key {}",
+      address.ip(),
+      edge.port,
+      edge.fingerprint
     );
   }
   slates_machine::log_line!(

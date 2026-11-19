@@ -42,6 +42,10 @@ const CHILD_NFS_PORT: &str = "SLATES_ANCHOR_TEST_NFS_PORT";
 /// descriptor it inherited to be bound to, and turning this binary into that child (A-625 part 3).
 #[cfg(unix)]
 const CHILD_VCS_HTTP_PORT: &str = "SLATES_ANCHOR_TEST_VCS_HTTP_PORT";
+/// Format: the environment variable carrying the port the SSH edge's listener-inheritance child expects the descriptor
+/// it inherited to be bound to, and turning this binary into that child (A-684).
+#[cfg(unix)]
+const CHILD_VCS_SSH_PORT: &str = "SLATES_ANCHOR_TEST_VCS_SSH_PORT";
 
 /// Format: the variable carrying how long the slow children's starts run (milliseconds), and turning this binary into
 /// [`slow_failing_child`] or [`briefly_serving_child`].
@@ -167,6 +171,33 @@ fn a_published_sealing_root_is_adopted_by_a_later_attachment() {
     [0u8; 32],
     "the root shares the page with the issuer secret and leaves it alone"
   );
+}
+
+/// A-684: do create a segment and read its SSH host key's seed, publish one as the anchor does before its first daemon,
+/// then read it through two later attachments (a daemon, and its successor after a restart, re-attaching the anchor's
+/// segment). Expect: none on the fresh segment; both later attachments reading the very seed the anchor published, so
+/// every daemon under the anchor serves its SSH edge with one key; and the secrets beside it left alone.
+#[test]
+fn a_published_ssh_host_seed_is_read_by_every_later_attachment() {
+  let id = identity();
+  let mut created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-ssh-host"), &id, geometry()).unwrap();
+  assert_eq!(
+    created.ssh_host_seed().unwrap(),
+    None,
+    "a fresh segment holds no SSH host key"
+  );
+  let seed = [11u8; 32];
+  created.publish_ssh_host_seed(&seed).unwrap();
+  let (handoff, len) = handoff_of(&created);
+  let daemon = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  assert_eq!(daemon.ssh_host_seed().unwrap(), Some(seed));
+  drop(daemon);
+  let successor = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  assert_eq!(successor.ssh_host_seed().unwrap(), Some(seed));
+  assert_eq!(successor.launcher_secret().unwrap(), None);
+  assert_eq!(successor.session_secret().unwrap(), None);
+  assert_eq!(successor.issuer_secret().unwrap(), [0u8; 32]);
 }
 
 /// A-299: do create a segment and read its launcher secret, publish one as the anchor does before its first daemon, then
@@ -634,6 +665,107 @@ fn the_supervised_child_inherits_the_held_vcs_http_listener() {
     Some(Some(0)),
     "the supervised child inherited the anchor's held edge listener at the bound port (2: none was handed over)"
   );
+}
+
+/// The SSH edge's listener-inheritance child (A-684): it verifies it inherited the edge's listener the anchor holds
+/// across the spawn — reads [`CHILD_VCS_SSH_PORT`] (its role signal) and `ENV_VCS_SSH` — and exits 0 if that descriptor
+/// is a socket bound at the expected port, 1 otherwise, and 2 when no descriptor was handed over. Ignored like
+/// `supervised_child`, and run by the parent with `--ignored --exact`.
+#[cfg(unix)]
+#[test]
+#[ignore = "the SSH edge's listener-inheritance child; run by the parent with --ignored"]
+fn vcs_ssh_listener_child() {
+  let Ok(expected) = std::env::var(CHILD_VCS_SSH_PORT) else {
+    return;
+  };
+  let expected: u16 = expected.parse().unwrap();
+  let Some(raw) = std::env::var(slates_anchor::ENV_VCS_SSH)
+    .ok()
+    .and_then(|number| number.parse::<i32>().ok())
+  else {
+    std::process::exit(2);
+  };
+  // SAFETY: the descriptor was inherited from the anchor across the spawn and named to us in the
+  // environment; borrowing it for one getsockname does not take ownership (the process owns it).
+  let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+  let port = match rustix::net::getsockname(borrowed) {
+    Ok(name) => match rustix::net::SocketAddr::try_from(name) {
+      Ok(rustix::net::SocketAddr::V4(v4)) => v4.port(),
+      _ => 0,
+    },
+    Err(_) => 0,
+  };
+  std::process::exit(i32::from(port != expected));
+}
+
+/// A-684 (§4.17.2 "Transports" item 2). Do: bind a listener as an anchor binds the SSH edge's, hold it in the supervisor,
+/// and start the supervised child. Expect: the child finds the same listening socket, at the bound port, on the
+/// descriptor `ENV_VCS_SSH` names (exit 0; 2 if none was handed over): every daemon an anchor starts serves the SSH edge
+/// on the port the anchor holds, so a restart never drops it.
+#[cfg(unix)]
+#[test]
+fn the_supervised_child_inherits_the_held_vcs_ssh_listener() {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  /// Shape: one queued pending connection suffices; nothing connects in this test.
+  const BACKLOG: i32 = 1;
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let fd = listener.into_owned();
+  // Make the descriptor inheritable so the spawned child receives it across the exec.
+  rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-vcs-ssh"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "vcs_ssh_listener_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
+  supervisor.hold_vcs_ssh_listener(fd);
+  // SAFETY: the test is single-threaded at this point; the child reads it. The role is chosen by the
+  // child's args, so a parallel test's child ignores this variable.
+  unsafe {
+    std::env::set_var(CHILD_VCS_SSH_PORT, port.to_string());
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let outcome = drive_until_the_child_exits(&mut supervisor, clock);
+  supervisor.stop().ok();
+  // SAFETY: single-threaded cleanup.
+  unsafe {
+    std::env::remove_var(CHILD_VCS_SSH_PORT);
+  }
+  assert_eq!(
+    outcome,
+    Some(Some(0)),
+    "the supervised child inherited the anchor's held SSH edge listener at the bound port (2: none was handed over)"
+  );
+}
+
+/// Steps `supervisor`, started at `clock`, until its child exits or the child's wait passes: the child's exit code, none
+/// if it never exited within the wait.
+#[cfg(unix)]
+fn drive_until_the_child_exits(supervisor: &mut Supervisor, clock: Instant) -> Option<Option<i32>> {
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  while clock.elapsed() < deadline {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code, .. } => {
+        return Some(exit_code);
+      }
+      Step::Stopped | Step::BackingOff { .. } => return None,
+    }
+  }
+  None
 }
 
 /// Steps the supervisor until the crash loop (or the deadline): the failed starts in a row its last restart counted,

@@ -73,6 +73,13 @@ pub const ENV_FLEET_SERVE: &str = "SLATES_ANCHOR_FLEET_SERVE";
 /// through `slates_rt::tcp::TcpListener::from_owned`.
 pub const ENV_VCS_HTTP: &str = "SLATES_ANCHOR_VCS_HTTP";
 
+/// Format: the environment variable carrying the descriptor of the version-control servers' SSH edge's listener the
+/// anchor holds (§4.17.2 "Transports" item 2; A-684), bound once at the address the operator gave (`--vcs-ssh`) and
+/// inherited by every daemon across its spawn, as [`ENV_VCS_HTTP`]'s is, so the edge's port never drops while a daemon
+/// restarts. Its host key is held beside it, in the segment (`layout::SUP_SSH_HOST_SEED`). Set only when the anchor
+/// holds one (Unix), and a daemon without it binds its own.
+pub const ENV_VCS_SSH: &str = "SLATES_ANCHOR_VCS_SSH";
+
 /// Shape: the failed starts in a row that make a crash loop (A-311): two, the first repeat. One failure is an event, and
 /// restarting it at once is the quickest recovery there is; a second in a row says the next start may fail the same way,
 /// so it waits.
@@ -251,6 +258,10 @@ pub struct Supervisor {
   /// the NFS listener is.
   #[cfg(unix)]
   vcs_http_listener: Option<OwnedFd>,
+  /// The version-control SSH edge's listener the anchor holds, if any (A-684): handed to each daemon it spawns (via
+  /// [`ENV_VCS_SSH`]), as the HTTP edge's is.
+  #[cfg(unix)]
+  vcs_ssh_listener: Option<OwnedFd>,
   /// The FUSE devices the anchor holds across daemon restarts, and the channel daemons send them on (A-61;
   /// [`crate::held`]). Linux only, as FUSE is.
   #[cfg(unix)]
@@ -352,6 +363,8 @@ impl Supervisor {
       fleet_serve: None,
       #[cfg(unix)]
       vcs_http_listener: None,
+      #[cfg(unix)]
+      vcs_ssh_listener: None,
       #[cfg(unix)]
       devices: None,
       #[cfg(windows)]
@@ -668,6 +681,14 @@ impl Supervisor {
     self.vcs_http_listener = Some(fd);
   }
 
+  /// Holds `fd` — a bound, listening socket at the address the operator gave the version-control SSH edge — as the
+  /// edge's listener handed to every daemon this supervisor spawns, so its port is stable across restarts (A-684). It
+  /// must be inheritable, as [`Supervisor::hold_vcs_http_listener`]'s is; the supervisor owns it for its life.
+  #[cfg(unix)]
+  pub fn hold_vcs_ssh_listener(&mut self, fd: OwnedFd) {
+    self.vcs_ssh_listener = Some(fd);
+  }
+
   /// The segment.
   pub fn segment(&self) -> &AnchorSegment {
     &self.segment
@@ -708,6 +729,8 @@ impl Supervisor {
     if let Some(fd) = &self.vcs_http_listener {
       env.push((ENV_VCS_HTTP.to_owned(), fd.as_raw_fd().to_string()));
     }
+    #[cfg(unix)]
+    let _ = &self.vcs_ssh_listener;
     // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
     // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
     // dead daemon left. The table's object is kept until the spawn holds its own copy.
