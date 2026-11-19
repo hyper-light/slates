@@ -11656,6 +11656,15 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > the tree stood then (the head's graft fixed by what the change index names since, the fix recorded whole in the chain
 > entry, its room derived before the verdict and added to the entry's bound by the service). Owed: a checkpoint of a
 > green holding a copy, and a rebase that restates one (the A-626 part 2 entry).
+>
+> **Status (2026-11-19, A-626 part 3).** Built in the engine: a checkpoint of a green holding a copy (`crate::checkpoint`
+> version 4, `crates/merge/src/engine/copy_checkpoint.rs`): every copy record made at or before the checkpoint's version,
+> each copied tree's keys holding then what the copy above them gave them (set by a restore with no history, so each
+> reads by its record again), and the identity's running sum, moved to the version as a branch moves it, which the
+> restore takes (what it holds beyond the restored state's entries is kept for the recount). The anchor's layout is 12:
+> a segment of an earlier layout is refused at adoption, so no version 3 checkpoint is ever read. Owed: a rebase that
+> restates a copy (part 4), and a restore grafting a copied tree whose source is unchanged since its version, where the
+> checkpoint lists it key by key (the A-626 part 3 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -13963,6 +13972,10 @@ and export by landing).
 > **Status (2026-11-19, A-626 part 2).** Built: a copy from a version its source changed after (`svn cp ^/trunk@N` with
 > the trunk changed since, as FSFS takes it), brought as the tree stood then, recorded whole in its chain entry with the
 > room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
+>
+> **Status (2026-11-19, A-626 part 3).** Built: a green holding copies is checkpointed (format version 4, the anchor's
+> layout 12), so a repository's chain is folded at its floor whatever it copied, as every other green's is. Owed: a
+> rebase restating a copy (part 4).
 >
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
@@ -45917,8 +45930,8 @@ Applied in the same change to: §4.16 (a status block, the verdict's sentence on
     slates-server's `--lib` 614 passed, 3 ignored, and the same one of main's failed (3 of 3 with main `dc46c9f`'s
     `verbs.rs`).
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
-- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: its copies and the identity's sum
-  carried); a rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
+- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: built as A-626 part 3, its entry); a
+  rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
 
 ### A-644 part 1 — A protected branch's answers from the store, in git's words: how a move changes its ref, decided by generation numbers with no walk where they decide it, and the first merge commit and the first unsigned commit a move brings (2026-11-19, g230, UI goal 93; §4.17.2 "Protected branches, in git's terms", "A push" step 6 and "Pieces (git)" piece 11; after A-590, A-614, A-620 and A-642)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `research/vcs-servers.md` §5.9; `crates/git`
@@ -47763,3 +47776,108 @@ with the fixed history first), GAPS (A-668's entry, where the census's failure w
   version before the head held it, its tree changed since; a put beneath that copy; the root copied into its own tree;
   a copy replacing its destination, then the same copy without replacing, refused; a copy with a file moved inside it
   as a stock client moves one; and two copies nested in one increment, the inner replacing the file the outer brought.
+
+### A-626 part 3 — A checkpoint of a green holding a copy: version 4 carries the copies' records, their trees' keys and the identity's sum, and the anchor's layout is 12 (2026-11-19, g307 for UI goal 93 (kiln 51cef9f7); §4.16 "The state's maps", "Commit" and A-238's checkpoint; §4.17.4 item 3 and piece 3; A-586, A-626 parts 1 and 2, A-202, A-238)
+Applied in the same change to: §4.16 (a status block under "The state's maps"), §4.17.4 (a status block), the A-626 part 2
+entry (its owed list), GAPS (the §4.17.4 entry; A-621's and A-646 part 2b's entries; "Formats the segment keeps changed
+without a layout bump", new, open), `crates/merge/src/checkpoint.rs` (version 4: `CopyRecord`, `Tables`, `Sum`,
+`SUM_BYTES`, the fields `copies`, `copied` and `sum`; a key or a record written twice refused `DuplicatePath`) and its
+tests (`src/checkpoint/tests.rs`, new), `crates/merge/src/engine/copy_checkpoint.rs` (new: `copied_at`,
+`leave_out_copied`, `copy_records_at`, `sum_at`, `restore_copied`, `take_sum`, the `place_*` setters),
+`crates/merge/src/engine.rs` (`checkpoint` without `copied_by`, `with_checkpoint` restoring the copies and the sum, the
+`restore_*` setters over `place_*`, `copies_before` and the recount), `crates/merge/src/engine/branch.rs`
+(`identity_moved_to`), `crates/merge/src/engine/copy.rs` (`every_key` for the engine; `brought_entry`, the record's
+kept fix, `record_bytes`, `release_kept_fixes`), the bug record
+`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`, `crates/merge/src/identity.rs`
+(`SUM_BYTES`, `add_sum`, `less`, `is_empty`, `to_bytes`, `from_bytes`), `crates/anchor/src/layout.rs`
+(`LAYOUT_VERSION` 12), and the tests (`engine/copy_tests.rs`: the checkpoint and restore test replacing the refusal's,
+the copy oracle restoring every history at every version; `tests/checkpoint.rs`, main's, updated by reading).
+- **What was there.** `Green::checkpoint` answered `None` at or after any copy (`copied_by`), so the service kept such a
+  green's chain whole, counting `merge.checkpoint.unavailable`: a Subversion repository green that ever copied (every
+  branch and tag is a copy) never folded its chain. Two facts stood in the way. A copied tree's keys hold what the copy
+  gave them with no history of their own, read by the copy's record, so a checkpoint listing the keys whose histories
+  changed after the origin left the copied trees out; and the identity's set hash holds one entry a copy, standing for
+  its tree's entries at the source's version (A-586), which a green restored from the origin and the listed keys cannot
+  recount, since the histories that hold the source at that version are folded into the checkpoint.
+- **The format, version 4.** After the changed keys' tables: the copy records made at or before the checkpoint's
+  version (destination, version, source, source version), by destination then version; the copied tables, one a
+  dimension, each copied tree's keys that hold at the version what the copy above them gave them (no change of their own
+  after that copy and at or before the version), read there as every reader reads them, with the copy's version (a key
+  absent then is listed only where something stood at it at or before the version, which a restore must take away);
+  then the identity's running sum, LtHash16's 1,024 lanes little-endian, 2,048 bytes; then the head check. A key of a
+  copied tree that its own change set after the copy is a changed key, as any key is, and the changed tables leave the
+  copied keys out. A version 3 checkpoint is refused `BadVersion`, and a key or a record written twice `DuplicatePath`.
+- **The sum at a version below the head.** The running sum is brought to the head on a copy of it (the green is not
+  changed), then moved to the version by the keys changed since, as a branch at that version moves it
+  (`identity_moved_to`, the branch's own reverts): what a branch costs, the keys changed since the version.
+- **The restore.** The changed keys as before; the copied keys set with no history, so each reads by its record again;
+  the records kept, each charged with the change index as its commit charged it; then the carried sum taken as the
+  green's identity. What the sum holds beyond the restored state's own entries (the copies' entries less their trees')
+  is kept (`copies_before`), and the recount adds it for the copies made at or before the restore, whose trees it can no
+  longer read, so the identity still equals its recount.
+- **The anchor's layout, 12** (main's ruling): the segment keeps every checkpoint, so its format's change bumps the
+  layout, and a segment of an earlier layout is refused once, typed, at adoption, before anything is served. No reader
+  of version 3 exists, and no green is fenced mid-service for one. A-621 and A-646 part 2b changed formats the segment
+  keeps without a bump; this one covers them from now on (GAPS, filed with the guard owed: a structural test tying every
+  persisted format's version to the layout).
+- **Cost.** A checkpoint lists each copied tree key by key, files with their bytes, where the green holds the tree by
+  reference: the price of a checkpoint a restore reads alone. Owed, if a measurement shows it worth its rules: a restore
+  that grafts a tree whose source is unchanged since its version by reference.
+- **Tests** (`crates/merge/src/checkpoint/tests.rs`, `crates/merge/src/engine/copy_tests.rs`).
+  - Golden vectors: a checkpoint touching every table, a copy's record and copied keys, 2,497 bytes laid out field by
+    field, identity `13b881c8102bee2341e78a0d61ba6ffc1b5e90b31a082162f724c50c29251df3`. Both derived outside the crate:
+    the layout field by field, the identity by a BLAKE3 written in Python from the BLAKE3 paper with no library, which
+    reproduces the empty input's hash, the official test vectors at 1, 1023, 1024, 1025, 2048, 2049 and 3072 bytes, and
+    A-646's ops-document vector (218 bytes, `553a422f…6c0d92`).
+  - The determinism gate over the copies and the copied tables declared in reverse; hostile input: every prefix, a
+    version 3 header, a copied key and a copy's record each written twice, a byte appended.
+  - A green holding a copy, checkpointed at the copy's version and after an edit beneath it, restored and given the
+    versions after: it reads and hashes as the green, its identity its recount.
+  - The copy oracle: every generated history's green checkpointed at every version, the checkpoint encoded and decoded,
+    restored and given every later chain entry, hashing as the replay at every version it reaches, reading as the model
+    at every version from the checkpoint on, its identity its recount; a census of checkpoints carrying copies and of
+    ones listing copied keys.
+- **Found by the oracle: what a copy brought is read from its graft, never below the floor.** The oracle's first run
+  restored greens at 2 and at 3 and replayed a copy made at 4 from version 1 (seed `cc ef9d3557…`, now a reviewed
+  seed). Their recounts read the source's history at 1, which a restored green does not hold. By reading, so did the
+  running identity for a key the copy brought that changes in its fold window or its own increment, and so did a sum
+  moved below the copy. A replica replaying such a copy hashed otherwise than its owner
+  (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). It is no artefact of
+  the oracle: the owner folds only as far as its retention budget needs, below the reachable floor it checkpoints at,
+  so a copy above its own fold floor may name a version below its last checkpoint, and recovery replays it.
+  - *Recording the entries a copy brought*: rejected. `svn copy ^/trunk ^/branches/x` is Subversion's most common
+    commit, and at A-645's scale it copies a 250 GB tree. A record holding every entry turns A-542's O(path length)
+    copy into O(the tree), in the format and in the checkpoint.
+  - *A floor rule* (a checkpoint waiting at the oldest source version a copy still needs): it does not meet the case.
+    The copies it fails on are made after the checkpoint, so no rule at the checkpoint holds them. And a copy at or
+    before the checkpoint needs nothing below it once restored: its keys read their current values from its record on,
+    the identity is past it, and the carried sum stands for what it brought.
+  - *No read below the floor* (taken). A copy grafts its source held at the version before it, with its fix (part 2).
+    Nothing reads what a copy brought unless the copy stands above the floor: the identity is brought past a copy before
+    the floor passes it, and a branch or a checkpoint is made at the floor or above. The version before such a copy
+    never lies below the floor or a restored green's checkpoint. The destination's own maps would answer a key the copy
+    gave and nothing changed since (its current value), and one changed later (its history at the copy's version). But
+    they cannot answer a key the copy's own version changed, or an inner copy of that version replaced, since that
+    value stood at no version: only the graft holds it. So every reader reads the graft (`Green::brought_entry`): the
+    source at the version before the copy, through the copy's fix. The fix, which the chain entry already carries whole,
+    is kept with the record while the copy stands above the fold floor and let go when the floor reaches it
+    (`Green::release_kept_fixes`). It is charged with the change index and secured before the verdict as the entry's
+    room is. A copy whose source was unchanged since its version keeps none: the common copy, from the head, stays
+    O(path length). The checkpoint's format is unchanged: a record carries no fix and no copied entry.
+  - Tests: a replica given a copy and then a change to a key it brought, its identity read once after both; one given
+    a copy whose own increment edits beneath it; each must hash as its owner and its identity equal its recount, and
+    the first replica's checkpoint below the copy must carry its owner's sum.
+- **Evidence** (debug, Windows x86_64, jupiter, 2026-11-19, `CARGO_BUILD_JOBS=4`, each run a fresh clone of the pushed
+  branch; the macOS arm64 run is owed while the Mac Studio is offline):
+  - Part 3 before the fix (7d08dd16a, over main 4644dcec3): `cargo test -p slates-merge --lib` 180 of 181, the copy
+    oracle failing at a restored green's recount (seed `cc ef9d3557…`); `cargo test -p slates-anchor --lib` 31 of 31,
+    main's baseline; `cargo fmt -p slates-merge -- --check` and `cargo fmt -p slates-anchor -- --check` clean.
+  - Red, the fix's tests over part 3 as it stood (d2a2b0afc, kiln r84): `cargo test -p slates-merge --lib copy_tests`,
+    22 passed and 3 failed, each at an identity: the two replica tests (`copy_tests.rs` 1270, "the replica's identity
+    at 5", and 1301) and the copy oracle on the seed, shrunk to a put, a directory, a put and a copy replacing its
+    destination from two versions back.
+  - Green (617ad96e0, r84): `cargo test -p slates-merge --lib` 182 of 183, every identity and model check passing and
+    the census meeting no nested replace (A-672's, landed before this part); the oracle run again alone, 1 of 1, its
+    census 77 accepted, 380 refused, 12 from the root, 36 from before the head, 26 into themselves, 19 from a changed
+    source, 17 changes beneath a copy, 35 replaced, 30 nested, 3 nested replacing, 26 moves, 265 checkpoints carrying
+    copies, 264 listing copied keys; `cargo test -p slates-anchor --lib` 31 of 31; both crates' fmt checks clean.
