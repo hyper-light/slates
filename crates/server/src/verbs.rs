@@ -414,9 +414,14 @@ fn home_redirect(
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
 /// registration through cancellation; an unavailable shard cannot produce a successful bootstrap. Each call (the
 /// operation on the control shard, then its publication on every other) is waited for in its target's own time
-/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is refused `Overloaded` after a
-/// window with no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the
-/// wall second while the bootstrap went on).
+/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is given up after a window with
+/// no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the wall second
+/// while the bootstrap went on). `Overloaded` answers only an operation that has not run: one whose task this shard
+/// could not spawn, or whose control shard refused it or was given up before it ran. A control shard wedged past the
+/// window may still run the operation when its poll ends; each of the three (`serve_consensus_control`) meets a second
+/// run as the first's outcome (a bootstrap already authorized, a recovery's receipt for its digest, a plan is a read),
+/// so the resend the refusal invites takes effect once. Once the operation ran, its answer says so
+/// ([`published_or_pending`], A-566).
 fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
@@ -447,25 +452,7 @@ fn consensus_on_control(
         reply @ (ReplyBody::Acknowledged | ReplyBody::RecoveryStarted { .. }),
         publication,
         shards,
-      )) => {
-        let mut reply = reply;
-        for shard in shards.into_iter().filter(|shard| *shard != control) {
-          let publication = publication.clone();
-          if crate::xshard::call_in_shard_time(
-            origin,
-            shard,
-            move |state| publication.apply(state),
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await
-          .is_none()
-          {
-            reply = refused(Refusal::Overloaded { shard });
-            break;
-          }
-        }
-        reply
-      }
+      )) => published_or_pending(origin, control, reply, (publication, shards)).await,
       Some((reply, _, _)) => reply,
       None => refused(Refusal::Overloaded { shard: control }),
     };
@@ -477,6 +464,38 @@ fn consensus_on_control(
   // Freshly admitted on the current shard; no await can retire its slot before detach.
   let _ = slates_rt::futures::detach(task);
   Served::Forwarded
+}
+
+/// The answer of a consensus operation that ran on the control shard, `reply`, once its `publication` has gone to every
+/// other shard of `shards` (§4.8): `reply` when each applied it, each waited for in its own time
+/// (`xshard::call_in_shard_time`). When one did not, `DurabilityPending`, with how long it waited since the operation's
+/// answer: the operation ran and stands on the control shard but is not yet where its answer waits for it, and that is
+/// the request's recorded outcome, so a resend under its id meets it and the operation runs again only under a new id,
+/// whose run publishes again. Until A-566 this was `Overloaded`, which says the operation did not start: left
+/// unrecorded since A-563, its resend ran the operation a second time.
+async fn published_or_pending(
+  origin: u16,
+  control: u16,
+  reply: ReplyBody,
+  (publication, shards): (crate::consensus::Publication, Vec<u16>),
+) -> ReplyBody {
+  let answered_ns = slates_machine::clock::monotonic_ns();
+  for shard in shards.into_iter().filter(|shard| *shard != control) {
+    let publication = publication.clone();
+    if crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| publication.apply(state),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .is_none()
+    {
+      let held_ns = slates_machine::clock::monotonic_ns().saturating_sub(answered_ns);
+      return refused(Refusal::DurabilityPending { held_ns });
+    }
+  }
+  reply
 }
 
 /// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —

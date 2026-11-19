@@ -3956,7 +3956,8 @@ pub enum Refusal {
   /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
   /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
   /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
-  /// not happen. Appended.
+  /// not happen. A consensus operation (a bootstrap, a recovery) answers it too when it ran on the control shard but
+  /// a shard of the daemon did not apply its publication within that shard's own time (A-566). Appended.
   DurabilityPending {
     /// How long the reply was held before it was told this, nanoseconds.
     held_ns: u64,
