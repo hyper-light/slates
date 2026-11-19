@@ -684,6 +684,15 @@ impl Liveness {
   pub fn recv_delivery(&self) -> Result<Option<ControlDelivery>, IpcError> {
     self.inner.recv_delivery()
   }
+
+  /// Waits, with no clock, until a delivery may be read from the control socket or the daemon has gone (Linux, A-523):
+  /// the socket readable, or its peer closed or reset. The daemon sends a descriptor before the ring reply that names
+  /// it, and answers a typed refusal where the send failed, so a client that read such a reply finds the delivery
+  /// waiting, or sees it within a scheduling tick; a daemon gone first ends the wait.
+  #[cfg(target_os = "linux")]
+  pub fn wait_delivery(&self) -> Result<(), IpcError> {
+    self.inner.wait_delivery()
+  }
 }
 
 impl std::fmt::Debug for Connected {
@@ -1119,6 +1128,18 @@ pub mod platform {
     /// The control socket, polled for the daemon's departure ([`super::Liveness::watch`]).
     pub(super) fn watch(&self) -> std::os::fd::BorrowedFd<'_> {
       std::os::fd::AsFd::as_fd(&self.socket)
+    }
+
+    /// Waits until the control socket is readable or its peer has gone, with no timeout
+    /// ([`super::Liveness::wait_delivery`], A-523). A signal ends the wait early, which the caller's loop reads as nothing
+    /// yet.
+    pub(super) fn wait_delivery(&self) -> Result<(), IpcError> {
+      use rustix::event::{PollFd, PollFlags, poll};
+      let mut interest = [PollFd::new(&self.socket, PollFlags::IN | PollFlags::RDHUP)];
+      match poll(&mut interest, None) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(error) => Err(refused("poll delivery", error)),
+      }
     }
 
     pub(super) fn daemon_gone(&self) -> bool {
@@ -2375,6 +2396,61 @@ pub mod platform {
           seal: std::cell::RefCell::new(client_seal),
         },
       ))
+    }
+
+    /// Shape: the reply deadline the client's delivery read gave up at before A-523: the anchor's liveness budget, a
+    /// second (`slates_server::daemon::LIVENESS_BUDGET_NS`).
+    const OLD_DELIVERY_DEADLINE_NS: u64 = 1_000_000_000;
+    /// Shape: how long the late daemon end holds what it sends: half again the old deadline.
+    const LATE_DELIVERY_NS: u64 = OLD_DELIVERY_DEADLINE_NS + OLD_DELIVERY_DEADLINE_NS / 2;
+
+    /// A-523 (R3's class C). Do: wait on a channel whose daemon end, from another thread, writes half again the old
+    /// deadline after the wait began; then wait on a channel whose daemon end closes. Expect: the first wait ends with
+    /// the socket readable, no sooner than the write; the second ends at the close, the daemon gone, before the old
+    /// deadline. Before A-523 the client's delivery read gave up at its reply deadline, a second, while the daemon lived.
+    #[test]
+    fn a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock()
+    -> Result<(), IpcError> {
+      use std::time::{Duration, Instant};
+      let (control, liveness) = channel()?;
+      let Control {
+        socket: daemon_socket,
+        ..
+      } = control;
+      let began = Instant::now();
+      let sender = std::thread::spawn(move || -> Result<(), IpcError> {
+        #[allow(clippy::disallowed_methods)]
+        // the daemon end writes late on purpose: the wait across the delay is what is tested.
+        std::thread::sleep(Duration::from_nanos(LATE_DELIVERY_NS));
+        rustix::io::write(&daemon_socket, &[1]).map_err(|e| super::refused("write", e))?;
+        // Kept open until the client has seen the write, so the wait ends at the write, not at a close.
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_nanos(LATE_DELIVERY_NS));
+        Ok(())
+      });
+      liveness.wait_delivery()?;
+      let waited = began.elapsed();
+      let alive_at_the_write = !liveness.daemon_gone();
+      sender.join().map_err(|_| IpcError::Layout {
+        reason: "the late daemon end's thread panicked",
+      })??;
+      if waited < Duration::from_nanos(LATE_DELIVERY_NS) || !alive_at_the_write {
+        return Err(IpcError::Layout {
+          reason: "the delivery wait ended before the late write, or at a close",
+        });
+      }
+      let (control, liveness) = channel()?;
+      drop(control);
+      let began = Instant::now();
+      liveness.wait_delivery()?;
+      if !liveness.daemon_gone()
+        || began.elapsed() >= Duration::from_nanos(OLD_DELIVERY_DEADLINE_NS)
+      {
+        return Err(IpcError::Layout {
+          reason: "the delivery wait did not end at the daemon's going",
+        });
+      }
+      Ok(())
     }
 
     /// A-161: the daemon sends a stream end with the attach it answers, and the client receives that very end. Do:

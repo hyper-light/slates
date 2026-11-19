@@ -640,7 +640,7 @@ mod linux {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{check_child, mount_id_at, open_checked_root, table_id};
+pub use macos::{check_child, mount_id_at, mount_id_in, open_checked_root, table_id};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -685,6 +685,16 @@ mod macos {
   /// [`super::record`].
   pub fn mount_id_at(point: &str, wanted: impl Fn(&str) -> bool) -> Option<u64> {
     let table = slates_bridge_oci::mount_table::mount_table().ok()?;
+    mount_id_in(&table, point, wanted)
+  }
+
+  /// [`mount_id_at`] in a table already read: how a successor's start judges every mount of its catalog against one
+  /// read of the kernel's table (A-540).
+  pub fn mount_id_in(
+    table: &[slates_bridge_oci::mount_table::MountEntry],
+    point: &str,
+    wanted: impl Fn(&str) -> bool,
+  ) -> Option<u64> {
     table
       .iter()
       .rev()
