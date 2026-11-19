@@ -49,18 +49,18 @@ use super::ProcessOptions;
 
 /// Format: the environment variables that select the anchor role, name the instance, and say what the first daemon
 /// holds (`wedged`, or `none` to serve).
-const ROLE: &str = "SLATES_A232_ROLE";
-const ANCHOR_ROLE: &str = "anchor";
-const INSTANCE: &str = "SLATES_A232_INSTANCE";
-const HOLD: &str = "SLATES_A232_HOLD";
+pub(super) const ROLE: &str = "SLATES_A232_ROLE";
+pub(super) const ANCHOR_ROLE: &str = "anchor";
+pub(super) const INSTANCE: &str = "SLATES_A232_INSTANCE";
+pub(super) const HOLD: &str = "SLATES_A232_HOLD";
 const WEDGED: &str = "wedged";
 /// Format: the daemon role's test path, which the anchor re-invokes this binary with.
 const DAEMON_ROLE: &str = "role::liveness_tests::a_daemon_role";
 /// Format: the roles' tags, looked for anywhere in a line (libtest's banner is glued to a role's first line).
-const DAEMON_READY: &str = "A232-DAEMON-READY";
+pub(super) const DAEMON_READY: &str = "A232-DAEMON-READY";
 const HELD_TAG: &str = "A232-HELD";
 /// Format: the words of the lines read, and the words that carry their numbers.
-const PID_WORD: &str = "pid=";
+pub(super) const PID_WORD: &str = "pid=";
 const RESTARTS_WORD: &str = "restarts=";
 const AT_WORD: &str = "at_ns=";
 const LAPSED_WORDS: &str = "slates anchor: the daemon's heartbeat lapsed (";
@@ -81,13 +81,13 @@ const STARVED_CGROUP_ENV: &str = "SLATES_A232_STARVED_CGROUP";
 /// Shape: shards in the daemon: two, so the held shard is one of several.
 const TEST_SHARDS: u16 = 2;
 /// Shape: the window and the beat.
-const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+pub(super) const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 const BEAT: Duration = Duration::from_nanos(HEARTBEAT_NS);
 /// Shape: how long the anchor and its daemon may take to start and a client to connect: twenty windows, a busy
 /// machine's start.
-const START_WAIT: Duration = Duration::from_nanos(20 * LIVENESS_BUDGET_NS);
+pub(super) const START_WAIT: Duration = Duration::from_nanos(20 * LIVENESS_BUDGET_NS);
 /// Shape: the loop's pause between steps: a hundredth of a beat, so the client's view of the daemon is read within it.
-const STEP_PAUSE: Duration = Duration::from_nanos(HEARTBEAT_NS / 100);
+pub(super) const STEP_PAUSE: Duration = Duration::from_nanos(HEARTBEAT_NS / 100);
 /// Shape: how long the starved case calls for: forty-five windows, the span A-232's red ran (45 s), many chances for a
 /// starved shard to miss a reply deadline.
 const CALLING: Duration = Duration::from_nanos(45 * LIVENESS_BUDGET_NS);
@@ -117,7 +117,7 @@ fn options(instance: String) -> ProcessOptions {
   }
 }
 
-fn pause(span: Duration) {
+pub(super) fn pause(span: Duration) {
   // The harness paces its loop; shipped code parks on its driver (D-9).
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(span);
@@ -248,7 +248,7 @@ fn wedge_for_good(daemon: &Daemon, index: usize) {
 }
 
 /// Reads `from` line by line on a thread of its own, each line stamped with when it arrived (the host's monotonic clock).
-fn lines_of(from: impl std::io::Read + Send + 'static) -> Receiver<(u64, String)> {
+pub(super) fn lines_of(from: impl std::io::Read + Send + 'static) -> Receiver<(u64, String)> {
   let (said, lines) = channel();
   std::thread::spawn(move || {
     for line in BufReader::new(from).lines() {
@@ -331,7 +331,7 @@ impl Drop for AnchorRole {
 }
 
 /// Waits for a line of `lines` carrying `tag`, within `within`; the line.
-fn await_tag(lines: &Receiver<(u64, String)>, tag: &str, within: Duration) -> String {
+pub(super) fn await_tag(lines: &Receiver<(u64, String)>, tag: &str, within: Duration) -> String {
   let started = Instant::now();
   loop {
     let left = within.saturating_sub(started.elapsed());
@@ -344,7 +344,7 @@ fn await_tag(lines: &Receiver<(u64, String)>, tag: &str, within: Duration) -> St
 }
 
 /// The number after `word` in `line`.
-fn number_after(line: &str, word: &str) -> u64 {
+pub(super) fn number_after(line: &str, word: &str) -> u64 {
   line
     .split(word)
     .nth(1)
@@ -357,7 +357,7 @@ fn number_after(line: &str, word: &str) -> u64 {
     .unwrap_or_else(|| panic!("the line names a number after {word:?}: {line}"))
 }
 
-fn connect(instance: &str) -> Client {
+pub(super) fn connect(instance: &str) -> Client {
   let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines()) {

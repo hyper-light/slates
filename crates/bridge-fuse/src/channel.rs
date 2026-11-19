@@ -1400,6 +1400,42 @@ fn refuse_revoked(
   revoked_turn(channel, state)
 }
 
+/// Takes one request of a mount whose volume this daemon cannot serve, one recovery could not rebuild (§4.8
+/// `NotRecovered`; A-509), and answers it `errno` without reaching any volume, as a revoked mount's requests are
+/// answered ([`refuse_revoked`]), but the mount stays: it is its user's to release (A-102), and its device stays held,
+/// so a later recovery that rebuilds the volume serves it again. [`Turn::Idle`] when no request waits,
+/// [`Turn::Refused`] once one is answered, [`Turn::Ended`] once the kernel has unmounted. A request that takes no reply
+/// (a `FORGET`) is answered by nothing, and the lookups it gives back are taken off what the kernel holds. The takeover
+/// round a restored mount owes (A-158) is owed no more: it tells the kernel of the volume's changes, and nothing of the
+/// volume is served from here.
+pub fn refuse_unserved(
+  channel: &mut FuseChannel,
+  state: &mut ServeState,
+  errno: i32,
+) -> Result<Turn, ChannelError> {
+  state.takeover = Takeover::Told;
+  let len = match channel.try_read_request() {
+    Ok(Some(len)) => len,
+    Ok(None) => return Ok(Turn::Idle),
+    Err(ChannelError::Disconnected) => return Ok(Turn::Ended),
+    Err(e) => return Err(e),
+  };
+  let request = channel.buffer.get(..len).unwrap_or(&[]);
+  let parsed = Request::parse(request).ok();
+  let opcode = parsed.as_ref().and_then(|parsed| parsed.opcode);
+  if !crate::bridge::takes_reply(opcode) {
+    note_delivered(request, 0, state);
+    return Ok(Turn::Refused);
+  }
+  let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
+  let n = ReplyHeader::write_error(unique, errno, &mut state.reply).map_err(ChannelError::from)?;
+  match channel.write_reply(state.reply.get(..n).unwrap_or(&[])) {
+    Ok(_) => Ok(Turn::Refused),
+    Err(ChannelError::Disconnected) => Ok(Turn::Ended),
+    Err(e) => Err(e),
+  }
+}
+
 /// The mount's notify thread, started with its first round ([`Notifier`]).
 fn notifier_of<'a>(
   channel: &FuseChannel,
@@ -2109,7 +2145,8 @@ pub enum Turn {
   Continued,
   /// The attachment admits no more requests and its kernel's cache is being dropped before the mount ends
   /// ([`revoked_turn`]; AUD-29-84): the request read, if any, was answered [`REVOKED_ERRNO`] without reaching the
-  /// volume. The owner turns again when a request or the round's end wakes it.
+  /// volume. The owner turns again when a request or the round's end wakes it. Also a request of a mount whose volume
+  /// this daemon cannot serve, answered its refusal ([`refuse_unserved`], A-509).
   Refused,
 }
 

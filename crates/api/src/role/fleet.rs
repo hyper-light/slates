@@ -25,10 +25,11 @@
 //! harness's relay), the peers still dialing `address`; `certificate`
 //! and `key` are DER files, resolved against the manifest's own directory. Every certificate is read (they
 //! are what the peers pin, and what the member ids derive from); only this node's key is read. A name is
-//! resolved by the daemon at every dial (`slates_server::dns`), through the nameservers of this host's
-//! `/etc/resolv.conf`, which is read here once at boot when any node is named (a manifest of literal
-//! addresses reads nothing). The reads are ordinary `std::fs` reads — this crate reads host paths (R1: it
-//! never writes one).
+//! resolved by the daemon at every dial (`slates_server::dns`), through this host's nameservers, read here once at
+//! boot when any node is named or an enrollment root is trusted (a peer enrolled under a root announces its address,
+//! which may be a name): on Unix from `/etc/resolv.conf`; on Windows, which has no such file, from the DNS servers its
+//! network adapters list (`windows_dns`, A-490). A manifest of literal addresses and no roots reads neither. The reads
+//! are ordinary `std::fs` reads and one IP Helper call — this crate reads host state (R1: it never writes any).
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -41,22 +42,32 @@ use slates_server::{DurabilityBound, Resolver};
 
 use super::{Failure, FleetSelection};
 
+// The Windows half of the resolver seam: the one IP Helper call and the walk over what it writes (A-490).
+#[cfg(windows)]
+mod windows_dns;
+
 /// Format: where the operating system's resolver configuration lives (`resolv.conf(5)`).
+#[cfg(any(not(windows), test))]
 const RESOLV_CONF: &str = "/etc/resolv.conf";
 /// Format: the DNS port a nameserver listens on (RFC 1035 §4.2.1).
 const DNS_PORT: u16 = 53;
 /// Format: the per-query timeout when `options timeout:` is absent — `RES_TIMEOUT`, 5 seconds
-/// (`resolv.conf(5)`); the file's value is capped at 30 as the resolver caps it.
+/// (`resolv.conf(5)`); the file's value is capped at 30 as the resolver caps it. Windows states no timeout an
+/// application can read, so it stands there too (A-490, `resolver_of_adapters`).
 const RESOLVER_TIMEOUT_DEFAULT_S: u64 = 5;
 /// Format: the resolver's cap on `options timeout:` (`RES_MAXRETRANS`, `resolv.conf(5)`).
+#[cfg(any(not(windows), test))]
 const RESOLVER_TIMEOUT_MAX_S: u64 = 30;
 /// Format: the attempts when `options attempts:` is absent — `RES_DFLRETRY`, 2 (`resolv.conf(5)`); the
-/// file's value is capped at 5 as the resolver caps it.
+/// file's value is capped at 5 as the resolver caps it. Windows states no attempt count an application can read, so
+/// it stands there too (A-490, `resolver_of_adapters`).
 const RESOLVER_ATTEMPTS_DEFAULT: u32 = 2;
 /// Format: the resolver's cap on `options attempts:` (`RES_MAXRETRY`, `resolv.conf(5)`).
+#[cfg(any(not(windows), test))]
 const RESOLVER_ATTEMPTS_MAX: u32 = 5;
 /// Format: how many `nameserver` lines the resolver honours (`MAXNS`, `resolv.conf(5)`); later ones are
 /// ignored as the resolver ignores them.
+#[cfg(any(not(windows), test))]
 const RESOLVER_MAX_NAMESERVERS: usize = 3;
 /// Format: nanoseconds per second, for the timeout.
 const NS_PER_S: u64 = 1_000_000_000;
@@ -64,7 +75,8 @@ const NS_PER_S: u64 = 1_000_000_000;
 /// Parses `resolv.conf(5)` text: the first three `nameserver` lines that carry an IPv4 address (the fleet
 /// dials IPv4; an IPv6 nameserver is skipped, and a line with a bad address is ignored as the resolver
 /// ignores it), and `options timeout:N attempts:N` with the documented defaults and caps. `None` when no
-/// IPv4 nameserver is listed — the caller refuses a named manifest then.
+/// IPv4 nameserver is listed — the caller refuses a manifest that may dial a name then.
+#[cfg(any(not(windows), test))]
 pub(crate) fn parse_resolv_conf(text: &str) -> Option<Resolver> {
   let mut nameservers = Vec::new();
   let mut timeout_s = RESOLVER_TIMEOUT_DEFAULT_S;
@@ -108,15 +120,75 @@ pub(crate) fn parse_resolv_conf(text: &str) -> Option<Resolver> {
   })
 }
 
-/// The host's resolver configuration, read from [`RESOLV_CONF`]: `Read` when the file cannot be read,
-/// `Resolver` when it lists no IPv4 nameserver.
+/// One network adapter as a Windows host reports it (`windows_dns::adapters`, A-490): what decides whether its DNS
+/// servers are this host's nameservers.
+#[cfg(any(windows, test))]
+struct Adapter {
+  /// Its operational status is up (`IfOperStatusUp`).
+  up: bool,
+  /// It lists at least one gateway.
+  has_gateway: bool,
+  /// The IPv4 DNS servers it lists, in its order (the fleet dials IPv4; an IPv6 server is not read).
+  dns_servers: Vec<Ipv4Addr>,
+}
+
+/// The resolver a Windows host's adapters give (A-490), by the rule Go's resolver applies there
+/// (`net/dnsconfig_windows.go`, `dnsReadConfig`): the DNS servers of every adapter that is up and has a gateway, in
+/// the order the adapters and their lists give them, each once (two adapters on one network routinely list one
+/// router). None is dropped past a count, since the Windows DNS client asks every server it holds (Microsoft's
+/// KB 2834226, "DNS client resolution timeouts"). Windows states no per-query timeout or attempt count an application
+/// can read, so `resolv.conf(5)`'s defaults stand, as Go takes them there; with one nameserver they give up 10 s after
+/// the first query, as the Windows DNS client does (KB 2834226). `None` when no such adapter lists a server: the
+/// caller refuses a manifest that may dial a name then.
+#[cfg(any(windows, test))]
+fn resolver_of_adapters(adapters: &[Adapter]) -> Option<Resolver> {
+  let mut nameservers: Vec<SocketAddrV4> = Vec::new();
+  for adapter in adapters
+    .iter()
+    .filter(|adapter| adapter.up && adapter.has_gateway)
+  {
+    for server in &adapter.dns_servers {
+      let nameserver = SocketAddrV4::new(*server, DNS_PORT);
+      if !nameservers.contains(&nameserver) {
+        nameservers.push(nameserver);
+      }
+    }
+  }
+  if nameservers.is_empty() {
+    return None;
+  }
+  Some(Resolver {
+    nameservers,
+    timeout_ns: RESOLVER_TIMEOUT_DEFAULT_S.saturating_mul(NS_PER_S),
+    attempts: RESOLVER_ATTEMPTS_DEFAULT,
+  })
+}
+
+/// The host's resolver configuration, read from `RESOLV_CONF`: `Read` when the file cannot be read,
+/// `Resolver` when it lists no IPv4 nameserver. The Unix half of the seam; Windows has its own (A-490).
+#[cfg(not(windows))]
 fn read_resolver() -> Result<Resolver, ManifestError> {
   let path = PathBuf::from(RESOLV_CONF);
   let text = std::fs::read_to_string(&path).map_err(|e| ManifestError::Read {
     path: path.clone(),
     reason: e.to_string(),
   })?;
-  parse_resolv_conf(&text).ok_or(ManifestError::Resolver { path })
+  parse_resolv_conf(&text).ok_or_else(|| ManifestError::Resolver {
+    source: format!("{RESOLV_CONF} lists none"),
+  })
+}
+
+/// The host's resolver configuration on Windows, which has no `resolv.conf` (A-490): the DNS servers its network
+/// adapters list (`windows_dns::adapters`), judged by `resolver_of_adapters`. `Adapters` when the platform refuses
+/// the read, `Resolver` when no adapter that is up and has a gateway lists an IPv4 nameserver. The Windows half of the
+/// seam.
+#[cfg(windows)]
+fn read_resolver() -> Result<Resolver, ManifestError> {
+  let adapters = windows_dns::adapters().map_err(|reason| ManifestError::Adapters { reason })?;
+  resolver_of_adapters(&adapters).ok_or_else(|| ManifestError::Resolver {
+    source: "no network adapter that is up and has a gateway lists one (GetAdaptersAddresses)"
+      .to_owned(),
+  })
 }
 
 /// Why a manifest did not load: which file, or which field, and what was expected of it.
@@ -148,10 +220,17 @@ enum ManifestError {
     /// The decoder's reason.
     reason: String,
   },
-  /// A node is addressed by a DNS name, but the host's resolver configuration lists no IPv4 nameserver.
+  /// The fleet may dial a DNS name (a node is named, or an enrollment root admits peers that may announce one), but
+  /// the host's resolver configuration gives no IPv4 nameserver.
   Resolver {
-    /// The configuration read.
-    path: PathBuf,
+    /// Where the configuration was read and what it lacked, as the refusal says it.
+    source: String,
+  },
+  /// Windows refused the list of its network adapters the nameservers are read from (A-490).
+  #[cfg(windows)]
+  Adapters {
+    /// The call's refusal.
+    reason: String,
   },
   /// The manifest's values yield no plan for this node.
   Plan(slates_server::DeployError),
@@ -166,10 +245,15 @@ impl std::fmt::Display for ManifestError {
       Self::Key { path, reason } => {
         write!(out, "{} is not a DER private key: {reason}", path.display())
       }
-      Self::Resolver { path } => write!(
+      Self::Resolver { source } => write!(
         out,
-        "a node is addressed by a DNS name, but {} lists no IPv4 nameserver to resolve it",
-        path.display()
+        "the fleet may dial a DNS name (a node is named, or an enrollment root admits peers that may announce one), \
+         but this host has no IPv4 nameserver to resolve it: {source}"
+      ),
+      #[cfg(windows)]
+      Self::Adapters { reason } => write!(
+        out,
+        "reading this host's network adapters for its DNS servers (GetAdaptersAddresses): {reason}"
       ),
       Self::Plan(e) => write!(out, "{e}"),
     }
@@ -428,7 +512,8 @@ fn plan_from(
   resolver: &mut dyn FnMut() -> Result<Resolver, ManifestError>,
 ) -> Result<FleetPlan, ManifestError> {
   let stated = parse(text)?;
-  // The host's resolver, when any node is addressed by name; a manifest of literal addresses reads nothing.
+  // The host's resolver, when any node is addressed by name or a root is trusted (a peer enrolled under it announces
+  // its address, which may be a name); a manifest of literal addresses and no roots reads nothing.
   let resolver = if !stated.enrollment_roots.is_empty()
     || stated.nodes.iter().any(|node| node.address.is_named())
   {
@@ -865,6 +950,54 @@ mod tests {
       RESOLVER_TIMEOUT_MAX_S * NS_PER_S,
       "the timeout is capped as the resolver caps it"
     );
+  }
+
+  /// A-490 (bug 5 of UI goal 85; `docs/bugs/2026-11-18-a-windows-fleet-node-looked-for-etc-resolv-conf.md`): do judge
+  /// a Windows host's adapters as `GetAdaptersAddresses` reports them; expect the resolver kiln's Windows runners need
+  /// to join a fleet whose root they trust: the servers of the adapters that are up and have a gateway, in order and
+  /// each once, with `resolv.conf(5)`'s default timeout and attempts; an adapter that is down or has no gateway adds
+  /// none, and a host none of whose adapters counts gives no resolver. Before A-490 Windows had no source at all, so
+  /// every such host was refused (red-checked by making no adapter count).
+  #[test]
+  fn a_windows_hosts_adapters_give_its_resolver() {
+    let adapter = |up: bool, has_gateway: bool, dns_servers: &[[u8; 4]]| Adapter {
+      up,
+      has_gateway,
+      dns_servers: dns_servers
+        .iter()
+        .map(|octets| Ipv4Addr::from(*octets))
+        .collect(),
+    };
+    let nameserver = |octets: [u8; 4]| SocketAddrV4::new(Ipv4Addr::from(octets), DNS_PORT);
+    let host = [
+      adapter(false, true, &[[10, 9, 9, 9]]),
+      adapter(true, false, &[[172, 17, 0, 1]]),
+      adapter(true, true, &[[192, 168, 1, 1], [192, 168, 1, 2]]),
+      adapter(true, true, &[[192, 168, 1, 2], [1, 1, 1, 1]]),
+    ];
+    assert_eq!(
+      resolver_of_adapters(&host),
+      Some(Resolver {
+        nameservers: vec![
+          nameserver([192, 168, 1, 1]),
+          nameserver([192, 168, 1, 2]),
+          nameserver([1, 1, 1, 1]),
+        ],
+        timeout_ns: RESOLVER_TIMEOUT_DEFAULT_S * NS_PER_S,
+        attempts: RESOLVER_ATTEMPTS_DEFAULT,
+      }),
+      "the down adapter and the one with no gateway add nothing; a server two adapters list is asked once"
+    );
+    assert_eq!(
+      resolver_of_adapters(&[
+        adapter(false, true, &[[10, 0, 0, 1]]),
+        adapter(true, false, &[[10, 0, 0, 2]]),
+        adapter(true, true, &[]),
+      ]),
+      None,
+      "no adapter that is up with a gateway lists a server: no resolver"
+    );
+    assert_eq!(resolver_of_adapters(&[]), None, "no adapter: no resolver");
   }
 
   /// A missing or malformed field is named by its path into the document.

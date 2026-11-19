@@ -18,9 +18,10 @@
 //! a line that names a successor moves the copy's routing to it; a line that ends at a completed takeover lets the copy
 //! go when the holder took part in that takeover ([`RegionalConfiguration::settled_for`]); and a successor's
 //! confirmation lets it go when the holder is outside the successor's placement (`stale_after_confirmation`) and was
-//! asked in that round, or, never asked, judges from the kept retirement that the object was recovered within tolerance
-//! ([`RegionalConfiguration::within_tolerance`], A-341). A holder sometimes misses installs and installs the newest
-//! configuration later, as a lagging node does.
+//! asked in that round. A holder never asked lets a copy go, on either path, only where the first takeover since the
+//! copy was written, its writer's, recovered the object within tolerance with its share done, judged on that
+//! takeover's kept retirement or its completion record ([`RegionalConfiguration::copy_stale`], A-341, A-484). A holder
+//! sometimes misses installs and installs the newest configuration later, as a lagging node does.
 //!
 //! **The oracle** is the property A-272 and A-309 exist for: a holder lets a copy go only if its object was adopted
 //! after that copy was written (an adoption made a newer record, so the copy is stale), or the copy's record was never
@@ -45,10 +46,18 @@
 //!   and 102 let go the last copy of a record placed at `f + 1`, after one failure at `f = 1`; the "certification" was
 //!   the dead owner's own cohort. Fixed by letting an unasked copy go only where the object's settled cohorts were
 //!   within tolerance, so the round learned a record at least as new.
+//! - A-341's rule judged an unasked copy by the last takeover in its line. Where the writer's takeover was past
+//!   tolerance its successor confirmed without learning the object; when that successor retired in turn, its own
+//!   takeover was within tolerance for an object it never held, and the copy, possibly the last, went (found by
+//!   reading, A-484; `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover` in the server's
+//!   daemon). Fixed by judging the writer's takeover, on its retirement or its completion record, which keeps the
+//!   neighbourhoods and the hosts held through it, so a copy first judged after the takeover completed is judged too.
 //!
 //! - `a_takeover_with_no_survivor_lets_no_holder_reclaim_an_object_nobody_adopted`: the minimal history by hand.
 //! - `holders_let_go_only_of_copies_an_adoption_made_stale` (proptest): the oracle and the bounds on every history.
 //! - `the_generated_histories_reach_every_verdict`: the non-vacuity counts over a fixed set of seeds.
+//! - `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record`: the record judgment (A-484) by
+//!   hand, under the oracle.
 
 // Test harness: an unwrap or indexing here is a failed test.
 #![allow(
@@ -76,6 +85,11 @@ const SEARCH_HISTORIES: u32 = 256;
 const NON_VACUITY_SEEDS: u64 = 400;
 /// Shape: the first id an admitted host takes, above every initial member's.
 const FIRST_JOINER: u64 = 100;
+/// Shape: the most writes, admissions or settle reports a hand-built history makes for one step before it gives up on it.
+const HAND_STEPS: u64 = 64;
+/// Shape: the most hosts the lagging-holder history admits: past five members a successor's three-host neighbourhood can
+/// leave the holder out, which the history needs.
+const LAGGING_JOINERS: u64 = 8;
 
 /// A small deterministic generator, so a history is a function of its seed (xorshift64*).
 struct Draw(u64);
@@ -127,6 +141,9 @@ struct HeldCopy {
   /// Whether the write that made this copy placed its record (`f + 1` of each cohort it went to): a record never placed
   /// was never acknowledged as durable, so the oracle does not hold its copies.
   committed: bool,
+  /// The owner whose write made this copy, kept while installs move its routing (A-484, `Acceptor::written_by`): the
+  /// first takeover in its line since it was written is this owner's.
+  writer: HostId,
 }
 
 /// One object's ground truth.
@@ -151,12 +168,16 @@ struct Counts {
   reclaimed_confirmed: u64,
   /// Copies kept because their line read unresolved or lost.
   kept_unknown: u64,
-  /// Copies kept because a takeover that never asked their holder was confirmed or completed where nothing shows the
-  /// object recovered within tolerance (past it, or judged by a completion record alone).
+  /// Copies kept because a takeover that never asked their holder was confirmed or completed where the copy's writer's
+  /// takeover does not show the object recovered within tolerance (past it, or its share not yet done).
   kept_unasked: u64,
-  /// Copies let go by a holder the takeover never asked, judged from the kept retirement with the object's settled
-  /// cohorts within tolerance (A-341).
+  /// Copies let go by a holder the takeover never asked, the copy's writer's takeover showing the object recovered
+  /// within tolerance (A-341, A-484).
   reclaimed_unasked: u64,
+  /// Of those, the ones judged on the writer's completion record, its retirement no longer kept (A-484). The generated
+  /// histories at the default seeds reach none (a holder must first judge its copy after the takeover completed), so
+  /// the hand-built `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record` asserts it moved.
+  reclaimed_unasked_record: u64,
   /// Adoptions made by rounds.
   adopted: u64,
   /// Of those, adoptions past tolerance: a cohort short of its recovery quorum, every surviving holder heard (A-309).
@@ -173,6 +194,7 @@ impl Counts {
     self.kept_unknown += other.kept_unknown;
     self.kept_unasked += other.kept_unasked;
     self.reclaimed_unasked += other.reclaimed_unasked;
+    self.reclaimed_unasked_record += other.reclaimed_unasked_record;
     self.adopted += other.adopted;
     self.recovered_past_tolerance += other.recovered_past_tolerance;
     self.completed += other.completed;
@@ -204,9 +226,9 @@ type Violation = (HostId, ObjectId, u64, u64);
 enum Confirmed {
   /// The successor confirmed and the holder was asked in its round, outside its placement: the copy is stale.
   Stale,
-  /// The successor confirmed and the holder is outside its placement, and the round never asked the holder, but the kept
-  /// retirement shows the object's settled cohorts within tolerance, so the round learned a record at least as new
-  /// (A-341): the copy is stale.
+  /// The successor confirmed and the holder is outside its placement, and the round never asked the holder, but the
+  /// copy's writer's takeover recovered the object within tolerance, so a round learned a record at least as new and
+  /// adopted it (A-341, A-484): the copy is stale.
   Covered,
   /// The successor confirmed and the holder is outside its placement, but the round never asked the holder and nothing
   /// shows the object recovered within tolerance: kept.
@@ -306,6 +328,7 @@ impl World {
           moved_from: None,
           departed: None,
           committed,
+          writer: owner,
         },
       );
     }
@@ -496,6 +519,7 @@ impl World {
           moved_from: None,
           departed: None,
           committed,
+          writer: successor,
         },
       );
     }
@@ -534,7 +558,7 @@ impl World {
             self.reclaim(holder, object);
           }
           Confirmed::Covered => {
-            self.counts.reclaimed_unasked += 1;
+            self.count_unasked_reclaim(copy.writer);
             self.reclaim(holder, object);
           }
           Confirmed::Unasked => self.counts.kept_unasked += 1,
@@ -567,6 +591,9 @@ impl World {
           if self.regional.settled_for(takeover, holder) {
             self.counts.reclaimed_settled += 1;
             self.reclaim(holder, object);
+          } else if self.regional.copy_stale(copy.writer, object) {
+            self.count_unasked_reclaim(copy.writer);
+            self.reclaim(holder, object);
           } else {
             self.counts.kept_unasked += 1;
           }
@@ -578,8 +605,8 @@ impl World {
 
   /// Whether the holder's copy, routed to the live member `copy.owner` after a takeover, is stale: that member's share
   /// of the copy's takeover is confirmed (in the kept retirement or its completion record), the holder is outside that
-  /// member's placement of the object, and the holder was asked in that round (a survivor of it) or the kept retirement
-  /// shows the object's settled cohorts within tolerance (A-341).
+  /// member's placement of the object, and the holder was asked in that round (a survivor of it) or the copy's writer's
+  /// takeover recovered the object within tolerance (A-341, A-484).
   fn stale_after_confirmation(
     &self,
     holder: HostId,
@@ -610,9 +637,18 @@ impl World {
     };
     match (confirmed && outside, asked) {
       (true, true) => Confirmed::Stale,
-      (true, false) if self.regional.within_tolerance(departed, object) => Confirmed::Covered,
+      (true, false) if self.regional.copy_stale(copy.writer, object) => Confirmed::Covered,
       (true, false) => Confirmed::Unasked,
       (false, _) => Confirmed::Not,
+    }
+  }
+
+  /// Counts a copy a holder no round asked lets go, and again among those judged on the writer's completion record when
+  /// the writer's retirement is no longer kept.
+  fn count_unasked_reclaim(&mut self, writer: HostId) {
+    self.counts.reclaimed_unasked += 1;
+    if !self.regional.retired.contains_key(&writer) {
+      self.counts.reclaimed_unasked_record += 1;
     }
   }
 
@@ -794,6 +830,147 @@ fn a_takeover_with_no_survivor_lets_no_holder_reclaim_an_object_nobody_adopted()
   }
 }
 
+/// A-484: a holder that lagged through a whole takeover judges its copy on the takeover's completion record, which keeps
+/// the neighbourhoods and the hosts held through it, and lets it go only as the oracle allows. Do: over the first three
+/// hosts as the writer and a few region sizes, run [`lagged_through_a_takeover`] until its holder keeps a copy only the
+/// record can judge. Expect that copy let go on the record, counted `reclaimed_unasked_record`, and no violation: the
+/// takeover adopted the object after the copy was written. Before, the record kept no neighbourhood and the copy was
+/// kept for good.
+#[test]
+fn a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record() {
+  let (world, holder, object) = (1..=3u64)
+    .flat_map(|writer| (1..=LAGGING_JOINERS).map(move |joiners| (HostId(writer), joiners)))
+    .find_map(|(writer, joiners)| lagged_through_a_takeover(writer, joiners))
+    .expect(
+      "a region whose holder keeps a copy of the retired writer's that only the record judges",
+    );
+  assert!(world.violations.is_empty(), "{:?}", world.violations);
+  assert!(
+    world.writer_of(object, holder).is_none(),
+    "the holder let its copy go on the record"
+  );
+  assert!(
+    world.counts.reclaimed_unasked_record >= 1,
+    "{:?}",
+    world.counts
+  );
+}
+
+/// The history of `a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record`: form a region on
+/// hosts 1, 2 and 3 at `f = 1`; have `writer` write each of its objects until the other two each hold a copy of it;
+/// admit `joiners` hosts, so `writer`'s neighbourhood leaves one of the two out (the holder); have `writer` write its
+/// objects again until its new neighbourhood is placed and settle it; let the holder lag; take `writer` over and run
+/// every owed round until the takeover completes; then let the holder install. The world after that install, the holder
+/// and an object whose copy at the holder `writer` wrote; `None` when the region leaves the holder no such copy (no
+/// neighbourhood left it out, or an adoption's placement reached it and overwrote its copy) or the takeover did not
+/// complete.
+fn lagged_through_a_takeover(writer: HostId, joiners: u64) -> Option<(World, HostId, ObjectId)> {
+  let mut draw = Draw::new(writer.0 ^ joiners);
+  let mut world = World::formed(&mut draw, 3, 1, 3);
+  let owned = world.owned_by(writer);
+  let others: Vec<HostId> = (1..=3).map(HostId).filter(|host| *host != writer).collect();
+  world.write_until_held(&mut draw, &owned, &others);
+  for _ in 0..joiners {
+    world.admit();
+  }
+  let holder = others
+    .into_iter()
+    .find(|host| !world.regional.neighbourhoods[&writer].hosts.contains(host))?;
+  if !world.settle_after_writing(&mut draw, writer, &owned)
+    || world.regional.holds_for(writer, holder)
+  {
+    return None;
+  }
+  world.lagging.insert(holder);
+  world.kill(writer);
+  world.install(false);
+  world.run_owed_rounds(&mut draw);
+  if !world.regional.completed.contains_key(&writer) {
+    return None;
+  }
+  let object = owned
+    .into_iter()
+    .find(|object| world.writer_of(*object, holder) == Some(writer))?;
+  world.lagging.clear();
+  world.install(true);
+  Some((world, holder, object))
+}
+
+/// The steps a hand-built history takes (`a_holder_that_lagged_through_a_takeover_judges_its_copy_on_the_completion_record`).
+impl World {
+  /// The objects `owner` owns now.
+  fn owned_by(&self, owner: HostId) -> Vec<ObjectId> {
+    self
+      .objects
+      .iter()
+      .filter(|(_, state)| state.owner == owner)
+      .map(|(object, _)| *object)
+      .collect()
+  }
+
+  /// Has each of `objects` written by its owner until every host of `hosts` holds a copy of it, at most
+  /// [`HAND_STEPS`] writes each.
+  fn write_until_held(&mut self, draw: &mut Draw, objects: &[ObjectId], hosts: &[HostId]) {
+    for object in objects {
+      for _ in 0..HAND_STEPS {
+        if hosts
+          .iter()
+          .all(|host| self.writer_of(*object, *host).is_some())
+        {
+          break;
+        }
+        self.write(draw, *object);
+      }
+    }
+  }
+
+  /// Has `owner` write `objects` and report its neighbourhood placed until that neighbourhood is settled, at most
+  /// [`HAND_STEPS`] times; whether it is settled.
+  fn settle_after_writing(&mut self, draw: &mut Draw, owner: HostId, objects: &[ObjectId]) -> bool {
+    let settled = |world: &World| {
+      world
+        .regional
+        .configuration_for(owner)
+        .is_some_and(|configuration| configuration.settled.is_none())
+    };
+    for _ in 0..HAND_STEPS {
+      if settled(self) {
+        return true;
+      }
+      for object in objects {
+        self.write(draw, *object);
+      }
+      self.settle(owner);
+    }
+    settled(self)
+  }
+
+  /// Runs every owed share, installing after each round (a lagging member skips the installs), until none is owed or
+  /// the bound on passes is spent.
+  fn run_owed_rounds(&mut self, draw: &mut Draw) {
+    for _ in 0..self.regional.retirement_bound() + 4 {
+      let owed = self.owed();
+      if owed.is_empty() {
+        break;
+      }
+      for (departed, successor) in owed {
+        self.round(draw, departed, successor);
+        self.install(false);
+      }
+    }
+  }
+
+  /// The owner that wrote `holder`'s copy of `object`, if it holds one.
+  fn writer_of(&self, object: ObjectId, holder: HostId) -> Option<HostId> {
+    self
+      .objects
+      .get(&object)?
+      .copies
+      .get(&holder)
+      .map(|copy| copy.writer)
+  }
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
     cases: slates_test_seeds::cases(SEARCH_HISTORIES),
@@ -813,8 +990,9 @@ proptest! {
 /// Non-vacuity: over a fixed set of seeds the histories reach every verdict the oracle judges, so a silently dead path
 /// can never pass as a held property. Do: run the seeds and add up what they did. Expect copies let go by a settled line
 /// and by a confirmed successor, copies kept on an unresolved or lost line and where a takeover that never asked their
-/// holder shows nothing within tolerance, copies let go by such a holder where it does (A-341), adoptions (some past
-/// tolerance, A-309) and completed takeovers, each at least once, and no violation.
+/// holder shows nothing within tolerance, copies let go by such a holder where it does (A-341), some judged on a
+/// completion record (A-484), adoptions (some past tolerance, A-309) and completed takeovers, each at least once, and no
+/// violation.
 #[test]
 fn the_generated_histories_reach_every_verdict() {
   let mut total = Counts::default();

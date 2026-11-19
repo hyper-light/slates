@@ -240,8 +240,9 @@ the other nodes of the fleet:
   export's clients.
 
 The answers to a node's own dials come back to the socket it sent from, which a stateful firewall (`ufw`, `nftables`
-with connection tracking) passes on its own. A node addressed by name also needs UDP 53 out to the nameservers
-of its `/etc/resolv.conf`. Nothing else: the MCP and SDK channels are local to the host. With `ufw`, a fleet on
+with connection tracking) passes on its own. A node that may dial a name (a node is named, or the manifest trusts an
+enrollment root) also needs UDP 53 out to its nameservers: those of its `/etc/resolv.conf` on Linux and macOS, and on
+Windows the DNS servers of its network adapters that are up and have a gateway. Nothing else: the MCP and SDK channels are local to the host. With `ufw`, a fleet on
 `192.168.1.0/24` at base port 7000 needs, on every node,
 `ufw allow proto udp from 192.168.1.0/24 to any port 7000:7001`. slates holds no privilege (R10), so the rule is
 the operator's, made once per host.

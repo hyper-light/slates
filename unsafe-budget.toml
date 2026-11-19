@@ -219,6 +219,14 @@
 #   the chosen-path launcher moved from slates-cli (`exec.rs`, Linux): its `unshare_unsafe`, marked
 #   unsafe because it changes every thread's namespace, sound in the single-threaded pre-exec
 #   launcher (1). The same block, not a new site; slates-cli lowered 3 → 2 in the same change.
+#   Raised 5 → 9 on 2026-11-18 (A-490, `role/fleet/windows_dns.rs`, compiled only for Windows): a fleet node's
+#   nameservers on Windows, which has no `/etc/resolv.conf`, are the DNS servers its network adapters list, and Win32
+#   has no safe wrapper for reading them: the `GetAdaptersAddresses` call (1), and the walk over what it writes, each
+#   read made only once the link or address is checked to lie wholly inside the call's buffer, aligned: an adapter
+#   entry (1), a DNS server entry (1), and a server's socket address with its address word read through the union (1).
+#   Raised 9 → 10 on 2026-11-19 (A-507, `mount.rs` `ask_unmount`, compiled for macOS and the BSDs): an unmount calls
+#   `unmount(2)` itself rather than running `umount` from the `PATH`, and neither rustix nor std wraps it there: the
+#   call on the mount point's C string (1).
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
@@ -381,7 +389,13 @@ slates-mem = 68
 #   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
 #   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
 #   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
-slates-rt = 102
+# 2026-11-18 (+4, A-475, `handle_wait.rs`, compiled only for Windows): a client's process handle awaited through the shard,
+#   which the completion port alone cannot hear: the wait registered with the thread pool (`RegisterWaitForSingleObject`,
+#   1), unregistered at the future's drop with every callback finished (`UnregisterWaitEx(INVALID_HANDLE_VALUE)`, 1), the
+#   handle asked with a zero timeout for the register-then-test and each wake's attribution (`WaitForSingleObject`, 1),
+#   and the callback's read of the context its registration boxed (1). The callback's post shares the kick's one
+#   `PostQueuedCompletionStatus` block (`iocp::post`, 0). None has a safe wrapper.
+slates-rt = 106
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
@@ -497,9 +511,11 @@ slates-ipc = 147
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 # 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
-slates-server = 8
+# 2026-11-18 (-3, A-475): the Windows liveness probe of a client's process (`peer.rs`'s open, zero-timeout wait and close)
+#   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
+slates-server = 5
 slates-client = 0
-slates-api = 5
+slates-api = 10
 slates-cli = 2
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
 #   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one

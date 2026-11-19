@@ -1531,9 +1531,9 @@ fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
   }
 }
 
-/// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
-/// confirmation deadline (`crates/server/src/nfs.rs`, `UNMOUNT_CONFIRM_NS`), so a loaded box's delay
-/// cannot hide an ended attachment.
+/// Shape: how long a forged `UMNT` is watched for effect: three times the bound a fresh daemon's first confirmation
+/// waits (the liveness window before any unmount was measured; `crates/server/src/nfs.rs`, `unmount_bound_ns`, A-493),
+/// so a loaded box's delay cannot hide an ended attachment.
 #[cfg(target_os = "macos")]
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
@@ -1598,12 +1598,8 @@ fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &st
     gid: 0,
     gids: Vec::new(),
   };
-  exchange(
-    port,
-    &umnt_call(1, &caller, &format!("/{name}")),
-    Duration::from_secs(5),
-  )
-  .expect("the daemon answers the forged UMNT");
+  exchange(port, &umnt_call(1, &caller, &format!("/{name}")))
+    .expect("the daemon answers the forged UMNT");
   // Watched past the daemon's confirmation deadline (one liveness budget), with room for a loaded box:
   // the attachment must hold the whole time.
   let watch_until = Instant::now() + FORGED_UNMOUNT_WATCH;
@@ -12354,6 +12350,9 @@ const GARBLED_HOLD_MESSAGES: usize = 20;
 const UNKNOWN_HOLD_KIND: u8 = 0xff;
 /// Format: the daemon status line carrying the anchor's hold refusals (A-213).
 const HOLD_REFUSALS_LINE: &str = "anchor_hold_refusals: ";
+/// Shape: the bounds the garbling daemon reads its handoff table against, each: past what the anchor holds for this test's
+/// one instance, which holds nothing at the garbler's start, so only the table's frame is read.
+const HANDED_BOUND: usize = 1 << 16;
 /// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it
 /// (`crates/api/src/role/daemon.rs`, `QUICK_PROBE_MS`).
 const QUICK_PROBE_MS: u64 = 5;
@@ -12370,11 +12369,23 @@ fn garbling_daemon() {
   let Ok(instance) = std::env::var(GARBLING_DAEMON_INSTANCE) else {
     return;
   };
-  let handed =
-    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
-  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment. It is
-  // borrowed, never owned, so it stays open across the exec below for the real daemon to adopt.
+  let pointer =
+    std::env::var(slates_anchor::held::ENV_HELD).expect("the anchor handed its table over");
+  let bounds = slates_anchor::held::TableBounds {
+    devices: HANDED_BOUND,
+    connections: HANDED_BOUND,
+    copies: HANDED_BOUND,
+  };
+  let (table, len) = slates_anchor::held::parse_pointer(&pointer, bounds).unwrap();
+  // SAFETY: the anchor made the table's object inheritable and named its number in the environment (A-462). It is
+  // borrowed, never owned: a copy is read here, and the object stays open across the exec below for the real daemon.
+  let object = unsafe { BorrowedFd::borrow_raw(table) };
+  let text = slates_anchor::held::read_table(object.try_clone_to_owned().unwrap(), len).unwrap();
+  let inherited =
+    slates_anchor::held::parse_devices(&slates_anchor::held::decode_table(&text).unwrap().devices)
+      .unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table. It is borrowed,
+  // never owned, so it stays open across the exec below for the real daemon to adopt.
   let channel = unsafe { BorrowedFd::borrow_raw(inherited.channel) };
   let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
   let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
