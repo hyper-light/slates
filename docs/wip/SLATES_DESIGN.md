@@ -12436,8 +12436,10 @@ engine: the verdict, rebase, position mapping, the register).
 > and its append (`Judge::append`), which moves the ref: one entry on that ref's own log, only while the ref is at the
 > position the verdict read (A-642). Without `atomic` each ref moves on its own; under it, one append moves every ref or
 > none (`append_atomic`). The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
-> band-2 lines. `Session` runs it all over one connection, sans-io: bytes in as they arrive, bytes out to the caller's
-> sink, the answer written as the push's last byte arrives. Proven byte for byte against eleven pushes stock git 2.50.1
+> band-2 lines. The push has two halves, `check` (the pack, fsck, connectivity, hidden refs) and `decide` (verdicts and
+> appends). `Session` runs them over one connection, sans-io: bytes in as they arrive, the repository handed to each call
+> that reads, the push then waiting checked while the caller admits its objects to the store's quarantine, and decided
+> through the judge and answered to the caller's sink. Proven byte for byte against eleven pushes stock git 2.50.1
 > made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
 > implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
 > versions (A-645), appended per A-642.
@@ -42713,6 +42715,21 @@ Applied in the same change to:
     `prop_oneof!` (R2), with its equal weights; `fed_in_chunks` (A-608's tests) refuses where it asserted; the receive
     module's comments are wrapped at 100 columns; GAPS' §4.17 entry loses the conflict markers a merge on main left,
     A-638's and A-624 part 2's paragraphs both kept.
+- **Then, part 2's first piece (2026-11-19): the push split at a checked point.** Part 2's judge must admit the pushed
+  objects to the store's quarantine before its first verdict (A-638's `PushedObjects` reads the index, then the
+  quarantine) and commit the store at its append (A-614's `Repository::commit`), and both need the store mutably, which
+  the repository's view (`IndexedObjects`) borrows. So nothing is held across calls: `outcomes` became `check` (the
+  connectivity check and the hidden refs' refusals, a refused pack's `unpacker error`) and `decide` (verdicts and
+  appends), with `Checked` between them carrying the request, the pack's outcome, each command's early refusal and the
+  pushed objects' sorted table, charged once. `receive` is `check` then `decide`. `Session::input` and `Session::end`
+  take the repository per call and say whether the push is now checked; `Session::checked` shows it, its objects for the
+  quarantine; `Session::answer` decides it through the judge and writes the answer.
+  - Tests: the session's five rewritten to the split, plus a checked push answered after the repository it was read
+    against is dropped, its input ended first as an HTTP body's end comes before its answer.
+  - Checks on the Mac Studio (2026-11-19): 377 of 377 under `--locked` (two of main's ignored; load 5.9, 17.3 s). Red
+    by mutation four ways: the checked push lost (4 failed), its objects hidden (2), a delete-only push waiting for a
+    pack (4); the fourth, `end` discarding a waiting push, passed every test, so the new test now ends the input first
+    and catches it (1 failed). Then 377 of 377 again (load 6.9, 16.5 s), `cargo fmt --check` clean.
 - **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
   A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
   versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's

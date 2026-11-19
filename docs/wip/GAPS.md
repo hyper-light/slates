@@ -333,11 +333,12 @@
 > each remaining command's ref name (A-615's rule), then the caller's verdict (`Judge::judge`, moving nothing) and its
 > append (`Judge::append`: one entry on that ref's own log at the position read, A-642; `append_atomic`, every ref or
 > none under `atomic`, stricter than git's code by the capability's own words), and report-status and
-> report-status-v2 with option lines, multiplexed after git's band-2 lines. `Session` runs it over one connection,
-> sans-io. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
+> report-status-v2 with option lines, multiplexed after git's band-2 lines. `check` and `decide` are its two halves, and
+> `Session` runs them over one connection, sans-io, the push waiting checked between them while the caller admits its
+> objects to the store's quarantine. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
 > (`fixtures/push/make-push-fixtures.sh`), answered byte for byte, the fsck push's band 2 but for git's prose. `cargo
 > test -p slates-git --lib` on the Mac Studio: part 1's 194 of 194, 287 merged; the continuation's 349 of 349 merged
-> with main, 17 failing first against stubs, red ten ways by mutation. Owed: part 2, `Judge` over the engine (each
+> with main, 17 failing first against stubs, red ten ways by mutation; the split, 377 of 377, red four ways. Owed: part 2, `Judge` over the engine (each
 > ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable versions, A-645; several
 > together under `atomic`, A-635; appended per A-642 through a trait until g261's append lands); then review requests
 > over `refs/for/`, signed pushes, `.have` lines, the warnings git's strict check writes on band 2, and A-590's blob
