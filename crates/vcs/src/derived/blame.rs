@@ -17,10 +17,10 @@
 //! each parent's file at its path, in parent order, then against its recorded source (a rename's or a copy's,
 //! [`super::history::PathSources`]); a line a diff keeps takes that candidate's attribution, the first that keeps it,
 //! and a line none keeps is the version's own. Mononoke's BlameV2 is derived the same way, from the parents' blames and
-//! "hunks coming from `diff_hunks`" \[C: `blame_v2.rs` 514-560\]. A derivation reads the file and its candidates'
+//! the hunks of a diff with each \[C: `blame_v2.rs` 514-565\]. A derivation reads the file and its candidates'
 //! versions of it alone ([`BlameCounters::lines_read`]): no ancestor's content, never a diff of the history. Mercurial's
 //! linelog keeps one weave a file that grows in place, over a linear main branch "ignoring p2" \[C:
-//! `hgext/fastannotate/__init__.py` 19-22\]; A-647's values are immutable, one a version, over a history of merges.
+//! `hgext/fastannotate/__init__.py` 23-26\]; A-647's values are immutable, one a version, over a history of merges.
 //!
 //! **A merge** (D-27). A line both parents changed is attributed by the merge's own recorded content, never by a merge
 //! inferred: the content is diffed against each parent's, and each line takes the first parent whose diff keeps it,
@@ -533,6 +533,9 @@ fn matched(old: &[u32], new: &[u32]) -> Option<Vec<(usize, usize)>> {
       && let Some((split_x, split_y)) = middle(old.get(x..u)?, new.get(y..v)?)?
     {
       let (split_x, split_y) = (x.checked_add(split_x)?, y.checked_add(split_y)?);
+      // Never a corner: the range's first lines differ and so do its last, so a shortest edit takes D >= 2 edits,
+      // and the split ends a path of D/2 edits (rounded up) from (x, y) that is part of a shortest one, with at least
+      // one edit left to (u, v) (Myers 1986, §4b). The check only keeps the loop finite were that ever not so.
       let whole = (split_x, split_y) == (x, y) || (split_x, split_y) == (u, v);
       if !whole {
         pending.push((split_x, u, split_y, v));
