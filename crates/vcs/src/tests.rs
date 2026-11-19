@@ -840,7 +840,10 @@ fn step() -> impl Strategy<Value = Step> {
     ),
   )
     .prop_map(
-      |((selector, push, index, git, blob, kind), (lie, key, payload, all, runs, (lookups_ns, inserts_ns)))| {
+      |(
+        (selector, push, index, git, blob, kind),
+        (lie, key, payload, all, runs, (lookups_ns, inserts_ns)),
+      )| {
         let tool = if git { Tool::Git } else { Tool::Hg };
         match selector {
           0..4 => Step::Admit(Arrival { push, tool, blob, kind, lie }),
@@ -859,13 +862,16 @@ fn step() -> impl Strategy<Value = Step> {
     )
 }
 
+/// One stored object's layout: each window's identity and its bytes.
+type Layout = BTreeMap<ContentId, Vec<u8>>;
+
 /// The oracle's model: each index a map of key to body, each push a map of id to kind and bytes, and every blob's
 /// layout.
 struct Model {
   indexes: Vec<Option<BTreeMap<Vec<u8>, Vec<u8>>>>,
   pushes: Vec<BTreeMap<Vec<u8>, (u8, Vec<u8>)>>,
   blobs: Vec<Vec<u8>>,
-  layouts: BTreeMap<ContentId, BTreeMap<ContentId, Vec<u8>>>,
+  layouts: BTreeMap<ContentId, Layout>,
 }
 
 impl Model {

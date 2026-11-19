@@ -998,10 +998,7 @@ fn decode_digest(hex: &[u8]) -> Option<[u8; DIGEST_BYTES]> {
     return None;
   }
   let mut digest = [0; DIGEST_BYTES];
-  for (slot, pair) in digest.iter_mut().zip(hex.chunks_exact(2)) {
-    let [high, low] = pair else {
-      return None;
-    };
+  for (slot, [high, low]) in digest.iter_mut().zip(hex.as_chunks::<2>().0) {
     *slot = hex_value(*high)?.checked_shl(HEX_BITS)? | hex_value(*low)?;
   }
   Some(digest)

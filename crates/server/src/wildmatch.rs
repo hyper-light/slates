@@ -498,6 +498,7 @@ pub(crate) mod reference {
       b"print" => isprint,
       b"punct" => sane(c, P | R | G | U),
       b"space" => isspace,
+      // Format: ASCII's case bit, clear in an upper-case letter.
       b"upper" => isalpha && c & 0x20 == 0,
       b"xdigit" => c.is_ascii_hexdigit(),
       _ => return None,

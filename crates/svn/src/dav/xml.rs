@@ -67,7 +67,7 @@ const XML_SAFE_CONTROLS: [u8; 4] = *b"\t\n\r\x7f";
 
 /// The control characters `svn_xml_fuzzy_escape` keeps as they are.
 /// Format: `libsvn_subr/xml.c` `svn_xml_fuzzy_escape`: line feed, carriage return and tab.
-const FUZZY_KEPT_CONTROLS: [u8; 3] = [b'\n', b'\r', b'\t'];
+const FUZZY_KEPT_CONTROLS: [u8; 3] = *b"\n\r\t";
 
 /// The radix of a hexadecimal character reference, `&#x…;`.
 /// Format: XML 1.0 §4.1.
