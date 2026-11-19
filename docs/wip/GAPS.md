@@ -261,6 +261,17 @@
 > over main bb535bd4d; failing first in r213, 4 of 39 with the walk stubbed; the oracle's census now requires the
 > sparse path). Owed: the service's slice (`<blob-ish>` resolved, its blob read, git's two refusals' words, a stock
 > git exchange recorded); main's Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, third slice (2026-11-19, g296; the service reads the blob):** `upload::sparse` resolves a
+> `sparse:oid=<blob-ish>` as git does with no work tree (an object's full name, or a ref by git's patterns, alone or
+> before `:<path>`, walked as `find_tree_entry` walks it; a relative path refused as git refuses it; parents,
+> ancestors, peels, reflogs, abbreviated names, `git describe`'s and `:/` refused by kind), reads the blob within the
+> request's admission and hands its patterns to the negotiation, under v2 and v0. A blob git's `pack-objects` dies of
+> is answered as git's server answers it (its `fatal:` line on band 2 in 128-byte reads, git's band-3 words, no
+> flush; with no band, the pack missing). Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid`
+> exchanges. 112 of 112 (1 ignored, main's) and slates-server's git edges 27 of 27 on the Mac Studio (r250 over main
+> b94ae6e90); failing first, 16 of 105 with the resolution, the tree walk and the death's answer stubbed. Owed:
+> `sparse:oid` within `combine:` (refused: git's answer turns on its order of walk); the revision forms refused by
+> kind; git's band-2 warning of an ambiguous ref name; main's Linux and Windows runs, clippy, xtask, docs.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -1139,7 +1150,18 @@
 > the Mac Studio, red on a mutated copy (see A-627, completed). Owed from it: (1) the update-report's resource walk, a
 > pre-1.2 client's; (2) the drive's facts carrying `dav_svn__get_safe_cr`'s revision, not `svn_fs_node_created_rev`'s,
 > for a node beneath a copy not changed since (A-616's drive over the index); (3) main's live capture against Apache
-> with `mod_dav_svn`. A-531 (2026-11-19): the ra_svn item codec, its
+> with `mod_dav_svn`. A-681 part 1, its first slice (2026-11-19, g297): Subversion's DAV site on the shared HTTP edge
+> (`slates-svn`'s `dav::site`, `slates-server`'s `vcs_http::svn`): the read side's resources (a public URL,
+> `!svn/rvr`, `!svn/bc`) answered to OPTIONS, PROPFIND (depth 0 and 1) and GET and HEAD from the index, the green and
+> the lock table, each path judged by the principal's compiled read rules; OPTIONS lists only the capabilities served
+> (none yet); every REPORT and write method `501`; stock svn 1.15.0's `info`, `cat`, `ls` and `proplist -v` read a
+> repository through the edge over HTTPS on loopback, on the Mac Studio (see A-681 part 1). Owed from it: (1) the
+> REPORTs over the index, then the update-report and replay through A-627's drive, each capability listed as it is
+> served, so `svn log` and `svn checkout` reach a repository (part 1's next slices); (2) the write side (part 2); (3)
+> the daemon composing the site beside git's and handing it the stores, `503` until then; (4) a repository whose name
+> holds a slash, which `SVNParentPath`'s first-segment rule cannot reach over HTTP without a longest-prefix search
+> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`); (6) Basic on the cleartext
+> loopback edge (A-686). A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
@@ -1358,6 +1380,22 @@
 > (`a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after`). Both passed at once, no drive change (macOS
 > arm64, Mac Studio, over main `3612d1ef9`: `cargo test --locked -p slates-svn --lib -- commit:: serve:: lock::
 > report::` 132 of 132, fmt clean). Owed: the Windows run and red-checks (main's).
+> Stock svn's interop tests (2026-11-19, g307, main's piece for UI goal 93; item 14's first scripted sessions):
+> `crates/cli/tests/svn_interop.rs` runs a round trip (a fresh repository checked out, a file committed, a second
+> checkout, an edit committed from it, the first copy updated, the log read with `--xml --verbose`) and a lock session
+> (a lock, another copy's commit refused with the head unchanged, an unlock, that commit again) as stock `svn` 1.15,
+> skipping loudly without it. The control runs both against stock `svnserve -t` 1.15.0 through `svn`'s own tunnel over
+> scratch FSFS repositories, so every step's expectation is Subversion's own: macOS arm64 (Mac Studio, kiln r293 over
+> main `e25799e8c`), `cargo test --locked -p slates-cli --test svn_interop` 1 passed (the control, 11.2 s) and 4
+> ignored, fmt clean. Each slates leg is ignored naming what it waits on, and run with `--ignored` each failed at its
+> first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
+> `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
+> yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
+> A-681's reads and commits (g297), A-686 (g258) and A-685, and its lock session on A-681's `LOCK` and `UNLOCK`;
+> `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
+> no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
+> differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
+> the file is Unix-only, as `tests/cli.rs` is).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

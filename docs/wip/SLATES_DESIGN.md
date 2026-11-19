@@ -13166,6 +13166,18 @@ engine: the verdict, rebase, position mapping, the register).
 > `sparse:oid` without its patterns, which the service does not read yet (the next slice), and one within a
 > `combine:`, where git's answer turns on its order of walk.
 
+> **Status (2026-11-19, A-640 part 4, third slice: the service reads the blob).** `crates/git` (`upload::sparse`)
+> resolves a `sparse:oid=<blob-ish>` as git resolves one in a repository with no work tree: an object's full name, or a
+> ref by git's patterns (`HEAD` and `@` the default branch), alone or before `:<path>`, the path walked below the
+> revision's tree as git's `find_tree_entry` walks it (`objects::Tree::find`). A relative path is refused as git
+> refuses it there; a form this server does not resolve (`~`, `^`, `^{...}`, `@{...}`, an abbreviated name, the name
+> `git describe` writes, `:/<text>`) is refused by kind. The blob is read within the request's admission and its
+> patterns handed to the negotiation, so `sparse:oid` alone is served under protocol v2 and v0. A blob git's
+> `pack-objects` dies of is answered as git's server answers it (`Answer::died`): what precedes the pack, then git's
+> `fatal:` line on band 2 in packets of at most 128 bytes, its band-3 words and no flush; under v0 with no band, the
+> acknowledgments alone. Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid` exchanges. Still refused:
+> `sparse:oid` within `combine:`.
+
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
 commands are `ls-refs`, `fetch`, `object-info` and `bundle-uri` [B: gitprotocol-v2]; it defines no push, so a push
@@ -14697,6 +14709,25 @@ and export by landing).
 > which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
 > Apache with `mod_dav_svn`.
 >
+> **Status (2026-11-19, A-681, part 1, its first slice).** Built: Subversion's DAV site on the shared HTTP edge, its
+> read side's resources (`slates-svn`'s `dav::site`, answered with no I/O, and the edge's site in `slates-server`'s
+> `vcs_http::svn`). A URL's first segment names the repository, as `SVNParentPath` routes, and the rest a node: a
+> public URL in the youngest revision, or `!svn/rvr/REV/PATH` and `!svn/bc/REV/PATH` in `REV`. The credentials are
+> proved to a principal as git's and Mercurial's sites prove them, the repository is found on its owner shard and its
+> policy asked, and the request is answered from the index, the green and the lock table as `mod_dav` and
+> `mod_dav_svn` answer it, each path judged by the principal's compiled read rules (A-606): OPTIONS with the HTTPv2
+> facts and only the capabilities served (none yet, so `SVN-Repository-MergeInfo: no`); PROPFIND at depth 0 and 1
+> (`allprop` and named properties, the live ones in `liveprops.c`'s order, `checked-in` at `dav_svn__get_safe_cr`'s
+> revision, a child the principal may not read left out); GET and HEAD of a file's text, streamed from the green a
+> piece a reply run with `set_headers`' fields. The edge's reply names the status its service decides as the reply
+> begins (`207`). Every REPORT and write method answers `501` with `SVN_ERR_UNSUPPORTED_FEATURE`. Held to stock svn
+> 1.15.0 over HTTPS on loopback (`info`, `cat`, `ls`, `proplist -v`, and `cat` of a hidden file refused `403`) and to
+> `mod_dav_svn`'s format strings with A-609's recorded bodies. Owed: the REPORTs over the index (log, get-locations,
+> get-location-segments, get-deleted-rev, dated-rev, mergeinfo, inherited-props, get-locks, list, file-revs, then the
+> update-report and replay through A-627's drive), so `svn log` and `svn checkout` reach a repository (part 1's next
+> slices); the write side (part 2); the daemon composing the site beside git's and handing it the stores (each
+> repository's index, green, lock table and authorization file, and a principal's Subversion user).
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
@@ -15215,6 +15246,15 @@ per-iteration budget (§4.3), and the replicas that serve them are A-273's and A
   over one dump, the clients' working copies then compared whole (bytes, `svn status`, `svn info -R`,
   `svn proplist -R -v`) and both repositories' `svnadmin dump` compared.
 
+> **Status (2026-11-19, item 14's first scripted sessions; g307).** Built: `crates/cli/tests/svn_interop.rs`, stock
+> `svn` 1.15 against a real anchor over each route (`--vcs-svn`, `--vcs-http`, `--vcs-ssh`): a round trip (checkout,
+> commit, a second checkout, commit, update, log) and a lock session (lock, another copy's commit refused with the
+> head unchanged, unlock, commit), each held first to stock `svnserve -t` 1.15.0 over scratch FSFS repositories (the
+> control, run wherever the tools are present: passing on the Mac Studio, 2026-11-19). The slates legs are ignored
+> until the pieces each waits on land (GAPS, §4.17.4's entry); the `svn://` and `svn+ssh://` legs lock nothing until
+> ra_svn's lock verbs are served. Owed: the session over one dump with the working copies and both repositories'
+> `svnadmin dump` compared whole, and Subversion's own suite.
+
 *Failure matrix* (beyond §4.17.1's). A client gone during a drive: the work is released and nothing commits (over HTTP,
 at its idle bound). The owner lost after `close-edit`: the submit retries by the increment's identity (§4.16); a client
 that heard nothing finds its revision by `svn update`, which brings its own edits back as the incoming change. A text or
@@ -15295,7 +15335,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
     (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
     report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
-    `DAV:lockdiscovery` property.
+    `DAV:lockdiscovery` property. Its third, the site on the shared HTTP edge (A-681), has begun: the read side's
+    resources answered to OPTIONS, PROPFIND, GET and HEAD (part 1's first slice); its REPORTs, so `svn log` and `svn
+    checkout` reach a repository, then the commit, PROPPATCH and the lock verbs (part 2), follow.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -51301,6 +51343,166 @@ Applied in the same change to:
   (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until they
   land), which open, seal, present, run and close the views at each point; git's words for each outcome (`pre-receive
   hook declined`, `hook declined`); main's runs (the other platforms, clippy, `xtask`, the doc gates).
+
+### A-640 part 4, third slice — The service reads the blob: a `<blob-ish>` resolved as git resolves one with no work tree, and a dying `pack-objects` answered as git's server answers it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-640 part 4 first and second slices, A-653 continued (4))
+Applied in the same change to:
+- §4.17.2's statuses (a status after the second slice's);
+- GAPS (the A-640 entries);
+- `crates/git/src/upload/sparse.rs` (new: the resolution and the read), `upload/mod.rs` (`Refusal::SparseBlob`,
+  `SparseForm`, `SparseRelative`, `SparseData` and `SparseTooLarge`, their words and git's warning; the module doc),
+  `upload/answer.rs` (`Answer::died`: git's report and its relay), `upload/fetch.rs` and `upload/v0.rs` (the blob
+  read, its patterns handed on, a death answered), `upload/refs.rs` (`dwim`, `peeled_node`), `objects/tree.rs`
+  (`Tree::find`), `store/graph.rs` (`StoreGraph::blob_bytes` and `tree_entry`), `store/repository.rs`
+  (`tree_entry`), `negotiation/sparse.rs` (an empty `Patterns` by default), `negotiation/filter.rs` (the
+  `sparse:oid` variant's doc);
+- the fixtures: the recorders `fixtures/make-fixtures.sh` and `fixtures/v0/make-v0-fixtures.sh`, and the nine
+  exchanges they recorded (`fixtures/fetch-sparse-*`, `fixtures/v0/sparse-*`, `fixtures/v0/SHA256SUMS`);
+- the tests: `upload/tests/sparse.rs` (new), `upload/tests/fetch.rs`, `upload/tests/refused.rs`,
+  `upload/tests/v0.rs`, `tests/objects/tree.rs`, `tests/fixtures.rs`, `tests/v0.rs`.
+
+- **What git does** [C: git v2.50.1, `list-objects-filter.c` `filter_sparse_oid__init`; `object-name.c`
+  `get_oid_with_context_1`, `get_oid_1`, `get_oid_basic`, `get_describe_name` and `resolve_relative_path`;
+  `tree-walk.c` `get_tree_entry` and `find_tree_entry`; `object-file.c` `read_object_with_reference`; `dir.c`
+  `add_patterns_from_blob_to_list`; `upload-pack.c` `create_pack_file` and `upload_pack_v2`; `usage.c` `vfreportf`].
+  `pack-objects` resolves the `<blob-ish>` as it begins, and dies when it names nothing ("unable to access sparse
+  blob in '%s'"), when its path is relative in a repository with no work tree ("relative path syntax can't be used
+  outside working tree"), or when it names no blob, or one past git's 100 MiB limit after a warning ("unable to
+  parse sparse filter data in %s"). By then upload-pack has written what precedes the pack: under v2 the sections
+  and the packfile section's header, which under `sideband-all` with `packfile-uris` waits for the pack's start and
+  so is never written; under v0 the acknowledgments. It relays `pack-objects`' error stream on band 2, a packet for
+  each read of at most 128 bytes, then its band-3 words, and ends with no flush; with no band it writes those lines
+  to its own error stream, and the client finds the pack missing. `die` writes `fatal: ` and the words as one line,
+  cut to 4,096 bytes with its newline, each control byte but a tab and a newline shown as `?`.
+- **The resolution** (`upload::sparse`), in `get_oid_with_context_1`'s order: the whole name as a revision; then an
+  index path, which names nothing, a served repository having no index; then a revision and the path after its first
+  `:` outside a `@{...}` or `^{...}`. A revision is an object's full name in the repository's format, either case,
+  held or not, or the ref the first of git's patterns finds (`refs::dwim`; `repo_dwim_ref` takes the first), `@`
+  read as `HEAD`. The path is walked below the revision's tree (peeled through tags and a commit, as
+  `read_object_with_reference` peels) an entry at a time by `Tree::find`, which searches the entries in the order
+  written and stops where git's loop stops, so a tree out of order is searched as git searches it; a submodule's
+  commit is an entry like any other, a trailing `/` names the directory and an empty path the tree itself. Refused
+  by kind (`Refusal::SparseForm`, answered with git's words for a name that names nothing and what this server
+  resolves): a parent or an ancestor, a peel or a reflog, an abbreviated name, `git describe`'s, and a search of
+  commit messages.
+- **The read.** The blob's length is charged to the request's admission before its bytes are read
+  (`StoreGraph::blob_bytes`), then its patterns (`Patterns::read`, the first slice); a blob past git's limit by its
+  length alone is refused unread.
+- **The answer** (`Answer::died`): what precedes the pack, then the warning's line (for a blob past git's limit)
+  and the `fatal:` line as `vfreportf` writes them, relayed in band-2 packets of at most 128 bytes, each line read
+  alone, then git's band-3 words and no flush, all charged to the admission first; with no band, what precedes the
+  pack alone.
+- **When the blob is read.** Under v0 once the pack is due, as git's `pack-objects` reads it, so a round with no
+  pack never meets it. Under v2 in every round its filter rides in, since the negotiation walks by its patterns in
+  the round that sends the pack; a blob that names nothing still dies only with the pack, so a round answered with
+  acknowledgments alone is answered as git answers it, but a blob past the request's admission is refused in any
+  round (not git's; the fetch fails either way). git warns on band 2 of a ref name two of its patterns find; this
+  server takes the first, as git does, without the warning.
+- **Tests.** Against stock git's recordings (the two scripts on the Mac Studio, kiln r114: git 2.50.1, Apple Git-155, as
+  every other fixture, each older one reproduced byte for byte but `fetch-progress`'s timed text): the served clone
+  under `main:dir/file` (a blob whose one pattern matches no path: every commit and tree, no blob) among the v2
+  exchanges, section for section with git's objects, and `sparse-v0` among v0's; five v2 deaths byte for byte (a path
+  not there, a path naming a tree, 140 `a`s with a tab, a control byte and DEL after them, whose line git relays in two
+  packets, and a path not there under `sideband-all`, alone and with `packfile-uris`); v0's death on side-band-64k and
+  on no band byte for byte. Resolution (`upload/tests/sparse.rs`): every form this server resolves names the same blob
+  and serves the same clone; names of no blob, names of nothing, relative paths and the forms not resolved are each
+  refused by their kind (a name of no blob naming its object, the others the name as sent); a blob past git's limit is
+  warned of, then refused; a 5,000-byte name's line is cut to git's 4,096 bytes in 32 full packets. A round that sends
+  no pack is answered as with no filter, its blob naming nothing (v2 and v0). `Tree::find` against git's loop traced by
+  hand over stock git's `ok-tree` in both formats, and over a tree written out of order.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r250, over main b94ae6e90 with this
+  slice (`agents/g296-a640-p4c` at cf032854e): `cargo test --locked -p slates-git --lib -- negotiation::
+  objects::tests::tree upload:: store::repository::graph::tests:: every_golden_vector` 112 passed, 1 ignored (main's
+  `upload_packs_for_git_index_pack`); `cargo test --locked -p slates-server --lib -- vcs_http::git::tests::
+  vcs_http::daemon_edge::tests:: vcs_ssh::git::tests:: vcs_ssh::site::tests:: --test-threads=4` 27 of 27, the git edges
+  that call `upload::serve`; `cargo fmt -p slates-git -- --check` clean. Failing first (the Studio, over main 0577ab0bd
+  with this slice, `agents/g296-a640-p4c-red` at 6f3b98227): with `sparse::read`, `Tree::find` and `Answer::died`
+  stubbed, 16 of 105 failed (the eight in `upload/tests/sparse.rs`, the two tree walks, the v2 and v0 deaths, the
+  v2 and v0 exchanges holding the served sparse clone, the v2 round without a pack and the refused filter's), the rest
+  passing. No integration target reaches the service's fetch: the CLI's two version-control tests stop at the edge's
+  `401`. The Linux and Windows runs are owed.
+- **Owed.** `sparse:oid` within `combine:` (refused, the second slice); the revision forms refused by kind; git's
+  band-2 warning of an ambiguous ref name.
+
+### A-681 part 1, its first slice — Subversion's DAV site on the shared HTTP edge: the read side's resources answered to OPTIONS, PROPFIND, GET and HEAD from the index, the green and the lock table, each path by the principal's read rules (2026-11-19, g297, UI goal 93 (kiln 51cef9f7); §4.17.4 item 5 "HTTP", item 10 and piece 13's third part; A-609, A-627, A-625, A-606, A-602)
+Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§3);
+`crates/svn` (`dav/site.rs` and its tests, new; `dav/response.rs`'s `Capability` and `Httpv2::served`; `dav/drive.rs`'s
+`uri_encode` and `dav/locking.rs`'s `error_answer` and `DAV_XML_CONTENT_TYPE` opened to the crate); `crates/http-edge`
+(`Connection::reply_status`); `crates/http` (`Status::MULTI_STATUS`); `crates/server` (`vcs_http/svn.rs` and its
+tests, new; `vcs_http.rs`'s `Exchange::reply_status` and module documentation).
+
+- **The site** (`slates-svn`'s `dav::site`, no I/O; Subversion 1.15.0's `mod_dav_svn` `repos.c`, `liveprops.c`,
+  `deadprops.c` and httpd 2.4.66's `mod_dav.c` and `props.c`). A request's path below the repository's root is read as
+  `parse_uri` reads it: a public URL is the node in the youngest revision; `!svn/rvr/REV/PATH` and `!svn/bc/REV/PATH`
+  the node in `REV`; `!svn` itself and every other special resource `mod_dav_svn` knows are not served here (`501`);
+  any other special name, or a revision that is not decimal, is `mod_dav_svn`'s malformed URI (`500`, 190001); a
+  revision past the youngest `404`, "No such revision N" (160006); a `.` or `..` name `400`; a path the principal's
+  rules hide `403`.
+  - OPTIONS: `200`, the `DAV` lines and, when the body asks for the activity collection, the HTTPv2 headers through
+    A-609's writer, which now lists a capability only where the site serves it (`response::Capability`,
+    `Httpv2::served`): none in this slice, since each names a report or a commit's form, and `SVN-Repository-MergeInfo:
+    no`. A stock client then lists a directory by PROPFIND at depth 1 and asks for no `list-report`, as recorded.
+  - PROPFIND: `207`, one response for the resource and, at depth 1 on a directory, one for each child the principal
+    may read, in name order, a collection's href ending in a slash. `allprop` is the node's own properties (`svn:`
+    names as `S:`, others as `C:`, a value XML cannot carry in base64), `resourcetype`, `mod_dav_svn`'s live
+    properties in `liveprops.c`'s order, then `supportedlock` for a file and `lockdiscovery` (A-627's). A named
+    property is found live, then among the node's own, else listed under `404 Not Found` with a generated `gN` prefix.
+    `checked-in` names the version at `dav_svn__get_safe_cr`'s revision: the node's history walked to its first
+    location without crossing a copy, through A-616's one copy-root walk. A missing `Depth` is infinity, refused `403`
+    on a directory as `mod_dav`'s default refuses it.
+  - GET and HEAD (`set_headers`, `deliver`): a file's text, streamed by the caller from the green a piece a reply run,
+    never held whole; `Cache-Control` a week for a URL naming its revision and none for a public one; `Last-Modified`
+    (RFC 1123, from the stored `svn:date`) for a public URL; the ETag `dav_svn__getetag` writes; `Content-Type` from a
+    valid `svn:mime-type` (`svn_mime_type_validate`), else `text/plain`.
+  - Every other method: `501` with `SVN_ERR_UNSUPPORTED_FEATURE` (200007), a REPORT in `mod_dav_svn`'s words for one
+    it does not know ("The requested report is unknown").
+- **The edge's site** (`slates-server`'s `vcs_http::svn`), in its module documentation's order: the route (the URL's
+  first segment names the repository, as `SVNParentPath` routes; `400` for an escape naming a slash or NUL, `414` past
+  the room, `404` for no name); the credentials, proved as git's and Mercurial's sites prove them (`401` with the
+  connection's challenges: Basic over TLS, which stock svn sends after one challenge and on every request after); a
+  repository on another shard moved there whole; none, or another tool's, `404`; the policy (`403` for a principal it
+  lets read nothing); the store (`503` where this shard lends none: `NoSvnStores`, the daemon's until it hands the site
+  Subversion's stores). A served request's body is read whole within the request's room (`413` past it) and answered
+  at its end; a file's text is lent from the green a reply run at a time. The XML reader's bounds derive from the
+  request's room: as many parsed elements as fit in it.
+- **The edge** (`slates-http-edge`): a service names its reply's status as the reply begins
+  (`Connection::reply_status`, `Exchange::reply_status`), taken only before any of the reply is sent, `200` otherwise
+  as before: a WebDAV answer's status follows from its outcome, which only the service knows once the body has ended.
+- **Departures, each stated in the module documentation.** An error `mod_dav` answers with Apache's own HTML page is
+  answered with its status and no body; `Content-Length` and `Accept-Ranges` are not sent (the edge chunks every reply
+  and serves no range); a GET naming a delta base gets the full text, which the protocol allows; a directory's GET
+  (its HTML listing) is `501`; `getcontenttype` and `getcontentlanguage` from Apache's MIME configuration are not
+  added to an `allprop`; the multistatus does not echo the request's namespaces; the root's URL path is written
+  URL-encoded where `mod_dav_svn` writes its configured root raw.
+- **Evidence.** What stock svn 1.15.0 asks of these resources, recorded on the Mac Studio (2026-11-19) against a
+  recorded responder (the notes' §3): a session's three OPTIONS; `svn info`'s PROPFIND of six properties at depth 0 on
+  the revision root's resource and of `lockdiscovery` on the public URL; `svn cat`'s and `svn export`'s PROPFIND of
+  `allprop` and `resourcetype`, then their GET; `svn ls` by `list-report` where `list` is listed, else by PROPFIND at
+  depth 0 and 1; `svn log` by `log-report`; `svn info -r N` by `get-locations`. No `mod_dav_svn` is installed
+  anywhere (main's ruling), so the answers are held to its format strings, with A-609's recorded request bodies, and
+  to the stock client reading them.
+- **Tests and the run.** 11 tests in `dav::site` (each answer byte for byte where `mod_dav_svn`'s format strings fix
+  it; every refusal's status; the read rules at depth 1); 5 in `vcs_http::svn` (the module documentation's order; the
+  exchange through the lent store and the rules; a GET streamed a piece a run; the site over `NoSvnStores`; stock svn
+  1.15.0 over HTTPS on loopback against the edge, skipping loudly where `svn` is absent); 1 in the edge's connection
+  (a status named as the reply begins written, one named after the first run never). macOS arm64, Mac Studio, kiln
+  r252, 2026-11-19 22:21-22:28Z, over main b94ae6e90 merged (tree `caee3ad4` after `cargo fmt`, the landed crates):
+  `cargo fmt -p slates-svn -p slates-server -p slates-http-edge -p slates-http -- --check` clean; `cargo test --locked
+  -p slates-http-edge --lib -- connection::tests::a_service_names_its_reply_` 2 of 2; `cargo test --locked -p
+  slates-svn --lib -- dav::` 73 of 73; `cargo test --locked -p slates-server --lib -- vcs_http:: --test-threads=4` 47
+  of 47, each crate compiled afresh; the stock test run alone with its output shown: `svn info` read the node kind,
+  revision 1, the UUID and author alice, `svn cat` the text, `svn ls` `a.txt` alone (the hidden directory left out),
+  `svn proplist -v` `svn:eol-style` `native`, and `svn cat` of the hidden file refused, "E175013: Access to
+  '/repo/trunk/secret/s.txt' forbidden". No integration target reaches the site: `slates-svn` and `slates-http-edge`
+  have no `tests/` directory, and the CLI's `vcs_http` test meets a `401` refusal, which the refusal path writes.
+- **Owed.** Part 1's next slices: the REPORTs over the index (log, get-locations, get-location-segments,
+  get-deleted-rev, dated-rev, mergeinfo, inherited-props, get-locks, list, file-revs) through A-613's reads, then the
+  update-report and replay through A-627's drive over A-616's, each capability listed as it is served, so `svn log` and
+  `svn checkout` reach a repository; part 2, the write side (the commit through HTTPv2's transaction, MERGE, PROPPATCH,
+  LOCK and UNLOCK); the daemon composing the site beside git's and handing it the stores (each repository's index,
+  green, lock table and authorization file, and a principal's Subversion user); a repository whose name holds a slash
+  (unreachable over HTTP by `SVNParentPath`'s first-segment rule without a longest-prefix search across partitions); a
+  browser's `?p=` and `?r=` and a directory's HTML listing; Basic on the cleartext loopback edge (A-686); main's runs
+  (clippy, `xtask`, the other platforms, red-checks).
 
 ### A-679 — Mercurial's `serve --stdio` behind the daemon's SSH edge: slates-hg's `serve::stdio` over the store the HTTP site's lender holds, its refusals in 7.2's words (2026-11-19, g304 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Transports" and piece 4; §4.17.2 "Transports" item 2; after A-650 part 2, A-651 and A-662)
 Applied in the same change to: `crates/server` (`vcs_ssh/hg.rs`, new; `vcs_ssh/site.rs`: `ToolServices<L, H>`,
