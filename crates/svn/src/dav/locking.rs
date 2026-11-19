@@ -76,7 +76,7 @@ const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
 
 /// The `Content-Type` of every XML answer.
 /// Format: `mod_dav.h` `DAV_XML_CONTENT_TYPE`.
-const DAV_XML_CONTENT_TYPE: &str = "text/xml; charset=\"utf-8\"";
+pub(crate) const DAV_XML_CONTENT_TYPE: &str = "text/xml; charset=\"utf-8\"";
 
 /// The namespace the `xml` prefix is bound to, which `xml:lang` is in.
 /// Format: Namespaces in XML 1.0 §3.
@@ -902,7 +902,7 @@ fn convert_status(code: u32) -> u16 {
 
 /// An answer with a `D:error` body as `dav_error_response_tag` and `dav_svn__error_response_tag` write one: the
 /// Subversion error's own element when `tagged`, then its code and message.
-fn error_answer(status: u16, tagged: bool, code: u32, message: &str) -> HttpAnswer {
+pub(crate) fn error_answer(status: u16, tagged: bool, code: u32, message: &str) -> HttpAnswer {
   let element = if tagged {
     " xmlns:C=\"svn:\">\n<C:error/>\n"
   } else {

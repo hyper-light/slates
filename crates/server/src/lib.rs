@@ -188,6 +188,14 @@ pub mod credentials;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod svn_hooks;
+// git's hooks as the server runs them (A-665 part 2): the read-only bare repository a hook runs
+// in, opened on the owner shard over the repository's store, sealed there in slices and handed to
+// the hook driver with receive-pack's variables; Unix alone with the driver. No caller outside
+// tests until git's push driver (`git_push`, A-654) runs its hooks in a view presented at a path
+// (part 3).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
 // each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
 // moved to its repository's shard, and the daemon's start, whose git site serves receive-pack through the push driver

@@ -660,7 +660,7 @@ fn hex_digest<const N: usize>(digest: &[u8; N]) -> Option<String> {
 
 /// `path` encoded as `svn_path_uri_encode` encodes it: each byte but letters, digits and the marks a path segment keeps
 /// as `%` and two upper-case hex digits.
-fn uri_encode(path: &str) -> Cow<'_, str> {
+pub(crate) fn uri_encode(path: &str) -> Cow<'_, str> {
   let safe = |byte: &u8| byte.is_ascii_alphanumeric() || URI_SAFE_MARKS.contains(byte);
   if path.as_bytes().iter().all(safe) {
     return Cow::Borrowed(path);
