@@ -60,6 +60,8 @@ use moved::Change;
 pub use tree::{TreeBase, TreeNode};
 
 #[cfg(test)]
+mod handed_tests;
+#[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod tests;
