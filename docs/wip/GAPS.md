@@ -5698,9 +5698,9 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >   answers. Raising shard threads above normal priority removed it (run 42059294312), on arms sharing a machine, so the gain is
 >   not yet measured, and it is a whole-daemon change. Also: under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both
 >   daemons for a late heartbeat in run 3 of all three jobs that reached it.
-> - **The reply spin window can be set by a noisy start (A-212's spin; OPEN, a measurement defect, owner winfsp-overlap,
->   2026-11-06).** Each receive worker times 15 one-way wakes through a bounded channel once as it starts and spins for
->   their median before it parks for a reply (`crates/bridge-winfsp/src/reply.rs`, `SAMPLES`). The median was meant to keep
+> - **The reply spin window can be set by a noisy start (A-212's spin; a measurement defect, 2026-11-06; FIXED
+>   2026-11-18, A-560, below).** Each receive worker timed 15 one-way wakes through a bounded channel once as it started
+>   and spun for their median before it parked for a reply (`crates/bridge-winfsp/src/reply.rs`, `SAMPLES`). The median was meant to keep
 >   one scheduling delay from setting the window, but a start where most samples are delayed sets it too. On CI's arm64
 >   runner, quiet, one daemon's two workers measured 143.9 µs and 108.1 µs (diagnostics run 42178889880, run 3), where the
 >   other runs' workers measured 4.1–11.5 µs. Such a worker spins up to 144 µs on each slow reply, taking a core from the
@@ -5708,7 +5708,14 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >   the receiver's gap against the DLL, but the window has no bound and no check that its samples agree. Owed: a window the
 >   measurement cannot set beyond what a wake on the machine costs (a bound derived from the profile's wake, or samples
 >   retaken until their spread is within the probe's own precision, as `wake.mean_ns` is), with a test that a delayed start
->   cannot set it.
+>   cannot set it. **Fixed by A-560:** the window is learned from the worker's own wakes for its whole life (each reply
+>   is stamped at its send, so a reply the worker parked for times its wake), by RFC 6298's estimator (its gains, its
+>   seed, and its `S + 4V` band past which a sample is a delay and is folded as the band's edge); it is zero until the
+>   wakes agree (the deviation below the RFC's seed, half the wake) and never longer than the step quantum of the shard
+>   that started the mount (`crates/bridge-winfsp/src/spin_window.rs`, pure; the start-up probe of 15 is gone). Test:
+>   `a_start_of_delayed_wakes_never_spins_past_the_ceiling_and_settles_on_the_wakes` (every host; the old rule's window
+>   on its start was 120 µs). **Owed (main's):** the Windows build and the bridge's Windows unit tests
+>   (`a_thread_learns_its_window_only_from_the_replies_it_parked_for`), and the WinFsp hops' A/B against A-212's figures.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >

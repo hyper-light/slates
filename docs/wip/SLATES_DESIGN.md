@@ -36641,3 +36641,27 @@ Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-
   red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
   file and the name kept its number (`replaced` 1, so the path was reached).
 
+### A-560 — A WinFsp receive worker learns its reply spin window from its own wakes, agreed before trusted and bounded by the shard's step quantum (2026-11-18, g230, UI goal 85's B4; §4.6 Windows, §4.3's 2-competitive rule; amends A-212's spin)
+Applied in the same change to: GAPS (the spin window's entry closed), `crates/bridge-winfsp/src/spin_window.rs` (new,
+pure), `reply.rs` (`Stamped`, `start`, `await_reply`; the start-up probe and its `SAMPLES` gone), `host.rs` (replies
+stamped at `Served::send`; `MountThread::start` reads the shard's step quantum), `dispatcher.rs` (`Worker::start` takes
+the ceiling), and `lib.rs`.
+- **What was there.** Each receive worker timed fifteen one-way channel wakes as it started and spun for their median for
+  its whole life, unbounded and unchecked: CI's arm64 runner, quiet, measured 143.9 and 108.1 µs on one daemon's two
+  workers where the other runs' measured 4.1 to 11.5 µs (diagnostics run 42178889880, run 3), and such a worker spun up
+  to 144 µs on every slow reply, a core taken from the shards of a 4-vCPU machine.
+- **The rule.** Every reply carries the instant the shard sent it (`reply::Stamped`), so each reply the worker parked
+  for, and that was sent after it parked, is one of its own wakes, and the window keeps learning from them for the
+  worker's life. The estimate is TCP's round-trip estimator as RFC 6298 §2 states it: a smoothed wake `S` and its
+  smoothed mean deviation `V`, gains `α = 1/8` and `β = 1/4`, seeded `S = R`, `V = R/2`, in Jacobson's fixed point. A
+  scheduling delay only lengthens a wake, so a sample past the RFC's band `S + 4V` is folded as the band's edge. The
+  wakes agree once `V < S/2`, below the RFC's seed; until then the window is zero and the worker parks. The window never
+  exceeds the step quantum of the shard that started the mount (`slates_rt::futures::step_budget_ns`, derived by the
+  daemon from the machine's measured wake): a longer spin takes more than a step of CPU from the shards. A worker
+  started off any shard has no quantum and never spins. No sample count is fixed; the constants are the RFC's.
+- **Tests.** `spin_window`'s, on every host: a start of delayed wakes (five of nine past 100 µs) never spins past the
+  ceiling, is zero while the wakes disagree, and settles within the settled wakes (4 to 11 µs); agreeing wakes are spun
+  for once a second confirms the first; agreeing wakes slower than the ceiling spin the ceiling, and a zero ceiling
+  never spins; one 10 ms delay moves the window by at most half a deviation. `reply`'s, on Windows (main's run): only a
+  reply the thread parked for teaches it, and a thread that started nothing never spins.
+
