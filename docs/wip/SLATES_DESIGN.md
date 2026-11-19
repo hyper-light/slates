@@ -51647,7 +51647,15 @@ Applied in the same change to:
     --test-threads=4` 79 of 79. Kiln r307: `cargo test --locked -p slates-db --test wire_order` 2 of 2 and 1 ignored
     (`LoggedChange`'s four tags published by hand and held); `--test model -- every_recovery_equals_the_live_partition`
     2 of 2 (every operation's apply now stamps its records); `cargo fmt -p slates-db -p slates-server -- --check` clean
-    both times. MERGED RUN PENDING.
+    both times.
+  - As it lands. Kiln r367 (at 96a5aa13b, this change merged with main 2f73eb075, whose repository verbs, push path and
+    Subversion commit share files with it): `cargo test --locked -p slates-db --lib -- repository:: register ledger
+    catalog` 138 of 138, the repository model test's census over its 128 histories 1,083 state-log records taken by the
+    copy, 603 operations of several logs, 17 members left with their destroys (beside A-635's 191 entries of several
+    greens, 409 moving state with versions and 122 alone, 318 recoveries from a snapshot and 37 from the log alone);
+    `--test wire_order` 2 of 2 and 1 ignored; `--test model -- every_recovery_equals_the_live_partition` 2 of 2;
+    `cargo test --locked -p slates-server --lib -- state_log takeover:: mirror:: fleet:: repository:: --test-threads=4`
+    85 of 85; `cargo fmt -p slates-db -p slates-server -- --check` clean.
 - **Owed.** A push's answer waiting for its records to commit at `f + 1` (the barrier the merge plane keeps for a
   submit, `MergeShardState::awaiting`); a candidate that joins a log's placement past parts every earlier candidate held,
   which needs the log's state installed before its next part (a state-log checkpoint, which also lets holders and the
