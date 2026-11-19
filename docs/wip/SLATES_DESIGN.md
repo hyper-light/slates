@@ -14034,6 +14034,19 @@ signature verification).
 > as recorded from stock 7.2 (research §27). In the daemon the lender is `ServedViews` (A-680 part 2a, above); the
 > edge serves `hg` in tests alone until the daemon starts it with that lender (A-684's `--vcs-ssh <addr>`), and serves
 > reads alone: the session's `unbundle` waits for its piece.
+>
+> **Status (2026-11-19, A-691: `listkeys phases` lists the stored draft roots, a hidden one among them).**
+> `serve::Repository::draft_roots` answers the register's draft roots whose phase is still draft, read past the served
+> filter as 7.2's `listphases` reads them from the unfiltered changelog (`phases.py` 1049-1058), and `listkeys phases`
+> answers them: `serve::indexed::Indexed` takes them where its forward walk holds every changeset's phase from the
+> lowest root on, before the filter keeps what it serves. Before, the roots were computed over the served view, so a
+> draft root an amend hid was left out. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19):
+> `fixtures/state`'s `amended-root`, whose draft root was amended under evolution, answers `hg debugpushkey` of
+> `phases`, locally and over `hg serve`, with the hidden draft root and its successor, where slates' view answered the
+> successor alone. Proven on macOS arm64 (Mac Studio, kiln r411 red and r421 green, 2026-11-19; the other platforms
+> owed): `slates-hg --lib serve:: push::` 91 passed and 0 failed, `slates-server --lib repository::hg_push
+> vcs_http::tests::hg` 13 passed and 0 failed, fmt clean
+> (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -52317,3 +52330,37 @@ the crate; `dav/locking.rs`'s `convert_status` with `dav_svn__convert_err`'s who
   inherited-props, get-locks, list, file-revs), then the update-report through A-627's drive for `svn checkout`, with
   the site composed into the daemon's edge (main's ask: git's site alone answers today, so a stock client of another
   tool meets `404`); part 2, the write side; main's runs (clippy, `xtask`, the other platforms, red-checks).
+
+### A-691 — `listkeys phases` lists the stored draft roots still draft, read past the served filter as 7.2's `listphases` reads them (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" item 1; A-619, A-680 part 1, A-690)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::Repository::draft_roots`, `serve::indexed`'s
+`still_draft` and module doc, `serve::pull`'s `listkeys phases`, the test repositories' roots, `serve/indexed_tests.rs`,
+`tests/fixtures.rs`), `crates/hg/fixtures/state` (`amended-root`), `crates/server` (the hg push tests' view, the HTTP
+tests' empty store and the SSH tests' probed repository), GAPS (a fixed entry),
+`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`.
+- **What was wrong.** `listkeys phases` answered the draft roots computed over the served view; 7.2 answers the stored
+  draft roots read from the unfiltered changelog, each kept where its phase is at most draft (`phases.py` 1049-1058,
+  `listphases`; `pushkey.py` 27-32), so a draft root an amend hid is listed in 7.2 and was not here. A-619's oracle
+  computed the roots as the implementation did, over histories that hide nothing, so it could not see the difference.
+- **The decision.** A `Repository` answers its stored draft roots still draft (`draft_roots`). The served view takes
+  them from the register's roots where its forward walk holds each changeset's phase, before the filter keeps what it
+  serves, so a hidden one is among them and one a root of a higher phase raised is not; a root whose node the changelog
+  lacks was dropped before, as `_readroots` drops it (195-229). No second rule: every test repository states its own
+  roots, and each hides nothing, so they are its draft changesets with no draft parent.
+- **Reproduced by use first** (Mac Studio, macOS arm64, stock Mercurial 7.2 from PyPI through uv, 2026-11-19).
+  `make-state-fixtures.sh . amended-root` makes a public root, a draft root on it amended under evolution (a marker
+  hides the old changeset) and another draft made secret afterwards; `make-served-fixtures.sh . amended-root` records
+  7.2's served answers. The repository rebuilt from those files stores the draft roots `4226264b` (hidden) and
+  `d57c1eb0` and the secret root `d6b2f99b`; `hg debugpushkey <repository> phases`, and under `hg serve`
+  `hg debugpushkey http://127.0.0.1:58762/ phases`, answer `4226264b… 1` and `d57c1eb0… 1`. 7.2 took the secret one
+  out of the draft roots when it was made secret, so the view's generated model covers a stored draft root a higher
+  root raised.
+- **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r411 over c396a7391 (the fixture and the golden
+  alone): `cargo test --locked -p slates-hg --lib serve::` 53 passed and 1 failed, the golden, at `listkeys phases`
+  (`d57c1eb0` alone answered). Green: kiln r421 over 2f9bd0664: `cargo test --locked -p slates-hg --lib -- serve::
+  push::` 91 passed and 0 failed; `cargo test --locked -p slates-server --lib -- repository::hg_push
+  vcs_http::tests::hg --test-threads=4` 13 passed and 0 failed; `cargo fmt -p slates-hg -p slates-server -- --check`
+  clean; slates-hg and slates-server compiled afresh. The golden holds `amended-root`'s two served changesets, the
+  hidden and the secret one left out, `heads`, `branchmap` and `listkeys` of `bookmarks` and `phases` to stock 7.2's;
+  the view's model states `listphases` literally over generated histories (roots of every phase, rewrites and prunes),
+  and a named test lists a hidden draft root and leaves out one under a secret root.
+- **Owed.** The other platforms' runs, and the red-checks (main's).
