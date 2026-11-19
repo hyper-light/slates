@@ -131,13 +131,20 @@ struct Read<'s> {
   served: &'s Served,
 }
 
-impl Greens for Read<'_> {
-  fn read(&self, name: &[u8]) -> Option<GreenRead<'_>> {
-    (name == MAIN).then(|| GreenRead {
+impl Read<'_> {
+  /// The served branch's green as a push reads it.
+  fn served(&self) -> GreenRead<'_> {
+    GreenRead {
       id: GREEN,
       position: self.served.green.head(),
       green: &self.served.green,
-    })
+    }
+  }
+}
+
+impl Greens for Read<'_> {
+  fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T> {
+    (name == MAIN).then(|| with(self.served()))
   }
 
   fn version_of(&self, green: u64, head: &ObjectId) -> Option<Version> {
@@ -148,10 +155,13 @@ impl Greens for Read<'_> {
   }
 
   /// The served branch is the default and has a head, so every create is made at its one version.
-  fn base_of_create(&self, _parent: Option<&ObjectId>) -> Option<(GreenRead<'_>, Version)> {
-    let read = self.read(MAIN)?;
+  fn base_of_create<T>(
+    &self,
+    _parent: Option<&ObjectId>,
+    with: impl FnOnce(GreenRead<'_>, Version) -> T,
+  ) -> Option<T> {
     let version = self.version_of(GREEN, &self.served.head)?;
-    Some((read, version))
+    Some(with(self.served(), version))
   }
 }
 

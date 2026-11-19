@@ -94,18 +94,24 @@ pub struct Version {
 }
 
 /// The greens a repository's refs name, as one push reads them (§4.17.1: a branch or a tag is a
-/// green).
+/// green). A green is lent for one call at a time, as the server lends one member of a lineage at a
+/// time (A-575), so each read runs its caller's step over the green and answers what it made.
 pub trait Greens {
-  /// The green the ref `name` names, read for this push; none for a ref that names none.
-  fn read(&self, name: &[u8]) -> Option<GreenRead<'_>>;
+  /// Runs `with` over the green the ref `name` names, read for this push: what it made, or none for a
+  /// ref that names none.
+  fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T>;
 
   /// The version of `green` whose head is `head`, if one held it (§4.17.1 item 1: a push's base).
   fn version_of(&self, green: u64, head: &ObjectId) -> Option<Version>;
 
-  /// The green and version a create whose new value's first parent is `parent` is made at (module
-  /// docs): the version whose head is `parent` where one can still be branched from; else the
-  /// default branch's head; none while the default branch is unborn.
-  fn base_of_create(&self, parent: Option<&ObjectId>) -> Option<(GreenRead<'_>, Version)>;
+  /// Runs `with` over the green and version a create whose new value's first parent is `parent` is
+  /// made at (module docs): the version whose head is `parent` where one can still be branched from;
+  /// else the default branch's head. What it made, or none while the default branch is unborn.
+  fn base_of_create<T>(
+    &self,
+    parent: Option<&ObjectId>,
+    with: impl FnOnce(GreenRead<'_>, Version) -> T,
+  ) -> Option<T>;
 }
 
 /// What a command's verdict carries to its append: one entry for a green's own log (A-642).
@@ -231,11 +237,13 @@ where
   /// A create's work, against the version it is made at, or over an empty green (module docs).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
     let parent = self.first_parent(&command.new, pushed);
-    let (from, increment) = match self.greens.base_of_create(parent.as_ref()) {
-      Some((read, version)) => (
-        Some((read.id, version.number)),
-        self.work(command, pushed, read.green, Some(version))?,
-      ),
+    let made = self.greens.base_of_create(parent.as_ref(), |read, version| {
+      self
+        .work(command, pushed, read.green, Some(version))
+        .map(|increment| (Some((read.id, version.number)), increment))
+    });
+    let (from, increment) = match made {
+      Some(made) => made?,
       None => (None, self.work(command, pushed, &Green::new(), None)?),
     };
     Ok(Entry::Create {
@@ -359,11 +367,17 @@ where
   type Accepted = Entry;
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
-    let read = self.greens.read(&command.name);
-    match (read, command.is_create(), command.is_delete()) {
+    let (create, delete) = (command.is_create(), command.is_delete());
+    let judged = self
+      .greens
+      .read(&command.name, |read| match (create, delete) {
+        (false, true) => self.retire(command, read),
+        (false, false) => self.update(command, pushed, read),
+        _ => Err(moved(&command.name)),
+      });
+    match (judged, create, delete) {
+      (Some(judged), ..) => judged,
       (None, true, false) => self.create(command, pushed),
-      (Some(read), false, true) => self.retire(command, read),
-      (Some(read), false, false) => self.update(command, pushed, read),
       _ => Err(moved(&command.name)),
     }
   }
