@@ -1,0 +1,14 @@
+Modified: trunk/data.bin
+===================================================================
+(Binary files differ)
+
+Modified: trunk/noeol
+===================================================================
+--- trunk/noeol	2026-11-19 05:06:42 UTC (rev 6)
++++ trunk/noeol	2026-11-19 05:07:49 UTC (rev 7)
+@@ -1 +1,2 @@
+-no newline at the end
+\ No newline at end of file
++no newline at the end
++now a second line
+

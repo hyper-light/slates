@@ -1,0 +1,37 @@
+Index: trunk
+===================================================================
+--- trunk	2026-11-19 05:00:00 UTC (rev 0)
++++ trunk	2026-11-19 05:01:07 UTC (rev 1)
+
+Property changes on: trunk
+___________________________________________________________________
+Added: svn:ignore
+## -0,0 +1 ##
++*.o
+Added: trunk/README
+===================================================================
+--- trunk/README	                        (rev 0)
++++ trunk/README	2026-11-19 05:01:07 UTC (rev 1)
+@@ -0,0 +1,2 @@
++Hello.
++This is the README.
+
+
+Property changes on: trunk/README
+___________________________________________________________________
+Added: color
+## -0,0 +1 ##
++red
+\ No newline at end of property
+Added: trunk/src/main.c
+===================================================================
+--- trunk/src/main.c	                        (rev 0)
++++ trunk/src/main.c	2026-11-19 05:01:07 UTC (rev 1)
+@@ -0,0 +1,6 @@
++#include <stdio.h>
++
++int main(void) {
++  puts("hi");
++  return 0;
++}
+

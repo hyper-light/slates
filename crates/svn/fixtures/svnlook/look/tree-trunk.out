@@ -1,0 +1,9 @@
+trunk/
+ README
+ café.txt
+ data.bin
+ empty
+ noeol
+ src/
+  main.c
+ with space/

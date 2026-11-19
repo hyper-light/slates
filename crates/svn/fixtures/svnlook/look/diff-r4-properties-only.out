@@ -1,0 +1,23 @@
+Index: trunk
+===================================================================
+--- trunk	2026-11-19 05:03:21 UTC (rev 3)
++++ trunk	2026-11-19 05:04:28 UTC (rev 4)
+
+Property changes on: trunk
+___________________________________________________________________
+Deleted: svn:ignore
+## -1 +0,0 ##
+-*.o
+Index: trunk/README
+===================================================================
+--- trunk/README	2026-11-19 05:03:21 UTC (rev 3)
++++ trunk/README	2026-11-19 05:04:28 UTC (rev 4)
+
+Property changes on: trunk/README
+___________________________________________________________________
+Modified: color
+## -1 +1 ##
+-red
+\ No newline at end of property
++blue
+\ No newline at end of property

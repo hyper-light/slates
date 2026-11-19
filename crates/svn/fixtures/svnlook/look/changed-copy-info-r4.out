@@ -1,0 +1,5 @@
+_U  trunk/
+_U  trunk/README
+A   trunk/empty
+A   trunk/noeol
+D   trunk/src/util.c

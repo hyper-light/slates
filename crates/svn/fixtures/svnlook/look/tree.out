@@ -1,0 +1,18 @@
+/
+ branches/
+  b1/
+   README
+   data.bin
+   src/
+    main.c
+    util.c
+ tags/
+ trunk/
+  README
+  café.txt
+  data.bin
+  empty
+  noeol
+  src/
+   main.c
+  with space/

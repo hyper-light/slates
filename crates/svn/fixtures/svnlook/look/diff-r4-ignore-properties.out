@@ -1,0 +1,17 @@
+Added: trunk/empty
+===================================================================
+Added: trunk/noeol
+===================================================================
+--- trunk/noeol	                        (rev 0)
++++ trunk/noeol	2026-11-19 05:04:28 UTC (rev 4)
+@@ -0,0 +1 @@
++no newline at the end
+\ No newline at end of file
+
+Deleted: trunk/src/util.c
+===================================================================
+--- trunk/src/util.c	2026-11-19 05:03:21 UTC (rev 3)
++++ trunk/src/util.c	2026-11-19 05:04:28 UTC (rev 4)
+@@ -1 +0,0 @@
+-int util(void) { return 1; }
+

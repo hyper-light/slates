@@ -1,0 +1,17 @@
+Deleted: trunk/README
+===================================================================
+--- trunk/README	2026-11-19 05:04:28 UTC (rev 4)
++++ trunk/README	2026-11-19 05:05:35 UTC (rev 5)
+@@ -1,3 +0,0 @@
+-Hello.
+-This is the README, edited.
+-A third line.
+
+Copied: trunk/README (from rev 4, branches/b1/README)
+===================================================================
+--- trunk/README	                        (rev 0)
++++ trunk/README	2026-11-19 05:05:35 UTC (rev 5)
+@@ -0,0 +1,2 @@
++Hello from branch b1.
++This is the README.
+
