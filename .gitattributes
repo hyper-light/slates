@@ -44,6 +44,8 @@ crates/hg/fixtures/**/*.hg -text
 crates/hg/fixtures/wire/** -text
 # Revisions stock `hg` 7.2 stored (A-588): NUL-separated extras and manifests, metadata blocks, kept as stored.
 crates/hg/fixtures/objects/** -text
+# Revlogs stock `hg` 7.2 stored (A-611): index, data and docket files, and every revision's text, kept as stored.
+crates/hg/fixtures/revlogs/** -text
 # git's own wire and packs, captured from stock git 2.50.1: slates-git's golden vectors (A-582).
 crates/git/fixtures/*.bin -text
 crates/git/fixtures/*.pack -text

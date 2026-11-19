@@ -138,6 +138,10 @@
 > `sideband-all`, `packfile-uris`); the server's refusals as `ERR` lines and band-3 errors; a duplicate `want-ref` (a
 > protocol error) caught where the server maps names to refs; the server keeping clients alive on band 2, never with
 > git's empty band-1 packet before the packfile; clippy and the cross-target lint over `src/v2` (main's run request).
+> **A-615 part 1 (2026-11-19, g296; one ref-name rule):** slates-git's two copies of git's `check_refname_format`
+> (A-590's tag-name check, A-582 part 2's protocol names) are one module, `refname`, which both callers ask; A-590's
+> golden fsck fixtures and A-582's cases both run against it, with a property test against refs.c's check transcribed
+> (144 of 144 on the Mac Studio, red twice). Owed in A-615: part 2, §4.17.2 piece 7's negotiation for upload-pack v2.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -217,7 +221,8 @@
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588) (2026-11-19; UI goals 91 and 92; owners g291, and g079 for A-598).** Built on §4.17.1: a named branch's
+> built (A-588) and its revlog reader (A-611) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598).** Built
+> on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -261,11 +266,17 @@
 > first against stubbed engines (14 of its 16 tests failed), against the five compressed bundles stock `hg` 7.2 wrote
 > (`crates/hg/fixtures/compressed/make-compressed-fixtures.sh`, `SHA256SUMS`), each made plain to exactly the bundle
 > 7.2 wrote uncompressed, and 7.2's server's zstd answer to a `getbundle`; every cut, a bit flipped at every place,
-> unknown engines and bytes after a stream refused by kind. Owed, in order, after §4.17.1's seven pieces: (3, rest) the
-> index's tables, then import of a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines
-> (flate2 over zlib-rs, and zstd), its tests holding inflated bytes; (4) read serving, the `0.2` answers compressed by
-> A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the shard's step
-> budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
+> unknown engines and bytes after a stream refused by kind. **Built (A-611):** the import's revlog reader: version 1
+> inline and split, version 2 and the changelog's version 2 behind their dockets, chunks raw, zlib (flate2 over zlib-rs)
+> and zstd with every byte charged to the admission and every stream ending exactly at its chunk's end, chains rebuilt
+> through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`, 182 of
+> 182 on the Mac Studio (2026-11-19, merged with A-598), against 158 files stock `hg` 7.2 stored in five repositories
+> (zstd, zlib, split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
+> (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). Owed, in order, after §4.17.1's seven pieces: (3, rest) the
+> index's tables on A-581's `slates-vcs`, then the import's walk of a store (the fncache, the path encodings, a version
+> 2 store's file index) and censored, ellipsis and externally stored revisions; (4) read serving, the `0.2` answers
+> compressed by A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the
+> shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
 > changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
 > (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
 > and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run

@@ -30,8 +30,8 @@
 //! no client writes (git's `oid_to_hex`, JGit, libgit2 and go-git all write lower case). A number is canonical decimal
 //! (git's `strtol` with base 0 also takes octal and `0x`). So every message this module accepts is written back byte
 //! for byte, the pkt-line lengths aside, whose digits part 1 reads in either case as git's `hexval` does and writes in
-//! lower case as git does. A ref name is `HEAD` or under `refs/` and passes `check_refname_format` (the private
-//! `refname` module).
+//! lower case as git does. A ref name is `HEAD` or under `refs/` and passes `check_refname_format`
+//! ([`crate::refname`]).
 //!
 //! **Order is the grammar's.** `fetch`'s sections come in the document's order. git 2.50.1's `upload_pack_v2` wrote
 //! `wanted-refs` before `shallow-info`, which its own client refused ("expected 'packfile', received 'shallow-info'"),
@@ -51,7 +51,6 @@ pub mod advertisement;
 pub mod fetch;
 mod line;
 pub mod ls_refs;
-mod refname;
 pub mod request;
 
 pub use line::{Ending, Line};

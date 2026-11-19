@@ -12549,6 +12549,19 @@ signature verification).
 > and against 7.2's server's zstd answer to a clone's `getbundle`; every cut is refused as cut short, a bit flipped at
 > every place is refused or judged, never a panic. A stream is inflated whole in one call, its work bounded by the
 > admission; inflating it in slices within the shard's step budget comes with push intake (piece 5).
+>
+> **Status (2026-11-19, A-611: piece 3's import half, the revlog reader, built).** `slates-hg`'s `revlog` reads a
+> revlog as 7.2 reads one: version 1's index of 64-byte entries, inline (each chunk after its entry, walked as 7.2's
+> `_inline_scan` walks them) or with a data file, with or without generaldelta; version 2 and the changelog's version 2
+> behind their dockets (`exp-revlogv2.2`, `exp-changelog-v2`), 96-byte entries and a compression mode per chunk; each
+> chunk raw (`u`, NUL, plain), zlib (flate2 over zlib-rs) or zstd (the workspace's crate), inflated with every byte
+> charged to the caller's admission and the stream ending exactly at the chunk's end; each text its chain's base patched
+> by its deltas through slates-hg's applier, as long as its entry says, and hashing to its node. Proven against 158
+> files stock 7.2 stored (`crates/hg/fixtures/revlogs`, the command in `make-revlog-fixtures.sh`): one history of a
+> branch and a merge in five repositories (zstd, zlib, split by a lowered inline limit, version 2, the changelog's
+> version 2), sparse-revlog's intermediate snapshots among its chains, every entry equal to 7.2's `debugindex --debug`
+> and every text to its `debugdata`. Owed with the import: walking a store (the fncache, the path encodings, a version 2
+> store's file index) and censored, ellipsis and externally stored revisions, refused by kind for now.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12932,8 +12945,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `capabilities`, `batch`, `wire`).
 3. The objects and the index: changeset texts, flat manifests and file metadata parsed and written, nodes checked, the
    index's tables, and an existing repository's store imported as a base. Built (A-588, `crates/hg`: `changeset`,
-   `manifest`, `filerev`, `node`): the objects and their nodes. Owed: the index's tables, then the import, whose zlib
-   and zstd revlog chunks A-607's engines inflate (flate2 over zlib-rs, and zstd), its tests holding inflated bytes.
+   `manifest`, `filerev`, `node`): the objects and their nodes. Built (A-611, `crates/hg`: `revlog`): the import's
+   revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
+   holding inflated bytes. Owed: the index's tables on A-581's `slates-vcs`, then the import's walk of a store.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
@@ -41442,6 +41456,84 @@ unknown).
       recorded as removed.
   - Main's: the integration suites (`crates/merge/tests/`, `ops_doc.rs` among them), clippy and `cargo xtask check`
     (the run-request queue).
+
+### A-611 — Mercurial's revlogs read as stock 7.2 reads them: version 1 inline and split, version 2 behind its docket, chunks raw, zlib and zstd, every chain rebuilt and every node checked (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, the import half; §4.9; A-588, A-607)
+Applied in the same change to: §4.17.3 (its status and piece 3), `crates/hg` (`revlog`, new; `fixtures/revlogs/` and
+its `make-revlog-fixtures.sh`; `flate2` and `zstd` as dependencies), `Cargo.lock` (flate2 1.1.11 and zlib-rs 0.6.8, as
+cargo resolved them on the Mac Studio; its re-pointing of five packages from windows-sys 0.60 to 0.61 left out, as
+A-600 left it), `.gitattributes` (the revlog fixtures kept as stored), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§16).
+- **What it does.** `revlog::Revlog::open` reads version 1's index (a header sharing the first entry's offset field,
+  64-byte entries) inline, each chunk after its entry, or beside its data file; `read_docket` and
+  `Revlog::open_docketed` read version 2 and the changelog's version 2 (96-byte entries; a compression mode per chunk;
+  the changelog's no base and no link). `chunk` routes a chunk by its first byte or its mode (raw `u`, raw NUL, plain,
+  zlib `x`, zstd `(`, the docket's default engine) and inflates it with every byte charged to the caller's admission;
+  `chain` walks 7.2's `_deltachain`; `text` patches the chain through slates-hg's applier and checks the text's length
+  and node.
+- **From the sources (`research/mercurial-server.md` §17).** 7.2's `revlog.py` (`start`, `_deltachain`, `decompress`,
+  `_chunk`), `revlogutils/constants.py` (versions, flags, the entry formats), `pure/parsers.py` (`_inline_scan`; the
+  first entry's offset read as 0), `revlogutils/docket.py` (`S_HEADER`, `parse_docket_args`), `revlogutils/deltas.py`
+  (`delta_compression`: a version 2 chunk is plain when raw, default when it begins with the docket's header, else
+  routed by its own), `repo/creation.py` and `repo/vfs_options.py` (how 7.2 makes a version 2 store).
+- **Stricter than 7.2, on purpose.** A negative length (7.2's inline scan would step backwards); an inline entry whose
+  offset is unlike the chunks before it; a base or a parent after its revision; a chunk past its file; bytes after a
+  compressed stream; version 0; a version 2 revlog marked inline; and revisions flagged censored, ellipsis or
+  externally stored, whose texts do not hash to their nodes (owed with their pieces). A zlib stream cut short is
+  refused by flate2's own reader ("incomplete deflate stream", `zio.rs`), a zstd frame cut short by zstd's.
+- **Golden vectors.** `crates/hg/fixtures/revlogs`, made on the Mac Studio (macOS 26.4, arm64), 2026-11-19 at 04:32 UTC,
+  by stock Mercurial 7.2 from PyPI through `uvx` (CPython 3.12), from a clone of the branch at 59bbf094, exactly: `bash
+  crates/hg/fixtures/revlogs/make-revlog-fixtures.sh "$D/out"`. One history (a file of SHA-256 lines growing a line a
+  changeset, a pseudo-random file, an empty file, a second head, a merge; thirteen changesets) in five repositories:
+  zstd (7.2's default), zlib, split (7.2's `revlog._maxinline` lowered to 256 bytes by an extension, so every revlog
+  keeps a data file; the zstd and zlib changelogs keep one already), version 2 and the changelog's version 2
+  (`storage.fileindex.slow-path=allow`, since 7.2's version 2 store brings a file index whose Rust implementation the
+  PyPI build lacks), all with `format.maxchainlen=3`: chains end at full and intermediate snapshots (`snap` four times
+  in the grown file's chain). 158 files, each SHA-256 checked equal after the copy; every repository's texts compared
+  byte for byte with the zstd one's by the script. Two earlier runs are recorded in the script's header.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test -p slates-hg --lib`: 166 of 166 at e7ab4ea78, 8 of them
+  this piece's, green at its first build; rustfmt's layout and cargo's lock entries taken from that run; then `cargo
+  test --locked -p slates-hg --lib` 166 of 166 and `cargo fmt -p slates-hg -- --check` clean at 273e72893 (load 5.4),
+  and 182 of 182, clean, once merged with main (A-598's 16 tests among them) at 757d09dc3 (load 5.0). Golden: every entry of
+  25 revlogs equal to 7.2's `debugindex --debug` (offset, flags, lengths, base, link, parents, node, mode), every text
+  equal to its `debugdata` and hashing to its node, and the shapes the fixtures were made for met (zlib, zstd and raw
+  chunks, chains longer than one, generaldelta bases other than the revision before, intermediate snapshots); every
+  docket naming its files. Hostile: version 0, an unknown version and an unknown flag; a split index not whole; a
+  negative length, a moved offset, a later base and parent, a flipped node, an unknown chunk header, the censored flag;
+  7.2's own zlib stream and zstd frame with a byte after them or cut short; every admission short of the need; any byte
+  of an inline or split revlog changed or cut, and of a docket, never panicking (properties). Red: not run (one run,
+  §8).
+- **Owed.** The store's walk for the import (the fncache, the path encodings, a version 2 store's file index), and
+  censored, ellipsis and externally stored revisions with their pieces; then the index's tables on A-581's
+  `slates-vcs`.
+
+### A-615 — slates-git's one ref-name rule, then upload-pack v2's negotiation over a commit-graph trait (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "The repository in git's terms" item 6, "A fetch" and "Pieces (git)" piece 7; after A-582 part 2 and A-590)
+
+**Part 1: one ref-name rule** (`crates/git/src/refname.rs`). A-590's tag-name check (`objects/refname.rs`) and A-582
+part 2's protocol-name check (`v2/refname.rs`) were two copies of git's `check_refname_format` with no flags [C:
+`refs.c` v2.50.1]. They are now one module, and both callers ask it:
+
+- `refname::is_valid`: a whole name the protocol carries, `HEAD` or a name under `refs/` (`want-ref`, `ls-refs`'s answer
+  and its symref targets, `wanted-refs`);
+- `refname::tag_name_is_valid`: a tag object's `tag` line, checked as `refs/tags/<name>` (fsck's `badTagName`).
+
+The rule is the one both copies held: components not empty, not beginning with `.`, not ending with `.lock`, with no
+`..`, no `@{` and no byte `refname_disposition` forbids; the name not ending with `.`; a NUL, which git's C strings
+cannot hold, refused.
+
+- **Tests.** Both sets are kept: A-590's golden fsck fixtures, among them the 37 `name-tag-*` tags stock git 2.50.1
+  judged, run through the tag parser, and A-582 part 2's whole-name cases. New: a list of tag names that pass and fail,
+  and a property test holding both questions to refs.c's own check transcribed in the test (its `refname_disposition`
+  table and its component loop) over names built from pieces that reach every rule (`.lock`, `..`, `@{`, a leading dot,
+  every disposition).
+- **Checks** (Mac Studio, `cargo test -p slates-git --lib`, 2026-11-19): 144 of 144 (kiln r636 and the runs after it),
+  `cargo fmt --check` clean. Red in the Studio's clone: without the `.lock` rule 3 tests failed, A-590's golden fsck
+  test among them; with the tag question always answering yes, 4 failed, A-590's tag and golden tests among them; and
+  the property test alone failed without the `.lock` rule and without the leading-dot rule, once its names were drawn
+  near valid (its first generator, of single bytes, missed the `.lock` rule).
+
+Part 1 applied in the same change to: `crates/git` (`refname.rs` and `tests/refname.rs`, new; `objects/refname.rs` and
+`v2/refname.rs`, removed; `objects/tag.rs`, `v2/fetch.rs` and `v2/ls_refs.rs` on the shared module; the `mod` line in
+`lib.rs`), GAPS (the §4.17 entry).
 
 ### A-593 — Subversion's dump format: formats 2 and 3 read as the stream arrives within the caller's admission and written byte for byte as `svnadmin dump` writes them (2026-11-19, g264, UI goal 92; §4.17.4 "Pieces that follow" piece 6, its first part; A-500, A-553)
 Applied in the same change to:
