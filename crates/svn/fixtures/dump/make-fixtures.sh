@@ -24,7 +24,7 @@
 #
 # Run on the Mac Studio (adas-mac-studio, macOS 26.4, arm64) on 2026-11-19 with Homebrew's Subversion 1.15.0
 # (r1937767), whose libsvn_repos dump.c and libsvn_subr hash.c are byte for byte those of the 1.14.x branch at
-# d434dc14 that docs/wip/research/vcs-servers-subversion.md reads (§11 there), through kiln with sync off, from a clone
+# d434dc14 that docs/wip/research/vcs-servers-subversion.md reads (§12 there), through kiln with sync off, from a clone
 # of the branch that carried this script, exactly:
 #   OUT=$(mktemp -d ~/.cache/g264-fixtures.XXXXXX) && bash crates/svn/fixtures/dump/make-fixtures.sh "$OUT"
 set -euo pipefail

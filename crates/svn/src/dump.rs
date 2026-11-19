@@ -5,7 +5,7 @@
 //!
 //! The format (`notes/dump-load-format.txt`; its writer `libsvn_repos/dump.c`, its reader `load.c` and
 //! `load-fs-vtable.c`, the property sections `libsvn_subr/hash.c`; Subversion's `1.14.x` branch at `d434dc14`, whose
-//! `dump.c` and `hash.c` Subversion 1.15.0 keeps byte for byte; `docs/wip/research/vcs-servers-subversion.md` §11): a
+//! `dump.c` and `hash.c` Subversion 1.15.0 keeps byte for byte; `docs/wip/research/vcs-servers-subversion.md` §12): a
 //! stream is a version record, then records, each a block of `Name: value` lines ended by an empty line and, for some, a
 //! content block whose length its headers state. A UUID record names the repository; a revision record carries the
 //! revision's properties; each node record that follows it adds, deletes, replaces or changes one path, with a property

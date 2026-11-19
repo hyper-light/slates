@@ -460,3 +460,79 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **The captures are reproducible but for the HTTP heads.** The SSH captures depend only on the script's fixed
   configuration; the HTTP requests carry the run's port (`host`) and the answers its date (`Date`), so those heads
   differ from run to run and the tests read only their fields.
+
+## 15. Found while building piece 3's objects and nodes (A-588, 2026-11-19; 7.2's code [C] from Homebrew's 7.2 and its PyPI source distribution, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/objects`)
+
+- **7.2 hashes nodes with SHA-1 collision detection.** `utils/hashutil.py` takes `sha1 = sha1dc.sha1` whenever its C
+  extension imports and falls back to `hashlib.sha1` only when it does not; `utils/storageutil.py`'s
+  `hashrevisionsha1` hashes every node through it. Homebrew's 7.2 ships `sha1dc.cpython-314-darwin.so`, and both
+  fixture runs of the PyPI 7.2 through `uvx` printed `hashutil.sha1 is <class 'sha1dc.sha1'>`. The binding
+  (`thirdparty/sha1dc/cext.c`, read from `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`) calls `SHA1DCInit` and then
+  `SHA1DCSetSafeHash(&(self->ctx), 0)`, "We don't want "safe" sha1s ... We just want to detect collisions", and its
+  `finalize` raises `OverflowError("sha1 collision attack detected")` when `SHA1DCFinal` reports one, so a revision
+  whose hashing shows a known attack ends 7.2's push. slates-hg hashes through `sha1-checked` configured the same way
+  (A-600's crate, git's configuration too). No public collision has 7.2's framing: the first forty bytes it hashes are
+  the two parents in ascending order, and SHAttered's prefix opens with a higher twenty bytes (`%PDF-1.3…`) than its
+  next twenty (` obj\n<</Width…`), so the detection is proven on the hash itself.
+- **A copy, as `filelog.renamed` reads it.** None unless the revision's first parent is null ("When creating a copy or
+  move we set filelog parents to null"), and none unless the block names both keys: "copy and copyrev occur in pairs.
+  In rare cases due to old bugs, one can occur without the other. So ensure both are present to flag as a copy"
+  (`filelog.py`). Half a pair is no copy, not an error, so a store from those old versions imports.
+- **7.2 reorders some file revisions' parents on the way in** (`revlogutils/rewrite.py` `filter_delta_issue6528`,
+  `_has_bad_parents`, on by default as `storage.revlog.issue6528.fix-incoming`): a revision with a metadata block and
+  one null parent gets the null parent first; one without a block gets it second. Mercurial 5.8 had written some the
+  other way round (issue6528). The node is unchanged, since it hashes the parents in order of value. Changegroup `04`
+  carries a separate flag for a revision with a block (`REVIDX_HASMETA`, bit 11, "used only by filelog") and swaps such
+  a revision's parents the other way in `emitrevisions`, so the rule a reader applies depends on the version it reads.
+- **An empty user corrupts a changeset text.** 7.2's writer refuses one: "An empty username or a username with a "\n"
+  will make the revision text contain two "\n\n" sequences -> corrupt repository since read cannot unpack the revision"
+  (`changelog.add`); and `readfiles` cuts a text at its first `\n\n`, which an empty user line would be, while
+  `changelogrevision` reads the files after the date line, so the two readers would disagree.
+- **The extras' escapes, run through 7.2's own `_string_unescape` (Python 3.14.7, Homebrew's 7.2).** The item
+  `k:\t\x41\101\'\q\777\\\0\\0` reads `k:` and tab, `A`, `A`, `'`, `\q` kept as it is (a `DeprecationWarning`, not an
+  error), `\777` as the byte `0xFF` (CPython keeps an octal escape's low byte), `\\` and NUL, `\\` and `0`: the `\0`
+  fix-up pairs backslashes from the left before `escape_decode` reads the rest. `decodeextra` of `branch:a\0branch:b`
+  is `{branch: b}`: a key given twice keeps the later value.
+- **7.2's C manifest reader refuses four things at parse time** (`cext/manifest.c` `find_lines`): an entry whose path
+  is empty, a text not ending in a newline, a line under 42 bytes, and paths not strictly ascending by `strcmp`; a node
+  that is not forty hexadecimal digits, or a flag other than `l`, `t` and `x`, fails only when the entry is read.
+  slates-hg refuses all of these when the text is read, and upper-case digits and the tree flag `t` too, so every text
+  it reads writes back to its bytes.
+- **`debugdata` and `debugindex`.** `hg debugdata -c|-m|FILE REV` writes a revision's raw text (`rawdata`, a file
+  revision's metadata block included): the 30 texts were byte for byte the ones the storage API's `revision()` gave.
+  `hg debugindex --debug` lists a header and seventeen columns per revision (`rev`, `rank`, `linkrev`, `nodeid`,
+  `p1-rev`, `p1-nodeid`, `p2-rev`, `p2-nodeid`, `full-size`, `delta-base`, `flags`, `comp-mode`, `data-offset`,
+  `chunk-size`, `sd-comp-mode`, `sidedata-offset`, `sd-chunk-size`); every text's length equalled its `full-size`, and
+  no revision had a flag.
+
+## 16. Found while building piece 1's compressed streams (A-598, 2026-11-19; 7.2's code [C] from its PyPI source distribution, SHA-256 `a250227e…`; the bundles stock `hg` 7.2 compressed on the Mac Studio, `fixtures/compressed`; libzstd 1.5.7's and libbz2-rs-sys 0.2.6's sources)
+
+- **How 7.2 frames a compressed bundle.** bundle1: `bundle2.bundletypes` maps `HG10UN` to (`HG10UN`, `UN`), `HG10GZ` to
+  (`HG10GZ`, `GZ`) and `HG10BZ` to (`HG10`, `BZ`): the bzip2 stream follows `HG10` whole, its own magic `BZ` reading as
+  the header's last two bytes. `exchange.readbundle` reads four bytes, then the two-byte type, and `cg1unpacker` turns
+  `BZ` into `_truncatedBZ`, whose reader feeds `BZ` back to the decompressor first. bundle2: `setcompression` adds
+  `Compression=<type>` (nothing for `UN`), and `getchunks` writes the magic, the parameters' length and block as they
+  are, then every core chunk through the engine. The fixtures open `HG10GZ` and `x\x9c`; `HG10BZh91AY&SY`; and `HG20`,
+  14, `Compression=GZ` and `x\x9c`, the same with `BZh91AY&SY`, and with a zstd frame.
+- **What 7.2's readers take.** `supportedbundletypes` is every registered bundle type, `_truncatedBZ` among them, so
+  `processcompression` takes `Compression=_truncatedBZ`; `cg1unpacker` takes any two-byte type in the set, so `HG10ZS`
+  is read, though `parsebundlespec` refuses `zstd-v1` ("compression engine zstd is not supported on v1 bundles";
+  `_bundlespecv1compengines` is `gzip`, `bzip2`, `none`, "THIS SHOULD NEVER CHANGE"). A second `Compression` runs
+  `processcompression` again, the last winning. Values are matched exactly (`gz` is unknown).
+- **Where 7.2's reading stops.** `_CompressedStreamReader.read` asks for 65,536 compressed bytes at a time, and the
+  bundle2 reader stops at the end-of-stream header, so bytes after a compressed stream, or a zlib trailer the bundle's
+  end comes before, are never read. zlib's end is found by feeding a copy of the decompressor one byte and finding it
+  unused, bz2's by `EOFError`, zstd's by the `ZstdError` python-zstandard raises once its `decompressobj` has finished a
+  frame: one frame is the whole stream.
+- **The relay.** `unbundle20._forwardchunks`, which an SSH client's `getbundle` relays through, reads the parameters,
+  drops every item whose raw name lower-cases to `compression`, and inflates the rest: the plain bundle
+  `compression::plain` makes.
+- **7.2's zstd frames.** `ZstdCompressor(level=3).compressobj()`, given no size: the fixture's frame and the wire
+  capture's (`http-clone.03`) both open `28 b5 2f fd 00 58`: no content size, no checksum, no dictionary, a 2 MiB window
+  (Exponent 11). For such a frame libzstd 1.5.7 holds a 131,072-byte input buffer and a 2,359,360-byte output buffer
+  (the window and two 128 KiB blocks, each with 32 bytes of slack): 2,490,432 bytes, which its `ZSTD_sizeof_DCtx`
+  reports after the fixture's frame is inflated.
+- **The default levels.** zlib `-1` (zlib's 6), bzip2 9 (`BZ2Compressor`'s, at work factor 0, libbzip2's 30), zstd 3,
+  single-threaded.
+- **libbz2-rs-sys's fast decoder** allocates `tt`, one `u32` per byte of the block size its header digit names (3.6 MB
+  at `BZh9`), when it reads that digit, beside a zeroed state; the fast mode is the one Python's `BZ2Decompressor` runs.

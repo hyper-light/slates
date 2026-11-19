@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 23:svn://127.0.0.1/missing 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) 
