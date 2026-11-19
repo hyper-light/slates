@@ -43,12 +43,14 @@
 mod admission;
 pub mod delta;
 pub mod entry;
+pub mod http;
 pub mod object_name;
 pub mod objects;
 pub mod out;
 pub mod pack;
 pub mod pktline;
 pub mod sideband;
+pub mod unpack;
 pub mod v2;
 
 pub use admission::{Admission, PastAdmission};

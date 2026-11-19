@@ -1685,8 +1685,10 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "crc32fast",
+ "flate2",
  "proptest",
  "sha1-checked",
+ "slates-http",
  "slates-test-seeds",
 ]
 
@@ -1707,6 +1709,15 @@ dependencies = [
  "sha1-checked",
  "slates-test-seeds",
  "zstd",
+]
+
+[[package]]
+name = "slates-http"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "proptest",
+ "slates-test-seeds",
 ]
 
 [[package]]

@@ -150,6 +150,18 @@ mod deadlines;
 mod hangup;
 mod reap;
 mod repository;
+// git's `wildmatch` with `WM_PATHNAME`: the glob of a git repository's ref patterns and of a Subversion glob rule's
+// segments (A-597). No caller outside tests until the version-control servers' policy reads it (their pieces).
+#[cfg_attr(not(test), allow(dead_code))]
+mod wildmatch;
+// §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597). No caller outside tests until the
+// repository record holds a policy and the servers' push paths ask it (their pieces).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_policy;
+// §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside
+// tests until the servers' push paths start hooks (their pieces).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_hooks;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

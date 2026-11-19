@@ -26,10 +26,10 @@
 //! - Type 0 (invalid) and 5 (reserved) are refused as soon as the first byte arrives (`Type`), as index-pack refuses
 //!   them ("unknown object type").
 //! - A size is read as `unpack_object_header_buffer` reads it on a 64-bit word: it refuses a further byte once the
-//!   shift passes the word less seven bits ("bad object header"), so a size has at most 60 bits (`SizeTooLong`), refused
-//!   before the byte that would pass it arrives. index-pack's own loop has no such check and shifts past the word; this
-//!   reader holds every entry to the stricter rule, which no pack git writes can break: a size past 60 bits is an object
-//!   of an exbibyte.
+//!   shift passes the word less seven bits ("bad object header"), so a size has at most 60 bits (`SizeTooLong`),
+//!   refused before the byte that would pass it arrives. index-pack's own loop has no such check and shifts past the
+//!   word; this reader holds every entry to the stricter rule, which no pack git writes can break: a size past 60 bits
+//!   is an object of an exbibyte.
 //! - An offset whose next byte would lose bits is refused as git refuses it ("offset value overflow for delta base
 //!   object", `OffsetTooLong`).
 //! - An OFS_DELTA's base must begin before its own entry and after the pack's header: an offset of zero names the entry
@@ -350,6 +350,19 @@ fn write_offset(offset: u64, out: &mut impl Out) {
     rest = rest.checked_shr(GROUP_BITS).unwrap_or(0);
   }
   out.put(bytes.get(first..).unwrap_or_default());
+}
+
+/// The most bytes an entry's header takes in a pack whose objects are named in `format`: its type and size (one byte,
+/// then one for each shift git reads a group at), then the longer of the two bases, an offset's ten bytes or a name.
+/// A reader that holds this many bytes of a header has it whole or refused.
+pub fn longest_header(format: ObjectFormat) -> usize {
+  let size_groups = SIZE_BITS
+    .saturating_sub(FIRST_SIZE_BITS)
+    .div_ceil(GROUP_BITS);
+  usize::try_from(size_groups)
+    .unwrap_or(usize::MAX)
+    .saturating_add(1)
+    .saturating_add(OFFSET_BYTES_MAX.max(format.raw_len()))
 }
 
 /// The bytes `header` takes when written for the entry at `at`, or why it cannot be written.
