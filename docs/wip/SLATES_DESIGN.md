@@ -12724,6 +12724,18 @@ and export by landing).
 > `fs-wrap.c`, `transaction.c`, `serve.c`) and equals it on generated histories. Owed: the verbs on the wire with the
 > ra_svn server (piece 7), the lock hooks (piece 11), DAV's LOCK and UNLOCK (piece 13), the entries' encoding in the
 > repository's register, the head view over the index, and the room derived from the shard's (item 12).
+>
+> **Status (2026-11-19, A-592).** Built: the commit rule (`slates-svn`'s `commit`, piece 5, items 3.2 to 3.4): the
+> drive's out-of-date test (`check_out_of_date`, `commit.c`'s); and the verdict at `close-edit` (`verdict`): FSFS's
+> `merge()` stated on the index, over the work's transaction as the index's own builder makes it on its base
+> (`Index::trial`), reading only the rows of the head's revisions since the base and the nodes they reach; then, once
+> it finds no conflict, the lock table's check (A-602's `LockTable::verdict`, handed in by the merge task), whose
+> refusal is the verdict's and whose entries are its accepted answer. Every refusal typed and named by its Subversion
+> error. Its oracle transcribes `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock` and
+> `svn_path_compare_paths` over the naive FSFS of the index's tests and equals the verdict, with the lock table's real
+> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. Owed with the server
+> (piece 7): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each
+> command arrives, over a transaction built a command at a time.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12836,7 +12848,10 @@ for Subversion.)
       both made the same change ("If any of the three entries is of type file, declare a conflict");
    2. for a name both sides changed: a double delete, a delete against a change, a replacement on either side ("even an
       identical replacement") and an addition on both ("two additions are not auto-mergeable") are conflicts, and a
-      directory changed on both sides otherwise is judged entry by entry, by these rules, beneath it;
+      directory changed on both sides otherwise is judged entry by entry, by these rules, beneath it, when both sides
+      kept its node and copy identities; a directory of a branch that no revision changed since the copy takes the
+      branch's copy identity when first changed inside it (a lazy copy, `get_copy_inheritance`), so two works that
+      change different files beneath it conflict there, as they do in FSFS (A-592);
    3. a directory on the path from the root to any node the work changed whose property list changed in (B, head] is a
       conflict (FSFS refuses the source's property change of a directory both sides changed beneath);
    4. a directory whose property list the work changed is a conflict when its names, or their node or copy identities,
@@ -13137,7 +13152,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
-   must give the same accept or conflict, and the same conflicting path.
+   must give the same accept or conflict, and the same conflicting path (built, A-592, with the drive's out-of-date
+   test, the lock table's check after the merge, and `verify_locks` in the oracle).
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
    `uuid`, `youngest`; the dump round trip is their gate.
 7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
@@ -39689,3 +39705,86 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   detection), so they could not pass on it.
 - **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
   zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-592 — The Subversion commit rule as a pure function: the drive's out-of-date test, and FSFS's merge at commit stated on the index, then the lock table's check, held to FSFS's own code transcribed (2026-11-19, g268 for UI goal 92; §4.17.4 items 3.2 to 3.4 and piece 5; A-553, A-602)
+Applied in the same change to: §4.17.4 (a status block; item 3.3 rule 2's lazy copy; piece 5 marked built), GAPS (the
+§4.17.4 entry, and the order A-602's lock check answers in), `docs/wip/research/vcs-servers-subversion.md` (five more
+sources and four notes of §6), `crates/svn/src/commit.rs` and `crates/svn/src/commit/tests.rs` (new),
+`crates/svn/src/index.rs` (`Index::trial`, `Trial`, `TrialNode`, `Builder::new_on`; a copy's source read in any
+committed revision), `crates/svn/src/index/tests.rs` (the naive filesystem's transaction on any base, `begin_on`, and
+its tree, `into_tree`; the oracle's types open to the crate), and `crates/svn/src/lib.rs`.
+- **What was there.** Item 3.3 stated FSFS's commit rule in five rules and piece 5 asked for it as a pure function with
+  a transcription of `merge()` as its oracle; nothing computed it. The lock table and its check at the verdict were
+  A-602's, landed the same day.
+- **The decision.** Subversion's rule as its code applies it (1.14.x at `d434dc14`), in its order. (1) During the
+  drive, `commit.c` `check_out_of_date` (179-198): a client's revision older than the node's created revision in the
+  transaction is out of date (`E160028`), one past the transaction's base is no such revision (`E160006`);
+  `check_out_of_date` takes the created revision as `svn_fs_node_created_rev` reads the transaction's root (none for a
+  node the transaction made; the base for an untouched root, `dag.c`'s issue #2608). (2) At `close-edit`, `tree.c`
+  `merge(target = the transaction, source = the head, ancestor = the base)` (1790-2146) from the root: the base cases;
+  the head's property change of a directory both sides changed; the work's against `compare_dir_structure`
+  (1724-1765: count, names, node and copy identities); the base's entries in name order (deleted on either side; a
+  file among the three sides, a node kind conflict when the kinds differ; no direct modification; else down into it);
+  then the head's additions. Stated on the index, it visits only the names the rows of (B, head] reach, since a row
+  makes a new node-revision of every directory above it and every other entry is the base's node-revision on both
+  sides. The work's identities come from the index's own builder begun on B (`Index::trial`), so a lazy copy is FSFS's:
+  two works changing different files beneath a directory a branch never changed since its copy conflict at that
+  directory, as in FSFS. Property lists compare by content, as `svn_fs_fs__prop_rep_equal` (`fs_fs.c` 1608-1665) does.
+  (3) Then, as `commit_body` runs `verify_locks` after the merge (`transaction.c` 3797), the lock check: the verdict
+  hands the work's changes to the check the merge task passes, A-602's `LockTable::verdict` over each change's path
+  and action for the commit's principal and presented tokens; its refusal is the verdict's (`E160034`, `E160037`,
+  `E160039`) and its entries (the locks the accepted commit releases) the verdict's accepted answer. The verdict is
+  generic in that answer, so a test can pass a check that answers nothing.
+- **Refusals,** typed (`CommitRefusal`), each with its Subversion error: out of date `E160028` (a file's, a
+  directory's or no node's words); a revision past the transaction's base `E160006`; a conflict `E160024`, naming the
+  check that found it (`ConflictKind`: properties changed, structure changed, deleted twice, deleted against a change,
+  kind changed, file changed, no direct modification, added twice); the lock check's refusal; and a work its base
+  cannot hold, the index's own refusal.
+- **Tests** (`crates/svn/src/commit/tests.rs`). One case a rule, each citing the line it holds the rule to: the worked
+  example's commits beside a later change; a file both changed, even alike; a directory's properties changed by the
+  head, the root's too; a property change against an added entry but not an entry changed in place; a double delete
+  and a delete against a change both ways; a node kind conflict; a replaced directory, even replaced alike; the lazy
+  copy beneath a branch, and the same changes on trunk committing; an addition on both sides, even alike; the first
+  conflict in `merge()`'s order (a base entry before an addition named earlier; a directory whole before `/trunk/d-x`,
+  which byte order puts first); the lock table's check refusing by each of its three errors, and accepting with the
+  presented locks released; a conflicting work never asking the check; the out-of-date test against the index's
+  created revision (Carol and Eve); a work its base cannot hold. The oracle: the index tests' generated histories, a
+  work on a base mostly near the head and after the root's last property change (some of the next revision's own
+  changes made again, then its own), up to six locks mostly on files the work's changes reach, the committer's or
+  another's, their tokens presented or not, the commit anonymous in a quarter of the cases; answered by the verdict
+  with the lock table's real check, and by `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock`,
+  `svn_fs_fs__allow_locked_operation`, `svn_path_compare_paths` and `svn_fspath__skip_ancestor` transcribed over the
+  naive filesystem's whole trees; equal on every case, with a census that must show every conflict kind, each lock
+  refusal, a lock met beneath every changed path and a changed path skipped. The case count, 4,096, is derived from
+  the census's rarest rule.
+- **Evidence** (the Mac Studio d1323898, kiln, debug builds of fresh clones). Failing first (04:01 UTC, load 3.2):
+  with `verdict` accepting whatever the index can build and `check_out_of_date` passing every command, `cargo test
+  --locked -p slates-svn --lib` failed 13 of the then 16 commit tests, the three passing being the commits beside a
+  later change, the index's refusals and a path-order case, since removed with the module's own lock reader (below,
+  "Rejected"). The first green run (03:57
+  UTC) overflowed the oracle's stack: its naive entries of `/` listed `/` itself under the empty name, so the
+  transcribed `merge()` went down into the root forever (fixed in the oracle; the rule's walk drops empty names). The
+  next (04:01 UTC) was equal on all 256 cases but met no double delete, a change of the root's properties answering 112
+  of them first, so the generator draws bases near the head and after that change, repeats changes, and places locks
+  where checks meet them. With the lock check asked before the merge (04:18 UTC, load 10.1), 2 failed: the
+  conflicting work asked the check once, and the oracle met a work that deletes `/a` and replaces `/b` by a copy, answered
+  at a lock beneath `/b` where FSFS answers its conflict. Green (04:18 UTC): 89 of 89 in 1.03 s, 15 of them the commit
+  rule's; the census over 4,096 cases: 1,733 commits (1,576 on the head); conflicts: properties changed 742, structure
+  changed 391, deleted twice 74, deleted against a change 200, kind changed 99, file changed 49, no direct modification
+  171, added twice 268; lock refusals `E160034` 120, `E160037` 85, `E160039` 164, 77 at a lock beneath every changed
+  path; 402 changed paths skipped. `cargo fmt` clean. Clippy, `xtask check` and the cross-target lint are main's (the
+  run-request queue).
+- **Found, owed to A-602.** `LockTable::verdict` verifies the locks a commit meets in the byte order of their paths;
+  FSFS checks the changed paths in `svn_path_compare_paths` order. A commit refused by locks at both `/t/a/b` and
+  `/t/a-b` is answered at `/t/a-b` where `svnserve` answers `/t/a/b`. The generated histories name paths of one-letter
+  names, where the two orders agree, so the oracle cannot see it; GAPS records it.
+- **Rejected.** Computing the work's identities in the commit module: a second copy of `get_copy_inheritance` and
+  `make_path_mutable` beside the index's, free to drift; the index's builder begun on the base is the one place they
+  live. Comparing whole trees, as the oracle does: a commit would cost its repository's size. A lock reader of the
+  commit module's own (built first, before A-602 landed: each changed path read in Subversion's order through a
+  per-path predicate): a second check beside the lock table's, which also holds expiry and release.
+- **Not here.** The drive (piece 7): asking the out-of-date test, and the lock check FSFS also makes at each editor
+  call (`fs-wrap.c` 151-152 begins a commit's transaction with `SVN_FS_TXN_CHECK_LOCKS`; `tree.c` checks at 1614, 2497,
+  2554 and 2645), as each command arrives, over a transaction built a command at a time; the drive's other checks. The
+  merged version's identities and mergeinfo counts (FSFS's `update_ancestry` and mergeinfo increment) are the index's
+  at the version's append (A-553), not the verdict's.

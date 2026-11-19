@@ -159,8 +159,19 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
-> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index and its lock table built
-> (2026-11-18, A-500, A-531, A-553 and A-602, D-28; UI goals 91 and 92; g292, g250).** A-602 (2026-11-19, g250): the
+> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index, its lock table and its
+> commit rule built (2026-11-18, A-500, A-531, A-553, A-602 and A-592, D-28; UI goals 91 and 92; g292, g250, g268).**
+> A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s `commit`: the drive's out-of-date test, and the verdict
+> (FSFS's `merge()` stated on the index, over the work's transaction as the index's own builder makes it on its base,
+> then the lock table's check); its oracle FSFS's `merge()` and `verify_locks` transcribed over the index tests' naive
+> filesystem, equal to the verdict with the lock table's real check on 4,096 generated histories a run; `cargo test -p
+> slates-svn --lib` on the Mac Studio (see A-592). Owed from it: the drive asking the out-of-date test, and the lock
+> check FSFS also makes at each editor call, as each command arrives, over a transaction built a command at a time
+> (piece 7). Found by it, owed to A-602's lock check: `LockTable::verdict` verifies the locks a commit meets in the byte
+> order of their paths, where FSFS checks the changed paths in `svn_path_compare_paths` order (a path's children
+> before its later siblings, `transaction.c` 3537-3539), so a commit refused by locks at both `/t/a/b` and `/t/a-b` is
+> answered at `/t/a-b` where `svnserve` answers `/t/a/b`; the verdict's refusal is the lock check's, so it follows when
+> that order does. A-602 (2026-11-19, g250): the
 > lock table, the guards of `lock` (with stealing) and `unlock` (with breaking), and the verdict's lock check (with
 > release or keep), each returning the register entries it decided, applied unconditionally; its oracle FSFS's lock
 > rules transcribed, equal on generated histories; `cargo test -p slates-svn --lib` 74 of 74 on the Mac Studio (see
@@ -184,8 +195,8 @@
 > (2026-11-19): Copy's maps, every map of a green's state copying a path's tree by reference on A-534's radix tree,
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
-> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the commit
-> rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server (with the
+> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
+> administration verbs (`svnadmin`, the dump round trip); the ra_svn server (with the
 > lock verbs); mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's:
 > the Python suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4
 > item 13. No speed is claimed until measured.

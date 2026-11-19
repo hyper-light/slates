@@ -379,9 +379,19 @@ fn the_lock_tables_check_answers_for_a_work_the_merge_accepts() {
     add_dir("/c"),
     add_file("/c/d", 2),
   ]]);
-  let changes = || vec![edit("/a/b", 5), row("/c", Action::Delete, NodeKind::Directory)];
+  let changes = || {
+    vec![
+      edit("/a/b", 5),
+      row("/c", Action::Delete, NodeKind::Directory),
+    ]
+  };
   let others = table_of(&[lock_on("/a/b", OTHER, 1)]);
-  let refused = judged_with_locks(&index, 1, changes(), (&others, &commit_by(Some(COMMITTER), &[])));
+  let refused = judged_with_locks(
+    &index,
+    1,
+    changes(),
+    (&others, &commit_by(Some(COMMITTER), &[])),
+  );
   assert_eq!(
     refused,
     Err(CommitRefusal::Locked(LockRefusal::OwnerMismatch {
@@ -391,7 +401,12 @@ fn the_lock_tables_check_answers_for_a_work_the_merge_accepts() {
   );
   assert_eq!(refused.unwrap_err().subversion_code(), 160_039);
   let mine = table_of(&[lock_on("/c/d", COMMITTER, 2)]);
-  let refused = judged_with_locks(&index, 1, changes(), (&mine, &commit_by(Some(COMMITTER), &[])));
+  let refused = judged_with_locks(
+    &index,
+    1,
+    changes(),
+    (&mine, &commit_by(Some(COMMITTER), &[])),
+  );
   assert_eq!(
     refused,
     Err(CommitRefusal::Locked(LockRefusal::TokenNotPresented {
@@ -432,10 +447,15 @@ fn a_conflict_answers_before_the_lock_check_is_asked() {
     vec![edit("/a/b", 8)],
   ]);
   let mut asked = 0_usize;
-  let answer = verdict(&index, 1, &work(vec![edit("/a/b", 5)]), |_| -> Result<(), LockRefusal> {
-    asked += 1;
-    Ok(())
-  });
+  let answer = verdict(
+    &index,
+    1,
+    &work(vec![edit("/a/b", 5)]),
+    |_| -> Result<(), LockRefusal> {
+      asked += 1;
+      Ok(())
+    },
+  );
   assert_eq!(answer, conflict_at("/a/b", ConflictKind::FileChanged));
   assert_eq!(asked, 0);
 }
@@ -895,8 +915,11 @@ impl Census {
 }
 
 /// The cases the oracle runs unless `PROPTEST_CASES` asks for another count (`slates_test_seeds::cases`).
-/// Derived: PENDING.
-const CASES: u32 = 4096;
+/// Derived: the census asserts that every rule it compares was met, and proptest draws a new seed every run, so the
+/// count must make the rarest rule's absence a broken rule rather than chance. Measured on the Mac Studio (kiln,
+/// 2026-11-19 04:18 UTC, this count): the rarest, a file both sides changed, 49 times in 4,096 cases (a double delete
+/// 74, a lock met beneath every changed path 77), so a run expects it about 49 times and misses it with probability
+/// about e^-49; the whole crate's suite ran in 1.03 s.
 
 /// How many of the last revisions a near base is drawn from. A work on an old base meets every revision since, and a
 /// change of the root's properties among them refuses it at the root before any other check (the first census, at
@@ -1034,12 +1057,19 @@ fn placed(changes: &[ChangedPath], path: &str, mark: u8) -> bool {
 /// The case's lock table and commit: each lock on one of the head's files (only a file is locked, §4.17.4 item 7) that
 /// its mark places, held by the committer or another principal, its token presented or not, the last lock on a path
 /// standing; the commit's principal, unless the case has none.
-fn locks_of(fs: &NaiveFs, head: &Tree, changes: &[ChangedPath], case: &Case) -> (LockTable, CommitLocks) {
+fn locks_of(
+  fs: &NaiveFs,
+  head: &Tree,
+  changes: &[ChangedPath],
+  case: &Case,
+) -> (LockTable, CommitLocks) {
   let mut chosen: BTreeMap<String, (Lock, bool)> = BTreeMap::new();
   for (number, (place, mark)) in case.locks.iter().enumerate() {
     let candidates: Vec<&String> = head
       .iter()
-      .filter(|(path, node)| fs.nodes[**node].kind == NodeKind::File && placed(changes, path, *mark))
+      .filter(|(path, node)| {
+        fs.nodes[**node].kind == NodeKind::File && placed(changes, path, *mark)
+      })
       .map(|(path, _)| path)
       .collect();
     let Some(path) = candidates.get(usize::from(*place) % candidates.len().max(1)) else {
