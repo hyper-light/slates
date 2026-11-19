@@ -464,6 +464,7 @@ mod tests {
   /// times the delay was still fresh.
   #[test]
   fn a_chokepoint_silent_past_the_live_failover_delay_is_reported_absent() {
+    use slates_vfs::clock::Clock;
     let window = crate::daemon::LIVENESS_BUDGET_NS;
     let reply = crate::daemon::audit_on_shard(move |s| {
       s.failover_ns = 2 * window;
@@ -476,9 +477,9 @@ mod tests {
           now.checked_sub(4 * window).unwrap(),
         )
         .end(1, now.checked_sub(3 * window).unwrap());
-      emit(s, span);
+      super::emit(s, span);
       let partition = s.partition;
-      drain_verb(s, partition)
+      super::drain_verb(s, partition)
     });
     let ReplyBody::Telemetry { report } = reply else {
       panic!("the drain answers a report: {reply:?}");
