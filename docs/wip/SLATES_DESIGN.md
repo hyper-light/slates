@@ -11367,6 +11367,15 @@ checkpoint is the green's state at its reachable floor, and a base below it is r
 names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
 holds (the record names the floor), so no replica keeps more history than its owner (A-385).
 
+> **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
+> order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
+> for a range that is not a point. A point (an insert's empty range) is not passed by an operation starting at it, which
+> lies after it without shifting it, so the walk goes on and meets an insert at the point that canonical order puts
+> behind an overwrite or a truncate there (`crate::map::lies_past`). Until A-668 it stopped at that overwrite or
+> truncate, and a work's insert landed after one that overwrote or truncated and inserted at its point was accepted
+> ahead of both, while the other order conflicted: two inserts at one point, which D-27 makes a conflict in both orders
+> (`docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`).
+
 **The verdict, two pure passes.** Inputs: the mapped increment, the effect ranges of the
 intervening deltas, and the referenced immutable content. Pass one: a sweep line over the
 increment's ranges and the intervening effect ranges per path, O((n+m) log(n+m)); disjoint
@@ -12281,8 +12290,12 @@ is one more version, and the chain itself is never rewritten.
 > logarithmic along runs and linear only in the merges a question must open. Path history is one since A-666 part 2
 > (`derived/history.rs`): each version's value names its map and a history tree of each path's node, kept from the
 > first parent the path is TREESAME to, so `log <path>` and `--follow` (past recorded renames and copies) read one node
-> a version they list, git's default mode exactly. Owed: A-553's and A-588's stores as types, blame, and the server's
-> use (A-647's and A-666's entries).
+> a version they list, git's default mode exactly. Blame is one since A-666 part 3 (`derived/blame.rs`): each version's
+> value keeps each file's blame (runs of lines, each naming its introducing version, the file's path there and its first
+> line there), kept from the first parent whose file holds the same content and otherwise made from the parents' blames
+> and one diff with each, so a question reads the path's trie nodes and the file's spans, never a diff of the history;
+> a line both parents of a merge changed is attributed by the merge's recorded content (D-27). Owed: A-553's and
+> A-588's stores as types, and the server's use (A-647's and A-666's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -12830,6 +12843,15 @@ engine: the verdict, rebase, position mapping, the register).
 > as `git verify-pack` checks one, counted (Windows x86_64, jupiter: 15 of 15, the crate 462 of 462; macOS owed).
 > Owed: part 2, the view presented to the hook driver on the owner shard (after A-662); main's run of stock git over
 > the view.
+>
+> **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
+> answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
+> capabilities and this server's agent. Each request is answered whole and statelessly: the shallow-update first,
+> then the acknowledgments have by have, as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed`
+> (with `no-done`) and neither, then the pack on side-band-64k, side-band or bare. Proven against stock git 2.50.1's
+> stateless answers and its one-round sessions. Those goldens found A-615's object choice missing git's rule for a
+> thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
+> session, an SSH client's, is owed.
 >
 > **Status (2026-11-19, A-644 part 2: protected branches through the policy, end to end).** `crates/server`
 > (`git_protect`) composes them: a ref's change read from A-614's store gives the right it needs (a create or a
@@ -14584,6 +14606,19 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
 > revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
 > a dangling link told apart; no core dumps; the Windows driver.
+>
+> **Status (2026-11-19, A-661 part 1: the hook glue).** `crates/server`'s `svn_hooks` is what every Subversion call
+> point runs its hooks through. `run` finds the hook the repository's policy configures at the input's point, runs it
+> with the driver over the caller's view, and answers what `svnserve` tells the client (`svn_told`), the run's lesson
+> for the hook's times, and pre-lock's token. `verdict` is what the commit drive resumes with: `Ok`, the refusal's
+> chain, or nothing once the client left, so the change does not go on. A point with no hook answers as `svnserve` does,
+> running nothing. The call points, agreed through main on 2026-11-19: the drive pauses for start-commit at `open-root`,
+> after its revision check, and for pre-commit at `close-edit`, before the verdict (`Step::Hook`, `Drive::resume`; g268,
+> A-655); the `svn://` task runs those, and post-commit after its append, whose words are `commit-info`'s
+> `post-commit-err` (g234, A-656); the lock hooks wrap A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK
+> and UNLOCK, DAV's wiring A-661's next part once g298's serving lands. Tested on Linux x86_64 (adacachy, 2026-11-19):
+> the server's lib tests 630 passed beside main's 624, the glue's five new and nothing failing that main's tree passed;
+> each of its four choices broken in a copy failed only its own tests. The macOS run is owed.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -44325,7 +44360,11 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     constant-time on histories of merges (Pǎtraşcu 2011), so each costs a search logarithmic along runs and a step for
     each merge it must open. A-666 part 2: a path's history, `log <path>` and `--follow`, from a type naming each path's
     node (Mononoke's unodes) under git's default-mode rule exactly, renames and copies as the works recorded them; a
-    question reads one node a version it lists. Owed: blame; the server's verbs over the types.)
+    question reads one node a version it lists. A-666 part 3: blame, each line's introducing version, the file's path
+    there and the line's number there, from a type keeping each file's blame, made from the parents' blames and one
+    diff with each (Myers' linear-space diff), never a diff of the history; a line both parents of a merge changed is
+    attributed by the merge's recorded content (D-27); a question reads the path's trie nodes and the file's spans.
+    Owed: the server's verbs over the types.)
   - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
     request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
     above it (with goal 91's federation).
@@ -44556,6 +44595,124 @@ items 1 to 4, "Pieces (git)" piece 7). Sources, read 2026-11-19 at git v2.50.1: 
 Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload`, new:
 `mod.rs`, `advertise.rs`, `refs.rs`, `fetch.rs`, `answer.rs` and `tests/`; `store/graph.rs`, `StoreGraph::new` made
 infallible through `ObjectId::null` and `head` added, with `tests/store_graph.rs`; the `mod` line in `lib.rs`).
+
+**Part 3: protocol v0 and v1 behind the same entry point** (`crates/git/src/upload/v0.rs`; §4.17.2 "Pieces (git)"
+piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack.c` (`send_ref`,
+`format_symref_info`, `upload_pack`, `receive_needs`, `get_common_commits`, `got_oid`, `do_got_oid`, `ok_to_give_up`,
+`send_unshallow`, `create_pack_file`, `send_client_data`), `sideband.c` (`send_sideband`), `pkt-line.h`
+(`DEFAULT_PACKET_MAX`), `builtin/pack-objects.c` (`--objects-edge-aggressive` under `--thin` and `--shallow`) and
+`revision.c` (`mark_edges_uninteresting`) [C]; `gitprotocol-pack` and `gitprotocol-capabilities` [B].
+
+- **The advertisement**, as `send_ref` writes it. Under v1, `version 1` comes first. Then `HEAD` where its branch has
+  a commit, then each ref in name order, an annotated tag's peeled line after it; a repository with no ref sends
+  `capabilities^{}`. The capabilities, in git's order: `multi_ack thin-pack side-band side-band-64k ofs-delta shallow
+  deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want
+  allow-reachable-sha1-in-want no-done`, then `symref=HEAD:<branch>` where the branch has a commit, `filter`,
+  `object-format` and `agent`. The two `allow-*` say that a want need not be a tip, which holds: as under v2, any held
+  object may be wanted.
+- **A request**, read whole and answered statelessly, as each `POST` of git's smart HTTP is:
+  - the wants, any of them carrying capabilities, as git reads them on any;
+  - `shallow`, `deepen`, `deepen-since`, `deepen-not`, `filter`, then a flush;
+  - the haves, ended by `done` or a flush, the request's end read as a flush.
+  A capability the server did not advertise is refused, by the document's words, where git 2.50.1 passes it. So is a
+  line out of its place, or bytes after the request's end.
+- **The answer** follows `upload_pack`. A request that deepens gets the shallow-update first (`receive_needs`), from
+  the negotiation's cut alone (`negotiation::shallow_update`). Then the acknowledgments, have by have, as
+  `get_common_commits` writes them:
+  - `ACK <id> common`, `continue` or plain;
+  - `ready` or `continue` for a lacked have once ready;
+  - at `done`, `ACK <last>` or `NAK`; at a flush, `ACK <last> ready`, `NAK`, and under `no-done` the closing `ACK`.
+  Ready is A-615's, asked of the held haves so far (`negotiation::ready`) only when one was added since it was last
+  asked, each asking kept within the request's room. git's `have_obj` count is kept as `do_got_oid` keeps it: a commit
+  counts unless an earlier held commit named it as a parent or it was named already, which decides git's plain
+  `ACK`s. The pack is A-615's for the wants and every have. It is framed on side-band-64k, on side-band (1000-byte
+  packets, so 995 bytes of the pack each) or bare, with a flush after it on either band, through the answer's framing
+  shared with v2.
+- **A-615's object rule, corrected** (`negotiation/objects.rs`, its oracle with it; the bug note
+  `docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`). Serving git's own `--deepen` fetch
+  (a thin pack; the client shallow at the tip, which it sent as a have) sent that tip's blobs again; git had left them
+  out. git's stateless `deepen 2` without `thin-pack` had sent them. The rule that holds both is `pack-objects`':
+  under `--thin` with `--shallow` it walks with `--objects-edge-aggressive`, and `mark_edges_uninteresting` leaves out
+  the tree of every uninteresting commit on its command line. That means each have `do_got_oid` lists, and each commit
+  `send_unshallow` adds to `extra_edge_obj`. Without a thin pack only the edges are left out. The negotiation's request
+  now carries `thin`, and the oracle states the same rule and draws `thin` as well.
+- **v0's ref names** (main's ask, after A-615's finding): an advertised ref is `HEAD`, `receive-pack`'s `.have`, or a
+  name `refname::is_valid` takes, read and written. It was any word. The word check stays first, so a bad byte is
+  still placed exactly.
+- **The pack from A-639's stream** (`upload/fragments.rs`, after A-639 landed). `Fragments` is the service's pack
+  source over `store::Upload`. The plan is copied as A-639's `Answered`: runs, single objects, the filter for the
+  runs, `thin-pack` and `ofs-delta`, each list charged first. A call hands out what the last turn wrote, at most the
+  room it is asked for, and takes one turn of the stream on the owner's clock, exchange and quantum only once all of it
+  is handed out. A turn may write nothing yet, as the stream counts the pack before its header.
+- **One call a step, packets framed full** (`upload/answer.rs`). The answer calls its source at most once a step,
+  asking for what the packet it is filling still has room for, and frames the packet once it is full or the pack has
+  ended; data that leaves it short waits in it for the next step's call. So a step does at most one turn of the
+  stream's work (§4.3's step budget), the packets are the same full ones whatever the caller's room and however the
+  turns divide the work, and a call that wrote nothing only ends its step. The earlier "stalled" refusal is gone: a
+  source's contract is to bring the pack nearer its end each call, which A-639's turns do, each doing at least one unit
+  of a finite stream. A source that refuses mid-pack still has the data it wrote before refusing sent first, the
+  packet being filled framed short, then git's band-3 words, as part 2 holds it and as git sends what `pack-objects`
+  wrote before it failed. The framed buffer now holds a whole packet and after it the longer of the flush and git's
+  71-byte band-3 packet (65,591 bytes, charged with the packet's data); it held the packet alone, so a pack whose last
+  data filled its packet grew the buffer past its charge.
+- **Stateless only.** Over SSH a v0 client speaks in rounds on one stream and the server keeps what each round taught
+  it; that is owed. git's client speaks v2 over SSH since 2.26, and v2 is stateless by design.
+- **Tests** (`src/upload/tests/v0.rs`, 8; the v0 repository rebuilt from the pack git sent its clone):
+  - the advertisement at v0 and v1 against git's;
+  - git's six stateless answers (`multi_ack`, `multi_ack_detailed` ending `done` and reaching `ready`, neither, an
+    `unshallow`, a want never advertised), packet for packet, packs as object sets;
+  - git's nine one-round sessions (clone and fetch at v0 and v1; depth, a deepening, `deepen-since`, `deepen-not`,
+    `filter blob:none`), every packet after the advertisement;
+  - side-band's 1000-byte packets (a 3,000-byte pack in packets of 995, 995, 995 and 15 bytes), and a bare pack;
+  - `no-done`;
+  - a lacked have keeping a flush from `ready`;
+  - refusals: a capability not advertised, SHA-256, a have before the flush, bytes after `done`, no flush;
+  - every cut and every bit flip of git's `detailed-done` request.
+  In A-604's tests, a test of the ref-name rule; its generator now draws valid names.
+  With A-639 (`src/upload/tests/fragments.rs`): git's five v2 fetches answered from A-639's packs, read back through
+  A-608's reader, every packet but the pack's data git's and the objects git's; and turns of one tick in steps of one
+  byte, the answer the same and steps that wrote nothing met; and A-639's stream handing out one byte a call, the
+  answer the same. A source that pauses every other call answers whole (`refused.rs`), and no step calls its source
+  twice (`steps.rs`).
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 424 of 424 (2 of main's ignored),
+  `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first, the first run failed 3:
+  - A-604's property test, drawing ref names as words;
+  - A-604's writer test, which placed a bad byte exactly;
+  - git's deepen-v0 session, which found the object rule above.
+  An edge kept always then failed git's `unshallow`, which held the rule to thin packs. Red nine ways, one guard at a
+  time:
+  - v0's answer stubbed: 7 tests failed;
+  - parents never marked: git's stateless golden;
+  - `NAK` always: git's stateless golden;
+  - `ready` despite a lacked have: its test;
+  - side-band sized as side-band-64k: its test;
+  - any capability taken: its test;
+  - the aggressive rule never applied: A-615's oracle and git's `deepen-v0`;
+  - the aggressive rule always applied: A-615's oracle and git's `unshallow`;
+  - any ref name taken: both of A-604's tests.
+  The join with A-639 was checked on Windows x86_64 (jupiter), the Studio being offline: `cargo test --locked -p
+  slates-git --lib`, 2026-11-19, 460 passed, 0 failed, 3 ignored (kiln r1447; main's baseline at 018d32ba2 is 447 and
+  3), and `cargo fmt --check` clean with rustfmt 1.98.1's one layout taken. Its first run (r1361, the join as first
+  written) failed 2 of 458, the pausing source and the turns of one tick: each call's bytes went out as a packet of
+  their own, and a step called its source again while it had room. The first fix (r1425) failed 1 of 460, part 2's
+  pack refused midway, whose last 20 bytes waited in the packet being filled and were cleared at the refusal. Red four
+  ways, one guard at a time:
+  - a step calling its source again while it has room: 3 tests failed;
+  - a packet framed after every call, full or not: 2;
+  - a turn's bytes not yet handed out dropped once the stream has ended: 1;
+  - a refused source's data dropped: 1.
+  The macOS run is owed (filed in main's run requests).
+- **Next** (A-640's parts): `sparse:oid` (part 4); a stateful v0 session over SSH; `packfile-uris` and `bundle-uri`
+  from the store's URI packs and bundle list; progress on band 2; the walk in cooperative slices.
+
+Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), the bug note
+`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`, `crates/git` (`upload/v0.rs`,
+new, with `upload/tests/v0.rs`; `upload/mod.rs`, v0 and v1 dispatched and their refusals; `upload/answer.rs`, the
+pack's framing, one source call a step and packets framed full; `upload/fragments.rs`, new, with
+`upload/tests/fragments.rs`, the pack from A-639's stream; `upload/advertise.rs`, `upload/refs.rs` and
+`upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`, `ready`, `shallow_update` and `Request::thin`;
+`negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`, the ref-name rule, with its tests;
+`tests/store_graph.rs`; `upload/tests/refused.rs` and `upload/tests/steps.rs`).
 
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
@@ -47476,6 +47633,189 @@ base text) and its tests.
 - **Tests.** `big.txt` from r5 to r6 (one line of 6,000 changed): its windows copy from the base, carry under a
   hundredth of the text as new data, and make the text `close-file` names; red with every window new data. The 29
   recorded drives still match, each delta by what it makes.
+
+### A-668 — Two inserts at one point conflict in both orders: the walk through a delta goes on past an operation starting at a point (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "Position mapping" and "The verdict"; D-27; found by A-659)
+
+- **What was wrong.** Two works insert at one point, each based before the other, and one also overwrites the bytes
+  from that point or truncates from it. Canonical order puts the overwrite or the truncate before the insert at one
+  offset (`OpsDoc::canonicalize`), and the walk through a delta (`crate::map::map_through_one`) stopped at the first
+  operation starting at or after a range's end. A point's end is its start, so the walk stopped at the overwrite or the
+  truncate and never met the insert behind it: the work landed second was accepted ahead of both, while in the other
+  order the two inserts met and conflicted. A-659 found it: its restatement takes the verdict's walk for both sides of
+  every pair of operations, and here the two sides disagreed.
+- **The decision** (main's, from D-27): a conflict in both orders. Accepting one insert ahead of the other chooses an
+  order, which is an inferred merge.
+- **The change.** `crate::map::lies_past(at, range)`: an operation lies past a range when it starts after the range's
+  end, or at its end for a range that is not a point. `map_through_one` stops only there, so a point walks on past an
+  overwrite or a truncate starting at it, which lie after it without shifting it, and meets an insert behind them. A
+  non-empty range is walked as before. Every reader of the walk takes it: the verdict's content, a rename's edits
+  (A-547), a rebase, pass two's point, a review comment's lines (never a point, so unchanged), and A-659's restatement,
+  whose moved walk counts an operation starting at a point as after it (`Meets::Beside`).
+- **Tests.** `crates/merge/src/map/tests.rs`: the point meets an insert behind an overwrite and behind a truncate at
+  it, and one in front of an overwrite; an overwrite alone, or one with an insert past it, leaves the point where it
+  was; at the verdict, an insert against an overwrite-then-insert and against a truncate-then-insert at one point, each
+  landed first in turn, conflict in all four. A-659's stack oracle generates the shape (an overwrite or a truncate, then
+  an insert, at one offset), which it had avoided, and now requires a work between that a replica refuses to land alone
+  over the stack's works below it, so a pair judged in one order only fails the oracle rather than passing as an order
+  the verdict depends on.
+- **Evidence** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the macOS run owed). Red (r1445, 04:13 PST) at
+  1ce46ee9a with `map.rs` and `stack/moved.rs` restored to f238bff73's, before the fix, in the scratch clone:
+  `cargo test -p slates-merge --lib -- map:: stack::oracle`, 3 of 4 failing: the map test (the point `Shifted` to 4
+  where it must meet the insert), the verdict's both orders, and the stack oracle, which met the pair by itself (the
+  green refused a bottom where every work between landed over it); the tree oracle passed. Green (r1448, 04:41 PST) at
+  1ce46ee9a: `cargo test -p slates-merge --lib -- --nocapture`, 166 of 166 in 36.3 s; `cargo fmt -p slates-merge --
+  --check` clean. The stack oracle's census: stacks through depths one to four 664, 405, 230 and 97 times; uppers moved
+  38, unmoved 694; uppers refused 147, bottoms 300; works between 1,266; collapsed 0. The tree oracle's: applied 178,
+  refused 142.
+- **The merged tree** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the macOS run owed). At 92038d5aa, A-668 over
+  main e3234e618 (A-669's and A-670's nodes handed on to links; a verdict that makes no file until it accepts):
+  `cargo test --locked -p slates-merge --lib -- --show-output` (r81, 17:12 to 17:32 UTC) ran 180 tests, main's 178 and
+  A-668's 2, and passed 179 in 35.58 s, A-668's two among them; `cargo fmt -p slates-merge -- --check` clean. The one
+  failure was A-626's copy oracle (`engine::copy_tests::every_copy_reads_as_its_model_over_every_history`): every
+  history agreed with its model, but its census, which requires every kind of copy met, met no nested pair whose inner
+  copy replaced a tree (0 of 30 nested pairs). A-668 cannot move it: that oracle bases every work at the head, so its
+  verdicts map through no delta and never reach the walk A-668 changed, and a seed decides the same there with or
+  without A-668. The kind is rare since A-626 part 2 (2 of 31 and 2 of 46 nested pairs in its recorded runs), so by a
+  Poisson estimate one run in three to five meets none (filed for its owner). Run alone again (r131, 18:09 UTC) it
+  passed, meeting 3 of 37. The stack oracle's census: stacks through depths one to four 646, 393, 236 and 103 times;
+  uppers moved 42, unmoved 690; uppers refused 128, bottoms 263; works between 1,073; collapsed 0. The tree oracle's:
+  applied 173, refused 133. Main's commits to f607f424c touch nothing slates-merge builds from.
+- **Applied in the same change to:** §4.16 "Position mapping" (the status); GAPS (A-668's entry beside A-612's, and
+  A-659's paragraph); `crates/merge/src/map.rs`, `map/tests.rs` (new), `engine/stack/moved.rs`,
+  `engine/stack/oracle.rs`; `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md` (new).
+
+### A-666 part 3 — Blame as derived data: each line's introducing version, its path and its line there, answered from each version's value; made from the parents' blames and one diff with each, never a diff of the history; a line both parents of a merge changed attributed by the merge's recorded content (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Queries by API", part 3; A-647; §4.17.1 "Reads")
+
+- **Why.** A-645: "Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+  client." Part 1 answered ancestry and part 2 a path's history; this part answers blame, the last of the four.
+- **The question** (`research/path-history.md` §6). `git blame` "Annotates each line in the given file with
+  information from the revision which last modified the line" \[C: git `git-blame.adoc` 20-21\]; Mercurial's linelog
+  emits for each line "the revision that introduced them and the line number in the file at the introducing revision"
+  \[C: Mercurial 7.2.4 `mercurial/linelog.py` 14-19\]. The type answers each line's introducing version, the file's path
+  there and the line's number there (from zero; git's output counts from one), as runs of lines (`Span`). git finds
+  whole-file renames by detection (`git-blame.adoc` 26-27, 67-69); the type follows the renames and copies the works
+  declared (part 2's `PathSources`), never one inferred.
+- **The value** (`crates/vcs/src/derived/blame.rs`, `Blame`, the type `slates-vcs blame 1` with the window its trees
+  split by): a version's blame tree, a path map whose files are each file's blame, a derived node naming the file's
+  content and an object of its spans (each span its lines and its origin, then its version's name and its path, each
+  after its length), its payload a tag and two counts (its lines, its spans' bytes). A file keeps the blame of the
+  first parent whose file at its path has the same content, as path history keeps a node, so a file no change reaches
+  keeps its first parent's blame by path copying.
+- **The rule.** A file the version's change sets otherwise is diffed once against each parent's file at its path, in
+  parent order, then against its recorded source (a rename's or a copy's; a copy from an older version read through
+  the inputs path history names, `DerivedType::inputs`); each line takes the attribution of the first candidate whose
+  diff keeps it, and a line none keeps is the version's own. Mononoke's BlameV2 is made the same way, from the
+  parent's blame and the hunks of one diff \[C: `mononoke_types/src/blame_v2.rs` 514-565\], and at a merge each line
+  from "the first one that does *not* match the merge changeset" (1605-1640). Mercurial's linelog is one weave a file
+  patched in place along a main branch "ignoring p2" \[C: `hgext/fastannotate/__init__.py` 23-26\]; A-647's values are
+  immutable, one a version, over histories of merges.
+- **A merge** (D-27). A line both parents changed is attributed by the merge's own recorded content: it takes the first
+  parent whose text the merge recorded there, else it is the merge's own. No merge of the parents is computed or
+  inferred; the diff only says which recorded lines are shared and makes no content.
+- **The diff** (`matched`): Myers' O(ND) algorithm in linear space \[A: E. W. Myers, "An O(ND) Difference Algorithm
+  and Its Variations", Algorithmica 1(2):251-266, 1986, §4b\]: the common prefix and suffix taken, the middle snake
+  found by searching from both ends at once as diff-match-patch's `diff_bisect` does \[C: `diff_match_patch.py`
+  254-354\], each side solved again, so the lines kept are a longest common subsequence. Each distinct line is numbered
+  once, so the diff compares numbers; the lines, their attributions and the search's arrays are charged to the store
+  and refused past its budget.
+- **The costs.** A derivation reads each file its change sets and its candidates' versions of that file, never an
+  ancestor's, never another file's (`BlameCounters::lines_read`, held to the replay's). The question (`blame`) reads
+  the trie nodes on the path, the file's blame node and its spans' bytes, by its code no more: never the content, never
+  the history. It reports both (`BlameCost`); no test holds the report yet (owed).
+- **Typed refusals** (`BlameRefused`): `NoVersion`, `Inputs`, `BadSource`, `Malformed` (a blame's bytes, or spans that
+  do not cover its lines), `Exhausted`, and the path map's and the store's own (a file's content not held among them).
+  A refused derivation leaves the store as it was.
+- **Tests** (`crates/vcs/src/derived/blame/tests.rs`; `cargo test -p slates-vcs --lib`, Windows x86_64, jupiter,
+  2026-11-19, kiln run r87: a fresh clone of each pushed branch, each made after the build before it, in one target
+  directory, and every build's log showing slates-vcs compiled again; the Mac Studio was offline, so the macOS run is
+  owed).
+  - Red first (db61572b3, branch `agents/g302-a666p3-red`, not for main: 160b47ebb's stubs, the derivation, the
+    question and the diff refusing at once, with the two tests added at 78dfa5ad5): 66 passed and 9 failed, every new
+    test but the hostile-bytes readers', which call no stub; the 66 are part 2's 65 and that one. Built in 15 min 51 s;
+    the tests ran 255.83 s.
+  - Green at ee6868011 (d7acb9700 the type; 78dfa5ad5 two tests a review found missing, a line both parents of a merge
+    hold, each way round, and forged values; ee6868011 its citations read again, comments only): 75 of 75, part 2's
+    65 and the ten new, the tests 213.05 s, built in 3 min 22 s with slates-vcs compiled from the green's own clone;
+    `cargo fmt -p slates-vcs -- --check` clean.
+  - The oracle (`t_a666_p3_every_blame_equals_a_replay_of_the_history`, 32 cases): histories grown from up to 63
+    generated steps each (at most 127 versions) over files of few distinct lines (lines inserted, removed and replaced,
+    a last newline dropped and restored, files made and removed, renames some edited as they move, copies from the
+    first parent and from up to four first-parent steps before it, merges of two and three keeping, taking or
+    resolving each file, criss-cross merges, unrelated roots), every version's blame derived eagerly and again lazily
+    from the newest down, and every file of every version blamed. Every blame is the one a replay of the whole
+    history computes by the rule, file by file from the roots; every line's attribution names a line of the same text
+    where it says it was introduced; the derivations judged exactly the files the changes set and read the lines the
+    replay read (the non-vacuity counts); the lazy values are the eager ones, identity for identity; and the store is
+    empty after. The replay shares the module's diff (`matched`): which of several longest common subsequences a diff
+    keeps decides a tie, and that choice is the diff's, held apart to the dynamic program (below). Its census: 818
+    versions, 215 merges, 49 versions renaming and 28 copying from an older version; 861 files judged, 153 keeping a
+    parent's blame whole and 708 blames made, 74 of them over two candidates or more; 2,299 blames asked, 6,963 lines,
+    at most 12 in a file; 103 lines a merge resolved itself, 175 kept through a later parent and 259 through a recorded
+    source.
+  - Beside it: the diff's pairs over 512 generated pairs of up to 60 lines drawn from two to five distinct lines (many
+    ties): strictly increasing, naming equal lines, and as many as the dynamic program's longest common subsequence.
+    D-27 three ways: from a, b, c, one side changing a and b and the other b and c, merges recording the first side's
+    b, the second side's and a b in neither give b to the first side, the second side and the merge itself, while a
+    keeps the first side and c the second. A line both parents' diffs keep, the parents merged each way round: the
+    first parent's each time. A rename edited as it moves keeps the versions and the path (`f`) that introduced its
+    lines, the added line the rename's; a copy from an older version keeps the lines as they stood there, none of the
+    later change. A file of 2,000 lines edited a line a version 300 times: the tip's blame gives each line the last
+    version that replaced it, else the first, and the derivations read 1,202,000 lines (2,000, then the file and its
+    parent's version each time), never the history. The format's bytes written by hand (a one-line file: the span's
+    object named by BLAKE3's hash, the blame and the tree's leaf by its key derivation). Hostile span bytes refused
+    five ways and a field cut short, and blame nodes three ways (a foreign tag, three names, a payload cut short).
+    Refusals by kind, the store as it was: `BadSource`, `Inputs`, a content not held, `OverBudget`, and a question of
+    a root that is no tree. Forged values refused `Malformed` four ways: a tree's file of another class, a file naming
+    the bare content, spans a byte longer than their object, and a parent's blame counting one line of two.
+  - Thirteen mutations wait on branch `agents/g302-a666p3-mutants` (not for main; each the green at 78dfa5ad5 with one
+    change to `blame.rs`: every unchanged file blamed again, the last parent's diff winning, a later parent's file of
+    the same content not kept whole, and ten guards against malformed values each removed). Under CLAUDE.md §8 they
+    are main's to run, filed in the run-request queue with the test each should fail.
+  - Main's: the macOS run, clippy, `xtask check` and the doc gate (the run-request queue).
+- **Owed.** The server's verbs over the type (each repository's values on its owner shard, A-662); a diff larger than
+  a slice cut into slices, as A-647's derivations larger than a slice are owed; a blame's spans shared between versions
+  by identity where an edit leaves them (one object a file version today, as Mononoke's); the question's reported cost
+  (`BlameCost`) held by the oracle; git's porcelain fields beyond the three (the previous version and path a line had,
+  `-L` ranges), from the same values.
+- **Applied in the same change to:** `crates/vcs/src/derived/blame.rs` and `derived/blame/tests.rs` (new);
+  `crates/vcs/src/derived.rs` (the module's docs, its owed line); `crates/vcs/src/derived/history.rs` (`inputs_of`
+  shared with blame); `docs/wip/research/path-history.md` (§6, new; §1's sources); A-645's entry ("Queries by API");
+  §4.17.1 "Reads"' status; GAPS' A-645 line.
+
+### A-661 part 1 — Subversion's hook glue: the hook a point's record configures, run by the driver, answered in svnserve's words, and the call points agreed (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-648, with A-655 and A-656)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17 entry); `crates/server` (`svn_hooks.rs` and its
+tests, new; `lib.rs`).
+
+- **The glue.** `svn_hooks::run(site, input, bound, client_gone)` takes the input a caller built for its point (the
+  builders of A-623, the environment the record gives, A-648), finds the hook the repository's policy configures at
+  that point (Subversion keeps one a point), and runs it with the driver over the caller's view, held to the hook's
+  learned bound and ended with the client. It answers `SvnHookRan`: what `svnserve` tells its client (`svn_told`), the
+  run's lesson for the hook's times, which the caller keeps, and pre-lock's token (`svn_lock_token`). A point with no
+  hook answers at once as `svnserve` does: nothing, but pre-revprop-change's `E165006`.
+- **The verdict.** `SvnHookRan::verdict` is what an admission point's caller resumes with: `Ok` to go on, the
+  refusal's chain (each error's number and message, outermost first), or nothing once the client left, so that no
+  change goes on for a client that is gone. An observing point's failure is no refusal.
+- **The call points**, agreed through main and relayed to each owner: the commit drive pauses for start-commit at
+  `open-root`, after its revision check and with the transaction named, and for pre-commit at `close-edit`, before the
+  verdict (`Step::Hook`, `Due::{StartCommit, PreCommit}`, `Drive::resume`; g268, A-655); the `svn://` connection task
+  runs those, and post-commit after its append, whose words are `commit-info`'s `post-commit-err` (g234, A-656); the
+  lock hooks run around A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK and UNLOCK, pre-lock per path
+  with its token the lock's, post-lock once with the paths locked.
+- **Tests** Linux x86_64 (adacachy), 2026-11-19, in capped `systemd-run --user` units (MemoryMax 24G, CPUWeight 1, Nice
+  19, nvme1n1 I/O at 150M and 400M). One clone, main's compiled tree first (main 4644dcec3's `lib.rs`, `svn_hooks`
+  removed): `cargo test --locked -p slates-server --lib -- --test-threads=4` 624 passed, 2 failed, 3 ignored, the
+  failures A-660's status capture and `hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind` (the
+  peer read WouldBlock, `hangup.rs:554`; it passed in the next run). Then A-661 at 2dc5e209e, the code landed here: 630
+  passed, 1 failed (A-660's), 3 ignored, the five new tests among the passes, `slates-server` recompiled; `cargo fmt -p
+  slates-server -- --check` clean. Red (`cargo test --locked -p slates-server --lib svn_hooks::`, green 5 of 5 first),
+  each choice broken in a copy and rebuilt: `verdict` without its client-left check failed
+  `a_runs_answer_is_svnserves_words_its_lesson_and_pre_locks_token` alone; a point with no hook answering nothing failed
+  `a_point_with_no_hook_answers_as_svnserve_does_without_running_anything` alone; the point match inverted failed the
+  lookup test and both end-to-end tests; the token dropped failed the run's answer test and the pre-lock one. Main's
+  commits since 4644dcec3 touch nothing under `crates/server`, `crates/db` or `crates/rt`, so these runs stand for the
+  merged tree. The macOS run is owed.
+- **Owed.** DAV's LOCK and UNLOCK wired through the glue (A-661's next part, once g298's DAV serving lands); the hook
+  times' table that keeps each hook's learned bound (A-622's list).
 
 ### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
 Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's
