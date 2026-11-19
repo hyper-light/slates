@@ -33,7 +33,9 @@
 //!   and still counted, since the slices done stored bytes. The next fill of the range clears it first. Unmarked and
 //!   uncounted instead, as before, its stored pages outlived the refusal, and where the file had since become a hole or
 //!   zeros a later fill skipped them, so a guest's map showed the old bytes
-//!   (`docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`).
+//!   (`docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`). A backing taken
+//!   back from a dead daemon's object clears each range not filled before its first fill (A-526): that daemon's range
+//!   table names only the ranges it answered, not one it was filling when it died.
 //! - The fill done, the answer is a new descriptor of the backing's object (on Windows, a section handle of the ask's
 //!   access, which the transport duplicates into the VMM's process). Every ask of the node is answered with the same
 //!   object, so every range of the file stays coherent however the device maps them.
@@ -619,9 +621,10 @@ impl DaxBackingSession {
           .prepare_range(pending.next)
           .map_err(|_| Refused::Object)?;
         // A range an earlier fill began and did not finish may hold bytes the file no longer has, and this fill skips
-        // the volume's holes and pages of zeros: it is cleared first, so it reads as a range never filled (A-419).
-        // Refused, it stays uncleared and counted, and the next ask clears it again.
-        if target.uncleared().contains(&pending.next) {
+        // the volume's holes and pages of zeros: it is cleared first, so it reads as a range never filled (A-419). So is
+        // a range a dead daemon's object holds that its range table did not name (A-526). Refused, it stays owed, and
+        // the next ask clears it again.
+        if target.owes_clear(pending.next) {
           target
             .object_mut()
             .zero(
@@ -1670,5 +1673,72 @@ mod tests {
     let state = bridge.dax_state().unwrap();
     session.release_all(state.backings);
     assert_eq!(charged(&mut bridge), 0, "let go, nothing is counted");
+  }
+
+  /// A-526 (A-365's adoption; A-419's sibling): a backing taken back from a dead daemon's object fills a range its
+  /// range table does not name from the volume as it is, whatever that daemon's fill left there. The table names a range
+  /// only once its ask is answered, so the range a daemon was filling when it died, or one whose fill it had refused, is
+  /// not named, and its object may hold that fill's bytes. Do: make an object and store `A` over a range's first slice,
+  /// as a fill does before its daemon dies; take it back into the store with no range named, as a successor does; write
+  /// zeros over the file's bytes there through the bridge; ask the range through the session that took the backing
+  /// back, and fill it whole. Expect the object to read zeros there, as the file does. Before, the fill skipped the
+  /// volume's pages of zeros, and the dead daemon's bytes stayed for the guest's map.
+  #[test]
+  fn a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again() {
+    let (mut store, mut volume) = store_and_volume();
+    let cx = context(volume_id());
+    let node = {
+      let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+      let root = bridge.root(&cx).unwrap();
+      let (file, _) = bridge
+        .create(ObjectId::new(root, 0), &cx, "f", 0o644, 0)
+        .unwrap();
+      bridge
+        .write(ObjectId::new(file.ino, 0), &cx, 0, &[BYTE; WRITTEN])
+        .unwrap();
+      file.ino
+    };
+    let mut object =
+      DaxObject::create(most_views(&store.shards_backings), DaxLayout::Identity).unwrap();
+    object.store(0, &[BYTE; SLICE as usize]).unwrap();
+    let handle = store
+      .shards_backings
+      .adopt_vmm(
+        object,
+        (volume.prefix(), InodeNo(node)),
+        (0, 0),
+        (Default::default(), Default::default()),
+        filled_charge(DaxLayout::Identity, []),
+      )
+      .unwrap();
+    assert!(
+      store.shards_backings.wake(handle),
+      "the backing takes changes again"
+    );
+    let mut session = DaxBackingSession::new();
+    assert!(
+      session.adopt(node, handle),
+      "the session takes the backing back"
+    );
+    assert!(
+      object_bytes(&mut store, &session, node, (0, WRITTEN))[..SLICE as usize]
+        .iter()
+        .all(|byte| *byte == BYTE),
+      "the object holds the dead daemon's fill"
+    );
+    {
+      let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+      bridge
+        .write(ObjectId::new(node, 0), &cx, 0, &[0; WRITTEN])
+        .unwrap();
+      ask_range(&mut session, &mut bridge, &cx, node, 0);
+      fill_whole(&mut session, &mut bridge, &cx);
+    }
+    assert!(
+      object_bytes(&mut store, &session, node, (0, WRITTEN))
+        .iter()
+        .all(|byte| *byte == 0),
+      "the object shows the file's zeros, not the bytes the dead daemon's fill left"
+    );
   }
 }

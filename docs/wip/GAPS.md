@@ -42,6 +42,21 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
+> **§4.17.4 the Subversion server: designed, its svndiff codec built (2026-11-18, A-500, D-28; UI goal 91; g292).**
+> Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
+> head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
+> property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
+> properties and locks as register entries, reads by history lists, the change index and extent-list deltas, ra_svn
+> without zlib, `svn+ssh` through slates' `svnserve -t`, HTTPv2 then DeltaV, hooks with slates' `svnlook`, Subversion's
+> authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
+> 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
+> `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
+> Owed, in order: the ra_svn item codec; node-exclusive operations and `Copy` in the engine; the Subversion index; the
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
+> suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
+> No speed is claimed until measured.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
@@ -848,7 +863,12 @@
 > the volume saved while unchanged since the cut or a clone of the cut's snapshot, else `[1, why]` with nothing changed.
 > Found with it: a clone keeps no orphan record for a nameless file it carries from its snapshot, so nothing reclaims
 > it until the clone is destroyed (any clone of a snapshot taken while a file was held with no name). A SAVE's snapshot
-> is published on the owner shard, not yet waited for at a live-shipped volume's candidates (§4.10).
+> was published on the owner shard and not waited for at a live-shipped volume's candidates (§4.10). **Built since
+> (A-516, 2026-11-19):** a SAVE of a live-shipped volume answers its tables only once the volume's log is durable where
+> the save's publication put it, as a guest's `FSYNC` on the stream waits (A-200), and is refused with its reason when
+> it is not within the liveness budget (`shards.save_held`, `shards.save_refused`); a volume shipped nowhere is
+> answered at once. Proven by the server's lib test over a real stream; Shards' own run of a save and a restore over a
+> live-shipped share is owed with its `shards restore` below. Still open of A-303's: the clone's orphan record above.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
@@ -1237,7 +1257,12 @@
 > --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
 > create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
 > (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
-> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> Center account (a slates-signed driver). **A-498 (2026-11-18, g258):** the harness stated the three lines on any WinFsp
+> drive, so it failed exactly a patched drive, whose clones link as NTFS's do. It now asks the drive: one file of the
+> mount's workload root is given a second name before the workloads run, and the lines are stated only where that is
+> refused (`HardLinks`, `mount_links`). On the patched driver git's history and Mercurial are held to every count NTFS
+> prints; on WinFsp as released the record notes the refusal and states the lines as before. Owed (main's): that run on
+> the test-signing VM, where Mercurial's hard-linked clone and store must come out identical. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
@@ -18939,9 +18964,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows` and
   `a_part_way_fill_stays_counted_until_its_range_is_filled_again`; red without the fix 3 of 3 (the first slice still
   read `A` after the file was zeroed; one range counted where two held bytes), green with it, on the Mac Studio.
-  - **Open, the siblings it found (each from reading, each owed a failing test):** a successor's adopted DAX object
-    (A-365) may hold a fill's bytes in a range its range table does not name (a range the dead daemon was filling, or
-    one that failed there), which the successor's next fill skips as before A-419; and on Windows a range is committed
+  - **Fixed 2026-11-18 (A-526, goal 85, g079): a successor's adopted DAX object (A-365) could hold a fill's bytes in a
+    range its range table does not name** (a range the dead daemon was filling, or one that failed there), which the
+    successor's next fill skipped as before A-419. A backing taken back from a dead daemon now clears each range not
+    filled before its first fill (`ShardsBacking::owes_clear`); held by
+    `a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again` (bridge-core's unit tests), red
+    without the fix on the Mac Studio. Record:
+    `docs/bugs/2026-11-18-a-range-a-dead-daemons-dax-fill-left-part-way-showed-its-bytes-to-the-successors-guest.md`.
+    **Left:** those bytes are counted by nothing until the range is filled or the backing goes (at most the ranges the
+    dead daemon's fills had begun and not finished).
+  - **Open, the other sibling (from reading, owed a failing test, a Windows one):** on Windows a range is committed
     before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
