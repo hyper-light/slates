@@ -299,7 +299,8 @@ where
 fn served_by<S, M, C, R>(seats: usize, make: M, client: C) -> (R, Seen)
 where
   S: SshSite + 'static,
-  M: FnMut() -> S + 'static,
+  S::Keys: Send + 'static,
+  M: Fn() -> S + Clone + Send + 'static,
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
