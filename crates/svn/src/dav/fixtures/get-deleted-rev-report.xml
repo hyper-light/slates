@@ -1,0 +1,1 @@
+<S:get-deleted-rev-report xmlns:S="svn:" xmlns:D="DAV:"><S:path>trunk/gone</S:path><S:peg-revision>5</S:peg-revision><S:end-revision>3</S:end-revision></S:get-deleted-rev-report>
