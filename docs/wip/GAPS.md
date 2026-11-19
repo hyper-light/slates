@@ -53,6 +53,18 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-582 part 3 (2026-11-19, g258; piece 2's rest):** `slates-git` reads and writes a pack entry's header (`entry`):
+> the type and the size, which git reads to 60 bits; an OFS_DELTA's offset, refused at zero and wherever it would put
+> the base before the pack's first entry; a REF_DELTA's base as an `ObjectId`; the size charged to the admission once
+> the header is whole. It reads, applies and writes git's delta (`delta`): sizes, copies and inserts, every refusal of
+> git's `patch_delta` a typed kind, the target checked whole, then charged, then made with no allocation that can
+> panic. Golden vectors: every entry of the offset-delta and reference-delta packs stock git 2.50.1 wrote reads as
+> `verify-pack -v` lists it and writes back to git's bytes; the two deltas they carry, inflated once by
+> `make-delta-fixtures.sh` and tied to both packs by their zlib Adler-32, each make the object git named along git's
+> chain (A-600's `name_of`). `cargo test -p slates-git --lib`: 44 of 44 on the Mac Studio, red five ways. Piece 2 is
+> whole. Owed in A-582's next parts (others'): protocol v2's messages; idx v2 and the pack header (A-591); the pack
+> stream with a deflate engine chosen by measurement (§4.17.2 piece 3). clippy and the cross-target lint over the
+> change are main's (run request).
 > **A-591 (2026-11-19, g293; the pack index and a pack's header and trailer):** `slates-git` reads a pack's header as a
 > stream delivers it and checks a whole pack's trailer before what it guards; it writes a pack's header and trailer as
 > the bytes pass. It decodes the index, version 2, in place once its own checksum holds, refusing by kind a fanout that

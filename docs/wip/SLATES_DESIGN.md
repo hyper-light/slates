@@ -11925,6 +11925,17 @@ engine: the verdict, rebase, position mapping, the register).
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
 >
+> **Status (2026-11-19, A-582 part 3: piece 2 built whole, with a pack entry's header and git's delta).** `crates/git`
+> reads and writes a pack entry's header (`entry`): the type and the size, which git reads to 60 bits; an OFS_DELTA's
+> offset back to its base, refused at zero and wherever it would put the base before the pack's first entry; and a
+> REF_DELTA's base name in the pack's object format. The size is charged to the caller's admission once the header is
+> whole. It reads, writes and applies git's delta (`delta`): the source's and the target's sizes, then copy and insert
+> instructions. Each is refused by kind where git refuses it: a copy outside the source, a source of another size, the
+> reserved byte zero, an instruction cut short, a target made too long or too short. The whole delta is checked before
+> its target is charged and made. Proven on the offset-delta and reference-delta packs stock git 2.50.1 wrote: every
+> entry's header reads as `git verify-pack -v` lists it and writes back to git's bytes, and each delta, applied to its
+> base, makes the object git named.
+>
 > **Status (2026-11-19, A-591: the pack index and a pack's header and trailer built).** `crates/git` (`pack`,
 > `pack::idx`) reads a pack's header as a stream delivers it: `PACK` is refused at its first wrong byte, versions 2 and
 > 3 are read, and the count follows. It checks a whole pack's trailer before any byte it guards, and writes a pack's
@@ -39000,6 +39011,79 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
 
 Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
 `.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
+
+**Part 3: a pack entry's header and git's delta, with an applier (2026-11-19, g258, UI goal 92; §4.17.2 "Pieces (git)"
+piece 2's rest, after A-600).**
+
+- **A pack entry's header** (`entry`). Sources: `gitformat-pack` (v2.50.1) lines 51-93 and 235-262 [B]; git's
+  `unpack_object_header_buffer` and `get_delta_base` (`packfile.c`), `unpack_raw_entry` (`builtin/index-pack.c`),
+  `encode_in_pack_object_header` (`pack-write.c`) and the offset writer of `builtin/pack-objects.c` [C]. `read` reads
+  one header from the bytes a pack stream has delivered, given where the entry begins, `None` until its last byte; it
+  charges the size to the caller's admission once the header is whole. `write` writes one as `pack-objects` does, each
+  number in the fewest bytes, and `written_len` measures it. A REF_DELTA's base is A-600's `ObjectId` in the pack's
+  format, and the four object types' numbers are A-600's. Each refusal is typed and names the entry's place:
+  - type 0 or 5, from the first byte;
+  - a size past 60 bits, refused before the byte that would pass it. `packfile.c` reads no group past shift 57, while
+    index-pack's own loop has no such check and shifts past the word. The stricter rule is kept: no pack git writes
+    breaks it, since a size past 60 bits is an object of an exbibyte;
+  - an offset past 64 bits;
+  - an offset of zero (`BaseNotBefore`), and one that puts the base inside the pack's 12-byte header or before the pack
+    (`BaseBeforePack`). git refuses a base at or before byte zero, and would find no entry inside the header.
+- **git's delta** (`delta`). Sources: `gitformat-pack` lines 95-175 [B]; `patch_delta` (`patch-delta.c`), `delta.h` and
+  `create_delta` (`diff-delta.c`) [C]. `sizes` and `Instructions` (each instruction with its place) read a delta.
+  `apply` checks the whole delta against the source, charges the target's size to the admission, then makes it in
+  memory reserved once (`try_reserve_exact`, so no allocation can panic); `apply_to` makes it into any `Out` and writes
+  nothing for a refused delta. `write_sizes`, `write_copy` and `write_insert` write as `create_delta` does. Each refusal
+  is typed, the first rule broken in the delta's order:
+  - under git's four bytes (`TooShort`);
+  - a size or an instruction cut short (`Truncated`). git's `get_delta_hdr_size` stops a size at the delta's end even
+    when its last byte says another follows; the document ends a size only at a byte whose top bit is clear;
+  - a size past 64 bits (`SizeTooLong`). git dies on a group that loses bits and leaves a group at a shift of 64 or more
+    undefined; here any such group is refused, zero or not;
+  - the reserved byte zero (`Reserved`), a source of another size (`SourceSize`), a copy outside the source
+    (`CopyOutsideSource`), and a target made too long (`PastTarget`) or too short (`ShortOfTarget`).
+
+  A copy whose size bytes say zero copies 0x10000 bytes. No bound is a literal: the input, the source, the target's
+  declared size and the caller's admission bound everything.
+- **Golden vectors.** The packs A-582 part 1 captured: `ofs.pack` and `ref.pack`, written by stock git 2.50.1's
+  `pack-objects` with offset deltas and with reference deltas, and `git verify-pack -v`'s listing of each. Both carry
+  the same two deltas: `671f3c00` from `adab45a6`, and `41debd46` from `671f3c00`, a chain of two. The crate has no
+  inflater until piece 3, so `make-delta-fixtures.sh` inflated the two deltas once, with Python 3.9.6's zlib 1.2.12, on
+  the Mac Studio on 2026-11-19; their SHA-256s were matched byte for byte where they were committed. The tests trust
+  neither the script nor its files: each delta's Adler-32 must equal the trailer its zlib stream ends with in both packs
+  (RFC 1950 §2.2). The three versions of the file `text` are rebuilt by `make-fixtures.sh`'s own recipe and named
+  through A-600's `name_of`.
+- **Tests** (`cargo test -p slates-git --lib`, 22 new). For the entry header:
+  - every entry of both packs, read at its listed offset, has the listed type and size and its base by offset or by
+    id, writes back to git's bytes, and its compressed data begins on a zlib header;
+  - every cut is not yet whole and charges nothing; every bit flip is read within its bytes or refused by kind at the
+    entry's place;
+  - an offset delta read as if it began at each place from 0 to 600 is refused until its base would reach byte 12;
+  - the 60-bit and 64-bit edges; types 0 and 5 from one byte; the admission; the writer's refusals; and a round-trip
+    property.
+
+  For the delta:
+  - each captured delta is tied to both packs by its Adler-32 and has its base's and its object's sizes;
+  - applied along git's chain, each makes the file git named, charged exactly its size;
+  - each reads as the instructions git chose, decoded by hand (`671f3c00` is three copies; `41debd46` is a copy, the
+    insert `100` and two copies), and writes back to git's bytes;
+  - every cut and every bit flip is refused by kind with nothing written, or applied whole;
+  - each rule is a refusal of its own kind; a zero size copies 0x10000; the admission; the writers at each operand
+    byte's edge; a model oracle (any copies and inserts over any source); and any bytes after a true source size.
+- **Checks.** On the Mac Studio (kiln, debug, 2026-11-19). The first run (load 2.0) passed 42 of 43. The failure was
+  the test's own: its reserved-byte delta was three bytes long, so it was refused `TooShort` before the byte was read.
+  With that fixed, the second run (load 2.9 to 7.5) passed 44 of 44, and `cargo fmt --check` was clean. Red five ways:
+  - the 60-bit bound removed: a size past it read as not yet whole, where `SizeTooLong` was due;
+  - the pack-header bound removed: the delta read at place 576 named base 0, where `BaseBeforePack` was due;
+  - the reserved byte read as an empty insert: `ShortOfTarget`, where `Reserved` was due;
+  - the target not charged: `hello world` made under an admission of 10 bytes, where `PastAdmission` was due;
+  - one byte of a captured delta changed: its Adler-32 896992619 against the pack's 897058156.
+- **Owed** (A-582's next parts, others'): protocol v2's messages; idx v2 and the pack header (A-591); the pack stream
+  with a deflate engine chosen by measurement (§4.17.2 piece 3), which reads these headers and applies these deltas.
+
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`entry.rs` and `delta.rs`, new;
+their tests and `tests/pack_fixtures.rs`; `lib.rs`'s module lines); `crates/git/fixtures` (`make-delta-fixtures.sh` and
+`deltas/`, new); `.gitattributes` (the deltas, binary).
 
 ### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
 Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
