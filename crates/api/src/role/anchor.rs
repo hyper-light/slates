@@ -381,6 +381,21 @@ fn stop_gracefully(
   }
 }
 
+/// Publishes `bound`, the age past which this anchor takes its daemon's beat for lapsed, in the supervision block
+/// (`slates_anchor::layout::SUP_LAPSE_BOUND`, A-574) when it differs from the one `published` last: the daemon reads it as
+/// its anchor's part of its failover detection (a stuck daemon is found by its own watchdog and killed once its withheld
+/// beat is this old), so a laptop's failover delay follows what this anchor measures of its own lateness. A block that
+/// cannot be read now is written at a later turn.
+fn publish_lapse_bound(supervisor: &Supervisor, bound: u64, published: &mut Option<u64>) {
+  if *published == Some(bound) {
+    return;
+  }
+  if let Ok(supervision) = supervisor.segment().supervision() {
+    supervision.record_lapse_bound(bound);
+    *published = Some(bound);
+  }
+}
+
 /// Derived: the window this anchor judges a daemon's process by (A-461): the liveness window raised to the scheduling
 /// delay this anchor measures of its own waits, its lateness p99 over its last timed waits (`lateness`), and never past
 /// the watchdog's ceiling: the rule the daemon's watchdog judges its shards by (A-455,
@@ -720,6 +735,8 @@ fn observe(
   let mut said_recovered = None;
   // Its starter asked it to stop if no daemon ever serves (A-366, `StartSpec::until_served`).
   let until_served = crate::start::until_served_asked();
+  // The lapse bound last published in the segment (A-574), so a turn writes only a change.
+  let mut published_bound = None;
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock, &lateness)?;
@@ -727,6 +744,7 @@ fn observe(
     }
     let now = clock.monotonic_ns();
     let bound = lateness.lapse_bound_ns();
+    publish_lapse_bound(supervisor, bound, &mut published_bound);
     // The window a start, and a silent watchdog's process, is judged by at this look (A-461).
     let window = anchor_window_ns(&lateness);
     match supervisor.step(now).map_err(|e| failed("step", e))? {

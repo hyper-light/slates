@@ -981,10 +981,14 @@ fn a_pinned_view_owes_no_content_journal_invalidation() {
   let mut pinned_owed = Vec::new();
   {
     let mut b = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
-    b.invalidations(&current, cursor_current, &mut current_owed)
-      .unwrap();
-    b.invalidations(&pinned, cursor_pinned, &mut pinned_owed)
-      .unwrap();
+    b.invalidations(&current, cursor_current, &mut current_owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
+    b.invalidations(&pinned, cursor_pinned, &mut pinned_owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
   }
   assert!(
     current_owed.iter().any(|inv| matches!(
@@ -1791,7 +1795,11 @@ fn a_scoped_view_never_leaks_an_out_of_scope_cache_invalidation() {
   {
     let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
     let mut scoped = ScopedBridge::new(&mut inner, shared);
-    scoped.invalidations(&cx, cursor, &mut owed).unwrap();
+    scoped
+      .invalidations(&cx, cursor, &mut owed, &mut || {
+        std::ops::ControlFlow::Continue(())
+      })
+      .unwrap();
   }
 
   // Not one invalidation may name an out-of-scope object.

@@ -41,6 +41,7 @@ use crate::region::{
   ClientRegion, PARKED_ASYNC, PARKED_STAMP_SLOT_ONE, PARKED_STAMP_SLOT_ZERO, REPLY_STAMP_CONFIRMED,
   REPLY_STAMP_SLOTS,
 };
+use crate::room::{RoomStep, RoomWait, Roomed};
 use crate::slot::{Slot, SlotKind};
 // The word-based wake serves Linux/macOS; Windows waits on and signals the region's named Event
 // instead (`ClientRegion::wake_wait`/`wake_signal`), so this import is dead there.
@@ -129,6 +130,12 @@ pub struct ClientEnd {
   /// Looks made at the daemon's life by a departure wait (macOS's and Windows' doubling, A-456): a non-vacuity count,
   /// zero on Linux, whose park waits on every departure itself.
   liveness_looks: u64,
+  /// Parks the waits for room on a full command ring took ([`Self::send_when_room`], A-571): a non-vacuity count, zero
+  /// for a wait that found room inside its spin.
+  room_parks: u64,
+  /// Looks at the daemon's life the waits for room made ([`Self::send_when_room`], A-571): on the doubling of the time
+  /// waited, whatever a park's early return adds to the parks.
+  room_looks: u64,
   /// The current departure wait's look schedule (macOS, Windows; A-456; reset as each wait begins).
   #[cfg(any(target_os = "macos", windows))]
   looks: Looks,
@@ -179,6 +186,8 @@ impl ClientEnd {
       wake_samples: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
       liveness_looks: 0,
+      room_parks: 0,
+      room_looks: 0,
       #[cfg(any(target_os = "macos", windows))]
       looks: Looks::default(),
       #[cfg(target_os = "linux")]
@@ -586,8 +595,60 @@ impl ClientEnd {
     self.send(&slot)
   }
 
-  /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
-  /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell for this region's shard
+  /// Writes a request into the command ring by `send`, one try that is refused `RingFull` while the ring is full, and
+  /// while it is full waits for room for as long as the daemon lives (`crate::room`'s rule, A-523, A-571): `Sent` once
+  /// written; `DaemonGone` when a look at the daemon's life found it gone first, nothing written; any other refusal of
+  /// `send` is the caller's at once. One rule for every client end: the SDK's (`slates_client::Client`) and the raw
+  /// clients of the daemon's tests alike.
+  pub fn send_when_room(
+    &mut self,
+    mut send: impl FnMut(&mut ClientEnd) -> Result<(), IpcError>,
+  ) -> Result<Roomed, IpcError> {
+    let started = Instant::now();
+    let mut wait = RoomWait::default();
+    loop {
+      match send(self) {
+        Err(IpcError::RingFull) => {}
+        sent => return sent.map(|()| Roomed::Sent),
+      }
+      if self.wait_for_room(&mut wait, elapsed_ns(started)) {
+        return Ok(Roomed::DaemonGone);
+      }
+    }
+  }
+
+  /// One step of a wait for room `elapsed_ns` into it ([`Self::send_when_room`]): a spin, a park, or a look at the
+  /// daemon's life; `true` when the look found the daemon gone.
+  fn wait_for_room(&mut self, wait: &mut RoomWait, elapsed_ns: u64) -> bool {
+    match wait.next(elapsed_ns, self.wake_estimate_ns()) {
+      RoomStep::Spin => std::hint::spin_loop(),
+      RoomStep::Look => {
+        self.room_looks = self.room_looks.saturating_add(1);
+        if self.daemon_gone() {
+          return true;
+        }
+        wait.looked(elapsed_ns);
+      }
+      RoomStep::Park(pause_ns) => {
+        self.room_parks = self.room_parks.saturating_add(1);
+        std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
+      }
+    }
+    false
+  }
+
+  /// Parks the waits for room on this end took ([`Self::send_when_room`]): a non-vacuity count.
+  pub fn room_parks(&self) -> u64 {
+    self.room_parks
+  }
+
+  /// Looks at the daemon's life the waits for room on this end made ([`Self::send_when_room`]).
+  pub fn room_looks(&self) -> u64 {
+    self.room_looks
+  }
+
+  /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps onto (nothing is dropped: a
+  /// caller waits for room with [`Self::send_when_room`]). Rings the doorbell for this region's shard
   /// when that shard has announced it is going idle — read after the doorbell protocol's fence ([`crate::doorbell`]), so
   /// a shard that missed this request on its re-check is always rung, and only that shard is woken (A-381).
   pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
@@ -1389,6 +1450,7 @@ mod departure {
   use crate::error::IpcError;
   use crate::region::{ClientRegion, RegionGeometry};
   use crate::rendezvous::Liveness;
+  use crate::room::Roomed;
   use crate::slot::Slot;
 
   /// Shape: the reply deadline the client's wait re-armed at before A-456, the anchor's liveness budget
@@ -1790,6 +1852,113 @@ mod departure {
       ended.duration_since(asked)
     );
     assert!(looks >= 1, "the restart was found by a look");
+  }
+
+  /// Shape: how long each raw client of the daemon's tests spun on a full command ring before A-571 (`CREDIT_WAIT`,
+  /// five seconds), whatever became of its daemon.
+  const OLD_CREDIT_WAIT_NS: u64 = 5_000_000_000;
+  /// Shape: how long the room test's daemon leaves its ring full: a fifth of a second, a thousand of the region's spin
+  /// windows, so a wait that parks shows its doubling.
+  const DRAINS_AFTER_NS: u64 = 200_000_000;
+
+  /// Fills `client`'s command ring, the daemon taking nothing: how many requests it wrote.
+  fn fill(client: &mut ClientEnd) -> u64 {
+    let mut written = 0;
+    loop {
+      match client.send(&Slot::inline(written + 1, b"fill").unwrap()) {
+        Ok(()) => written += 1,
+        Err(IpcError::RingFull) => return written,
+        Err(error) => panic!("filling the ring: {error}"),
+      }
+    }
+  }
+
+  /// A-571 (A-523's rule, now every client end's). Do: fill a live daemon's command ring; on its own thread the daemon
+  /// takes one request a fifth of a second later; meanwhile send one more, waiting for room. Expect: the request written
+  /// once the daemon took a slot, never before; the wait parked, where a spinning wait parks never; and its looks at the
+  /// daemon's life on the doubling, no more than the logarithm of the wait over its first look (twice the wake
+  /// estimate) plus two. Before A-571 each raw client of the daemon's tests spun its core on a full ring for up to five
+  /// seconds.
+  #[test]
+  fn a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees() {
+    let _gate = crate::descriptor_test_gate();
+    let instance = unique_name("slates-endpoint-room-daemon");
+    #[cfg(any(target_os = "macos", windows))]
+    let _rendezvous = published(&instance).unwrap();
+    let (life, liveness) = daemon_life(&instance).unwrap();
+    let mut rings = rings("slates-endpoint-room", liveness).unwrap();
+    let open_daemon = rings.daemon_end();
+    let filled = fill(&mut rings.client);
+    let drainer = std::thread::spawn(move || -> Result<(u64, Instant), IpcError> {
+      let mut daemon = open_daemon()?;
+      #[allow(clippy::disallowed_methods)]
+      // the daemon leaves its ring full on purpose: the full ring is what is tested.
+      std::thread::sleep(Duration::from_nanos(DRAINS_AFTER_NS));
+      // Read before the take: the slot frees inside it, so no write can come before this instant.
+      let freeing = Instant::now();
+      let taken = daemon.try_take()?.map_or(0, |request| request.request);
+      Ok((taken, freeing))
+    });
+    let asked = Instant::now();
+    let roomed = rings
+      .client
+      .send_when_room(|end| end.send(&Slot::inline(filled + 1, b"room")?))
+      .unwrap();
+    let written = Instant::now();
+    let (taken, freeing) = drainer.join().unwrap().unwrap();
+    drop(life);
+    let (parks, looks) = (rings.client.room_parks(), rings.client.room_looks());
+    let wake = rings.client.wake_estimate_ns().max(1);
+    let took = written.duration_since(asked);
+    println!(
+      "a full ring a daemon drained after {DRAINS_AFTER_NS} ns: {roomed:?} after {took:?}, {parks} parks, {looks} \
+       looks, wake {wake} ns"
+    );
+    assert_eq!(roomed, Roomed::Sent);
+    assert_eq!(taken, 1, "the daemon took the oldest request");
+    assert!(
+      written >= freeing,
+      "written only once the daemon began to take a slot"
+    );
+    assert!(parks >= 1, "{parks} parks across {took:?}: the wait spun");
+    // The looks come on the doubling of the time waited, so a park the OS ends early adds a park but never a look (the
+    // Mac Studio parked 12 and 18 times across 377.7 and 309.2 ms at load 12 to 38).
+    let took_ns = u64::try_from(took.as_nanos()).unwrap();
+    let bound = u64::from((took_ns / (2 * wake)).max(1).ilog2()) + 2;
+    assert!(
+      (1..=bound).contains(&looks),
+      "{looks} looks across {took:?} from a {wake} ns wake"
+    );
+  }
+
+  /// A-571. Do: fill the command ring of a daemon whose process ended before the wait began, then send one more,
+  /// waiting for room. Expect: `DaemonGone` at the wait's first look, nothing written, well inside the five seconds
+  /// each raw client of the daemon's tests spun on a full ring before A-571 and then failed `RingFull`, its daemon alive
+  /// or gone.
+  #[test]
+  fn a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look() {
+    let _gate = crate::descriptor_test_gate();
+    let instance = unique_name("slates-endpoint-room-gone-daemon");
+    #[cfg(any(target_os = "macos", windows))]
+    let _rendezvous = published(&instance).unwrap();
+    let (life, liveness) = daemon_life(&instance).unwrap();
+    let mut rings = rings("slates-endpoint-room-gone", liveness).unwrap();
+    let filled = fill(&mut rings.client);
+    drop(life);
+    let asked = Instant::now();
+    let roomed = rings
+      .client
+      .send_when_room(|end| end.send(&Slot::inline(filled + 1, b"room")?))
+      .unwrap();
+    let took = asked.elapsed();
+    let looks = rings.client.room_looks();
+    println!("a full ring whose daemon is gone: {roomed:?} after {took:?}, {looks} looks");
+    assert_eq!(roomed, Roomed::DaemonGone, "after {took:?}");
+    assert_eq!(looks, 1, "seen gone at the first look");
+    assert!(
+      took < Duration::from_nanos(OLD_CREDIT_WAIT_NS / 10),
+      "seen gone after {took:?}, not near the old five seconds"
+    );
   }
 }
 

@@ -364,48 +364,61 @@ fn with_export<R>(
     attachments,
     nfs_v4_files,
     snapshot_views,
+    nfs_pending_base,
     ..
   } = s;
   let mut handles = new_handle_store();
-  // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
-  let mut bridge = match snapshot_views.get_mut(&capability.0) {
-    Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
-    None => {
-      let slot = volumes.get_mut(handle).ok()?;
-      VolumeBridge::attached(
-        volume,
-        &mut slot.volume,
-        store,
-        &mut handles,
-        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-      )
+  // The slot's base host is lent through a lens that notes the fetch a host call of this request met pending (A-555):
+  // the bridge answers the refusal on the wire, and the call then parks on that fetch (`serve_local_held`).
+  let mut lens = None;
+  let served = {
+    // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
+    let mut bridge = match snapshot_views.get_mut(&capability.0) {
+      Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
+      None => {
+        let slot = volumes.get_mut(handle).ok()?;
+        lens = slot
+          .host
+          .as_mut()
+          .map(|host| crate::base_wait::Lens::over(host));
+        VolumeBridge::attached(
+          volume,
+          &mut slot.volume,
+          store,
+          &mut handles,
+          lens.as_mut().map(|lens| lens as &mut dyn HostFs),
+        )
+      }
+    };
+    attachments.begin(admitted).ok()?;
+    let mut scoped;
+    let served: &mut dyn slates_bridge_core::Bridge = match scope {
+      Some(scope) => {
+        scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+        &mut scoped
+      }
+      None => &mut bridge,
+    };
+    let mut export = Export::over(served, volume, subject, attachments, admitted);
+    export.set_groups(groups);
+    if stranger {
+      export.set_stranger();
     }
-  };
-  attachments.begin(admitted).ok()?;
-  let mut scoped;
-  let served: &mut dyn slates_bridge_core::Bridge = match scope {
-    Some(scope) => {
-      scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
-      &mut scoped
+    export.set_dialect(dialect);
+    // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
+    // learn whether unstable writes were lost; each is published before its reply (A-358), so none are.
+    export.set_write_verifier(write_verifier);
+    export.set_capability(capability);
+    if let Some(files) = nfs_v4_files.as_mut() {
+      export.lend_file_state(files);
     }
-    None => &mut bridge,
+    let served = f(&mut export);
+    drop(export);
+    attachments.end(admitted);
+    served
   };
-  let mut export = Export::over(served, volume, subject, attachments, admitted);
-  export.set_groups(groups);
-  if stranger {
-    export.set_stranger();
-  }
-  export.set_dialect(dialect);
-  // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
-  // learn whether unstable writes were lost; each is published before its reply (A-358), so none are.
-  export.set_write_verifier(write_verifier);
-  export.set_capability(capability);
-  if let Some(files) = nfs_v4_files.as_mut() {
-    export.lend_file_state(files);
-  }
-  let served = f(&mut export);
-  drop(export);
-  attachments.end(admitted);
+  let met = lens.as_ref().and_then(crate::base_wait::Lens::met);
+  *nfs_pending_base = met.map(|fetch| (volume, fetch)).or(*nfs_pending_base);
   Some(served)
 }
 
@@ -1040,6 +1053,7 @@ fn serve_local(
   let _ = state::with_state_counted(|s| {
     s.store.recall_gate.act_as(requester.client);
     s.nfs_call = call;
+    s.nfs_pending_base = None;
   });
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
@@ -1260,7 +1274,8 @@ async fn serve_remote(
     origin,
     owner,
     move || async move {
-      let (served, owed) = serve_local(requester, xid, program, procedure, &args, port);
+      let ((served, owed), _) =
+        serve_local_fetched(requester, xid, program, procedure, &args, port).await;
       let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
@@ -1542,6 +1557,61 @@ async fn serve_v3(
   served
 }
 
+/// Serves one call locally ([`serve_local`]) on the volume's owner shard, waiting while what it reads is fetched from an
+/// S3 base (§4.15 "An S3 base", A-555): a call answered `NFS3ERR_JUKEBOX` after a host call of it met a pending fetch
+/// changed nothing, so it waits for that fetch (`crate::base_wait`) and is served again from its start once it lands,
+/// within the failover delay from its first wait, the most a reply is held. A call that cannot wait (the shard's waits
+/// at their bound, the delay passed) is answered the retry it was given. With the answer goes the recall gate's
+/// refusals as they stood just before the run that answered, which a delegation's hold judges by (A-79).
+async fn serve_local_fetched(
+  requester: Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> (
+  ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>),
+  Option<u64>,
+) {
+  let mut until = None;
+  loop {
+    let seen = state::with_state(|s| s.store.recall_gate.refusals());
+    let answered = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let Some(key) = met_pending_base(&answered.0) else {
+      return (answered, seen);
+    };
+    if !waited_for_base(key, &mut until).await {
+      return (answered, seen);
+    }
+  }
+}
+
+/// The fetch a call just served waits for (A-555): the one a host call of it met pending
+/// (`ShardState::nfs_pending_base`, taken here so it never outlives its call), when the call was answered the retry a
+/// pending base's refusal is on this wire (`NFS3ERR_JUKEBOX`). `None` for every other call.
+fn met_pending_base(served: &(AcceptStatus, Vec<u8>)) -> Option<crate::base_wait::Key> {
+  let met = state::with_state(|s| s.nfs_pending_base.take()).flatten()?;
+  (served.0 == AcceptStatus::Success && leading_status(&served.1) == Some(Nfsstat3::Jukebox as u32))
+    .then_some(met)
+}
+
+/// Waits for the fetch `key` names to land, until the call's deadline: `until`, the failover delay from its first wait,
+/// set then. Whether the call runs again.
+async fn waited_for_base(key: crate::base_wait::Key, until: &mut Option<u64>) -> bool {
+  let deadline = match *until {
+    Some(deadline) => deadline,
+    None => {
+      let failover =
+        state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+      let deadline = futures::now_ns().saturating_add(failover);
+      *until = Some(deadline);
+      deadline
+    }
+  };
+  crate::base_wait::wait(key, deadline).await == crate::base_wait::Waited::Landed
+}
+
 /// Counter: NFSv3 calls the recall gate refused that were held for the delegation's return rather than answered
 /// `NFS3ERR_JUKEBOX` (A-79), one per wait.
 const V3_HELD: &str = "nfs.v3.held_for_recall";
@@ -1566,8 +1636,8 @@ async fn serve_local_held(
   let holdable = program == NFS_PROGRAM && matches!(requester.dialect, Dialect::Nfs3 { .. });
   let mut deadline: Option<u64> = None;
   loop {
-    let seen = state::with_state(|s| s.store.recall_gate.refusals());
-    let (served, owed) = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let ((served, owed), seen) =
+      serve_local_fetched(requester.clone(), xid, program, procedure, args, port).await;
     let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.
@@ -2009,9 +2079,50 @@ impl compound::Backend for PurgeBackend {
   }
 }
 
-/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): at the reap loop's cadence,
-/// so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a client. A
-/// table that is not built yet is built when its partition owes purges, as its first compound would build it.
+/// Keeps the deadline of this shard's next purge round (A-570), as each access to the NFSv4 table closes
+/// (`crate::nfs_state::record_clients`): while the table owes a purge, a round a retry window on
+/// (`crate::deadlines::retry_window_ns`), so one an owner could not take goes again then; none once it owes nothing. A
+/// round in flight, a client's own included, settles what its owners took before the deadline comes. Until A-570 the
+/// reap loop's tick sent what was owed once a liveness window, whether anything was owed or not.
+pub(crate) fn note_purges(state: &mut ShardState) {
+  let owes = state
+    .nfs_v4
+    .as_ref()
+    .is_some_and(|server| server.sessions.owes());
+  if !owes {
+    state.nfs_purge_at = None;
+    return;
+  }
+  if state.nfs_purge_at.is_none() {
+    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    let at = now.saturating_add(crate::deadlines::retry_window_ns());
+    state.nfs_purge_at = Some(at);
+    crate::deadlines::noted(state, at);
+  }
+}
+
+/// Owes a purge round at once when the shard's partition starts owing purges a predecessor journaled (A-570): every
+/// purge a restart left owed goes out at the start, not a tick later.
+pub(crate) fn arm_purges_at_start(state: &mut ShardState, now: u64) {
+  if state.db.partition().nfs_purges().next().is_some() {
+    state.nfs_purge_at = Some(now);
+  }
+}
+
+/// Hands a purge round to the shard's reaper (A-570), from the deadline keeper's pass at `nfs_purge_at`: the round
+/// awaits its owners' answers, so the keeper does not run it.
+pub(crate) fn owe_purge_round(state: &mut ShardState) {
+  state.nfs_purge_at = None;
+  state.nfs_purge_owed = true;
+  if let Some(reaper) = state.reaper_task {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): run by the shard's reaper
+/// when the deadline keeper hands it a round (A-570: at a start that owes purges, and a retry window after a round left
+/// any owed), so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a
+/// client. A table that is not built yet is built when its partition owes purges, as its first compound would build it.
 pub(crate) async fn purge_owed_here() {
   let owes = state::with_state(|s| {
     if s.nfs_v4.is_none() && s.db.partition().nfs_purges().next().is_some() {
@@ -3736,5 +3847,91 @@ mod tests {
       "a client silent a whole lease makes room"
     );
     assert!(!table.holds_client(idle.clientid));
+  }
+}
+
+#[cfg(test)]
+mod purge_round_tests {
+  use std::time::{Duration, Instant};
+
+  use slates_bridge_nfs::v4::session::ExchangeId;
+  use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
+  use slates_vfs::clock::Clock;
+
+  use crate::daemon::LIVENESS_BUDGET_NS;
+
+  /// Shape: how long the test lets its daemon run before the purge is owed: past the reap loop's first look a window
+  /// into the start, by half a window, so the loop's next look comes half a window after the refused round.
+  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS / 2 * 3;
+  /// Shape: how long past a window after the refused round the test waits for the next round: half a window.
+  const AGAIN_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
+  /// Shape: the pause between the test's looks.
+  const LOOK_PAUSE_NS: u64 = 1_000_000;
+  /// Shape: the NFSv4 client the test makes and drops: any owner and uid.
+  const OWNER: &[u8] = b"purge-round-test";
+
+  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon past the reap loop's first look, its owners refusing
+  /// every purge (`Daemon::inject_nfs_purge_refusal`'s flag), make and drop an NFSv4 client, so its table owes the
+  /// purge, and run a purge round as a client's call would, refused; then watch for the next round. Expect: the next
+  /// round no sooner than a window after the refused one and within half a window more, at the deadline the table's
+  /// debt set. The reap loop's tick sent what was owed at its looks, half a window after the refused round here.
+  #[test]
+  fn a_refused_purge_goes_again_a_window_after_its_round() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    // The harness waits out the reap loop's first look; the daemon under test runs on.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
+    let refused_at = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.nfs_purges_refused = true;
+      if state.nfs_v4.is_none() {
+        state.nfs_v4 = crate::nfs_state::server(state);
+      }
+      let now = state.clock.monotonic_ns();
+      let server = state.nfs_v4.as_mut().unwrap();
+      let granted = server
+        .sessions
+        .exchange_id(
+          &ExchangeId {
+            verifier: [1; VERIFIER_SIZE],
+            owner: OWNER.to_vec(),
+            principal: 0,
+          },
+          now,
+        )
+        .unwrap();
+      server.sessions.destroy_clientid(granted.clientid).unwrap();
+      assert!(crate::nfs_state::record_clients(state));
+      let round = slates_rt::futures::spawn(super::purge_owed_here()).unwrap();
+      let _ = slates_rt::futures::detach(round);
+    });
+    let refusals = |daemon: &crate::daemon::Daemon| {
+      crate::daemon::observe_first(daemon, |state| {
+        state
+          .refusals
+          .get(super::NFS4_PURGES_REFUSED_INJECTED)
+          .copied()
+          .unwrap_or(0)
+      })
+    };
+    let again = loop {
+      if refusals(&daemon) >= 2 {
+        break Some(refused_at.elapsed());
+      }
+      if refused_at.elapsed() > Duration::from_nanos(LIVENESS_BUDGET_NS + AGAIN_WITHIN_NS) {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    };
+    daemon.stop();
+    let again = again
+      .expect("the refused purge went again within half a window past a window after its round");
+    println!("a refused purge went again {again:?} after its round");
+    assert!(
+      again >= Duration::from_nanos(LIVENESS_BUDGET_NS),
+      "not sent again before a window after the refused round: {again:?}"
+    );
   }
 }

@@ -5104,8 +5104,9 @@ impl Volume {
     child: Child,
   ) -> Result<(), VfsError> {
     // Admit the namespace dimension (§4.2): a whiteout replaced or a fresh name both add one live
-    // entry, so charge one against the allowance before either.
-    if self.live_entries >= self.entry_allowance {
+    // entry, so charge one against the allowance before either. A whiteout placed (only a recovery
+    // rebuilding one places it) is no entry, so it is not charged (A-572).
+    if child != Child::Whiteout && self.live_entries >= self.entry_allowance {
       return Err(VfsError::NoSpace);
     }
     self.dir_place(store, dir, name, child).map(drop)
@@ -5149,12 +5150,17 @@ impl Volume {
     // step refuses before copying, and a completed one has replaced them.
     self.retire_blocks(store, retired)?;
     placed?;
-    self.live_entries = self.live_entries.saturating_add(1);
+    // A whiteout is no live entry (§4.2, as `dir_remove` and `DirNode::live_len` keep it), so only a
+    // name that names a child counts. Before A-572 a recovery that placed a whiteout counted it.
+    if child != Child::Whiteout {
+      self.live_entries = self.live_entries.saturating_add(1);
+    }
     Ok(over_whiteout)
   }
 
   /// Undoes [`Volume::dir_place`] of `name` in `dir`: the whiteout back, or the entry removed. Its path
-  /// was made current by the placement, so it copies nothing.
+  /// was made current by the placement, so it copies nothing. Its one caller undoes a rename's
+  /// placement, which names a child and was counted, so the count goes down by one.
   fn dir_unplace(
     &mut self,
     store: &mut Store,

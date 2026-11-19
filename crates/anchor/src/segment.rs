@@ -12,9 +12,9 @@ use crate::layout::{
   LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD,
   RING_SEQ_BASE, RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES,
   SESSION_SECRET_BYTES, SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER,
-  SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET, SUP_LOG_REFUSALS, SUP_LOOKED, SUP_PID, SUP_RECOVERED,
-  SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING, SUP_SESSION_PRESENT,
-  SUP_SESSION_SECRET, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  SUP_LAPSE_BOUND, SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET, SUP_LOG_REFUSALS, SUP_LOOKED,
+  SUP_PID, SUP_RECOVERED, SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING,
+  SUP_SESSION_PRESENT, SUP_SESSION_SECRET, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -81,6 +81,7 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::one(at.saturating_add(SUP_SERVING), Width::U64))
         .with(WordRun::one(at.saturating_add(SUP_LOOKED), Width::U64))
         .with(WordRun::one(at.saturating_add(SUP_RECOVERED), Width::U64))
+        .with(WordRun::one(at.saturating_add(SUP_LAPSE_BOUND), Width::U64))
         .with(WordRun::one(
           at.saturating_add(SUP_SESSION_PRESENT),
           Width::U64,
@@ -164,6 +165,7 @@ pub struct Supervision<'a> {
   serving: &'a AtomicU64,
   looked: &'a AtomicU64,
   recovered: &'a AtomicU64,
+  lapse_bound: &'a AtomicU64,
 }
 
 impl Supervision<'_> {
@@ -292,6 +294,18 @@ impl Supervision<'_> {
   /// The log lines the anchor could not write over its life, as it last published them (A-213).
   pub fn log_refusals(&self) -> u64 {
     self.log_refusals.load(Ordering::Acquire)
+  }
+
+  /// The anchor publishes the age past which it takes its daemon's beat for lapsed (`layout::SUP_LAPSE_BOUND`, A-574).
+  pub fn record_lapse_bound(&self, bound_ns: u64) {
+    self.lapse_bound.store(bound_ns, Ordering::Release);
+  }
+
+  /// The age past which the anchor takes its daemon's beat for lapsed, as it last published it (A-574); `None` where no
+  /// anchor published one (a daemon run alone, or one under an older anchor).
+  pub fn lapse_bound_ns(&self) -> Option<u64> {
+    std::num::NonZeroU64::new(self.lapse_bound.load(Ordering::Acquire))
+      .map(std::num::NonZeroU64::get)
   }
 
   /// The anchor records an exit.
@@ -619,6 +633,7 @@ impl AnchorSegment {
       serving: self.word_at(spec, SUP_SERVING)?,
       looked: self.word_at(spec, SUP_LOOKED)?,
       recovered: self.word_at(spec, SUP_RECOVERED)?,
+      lapse_bound: self.word_at(spec, SUP_LAPSE_BOUND)?,
     })
   }
 

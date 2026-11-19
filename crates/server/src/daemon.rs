@@ -3050,21 +3050,33 @@ impl Daemon {
 
   /// Test support: the host memory available that this daemon's pressure sampler reads from now on, in
   /// place of the platform's reading (§4.2; admission.md §5.5) — so a test drives the sampler's
-  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard, since the
-  /// sampling shard is the reaper's.
+  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard; each reading is a report to
+  /// the sampler, as the kernel's would be (A-570), and the first replaces the source the baseline was taken from, so
+  /// the baseline is taken again from it.
   pub fn inject_available_memory(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.injected_available = Some(bytes))?;
+      self.observe(Some(shard), move |s| {
+        if s.injected_available.replace(bytes).is_none() {
+          s.pressure_baseline = None;
+        }
+        crate::pressure::ask(s);
+      })?;
     }
     Ok(())
   }
 
   /// Test support: this process's own resident memory as the pressure sampler reads it from now on, in place of the
   /// platform's reading (§4.2): with [`Daemon::inject_available_memory`], a test drives the sampler's split between
-  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is.
+  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is, a
+  /// report to the sampler as that is, and the first replaces the resident baseline's source as that does.
   pub fn inject_resident_memory(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.injected_resident = Some(bytes))?;
+      self.observe(Some(shard), move |s| {
+        if s.injected_resident.replace(bytes).is_none() {
+          s.pressure_resident_baseline = None;
+        }
+        crate::pressure::ask(s);
+      })?;
     }
     Ok(())
   }
@@ -3255,7 +3267,8 @@ impl Daemon {
 
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
-  /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
+  /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at each report of the host's
+  /// memory pressure (A-570, `crate::pressure`); this
   /// drives it directly so a test proves the mechanism without a real low-memory host: a raised hold
   /// refuses a new reservation while an admitted volume's within-entitlement writes still land. The
   /// injected hold is pinned: the sampler leaves those shards' holds alone from then on, so the test is
@@ -3418,9 +3431,10 @@ impl Daemon {
   /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
   /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
   /// a staging buffer), for a test whose subject is that bound's or term's rule. `None` returns to the estimate at the
-  /// control shard's next period, which the fan carries to the others.
+  /// control shard's next beat, which its fan carries to the others (A-574).
   pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
-    // On every shard at once: a laptop runs no coordinator to fan it, and a fleet's fan carries the same value.
+    // On every shard at once, so a wait on any shard reads it before the control shard's next beat fans the same value
+    // (A-574).
     for shard in self.shards.iter().copied() {
       self.observe(Some(shard), move |s| {
         s.injected_failover_ns = ns;
@@ -3827,12 +3841,8 @@ impl Daemon {
     // The window the log writer's drain is judged by (A-552): the widest this daemon's shards are judged by now (A-455),
     // read while they still run. A host that keeps the shards off their CPUs that long keeps the writer's thread off its
     // own as long, so a narrower window would give up a writer that is only starved.
-    let log_window_ns = self
-      .shards
-      .iter()
-      .map(|shard| crate::watchdog::shard_window_ns(shard.0))
-      .max()
-      .unwrap_or_else(|| crate::watchdog::watch_window_ns(0));
+    let shard_ids: Vec<u16> = self.shards.iter().map(|shard| shard.0).collect();
+    let log_window_ns = crate::watchdog::widest_window_ns(&shard_ids);
     // The FUSE mounts end with each shard's serve loop (`EndMounts`), on the shard's own thread as the
     // shutdown cancels it — never as a question queued behind the shard's work, which would answer every
     // question already waiting there instead of terminating it (§4.6; AUD-29-64).
@@ -4448,6 +4458,18 @@ async fn init_shard(
   // The client session secret (`crate::session_key`), published before any shard starts: a client's key is checked
   // on the shard that serves it.
   let session_secret = crate::session_key::secret_of(&segment)?;
+  // The detection this node's anchor gives it, read at boot as the control shard reads it at every beat (A-574,
+  // `fleet::refresh_supervision`): the widest window the watchdog judges this daemon's shards by, then the lapse bound
+  // the anchor publishes. Before any peer's detector judges the node, its failover delay is that and the recovery.
+  let mut failover = slates_cluster::failover::Failover::new();
+  failover.supervise(
+    crate::watchdog::widest_window_ns(config_shards),
+    segment
+      .supervision()
+      .ok()
+      .and_then(|supervision| supervision.lapse_bound_ns()),
+  );
+  let failover_ns = crate::fleet::failover_in_periods(failover.estimate().total_ns());
   // The attachment counter starts past every attachment recovered with the partition — a host mount's
   // survives a restart (AUD-01) — so a fresh mint never meets a kept record's id.
   let next_attachment = verbs::next_attachment_counter(db.partition());
@@ -4493,6 +4515,7 @@ async fn init_shard(
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
     nfs_call: None,
+    nfs_pending_base: None,
     held_nfs_replies: std::collections::BTreeMap::new(),
     held_nfs_replies_changed: false,
     recovered_nfs_replies: std::collections::BTreeMap::new(),
@@ -4601,6 +4624,7 @@ async fn init_shard(
     current_request: None,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
+    base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
@@ -4679,22 +4703,20 @@ async fn init_shard(
     injected_resident: None,
     pressure_resident_baseline: None,
     pressure_sent: vec![(0, 0); config_shards.len()],
+    pressure_task: None,
+    pressure_asked: false,
     stop_watch: None,
     nfs_purges_refused: false,
+    nfs_purge_at: None,
+    nfs_purge_owed: false,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
-    // Supervised by its anchor within the liveness window (A-405): the detection a node has before any peer judges it.
-    failover: slates_cluster::failover::Failover::new().supervised(LIVENESS_BUDGET_NS),
-    failover_ns: crate::fleet::failover_in_periods(
-      slates_cluster::failover::Failover::new()
-        .supervised(LIVENESS_BUDGET_NS)
-        .estimate()
-        .total_ns(),
-    ),
+    failover,
+    failover_ns,
     injected_failover_ns: None,
     attachment_paces: std::collections::BTreeMap::new(),
     council,
@@ -4751,6 +4773,8 @@ async fn init_shard(
   // window into the start, by the deadline keeper (A-265, A-554).
   let started_ns = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   crate::landing::arm_owed_audit_look(&mut state, started_ns);
+  // The NFSv4 purges a predecessor journaled and its owners never took go out at once (A-570).
+  crate::nfs::arm_purges_at_start(&mut state, started_ns);
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
@@ -4808,6 +4832,10 @@ async fn init_shard(
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The pressure hold's sampler (A-570): on the control shard it samples at its start and at each report of the host's
+  // memory pressure; elsewhere it ends at once.
+  let sampler = futures::spawn(crate::pressure::sampler()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(sampler);
   // The NFS mounts this shard learned from its predecessor end their attachments when the kernel lets them go, as a
   // mount bound later does (A-511): the shard's watch of the kernel's unmounts starts once it holds an own mount.
   #[cfg(target_os = "macos")]
@@ -4859,16 +4887,18 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: the pressure hold, NFS purges, base hints
-/// and the idle seal; since A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
+/// The shard's tick for the cold work it still owns, at the liveness cadence: base hints and the idle seal. Since
+/// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
 /// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
-/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`). Dead clients are no longer its: since A-475
-/// each client's watch reports its hang-up and the shard's reaper retires it then (`crate::reap`); nor, since A-522,
-/// A-536 and A-554, are abandoned staging buffers, status captures, lapsed write leases, lapsed CLI attachments, grants
-/// past their term and the owed audit's resend, which the shard's keeper takes at their own deadlines
-/// (`crate::deadlines`), nor destroys, which the serve loop steps once woken and the keeper retries at a refused
-/// record's deadline. The jobs left here leave a piece at a time for the events or deadlines that own them, and then
-/// the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the budget.
+/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
+/// own reports (`crate::pressure`), and the NFSv4 purges owed are sent by the reaper at their own deadline
+/// (`crate::nfs::note_purges`). Dead clients are no longer its: since A-475 each client's watch reports its hang-up and
+/// the shard's reaper retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging
+/// buffers, status captures, lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's
+/// resend, which the shard's keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve
+/// loop steps once woken and the keeper retries at a refused record's deadline. The jobs left here leave a piece at a
+/// time for the events or deadlines that own them, and then the loop and its tick go (the reaper series, GAPS).
+/// Derived: the cadence is the budget.
 async fn reap_loop() {
   let cadence = derived!(
     LIVENESS_BUDGET_NS,
@@ -4878,9 +4908,6 @@ async fn reap_loop() {
   .get();
   loop {
     pace(cadence).await;
-    refresh_pressure_hold().await;
-
-    crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
@@ -5432,9 +5459,10 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 }
 
 /// Samples the host's available memory and withholds the daemon's pressure hold from admission (§4.2; admission.md
-/// §5.5), run by the control shard's reap loop at the liveness cadence — the design's "cheap-refresh", one sampler a
-/// daemon (every shard runs a reap loop; before 2026-10-09 each sampled and sent its own reading to every shard, N²
-/// cross-shard messages a second on a daemon at rest, each waking a parked shard).
+/// §5.5), run by the control shard's sampler at its start and at each report of the host's memory pressure
+/// (`crate::pressure`, A-570; the reap loop's tick ran it once a liveness window until then) — the design's
+/// "cheap-refresh", one sampler a daemon (before 2026-10-09 every shard sampled and sent its own reading to every
+/// shard, N² cross-shard messages a second on a daemon at rest, each waking a parked shard).
 ///
 /// The hold is the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that
 /// is committed content, charged already), and never more than the daemon's unfilled room exceeds the host's free
@@ -5453,7 +5481,7 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 /// (`memory_available_now` is `None` on an unsupported platform) leaves the hold at zero — the budget then admits
 /// exactly as before, no worse than not sampling. The read is one cheap syscall or `/proc` line per cadence, not per
 /// request; the shards are asked for their free room only while the pool cannot cover the hold.
-async fn refresh_pressure_hold() {
+pub(crate) async fn refresh_pressure_hold() {
   let Some((origin, shards, hold)) = sample_pressure_hold() else {
     return;
   };
@@ -5528,10 +5556,10 @@ fn sample_pressure_hold() -> Option<(u16, Vec<u16>, u64)> {
 async fn free_room_of(origin: u16, shards: &[u16]) -> Vec<u64> {
   let mut free = Vec::with_capacity(shards.len());
   for &shard in shards {
-    // A wall bound, by its reason (A-435): the reap cadence's sample, taken on the control shard's reaper task beside
-    // its lease expiries and reaps; a shard that does not answer within a heartbeat reads as no room (counted), and
-    // the hold it would have taken goes to the others or to the debt the next growth takes on, so nothing is lost,
-    // while a wait in the shard's own time would hold the cadence's other work behind one busy shard.
+    // A wall bound, by its reason (A-435): the sampler's question (`crate::pressure`, A-570); a shard that does not
+    // answer within a heartbeat reads as no room (counted), and the hold it would have taken goes to the others or to
+    // the debt the next growth takes on, so nothing is lost, while a wait in the shard's own time would hold the
+    // sample behind one busy shard, past the report that asked for it.
     let room = crate::xshard::call_within(
       origin,
       shard,
@@ -6496,9 +6524,9 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
       log_late_beat(now.saturating_sub(beat), &before, &counters);
     }
     last = Some((now, counters));
-    let requested = match segment.supervision() {
-      Ok(sup) => sup.stop_requested_at().is_some(),
-      Err(_) => false,
+    let (requested, lapse_bound_ns) = match segment.supervision() {
+      Ok(sup) => (sup.stop_requested_at().is_some(), sup.lapse_bound_ns()),
+      Err(_) => (false, None),
     };
     state::with_state(|s| {
       if let Some(watch) = s.stop_watch.as_ref()
@@ -6507,7 +6535,12 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
         // Bounded by one: a reason already sent and not yet taken is the same news.
         let _full_or_gone = watch.wake.try_send(());
       }
+      // This node's detection by its anchor (A-574): the watchdog's widest window and the anchor's published lapse bound,
+      // read at every beat on every node, laptop or fleet, and the failover delay published from them.
+      crate::fleet::refresh_supervision(s, lapse_bound_ns);
     });
+    // The delay to every shard where it moved: a laptop's other shards read it as a fleet's do (A-574).
+    crate::fleet::fan_failover();
     pace(HEARTBEAT_NS).await;
   }
 }
@@ -6657,6 +6690,77 @@ mod starved_share_tests {
       starved_share_ns(HEARTBEAT_NS / 2, held),
       HEARTBEAT_NS,
       "a span under a beat spins a beat at most"
+    );
+  }
+}
+
+#[cfg(test)]
+mod laptop_failover_tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used)]
+  use super::{LIVENESS_BUDGET_NS, audit_daemon_of, observe_at, observe_first};
+
+  /// Shape: the lapse bound the test publishes as the daemon's anchor does: four liveness windows, as an anchor whose own
+  /// waits ran three windows late measures it, far from any delay the daemon held before.
+  const LAPSE_NS: u64 = 4 * LIVENESS_BUDGET_NS;
+  /// Shape: how long the test looks for every shard to read the delay: ten seconds, a hundred of the control shard's
+  /// beats, far past the beat that reads the bound and the fan that carries the delay.
+  const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+  /// Shape: the pause between the test's looks, half a beat.
+  const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+
+  /// A-574 (A-405's laptop detection, derived; R8). Do: start a two-shard daemon with no fleet (`f = 0`, a laptop's),
+  /// publish a lapse bound in its supervision block as its anchor does, and look at both shards' failover delay until
+  /// they agree. Expect each to be at least the liveness window, then the published lapse and the recovery prior, in
+  /// whole periods, and the control shard's detection term to be the watchdog's widest window (from the liveness window
+  /// to its ceiling) and then exactly the lapse, read from what was measured: the laptop's detection read on the control
+  /// shard's beat from what its watchdog and its anchor measure, and fanned to every shard. Before, a laptop's delay was
+  /// the liveness window and the recovery prior, set at boot and never read again.
+  #[test]
+  fn a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse() {
+    let daemon = audit_daemon_of(2);
+    daemon
+      .segment()
+      .supervision()
+      .unwrap()
+      .record_lapse_bound(LAPSE_NS);
+    let floor = crate::fleet::failover_in_periods(
+      LIVENESS_BUDGET_NS + LAPSE_NS + slates_db::replay::RECOVERY_BUDGET_NS,
+    );
+    let began = std::time::Instant::now();
+    let read = loop {
+      let control = observe_first(&daemon, |s| {
+        (s.failover_ns, s.failover.estimate().detection)
+      });
+      let other = observe_at(&daemon, 1, |s| s.failover_ns);
+      if control.0 >= floor && other == control.0 {
+        break Some(control);
+      }
+      if began.elapsed() > WAIT {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test reads on its own beat.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(LOOK);
+    };
+    daemon.stop();
+    let (failover_ns, detection) =
+      read.expect("every shard read a delay with the anchor's lapse in it");
+    let detection = detection.expect("its anchor detects it");
+    let window = detection
+      .ns
+      .checked_sub(LAPSE_NS)
+      .expect("the detection holds the lapse");
+    assert!(
+      (LIVENESS_BUDGET_NS..=crate::watchdog::WINDOW_CEILING_NS).contains(&window),
+      "the watchdog's widest window, then the lapse: {window} ns"
+    );
+    assert!(
+      detection.samples > 0,
+      "read from what was measured: {detection:?}"
+    );
+    println!(
+      "a laptop's failover delay {failover_ns} ns: the watchdog's widest window {window} ns, the anchor's lapse \
+       {LAPSE_NS} ns, then the recovery"
     );
   }
 }

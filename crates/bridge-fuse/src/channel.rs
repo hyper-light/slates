@@ -38,8 +38,8 @@ use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
 use crate::bridge::{Bridge, KernelChange, reply_error};
 use crate::coherence::{
-  KernelHolds, MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES, WritableOpens,
-  WritebackVerdict,
+  KernelHolds, MOST_ADDED_BY_AN_UPDATE, OverrunRound, OwnRecords, PageStates, RANGE_BYTES,
+  WritableOpens, WritebackVerdict,
 };
 use crate::dispatch;
 use crate::error::FuseError;
@@ -254,7 +254,7 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
       let (off, len) = notified_range(*data);
       inval_inode(*ino, off, len, &mut out)
     }
-    // Never one message: the round expands it into what the kernel holds ([`everything_told`]).
+    // Never one message: the mount's overrun round tells what the kernel holds instead ([`OverrunRound`]).
     Invalidation::Everything => return None,
   };
   let n = encoded.ok()?;
@@ -645,9 +645,12 @@ pub struct ServeState {
   /// Whether the round out carries a slice of the takeover round: until it is back, the kernel has been told of nothing
   /// this mount's writers could rely on ([`ServeState::told_through`]).
   takeover_out: bool,
-  /// The time one slice of the takeover round may take on the serving thread, set by the owner before each turn from its
-  /// shard's live step quantum ([`ServeState::slices_within`]). Zero sends one inode a slice.
-  slice_ns: u64,
+  /// The time a turn's rounds may take on the serving thread — the takeover round's slice, the journal gather's and the
+  /// overrun round's together — set by the owner before each turn from its shard's live step quantum
+  /// ([`ServeState::slices_within`]; A-158, A-562). Each round takes at least one item a turn, so zero sends one item of
+  /// each. `None` until an owner sets it: a harness driving the loop itself, or [`serve_blocking`], keeps no shard's
+  /// step, and its rounds are built whole.
+  slice_ns: Option<u64>,
   /// Takeover rounds that bumped the kernel's dentry epoch, since this was last read: the non-vacuity count of the
   /// names half of A-158. Read and cleared by the owner that reports it.
   epochs_bumped: u64,
@@ -680,6 +683,13 @@ pub struct ServeState {
   /// What this mount's kernel holds of the volume — every node it references and every name it was handed — fed by
   /// each reply as it reaches the kernel: what an overrun invalidates (A-141).
   holds: KernelHolds,
+  /// The round this mount owes once it falls behind the journal's retention: every node and name its kernel holds,
+  /// told a slice a turn (A-141, A-562).
+  overrun: OverrunRound,
+  /// Where the byte states were fed through while a round's gather stands behind it (A-562): the states take every
+  /// record through the head at each round ([`feed_states`]), and a gather its slice cut leaves the cursor short of
+  /// that, so the next feed starts here and no record is fed twice. `None` once a round's gather is whole.
+  states_fed_through: Option<u64>,
   /// Rounds that found this mount behind the journal's retention and invalidated everything its kernel holds, since
   /// this was last read. Read and cleared by the owner that reports it.
   journal_overruns: u64,
@@ -727,7 +737,7 @@ impl ServeState {
       adopt_restored: false,
       takeover: Takeover::Told,
       takeover_out: false,
-      slice_ns: 0,
+      slice_ns: None,
       epochs_bumped: 0,
       epochs_unsupported: 0,
       takeover_invalidated: 0,
@@ -737,6 +747,8 @@ impl ServeState {
       refused_writebacks: std::collections::BTreeMap::new(),
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
+      overrun: OverrunRound::default(),
+      states_fed_through: None,
       journal_overruns: 0,
       states_charged: 0,
       dropping: None,
@@ -808,12 +820,26 @@ impl ServeState {
     std::mem::take(&mut self.journal_overruns)
   }
 
-  /// Whether this mount, taken over from a daemon that died, has a slice of its takeover round to send now (A-158): some
-  /// is owed and no round is out. Its owner turns it at once while this holds, rather than waiting for a request or a
-  /// change: a kernel serving from its cache sends neither, and the round is what tells it its cache is stale. While a
-  /// round is out this is false, and the round's return wakes the owner, so a takeover never spins its owner's shard.
-  pub fn owes_takeover_round(&self) -> bool {
-    self.takeover != Takeover::Told && !self.notifier.as_ref().is_some_and(Notifier::busy)
+  /// Whether this mount has a slice of a round to send now and no round is out: its takeover round, taken over from a
+  /// daemon that died (A-158); the rest of a journal gather its slice cut, or of its overrun round (A-562). Its owner
+  /// turns it at once while this holds, rather than waiting for a request or a change: a kernel serving from its cache
+  /// sends neither, and the round is what tells it its cache is stale. While a round is out this is false, and the
+  /// round's return wakes the owner, so a round never spins its owner's shard.
+  pub fn owes_round_now(&self) -> bool {
+    let owed = self.takeover != Takeover::Told || self.overrun.owed() || self.coherence.owes();
+    owed && !self.notifier.as_ref().is_some_and(Notifier::busy)
+  }
+
+  /// The rounds that outgrew their turn and the slices that resumed one since this was last asked, and zero afterwards,
+  /// as `(outgrown, resumed)`: the journal gather's and the overrun round's together (A-562). A round outgrows its turn
+  /// when its first slice stops with items still owed; the resumed slices are the sliced path's non-vacuity count.
+  pub fn take_sliced_counts(&mut self) -> (u64, u64) {
+    let (gathers_outgrown, gathers_resumed) = self.coherence.take_sliced_counts();
+    let (overruns_outgrown, overruns_resumed) = self.overrun.take_counts();
+    (
+      gathers_outgrown.saturating_add(overruns_outgrown),
+      gathers_resumed.saturating_add(overruns_resumed),
+    )
   }
 
   /// How far this mount's kernel has been told of its volume's journal, for a writer outside FUSE whose reply waits on
@@ -825,21 +851,37 @@ impl ServeState {
   /// kernel stands where the cursor stood before it (a first round out started at the head with an empty kernel, so the
   /// cursor stands). The cursor also moves past this mount's own requests' records, which its kernel made and needs no
   /// notice of. A mount taken over from a daemon that died has been told of nothing until its takeover round is sent and
-  /// back (A-158): the records before its adoption reach its kernel only through that round.
+  /// back (A-158): the records before its adoption reach its kernel only through that round. A mount that fell behind
+  /// the journal's retention has been told nothing past where it fell behind until its overrun round is sent whole and
+  /// back (A-562): the records it missed reach its kernel only through that round, which may take several turns.
   pub fn told_through(&self) -> Option<u64> {
     if self.takeover != Takeover::Told || self.takeover_out {
       return Some(TOLD_OF_NOTHING);
     }
-    match self.notifier.as_ref().and_then(|notifier| notifier.out) {
+    let told = match self.notifier.as_ref().and_then(|notifier| notifier.out) {
       Some(Some(before)) => Some(before.journal_seq),
       Some(None) | None => self.coherence.cursor().map(|cursor| cursor.journal_seq),
+    };
+    match self.overrun.told_before() {
+      Some(before) => Some(told.map_or(before, |told| told.min(before))),
+      None => told,
     }
   }
 
-  /// Bounds each slice of the takeover round to `ns` of the serving thread (A-158): the owner's share of its shard's live
-  /// step quantum, set before each turn so the slices follow the quantum the shard keeps (§4.3).
+  /// The journal sequence the byte states have taken every record through: the coherence cursor, or past it where a
+  /// gather its slice cut left the cursor short of the states' last feed (A-562). `None` before the first round.
+  fn states_through(&self) -> Option<u64> {
+    let cursor = self.coherence.cursor().map(|cursor| cursor.journal_seq);
+    match (cursor, self.states_fed_through) {
+      (Some(cursor), Some(fed)) => Some(cursor.max(fed)),
+      (cursor, fed) => cursor.or(fed),
+    }
+  }
+
+  /// Bounds a turn's rounds to `ns` of the serving thread (A-158, A-562): the owner's share of its shard's live step
+  /// quantum, set before each turn so the slices follow the quantum the shard keeps (§4.3).
   pub fn slices_within(&mut self, ns: u64) {
-    self.slice_ns = ns;
+    self.slice_ns = Some(ns);
   }
 
   /// The takeover rounds sent since this was last asked, and zero afterwards, as `(epoch bumped, epoch unsupported,
@@ -1057,6 +1099,7 @@ fn deliver_owed(
       return Ok(Delivered {
         written: 0,
         gather_refused: true,
+        cut: false,
       });
     };
     // The round is back, whatever its outcome: a takeover slice it carried is no longer out.
@@ -1070,6 +1113,8 @@ fn deliver_owed(
         state.entry_invalidations_refused = state
           .entry_invalidations_refused
           .saturating_add(u64::from(refused));
+        // Written: an overrun round whose last slice it carried is told whole (A-562).
+        state.overrun.settle();
       }
     }
   }
@@ -1081,48 +1126,76 @@ fn deliver_owed(
   let root = bridge.root(cx).ok();
   let before = state.coherence.cursor();
   let mut messages: Round = Vec::new();
+  // One budget for the turn's rounds, from its start (A-158, A-562): the takeover round's slice, the journal gather's
+  // and the overrun round's take what is left of it in that order, and at least one item each, so every round owed
+  // moves on at every turn.
+  let turn = TurnSlice::starting_now(state.slice_ns);
+  let mut more = || turn.more();
   // A restored mount's rounds open with a slice of its takeover round until it is sent whole (A-158). A slice counts as
   // sent only once its round reaches the notify thread, so a turn refused before then sends it again.
   let takeover = (state.takeover != Takeover::Told)
-    .then(|| takeover_told(bridge, cx, state, root, &mut messages));
+    .then(|| takeover_told(bridge, cx, state, root, &mut more, &mut messages));
   let mut overran = false;
   let holds = &mut state.holds;
-  let delivered = state
-    .coherence
-    .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      if matches!(invalidation, Invalidation::Everything) {
-        overran = true;
-        everything_told(holds, expire_only, &mut messages);
-        return Ok::<(), ChannelError>(());
-      }
-      let addressed = addressed_to_the_kernel(invalidation, root);
-      if let Some((message, entry)) = encode_invalidation(&addressed, expire_only) {
-        // The kernel drops or expires the name as this round reaches it; a later use is a new lookup that names it
-        // again ([`KernelHolds::unnamed`]). Taken now, not when the round returns, so a lookup answered meanwhile is
-        // never lost. Its `ENOENT` counts as a refusal only for a name the kernel was handed: one it never got is not in
-        // its cache, and since A-137 no lookup miss is cached either, so its `ENOENT` is the expected answer.
-        let held = match &addressed {
-          Invalidation::Entry { parent, name, .. } => {
-            let held = holds.holds_name(*parent, name);
-            holds.unnamed(*parent, name);
-            held
-          }
-          Invalidation::Inode { .. } | Invalidation::Everything => false,
-        };
-        messages.push((message, entry && held));
-      }
-      Ok::<(), ChannelError>(())
-    })?;
+  let delivered =
+    state
+      .coherence
+      .deliver(bridge, cx, &mut more, &mut |invalidation: &Invalidation| {
+        if matches!(invalidation, Invalidation::Everything) {
+          overran = true;
+          return Ok::<(), ChannelError>(());
+        }
+        let addressed = addressed_to_the_kernel(invalidation, root);
+        if let Some((message, entry)) = encode_invalidation(&addressed, expire_only) {
+          // The kernel drops or expires the name as this round reaches it; a later use is a new lookup that names it
+          // again ([`KernelHolds::unnamed`]). Taken now, not when the round returns, so a lookup answered meanwhile is
+          // never lost. Its `ENOENT` counts as a refusal only for a name the kernel was handed: one it never got is not in
+          // its cache, and since A-137 no lookup miss is cached either, so its `ENOENT` is the expected answer.
+          let held = match &addressed {
+            Invalidation::Entry { parent, name, .. } => {
+              let held = holds.holds_name(*parent, name);
+              holds.unnamed(*parent, name);
+              held
+            }
+            Invalidation::Inode { .. } | Invalidation::Everything => false,
+          };
+          messages.push((message, entry && held));
+        }
+        Ok::<(), ChannelError>(())
+      })?;
   if overran {
     state.journal_overruns = state.journal_overruns.saturating_add(1);
+    // The kernel stood where this round's gather began when it fell behind: the records it missed reach it only through
+    // the overrun round, which tells every node and name it holds instead (A-141).
+    state
+      .overrun
+      .begin(before.map_or(TOLD_OF_NOTHING, |cursor| cursor.journal_seq));
   }
-  // The records this round gathered, consumed by the byte states from the same point (the dirty-page write-back rule).
-  // Before the first round nothing is tracked, so there is nothing to feed.
+  // A slice of the overrun round, from where the last one stopped (A-562). The kernel may have dropped some of these
+  // already, so its `ENOENT` for a name here is expected and is not counted as a refusal.
+  state
+    .overrun
+    .slice(&mut state.holds, &mut more, &mut |invalidation| {
+      if let Some((message, _entry)) = encode_invalidation(&invalidation, expire_only) {
+        messages.push((message, false));
+      }
+    });
+  // The records this round gathered, consumed by the byte states from the same point (the dirty-page write-back rule),
+  // and every record after them through the head, so a write-back's pending records stay few. A gather its slice cut
+  // left the cursor short of where the states were fed, so the next feed starts there instead (A-562). Before the first
+  // round nothing is tracked, so there is nothing to feed.
   if let (false, Some(since)) = (delivered.gather_refused, before) {
-    feed_states(bridge, cx, state, since.journal_seq);
+    let from = state
+      .states_fed_through
+      .map_or(since.journal_seq, |fed| fed.max(since.journal_seq));
+    let through = feed_states(bridge, cx, state, from);
+    state.states_fed_through = delivered.cut.then_some(through);
   }
   refused_writebacks_told(state, &mut messages);
-  if !messages.is_empty() {
+  if messages.is_empty() {
+    // No round goes out: an overrun round whose last slice told nothing more is told whole now.
+    state.overrun.settle();
+  } else {
     notifier_of(channel, state)?.send(messages, before)?;
     state.takeover_out = takeover.is_some();
   }
@@ -1205,10 +1278,9 @@ fn takeover_told(
   cx: &slates_bridge_core::OpContext,
   state: &ServeState,
   root: Option<u64>,
+  more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   messages: &mut Round,
 ) -> TakeoverSlice {
-  let began = std::time::Instant::now();
-  let budget = std::time::Duration::from_nanos(state.slice_ns);
   let first = state.takeover == Takeover::Owed;
   let bumped = first
     && state
@@ -1246,11 +1318,7 @@ fn takeover_told(
     if Some(ino) != root {
       invalidate(ino, messages);
     }
-    if began.elapsed() >= budget {
-      std::ops::ControlFlow::Break(())
-    } else {
-      std::ops::ControlFlow::Continue(())
-    }
+    more()
   });
   let next = match (whole, last) {
     (false, Some(after)) => Takeover::SentThrough { after },
@@ -1327,8 +1395,7 @@ fn revoked_turn(channel: &FuseChannel, state: &mut ServeState) -> Result<Revoked
   let Dropping::Owed { after } = dropping else {
     return Ok(Revoked::Ended);
   };
-  let began = std::time::Instant::now();
-  let budget = std::time::Duration::from_nanos(state.slice_ns);
+  let turn = TurnSlice::starting_now(state.slice_ns);
   let expire_only = state.expire_only;
   let mut messages: Round = Vec::new();
   let invalidate = |ino: u64, messages: &mut Round| {
@@ -1349,7 +1416,7 @@ fn revoked_turn(channel: &FuseChannel, state: &mut ServeState) -> Result<Revoked
     if ino != crate::bridge::FUSE_ROOT_ID {
       let _ = invalidate(ino, &mut messages);
     }
-    if began.elapsed() >= budget {
+    if turn.more().is_break() {
       cut = true;
       break;
     }
@@ -1454,35 +1521,29 @@ fn notifier_of<'a>(
   Ok(state.notifier.insert(notifier))
 }
 
-/// The messages an `Everything` becomes (A-141): an attribute-and-data invalidation of every node the kernel references
-/// and of the root, and an entry invalidation of every name it holds — expire-only where the kernel took that, so a
-/// busy directory is revalidated rather than torn down
-/// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). The kernel
-/// may have dropped some of these already, so its `ENOENT` for a name here is expected and is not counted as a refusal.
-fn everything_told(holds: &mut KernelHolds, expire_only: bool, messages: &mut Round) {
-  let (nodes, names) = holds.invalidate_everything();
-  for ino in nodes
-    .into_iter()
-    .chain(std::iter::once(crate::bridge::FUSE_ROOT_ID))
-  {
-    if let Some(message) = encode_invalidation(
-      &Invalidation::Inode {
-        ino,
-        data: CachedBytes::ALL,
-      },
-      expire_only,
-    ) {
-      messages.push(message);
+/// The time a turn's rounds may take on the serving thread, counted from the turn's start ([`ServeState::slices_within`];
+/// A-158, A-562): each round asks it before each item after its first, so one budget bounds them all.
+struct TurnSlice {
+  /// When the turn's rounds began.
+  began: std::time::Instant,
+  /// What they may take; `None` builds them whole, for an owner that keeps no shard's step.
+  budget: Option<std::time::Duration>,
+}
+
+impl TurnSlice {
+  /// A turn's slice of `ns` from now, or a whole one for `None`.
+  fn starting_now(ns: Option<u64>) -> TurnSlice {
+    TurnSlice {
+      began: std::time::Instant::now(),
+      budget: ns.map(std::time::Duration::from_nanos),
     }
   }
-  for (parent, name) in names {
-    let entry = Invalidation::Entry {
-      parent,
-      name,
-      expire: true,
-    };
-    if let Some((message, _counted)) = encode_invalidation(&entry, expire_only) {
-      messages.push((message, false));
+
+  /// Whether a round may take another item: [`std::ops::ControlFlow::Break`] once the budget is spent.
+  fn more(&self) -> std::ops::ControlFlow<()> {
+    match self.budget {
+      Some(budget) if self.began.elapsed() >= budget => std::ops::ControlFlow::Break(()),
+      _ => std::ops::ControlFlow::Continue(()),
     }
   }
 }
@@ -1541,7 +1602,7 @@ fn dispatch_request(
   if state.adopts_unseen_handles
     && let Some((fh, ino)) = written_handle(request)
   {
-    adopt_unseen_handle(fh, ino, started_at, bridge, cx, state);
+    adopt_unseen_handle(fh, ino, bridge, cx, state);
   }
   let served = match crate::bridge::cache_writeback(request) {
     Some(nodeid) => serve_writeback(request, nodeid, started_at, bridge, cx, state),
@@ -1639,7 +1700,7 @@ fn note_read(
   state: &mut ServeState,
 ) {
   let started_at = state.started_at.unwrap_or(before);
-  adopt_unseen_handle(read.fh, ino, started_at, bridge, cx, state);
+  adopt_unseen_handle(read.fh, ino, bridge, cx, state);
   if !state.writable.holds(ino) {
     return;
   }
@@ -1675,11 +1736,13 @@ fn written_handle(request: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// On a mount taken over from a daemon that died (A-61), at its first turn: tracks every file the volume restored opens
-/// of for this mount's owner (A-152) as fresh as of the mount's start, and starts the rounds there, so they feed each
-/// file every change after it and no write-back of it reads the journal back to the start. A request naming one of its
-/// handles then finds it tracked ([`adopt_unseen_handle`]). Until 2026-10-23 every such file was adopted only when a
-/// request named it, from the journal's records since the start, and lost once the journal no longer reached back. A
-/// handle opened after the last publication is in no count, so its file is still adopted when a request names it.
+/// of for this mount's owner (A-152) as the takeover rule adopts it ([`crate::coherence::taken_over`], A-567): fresh as
+/// of before the successor's first journal record, with every change since, the writes it replayed among them, so a
+/// write-back over a byte one changed is judged by the volume's bytes. The rounds start at the head, so they feed each
+/// file every change after it. A request naming one of its handles then finds it tracked ([`adopt_unseen_handle`]).
+/// Until 2026-10-23 every such file was adopted only when a request named it, and until A-567 each was fresh as of the
+/// mount's start, after the replay. A handle opened after the last publication is in no count, so its file is still
+/// adopted when a request names it.
 fn adopt_restored(
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
@@ -1691,11 +1754,15 @@ fn adopt_restored(
   state.adopt_restored = false;
   let seen = bridge.seen(cx);
   state.coherence.begin_at(seen);
-  let start = *state.started_at.get_or_insert(seen.journal_seq);
-  let files = bridge.restored_open_files(cx);
-  make_room(bridge, cx, state, files.len());
-  for ino in files {
-    state.states.adopted(ino, start, Some(&[]));
+  if state.started_at.is_none() {
+    state.started_at = Some(seen.journal_seq);
+  }
+  for ino in bridge.restored_open_files(cx) {
+    let adoption = crate::coherence::taken_over(&state.own, ino, bridge, cx);
+    make_room(bridge, cx, state, adoption.most_ranges());
+    state
+      .states
+      .adopted(ino, adoption.from, adoption.changes.as_deref());
   }
 }
 
@@ -1711,9 +1778,10 @@ fn drop_released_restored(state: &mut ServeState, ino: u64, restored: &[u64]) {
 
 /// On a mount taken over from a daemon that died (A-61), a request naming handle `fh` of `ino` that this mount never saw
 /// opened adopts it (A-147). The kernel opened the handle before this daemon served it, maybe for writing, and a store
-/// through a map of it reaches this mount as a cache write-back. Its file is tracked from here on
-/// ([`PageStates::adopted`]): fresh as of the mount's start `started_at`, with the journal's changes to it since then.
-/// So a re-fetch is recorded, and a write-back is judged as on a mount that saw the open.
+/// through a map of it reaches this mount as a cache write-back. Its file is tracked from here on as the takeover rule
+/// adopts it ([`crate::coherence::taken_over`], A-567): fresh as of before the successor's first journal record, with
+/// every change since. So a re-fetch is recorded, and a write-back is judged as on a mount that saw the open, a replayed
+/// write's bytes stale until re-fetched.
 ///
 /// Before A-147 such a file stayed untracked, and each write-back of it was judged against every change since the
 /// mount's start. A store made after a re-fetch of bytes another path had changed was kept back, and lost
@@ -1723,7 +1791,6 @@ fn drop_released_restored(state: &mut ServeState, ino: u64, restored: &[u64]) {
 fn adopt_unseen_handle(
   fh: u64,
   ino: u64,
-  started_at: u64,
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
@@ -1735,14 +1802,11 @@ fn adopt_unseen_handle(
   if state.states.tracks(ino) {
     return;
   }
-  let changes = pending_changes(ino, started_at, bridge, cx, state);
-  let most = changes
-    .as_ref()
-    .map_or(0, Vec::len)
-    .saturating_mul(MOST_ADDED_BY_AN_UPDATE)
-    .saturating_add(1);
-  make_room(bridge, cx, state, most);
-  state.states.adopted(ino, started_at, changes.as_deref());
+  let adoption = crate::coherence::taken_over(&state.own, ino, bridge, cx);
+  make_room(bridge, cx, state, adoption.most_ranges());
+  state
+    .states
+    .adopted(ino, adoption.from, adoption.changes.as_deref());
 }
 
 /// Feeds what `request` made the kernel hold now that its reply of `len` bytes reached it — or at once, for a request
@@ -1854,20 +1918,21 @@ fn ranges_per_page() -> usize {
 /// sequence ([`OwnRecords`]): what the round just gathered for invalidation, consumed from the same point in the same
 /// turn. Every record through the head is then consumed, so the points at or below it are raised to it
 /// ([`PageStates::consumed`]). A journal that no longer reaches back to `since` loses every tracked file, whose
-/// write-backs are then refused rather than guessed.
+/// write-backs are then refused rather than guessed. Answers the head the states were fed through.
 fn feed_states(
   bridge: &mut dyn Bridge,
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
   since: u64,
-) {
+) -> u64 {
+  let head = bridge.seen(cx).journal_seq;
   let mut changes = Vec::new();
   let complete = bridge
     .data_changes(cx, since, &mut changes)
     .unwrap_or(false);
   if !complete {
     state.states.lose_all();
-    return;
+    return head;
   }
   make_room(
     bridge,
@@ -1882,7 +1947,8 @@ fn feed_states(
       .changed(change.ino, change.range, change.seq, own);
   }
   // The same synchronous turn as the walk: no record can have come between it and this reading of the head.
-  state.states.consumed(bridge.seen(cx).journal_seq);
+  state.states.consumed(head);
+  head
 }
 
 /// Serves a cache write-back of node `nodeid` by the dirty-page write-back rule ([`dispatch_request`],
@@ -1980,8 +2046,9 @@ fn stale_in_writeback(
 }
 
 /// The journal's changes to node `nodeid` that its byte states do not hold yet, each with whether it is the mount's own:
-/// those after the coherence cursor, or, for a file not tracked, after `started_at`. A cache write-back and an ambiguous
-/// read are judged with the same records. `None` when the journal no longer reaches back that far.
+/// those after the point the states were fed through ([`ServeState::states_through`]), or, for a file not tracked, after
+/// `started_at`. A cache write-back and an ambiguous read are judged with the same records. `None` when the journal no
+/// longer reaches back that far.
 fn pending_changes(
   nodeid: u64,
   started_at: u64,
@@ -1990,27 +2057,11 @@ fn pending_changes(
   state: &ServeState,
 ) -> Option<Vec<(std::ops::Range<u64>, u64, bool)>> {
   let since = if state.states.tracks(nodeid) {
-    state
-      .coherence
-      .cursor()
-      .map_or(started_at, |cursor| cursor.journal_seq)
+    state.states_through().unwrap_or(started_at)
   } else {
     started_at
   };
-  let mut changes = Vec::new();
-  if !bridge.data_changes(cx, since, &mut changes).ok()? {
-    return None;
-  }
-  Some(
-    changes
-      .into_iter()
-      .filter(|change| change.ino == nodeid)
-      .map(|change| {
-        let own = state.own.took(change.seq);
-        (change.range, change.seq, own)
-      })
-      .collect(),
-  )
+  crate::coherence::changes_since(&state.own, nodeid, since, bridge, cx)
 }
 
 /// Whether a `READ` made through a handle with these open flags may have bypassed the kernel's page cache (A-144): a

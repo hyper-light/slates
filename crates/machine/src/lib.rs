@@ -27,6 +27,9 @@
 //!   machine code, so a judgment in CPU time is held to the build it runs in (A-318).
 //! - [`facts`] — the fixed facts queried from the OS (pages, cache line, the cores this process may run
 //!   on, its CPU budget, memory, power).
+//! - [`memory_pressure`] — the host's reports of a change in its memory pressure, as the kernel makes them (macOS's
+//!   dispatch memory-pressure source, Linux's pressure-stall trigger, Windows' memory resource notifications): what
+//!   wakes the daemon's pressure sampler (A-570).
 //! - [`memory_stall`] — the host's memory stall, read at a look: whether its tasks have been held waiting on memory,
 //!   so a liveness judgment tells a shard waiting on a page-in from a wedged one (A-336).
 //! - [`placement`] — where the shards run: how many, and whether they are fixed to cores the process
@@ -56,6 +59,7 @@ pub mod derived;
 pub mod error;
 pub mod facts;
 pub mod log;
+pub mod memory_pressure;
 pub mod memory_stall;
 pub mod placement;
 pub mod probes;

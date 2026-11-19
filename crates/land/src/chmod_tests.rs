@@ -3,9 +3,11 @@
 //! against a disk that kept the file as the volume witnessed it, already holds the volume's change, or changed it
 //! another way. Its bytes are never rewritten: the same file keeps its inode.
 
+use slates_mem::Handle;
 use slates_vfs::base::BaseConfig;
-use slates_vfs::host::HostFs;
+use slates_vfs::dir::{Child, DirNode};
 use slates_vfs::host::sim::{SimHost, SimVerb};
+use slates_vfs::host::{HostError, HostFs, OsCode};
 use slates_vfs::inode::{Kind, WindowsAttributes};
 use slates_vfs::volume::{Store, Volume};
 
@@ -53,6 +55,11 @@ const GROUP_DIR_MODE: u32 = 0o040_750;
 const HEAD_LANDING: u64 = 1;
 /// Shape: see `HEAD_LANDING`.
 const SNAPSHOT_LANDING: u64 = 2;
+/// Shape: the code a symbolic link's set answers on a Windows account without the link privilege
+/// (`ERROR_PRIVILEGE_NOT_HELD`, winerror.h).
+const PRIVILEGE_NOT_HELD: u32 = 1314;
+/// Shape: a file the overlay makes, read-write for its owner.
+const NEW_FILE_MODE: u32 = 0o644;
 
 /// A disk holding `/run.sh` (the script, at `SCRIPT_MODE`) and the directory `/lib` (at `DIR_MODE`) with a file in it, and
 /// an overlay of it, the disk settled before the mount.
@@ -258,6 +265,73 @@ fn a_metadata_entry_whose_open_the_host_refuses_fails_alone_whatever_the_kind() 
       "{refusal:?}: the mode untouched"
     );
   }
+}
+
+/// The overlay's root directory.
+fn root_of(vol: &mut Volume, host: &mut SimHost, store: &mut Store) -> Handle<DirNode> {
+  match vol.with_host(host).resolve(store, "/").unwrap().child {
+    Child::Dir(handle) => handle,
+    other => panic!("the root is {other:?}"),
+  }
+}
+
+/// A-568 (a link the account may not make fails alone, as A-438's design has it). Do: make through the overlay a new
+/// link `/ln` to `run.sh` and a new file `/new.txt`, and land them over a host that refuses the link for a privilege
+/// this process does not hold (a Windows account without `SeCreateSymbolicLinkPrivilege`: `ERROR_PRIVILEGE_NOT_HELD`).
+/// Expect the link's entry failed alone by that code and the file written, the landing `Partial` and never crashed, and
+/// no link nor hidden name left on the disk. Before A-568 the refusal ended the whole landing, `Aborted`.
+#[test]
+fn a_link_the_host_refuses_for_a_privilege_the_process_lacks_fails_alone() {
+  let mut store = store();
+  let (mut host, mut vol) = overlay_of_a_script(&mut store);
+  let root = root_of(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .symlink(&mut store, root, "ln", "run.sh")
+    .unwrap();
+  let made = vol
+    .with_host(&mut host)
+    .create_file(&mut store, root, "new.txt", NEW_FILE_MODE)
+    .unwrap();
+  vol
+    .with_host(&mut host)
+    .write(&mut store, made, 0, SCRIPT)
+    .unwrap();
+  let refusal = HostError::Unprivileged(OsCode::Win32(PRIVILEGE_NOT_HELD));
+  host.fail(SimVerb::Symlink, "/ln", refusal, 1);
+  let (_, landed) = land_granted(&mut host, &mut vol, &mut store);
+  let report = landed.unwrap();
+  let outcome_of = |path: &str| {
+    report
+      .entries
+      .iter()
+      .find(|entry| &*entry.path == path)
+      .and_then(|entry| entry.outcome.clone())
+  };
+  assert_eq!(
+    outcome_of("/ln"),
+    Some(Outcome::Failed {
+      code: refusal.code()
+    }),
+    "{report:?}"
+  );
+  assert_eq!(outcome_of("/new.txt"), Some(Outcome::Written), "{report:?}");
+  assert!(
+    !report
+      .degraded
+      .iter()
+      .any(|degraded| matches!(degraded, Degradation::Crashed { .. })),
+    "{report:?}"
+  );
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert_eq!(host.bytes("/new.txt").as_deref(), Some(SCRIPT));
+  let paths: Vec<String> = host.paths().into_iter().map(|(path, _)| path).collect();
+  assert!(
+    !paths
+      .iter()
+      .any(|path| path == "/ln" || path.contains(".slates-")),
+    "{paths:?}"
+  );
 }
 
 /// A-472 (a landed mode is durable before it is reported). Do: `chmod` `/run.sh` through the overlay and land it over the
