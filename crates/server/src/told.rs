@@ -288,7 +288,7 @@ pub(crate) fn hold_until_told(
 
 /// Delivers a held reply where its request waits: on this shard's ring when its client is served here, else as a task
 /// on the client's shard, waiting for room as every reply carried home does (`crate::xshard::send_back`).
-fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
+pub(crate) fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
     state::deliver(route.client_index, route.request, reply, true);
     return;

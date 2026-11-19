@@ -195,12 +195,14 @@ impl<K> Answer<K> {
   }
 
   /// Writes the answer's next bytes to `out`, at most `room` of them, the pack's from `packs` with `served` lent for the
-  /// step, `packs` called at most once: whether any are left. A pack that cannot be finished ends with its band-3
-  /// words, and [`Answer::refusal`] then says why.
+  /// step and what the step holds for a while charged to the request's `admission` (the one it was made within),
+  /// `packs` called at most once: whether any are left. A pack that cannot be finished ends with its band-3 words, and
+  /// [`Answer::refusal`] then says why.
   pub fn write<P: PackSource<Pack = K>>(
     &mut self,
     served: &Served<'_>,
     packs: &mut P,
+    admission: &mut Admission,
     out: &mut impl Out,
     room: usize,
   ) -> Written {
@@ -214,7 +216,7 @@ impl<K> Answer<K> {
     };
     let left = streaming.put_framed(out, room.saturating_sub(put));
     if left > 0 && streaming.wants_data() {
-      if let Err(refusal) = streaming.frame_next(served, packs) {
+      if let Err(refusal) = streaming.frame_next(served, packs, admission) {
         self.refusal = Some(refusal);
       }
       streaming.put_framed(out, left);
@@ -253,11 +255,12 @@ impl<K> Streaming<K> {
     &mut self,
     served: &Served<'_>,
     packs: &mut P,
+    admission: &mut Admission,
   ) -> Result<(), Refusal> {
     self.framed.clear();
     self.framed_written = 0;
     let room = self.framing.data().saturating_sub(self.data.len());
-    match packs.write(served, &mut self.source, &mut self.data, room) {
+    match packs.write(served, &mut self.source, admission, &mut self.data, room) {
       Ok(true) if self.data.len() < self.framing.data() => Ok(()),
       Ok(more) => self
         .frame_data(more)
