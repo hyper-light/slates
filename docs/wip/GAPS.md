@@ -4205,7 +4205,18 @@
 >   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
 >   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
 >   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
->   seconds on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   seconds on the wall. The same two waits in `ack_release.rs`, `attach_forms.rs` and `shards.rs` since A-571
+>   (2026-11-19, g251b): a connect is one claim, which waits while the rendezvous's holder lives (A-468), so a refusal
+>   fails the test at once; a full request ring is waited out while the daemon lives by the product's own rule, now
+>   every client end's (`ClientEnd::send_when_room`, `slates_ipc::room`, the SDK's since A-523), where the fleet suite
+>   keeps A-454's shard steps for the daemons it freezes on purpose; and a hold's start is waited on its observation,
+>   which ends by its answer or its typed refusal past the observe budget
+>   (`a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`,
+>   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). Owed (A-571's next part):
+>   `shards.rs`'s guest windows (`Guest::await_answer`, A-65 and A-228's rule sized by `CREDIT_WAIT`), its condition
+>   polls (`wait_until`, `wait_for_count`), its attach's answer and its stream reads, each still five seconds on the
+>   wall; `daemon.rs`'s raw client, the same constant and the same two waits; and `common/client.rs`'s `START_WAIT`, a
+>   connect retried five seconds while a daemon starts. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
@@ -4250,7 +4261,8 @@
 >   wait for a slot on a full ring since A-523 (2026-11-18, g251b): it spun for a whole reply deadline (a second),
 >   asked the daemon's liveness at each one and paced its tries at a tenth of it; it now spins for the client's wake
 >   estimate, then parks, each pause twice the last and never past the next look, the looks on A-443's doubling
->   (`RoomWait`, `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`). Owed: a slot that
+>   (`RoomWait`, `a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`; every client end's
+>   since A-571, `ClientEnd::send_when_room`). Owed: a slot that
 >   frees still wakes nothing, so a wait finds it within the time already waited; the daemon waking a client that
 >   waits for room, as it wakes one that waits for a reply, would end the wait at the slot. The async driver's tick since A-523 (2026-11-18, g251b; the rest of class
 >   C): each call asked the daemon's liveness at every reply deadline (a second); it now asks on A-443's doubling
