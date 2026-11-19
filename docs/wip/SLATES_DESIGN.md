@@ -8557,8 +8557,9 @@ the format floor.
 > `Malformed` (whole and matching its checksum, but breaking the format's rules). A tree past the asked size or the
 > room is refused `BudgetExceeded`, a held name `AlreadyExists`. Owners and set-id bits come back as the archive holds
 > them, as a takeover's restore brings them back; a host mount the daemon makes honours no set-id bit and opens no
-> device node (`nosuid,nodev`, A-94). Owed: a streamed decoder, since the file is held whole while it is decoded, as
-> the export's encoding is; and the manifest's decode and identity in pieces (one piece today: the whole tree's).
+> device node (`nosuid,nodev`, A-94). Owed then: a streamed decoder, since the file was held whole while it was decoded,
+> as the export's encoding was (built since: A-494, below); and the manifest's decode and identity in pieces (one piece
+> today: the whole tree's).
 
 > **Status (2026-11-18, A-459: the export's archive is written as a stream).** An export no longer holds the snapshot's
 > content or its archive whole. It walks the snapshot twice, as the streamed checkpoint counts before it encodes
@@ -8578,7 +8579,33 @@ the format floor.
 > The bytes are the whole-buffer encoder's (`Archive::encode`), byte for byte; that encoder is the streamed one's oracle
 > in the tests and stays the encoder of a holder that keeps an archive whole (the fleet's replication). The cost is the
 > second walk: the chunks' identities and compression are computed twice. Owed: the manifest's encoding is held whole
-> while it is written (the tree's metadata, never its content), and the import's decoder still holds its file whole.
+> while it is written (the tree's metadata, never its content). The import's decoder held its file whole until A-494
+> (below).
+
+> **Status (2026-11-18, A-494: the import's decoder is fed its file a slice at a time).** An import no longer holds the
+> archive file whole. `slates_archive::Decoding` is fed the stream in order, a slice a call, and holds nothing but what
+> the archive keeps and one fixed-width field:
+> - each slice is folded into the whole-archive BLAKE3 as it is fed, and framed as it arrives: a chunk record's payload
+>   is copied into its own chunk once the record's declared sizes are admitted (its raw length against the archive's
+>   chunk maximum, its canonical form, its payload against the stream left), the manifest's bytes into the manifest's
+>   buffer once its length is admitted, and every fixed-width field (the header, a record's fixed fields, the
+>   manifest's length, the seek table's magic, the trailer's pieces) assembled in a stage of one field at most
+>   (`LONGEST_FIELD`, the header's 116 bytes);
+> - once the stream is fed whole its checks run a piece a step, in the whole decode's order: the trailer's magic and
+>   the checksum; then each chunk's payload decoded and held to its identity, so nothing a record carries is decoded
+>   before the checksum holds (§4.9); then the totals, the manifest and the seek table. A record or section that breaks
+>   the format is kept and refused there, so an altered stream is refused `Corrupt` whatever framing the alteration
+>   broke;
+> - the layout is the one every writer makes: the records from the header's end, each section where the one before it
+>   ends, as the trailer's index names them. An index that names another place is refused `BadLayout` (`Malformed`).
+>
+> `Archive::decode` feeds a whole stream in one call, so one code path decodes either way. The import reads its file
+> from where the decoder stands, a feed slice a unit, and feeds it, so it holds at most that slice and one field
+> (`Decoding::bound`; a unit past it is counted, `image.archive_import_stage_past_bound`). The feed slice is derived
+> (D-11): each byte is copied out of the volume, hashed and copied into its chunk, so a unit of `b` bytes fits the
+> slice's half quantum when `b = 1 / (2/copy_slice + 1/archive_slice)`, both slices half the quantum at the
+> deployment's measured memcpy and BLAKE3 rates. Owed: the decoded archive is still held beside the restored tree until
+> the restore ends (the file's bytes less its framing), and the manifest's decode is one piece.
 
 ### 4.12 Agent surfaces (D-19)
 
@@ -34213,6 +34240,72 @@ carries a turn's messages; `apply` and `replay` take them in order and acknowled
   doc builds and the suites are main's (CLAUDE.md §8).
 - **Owed.** The supervisor's A/B again, the same arms (without the replicas 95bbed246; with them this landing): if it
   is still not green, the replicas come out, recorded measured-and-rejected.
+
+### A-494 — The import's decoder is fed its archive file a slice at a time, and never holds it whole (2026-11-18, goal 90 via g081; A-453's owed decoder, A-459's last gap; §4.11 "Archive", D-17; §4.9 hostile input; D-11)
+
+Applied in the same change to: §4.11 (a status block; A-453's and A-459's owed lines), GAPS (A-453's entry),
+`crates/archive/src/archive.rs` (`Decoding` fed in order: `new(len)`, `feed`, `step`, `bound`, `LONGEST_FIELD`;
+`Archive::decode` feeds it whole; `record_fields` and `verify_chunk`, shared with `chunk_by_identity`; the tests
+`an_archive_fed_in_any_slices_decodes_as_its_whole_stream` and `a_stream_many_times_its_bound_is_fed_within_it`),
+`crates/archive/src/format.rs` (`ArchiveError::BadLayout`), `crates/archive/tests/archive.rs` (its pieces helper fed a
+byte a step), and `crates/server/src/image.rs` (`ImportJob::open`, `feed_step`, `decode_step`, `feed_slice_bytes`, the
+counter `image.archive_import_stage_past_bound`, `BadLayout` classed `Malformed`; the tests
+`an_archive_imported_a_slice_at_a_time_lays_the_volume_the_whole_file_lays` and
+`an_import_reads_an_archive_many_times_its_bound_within_it`).
+
+- **What was there.** A-453's import read its archive file whole into one buffer, reserved at the file's admitted
+  length, and then decoded it from that buffer (`Decoding` borrowed the whole stream). The decoded archive holds every
+  record's payload too, so an import held the file's bytes twice until the decode ended. A-459 had streamed the export
+  the same day; the import stayed whole.
+- **The shape.** `Decoding` is fed the stream in order, a slice a call, and keeps only what the archive keeps: a record's
+  payload goes into its chunk and the manifest's bytes into the manifest's buffer, each once its declared length is
+  admitted against its cap and the stream left, before its room is allocated. A fixed-width field is assembled in a
+  stage no longer than the longest field (`LONGEST_FIELD`, the header's 116 bytes). A caller that feeds `s` bytes a
+  call therefore holds at most `Decoding::bound(s) = s + LONGEST_FIELD` of the stream at once. `Archive::decode` feeds
+  a whole stream in one call: one decoder, one code path (A-453's rule). The borrowed decoder is replaced, not kept
+  beside it.
+- **The order of the checks.** The same as the whole decode's, with the same refusals. Fed: the header's fixed fields
+  at once (a foreign magic, an unknown major or flag, a chunk maximum past the cap, before a byte past the header is
+  taken), then the length against the header and trailer. Stepped once fed whole: the trailer's magic, the checksum,
+  where the records begin; each chunk's payload decoded and held to its identity, a chunk a piece; then a record's kept
+  fault, the totals, the manifest's place, its kept fault, its decode and identity, the seek table's place, its kept
+  fault and its magic. Framing reads only lengths and kinds before the checksum, each admitted against its cap; every
+  decode of a payload or the manifest waits for the checksum. A framing fault is kept while the rest of the body is
+  hashed through to the trailer, so a stream the checksum refuses is refused `Corrupt` (copy it again), never
+  `Malformed` because its alteration happened to break a length.
+- **The layout.** A fed decoder reads sections where they lie in order, not where the trailer points. The trailer's
+  index must name those places (the records at the header's end, the manifest after the last record, the seek table
+  after the manifest), or the stream is refused `BadLayout` once the checksum holds. Every writer makes that layout
+  (`Archive::encode`, `StreamWriter`); the whole-buffer decoder had followed the index and so would have read a
+  hash-valid archive with gaps or overlapping sections. No archive a slates writer made changes its verdict.
+- **The feed slice (D-11).** Each byte of the file is copied out of the archive volume, folded into BLAKE3 and copied
+  into the chunk or manifest that keeps it. So a unit of `b` bytes takes `b/memcpy + b/blake3 + b/memcpy` of the
+  shard's time, and fits the slice ([`image::sliced`], half the live step quantum) when
+  `b = 1 / (2/copy_slice + 1/archive_slice) = c·h / (2h + c)`, where `copy_slice_bytes` and `archive_slice_bytes`
+  are half the quantum at the deployment's measured memcpy and BLAKE3 rates (`image::feed_slice_bytes`). The reading's
+  bound is `Decoding::bound` of it, and a unit past it is counted (`image.archive_import_stage_past_bound`).
+- **Rejected.**
+  - Two passes over the file, a hash pass and then a decode pass. They keep "nothing past the header parsed before the
+    checksum" whole, but read the file twice, and a write to the archive volume between the passes would put bytes no
+    checksum covered into the decode. One pass with every payload and manifest decode after the checksum reads once and
+    leaves only lengths and kinds parsed first, each admitted against its cap.
+  - Keeping the borrowed whole-buffer decoder for `Archive::decode` beside the fed one: two decoders of one format
+    could drift (banned item 7). The tests hold the fed decoder to the writer instead: `decode(encode(a)) == a`, sliced
+    any way.
+- **Owed.** The decoded archive is held beside the restored tree until the restore ends, so an import near the shard's
+  room still holds its tree about twice for that time; and the manifest's decode and identity are one piece (both
+  A-453's, in GAPS).
+- **Evidence (Mac Studio d1323898, 2026-11-19 UTC, debug).** `cargo test --locked -p slates-archive --lib`: 9 of 9 in
+  0.62 s, among them the oracle (`an_archive_fed_in_any_slices_decodes_as_its_whole_stream`: 256 generated archives of
+  raw and LZ4 records fed in slices of 1 to 299 bytes, whole, cut and flipped, each equal to the stream fed at once and
+  a whole one to the archive encoded) and the bound (`a_stream_many_times_its_bound_is_fed_within_it`: a stream more
+  than 100 times `Decoding::bound(64)` fed with the stage within one field), and A-459's streamed-writer tests, which
+  decode through it. `cargo test --locked -p slates-server --lib image::tests`: 2 of 2 in 0.76 s (the volume an import
+  fed 7 bytes a unit lays equals the whole-file import's in every path's attributes and bytes; an archive of 8 noisy
+  files more than 100 times its bound imported within it). The oracle's first runs found its own feed count wrong for
+  a stream refused at its header (fed to the refusal, not to its end); that seed is kept
+  (`crates/archive/src/archive.proptest-regressions`). The tests' red-checks, the archive and api suites and the lints
+  are filed for main (run-requests.md, 2026-11-19).
 
 ### A-471 — The S3 base's network client: signed requests over the runtime's TCP and rustls, every length capped and every wait learned (2026-11-18, goal g268; Mantle's CP-T10.5 part 2; §4.15 "An S3 base"; §4.9 hostile input; D-9, R3, R6; RFC 9112, RFC 9002, RFC 6298; A-442, A-464)
 Applied in the same change to: `crates/base/src/s3` (`client`, `http`, `tls` and `wait`, each with its tests;
