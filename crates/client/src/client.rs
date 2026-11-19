@@ -2173,8 +2173,8 @@ impl Client {
   }
 
   /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
-  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step bounded by the client's
-  /// reply deadline.
+  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step waiting while the route's
+  /// connection lives (`slates_ipc::route::claim`, A-523).
   #[cfg(target_os = "macos")]
   fn claim_offer(
     &self,
@@ -2185,8 +2185,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Stream, attachment),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| (claimed.descriptor, claimed.resync))
     .map_err(ClientError::Ipc)
@@ -2206,7 +2204,8 @@ impl Client {
   }
 
   /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its descriptor, each step of
-  /// the claim waited for in reply deadlines while the daemon lives, as the map's own reply is (A-186).
+  /// the claim waiting while the route's connection lives, as the map's own reply waits while the daemon does (A-186,
+  /// A-523).
   #[cfg(target_os = "macos")]
   fn claim_map(
     &self,
@@ -2217,8 +2216,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Map, mapping_id),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| claimed.descriptor)
     .map_err(ClientError::Ipc)

@@ -2848,14 +2848,8 @@ mod route {
     }
 
     // The honest claim, after all of it, succeeds; a second with the same secret finds no offer.
-    let claimed = slates_ipc::route::claim(
-      &instance,
-      (OfferKind::Stream, attachment),
-      &secret,
-      CREDIT_WAIT,
-      &mut || false,
-    )
-    .unwrap();
+    let claimed =
+      slates_ipc::route::claim(&instance, (OfferKind::Stream, attachment), &secret).unwrap();
     let mut guest = Guest::over(Attached {
       answer: ShardsAttached {
         attachment,
@@ -2868,13 +2862,7 @@ mod route {
     guest.init();
     assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
     assert!(matches!(
-      slates_ipc::route::claim(
-        &instance,
-        (OfferKind::Stream, attachment),
-        &secret,
-        CREDIT_WAIT,
-        &mut || false,
-      ),
+      slates_ipc::route::claim(&instance, (OfferKind::Stream, attachment), &secret,),
       Err(IpcError::RouteRefused {
         refusal: slates_ipc::error::RouteRefusal::NoOffer
       })
@@ -2956,22 +2944,17 @@ mod route {
     let mut flushed = 0usize;
     for _ in 0..CLAIMS_UNDER_CHURN {
       let (attachment, secret) = offer(client, id);
-      let claimed = match slates_ipc::route::claim(
-        instance,
-        (OfferKind::Stream, attachment),
-        &secret,
-        CREDIT_WAIT,
-        &mut || false,
-      ) {
-        Ok(claimed) => claimed,
-        Err(IpcError::RouteRefused {
-          refusal: slates_ipc::error::RouteRefusal::Flushed,
-        }) => {
-          flushed += 1;
-          continue;
-        }
-        Err(other) => panic!("a claim failed: {other}"),
-      };
+      let claimed =
+        match slates_ipc::route::claim(instance, (OfferKind::Stream, attachment), &secret) {
+          Ok(claimed) => claimed,
+          Err(IpcError::RouteRefused {
+            refusal: slates_ipc::error::RouteRefusal::Flushed,
+          }) => {
+            flushed += 1;
+            continue;
+          }
+          Err(other) => panic!("a claim failed: {other}"),
+        };
       let resync = claimed
         .resync
         .expect("a stream's resync end rides beside it (A-339)");
@@ -3030,14 +3013,8 @@ mod route {
     // The test thread waits past the old life; no runtime wheel serves this thread (D-9 allows a test).
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(PAST_THE_OLD_LIFE);
-    let claimed = slates_ipc::route::claim(
-      &instance,
-      (OfferKind::Stream, attachment),
-      &secret,
-      CREDIT_WAIT,
-      &mut || false,
-    )
-    .expect("an offer whose client lives was claimable past the old fixed life");
+    let claimed = slates_ipc::route::claim(&instance, (OfferKind::Stream, attachment), &secret)
+      .expect("an offer whose client lives was claimable past the old fixed life");
     let mut guest = Guest::over(Attached {
       answer: ShardsAttached {
         attachment,
@@ -3076,13 +3053,7 @@ mod route {
       ),
       "the detach"
     );
-    let claimed = slates_ipc::route::claim(
-      &instance,
-      (OfferKind::Stream, attachment),
-      &secret,
-      CREDIT_WAIT,
-      &mut || false,
-    );
+    let claimed = slates_ipc::route::claim(&instance, (OfferKind::Stream, attachment), &secret);
     assert!(
       matches!(
         claimed,
