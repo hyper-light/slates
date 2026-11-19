@@ -3802,3 +3802,6 @@ fn special_payload(
   let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
   SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
 }
+
+#[cfg(test)]
+mod node_exclusive_tests;
