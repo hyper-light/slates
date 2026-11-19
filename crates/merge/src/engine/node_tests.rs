@@ -594,24 +594,31 @@ fn rebased_at_the_fifo(work: fn() -> Work) -> Result<AtTheFifo, String> {
   }
 }
 
-/// A work and its own declared journal, as its volume records it.
-type Declared = (fn() -> Work, Vec<VolumeOp>);
+/// A work, its own declared journal as its volume records it, and what the server answers of it
+/// at the linked FIFO rebased and as its own submit.
+type Pinned = (fn() -> Work, Vec<VolumeOp>, AtTheFifo, AtTheFifo);
 
 /// A-677's sibling (A-646's hand-over of an IPC node; GAPS, the inode-aware namespace journal
 /// owed). Do: rebase at the head a work that removes the FIFO `SPECIAL`, which `SECOND` names, and
 /// one that renames `FILE` over it, and seal and submit each rebased work's restated journal, as its
 /// next submit; beside each, seal and submit the work's own declared journal, as the server makes
-/// its submit. Expect each rebased work answered as its own submit is: a refusal alike, or `SECOND`
-/// holding alike. A rebased work's view lists no IPC node, so its next submit is where what it
-/// holds of the FIFO lands.
+/// its submit. Expect each refused by the deriver, rebased or not: the removal `Unsupported` both
+/// ways (a name's unlink while a link names its IPC node), the rename `PathKindConflict` as the work
+/// declared it and `Unsupported` as the rebase restates it, the replaced FIFO's removal written out.
+/// No work in the server seals, submits or rebases either, so no rebased work holds a FIFO handed to
+/// a link; when the inode-aware journal composes them this fails, and the heir FIFO is to be held to
+/// the submit's, as the mode and attributes are.
 #[test]
-fn a_rebased_work_is_answered_as_its_own_submit_at_a_linked_fifo() -> Result<(), String> {
-  let cases: [Declared; 2] = [
+fn a_linked_fifos_removal_or_replacement_is_refused_rebased_or_not() -> Result<(), String> {
+  let unsupported = || AtTheFifo::Refused(DeriveError::Unsupported(SPECIAL.to_owned()));
+  let cases: [Pinned; 2] = [
     (
       removed_fifo,
       vec![VolumeOp::Unlink {
         path: SPECIAL.to_owned(),
       }],
+      unsupported(),
+      unsupported(),
     ),
     (
       replaced_fifo,
@@ -619,16 +626,17 @@ fn a_rebased_work_is_answered_as_its_own_submit_at_a_linked_fifo() -> Result<(),
         from: FILE.to_owned(),
         to: SPECIAL.to_owned(),
       }],
+      unsupported(),
+      AtTheFifo::Refused(DeriveError::PathKindConflict(SPECIAL.to_owned())),
     ),
   ];
-  for (work, declared) in cases {
-    let (rebased, own) = (
+  for (work, declared, rebased_answer, own_answer) in cases {
+    let found = (
       rebased_at_the_fifo(work)?,
       submitted_at_the_fifo(&declared, 6)?,
     );
-    eprintln!("A-677's sibling, a linked FIFO: rebased {rebased:?}, its own submit {own:?}");
-    if rebased != own {
-      return Err(format!("rebased {rebased:?}, its own submit {own:?}"));
+    if found != (rebased_answer, own_answer) {
+      return Err(format!("rebased, then its own submit: {found:?}"));
     }
   }
   Ok(())
