@@ -12018,6 +12018,13 @@ is one more version, and the chain itself is never rewritten.
 > links; kind transitions; one copy of a pushed blob's bytes shared by the store and the green (A-581's owed content
 > index); the post-state assembly shared with the server's (`verbs::assemble_post_state`), so the two never lay a
 > document out apart.
+>
+> **Status (2026-11-19, A-664 part 2: item 3's commit the server makes, as derived data).** A version a work with no head
+> operation made has its git objects derived from the history alone (`slates_git::derived`, §4.17.2's status): its
+> trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
+> and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
+> client pushed keeps the client's commit. Owed: item 4's identities in the principal's record and the refusals at
+> submit (A-664 part 1), the commit recorded with the version and admitted (part 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12553,6 +12560,21 @@ engine: the verdict, rebase, position mapping, the register).
 > keeps the admission's sets as the type's value with no second walk (`Repository::reach_value`). The store's outputs
 > are unchanged.
 >
+> **Status (2026-11-19, A-664 part 2: a version's trees and commit as derived data, piece 13's first part).**
+> `crates/git` (`derived`) makes the git objects of a version the server turns into git's (§4.17.1 "A push is a work"
+> items 3 and 4) as two types of A-647's derived data. `Trees` is derived from the change a version's path map reads:
+> each file's mode from its class (`FileClass`: `100644`, `100755`, `120000`, and `160000` for the special node, whose
+> content is the commit's id), git's entry order, and only the directories the change touched made again, every other
+> subtree taken from the parent's value by identity; a directory with more subtrees than one node names holds them
+> through lists, as the store holds an object past a window. `Commits` is a pushed version's own client commit, or the
+> commit the server makes of the version's tree, its parents' commits, the merging principal's identity (`Identity`,
+> refused where git would change it) at the merge record's time in UTC and the submit's message, written as `git
+> commit-tree -m` writes it. Every tree and commit made passes git's strict fsck. Held to stock git 2.50.1's own
+> objects, to the trees built from each version's whole path map over generated histories, and to themselves derived
+> again lazily in another store, node for node. Owed: the green's state as the path map (A-647's owed map), the
+> principal's identities and the submit's message (part 1), and the made commit recorded with the version and admitted
+> to the git store (part 3, over A-662).
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -13014,7 +13036,9 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 10. Hooks over a read-only bare-repository view; push options; push to review with report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
-13. Server-side merge and rebase of review requests; `log` and `blame` through the API.
+13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
+    A-664: part 2 built, a version's trees and commit as derived types; part 1, the principal's identities and
+    `MessageRequired` and `IdentityRequired` at submit, and part 3, the made commit recorded and admitted, owed.)
 14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
 15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
     landing.
@@ -44103,7 +44127,8 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     (Built, A-647: the mechanism in `slates-vcs`'s `derived` module, a value kept as content under (type, version) in
     an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
     step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
-    the store's outputs unchanged (part 2). Owed: A-553's and A-588's stores as types.)
+    the store's outputs unchanged (part 2). A version's git trees and commit as types, the commit the server makes
+    (A-664 part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -46321,3 +46346,91 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   check` and the doc gate are main's (the run-request queue).
 - **Owed.** Part 2: the owner's commit step through A-635's `RepositoryLogs::append`, at the position the commit read
   (`Moved` answered as `svnserve`'s out-of-date), which a dump's import drives too (A-652 part 3).
+
+### A-664 part 2 — A version's git trees and commit as derived data: the commit the server makes, the same on every holder (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.17.1 "A push is a work" items 3 and 4; §4.17.2 "The repository in git's terms" item 5 and "Pieces (git)" piece 13; A-645, A-647; after A-590, A-600, A-637)
+
+- **What A-664 is.** The commits the server makes for the works it turns into the tool's objects: an agent's work through
+  the SDK or a mount, and later a merged review request and a server-side rebase. Such a work carries no head
+  operation, so the server makes the commit after the verdict, and every holder recomputes it from the record (§4.17.1
+  item 3, §4.16 "Apply on holders"): this is how native work becomes visible to stock clients. Three parts, git first:
+  1, a principal's record holds its tool identities and a submit to a repository's green carries a message, refused
+  `MessageRequired` and `IdentityRequired` before any work is built; 2, this one; 3, the made commit recorded with the
+  version and admitted to the repository's git store, over A-662. Mercurial's changesets (§4.17.3 decision 7, piece 6)
+  and Subversion's revisions follow by the same rule (GAPS).
+- **Where, and why there.** `slates-git`'s `derived` module (`crates/git/src/derived.rs`, `derived/tree.rs`,
+  `derived/commit.rs`): git's naming, tree writer and fsck are there, and A-647's mechanism (`slates-vcs`) is a
+  dependency it has already.
+- **The trees** (`Trees`, a type over any history whose changes the path map reads). One node a directory names the
+  directory's tree object, kept as content exactly as git hashes it after its header (so the git store's row for the
+  same object names the same content), then its subtrees' nodes in the tree's order; its payload is the tree's id, the
+  object's length, its count of subtrees and its height. A directory with more subtrees than one node names holds them
+  through list nodes a level above another, the store's own rule for an object past a window (A-581). Each file's mode
+  is its class's (`FileClass`: `100644`, `100755`, `120000`, and `160000` for the special node, whose content is the
+  commit id's raw bytes, as A-637's `SpecialKind::Gitlink` holds it), entries are in git's order (`objects::tree::
+  compare`), a blob's id is hashed from the content's windows as `git hash-object` names the bytes, and a change makes
+  again only the directories it touched, from the deepest up, reading each from its tree object, every other subtree
+  taken from the parent's value by identity. A from-scratch `build` is the oracle's other leg. The path map's rule
+  decides what a change may do, so the two types refuse the same changes.
+- **The commit** (`Commits`, over a history that says how each version's commit is had, `CommitSource`). A version a
+  stock client pushed has the client's own commit, a node naming nothing but its id. A version the server makes has
+  its tree (the `Trees` value's root, which the commit's node names, so the trees live as long as the commit), a
+  `parent` for each of the version's parents, in order, each that parent's commit whether pushed or made, `author` and
+  `committer` the merging principal's identity at the merge record's time in seconds, in UTC (`+0000`), and the
+  submit's message, its last line completed as `git commit-tree -m` completes it [C: builtin/commit-tree.c,
+  `strbuf_complete_line`; an empty message stays empty]. Written as `commit_tree_extended` writes a commit (commit.c,
+  git v2.50.1): no `encoding`, every field UTF-8, no signature.
+- **An identity as git writes it** (`Identity::new`). git cleans a name and an email before it writes them [C: ident.c
+  `strbuf_addstr_without_crud`, git v2.50.1, read 2026-11-19]: it strips from both ends any byte up to the space and
+  `,` `:` `;` `<` `>` `"` `\` `'` (no period), drops a newline, `<` and `>` from inside, and refuses an empty name. An
+  identity git would change is refused here, by part and byte, so a principal's record holds the bytes every commit
+  carries; the golden cases `crud`, `inner` and `noemail` show stock git doing each.
+- **What a made object may hold.** Every tree and commit made passes git's strict fsck, the check `transfer.fsckObjects`
+  runs on a fetch: a version holding a `.git` name in any case, a `.gitmodules` symbolic link, a name past 4096 bytes or
+  a submodule link to the null id, or a message holding a NUL, is refused by kind (`TreesRefused::Fsck`,
+  `CommitsRefused::Fsck`), never made into an object a stock client refuses.
+- **Typed refusals.** `TreesRefused`: no change, a bad path (an empty name, `.`, `..`, a NUL), a removal of an absent
+  file, a file shadowing a directory or a directory a file, an unknown class, a content that is no file's, a submodule
+  link holding no id, a SHA-1 collision, a strict fsck finding, a malformed node, a window too small, another window,
+  the store's own. `CommitsRefused`: no commit, a foreign id, a malformed tree or parent, a date past `i64::MAX`, a
+  strict fsck finding, a collision, another window, the store's own. Each leaves the store as it was.
+- **No tunable.** The shapes (one node a directory, lists of as many as a node names) follow from the store's window,
+  which the types' names carry; a store of another window is refused.
+- **Tests** (`crates/git/src/tests/derived/`; `cargo test --locked -p slates-git --lib`, Windows x86_64, jupiter,
+  2026-11-19, a fresh clone of the pushed branch at 42f3aeb64 with its own target directory, `CARGO_BUILD_JOBS=4`,
+  while the Mac Studio was offline; the macOS run is owed).
+  - Green: 461 passed, 3 ignored (main's), in 14.06 s: main's baseline at 018d32ba2 (447 and 3) and the 14 new; no
+    warning from `slates-git`; `cargo fmt` clean.
+  - Golden vectors (`fixtures/made/make-made-fixtures.sh`, stock git 2.50.1 (Apple Git-155), run twice, byte for byte
+    the same; `SHA256SUMS` checked): every tree `git update-index --cacheinfo` and `git write-tree` wrote of
+    `files.tsv` (a file, an executable, a symbolic link, a submodule's commit, an empty and a binary file, `foo-bar`,
+    `foo.c`, `foo/` and `foo0`, `sub.txt` before `sub/`), the empty tree `git mktree` wrote, and eight commits
+    `git commit-tree -m` wrote (a root, one over it, a merge, the empty tree with an empty message, UTF-8, a message
+    ending in blank lines, and the identity cases), in SHA-1 and SHA-256, each id and each byte.
+  - The oracle (`t_a664_the_derived_trees_are_the_trees_built_from_the_whole_path_map_at_every_version`, 48 cases, both
+    formats): generated histories with merges, nested and wide directories, every class, pushed and made versions and
+    one hostile change in about one recording in four, A-647's path map, the trees and the commits each derived as the
+    version is recorded. Every version's trees are, identity for identity, the trees built from scratch from the
+    version's whole path map, with the naive recomputation's id; each derivation made exactly its change's directories
+    and hashed exactly the files it set (the non-vacuity counters); each commit is the client's or the naive
+    `git commit-tree -m` commit; each hostile change is refused by its kind with the store as it was. Its census:
+    1,186 versions, 146 merges, 352 pushed and 834 made, 240 lists, a directory of 40 subdirectories, a derivation of
+    49 directories, all 8 refusal kinds.
+  - The determinism gate (`t_a664_every_value_derived_again_elsewhere_is_the_same_byte_for_byte`, 24 cases, both
+    formats): every history derived again lazily, newest version first, in a store holding only the files' contents,
+    every value the same root and every node and content it names the same bytes.
+  - Beside them: a change of one file among 202 reads and makes 3 directories and hashes 1 blob; a directory of 100
+    subtrees named through 4 lists, then through itself with 10 left; a path resolved a tree a name; a file past four
+    windows named from its windows; every refusal by kind with the store unchanged; hostile nodes refused malformed;
+    identities git would change refused by part and byte; a pushed version's commit the next made one's parent.
+  - Red three ways, a mutation at a time in the clone, each restored with `git show` (jupiter): git's entry order
+    replaced by byte order (4 failed: both golden tests and both oracles); a message's last line left uncompleted (4
+    failed: the golden commits, both oracles, the pushed-then-made test); no crud refused (the identity test). A first
+    try of the second applied no change, its patch not matching, and is not counted.
+- **Owed.** The green's state as the path map these types read (A-647's owed map; its classes `FileClass`'s); part 1;
+  part 3 over A-662; a submit refused before the verdict when its post-state is one git cannot hold; a `.gitmodules`
+  blob's own checks; a blob's id read by its content from the git store's rows, so a rename or a revert hashes nothing;
+  a derivation's transient listings charged to the store; Mercurial's and Subversion's made objects. Main's: the macOS
+  run of these tests, clippy, `xtask`, the doc build.
+- **Applied in the same change to:** `crates/git/src/derived.rs`, `derived/tree.rs`, `derived/commit.rs` (new),
+  `crates/git/src/lib.rs`; `crates/git/src/tests/derived/` (new); `crates/git/fixtures/made/` (new); §4.17.1 "A push is
+  a work"'s status; §4.17.2's status and piece 13; A-645's entry; GAPS' §4.17 entry.
