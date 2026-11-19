@@ -12336,6 +12336,16 @@ engine: the verdict, rebase, position mapping, the register).
 > close end the channel in order. The listener on the runtime, the host key's keeping and the commands' serving are
 > owed.
 >
+> **Status (2026-11-19, A-634: the post-quantum key exchange built).** The transport runs `mlkem768x25519-sha256`, the
+> ML-KEM-768 and X25519 hybrid OpenSSH made its default in 10.0, and offers it first; a client that does not list it
+> gets `curve25519-sha256`, since the client's first choice decides. The server checks `C_INIT`'s length, encapsulates
+> to the client's ML-KEM key through aws-lc-rs (AWS-LC runs FIPS 203 §7.2's modulus check inside the encapsulation),
+> keeps RFC 8731's checks on the X25519 half, and enters `K = SHA-256(K_PQ || K_CL)` into the hash and the key
+> derivation as a string. OpenSSH 10.1 and later warn on every connection whose exchange is not post-quantum, and each
+> of them lists the hybrid first, so none warns here. Held to whole handshakes and rekeys against the test client,
+> which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
+> mutations of the secret's encoding and order, the reply's order and the length check, each caught.
+>
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
 > inflated through flate2 over zlib-rs (A-607) into room for exactly the size its header names, then the trailer, which
@@ -12571,7 +12581,10 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
    bound to its one endpoint and refusing every transfer coding, lent its line bound and its staged close, and moving it
    onto the codec is owed. The git edge adds TLS, authentication and streaming responses.
 2. **SSH**, served by slates itself: the transport [B: RFC 4253], user authentication by public key [B: RFC 4252] and
-   one session channel [B: RFC 4254]. Key exchange `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
+   one session channel [B: RFC 4254]. Key exchange `mlkem768x25519-sha256` first, ML-KEM-768 with X25519
+   [B: `draft-ietf-sshm-mlkem-hybrid-kex-10`; FIPS 203], OpenSSH's default since 10.0, whose clients since 10.1 warn on
+   every connection without a post-quantum exchange [B: OpenSSH 10.0 and 10.1 release notes] (A-634), then
+   `curve25519-sha256` [B: RFC 8731]; host and user keys `ssh-ed25519`
    [B: RFC 8709], and user keys in RSA under `rsa-sha2-512` and `rsa-sha2-256` [B: RFC 8332] (A-633), with the ECDSA
    and FIDO key forms users also hold as owed reading; ciphers `aes256-gcm@openssh.com`
    and `chacha20-poly1305@openssh.com`, the forms OpenSSH clients speak ("Because of problems with the design of the
@@ -13035,6 +13048,17 @@ signature verification).
 > bookmarks and markers beside the logs (pieces 5 and 7; until then an import is not served), the import sliced under
 > the shard's budget and resumed after a pending read, revlogs read by ranges, a rebuild that starts from the text
 > before it, and the server's adapter from the base's host seam.
+>
+> **Status (2026-11-19, A-619 part 3: the session of `slates hg serve --stdio`).** `serve::session::serve` serves the
+> SSH version 1 request at the front of the buffered input as 7.2's `_runsshserver` does: `hello` and `capabilities` of
+> what is served (`batch`, `branchmap`, `bundle2`, `getbundle`, `known`, `protocaps`), `protocaps`, `batch` of the
+> string-answering calls, discovery and `listkeys`, and `getbundle`'s stream, its refusal of a bundle2 request answered
+> as an `ERROR:ABORT` part; an empty answer for a name 7.2 lacks; the commands 7.2 serves and this server does not read
+> and refused out of band; an empty line ending the session. Proven by `cargo test --locked -p slates-hg --lib` on the
+> Mac Studio, 219 of 219, red first (5 of 5 failed against a stub): the three captured sessions served whole (every
+> string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
+> requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
+> HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13434,8 +13458,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    7), the import sliced and by ranges, and the server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
-   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; owed: the stdio loop,
-   HTTP.
+   with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
+   3); owed: the process around it, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
    the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
@@ -13563,8 +13587,20 @@ and export by landing).
 > writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
 > the svndiff codec, a deletion and the addition of its path read as the one replacement FSFS records. Held to four
 > dumps stock `svnadmin` 1.15.0 wrote (golden, SHA-256 checked), to `svnlook changed`, to format 3 rebuilding format
-> 2's trees, to every cut and bit flip. Owed of piece 6: the verbs over it (`svnadmin create`, `load`, `dump`,
-> `setrevprop`, `setlog`, `info`, `uuid`, `youngest`) and the dump round trip.
+> 2's trees, to every cut and bit flip. Owed of piece 6 then: the import and export over it, built by A-628.
+>
+> **Status (2026-11-19, A-628, its first part).** Built: the repository's import and export (`slates-svn`'s
+> `migration`, piece 6's rest as Ada scoped it: slates offers the server portion, stock tools stay stock). A
+> repository's records: the index, each revision's properties, every text and property list held once by its BLAKE3
+> identity, the UUID, all within the caller's room. A dump is imported as its history as `svnadmin load` makes it
+> through FSFS (`load-fs-vtable.c`'s calls applied to a transaction, the changed paths FSFS records and folds, every
+> checksum the stream carries checked, revisions kept at their numbers); a range of revisions is exported in format 2 as
+> `svn_repos_dump_fs4` writes it (its replay's path driver, `dump_node`'s comparisons by representation, deletions at
+> their directory's close). Held to the golden dumps: `full.dump` and `part1.dump` exported again byte for byte,
+> `deltas.dump` and `part1.dump` then `part2.dump` importing to `full.dump`'s history, every revision's changed paths
+> `svnlook changed`'s account of the repository `svnadmin` dumped, and import(export(R)) equal to R for those and for
+> generated histories held to a model tree. Owed: the export in format 3 (Subversion's deltifier, its second part), and
+> the wiring (a `CreateRepository` repository's records held by its shard, the two verbs on the control channel).
 >
 > **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
 > piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
@@ -13631,6 +13667,19 @@ and export by landing).
 > LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
 > `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
 > answers to `close-edit` and `abort-edit`.
+>
+> **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
+> `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
+> (`reads::Repository`: entries, property lists, revision properties, texts in runs) and the session's `Guards` (its
+> locks and what its principal may read): an explicit stack of frames, never recursion, a step at a time under the
+> caller's budget, the report read one path ahead as `reporter.c` reads it; entry properties, lock tokens removed,
+> property differences, absent entries, deletions with `svn_repos_deleted_rev`'s revision, depth upgrades and
+> exclusions, copy sources by `fs_closest_copy` when asked, and the refusals `svnserve` makes in its words. Held to
+> every drive `svnserve` made in the recorded sessions (27, the early answer's being the handler's), replayed from
+> each session's own report over `history.txt` rebuilt into an index and a green and checked against
+> `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
+> delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
+> sent today as new data; and the handler.
 >
 > **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
 > (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
@@ -14149,8 +14198,13 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
    must give the same accept or conflict, and the same conflicting path (built, A-592, with the drive's out-of-date
    test, the lock table's check after the merge, and `verify_locks` in the oracle).
-6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format; its codec built, A-593),
-   `setrevprop`, `setlog`, `info`, `uuid`, `youngest`; the dump round trip is their gate.
+6. The repository's import and export (Ada, 2026-11-19: slates offers the server portion only, and stock clients and
+   tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
+   as its history, and a history exported as a dump for migration, each a server verb over the index and the records
+   with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
+   gate (the dump codec built, A-593; the verbs built for format 2, A-628; format 3's export and the wiring owed).
+   `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
+   property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
    the plain reads; the reporter (update, switch, status, diff, checkout; its commands and report built, A-616
    part 1, its editor drive owed); commit; log, locations, segments, file revisions, deleted revision, replay;
@@ -43672,7 +43726,8 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
 Applied in the same change to:
 - §4.17.2's status and its SSH item (RSA user keys under RFC 8332; Mercurial's and Subversion's commands); §4.17.3's
   transports and §4.17.4's svn+ssh (slates' own SSH server reads their commands); GAPS (the §4.17 entry);
-  `research/vcs-servers.md` §5.6 (new: the sources, pinned by hash);
+  `research/vcs-servers.md` §5.7 (new: the sources, pinned by hash; first numbered §5.6, beside A-624's, and renumbered
+  by A-634);
 - `crates/ssh` (new: `userauth`, `channel`, `command`, `session`; `transport` sends EXT_INFO and gives each upper-layer
   message its sequence number; `refusal` gains reason 14; their tests; `fixtures/userauth` with `make-fixtures.sh`).
 - **Authentication** (RFC 4252). `none` is answered with a failure naming `publickey` and is never counted. A query is
@@ -44453,6 +44508,236 @@ Applied in the same change to:
   Red on r960, with the old rename rule and the old scans restored (the scans counting): 4 of the 7 tests the run
   selected failed, and the guards passed either way. The file over the symlink, and the file over its own link, were
   each `TypeChanged`; the oracle shrank to the hard link renamed over the symlink; the removal examined 2,000 entries.
+
+### A-619 (part 3) — Mercurial's read serving, part 3: the SSH version 1 session of `slates hg serve --stdio`, held to three captured sessions of stock Mercurial 7.2 served whole (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone", piece 4; A-569, A-619 parts 1 and 2)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve::session`, new: `serve`,
+`Step`, `Refused`; `serve::Refusal` is `Copy`; its tests beside `getbundle`'s, whose store they share), GAPS (the
+§4.17.3 entry), `research/mercurial-server.md` (§22).
+- **What it does.** One step serves the request at the front of the buffered input: the command line, its arguments by
+  7.2's spec, then a string answer, `getbundle`'s raw stream, or an out-of-band error; `More` where the buffer holds
+  only part of a request. The commands served are those part 1 and part 2 answer, with `hello`, `capabilities`,
+  `protocaps` and `batch`; 7.2's others are read and refused out of band, so the session stays in step.
+- **Decided.** A request that cannot be read ends the session after an error answer, where 7.2 fails mid-stream; a
+  command's own refusal is answered out of band and the session goes on, where 7.2's exceptions end the process; a
+  bundle2 request's `getbundle` refusal is 7.2's `ERROR:ABORT` part with 7.2's words where 7.2 aborts alike. The
+  advertised capabilities are what is served; a 7.2 client asks the same `getbundle` of them (`_pullbundle2` reads
+  `phases`, `bookmarks`, `listkeys`, `obsmarkers`).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 219 of 219 (load 9.1), 5 of
+  them this part's; red first against a step that ends at once, 5 of 5 failed; fmt clean. Golden: each captured session
+  served whole and ended by an empty line, `between`, `protocaps`, `batch` and `listkeys` byte for byte with their
+  framing, `getbundle` by meaning, `hello` each capability one 7.2 advertised. Hostile: an unknown name, `lookup`, a
+  batch calling `getbundle`, a batch call without its space, `known` of a non-hex node, a bundle1 `getbundle`, a client
+  with only version 01 (its `ERROR:ABORT` part), partial requests, an argument past the admission, a line too long;
+  arbitrary input (a session ends cleanly only on an empty line, by a refusal only with the rest taken).
+- **Owed.** The process around the session (the CLI's stdin and stdout through the runtime, sliced within the shard's
+  budget), HTTP version 1 over `slates-http` (A-595) and the shared edge (A-625), held deltas, `obsolete`'s `listkeys`
+  dump, and the index's kept heads.
+
+### A-634 — The SSH server's post-quantum key exchange: `mlkem768x25519-sha256`, ML-KEM-768 with X25519 through aws-lc-rs, offered first, and OpenSSH's warning checked against its release notes (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2; after A-594 and A-633)
+Applied in the same change to:
+- §4.17.2's status and its SSH item (the key exchange); GAPS (the §4.17 entry); `research/vcs-servers.md` §5.8 (new:
+  the draft, FIPS 203's checks where AWS-LC runs them, OpenSSH's release notes and its post-quantum page, pinned by
+  hash), with A-633's sources renumbered §5.7 and moved into §5, where a merge had left them after §6 under A-624's
+  number;
+- `crates/ssh`: `kex` (the hybrid's half; one X25519 step both methods share, the all-zero check in it alone);
+  `kexinit` (the method list, `KexMethod::Mlkem768X25519Sha256`); `transport` (each method's half; `Algorithms::kex`);
+  `entropy` (the one draw that does not pass through it); the tests (the hybrid's half, hostile values, negotiation,
+  whole handshakes; the test client decapsulates for itself and lists OpenSSH 10's default methods; the tests'
+  narrowing casts are checked conversions now).
+- **The claim, checked.** The brief said OpenSSH 10 "may warn on every non-post-quantum exchange". The release notes
+  say so of 10.1, not 10.0. OpenSSH 10.0 (released 2025-04-09) made the hybrid its default: "the hybrid post-quantum
+  algorithm mlkem768x25519-sha256 is now used by default for key agreement" [B: release-10.0]. OpenSSH 10.1
+  (2025-10-06), among its potentially incompatible changes, has `ssh(1)` "add a warning when the connection negotiates
+  a non-post quantum key agreement algorithm", "due to the risk of "store now, decrypt later" attacks", controlled by
+  "a new WarnWeakCrypto ssh_config option, defaulting to on" [B: release-10.1]. OpenSSH 10.2 (2025-10-10) changes
+  nothing here. The warning is the client's, on every such connection: "** WARNING: connection is not using a
+  post-quantum key exchange algorithm." It stays silent when the server offers `mlkem768x25519-sha256` or
+  `sntrup761x25519-sha512` [B: openssh.com/pq.html]. So `git` and `hg` over OpenSSH 10.1 or later would have warned
+  on every connection to slates before this change. Now none does, since every such client lists the hybrid first
+  (`KEX_CLIENT_KEX` in `myproposal.h` at `fa4b2a82`) [C].
+- **Not offered: `sntrup761x25519-sha512`**, OpenSSH's post-quantum default from 9.0 to 9.8. AWS-LC has no Streamlined
+  NTRU Prime, and every client that warns offers the hybrid; a 9.0 to 9.8 client gets `curve25519-sha256` here and does
+  not warn.
+- **The exchange** (the draft §2.1 to §2.5). Messages 30 and 31 carry longer values: `C_INIT` is the client's
+  ML-KEM-768 encapsulation key (1184 bytes) and then its X25519 key, and `S_REPLY` is the ciphertext (1088 bytes) and
+  then the server's X25519 key. The server checks that `C_INIT` is exactly 1216 bytes ("MUST check that the length of
+  the C_INIT is the sum of the expected length of each public key"), runs the X25519 half with RFC 8731's checks,
+  encapsulates through aws-lc-rs, and computes `K = SHA-256(K_PQ || K_CL)` over the two secrets as fixed-length byte
+  strings. "K is encoded as a string" in the hash and the key derivation, not as an `mpint` (§2.5). Every refusal ends
+  the connection with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, as §2.1 requires. OpenSSH's server does the same
+  (`kex_kem_mlkem768x25519_enc` in `kexmlkem768x25519.c` at `fa4b2a82`) [C].
+- **FIPS 203 §7.2's checks.** The length check is the server's own. The modulus check is part of ML-KEM's encapsulation
+  as FIPS 203 defines its input checking, and AWS-LC runs it there: `mlk_kem_enc_derand` calls `mlk_kem_check_pk`,
+  "Implements @[FIPS203, Section 7.2, Modulus check]" (`vendor/aws-lc-sys/aws-lc/crypto/fipsmodule/ml_kem/mlkem/kem.c`
+  line 331, aws-lc-sys 0.45.0). The crate does not check it again, since a second check would be a second path doing
+  the same thing; a hostile test holds AWS-LC to it instead: a coefficient at q or at 4095 is refused, one at q - 1
+  served.
+- **Negotiation.** The method is the client's first that the server runs (RFC 4253 §7.1): the hybrid for a client
+  listing it first, `curve25519-sha256` for one that prefers it or lacks the hybrid. A guess is judged by the first
+  names as before, so a client listing the hybrid first now guesses right. `Established` and `Rekeyed` name the method
+  (`Algorithms::kex`), so a deployment can count the connections that ran it.
+- **Randomness.** The encapsulation's 32 random bytes come from AWS-LC's generator inside AWS-LC, the source
+  `SystemEntropy` reads. aws-lc-rs encapsulates from no given bytes, and AWS-LC's encapsulation that does
+  (`EVP_PKEY_encapsulate_deterministic`) is experimental and unwrapped. Production's source is unchanged, but a hybrid
+  transcript is not reproducible from the test seeds, so the determinism test holds the classical exchange (`entropy`'s
+  module doc says this). Measured: 64 encapsulations to one key gave 64 different ciphertexts, as the draft's §6 asks
+  ("MUST NOT reuse randomness in the generation of ML-KEM ciphertexts").
+- **Tests** (`cargo test --locked -p slates-ssh --lib`, Mac Studio d1323898). 110 of 110 at a064d221.
+  - Red first at bdb2fb7d: 100 passed and the 10 new and changed tests failed, with the server offering the classical
+    exchange alone and the hybrid's half a stub that refused.
+  - Green at 07650154 on its first build, 110 of 110.
+  - The hybrid's half against a client decapsulating with its own key, with RFC 7748's X25519 values on both sides,
+    over 64 runs that must include a hash with its top bit set, where an `mpint` and a `string` differ.
+  - Hostile `C_INIT`s refused by kind beside served controls: a byte short or long, a classical key, a coefficient at
+    q or 4095, the all-zero point.
+  - Negotiation by the client's choice; the KEXINIT's lists; guesses right and wrong, counted by the exchange messages
+    the client sent.
+  - Whole connections against the test client: handshakes under both ciphers with and without strict key exchange,
+    client and server rekeys, and every session and authentication test, all running the hybrid; a classical client
+    and one preferring `curve25519-sha256`, each through a handshake and a rekey.
+  - Red four ways on the Studio:
+    - `K` written as an `mpint`: 23 of 110 failed, the unit test only by chance, so it now requires a top-bit run and
+      failed each of 3 runs;
+    - the two secrets swapped: 35 failed;
+    - the length check removed: both hostile tests failed;
+    - the reply's two parts swapped: 35 failed.
+- **Owed.** Main's live interop with OpenSSH 10.2 (`ssh -v` naming `mlkem768x25519-sha256`, and no warning), and a
+  golden transcript with known keys, which needs a client with a fixed ML-KEM key, since the draft gives no vector.
+
+### A-628 — The repository's import and export: a dump made into a repository's history as FSFS's load makes it, and a history written as `svnadmin dump` writes it (2026-11-19, g264, UI goal 93; §4.17.4 "Pieces that follow" piece 6's rest, rescoped by Ada; A-553, A-575, A-593)
+Applied in the same change to:
+- §4.17.4 (a status block; piece 6 restated as Ada scoped it) and GAPS (the §4.17.4 entry);
+- `research/vcs-servers-subversion.md` §15 (new: the replay, load and FSFS sources the verbs follow, each with its
+  sha256, and what each decided);
+- `crates/svn` (`migration.rs` and `migration/` new: `paths.rs`, `properties.rs`, `records.rs`, `import.rs`,
+  `export.rs`, `tests.rs`, `tests/`; `lib.rs`'s module line and its module list; `Cargo.toml`), and the lock
+  (`slates-svn` gains `blake3`, the workspace's, nothing re-resolved). A-593's codec and tests kept to the lint habits
+  in a sibling change (`as_chunks`, a byte string, no `prop_oneof!`, no panic in a test function returning `Result`).
+- **What was there.** Piece 6 named `svnadmin`'s verbs (`create`, `load`, `dump`, `setrevprop`, `setlog`, `info`,
+  `uuid`, `youngest`), and A-628 was first assigned as those verbs with `svnadmin`'s output and errors. Ada's scope
+  (2026-11-19): slates offers the server portion only, and stock clients and tools stay stock; no `svnadmin` command
+  line and no matching of its text; A-628 is the server's import and export. The work done toward the command line
+  (golden output of stock `svnadmin` 1.15.0's verbs, a transcription of its messages) is parked unmerged on
+  `agents/g264-a628-svnadmin`.
+- **The records** (`Repository`): the index (A-553), each revision's properties, every text and property list held once
+  by its content identity (BLAKE3 of the bytes; a property list in FSFS's own form, `K`/`V` entries in name order and
+  `END`, so equal lists share an identity as FSFS shares their representation), and the UUID. `Repository::new` is what
+  `CreateRepository` leaves: revision 0, an empty root, `svn:date` its caller's time. A `Room` the caller derives bounds
+  the index's entries and the bytes held; an import past it is refused, typed, before the bytes past it are kept.
+- **The import** (`Importer`) reads a dump through A-593's reader as its bytes arrive and makes each revision as `svnadmin
+  load` makes it through `load-fs-vtable.c` and FSFS: a transaction on the youngest revision, named as FSFS names one
+  (the base, `-`, the repository's count of transactions in base 36, design item 3.1's form); each record's path read
+  through `svn_relpath_canonicalize` (checked against `dirent_uri.c` at `d434dc14`); `change` makes no call, `delete`
+  deletes, `add` makes or copies, `replace` does both; a whole property section removes each property the node has and
+  sets each it lists, a format-3 section deletes and sets what it names; a text is set whole or a delta applied window by
+  window to the node's text; the changed path FSFS records is kept, folded as `fold_change` folds one path's calls (an
+  addition after a deletion a replacement, a deletion of an addition nothing, a modification keeping an addition's
+  action, a deletion dropping what the revision did beneath it), and a property change recorded where a call was made,
+  a text change where a text was set. Then the revision is appended to the index with exactly the stream's revision
+  properties. Every checksum the stream carries is checked: a whole text's by the reader, a delta's base and result and
+  a copy source's text here, SHA-1 beside MD5.
+- **Where it keeps what `svnadmin load` would change.** A revision keeps the number the stream gives it: a stream
+  continues the history (revision 0 into an empty repository, else the one after the youngest) or is refused
+  (`OutOfSequence`), so a dump made in parts loads part after part; a UUID record names a repository that holds no
+  revision but 0 and is refused when it names another than one that holds history (`ForeignRepository`), where
+  `svnadmin load` ignores it. Properties are kept byte for byte, where `svnadmin load` by default validates `svn:`
+  properties and rewrites `svn:mergeinfo` into its canonical form, so the history imported is the one its source served.
+  The mergeinfo flag of a changed path says whether `svn:mergeinfo`'s value changed (what `svn log -g` reads it for);
+  FSFS's own load sets it for every rewrite of a whole list that holds `svn:mergeinfo`, which no dump carries.
+- **The export** (`Exporter`) writes a range as `svn_repos_dump_fs4` writes it: the version and UUID records, each
+  revision's record with its properties (a section even when empty), and each revision but 0 replayed as
+  `svn_repos_replay2` drives `dump.c`'s editor: the changed paths in `svn_path_compare_paths` order through the path
+  driver; a deletion written when its directory closes, a directory's in byte order; a replacement by a copy a deletion
+  record and an addition; an addition's whole property list and text; a change's or a copy's property list and text when
+  they differ from the node it is compared with, itself in the revision before, its copy source, or the place beneath a
+  directory copied in the same revision. `dump.c` compares representation keys (`svn_fs_props_changed`,
+  `svn_fs_contents_changed`) and FSFS shares equal representations, so equal content identities compare unchanged. A
+  range starting after revision 0 is written incrementally; the whole tree `svnadmin dump` writes for a range that is
+  not incremental is not offered. Format 3 is refused (`DeltasOwed`) until Subversion's deltifier is ported, since only
+  its windows make `svnadmin dump --deltas`'s bytes.
+- **Refusals**, each typed with the Subversion error the same refusal is: the stream's (A-593's, its own number), a
+  delta's (svndiff's), `OutOfSequence`, `CopyFromFuture` (`E160006`), `ForeignRepository` (`E125008`), `PathSyntax`
+  (`E160005`), `RootChange` (`E160021`), `NotFound` (`E160013`), `AlreadyExists` (`E160020`), `NotDirectory`
+  (`E160016`), `KindMismatch` (`E145001`), the three checksum mismatches (`E200014`), the index's (its own), `Room`
+  (`E160000`), `Corrupt` (`E160004`), `BadRange` (`E165004`) and `DeltasOwed` (`E200007`). A refused import keeps the
+  revisions committed before it and nothing of the one being read, and answers every later call the same.
+- **Tests** (`crates/svn/src/migration/tests*`, 27; Mac Studio, 2026-11-19, kiln, debug). Red first: the 27 over the
+  two verbs stubbed to refuse failed 27 of 27 (dfc714085); then `cargo test -p slates-svn --lib --locked` 313 of 313 at
+  7156ebc0e and again at f4dc10b69, rustfmt's layout taken from that run (the first green run had shared its target
+  directory with the red tree and reused its binary; the rerun touched the sources). On the tree merged with main
+  (1fbcc1e79, `slates-svn` then holding A-613's `list` and `get-location-segments` and A-617's report): 357 of 358 with
+  `--locked`, rustfmt clean, the one failure main's own `reads::tests::hostile_commands_are_answered_or_end_the_connection`
+  (A-613: `list` with the parameters `5:trunk ( ) true` streams fewer than four items), which fails alone on origin/main
+  a5dffc913 replayed from its seed `cc 8c15aaa60f4700e2c4cf9ad02498c39f24f70500057be3b37f4181c424a4d919`, reported to
+  main; 359 of 359 at b83497e7f, merged again with A-613's `get-deleted-rev` (that proptest's failing input not drawn),
+  rustfmt clean. Golden: `full.dump` and
+  `part1.dump` imported and exported again byte for byte; `deltas.dump`, `part1.dump` then `part2.dump`, and the two as
+  one stream, whole, a byte at a time and in pieces of 7 and 4,096, each importing to `full.dump`'s history and
+  exporting as `full.dump`; every revision's changed paths equal, line for line, to `svnlook changed --copy-info` of the
+  repository `svnadmin` dumped (FSFS's text and property flags among them); the history exported in two incremental
+  parts importing to the same; import(export(R)) = R. Rules: a change that makes no call records nothing; a text set to
+  its own bytes is a change written without its text; one path's records fold as `fold_change` folds them; a change
+  beneath a later deletion is dropped; the mergeinfo flag; changes beneath a copy written against its source; deletions
+  at their directory's close in byte order. Refusals: each above. Generated: up to seven revisions of additions,
+  changes, deletions, copies from any earlier revision and replacements, written as `svnadmin` writes them, imported in
+  pieces and held to the model's tree path by path in every revision, then import(export(R)) = R, the export's export
+  the same bytes, and an export in two parts the same history.
+- **Found, not this change's to fix.** The index refuses a replacement by a copy of the node-revision it replaces
+  (`CopyOntoItself`), which FSFS records when the deletion comes first (`tree.c` `copy_helper` makes a copy onto the very
+  node a no-op only while the destination still holds it); a dump holding one is refused here with the index's refusal.
+  Reported to main for A-553's owner; the generated histories keep a copy off the node it would replace.
+- **Owed of A-628.** The export in format 3 (`text_delta.c`'s windowing and `xdelta.c` ported, so `deltas.dump` and
+  `part2.dump` are written again byte for byte); the wiring: a repository `CreateRepository` made holding these records
+  on its shard, its texts in the shared object store, the import and export on the control channel, a revision a
+  version of the repository's green, and an import or export sliced under the shard's budget.
+
+### A-616, continued (2) — The reporter's drive over the index and the green (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); the research notes (§1, the drive's
+sources); `crates/svn` (`report/drive.rs`'s `Drive`, `Guards`, `DriveFailure` and `Next`; `report/drive/history.rs`,
+`green.rs` and `tests.rs`, new; `report/recorded.rs` gains the report and drive readers both test modules share;
+`report/editor.rs`'s integer reader seen by the reporter's tests).
+
+- **The walk** (`reporter.c` at 1.15.0, its 1.14.x twin): `drive` checks the anchor's read access (220000 "Not
+  authorized to open root of edit operation"), the source revision (160006 "No such revision N"), and a target without
+  an operand (160005 "Target path '…' does not exist", "Cannot replace a directory from within"), then writes the
+  target revision and the root. `delta_dirs` compares a directory's properties, then its reported paths in the
+  client's order (a deletion only noted), then the source entries the target lacks, then the target entries the report
+  did not name, by name, each as `update_entry` decides: left alone when unchanged and unreported (or reported holding
+  the lock's own token), deleted with `svn_repos_deleted_rev`'s revision when unrelated (the one before the target's
+  when the path still holds a node), made absent when the principal may not read it, opened when related, else added,
+  a file with its copy source when the client asked. A reported path missing from the repository is 160013 "Working
+  copy path '…' does not exist in repository"; a refusal ends the drive with `AbortEdit` after the calls already made,
+  and `Drive::failure` names it.
+- **Bounded and stackless.** The walk is an explicit stack of frames (the anchor, each directory being compared, each
+  file being sent), so a path's depth is data, never stack; each step does one bounded thing (a directory's entries
+  read, one entry decided, one deletion found, one node's properties, one window), and `Drive::next` pauses when the
+  caller's steps are spent. The report is read one path ahead (`fetch_path_info`, `skip_path_info`, `any_path_info`).
+- **History over the index** (`report/drive/history.rs`): `fs_closest_copy` (the youngest copy root along the path,
+  kept only when the node there is of the copy's line and not made new beneath it in the copy's revision) and
+  `svn_repos_deleted_rev`'s binary search, bounded at 65 halvings. A path out of canonical form names nothing, as
+  `open_path` finds no entry `..`. g262's `reads` walks copy roots too (`youngest_copy_root`, private): one of the two
+  should serve both.
+- **Where it differs from `svnserve`**, each in what a client reads alike: deletions and a node's own properties in
+  name order, where `svnserve`'s are in APR's seeded hash order; property lists and texts compared by content
+  identity, where FSFS compares a representation's place unless asked strictly; and a text sent as new data, a window
+  of up to 102,400 bytes at a time, where `svnserve` sends `xdelta.c`'s delta or FSFS's stored one.
+- **Evidence.** `history.txt` rebuilt by the tests into an index and a green (`report/drive/green.rs`:
+  `make-fixtures.py`'s grammar and texts, each `svnmucc` action a changed-path row) and rendered as
+  `svnlook changed --copy-info`, equal to the recorder's `changed.txt`. Every recorded drive (27 of the 38 sessions;
+  the early answer's is the handler's) replayed from the session's own report: call for call, entry properties in
+  order, a node's own properties and a directory's deletions as sets, each delta by the MD5 and length of what it
+  makes of the text its base MD5 names; refused drives with `svnserve`'s number and message.
+- **Tests.** Six: that history check, that replay, the deletion revisions and closest copies of the history's
+  deletions, move and branch, an added copy with and without copy sources, pausing at one and two steps a call (the
+  same calls, at least one pause), and generated hostile reports (names held and not, empty and `..`, deletions,
+  links, tokens, revisions past the youngest, every depth) whose drives must end with every call taken in order by
+  ra_svn's writer. `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: 6 of 6 at once, then red
+  six ways by mutation (the drive ending at once: 4 tests; an unchanged entry never left alone, `deleted_revision`
+  answering none, property removals dropped, depth upgrades never made, lock tokens ignored: the replay each time),
+  then the crate whole on the formatted, merged tree.
+- **Owed** (GAPS): the deltas of changed texts against their base, `xdelta.c` ported; the handler that writes the
+  drive, reads the client's early answer and its answers to `close-edit` and `abort-edit`, and answers the command;
+  one copy-root walk for `reads` and the drive.
 
 ### A-627, completed — The replay answer and the update-report's from A-616's one drive, and LOCK and UNLOCK onto A-602's guards, each answered as mod_dav and mod_dav_svn answer it (2026-11-19, g298, UI goal 93; §4.17.4 piece 13's second part; with A-616 part 2 and A-602)
 Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§1's sources,
