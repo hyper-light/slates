@@ -110,8 +110,9 @@ pub enum Applied {
   /// Remove an xattr: path, name.
   RemoveXattr(String, String),
   /// Copy `from`'s tree to `dst` by reference (A-586): what the head holds of it, which the verdict found unchanged
-  /// since `version`, the source's version the increment declared. Encoded as its two paths; `version` is read back
-  /// from the increment's own `Copy` operation, so the entry costs no more than its bound's two strings.
+  /// since `version`, the source's version the increment declared, replacing what `dst` holds when `replace` (A-626).
+  /// Encoded as its two paths; `version` and `replace` are read back from the increment's own `Copy` operation, so the
+  /// entry costs no more than its bound's two strings.
   CopyTree {
     /// The destination.
     dst: String,
@@ -119,6 +120,8 @@ pub enum Applied {
     from: String,
     /// The version of the source the increment copies.
     version: u64,
+    /// Whether the copy replaces what the destination holds ([`crate::ops_doc::REPLACE`]).
+    replace: bool,
   },
 }
 
@@ -453,15 +456,17 @@ fn put_tagged_paths(out: &mut Vec<u8>, tag: u8, paths: &[&str]) {
 }
 
 /// What an increment declares, indexed for its entry's effects (A-632): each path's content ops in
-/// order, and each copy's source version by its destination and source (A-586). Built in one pass
+/// order, and each copy's source version and whether it replaces, by its destination and source
+/// (A-586, A-626). Built in one pass
 /// over the increment's ops, once per entry encoded or decoded; finding them by scanning every op
 /// for each splice and each copy cost O(effects × ops), quadratic for a version that splices many
 /// files.
 struct Declared<'a> {
   /// Each path's content ops, in the increment's order.
   ops: BTreeMap<&'a str, Vec<Op>>,
-  /// Each copy's source version, by destination, then source; the first a pair declares.
-  copies: BTreeMap<&'a str, BTreeMap<&'a str, u64>>,
+  /// Each copy's source version and whether it replaces, by destination, then source; the first a
+  /// pair declares.
+  copies: BTreeMap<&'a str, BTreeMap<&'a str, (u64, bool)>>,
 }
 
 impl<'a> Declared<'a> {
@@ -488,7 +493,7 @@ impl<'a> Declared<'a> {
           .entry(path)
           .or_default()
           .entry(from)
-          .or_insert(op.at);
+          .or_insert((op.at, op.replaces()));
       }
     }
     declared
@@ -499,9 +504,9 @@ impl<'a> Declared<'a> {
     self.ops.get(path).map_or(&[][..], Vec::as_slice)
   }
 
-  /// The source version of the copy the increment declares from `from` to `dst`; `None` when it
-  /// declares none, which no entry the engine recorded holds.
-  fn copy(&self, dst: &str, from: &str) -> Option<u64> {
+  /// The source version of the copy the increment declares from `from` to `dst`, and whether it
+  /// replaces; `None` when it declares none, which no entry the engine recorded holds.
+  fn copy(&self, dst: &str, from: &str) -> Option<(u64, bool)> {
     self.copies.get(dst)?.get(from).copied()
   }
 }
@@ -621,8 +626,13 @@ fn take_applied(
     tag::COPY_TREE => {
       let dst = take_str(reader)?;
       let from = take_str(reader)?;
-      let version = declared.copy(&dst, &from).ok_or(DocDecodeError::BadKind)?;
-      Applied::CopyTree { dst, from, version }
+      let (version, replace) = declared.copy(&dst, &from).ok_or(DocDecodeError::BadKind)?;
+      Applied::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+      }
     }
     _ => return Err(DocDecodeError::BadKind),
   })

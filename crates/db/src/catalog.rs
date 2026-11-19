@@ -1666,9 +1666,9 @@ pub struct ReviewApprovalRecord {
   pub stale_at: Option<u64>,
 }
 
-/// A check an entry of a repository's register makes (§4.17.1 shared piece 2, A-603): read at the entry's register
-/// position, before any of the entry's own changes and in the step that commits it, so it holds at exactly the position
-/// the entry takes. A check that does not hold refuses the whole entry.
+/// A check an entry makes (§4.17.1 shared piece 2; A-603, A-642): read before any of the entry's own changes and in the
+/// step that commits it, against each log's own position, so it holds at exactly the positions the entry appends at. A
+/// check that does not hold refuses the whole entry.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum RepositoryCheck {
   /// A green is at `version`: a head the client saw that the entry does not move is unchanged (Mercurial's
@@ -1688,6 +1688,156 @@ pub enum RepositoryCheck {
     /// Every name under it and the green it binds, in name order.
     bound: Vec<NameBinding>,
   },
+  /// One of the repository's own state logs is at `position` (A-642): nothing changed it since the push read it.
+  Log {
+    /// The log.
+    log: StateLog,
+    /// The position it must be at.
+    position: u64,
+  },
+}
+
+/// The repository's own state's logs (A-642): each moved by its own changes, at its own positions, never by a counter
+/// every push passes. A green's log is its chain of versions.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StateLog {
+  /// The namespace: names bound and retired, the default, and greens joining the lineage.
+  Names,
+  /// Mercurial's phase roots.
+  Phases,
+  /// Mercurial's obsolescence markers.
+  Markers,
+  /// Git LFS's locks.
+  Locks,
+}
+
+/// One of a repository's logs (A-642): a green's chain, or one of the repository's own state's.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogName {
+  /// A green's log: its chain of versions, positions its versions.
+  Green {
+    /// The green.
+    green: VolumeId,
+  },
+  /// One of a repository's state logs.
+  State {
+    /// The repository.
+    repository: RepositoryId,
+    /// The log.
+    log: StateLog,
+  },
+}
+
+/// What one record moved of one log (A-642): from the position it found the log at to the one it left it at.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogSpan {
+  /// The log.
+  pub log: LogName,
+  /// The position the record found it at: its predecessor.
+  pub from: u64,
+  /// The position it left it at.
+  pub to: u64,
+}
+
+/// An atomic record (A-642): one entry that moved two logs or more, a green's among them, committed whole or not at all.
+/// Each position it took on each log points to it, and a holder applies it only once every log it moves is at the
+/// position it moved it from (its join); a cut of positions holds all of it or none of it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AtomicRecord {
+  /// What it moved of each log, in log order.
+  pub spans: Vec<LogSpan>,
+}
+
+/// A position of a green's log (A-642): a version of the green.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenPosition {
+  /// The green.
+  pub green: VolumeId,
+  /// The version.
+  pub version: u64,
+}
+
+/// An atomic record as a partition snapshot carries it (A-642): the record and the positions of greens' logs that point
+/// to it still, those its greens' checkpoints and destroys have not folded.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AtomicHeld {
+  /// The record.
+  pub record: AtomicRecord,
+  /// The positions pointing to it.
+  pub pointers: Vec<GreenPosition>,
+}
+
+/// Where a holder's logs stand against an atomic record (A-642).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+  /// Some log it moves has not reached its predecessor yet: the holder waits.
+  Waiting,
+  /// Every log it moves is at its predecessor: the holder applies it now.
+  Ready,
+  /// Every log it moves holds it already.
+  Applied,
+  /// Its logs disagree, some holding it and some not: a holder never comes to this, so it is refused loudly.
+  Diverged,
+}
+
+impl AtomicRecord {
+  /// Where logs at the positions `at` gives stand against the record (A-642's join).
+  pub fn join(&self, at: impl Fn(&LogName) -> u64) -> Join {
+    let (mut before, mut ready, mut held) = (false, false, false);
+    for span in &self.spans {
+      let position = at(&span.log);
+      if position >= span.to {
+        held = true;
+      } else if position == span.from {
+        ready = true;
+      } else if position < span.from {
+        before = true;
+      } else {
+        // Inside a span of several positions: part of the record held on this log.
+        return Join::Diverged;
+      }
+    }
+    match (before, ready, held) {
+      (false, false, true) => Join::Applied,
+      (_, _, true) => Join::Diverged,
+      (true, _, false) => Join::Waiting,
+      (false, _, false) => Join::Ready,
+    }
+  }
+
+  /// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of the
+  /// record and not the rest: a log inside a span, or one log past its span beside another before its own.
+  pub fn split_by(&self, at: impl Fn(&LogName) -> Option<u64>) -> bool {
+    let mut side = None;
+    for span in &self.spans {
+      let Some(position) = at(&span.log) else {
+        continue;
+      };
+      let held = if position >= span.to {
+        true
+      } else if position <= span.from {
+        false
+      } else {
+        return true;
+      };
+      match side {
+        None => side = Some(held),
+        Some(seen) if seen != held => return true,
+        Some(_) => {}
+      }
+    }
+    false
+  }
+}
+
+/// A Git LFS lock as a repository's lock log holds it (A-642): the locked path and the lock's record, its bytes the LFS
+/// server's (id, owner, time).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LockRecord {
+  /// The locked path.
+  pub path: String,
+  /// The lock.
+  pub lock: Vec<u8>,
 }
 
 /// A name and the green it binds, as a [`RepositoryCheck::Names`] lists them (A-603).
@@ -1763,24 +1913,39 @@ pub enum StateChange {
     /// The marker's bytes.
     marker: Vec<u8>,
   },
+  /// `path` is locked by `lock` (Git LFS's locks, A-642): refused when the path is locked already.
+  LockTaken {
+    /// The path.
+    path: String,
+    /// The lock's record.
+    lock: Vec<u8>,
+  },
+  /// `path`'s lock `lock` is released: refused unless the path is locked by exactly that lock.
+  LockReleased {
+    /// The path.
+    path: String,
+    /// The lock released.
+    lock: Vec<u8>,
+  },
 }
 
-/// One entry of a repository's register (§4.17.1 item 2, shared piece 2; A-603): what one step commits of a repository,
-/// all of it or none. Its checks are read at its position; then its members join, its greens' versions are committed,
-/// its names change and its state moves, each part in its order and each item judged against what the items before it
-/// left, so git's atomic push ("Either all refs are updated or none") and a Mercurial push that adds changesets, moves
-/// bookmarks, phases and markers are each one durable step.
+/// One entry of a repository's logs (§4.17.1 item 2, shared piece 2; A-603 rebuilt by A-642): what one step commits of
+/// a repository, all of it or none. Each green it moves keeps its own log, and the entry appends to it only while the
+/// green is at the position the push read; the repository's own state moves in logs of its own; there is no position
+/// of the whole repository. Its checks are read first; then its members join, its greens' versions are committed, its
+/// names change and its state moves, each item judged against what the items before it left, so git's atomic push
+/// ("Either all refs are updated or none") and a Mercurial push that adds changesets, moves bookmarks, phases and
+/// markers are each one durable step. An entry that moves two logs or more, a green's among them, is an atomic record.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryEntry {
   /// The repository.
   pub repository: RepositoryId,
-  /// The register position the entry takes: the register's next, so its entries are dense from 0.
-  pub position: u64,
-  /// What must hold at the position, before the entry's own changes.
+  /// What must hold before the entry's own changes, each against its log's position.
   pub checks: Vec<RepositoryCheck>,
   /// Greens joining the repository's lineage, in order.
   pub joined: Vec<MemberRecord>,
-  /// The greens' versions the entry commits, in order.
+  /// The greens' versions the entry commits, in order: each appended only while its green is at the position before
+  /// it, the position the push read.
   pub versions: Vec<GreenVersion>,
   /// The namespace's changes, in order.
   pub names: Vec<NameChange>,
@@ -1797,16 +1962,22 @@ pub struct PhaseRoot {
   pub node: Vec<u8>,
 }
 
-/// A repository's register as a partition snapshot carries it (A-603): the position its next entry takes, and the
-/// repository's own state.
+/// A repository's own state as a partition snapshot carries it (A-603, A-642): each state log's position and what it
+/// holds. The markers log's position is the markers it holds.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct RegisterRecord {
   /// The repository.
   pub repository: RepositoryId,
-  /// The position the next entry takes.
-  pub next: u64,
+  /// The names log's position.
+  pub names_position: u64,
+  /// The phases log's position.
+  pub phases_position: u64,
+  /// The locks log's position.
+  pub locks_position: u64,
   /// The phase roots, in (phase, node) order.
   pub phase_roots: Vec<PhaseRoot>,
-  /// The obsolescence markers, in the order the register received them.
+  /// The obsolescence markers, in the order the log received them.
   pub markers: Vec<Vec<u8>>,
+  /// The locks, in path order.
+  pub locks: Vec<LockRecord>,
 }

@@ -1,6 +1,7 @@
-//! receive-pack's ref advertisement (A-620 part 1; gitprotocol-pack "Reference Discovery"; git's `show_ref` and
-//! `write_head_info`, v2.50.1): A-604's protocol v0 advertisement ([`crate::v0::Advertisement`]), written with the
-//! capabilities receive-pack advertises in `show_ref`'s order and no peeled lines, which receive-pack never sends.
+//! receive-pack's ref advertisement (A-620 part 1; gitprotocol-pack "Reference Discovery"; git's
+//! `show_ref` and `write_head_info`, v2.50.1): A-604's protocol v0 advertisement
+//! ([`crate::v0::Advertisement`]), written with the capabilities receive-pack advertises in
+//! `show_ref`'s order and no peeled lines, which receive-pack never sends.
 
 use super::Refusal;
 use crate::object_name::{ObjectFormat, ObjectId};
@@ -45,8 +46,9 @@ pub struct Advertised<'a> {
   pub agent: &'a [u8],
 }
 
-/// Writes receive-pack's advertisement of `refs` (each an id and a name, in the order to advertise them: git's is by
-/// name) as git writes it, through A-604's writer: refused, nothing written, for a part that writer refuses.
+/// Writes receive-pack's advertisement of `refs` (each an id and a name, in the order to advertise
+/// them: git's is by name) as git writes it, through A-604's writer: refused, nothing written, for
+/// a part that writer refuses.
 pub fn write_advertisement(
   refs: &[(ObjectId, &[u8])],
   advertised: &Advertised<'_>,

@@ -1898,6 +1898,9 @@ dependencies = [
  "slates-cluster",
  "slates-conformance",
  "slates-db",
+ "slates-git",
+ "slates-http",
+ "slates-http-edge",
  "slates-image",
  "slates-ipc",
  "slates-land",
@@ -1927,6 +1930,7 @@ name = "slates-svn"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "blake3",
  "hmac",
  "lz4_flex",
  "md-5",

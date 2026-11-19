@@ -1,0 +1,11 @@
+marker: fileindex-v1
+list_file_size: 555
+meta_file_size: 184
+tree_file_size: 198
+list_file_id: 150e1cfc
+meta_file_id: b870a51b
+tree_file_id: 88698448
+tree_root_pointer: 27
+tree_unused_bytes: 27
+reserved_flags: 0
+garbage_entries: 0

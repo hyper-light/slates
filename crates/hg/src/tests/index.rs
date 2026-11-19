@@ -354,6 +354,53 @@ fn with_one_changeset() -> (HgIndex, ContentStore, ContentId) {
   (index, store, text)
 }
 
+/// The 20 bytes that keyed a log row of `path` at revision `rev` before the rows carried kind tags of their own beside
+/// object rows: `L`, `f`, the path, a NUL and the number, big-endian. A 13-byte path's are a node's length.
+fn untagged_log_key(path: &[u8], rev: u32) -> Vec<u8> {
+  [&b"Lf"[..], path, &[0], &rev.to_be_bytes()].concat()
+}
+
+/// A-649 (the sibling A-630 found): do append a revision of a 13-byte path, whose log row is twenty bytes long, and
+/// commit an object whose twenty-byte id is exactly those bytes. Expect both rows kept and each read back as its kind:
+/// the log's revision under its number, and the object's kind, length and content under its node; the quarantine's
+/// holds given back.
+#[test]
+fn a_log_row_never_meets_an_object_key_whatever_a_path_s_length() {
+  let (mut index, mut store, content) = with_one_changeset();
+  let path = b"thirteen-byte";
+  let log = Log::File(path);
+  let group = [revision(1, None, None, [9; NODE_LEN], content)];
+  assert_eq!(index.append_revisions(&mut store, log, &group), Ok(vec![0]));
+  let id = untagged_log_key(path, 0);
+  assert_eq!(id.len(), NODE_LEN);
+  let mut quarantine = Quarantine::new();
+  let held = quarantine.hold_named(&mut store, &id, FILE, b"the object's bytes");
+  assert_eq!(held, Ok(Admitted::New));
+  assert!(index.commit_objects(&mut store, &mut quarantine).is_ok());
+  let node = Node::try_from(id.as_slice()).unwrap();
+  let (kind, len, root) = index.object(&store, &node).unwrap();
+  let object = (kind, len, store.get(&root));
+  assert_eq!(object, (FILE, 18, Some(&b"the object's bytes"[..])));
+  let revision = index.revision(&store, log, 0).map(|row| row.node);
+  assert_eq!(
+    (revision, quarantine.is_empty()),
+    (Some([1; NODE_LEN]), true)
+  );
+}
+
+/// AC-HG.9, A-649: do commit an object whose id is not a node's twenty bytes. Expect it refused by kind with nothing
+/// written and the quarantine still holding it.
+#[test]
+fn an_object_whose_id_is_not_a_node_is_refused() {
+  let (mut index, mut store, _) = with_one_changeset();
+  let mut quarantine = Quarantine::new();
+  let held = quarantine.hold_named(&mut store, b"short", FILE, b"bytes");
+  assert_eq!(held, Ok(Admitted::New));
+  let refused = index.commit_objects(&mut store, &mut quarantine);
+  assert_eq!(refused, Err(Refused::NotANode { len: 5 }));
+  assert_eq!(quarantine.len(), 1);
+}
+
 /// AC-HG.9 (hostile input), A-588 part 2: do append a group whose second revision names a parent no log holds, one
 /// whose link names no changeset, and one naming a changeset as a file's link with a parent from another file's log.
 /// Expect each refused by kind with nothing of it written: the log as long as before, the group's first revision not
