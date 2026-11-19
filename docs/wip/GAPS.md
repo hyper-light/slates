@@ -1052,7 +1052,7 @@
 > the not-served words; input arriving after the session ended given back to the window.
 > Red first (`cargo test --locked -p slates-server --lib -- vcs_ssh`: 25 passed, the 7 new failed against stubs), then
 > `-- vcs_ssh vcs_http::hg` 39 of 39, no warning, fmt clean, on macOS arm64 (Mac Studio, kiln r128; over main
-> 0462bd922 as it landed, kiln r378, 44 of 44 with A-651 parts 3 and 4's tests): the probe stock `hg serve --stdio` 7.2
+> b288b412e as it landed, kiln r400, 44 of 44 with A-651 parts 3 and 4's tests): the probe stock `hg serve --stdio` 7.2
 > answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a scripted SSH client. The
 > other platforms, and main's live `hg clone` over SSH once the daemon starts the edge with that lender (A-684), owed.
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the daemon starting the SSH edge (A-684,
