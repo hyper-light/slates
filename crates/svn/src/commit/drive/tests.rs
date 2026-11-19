@@ -843,7 +843,8 @@ fn a_path_beneath_a_copy_reads_the_copys_source() {
 
 /// The authorization rules the authorization cases run under: everyone reads, alice writes, but only reads beneath
 /// `sub` and cannot read `gone`.
-const RULES: &[u8] = b"[/]\n* = r\nalice = rw\n[/trunk/project/sub]\nalice = r\n[/trunk/project/gone]\nalice =\n";
+const RULES: &[u8] =
+  b"[/]\n* = r\nalice = rw\n[/trunk/project/sub]\nalice = r\n[/trunk/project/gone]\nalice =\n";
 
 /// A drive's case: its commands, whether it runs under [`RULES`], the failure's errors it writes, and its last step.
 struct Check {
@@ -865,7 +866,10 @@ const CHECKS: &[Check] = &[
     name: "a control character in an added path",
     commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( add-file ( 3:a\x01b 2:d0 2:c1 ( ) ) ) ",
     authz: false,
-    failure: Some(&[(160_005, "Invalid control character '0x01' in path 'a\\001b'")]),
+    failure: Some(&[(
+      160_005,
+      "Invalid control character '0x01' in path 'a\\001b'",
+    )]),
     last: Last::Refused,
   },
   Check {
@@ -901,11 +905,15 @@ indicate a bug in your client",
   },
   Check {
     name: "an svn: property with a carriage return",
-    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 10:svn:ignore ( 3:a\r\n ) ) ) ",
+    commands:
+      b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 10:svn:ignore ( 3:a\r\n ) ) ) ",
     authz: false,
     failure: Some(&[
       (125_005, "Invalid property value"),
-      (125_017, "Cannot accept non-LF line endings in 'svn:ignore' property"),
+      (
+        125_017,
+        "Cannot accept non-LF line endings in 'svn:ignore' property",
+      ),
     ]),
     last: Last::Refused,
   },
@@ -936,7 +944,8 @@ indicate a bug in your client",
   },
   Check {
     name: "mergeinfo holding a NUL",
-    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 13:svn:mergeinfo ( 6:/a:1\x00x ) ) ) ",
+    commands:
+      b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 13:svn:mergeinfo ( 6:/a:1\x00x ) ) ) ",
     authz: false,
     failure: Some(&[(
       200_020,
@@ -946,7 +955,8 @@ indicate a bug in your client",
   },
   Check {
     name: "mergeinfo that does not parse",
-    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 13:svn:mergeinfo ( 5:/a:xx ) ) ) ",
+    commands:
+      b"( open-root ( ( 3 ) 2:d0 ) ) ( change-dir-prop ( 2:d0 13:svn:mergeinfo ( 5:/a:xx ) ) ) ",
     authz: false,
     failure: Some(&[(
       200_020,
@@ -995,11 +1005,19 @@ indicate a bug in your client",
 
 /// Every error of a failure item, outermost first.
 fn errors_of(item: &Value<'_>) -> Option<Vec<(u64, String)>> {
-  let Value::List(parts) = item else { return None };
-  let [Value::Word("failure"), Value::List(errors)] = parts.as_slice() else { return None };
+  let Value::List(parts) = item else {
+    return None;
+  };
+  let [Value::Word("failure"), Value::List(errors)] = parts.as_slice() else {
+    return None;
+  };
   let read = |error: &Value<'_>| {
-    let Value::List(error) = error else { return None };
-    let [Value::Number(code), Value::String(words), ..] = error.as_slice() else { return None };
+    let Value::List(error) = error else {
+      return None;
+    };
+    let [Value::Number(code), Value::String(words), ..] = error.as_slice() else {
+      return None;
+    };
     Some((*code, String::from_utf8_lossy(words).into_owned()))
   };
   errors.iter().map(read).collect()
@@ -1034,9 +1052,13 @@ fn check_case(replay: &Replay, case: &Check) {
     let step = drive.command(&replay.index, &replay.green, &replay.locks, &item, &mut out);
     last = kind_of(&step.unwrap());
   }
-  let failure = items(&out).into_iter().find_map(|(item, _)| errors_of(&item));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
   let expected = case.failure.map(|errors| {
-    let owned = errors.iter().map(|(code, words)| (u64::from(*code), (*words).to_owned()));
+    let owned = errors
+      .iter()
+      .map(|(code, words)| (u64::from(*code), (*words).to_owned()));
     owned.collect::<Vec<_>>()
   });
   assert_eq!((failure, last), (expected, case.last), "{}", case.name);
@@ -1110,7 +1132,9 @@ fn begun(session: &Session<'_>, params: &[Value<'_>], now: bool) -> Began {
     Begun::Answered => "answered",
     Begun::Close => "close",
   };
-  let failure = items(&out).into_iter().find_map(|(item, _)| errors_of(&item));
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| errors_of(&item));
   (kind, failure, out)
 }
 
@@ -1122,7 +1146,10 @@ fn begun(session: &Session<'_>, params: &[Value<'_>], now: bool) -> Began {
 fn an_anonymous_session_authenticates_for_write_before_its_commit() {
   let params = commit_params(&[]);
   let anonymous = recorded_session("/trunk/project", None, None);
-  assert_eq!(begun(&anonymous, &params, false), ("authenticate", None, Vec::new()));
+  assert_eq!(
+    begun(&anonymous, &params, false),
+    ("authenticate", None, Vec::new())
+  );
   let alice = recorded_session("/trunk/project", Some("alice"), None);
   let driving = ("driving", None, b"( success ( ) ) ".to_vec());
   assert_eq!(begun(&alice, &params, true), driving);

@@ -70,11 +70,11 @@ use aws_lc_rs::digest::{Context, MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ON
 
 use super::edit::{CommitRequest, CopiedFrom, EditCommand, EditRefusal, LockTokensRefusal};
 use super::{CommitRefusal, check_out_of_date, verdict};
+use crate::authz::{Access, Authz, Principal, PrincipalRules, RepositoryPath};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
   Revision, RevisionRecord, Text,
 };
-use crate::authz::{Access, Authz, Principal, PrincipalRules, RepositoryPath};
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
 use crate::mergeinfo::{Mergeinfo, MergeinfoRefusal};
 use crate::ra_svn::{ItemError, Value, write};
@@ -441,7 +441,9 @@ pub fn commit(
     locks,
     now: start.now,
     room: start.room,
-    rules: session.authz.map(|(authz, name)| authz.rules(name, principal)),
+    rules: session
+      .authz
+      .map(|(authz, name)| authz.rules(name, principal)),
     revision_properties: revision_properties(&request, session.user),
   };
   Ok(Begun::Driving(Box::new(Drive::new(setup))))
@@ -601,7 +603,9 @@ impl DriveRefusal {
       Self::ControlCharacter { .. } => SVN_ERR_FS_PATH_SYNTAX,
       Self::NotRegular { .. } => SVN_ERR_REPOS_BAD_ARGS,
       Self::NotUtf8 { .. } | Self::NonLf { .. } | Self::BadDate => SVN_ERR_BAD_PROPERTY_VALUE,
-      Self::MergeinfoTerminator { .. } | Self::MergeinfoInvalid { .. } => SVN_ERR_MERGEINFO_PARSE_ERROR,
+      Self::MergeinfoTerminator { .. } | Self::MergeinfoInvalid { .. } => {
+        SVN_ERR_MERGEINFO_PARSE_ERROR
+      }
       Self::Unwritable => SVN_ERR_AUTHZ_UNWRITABLE,
       Self::Unreadable => SVN_ERR_AUTHZ_UNREADABLE,
     }
@@ -864,7 +868,9 @@ fn may_write(session: &Session<'_>, path: Option<&str>, needs_username: bool) ->
     let rules = authz.rules(name, Principal::named(session.user.map(str::as_bytes)));
     let granted = match path {
       None => rules.access_anywhere(),
-      Some(path) => RepositoryPath::new(path.as_bytes()).map_or(Access::None, |at| rules.access(at)),
+      Some(path) => {
+        RepositoryPath::new(path.as_bytes()).map_or(Access::None, |at| rules.access(at))
+      }
     };
     granted == Access::Write
   });
@@ -1520,7 +1526,9 @@ impl Drive {
     self.check_authz(&parent, true, false)?;
     let present = self.view(world.index, &full)?;
     let copy_from = match added.copied_from {
-      Some(source) => Some(self.copy_source(world, &full, present.as_ref(), copied, (source, added.kind))?),
+      Some(source) => {
+        Some(self.copy_source(world, &full, present.as_ref(), copied, (source, added.kind))?)
+      }
       None => {
         if present.is_some() {
           return Err(DriveRefusal::AlreadyExists { path: full }.into());
@@ -2065,7 +2073,10 @@ impl Drive {
 
   /// A file's first change: its write checked once (`checked_write`, `commit.c` 573-579 and 659-665).
   fn check_written(&mut self, token: &[u8], path: &str) -> Result<(), DriveRefusal> {
-    if matches!(self.tokens.get(token), Some(Baton::File(File { checked: true, .. }))) {
+    if matches!(
+      self.tokens.get(token),
+      Some(Baton::File(File { checked: true, .. }))
+    ) {
       return Ok(());
     }
     self.check_authz(path, true, false)?;
@@ -2388,7 +2399,11 @@ fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3])
     .checked_mul(DAYS_PER_YEAR)?
     .checked_add(year.checked_div(LEAP_EVERY)?)?
     .checked_sub(centuries)?
-    .checked_add(centuries.checked_add(CENTURY_LEAP_OFFSET)?.checked_div(LEAP_EVERY)?)?
+    .checked_add(
+      centuries
+        .checked_add(CENTURY_LEAP_OFFSET)?
+        .checked_div(LEAP_EVERY)?,
+    )?
     .checked_add(offset)?
     .checked_add(day)?
     .checked_sub(1)?
@@ -2413,7 +2428,10 @@ fn write_failure_errors(errors: &[(u32, String)], out: &mut Vec<u8>) -> Result<(
       Value::Number(0),
     ])
   });
-  write(&Value::List(vec![Value::Word(FAILURE), Value::List(items.collect())]), out)
+  write(
+    &Value::List(vec![Value::Word(FAILURE), Value::List(items.collect())]),
+    out,
+  )
 }
 
 /// Writes a failure of one error.
