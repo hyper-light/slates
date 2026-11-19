@@ -42,11 +42,20 @@
 //! version: a commit inside an earlier push. What the green changed since it is read as whole-value differences between
 //! the tree and the head at the paths the work names (`tree`, its module docs).
 
-use super::{ConflictWindow, Green, Increment, Judgment};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{ConflictWindow, Green, Increment, Judgment, Resolved, node_exclusive_paths};
 use crate::chain_entry::Applied;
 use crate::ops_doc::OpsDoc;
 
+mod judge;
+mod levels;
+mod moved;
 mod tree;
+
+use judge::Against;
+use levels::Level;
+use moved::Change;
 
 pub use tree::{TreeBase, TreeNode};
 
@@ -165,7 +174,7 @@ impl Green {
   pub fn land_stack(&mut self, bottom: &Increment, uppers: &[Upper]) -> Vec<Landed> {
     let mut landed = Vec::with_capacity(uppers.len().saturating_add(1));
     let mut first_refused = None;
-    let outcome = self.land_one(bottom.clone(), false);
+    let outcome = self.land_one(Landing::Bottom(bottom));
     if !matches!(outcome, Landed::Accepted { .. }) {
       first_refused = Some(0);
     }
@@ -177,7 +186,7 @@ impl Green {
       }
       let lowers = uppers.get(..index).unwrap_or_default();
       let outcome = match self.restate((bottom, lowers), upper) {
-        Restated::Over(increment) => self.land_one(increment, true),
+        Restated::Over(increment) => self.land_one(Landing::Upper(increment)),
         Restated::Conflict { windows } => Landed::Conflict { windows },
         Restated::Refused(why) => Landed::Refused(why),
       };
@@ -193,30 +202,123 @@ impl Green {
   /// bottom and the uppers in order, each of which must have landed. The upper as a work based on that version, or the
   /// windows of the changes it meets, or why it cannot be restated.
   pub fn restate(&self, stack: (&Increment, &[Upper]), upper: &Upper) -> Restated {
-    let (bottom, _) = stack;
-    let _ = (bottom, upper);
-    Restated::Refused(RestateRefused::NotLanded { below: 0 })
+    match self.restated(stack, upper) {
+      Ok(Ok(work)) => Restated::Over(work),
+      Ok(Err(windows)) => Restated::Conflict { windows },
+      Err(why) => Restated::Refused(why),
+    }
   }
 
-  /// Judges and commits one work of a stack at the head: the version it landed as, or why it did not. `restated` says
-  /// whether it is an upper's restatement, which the answer carries for the chain.
-  fn land_one(&mut self, increment: Increment, restated: bool) -> Landed {
-    match self.judge(&increment) {
+  /// [`Green::restate`]: the upper restated, or its windows; or why it cannot be.
+  fn restated(
+    &self,
+    (bottom, lowers): (&Increment, &[Upper]),
+    upper: &Upper,
+  ) -> Result<Result<Increment, Vec<ConflictWindow>>, RestateRefused> {
+    let levels = self.levels(bottom, lowers)?;
+    let at = levels.last().map_or(bottom.base, Level::landed);
+    let mut work = Increment {
+      id: restated_identity(UPPER_CONTEXT, &upper.id, at),
+      base: at,
+      doc: upper.doc.clone(),
+      post_state: upper.post_state.clone(),
+      evidence: upper.evidence.clone(),
+    };
+    let resolved = Green::resolve(&work);
+    if let Some(path) = resolved.copies.keys().next() {
+      return Err(RestateRefused::Copy { path: path.clone() });
+    }
+    let mut changes = BTreeMap::new();
+    for path in named(&resolved, &work.doc) {
+      let change = self.change_at(&levels, &path)?;
+      changes.insert(path, change);
+    }
+    let against = Against {
+      changes: &changes,
+      at,
+      unchanged: Change::default(),
+    };
+    let judged = self.judge_upper((&work, &resolved), &against);
+    Ok(judged.map(|ops| {
+      work.doc.ops = ops;
+      work
+    }))
+  }
+
+  /// The works below an upper (`levels`): each one's operations, the span of the green it was mapped through and the
+  /// version it landed as; refused when one has not landed, declares a copy, or was mapped through history the green
+  /// no longer holds.
+  fn levels(&self, bottom: &Increment, lowers: &[Upper]) -> Result<Vec<Level>, RestateRefused> {
+    let floor = self.folded_below.max(self.deltas_from);
+    if bottom.base < floor {
+      return Err(RestateRefused::Folded { floor });
+    }
+    let mut landed = self
+      .accepted
+      .get(&bottom.id)
+      .copied()
+      .ok_or(RestateRefused::NotLanded { below: 0 })?;
+    let mut levels = Vec::with_capacity(lowers.len().saturating_add(1));
+    levels.push(Level::of(&bottom.doc, (bottom.base, landed))?);
+    for (index, lower) in lowers.iter().enumerate() {
+      let id = restated_identity(UPPER_CONTEXT, &lower.id, landed);
+      let below = index.saturating_add(1);
+      let next = self
+        .accepted
+        .get(&id)
+        .copied()
+        .ok_or(RestateRefused::NotLanded { below })?;
+      levels.push(Level::of(&lower.doc, (landed, next))?);
+      landed = next;
+    }
+    Ok(levels)
+  }
+
+  /// Judges and commits a work of a stack at the head: the version it landed as, or why it did not.
+  fn land_one(&mut self, landing: Landing<'_>) -> Landed {
+    match self.judge(landing.work()) {
       Judgment::Accepted(judged) => {
         let (version, applied) = self.commit_held(judged);
         Landed::Accepted {
           version,
-          restated: restated.then_some(increment),
+          restated: landing.restated(),
           applied: Some(applied),
         }
       }
       Judgment::AcceptedBefore { version } => Landed::Accepted {
         version,
-        restated: restated.then_some(increment),
+        restated: landing.restated(),
         applied: None,
       },
       Judgment::Conflict { windows } => Landed::Conflict { windows },
       Judgment::BaseUnavailable { base, floor } => Landed::BaseUnavailable { base, floor },
+    }
+  }
+}
+
+/// A work of a stack as it is landed ([`Green::land_one`]): the bottom as given, or an upper's restatement, which its
+/// answer carries for the chain.
+enum Landing<'a> {
+  /// The bottom.
+  Bottom(&'a Increment),
+  /// An upper, restated.
+  Upper(Increment),
+}
+
+impl Landing<'_> {
+  /// The work judged.
+  fn work(&self) -> &Increment {
+    match self {
+      Landing::Bottom(work) => work,
+      Landing::Upper(work) => work,
+    }
+  }
+
+  /// The restatement its answer carries: an upper's.
+  fn restated(self) -> Option<Increment> {
+    match self {
+      Landing::Bottom(_) => None,
+      Landing::Upper(work) => Some(work),
     }
   }
 }
@@ -229,4 +331,31 @@ fn restated_identity(context: &str, id: &[u8; 32], base: u64) -> [u8; 32] {
   hasher.update(id);
   hasher.update(&base.to_le_bytes());
   *hasher.finalize().as_bytes()
+}
+
+/// Every path an upper's verdict reads (`judge`): the paths its operations change, the sources its renames move, the
+/// nodes its hard links name, and a node-exclusive operation's paths.
+fn named(resolved: &Resolved, doc: &OpsDoc) -> BTreeSet<String> {
+  let mut paths: BTreeSet<String> = resolved.content.keys().cloned().collect();
+  for (path, source) in &resolved.renames {
+    paths.insert(path.clone());
+    paths.insert(source.clone());
+  }
+  for (path, target) in &resolved.hardlinks {
+    paths.insert(path.clone());
+    paths.insert(resolved.link_node(target).0.to_owned());
+  }
+  paths.extend(resolved.unlinks.iter().cloned());
+  paths.extend(resolved.rmdirs.iter().cloned());
+  paths.extend(resolved.modes.keys().cloned());
+  paths.extend(resolved.symlinks.keys().cloned());
+  paths.extend(resolved.specials.keys().cloned());
+  paths.extend(resolved.xattr_sets.iter().map(|(path, ..)| path.clone()));
+  paths.extend(resolved.xattr_removes.iter().map(|(path, _)| path.clone()));
+  for op in doc.ops.iter().filter(|op| op.is_node_exclusive()) {
+    for (index, _) in node_exclusive_paths(op) {
+      paths.extend(doc.paths.path(index).map(str::to_owned));
+    }
+  }
+  paths
 }
