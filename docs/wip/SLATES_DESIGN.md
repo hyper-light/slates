@@ -10984,8 +10984,10 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > of reach (against A-207 and the recovery rule above, "unserved until it has"), and each floor holding its green's
 > checkpoint at its base. The list is now read, never taken (`verbs::unbuilt_works`), each ask is made once more after
 > a lost answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
-> nothing (`verbs::install_replayed_work`). Owed: a work whose asks go unanswered twice stays unbuilt until the next
-> start; its verbs then answer `NotFound` rather than `Unpublished`.
+> nothing (`verbs::install_replayed_work`). *Done by A-533 (2026-11-19):* a work whose asks go unanswered twice keeps
+> its record and answers `Unpublished`, never recorded as the request's completion, and its shard asks its green's
+> owner again as clients are let in, by messages each shard runs when it next runs: no timer, and no wait holds the
+> admission.
 
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
@@ -35367,3 +35369,33 @@ Applied in the same change to: §4.17.1 (a status block, the terms table, the cl
 identity, the hooks' first deadline, the worked example, the pieces list), §4.17.2 (large files), GAPS (the §4.17
 entry), `research/vcs-servers.md` §4, `crates/db/src/{repository,catalog,op,partition,error,lib}.rs`,
 `crates/db/tests/wire_order.{rs,txt}`, `crates/server/src/error.rs`.
+
+### A-533 — A work left unbuilt at recovery answers `Unpublished`, never recorded, and is asked for again as clients are let in, by messages, never a timer (2026-11-19, goal 85 via g225; A-513's remainder; §4.16 "Recovery"; A-207, A-247)
+
+- **What was there.** At recovery a work whose green lives on another partition is replayed through the green's owner
+  (A-247), each ask made once more after a lost answer (A-513). A work whose asks both went unanswered kept its record
+  and stayed unbuilt until the daemon's next start, and its verbs ran and answered `NotFound`, as if it were gone,
+  against §4.16's rule that such a work "is unserved (`Unpublished`) until it has" been replayed. And an `Unpublished`
+  a verb answered was recorded as the request's completion, though the protocol defines it as never answered from
+  memory: a resend under the same id met it for good.
+- **The rule.** A verb naming a work recorded unbuilt answers `Unpublished` (`work_home::unbuilt_refusal`, counted
+  `merge.work_unbuilt_unpublished`). `Unpublished` is now a reply of a verb not started (`verbs::not_started`, beside
+  `Overloaded`), so it is never recorded and a resend under its id runs the verb. As clients are let in, every shard is
+  told to ask its recorded works' green owners again (`daemon::ask_again_for_unbuilt_works`,
+  `verbs::ask_owners_to_replay`, counted `merge.work_rebuild_asked_again`): a message the owner runs when it next runs,
+  at once or once it comes back from a stop, replays the work and sends the outcome back by a message of its own, which
+  installs it once (`install_replayed_work`, A-513). Each message waits for room on its target's channel while that
+  shard lives (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
+- **Why this and not another.** Events, not a clock: the shards that did not answer run these messages when they run
+  again, which is exactly when a replay can succeed, so the retry needs no timer and holds no admission, and a work's
+  verbs meanwhile tell its client to come back rather than that the work is gone.
+- **What it changes beside.** Every `Unpublished` a verb answers inside its transaction is now left unrecorded, as the
+  protocol always said; the `Overloaded` count (`verb.overloaded_unrecorded`) counts `Overloaded` alone.
+- **Tests.** `an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt` (on a shard: a
+  recorded unbuilt work's read answered `Unpublished`; its record ended; the resend under the same id runs and answers
+  `NotFound`) and `an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it` (a two-shard daemon:
+  the green on one shard, the work recorded unbuilt on the other, the work installed by the owner's message)
+  (`crates/server/src/verbs.rs`).
+
+Applied in the same change to: §4.16 (A-513's status: its owed item done), GAPS (A-513's remainder closed), A-513's bug
+record, `crates/server/src/{work_home,verbs,daemon}.rs`.

@@ -3993,10 +3993,12 @@
 >   of the shard. Now the list is read, never taken (`verbs::unbuilt_works`), each ask is made once more after a lost
 >   answer (`daemon::ask_once_more`), and the install ends the work's record on its shard, so a second ask changes
 >   nothing (`verbs::install_replayed_work`), where it once made the work afresh and charged it twice;
->   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
->   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
->   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
->   not built. The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
+>   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). Its remainder closed
+>   by A-533 (2026-11-19, g225): a work whose asks go unanswered twice keeps its record and answers `Unpublished`, left
+>   unrecorded so its resend runs the verb again (`verbs::not_started`), and its shard asks its green's owner again as
+>   clients are let in, by messages each shard runs when it next runs, never a timer (`verbs::ask_owners_to_replay`;
+>   `an_unbuilt_works_verb_answers_unpublished_and_its_resend_runs_once_the_work_is_rebuilt`,
+>   `an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it`). The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
 >   its exchange and answers copies of its ends, kept on the owner shard until the exchange settles the claim, retired
 >   once handed or claimable again;
 >   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`).

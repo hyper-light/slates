@@ -2904,20 +2904,24 @@ const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
 
 /// Whether `reply` says its verb was not started: `Overloaded`, which the protocol defines as "the request was not
 /// started and may be retried" under the same id (`slates_ipc::protocol::Refusal::Overloaded`; the client holds such an
-/// id for its resend, `slates_client::Client::begin_again`). Such a reply is never a completion (§4.9 RIFL): recorded,
-/// it was what every resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000
-/// clients"; `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`).
+/// id for its resend, `slates_client::Client::begin_again`), and `Unpublished`, "not completed, may be retried under the
+/// same id (it re-executes; it is never answered from memory)" (`slates_ipc::protocol::Refusal::Unpublished`; a work
+/// unserved until it is rebuilt, A-533). Such a reply is never a completion (§4.9 RIFL): recorded, it was what every
+/// resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000 clients";
+/// `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Until A-533 an `Unpublished` a verb
+/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again.
 fn not_started(reply: &ReplyBody) -> bool {
   matches!(
     reply,
     ReplyBody::Refused {
-      refusal: Refusal::Overloaded { .. }
+      refusal: Refusal::Overloaded { .. } | Refusal::Unpublished { .. }
     }
   )
 }
 
 /// Answers a verb that was not started ([`not_started`]) without recording a completion, so the request's id stays
-/// unanswered and a resend under it runs the verb; counted by the refusal's name and [`OVERLOADED_UNRECORDED`]. Its
+/// unanswered and a resend under it runs the verb; counted by the refusal's name, and an `Overloaded` one by
+/// [`OVERLOADED_UNRECORDED`]. Its
 /// transaction commits what the verb applied before refusing, which a resend meets as its own: nothing; the verb's
 /// undoing of what it began (`crate::shards::attach` ends the attachment it recorded when its stream's task cannot be
 /// spawned); or the write lease a FUSE or WinFsp mount took before its task, which the resend's attach renews as its
@@ -2926,8 +2930,10 @@ fn unrecorded_not_started(state: &mut ShardState, reply: ReplyBody) -> ReplyBody
   state.served = state.served.saturating_add(1);
   if let ReplyBody::Refused { refusal } = &reply {
     state.count(refusal_name(refusal), 1);
+    if matches!(refusal, Refusal::Overloaded { .. }) {
+      state.count(OVERLOADED_UNRECORDED, 1);
+    }
   }
-  state.count(OVERLOADED_UNRECORDED, 1);
   reply
 }
 
@@ -16761,6 +16767,54 @@ pub(crate) fn install_replayed_work(
 /// hold them (A-207). Format: a refusal name in the daemon's status report.
 const WORK_REBUILD_REFUSED: &str = "merge.work_rebuild_refused";
 
+/// Format: the refusal-ledger name of a recorded unbuilt work whose replay this shard asked of its green's owner again
+/// as clients were let in ([`ask_owners_to_replay`], A-533): the retry's non-vacuity count.
+const WORK_REBUILD_ASKED_AGAIN: &str = "merge.work_rebuild_asked_again";
+/// Format: the refusal-ledger name of a message of that retry that no shard could keep (its target gone, or the
+/// carrier refusing it): the work stays recorded, answering `Unpublished`, until the daemon's next start.
+const WORK_REBUILD_ASK_REFUSED: &str = "merge.work_rebuild_ask_refused";
+
+/// On a work's shard, as clients are let in (A-533): asks the green's owner of every work recorded unbuilt here (its
+/// rebuild asks at recovery went unanswered twice) to replay it again, by a message the owner runs when it next runs,
+/// at once or once it comes back from a stop, whose outcome comes back here by a message of its own and is installed
+/// once ([`install_replayed_work`]). Nothing waits on an answer, and no timer runs: the owner's running is the event
+/// that rebuilds the work, which answers `Unpublished` until then (`work_home::unbuilt_refusal`). A work whose green
+/// this shard holds is replayed here. Each message waits for room on its target's channel while that shard lives
+/// (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
+pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
+  let here = state.shard;
+  for unbuilt in state.work_home.unbuilt.clone() {
+    let entries = state.db.partition().work_log(unbuilt.work).to_vec();
+    let Some(owner) = state
+      .shards
+      .get(usize::from(owner_of(to_wire_volume(unbuilt.green))))
+      .copied()
+    else {
+      continue;
+    };
+    state.count(WORK_REBUILD_ASKED_AGAIN, 1);
+    if owner == here {
+      let replayed = owner_replay(state, unbuilt.green, unbuilt.created_at, &entries);
+      install_replayed_work(state, &unbuilt, replayed);
+      continue;
+    }
+    crate::xshard::run_on_waiting(
+      here,
+      owner,
+      move |owner_state| {
+        let replayed = owner_replay(owner_state, unbuilt.green, unbuilt.created_at, &entries);
+        crate::xshard::run_on_waiting(
+          owner_state.shard,
+          here,
+          move |work_state| install_replayed_work(work_state, &unbuilt, replayed),
+          WORK_REBUILD_ASK_REFUSED,
+        );
+      },
+      WORK_REBUILD_ASK_REFUSED,
+    );
+  }
+}
+
 /// A shard's slice of the anchor content object, read by copies (§4.8): the object is sparse (backed
 /// only where it is touched) and hands out no reference to its bytes (AUD-29-09), so the image is found
 /// and copied out without ever viewing the whole slice.
@@ -21860,7 +21914,7 @@ mod tests {
         green: super::DbVolumeId { bytes: [0x54; 16] },
         created_at: 1,
       };
-      state.work_home.unbuilt.push(unbuilt.clone());
+      state.work_home.unbuilt.push(unbuilt);
       let id = slates_wire::request::RequestId {
         client: 1,
         sequence: 1,
@@ -21897,6 +21951,95 @@ mod tests {
         refusal: Refusal::NotFound
       }),
       "the resend under the same id ran the verb, not the recorded first answer"
+    );
+  }
+
+  /// A name that the partition of `state`'s shard owns, starting `prefix`.
+  fn owned_name(state: &crate::state::ShardState, prefix: &str) -> String {
+    (0u32..)
+      .map(|n| format!("{prefix}-{n}"))
+      .find(|name| super::owner_of_name(name, state.shards.len()) == state.partition)
+      .unwrap()
+  }
+
+  /// What the work's shard holds of the work, polled until it is rebuilt or the observation budget passes: whether the
+  /// work is installed, whether its record is gone, and the retry's and the failed rebuild's counts.
+  fn rebuilt_by_now(
+    daemon: &crate::daemon::Daemon,
+    partition: usize,
+    work: super::DbVolumeId,
+  ) -> (bool, bool, Option<u64>, Option<u64>) {
+    let look = move |state: &mut crate::state::ShardState| {
+      (
+        state.works.contains_key(&work),
+        state.work_home.unbuilt.is_empty(),
+        state.refusals.get(super::WORK_REBUILD_ASKED_AGAIN).copied(),
+        state.refusals.get(super::WORK_REBUILD_REFUSED).copied(),
+      )
+    };
+    let started = std::time::Instant::now();
+    loop {
+      let seen = crate::daemon::observe_at(daemon, partition, look);
+      if (seen.0 && seen.1)
+        || started.elapsed() >= std::time::Duration::from_nanos(crate::daemon::OBSERVE_BUDGET_NS)
+      {
+        return seen;
+      }
+      std::thread::yield_now();
+    }
+  }
+
+  /// A-533 (A-513's remainder; §4.16 "Recovery", A-247): a work whose rebuild asks went unanswered twice at recovery is
+  /// asked for again as clients are let in, by messages, never a timer. Do: on a two-shard daemon, make a green on one
+  /// shard; on the other, record a work over it unbuilt and ask its green's owner again
+  /// (`ask_owners_to_replay`). Expect: the owner's replay comes back by its own message and the work is installed on
+  /// its shard, its record ended, asked again once and no rebuild refused. Before, such a work stayed unbuilt until the
+  /// daemon's next start.
+  #[test]
+  fn an_unbuilt_works_shard_asks_its_greens_owner_again_by_message_and_installs_it() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (green, created_at, owner_partition) = crate::daemon::observe_first(&daemon, |state| {
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let made = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::CreateGreen {
+          name: owned_name(state, "unbuilt-green"),
+          require_evidence: false,
+          base: None,
+        },
+      );
+      let ReplyBody::GreenCreated { id } = made else {
+        panic!("the green was not created: {made:?}")
+      };
+      let green = super::to_db_volume(id);
+      let head = state
+        .greens
+        .get(&green)
+        .map(|engine| engine.head())
+        .unwrap();
+      (green, head, usize::from(state.partition))
+    });
+    let work_partition = (owner_partition + 1) % 2;
+    let work = super::DbVolumeId { bytes: [0x55; 16] };
+    crate::daemon::observe_at(&daemon, work_partition, move |state| {
+      state.work_home.unbuilt.push(crate::work_home::Unbuilt {
+        work,
+        green,
+        created_at,
+      });
+      super::ask_owners_to_replay(state);
+    });
+    let seen = rebuilt_by_now(&daemon, work_partition, work);
+    daemon.stop();
+    assert_eq!(
+      seen,
+      (true, true, Some(1), None),
+      "(installed, record ended, asked again, rebuilds refused) on the work's shard"
     );
   }
 
