@@ -929,6 +929,20 @@ fn a_listing_streams_a_slice_at_a_time_in_the_room_given() {
   );
 }
 
+/// A-613 part 2 (`list`): an empty pattern list answers at once, as `svn_repos_list` returns before any walk ("We
+/// don't want the server to waste time here"): one slice even in a room of one byte, nothing but `done` and the
+/// answer.
+#[test]
+fn an_empty_pattern_list_answers_without_a_walk() {
+  let fixture = Fixture::new();
+  let command = b"( list ( 0: ( ) infinity ( kind ) ( ) ) ) ";
+  let (_, out, slices) = streamed(&fixture, &fixture.green, command, 1);
+  assert_eq!(
+    (out.as_slice(), slices),
+    (b"( success ( ( ) 0: ) ) done ( success ( ) ) ".as_slice(), 1)
+  );
+}
+
 /// A-613 part 2 (`list`): `fill_dirent` parses each created revision's date, and one that does not parse refuses the
 /// listing after the dirents before it, with `done` then "Bogus date"; with no field beyond the kind asked no date is
 /// read and the listing is whole.

@@ -13382,8 +13382,11 @@ and export by landing).
 > whole. Its second slice (2026-11-19, g297): `get-file` (the checksum from the node row, the properties and inherited
 > properties, then the text in `svnserve`'s 4,096-byte strings, the empty string and a second response), the text read
 > from the green a piece at a time and written a slice at a time in the room the caller gives (a `Stream` the server
-> resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Owed: `list`, `log` with merged
-> revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`; read access by the authorization rules
+> resumes), so no file is held whole; the stock `svn cat` sessions replayed whole. Its third slice (2026-11-19, g297):
+> `list`, `svn_repos_list`'s walk streamed a slice at a time (each slice bounded by the bytes it writes and the entries
+> it visits), its patterns matched by APR's `apr_fnmatch` after Subversion's fold, exact over ASCII names; `svn ls -v
+> -R` replayed whole. Owed: `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
 > (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
@@ -42289,9 +42292,31 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
 - **Scope** (Ada, 2026-11-18, through main): slates offers the server's portion; `svn mergeinfo --show-revs`'s eligible
   and merged revisions are the stock client's work over `get-mergeinfo`, `log` and the location segments, so no
   server piece computes them.
-- **Owed** (the next slices): `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`,
-  `get-deleted-rev`, each replayed against the transcripts already recorded; read access by A-606's rules, and the
-  authentication request a denied anonymous read makes when the session could authenticate.
+- **Part 2, its third slice** (2026-11-19, g297): `list` (`reads/list.rs`). The parameters `c(?r)w?l?l` (the
+  fields, each a word, any word but the six ignored; the patterns, each a string read to its NUL); the authentication
+  request; a revision past the youngest refused before `done`; then `svn_repos_list`'s walk, its `done` and its answer:
+  a depth below `empty` refused "Invalid depth 'N' in svn_repos_list" (165002; `exclude` -1, `unknown` and every word
+  `svn_depth_from_word` does not know -2), an absent path "Path 'P' not found" (160013), a file listed alone, an empty
+  pattern list answered at once, the path's own dirent when its name matches, then its entries depth-first, each
+  directory's in byte order, directories left out at `files`, a file matching no pattern left out, a directory
+  matching none walked unreported. A dirent is `( path kind ( size ) ( has-props ) ( created-rev ) ( date ) ( author ) )`
+  with absolute paths, each list empty when its field is not asked and the kind `unknown`, or `( path kind )` when
+  only the kind is asked; filled, every field is read whichever are asked, so a date that does not parse refuses the
+  listing after the dirents before it. Names match after Subversion's fold (`svn_utf__fuzzy_glob_match`: utf8proc's
+  decomposition, case folding and mark stripping, composed again; over ASCII the letters lowered), through A-606's
+  `apr_fnmatch` port, now re-exported to the crate. The walk is a `Stream`: it keeps one level of sorted names per
+  directory on its path, and a slice ends when the bytes it wrote and the entries it visited reach the caller's room.
+  Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 322 of 322 plus the empty pattern list's,
+  `cargo fmt --check` clean; the `list` session (16 commands), its hostile one and `svn ls -v -R` replayed whole;
+  slicing; a date that does not parse; the parameters; a pattern read to its NUL. Red-checked eight ways (entries in
+  reverse, names not folded, the kind `none` when not asked, `exclude` walked, dates never read, directories kept at
+  `files`, recursion at every depth: each failed named tests; an empty pattern list walked passed until the test of
+  its one slice was added, since its answer is the same).
+- **Owed** (the next slices): `log` with merged revisions, `get-location-segments`, `get-file-revs`,
+  `get-deleted-rev`, each replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
+  (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
+  general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
+  when the session could authenticate.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
