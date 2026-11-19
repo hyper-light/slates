@@ -484,7 +484,6 @@ impl HookTimes {
   pub(crate) fn cut_runs(&self) -> u64 {
     self.cuts
   }
-
 }
 
 /// What a run teaches its hook's times (A-622 part 3): the runner reports a run that finished and a run cut at its bound
@@ -722,7 +721,11 @@ impl HookRun {
 
   /// A run whose process its driver started at `started_ns`, held to `bound_ns` (its hook's learned bound, read by the
   /// driver before its first await), its words kept to `words_cap` bytes; and what the driver does first.
-  pub(crate) fn with_bound(started_ns: u64, bound_ns: Option<u64>, words_cap: usize) -> (Self, Step) {
+  pub(crate) fn with_bound(
+    started_ns: u64,
+    bound_ns: Option<u64>,
+    words_cap: usize,
+  ) -> (Self, Step) {
     let run = Self {
       state: RunState::Running,
       words: Words::default(),

@@ -187,7 +187,13 @@ impl Hook {
     let (words_read, words_write) = std::io::pipe().map_err(|error| start_refused(&error))?;
     let mut command = Command::new(launch.program);
     command
-      .args(launch.input.args.iter().map(|arg| std::ffi::OsStr::from_bytes(arg)))
+      .args(
+        launch
+          .input
+          .args
+          .iter()
+          .map(|arg| std::ffi::OsStr::from_bytes(arg)),
+      )
       .current_dir(launch.view_root)
       .process_group(0)
       .stdin(Stdio::piped());
@@ -497,7 +503,10 @@ fn start_refused(error: &std::io::Error) -> StartRefused {
     std::io::ErrorKind::NotFound => StartRefused::NotFound,
     std::io::ErrorKind::PermissionDenied => StartRefused::NotPermitted,
     std::io::ErrorKind::OutOfMemory => StartRefused::NoRoom,
-    _ => match error.raw_os_error().map(rustix::io::Errno::from_raw_os_error) {
+    _ => match error
+      .raw_os_error()
+      .map(rustix::io::Errno::from_raw_os_error)
+    {
       Some(rustix::io::Errno::AGAIN | rustix::io::Errno::MFILE | rustix::io::Errno::NFILE) => {
         StartRefused::NoRoom
       }
@@ -541,6 +550,8 @@ mod tests {
   const LARGE_INPUT: usize = 1 << 20;
   /// Format: the exit code the refusing role exits with.
   const REFUSED: i32 = 3;
+  /// Shape: how often a test asks whether a killed process is gone: a hundredth of a liveness window.
+  const ASK_EVERY_NS: u64 = LIVENESS_BUDGET_NS / 100;
 
   /// The role this binary plays when re-invoked as a hook (`ROLE`); a test that does nothing otherwise.
   #[test]
@@ -552,12 +563,21 @@ mod tests {
       "accept" => {
         let mut input = Vec::new();
         let _ = std::io::stdin().read_to_end(&mut input);
-        let args: Vec<String> = std::env::args().skip_while(|arg| arg != "--").skip(1).collect();
+        let args: Vec<String> = std::env::args()
+          .skip_while(|arg| arg != "--")
+          .skip(1)
+          .collect();
         println!("{TAG}stdin={}", input.len());
         println!("{TAG}args={}", args.join("|"));
         println!("{TAG}node={}", std::env::var("HG_NODE").unwrap_or_default());
-        println!("{TAG}pending={}", std::env::var("HG_PENDING").unwrap_or_default());
-        println!("{TAG}count={}", std::env::var("GIT_PUSH_OPTION_COUNT").is_ok());
+        println!(
+          "{TAG}pending={}",
+          std::env::var("HG_PENDING").unwrap_or_default()
+        );
+        println!(
+          "{TAG}count={}",
+          std::env::var("GIT_PUSH_OPTION_COUNT").is_ok()
+        );
         println!("{TAG}cwd={}", std::env::current_dir().unwrap().display());
         std::process::exit(0);
       }
@@ -635,7 +655,12 @@ mod tests {
 
   /// Runs `hook` (by `program`, `/` standing for the test binary) to its outcome, held to `bound_ns`, its client
   /// leaving after `leaves_after_ns` when given.
-  fn drive(program: Option<&str>, hook: HookInput, bound_ns: Option<u64>, leaves_after_ns: Option<u64>) -> Ran {
+  fn drive(
+    program: Option<&str>,
+    hook: HookInput,
+    bound_ns: Option<u64>,
+    leaves_after_ns: Option<u64>,
+  ) -> Ran {
     let runtime = runtime();
     let (sent, got) = channel();
     let (binary, view) = program_and_view();
@@ -659,7 +684,12 @@ mod tests {
         let began = slates_rt::futures::now_ns();
         let ran = slates_rt::futures::within(TEST_BOUND_NS, run(launch, bound_ns, client)).await;
         let took = slates_rt::futures::now_ns().saturating_sub(began);
-        let _ = sent.send(ran.ok().flatten().map(|(outcome, lesson)| (outcome, lesson, took)));
+        let _ = sent.send(
+          ran
+            .ok()
+            .flatten()
+            .map(|(outcome, lesson)| (outcome, lesson, took)),
+        );
       })
       .expect("the run's task");
     runtime.run_until_idle();
@@ -678,9 +708,9 @@ mod tests {
   /// A hook's words, as text.
   fn text(outcome: &Outcome) -> String {
     match outcome {
-      Outcome::Accepted { words } | Outcome::Refused { words, .. } | Outcome::TimedOut { words, .. } => {
-        String::from_utf8_lossy(&words.kept).into_owned()
-      }
+      Outcome::Accepted { words }
+      | Outcome::Refused { words, .. }
+      | Outcome::TimedOut { words, .. } => String::from_utf8_lossy(&words.kept).into_owned(),
       _ => String::new(),
     }
   }
@@ -694,7 +724,7 @@ mod tests {
       if !alive {
         return true;
       }
-      std::thread::sleep(std::time::Duration::from_millis(10));
+      std::thread::sleep(std::time::Duration::from_nanos(ASK_EVERY_NS));
     }
     false
   }
@@ -708,7 +738,12 @@ mod tests {
     let (_, view) = program_and_view();
     let stdin = b"0000 1111 refs/heads/main\n".to_vec();
     let length = stdin.len();
-    let hook = input(HookPoint::GitPreReceive, "accept", &["refs/heads/main", "two"], stdin);
+    let hook = input(
+      HookPoint::GitPreReceive,
+      "accept",
+      &["refs/heads/main", "two"],
+      stdin,
+    );
     let (outcome, lesson, _) = drive(None, hook, None, None).expect("the run ended");
     let words = text(&outcome);
     assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
@@ -732,18 +767,40 @@ mod tests {
   /// git's words holding both lines, Subversion's the standard error line alone.
   #[test]
   fn a_refusing_hook_is_refused_with_its_exit_and_its_points_words() {
-    let both = drive(None, input(HookPoint::GitPreReceive, "refuse", &[], Vec::new()), None, None);
+    let both = drive(
+      None,
+      input(HookPoint::GitPreReceive, "refuse", &[], Vec::new()),
+      None,
+      None,
+    );
     let (outcome, _, _) = both.expect("the run ended");
     assert!(
-      matches!(outcome, Outcome::Refused { status: ExitStatus::Code(REFUSED), .. }),
+      matches!(
+        outcome,
+        Outcome::Refused {
+          status: ExitStatus::Code(REFUSED),
+          ..
+        }
+      ),
       "{outcome:?}"
     );
     let words = text(&outcome);
-    assert!(words.contains("refused by the hook") && words.contains("to standard output"), "{words}");
-    let error = drive(None, input(HookPoint::SvnPreCommit, "refuse", &[], Vec::new()), None, None);
+    assert!(
+      words.contains("refused by the hook") && words.contains("to standard output"),
+      "{words}"
+    );
+    let error = drive(
+      None,
+      input(HookPoint::SvnPreCommit, "refuse", &[], Vec::new()),
+      None,
+      None,
+    );
     let (outcome, _, _) = error.expect("the run ended");
     let words = text(&outcome);
-    assert!(words.contains("refused by the hook") && !words.contains("to standard output"), "{words}");
+    assert!(
+      words.contains("refused by the hook") && !words.contains("to standard output"),
+      "{words}"
+    );
   }
 
   /// A-622 part 3 (the learned deadline, the group's kill, the reap). Do: with a learned bound, run a hook that sleeps.
@@ -753,13 +810,21 @@ mod tests {
   fn a_hook_past_its_learned_bound_is_killed_with_its_group_and_reaped() {
     let times = learned();
     let bound = times.bound_ns().expect("learned");
-    let (outcome, lesson, took) =
-      drive(None, input(HookPoint::GitUpdate, "sleep", &[], Vec::new()), Some(bound), None).expect("the run ended");
+    let (outcome, lesson, took) = drive(
+      None,
+      input(HookPoint::GitUpdate, "sleep", &[], Vec::new()),
+      Some(bound),
+      None,
+    )
+    .expect("the run ended");
     assert!(
       matches!(outcome, Outcome::TimedOut { bound_ns, .. } if bound_ns == bound),
       "{outcome:?}"
     );
-    assert!(took >= bound && took < bound + LIVENESS_BUDGET_NS, "ended {took} ns in, the bound {bound} ns");
+    assert!(
+      took >= bound && took < bound + LIVENESS_BUDGET_NS,
+      "ended {took} ns in, the bound {bound} ns"
+    );
     let mut taught = learned();
     lesson.teach(&mut taught);
     assert_eq!(taught.cut_runs(), 1);
@@ -779,7 +844,10 @@ mod tests {
     )
     .expect("the run ended");
     assert_eq!(outcome, Outcome::Abandoned);
-    assert!(took >= LEAVES_AFTER_NS && took < LIVENESS_BUDGET_NS, "ended {took} ns in");
+    assert!(
+      took >= LEAVES_AFTER_NS && took < LIVENESS_BUDGET_NS,
+      "ended {took} ns in"
+    );
     assert_eq!(lesson, Lesson::default());
   }
 
@@ -789,8 +857,13 @@ mod tests {
   #[test]
   fn a_hook_whose_child_holds_its_output_is_judged_by_its_exit_and_its_child_ended() {
     let bound = learned().bound_ns().expect("learned");
-    let (outcome, lesson, took) =
-      drive(None, input(HookPoint::GitPostReceive, "linger", &[], Vec::new()), Some(bound), None).expect("the run ended");
+    let (outcome, lesson, took) = drive(
+      None,
+      input(HookPoint::GitPostReceive, "linger", &[], Vec::new()),
+      Some(bound),
+      None,
+    )
+    .expect("the run ended");
     assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
     assert!(took >= bound, "held until the bound: {took} ns");
     let words = text(&outcome);
@@ -800,7 +873,10 @@ mod tests {
       .and_then(|rest| rest.lines().next())
       .and_then(|pid| pid.trim().parse().ok())
       .expect("the child's pid");
-    assert!(gone(pid), "the lingering child {pid} was ended with its group");
+    assert!(
+      gone(pid),
+      "the lingering child {pid} was ended with its group"
+    );
     let mut taught = HookTimes::default();
     lesson.teach(&mut taught);
     assert_eq!(taught.finished_runs(), 1, "its exit was a sample");
@@ -810,18 +886,31 @@ mod tests {
   /// Expect: accepted when it exits, the driver having stopped feeding at its closed input.
   #[test]
   fn a_hook_that_reads_none_of_a_large_input_ends_its_run_by_its_exit() {
-    let (outcome, _, _) =
-      drive(None, input(HookPoint::GitPreReceive, "early", &[], vec![b'x'; LARGE_INPUT]), None, None)
-        .expect("the run ended");
+    let (outcome, _, _) = drive(
+      None,
+      input(
+        HookPoint::GitPreReceive,
+        "early",
+        &[],
+        vec![b'x'; LARGE_INPUT],
+      ),
+      None,
+      None,
+    )
+    .expect("the run ended");
     assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
   }
 
   /// A-622 part 3. Do: launch a program that does not exist. Expect: unstartable, not found.
   #[test]
   fn a_hook_that_cannot_start_is_unstartable_by_its_cause() {
-    let (outcome, lesson, _) =
-      drive(Some("/nonexistent/slates-hook"), input(HookPoint::GitUpdate, "accept", &[], Vec::new()), None, None)
-        .expect("the run ended");
+    let (outcome, lesson, _) = drive(
+      Some("/nonexistent/slates-hook"),
+      input(HookPoint::GitUpdate, "accept", &[], Vec::new()),
+      None,
+      None,
+    )
+    .expect("the run ended");
     assert_eq!(
       outcome,
       Outcome::Unstartable {
