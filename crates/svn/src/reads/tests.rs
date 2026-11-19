@@ -10,6 +10,7 @@ use super::*;
 use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
 use crate::ra_svn::{Bounds, Parsed, Parser};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use std::collections::BTreeMap;
 
 /// A transaction name of the form §4.17.4 item 3.1 gives.
@@ -43,7 +44,7 @@ impl Contents for Green {
       tree
         .keys()
         .filter(|place| place.as_str() != directory && parent(place) == Some(directory))
-        .map(|place| place.rsplit('/').next().unwrap().to_owned())
+        .filter_map(|place| Some(place.rsplit('/').next()?.to_owned()))
         .collect(),
     )
   }
@@ -92,7 +93,7 @@ struct Fixture {
 fn unhex(text: &str) -> Vec<u8> {
   (0..text.len())
     .step_by(2)
-    .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+    .map(|at| u8::from_str_radix(text.get(at..at + 2).unwrap(), 16).unwrap())
     .collect()
 }
 
@@ -222,7 +223,7 @@ impl Fixture {
           .iter()
           .filter(|(place, _)| at_or_beneath(place, &source.path))
         {
-          let moved = format!("{path}{}", &place[source.path.len()..]);
+          let moved = format!("{path}{}", place.get(source.path.len()..).unwrap());
           tree.insert(moved, *node);
         }
       }
@@ -320,54 +321,84 @@ const PROPERTY_LISTS: [&str; 2] = ["rev-proplist", "get-iprops"];
 /// the session as `svnserve` ended it; answers how many commands were answered here.
 fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize {
   let fixture = Fixture::new();
-  let session = Session { base: "/" };
-  let commands = items(client);
   let answers = items(server);
   let mut at = 4;
   let mut answered = 0;
-  for command in commands.iter().skip(2) {
-    let Value::List(parts) = command else {
-      panic!("{name}: a client item that is no command");
-    };
-    let Some(Value::Word(word)) = parts.first() else {
-      panic!("{name}: a command without its word");
-    };
+  for command in items(client).iter().skip(2) {
+    let word = command_word(name, command);
     let mut out = Vec::new();
-    match answer(&fixture.index, &fixture.green, &session, command, &mut out).unwrap() {
+    match answer(
+      &fixture.index,
+      &fixture.green,
+      &Session { base: "/" },
+      command,
+      &mut out,
+    )
+    .unwrap()
+    {
       Outcome::Answered => {
-        let mine = items(&out);
-        let theirs = &answers[at..at + mine.len()];
-        if PROPERTY_LISTS.contains(word) {
-          let mine: Vec<String> = mine.iter().map(normalized).collect();
-          let theirs: Vec<String> = theirs.iter().map(normalized).collect();
-          assert_eq!(mine, theirs, "{name}: {word}");
-        } else {
-          assert_eq!(mine.as_slice(), theirs, "{name}: {word}");
-        }
-        at += mine.len();
+        at = same_answer(name, word, &items(&out), &answers, at);
         answered += 1;
       }
       Outcome::Elsewhere => {
         assert!(
-          elsewhere.contains(word),
+          elsewhere.contains(&word),
           "{name}: {word} is another piece's"
         );
         at += 2;
       }
-      Outcome::Close => {
-        assert_eq!(
-          at,
-          answers.len(),
-          "{name}: svnserve wrote after the malformed {word}"
-        );
-        return answered;
-      }
+      Outcome::Close => return closed(name, word, at, answers.len(), answered),
     }
   }
   assert_eq!(
     at,
     answers.len(),
     "{name}: svnserve answered more than was replayed"
+  );
+  answered
+}
+
+/// A client command's word.
+fn command_word<'a>(name: &str, command: &'a Value<'_>) -> &'a str {
+  match command {
+    Value::List(parts) => match parts.first() {
+      Some(Value::Word(word)) => word,
+      _ => panic!("{name}: a command without its word"),
+    },
+    _ => panic!("{name}: a client item that is no command"),
+  }
+}
+
+/// Holds one answer to `svnserve`'s items from `at`, property lists as sets for the commands that hold them; answers
+/// where the next answer starts.
+fn same_answer(
+  name: &str,
+  word: &str,
+  mine: &[Value<'_>],
+  answers: &[Value<'_>],
+  at: usize,
+) -> usize {
+  let theirs = &answers[at..at + mine.len()];
+  let (mine, theirs): (Vec<String>, Vec<String>) = if PROPERTY_LISTS.contains(&word) {
+    (
+      mine.iter().map(normalized).collect(),
+      theirs.iter().map(normalized).collect(),
+    )
+  } else {
+    (
+      mine.iter().map(|value| format!("{value:?}")).collect(),
+      theirs.iter().map(|value| format!("{value:?}")).collect(),
+    )
+  };
+  assert_eq!(mine, theirs, "{name}: {word}");
+  at + mine.len()
+}
+
+/// A malformed command: `svnserve` wrote nothing after it; answers the commands answered before it.
+fn closed(name: &str, word: &str, at: usize, answers: usize, answered: usize) -> usize {
+  assert_eq!(
+    at, answers,
+    "{name}: svnserve wrote after the malformed {word}"
   );
   answered
 }
@@ -538,62 +569,61 @@ fn other_pieces_commands_are_handed_back_and_unknown_ones_refused() {
 /// search's edges.
 #[test]
 fn dates_are_read_and_written_as_subversion_reads_and_writes_them() {
-  let read = |text: &str| parse_time(text.as_bytes());
-  assert_eq!(read("1970-01-01T00:00:00.000000Z"), Some(0));
-  assert_eq!(read("1970-01-01T00:00:01.000002Z"), Some(1_000_002));
-  assert_eq!(
-    read("2026-01-03T03:00:00.000000Z")
-      .map(format_time)
-      .as_deref(),
-    Some("2026-01-03T03:00:00.000000Z")
-  );
-  assert_eq!(
-    read("2026-1-3T3:0:0.5Z").map(format_time).as_deref(),
-    Some("2026-01-03T03:00:00.000005Z")
-  );
-  assert_eq!(
-    read("2026-01-32T00:00:00.000000Z")
-      .map(format_time)
-      .as_deref(),
-    Some("2026-02-01T00:00:00.000000Z")
-  );
-  assert_eq!(
-    read("2024-02-29T23:59:59.999999Z")
-      .map(format_time)
-      .as_deref(),
-    Some("2024-02-29T23:59:59.999999Z")
-  );
-  assert_eq!(
-    read("2100-03-01T00:00:00.000000Z")
-      .map(format_time)
-      .as_deref(),
-    Some("2100-03-01T00:00:00.000000Z")
-  );
-  for bogus in [
-    "2026-00-01T00:00:00.000000Z",
-    "2026-13-01T00:00:00.000000Z",
-    "1969-12-31T23:59:59.000000Z",
-    "2026-01-04",
-    "2026-01-04T00:00:00Z",
-    " 2026-01-04T00:00:00.000000Z",
-    "+2026-01-04T00:00:00.000000Z",
-    "",
-  ] {
-    assert_eq!(read(bogus), None, "{bogus}");
+  let read: [(&str, Option<&str>); 15] = [
+    (
+      "1970-01-01T00:00:00.000000Z",
+      Some("1970-01-01T00:00:00.000000Z"),
+    ),
+    (
+      "1970-01-01T00:00:01.000002Z",
+      Some("1970-01-01T00:00:01.000002Z"),
+    ),
+    (
+      "2026-01-03T03:00:00.000000Z",
+      Some("2026-01-03T03:00:00.000000Z"),
+    ),
+    ("2026-1-3T3:0:0.5Z", Some("2026-01-03T03:00:00.000005Z")),
+    (
+      "2026-01-32T00:00:00.000000Z",
+      Some("2026-02-01T00:00:00.000000Z"),
+    ),
+    (
+      "2024-02-29T23:59:59.999999Z",
+      Some("2024-02-29T23:59:59.999999Z"),
+    ),
+    (
+      "2100-03-01T00:00:00.000000Z",
+      Some("2100-03-01T00:00:00.000000Z"),
+    ),
+    ("2026-00-01T00:00:00.000000Z", None),
+    ("2026-13-01T00:00:00.000000Z", None),
+    ("1969-12-31T23:59:59.000000Z", None),
+    ("2026-01-04", None),
+    ("2026-01-04T00:00:00Z", None),
+    (" 2026-01-04T00:00:00.000000Z", None),
+    ("+2026-01-04T00:00:00.000000Z", None),
+    ("", None),
+  ];
+  for (text, written) in read {
+    assert_eq!(
+      parse_time(text.as_bytes()).map(format_time).as_deref(),
+      written,
+      "{text}"
+    );
   }
-  let fixture = Fixture::new();
-  let session = Session { base: "/" };
-  let dated = |date: &str| {
+  assert_eq!(parse_time(b"1970-01-01T00:00:01.000002Z"), Some(1_000_002));
+  let dated = [
+    ("2026-01-01T00:00:00.000000Z", 0),
+    ("2026-01-01T01:00:00.000000Z", 1),
+    ("2026-01-07T07:00:00.000000Z", 7),
+    ("2026-01-06T06:00:00.000001Z", 6),
+  ];
+  for (date, revision) in dated {
     let command = format!("( get-dated-rev ( {}:{date} ) ) ", date.len());
-    let value = items(command.as_bytes()).remove(0);
-    let mut out = Vec::new();
-    answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
-    String::from_utf8(out).unwrap()
-  };
-  assert!(dated("2026-01-01T00:00:00.000000Z").ends_with("( success ( 0 ) ) "));
-  assert!(dated("2026-01-01T01:00:00.000000Z").ends_with("( success ( 1 ) ) "));
-  assert!(dated("2026-01-07T07:00:00.000000Z").ends_with("( success ( 7 ) ) "));
-  assert!(dated("2026-01-06T06:00:00.000001Z").ends_with("( success ( 6 ) ) "));
+    let (_, out) = answered(command.as_bytes());
+    let expected = format!("( success ( ( ) 0: ) ) ( success ( {revision} ) ) ");
+    assert_eq!(String::from_utf8(out).unwrap(), expected, "{date}");
+  }
 }
 
 /// The bounds a hostile command is read within.
@@ -606,6 +636,28 @@ fn hostile_bounds() -> Bounds {
   }
 }
 
+/// One hostile parameter: one of the shapes the commands read, or a number, or a short string of path bytes and NUL.
+fn hostile_param() -> impl Strategy<Value = String> {
+  let shapes = prop::sample::select(vec![
+    "( ) ",
+    "( 3 ) ",
+    "( 18446744073709551615 ) ",
+    "5:trunk ",
+    "0: ",
+    "true ",
+    "inherited ",
+    "( 5:trunk 1:x ) ",
+    "27:2026-01-03T03:00:00.000000Z ",
+  ]);
+  (0_u8..3, shapes, any::<u64>(), "[a-z/.\\x00]{0,12}").prop_map(|(pick, shape, number, text)| {
+    match pick {
+      0 => shape.to_owned(),
+      1 => format!("{number} "),
+      _ => format!("{}:{text} ", text.len()),
+    }
+  })
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
@@ -614,22 +666,10 @@ proptest! {
   #[test]
   fn hostile_commands_are_answered_or_end_the_connection(
     name in prop::sample::select(vec![
-      "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat", "get-mergeinfo",
-      "get-iprops", "no-such-command",
+      "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
+      "get-mergeinfo", "get-iprops", "no-such-command",
     ]),
-    params in prop::collection::vec(prop_oneof![
-      Just("( ) ".to_owned()),
-      Just("( 3 ) ".to_owned()),
-      Just("( 18446744073709551615 ) ".to_owned()),
-      Just("5:trunk ".to_owned()),
-      Just("0: ".to_owned()),
-      Just("true ".to_owned()),
-      Just("inherited ".to_owned()),
-      Just("( 5:trunk 1:x ) ".to_owned()),
-      Just("27:2026-01-03T03:00:00.000000Z ".to_owned()),
-      any::<u64>().prop_map(|number| format!("{number} ")),
-      "[a-z/.\\x00]{0,12}".prop_map(|text| format!("{}:{text} ", text.len())),
-    ], 0..5),
+    params in prop::collection::vec(hostile_param(), 0..5),
   ) {
     let command = format!("( {name} ( {}) ) ", params.concat());
     let mut parser = Parser::new(hostile_bounds());
@@ -638,7 +678,8 @@ proptest! {
     };
     let fixture = Fixture::new();
     let mut out = Vec::new();
-    let outcome = answer(&fixture.index, &fixture.green, &Session { base: "/" }, &value, &mut out).unwrap();
+    let outcome = answer(&fixture.index, &fixture.green, &Session { base: "/" }, &value, &mut out)
+      .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
     match outcome {
       Outcome::Close | Outcome::Elsewhere => prop_assert!(out.is_empty()),
       Outcome::Answered => {

@@ -158,7 +158,7 @@ const ELSEWHERE: [&str; 24] = [
 /// The separators of `svn_time_from_cstring`'s format, each after its field: year, month, day, hour, minute, second,
 /// microsecond.
 /// Format: `TIMESTAMP_FORMAT`, `%04d-%02d-%02dT%02d:%02d:%02d.%06dZ` (`time.c`).
-const TIME_SEPARATORS: [u8; 7] = [b'-', b'-', b'T', b':', b':', b'.', b'Z'];
+const TIME_SEPARATORS: [u8; 7] = *b"--T::.Z";
 
 /// The days from the 1st of March to the 1st of each month, January and February counted in the year before.
 /// Format: APR's `apr_time_exp_get` `dayoffset` (`time/unix/time.c`), which starts a year on the 1st of March so that a
@@ -440,28 +440,47 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     while bottom <= top {
       let middle = bottom.saturating_add(top) / 2;
       let this = self.time_of(middle)?;
-      if this > time {
-        let Some(previous) = middle.checked_sub(1) else {
-          return Ok(0);
-        };
-        if self.time_of(previous)? <= time {
-          return Ok(previous);
-        }
-        top = previous;
+      let step = if this > time {
+        self.overshot(middle, time)?
       } else if this < time {
-        let next = middle.saturating_add(1);
-        if next > latest {
-          return Ok(latest);
-        }
-        if self.time_of(next)? > time {
-          return Ok(middle);
-        }
-        bottom = next;
+        self.undershot(middle, latest, time)?
       } else {
-        return Ok(middle);
+        Search::Found(middle)
+      };
+      match step {
+        Search::Found(revision) => return Ok(revision),
+        Search::Below(next) => top = next,
+        Search::Above(next) => bottom = next,
       }
     }
     Ok(0)
+  }
+
+  /// The search's step past the date at `middle`: revision 0 at the bottom, the one before when its date is not past
+  /// the date, else on below it.
+  fn overshot(&self, middle: Revision, time: i64) -> Result<Search, Failure> {
+    let Some(previous) = middle.checked_sub(1) else {
+      return Ok(Search::Found(0));
+    };
+    Ok(if self.time_of(previous)? <= time {
+      Search::Found(previous)
+    } else {
+      Search::Below(previous)
+    })
+  }
+
+  /// The search's step short of the date at `middle`: the youngest at the top, `middle` when the next revision's date
+  /// is past the date, else on above it.
+  fn undershot(&self, middle: Revision, latest: Revision, time: i64) -> Result<Search, Failure> {
+    let next = middle.saturating_add(1);
+    if next > latest {
+      return Ok(Search::Found(latest));
+    }
+    Ok(if self.time_of(next)? > time {
+      Search::Found(middle)
+    } else {
+      Search::Above(next)
+    })
   }
 
   /// `rev_hunt.c` `get_time`: a revision's date, refused when it has none or one that does not parse.
@@ -640,12 +659,11 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
   }
 
   /// The ancestors of `path` holding properties, root first, each by its path without the leading separator.
-  #[allow(clippy::type_complexity)]
   fn ancestors_properties<'path>(
     &self,
     path: &'path str,
     revision: Revision,
-  ) -> Result<Vec<(&'path str, Vec<(&'reads [u8], &'reads [u8])>)>, Failure> {
+  ) -> Result<Ancestors<'path, 'reads>, Failure> {
     if self.node(path, revision)?.is_none() {
       return Err(Failure::new(
         SVN_ERR_FS_NOT_FOUND,
@@ -759,6 +777,20 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     Ok(Outcome::Answered)
   }
 }
+
+/// Where one step of the dated search goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Search {
+  /// The revision is found.
+  Found(Revision),
+  /// It lies at or below this revision.
+  Below(Revision),
+  /// It lies at or above this revision.
+  Above(Revision),
+}
+
+/// The ancestors of a path holding properties, each by its path without the leading separator, with its properties.
+type Ancestors<'path, 'reads> = Vec<(&'path str, Vec<(&'reads [u8], &'reads [u8])>)>;
 
 /// A dirent as `stat` writes it, owning its formatted date.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -976,7 +1008,7 @@ fn time_field(text: &[u8], at: usize) -> (i32, usize) {
 /// `svn_time_from_cstring`'s format, `YYYY-MM-DDTHH:MM:SS.UUUUUUZ`, each field followed by its separator, then APR's
 /// `apr_time_exp_gmt_get`: microseconds since 1970, or `None` for a bogus date.
 fn parse_time(text: &[u8]) -> Option<i64> {
-  let mut fields = [0_i32; 7];
+  let mut fields = [0_i32; TIME_SEPARATORS.len()];
   let mut at = 0;
   for (field, separator) in fields.iter_mut().zip(TIME_SEPARATORS) {
     let (value, after) = time_field(text, at);
