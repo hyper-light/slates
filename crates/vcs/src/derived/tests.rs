@@ -72,6 +72,11 @@ impl History {
   }
 }
 
+/// A version's place among the model's versions.
+fn index(version: u64) -> usize {
+  usize::try_from(version).unwrap()
+}
+
 /// A map of files as the model keeps it.
 type Files = BTreeMap<Vec<u8>, Entry>;
 
@@ -490,8 +495,8 @@ impl Run {
       lazy_kept: false,
     });
     for refused in [
-      &self.models[version as usize].eager,
-      &self.models[version as usize].lazy,
+      &self.models[index(version)].eager,
+      &self.models[index(version)].lazy,
     ]
     .into_iter()
     .filter_map(|model| model.as_ref().err())
@@ -525,7 +530,7 @@ impl Run {
       &mut self.store,
     );
     fill.release(&mut self.store).unwrap();
-    let model = &self.models[version as usize];
+    let model = &self.models[index(version)];
     match (&model.eager, answer) {
       (Ok(files), Ok(root)) => {
         let derived = self.derivations.counters().derived - before.0.derived;
@@ -554,7 +559,7 @@ impl Run {
     let mut found = BTreeSet::new();
     let mut pending = vec![version];
     while let Some(at) = pending.pop() {
-      let model = &self.models[at as usize];
+      let model = &self.models[index(at)];
       if !model.lazy_kept && found.insert(at) {
         pending.extend(&model.parents);
       }
@@ -580,12 +585,12 @@ impl Run {
     );
     let derived = self.derivations.counters().derived - before.0.derived;
     let walked = self.derivations.counters().walked - before.0.walked;
-    match (self.models[version as usize].lazy.clone(), answer) {
+    match (self.models[index(version)].lazy.clone(), answer) {
       (Ok(files), Ok(root)) => {
         let entered = self.lazy.counters().directories - before.1.directories;
         let expected: u64 = to_fill
           .iter()
-          .map(|at| reached(&self.models[*at as usize].change))
+          .map(|at| reached(&self.models[index(*at)].change))
           .sum();
         assert_eq!(
           (derived, walked, entered),
@@ -609,7 +614,7 @@ impl Run {
 
   fn kept(&mut self, versions: &BTreeSet<u64>) {
     for at in versions {
-      self.models[*at as usize].lazy_kept = true;
+      self.models[index(*at)].lazy_kept = true;
     }
   }
 
@@ -695,7 +700,7 @@ fn chain(len: u64) -> (ContentStore, History, Vec<ContentId>) {
   for version in 0..len {
     let entry = |at: u64| Entry {
       class: 0,
-      content: blobs[(at % 2) as usize],
+      content: blobs[index(at % 2)],
     };
     let change = Change::from([
       (format!("f{version}").into_bytes(), Some(entry(0))),
@@ -974,7 +979,7 @@ fn trie_depth(store: &ContentStore, root: ContentId, name: &[u8]) -> usize {
     } else {
       byte & 0x0f
     };
-    let below = (bitmap & ((1_u16 << digit) - 1)).count_ones() as usize;
+    let below = usize::try_from((bitmap & ((1_u16 << digit) - 1)).count_ones()).unwrap();
     node = read.name(below).unwrap();
     depth += 1;
   }
