@@ -148,11 +148,14 @@ pub trait PackSource {
 
   /// Writes `pack`'s next bytes to `out`, at most `room` of them, doing at most a turn's work toward them: whether any
   /// are left after them. A call may work and write nothing yet; the answer then asks again at its next step, so each
-  /// call must bring the pack nearer its end.
+  /// call must bring the pack nearer its end. What a turn's work holds only for a while (A-653 continued (4): a delta
+  /// search over an object past a window) is charged to the request's `admission` as it begins and given back as it
+  /// ends, within the same request.
   fn write(
     &mut self,
     served: &Served<'_>,
     pack: &mut Self::Pack,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused>;
