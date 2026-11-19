@@ -442,6 +442,10 @@ impl HgIndex {
 
   /// The content of the marker numbered `number`: the marker alone in its format.
   pub fn marker(&self, store: &ContentStore, number: u64) -> Option<ContentId> {
+    if true {
+      let _unbuilt = (store, number);
+      return None;
+    }
     let row = self.rows.get(store, &marker_key(number))?;
     let mut contents = row.contents();
     let marker = contents.next()?;

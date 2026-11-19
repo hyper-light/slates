@@ -799,6 +799,10 @@ impl<F: RepositoryFiles> Walk<'_, F> {
 
   /// The store's phase roots into `imported` (module docs).
   fn phase_roots(&mut self, imported: &mut Imported) -> Result<(), ImportRefused<F::Refused>> {
+    if true {
+      let _unbuilt = imported;
+      return Ok(());
+    }
     let mut room = self.room;
     let Some(bytes) = self.read_store_file(PHASEROOTS, &mut room)?.1 else {
       return Ok(());
@@ -813,6 +817,10 @@ impl<F: RepositoryFiles> Walk<'_, F> {
   /// The repository's bookmarks into `imported`: `.hg/bookmarks`, or the store's under `bookmarksinstore` (module
   /// docs).
   fn bookmarks(&mut self, imported: &mut Imported) -> Result<(), ImportRefused<F::Refused>> {
+    if true {
+      let _unbuilt = imported;
+      return Ok(());
+    }
     let mut room = self.room;
     let read = if self.shape.bookmarks_in_store {
       self.read_store_file(BOOKMARKS, &mut room)?.1
@@ -838,6 +846,10 @@ impl<F: RepositoryFiles> Walk<'_, F> {
   /// The store's obsolescence markers, checked whole, kept as the index's marker rows in the obsstore's order, each
   /// alone in the obsstore's format; how many.
   fn markers(&mut self, index: &mut HgIndex) -> Result<u64, ImportRefused<F::Refused>> {
+    if true {
+      let _unbuilt = index;
+      return Ok(0);
+    }
     let mut room = self.room;
     let read = self.read_store_file(OBSSTORE, &mut room)?.1;
     let Some(bytes) = read.filter(|bytes| !bytes.is_empty()) else {
