@@ -37066,7 +37066,7 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
   test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
   `Outcome::Failed { code: Option<OsCode> }`, and clippy.
 
-### A-554 — Grants, the owed audit, departed hosts, held copies and the pressure hold leave the reap loop's tick, each at its own deadline or event (2026-11-19, goal 86, g255; the event-driven reaper's piece 4; §4.7; A-265, A-266, A-222, A-197, A-475, A-522, A-536)
+### A-554 — Grants, the owed audit, departed hosts and held copies leave the reap loop's tick, each at its own deadline or event (2026-11-19, goal 86, g255; the event-driven reaper's piece 4; §4.7; A-265, A-266, A-222, A-197, A-475, A-522, A-536)
 
 - **What was there.** The reap loop's tick, once a liveness window on every shard, ended the grants past their term
   (`landing::end_expired_grants`, a walk of every grant the shard holds), then sent again what the shard owed the audit
@@ -37135,7 +37135,20 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
   agent could neither build nor run it on its macOS host (§8): the test, `crates/server/src/held_copy.rs`
   `an_unclaimed_map_is_reclaimed_at_its_claims_deadline_without_a_tick` (a map entered unclaimed with its claim due a
   tenth of a window ahead: reclaimed within half a window and counted once), is filed for main's Linux build, red on
-  80c9aa2 with the test alone and green on this change.
+  80c9aa2 with the test alone and green on this change. On macOS the change builds its `None` arm: green on 570664b
+  (the Mac Studio, 2026-11-19 17:52 local, load 22.9, debug), `slates-server --lib` 25 of 25 (`deadlines::`, `reap::`,
+  `remote_attach::`, `landing::`).
+- **The merged tree.** c2abf6e (the Mac Studio, 2026-11-19 17:54 local, load 18.8, debug): `cargo fmt --check` clean
+  for the three crates; `slates-land --lib grant::` 5 of 5, `slates-cluster --lib fleet::` 10 of 10, `slates-server
+  --lib` 30 of 30 (`deadlines::`, `reap::`, `remote_attach::`, `landing::`, the learn paths' three, the relinquish).
+- **Left for piece 5, in order.** The pressure hold: its event is a watermark crossing (A-470's plan), which the hosts
+  name for themselves and slates already reads polled (`slates_machine::memory_stall`: Linux PSI's memory `some`, macOS
+  `kern.memorystatus_vm_pressure_level`, Windows' low-memory notification); awaiting them is per-platform work (a PSI
+  trigger's `POLLPRI` through the shard's readiness wait on Linux, the notification handle through
+  `slates_rt::handle_wait` on Windows, XNU's memory-status level on macOS), and the hold today follows the shortfall
+  below the boot baseline rather than the host's level, so which signal moves it is the piece's first decision. Then
+  NFS purges, base hints with their delegation drain, the idle seal and the huge-page re-arm; then the reap loop and its
+  tick are deleted, which §4.7's status will say.
 
 Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
 `crates/cluster/src/fleet.rs`,
