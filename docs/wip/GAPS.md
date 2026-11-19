@@ -13,34 +13,42 @@
 > green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
 > greens; the record's replication in a fleet (with piece 2).
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
-> (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks
-> are greens; phases only move toward public, and a public changeset is never dropped or rewritten; markers are kept and
-> exchanged; topics are review requests; a stock push is judged whole-file and answered with Mercurial's own race abort,
-> and rebase on push is a line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code
-> and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2,
-> bundle1, changegroups `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input,
-> every structure counted and charged exactly to the caller's admission before it is built, no recursion; proven by
-> `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden
-> vectors stock `hg` 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle`
-> lists it, every text rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed,
-> four tests failed). **Built (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and
-> `check:bookmarks`, `check:heads` and `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies,
-> listkeys lines and namespace nodes), nothing allocated in decoding, every encoder's exact length given before it
-> writes; proven by `cargo test -p slates-hg --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against
-> golden vectors stock `hg` 7.2 made twice, byte for byte alike but the replies' cut
-> (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over SSH captured on the wire, the server's
-> replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask findings in the crate are folded in (the
-> no-panic root attribute among them); clippy and xtask are main's to rerun. Measured on stock 7.2 and recorded
-> (research §13): its C and pure marker readers disagree on a marker's size and on parent counts 0 and past 3. Owed, in
-> order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
-> (D-17); (2) the SSH and HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory;
-> (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8)
-> access and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow,
-> ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own
-> suite through a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a
-> 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
-> run checks it). No speed is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
+> piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's
+> heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
+> dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
+> and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
+> markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built
+> (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups `01` to `05` and their deltas, every length
+> read as 7.2 reads it and checked against the input, every structure counted and charged exactly to the caller's
+> admission before it is built, no recursion; proven by `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio
+> (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg` 7.2 made
+> (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text rebuilds
+> from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed). **Built
+> (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and `check:bookmarks`, `check:heads` and
+> `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies, listkeys lines and namespace nodes),
+> nothing allocated in decoding, every encoder's exact length given before it writes; proven by `cargo test -p slates-hg
+> --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against golden vectors stock `hg` 7.2 made twice,
+> byte for byte alike but the replies' cut (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over
+> SSH captured on the wire, the server's replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask
+> findings in the crate are folded in (the no-panic root attribute among them); clippy and xtask are main's to rerun.
+> Measured on stock 7.2 and recorded (research §13): its C and pure marker readers disagree on a marker's size and on
+> parent counts 0 and past 3. **Built (A-569):** the wire protocol's version 1 framings: SSH's commands, arguments,
+> dictionary, chunked input, answers and error form; HTTP's arguments from the query, the `X-HgArg-<N>` headers and the
+> body's front behind `X-HgArgs-Post` in 7.2's precedence, `X-HgProto`, and the `0.1`, `0.2` and `hg-error` framings;
+> the capabilities line and the bundle2 capability blob; `batch`'s escapes and calls; every line bounded by the server's
+> own table and spec and the digits of the caller's room, every length and count by that room, every decoded byte
+> charged to the admission first; proven by `cargo test -p slates-hg --lib`, 126 of 126 on the Mac Studio (2026-11-19,
+> debug, load 21.7), against 103 captures stock `hg` 7.2 made over SSH and HTTP
+> (`crates/hg/fixtures/wire/make-wire-fixtures.sh`), every request and answer read and written again to its bytes. Owed,
+> in order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
+> (D-17); (3) the objects and the index, and import of a repository directory; (4) read serving; (5) pushes; (6) the
+> changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
+> (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
+> and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
+> against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
+> sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
+> main measures it.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
