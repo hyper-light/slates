@@ -75,7 +75,8 @@
 //! No I/O, no clock, no randomness, no panic.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 /// A revision number. Revision 0 is the empty root every repository starts with (`svn_fs.h` 1021-1104; notes §5).
 pub type Revision = u64;
@@ -90,6 +91,16 @@ const ROOT: &str = "/";
 /// The character between a path's names.
 /// Format: Subversion's path separator (`svn_fspath__join`).
 const SEPARATOR: char = '/';
+
+/// The character after the separator in byte order: every path beneath a directory sorts before the directory's path
+/// followed by it, so a run of the path map passes a whole subtree by starting there.
+/// Format: ASCII, `/` 0x2F then `0` 0x30.
+const AFTER_SEPARATOR: char = '0';
+
+/// A name beneath a directory, which the shape of what stands beneath it is asked for: any name decides alike, since
+/// only the directories above a path are read (`shape_above`).
+/// Format: one character of a canonical name.
+const PROBE_NAME: &str = "-";
 
 /// The name that means the directory itself, which no stored path holds.
 /// Format: `svn_fs__path_valid` refuses "'.' or '..' element\[s\]" (`libsvn_fs/fs-loader.c`).
@@ -577,6 +588,16 @@ fn checked_path(path: &str) -> Result<&str, IndexRefusal> {
   }
 }
 
+/// The path of `name` beneath `directory`; with an empty name, the directory's path with its separator, which every
+/// path beneath it begins with.
+fn child_path(directory: &str, name: &str) -> String {
+  if directory == ROOT {
+    format!("{ROOT}{name}")
+  } else {
+    format!("{directory}{SEPARATOR}{name}")
+  }
+}
+
 /// The directories above `path` other than the root, outermost first, each with where it ends in `path`: `/a/b/c`
 /// gives `/a` ending at 2 and `/a/b` ending at 4.
 fn inner_ancestors(path: &str) -> impl DoubleEndedIterator<Item = (&str, usize)> {
@@ -952,6 +973,92 @@ impl Index {
     match self.resolve(path, revision)? {
       Some(id) => self.node_revision(id).map(Some),
       None => Ok(None),
+    }
+  }
+
+  /// The names of the entries of the directory at `path` in `revision`, in byte order (`svn_fs_dir_entries`); `None`
+  /// where nothing, or a file, stands there. The index holds no directory listing: the names are those it named directly
+  /// beneath `path`, and beneath each copy's source that what stands beneath `path` comes from, down the chain of
+  /// copies `shape_above` decides for a name with no history of its own (module documentation, "Reading"), each kept
+  /// where its own path resolves to a node in `revision`. Each run of the path map passes a named child's subtree at
+  /// once, so a listing reads the names beneath the directory and its sources, never their descendants.
+  ///
+  /// # Errors
+  /// [`IndexRefusal`] for a path out of canonical form, a revision past the youngest, or an index that contradicts
+  /// itself.
+  pub fn children(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<Vec<String>>, IndexRefusal> {
+    let path = checked_path(path)?;
+    self.check_revision(revision)?;
+    match self.resolve(path, revision)? {
+      Some(id) if self.node_revision(id)?.kind() == NodeKind::Directory => {}
+      _ => return Ok(None),
+    }
+    let mut names = BTreeSet::new();
+    let (mut directory, mut at) = (Cow::Borrowed(path), revision);
+    loop {
+      self.named_beneath(&directory, &mut names);
+      let probe = child_path(&directory, PROBE_NAME);
+      let Some((
+        ShapeEntry {
+          shape:
+            Shape::Copied {
+              from,
+              revision: source_revision,
+            },
+          ..
+        },
+        end,
+      )) = self.shape_above(&probe, at, None)
+      else {
+        break;
+      };
+      // A copy's source revision is before the copy's (refused otherwise at its append), so each step goes back.
+      let source = beneath(self.path_name(from)?, &directory, end)?;
+      directory = Cow::Owned(if source.is_empty() {
+        ROOT.to_owned()
+      } else {
+        source
+      });
+      at = source_revision;
+    }
+    let mut children = Vec::with_capacity(names.len());
+    for name in names {
+      if self.resolve(&child_path(path, &name), revision)?.is_some() {
+        children.push(name);
+      }
+    }
+    Ok(Some(children))
+  }
+
+  /// Every name the index named directly beneath `directory`, into `names`: one run of the path map from the
+  /// directory's own path on, a child's subtree passed at once ([`AFTER_SEPARATOR`]).
+  fn named_beneath(&self, directory: &str, names: &mut BTreeSet<String>) {
+    let prefix = child_path(directory, "");
+    let mut from = Bound::Included(prefix.clone());
+    while let Some((key, _)) = self
+      .numbers
+      .range::<str, _>((from.as_ref().map(String::as_str), Bound::Unbounded))
+      .next()
+    {
+      let Some(rest) = key.strip_prefix(prefix.as_str()) else {
+        break;
+      };
+      from = match rest.split_once(SEPARATOR) {
+        None => {
+          if !rest.is_empty() {
+            names.insert(rest.to_owned());
+          }
+          Bound::Excluded(key.to_string())
+        }
+        Some((name, _)) => {
+          names.insert(name.to_owned());
+          Bound::Included(format!("{prefix}{name}{AFTER_SEPARATOR}"))
+        }
+      };
     }
   }
 

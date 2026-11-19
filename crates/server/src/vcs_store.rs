@@ -83,6 +83,7 @@ use crate::state::ShardState;
 
 pub(crate) mod hg_import;
 pub(crate) mod hg_view;
+pub(crate) mod svn_view;
 pub(crate) mod paths;
 pub(crate) mod record;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
