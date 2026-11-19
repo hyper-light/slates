@@ -167,6 +167,15 @@
 > session channel with git's `exec` and `env` (RFC 4254); the listener on the runtime, with the connection-lifetime
 > estimator that feeds the key time and the host key's keeping; main's live interop with stock `ssh` clients, and its
 > clippy and `xtask` over the crate; a post-quantum exchange (`mlkem768x25519-sha256`) after its own amendment.
+> **A-633 (2026-11-19, g294; piece 9's second part, authentication and the session channel):** `slates-ssh`'s
+> `Session` serves a connection whole: publickey authentication (the `none` probe, `PK_OK` for held keys, Ed25519 and
+> RSA SHA-2 signatures over the session id, partial success, the banner, a failure limit, `server-sig-algs`) through
+> a `KeyHolders` lookup over §4.13's principals; one session channel taking `env GIT_PROTOCOL` and one `exec` of git's,
+> Mercurial's or Subversion's command in its client's quoting, raised and never run; everything else refused by kind;
+> windows from the caller's budget and the transport's cap; `exit-status`, EOF and close in order; replies held through
+> the server's own rekey (`cargo test -p slates-ssh --lib`, 105 of 105; red five ways). Owed: the listener on
+> slates-rt with the reaper and the lifetime estimator, the host key's keeping, the key store, serving each command,
+> ECDSA and FIDO user keys, and main's live interop with stock `ssh`, `git`, `hg` and `svn`.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

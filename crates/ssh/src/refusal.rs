@@ -23,6 +23,8 @@ pub enum DisconnectReason {
   ProtocolVersionNotSupported,
   /// `SSH_DISCONNECT_BY_APPLICATION`, 11.
   ByApplication,
+  /// `SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE`, 14.
+  NoMoreAuthMethodsAvailable,
 }
 
 impl DisconnectReason {
@@ -35,6 +37,7 @@ impl DisconnectReason {
       DisconnectReason::ServiceNotAvailable => SERVICE_NOT_AVAILABLE,
       DisconnectReason::ProtocolVersionNotSupported => PROTOCOL_VERSION_NOT_SUPPORTED,
       DisconnectReason::ByApplication => BY_APPLICATION,
+      DisconnectReason::NoMoreAuthMethodsAvailable => NO_MORE_AUTH_METHODS_AVAILABLE,
     }
   }
 }
@@ -51,6 +54,8 @@ const SERVICE_NOT_AVAILABLE: u32 = 7;
 const PROTOCOL_VERSION_NOT_SUPPORTED: u32 = 8;
 /// Format: `SSH_DISCONNECT_BY_APPLICATION`.
 const BY_APPLICATION: u32 = 11;
+/// Format: `SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE`.
+const NO_MORE_AUTH_METHODS_AVAILABLE: u32 = 14;
 
 /// A direction of the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

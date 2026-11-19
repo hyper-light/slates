@@ -105,3 +105,28 @@ impl Entropy for FailingAfter {
     self.inner.fill(out)
   }
 }
+
+/// The bytes `text` spells in RFC 4648 §4's base64, whitespace and padding ignored.
+pub(crate) fn base64(text: &str) -> Vec<u8> {
+  const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let mut bytes = Vec::new();
+  let mut word = 0u32;
+  let mut bits = 0u32;
+  for character in text
+    .bytes()
+    .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+  {
+    let value = ALPHABET
+      .iter()
+      .position(|letter| *letter == character)
+      .expect("a base64 character") as u32;
+    word = (word << 6) | value;
+    bits += 6;
+    if bits >= 8 {
+      bits -= 8;
+      bytes.push((word >> bits) as u8);
+      word &= (1 << bits) - 1;
+    }
+  }
+  bytes
+}
