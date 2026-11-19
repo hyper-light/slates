@@ -57,7 +57,7 @@ fn read_in(
 }
 
 /// What `input` read whole gives.
-fn read_whole(framing: Framing, input: &[u8]) -> Result<(Vec<u8>, usize), BodyRefused> {
+fn read_whole(framing: Framing, input: &[u8]) -> Result<(Vec<u8>, usize), Failed> {
   read_in(framing, &[input], &mut Admission::new(ROOM))
 }
 

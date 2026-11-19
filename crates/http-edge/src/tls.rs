@@ -20,6 +20,8 @@
 //! connection alone; the key is cloned into it and nothing is shared between connections.
 #![allow(clippy::disallowed_types)]
 
+use std::io::{Read as _, Write as _};
+
 use rustls::ServerConnection;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -51,15 +53,40 @@ impl ServingIdentity {
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
   ) -> Result<ServingIdentity, TlsRefused> {
-    Ok(ServingIdentity { chain, key })
+    let identity = ServingIdentity { chain, key };
+    // Refused now rather than at the first client: a chain and key rustls cannot use make no configuration.
+    identity.config()?;
+    Ok(identity)
   }
 
   /// A server connection for one client, waiting for its `ClientHello`.
   pub fn connection(&self) -> Result<ServerConnection, TlsRefused> {
-    let _ = (&self.chain, &self.key);
-    Err(TlsRefused::Io("not built".to_owned()))
+    let config = self.config()?;
+    // structural: allow — D-8 exception 2: `ServerConnection::new` takes `Arc` by signature; one owner, this connection.
+    ServerConnection::new(std::sync::Arc::new(config)).map_err(TlsRefused::Setup)
+  }
+
+  /// One connection's configuration: TLS 1.3 and 1.2, ALPN `http/1.1`, no client certificate, no resumption.
+  fn config(&self) -> Result<rustls::ServerConfig, TlsRefused> {
+    // structural: allow — D-8 exception 2: `builder_with_provider` takes the provider as `Arc` by signature.
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+      .with_safe_default_protocol_versions()
+      .map_err(TlsRefused::Setup)?
+      .with_no_client_auth()
+      .with_single_cert(self.chain.clone(), self.key.clone_key())
+      .map_err(TlsRefused::Setup)?;
+    config.alpn_protocols = vec![ALPN_HTTP_1_1.to_vec()];
+    config.send_tls13_tickets = 0;
+    // structural: allow — D-8 exception 2: rustls keeps its session store as `Arc` by type; none is kept here.
+    config.session_storage = std::sync::Arc::new(rustls::server::NoServerSessionStorage {});
+    Ok(config)
   }
 }
+
+/// Format: the most plaintext one TLS record carries (RFC 8446 §5.1, RFC 5246 §6.2.1: 2^14 bytes), the session's read
+/// buffer.
+const TLS_RECORD_PLAINTEXT: usize = 1 << 14;
 
 /// One connection's TLS session.
 pub struct HttpsSession {
@@ -83,7 +110,7 @@ impl HttpsSession {
 
   /// Whether the handshake is still running: no request may be read until it ends.
   pub fn is_handshaking(&self) -> bool {
-    false
+    self.connection.is_handshaking()
   }
 
   /// Whether the peer sent `close_notify`: its side of the connection has ended cleanly.
@@ -94,24 +121,89 @@ impl HttpsSession {
   /// Takes `ciphertext` from the socket and appends the plaintext it completes to `plaintext`. A refusal means the
   /// connection ends after [`HttpsSession::transmit`] sends the alert rustls queued.
   pub fn receive(&mut self, ciphertext: &[u8], plaintext: &mut Vec<u8>) -> Result<(), TlsRefused> {
-    let _ = (ciphertext, plaintext);
+    let mut rest = ciphertext;
+    while !rest.is_empty() {
+      // `read_tls` takes what its buffer holds; the loop hands it the rest once that is processed and read.
+      let taken = self
+        .connection
+        .read_tls(&mut rest)
+        .map_err(|error| TlsRefused::Io(error.to_string()))?;
+      self
+        .connection
+        .process_new_packets()
+        .map_err(TlsRefused::Session)?;
+      self.read_plaintext(plaintext)?;
+      if taken == 0 {
+        break;
+      }
+    }
     Ok(())
   }
 
-  /// Seals `plaintext` for the socket (sent by the next [`HttpsSession::transmit`]).
+  /// Moves the session's decrypted bytes to `plaintext`, noting the peer's `close_notify`.
+  fn read_plaintext(&mut self, plaintext: &mut Vec<u8>) -> Result<(), TlsRefused> {
+    let mut chunk = [0u8; TLS_RECORD_PLAINTEXT];
+    loop {
+      match self.connection.reader().read(&mut chunk) {
+        Ok(0) => {
+          self.peer_closed = true;
+          return Ok(());
+        }
+        Ok(count) => plaintext.extend_from_slice(chunk.get(..count).unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(error) => return Err(TlsRefused::Io(error.to_string())),
+      }
+    }
+  }
+
+  /// Seals `plaintext` for the socket (sent by the next [`HttpsSession::transmit`]), handed over in the pieces rustls
+  /// takes, the records each fills moved out between them.
   pub fn send(&mut self, plaintext: &[u8]) -> Result<(), TlsRefused> {
-    let _ = plaintext;
+    let mut rest = plaintext;
+    while !rest.is_empty() {
+      let taken = self
+        .connection
+        .writer()
+        .write(rest)
+        .map_err(|error| TlsRefused::Io(error.to_string()))?;
+      rest = rest.get(taken..).unwrap_or_default();
+      let sealed_before = self.sealed.len();
+      self.seal()?;
+      if taken == 0 && self.sealed.len() == sealed_before {
+        return Err(TlsRefused::Io(
+          "the session took none of the plaintext and sealed nothing to make room".to_owned(),
+        ));
+      }
+    }
     Ok(())
   }
 
   /// Seals `close_notify` (RFC 8446 §6.1): the server's side ends cleanly.
   pub fn close(&mut self) -> Result<(), TlsRefused> {
-    Ok(())
+    self.connection.send_close_notify();
+    self.seal()
   }
 
   /// Appends to `out` every byte the session has to send: handshake flights, alerts and sealed records.
   pub fn transmit(&mut self, out: &mut Vec<u8>) -> Result<(), TlsRefused> {
     out.append(&mut self.sealed);
+    while self.connection.wants_write() {
+      self
+        .connection
+        .write_tls(out)
+        .map_err(|error| TlsRefused::Io(error.to_string()))?;
+    }
+    Ok(())
+  }
+
+  /// Moves the records rustls holds into [`HttpsSession::sealed`], which frees its buffer for more plaintext.
+  fn seal(&mut self) -> Result<(), TlsRefused> {
+    while self.connection.wants_write() {
+      self
+        .connection
+        .write_tls(&mut self.sealed)
+        .map_err(|error| TlsRefused::Io(error.to_string()))?;
+    }
     Ok(())
   }
 }

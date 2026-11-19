@@ -595,6 +595,7 @@ fn drive_tls(
         Some(run) => connection.reply(run),
         None => connection.reply_end(),
       },
+      Next::BodyEnd => {}
       other => panic!("{other:?}"),
     }
   }
