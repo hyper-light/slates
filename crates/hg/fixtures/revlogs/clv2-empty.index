@@ -1,0 +1,2 @@
+   rev   rank linkrev                                   nodeid p1-rev                                p1-nodeid p2-rev                                p2-nodeid            full-size delta-base flags comp-mode          data-offset chunk-size sd-comp-mode      sidedata-offset sd-chunk-size
+     0     -1       0 b80de5d138758541c5f05265ad144ab9fa86d1db     -1 0000000000000000000000000000000000000000     -1 0000000000000000000000000000000000000000                    0          0     0         0                    0          0       inline                    0             0

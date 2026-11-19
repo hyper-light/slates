@@ -504,3 +504,61 @@ server's directory are the ones its reviewed expected-failure list starts from.
   `p1-rev`, `p1-nodeid`, `p2-rev`, `p2-nodeid`, `full-size`, `delta-base`, `flags`, `comp-mode`, `data-offset`,
   `chunk-size`, `sd-comp-mode`, `sidedata-offset`, `sd-chunk-size`); every text's length equalled its `full-size`, and
   no revision had a flag.
+
+## 16. Found while building piece 1's compressed streams (A-598, 2026-11-19; 7.2's code [C] from its PyPI source distribution, SHA-256 `a250227e…`; the bundles stock `hg` 7.2 compressed on the Mac Studio, `fixtures/compressed`; libzstd 1.5.7's and libbz2-rs-sys 0.2.6's sources)
+
+- **How 7.2 frames a compressed bundle.** bundle1: `bundle2.bundletypes` maps `HG10UN` to (`HG10UN`, `UN`), `HG10GZ` to
+  (`HG10GZ`, `GZ`) and `HG10BZ` to (`HG10`, `BZ`): the bzip2 stream follows `HG10` whole, its own magic `BZ` reading as
+  the header's last two bytes. `exchange.readbundle` reads four bytes, then the two-byte type, and `cg1unpacker` turns
+  `BZ` into `_truncatedBZ`, whose reader feeds `BZ` back to the decompressor first. bundle2: `setcompression` adds
+  `Compression=<type>` (nothing for `UN`), and `getchunks` writes the magic, the parameters' length and block as they
+  are, then every core chunk through the engine. The fixtures open `HG10GZ` and `x\x9c`; `HG10BZh91AY&SY`; and `HG20`,
+  14, `Compression=GZ` and `x\x9c`, the same with `BZh91AY&SY`, and with a zstd frame.
+- **What 7.2's readers take.** `supportedbundletypes` is every registered bundle type, `_truncatedBZ` among them, so
+  `processcompression` takes `Compression=_truncatedBZ`; `cg1unpacker` takes any two-byte type in the set, so `HG10ZS`
+  is read, though `parsebundlespec` refuses `zstd-v1` ("compression engine zstd is not supported on v1 bundles";
+  `_bundlespecv1compengines` is `gzip`, `bzip2`, `none`, "THIS SHOULD NEVER CHANGE"). A second `Compression` runs
+  `processcompression` again, the last winning. Values are matched exactly (`gz` is unknown).
+- **Where 7.2's reading stops.** `_CompressedStreamReader.read` asks for 65,536 compressed bytes at a time, and the
+  bundle2 reader stops at the end-of-stream header, so bytes after a compressed stream, or a zlib trailer the bundle's
+  end comes before, are never read. zlib's end is found by feeding a copy of the decompressor one byte and finding it
+  unused, bz2's by `EOFError`, zstd's by the `ZstdError` python-zstandard raises once its `decompressobj` has finished a
+  frame: one frame is the whole stream.
+- **The relay.** `unbundle20._forwardchunks`, which an SSH client's `getbundle` relays through, reads the parameters,
+  drops every item whose raw name lower-cases to `compression`, and inflates the rest: the plain bundle
+  `compression::plain` makes.
+- **7.2's zstd frames.** `ZstdCompressor(level=3).compressobj()`, given no size: the fixture's frame and the wire
+  capture's (`http-clone.03`) both open `28 b5 2f fd 00 58`: no content size, no checksum, no dictionary, a 2 MiB window
+  (Exponent 11). For such a frame libzstd 1.5.7 holds a 131,072-byte input buffer and a 2,359,360-byte output buffer
+  (the window and two 128 KiB blocks, each with 32 bytes of slack): 2,490,432 bytes, which its `ZSTD_sizeof_DCtx`
+  reports after the fixture's frame is inflated.
+- **The default levels.** zlib `-1` (zlib's 6), bzip2 9 (`BZ2Compressor`'s, at work factor 0, libbzip2's 30), zstd 3,
+  single-threaded.
+- **libbz2-rs-sys's fast decoder** allocates `tt`, one `u32` per byte of the block size its header digit names (3.6 MB
+  at `BZh9`), when it reads that digit, beside a zeroed state; the fast mode is the one Python's `BZ2Decompressor` runs.
+
+## 17. Found while building piece 3's revlog reader (A-611, 2026-11-19; 7.2's code [C] from Homebrew's 7.2, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/revlogs`)
+
+- **The changelog keeps a data file from its first revision.** In the zstd and zlib repositories every changelog had a
+  `00changelog.d` beside its index while the manifests and files stayed inline under 7.2's 128 KiB `_maxinline`
+  (`revlog.py`), so a store holds both shapes from its start. `_maxinline` is a module constant with no configuration;
+  the fixtures lower it with a two-line extension to split every revlog, as the store's own rule would at that size.
+- **Version 2 in 7.2.** `experimental.revlogv2=enable-unstable-format-and-corrupt-my-data` makes an `exp-revlogv2.2`
+  store with `fileindex-v1` and without `fncache` or `dotencode` (`repo/creation.py`); each revlog's `.i` is an 83-byte
+  docket (the header `0x0000DEAD`, three 8-byte ids, the sizes, `(` as the default header) naming `<radix>-<id>.idx`
+  (96-byte entries), `.dat` and `.sda`. The PyPI build aborts on such a store ("accessing `fileindex` repository
+  without associated fast implementation") unless `storage.fileindex.slow-path=allow` (`repo/vfs_options.py`).
+  `format.exp-use-changelog-v2` gives the changelog 96-byte entries of its own with no base and no link, every
+  revision a full text.
+- **A version 2 chunk's mode** (`revlogutils/deltas.py` `delta_compression`): plain for an empty chunk, a raw one
+  beginning with NUL, or a `u` chunk with its `u` dropped; default when it begins with the docket's default header,
+  which stays in place (a zstd frame's magic begins with `(`); else its own header. The grown file's twelve revisions
+  in the version 2 store were nine default and three plain.
+- **Sparse-revlog's intermediate snapshots need large texts.** With `format.maxchainlen=3` and 300-byte texts 7.2 wrote
+  only full snapshots; with a file of about 6 KB of SHA-256 lines growing a line a changeset it wrote four intermediate
+  snapshots (`hg debugdeltachain`: `snap`), a delta against an earlier snapshot no longer than half the text and than
+  that snapshot (`_is_good_delta_info_snapshot_constraints`).
+- **A compressed chunk cut short is refused by its engine's own reader:** flate2 1.1.11's `zio::read` answers
+  `UnexpectedEof`, "incomplete deflate stream", once its input ends with the stream unfinished (`src/zio.rs`), and
+  zstd's reader refused a frame cut short (the test `a_compressed_chunk_must_end_exactly`); bytes after a stream are
+  found by the count of the bytes it took.
