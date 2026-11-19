@@ -831,11 +831,18 @@ pub trait Bridge {
   /// named by `cx` did not make itself — and returns the cursor to pass next time. Bounded by the
   /// journal's retention budget and by the entries loaded under the hinted directories. The
   /// default reports nothing, for a bridge that changes only through its own transport.
+  ///
+  /// **Slices** (A-562). The gather runs on the serving thread, so it takes what its turn allows: `more` is asked
+  /// before each journal record after the first, and at [`std::ops::ControlFlow::Break`] the gather stops there and
+  /// returns the cursor through the last record it took, the rest owed to the next gather, which resumes from it. A
+  /// gather that `more` never stops reports everything owed. The changes beneath a base directory are gathered only once
+  /// the journal's are whole, in the same gather.
   fn invalidations(
     &mut self,
     _cx: &OpContext,
     cursor: InvalidationCursor,
     _out: &mut Vec<Invalidation>,
+    _more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     Ok(cursor)
   }
@@ -877,12 +884,15 @@ pub trait Bridge {
   fn restored_open_files(&mut self, _cx: &OpContext) -> Vec<u64> {
     Vec::new()
   }
-  /// Visits the inodes whose cached state this attachment's kernel may hold older than the volume's after a takeover
-  /// (A-158), in inode order and each once, starting after `after`, until `visit` breaks; whether every one was
-  /// visited. The set is the references the recovery gave back to the attachment, with any taken since, and the inodes
-  /// the write-log replay wrote. A mount taken over by this daemon invalidates them in slices from its first turn, so
-  /// nothing the dead daemon changed and never told the kernel of outlives the takeover. The default, none, is a bridge
-  /// with nothing restored.
+  /// Visits the inodes whose cached state this attachment's kernel may hold otherwise than the volume does after a
+  /// takeover (A-158, A-573), each once, starting after `after`, until `visit` breaks; whether every one was visited.
+  /// For a view of the head the set is every inode of the head, in the table's order: a lookup made after the last
+  /// publication is in no image, and such a kernel can hold bytes a mutation showed before the publication the death
+  /// lost, or a base file's pages an outsider changed while no daemon ran. For a pinned view it is the references the
+  /// recovery gave back to the attachment, with any taken since, and the inodes the write-log replay wrote, in inode
+  /// order. A mount taken over by this daemon invalidates them in slices from its first turn, so nothing the dead
+  /// daemon showed or changed and never told the kernel of outlives the takeover. The default, none, is a bridge with
+  /// nothing restored.
   fn takeover_inodes(
     &mut self,
     _cx: &OpContext,

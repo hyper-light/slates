@@ -12,8 +12,9 @@
 //! **What it is not.** A second API. Every method is the [`Instance`] verb of the same name, taking and returning the
 //! contract's own types: no outcome or error type is added for it, and a contract change reaches it as it reaches the
 //! instance. The trait carries what a scheduler does with volumes: provision from every source, snapshot, destroy,
-//! list, serve one to a Shards microVM, mount one on the host, bind a mount into a container (A-520), and end an
-//! attachment. Landings, merges and write policy stay on the instance, which a host that schedules work does not drive.
+//! list, serve one to a Shards microVM, mount one on the host, bind a mount into a container (A-520), export one to a
+//! client on another machine (A-521), and end an attachment. Landings, merges and write policy stay on the instance,
+//! which a host that schedules work does not drive.
 //!
 //! **What the simulator answers.** The same typed outcome or [`Error`] the instance answers for the same request, for
 //! every case the conformance suite exercises; it serves no file system, so a stream it hands out is answered by
@@ -21,6 +22,7 @@
 
 use crate::container::ContainerBind;
 use crate::error::Error;
+use crate::export::{ExportOptions, Exported};
 use crate::instance::Instance;
 use crate::mount::{MountOptions, Mounted, Unmounted};
 use crate::volume::{Provisioned, VolumeSpec};
@@ -74,7 +76,16 @@ pub trait Volumes {
     intent: Intent,
   ) -> Result<ContainerBind, Error>;
 
-  /// [`Instance::detach`]: an attachment (a mount's, a stream's) ended.
+  /// [`Instance::export`]: `volume` exported to one client, the Unix identity `uid`: the export's attachment and the
+  /// path its capability authorizes, which the client's mount names (A-521).
+  fn export(
+    &mut self,
+    volume: VolumeId,
+    uid: u32,
+    options: &ExportOptions,
+  ) -> Result<Exported, Error>;
+
+  /// [`Instance::detach`]: an attachment (a mount's, a stream's, an export's) ended.
   fn detach(&mut self, attachment: u64) -> Result<(), Error>;
 }
 
@@ -129,6 +140,15 @@ impl Volumes for Instance {
     intent: Intent,
   ) -> Result<ContainerBind, Error> {
     Instance::bind_into_container(self, volume, source, destination, intent)
+  }
+
+  fn export(
+    &mut self,
+    volume: VolumeId,
+    uid: u32,
+    options: &ExportOptions,
+  ) -> Result<Exported, Error> {
+    Instance::export(self, volume, uid, options)
   }
 
   fn detach(&mut self, attachment: u64) -> Result<(), Error> {

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use slates_anchor::AnchorSegment;
-use slates_base::OsHost;
+use slates_base::BaseHost;
 use slates_db::Db;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_db::register::{Acceptor, ObjectId};
@@ -95,8 +95,9 @@ pub struct VolumeSlot {
   pub name: String,
   /// The volume.
   pub volume: Volume,
-  /// The read-only host of the base directory, for an overlay.
-  pub host: Option<OsHost>,
+  /// The read-only host of the overlay's base, for an overlay: a host directory, or the objects under an S3 base's
+  /// prefix (A-555).
+  pub host: Option<BaseHost>,
   /// The reservation, for a bounded volume.
   pub reservation: Option<slates_mem::budget::Reservation>,
   /// The inode-version reservation (§4.2 inode dimension): the volume's logical inode allowance
@@ -401,6 +402,10 @@ pub struct ShardState {
   /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
   /// call so a file-state change it makes carries the compound's record in its own transaction.
   pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
+  /// The fetch the NFS call this shard is serving right now met pending, with the volume whose base names it (A-555):
+  /// set by the call's export when a host call of the call was answered pending, taken by the call's serve once it
+  /// returns, so the call parks on that fetch (`crate::base_wait`). `None` between calls.
+  pub(crate) nfs_pending_base: Option<(VolumeId, slates_vfs::host::FetchId)>,
   /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
   /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
   /// replies are sent. At most a turn's mutations per held connection on this shard.
@@ -839,6 +844,9 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
+  /// Requests parked until the S3 base fetch they met lands (`crate::base_wait`; §4.15 "An S3 base", A-555), bounded by
+  /// the shard's client credit.
+  pub(crate) base_waits: crate::base_wait::BaseWaits,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
@@ -1146,12 +1154,23 @@ pub struct ShardState {
   /// one sampler): they are sent only when they change, so a daemon at rest sends none. Every shard's hold and debt
   /// start at zero at boot, and so does this. Bounded by the shards.
   pub(crate) pressure_sent: Vec<(u64, u64)>,
+  /// The pressure sampler's task on the control shard (A-570, `crate::pressure::sampler`), woken when it is asked to
+  /// sample (`crate::pressure::ask`); `None` elsewhere and before it starts.
+  pub(crate) pressure_task: Option<slates_rt::TaskId>,
+  /// Whether the sampler was asked to sample since it last looked (A-570): a reading a test put in the host's place,
+  /// which stands for the kernel's report.
+  pub(crate) pressure_asked: bool,
   /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
   /// shard; `None` until a process installs it (and on every other shard).
   pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
   /// Test support: this shard refuses every NFSv4 purge sent to it (`Daemon::inject_nfs_purge_refusal`), as an owner
   /// that cannot make the drop durable does, so a test can leave a purge owed across a restart.
   pub(crate) nfs_purges_refused: bool,
+  /// When the deadline keeper next hands a purge round to the reaper (A-570, `crate::nfs::note_purges`): at once at a
+  /// start whose partition owes purges, a retry window on while the NFSv4 table owes any; `None` while none is owed.
+  pub(crate) nfs_purge_at: Option<u64>,
+  /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
+  pub(crate) nfs_purge_owed: bool,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder
@@ -1257,8 +1276,9 @@ pub struct ShardState {
   /// materialized into a served volume (§4.10 "Promotion and takeover" → serve): the adopted head
   /// value, kept until the manifest's archive is held (already, as a content candidate, or fetched
   /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
-  /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
-  pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
+  /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on. A verb held for one waits
+  /// for its end, woken when its entry is removed ([`PendingMaterializations`], A-548).
+  pub pending_materializations: PendingMaterializations,
   /// On a taken-over volume's owner shard, its materialization made in turns of this shard's clock by a task of its own
   /// (g251, `fleet::make_taken`; a live log's or a placed seal's): running, with the turns it has taken, or ended, until
   /// the control shard's next attempt reads the end and forgets it. A later attempt joins a running one and never
@@ -1858,6 +1878,79 @@ fn round_advanced(seen: &mut Option<u64>, advances: u64) -> bool {
   let advanced = seen.is_some_and(|seen| seen != advances);
   *seen = Some(advances);
   advanced
+}
+
+/// The taken-over volumes awaiting materialization ([`ShardState::pending_materializations`]), and the verbs held until
+/// each one's materialization ends (A-548). An entry leaves only through [`PendingMaterializations::remove`], however
+/// its materialization ends (made, given up, or its volume tombstoned), and that removal wakes every task waiting on
+/// the object ([`PendingMaterializations::wait_for_end`]), so no held verb outlives the event it waits for and none
+/// waits on a timer. Until A-548 a held verb looked at the map each heartbeat and gave up at one liveness window.
+#[derive(Debug, Default)]
+pub struct PendingMaterializations {
+  pending: BTreeMap<ObjectId, PendingVolume>,
+  /// The tasks waiting for an object's materialization to end: one waker a task, a task that waits again replacing its
+  /// own (`will_wake`, as a volume's change waiters do), drained when the object's entry is removed. Bounded by the
+  /// tasks waiting, each a held verb's, which the shard's task arena bounds; a waiting task dropped at the shard's stop
+  /// leaves a waker that reaches nothing (the runtime's task word is generation-checked) until the object's end.
+  waiting: BTreeMap<ObjectId, Vec<std::task::Waker>>,
+}
+
+impl PendingMaterializations {
+  /// Whether `object` awaits materialization.
+  pub fn contains_key(&self, object: &ObjectId) -> bool {
+    self.pending.contains_key(object)
+  }
+
+  /// `object`'s pending materialization, if any.
+  pub fn get(&self, object: &ObjectId) -> Option<&PendingVolume> {
+    self.pending.get(object)
+  }
+
+  /// `object`'s pending materialization to change, if any.
+  pub fn get_mut(&mut self, object: &ObjectId) -> Option<&mut PendingVolume> {
+    self.pending.get_mut(object)
+  }
+
+  /// Records `object` as awaiting materialization as `pending`; the entry it replaces, if any. A replaced entry's
+  /// materialization has not ended, so no waiting task is woken.
+  pub fn insert(&mut self, object: ObjectId, pending: PendingVolume) -> Option<PendingVolume> {
+    self.pending.insert(object, pending)
+  }
+
+  /// Ends `object`'s pending materialization, however it ended, and wakes every task waiting on it: the entry, if any.
+  /// The only way an entry leaves.
+  pub fn remove(&mut self, object: &ObjectId) -> Option<PendingVolume> {
+    if let Some(waiting) = self.waiting.remove(object) {
+      for waker in waiting {
+        waker.wake();
+      }
+    }
+    self.pending.remove(object)
+  }
+
+  /// Every pending materialization, in object order.
+  pub fn iter(&self) -> impl Iterator<Item = (&ObjectId, &PendingVolume)> {
+    self.pending.iter()
+  }
+
+  /// Every pending materialization's record, in object order.
+  pub fn values(&self) -> impl Iterator<Item = &PendingVolume> {
+    self.pending.values()
+  }
+
+  /// Whether `object`'s materialization has ended (it awaits none); when it has not, `waker` is woken at its end
+  /// ([`PendingMaterializations::remove`]).
+  pub fn wait_for_end(&mut self, object: ObjectId, waker: &std::task::Waker) -> bool {
+    if !self.pending.contains_key(&object) {
+      return true;
+    }
+    let waiting = self.waiting.entry(object).or_default();
+    match waiting.iter_mut().find(|parked| parked.will_wake(waker)) {
+      Some(parked) => parked.clone_from(waker),
+      None => waiting.push(waker.clone()),
+    }
+    false
+  }
 }
 
 #[cfg(test)]

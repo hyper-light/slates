@@ -241,7 +241,14 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 86
+slates-machine = 97
+# 2026-11-19 (+11, A-570; 86 -> 97): the host's memory-pressure reports (`memory_pressure.rs`), the kernel's own event
+#   in place of the reap loop's once-a-window sample. macOS (+7): libdispatch's memory-pressure source, which no crate
+#   the workspace takes wraps: the `unsafe extern` block, the global queue, the source's creation, the block that sets
+#   its context and handlers and resumes it, the report handler's read of its context, the cancel handler's free of
+#   it, and the drop's cancel and release. Windows (+4): `CreateMemoryResourceNotification`, the handle taken into an
+#   `OwnedHandle`, `QueryMemoryResourceNotification` at the open, and `GetLastError` for a refusal. Linux: none
+#   (rustix's safe epoll and file calls).
 # 2026-11-18 (+1, A-456, Linux only; 85 -> 86): `switches::switches_now`'s Linux arm, one `libc::getrusage` with
 #   `RUSAGE_THREAD` into a zeroed, fully sized `rusage` this frame owns (rustix has no `getrusage`). A client's park that
 #   waits on its daemon's departure beside its reply polls a descriptor, so the daemon's futex wake cannot confirm it
@@ -553,6 +560,12 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 156 -> 159 on 2026-11-19 (A-551, a folding volume's drive names each open by the spelling
+# Windows holds or the volume stores; counted by hand, for main's `cargo xtask unsafe` to confirm): in `host.rs` the
+# call of ntdll's `RtlUpcaseUnicodeChar` in `system_upcase`, the system's upcase table the driver compares names by,
+# which no safe wrapper offers, 1; and `put_normalized_name` (an `unsafe fn`, as `put_info` is, and its block: WinFsp's
+# `FSP_FSCTL_OPEN_FILE_INFO` behind Create's and Open's `FileInfo`, its name buffer written when the name fits), 2.
+# The rule that picks the name, and the response's clear, are safe Rust (`crate::normalized`, `crate::inflight`).
 # slates-bridge-winfsp lowered 158 -> 156 on 2026-11-18 (A-369, the drive a Mount Manager drive WinFsp's driver makes):
 # `held.rs` loses the drive's `DefineDosDeviceW` and its removal, the temporary link's open, ownership and
 # `NtMakeTemporaryObject` (5) and gains the `FSP_FSCTL_MOUNTMGR` request and the `QueryDosDeviceW` check (2); `host.rs`
@@ -632,7 +645,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 156
+slates-bridge-winfsp = 159
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

@@ -166,6 +166,8 @@ mod tests {
             std::thread::scope(|inner| {
               inner.spawn(move || {
                 is_waiting.recv().unwrap();
+                // The harness paces its replier, the stand-in for a slow reply; the code under test parks on its event.
+                #[allow(clippy::disallowed_methods)]
                 std::thread::sleep(PAUSE);
                 reply.send(Stamped::now(7u32)).unwrap();
               });

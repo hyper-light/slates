@@ -1064,8 +1064,37 @@ fn describe(verdict: Verdict, window_ns: Option<u64>) -> String {
 /// at each wait it folds in (`slates_rt::shard::ShardContext::scheduler_overrun_ns`). Zero for a slot that holds no
 /// registration, which has no look either.
 fn overrun_of(holder: SlotHolder) -> u64 {
-  slates_rt::registry::with_entry(holder.shard(), |entry| entry.pulse.scheduler_overrun_ns())
-    .unwrap_or(0)
+  overrun_of_shard(holder.shard())
+}
+
+/// [`overrun_of`] by the shard's registry id.
+fn overrun_of_shard(shard: u16) -> u64 {
+  slates_rt::registry::with_entry(shard, |entry| entry.pulse.scheduler_overrun_ns()).unwrap_or(0)
+}
+
+/// The window the watchdog judges shard `shard` by now ([`watch_window_ns`] over the overrun its pulse carries, A-455):
+/// what a wait the daemon judges by that shard's liveness reads, so it follows the same window (A-552). The liveness
+/// window for a slot that holds no registration.
+pub fn shard_window_ns(shard: u16) -> u64 {
+  watch_window_ns(overrun_of_shard(shard))
+}
+
+/// The widest window the watchdog judges any of `shards` by now ([`shard_window_ns`]): how long a daemon whose shards
+/// these are may hold any one of them stuck before its watchdog says so (A-552's log-writer drain, A-574's failover
+/// detection). The liveness window for none.
+pub fn widest_window_ns(shards: &[u16]) -> u64 {
+  shards
+    .iter()
+    .map(|shard| shard_window_ns(*shard))
+    .max()
+    .unwrap_or_else(|| watch_window_ns(0))
+}
+
+/// The window the watchdog judges the calling thread's shard by now ([`shard_window_ns`]): what a shard thread's own
+/// wait inside one poll reads, since its shard is judged by it all the while (A-552). The liveness window on a thread
+/// that is no shard's.
+pub fn own_window_ns() -> u64 {
+  slates_rt::registry::current_shard().map_or_else(|| watch_window_ns(0), shard_window_ns)
 }
 
 /// One look at the shard `holder` names, at `now_ns`, by a watchdog whose own looks run `watcher_late_ns` late at
