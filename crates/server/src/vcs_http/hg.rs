@@ -6,8 +6,9 @@
 //! the answer decides, named as the reply begins (A-650's edge change).
 //!
 //! **The order**, each refusal with its status:
-//! 1. The route. A path whose escapes are malformed or name a slash or a NUL, or a query that cannot be read, is
-//!    `400`. A wire request (a `cmd` 7.2's table holds) by a method other than `GET` or `POST` is `405` with `Allow`.
+//! 1. The route. A path whose escapes are malformed or name a slash or a NUL is `400`; a path, or a query's fields,
+//!    past the request's room is `414`, as git's routes answer a target past theirs. A wire request (a `cmd` 7.2's
+//!    table holds) by a method other than `GET` or `POST` is `405` with `Allow`.
 //! 2. The credentials, judged as git's site judges them (its `prove`, over A-625 part 3's credential record): none, or
 //!    none proving a principal (unknown, expired, a revoked consumer's, an SSH key's), is `401` with the challenges
 //!    the connection accepts; a repeated or malformed `Authorization` is `400`; a record that did not answer is `503`.
@@ -46,7 +47,7 @@ use slates_hg::phases::Phase;
 use slates_hg::serve::getbundle::{Logged, Store};
 use slates_hg::serve::http::{self as hg_http, Compression, Compressor, Media, Permission};
 use slates_hg::serve::{Repository, Rev};
-use slates_hg::{Admission, Node};
+use slates_hg::{Admission, Node, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
@@ -379,8 +380,8 @@ fn judged<E>(
 }
 
 /// Routes `head` (the module doc's names): its repository's name and its command's permission, each read within
-/// `room`; refused `400` where the path's escapes or the query cannot be read, and `404` where no repository could be
-/// named.
+/// `room`; refused `400` where the path's escapes cannot be read, `414` where the path or the query's fields are past
+/// `room`, and `404` where no repository could be named.
 fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
   let Target::Path { path, query } = head.target else {
     return Err(Status::NOT_FOUND);
@@ -397,13 +398,25 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
   percent::decode_into(path, Plus::Plus, &mut decoded).map_err(|_| Status::BAD_REQUEST)?;
   let name = String::from_utf8(trimmed(&decoded).to_vec()).map_err(|_| Status::NOT_FOUND)?;
   let command = match query {
-    Some(query) => hg_http::command(query, &mut admission).map_err(|_| Status::BAD_REQUEST)?,
+    Some(query) => hg_http::command(query, &mut admission).map_err(query_refused)?,
     None => None,
   };
   Ok(Routed {
     name,
     permission: command.as_deref().and_then(hg_http::permission),
   })
+}
+
+/// The status of a query whose fields cannot be read: `414` where they are past the request's room, as a path past it
+/// is (RFC 9110 §15.5.15: a target "longer than the server is willing to interpret"); `400` for every other refusal,
+/// each named, so a refusal the codec adds is judged here before it compiles.
+fn query_refused(refusal: hg_wire::Refusal) -> Status {
+  match refusal {
+    hg_wire::Refusal::PastAdmission(_) => Status::URI_TOO_LONG,
+    hg_wire::Refusal::PostArguments
+    | hg_wire::Refusal::MissingArgument { .. }
+    | hg_wire::Refusal::MediaHeader => Status::BAD_REQUEST,
+  }
 }
 
 /// `path` without the slashes at either end, as hgwebdir strips them.

@@ -766,6 +766,26 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   `svnserve` before its buffered authentication request is flushed: the recording holds nothing after the handshake,
   and `svnserve`'s standard error "E235000: In file 'subversion/libsvn_repos/rev_hunt.c' line 1695: assertion failed
   (mainline_path_revisions->nelts > 0)".
+- **A read's authentication mid-command** [C: `serve.c` `must_have_access` 809-850, `lookup_access` 762-793,
+  `internal_auth_request` 696-727, `send_mechs` 582-592; the six reads' calls, `get_file` 1627, `get_dir` 1813,
+  `check_path` 2559, `stat_cmd` 2594, `get_inherited_props` 3635, `list` 3753, each with `needs_username` false and
+  first in its command; at 1.15.0; recorded on the Mac Studio, kiln r149]: a lookup that fails sends an anonymous
+  session, whose repository grants authenticated users the access and keeps a way in (a tunnel's user, a password
+  database, SASL), an authentication request made with a username needed (`EXTERNAL`, `CRAM-MD5`, never `ANONYMOUS`),
+  then looks up again: refused "Authorization failed" with nothing before it, or the command goes on with no trivial
+  request after the authentication's success. Stock `svn` 1.15.0 answers `ANONYMOUS` at the handshake when it is
+  offered, even with a username, so it meets this request: `svn cat` and `svn ls` of `/trunk/secret` as alice, and
+  `svn cat` as bob, refused after his `( success ( ) )`.
+- **The fold of a listed name** [C: `libsvn_subr/utf8proc.c` 77-182 (`unicode_decomposition`, `normalize_cstring`),
+  238-275 (`svn_utf__xfrm`, `svn_utf__fuzzy_glob_match`), `libsvn_repos/list.c` `matches_any` 100-106; utf8proc
+  2.12.0, Homebrew's `libutf8proc.3.3.0` that the Mac Studio's `svnserve` links, whose tables are Unicode 18.0.0;
+  recorded through ctypes, `crates/svn/fixtures/fold`]: the name is decomposed with `UTF8PROC_DECOMPOSE | STABLE |
+  CASEFOLD | STRIPMARK` and reencoded with `UTF8PROC_COMPOSE | STABLE`, the pattern left as the client sent it, and a
+  name utf8proc refuses matches nothing. `utf8proc_decompose_char` takes a Hangul syllable apart first, drops a mark
+  (Mn, Mc, Me) before it could fold, then case-folds (CaseFolding.txt's C and F lines, `ß` to `ss`), then decomposes,
+  each code point of a folding or a decomposition taken through the same steps; canonical order follows, then
+  composition with composition exclusions excluded. Unicode's CaseFolding.txt 17.0.0 (sha256 `ff8d8fef…`, 87,539
+  bytes, 1,585 C and F lines) is the fold's own table; `unicode-normalization` 0.1.25's are 17.0.0 too.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
