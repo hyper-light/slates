@@ -21,8 +21,8 @@ use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::ContentStore;
 
 use super::{
-  BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, branch_prefix, land, line_name, line_of,
-  prepare, transaction_id,
+  BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, bookmark_of, branch_prefix, land,
+  line_name, line_of, prepare, transaction_id,
 };
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
@@ -806,8 +806,10 @@ fn a_bookmark_moves_on_its_own_green() {
   });
 }
 
-/// A-657 (the namespace, decided). Do: name lines and bookmarks of names stock clients make and of hostile ones.
-/// Expect: a stock name reads as itself; `:`, `%`, a control byte and bytes not UTF-8 escaped.
+/// A-657 (the namespace, decided), A-680 part 2 (a bookmark's name read back). Do: name lines and bookmarks of names
+/// stock clients make and of hostile ones, and read bookmarks' names back. Expect: a stock name reads as itself; `:`,
+/// `%`, a control byte and bytes not UTF-8 escaped; a bookmark's name read back as its bookmark, and a second spelling
+/// of one, a line's name or a name without its end read as no bookmark.
 #[test]
 fn names_read_as_themselves_and_escape_what_would_meet() {
   assert_eq!(line_name(b"default", 0), "branch:default:0");
@@ -822,6 +824,18 @@ fn names_read_as_themselves_and_escape_what_would_meet() {
     "a second spelling of `A` read as a line"
   );
   assert_eq!(line_of("branch:a%3Ab:1"), Some((b"a:b".to_vec(), 1)));
+  assert_eq!(bookmark_of("bookmark:main:"), Some(b"main".to_vec()));
+  assert_eq!(
+    bookmark_of("bookmark:caf\u{e9}%FF:"),
+    Some(b"caf\xc3\xa9\xff".to_vec())
+  );
+  assert_eq!(
+    bookmark_of("bookmark:%41:"),
+    None,
+    "a second spelling of `A`"
+  );
+  assert_eq!(bookmark_of("bookmark:main"), None, "a name without its end");
+  assert_eq!(bookmark_of("branch:main:0"), None, "a line's name");
 }
 
 proptest! {
@@ -847,6 +861,8 @@ proptest! {
     prop_assert!(!mark.contains('\0') && mark.starts_with(BOOKMARK_TAG) && !mark.starts_with(LINE_TAG));
     prop_assert_eq!(bookmark_name(&second).starts_with(&mark), first == second);
     prop_assert!(line_of(&mark).is_none());
+    prop_assert_eq!(bookmark_of(&mark), Some(first.clone()));
+    prop_assert!(bookmark_of(&line).is_none());
   }
 }
 
