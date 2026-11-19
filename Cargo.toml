@@ -49,6 +49,7 @@ slates-cluster = { path = "crates/cluster", version = "0.1.0" }
 slates-archive = { path = "crates/archive", version = "0.1.0" }
 slates-image = { path = "crates/image", version = "0.1.0" }
 slates-conformance = { path = "crates/conformance", version = "0.1.0" }
+slates-vcs = { path = "crates/vcs", version = "0.1.0" }
 # HTTP/1.1's request codec, shared by the git, Mercurial and Subversion servers (A-595, §4.17.2 "Transports" 1).
 slates-http = { path = "crates/http", version = "0.1.0" }
 

@@ -78,6 +78,7 @@ pub mod delta;
 pub mod filerev;
 pub mod heads;
 pub mod http;
+pub mod index;
 mod lines;
 pub mod manifest;
 pub mod node;
@@ -135,3 +136,7 @@ mod object_tests;
 #[cfg(test)]
 #[path = "tests/revlogs.rs"]
 mod revlog_tests;
+
+#[cfg(test)]
+#[path = "tests/index.rs"]
+mod index_tests;
