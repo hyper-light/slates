@@ -178,7 +178,11 @@ pub(crate) fn start(
       "it has no identity, and serves cleartext on a loopback address alone",
     ));
   }
-  let listener = match listener_for(edge.address, bounds) {
+  let listener = match crate::daemon::held_or_bound_listener(
+    slates_anchor::ENV_VCS_HTTP,
+    edge.address,
+    bounds.backlog(),
+  ) {
     Ok(listener) => listener,
     Err(why) => return Ok(not_started(&why)),
   };
@@ -237,37 +241,6 @@ fn bounds_of(config: &DaemonConfig) -> Bounds {
 /// (`crate::daemon::bind_vcs_http_listener`), so both queue alike.
 pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpListener, RtError> {
   TcpListener::bind(address, bounds_of(config).backlog())
-}
-
-/// The edge's listener: the one a supervising anchor holds and handed over ([`slates_anchor::ENV_VCS_HTTP`]), adopted so
-/// the edge's port never drops while a daemon restarts (a client that connects then waits in its queue), when it listens
-/// where the configuration says ([`listens_at`]); else, with none handed over, one bound here at `address`. Why there
-/// is none, otherwise: a held listener elsewhere is refused, never served, since the edge would then answer somewhere
-/// the operator did not ask.
-fn listener_for(address: SocketAddrV4, bounds: Bounds) -> Result<TcpListener, String> {
-  match crate::daemon::held_listener(slates_anchor::ENV_VCS_HTTP) {
-    Some(Ok(held)) => {
-      let at = held
-        .local_addr()
-        .map_err(|error| format!("the anchor's listener's address is unread: {error}"))?;
-      if listens_at(at, address) {
-        Ok(held)
-      } else {
-        Err(format!(
-          "the anchor's listener is at {at}, not at {address}"
-        ))
-      }
-    }
-    Some(Err(error)) => Err(format!("the anchor's listener was not adopted: {error}")),
-    None => TcpListener::bind(address, bounds.backlog())
-      .map_err(|error| format!("{address} did not bind: {error}")),
-  }
-}
-
-/// Whether a listener bound at `at` listens where `address` says: at its address, and at its port unless it asks for
-/// any (port 0, the system's pick, which an anchor makes once for every daemon it starts).
-fn listens_at(at: SocketAddrV4, address: SocketAddrV4) -> bool {
-  at.ip() == address.ip() && (address.port() == 0 || at.port() == address.port())
 }
 
 #[cfg(test)]

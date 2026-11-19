@@ -12799,8 +12799,9 @@ engine: the verdict, rebase, position mapping, the register).
 > the deployment plan hands them over (`FleetPlan::edge_identity`) from the DER the command read from the manifest's
 > files, so the daemon reads none (R1), and the transport's key stays private to it. A daemon that is no fleet node has
 > no identity to present, so its edge serves cleartext, on a loopback address alone; any other address is refused where
-> the flag is read (`slates_api::role::vcs_http_address`, by both roles and the `slates` command), as usage before
-> anything starts, rather than by a daemon that would start without its edge.
+> the flag is read (`slates_api::role::vcs_address`, by both roles and the `slates` command; named `vcs_http_address`
+> until A-689 made it the one reader of `--vcs-http` and `--vcs-svn`), as usage before anything starts, rather than by
+> a daemon that would start without its edge.
 >
 > **Status (2026-11-19, A-625 part 3 continued (2): the anchor holds the edge's port, built).** On Unix the anchor binds
 > the edge's listener once, at the address `--vcs-http` names, with the backlog the edge derives
@@ -14835,6 +14836,31 @@ and export by landing).
 > authentication for `lock-many` (the reporter's `lock-a` session), byte for byte; red seven ways. Owed: the lock
 > verbs; the read commands' authentication for one command with their authorization (A-606); the daemon's commit
 > once A-655 part 2b lands.
+>
+> **Status (2026-11-19, A-689: the svn:// listener, A-656 part 2's first slice).** Built: `slates anchor|daemon
+> --vcs-svn ADDRESS` (read by the roles' one version-control address reader, `slates_api::role::vcs_address`, beside
+> `--vcs-http`: loopback alone for a daemon that is no fleet node, since ra_svn has no TLS) starts the daemon's
+> svn:// listener on the control shard (`crates/server/src/vcs_svn.rs`), its port logged before the daemon's serving
+> line. On Unix the anchor binds the listener once, at that address (`slates_server::daemon::bind_vcs_svn_listener`),
+> and hands it to every daemon it starts (`slates_anchor::ENV_VCS_SVN`), as it holds the HTTP edge's: the daemon adopts
+> it only where its configuration would have bound (`crate::daemon::held_or_bound_listener`, now the HTTP edge's too),
+> so a restart never drops the port and a client that connects meanwhile is answered by the next daemon; a library
+> starter asks for it with `StartSpec::vcs_svn`. Each accepted connection is a seated child task running A-656's
+> connection over its socket: `svnserve`'s greeting byte for byte but for `svndiff1` ("5. The wire"), the client's
+> answer judged by A-599's handshake, and its URL answered "No repository found" (210005), as `svnserve` answers under
+> a root holding no repository, then the connection's end. Its seats and its overdue rule are the HTTP edge's: as many
+> connections as the shard seats clients, a wait past the connection's first RTO (its own handshake round trip)
+> marking it overdue, and the most overdue reaped only when a seat is needed. Proven against stock `svnserve` 1.15.0's
+> recorded `no-repository` session, the URL naming the listener's port: in-process
+> (`vcs_svn::tests::a_connection_is_greeted_as_svnserve_greets_and_its_url_refused_in_svnserves_words`), through a
+> real anchor (`an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener`), and across a `kill -9` of the daemon, a
+> connection made while it was down answered by its successor on the same port
+> (`a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again`); red first, the flag unknown. Owed: the
+> repositories' lookup (the rest of `find_repos`: the scheme, the URL's canonical form, a path that climbs with `..`;
+> a name located on its partition's shard, the connection moved there as the HTTP edge moves one), the repository's
+> sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
+> HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
+> (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -51844,6 +51870,63 @@ Applied in the same change to: §4.17.3 (its status), `crates/hg` (`bookmarks::d
 - **Siblings.** A-691 (next): `listkeys phases` answers the served view's draft roots, where 7.2 answers its stored
   draft roots read from the unfiltered changelog (`phases.py` 1049-1058), so a hidden draft root is left out here.
 - **Owed.** The other platforms' runs, and the oracle's red-check with the filter taken out (main's).
+
+### A-689 — The svn:// listener: `slates anchor|daemon --vcs-svn ADDRESS`, held by the anchor across daemon restarts (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's first slice; after A-625 part 3 continued (2))
+Applied in the same change to: §4.17.4's status; §4.17.2's status (A-625 part 3 continued's reader, renamed); GAPS
+(the A-656 entry); `crates/api/src/role/mod.rs` (`ProcessOptions::vcs_svn`, `vcs_address` replacing
+`vcs_http_address` as the one reader of both flags, `Role::args`), `role/daemon.rs` (`DaemonConfig::vcs_svn`, the port
+line), `role/anchor.rs` (`hold_vcs_svn_listener`), `start.rs` (`StartSpec::vcs_svn` and its test), `lib.rs`
+(`CONTRACT` 54); `crates/anchor/src/supervise.rs` (`ENV_VCS_SVN`, `Supervisor::hold_vcs_svn_listener`) and `lib.rs`;
+`crates/cli/src/args.rs` (the roles' grammar and usage); `crates/server/src/vcs_svn.rs` and `vcs_svn/tests.rs` (new),
+`config.rs` (`DaemonConfig::vcs_svn`), `daemon.rs` (`Daemon::vcs_svn_port`, `bind_vcs_svn_listener`, and
+`held_or_bound_listener` with `listens_at`, moved from `vcs_http::daemon_edge`'s `listener_for` and `listens_at` so
+both servers adopt an anchor's listener one way), `vcs_http/daemon_edge.rs` and its test, `vcs_http.rs` (`awaited`
+visible to the crate); `crates/cli/tests/cli.rs` (`edge_port_before_serving` takes the line naming the port);
+`docs/cli.md`; the README's command table.
+
+- **Why.** The daemon had no svn:// listener: A-656 part 1 built the connection with no I/O, and nothing served it, so
+  a stock `svn` could not connect at all.
+- **The listener.** `--vcs-svn ADDRESS` is read as `--vcs-http` is, by one reader (`vcs_address`): an IPv4 address and
+  port, port 0 the system's pick, which the daemon logs (`slates daemon: the svn:// listener serves on IP:PORT`) before
+  it says it serves; an address off loopback is refused as usage for a daemon that is no fleet node, since ra_svn is
+  cleartext (CRAM-MD5 sends no password, every other byte crosses as written), and the daemon's start checks it again.
+  The listener runs on the control shard; each connection is a child task (spawned, detached, cancelled and joined with
+  the listener). Its bounds are the HTTP edge's (`Bounds::of_shard`: a seat for each client the shard seats, an item at
+  most a client region's bytes) and one read is `svnserve`'s own read buffer, `SVN_RA_SVN__READBUF_SIZE` (four 4,096-byte
+  pages, `libsvn_ra_svn/ra_svn.h` 65-67). A wait on a client past RFC 6298's first RTO of the connection's own handshake
+  round trip marks the connection overdue and goes on; with every seat taken the most overdue is reaped for a new one,
+  and none is cut while seats are free (the HTTP edge's rule, main's ruling of 2026-11-19).
+- **The anchor holds its port.** As A-625 part 3 continued (2) holds the HTTP edge's: on Unix the anchor binds the
+  listener once at the operator's address, with the backlog the daemon derives (`bind_vcs_svn_listener`), and every
+  daemon it starts inherits it (`ENV_VCS_SVN`) and adopts it where it listens at the configured address (the same
+  port unless port 0), else refuses it and starts no listener, logged; with no anchor the daemon binds its own. A
+  restart never drops the port: a connection made while the daemon is down waits in the listener's queue for its
+  successor. An address the anchor cannot bind ends its start by name. Windows keeps no listener across a restart
+  (`docs/wip/platforms.md`, gap 2).
+- **What a connection does.** A-656's `Connection`: the greeting (`svnserve`'s without `svndiff1`, "5. The wire"),
+  the client's answer judged by A-599's handshake, and the URL answered "No repository found in '…'" (210005),
+  `svnserve`'s answer under a root that holds no repository (`serve.c` `find_repos`), then its end. Until the lookup's
+  piece, the repository type the handshake's calls name is an uninhabited one (`Unresolved`), so no sources can be
+  handed to a connection.
+- **Tests.** Red first (macOS arm64, Mac Studio, 2026-11-19 21:55Z, at 825715a27 over main 2410011da): the CLI
+  test `an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener` failed, the anchor ending before any daemon served,
+  `--vcs-svn` unknown. The first build of the listener failed the same test by the test's own expectation: it read
+  `svnserve`'s 207-byte greeting whole where the daemon writes 198, `svndiff1` aside as "5. The wire" decides, and
+  waited out its timeout; the tests now take `svndiff1` out of the recording, as `slates_svn::handshake`'s tests do.
+  Green (macOS arm64, Mac Studio, 2026-11-19 22:45-22:51Z, kiln r310, at 39478a4a8 over main b94ae6e90):
+  `cargo test --locked -p slates-server --lib -- vcs_svn:: vcs_http::daemon_edge:: deploy::` 19 of 19 (the listener
+  in-process, the HTTP edge's adoption through the shared function, the deploy plan's configuration);
+  `-p slates-api --lib -- role:: start::tests contract_history` 39 passed, 4 ignored (child roles);
+  `-p slates-cli --bin slates -- the_grammar` 12 of 12; `-p slates-cli --test cli -- vcs_svn svn_listeners vcs_http`
+  4 of 4 (the svn start and restart tests, and the HTTP edge's two over the shared port reader);
+  `-p slates-anchor --test anchor -- held_vcs_http` 1 of 1; `cargo fmt -p slates-anchor -p slates-api -p
+  slates-server -p slates-cli -- --check` clean. The same commands again over main 693bc8feb, whose A-681, A-651 part
+  3 and A-655 part 2b had changed slates-server and slates-svn, and whose hg interop tests' helpers the start test now
+  shares (kiln r344, 22:55-23:03Z): 19 of 19, 39 and 4 ignored, 12 of 12, 4 of 4 (main's ignored hg test aside), 1 of
+  1, fmt clean.
+- **Owed.** The repositories' lookup (the rest of `find_repos`, a name located on its partition's shard, the
+  connection moved there), the repository's sources with every call, CRAM-MD5 keys over §4.13's principals, learned
+  waits (one mechanism for the three edges), the SSH tunnel's entry point; the Windows and Linux runs (main's).
 
 ### A-636 part 2b — The partition's records shipped a log at a time: each state log's record of each operation, naming the operation whole, held by its holders as a prefix of the log; every server dispatch by the register's class (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half's live plane; §4.8 "records are sent to all candidates; committed at f + 1" and "Promotion and takeover"; after A-636 part 2a)
 
