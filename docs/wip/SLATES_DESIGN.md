@@ -11931,6 +11931,17 @@ decides the details.
 > long-lived branch costs its source is that history, bounded by the source's retention budget. Owed: a branch's base
 > recorded as a delta against its source's checkpoint, which ends both.
 >
+> **Status (2026-11-19, A-685: a repository made from the command line).** `slates repository create NAME --tool
+> git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]` sends `CreateRepository` through the client
+> (`Client::create_repository`, `RepositorySpec`) and prints the repository's name and its root green's id; a name any
+> repository holds is refused `AlreadyExists` (exit 1). What a creator names by default is decided beside the verb
+> (`crates/server/src/repository.rs`: `object_formats`, `root_binding`), so every surface creates alike: git's SHA-1
+> (or SHA-256), its root bound to `main` or the branch named, held to git's ref rules under `refs/heads/`; Mercurial's
+> SHA-1, its root the first line of `default` or of the branch named (`branch:<B>:0`, the name its push reads);
+> Subversion's revision numbers, its one green bound to `root`, no branch taken. A format or a branch the tool cannot
+> have is a usage error before the daemon is asked. Owed: the other repository verbs' words (`CreateBranch`,
+> `BindBranch`, `RetireBranch`, `SetRepositoryPolicy`, `ImportRepository`) on the command line, and the SDKs' and MCP's.
+>
 > **Status (2026-11-19, A-603: shared piece 2 built on the owner).** A repository's register is built in the metadata
 > database (`crates/db/src/repository.rs`, the entry's guard in `crates/db/src/repository/entry.rs`;
 > `Op::RepositoryAdvanced`). One entry commits, as one durable step, any of: several of the repository's greens'
@@ -51555,6 +51566,61 @@ Applied in the same change to:
   `EdgeState::new` on the listener's shard and `EdgeState::arrivals` on the others); Subversion's tunnel moved to the
   shard of the repository its greeting names (A-688); a test of an arrival that waits for a full shard's seat and of
   one refused past the bound; main's live OpenSSH `git clone` over SSH and the other platforms' runs.
+
+### A-685 — A repository made from the command line: `slates repository create`, each tool's defaults decided beside the verb (2026-11-19, g305, UI goal 93 (kiln 51cef9f7); §4.17.1 "The repository and its greens" item 1; §4.12; A-575's `CreateRepository`, the interop tests' first verb)
+
+Applied in the same change to: §4.17.1 (a status block), GAPS (the §4.17 entry), `docs/cli.md`, `crates/server`
+(`repository`: `object_formats`, `root_binding`, `RootRefused`, re-exported from the crate's root; `git_push`: `HEADS`
+and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_repository`; `VcsTool` and
+`ObjectFormat` re-exported), `crates/cli` (`args`: the verb, its four flags, its usage lines and two grammar tests;
+`verbs`: its answer; `tests/cli.rs`: the anchored test, the edge's request helper shared).
+- **What was there.** `CreateRepository` (A-575) was sent only by the server's own tests and the Subversion migration's
+  tests: no client or CLI verb made a repository, so no stock git, Mercurial or Subversion client could be pointed at
+  one, and every interop test was blocked on it.
+- **The verb.** `slates repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root
+  GREEN] [--json]` sends `CreateRepository` through the client (`Client::create_repository` with a `RepositorySpec`,
+  `CreateRepository`'s fields), routed to the partition the name hashes to as every repository verb is, and prints
+  `repository: NAME` and `id: ROOT`, the root green's id (the reply's `GreenCreated`), or `{"repository","id"}` under
+  `--json`. A refusal is the client's, exit 1 as every verb's: a name any repository holds, whatever its tool,
+  `AlreadyExists`; an empty name or one holding a NUL `InvalidName`; a root that cannot join `NotGreen`, `Forbidden` or
+  `NotFound`.
+- **Each tool's defaults, decided beside the verb.** A client names what the server's namespace reads, so the defaults
+  live in the server crate (`repository::object_formats`, `repository::root_binding`) and the command asks them; an SDK
+  or MCP surface creating a repository asks the same. Formats (item 1): git SHA-1, the format git takes when none is
+  named (A-600), or SHA-256; Mercurial SHA-1 alone; Subversion revision numbers alone; the first is each tool's default.
+  The root's binding: git's branch `N` is the name `N`, the ref `refs/heads/N` (`git_push`'s namespace), `main` when
+  none is named (the branch the server's push tests and its stock-git captures bind; a stock clone of the empty
+  repository takes it from the unborn `HEAD` the site advertises), held to git's ref rules (`git_push::ref_of`), and a
+  name beginning `refs/` refused since the namespace reads it as a ref of its own, never a branch; Mercurial's branch
+  `B` is its first line `branch:<B>:0`, `default`'s when none is named, the green `hg_push`'s module docs say the verb
+  makes and a new repository's first push takes (a root bound to the bare name would leave a first push "no line to
+  make a branch from"); Subversion's one green is bound to `root`, its branches being directories in it (§4.17.4), and
+  a branch named for it is refused. A format or a branch the tool cannot have is refused as usage (exit 2), naming the
+  flag, before the daemon is asked.
+- **Not taken.** A wire `default_branch` the server fills when empty: a second meaning for one field, a mode switch.
+  The defaults kept in the CLI: Mercurial's line names are the server's encoding, and a second copy would drift.
+- **Tests.** The grammar (`crates/cli/src/args.rs`): `the_grammar_parses_the_repository_verb` (each tool's defaults,
+  every flag as given, Mercurial's branch by its first line) and `the_grammar_refuses_a_repository_its_tool_cannot_have`
+  (no tool, a tool slates serves none of, a format each tool cannot name, `refs/heads/main` and `a..b` for git, a
+  branch for Subversion, a root that is no id, the verb's own form). A real anchor (`crates/cli/tests/cli.rs`,
+  `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`): an anchor with `--vcs-http 127.0.0.1:0`; the
+  create answers the name and a 32-digit root id; the name again, for Mercurial, refused `AlreadyExists` (exit 1); a
+  Mercurial, a Subversion and a SHA-256 git repository (`--json`) each created with its defaults; a token enrolled with
+  `slates credential token` and sent as a bearer token finds the repository by its name (receive-pack's advertisement,
+  `200`) where a name no repository has answers `404`. Where no issuer surface is published (Linux) the token's leg
+  skips loudly.
+- **Runs.** macOS arm64, Mac Studio (kiln r294, 2026-11-19 22:35-22:45Z, debug, rustc 1.98.1, `CARGO_BUILD_JOBS=2`, a
+  fresh clone of the branch at dbe8ba1ef, load 7.7). Red first, on the same tree with the verb's dispatch taken out of
+  the grammar, so `repository` is unknown to it: `cargo test --locked -p slates-cli --bin slates the_grammar` 11
+  passed, 2 failed (the two above, each at its first parse); `--test cli a_repository_the_cli_creates` 1 failed, its
+  first create answered exit 2 (usage). Green: `--bin slates the_grammar` 13 of 13; `--test cli vcs_http` 3 of 3 in
+  5.2 s (this test and the two A-625 edge tests, whose request helper it now shares). `cargo fmt -p slates-cli -p
+  slates-client -p slates-server -- --check` asked for layout alone; rustfmt's own patch from that clone is applied.
+  Main's: clippy, `xtask check`, the doc gates, the Linux and Windows runs.
+- **Owed.** The other repository verbs on the command line (`CreateBranch`, `BindBranch`, `RetireBranch`,
+  `SetRepositoryPolicy`, `ImportRepository`); the SDKs' and MCP's words for them; the server's own refusal of a format
+  its tool does not name (today it records the repository, and a git one in revision numbers gets no store,
+  `vcs_store.unmade` counted; the command refuses it before asking); the Linux and Windows runs (main's).
 
 ### A-664 part 3, first piece — Each git green's map of paths to git's files, kept at its head as each version commits: derived from the one before over the change index and the links it leaves out, built whole where no map of the version before is kept or a copy names a tree alone, given back as the green leaves its lineage, made again by a recovery (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.17.1 "A version" and "A push is a work" item 3; §4.17.2 "The repository in git's terms" item 5 and piece 13; A-647's owed map; A-662; A-586; after A-664 part 2)
 
