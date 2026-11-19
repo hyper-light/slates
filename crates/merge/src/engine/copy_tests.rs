@@ -548,8 +548,10 @@ fn base_paths(base: &Base) -> BTreeSet<String> {
 }
 
 /// The paths the oracle's histories name: the root (as a copy's source only) first, then paths that are prefixes of one
-/// another and siblings sharing a first byte.
-const PATHS: [&str; 8] = ["", "a", "a/x", "a/x/y", "a/b", "b", "b/x", "ab"];
+/// another, siblings sharing a first byte, and paths often empty, so copies land and later steps change their trees.
+const PATHS: [&str; 11] = [
+  "", "a", "a/x", "a/x/y", "a/b", "b", "b/x", "ab", "c", "c/x", "d",
+];
 
 /// One generated step of the oracle (module docs).
 #[derive(Clone, Debug)]
@@ -569,7 +571,7 @@ fn step() -> impl Strategy<Value = Step> {
     3 => (any::<usize>(), any::<u8>()).prop_map(|(path, byte)| Step::Put { path, byte }),
     1 => any::<usize>().prop_map(|path| Step::Take { path }),
     1 => (any::<usize>(), any::<u8>()).prop_map(|(path, mode)| Step::Mkdir { path, mode }),
-    3 => (any::<usize>(), any::<usize>(), any::<u8>()).prop_map(|(from, to, back)| Step::Copy { from, to, back }),
+    4 => (any::<usize>(), any::<usize>(), any::<u8>()).prop_map(|(from, to, back)| Step::Copy { from, to, back }),
   ]
 }
 
@@ -582,6 +584,8 @@ struct Census {
   from_before: usize,
   into_themselves: usize,
   changed_after: usize,
+  /// Puts and takes of a path a copy's tree holds: a key's change after its copy.
+  changed_beneath: usize,
 }
 
 /// A green that copies by reference, the reference that copies key by key, and what each accepted version applied.
@@ -615,6 +619,9 @@ impl Pair {
   /// Applies one step to both; the green's and the reference's outcomes must agree.
   fn apply(&mut self, step: &Step, census: &mut Census) -> Result<(), TestCaseError> {
     let at = |index: usize| PATHS[1 + index % (PATHS.len() - 1)];
+    if let Step::Put { path, .. } | Step::Take { path } = *step {
+      census.changed_beneath += usize::from(self.green.copy_above(at(path)).is_some());
+    }
     let work = match *step {
       Step::Put { path, byte } => self.put(at(path), byte),
       Step::Take { path } => self.take(at(path)),
@@ -860,8 +867,8 @@ fn run(steps: &[Step], census: &mut Census) -> Result<(), TestCaseError> {
 /// version (each base, each file's bytes), their change indexes agree with each copy's destination standing for its
 /// tree, every copy walked no map, the identity equals its recount and the change index's bytes theirs, no map refused
 /// a copy its verdict passed; and the green's chain, replayed from its entries, reads and hashes as it does. The census
-/// shows copies accepted and refused, from the root, from a version before the head, into their own source's tree, and
-/// refused for a source changed since.
+/// shows copies accepted and refused, from the root, from a version before the head, into their own source's tree,
+/// refused for a source changed since, and keys put or taken beneath a copy.
 #[test]
 fn every_copy_reads_as_its_key_by_key_reference_over_every_history() {
   let census = RefCell::new(Census::default());
@@ -886,6 +893,7 @@ fn every_copy_reads_as_its_key_by_key_reference_over_every_history() {
     census.from_before,
     census.into_themselves,
     census.changed_after,
+    census.changed_beneath,
   ];
   assert!(
     met.iter().all(|&count| count > 0),
