@@ -13499,9 +13499,9 @@ and export by landing).
 > refusal is the verdict's and whose entries are its accepted answer. Every refusal typed and named by its Subversion
 > error. Its oracle transcribes `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock` and
 > `svn_path_compare_paths` over the naive FSFS of the index's tests and equals the verdict, with the lock table's real
-> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. Owed with the server
-> (piece 7): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each
-> command arrives, over a transaction built a command at a time.
+> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. The drive asking the
+> out-of-date test, and the lock check FSFS also makes at each editor call, as each command arrives, are A-617's (part
+> 2b).
 >
 > **Status (2026-11-19, A-599).** Built: ra_svn's greeting and authentication (`slates-svn`'s `handshake`, piece 7's
 > first part), a state machine that does no I/O, from the greeting to `repos-info`: the client's answer read as
@@ -13597,10 +13597,29 @@ and export by landing).
 > recorded on the Mac Studio, four of them refused by `svnserve`: stock `svn` 1.15.0 against stock `svnserve` 1.15.0
 > through a relay (`crates/svn/fixtures/commit`, its `make-fixtures.py`, each file's SHA-256 in `SHA256SUMS`), every
 > command read and written back byte for byte, every text delta decoded whole and applied to its file's text; and to
-> `vparse_tuple` transcribed over generated items for every prototype. Owed (part 2b): the drive, each command checked
-> as it arrives (the tokens, the paths, the out-of-date test, the lock check) and declared on a trial built a command at
-> a time, the texts through the svndiff codec with their MD5 checked, `close-edit`'s verdict, and the answers `svnserve`
-> writes: after a failure, the commands read and dropped until `abort-edit` (`editorp.c` 1149-1208).
+> `vparse_tuple` transcribed over generated items for every prototype. The drive is part 2b's, below.
+>
+> **Status (2026-11-19, A-617, part 2b).** Built: the commit's drive (`slates-svn`'s `commit::drive`, piece 7's commit,
+> its second part). `commit` is answered up to its drive as `serve.c` answers it, the lock tokens joined to the
+> session's path. Each editor command is checked as `svnserve`'s commit editor checks it, in its order and words:
+> `open-root` past the youngest; the out-of-date test at `delete-entry`, `open-file` and a directory's first property
+> change (A-592's); a deletion of an absent path, an add over a present one, a copy onto one unless its directory was
+> copied, a copy's source outside this repository or absent at its revision, `open-dir` and `open-file` of absent paths;
+> and FSFS's lock check at each call that changes a path (A-602's, over that one path, at or beneath it for a deletion,
+> a directory's addition, a copy and a directory's property change). Text deltas are decoded and applied a window at a
+> time against the file's text in the transaction by the svndiff codec, the base and resulting MD5 checked (`E200014`),
+> the new text's MD5 and SHA-1 taken as it is written (aws-lc-rs); a property change is one new list. `close-edit` runs
+> A-592's verdict and hands the accepted work to the owner, who commits it and writes `svnserve`'s answer. Token faults
+> and a client's failure end the connection; a refusal is written at once and every item after it dropped until
+> `abort-edit`. The drive keeps the revision's rows, folded as FSFS folds them, and reads them over the index at its
+> base, borrowing nothing between commands, since the owner appends other commits while drives run. Held to the
+> seventeen recorded commits replayed in their order (bob's lock taken with its recorded token, bob's race landing
+> during alice's drive), every answer from `commit` on byte for byte as `svnserve` wrote it, revisions 1 to 13 and the
+> out-of-date, lock and conflict refusals among them; and to hostile drives, each refusal in `svnserve`'s number and
+> words, every guard red-checked. Owed (A-617's next part): `svn_repos__validate_prop`'s property checks, the
+> authorization checks (`check_authz`, A-606's rules), an added path's validation (`svn_repos__validate_new_path`), a
+> session that must authenticate for write before `commit`, and the owner's commit step with the connection task that
+> runs the drive.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -44378,3 +44397,33 @@ requirements reader, now strict, and its plain encoding; `fixtures/import/` and 
   holds twice, fncache entries; every refusal leaving the store as it found it; any byte of either store changed or cut
   (256 generated cases) never a panic and never a hold left. Unit: 7.2's `_plain_encode` doctests, the store's shape
   for each layout, every kind of refused requirement, the file index's docket, files and paths.
+
+### A-617 part 2b — The commit's drive: each editor command checked as `svnserve`'s commit editor checks it, in its order and words, the transaction read over the index at its base, held to stock `svn` 1.15.0's commits replayed in their order (2026-11-19, g268 for UI goal 93; §4.17.4 items 3.2 to 3.4, "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-617, part 2b; A-592's, whose owed drive is built), GAPS (the §4.17.4
+entry), the research notes (§1's `svn_fs_util.h` and `checksum.c` rows; §14's drive), `crates/svn/src/commit.rs` (`pub
+mod drive`, its doc sentence), `crates/svn/src/commit/drive.rs` and `crates/svn/src/commit/drive/tests.rs` (new).
+- **What was there.** Part 2a read the commit's request and each editor command. A-592's out-of-date test and verdict
+  waited for a drive to ask them.
+- **The decision.** `Drive::command` takes one item and writes what `svnserve` writes for it: `begin` answers `commit`
+  up to its drive, `write_commit_info` answers an accepted work once the owner committed it. The green is a seam
+  (`Green`: texts and property lists by identity, and the identities the work's new ones get). Refusals are
+  `DriveRefusal`, each with `svnserve`'s number and words, an error that has no message given the code's own
+  (`svn_err_best_message`: "Invalid character in hex checksum", "LZ4 decompression failed"). The transaction is the
+  drive's rows read over the index at its base, not A-592's `Trial`: a trial borrows the index for the whole drive, and
+  the owner must append other commits during it (the recorded race does), so the drive borrows nothing between commands
+  and the verdict builds the full trial once. Departures, each for an input no stock client sends: a path that is not
+  UTF-8 is refused; a copy source continuing the root URL without a `/` is from another repository; "File already
+  exists" names the green where FSFS names its directory on disk; a file closed with its delta open keeps its text; the
+  room the work's texts and lists may hold is the caller's.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). First build (06:12 UTC): one error, a closure's lifetime, made a function. First run (06:13 UTC): the
+  replay of every recorded commit passed; one hostile case was wrong in the test (the import's `gone/` stands at
+  revision 3) and was fixed there. Red (06:17 to 06:19 UTC), each guard removed in the Studio's copy: `open-file`'s
+  out-of-date test, 3 of 5 tests failed; the drop after a refusal, 3 of 5; the lock check at each call, the lock test
+  alone (the verdict refuses the same bytes at `close-edit`, so the replay cannot tell them apart); the read through a
+  copy, the copy test alone (no recorded commit opens a path beneath a copy). Green (99674c480, 06:20 UTC, load 7.1):
+  `cargo test --locked -p slates-svn --lib` 321 of 321 in 9.27 s, `cargo fmt -p slates-svn -- --check` clean. On the
+  tree merged with main (5d5a94bde, 06:28 UTC): 338 of 338 in 8.80 s, rustfmt clean. Clippy, `xtask check` and the doc
+  gate are main's (the run-request queue).
+- **Owed.** `svn_repos__validate_prop`, the authorization checks (A-606), `svn_repos__validate_new_path`, authenticating
+  for write before `commit`, the owner's commit step and the connection task (A-617's next part).
