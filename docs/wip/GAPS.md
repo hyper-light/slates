@@ -294,13 +294,14 @@
 > waits per phase on main's rulings (RFC 6298's first RTO of the connection's own round trip before a phase learns; a
 > wait past its bound marks its seat overdue; the most overdue reaped only for a new connection with every seat taken,
 > so a passphrase after `PK_OK` and a push's compression are never cut while no one needs the seat); keys through the
-> site's lookup, today refusing every key until the credentials record lands (main's ruling); each `exec` dispatched by
+> site's lookup, refusing every key until the credentials record landed (main's ruling; read since part 3, below);
+> each `exec` dispatched by
 > its tool and refused in that tool's own words and exit status (a missing repository, the policy, and all four
 > services as not served until A-662's stores and A-654's and A-656's entry points land); commands stepped sans-io with
 > the window given back as input is consumed (`cargo test -p slates-server --lib vcs_`, 92 of 92; slates-ssh 111 of
 > 111; as it landed over main 71a43cd97, `--lib vcs_ssh` 19 of 19, macOS arm64, Mac Studio). Owed: the daemon
-> starting the edge, the credentials record, the stores and entry points, four of five red-checks (main's runs under
-> §8), and main's live OpenSSH `git clone` over SSH.
+> starting the edge, the stores and entry points, four of five red-checks (main's runs under §8), and main's live
+> OpenSSH `git clone` over SSH (the credentials record behind the key lookup, closed by A-651 part 3).
 > **A-651 part 2 (2026-11-19, g294; git's upload-pack behind the SSH edge):** `vcs_ssh::git` drives A-640's entry
 > point over an SSH session, the store lent a step at a time by the HTTP edge's `StoreLender`: each request measured
 > whole, a flush ending the session 0, a refused request and the end of input inside a request ending it with git's
@@ -309,6 +310,18 @@
 > negotiates in rounds (`--lib vcs_ssh`: red 23 of 25 at 8dfd557f, green 25 of 25 at caa2fc0f, macOS arm64, Mac
 > Studio). Owed: the `StoreLender` over A-662's map (A-662's), without which no store is lent and the edge's services
 > stay `NotYet`; the stateful v0 session over SSH; main's live `git clone` over SSH.
+> **A-651 part 3 (2026-11-19, g294; the SSH edge proves a key by the credential record):** a key `slates-ssh`'s
+> session cannot answer for at once (`Holding::Unknown`) holds its request unanswered and uncounted until the caller
+> answers (`SessionEvent::KeyWanted`, `Session::key_resolved`); the edge's production holders (`RecordKeys`, replacing
+> `NoKeyRecord`) answer every key so, and the site's lookup proves it by A-625 part 3's record: `credentials::find` of
+> `ssh_key_id(blob)` from any shard, an SSH key of the same bytes live on the wall clock, a consumer's only while
+> enrolled and not revoked (`credentials::consumer_revoked`, the HTTP edge's check moved beside `find`), anything else
+> nobody, counted by its reason (macOS arm64, Mac Studio: red at 6a6b0c84, slates-ssh `--lib -- userauth session` 32
+> of 34 and slates-server `--lib -- vcs_ssh credentials daemon_edge` 34 of 38; as it landed over main 9d54e0f9,
+> after the tests' client race its runs met was fixed on its own (4a74c118), 34 of 34 and 38 of 38, fmt clean).
+> Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
+> a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
+> connection there (main's finding, its own piece).
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -511,8 +524,8 @@
 > credentials` 5 of 5, `slates-server --lib credentials` 9 of 9 and `--lib vcs_http` 32 of 32, `slates-http-edge --lib`
 > 31 of 31, `slates-cli` `credential` 1 of 1, `--test wire_order` 2 of 2 in `slates-db` and `slates-ipc`. Owed:
 > upload-pack served once A-662's stores land (`503` until then), A-654's session, LFS's routes on the site (main's
-> Streamed/AfterBody ruling), a consumer's revocation in the SSH edge's key holders (A-651), listing credentials,
-> Mercurial's and Subversion's sites, the live `git clone` (main's).
+> Streamed/AfterBody ruling), a consumer's revocation in the SSH edge's key holders (A-651; closed by A-651 part 3),
+> listing credentials, Mercurial's and Subversion's sites, the live `git clone` (main's).
 > **A-625 part 3, continued: `--vcs-http ADDRESS` (2026-11-19, g299):** `slates anchor|daemon --vcs-http ADDRESS`
 > starts the shared edge there, and the daemon logs where it serves; a fleet node's edge presents the node's own
 > certificate and key, handed over by its deployment plan (`FleetPlan::edge_identity`); a daemon that is no fleet node
