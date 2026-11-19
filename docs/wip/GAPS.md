@@ -751,7 +751,7 @@
 > pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-651, g294); `obsolete`'s `listkeys` dump,
 > the process around `slates hg serve --stdio`'s session, HTTP version 1 (A-650 part 1), held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
-> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`, `Prepared::asks`) and the hooks at
+> the walks over the whole view; (5, rest) pushes: the policy (`vcs_policy::admit`) and the hooks at
 > `pretxnchangegroup` and `changegroup` (A-657 part 4); the server's home for each Mercurial repository's index and
 > content store and the served view over them (with A-650's site), which the landing takes as a seam until then; part
 > 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a compressed

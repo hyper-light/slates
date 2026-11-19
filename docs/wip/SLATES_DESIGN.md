@@ -47911,7 +47911,7 @@ with the fixed history first), GAPS (A-668's entry, where the census's failure w
   work's size.
 - **Evidence.** Pending the Mac Studio's runs (offline 2026-11-19 from the start of this part): `cargo test -p
   slates-hg --lib` and `cargo test -p slates-server --lib hg_push`, red first against stubs.
-- **Owed.** Part 4: `vcs_policy::admit` before the append (`Prepared::asks` gives what to ask) and the hook driver at
+- **Owed.** Part 4: `vcs_policy::admit` before the append, with the right each change needs, and the hook driver at
   `pretxnchangegroup` and `changegroup`. The server's home for each Mercurial repository's index and content store and
   the served view over them (with A-650's site); the bundle read in slices; the pushkey compatibility hooks; markers
   (piece 7); the fleet half of the append (A-636).

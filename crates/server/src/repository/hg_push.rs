@@ -61,7 +61,6 @@ use slates_vcs::{ContentStore, IndexRefused};
 
 use super::push::{AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
 use crate::state::ShardState;
-use crate::vcs_policy::{Asked, Name, Namespace, Right};
 
 #[cfg(test)]
 mod tests;
@@ -378,7 +377,8 @@ fn refused_words(what: &impl core::fmt::Debug) -> Vec<u8> {
   words
 }
 
-/// A push ready to land: the entry it appends, what it keeps in the index, its reply, and what its admission asks.
+/// A push ready to land: the entry it appends, what it keeps in the index, and its reply. What its admission asks and
+/// what its hooks name come with the policy and the hooks (A-657 part 4).
 #[derive(Debug)]
 pub(crate) struct Prepared {
   /// The branches it changes.
@@ -391,24 +391,6 @@ pub(crate) struct Prepared {
   replied: Vec<Replied>,
   /// Whether the client asked for a reply (`replycaps`).
   wanted: bool,
-  /// The first and last changesets it adds, which its hooks name (`HG_NODE`, `HG_NODE_LAST`).
-  pub(crate) added: Option<(Node, Node)>,
-  /// Each name it changes and the right its change needs (A-622 part 2's `admit`): its namespace, its label, the right.
-  pub(crate) asked: Vec<(Namespace, String, Right)>,
-}
-
-impl Prepared {
-  /// What the push asks the repository's policy, in `admit`'s form.
-  pub(crate) fn asks(&self) -> Vec<Asked<'_>> {
-    self
-      .asked
-      .iter()
-      .map(|(namespace, name, right)| Asked {
-        name: Name::Hg(*namespace, name),
-        right: *right,
-      })
-      .collect()
-  }
 }
 
 /// What `prepare` needs besides the push: the view the push read and what the repository holds (its index).
@@ -456,8 +438,6 @@ pub(crate) fn prepare<V: Repository, H: Held>(
     parts,
     replied: plan.replied.clone(),
     wanted: unbundle.reply_caps().is_some(),
-    added: plan.added,
-    asked: asked(&plan, &read),
     verified,
   })
 }
@@ -690,66 +670,6 @@ fn entry_parts(unbundle: &Unbundle, plan: &Plan, read: &Read) -> EntryParts {
     names: Vec::new(),
     state,
   }
-}
-
-/// The label of a name as the policy reads it (`Name::Hg` takes text).
-fn policy_name(name: &[u8]) -> String {
-  let mut text = String::new();
-  label(name, &mut text);
-  text
-}
-
-/// Each name the plan changes and the right its change needs (`vcs_policy::admit`): a line moved, merged away or made
-/// on a new branch submits to its branch, a line made beside another head of its branch rewrites it (Mercurial's
-/// forced push); a bookmark moved forward or made submits, moved elsewhere rewrites, and deleted deletes.
-fn asked(plan: &Plan, read: &Read) -> Vec<(Namespace, String, Right)> {
-  let mut asked: Vec<(Namespace, String, Right)> = Vec::new();
-  let mut ask = |namespace: Namespace, name: &[u8], right: Right| {
-    let name = policy_name(name);
-    if !asked
-      .iter()
-      .any(|(held, named, wanted)| *held == namespace && *named == name && *wanted == right)
-    {
-      asked.push((namespace, name, right));
-    }
-  };
-  for moved in &plan.lines {
-    let (LineMove::Moved { line, .. } | LineMove::Retired { line }) = moved;
-    if let Some((_, branch, _)) = read.lines.get(*line) {
-      ask(Namespace::Branch, branch.as_slice(), Right::Submit);
-    }
-  }
-  for made in &plan.created {
-    let headed = read
-      .lines
-      .iter()
-      .any(|(named, branch, _)| *branch == made.branch && named.head.is_some());
-    let right = if headed {
-      Right::Rewrite
-    } else {
-      Right::Submit
-    };
-    ask(Namespace::Branch, made.branch.as_slice(), right);
-  }
-  for moved in &plan.bookmarks {
-    match moved {
-      BookmarkMove::Moved { name, forward, .. } => {
-        let right = if *forward {
-          Right::Submit
-        } else {
-          Right::Rewrite
-        };
-        ask(Namespace::Bookmark, name.as_slice(), right);
-      }
-      BookmarkMove::Created { name, .. } => {
-        ask(Namespace::Bookmark, name.as_slice(), Right::Submit)
-      }
-      BookmarkMove::Deleted { name, .. } => {
-        ask(Namespace::Bookmark, name.as_slice(), Right::Delete)
-      }
-    }
-  }
-  asked
 }
 
 /// What a landing answered, and what it gave back.
