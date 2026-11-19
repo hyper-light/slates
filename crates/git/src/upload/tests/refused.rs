@@ -199,23 +199,6 @@ fn an_answer_past_its_admission_is_refused() {
   assert_eq!(answer.refusal(), None);
 }
 
-/// A-640 part 2 (versions): do ask for the advertisement and a request at v0 and v1. Expect: an `ERR` line until part 3
-/// serves them.
-#[test]
-fn protocol_v0_and_v1_are_refused_until_part_three() {
-  let fixture = served::served();
-  for version in [Version::V0, Version::V1] {
-    for asked in [Asked::Advertise, Asked::Request(FETCH_CLONE_REQUEST)] {
-      let (bytes, answer) = answer_of(&fixture, &REFS, MAIN_REF, version, asked);
-      assert_eq!(answer.refusal(), Some(&Refusal::Version(version)));
-      assert_eq!(
-        bytes,
-        pkt(b"ERR upload-pack: protocol v0 and v1 are not served yet")
-      );
-    }
-  }
-}
-
 /// A-640 part 2 (a flush alone; the served refs' order): do send a flush alone, then serve refs out of order. Expect:
 /// nothing answered and the session's end; then a refusal naming the first ref out of place.
 #[test]
@@ -234,15 +217,14 @@ fn a_flush_alone_ends_the_session_and_refs_must_be_in_order() {
   assert_eq!(answer.refusal(), Some(&Refusal::Refs { at: 1 }));
 }
 
-/// A source that writes a whole-object pack until `before` of its bytes are written, then refuses with `refusal`, or
-/// stalls (writes nothing and says more is coming) when there is none.
+/// A source that writes a whole-object pack until `before` of its bytes are written, then refuses with `refusal`.
 struct Failing<'o> {
   /// The pack it writes until then.
   whole: WholeObjects<'o>,
   /// How many bytes it writes.
   before: usize,
-  /// Its refusal, or a stall.
-  refusal: Option<PackRefused>,
+  /// Its refusal.
+  refusal: PackRefused,
 }
 
 impl PackSource for Failing<'_> {
@@ -265,67 +247,137 @@ impl PackSource for Failing<'_> {
     room: usize,
   ) -> Result<bool, PackRefused> {
     if pack.1 >= self.before {
-      return self.refusal.map_or(Ok(true), Err);
+      return Err(self.refusal);
     }
     let room = room.min(self.before - pack.1);
     self.whole.write(served, pack, out, room)
   }
 }
 
-/// A-640 part 2 (a pack that cannot be finished): do serve the clone from a source that refuses after 20 bytes, then
-/// from one that stalls there, in steps of 7 bytes. Expect: the 20 bytes on band 1, then git's band-3 words for a pack
-/// that could not be finished and nothing after, and the refusal kept: the source's, then the stall.
+/// A-640 part 2 (a pack that cannot be finished): do serve the clone from a source that refuses after 20 bytes, in
+/// steps of 7 bytes. Expect: the 20 bytes on band 1, then git's band-3 words for a pack that could not be finished and
+/// nothing after, and the source's refusal kept.
 #[test]
 fn a_pack_that_fails_midway_ends_with_gits_band_three_words() {
   let fixture = served::served();
   let served = serving(&fixture, &REFS, MAIN_REF);
   let past = PackRefused::PastAdmission(PastAdmission { asked: 1, left: 0 });
-  for (refusal, kept) in [(Some(past), past), (None, PackRefused::Stalled)] {
-    let mut source = Failing {
-      whole: WholeObjects::new(&fixture.objects),
-      before: 20,
-      refusal,
-    };
-    let mut answer = serve(
-      &served,
-      Version::V2,
-      Asked::Request(FETCH_CLONE_REQUEST),
-      &mut source,
-      &mut Admission::new(u64::MAX),
-    );
-    let mut bytes = Vec::new();
-    while answer.write(&served, &mut source, &mut bytes, 7) == Written::More {}
-    assert_eq!(answer.refusal(), Some(&Refusal::Pack(kept)));
-    assert!(bytes.ends_with(&on_band_three(ABORT)));
-    let events = decode_response(
-      &bytes,
-      ObjectFormat::Sha1,
-      false,
-      &mut Admission::new(u64::MAX),
-    )
-    .unwrap();
-    let packed: Vec<u8> = events
-      .iter()
-      .filter_map(|event| match event {
-        Event::Pack(data) => Some(*data),
-        _ => None,
-      })
-      .flatten()
-      .copied()
-      .collect();
-    assert_eq!(packed.len(), 20);
-    let others: Vec<&Event<'_>> = events
-      .iter()
-      .filter(|event| !matches!(event, Event::Pack(_)))
-      .collect();
-    assert_eq!(
-      others,
-      [
-        &Event::Header(Line::lf(Section::Packfile)),
-        &Event::Error(ABORT)
-      ]
-    );
+  let mut source = Failing {
+    whole: WholeObjects::new(&fixture.objects),
+    before: 20,
+    refusal: past,
+  };
+  let mut answer = serve(
+    &served,
+    Version::V2,
+    Asked::Request(FETCH_CLONE_REQUEST),
+    &mut source,
+    &mut Admission::new(u64::MAX),
+  );
+  let mut bytes = Vec::new();
+  while answer.write(&served, &mut source, &mut bytes, 7) == Written::More {}
+  assert_eq!(answer.refusal(), Some(&Refusal::Pack(past)));
+  assert!(bytes.ends_with(&on_band_three(ABORT)));
+  let events = decode_response(
+    &bytes,
+    ObjectFormat::Sha1,
+    false,
+    &mut Admission::new(u64::MAX),
+  )
+  .unwrap();
+  let packed: Vec<u8> = events
+    .iter()
+    .filter_map(|event| match event {
+      Event::Pack(data) => Some(*data),
+      _ => None,
+    })
+    .flatten()
+    .copied()
+    .collect();
+  assert_eq!(packed.len(), 20);
+  let others: Vec<&Event<'_>> = events
+    .iter()
+    .filter(|event| !matches!(event, Event::Pack(_)))
+    .collect();
+  assert_eq!(
+    others,
+    [
+      &Event::Header(Line::lf(Section::Packfile)),
+      &Event::Error(ABORT)
+    ]
+  );
+}
+
+/// A source that works without writing on every other call, as A-639's stream does while it counts the pack, and
+/// otherwise writes a whole-object pack.
+struct Pausing<'o> {
+  /// The pack it writes.
+  whole: WholeObjects<'o>,
+  /// Whether its next call only works.
+  pause: bool,
+}
+
+impl PackSource for Pausing<'_> {
+  type Pack = WholePack;
+
+  fn begin(
+    &mut self,
+    served: &Served<'_>,
+    plan: &PackPlan<'_>,
+    admission: &mut Admission,
+  ) -> Result<WholePack, PackRefused> {
+    self.whole.begin(served, plan, admission)
   }
+
+  fn write(
+    &mut self,
+    served: &Served<'_>,
+    pack: &mut WholePack,
+    out: &mut Vec<u8>,
+    room: usize,
+  ) -> Result<bool, PackRefused> {
+    self.pause = !self.pause;
+    if self.pause {
+      return Ok(true);
+    }
+    self.whole.write(served, pack, out, room)
+  }
+}
+
+/// A-640 part 3 (a source's call may work and write nothing yet): do serve the clone from a source that writes on every
+/// other call, in steps of one byte, so a call that writes nothing has a step to itself (a step calls its source once,
+/// and only when everything framed is written). Expect: the same answer as a source that always writes, and steps that
+/// wrote nothing yet asked for more.
+#[test]
+fn a_source_that_works_without_writing_ends_the_step_and_is_asked_again() {
+  let fixture = served::served();
+  let (whole, _) = answer_v2(&fixture, FETCH_CLONE_REQUEST);
+  let served = serving(&fixture, &REFS, MAIN_REF);
+  let mut source = Pausing {
+    whole: WholeObjects::new(&fixture.objects),
+    pause: false,
+  };
+  let mut answer = serve(
+    &served,
+    Version::V2,
+    Asked::Request(FETCH_CLONE_REQUEST),
+    &mut source,
+    &mut Admission::new(u64::MAX),
+  );
+  let mut bytes = Vec::new();
+  let mut empty = 0;
+  loop {
+    let before = bytes.len();
+    let written = answer.write(&served, &mut source, &mut bytes, 1);
+    if written == Written::End {
+      break;
+    }
+    if bytes.len() == before {
+      empty += 1;
+    }
+  }
+  assert_eq!(bytes, whole);
+  assert!(empty > 0 && answer.refusal().is_none());
 }
 
 /// A-640 part 2 (hostile input, §4.9): do send every cut of git's fetch request and every one of its bits flipped.

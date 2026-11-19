@@ -1737,6 +1737,231 @@ fn a_repository_allowing_no_one_is_denied_before_any_request() {
   );
 }
 
+/// An anonymous session of a stock client on the repository that allows both, as an authentication
+/// for one command finds it.
+fn anonymous_session() -> crate::handshake::Session {
+  crate::handshake::Session {
+    principal: Principal::Anonymous,
+    capabilities: ClientCapabilities::of(&[
+      "edit-pipeline",
+      "svndiff1",
+      "accepts-svndiff2",
+      "absent-entries",
+      "depth",
+      "mergeinfo",
+      "log-revprops",
+    ]),
+    uuid: UUID_BOTH.to_vec(),
+    root_url: b"svn://127.0.0.1/both".to_vec(),
+  }
+}
+
+/// A-656 (`must_have_access`, `serve.c` 826-836, asking `internal_auth_request` with
+/// `needs_username`; `send_mechs` 580-591 and `auth` 649-690): ask an anonymous session to
+/// authenticate for one command where users hold keys; answer `ANONYMOUS`, then CRAM-MD5 as alice
+/// with her key; expect the request listing `CRAM-MD5` alone in the realm, "Must authenticate with
+/// listed mechanism" for `ANONYMOUS`, the challenge, then `( success ( ) )` with nothing after it,
+/// the session alice's with its capabilities and repository unchanged, and nothing more read.
+#[test]
+fn an_authentication_for_one_command_offers_no_anonymous_and_ends_at_its_success() {
+  let mut written = Vec::new();
+  let mechanisms = CommandMechanisms {
+    realm: UUID_BOTH,
+    tunnel_user: None,
+    cram_md5: true,
+  };
+  let item_bytes = roomy(&alices_response());
+  let mut server =
+    Server::for_command(anonymous_session(), &mechanisms, item_bytes, &mut written).unwrap();
+  let request = cat(&[
+    b"( success ( ( CRAM-MD5 ) ",
+    &string_item(UUID_BOTH),
+    b") ) ",
+  ]);
+  assert_bytes(&written, &request, "the request");
+  written.clear();
+  let anonymous = b"( ANONYMOUS ( 0: ) ) ";
+  assert_eq!(
+    server.receive(anonymous, &mut written),
+    Ok(Progress::Failed {
+      failure: AuthFailure::NotListed,
+      consumed: anonymous.len(),
+    })
+  );
+  let unlisted = cat(&[
+    b"( failure ( ",
+    &string_item(b"Must authenticate with listed mechanism"),
+    b") ) ",
+  ]);
+  assert_bytes(&written, &unlisted, "the unlisted attempt");
+  let cram = b"( CRAM-MD5 ( ) ) ";
+  assert_eq!(
+    server.receive(cram, &mut written),
+    Ok(Progress::ChallengeNeeded {
+      consumed: cram.len(),
+    })
+  );
+  let parts = fixed_challenge();
+  server
+    .challenge(parts.nonce, parts.time_micros, &parts.host, &mut written)
+    .unwrap();
+  let response = alices_response();
+  assert_eq!(
+    server.receive(&response, &mut written),
+    Ok(Progress::KeyNeeded {
+      user: b"alice".as_slice(),
+      consumed: response.len(),
+    })
+  );
+  written.clear();
+  let key = CramKey::from_secret(SECRET_SHORT).unwrap();
+  assert_eq!(
+    server.key(Some(&key), &mut written),
+    Ok(Verdict::Established(Principal::User(b"alice".to_vec())))
+  );
+  assert_bytes(&written, b"( success ( ) ) ", "the success alone");
+  let alice = crate::handshake::Session {
+    principal: Principal::User(b"alice".to_vec()),
+    ..anonymous_session()
+  };
+  assert_eq!(server.session(), Some(&alice));
+  assert_eq!(
+    server.receive(FIRST_COMMAND, &mut written),
+    Err(Refused::OutOfTurn)
+  );
+}
+
+/// The reporter's recorded `lock-a` session (`crates/svn/fixtures/report/`, `make-fixtures.py`):
+/// an anonymous client asks for `lock-many`, and `svnserve` asks it to authenticate in the middle
+/// of the command, which it does by CRAM-MD5 as alice.
+const LOCK_A: Session = Session {
+  name: "lock-a.1",
+  client: include_bytes!("../../fixtures/report/lock-a.1.client.bin"),
+  server: include_bytes!("../../fixtures/report/lock-a.1.server.bin"),
+};
+
+/// The reporter's fixtures' repository's identity, which is also its realm (`make-fixtures.py`
+/// `UUID`).
+const UUID_REPORT: &[u8] = b"00000000-0000-4000-8000-0000000a0616";
+
+/// alice's secret in the reporter's fixtures (`make-fixtures.py` `PASSWD`).
+const SECRET_REPORT: &[u8] = b"secret";
+
+/// A-656 (stock `svnserve` 1.15.0's own authentication for one command: `lock-many` in the
+/// recorded `lock-a` session, an anonymous session where users hold keys, `must_have_access`
+/// 826-836): ask for an authentication for one command where users hold keys, in the session's
+/// realm; answer the client's recorded CRAM-MD5 choice and response, with the challenge `svnserve`
+/// sent and alice's key; expect the request, the challenge and the success `svnserve` wrote, byte
+/// for byte (no repository information after the success), and alice established.
+#[test]
+fn an_authentication_for_one_command_writes_what_svnserve_wrote_for_lock_many() {
+  let (client, server) = (items(LOCK_A.client), items(LOCK_A.server));
+  let session = crate::handshake::Session {
+    uuid: UUID_REPORT.to_vec(),
+    root_url: b"svn://127.0.0.1/repo".to_vec(),
+    ..anonymous_session()
+  };
+  let mechanisms = CommandMechanisms {
+    realm: UUID_REPORT,
+    tunnel_user: None,
+    cram_md5: true,
+  };
+  let mut written = Vec::new();
+  let item_bytes = roomy(LOCK_A.client);
+  let mut asking = Server::for_command(session, &mechanisms, item_bytes, &mut written).unwrap();
+  assert_bytes(&written, server[4], "the request");
+  written.clear();
+  assert_eq!(
+    asking.receive(client[3], &mut written),
+    Ok(Progress::ChallengeNeeded {
+      consumed: client[3].len(),
+    })
+  );
+  let parts = challenge_parts(server[5]).unwrap();
+  asking
+    .challenge(parts.nonce, parts.time_micros, &parts.host, &mut written)
+    .unwrap();
+  assert_eq!(
+    asking.receive(client[4], &mut written),
+    Ok(Progress::KeyNeeded {
+      user: b"alice".as_slice(),
+      consumed: client[4].len(),
+    })
+  );
+  let key = CramKey::from_secret(SECRET_REPORT).unwrap();
+  let alice = Principal::User(b"alice".to_vec());
+  assert_eq!(
+    asking.key(Some(&key), &mut written),
+    Ok(Verdict::Established(alice.clone()))
+  );
+  assert_bytes(
+    &written,
+    &cat(&[server[5], server[6]]),
+    "the challenge and the success",
+  );
+  assert_eq!(
+    asking.session().map(|session| &session.principal),
+    Some(&alice)
+  );
+}
+
+/// A-656 (`send_mechs` 580-591 with `needs_username` through a tunnel; `auth` 659-669): ask a
+/// tunnelled anonymous session to authenticate for one command where no keys are held; answer
+/// `EXTERNAL`; expect the request listing `EXTERNAL` alone, then `( success ( ) )` alone, and the
+/// session the tunnel's user's.
+#[test]
+fn a_tunnels_authentication_for_one_command_takes_its_user() {
+  let mut written = Vec::new();
+  let mechanisms = CommandMechanisms {
+    realm: UUID_BOTH,
+    tunnel_user: Some(TUNNEL_USER),
+    cram_md5: false,
+  };
+  let external = b"( EXTERNAL ( 0: ) ) ";
+  let mut server = Server::for_command(
+    anonymous_session(),
+    &mechanisms,
+    roomy(external),
+    &mut written,
+  )
+  .unwrap();
+  let request = cat(&[
+    b"( success ( ( EXTERNAL ) ",
+    &string_item(UUID_BOTH),
+    b") ) ",
+  ]);
+  assert_bytes(&written, &request, "the request");
+  written.clear();
+  assert_eq!(
+    server.receive(external, &mut written),
+    Ok(Progress::Established {
+      principal: Principal::User(TUNNEL_USER.to_vec()),
+      consumed: external.len(),
+    })
+  );
+  assert_bytes(&written, b"( success ( ) ) ", "the success alone");
+  assert_eq!(
+    server.session().map(|session| &session.principal),
+    Some(&Principal::User(TUNNEL_USER.to_vec()))
+  );
+}
+
+/// A-656 (the caller's error: `must_have_access` asks only where the client could authenticate):
+/// ask for an authentication for one command that allows no mechanism; expect `OutOfTurn` and
+/// nothing written.
+#[test]
+fn an_authentication_for_one_command_allowing_no_mechanism_is_the_callers_error() {
+  let mut written = Vec::new();
+  let mechanisms = CommandMechanisms {
+    realm: UUID_BOTH,
+    tunnel_user: None,
+    cram_md5: false,
+  };
+  let asked = Server::for_command(anonymous_session(), &mechanisms, 1, &mut written);
+  assert_eq!(asked.err(), Some(Refused::OutOfTurn));
+  assert!(written.is_empty());
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
