@@ -178,6 +178,13 @@ mod hook_driver;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod svn_hooks;
+// git's hooks as the server runs them (A-665 part 2): the read-only bare repository a hook runs
+// in, opened on the owner shard over the repository's store, sealed there in slices and handed to
+// the hook driver with receive-pack's variables; Unix alone with the driver. No caller outside
+// tests until receive-pack runs its hooks (A-654) in a view presented at a path (part 3).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
 // phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
