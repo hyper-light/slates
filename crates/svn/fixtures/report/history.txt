@@ -1,0 +1,59 @@
+# The repository every report fixture was recorded against (A-616). make-fixtures.py builds it with stock svnmucc over
+# file://, one svnmucc commit a revision, then sets each revision's svn:date with svnadmin setrevprop; the tests build
+# the same history into the index (A-553) and their model of the tree, so the two are one history by construction.
+#
+# Grammar, one revision a block:
+#   revision AUTHOR DATE                 the revision's svn:author and svn:date
+#   mkdir PATH                           svnmucc's actions, PATH relative to the repository's root
+#   put PATH TEXT                        TEXT the rest of the line, with the escapes \n \t \\ and \xHH
+#   put PATH bytes:N                     the bytes 0 to N - 1 (N at most 256)
+#   put PATH lines:N                     N numbered lines, "line I of a text long enough to need several windows\n"
+#   put PATH lines:N:edit:I              the same with line I as "line I, edited on the branch of history\n"
+#   rm PATH
+#   cp REV SRC DST
+#   mv SRC DST
+#   propset NAME VALUE PATH              VALUE holds no blank
+#   propdel NAME PATH
+# Blank lines and lines starting with # are ignored.
+
+revision alice 2026-01-01T00:00:01.000000Z
+mkdir trunk
+mkdir branches
+mkdir tags
+put trunk/a.txt alpha\n
+propset color red trunk/a.txt
+mkdir trunk/dir
+propset owner dan trunk/dir
+put trunk/dir/b.txt bravo\n
+put trunk/dir/c.bin bytes:256
+propset svn:mime-type application/octet-stream trunk/dir/c.bin
+put trunk/script.sh #!/bin/sh\necho hi\n
+propset svn:executable * trunk/script.sh
+mkdir trunk/secret
+put trunk/secret/s.txt secret\n
+
+revision bob 2026-01-02T00:00:02.000000Z
+put trunk/a.txt alpha\nalpha two\n
+propset color blue trunk/a.txt
+put trunk/new.txt new\n
+propset owner erin trunk/dir
+
+revision alice 2026-01-03T00:00:03.000000Z
+cp 2 trunk branches/b1
+
+revision bob 2026-01-04T00:00:04.000000Z
+put branches/b1/a.txt alpha\nbranch edit\n
+rm trunk/dir/c.bin
+mkdir trunk/dir/sub
+put trunk/dir/sub/d.txt delta\n
+mv trunk/new.txt trunk/renamed.txt
+
+revision alice 2026-01-05T00:00:05.000000Z
+put trunk/big.txt lines:6000
+put trunk/a.txt alpha\nalpha two\nalpha three\n
+
+revision bob 2026-01-06T00:00:06.000000Z
+propset svn:mergeinfo /branches/b1:3-5 trunk
+propdel color trunk/a.txt
+put trunk/dir/b.txt bravo\nbravo two\n
+put trunk/big.txt lines:6000:edit:3000
