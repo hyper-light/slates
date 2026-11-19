@@ -326,8 +326,8 @@
 > (`store::views`). receive-pack's `Repository` is the index alone (`IndexedObjects`), and A-618's `PushObjects` is the
 > index, then the push's quarantine (`PushedObjects`). An object of one window is lent as the store keeps it; a longer
 > base is assembled once, kept, and charged to the view's room first, and a base refused for the room is named. A tree's
-> modes are read as git's tree walk reads them, held to stock git 2.50.1's table. Tests: `slates-git --lib` 294 of 294
-> on the Mac Studio, red first (7 of 7) and red five ways by mutation. A thin pack resolved by `receive` against the
+> modes are read as git's tree walk reads them, held to stock git 2.50.1's table. Tests: `slates-git --lib` 333 of 333
+> on the Mac Studio, merged with main, red first (7 of 7) and red five ways by mutation. A thin pack resolved by `receive` against the
 > store, and two pushes made works through it, are among the tests. Owed: receive-pack's part 2 submitting each ref's
 > work through these views. A `Cow` return on `unpack::Outside` and `receive::Repository` would let a view lend an
 > assembled base without keeping it (those traits are A-608's and A-620's).

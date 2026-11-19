@@ -43096,8 +43096,8 @@ Applied in the same change to:
 
   On the Mac Studio, 2026-11-19: the tests were red first, 7 of 7 failing against stubs, and red five ways by mutation:
   `holds` reading bytes (2 failed), no reuse (2), only the standard modes (1), no lending without a copy (4), the room
-  uncharged (1). `cargo test -p slates-git --lib` passed 294 of 294, `cargo test -p slates-merge --lib` 88 of 88, and
-  fmt was clean.
+  uncharged (1). Merged with main (A-614 part 2, A-615, A-624), `cargo test -p slates-git --lib` passed 333 of 333 with
+  main's 2 ignored, `cargo test -p slates-merge --lib` 92 of 92, and fmt was clean.
 - **Applied in the same change to:** `crates/git/src/store/views.rs` (new), `store/mod.rs` (its `mod` line),
   `store/repository.rs` (`indexed`), `objects/tree.rs` (`canonical_mode`), `crates/merge/src/push.rs` (`Unavailable`),
   `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
