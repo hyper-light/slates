@@ -35518,3 +35518,33 @@ case, `fleet.heal.adopted_replaced`).
   layout bump so a mixed fleet never reads an older build's confirmation as certified. An owner's settle certifies
   content the same way, and A-508's holders then drop content too. The replace could also run at once for an adopted
   volume rather than at the healer's cadence.
+
+### A-538 — A stale copy's content goes on a confirmation that certifies it; an older build's confirmation certifies nothing (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; the content release signal's second half; A-529, A-335)
+Applied in the same change to: GAPS (A-529's entry), `crates/db/src/register.rs` (`Retirement::certified`,
+`CompletedTakeover::certified`, `RegionalConfiguration::certifies_content`), `crates/cluster/src/raft_wire.rs` (regional
+layout 6; layout 5 still read, uncertified), `crates/server/src/content_retention.rs` (`release_certified`) and
+`crates/server/src/takeover.rs` (`let_go_stale`'s certified case, `fleet.takeover.released_certified`).
+- **What was there.** Since A-529 a successor confirms only once it serves each adopted volume from its own placement,
+  so its confirmation certifies that no head it serves names a holder outside that placement. Holders did not use it.
+  A stale copy whose content its own head named was kept whole for good (A-335,
+  `fleet.takeover.kept_holding_content`).
+- **The rule.** Each retirement and completion record says whether its confirmations certify their content. This build
+  marks every retirement it makes certified, and a record carries the mark from its retirement. Where the copy's
+  successor confirmed on a certified takeover, and the holder is outside that successor's placement, the holder lets
+  go the content its own stale records name (`content_retention::release_certified`). Content placed ahead of those
+  records stays: it may be the successor's own re-placement, made while this holder was a candidate, which its
+  republished head names. The copy then goes whole unless such content remains. A settled line's lagging holder judges
+  no successor's placement, so its content goes only as its retention rule lets it, as before.
+- **Mixed fleets.** The regional layout is 6. Each retirement and record carries a certification byte after its
+  version. A configuration an older build wrote (layout 5) is still read, with every takeover uncertified: its
+  confirmations may have come before the content was placed again, so their holders keep the content. Any other layout
+  is refused by name.
+- **Tests.** `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation` (red before:
+  kept whole). `a_holder_outside_the_successors_placement_keeps_the_content_its_head_names` now runs on an uncertified
+  takeover; red with an uncertified takeover's content let go. `a_layout_five_configuration_reads_its_takeovers_as_uncertified`
+  (`crates/cluster/src/raft_wire.rs`), `a_takeover_this_build_makes_certifies_its_content` (`crates/db/src/register.rs`),
+  and the A-341 holder test, whose head's content now goes at the certified confirmation. Kiln on the Mac Studio,
+  2026-11-19, debug: `slates-db` `register::` 86 of 86, `slates-cluster` `raft_wire::` 22 of 22, `slates-server`
+  `takeover::`, retention, the healer and the holder tests 33 of 33; red once on a mutated copy that let an uncertified
+  takeover's content go: the uncertified A-335 test failed at its first install.
+- **Owed.** An owner's settle certifies content the same way, and A-508's holders then drop content too.
