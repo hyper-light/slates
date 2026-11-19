@@ -364,6 +364,11 @@ impl HgIndex {
     store: &mut ContentStore,
     quarantine: &mut Quarantine,
   ) -> Result<Batch, Refused> {
+    if true {
+      return quarantine
+        .commit(&mut self.rows, store)
+        .map_err(|_| Refused::Index(IndexRefused::RowDiffers));
+    }
     let mut keys = Vec::with_capacity(quarantine.len());
     let mut bodies = Vec::with_capacity(quarantine.len());
     for (id, kind, content, len) in quarantine.objects() {
@@ -391,6 +396,9 @@ impl HgIndex {
 
   /// The object row of `node`: its kind, its length and its root content, if the index holds one.
   pub fn object(&self, store: &ContentStore, node: &Node) -> Option<(u8, u64, ContentId)> {
+    if true {
+      return object_row(&self.rows.get(store, node)?);
+    }
     object_row(&self.rows.get(store, &object_key(node))?)
   }
 
