@@ -2999,6 +2999,12 @@ tests and the abstract states must agree.
 service for the export's root handle over its own loopback socket and passes it to `mount(2)` in
 Apple's XDR arguments (`NFS_MATTR_FH`). The mount's source is `slates:/<name>`. The capability
 therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every local user can read.
+- **The MOUNT call waits while its connection lives** (A-517), as the hard mount it makes waits (Apple's
+  `mount_nfs(8)`: an unresponsive server's calls "will hang uninterruptibly until the server comes back", and `intr`
+  lets a termination signal end them). No daemon on the port refuses the connect (`connect(2)`, `ECONNREFUSED`); a
+  daemon that goes closes its sockets with its process (`close(2)`), which the read meets as the peer's close
+  (`recv(2)`); a stuck one is ended by its watchdog or its anchor (A-232). Until A-517 each of the call's connect, send
+  and receive was bounded by one liveness budget, so a live daemon that answered later failed the mount.
 - **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself. The daemon ends
   the attachment of a host mount of that volume only once the kernel's mount table
   (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point. Since A-493 it watches the table
@@ -34138,3 +34144,29 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **Owed.** The lineage model's mirror of the rule and its own oracle (a live owner's copy let go only while a record at
   least as new is on `f + 1` members), main's to compile and run beyond its default cases; the content release signal
   (a successor confirms once its adopted content is re-placed, a settle certifies content too); the Lineage.tla text.
+
+### A-517 — The macOS mount's MOUNT call waits while its connection lives, as the hard mount it makes does: no fixed deadline (2026-11-18, UI goal 86 via g251b; R3's class C, C-b's third part; §4.6 "Mounting without exposing the capability"; A-34, A-232)
+
+- **What was there.** `slates mount` on macOS asks the daemon's MOUNT service for the export's root handle over its own
+  loopback socket (`slates_bridge_nfs::client::fetch_root_handle`, A-34), and each of that call's connect, send and
+  receive was bounded by `MOUNT_CALL_DEADLINE` (`crates/api/src/mount.rs`): one liveness budget, a second. A daemon
+  alive and slower to answer (a busy machine, a long start) failed the mount.
+- **The evidence (Apple's documentation, the man pages macOS 26.4 ships).** The mount this call precedes is hard
+  (`NFS_MFLAG_SOFT` cleared, `NFS_MFLAG_INTR` set), and `mount_nfs(8)` states that rule: "If the server becomes
+  unresponsive while an NFS file system is mounted, any new or outstanding file operations on that file system will
+  hang uninterruptibly until the server comes back (or that NFS file system is forcibly unmounted)"; `intr` makes
+  "file system calls that are delayed due to an unresponsive server ... fail with EINTR when a termination signal is
+  posted for the process". The call's own socket ends at once wherever no daemon can answer: `connect(2)` fails
+  `ECONNREFUSED` when "the target is not listening for connections"; a daemon's exit frees its descriptors
+  (`close(2)`: "When a process exits, all associated file descriptors are freed"), and a read then returns 0, "the peer
+  has closed its half side of the connection", or `ECONNRESET` (`recv(2)`). A daemon alive but stuck is ended by its
+  own watchdog or killed by its anchor (A-232, §4.14), which is that close.
+- **The rule.** `exchange(port, call)` and `fetch_root_handle(port, caller, path)` take no deadline: a blocking
+  connect, send and receive on the loopback socket, waiting while the connection lives. `MOUNT_CALL_DEADLINE` is gone;
+  the examples and the forged-`UMNT` CLI test call the same functions without one.
+- **Tests (`slates-bridge-nfs --lib`, `client::tests`).** `a_mount_call_answered_past_the_old_deadline_is_served` (a
+  stand-in daemon answers 1.5 s after the call: served), written first and red on the old code: "Err(Io(Os { code:
+  35, kind: WouldBlock ... })) after 1.002248833s", the receive timeout `recv(2)` reports as `EAGAIN`;
+  `a_mount_call_whose_daemon_goes_unanswered_ends_at_once` (the stand-in reads the call and closes: ended before the
+  old deadline) and `a_mount_call_to_a_port_nothing_listens_on_is_refused_at_once` (`ConnectionRefused`), which hold
+  the rule's other half and pass before and after.

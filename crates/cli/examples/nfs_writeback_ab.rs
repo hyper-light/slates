@@ -269,7 +269,7 @@ mod unix {
       gid: 0,
       gids: Vec::new(),
     };
-    let root = fetch_root_handle(port, &caller, &path, WAIT).unwrap().0;
+    let root = fetch_root_handle(port, &caller, &path).unwrap().0;
     let mut client = Rpc::connect(port);
     let mut other = Rpc::connect(port);
     // The client's files and the other connection's, each 1 MiB of its own byte; the client reads every page of both
