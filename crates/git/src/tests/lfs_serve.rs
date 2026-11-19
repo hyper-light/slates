@@ -10,7 +10,7 @@ use slates_http::head::{Head, HeadReader, Progress, Target, Version};
 use slates_vcs::ContentStore;
 
 use super::{
-  Access, Allow, Answer, Context, Endpoint, Kind, LockRecord, Locks, LocksFull, Need, PAGE_SLOT,
+  Access, Allow, Answer, Context, Endpoint, Kind, LockRecord, Locks, LocksRefused, Need, PAGE_SLOT,
   Request, RouteRefused, Routed, Server, Stored, Taken, base_url, route,
 };
 use crate::Admission;
@@ -58,7 +58,7 @@ struct ModelLocks {
 }
 
 impl Locks for ModelLocks {
-  fn take(&mut self, path: &str, owner: &str, at: Timestamp) -> Result<Taken, LocksFull> {
+  fn take(&mut self, path: &str, owner: &str, at: Timestamp) -> Result<Taken, LocksRefused> {
     if let Some((_, holder)) = self.held.iter().find(|(_, holder)| holder.path == path) {
       return Ok(Taken::Held(holder.clone()));
     }
@@ -66,7 +66,7 @@ impl Locks for ModelLocks {
       .capacity
       .is_some_and(|capacity| self.held.len() >= capacity)
     {
-      return Err(LocksFull);
+      return Err(LocksRefused::Full);
     }
     self.last += 1;
     let record = LockRecord {
@@ -79,24 +79,21 @@ impl Locks for ModelLocks {
     Ok(Taken::New(record))
   }
 
-  fn find(&self, id: &str) -> Option<&LockRecord> {
-    self
-      .held
-      .iter()
-      .map(|(_, record)| record)
-      .find(|record| record.id == id)
+  fn find(&self, id: &str) -> Option<LockRecord> {
+    let mut held = self.held.iter().map(|(_, record)| record);
+    held.find(|record| record.id == id).cloned()
   }
 
-  fn listed_from(&self, from: Option<&str>) -> Option<impl Iterator<Item = &LockRecord>> {
+  fn listed_from(&self, from: Option<&str>) -> Option<impl Iterator<Item = LockRecord> + '_> {
     let start = match from {
       Some(id) => id.strip_prefix("lock-")?.parse::<u64>().ok()?,
       None => 0,
     };
     let listed = self.held.iter().filter(move |(place, _)| *place >= start);
-    Some(listed.map(|(_, record)| record))
+    Some(listed.map(|(_, record)| record.clone()))
   }
 
-  fn release(&mut self, id: &str) -> Result<Option<LockRecord>, LocksFull> {
+  fn release(&mut self, id: &str) -> Result<Option<LockRecord>, LocksRefused> {
     let Some(at) = self.held.iter().position(|(_, record)| record.id == id) else {
       return Ok(None);
     };
@@ -886,7 +883,7 @@ fn a_full_log_and_a_foreign_cursor_are_refused_by_kind() {
 }
 
 /// The bytes a lock takes on a page by the paging rule: its JSON in a list with the separator
-/// before it, and the page's slot for it.
+/// before it, the page's slot for it, and its record's text.
 fn place_bytes(lock: &LockRecord) -> u64 {
   let written = serde_json::json!({
     "id": lock.id,
@@ -894,7 +891,9 @@ fn place_bytes(lock: &LockRecord) -> u64 {
     "locked_at": rfc3339(lock.locked_at),
     "owner": {"name": lock.owner},
   });
-  len_of(",") + len_of(&written.to_string()) + u64::try_from(PAGE_SLOT).unwrap()
+  let text = lock.id.len() + lock.path.len() + lock.owner.len();
+  let slot = u64::try_from(PAGE_SLOT + text).unwrap();
+  len_of(",") + len_of(&written.to_string()) + slot
 }
 
 /// The bytes a page's cursor naming `id` takes in its answer.
@@ -983,9 +982,44 @@ proptest! {
     take_locks(&mut world, count);
     release_unkept(&mut world, &kept, count);
     let held: Vec<LockRecord> =
-      world.locks.listed_from(None).map(|held| held.cloned().collect()).unwrap_or_default();
+      world.locks.listed_from(None).map(|held| held.collect()).unwrap_or_default();
     let (listing, longest) = follow(&mut world, limit, room, 24);
     prop_assert_eq!(listing, paging_rule(&held, limit, room));
     prop_assert!(u64::try_from(longest).is_ok_and(|longest| longest <= room));
   }
+}
+
+/// A principal who may upload to `refs/heads/topic` alone.
+fn topic_only(need: Need, ref_name: Option<&str>) -> bool {
+  need == Need::Upload && ref_name == Some("refs/heads/topic")
+}
+
+/// A-629 part 2b: do ask the batch API for an upload naming `refs/heads/topic`, as a principal who
+/// may upload there alone, then put the object at the href the batch handed out and at that href
+/// without its query. Expect the href to name the ref (`refspec`), the put there answered, and the
+/// put without it refused `403`: a transfer is judged on the ref its batch was.
+#[test]
+fn a_transfer_is_judged_on_the_ref_its_batch_named() {
+  let mut world = World::new();
+  let object = serde_json::json!({"oid": LfsNaming::oid(b"new\n").to_string(), "size": 4});
+  let ask = serde_json::json!({
+    "operation": "upload",
+    "objects": [object],
+    "ref": {"name": "refs/heads/topic"},
+  });
+  let (batch, body) = (lfs("/objects/batch"), ask.to_string());
+  let sent: Sent<'_> = ("POST", &batch, &[JSON], body.as_bytes());
+  let answer = json(&world.serve(&topic_only, sent, &context("test")));
+  let href = answer["objects"][0]["actions"]["upload"]["href"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let target = href.strip_prefix("https://lfs.example").unwrap().to_owned();
+  let bare = target.split('?').next().unwrap().to_owned();
+  let codes = [&target, &bare].map(|target| {
+    let sent: Sent<'_> = ("PUT", target, &[], b"new\n");
+    world.serve(&topic_only, sent, &context("test")).status.code
+  });
+  let named = target.ends_with("?refspec=refs/heads/topic");
+  assert_eq!((named, codes), (true, [200, 403]));
 }
