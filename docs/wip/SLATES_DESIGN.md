@@ -12580,6 +12580,15 @@ engine: the verdict, rebase, position mapping, the register).
 > record a change is `500`, apart from one at its capacity (`507`). Part 2b-ii is the server's: `Access`, `Locks`
 > over the locks log through `RepositoryLogs::append`, and the call A-625's edge makes.
 >
+> **Status (2026-11-19, A-629 part 2b-ii: LFS on the daemon).** `crates/server` (`lfs`): `answer`, the call the
+> version-control HTTP edge makes with a request routed at its head and read whole; `LfsAccess`, vcs_policy's
+> `admit` for the right each need takes on the ref named (the default branch when none; another's lock a rewrite;
+> no principal refused); `LogLocks`, each lock in the repository's locks log (A-635) through
+> `RepositoryLogs::append`, its id the log's position and its path. Owed: the edge's answer whose status follows
+> the body (LFS answers `201`, `409`, `422` and `507` after reading it); the objects' durable store on the owner
+> shard (A-581); principals' names for people (§4.13); locks by others than the owner once the push's policy
+> check lands.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -46153,3 +46162,32 @@ new; git's site's tests; the manifest's dev-dependency on `slates-vcs`) and the 
   `ls-refs` answered with the flush alone, a body that is no pkt-line answered `ERR`, receive-pack and an unheld store
   `503`.
 - **Owed.** As the status says.
+
+### A-629 part 2b-ii — Git LFS on the daemon: the edge's call, access by the repository's policy, locks in its locks log (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files" and "Access"; after A-629 part 2b-i, A-622 part 2, A-625 part 2 and A-635)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/server` (`lfs.rs` and `lfs/tests.rs`,
+new; `lib.rs`); `crates/db` (`Repositories::lock_on`, `locks_from`); `crates/git` (`lfs::objects` re-exports the
+store's `Admitted` and `ContentStore`, which an implementer of the `Objects` seam names).
+- **The call** (`lfs::answer(state, objects, call)`): the edge routes a request at its head
+  (`slates_git::lfs::serve::route`, refusing there with its status and `Allow`), reads its body within its room, and
+  hands the call the route, query, body, proven principal, credential expiry, challenge, scheme and authority, request
+  id and room. It answers on the repository's owner shard: `404` for no repository of that name there, else
+  `slates_git`'s answer, whose status, challenge and body the edge writes.
+- **Access** (`LfsAccess`) is the push's check point, vcs_policy's `admit` (A-597, A-622 part 2): downloading and
+  listing read; uploading, locking, verifying and releasing one's own lock submit; another's lock with force rewrites,
+  the right that overrides another's work on a name. A request naming no ref is judged on the default branch
+  (`refs/heads/<default>`, git's `HEAD`); one without a principal is refused, so the edge asks for credentials.
+- **The locks** (`LogLocks`) are the repository's locks log (A-642, A-635), each change appended through
+  `RepositoryLogs::append` at the position read. A lock's bytes are `HeldLock` (the position it was taken at, its owner,
+  its time); its id is that position and its path in hexadecimal (RFC 3986 unreserved, as git-lfs needs), so an unlock
+  finds it by path and an id whose path was locked again names nothing. The log lists by path, so a page goes on at
+  its cursor's path (`locks_from`). An owner shows as its principal's key in hexadecimal until §4.13 names people.
+- **Limits stated.** `append` keeps its owner rule until the push's policy check lands (A-635), so only a repository's
+  owner takes and releases locks today. The objects are a seam the caller hands in: no durable object store is on the
+  owner shard yet (A-581), and one that forgot its objects at a restart would lose them. The edge's `Serve` fixes `200`
+  at the head, and LFS answers `201`, `409`, `422`, `413` and `507` after reading the body, so the edge owes a decision
+  whose status follows the body.
+- **Tests** (`lfs/tests.rs`, 4): the owner's lock taken, listed, held in the log and released; a stranger `403`, no
+  credentials `401` with the challenge, no repository `404`, nothing logged; an id naming its own lock alone; the
+  access verdicts under a policy. On the Mac Studio (2026-11-19): red at 07:12Z with `answer` and `allows` stubbed, 4 of
+  4 failing; green at 07:14Z on 9d7108e76, `cargo test -p slates-server --lib` 632 passed and one failed, main's
+  `deadlines` test that fails without this change; `slates-git --lib` 443 and `slates-db --lib` 142; fmt clean.
