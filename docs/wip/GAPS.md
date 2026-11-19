@@ -107,8 +107,12 @@
 > authorization file, and a learned estimator for every tunable. Built: `slates-svn`'s svndiff codec (versions 0 and
 > 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
 > `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
-> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. Owed, in order: `Copy` in the
-> engine (on A-534's persistent radix tree); the commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. A-542's second half, part 1
+> (2026-11-19): Copy's maps, every map of a green's state copying a path's tree by reference on A-534's radix tree,
+> O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
+> Mac Studio, see A-542). Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and
+> `last_changed` entries by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the
+> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.
