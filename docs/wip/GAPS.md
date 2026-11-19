@@ -571,7 +571,7 @@
 > Studio, kiln r295 red over main b94ae6e90: 2, 8 and 1 failing, stock hg 7.2 in its crash report; r325 green over
 > main 770ae8826): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 46 of 46 (stock hg
 > 7.2 against the edge serving the hg site: `abort: HTTP Error 503`, the site reached), `slates-cli --test cli
-> vcs_http` 2 of 2, fmt clean.
+> vcs_http` 2 of 2, fmt clean; over main 693bc8feb (kiln r361, Subversion's site deciding alike) 10, 51 and 2 of each.
 > Owed: the daemon serving the hg site beside git's (its site is git's alone, so stock hg against a running anchor
 > meets git's `404`; A-680 part 2 and the sites' composition), then g083's stock-hg anchor tests un-ignored; stock
 > svn over the loopback edge (A-681); the Windows and Linux runs (main's).

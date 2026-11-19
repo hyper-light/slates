@@ -51613,17 +51613,24 @@ Applied in the same change to:
   edge's and the edge's tests; stock hg 7.2 ran, no skip, and ended `abort: HTTP Error 503: Service Unavailable`), 2 of
   2 with g083's ignored HTTP test listed (`slates-cli`); `cargo fmt --all -- --check` clean; no warning in this piece's
   lines (a non-test build of `slates-server` warns 21 times, LFS's unreached call and an unused `UploadServices` import,
-  alike in the red run over main's tree).
+  alike in the red run over main's tree). Over main 693bc8feb as it lands (kiln r361, at e338ae715, with A-681 part 1's
+  Subversion site deciding without the connection's kind too): `slates-http-edge --lib credential` 10 of 10,
+  `slates-server --lib vcs_http::` 51 of 51 (Subversion's site's five among them, its stock svn read over HTTPS; stock
+  hg ran again and reached the site), `slates-cli --test cli vcs_http` 2 of 2, `--test svn_interop -- --list` compiled
+  (5 tests), fmt clean.
 - **Not changed, on purpose.** The daemon's site is git's alone (`DaemonSite`), so stock hg against a running anchor
   still meets git's route (`404`) until the sites are composed; g083's two stock-hg tests over the anchor's HTTP edge
-  stay ignored on A-680 (and A-685), A-686 dropped from their reasons.
+  stay ignored on A-680 (and A-685), and the stock-svn interop tests' two HTTP legs on A-681's later parts and A-685,
+  A-686 dropped from all four tests' reasons.
 - **Owed.** Stock hg's clone over a running anchor, once the daemon serves the hg site (A-680 part 2 and the sites'
   composition); stock svn over the loopback edge (A-681); the Windows and Linux runs (main's).
 - **Applied in the same change to:** `crates/http-edge/src/credential.rs` (`credential`, `challenges`,
-  `CredentialRefused`, the module doc) and its tests; `crates/server/src/vcs_http.rs` (`Site::decide`'s doc);
-  `vcs_http/git.rs` (the module doc's step 2, `Refused`, the site's steps without the connection's kind);
-  `vcs_http/hg.rs` (the module doc's step 2, the site's steps); `vcs_http/tests/git.rs`, `tests/hg.rs`,
-  `tests/daemon_edge.rs` (`daemon_named`, the cleartext client and the two tests) and `tests/serve.rs` (`served_by`,
-  the stock-hg test and its site); `crates/cli/tests/cli.rs` (the anchor's edge test; g083's two stock-hg tests' waits);
-  §4.17.2 "Access" and its status; A-625 part 1's "Credentials", part 2's "git's site" and part 3's "Main's rulings";
-  GAPS (A-625 part 1's line, the A-686 entry).
+  `CredentialRefused`, the module doc), `lib.rs` (the crate doc's credentials), `tests/credential.rs` and
+  `tests/connection.rs` (the TLS test's read); `crates/server/src/vcs_http.rs` (`Site::decide`'s doc); `vcs_http/git.rs`
+  (the module doc's step 2, `Refused`, the site's steps without the connection's kind); `vcs_http/hg.rs` and
+  `vcs_http/svn.rs` (each module doc's step 2, the site's steps); `vcs_http/tests/git.rs`, `tests/hg.rs`,
+  `tests/svn.rs`, `tests/daemon_edge.rs` (`daemon_named`, the cleartext client and the two tests) and `tests/serve.rs`
+  (`served_by`, the stock-hg test and its site); `crates/cli/tests/cli.rs` (the anchor's edge test; g083's two stock-hg
+  tests' waits) and `tests/svn_interop.rs` (two HTTP legs' waits); §4.17.2 "Access" and its status list (A-625 part 1's
+  and part 2's lines, and A-686's); A-625 part 1's "Credentials", part 2's "git's site" and part 3's "Main's rulings";
+  GAPS (A-625 part 1's and part 2's lines, g083's §4.17.3 line, the A-686 entry).
