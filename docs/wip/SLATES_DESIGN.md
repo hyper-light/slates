@@ -14792,6 +14792,22 @@ and export by landing).
 > slices); the write side (part 2); the daemon composing the site beside git's and handing it the stores (each
 > repository's index, green, lock table and authorization file, and a principal's Subversion user).
 >
+> **Status (2026-11-19, A-681, part 1, its second slice).** Built: the `log-report` over HTTP, so stock `svn log` and
+> `svn log -v` read a repository through the edge. The REPORT's body is read as A-609 reads it, the resource's node
+> must exist (`404` as `dav_method_report` answers), and the answer is A-613's log walk (`svn_repos_get_logs5`, held
+> to `svnserve`'s transcripts) with `mod_dav_svn`'s receivers in place of `svnserve`'s (`reports/log.c`): the header
+> written before the first changed path or entry, each item opened before its first changed path, `D:version-name`
+> `-1` closing a run of merged revisions, the principal's rules censoring paths, copy sources and revision properties
+> as for ra_svn. The edge's exchange steps the walk's first slices at the body's end, yielding between them, until it
+> has written or ended: a walk refused before its first byte is answered `dav_svn__convert_err`'s status with the
+> error in `D:error` (`404` for a missing path or revision), and one refused after it ends the connection. OPTIONS now
+> lists `log-revprops`. Held to the ra_svn walk over nine requests (every revision, merged revisions, oldest first with
+> a limit, strict history, two paths with a custom property, the locked rules' refusal and censoring, a missing path
+> and a revision past the youngest), each answer equal entry for entry, and to stock svn 1.15.0's `svn log` and
+> `svn log -v` through the edge over HTTPS. Owed: the other REPORTs, then the update-report for `svn checkout`; a
+> negative `S:limit` is refused (`svn_repos_get_logs5` would read it as two limits); revision properties are written in
+> the green's order where `mod_dav_svn` walks an APR hash.
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
@@ -15425,8 +15441,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
     (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
     report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
     `DAV:lockdiscovery` property. Its third, the site on the shared HTTP edge (A-681), has begun: the read side's
-    resources answered to OPTIONS, PROPFIND, GET and HEAD (part 1's first slice); its REPORTs, so `svn log` and `svn
-    checkout` reach a repository, then the commit, PROPPATCH and the lock verbs (part 2), follow.
+    resources answered to OPTIONS, PROPFIND, GET and HEAD (part 1's first slice) and the `log-report`, so `svn log`
+    reaches a repository (its second); the other REPORTs, so `svn checkout` does, then the commit, PROPPATCH and the
+    lock verbs (part 2), follow.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -52010,3 +52027,59 @@ Applied in the same change to:
 - **Owed.** The objects a hidden ref alone reaches hidden by slates-git; the daemon starting the SSH edge (A-684); the
   live stock `git clone` and fetch over the daemon's edge (the next piece, g309's); the exchange moved by the live
   signals; Linux and Windows runs, clippy, the doc and lint gates (main's).
+
+### A-681 part 1, its second slice — The `log-report`: A-613's log walk with `mod_dav_svn`'s receivers, streamed by the edge a slice a reply run, its status decided by its first slices (2026-11-19, g297, UI goal 93 (kiln 51cef9f7); §4.17.4 item 5 "HTTP" and piece 13's third part; A-609, A-613, A-606)
+Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§3);
+`crates/svn` (`reads/log.rs`'s two writers; `reads/log/dav.rs`, new; `reads.rs`'s `DavLog` and `DavLogProgress`;
+`dav/site.rs`'s REPORT, `Report` and `ReportProgress`, `log-revprops` listed; `dav/response.rs`'s log pieces opened to
+the crate; `dav/locking.rs`'s `convert_status` with `dav_svn__convert_err`'s whole table; the tests); `crates/server`
+(`vcs_http/svn.rs`'s report answer and its first slices; its tests).
+
+- **One walk, two writers** (`reads/log.rs`, `reads/log/dav.rs`; Subversion 1.15.0 `mod_dav_svn/reports/log.c`). The
+  log's walk stays A-613's, held to `svnserve`'s transcripts; where it wrote `svnserve`'s items it now hands each
+  changed path, entry and end to one of two writers, a closed set: `svnserve`'s receivers, as before, or
+  `mod_dav_svn`'s. The latter writes the XML declaration and `S:log-report` before the first changed path or entry
+  (`maybe_send_header`), opens each `S:log-item` before its first changed path (`maybe_start_log_item`), so a merged
+  revision passed over leaves its changed paths to the next item as both servers do, writes `D:version-name` `-1` for
+  the entry closing a run of merged revisions, and keeps a refusal for its caller. The request is
+  `dav_svn__log_report`'s: each `S:path` joined to the resource's repository path, a missing or negative start or end
+  the youngest, the revision-property elements as named, every flag by its presence. A-609's whole-answer writer and
+  the streamed one share the format pieces (`LOG_REPORT_START`, `LOG_ITEM_START`, `changed_path`, `log_item_end`).
+- **The REPORT** (`dav::site`; httpd 2.4.66 `dav_method_report`, `version.c` `deliver_report`): the body read as A-609
+  reads it, an unknown report `501` in `mod_dav_svn`'s words; the resource's node, `404` without one; a `log-report`
+  becomes a `Report` the caller resumes a slice at a time, `text/xml; charset="utf-8"`. A walk refused before its
+  first byte is the answer `dav_svn__convert_err` gives (`404` for `SVN_ERR_FS_NOT_FOUND` and
+  `SVN_ERR_FS_NO_SUCH_REVISION`, `501`, `423` and `412` for theirs, else the report's `400`), its error in `D:error`;
+  refused after it, the connection ends. `convert_status` now carries the whole table with the caller's status, the
+  lock verbs passing their `500` as before. OPTIONS lists `log-revprops`, which a client checks before naming a custom
+  revision property.
+- **The edge's exchange** (`vcs_http::svn`): at the body's end the report's first slices are stepped, the store lent
+  for each and the task yielding between them, until it has written its first bytes or ended, since they decide the
+  status the reply begins with; then a slice of the request's room a reply run.
+- **Departures, each stated.** The revision properties are written in the green's order where `mod_dav_svn` walks an
+  APR hash, whose seed varies its order; a negative `S:limit`, which `svn_repos_get_logs5` reads as no limit in its
+  shortcut and one entry in its walk, is refused `400`; a refusal within the first slices after the first byte is
+  `500` with nothing sent, where `mod_dav` sends the bytes and ends the connection; `mod_dav_svn`'s forced flushes
+  after the 4th, 16th, 64th and 256th item are the edge's slices.
+- **Tests and the run.** `reads::tests::a_log_report_answers_the_entries_svnserve_answers` runs nine requests through
+  both writers over the transcripts' repository, each resumed in the smallest room (every revision with every
+  property; a file's merged revisions; a branch oldest first with a limit, across its copy; strict history with no
+  property; two paths with a custom property named; the locked rules' root refused and the trunk's history censored;
+  a missing path; a revision past the youngest) and holds the answers equal entry for entry, with the shape of each
+  (twelve entries for every revision, entries for each walk, the three refusals' numbers) so no comparison is of two
+  empty answers; its first run caught the trunk's case asking the youngest revision alone, which touches no trunk path.
+  `a_negative_log_limit_is_no_walk`; the site's `a_log_report_streams_its_walk_and_is_refused_before_its_first_byte`
+  (`svn log -v`'s recorded body: revisions 5 and 4 with their changed paths in order and the copy's source, `log.c`'s
+  header and end; a missing path `404` with FSFS's words) and `a_report_is_refused_by_its_resource_its_name_and_its_limit`;
+  the exchange's `a_log_report_is_streamed_by_the_principals_rules` (the answer byte for byte, the owner's hidden paths
+  and message left out); the stock test now runs `svn log` and `svn log -v`. macOS arm64, Mac Studio, 2026-11-19:
+  kiln r393 (23:20-23:25Z, over main 693bc8feb with the slice at db4b0f20b) `cargo test --locked -p slates-server
+  --lib -- vcs_http:: --test-threads=4` 48 of 48, slates-server compiled afresh; the stock test with its output shown:
+  `svn log` printed `r1 | alice | 2026-11-18 16:00:01 -0800 (Wed, 18 Nov 2026) | 1 line` with an empty message, `svn
+  log -v` `A /trunk` and `A /trunk/a.txt` alone; the run at 23:28-23:29Z over 211f141c0 (crates byte for byte this
+  change's after `cargo fmt`, tree `5c92a4da`): `cargo test --locked -p slates-svn --lib -- reads:: dav::` 118 of 118,
+  `cargo fmt -p slates-svn -p slates-server -- --check` clean. No integration target reaches the site.
+- **Owed.** The other REPORTs (get-locations, get-location-segments, get-deleted-rev, dated-rev, mergeinfo,
+  inherited-props, get-locks, list, file-revs), then the update-report through A-627's drive for `svn checkout`, with
+  the site composed into the daemon's edge (main's ask: git's site alone answers today, so a stock client of another
+  tool meets `404`); part 2, the write side; main's runs (clippy, `xtask`, the other platforms, red-checks).

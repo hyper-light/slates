@@ -1217,7 +1217,12 @@
 > the daemon composing the site beside git's and handing it the stores, `503` until then; (4) a repository whose name
 > holds a slash, which `SVNParentPath`'s first-segment rule cannot reach over HTTP without a longest-prefix search
 > across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`); (6) Basic on the cleartext
-> loopback edge (A-686). A-531 (2026-11-19): the ra_svn item codec, its
+> loopback edge (A-686). A-681 part 1, its second slice (2026-11-19, g297): the `log-report`, A-613's log walk with
+> `mod_dav_svn`'s receivers, streamed by the edge's exchange a slice a reply run, its status decided by its first
+> slices (a refusal before its first byte answered with its error, one after it ending the connection); held to the
+> ra_svn walk entry for entry over nine requests and to stock `svn log` and `svn log -v` (see A-681 part 1, second
+> slice). Owed from it: (1) a negative `S:limit`, refused where `svn_repos_get_logs5` reads two limits; (2) the other
+> REPORTs and the update-report. A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its
