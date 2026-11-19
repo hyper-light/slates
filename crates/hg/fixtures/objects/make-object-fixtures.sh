@@ -34,7 +34,7 @@ index, expected = [], []
 def h(value):
     return value.hex() if value else "-"
 def dump(log, name, storage):
-    for rev in storage.revs():
+    for rev in range(len(storage)):
         node = storage.node(rev)
         p1, p2 = storage.parents(node)
         text = storage.revision(node) if log != "file" else storage._revlog.revision(node)
@@ -57,7 +57,7 @@ for rev in repo:
         expected.append(" ".join(["entry", str(rev), path.hex(), manifest[path].hex(), manifest.flags(path).decode() or "-"]))
 for path in paths:
     log = repo.file(path)
-    for rev in log.revs():
+    for rev in range(len(log)):
         renamed = log.renamed(log.node(rev))
         copy = "%s %s" % (renamed[0].hex(), renamed[1].hex()) if renamed else "- -"
         expected.append(" ".join(["filerev", path.encode().hex() if isinstance(path, str) else path.hex(), str(rev), copy]))
