@@ -151,10 +151,12 @@ mod deadlines;
 mod hangup;
 mod reap;
 mod repository;
-// git's `wildmatch` with `WM_PATHNAME`: the glob of a git repository's ref patterns and of a Subversion glob rule's
-// segments (A-597). No caller outside tests until the version-control servers' policy reads it (their pieces).
-#[cfg_attr(not(test), allow(dead_code))]
-mod wildmatch;
+// git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
+// that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both
+// crates' tests hold one transcription and no product build links it (A-671). The matcher is `slates_vcs::wildmatch`.
+#[cfg(test)]
+#[path = "../../vcs/src/wildmatch/reference.rs"]
+mod wildmatch_reference;
 // §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
 // policy the repository's record holds (`admit`, A-622). No caller outside tests until the servers' push paths ask it
 // (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).

@@ -12276,6 +12276,11 @@ is one more version, and the chain itself is never rewritten.
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
 
+> **Status (2026-11-19, A-671: the matcher's home).** git's `wildmatch` is `slates_vcs::wildmatch`
+> (`crates/vcs/src/wildmatch.rs`), moved whole from `crates/server`, behaviour unchanged: slates-vcs is the crate every
+> version-control server's crate builds on, so the policy and git's own crate (its sparse filter, A-640 part 4) hold one
+> matcher. Its oracle, git's `dowild` transcribed, is a file both crates' tests compile and no product build links.
+
 > **Status (2026-11-19, A-647 part 1: derived data, one mechanism, A-645).** What a read computes for a version is a
 > type of derived data (`crates/vcs/src/derived.rs`): a pure function of the version's change and its parents' values
 > of the same type, kept as content under the type's name and the version's in an index whose rows never change, so
@@ -48279,3 +48284,71 @@ Applied in the same change to: §4.17.2's A-653 status block, GAPS (the A-653 en
 - **Owed.** The live clone over the HTTP edge (A-625 part 3: the server's git store per repository and its lender);
   the red-checks and the other platforms' runs (main's); a delta search for an object past a window; the fragments'
   encoding sliced.
+
+### A-660 — The deadlines tests hold their failover delay through the daemon's seam, and their look counts the descheduling their shard measured (2026-11-19, g229, main's bug for the server's gates; A-574, A-536, A-525)
+Applied in the same change to: `crates/server/src/deadlines.rs`'s tests;
+`docs/bugs/2026-11-19-the-deadlines-tests-wrote-the-failover-delay-the-beat-overwrites.md`, new.
+
+- **The bug.** `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` failed
+  on every machine (`deadlines.rs:830`), and every server agent's green run carried it (A-648's entry among others).
+  Since A-574 the control shard's beat publishes `injected_failover_ns.unwrap_or(estimate)` into `failover_ns` at
+  every beat. The test wrote `failover_ns` itself and captured two delays later, so the capture was held the estimate,
+  past the half window it looks for. The CLI attachment's test wrote it the same way and passed only because it reads
+  its delay in the same observe.
+- **The fix.** Both tests inject their delay with `Daemon::inject_failover`, which every beat then publishes; nothing
+  else in the module writes `failover_ns`. The seven other test sites that write it (`fleet.rs`'s fan test among
+  them) each read it within one `audit_on_shard` closure, where no beat runs between, so none needs it.
+- **Under load.** Asked to check the write lease's test under load: one whole-suite run of eleven with the fix missed
+  the bare half window in it and in the CLI attachment's test (load average 14.7). With the look allowed ten seconds,
+  every release in the whole suite came 101 to 166 ms after its 100 ms term. `look_until` now widens its half window
+  by the descheduling the shard measured (`slates_rt::futures::scheduler_overrun_ns`), which is next to nothing on a
+  quiet host, and a miss reports how long it looked and what the shard measured. The miss was not reproduced in twelve
+  suites run two at a time since, with or without the widening: the widening is a measured noise floor, not a proven
+  cure.
+- **Tests** macOS arm64, Mac Studio, 2026-11-19 (kiln r66), on a8c2fc09b, main 2e4433040 with this change merged, the
+  code this commit lands: `cargo fmt -p slates-server -- --check` clean; `cargo test --locked -p slates-server --lib
+  deadlines:: -- --test-threads=4` 10 of 10, the status capture's test among them (main's file failed it 10 of 10
+  alone; the bug record holds the red); and, each by name with `--test-threads=4`, the 19 integration tests that inject
+  the failover delay through the same seam, 19 of 19: `slates-server`'s `attachment_term` (its four),
+  `landing_fairness`'s `a_landing_longer_than_its_lease_term_renews_it_and_lands_everything`, twelve of `fleet`'s (the
+  forward's paths floor, the durability refusal at the failover delay, both live-shipped held-reply bounds, the
+  forward's location budget, and the seven takeovers on `lone_fleet_node`), and `slates-client`'s `reap` and `client`
+  term tests. The same counts on 3ed9ad19f (main b1926d201, kiln r53), before A-657 part 3 and A-626 part 3 changed
+  what `slates-server` builds from. The Linux and Windows runs are owed.
+
+### A-671 — git's `wildmatch` moved to slates-vcs, the crate every version-control server's crate builds on (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.1 "Policy" and shared piece 3; A-597, A-640 part 4)
+Applied in the same change to:
+- §4.17.1's policy statuses (a status after A-622 part 3's: where the matcher lives);
+- GAPS (the §4.17 entry);
+- `crates/vcs` (`wildmatch.rs`, moved from `crates/server`; `wildmatch/reference.rs`, its oracle as a file of its own;
+  `lib.rs`; `Cargo.toml`'s description);
+- `crates/server` (`lib.rs`: the module gone, its oracle compiled for the tests; `vcs_policy.rs`: the imports and the
+  docs' links; `Cargo.toml`: slates-vcs moved from the dev-dependencies to the dependencies).
+
+- **Why it moved.** git's `sparse:oid` filter (A-640 part 4) reads its patterns with git's glob, in slates-git, which
+  builds on slates-vcs and not on slates-server (slates-server builds on slates-git), so the matcher could not be
+  reached from there, and a second matcher would be two to hold to git. slates-vcs is the crate both build on.
+- **What moved, and what did not change.** The module whole, as a rename: its code, its docs, git's 190 vectors and
+  the generated comparison with the transcription of `dowild`. Only its visibility changed (`Glob`, `Glob::new`,
+  `Glob::matches` and `is_glob_special` are public; the rest stays private) and the doc's account of where it lives.
+  No behaviour changed.
+- **The oracle, one file in two crates' tests.** The transcription of `dowild` judges the matcher's own generated
+  cases, and it is `vcs_policy`'s oracle of git's ref patterns and Subversion's segments. It is now a file of its own
+  (`wildmatch/reference.rs`): slates-vcs declares it under `#[cfg(test)]`, and slates-server's `lib.rs` compiles the
+  same file under `#[cfg(test)]` with `#[path]`, as other crates' tests compile the server's test support
+  (`crates/api/tests/api.rs`). Rejected: a cargo feature that slates-server's tests turn on, the route first planned.
+  A feature's code compiles as product code, where the lint wall denies the transcription's indexing
+  (`clippy::indexing_slicing`; clippy.toml's `allow-indexing-slicing-in-tests` covers `#[cfg(test)]` code alone), and
+  passing it would mean rewriting git's lines. Also rejected: a copy (two oracles to keep equal), and `vcs_policy`'s
+  oracle reading the product matcher (an oracle that is the code it checks).
+- **Tests** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r61, over main a6306963e with this change
+  (`agents/g296-wildmatch-check` at d9528b6f2):
+  `cargo test --locked -p slates-server --lib -- vcs_policy:: vcs_http::git::tests:: lfs::tests:: --test-threads=4`
+  29 of 29: `vcs_policy`'s 15 (its oracle reading the transcription through the included file) and its two callers'
+  tests, the HTTP edge's git site 10 (its gate is `reaches`) and LFS 4 (its access is `admit`);
+  `cargo test --locked -p slates-vcs --lib wildmatch` 3 of 3, the module's own (git's 190 vectors, a long starry
+  pattern answered without recursion, the generated comparison with the transcription);
+  `cargo fmt -p slates-server -- --check` and `cargo fmt -p slates-vcs -- --check` clean. Earlier, on Windows x86_64
+  (jupiter, kiln r144, over 0cd28dead): `cargo test --locked -p slates-vcs --lib` 68 of 68. No integration target
+  reaches the matcher or the policy: `vcs_http` and `lfs` have no caller outside tests yet, and no target under
+  `crates/*/tests` names either. The server's runs on Linux and Windows are owed.
