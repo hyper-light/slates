@@ -10244,6 +10244,12 @@ pub(crate) fn admit_clone(
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
   let allowed = volume_core.set_inode_allowance(clone_allowance);
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  // And its namespace dimension (§4.2), as a create's admission and a restart's set it: a create's share, but never
+  // below the entries the clone holds, which are its snapshot's (A-549). It reserves nothing, so it is set from the
+  // clone's own count. Before A-572 a clone carried no entry allowance until a restart set one.
+  let entries = entry_allowance(size).max(volume_core.entry_usage().0);
+  let entries_allowed = volume_core.set_entry_allowance(entries);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, entries_allowed);
   // A dynamic clone's slots become its version hold, returned with it at teardown, never a reserved credit (A-342).
   let version_credit = match version_credit {
     Some(credit) if dynamic => {
@@ -23514,12 +23520,13 @@ fn nfs_quantile(state: &ShardState, times: NfsTimes, ppm: u64) -> Option<u64> {
 }
 
 /// A-549: a clone's admission sizes its version slots and its allowance by the inodes its snapshot's tree holds, not by
-/// what its origin holds at the clone (A-541's sibling).
+/// what its origin holds at the clone (A-541's sibling). A-572: it admits the clone's namespace dimension too, an entry
+/// allowance never below the entries its snapshot holds.
 #[cfg(test)]
 mod clone_admission_tests {
   use super::{
     NamePolicy, ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch,
-    inode_allowance, to_db_volume,
+    entry_allowance, inode_allowance, to_db_volume,
   };
 
   /// Format: the uid of the volumes' owner, who may snapshot and clone them.
@@ -23532,6 +23539,8 @@ mod clone_admission_tests {
   const PAST_FAIR: u64 = 8;
   /// Shape: the files the dynamic origin holds at its snapshot.
   const DYNAMIC_FILES: u64 = 12;
+  /// Shape: the files the small origin of the entry test holds at its snapshot.
+  const FEW_FILES: u64 = 3;
   /// Format: a file's mode.
   const FILE_MODE: u32 = 0o644;
 
@@ -23705,6 +23714,107 @@ mod clone_admission_tests {
       hold, count,
       "the clone holds a version slot for each inode it holds"
     );
+  }
+
+  /// Links `count` more names `prefix-n` to the file `target` in `volume`'s root.
+  pub(super) fn link_names(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    target: slates_vfs::ids::InodeNo,
+    (prefix, count): (&str, u64),
+  ) {
+    on_core(state, volume, |core, store| {
+      let root = core.root_inode(store).unwrap();
+      for n in 0..count {
+        core
+          .link_no(store, root, &format!("{prefix}-{n}"), target)
+          .unwrap();
+      }
+    });
+  }
+
+  /// The entries a walk of `volume`'s namespace from its root reaches, then its entry count and its allowance.
+  pub(super) fn entries_of(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+  ) -> (u64, u64, u64) {
+    on_core(state, volume, |core, store| {
+      let mut walked = 0;
+      let mut directories = vec![core.root_inode(store).unwrap()];
+      while let Some(directory) = directories.pop() {
+        for row in core.readdir_no(store, directory).unwrap() {
+          walked += 1;
+          if row.kind == slates_vfs::inode::Kind::Dir {
+            directories.push(row.inode);
+          }
+        }
+      }
+      let (count, allowance) = core.entry_usage();
+      (walked, count, allowance)
+    })
+  }
+
+  /// A-572 (A-549's sweep). Do: make a bounded origin holding a file, raise its entry allowance past its share (as a
+  /// restart floors one at the entries it recovered) and link the file until its names pass the share by
+  /// [`PAST_FAIR`], snapshot it, remove names until it holds fewer than the share, and clone the snapshot; and clone a
+  /// snapshot of a second origin holding a few files. Expect each clone's entry allowance to be the share, or its
+  /// snapshot's entries where those are more, its entry count the entries a walk of its namespace reaches, and no
+  /// allowance refused. Before A-572 a clone was admitted with no entry allowance (`u64::MAX`) until a restart set one.
+  #[test]
+  fn a_clone_is_admitted_with_an_entry_allowance_never_below_its_snapshots_entries() {
+    let (share, floored, few, refused) = crate::daemon::audit_on_shard(|state| {
+      let size = SizeClass::Bounded {
+        limit: BOUNDED_BYTES,
+      };
+      let share = entry_allowance(size);
+      let named = made(state, "named", size);
+      let file = on_core(state, named, |core, store| {
+        let root = core.root_inode(store).unwrap();
+        core.create_file_no(store, root, "f", FILE_MODE).unwrap()
+      });
+      on_core(state, named, |core, _| {
+        core.set_entry_allowance(share + PAST_FAIR).unwrap();
+      });
+      // The file's own name and its links: the share and `PAST_FAIR` names past it, all the raised allowance admits.
+      link_names(state, named, file, ("l", share + PAST_FAIR - 1));
+      // One name more than those past the share: the origin then holds one fewer than its share.
+      let (_, floored) = snapshot_then_clone(state, named, ("l", PAST_FAIR + 1), "named-clone");
+      let floored = entries_of(state, floored);
+      let few_origin = made(state, "few", size);
+      make_files(state, few_origin, "f", FEW_FILES);
+      let (_, few) = snapshot_then_clone(state, few_origin, ("f", 1), "few-clone");
+      let few = entries_of(state, few);
+      let refused = state
+        .refusals
+        .get(VOLUME_ALLOWANCE_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (share, floored, few, refused)
+    });
+    let (walked, count, allowance) = floored;
+    assert_eq!(
+      count, walked,
+      "the floored clone counts the entries its namespace holds"
+    );
+    assert_eq!(
+      walked,
+      share + PAST_FAIR,
+      "the floored clone holds its snapshot's names, past the share"
+    );
+    assert_eq!(
+      allowance, walked,
+      "the floored clone's entry allowance is the entries its snapshot holds, above the share"
+    );
+    let (walked, count, allowance) = few;
+    assert_eq!(
+      count, walked,
+      "the small clone counts the entries its namespace holds"
+    );
+    assert_eq!(
+      allowance, share,
+      "the small clone's entry allowance is a create's share"
+    );
+    assert_eq!(refused, 0, "no allowance was refused");
   }
 }
 
