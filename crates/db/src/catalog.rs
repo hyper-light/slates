@@ -506,6 +506,33 @@ pub struct SnapshotRecord {
   pub taken_ns: u64,
 }
 
+/// What a captured clone's move carried of its capture (§4.15 `capture_base`, A-291's move; A-503, stage 2 of a captured
+/// clone's landing): the identity of the head the move handed over (its archive manifest's, the same wherever the tree
+/// is exported), and the captured state of every path where the capture and that head differ, in
+/// `slates_vfs::captured::CarriedCapture`'s canonical encoding (opaque here: this crate keeps it, the volume core reads
+/// it). Shipped in the volume's catalog register, so the member a move hands the volume to judges its landings against
+/// the capture as the member that made the clone did.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CarriedRecord {
+  /// The head the carried paths are relative to, by its archive manifest's identity.
+  pub head: [u8; 32],
+  /// The carried paths, encoded by the volume core.
+  pub entries: Vec<u8>,
+}
+
+/// A volume's carried capture as a partition keeps it (A-503): what its catalog ships ([`CarriedRecord`]) and, when this
+/// node holds that head's tree as one of the volume's snapshots, that snapshot, the **mark** its landings are judged from.
+/// The mark is this node's own snapshot id, so it is never shipped.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CarriedCaptureRecord {
+  /// The volume.
+  pub volume: VolumeId,
+  /// What its catalog ships.
+  pub carried: CarriedRecord,
+  /// Its snapshot holding the head `carried` is relative to, when this node holds one.
+  pub mark: Option<SnapshotId>,
+}
+
 /// A lineage edge: a clone and its origin.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LineageEdge {
@@ -1284,4 +1311,96 @@ pub struct SealKeyRecord {
   /// The wrapped record: [`SEAL_KEY_RECORD_BYTES`] long, or for the node's recipient its sealed form, at most
   /// [`SEAL_RECIPIENT_RECORD_MAX`].
   pub record: Vec<u8>,
+}
+
+/// The version-control tool a repository serves (§4.17, D-28): the protocols its clients speak and the rules its pushes
+/// keep (§4.17.2 git, §4.17.3 Mercurial, §4.17.4 Subversion).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VcsTool {
+  /// git.
+  Git,
+  /// Mercurial.
+  Mercurial,
+  /// Subversion.
+  Subversion,
+}
+
+/// How a repository names its objects (§4.17.1 "The repository and its greens", item 1): fixed at creation, since every
+/// object id, index row and wire answer of the repository is in it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectFormat {
+  /// SHA-1 names: git's default object format and Mercurial's node ids.
+  Sha1,
+  /// SHA-256 names: git's `object-format=sha256`.
+  Sha256,
+  /// Revision numbers: Subversion, which names a node by its path and revision, not by a hash.
+  Revisions,
+}
+
+/// A repository id (§4.17.1; A-515): 128 bits minted as a volume id is (`slates_server::verbs::fresh_volume_id`): the
+/// creator host in the high 8 bytes, then the owner partition (bytes 8-9), then a per-host counter. The partition is
+/// where the repository's record and every green of its namespace live.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RepositoryId {
+  /// The bytes.
+  pub bytes: [u8; 16],
+}
+
+/// Format: the bytes of a 128-bit id that name its owner partition (8 and 9, big-endian), as a volume id's do
+/// (`slates_server::verbs::owner_of`).
+const ID_PARTITION_BYTES: std::ops::Range<usize> = 8..10;
+
+/// The owner partition an id's bytes 8-9 name.
+fn id_partition(bytes: &[u8; 16]) -> u16 {
+  match bytes.get(ID_PARTITION_BYTES) {
+    Some(&[high, low]) => u16::from_be_bytes([high, low]),
+    _ => 0,
+  }
+}
+
+impl RepositoryId {
+  /// The partition that owns the repository and every green of its namespace.
+  pub fn partition(&self) -> u16 {
+    id_partition(&self.bytes)
+  }
+}
+
+impl VolumeId {
+  /// The partition the id names (bytes 8-9): where the volume was created and is owned within its node.
+  pub fn partition(&self) -> u16 {
+    id_partition(&self.bytes)
+  }
+}
+
+/// A repository (§4.17.1 "The repository and its greens"; A-515): a name a tool's clients reach, its tool and object
+/// format, its default branch, and its owner. Its namespace, each branch name bound to the green whose versions are the
+/// branch's values, is held beside it as [`BranchRecord`]s, so binding one branch never rewrites the others.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryRecord {
+  /// The id; its partition bytes name the partition that holds it.
+  pub id: RepositoryId,
+  /// The name clients reach it by: unique on its partition, which a stable hash of the name chooses
+  /// (`slates_server::verbs::owner_of_name`), so unique everywhere.
+  pub name: String,
+  /// The tool it serves.
+  pub tool: VcsTool,
+  /// How it names its objects.
+  pub format: ObjectFormat,
+  /// The branch a client gets when it names none (git's `HEAD`): a name that may be bound to no green yet, as git's
+  /// `HEAD` may name an unborn branch. `None` until set.
+  pub default_branch: Option<String>,
+  /// Who created it, and holds every right on it until a policy says otherwise (§4.13).
+  pub owner: Principal,
+}
+
+/// One name of a repository's namespace (§4.17.1; A-515): a branch, bound to the green whose versions are its values.
+/// A green is bound to at most one name, and lives on its repository's partition.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct BranchRecord {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The branch's name.
+  pub name: String,
+  /// The green.
+  pub green: VolumeId,
 }

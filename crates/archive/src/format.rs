@@ -173,13 +173,17 @@ pub enum ArchiveError {
   BadName,
   /// Two entries restore to one path.
   DuplicatePath,
-  /// Restoring needs more bytes than the caller admitted, refused before any allocation.
+  /// Restoring needs more bytes than the caller admitted, refused before any allocation; or the allocator refused the
+  /// room a decode admitted for a payload or a manifest (`budget` zero: no budget was named).
   OverBudget {
-    /// The bytes the restore needs: every file's length and one chunk's decode space.
+    /// The bytes the restore needs: every file's length and one chunk's decode space; or the room a decode asked.
     needed: u64,
     /// The bytes the caller admitted.
     budget: u64,
   },
+  /// A section does not lie where the trailer's index names it: the chunk records not at the header's end, or the
+  /// manifest or the seek table not where the section before it ends. A layout no writer makes (A-494).
+  BadLayout,
 }
 
 impl core::fmt::Display for ArchiveError {
@@ -215,6 +219,7 @@ impl core::fmt::Display for ArchiveError {
           "restoring needs {needed} bytes, past the {budget} admitted"
         )
       }
+      Self::BadLayout => f.write_str("archive sections do not lie where its index names them"),
     }
   }
 }

@@ -1624,6 +1624,12 @@ impl Client {
     self.end.unanswered_wakes()
   }
 
+  /// Parks a look at the daemon's life ended, the daemon found alive and the client parked again (macOS, Windows;
+  /// A-506; `ClientEnd::parks_ended_by_looks`).
+  pub fn parks_ended_by_looks(&self) -> u64 {
+    self.end.parks_ended_by_looks()
+  }
+
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     // Every `ack_every` requests, the client acknowledges them first (one request), so the daemon's retained records

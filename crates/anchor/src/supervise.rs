@@ -259,6 +259,18 @@ struct DeviceHold {
   logged: crate::handles::RefusalLog<crate::held::HoldRefusal>,
 }
 
+/// What a spawn is handed of the anchor's holdings (A-462): the environment naming the handoff table, and the table's
+/// sealed object, which the caller keeps until the spawn holds its own copy of its descriptor. Nothing of either where
+/// the anchor holds no device channel.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct HeldHandoff {
+  /// The variables to set: the table's pointer.
+  env: Vec<(String, String)>,
+  /// The table's object.
+  table: Option<crate::held::TableObject>,
+}
+
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
 /// every message an attachment's life sends, so a drain is bounded whatever a daemon sends, and a daemon at
 /// the bound with every attachment changing state at once is drained in one call.
@@ -526,14 +538,18 @@ impl Supervisor {
     self.devices.as_ref().map_or(0, |hold| hold.refused)
   }
 
-  /// The environment handing the device channel and every held device to a daemon about to be spawned, each
-  /// descriptor made inheritable. A descriptor that cannot be made inheritable is left out (and counted): handing
-  /// a number the daemon does not inherit would have it adopt whatever that number names in its own table.
+  /// The handoff to a daemon about to be spawned (A-462): the device channel and every held device, connection and copy,
+  /// each descriptor made inheritable, in one table written into a sealed, read-only object whose descriptor the spawn
+  /// inherits too ([`crate::held::TableObject`]), and the environment naming it ([`crate::held::ENV_HELD`]). The caller
+  /// keeps the object until the spawn holds its own copy. A descriptor that cannot be made inheritable is left out (and
+  /// counted): handing a number the daemon does not inherit would have it adopt whatever that number names in its own
+  /// table. A table that cannot be made refuses the spawn ([`AnchorError::Handoff`]): a daemon started without it would
+  /// take every held entry for none.
   #[cfg(unix)]
-  fn device_env(&mut self) -> Vec<(String, String)> {
+  fn device_env(&mut self) -> Result<HeldHandoff, AnchorError> {
     self.drain_devices();
     let Some(hold) = self.devices.as_mut() else {
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     };
     let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
     if let Err(e) = inheritable(&hold.daemon_end) {
@@ -541,7 +557,7 @@ impl Supervisor {
         call: "fcntl(F_SETFD) on the channel",
         code: e.raw_os_error(),
       });
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     }
     let mut lost = Vec::new();
     for (attachment, held) in hold.held.iter() {
@@ -581,20 +597,24 @@ impl Supervisor {
         reason: "a held copy could not be made inheritable",
       });
     }
-    let value = hold
-      .held
-      .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
-    vec![
-      (crate::held::ENV_DEVICES.to_owned(), value),
-      (
-        crate::held::ENV_CONNECTIONS.to_owned(),
-        hold.held.connections_env_value(),
-      ),
-      (
-        crate::held::ENV_COPIES.to_owned(),
-        hold.held.copies_env_value(),
-      ),
-    ]
+    let table = crate::held::Table {
+      devices: hold
+        .held
+        .devices_part(std::os::fd::AsFd::as_fd(&hold.daemon_end)),
+      connections: hold.held.connections_part(),
+      copies: hold.held.copies_part(),
+    };
+    let object = crate::held::TableObject::new(&table).map_err(AnchorError::Handoff)?;
+    rustix::io::fcntl_setfd(object.descriptor(), rustix::io::FdFlags::empty()).map_err(|e| {
+      AnchorError::Handoff(crate::held::HoldRefusal::Os {
+        call: "fcntl(F_SETFD) on the handoff table",
+        code: e.raw_os_error(),
+      })
+    })?;
+    Ok(HeldHandoff {
+      env: vec![(crate::held::ENV_HELD.to_owned(), object.pointer())],
+      table: Some(object),
+    })
   }
 
   /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
@@ -656,10 +676,16 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
-    // And the hold channel with every FUSE device (A-61) and NFS connection (A-113) held: the daemon takes back the
-    // mounts it recovers and answers the connections the dead daemon left.
+    // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
+    // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
+    // dead daemon left. The table's object is kept until the spawn holds its own copy.
     #[cfg(unix)]
-    env.extend(self.device_env());
+    let HeldHandoff {
+      env: held_env,
+      table: _table,
+    } = self.device_env()?;
+    #[cfg(unix)]
+    env.extend(held_env);
     env.extend(self.environment.iter().cloned());
     // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
     // before the next reads it. No daemon runs now, so nothing else writes it.

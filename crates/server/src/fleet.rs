@@ -403,15 +403,15 @@ fn adopt_inherited(
 }
 
 /// Takes ownership of a descriptor the supervisor handed over at `raw`: a fleet serve socket
-/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::held::ENV_DEVICES`,
-/// `crate::fuse_hold`).
+/// (`ENV_FLEET_SERVE`), or the handoff table's object and the descriptors it names, the device channel, the held
+/// devices, connections and copies (`slates_anchor::held::ENV_HELD`, A-462; `crate::fuse_hold`).
 #[cfg(unix)]
 pub(crate) fn inherited_descriptor(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {
   use std::os::fd::FromRawFd;
   // SAFETY: the supervisor made this descriptor inheritable and handed it across the spawn at this number
-  // (`ENV_FLEET_SERVE` or `ENV_DEVICES`; every number non-negative and distinct from the others in its
-  // variable, checked by the parser); this process adopts each once, at start, before anything else could claim
-  // the number, so the `OwnedFd` is its single owner and closes it on drop. The supervisor keeps its own copy.
+  // (`ENV_FLEET_SERVE`, or `ENV_HELD` and the table it names; every number non-negative and distinct from the others,
+  // checked by the parsers); this process adopts each once, at start, before anything else could claim the number, so
+  // the `OwnedFd` is its single owner and closes it on drop. The supervisor keeps its own copy.
   unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
 }
 
@@ -2533,7 +2533,15 @@ fn owed_catalog(
     state,
     config,
     (catalog, record.catalog_version),
-    crate::catalog::CatalogValue::of(record).to_record_bytes(),
+    crate::catalog::CatalogValue::of(
+      record,
+      state
+        .db
+        .partition()
+        .carried(record.id)
+        .map(|(carried, _)| carried),
+    )
+    .to_record_bytes(),
     local,
   );
   let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
@@ -3404,13 +3412,17 @@ fn heal_for(
   let configuration = state.fleet.configuration();
   let quorum = configuration.quorum;
   let candidates = configuration.place(object).candidates;
+  let adopted = crate::takeover::adopted_here(state, object);
   let (heal, found) = heal_decision(
     local,
     region,
     &state.council.configuration().members,
     &candidates,
-    quorum,
+    (quorum, adopted),
   );
+  if adopted && heal == Some(Heal::Replace) && found.named_outside_candidates {
+    state.count(HEAL_ADOPTED_REPLACED, 1);
+  }
   for (seen, counter) in [
     (found.named_gone, HEAL_NAMED_GONE),
     (found.named_short, HEAL_NAMED_SHORT),
@@ -3439,10 +3451,14 @@ struct HealFindings {
 }
 
 /// The heal for a placement naming `region`, owned by `local`, under the council's `members` and the object's current
-/// `candidates` at `quorum` (§4.10 "the healer"; A-276). Pure, so the rule is tested at `f = 0` and on a fleet alike:
+/// `candidates` at `quorum`, `adopted` when a takeover round here adopted the volume and has not confirmed (§4.10 "the
+/// healer"; A-276, A-529). Pure, so the rule is tested at `f = 0` and on a fleet alike:
 /// - a **replace** when a remote holder it names is no longer a member, which no re-offer can reach, or when it names
 ///   fewer than `f + 1` holders (one recorded before the fleet's `f` grew): the content is placed on the current cohort
 ///   at the next sequence and the head republished there;
+/// - a **replace** too for an adopted volume whose placement names a member outside its candidates (A-529): its round
+///   confirms only once it serves the volume from its own placement (`takeover::adopted_served`), and a restore would
+///   leave that member named for good;
 /// - otherwise a **restore** of the holders it names that can be put to: the owner, which holds its own content, and the
 ///   named remote holders among the candidates, the only ones that admit a placement from this owner
 ///   (`content_authority`). A named member outside the candidates keeps the copy its head names and serves reads of it,
@@ -3457,7 +3473,7 @@ fn heal_decision(
   region: &[u64],
   members: &[HostId],
   candidates: &[HostId],
-  quorum: Quorum,
+  (quorum, adopted): (Quorum, bool),
 ) -> (Option<Heal>, HealFindings) {
   let mut named: Vec<HostId> = Vec::with_capacity(region.len());
   for host in region.iter().map(|host| HostId(*host)) {
@@ -3472,7 +3488,7 @@ fn heal_decision(
     named_short: copies < u64::from(quorum.f).saturating_add(1),
     named_outside_candidates: remote().any(|host| !candidates.contains(host)),
   };
-  if found.named_gone || found.named_short {
+  if found.named_gone || found.named_short || (adopted && found.named_outside_candidates) {
     return (Some(Heal::Replace), found);
   }
   // The holders the restore ends with: the owner when the placement names it, and the named remote holders it can put
@@ -3503,6 +3519,12 @@ const HEAL_NAMED_SHORT: &str = "fleet.heal.named_short";
 /// it, and only the named candidates are restored.
 /// Format: a refusal name in the daemon's status report.
 const HEAL_NAMED_OUTSIDE_CANDIDATES: &str = "fleet.heal.named_outside_candidates";
+
+/// The status count under which the healer records a replace of an adopted volume's placement that named a member
+/// outside the volume's candidates (A-529): a restore would have left that member named, and the takeover round that
+/// adopted the volume waits to confirm until it serves it from its own placement. Format: a refusal name in the daemon's
+/// status report.
+const HEAL_ADOPTED_REPLACED: &str = "fleet.heal.adopted_replaced";
 
 /// The status count under which the healer records a heal that ran its bound ([`heal_bound_ns`]) without finishing
 /// (every put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later
@@ -11584,6 +11606,163 @@ mod discovery_wait_tests {
 #[cfg(test)]
 mod tests {
 
+  /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
+  /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
+  /// ([`super::install_slice`]), as the coordinator's period drives it ([`super::drive_install_walk`]).
+  fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
+    let regional = state.council.configuration().clone();
+    let Some(configuration) = regional.configuration_for(local) else {
+      return;
+    };
+    let version = configuration.version;
+    crate::readmission::install_placement(state, configuration, &regional.members);
+    state.install_walk = Some(super::InstallWalk {
+      version,
+      after: None,
+      walking: false,
+    });
+    // Every turn reaches at least one copy, so the walk ends within one turn a copy and one more.
+    let turns = state.holder_records.len().saturating_add(1);
+    for _ in 0..turns {
+      if !super::install_slice(state, local, version) {
+        return;
+      }
+    }
+  }
+
+  /// What a holder's copy of a moved object answers once its install's walk has reached it
+  /// ([`a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it`]).
+  #[derive(Debug)]
+  struct Followed {
+    /// The member the object moved from (its creator) and the member it moved to.
+    from: super::HostId,
+    to: super::HostId,
+    /// The owner this node's routing names for the object.
+    routed: Option<super::HostId>,
+    /// The owner the copy's authority names.
+    authority: Option<super::HostId>,
+    /// How the copy judges the next record from the move's new owner, and from the owner it left.
+    from_new: Option<Result<(), slates_db::register::RegisterError>>,
+    from_old: Option<Result<(), slates_db::register::RegisterError>>,
+    /// The copies counted followed (`fleet.move.followed`).
+    followed: u64,
+  }
+
+  /// A-487, goal 85's bug 2, closed by A-485's rule (§4.8 "Authority scope", A-291's switch through A-398's walk). Do: on
+  /// a holder in a region of three members at `f = 1`, hold a copy of an object its creator owns, then commit the
+  /// creator's move of it to the third member and install that configuration through the walk as the coordinator drives
+  /// it ([`walk_the_install`]). Expect the copy routed to the new owner, its authority naming the new owner, its next
+  /// record from the new owner accepted and one from the creator refused `Unauthorized`, and the copy counted followed.
+  /// Before A-485 the walk's per-copy step followed a move only for a copy routed to a retired host, so the copy kept the
+  /// creator's authority and refused every record and content put of the new owner: a volume moved back to its creator
+  /// could never place its head off its owner, and the move test's answers alternated `Moving` and
+  /// `MoveRefused { Unplaced }` until its deadline (the third node refusing 8,006 records and 2,663 content puts
+  /// `Unauthorized`, quiet Mac Studio, main 3022c6894).
+  #[test]
+  fn a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, ObjectId, Quorum, Record};
+      let local = state.fleet.host();
+      let (from, to) = (super::HostId(local.0 ^ 1), super::HostId(local.0 ^ 2));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      for host in [from, to] {
+        assert!(
+          state
+            .council
+            .propose(Reconfiguration::Admit { host, domain: None })
+        );
+      }
+      walk_the_install(state, local);
+      let object = ObjectId::new(from, 7);
+      let generation = state.fleet.configuration().version;
+      let mut copy = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: from,
+        },
+      );
+      copy
+        .accept(&Record {
+          owner: from,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"the head before the move".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, copy);
+      state.fleet.track_object_owner(object, from);
+      assert!(state.council.propose(Reconfiguration::Move {
+        object,
+        from,
+        to,
+        cohort: vec![from, local, to],
+      }));
+      walk_the_install(state, local);
+      let generation = state.council.configuration().version;
+      let fence = state
+        .holder_records
+        .get(&object)
+        .map(|copy| copy.persisted().0);
+      let next = |owner| {
+        fence.map(|epoch| Record {
+          owner,
+          object,
+          sequence: 1,
+          epoch,
+          generation,
+          value: b"the next head".to_vec(),
+        })
+      };
+      Followed {
+        from,
+        to,
+        routed: state.fleet.object_owner(object),
+        authority: state.holder_records.get(&object).map(Acceptor::owner),
+        from_new: next(to).map(|record| super::check_held_record(state, local, to, &record)),
+        from_old: next(from).map(|record| super::check_held_record(state, local, from, &record)),
+        followed: state
+          .refusals
+          .get("fleet.move.followed")
+          .copied()
+          .unwrap_or(0),
+      }
+    });
+    assert_eq!(
+      seen.routed,
+      Some(seen.to),
+      "the copy is routed to the move's new owner: {seen:?}"
+    );
+    assert_eq!(
+      seen.authority,
+      Some(seen.to),
+      "the copy's authority names the new owner: {seen:?}"
+    );
+    assert_eq!(
+      seen.from_new,
+      Some(Ok(())),
+      "the new owner's next record is accepted: {seen:?}"
+    );
+    assert_eq!(
+      seen.from_old,
+      Some(Err(slates_db::register::RegisterError::Unauthorized)),
+      "the old owner's ({:?}) is refused: {seen:?}",
+      seen.from
+    );
+    assert_eq!(seen.followed, 1, "the copy is counted followed: {seen:?}");
+  }
+
   /// CLAUDE.md §2 item 8 with §4.8's paged takeover: a taken-over object's wait for a register the still-paging round
   /// of its departed owner may yet bring reads that round's page advances, which the bound takes as its progress; every
   /// other wait, and every wait once the round stops paging, reads none and counts. Do: ask for the round of a catalog
@@ -12116,26 +12295,45 @@ mod tests {
   /// candidates, one naming a departed holder, one naming fewer than `f + 1` holders, one whose named holder is a member
   /// outside the candidates, and one naming a holder twice. Expect: no heal at `f = 0`, since the owner's copy is the
   /// whole placement; a restore of exactly the named candidates with the owner; a replace for the departed and for the
-  /// short, each found; no heal when no named candidate is left, the outsider found; and the repeat counted once.
+  /// short, each found; no heal when no named candidate is left, the outsider found, but a replace for the same
+  /// placement of an adopted volume (A-529); and the repeat counted once.
   /// Before (2026-11-17), a placement naming no remote holder was replaced, so at `f = 0` every healer step advanced the
   /// head's sequence by one, for good.
   #[test]
   fn the_heal_restores_named_candidates_and_replaces_only_a_departed_or_short_placement() {
     let (owner, b, c, d) = (HostId(1), HostId(2), HostId(3), HostId(4));
-    let lone = heal_decision(owner, &[owner.0], &[owner], &[owner], Quorum { f: 0 });
+    let lone = heal_decision(
+      owner,
+      &[owner.0],
+      &[owner],
+      &[owner],
+      (Quorum { f: 0 }, false),
+    );
     assert_eq!(
       lone,
       (None, HealFindings::default()),
       "f = 0: the owner's own copy is the whole placement; nothing to heal"
     );
     let fleet = [owner, b, c];
-    let restored = heal_decision(owner, &[owner.0, b.0], &fleet, &fleet, Quorum { f: 1 });
+    let restored = heal_decision(
+      owner,
+      &[owner.0, b.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       restored,
       (Some(Heal::Restore(vec![owner, b])), HealFindings::default()),
       "every named holder a member and a candidate: restore exactly them"
     );
-    let departed = heal_decision(owner, &[owner.0, d.0], &fleet, &fleet, Quorum { f: 1 });
+    let departed = heal_decision(
+      owner,
+      &[owner.0, d.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       departed,
       (
@@ -12148,7 +12346,7 @@ mod tests {
       ),
       "a named holder that left: replace"
     );
-    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, Quorum { f: 1 });
+    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, (Quorum { f: 1 }, false));
     assert_eq!(
       short,
       (
@@ -12160,7 +12358,13 @@ mod tests {
       ),
       "fewer than f + 1 named: replace"
     );
-    let moved = heal_decision(owner, &[owner.0, c.0], &fleet, &[owner, b], Quorum { f: 1 });
+    let moved = heal_decision(
+      owner,
+      &[owner.0, c.0],
+      &fleet,
+      &[owner, b],
+      (Quorum { f: 1 }, false),
+    );
     assert_eq!(
       moved,
       (
@@ -12172,7 +12376,31 @@ mod tests {
       ),
       "the named holder a member outside the candidates: left as its head names it, found"
     );
-    let repeated = heal_decision(owner, &[owner.0, b.0, b.0], &fleet, &fleet, Quorum { f: 2 });
+    let adopted = heal_decision(
+      owner,
+      &[owner.0, c.0],
+      &fleet,
+      &[owner, b],
+      (Quorum { f: 1 }, true),
+    );
+    assert_eq!(
+      adopted,
+      (
+        Some(Heal::Replace),
+        HealFindings {
+          named_outside_candidates: true,
+          ..HealFindings::default()
+        }
+      ),
+      "an adopted volume naming a member outside its candidates: replace, so its round can confirm (A-529)"
+    );
+    let repeated = heal_decision(
+      owner,
+      &[owner.0, b.0, b.0],
+      &fleet,
+      &fleet,
+      (Quorum { f: 2 }, false),
+    );
     assert_eq!(
       repeated,
       (

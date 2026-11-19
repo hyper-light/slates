@@ -463,26 +463,7 @@ fn sender_pid(message: &Received) -> Option<u32> {
 
 /// The parent of process `pid`, from the kernel's process table; `None` when the kernel answers nothing for it.
 fn parent_of(pid: u32) -> Option<u32> {
-  let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-  let size = c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
-  // SAFETY: `info` is a live, writable, zero-initialized `proc_bsdinfo` of `size` bytes; the call writes at most
-  // `size` bytes into it and returns how many it wrote.
-  let written = unsafe {
-    libc::proc_pidinfo(
-      c_int::try_from(pid).ok()?,
-      libc::PROC_PIDTBSDINFO,
-      0,
-      info.as_mut_ptr().cast(),
-      size,
-    )
-  };
-  if written != size {
-    return None;
-  }
-  // SAFETY: zero-initialized and then written whole by the kernel (`written == size`); every field is a plain integer
-  // or byte array, for which any bytes are a value.
-  let info = unsafe { info.assume_init() };
-  Some(info.pbi_ppid)
+  crate::exit_watch::bsd_info(pid).map(|info| info.pbi_ppid)
 }
 
 /// Format: the audit token's offset in `mach_msg_audit_trailer_t`: after its type, size, sequence (4 bytes each) and

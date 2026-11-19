@@ -95,6 +95,10 @@ pub enum DbError {
   Anchor(AnchorError),
   /// The memory crate refused.
   Memory(MemError),
+  /// A repository's namespace names greens only (§4.17.1, A-515): the volume named is not one.
+  NotGreen,
+  /// A repository's or a branch's name is empty or holds a NUL byte (§4.17.1, A-515).
+  InvalidName,
 }
 
 impl fmt::Display for DbError {
@@ -137,6 +141,8 @@ impl fmt::Display for DbError {
       Self::Wire(e) => write!(f, "encoding: {e}"),
       Self::Anchor(e) => write!(f, "segment: {e}"),
       Self::Memory(e) => write!(f, "memory: {e}"),
+      Self::NotGreen => f.write_str("not a green volume"),
+      Self::InvalidName => f.write_str("an empty name, or one holding a NUL byte"),
     }
   }
 }

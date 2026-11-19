@@ -1188,11 +1188,9 @@ fn device_child() {
   if std::env::var(CHILD_DEVICES).is_err() {
     return;
   }
-  let handed =
-    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
-  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment;
-  // this process adopts it once, here, so the `OwnedFd` is its single owner.
+  let inherited = handed_devices();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table; this process adopts
+  // it once, here, so the `OwnedFd` is its single owner.
   let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
   let Some(device) = inherited.devices.first() else {
     let (reader, writer) = rustix::pipe::pipe().unwrap();
@@ -1248,7 +1246,9 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
   // is a crash loop, which ends the test's watch.
   let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
   // Shape: room for this test's one device.
-  supervisor.hold_descriptors(4, 4, 4).unwrap();
+  supervisor
+    .hold_descriptors(HELD_BOUND, HELD_BOUND, HELD_BOUND)
+    .unwrap();
   // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child
   // ignores this variable.
   unsafe {
@@ -1411,6 +1411,258 @@ const DEVICE_REFUSAL_LINE: &str = "a hold message was refused";
 /// Format: the garbling daemon's exit code, distinct from libtest's, so a run that selected no test cannot pass.
 #[cfg(unix)]
 const GARBLER_EXIT: i32 = 9;
+/// Shape: the devices, connections and copies the device fixtures' anchors hold at most, each: room for their one device.
+#[cfg(unix)]
+const HELD_BOUND: usize = 4;
+
+/// The devices part of the handoff table the anchor handed this child (A-462), and the table's length: the table read
+/// from the sealed object `ENV_HELD` names, the object taken as this process's own and closed once read, against bounds
+/// of `devices` devices and the fixtures' connections and copies.
+#[cfg(unix)]
+fn handed_table(devices: usize) -> (slates_anchor::held::Inherited, usize) {
+  use slates_anchor::held;
+  use std::os::fd::{FromRawFd, OwnedFd};
+  let pointer = std::env::var(held::ENV_HELD).expect("the anchor handed its table over");
+  let bounds = held::TableBounds {
+    devices,
+    connections: HELD_BOUND,
+    copies: HELD_BOUND,
+  };
+  let (table, len) = held::parse_pointer(&pointer, bounds).unwrap();
+  // SAFETY: the anchor made the table's object inheritable and named its number in the environment; this process adopts
+  // it once, here, so the `OwnedFd` is its single owner.
+  let object = unsafe { OwnedFd::from_raw_fd(table) };
+  let text = held::read_table(object, len).unwrap();
+  let devices = held::parse_devices(&held::decode_table(&text).unwrap().devices).unwrap();
+  (devices, len)
+}
+
+/// The devices part of the handoff table the anchor handed this child, against the fixtures' bounds ([`handed_table`]).
+#[cfg(unix)]
+fn handed_devices() -> slates_anchor::held::Inherited {
+  handed_table(HELD_BOUND).0
+}
+
+/// Format: the variable that makes a re-invoked test binary the full-table child (A-462).
+#[cfg(unix)]
+const CHILD_FULL_TABLE: &str = "SLATES_ANCHOR_TEST_FULL_TABLE";
+/// Format: the full-table first daemon's exit code, distinct from the successor's verdicts.
+#[cfg(unix)]
+const FULL_SENDER_EXIT: i32 = 13;
+/// Format: the full-table successor's exit code for a table within the old limit, which would prove nothing.
+#[cfg(unix)]
+const FULL_SHORT_EXIT: i32 = 14;
+/// Format: the low bits every full-table attachment carries, so each id takes all sixteen hexadecimal digits and the
+/// table passes the old limit with the fewest descriptors.
+#[cfg(unix)]
+const FULL_ID_LOW: u64 = 0xFFFF_FFFF;
+/// Format: the shortest text one full-table device takes in the devices part: `;`, sixteen digits of id, `:`, one digit
+/// of descriptor, `:` and a session at the cap in hexadecimal.
+#[cfg(unix)]
+const FULL_DEVICE_TEXT_MIN: usize = 3 + 16 + 1 + slates_anchor::held::SESSION_CAP * 2;
+/// Shape: the full table's margin past the old limit, in tenths: a tenth past it.
+#[cfg(unix)]
+const FULL_MARGIN_TENTHS: usize = 11;
+/// Shape: the descriptors the harness itself keeps open beside the held devices (its standard ones, the segment, the
+/// channel, a pipe's two ends while one is made): far more than it uses.
+#[cfg(unix)]
+const FULL_SLACK: u64 = 256;
+/// Shape: how long the full-table test waits for its two daemons (milliseconds): thousands of holds cross a datagram
+/// pair the anchor drains a step at a time, on a loaded runner.
+#[cfg(unix)]
+const FULL_WAIT_MS: u64 = 120_000;
+
+/// Derived: the bytes past which the old handoff failed its exec here: Linux's limit on one string, `MAX_ARG_STRLEN`,
+/// `PAGE_SIZE * 32` ("the limit per string is 32 pages": `execve(2)`; `include/uapi/linux/binfmts.h`).
+#[cfg(target_os = "linux")]
+fn old_handoff_limit() -> usize {
+  rustix::param::page_size().saturating_mul(32)
+}
+
+/// Measured: macOS's `ARG_MAX`, the bytes of an exec's arguments and environment together, read from the machine the
+/// test runs on (`getconf ARG_MAX`, which answers `sysconf(_SC_ARG_MAX)`; 1,048,576 on the Mac Studio, macOS 26.4,
+/// 2026-11-18), never a value frozen from one machine.
+#[cfg(target_os = "macos")]
+fn old_handoff_limit() -> usize {
+  let answer = std::process::Command::new("getconf")
+    .arg("ARG_MAX")
+    .output()
+    .expect("getconf runs");
+  assert!(
+    answer.status.success(),
+    "getconf ARG_MAX answered {answer:?}"
+  );
+  String::from_utf8(answer.stdout)
+    .expect("getconf prints text")
+    .trim()
+    .parse()
+    .expect("getconf prints ARG_MAX as a number")
+}
+
+/// Derived: the devices the full table holds: enough, each at its shortest, to pass the old limit by
+/// [`FULL_MARGIN_TENTHS`].
+#[cfg(unix)]
+fn full_devices() -> usize {
+  old_handoff_limit() / FULL_DEVICE_TEXT_MIN * FULL_MARGIN_TENTHS / 10
+}
+
+/// The full-table child (A-462): with no device handed over it is the first daemon: it sends the anchor
+/// [`full_devices`] devices (pipes), each with a session at the cap, and exits [`FULL_SENDER_EXIT`]; handed devices, it
+/// is the successor: it exits [`FULL_SHORT_EXIT`] for a table within the old limit, else 0 iff every device came back
+/// under its attachment with its session, its descriptor live. Run by the parent with `--ignored --exact`.
+#[cfg(unix)]
+#[test]
+#[ignore = "the full-table child; run by the parent with --ignored"]
+fn full_table_child() {
+  use slates_anchor::held::{self, Outgoing, SESSION_CAP};
+  use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+  if std::env::var(CHILD_FULL_TABLE).is_err() {
+    return;
+  }
+  let devices = full_devices();
+  let (inherited, len) = handed_table(devices);
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table; this process adopts
+  // it once, here, so the `OwnedFd` is its single owner.
+  let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
+  let attachment = |index: usize| (u64::try_from(index).unwrap() << 32) | FULL_ID_LOW;
+  let session = |index: usize| [u8::try_from(index % 251).unwrap(); SESSION_CAP];
+  if inherited.devices.is_empty() {
+    for index in 0..devices {
+      let (reader, _writer) = rustix::pipe::pipe().unwrap();
+      held::send(
+        channel.as_fd(),
+        &Outgoing::Hold {
+          attachment: attachment(index),
+          device: reader.as_fd(),
+        },
+      )
+      .unwrap();
+      held::send(
+        channel.as_fd(),
+        &Outgoing::Session {
+          attachment: attachment(index),
+          session: &session(index),
+        },
+      )
+      .unwrap();
+    }
+    std::process::exit(FULL_SENDER_EXIT);
+  }
+  if len <= old_handoff_limit() {
+    std::process::exit(FULL_SHORT_EXIT);
+  }
+  let right = inherited.devices.len() == devices
+    && inherited.devices.iter().enumerate().all(|(index, device)| {
+      // SAFETY: a number the anchor's table names, inherited across the spawn and open for this process's life; only
+      // borrowed for the check.
+      let live = rustix::fs::fstat(unsafe { BorrowedFd::borrow_raw(device.fd) }).is_ok();
+      device.attachment == attachment(index)
+        && device.session.as_deref() == Some(&session(index)[..])
+        && live
+    });
+  std::process::exit(i32::from(!right));
+}
+
+/// Raises this process's soft descriptor limit to at least `needed`, as the anchor raises its own (no privilege); whether
+/// there is room for that many.
+#[cfg(unix)]
+fn descriptor_room(needed: u64) -> bool {
+  use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+  let limit = getrlimit(Resource::Nofile);
+  if limit.current.is_none_or(|current| current >= needed) {
+    return true;
+  }
+  if limit.maximum.is_some_and(|maximum| maximum < needed) {
+    return false;
+  }
+  setrlimit(
+    Resource::Nofile,
+    Rlimit {
+      current: Some(needed),
+      maximum: limit.maximum,
+    },
+  )
+  .is_ok()
+}
+
+/// A-462: the handoff past the old exec limit across a real restart. Do: in a real supervisor, let the first daemon hold
+/// [`full_devices`] devices, each with a session at the cap, so the anchor's table passes the old limit (Linux's
+/// `MAX_ARG_STRLEN`, macOS's `ARG_MAX`), then exit; the supervisor restarts it. Expect the anchor to hold them all past
+/// the first daemon's death, nothing refused, and the successor to read every one from the table's sealed object, under
+/// its attachment with its session and its descriptor live. Before A-462 the table rode environment variables, and the
+/// successor's exec failed `E2BIG`. Skips loudly where the descriptor limit has no room for the devices.
+#[cfg(unix)]
+#[test]
+fn a_table_past_the_old_exec_limit_reaches_the_successor_whole() {
+  let devices = full_devices();
+  if !descriptor_room(u64::try_from(devices).unwrap() + FULL_SLACK) {
+    eprintln!("SKIP: no descriptor room for {devices} held devices beside the harness's own");
+    return;
+  }
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-full-table"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "full_table_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  // As the device test: the first daemon's exit is restarted at once, the successor's ends the watch.
+  let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
+  supervisor
+    .hold_descriptors(devices, HELD_BOUND, HELD_BOUND)
+    .unwrap();
+  // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child
+  // ignores this variable.
+  unsafe {
+    std::env::set_var(CHILD_FULL_TABLE, "1");
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let deadline = Duration::from_millis(FULL_WAIT_MS);
+  let mut exits = Vec::new();
+  let mut held_after_first = None;
+  while clock.elapsed() < deadline && exits.len() < 2 {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } => {
+        if exits.is_empty() {
+          held_after_first = Some(supervisor.held_devices());
+        }
+        exits.push(exit_code);
+      }
+      Step::CrashLoop { exit_code, .. } => {
+        exits.push(exit_code);
+        break;
+      }
+      Step::BackingOff { .. } | Step::Stopped => break,
+    }
+  }
+  supervisor.stop().ok();
+  // SAFETY: single-threaded cleanup.
+  unsafe {
+    std::env::remove_var(CHILD_FULL_TABLE);
+  }
+  assert_eq!(
+    held_after_first,
+    Some(devices),
+    "the anchor held every device the dead daemon sent"
+  );
+  assert_eq!(supervisor.device_refusals(), 0, "no message was refused");
+  assert_eq!(
+    exits,
+    [Some(FULL_SENDER_EXIT), Some(0)],
+    "the first daemon sent its devices and left; its successor read every one from the table past the old limit"
+  );
+}
 /// Format: the anchor role's exit code, for the same reason.
 #[cfg(unix)]
 const DEVICE_ANCHOR_EXIT: i32 = 11;
@@ -1428,11 +1680,9 @@ fn device_garbler() {
   if std::env::var(DEVICE_REFUSAL_ROLE).as_deref() != Ok(DEVICE_GARBLER) {
     return;
   }
-  let handed =
-    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
-  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment; this
-  // process adopts it once, here, so the `OwnedFd` is its single owner.
+  let inherited = handed_devices();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table; this process adopts
+  // it once, here, so the `OwnedFd` is its single owner.
   let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
   let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
   let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
@@ -1467,7 +1717,9 @@ fn device_refusals_anchor() {
   let args = ["--ignored", "--exact", DEVICE_GARBLER, "--nocapture"].map(str::to_owned);
   let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
   // Shape: a drain of 28 messages a step (4 devices × 3 + 4 connections × 2 + 4 copies × 2), above the garbler's 20.
-  supervisor.hold_descriptors(4, 4, 4).unwrap();
+  supervisor
+    .hold_descriptors(HELD_BOUND, HELD_BOUND, HELD_BOUND)
+    .unwrap();
   supervisor.hold_environment(DEVICE_REFUSAL_ROLE, DEVICE_GARBLER.to_owned());
   let clock = Instant::now();
   supervisor.start(now_ns(clock)).unwrap();
