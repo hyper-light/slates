@@ -258,6 +258,8 @@ pub struct Daemon {
   /// The port the version-control servers' HTTP edge listens on, when the configuration asked for one and it started
   /// (A-625 part 3).
   vcs_http_port: Option<u16>,
+  /// The port the svn:// listener listens on, when the configuration asked for one and it started (A-656 part 2).
+  vcs_svn_port: Option<u16>,
   /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
   start_beats: u64,
 }
@@ -1105,6 +1107,8 @@ impl Daemon {
     // The version-control servers' HTTP edge, when the operator asked for one (§4.17.2 "Transports" item 1, A-625 part 3):
     // its listener on the control shard beside the NFS transport, every shard keeping its seats.
     let vcs_http_port = crate::vcs_http::start(&runtime, control, &shards, &config)?;
+    // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-656 part 2): on the control shard too.
+    let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &config)?;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
@@ -1115,6 +1119,7 @@ impl Daemon {
       shards,
       nfs_port,
       vcs_http_port,
+      vcs_svn_port,
       start_beats: start_beat.beats,
     })
   }
@@ -1129,6 +1134,12 @@ impl Daemon {
   /// configuration asked for one and it started.
   pub fn vcs_http_port(&self) -> Option<u16> {
     self.vcs_http_port
+  }
+
+  /// The port the svn:// listener listens on (§4.17.4 piece 7, A-656 part 2), when the configuration asked for one and it
+  /// started.
+  pub fn vcs_svn_port(&self) -> Option<u16> {
+    self.vcs_svn_port
   }
 
   /// How many times this daemon's start beat before its watchdog took the beat over (§2.6 boot step 2, A-312): at least

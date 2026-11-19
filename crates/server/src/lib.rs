@@ -194,6 +194,7 @@ mod svn_hooks;
 // each repository's store lives on its owner shard (A-662).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
+mod vcs_svn;
 // §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
 // phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
 // dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
