@@ -47999,14 +47999,25 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   revocation while the read is away refuses the submit, which built nothing; a later read never replaces what a
   session keeps; a read that returns to a seat another session (an agent's) now holds, or to one retiring, is refused
   `NotFound`, kept by neither seat, counted by none, and builds nothing; a read the fenced partition never answers
-  refuses `Overloaded`, nothing recorded. Runs owed: the first build on Windows x86_64 (jupiter) ended at 18:40Z on
-  2026-11-19 with the machine's disk full (os error 112), before any test ran; the green run of `slates-server --lib`
-  against main's 23 failures there, the Mercurial user's test red over the one-line rule first, the lib tests of
-  `slates-ipc`, `slates-api` and `slates-client`, and the macOS run.
-- **Owed.** A session's first submit on a fleet node (f ≥ 1), answered on its own route once its commit lands (main's
-  fleet lane: `crates/server/tests/fleet.rs` and `works_off_owner.rs` submit through sessions); the clients' surfaces
-  (the typed client's submits carrying a message, the SDKs, the MCP and the CLI, setting identities); Subversion's
-  author; part 3 (the merge record carrying the message and the identities, and the commit admitted, over A-662).
+  refuses `Overloaded`, nothing recorded.
+- **Runs** (macOS arm64, the Mac Studio, 2026-11-19, rustc 1.98.1, debug), over the change merged with main at
+  b1926d201 (agents/g308-server-half 6daffdb98). The first build, at 5b4a4ce26, stopped at E0599: `identities::record`
+  read the clock with `slates_vfs::clock::Clock` out of scope; the import is in this change. Red first, the Mercurial
+  user's test over the one-line rule (the two strip checks made no-ops): `cargo test --locked -p slates-server --lib
+  t_a664_a_mercurial_user` failed, answered `[Some(BadRequest ..), Some(BadRequest ..), None, None]`, the leading space
+  and the trailing vertical tab recorded. Green, slates-server compiled afresh: `cargo test --locked -p slates-server
+  --lib identities` 15 of 15 (the 13 above and two other tests the filter names); `-p slates-ipc --lib protocol::` 5
+  passed and 1 ignored (the health table's writer), and `--test wire_order every_wire_enum` 2 of 2, the four tags
+  published; `-p slates-api --lib -- the_contract_history error::` 12 of 12; `-p slates-client --lib` 7 of 7. The
+  integration tests whose code the change edited, directly or through a helper, filtered to those: `-p slates-client
+  --test edit_and_submit` 1 of 1; `-p slates-server --test daemon` 7 of 7, `--test verdict_pages` 4 of 4, `--test
+  works_off_owner` 6 of 6 and `--test fleet` 36 of 36 (273.6 s), every session's first submit there reading its
+  identities before it is routed, at f = 1 too, where its acceptance waits for its commit and answers its own request.
+  `cargo build --locked -p slates-client --example load_bench`; `cargo fmt -- --check` clean for the four crates. The
+  Windows x86_64 and Linux runs, clippy, xtask and the doc gate are main's.
+- **Owed.** The clients' surfaces (the typed client's submits carrying a message, the SDKs, the MCP and the CLI,
+  setting identities); Subversion's author; part 3 (the merge record carrying the message and the identities, and the
+  commit admitted, over A-662).
 - **Applied in the same change to:** `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`;
   `crates/server/src/identities.rs`, `identities/tests.rs` (new), `verbs.rs` (`owner_of_key`, `refusal_name`'s two
   arms, the submit verbs), `work_home.rs`, `state.rs`, `landing.rs`, `lib.rs`, `daemon.rs`, `deadlines.rs`, `reap.rs`,

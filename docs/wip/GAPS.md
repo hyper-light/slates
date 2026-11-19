@@ -17,7 +17,8 @@
 > Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
 > the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
 > by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
-> macOS run owed). Part 1's server half BUILT, its runs OWED (`crates/server/src/identities/tests.rs`; A-664's entry):
+> macOS run owed). Part 1's server half BUILT (`crates/server/src/identities/tests.rs`; A-664's entry has the runs, on
+> macOS arm64, the fleet's submits through sessions at f = 1 among them; Windows and Linux main's):
 > `SetIdentities` on the control channel (the launcher's proof, `Forbidden` on a consumer's channel, git's identity held
 > to `slates_git::derived::Identity`, a Mercurial user as Mercurial 7.2's `changelog.add` writes it: not empty, one
 > line, no byte it strips from either end), recorded on the principal's partition; a session's
@@ -25,8 +26,7 @@
 > claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
 > submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
 > constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
-> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: a session's first submit on a fleet node
-> (f ≥ 1), its acceptance waiting for its commit, answered on its own route (main's fleet lane); the clients' surfaces
+> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
 > commit recorded with the version (the merge record
