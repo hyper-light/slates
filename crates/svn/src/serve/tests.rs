@@ -726,7 +726,11 @@ fn cram_md5(connection: &mut Connection, user: &[u8], secret: &[u8]) -> (String,
 /// Drives [`ADD_NEWDIR`] and `close-edit` through `connection`, each command taken without a word,
 /// start-commit answered at `open-root` and pre-commit at `close-edit`, both passing; returns the
 /// work accepted once pre-commit passed, for which nothing is written.
-fn drive_newdir(fixture: &Fixture, guards: &FixtureGuards, connection: &mut Connection) -> Box<Work> {
+fn drive_newdir(
+  fixture: &Fixture,
+  guards: &FixtureGuards,
+  connection: &mut Connection,
+) -> Box<Work> {
   let sources = fixture.sources(guards);
   for (at, command) in ADD_NEWDIR.into_iter().enumerate() {
     let mut out = Vec::new();
@@ -825,7 +829,10 @@ fn an_update_the_principal_may_not_read_is_refused_where_authentication_cannot_h
   let bob = Principal::User(b"bob".to_vec());
   assert_eq!(verdict, Verdict::Established(bob));
   let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
-  assert_eq!((out, turn), (not_authorized(), Ok(format!("{:?}", Turn::Wrote))));
+  assert_eq!(
+    (out, turn),
+    (not_authorized(), Ok(format!("{:?}", Turn::Wrote)))
+  );
   assert_eq!(connection.waiting(), Waiting::Command);
 }
 
@@ -963,7 +970,10 @@ fn a_commit_by_a_user_the_rules_keep_from_writing_is_refused_after_the_authentic
   let bob = Principal::User(b"bob".to_vec());
   assert_eq!(verdict, Verdict::Established(bob));
   let (out, turn) = send(&fixture, &anonymous, &mut connection, b"");
-  assert_eq!((out, turn), (not_authorized(), Ok(format!("{:?}", Turn::Wrote))));
+  assert_eq!(
+    (out, turn),
+    (not_authorized(), Ok(format!("{:?}", Turn::Wrote)))
+  );
   assert_eq!(connection.waiting(), Waiting::Command);
 }
 
@@ -1021,13 +1031,25 @@ fn a_start_commit_hooks_failure_is_open_roots_and_the_drive_is_dropped() {
   let open_root = ADD_NEWDIR[0].as_bytes();
   let mut out = Vec::new();
   let turn = connection.receive(Some(&sources), open_root, &mut out, PLENTY);
-  assert!(matches!(turn, Ok(Turn::Hook { due: Due::StartCommit { .. }, .. })), "{turn:?}");
+  assert!(
+    matches!(
+      turn,
+      Ok(Turn::Hook {
+        due: Due::StartCommit { .. },
+        ..
+      })
+    ),
+    "{turn:?}"
+  );
   let pending = connection.pending().unwrap();
   assert_eq!((pending.transaction, pending.base), (TRANSACTION, 6));
   let log = (b"svn:log".to_vec(), b"newdir".to_vec());
   assert!(pending.revision_properties.contains(&log));
   let refused = vec![
-    (165_001, "Commit blocked by start-commit hook (exit code 1) with output:\nno".to_owned()),
+    (
+      165_001,
+      "Commit blocked by start-commit hook (exit code 1) with output:\nno".to_owned(),
+    ),
     (165_001, "the hook's own words".to_owned()),
   ];
   let answered = connection.answer_hook(Err(refused), &sources, &mut out);
@@ -1079,7 +1101,16 @@ fn a_pre_commit_hooks_failure_is_close_edits_and_no_work_is_accepted() {
     }
   }
   let closing = connection.receive(Some(&sources), CLOSE_EDIT, &mut out, PLENTY);
-  assert!(matches!(closing, Ok(Turn::Hook { due: Due::PreCommit { .. }, .. })), "{closing:?}");
+  assert!(
+    matches!(
+      closing,
+      Ok(Turn::Hook {
+        due: Due::PreCommit { .. },
+        ..
+      })
+    ),
+    "{closing:?}"
+  );
   let refused = vec![(165_001, "no commits on Fridays".to_owned())];
   let answered = connection.answer_hook(Err(refused), &sources, &mut out);
   assert_eq!(answered, Ok(Turn::Took { consumed: 0 }));
@@ -1116,14 +1147,20 @@ fn a_call_while_a_hook_is_due_or_an_answer_with_none_due_is_the_callers_error() 
   let next = ADD_NEWDIR[1].as_bytes();
   let refused = connection.receive(Some(&sources), next, &mut out, PLENTY);
   assert_eq!(refused, Err(Refused::OutOfTurn));
-  assert_eq!(connection.commit(start(), &sources, &mut out), Err(Refused::OutOfTurn));
+  assert_eq!(
+    connection.commit(start(), &sources, &mut out),
+    Err(Refused::OutOfTurn)
+  );
   let made = Made {
     revision: 7,
     date: DATE,
     author: None,
     post_commit_error: None,
   };
-  assert_eq!(connection.committed(&made, &mut out), Err(Refused::OutOfTurn));
+  assert_eq!(
+    connection.committed(&made, &mut out),
+    Err(Refused::OutOfTurn)
+  );
   let unmade = connection.not_committed(&Uncommitted::NotServed, &mut out);
   assert_eq!(unmade, Err(Refused::OutOfTurn));
   assert!(out.is_empty());
@@ -1152,7 +1189,10 @@ fn a_commit_call_out_of_turn_is_the_callers_error_and_changes_nothing() {
     author: None,
     post_commit_error: None,
   };
-  assert_eq!(connection.committed(&made, &mut out), Err(Refused::OutOfTurn));
+  assert_eq!(
+    connection.committed(&made, &mut out),
+    Err(Refused::OutOfTurn)
+  );
   let unmade = connection.not_committed(&Uncommitted::NotServed, &mut out);
   assert_eq!(unmade, Err(Refused::OutOfTurn));
   assert_eq!(connection.waiting(), Waiting::Command);

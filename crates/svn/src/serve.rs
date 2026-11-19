@@ -818,7 +818,9 @@ impl Connection {
       Phase::Reporting(established, exchange) => {
         self.exchange(established, exchange, sources, input, out, budget)
       }
-      Phase::Resuming(established, interrupted) => self.resume(established, *interrupted, sources, out),
+      Phase::Resuming(established, interrupted) => {
+        self.resume(established, *interrupted, sources, out)
+      }
       Phase::Committing(established, drive) => {
         self.editing(established, drive, sources, input, out)
       }
@@ -1149,7 +1151,14 @@ impl Connection {
     policy: &Policy<'_>,
     out: &mut Vec<u8>,
   ) -> Result<(), Refused> {
-    let begun = self.call_commit(&established, &command, &start, authenticated_now, policy, out)?;
+    let begun = self.call_commit(
+      &established,
+      &command,
+      &start,
+      authenticated_now,
+      policy,
+      out,
+    )?;
     match begun {
       Begun::Driving(drive) => self.phase = Phase::Committing(established, drive),
       Begun::Answered => self.phase = Phase::Commands(established),

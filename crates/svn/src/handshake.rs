@@ -770,10 +770,7 @@ impl Server {
     if offered.is_empty() {
       return Err(Refused::OutOfTurn);
     }
-    let request = Value::List(vec![
-      Value::List(offered),
-      Value::String(mechanisms.realm),
-    ]);
+    let request = Value::List(vec![Value::List(offered), Value::String(mechanisms.realm)]);
     write_response(SUCCESS, request, out)?;
     let bounds = client_bounds(item_bytes);
     Ok(Self {

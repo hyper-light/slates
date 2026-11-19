@@ -38,16 +38,8 @@ macro_rules! recording {
     (
       $name,
       $user,
-      include_bytes!(concat!(
-        "../../../fixtures/commit/",
-        $name,
-        ".1.client.bin"
-      )),
-      include_bytes!(concat!(
-        "../../../fixtures/commit/",
-        $name,
-        ".1.server.bin"
-      )),
+      include_bytes!(concat!("../../../fixtures/commit/", $name, ".1.client.bin")),
+      include_bytes!(concat!("../../../fixtures/commit/", $name, ".1.server.bin")),
     )
   };
 }
@@ -341,7 +333,10 @@ impl Replay {
 
 /// What every call hands over, the guards `guards` (`make-fixtures.py`'s `svnserve.conf`: no
 /// anonymous access, authenticated users write, no authorization file).
-fn sources<'s>(view: &'s View<'s>, guards: &'s FixtureGuards) -> Sources<'s, View<'s>, FixtureGuards> {
+fn sources<'s>(
+  view: &'s View<'s>,
+  guards: &'s FixtureGuards,
+) -> Sources<'s, View<'s>, FixtureGuards> {
   Sources {
     index: view.records.index(),
     repository: view,
@@ -358,14 +353,23 @@ fn sources<'s>(view: &'s View<'s>, guards: &'s FixtureGuards) -> Sources<'s, Vie
 
 /// Commits an accepted `work` through A-655's step at the instant `svnserve` recorded for it, and
 /// answers it on `connection`.
-fn make(replay: &mut Replay, connection: &mut Connection, work: Work, recorded: &str, out: &mut Vec<u8>) {
+fn make(
+  replay: &mut Replay,
+  connection: &mut Connection,
+  work: Work,
+  recorded: &str,
+  out: &mut Vec<u8>,
+) {
   let now = svn_time(recorded).unwrap();
   replay.built.hold(&work, recorded);
   let revision = RevisionToCommit::of_work(work, now).unwrap();
   let date = revision.date().unwrap().to_owned();
   let author = revision.author().map(str::to_owned);
   let number = replay.records.commit(revision).unwrap();
-  assert_eq!(date, recorded, "svn:date the owner's instant, as svnserve wrote it");
+  assert_eq!(
+    date, recorded,
+    "svn:date the owner's instant, as svnserve wrote it"
+  );
   let made = Made {
     revision: number,
     date: &date,
@@ -393,7 +397,11 @@ fn recorded_date(server: &[u8]) -> Option<String> {
 /// Replays one recorded connection through a connection tunnelled as its user, every hook
 /// passing and each accepted work committed through A-655's step; `race` is replayed whole just
 /// before the client's `close-edit` is handed over. Returns what the connection wrote.
-fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Recording>) -> Vec<u8> {
+fn replay_connection(
+  replay: &mut Replay,
+  recording: Recording,
+  race: Option<Recording>,
+) -> Vec<u8> {
   let (name, user, client, server) = recording;
   let tunnel = Repository {
     uuid: IDENTITY,
@@ -534,7 +542,13 @@ fn take_lock(replay: &mut Replay, server: &[u8]) {
   let decision = replay
     .records
     .locks()
-    .lock(&request, &Head(replay.records.index()), AprTime(0), ROOM, &mut draw)
+    .lock(
+      &request,
+      &Head(replay.records.index()),
+      AprTime(0),
+      ROOM,
+      &mut draw,
+    )
     .unwrap();
   replay
     .records
@@ -580,6 +594,9 @@ fn every_recorded_commit_is_answered_as_svnserve_answered_it() {
     replayed += 1 + usize::from(race.is_some());
   }
   assert_eq!(replayed, REPLAYED);
-  assert_eq!(replay.in_hash_order, IN_HASH_ORDER, "items matched only as sets");
+  assert_eq!(
+    replay.in_hash_order, IN_HASH_ORDER,
+    "items matched only as sets"
+  );
   assert_eq!(replay.records.youngest(), YOUNGEST);
 }
