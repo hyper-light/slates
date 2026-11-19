@@ -438,6 +438,58 @@ fn every_captured_stream_encodes_back_to_its_bytes() {
   }
 }
 
+/// A-545 (golden): do read the server's answers to the `listkeys phases` 7.2's client sent after each push, as the
+/// server wrote them on the wire. Expect the amended draft as the one draft root after the modern push (its value 1,
+/// draft's number), none after the legacy push made it public, the strict push's commit after that push, and each
+/// payload encoded back to its bytes at the length `listkeys_encoded_len` gave.
+#[test]
+fn the_servers_listkeys_answers_name_its_draft_roots() {
+  for (payload, root) in [
+    (payloads::PUSH_MODERN_LISTKEYS_PHASES, Some(amended())),
+    (payloads::PUSH_LEGACY_LISTKEYS_PHASES, None),
+    (payloads::PUSH_STRICT_LISTKEYS_PHASES, Some(strict())),
+  ] {
+    let entries: Vec<_> = pushkey::listkeys(payload).unwrap().collect();
+    let roots: Vec<Option<Node>> = entries
+      .iter()
+      .map(|(key, _)| pushkey::hex_node(key).unwrap())
+      .collect();
+    assert_eq!(roots, root.into_iter().map(Some).collect::<Vec<_>>());
+    assert!(entries.iter().all(|(_, value)| *value == b"1"));
+    assert_eq!(pushkey::listkeys_encoded_len(&entries), Ok(len_of(payload)));
+    let mut out = Vec::new();
+    pushkey::encode_listkeys(&entries, &mut out).unwrap();
+    assert_eq!(out, payload);
+  }
+}
+
+/// A-545 (golden): do read 7.2's `debugpushkey` of the server's namespaces and of its bookmarks before the pushes:
+/// lines of the form a listkeys answer has, with one more newline at the end, which `splitlines()` drops. Expect the
+/// four namespaces 7.2 serves, each with an empty value, and `main` at the base.
+#[test]
+fn mercurials_namespaces_and_bookmarks_read_as_listkeys_lines() {
+  let namespaces: Vec<_> = pushkey::listkeys(payloads::SERVER_NAMESPACES.as_bytes())
+    .unwrap()
+    .collect();
+  let expected: [(&[u8], &[u8]); 4] = [
+    (b"bookmarks", b""),
+    (b"namespaces", b""),
+    (b"obsolete", b""),
+    (b"phases", b""),
+  ];
+  assert_eq!(namespaces, expected);
+  let bookmarks: Vec<_> = pushkey::listkeys(payloads::SERVER_BOOKMARKS_BEFORE.as_bytes())
+    .unwrap()
+    .collect();
+  let [(name, value)] = bookmarks.as_slice() else {
+    panic!("one bookmark")
+  };
+  assert_eq!(
+    (*name, pushkey::hex_node(value)),
+    (&b"main"[..], Ok(Some(base())))
+  );
+}
+
 /// A-545 (golden): do decode the obsstore 7.2 wrote in format 1. Expect the three markers 7.2's `debugobsolete`
 /// lists (the amend, the prune with its parent, the split with its own date and user), the dates and the prune's
 /// parent in fields, and the obsstore encoded back to its bytes.

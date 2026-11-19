@@ -133,8 +133,9 @@ pub(crate) fn descriptions() -> Vec<String> {
 }
 
 /// The part payloads' golden vectors (A-545): what 7.2's client sent with `unbundle` in three pushes over SSH, the
-/// server's replies, 7.2's `debugbundle --all` of each, two obsstores 7.2 wrote, and the logs and server state they
-/// are judged by. Made by `fixtures/payloads/make-payload-fixtures.sh` (its header names the exact command).
+/// server's replies and its answers to the `listkeys phases` that followed each, 7.2's `debugbundle --all` of each
+/// stream, two obsstores 7.2 wrote, and the logs and server state they are judged by. Made by
+/// `fixtures/payloads/make-payload-fixtures.sh` (its header names the exact command).
 pub(crate) mod payloads {
   /// The modern push: bookmarks, check:bookmarks, check:phases, check:updated-heads, changegroup 03, obsmarkers.
   pub(crate) const PUSH_MODERN: &[u8] = include_bytes!("../../fixtures/payloads/push-modern.hg");
@@ -175,4 +176,16 @@ pub(crate) mod payloads {
   /// The server's bookmarks before the first push (`debugpushkey`).
   pub(crate) const SERVER_BOOKMARKS_BEFORE: &str =
     include_str!("../../fixtures/payloads/server-bookmarks-before.txt");
+  /// The namespaces the server serves (`debugpushkey`).
+  pub(crate) const SERVER_NAMESPACES: &str =
+    include_str!("../../fixtures/payloads/server-namespaces.txt");
+  /// The server's answer to the `listkeys phases` the client sent after the modern push, its SSH v1 framing removed.
+  pub(crate) const PUSH_MODERN_LISTKEYS_PHASES: &[u8] =
+    include_bytes!("../../fixtures/payloads/push-modern-listkeys-phases.bin");
+  /// The same after the legacy push.
+  pub(crate) const PUSH_LEGACY_LISTKEYS_PHASES: &[u8] =
+    include_bytes!("../../fixtures/payloads/push-legacy-listkeys-phases.bin");
+  /// The same after the strict push.
+  pub(crate) const PUSH_STRICT_LISTKEYS_PHASES: &[u8] =
+    include_bytes!("../../fixtures/payloads/push-strict-listkeys-phases.bin");
 }
