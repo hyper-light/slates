@@ -12828,6 +12828,15 @@ engine: the verdict, rebase, position mapping, the register).
 > as `git verify-pack` checks one, counted (Windows x86_64, jupiter: 15 of 15, the crate 462 of 462; macOS owed).
 > Owed: part 2, the view presented to the hook driver on the owner shard (after A-662); main's run of stock git over
 > the view.
+>
+> **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
+> answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
+> capabilities and this server's agent. Each request is answered whole and statelessly: the shallow-update first,
+> then the acknowledgments have by have, as `get_common_commits` writes them under `multi_ack`, `multi_ack_detailed`
+> (with `no-done`) and neither, then the pack on side-band-64k, side-band or bare. Proven against stock git 2.50.1's
+> stateless answers and its one-round sessions. Those goldens found A-615's object choice missing git's rule for a
+> thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
+> session, an SSH client's, is owed.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -14145,6 +14154,39 @@ and export by landing).
 > from nothing): the copy named as `svnserve` names it, `/trunk/new.txt` at r3, and no text sent for a copy of the
 > same text. Owed: the server's connection task that runs it (piece 7's), and the deltas of changed texts (A-652's
 > generator).
+>
+> **Status (2026-11-19, A-656, part 1).** Built: one ra_svn connection's server side with no I/O (`slates-svn`'s
+> `serve::Connection`): A-599's handshake, then every command answered as `serve.c`'s command loop answers it: A-613's
+> reads and their streams, `reparent` (170000 for a URL outside the repository), A-616's report exchange, and every
+> other command of `svnserve`'s set refused as one it does not know (210001, `Turn::Unserved`) until its piece lands
+> (commit, A-655; the lock verbs; `get-file-revs`, `replay`, `change-rev-prop`); `update`'s target checked for read
+> access on the session's path. One connection serves `svn://` and `svnserve -t`: a tunnel's user comes in through the
+> repository its caller names (`EXTERNAL`). Held to every recorded report session replayed from its first byte against
+> stock `svnserve` 1.15.0's (40 sessions; property lists and listings as sets; the one listing where A-613's `get-dir`
+> shows an entry `svnserve` hides from the principal counted, authorization owed in the reads); red five ways. A-616's
+> drive now sends a changed text as A-652's deltifier makes it against the client's base. Owed: part 2, the server's
+> listener over TCP and the SSH tunnel's entry point.
+>
+> **Status (2026-11-19, A-656, part 1 continued: commit and the authentication for one command).** Built: `commit`
+> through the connection: handed to the caller (`Turn::CommitAsked`), begun through A-655's entry point with the
+> caller's transaction, instant and room (`Connection::commit`), the client's editor commands into its drive, the work
+> it accepts at `close-edit` handed to the caller (`Turn::Accepted`) and answered with the revision made
+> (`Connection::committed`) or refused as `close-edit`'s failure in A-655's step's words, the client's commands then
+> dropped until its `abort-edit` or `success` (`Connection::not_committed`; `editorp.c` 1149-1208); the hooks the
+> drive waits for, start-commit at `open-root` and pre-commit at `close-edit` (A-661), handed to the caller
+> (`Turn::Hook`, `Connection::pending`, `Connection::answer_hook`). The crate's tests commit through A-655 part 2a's
+> step (`Revision::of_work`, the records' `commit`); until part 2b appends through the repository's logs, the daemon
+> refuses every work (`Uncommitted::NotServed`, 200007); nothing else applies a work. And `svnserve`'s
+> authentication in the middle of a command (`must_have_access`): an anonymous session whose command needs access it
+> lacks, where the client could authenticate, is asked for `EXTERNAL` or `CRAM-MD5` alone and answered
+> `( success ( ) )` alone (A-599's `handshake::Server::for_command`), then the command runs again as the principal
+> proved, with no trivial auth request, or is refused "Authorization failed" (170001): for `commit` and for `update`'s
+> target. Held to every recorded commit connection (`crates/svn/fixtures/commit/`, 16 and bob's race) replayed from its
+> first byte through the connection, every item byte for byte but one property list `svnserve` wrote in its hash
+> table's order (`import`'s `get-dir`, compared as a set and counted; A-656 continued (1)), and to `svnserve`'s own
+> authentication for `lock-many` (the reporter's `lock-a` session), byte for byte; red seven ways. Owed: the lock
+> verbs; the read commands' authentication for one command with their authorization (A-606); the daemon's commit
+> once A-655 part 2b lands.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -14344,7 +14386,7 @@ for Subversion.)
   `svndiff1`: a sender uses zlib only for a peer that announced `svndiff1` (`marshal.c`, notes §2), so slates never
   receives it and never needs zlib, and it answers clients older than 1.10 in version 0. `mergeinfo` is announced in
   `repos-info`. An editor drive follows the protocol's early-error rule: an error is written as soon as it is known,
-  on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit`.
+  on a send that never blocks the task, and the rest of the drive is read and dropped until `abort-edit` or `success`.
 - **svn+ssh.** sshd starts `svnserve -t` as the logged-in user; slates installs that command as one of its own (a CLI
   verb under the name `svnserve`), which speaks ra_svn on its standard input and output and relays to the daemon
   through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
@@ -44512,6 +44554,124 @@ Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 en
 `mod.rs`, `advertise.rs`, `refs.rs`, `fetch.rs`, `answer.rs` and `tests/`; `store/graph.rs`, `StoreGraph::new` made
 infallible through `ObjectId::null` and `head` added, with `tests/store_graph.rs`; the `mod` line in `lib.rs`).
 
+**Part 3: protocol v0 and v1 behind the same entry point** (`crates/git/src/upload/v0.rs`; §4.17.2 "Pieces (git)"
+piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack.c` (`send_ref`,
+`format_symref_info`, `upload_pack`, `receive_needs`, `get_common_commits`, `got_oid`, `do_got_oid`, `ok_to_give_up`,
+`send_unshallow`, `create_pack_file`, `send_client_data`), `sideband.c` (`send_sideband`), `pkt-line.h`
+(`DEFAULT_PACKET_MAX`), `builtin/pack-objects.c` (`--objects-edge-aggressive` under `--thin` and `--shallow`) and
+`revision.c` (`mark_edges_uninteresting`) [C]; `gitprotocol-pack` and `gitprotocol-capabilities` [B].
+
+- **The advertisement**, as `send_ref` writes it. Under v1, `version 1` comes first. Then `HEAD` where its branch has
+  a commit, then each ref in name order, an annotated tag's peeled line after it; a repository with no ref sends
+  `capabilities^{}`. The capabilities, in git's order: `multi_ack thin-pack side-band side-band-64k ofs-delta shallow
+  deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want
+  allow-reachable-sha1-in-want no-done`, then `symref=HEAD:<branch>` where the branch has a commit, `filter`,
+  `object-format` and `agent`. The two `allow-*` say that a want need not be a tip, which holds: as under v2, any held
+  object may be wanted.
+- **A request**, read whole and answered statelessly, as each `POST` of git's smart HTTP is:
+  - the wants, any of them carrying capabilities, as git reads them on any;
+  - `shallow`, `deepen`, `deepen-since`, `deepen-not`, `filter`, then a flush;
+  - the haves, ended by `done` or a flush, the request's end read as a flush.
+  A capability the server did not advertise is refused, by the document's words, where git 2.50.1 passes it. So is a
+  line out of its place, or bytes after the request's end.
+- **The answer** follows `upload_pack`. A request that deepens gets the shallow-update first (`receive_needs`), from
+  the negotiation's cut alone (`negotiation::shallow_update`). Then the acknowledgments, have by have, as
+  `get_common_commits` writes them:
+  - `ACK <id> common`, `continue` or plain;
+  - `ready` or `continue` for a lacked have once ready;
+  - at `done`, `ACK <last>` or `NAK`; at a flush, `ACK <last> ready`, `NAK`, and under `no-done` the closing `ACK`.
+  Ready is A-615's, asked of the held haves so far (`negotiation::ready`) only when one was added since it was last
+  asked, each asking kept within the request's room. git's `have_obj` count is kept as `do_got_oid` keeps it: a commit
+  counts unless an earlier held commit named it as a parent or it was named already, which decides git's plain
+  `ACK`s. The pack is A-615's for the wants and every have. It is framed on side-band-64k, on side-band (1000-byte
+  packets, so 995 bytes of the pack each) or bare, with a flush after it on either band, through the answer's framing
+  shared with v2.
+- **A-615's object rule, corrected** (`negotiation/objects.rs`, its oracle with it; the bug note
+  `docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`). Serving git's own `--deepen` fetch
+  (a thin pack; the client shallow at the tip, which it sent as a have) sent that tip's blobs again; git had left them
+  out. git's stateless `deepen 2` without `thin-pack` had sent them. The rule that holds both is `pack-objects`':
+  under `--thin` with `--shallow` it walks with `--objects-edge-aggressive`, and `mark_edges_uninteresting` leaves out
+  the tree of every uninteresting commit on its command line. That means each have `do_got_oid` lists, and each commit
+  `send_unshallow` adds to `extra_edge_obj`. Without a thin pack only the edges are left out. The negotiation's request
+  now carries `thin`, and the oracle states the same rule and draws `thin` as well.
+- **v0's ref names** (main's ask, after A-615's finding): an advertised ref is `HEAD`, `receive-pack`'s `.have`, or a
+  name `refname::is_valid` takes, read and written. It was any word. The word check stays first, so a bad byte is
+  still placed exactly.
+- **The pack from A-639's stream** (`upload/fragments.rs`, after A-639 landed). `Fragments` is the service's pack
+  source over `store::Upload`. The plan is copied as A-639's `Answered`: runs, single objects, the filter for the
+  runs, `thin-pack` and `ofs-delta`, each list charged first. A call hands out what the last turn wrote, at most the
+  room it is asked for, and takes one turn of the stream on the owner's clock, exchange and quantum only once all of it
+  is handed out. A turn may write nothing yet, as the stream counts the pack before its header.
+- **One call a step, packets framed full** (`upload/answer.rs`). The answer calls its source at most once a step,
+  asking for what the packet it is filling still has room for, and frames the packet once it is full or the pack has
+  ended; data that leaves it short waits in it for the next step's call. So a step does at most one turn of the
+  stream's work (§4.3's step budget), the packets are the same full ones whatever the caller's room and however the
+  turns divide the work, and a call that wrote nothing only ends its step. The earlier "stalled" refusal is gone: a
+  source's contract is to bring the pack nearer its end each call, which A-639's turns do, each doing at least one unit
+  of a finite stream. A source that refuses mid-pack still has the data it wrote before refusing sent first, the
+  packet being filled framed short, then git's band-3 words, as part 2 holds it and as git sends what `pack-objects`
+  wrote before it failed. The framed buffer now holds a whole packet and after it the longer of the flush and git's
+  71-byte band-3 packet (65,591 bytes, charged with the packet's data); it held the packet alone, so a pack whose last
+  data filled its packet grew the buffer past its charge.
+- **Stateless only.** Over SSH a v0 client speaks in rounds on one stream and the server keeps what each round taught
+  it; that is owed. git's client speaks v2 over SSH since 2.26, and v2 is stateless by design.
+- **Tests** (`src/upload/tests/v0.rs`, 8; the v0 repository rebuilt from the pack git sent its clone):
+  - the advertisement at v0 and v1 against git's;
+  - git's six stateless answers (`multi_ack`, `multi_ack_detailed` ending `done` and reaching `ready`, neither, an
+    `unshallow`, a want never advertised), packet for packet, packs as object sets;
+  - git's nine one-round sessions (clone and fetch at v0 and v1; depth, a deepening, `deepen-since`, `deepen-not`,
+    `filter blob:none`), every packet after the advertisement;
+  - side-band's 1000-byte packets (a 3,000-byte pack in packets of 995, 995, 995 and 15 bytes), and a bare pack;
+  - `no-done`;
+  - a lacked have keeping a flush from `ready`;
+  - refusals: a capability not advertised, SHA-256, a have before the flush, bytes after `done`, no flush;
+  - every cut and every bit flip of git's `detailed-done` request.
+  In A-604's tests, a test of the ref-name rule; its generator now draws valid names.
+  With A-639 (`src/upload/tests/fragments.rs`): git's five v2 fetches answered from A-639's packs, read back through
+  A-608's reader, every packet but the pack's data git's and the objects git's; and turns of one tick in steps of one
+  byte, the answer the same and steps that wrote nothing met; and A-639's stream handing out one byte a call, the
+  answer the same. A source that pauses every other call answers whole (`refused.rs`), and no step calls its source
+  twice (`steps.rs`).
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 424 of 424 (2 of main's ignored),
+  `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first, the first run failed 3:
+  - A-604's property test, drawing ref names as words;
+  - A-604's writer test, which placed a bad byte exactly;
+  - git's deepen-v0 session, which found the object rule above.
+  An edge kept always then failed git's `unshallow`, which held the rule to thin packs. Red nine ways, one guard at a
+  time:
+  - v0's answer stubbed: 7 tests failed;
+  - parents never marked: git's stateless golden;
+  - `NAK` always: git's stateless golden;
+  - `ready` despite a lacked have: its test;
+  - side-band sized as side-band-64k: its test;
+  - any capability taken: its test;
+  - the aggressive rule never applied: A-615's oracle and git's `deepen-v0`;
+  - the aggressive rule always applied: A-615's oracle and git's `unshallow`;
+  - any ref name taken: both of A-604's tests.
+  The join with A-639 was checked on Windows x86_64 (jupiter), the Studio being offline: `cargo test --locked -p
+  slates-git --lib`, 2026-11-19, 460 passed, 0 failed, 3 ignored (kiln r1447; main's baseline at 018d32ba2 is 447 and
+  3), and `cargo fmt --check` clean with rustfmt 1.98.1's one layout taken. Its first run (r1361, the join as first
+  written) failed 2 of 458, the pausing source and the turns of one tick: each call's bytes went out as a packet of
+  their own, and a step called its source again while it had room. The first fix (r1425) failed 1 of 460, part 2's
+  pack refused midway, whose last 20 bytes waited in the packet being filled and were cleared at the refusal. Red four
+  ways, one guard at a time:
+  - a step calling its source again while it has room: 3 tests failed;
+  - a packet framed after every call, full or not: 2;
+  - a turn's bytes not yet handed out dropped once the stream has ended: 1;
+  - a refused source's data dropped: 1.
+  The macOS run is owed (filed in main's run requests).
+- **Next** (A-640's parts): `sparse:oid` (part 4); a stateful v0 session over SSH; `packfile-uris` and `bundle-uri`
+  from the store's URI packs and bundle list; progress on band 2; the walk in cooperative slices.
+
+Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), the bug note
+`docs/bugs/2026-11-19-a-thin-shallow-pack-sent-blobs-the-client-held.md`, `crates/git` (`upload/v0.rs`,
+new, with `upload/tests/v0.rs`; `upload/mod.rs`, v0 and v1 dispatched and their refusals; `upload/answer.rs`, the
+pack's framing, one source call a step and packets framed full; `upload/fragments.rs`, new, with
+`upload/tests/fragments.rs`, the pack from A-639's stream; `upload/advertise.rs`, `upload/refs.rs` and
+`upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`, `ready`, `shallow_update` and `Request::thin`;
+`negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`, the ref-name rule, with its tests;
+`tests/store_graph.rs`; `upload/tests/refused.rs` and `upload/tests/steps.rs`).
+
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
 `report/editor.rs` with its tests, new; `report/recorded.rs`, the recorded sessions in one table both test modules
@@ -47328,6 +47488,109 @@ Applied in the same change to:
   slates-merge --lib`): 177 of 178 at ac6a83b09, A-643's model failing as said; 178 of 178 at e8c10097e; the census
   33 refused and 13 kept at a late link, 130 agreed, 102 refused by the deriver, 34 conflicts; `cargo fmt -p
   slates-merge -- --check` clean.
+
+### A-656 — One ra_svn connection's server side, part 1: the connection with no I/O (2026-11-19, g234; §4.17.4 piece 7, with piece 12's tunnel)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`serve.rs` and its tests,
+new; `lib.rs`; `report.rs` opens `join_fspath`, `repository_path` and its answers' writers to the crate;
+`report/exchange.rs`'s `awaiting`; the reporter's test fixtures open to the crate's tests).
+
+- **The connection** (`serve::Connection`; `serve.c` `serve` and `svn_ra_svn__handle_commands2` over `main_commands`
+  at `d434dc14`, 1.15.0 alike): the handshake (A-599), its URL, challenge and key asked of the caller as turns; then
+  each command, parsed within the caller's item bytes and `svnserve`'s deepest prototype (`COMMAND_DEPTH`, five lists:
+  `lock-many`'s), handed to the read commands (A-613), whose streams resume within the caller's room; those they hand
+  back: `reparent` (a trivial auth request, then the session moved, or 170000 "'…' is not the same repository as
+  '…'"), the report commands (A-616's exchange, `update`'s target checked for read access by the principal's guards
+  first), and every other command of `svnserve`'s set answered 210001 "Unknown editor command '…'" and counted
+  (`Turn::Unserved`), the connection going on; an item that is no command ends it. What it waits on its client for
+  (`Connection::waiting`) is the server's learned waits' phase.
+- **One connection, two transports**: `svn://` over TCP and `svnserve -t` through an SSH tunnel; the tunnel's user
+  comes in as the repository's `tunnel_user`, which `EXTERNAL` takes, as `svnserve -t` takes its tunnel's.
+- **Evidence.** Every recorded report session (40, `crates/svn/fixtures/report`) replayed from its first byte, the
+  client's items handed over as a stock client sends them: `svnserve`'s greeting less `svndiff1`, every item as a tree
+  (property lists and listings as sets), the drive call for call, up to the first command not served yet (`lock-many`
+  behind a mid-session authentication; `get-locks`), answered 210001. One difference is counted, not hidden:
+  `update-depth-files`'s listing of `/trunk`, where `svnserve` leaves out `secret` for the anonymous principal and
+  A-613's `get-dir` lists it (the read commands apply no authorization yet, A-606).
+- **Tests.** Eight: that replay, the smallest budget, `reparent`, a command not served yet, the caller's errors, what
+  the connection waits for, a tunnel's user and a closed repository, and `update` of an unreadable target.
+  `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: red first (`receive` refusing at once: 6 of
+  7 failed), then red four more ways by mutation (`reparent` not moving the session, an unserved command answered
+  silently, a long read's rest dropped, every target readable), each caught; 427 of 427.
+- **Owed** (GAPS): part 2, the server's listener on the runtime's TCP in `vcs_http`'s pattern and the SSH tunnel's
+  entry point; commit through A-655's entry point; the lock verbs and the mid-session authentication `svnserve` asks
+  for when a command needs a user; the read commands' authorization (A-606, the reads' owner).
+
+### A-656, continued (1) — Commit through the connection, and the authentication for one command (2026-11-19, g234; §4.17.4 piece 7, with A-655)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`serve.rs` and its tests,
+`serve/tests/commit.rs` new; `handshake.rs` and its tests: `Server::for_command`, `CommandMechanisms`; `report.rs`:
+`Context::authenticated_now`, `uri_decode` open to the crate; the reporter's test green names content for a commit).
+
+- **Commit** (`serve.c` `commit` 1471-1580 at `d434dc14`): the client's `commit` is handed to the caller
+  (`Turn::CommitAsked`), which gives the transaction's name, its instant and its room (`Connection::commit`); A-655's
+  entry point (`commit::drive::commit`) decides access and answers; the client's editor commands go to its drive, which
+  writes each early refusal at once; the work it accepts at `close-edit` is handed to the caller (`Turn::Accepted`),
+  which makes it and answers with the revision made (`Connection::committed`: `close-edit`'s success, the trivial auth
+  request, the revision, its date, its author and post-commit's words, 1555-1577) or refuses it
+  (`Connection::not_committed`): `close-edit`'s failure in the words of A-655's step (`StepRefusal`, "Transaction out
+  of date" 160028 for a head a commit passed since the verdict), or 200007 "This server does not make commits yet",
+  which the daemon answers until A-655 part 2b appends through the repository's logs; then the client's commands are
+  read and dropped until its `abort-edit` or `success` (`editorp.c` 1193-1208). Nothing else applies a work.
+- **The hooks** (A-661; A-655 part 2a's pauses): the drive waits for start-commit at `open-root` and pre-commit at
+  `close-edit` before its verdict; the connection hands the hook to the caller (`Turn::Hook`), which runs it over the
+  transaction (`Connection::pending`) and answers (`Connection::answer_hook`, A-655's `Drive::resume`): a failure is
+  the command's, the client's commands then dropped until `abort-edit` or `success`. The post-commit hook is the
+  caller's, after the owner's commit, its words `commit-info`'s (`Made::post_commit_error`).
+- **The authentication for one command** (`must_have_access` 807-850): where a command needs access the session's
+  principal lacks, the session is anonymous and the client could authenticate, `svnserve` asks again with
+  `needs_username` (826-836): `EXTERNAL` and `CRAM-MD5` where authenticated users have the access, never `ANONYMOUS`,
+  attempts looping as at the handshake, a success answered `( success ( ) )` alone; then it decides again with the
+  principal proved, which the connection keeps. Built in A-599's handshake (`Server::for_command`) and asked by the
+  connection for `commit` (A-655's `Begun::Authenticate`) and for `update`'s unreadable target; the command runs again
+  at the caller's next call with the new principal's guards and no trivial auth request (`Context::authenticated_now`),
+  or is refused "Authorization failed" (170001). A principal whose name is no UTF-8 cannot be `svn:author`; its
+  commit is refused the same way.
+- **Corrected.** Part 1 answered an anonymous `update` of an unreadable target "Authorization failed" at once, and its
+  test said that was `svnserve`'s answer. Wrong where the client could authenticate: `svnserve` asks for an
+  authentication first (`must_have_access` 832-836). The test now asks for it, and holds the refusal to where
+  authentication cannot help.
+- **Evidence.** Every recorded commit connection (`crates/svn/fixtures/commit/`: 16, and bob's race replayed before
+  alice's `close-edit`) replayed from its first byte through a connection tunnelled as its user, bob's lock taken with
+  its recorded token, every hook passing, each accepted work committed through A-655 part 2a's step into the owner's
+  records (`Revision::of_work` at the instant `svnserve` recorded, the records' `commit`): `svnserve`'s greeting less
+  `svndiff1`, every item byte for byte but one, the youngest the recorded 13. The one: `import`'s `get-dir` before its
+  commit, whose entry properties `svnserve` wrote in its hash table's order (`get_props` fills the hash, `serve.c`
+  1089-1118 at `d434dc14`, and `svn_ra_svn__write_proplist` walks it, `marshal.c` 799-814) where slates writes them
+  sorted; a property list in another order is compared as a set and counted, the count held to 1. `svnserve`'s own
+  authentication for one command, `lock-many`'s in the reporter's recorded `lock-a` session: the request, the
+  challenge and the success alone, byte for byte, through `Server::for_command`.
+- **Tests.** Handshake: four (that recording, CRAM-MD5 and `EXTERNAL` for one command, no mechanism the caller's
+  error). Connection: the commit replay; a commit answered with the revision made; an anonymous commit authenticated
+  for write and refused as not made, the client's commands dropped until `abort-edit`, and in another test until
+  `success`, the drop's other end; a commit refused after authenticating as a user the rules keep from writing; a
+  work refused in the step's words; start-commit's and pre-commit's failures, the transaction a hook reads, and calls
+  while a hook is due; calls out of turn; `update`'s unreadable target, authenticated and where authentication cannot
+  help.
+  `cargo test --locked -p slates-svn --lib` on jupiter (Windows x86_64), 2026-11-19: red seven ways by mutation: an
+  authentication for one command whose success the repository's information follows, as the handshake's does (5 failed);
+  an interrupted `update` run again as if not just authenticated (1); a hook's pause passed over (7); the drop after a
+  refused commit ending at any item, at none, at `success` alone (1 each); and at `abort-edit` alone, which all 465
+  tests passed, since each ended its drop with `abort-edit`, until the test ending it at `success` was written, which
+  alone fails it now. Then 466 of 466 and `cargo fmt -p slates-svn -- --check` clean; the macOS run owed while the Mac
+  Studio is offline.
+- **Owed** (GAPS): the daemon's commit once A-655 part 2b appends through the repository's logs; the lock verbs; the
+  read commands' authentication for one command with their authorization (A-606).
+
+### A-616, continued (5) — A changed text through A-652's deltifier (2026-11-19, g234, UI goal 93)
+Applied in the same change to: `crates/svn/src/report/drive.rs` (`window`, `window_of`, the file's frame keeps its
+base text) and its tests.
+
+- **The windows** are `txdelta_next_window`'s, now with A-652's deltifier (`svndiff::deltas`, `xdelta.c` ported by
+  g264): each target piece of up to 102,400 bytes made from the source piece at the same place, read from the green's
+  runs into two bounded buffers, never a whole text; once the source has run out, new data with its view where the
+  source ended. So a drive's windows are the ones a stock server sends, stored or computed.
+- **Tests.** `big.txt` from r5 to r6 (one line of 6,000 changed): its windows copy from the base, carry under a
+  hundredth of the text as new data, and make the text `close-file` names; red with every window new data. The 29
+  recorded drives still match, each delta by what it makes.
 
 ### A-653 — A part only partly wanted read entry by entry, its wanted entries alone judged; the holders of objects still wanted found by their rows; one pack source (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch" item 3 and "Filters", piece 7; after A-639; A-640 part 3)
 
