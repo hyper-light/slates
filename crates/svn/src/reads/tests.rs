@@ -1139,11 +1139,17 @@ fn a_history_opened_again_at_each_step_walks_as_one_kept_open() {
   for _ in 0..32 {
     many.push_str("9:trunk/dir ");
   }
-  let reopened = format!("( log ( ( {many}11:tags/t1/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) ");
-  let kept = b"( log ( ( 11:tags/t1/dir 9:trunk/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) ";
+  let reopened = format!(
+    "( log ( ( {many}11:tags/t1/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) "
+  );
+  let kept =
+    b"( log ( ( 11:tags/t1/dir 9:trunk/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) ";
   let (_, reopened, _) = streamed(&fixture, &fixture.green, reopened.as_bytes(), usize::MAX);
   let (_, kept, _) = streamed(&fixture, &fixture.green, kept, usize::MAX);
-  assert_eq!(String::from_utf8(reopened).unwrap(), String::from_utf8(kept).unwrap());
+  assert_eq!(
+    String::from_utf8(reopened).unwrap(),
+    String::from_utf8(kept).unwrap()
+  );
 }
 
 /// The bounds a hostile command is read within.
@@ -1198,8 +1204,14 @@ fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
   };
   let fixture = Fixture::new();
   let mut out = Vec::new();
-  let outcome = answer(&fixture.index, &fixture.green, &ROOT_SESSION, &value, &mut out)
-    .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
+  let outcome = answer(
+    &fixture.index,
+    &fixture.green,
+    &ROOT_SESSION,
+    &value,
+    &mut out,
+  )
+  .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
   let mut stream = match outcome {
     Outcome::Close | Outcome::Elsewhere => {
       prop_assert!(out.is_empty());

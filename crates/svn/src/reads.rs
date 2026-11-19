@@ -48,8 +48,8 @@
 
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
-use crate::report::drive::history as copies;
 use crate::ra_svn::{ItemError, Value, write};
+use crate::report::drive::history as copies;
 
 /// `SVN_ERR_BAD_DATE`, "Bogus date".
 /// Format: the bad-input category's start, 120,000 + 1 × 5,000 = 125,000, plus 3 (`svn_error_codes.h` 107-108, 177-178).
