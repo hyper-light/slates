@@ -101,6 +101,10 @@ impl SshSite for Site {
     Keys
   }
 
+  async fn lookup(&mut self, user: &[u8], key: &UserKey, key_blob: &[u8]) -> Holding<Principal> {
+    Keys.holding(user, key, key_blob)
+  }
+
   fn dispatch(
     &mut self,
     _principal: &Principal,
@@ -116,6 +120,44 @@ impl SshSite for Site {
         exit_status: super::site::GIT_DIE_STATUS,
       }),
     }
+  }
+}
+
+/// A connection lookup that cannot say of any key: every key is looked up where its record lives.
+#[derive(Clone)]
+struct Asking;
+
+impl KeyHolders for Asking {
+  type Principal = Principal;
+
+  fn holding(&mut self, _user: &[u8], _key: &UserKey, _key_blob: &[u8]) -> Holding<Principal> {
+    Holding::Unknown
+  }
+}
+
+/// [`Site`], its keys looked up away from the session (A-651 part 3): the held key proves [`HOLDER`] once the lookup
+/// answers.
+struct LooksUp;
+
+impl SshSite for LooksUp {
+  type Keys = Asking;
+  type Command = Scripted;
+
+  fn keys(&mut self) -> Asking {
+    Asking
+  }
+
+  async fn lookup(&mut self, user: &[u8], key: &UserKey, key_blob: &[u8]) -> Holding<Principal> {
+    Keys.holding(user, key, key_blob)
+  }
+
+  fn dispatch(
+    &mut self,
+    principal: &Principal,
+    command: &Asked,
+    git_protocol: Option<&[u8]>,
+  ) -> Dispatched<Scripted> {
+    Site.dispatch(principal, command, git_protocol)
   }
 }
 
@@ -233,6 +275,17 @@ where
   C: FnOnce(SocketAddrV4) -> R + Send + 'static,
   R: Send + 'static,
 {
+  served_by(seats, || Site, client)
+}
+
+/// As [`served`], with sites `make` makes.
+fn served_by<S, M, C, R>(seats: usize, make: M, client: C) -> (R, Seen)
+where
+  S: SshSite + 'static,
+  M: FnMut() -> S + 'static,
+  C: FnOnce(SocketAddrV4) -> R + Send + 'static,
+  R: Send + 'static,
+{
   let runtime = runtime();
   let bounds = Bounds::of_shard(seats, ROOM_BYTES, TICK_NS);
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog())
@@ -244,7 +297,7 @@ where
     .expect("the edge's state kept on its shard");
   runtime
     .spawn(async move {
-      let _ = serve(listener, state, || Site).await;
+      let _ = serve(listener, state, make).await;
     })
     .expect("the listener's task");
   let shard = runtime.shard_id().0;
@@ -444,9 +497,15 @@ struct Transcript {
   status: Option<u32>,
   /// The channel messages' numbers, in order (each data message once in a row).
   order: Vec<u8>,
+  /// Whether the server ended the connection after the client's close, within the client's patience.
+  ended: bool,
 }
 
-/// Reads the session until the server closes it, then closes it too: everything it gave.
+/// Reads the session until the server closes it, then closes it too and waits for the server to end the connection:
+/// everything it gave. The edge counts a connection and learns its closing wait before its socket closes (`ended` in the
+/// edge), and a shard drains its controls before it polls a task, so a client that returned at its own close let
+/// [`StopsShard`] cancel the edge's task before it read that close
+/// (`docs/bugs/2026-11-19-the-ssh-edge-tests-stopped-the-shard-before-the-edge-read-the-close.md`).
 fn transcript(peer: &mut Peer) -> Transcript {
   let mut transcript = Transcript::default();
   while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
@@ -469,6 +528,7 @@ fn transcript(peer: &mut Peer) -> Transcript {
         let mut close = vec![97];
         close.extend_from_slice(&peer.channel.to_be_bytes());
         peer.send(&close);
+        transcript.ended = peer.ended();
         break;
       }
       _ => {}
@@ -478,13 +538,14 @@ fn transcript(peer: &mut Peer) -> Transcript {
 }
 
 /// The transcript of a command that took [`PACK`] and exited 0: [`READY`], `got:` and the pack, then exit-status, EOF and
-/// close, in that order.
+/// close, in that order, and the connection ended.
 fn pushed() -> Transcript {
   Transcript {
     out: [READY, b"got:", PACK].concat(),
     err: Vec::new(),
     status: Some(0),
     order: vec![94, 98, 96, 97],
+    ended: true,
   }
 }
 
@@ -563,6 +624,7 @@ fn a_refused_exec_is_answered_on_standard_error_with_its_exit_status() {
       err: b"fatal: refused\n".to_vec(),
       status: Some(super::site::GIT_DIE_STATUS),
       order: vec![95, 98, 96, 97],
+      ended: true,
     })
   );
   assert_eq!(
@@ -662,4 +724,14 @@ fn a_slow_push_is_reaped_when_a_new_connection_needs_its_seat() {
     ),
     (1, true, 1, 1)
   );
+}
+
+/// A-651 part 3 (a key whose record lives elsewhere). Do: with a site whose connection lookup cannot say of any key and
+/// whose record lookup holds the held key, authenticate and run the command. Expect: the session waits for the lookup,
+/// then proves the principal, and the command runs to its end as with a lookup that answers at once.
+#[test]
+fn a_key_looked_up_where_its_record_lives_proves_its_principal() {
+  let (transcript, seen) = served_by(ONE_SEAT, || LooksUp, |address| session(address, 0, 0));
+  assert_eq!(transcript, Some(pushed()));
+  assert_eq!(seen.counts.commands_run, 1);
 }

@@ -70,6 +70,7 @@ impl PackSource for NoPacks {
     &mut self,
     _served: &Served<'_>,
     _pack: &mut (),
+    _admission: &mut slates_git::Admission,
     _out: &mut Vec<u8>,
     _room: usize,
   ) -> Result<bool, PackRefused> {
@@ -286,6 +287,7 @@ fn record(id: RepositoryId) -> RepositoryRecord {
       rules: Vec::new(),
       hooks: Vec::new(),
       hooks_env: Vec::new(),
+      signers: Vec::new(),
     },
   }
 }

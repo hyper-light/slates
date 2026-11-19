@@ -48,10 +48,13 @@ impl<S: PackSource> PackSource for Narrow<S> {
     &mut self,
     served: &Served<'_>,
     pack: &mut S::Pack,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused> {
-    self.inner.write(served, pack, out, room.min(self.most))
+    self
+      .inner
+      .write(served, pack, admission, out, room.min(self.most))
   }
 }
 
@@ -114,6 +117,7 @@ fn streamed_from(
   most: usize,
 ) -> (Vec<u8>, usize) {
   let mut clock = Ticks(0);
+  let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(
     served,
     Version::V2,
@@ -126,7 +130,7 @@ fn streamed_from(
       },
       most,
     },
-    &mut Admission::new(u64::MAX),
+    &mut admission,
   );
   assert_eq!(answer.refusal(), None);
   let mut bytes = Vec::new();
@@ -141,7 +145,7 @@ fn streamed_from(
       most,
     };
     let before = bytes.len();
-    if answer.write(served, &mut source, &mut bytes, room) == Written::End {
+    if answer.write(served, &mut source, &mut admission, &mut bytes, room) == Written::End {
       assert_eq!(answer.refusal(), None);
       return (bytes, empty);
     }
@@ -365,12 +369,11 @@ fn a_pack_through_the_source_is_read_from_the_kept_parts() {
     exchange: EXCHANGE,
     quantum_ns: LONG_TURN,
   };
-  let mut pack = source
-    .begin(&served, &plan, &mut Admission::new(u64::MAX))
-    .unwrap();
+  let mut admission = Admission::new(u64::MAX);
+  let mut pack = source.begin(&served, &plan, &mut admission).unwrap();
   let mut bytes = Vec::new();
   while source
-    .write(&served, &mut pack, &mut bytes, usize::MAX)
+    .write(&served, &mut pack, &mut admission, &mut bytes, usize::MAX)
     .unwrap()
   {}
   let counters = pack.counters();

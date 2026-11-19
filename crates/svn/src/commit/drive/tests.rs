@@ -8,7 +8,7 @@ use super::*;
 use crate::authz;
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::dump::Uuid;
-use crate::lock::{HeadView, LockRequest, LockTarget};
+use crate::lock::{HeadView, Lock, LockRequest, LockTarget};
 use crate::migration::{Repository, Room};
 use crate::ra_svn::{Bounds, Parsed, Parser};
 
@@ -810,6 +810,100 @@ fn a_lock_in_the_way_refuses_the_call_that_meets_it() {
   assert_eq!(
     (failure, last),
     (Some((160_039, words.to_owned())), Last::Dropped)
+  );
+}
+
+/// The instant bob's lock on `a.txt` expires in the expiry test: a second past the epoch. The lock
+/// binds at it and has lapsed a microsecond later (`lock.c` `lock_expired`: past it).
+/// Format: `apr_time_t`, microseconds since the Unix epoch.
+const LOCK_EXPIRES: AprTime = AprTime(1_000_000);
+
+/// A microsecond past [`LOCK_EXPIRES`].
+/// Format: `apr_time_t`, microseconds since the Unix epoch.
+const PAST_LOCK_EXPIRY: AprTime = AprTime(1_000_001);
+
+/// bob's lock on `a.txt` made to expire at [`LOCK_EXPIRES`]: the lock the replay holds taken away
+/// and set again with its token and that expiry. Answers the token.
+fn expiring_lock(replay: &mut Replay) -> String {
+  let held = replay
+    .repository
+    .locks()
+    .get_lock(LOCKED, AprTime(0))
+    .unwrap()
+    .clone();
+  let token = held.token.as_str().to_owned();
+  let expiring = Lock {
+    expires: Some(LOCK_EXPIRES),
+    ..held.clone()
+  };
+  replay
+    .repository
+    .apply_lock_entries(&[
+      LockEntry::Removed {
+        path: held.path,
+        token: held.token,
+      },
+      LockEntry::Set(expiring),
+    ])
+    .unwrap();
+  token
+}
+
+/// alice opening `a.txt` and applying a text delta to it while presenting `token` for it, with
+/// locks judged at `now` (the drive's `Setup::now`, a commit's `CommitStart::now`): the refusal
+/// met, if any, and how the last call went.
+fn presenting_the_token_at(
+  replay: &Replay,
+  token: &str,
+  now: AprTime,
+) -> (Option<(u64, String)>, Last) {
+  let commands = b"( open-root ( ( ) 2:d0 ) ) ( open-file ( 5:a.txt 2:d0 2:c1 ( ) ) ) \
+( apply-textdelta ( 2:c1 ( ) ) ) ";
+  let mut drive = Drive::new(Setup {
+    base_path: "/trunk/project".to_owned(),
+    repository_url: REPOSITORY.to_owned(),
+    filesystem: "fixture".to_owned(),
+    transaction: "11-1".to_owned(),
+    locks: CommitLocks {
+      user: Some("alice".to_owned()),
+      presented: BTreeMap::from([(LOCKED.to_owned(), token.to_owned())]),
+      keep: false,
+    },
+    now,
+    room: ROOM,
+    rules: None,
+    revision_properties: Vec::new(),
+  });
+  let mut out = Vec::new();
+  let mut last = Last::Taken;
+  for (item, _) in items(commands) {
+    last = kind_of(&replay.command(&mut drive, &item, &mut out));
+  }
+  let failure = items(&out)
+    .into_iter()
+    .find_map(|(item, _)| failure_of(&item));
+  (failure, last)
+}
+
+/// A-656 continued (3), a commit's lock instant (FSFS's `svn_fs_fs__allow_locked_operation`, which
+/// takes an expired lock for none, at the caller's `CommitStart::now`). Do: with bob's lock on
+/// `a.txt` expiring at [`LOCK_EXPIRES`], let alice, presenting its token, open `a.txt` and apply a
+/// text delta, with locks judged at the expiry and a microsecond past it. Expect: `E160039` at the
+/// expiry, the lock still bob's, `apply-textdelta` refused, and no failure past it, the call taken.
+#[test]
+fn a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after() {
+  let mut replay = replayed_until("locked-by-other");
+  let token = expiring_lock(&mut replay);
+  let at_expiry = presenting_the_token_at(&replay, &token, LOCK_EXPIRES);
+  let past_expiry = presenting_the_token_at(&replay, &token, PAST_LOCK_EXPIRY);
+  let words =
+    "User 'alice' does not own lock on path '/trunk/project/a.txt' (currently locked by 'bob')";
+  assert_eq!(
+    (at_expiry, past_expiry),
+    (
+      (Some((160_039, words.to_owned())), Last::Refused),
+      (None, Last::Taken)
+    )
   );
 }
 

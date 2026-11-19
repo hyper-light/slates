@@ -21,7 +21,9 @@
 //!
 //! **What an edge decides.** A credential proves its principal while it is held and live on the wall clock
 //! (`CredentialRecord::live_at`): expiry is decided at authentication, never in the database's `apply`, where the clock
-//! would replay differently. A revocation removes the record, so the next lookup finds nothing.
+//! would replay differently. A revocation removes the record, so the next lookup finds nothing. A credential that proves
+//! an enrolled consumer proves it only while the consumer is enrolled and not revoked (§4.13: "every later effect
+//! refuses"), which both edges ask of the consumer's own partition ([`consumer_revoked`]).
 
 use slates_anchor::layout::ISSUER_SECRET_BYTES;
 use slates_db::Op;
@@ -312,6 +314,32 @@ pub async fn find(id: [u8; 32]) -> Result<Option<CredentialRecord>, Unanswered> 
     origin,
     owner,
     move |state| state.db.partition().credentials().get(&id).cloned(),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .ok_or(Unanswered::Silent)
+}
+
+/// Whether enrolled consumer `consumer` was revoked, or holds no enrollment (the module doc), asked from a task on any
+/// shard of the daemon of the partition its id routes to, as [`find`] asks: what the HTTP edge's authenticator and the
+/// SSH edge's lookup check of a credential that proves a consumer.
+pub(crate) async fn consumer_revoked(consumer: u64) -> Result<bool, Unanswered> {
+  let (origin, owner) = crate::state::with_state(|state| {
+    let partition = crate::verbs::owner_of_consumer(consumer);
+    (state.shard, shard_of_partition(state, partition))
+  })
+  .ok_or(Unanswered::NoShard)?;
+  let owner = owner.ok_or(Unanswered::NoShard)?;
+  crate::xshard::call_in_shard_time_given_room(
+    origin,
+    owner,
+    move |state| {
+      state
+        .db
+        .partition()
+        .consumer(consumer)
+        .is_none_or(|record| record.revoked)
+    },
     crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await

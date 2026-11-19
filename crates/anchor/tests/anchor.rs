@@ -38,6 +38,10 @@ const EXIT: i32 = 3;
 /// descriptor it inherited to be bound to, and turning this binary into that child.
 #[cfg(unix)]
 const CHILD_NFS_PORT: &str = "SLATES_ANCHOR_TEST_NFS_PORT";
+/// Format: the environment variable carrying the port the version-control edge's listener-inheritance child expects the
+/// descriptor it inherited to be bound to, and turning this binary into that child (A-625 part 3).
+#[cfg(unix)]
+const CHILD_VCS_HTTP_PORT: &str = "SLATES_ANCHOR_TEST_VCS_HTTP_PORT";
 
 /// Format: the variable carrying how long the slow children's starts run (milliseconds), and turning this binary into
 /// [`slow_failing_child`] or [`briefly_serving_child`].
@@ -533,6 +537,102 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
     outcome,
     Some(Some(0)),
     "the supervised child inherited the anchor's held listener at the bound port"
+  );
+}
+
+/// The version-control edge's listener-inheritance child (A-625 part 3): it verifies it inherited the edge's listener
+/// the anchor holds across the spawn — reads [`CHILD_VCS_HTTP_PORT`] (its role signal) and `ENV_VCS_HTTP` — and exits 0
+/// if that descriptor is a socket bound at the expected port, 1 otherwise, and 2 when no descriptor was handed over.
+/// Ignored like `supervised_child`, and run by the parent with `--ignored --exact`.
+#[cfg(unix)]
+#[test]
+#[ignore = "the version-control edge's listener-inheritance child; run by the parent with --ignored"]
+fn vcs_http_listener_child() {
+  let Ok(expected) = std::env::var(CHILD_VCS_HTTP_PORT) else {
+    return;
+  };
+  let expected: u16 = expected.parse().unwrap();
+  let Some(raw) = std::env::var(slates_anchor::ENV_VCS_HTTP)
+    .ok()
+    .and_then(|number| number.parse::<i32>().ok())
+  else {
+    std::process::exit(2);
+  };
+  // SAFETY: the descriptor was inherited from the anchor across the spawn and named to us in the
+  // environment; borrowing it for one getsockname does not take ownership (the process owns it).
+  let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+  let port = match rustix::net::getsockname(borrowed) {
+    Ok(name) => match rustix::net::SocketAddr::try_from(name) {
+      Ok(rustix::net::SocketAddr::V4(v4)) => v4.port(),
+      _ => 0,
+    },
+    Err(_) => 0,
+  };
+  std::process::exit(i32::from(port != expected));
+}
+
+/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: bind a listener as an anchor binds the version-control edge's, hold
+/// it in the supervisor, and start the supervised child. Expect: the child finds the same listening socket, at the bound
+/// port, on the descriptor `ENV_VCS_HTTP` names (exit 0; 2 if none was handed over): the mechanism by which every daemon
+/// an anchor starts serves the edge on the port the anchor holds, so a restart never drops it.
+#[cfg(unix)]
+#[test]
+fn the_supervised_child_inherits_the_held_vcs_http_listener() {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  /// Shape: one queued pending connection suffices; nothing connects in this test.
+  const BACKLOG: i32 = 1;
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let fd = listener.into_owned();
+  // Make the descriptor inheritable so the spawned child receives it across the exec.
+  rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-vcs-http"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "vcs_http_listener_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let mut supervisor = Supervisor::new(segment, &args, policy()).unwrap();
+  supervisor.hold_vcs_http_listener(fd);
+  // SAFETY: the test is single-threaded at this point; the child reads it. The role is chosen by the
+  // child's args, so a parallel test's child ignores this variable.
+  unsafe {
+    std::env::set_var(CHILD_VCS_HTTP_PORT, port.to_string());
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  // Drive until the child exits; it exits 0 iff it inherited the listener at the expected port.
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  let mut outcome = None;
+  while clock.elapsed() < deadline {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code, .. } => {
+        outcome = Some(exit_code);
+        break;
+      }
+      Step::Stopped | Step::BackingOff { .. } => break,
+    }
+  }
+  supervisor.stop().ok();
+  // SAFETY: single-threaded cleanup.
+  unsafe {
+    std::env::remove_var(CHILD_VCS_HTTP_PORT);
+  }
+  assert_eq!(
+    outcome,
+    Some(Some(0)),
+    "the supervised child inherited the anchor's held edge listener at the bound port (2: none was handed over)"
   );
 }
 
@@ -1073,6 +1173,38 @@ fn a_segment_from_before_version_5_checkpoints_is_refused_at_start() {
       })
     ),
     "a segment whose checkpoints are version 4 is refused at start: {result:?}"
+  );
+}
+
+/// A-626 part 4 (a work's logged journal may hold a copy, `LoggedOp::Copy`). Do: write layout 13, the layout before it,
+/// into a segment's header and attach it. Expect: refused at start, never read. The segment keeps every work's logged
+/// journal, and a reader of layout 13 knows no copy among its operations; the layout refuses the whole segment once,
+/// typed, before anything is served. Before part 4 layout 13 was the current one, and the attach succeeded.
+#[test]
+fn a_segment_from_before_logged_copies_is_refused_at_start() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: the layout before a logged journal could hold a copy.
+  const BEFORE_LOGGED_COPIES: u32 = 13;
+  let name = format!("slates-anchor-unlogged-copies-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &BEFORE_LOGGED_COPIES.to_le_bytes())
+    .unwrap();
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "a segment from before logged copies is refused at start: {result:?}"
   );
 }
 

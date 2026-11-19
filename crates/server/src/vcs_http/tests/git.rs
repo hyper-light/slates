@@ -133,6 +133,7 @@ impl Repositories for Held {
         rules,
         hooks: Vec::new(),
         hooks_env: Vec::new(),
+        signers: Vec::new(),
       },
     })
   }
@@ -536,6 +537,7 @@ impl PackSource for NoPacks {
     &mut self,
     _served: &UploadServed<'_>,
     _pack: &mut (),
+    _admission: &mut slates_git::Admission,
     _out: &mut Vec<u8>,
     _room: usize,
   ) -> Result<bool, PackRefused> {
@@ -661,9 +663,9 @@ fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
   );
 }
 
-/// A-625 part 3 (A-654 owed). Do: as the owner, with upload-pack served, ask for receive-pack's advertisement, and
-/// upload-pack's of a repository whose store is not held. Expect: `503` for each: receive-pack's entry point has not
-/// landed, and no store is lent for that repository.
+/// A-625 part 3 (A-654 part 3: each service from its own half). Do: as the owner, with upload-pack's half alone, ask for
+/// receive-pack's advertisement, and upload-pack's of a repository whose store is not held. Expect: `503` for each:
+/// upload-pack's half serves upload-pack alone, and no store is lent for that repository.
 #[test]
 fn receive_pack_and_an_unheld_store_are_503() {
   let lender = Lends::empty();

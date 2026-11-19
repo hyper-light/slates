@@ -71,8 +71,9 @@ mod v0;
 pub use answer::{Answer, Written};
 pub use fragments::{Fragments, Planned, Streamed};
 
-/// Format: the name this server gives itself in `agent`, under every protocol version, its crate's version after it.
-const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
+/// Format: the name this server gives itself in `agent`, under every protocol version, its crate's version after it;
+/// receive-pack advertises the same (A-654).
+pub const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
 
 /// Format: git's band-3 words for a pack that could not be finished (`upload-pack.c` `create_pack_file`'s
 /// `abort_msg`).
@@ -148,11 +149,14 @@ pub trait PackSource {
 
   /// Writes `pack`'s next bytes to `out`, at most `room` of them, doing at most a turn's work toward them: whether any
   /// are left after them. A call may work and write nothing yet; the answer then asks again at its next step, so each
-  /// call must bring the pack nearer its end.
+  /// call must bring the pack nearer its end. What a turn's work holds only for a while (A-653 continued (4): a delta
+  /// search over an object past a window) is charged to the request's `admission` as it begins and given back as it
+  /// ends, within the same request.
   fn write(
     &mut self,
     served: &Served<'_>,
     pack: &mut Self::Pack,
+    admission: &mut Admission,
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused>;

@@ -66,6 +66,9 @@ pub(crate) mod hg_push;
 // import (A-652 part 3) call it, a daemon build calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod svn_commit;
+// The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
+// `vcs_store::hg_import`, the request answered when the import ends.
+pub(crate) mod import;
 
 /// Format: where RFC 4122's form puts a `-` among a UUID's sixteen bytes, written as two hexadecimal digits each:
 /// before bytes 4, 6, 8 and 10 (8-4-4-4-12 digits).
@@ -418,8 +421,9 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
 pub(crate) const LINEAGE_UNINSTALLED: &str = "repository.lineage_uninstalled";
 
 /// The version of `source` a branch is made at, checked: its head when `version` is none; `UnknownBase` past the head
-/// or below the oldest version the source reconstructs, in memory or at a recovery (its checkpoint's).
-fn branch_version(
+/// or below the oldest version the source reconstructs, in memory or at a recovery (its checkpoint's). git's push asks
+/// it of the version a create is made at (A-654).
+pub(crate) fn branch_version(
   state: &ShardState,
   source: DbVolumeId,
   version: Option<u64>,
@@ -596,18 +600,21 @@ pub(crate) fn retire_branch(
 }
 
 /// Sets repository `repository`'s policy whole (§4.17.1 "Policy", A-622): its owner's verb, made from policy version
-/// `read`, the version its owner read: its rules, its hooks and, for Subversion, its hooks-env (A-648). One entry of
-/// the repository's register: `Op::RepositoryPolicySet` takes its next position. The database's guard refuses a version
-/// the policy has moved past (`PolicyChanged`, naming the version now) and a rule, hook or hooks-env section the
-/// repository cannot hold (`Database`, naming the first by index), before anything is recorded.
+/// `read`, the version its owner read: its rules, its hooks, for Subversion its hooks-env (A-648), and for git the keys
+/// trusted to sign its commits (A-644). One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
+/// position. The database's guard refuses a version the policy has moved past (`PolicyChanged`, naming the version now)
+/// and a rule, hook or hooks-env section the repository cannot hold (`Database`, naming the first by index), before
+/// anything is recorded; this verb refuses a trusted signer A-321's verifier cannot read, or signers for a repository
+/// that is not git's (`BadRequest`), and keeps each key once, in the order given.
 pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks, hooks_env): (
+  (rules, hooks, hooks_env, signers): (
     &[slates_ipc::protocol::PolicyRule],
     &[slates_ipc::protocol::HookConfig],
     &[slates_ipc::protocol::HooksEnvSection],
+    &[Vec<u8>],
   ),
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "set_repository_policy") {
@@ -619,11 +626,16 @@ pub(crate) fn set_policy(
       current: record.policy.version,
     });
   };
+  let signers = match commit_signers(record.tool, signers) {
+    Ok(signers) => signers,
+    Err(refusal) => return refused(refusal),
+  };
   let policy = RepositoryPolicy {
     version,
     rules: rules.iter().map(db_rule).collect(),
     hooks: hooks.iter().map(db_hook).collect(),
     hooks_env: hooks_env.iter().map(db_hooks_env_section).collect(),
+    signers,
   };
   let op = Op::RepositoryPolicySet {
     repository: record.id,
@@ -633,6 +645,35 @@ pub(crate) fn set_policy(
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The keys a repository's policy trusts to sign its commits, as its record keeps them (A-644): each one A-321's
+/// verifier reads (`TrustedKey::from_wire`), once, in the order given; and none but a git repository's, the one tool
+/// whose push judges a commit's signature.
+fn commit_signers(
+  tool: slates_db::catalog::VcsTool,
+  keys: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, Refusal> {
+  if tool != slates_db::catalog::VcsTool::Git && !keys.is_empty() {
+    return Err(Refusal::BadRequest {
+      reason: "trusted commit signers are a git repository's alone".to_owned(),
+    });
+  }
+  let mut seen: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
+  let mut kept: Vec<Vec<u8>> = Vec::new();
+  for key in keys {
+    if crate::signed_work::TrustedKey::from_wire(key.clone()).is_err() {
+      return Err(Refusal::BadRequest {
+        reason:
+          "a trusted signer is an ssh-ed25519 or sk-ssh-ed25519@openssh.com key in SSH wire form"
+            .to_owned(),
+      });
+    }
+    if seen.insert(key.as_slice()) {
+      kept.push(key.clone());
+    }
+  }
+  Ok(kept)
 }
 
 /// The database's form of a policy rule (A-622).
@@ -653,6 +694,8 @@ fn db_rule(rule: &slates_ipc::protocol::PolicyRule) -> slates_db::catalog::Polic
       wire::PolicyRight::Submit => PolicyRight::Submit,
       wire::PolicyRight::Rewrite => PolicyRight::Rewrite,
       wire::PolicyRight::Delete => PolicyRight::Delete,
+      wire::PolicyRight::MergeCommit => PolicyRight::MergeCommit,
+      wire::PolicyRight::UnsignedCommit => PolicyRight::UnsignedCommit,
     },
     effect: match rule.effect {
       wire::PolicyEffect::Allow => PolicyEffect::Allow,
@@ -1020,8 +1063,9 @@ mod tests {
   }
 
   /// A-603, A-642 (§4.17.1 shared piece 2: each green keeps its own log; the namespace is a log of its own). Do: create a
-  /// repository, write its root twice, branch it at a version it folded and then at its head, retire the branch's name
-  /// and bind it again, write the branch; then write a green no repository holds, and send a bind the guard refuses.
+  /// repository, write its root until the service folds its first version (`write_until_folded`: as many writes as the
+  /// doubling rule's own inputs ask), branch it at that version and then at its head, retire the branch's name and bind
+  /// it again, write the branch; then write a green no repository holds, and send a bind the guard refuses.
   /// Expect: each verb moves the names log alone, by each change it makes; each member's version moves its own green's
   /// log alone; the refused branch, the lone green's version and the refused bind move no log of the repository; and no
   /// verb or lone version is an atomic record.
@@ -1041,8 +1085,9 @@ mod tests {
         |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
       assert_eq!(names(state), Some(2), "the root joined and its name bound");
       write(state, root, b"v1", 1);
-      write(state, root, b"v2", 2);
-      assert_eq!((names(state), head_of(state, root)), (Some(2), 2));
+      let mut serial = 1;
+      let root_head = write_until_folded(state, root, &mut serial);
+      assert_eq!((names(state), head_of(state, root)), (Some(2), root_head));
       // No reader held version 1, so the root folded it: a branch there is refused before any record.
       assert!(matches!(
         refusal(branch(state, ("tree", "early", "main"), Some(1))),
@@ -1052,18 +1097,49 @@ mod tests {
       assert_eq!(names(state), Some(4));
       retire_and_bind_again(state, topic);
       assert_eq!(names(state), Some(6));
-      write(state, topic, b"t1", 3);
+      write(state, topic, b"t1", serial + 1);
       assert_eq!(
         (names(state), head_of(state, topic), head_of(state, root)),
-        (Some(6), 1, 2)
+        (Some(6), 1, root_head)
       );
-      assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic);
+      assert_a_lone_green_and_a_refused_bind_move_nothing(state, topic, serial + 2);
       assert_eq!(names(state), Some(6));
       assert_eq!(
         state.db.partition().repositories().atomic_records().count(),
         0
       );
     });
+  }
+
+  /// Writes `green` a version at a time, each through a work destroyed after (`write`), so no reader holds a version,
+  /// until the service's doubling rule takes a checkpoint past the one `green` holds
+  /// (`merge_service::checkpoint_green_when`: a checkpoint is taken once the increments it would fold reach the size of
+  /// the one held). How many writes that takes follows the checkpoint's and the increments' encodings, so it is read
+  /// from the rule's own inputs after each write (`merge_service::fold_inputs`), never fixed here: while no checkpoint
+  /// is taken the rule must be waiting on them, and each write must have added bytes to fold, so the writes end within
+  /// the held checkpoint's size in bytes. Returns the head reached, `serial` left at the last serial used.
+  fn write_until_folded(state: &mut ShardState, green: VolumeId, serial: &mut u32) -> u64 {
+    let id = to_db_volume(green);
+    let held = state.db.partition().green_floor(id);
+    let mut waited_on = 0;
+    loop {
+      *serial += 1;
+      let head = write(state, green, format!("v{serial}").as_bytes(), *serial);
+      if state.db.partition().green_floor(id) > held {
+        return head;
+      }
+      let inputs =
+        crate::merge_service::fold_inputs(state, id).expect("versions past the checkpoint");
+      assert!(
+        inputs.waits(),
+        "the doubling rule's inputs say fold, yet no checkpoint was taken: {inputs:?}"
+      );
+      assert!(
+        inputs.to_fold > waited_on,
+        "a version added no bytes to fold: {inputs:?}"
+      );
+      waited_on = inputs.to_fold;
+    }
   }
 
   /// Retires `topic`'s name and binds it again.
@@ -1089,8 +1165,13 @@ mod tests {
     assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
   }
 
-  /// Writes a green no repository holds, and binds a taken name: the one moves its own log, the other nothing.
-  fn assert_a_lone_green_and_a_refused_bind_move_nothing(state: &mut ShardState, topic: VolumeId) {
+  /// Writes a green no repository holds (its work named by `serial`), and binds a taken name: the one moves its own
+  /// log, the other nothing.
+  fn assert_a_lone_green_and_a_refused_bind_move_nothing(
+    state: &mut ShardState,
+    topic: VolumeId,
+    serial: u32,
+  ) {
     let lone = green_of(ask(
       state,
       &owner(),
@@ -1100,7 +1181,7 @@ mod tests {
         base: None,
       },
     ));
-    write(state, lone, b"l1", 4);
+    write(state, lone, b"l1", serial);
     assert_eq!(state.db.partition().green_head(to_db_volume(lone)), 1);
     let taken = ask(
       state,
@@ -1314,6 +1395,7 @@ mod tests {
             rules,
             hooks,
             hooks_env: Vec::new(),
+            signers: Vec::new(),
           },
         )
       };
@@ -1461,6 +1543,7 @@ mod tests {
             rules: Vec::new(),
             hooks,
             hooks_env,
+            signers: Vec::new(),
           },
         )
       };
@@ -1513,6 +1596,119 @@ mod tests {
         held(state, "svn"),
         first,
         "a refused setting changes nothing"
+      );
+    });
+  }
+
+  /// An `ssh-ed25519` public key in SSH wire form, `fill` in every byte of its key.
+  fn signer_key(fill: u8) -> Vec<u8> {
+    let mut blob = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
+    blob.extend_from_slice(&[fill; 32]);
+    blob
+  }
+
+  /// Sets repository `repository`'s policy from version `read`: `rules` and `signers`, no hook.
+  fn set_signed(
+    state: &mut ShardState,
+    (repository, read): (&str, u64),
+    rules: Vec<slates_ipc::protocol::PolicyRule>,
+    signers: Vec<Vec<u8>>,
+  ) -> ReplyBody {
+    let body = RequestBody::SetRepositoryPolicy {
+      repository: repository.to_owned(),
+      read,
+      rules,
+      hooks: Vec::new(),
+      hooks_env: Vec::new(),
+      signers,
+    };
+    ask(state, &owner(), body)
+  }
+
+  /// A rule denying everyone `right` on `pattern` of `names`.
+  fn denying(
+    names: slates_ipc::protocol::PolicyNames,
+    pattern: &str,
+    right: slates_ipc::protocol::PolicyRight,
+  ) -> slates_ipc::protocol::PolicyRule {
+    slates_ipc::protocol::PolicyRule {
+      names,
+      pattern: pattern.to_owned(),
+      right,
+      effect: slates_ipc::protocol::PolicyEffect::Deny,
+      who: slates_ipc::protocol::PolicyWho::Anyone,
+    }
+  }
+
+  /// A-644 (§4.17.2 "Protected branches", configured through A-622's policy). Do: set a git repository's policy with
+  /// rules denying merge commits and unsigned commits on `main` and three signers, one repeated; set one whose signer
+  /// is no key; create a Mercurial repository and set its policy with a signer, then with a rule denying merge commits.
+  /// Expect: the first acknowledged, its record holding both rules and the two keys once each, in order; the malformed
+  /// key refused `BadRequest`, nothing changed; the Mercurial signer refused `BadRequest` and its rule refused by the
+  /// database's guard naming it, since no Mercurial push judges either.
+  #[test]
+  fn protections_and_trusted_signers_are_a_git_repositorys_policy() {
+    use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
+    crate::daemon::audit_on_shard(|state| {
+      green_of(create(state, "linux", "main"));
+      let rules = vec![
+        denying(
+          PolicyNames::Refs,
+          "refs/heads/main",
+          PolicyRight::MergeCommit,
+        ),
+        denying(
+          PolicyNames::Refs,
+          "refs/heads/main",
+          PolicyRight::UnsignedCommit,
+        ),
+      ];
+      let keys = vec![signer_key(1), signer_key(2), signer_key(1)];
+      let set = set_signed(state, ("linux", 0), rules, keys);
+      assert_eq!(set, ReplyBody::Acknowledged);
+      let held = |state: &ShardState, name: &str| {
+        let repositories = state.db.partition().repositories();
+        repositories
+          .repository_named(name)
+          .map(|record| record.policy.clone())
+          .unwrap()
+      };
+      let policy = held(state, "linux");
+      let rights: Vec<_> = policy.rules.iter().map(|rule| rule.right).collect();
+      use slates_db::catalog::PolicyRight as Held;
+      assert_eq!(rights, vec![Held::MergeCommit, Held::UnsignedCommit]);
+      assert_eq!(policy.signers, vec![signer_key(1), signer_key(2)]);
+      let malformed = set_signed(state, ("linux", 1), Vec::new(), vec![b"not a key".to_vec()]);
+      assert!(matches!(refusal(malformed), Refusal::BadRequest { .. }));
+      assert_eq!(
+        held(state, "linux"),
+        policy,
+        "a refused setting changes nothing"
+      );
+      let created = ask(
+        state,
+        &owner(),
+        RequestBody::CreateRepository {
+          name: "hg".to_owned(),
+          tool: VcsTool::Mercurial,
+          format: ObjectFormat::Sha1,
+          default_branch: "default".to_owned(),
+          green: None,
+        },
+      );
+      assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+      let signed = set_signed(state, ("hg", 0), Vec::new(), vec![signer_key(1)]);
+      assert!(matches!(refusal(signed), Refusal::BadRequest { .. }));
+      let merges = vec![denying(
+        PolicyNames::Branches,
+        "default",
+        PolicyRight::MergeCommit,
+      )];
+      assert_eq!(
+        refusal(set_signed(state, ("hg", 0), merges, Vec::new())),
+        Refusal::Database {
+          refusal: DatabaseRefusal::PolicyRuleMalformed { index: 0 }
+        }
       );
     });
   }

@@ -6,6 +6,8 @@
 
 use slates_wire::Wire;
 
+use crate::register::{ObjectId, RegisterClass};
+
 /// A volume id: 128 random bits whose high half names the creator host (§4.8 "Lookup").
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct VolumeId {
@@ -1480,8 +1482,8 @@ pub struct RepositoryRecord {
 /// rules by name pattern and its hooks, set whole by its owner (`Op::RepositoryPolicySet`) and carried by its record,
 /// so a partition's snapshot carries it and a replay sets it again. Empty at creation: no rule and no hook, so the
 /// repository's own rule decides everything (its owner holds every right, A-575) and no hook runs. Bounded by the
-/// partition's merge byte budget, which its rules' and hooks' encoded bytes are charged to, and by one log record, since
-/// it is set whole.
+/// partition's merge byte budget, which its rules', hooks', hooks-env sections' and trusted signers' encoded bytes are
+/// charged to, and by one log record, since it is set whole.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryPolicy {
   /// How many times it has been set: a setting names the version after the one its setter read, so one made from a
@@ -1495,6 +1497,10 @@ pub struct RepositoryPolicy {
   /// A Subversion repository's hooks-env (A-648), its sections in the order given: what each of its hooks' environment
   /// is. Empty for git and Mercurial, whose hooks inherit the server's environment. Appended.
   pub hooks_env: Vec<HooksEnvSection>,
+  /// The keys trusted to sign the repository's commits (A-644), each an SSH public key in wire form, in the order set:
+  /// a commit a rule requires signed verifies under one of them (A-321's verifier, under git's namespace). Kept only as
+  /// the server's verb accepted them, and only for a git repository. Appended.
+  pub signers: Vec<Vec<u8>>,
 }
 
 /// What a policy rule's pattern names (§4.17.1; A-597): the names its repository's tool has, each in its tool's form.
@@ -1527,7 +1533,7 @@ impl PolicyNames {
   }
 }
 
-/// A right a policy rule decides (§4.17.1 "Policy").
+/// A right a policy rule decides (§4.17.1 "Policy"; A-644's requirements).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyRight {
   /// Read the branch.
@@ -1538,6 +1544,24 @@ pub enum PolicyRight {
   Rewrite,
   /// Delete it.
   Delete,
+  /// Bring it a merge commit, one of more than one parent, among the commits a change brings (A-644). A requirement: a
+  /// rule denying it keeps the name's history linear, a later one allowing it exempts whom it names, and where no rule
+  /// speaks nothing is required. git's alone. Appended.
+  MergeCommit,
+  /// Bring it a commit that no key of the policy's `signers` signed (A-644). A requirement as `MergeCommit` is: a rule
+  /// denying it requires signed commits. git's alone. Appended.
+  UnsignedCommit,
+}
+
+impl PolicyRight {
+  /// Whether a repository serving `tool` has this right: the requirements are git's alone, the one tool whose push
+  /// path judges them (§4.17.2 "Protected branches").
+  pub fn of(self, tool: VcsTool) -> bool {
+    match self {
+      Self::Read | Self::Submit | Self::Rewrite | Self::Delete => true,
+      Self::MergeCommit | Self::UnsignedCommit => tool == VcsTool::Git,
+    }
+  }
 }
 
 /// Whether a policy rule allows its right or denies it.
@@ -1847,6 +1871,22 @@ pub enum LogName {
     /// The log.
     log: StateLog,
   },
+}
+
+impl LogName {
+  /// The register that holds this log in the fleet (A-636 part 2a; §4.8 "Data model"): a green's log is the green's
+  /// own register, its chain of versions; a state log is its repository's register of the log's class
+  /// ([`RegisterClass::State`]), placed and taken over as the repository is, so a repository's state moves as one, as
+  /// a volume's catalog moves with its volume. No two logs of one repository share a register, so a holder of several
+  /// tells each log's records and promises apart by it.
+  pub fn register(&self) -> ObjectId {
+    match self {
+      LogName::Green { green } => ObjectId(green.bytes),
+      LogName::State { repository, log } => {
+        ObjectId(repository.bytes).in_class(RegisterClass::State(*log))
+      }
+    }
+  }
 }
 
 /// What one record moved of one log (A-642): from the position it found the log at to the one it left it at.

@@ -2601,7 +2601,8 @@ pub(crate) fn route_gated(
     RequestBody::CreateBranch { repository, .. }
     | RequestBody::BindBranch { repository, .. }
     | RequestBody::RetireBranch { repository, .. }
-    | RequestBody::SetRepositoryPolicy { repository, .. } => {
+    | RequestBody::SetRepositoryPolicy { repository, .. }
+    | RequestBody::ImportRepository { repository, .. } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -4632,6 +4633,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ChosenPathUnavailable { .. } => "chosen_path_unavailable",
     Refusal::MessageRequired => "message_required",
     Refusal::IdentityRequired { .. } => "identity_required",
+    Refusal::ImportRefused { .. } => "import_refused",
   }
 }
 
@@ -5130,12 +5132,17 @@ fn dispatch_inner(
       rules,
       hooks,
       hooks_env,
+      signers,
     } => crate::repository::set_policy(
       state,
       principal,
       (&repository, read),
-      (&rules, &hooks, &hooks_env),
+      (&rules, &hooks, &hooks_env, &signers),
     ),
+    // A Mercurial repository's directory imported into its store, answered when the import ends (A-678).
+    RequestBody::ImportRepository { repository, path } => {
+      crate::repository::import::import_repository(state, principal, (&repository, &path))
+    }
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
       principal: proven,
@@ -7043,7 +7050,7 @@ pub(crate) fn reserve_metadata(
 }
 
 /// Why the base directory at `path` could not be opened, as a create (and a clone of an overlay) is refused for it.
-fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal {
+pub(crate) fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal {
   match error {
     // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
     slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
@@ -9401,6 +9408,9 @@ fn judge_submission(
   // this verb, on the single-threaded owner shard — every declared operation before it is in the
   // increment, and a write that arrives after it is a later verb that lands in the next increment,
   // never this one.
+  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
+  }
   let (green_id, inc) = match build_increment(state, sealed, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
@@ -9712,6 +9722,9 @@ fn map_rebase(
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
+  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
+  }
   let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),

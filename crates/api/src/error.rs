@@ -38,9 +38,9 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse,
-  Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VcsTool,
-  VolumeId, VolumeRefusal,
+  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, ImportFault, MoveRefusal,
+  OwnMountUse, Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason,
+  VcsTool, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -534,6 +534,10 @@ pub enum Invalid {
   /// The bytes an archive import read make no volume, by their kind (A-453): another format's file, a newer format, a
   /// copy cut off or altered, or an archive a faulty writer made. Nothing was made.
   Archive(ArchiveFault),
+  /// A repository's import was refused by its fault (A-678): another tool's repository, a store with a history, an
+  /// import under way, a format or a file the import does not take, more than it may hold, a fetch still pending, or
+  /// the import given back. The repository's store is as it was.
+  Import(ImportFault),
 }
 
 /// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
@@ -949,6 +953,7 @@ impl Error {
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),
       Refusal::ImageRefused { reason } => Error::Invalid(Invalid::Image(Note::new(reason))),
       Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
+      Refusal::ImportRefused { fault } => Error::Invalid(Invalid::Import(fault)),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
@@ -1664,11 +1669,11 @@ impl fmt::Display for StartFault {
 #[cfg(test)]
 mod tests {
   use slates_client::ClientError;
-  use slates_ipc::protocol::{Refusal, VolumeId};
+  use slates_ipc::protocol::{ImportFault, Refusal, VolumeId};
 
   use super::{
-    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, OsCode, ProtocolFault,
-    RetryCause, Stale, TargetRefusal, Unreported, Unusable,
+    Busy, Denied, Error, Exhausted, Existing, HostFault, Invalid, Missing, Note, OsCode,
+    ProtocolFault, RetryCause, Stale, TargetRefusal, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1728,6 +1733,21 @@ mod tests {
     );
     assert!(overloaded.is_retryable());
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
+  }
+
+  /// A-678: do type a repository import's refusal as a consumer meets it, from a call that names no volume; expect an
+  /// invalid request naming the import's fault, never retried.
+  #[test]
+  fn an_import_refusal_is_typed_invalid_by_its_fault() {
+    let fault = ImportFault::Damaged {
+      path: "store/data/a.i".to_owned(),
+    };
+    let refused = ClientError::Refused(Refusal::ImportRefused {
+      fault: fault.clone(),
+    });
+    let typed = Error::of_client("i", refused, None, PAUSE_NS);
+    assert_eq!(typed, Error::Invalid(Invalid::Import(fault)));
+    assert!(!typed.is_retryable());
   }
 
   /// A volume-core refusal as a consumer meets it.

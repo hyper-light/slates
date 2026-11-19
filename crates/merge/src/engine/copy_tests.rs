@@ -12,7 +12,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::copy::{appearance_bytes, in_tree, joined, relative};
-use super::{Green, Increment, Lineage, Outcome, Reanchored, Rebased, change_bytes};
+use super::{Green, Increment, Judgment, Lineage, Outcome, Reanchored, change_bytes};
 use crate::chain_entry;
 use crate::checkpoint::{Checkpoint, Tables};
 use crate::increment::Base;
@@ -638,26 +638,6 @@ fn a_green_holding_a_copy_is_checkpointed_and_restored() {
     assert_eq!(read, expected, "restored at {at}");
     assert_eq!(read.3, read.4, "the restored identity is its recount");
   }
-}
-
-/// A-586 (owed: a rebase restating a copy). Do: rebase a work holding a copy. Expect: a type conflict naming its
-/// destination, and the green untouched.
-#[test]
-fn a_rebase_of_a_work_with_a_copy_is_refused_typed() {
-  let mut green = trunk();
-  let identity = green.head_identity();
-  let rebased = green.rebase(&one_copy("trunk", "b", 1).at(2, 1));
-  assert_eq!(
-    rebased,
-    Rebased::Conflict {
-      windows: vec![super::ConflictWindow {
-        path: "b".to_owned(),
-        range: Range::new(0, 0),
-        class: MergeConflictClass::TypeChanged,
-      }],
-    }
-  );
-  assert_eq!((green.head(), green.head_identity()), (1, identity));
 }
 
 /// Every path a base names, in any dimension.
@@ -2299,4 +2279,34 @@ fn every_copy_reads_as_its_model_over_every_history() {
   }
   // The figures the evidence quotes (`-- --nocapture`): the fixed history's counts and the generated histories'.
   eprintln!("copy oracle census: {:?}", census.into_inner());
+}
+
+/// A-658 (a work's copies judged again once the green moved). Do: compute, on a copy of a trunk at version 1, a work
+/// copying `trunk` at version 1 to `b`; land on the owner an overwrite of `trunk/a` as version 2; hand the owner the
+/// computed verdict. Expect: the copies' unit judged again, the verdict held at version 2 equal to the one the owner
+/// computes there itself (the copy fixed to bring `trunk/a` as it stood at version 1); committed, `b/a` holds `alpha`.
+#[test]
+fn a_copy_computed_before_the_green_moved_is_judged_again_by_position() {
+  let copy = trunk();
+  let mut owner = trunk();
+  let work = one_copy("trunk", "b", 1).at(3, 1);
+  let computed = copy.compute(&work).expect("computed at version 1");
+  accept(
+    &mut owner,
+    Work::default().overwrite("trunk/a", 0, b"ALPHA"),
+    2,
+  );
+  let again = owner.judged_again();
+  let own = owner.compute(&work).expect("computed at version 2");
+  let Ok(Judgment::Accepted(held)) = owner.judge_computed(&work, computed) else {
+    panic!("not accepted by position");
+  };
+  let judged = (
+    owner.judged_again() - again,
+    held.at(),
+    Some(held.applied()),
+  );
+  assert_eq!(judged, (1, 2, own.applied()));
+  owner.commit_judged(held).expect("committed at its head");
+  assert_eq!(owner.content("b/a"), Some(&b"alpha"[..]));
 }

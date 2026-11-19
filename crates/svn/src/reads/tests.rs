@@ -742,7 +742,7 @@ fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
 }
 
 /// A-613: the recorder's `SHA256SUMS` names every transcript the tests read, the recorder's record of the repository
-/// and the `locked` repository's rules; the Studio run checks each sum with `shasum -a 256 -c`.
+/// and the `locked` repository's rules; each sum is held to its file's bytes by `crate::fixture_sums`.
 #[test]
 fn every_fixture_has_its_recorded_sum() {
   let sums = include_str!("../../fixtures/reads/SHA256SUMS");
