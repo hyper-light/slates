@@ -11,7 +11,8 @@ use slates_vcs::ContentStore;
 use super::{ADVERTISED, commit_text, pack_of, request, unbounded, zero};
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::receive::works::{
-  Appends, Entry, GreenRead, Greens, KIND_CHANGED, Unappended, Version, Works,
+  Appends, Entry, GreenRead, Greens, KIND_CHANGED, Unappended, Version, Works, append_declined,
+  atomic_declined,
 };
 use crate::receive::{
   ATOMIC_TRANSACTION_FAILED, Declined, FAILED_TO_UPDATE, NoneHidden, Outcome, Received, Session,
@@ -131,13 +132,20 @@ struct Read<'s> {
   served: &'s Served,
 }
 
-impl Greens for Read<'_> {
-  fn read(&self, name: &[u8]) -> Option<GreenRead<'_>> {
-    (name == MAIN).then(|| GreenRead {
+impl Read<'_> {
+  /// The served branch's green as a push reads it.
+  fn served(&self) -> GreenRead<'_> {
+    GreenRead {
       id: GREEN,
       position: self.served.green.head(),
       green: &self.served.green,
-    })
+    }
+  }
+}
+
+impl Greens for Read<'_> {
+  fn read<T>(&self, name: &[u8], with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T> {
+    (name == MAIN).then(|| with(self.served()))
   }
 
   fn version_of(&self, green: u64, head: &ObjectId) -> Option<Version> {
@@ -145,6 +153,16 @@ impl Greens for Read<'_> {
       number: 1,
       tree: self.served.tree,
     })
+  }
+
+  /// The served branch is the default and has a head, so every create is made at its one version.
+  fn base_of_create<T>(
+    &self,
+    _parent: Option<&ObjectId>,
+    with: impl FnOnce(GreenRead<'_>, Version) -> T,
+  ) -> Option<T> {
+    let version = self.version_of(GREEN, &self.served.head)?;
+    Some(with(self.served(), version))
   }
 }
 
@@ -352,9 +370,10 @@ fn an_old_value_no_version_held_is_a_ref_that_moved() {
   }
 }
 
-/// A-620 part 2 (§4.17.1's namespace item 4: a create makes a new green). Do: create `topic` at a
-/// new commit. Expect: `ok`; one create appended under its name; its work, submitted to a new
-/// green, holding the client's bytes and head.
+/// A-620 part 2, A-654 (§4.17.1's namespace item 4: a create makes a new green, made at its first
+/// parent's version). Do: create `topic` at a new commit on the served head. Expect: `ok`; one
+/// create appended under its name, made at the served branch's version 1; its work, submitted to a
+/// green holding that version, holding the client's bytes and head.
 #[test]
 fn a_create_is_a_new_green_holding_the_clients_tree() {
   let mut served = Served::new();
@@ -367,21 +386,72 @@ fn a_create_is_a_new_green_holding_the_clients_tree() {
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
-  let named =
-    matches!(logs.appended.as_slice(), [Entry::Create { name, .. }] if name == b"refs/heads/topic");
+  let named = matches!(
+    logs.appended.as_slice(),
+    [Entry::Create { name, from: Some((GREEN, 1)), .. }] if name == b"refs/heads/topic"
+  );
   assert!(named, "{:?}", logs.appended);
-  let mut green = Green::new();
-  let verdict = green.submit(only_increment(&logs).unwrap());
+  let increment = only_increment(&logs).unwrap().clone();
+  let verdict = served.green.submit(&increment);
   assert!(
-    matches!(verdict, Verdict::Accepted { version: 1 }),
+    matches!(verdict, Verdict::Accepted { version: 2 }),
     "{verdict:?}"
   );
-  assert_holds(&green, b"topic\n", topic);
+  assert_holds(&served.green, b"topic\n", topic);
 }
 
-/// A-620 part 2 (§4.17.1 item 6: a tag is a green). Do: create `refs/tags/v1` at an annotated tag
-/// of the served head. Expect: one create appended; its work, submitted to a new green, holding the
-/// tagged commit's tree and naming the tag as its head.
+/// A-654 (main's ruling: an orphan create is made at the default branch's head, its work the whole
+/// difference against that head's tree). Do: create `orphan` at a root commit whose tree holds a
+/// file the served tree does not, and not the served one. Expect: `ok`; the create made at the
+/// served branch's version 1; its work, submitted to a green holding that version, leaving exactly
+/// the client's tree: the served file gone, the client's present, the head the client's.
+#[test]
+fn an_orphan_create_states_the_whole_difference_from_the_default_head() {
+  let mut served = Served::new();
+  let blob = id_of(Kind::Blob, b"other\n");
+  let tree = tree_bytes(&[(b"100644", b"other", blob)]);
+  let commit = commit_text(id_of(Kind::Tree, &tree), &[]);
+  let orphan = id_of(Kind::Commit, &commit);
+  let objects = vec![
+    (Kind::Blob, b"other\n".to_vec()),
+    (Kind::Tree, tree),
+    (Kind::Commit, commit),
+  ];
+  let bytes = push_of(
+    &[(zero(), orphan, b"refs/heads/orphan")],
+    &objects,
+    b" report-status",
+  );
+  let mut logs = Logs::served();
+  let received = pushed(&mut served, &bytes, &mut logs);
+  assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
+  let made_at = matches!(
+    logs.appended.as_slice(),
+    [Entry::Create {
+      from: Some((GREEN, 1)),
+      ..
+    }]
+  );
+  assert!(made_at, "{:?}", logs.appended);
+  let increment = only_increment(&logs).unwrap().clone();
+  let verdict = served.green.submit(&increment);
+  assert!(
+    matches!(verdict, Verdict::Accepted { version: 2 }),
+    "{verdict:?}"
+  );
+  assert_eq!(served.green.content("file"), None);
+  assert_eq!(served.green.content("other"), Some(&b"other\n"[..]));
+  assert_eq!(
+    served.green.xattr(ROOT, HEAD_ATTRIBUTE),
+    Some(orphan.as_bytes())
+  );
+}
+
+/// A-620 part 2, A-654 (§4.17.1 item 6: a tag is a green, made at a base like any create). Do:
+/// create `refs/tags/v1` at an annotated tag of the served head, a root commit. Expect: one create
+/// appended, made at the served branch's version 1 (the default head, the commit having no
+/// parent); its work, submitted to a green holding that version, holding the tagged commit's tree
+/// and naming the tag as its head.
 #[test]
 fn an_annotated_tag_is_a_green_of_its_commits_tree() {
   let mut served = Served::new();
@@ -400,13 +470,18 @@ fn an_annotated_tag_is_a_green_of_its_commits_tree() {
   let mut logs = Logs::served();
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [Outcome::Ok(Vec::new())]);
-  let mut green = Green::new();
-  let verdict = green.submit(only_increment(&logs).unwrap());
+  let made_at = matches!(
+    logs.appended.as_slice(),
+    [Entry::Create { name, from: Some((GREEN, 1)), .. }] if name == b"refs/tags/v1"
+  );
+  assert!(made_at, "{:?}", logs.appended);
+  let increment = only_increment(&logs).unwrap().clone();
+  let verdict = served.green.submit(&increment);
   assert!(
-    matches!(verdict, Verdict::Accepted { version: 1 }),
+    matches!(verdict, Verdict::Accepted { version: 2 }),
     "{verdict:?}"
   );
-  assert_holds(&green, b"one\n", tag_id);
+  assert_holds(&served.green, b"one\n", tag_id);
 }
 
 /// A-620 part 2 (§4.17.1's namespace item 5: deleting a branch retires its green). Do: delete the
@@ -492,4 +567,32 @@ fn a_work_a_store_cannot_build_is_refused_in_slates_words_naming_its_path() {
   let received = pushed(&mut served, &bytes, &mut logs);
   assert_eq!(received.outcomes, [refused(KIND_CHANGED, MAIN, b"file")]);
   assert!(logs.appended.is_empty());
+}
+
+/// A-654 (an entry the append refused for a reason of its own: git's words for a ref not updated,
+/// slates' on band 2). Do: decline one ref's entry the append refused for the shard's budget, and
+/// an atomic push whose second entry it refused so. Expect: `failed to update ref` for the one and
+/// `atomic transaction failed` for the push, each band-2 line naming the refused ref and why.
+#[test]
+fn an_entry_the_append_refused_for_its_own_reason_is_answered_in_git_words_with_slates_why() {
+  let why = b"past the shard's budget".to_vec();
+  let one = append_declined(
+    MAIN,
+    &Unappended::Refused {
+      at: 0,
+      why: why.clone(),
+    },
+  );
+  assert_eq!(one.reason, FAILED_TO_UPDATE);
+  assert_eq!(
+    one.message,
+    Some(message(b"refs/heads/main: past the shard's budget"))
+  );
+  let names: [&[u8]; 2] = [MAIN, b"refs/heads/topic"];
+  let atomic = atomic_declined(&names, &Unappended::Refused { at: 1, why });
+  assert_eq!(atomic.reason, ATOMIC_TRANSACTION_FAILED);
+  assert_eq!(
+    atomic.message,
+    Some(message(b"refs/heads/topic: past the shard's budget"))
+  );
 }

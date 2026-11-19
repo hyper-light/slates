@@ -26,7 +26,7 @@ const LS_REFS: &[u8] =
   include_bytes!("../../../fixtures/http/04-post-git-upload-pack.request-body.bin");
 
 /// Format: the clone's `fetch` request, as git 2.50.1's client sent it, inflated from the gzip it was sent in.
-const FETCH: &[u8] =
+pub(super) const FETCH: &[u8] =
   include_bytes!("../../../fixtures/http/05-post-git-upload-pack.request-inflated.bin");
 
 /// Format: the identity fast-import gave every commit, its author taken from its committer.
@@ -36,7 +36,7 @@ const SIGNATURE: &str = "test <test@example.com> 1112911993 +0000";
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// small.git's branches in name order, each with its commit's message: `main`, then `side0001` to `side0030`.
-fn branches() -> Vec<(String, String)> {
+pub(super) fn branches() -> Vec<(String, String)> {
   let mut branches = vec![("refs/heads/main".to_string(), "main\n".to_string())];
   branches.extend((1..=30).map(|n| {
     (
@@ -49,7 +49,7 @@ fn branches() -> Vec<(String, String)> {
 
 /// small.git rebuilt: the empty tree and a commit on it for each branch, in a store whose greens are the branches, in
 /// order; and each branch's commit.
-fn small() -> (served::Served, Vec<ObjectId>) {
+pub(super) fn small() -> (served::Served, Vec<ObjectId>) {
   let commits: Vec<Vec<u8>> = branches()
     .iter()
     .map(|(_, message)| {
@@ -100,7 +100,7 @@ fn small() -> (served::Served, Vec<ObjectId>) {
 }
 
 /// The refs small.git serves: each branch, its green its place in order.
-fn refs(names: &[(String, String)]) -> Vec<NamedRef<'_>> {
+pub(super) fn refs(names: &[(String, String)]) -> Vec<NamedRef<'_>> {
   names
     .iter()
     .enumerate()

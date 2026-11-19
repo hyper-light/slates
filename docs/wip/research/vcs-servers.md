@@ -414,6 +414,35 @@ A commit's signature and payload are split exactly as `commit.c` splits them, an
 history. Gitea's `--not --all` reads every ref's position (a global reference, A-642) and lets a protected branch be
 made at a commit pushed first to a branch nothing protects; it is not followed.
 
+### 5.10 The SSH edge: what waits on people, and how each tool's program refuses (A-651, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| OpenSSH `sshconnect2.c`, `sshconnect.c`, `channels.h` | openssh-portable `master` at `fa4b2a82be7df9768272cfabc2d78e4a12c2b3c0` | 1caf45cb23fd452e, b5b0ec1052da2c26, ffbc133ac4c1a4c1 |
+| git `usage.c`, `builtin/upload-pack.c` | git `master` at `e1ec09b23c8e0deb21a0b95ac5996422277395d4` | 114f74835706dd86, ff09e4385553b959 |
+| Mercurial `mercurial/dispatch.py`, `mercurial/scmutil.py`, `mercurial/localrepo.py` | 7.2's PyPI source distribution, SHA-256 `a250227e…` (as §5.7) | 7f057268680b0b53, cea9db559e8c7dee, 4fa160a96510dad8 |
+| Subversion `subversion/svnserve/svnserve.c` | `1.14.x` at `d434dc14866e0c48602dba59a15443255d0b8c1e` | 43155c2bd557492f |
+
+What it rests on (quoted):
+- **People inside a connection** [C: OpenSSH]: `input_userauth_pk_ok` ("Server accepts key") calls
+  `sign_and_send_pubkey` (`sshconnect2.c` 745); `identity_sign`, for a key that is neither in an agent nor loaded,
+  "Load the private key from the file" through `load_identity_file` (1242), which builds the prompt "Enter passphrase for
+  key '%.100s': " (1543) and reads it; `check_host_key` asks "Are you sure you want to continue connecting" through
+  `confirm` (`sshconnect.c` 1302-1305), before the client's NEWKEYS. `CHAN_SES_PACKET_DEFAULT (32*1024)`
+  (`channels.h` 224).
+- **git's refusals** [C: git]: `die_builtin` reports with the prefix "fatal: " (`usage.c` 74) and `exit(128)` (87);
+  upload-pack's `die("'%s' does not appear to be a git repository", dir)` when it cannot enter the repository
+  (`builtin/upload-pack.c` 62).
+- **Mercurial's** [C: Mercurial 7.2]: `RepoError(_(b'repository %s not found') % path)` (`localrepo.py` 574),
+  printed "abort: %s" by `callcatch`, whose coarse exit code is -1 (`scmutil.py` 198, 231-234, 311), and
+  `sys.exit(status & 255)` (`dispatch.py` 106): 255.
+- **svnserve's** [C]: a failure is reported by `svn_cmdline_handle_exit_error(err, NULL, "svnserve: ")` with
+  `EXIT_FAILURE` (`svnserve.c` 1426-1427).
+
+What follows for slates (A-651): the SSH edge reaps a stalled connection only when a new one needs its seat, since the
+waits above belong to people and to a push's compression; and a command the edge cannot run is refused as its tool's
+own program refuses, in its words and with its status, after the `exec` itself is accepted.
+
 ## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
 
 Read 2026-11-19 (UTC) by g255. Each file was downloaded and hashed; the lines cited are each file's own.

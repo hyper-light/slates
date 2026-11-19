@@ -33,7 +33,8 @@ use slates_ipc::protocol::{
   VolumeSummary, WorkOp, unpack,
 };
 use slates_ipc::protocol::{
-  ChangedCursor, EntriesCursor, PlannedEntry, PolicySubject, Verification, WritePolicy,
+  ChangedCursor, CredentialMaterial, EntriesCursor, PlannedEntry, PolicySubject, Verification,
+  WritePolicy,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -3326,10 +3327,7 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<RequestId, ClientError> {
-    let id = self.begin(&RequestBody::Submit {
-      work,
-      evidence: evidence.to_vec(),
-    })?;
+    let id = self.begin(&RequestBody::submit(work, evidence.to_vec()))?;
     // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
     self
       .verdict_chains
@@ -4165,10 +4163,7 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<Submitted, ClientError> {
-    let reply = self.call(&RequestBody::Submit {
-      work,
-      evidence: evidence.to_vec(),
-    })?;
+    let reply = self.call(&RequestBody::submit(work, evidence.to_vec()))?;
     self
       .verdict_of(work, VerdictKind::Submit, reply)?
       .submitted()
@@ -4234,8 +4229,9 @@ impl Client {
         work,
         evidence,
         signature: signature.to_vec(),
+        authorship: Default::default(),
       },
-      None => RequestBody::Submit { work, evidence },
+      None => RequestBody::submit(work, evidence),
     })?;
     self.judged_of(work, reply)
   }
@@ -4254,6 +4250,7 @@ impl Client {
       work,
       evidence: evidence.to_vec(),
       signature: None,
+      authorship: Default::default(),
     })? {
       ReplyBody::MergeApprovalRequired {
         identity,
@@ -4299,6 +4296,7 @@ impl Client {
       identity,
       proof,
       signature: signature.map(<[u8]>::to_vec),
+      authorship: Default::default(),
     })?;
     self.judged_of(work, reply)
   }
@@ -4380,6 +4378,7 @@ impl Client {
       delete_len,
       insert,
       evidence: evidence.to_vec(),
+      authorship: Default::default(),
     };
     let inline = request(slates_ipc::protocol::EditBytes::Inline {
       bytes: bytes.to_vec(),
@@ -5058,6 +5057,41 @@ impl Client {
     match self.call(&RequestBody::Revoke { consumer, proof })? {
       ReplyBody::Revoked => Ok(()),
       _ => Err(ClientError::UnexpectedReply { verb: "revoke" }),
+    }
+  }
+
+  /// Enrolls a version-control credential for `principal` until `expires_ns` on the wall clock (§4.13, §4.17.2
+  /// "Access"; A-625 part 3): the human surface's verb with its proof of issuer authority
+  /// (`slates_server::credentials::enroll_proof`). Returns the credential's id: an SSH key's fingerprint, or the hash a
+  /// token was given by.
+  pub fn enroll_credential(
+    &mut self,
+    principal: Principal,
+    material: CredentialMaterial,
+    expires_ns: Option<u64>,
+    proof: [u8; 32],
+  ) -> Result<[u8; 32], ClientError> {
+    match self.call(&RequestBody::EnrollCredential {
+      principal,
+      material,
+      expires_ns,
+      proof,
+    })? {
+      ReplyBody::CredentialEnrolled { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "enroll_credential",
+      }),
+    }
+  }
+
+  /// Revokes the version-control credential named `id` (§4.13; A-625 part 3): the human surface's verb with its proof of
+  /// issuer authority (`slates_server::credentials::revoke_proof`).
+  pub fn revoke_credential(&mut self, id: [u8; 32], proof: [u8; 32]) -> Result<(), ClientError> {
+    match self.call(&RequestBody::RevokeCredential { id, proof })? {
+      ReplyBody::CredentialRevoked => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "revoke_credential",
+      }),
     }
   }
 

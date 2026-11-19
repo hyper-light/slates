@@ -140,15 +140,18 @@ struct Built {
 }
 
 /// Appends a `getbundle`'s answer for `asked`: the bundle2 stream of the parts asked for, nothing past the admission.
+/// The client's bundle capabilities are judged before what is missing is looked for, in 7.2's order (`getbundle`'s
+/// bundle2 check, then `getbundlechunks`' capabilities before its changegroup part), so a bundle1 request is refused as
+/// one whatever it names, and its client is never sent a bundle2 abort (A-650).
 pub fn getbundle(
   store: &impl Store,
   asked: &Asked<'_>,
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refusal> {
-  let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
   let mut unquoted = Vec::new();
   let caps = bundle2_capabilities(asked.bundlecaps, admission, &mut unquoted)?;
+  let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
   let mut parts = Vec::new();
   parts.extend(changegroup_part(
     store, &outgoing, asked.cg, &caps, admission,

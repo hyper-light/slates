@@ -227,6 +227,29 @@ fn serves_both_ways(session: &mut Session) {
   assert_eq!(session.last_received(), &[52]);
 }
 
+/// A-651 (RFC 4253 §7.3: the keys are in use once each side's NEWKEYS is taken). Do: pass a client's identification and
+/// KEXINIT, then its exchange message, then its NEWKEYS. Expect: the transport established only after the NEWKEYS, though
+/// the session id is known a round trip before.
+#[test]
+fn the_transport_is_established_by_the_clients_newkeys() {
+  let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
+  let first = session.client.take_output();
+  session.to_server(&first).unwrap();
+  let before = session.server.is_established();
+  session.to_client();
+  let init = session.client.take_output();
+  session.to_server(&init).unwrap();
+  let known = (
+    session.server.session_id().is_some(),
+    session.server.is_established(),
+  );
+  session.pump().unwrap();
+  assert_eq!(
+    (before, known, session.server.is_established()),
+    (false, (true, false), true)
+  );
+}
+
 /// A-594: do connect a client that prefers AES-GCM for what it sends and ChaCha20-Poly1305 for what it receives. Expect
 /// each direction under its own cipher, and messages passing both ways.
 #[test]

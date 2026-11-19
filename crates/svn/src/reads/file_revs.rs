@@ -21,10 +21,11 @@
 //!   and computes), svndiff 2 to a client that accepts it and 0 to any other (never 1, zlib: the report editor's rule),
 //!   a string for each write `svn_txdelta_to_svndiff3` makes: the header at the first window, or alone when the target
 //!   is empty and there is none; each window's integers, then its instruction and new-data sections when not empty (the
-//!   report editor's `window_sections`). In svndiff 0 a window of new data alone is `send_simple_insertion_window`'s:
-//!   the header if it is not out, the integers and the instruction in one string, then the new data. A section an LZ4
-//!   block shortens is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it may differ in bytes while it decodes to
-//!   the same window; svndiff 0 is `svnserve`'s byte for byte.
+//!   report editor's `DeltaWrites`, the one writer of these writes, whose `textdelta-chunk`s are the same strings, as
+//!   `svnserve`'s are: A-616 continued (7)). In svndiff 0 a window of new data alone is
+//!   `send_simple_insertion_window`'s: the header if it is not out, the integers and the instruction in one string,
+//!   then the new data. A section an LZ4 block shortens is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it may
+//!   differ in bytes while it decodes to the same window; svndiff 0 is `svnserve`'s byte for byte.
 //! - Then `done`, then `( success ( ) )` or the refusal.
 //!
 //! Merged revisions of one number from more than one file (a revision that changed two merged sources) have no order to
@@ -46,8 +47,8 @@ use crate::handshake::ClientCapabilities;
 use crate::index::{Node, NodeKind, PropertyList, Revision, Text};
 use crate::mergeinfo::{Compare, Mergeinfo, MergeinfoInheritance, mergeinfo_at};
 use crate::ra_svn::{ItemError, Value, write};
-use crate::report::editor::{simple_insertion, window_sections};
-use crate::svndiff::{Compression, Encoder, Version, WINDOW_LIMIT, deltas};
+use crate::report::editor::DeltaWrites;
+use crate::svndiff::{Compression, Version, WINDOW_LIMIT, deltas};
 use std::collections::{BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
@@ -120,8 +121,8 @@ impl FileRevsRequest {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `get-file-revs ( path [ start ] [ end ] ? merged )` (`serve.c` `get_file_revs`): the authentication request, then
-  /// a [`Stream`] of the file's revisions.
+  /// `get-file-revs ( path [ start ] [ end ] ? merged )` (`serve.c` `get_file_revs`): a [`Stream`] of the file's
+  /// revisions, the authentication request written at its first step, once they are found.
   pub(super) fn file_revisions(
     &mut self,
     params: &[Value<'_>],
@@ -130,7 +131,6 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     let Some(request) = FileRevsRequest::parse(params, self.base) else {
       return Ok(Outcome::Close);
     };
-    self.trivial_auth()?;
     let (version, compression) = if capabilities.accepts_svndiff2 {
       (Version::Two, Compression::Lz4)
     } else {
@@ -166,7 +166,7 @@ pub(super) struct FileRevsStream {
 
 impl FileRevsStream {
   /// Sends revisions until the bytes written and the revisions sent reach `room`, at least one step, or until the
-  /// answer is whole.
+  /// answer is whole; [`Progress::Close`] where `svnserve`'s process aborts (an empty mainline, `Stop::Aborted`).
   pub(super) fn resume<R: Repository + ?Sized>(
     &mut self,
     reads: &mut Reads<'_, R>,
@@ -178,6 +178,10 @@ impl FileRevsStream {
       match self.step(reads) {
         Ok(()) => {}
         Err(Stop::Refused(failure)) => self.finish(reads, Some(&failure))?,
+        Err(Stop::Aborted) => {
+          self.ended = true;
+          return Ok(Progress::Close);
+        }
         Err(Stop::Unwritten(error)) => return Err(error),
       }
       steps = steps.saturating_add(1);
@@ -189,10 +193,17 @@ impl FileRevsStream {
     Ok(Progress::Done)
   }
 
-  /// One step: the revisions found, or the next sent, or the end once none is left.
+  /// One step: the revisions found, or the next sent, or the end once none is left. The first writes the
+  /// authentication request once the revisions are found, unless their walk aborted: `svnserve` writes the request into
+  /// its connection's buffer before it walks, and the process aborts before the buffer is flushed, so its client reads
+  /// nothing for the command (the `locked-file-revs-abort` recording).
   fn step<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), Stop> {
     let Some(pending) = self.pending.as_mut() else {
-      self.pending = Some(reads.file_revisions_to_send(&self.request)?);
+      let found = reads.file_revisions_to_send(&self.request);
+      if !matches!(found, Err(Stop::Aborted)) {
+        reads.trivial_auth()?;
+      }
+      self.pending = Some(found?);
       return Ok(());
     };
     let Some(next) = pending.pop_front() else {
@@ -252,10 +263,8 @@ impl FileRevsStream {
   }
 
   /// The delta from the previous revision's text (none for the first) to `node`'s, a string for each write
-  /// `svn_txdelta_to_svndiff3` makes (`svndiff.c` `window_handler`): the header at the first window, or alone when
-  /// there is none; each window's integers, then its instruction and new-data sections when they are not empty. In
-  /// svndiff 0 a window of new data alone is written as `send_simple_insertion_window` writes it: the header if it is
-  /// not out, the integers and the instruction in one string, then the new data.
+  /// `svn_txdelta_to_svndiff3` makes (`serve.c` `svndiff_handler`), the writes the report editor's `DeltaWrites` makes,
+  /// the one writer of them (A-616 continued (7)).
   fn delta<R: Repository + ?Sized>(
     &self,
     reads: &mut Reads<'_, R>,
@@ -268,31 +277,18 @@ impl FileRevsStream {
     let target = reads.whole_text(node.text())?;
     let room = NonZeroUsize::new(usize::try_from(WINDOW_LIMIT).map_err(|_| Failure::corrupt())?)
       .ok_or_else(Failure::corrupt)?;
-    let mut encoder = Encoder::new(self.version);
-    let header = encoder.header();
-    let mut header_out = false;
+    let mut writes = DeltaWrites::new(self.version);
     let mut encoded = Vec::new();
     for window in deltas(&source, &target, room).map_err(|_| Failure::corrupt())? {
-      encoded.clear();
-      encoder
+      let window_writes = writes
         .window(&window, self.compression, &mut encoded)
         .map_err(|_| Failure::corrupt())?;
-      let [integers, instructions, new_data] =
-        window_sections(&encoded).map_err(|_| Failure::corrupt())?;
-      let unwritten_header: &[u8] = if header_out { &[] } else { &header };
-      if simple_insertion(self.version, &window) {
-        let joined = [unwritten_header, integers, instructions].concat();
-        write_sections(&[joined.as_slice(), new_data], reads.out)?;
-      } else {
-        write_sections(
-          &[unwritten_header, integers, instructions, new_data],
-          reads.out,
-        )?;
+      for piece in window_writes.iter() {
+        write(&Value::String(piece), reads.out)?;
       }
-      header_out = true;
     }
-    if !header_out {
-      write_sections(&[header.as_slice()], reads.out)?;
+    if let Some(header) = writes.end() {
+      write(&Value::String(&header), reads.out)?;
     }
     Ok(())
   }
@@ -314,11 +310,9 @@ impl FileRevsStream {
 }
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
-  /// `svn_repos_get_file_revs2`'s revisions, in the order they are sent.
-  fn file_revisions_to_send(
-    &self,
-    request: &FileRevsRequest,
-  ) -> Result<VecDeque<PathRev>, Failure> {
+  /// `svn_repos_get_file_revs2`'s revisions, in the order they are sent; [`Stop::Aborted`] where its assertion that the
+  /// mainline holds a revision fails, the file's first location being one the session may not read.
+  fn file_revisions_to_send(&self, request: &FileRevsRequest) -> Result<VecDeque<PathRev>, Stop> {
     let youngest = i64::try_from(self.index.youngest()).map_err(|_| Failure::corrupt())?;
     let valid = |revision: Option<i64>| {
       revision
@@ -329,7 +323,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     if end < start {
       if request.merged {
         let message = String::from("Trying to use an unsupported feature");
-        return Err(Failure::new(SVN_ERR_UNSUPPORTED_FEATURE, message));
+        return Err(Failure::new(SVN_ERR_UNSUPPORTED_FEATURE, message).into());
       }
       let (older, newer) = (unsigned(end)?, unsigned(start)?);
       let mut found = BTreeSet::new();
@@ -343,6 +337,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       mark: false,
     };
     let mainline = self.interesting(&request.path, start, end, walk, &mut found)?;
+    if mainline.is_empty() {
+      return Err(Stop::Aborted);
+    }
     let merged = if request.merged {
       self.merged_revisions(start, &mainline, &mut found)?
     } else {
@@ -352,8 +349,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   }
 
   /// `find_interesting_revisions`: the file's history from `end` back across copies, each location kept until one at
-  /// or before `start`, or one already found when merged revisions are included; refused when the path is no file in
-  /// `end`.
+  /// or before `start`, or one already found when merged revisions are included, or one the session may not read;
+  /// refused when the path is no file in `end`.
   fn interesting(
     &self,
     path: &str,
@@ -374,7 +371,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     let mut revisions = Vec::new();
     while let Some(location) = self.history_prev(&history, true)? {
       let key = (location.path.clone(), location.revision);
-      if walk.merged && found.contains(&key) {
+      if (walk.merged && found.contains(&key)) || !self.readable(&location.path) {
         break;
       }
       let merged_mergeinfo = if walk.merged {
@@ -556,19 +553,6 @@ fn same_text(first: Option<Text>, second: Option<Text>) -> bool {
   digests(first) == digests(second)
 }
 
-/// Each section that is not empty as a string, in order, as each stream write sends one (`serve.c`
-/// `svndiff_handler`).
-fn write_sections(sections: &[&[u8]], out: &mut Vec<u8>) -> Result<(), ItemError> {
-  for section in sections
-    .iter()
-    .copied()
-    .filter(|section| !section.is_empty())
-  {
-    write(&Value::String(section), out)?;
-  }
-  Ok(())
-}
-
 /// `svn_prop_diffs`: the changes from `previous` to `properties`, deletions with no value; in byte order of the names,
 /// where `svnserve`'s is its hash order.
 fn property_diffs<'value>(
@@ -616,11 +600,16 @@ fn unsigned(revision: i64) -> Result<Revision, Failure> {
   Revision::try_from(revision).map_err(|_| Failure::corrupt())
 }
 
-/// Why a step stopped: a refusal the answer carries after `done`, or an item that could not be written.
+/// Why a step stopped: a refusal the answer carries after `done`, the connection's end where `svnserve` aborts, or an
+/// item that could not be written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stop {
   /// A refusal: the answer ends with `done` and it.
   Refused(Failure),
+  /// `SVN_ERR_ASSERT(mainline_path_revisions->nelts > 0)` failing: `svnserve` sets no malfunction handler, so
+  /// Subversion's default aborts its process and the connection ends with nothing written for the command, its
+  /// authentication request lost in the unflushed buffer; here it ends the same way.
+  Aborted,
   /// An item the writer refused.
   Unwritten(ItemError),
 }

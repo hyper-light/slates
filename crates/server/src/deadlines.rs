@@ -264,7 +264,8 @@ mod tests {
   /// Shape: how far ahead the tests set a deadline: a tenth of a liveness window, so the reap loop's tick, once a
   /// window, could not be what released it in time.
   const SOON_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 10;
-  /// Shape: how long a test looks for the release: half a liveness window, past the deadline and short of the tick.
+  /// Shape: how long a test looks for the release: half a liveness window, past the deadline and short of the tick, and
+  /// widened by the shard's measured descheduling ([`look_until`]).
   const RELEASED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks, short beside the deadline.
   const LOOK_PAUSE_NS: u64 = 1_000_000;
@@ -279,18 +280,32 @@ mod tests {
     }
   }
 
-  /// Looks at `daemon`'s shard with `look` until it answers true or [`RELEASED_WITHIN_NS`] passes: how long that took.
+  /// Looks at `daemon`'s shard with `look` until it answers true: how long that took. Past [`RELEASED_WITHIN_NS`],
+  /// widened by the descheduling the shard measured meanwhile (`slates_rt::futures::scheduler_overrun_ns`), it gives up
+  /// and says how long it looked and what the shard measured. A host that keeps the shard off its CPUs delays the
+  /// keeper's wake by as much, which says nothing of the deadline the keeper armed; on a quiet host the shard measures
+  /// next to nothing and the bound is the half window. Once in eleven whole-suite runs on the loaded Mac Studio the CLI
+  /// attachment's and the write lease's tests missed the bare half window, though with the look allowed ten seconds
+  /// every release came 101 to 166 ms after its 100 ms term (A-660).
   fn look_until(
     daemon: &crate::daemon::Daemon,
     since: Instant,
     look: impl Fn(&mut ShardState) -> bool + Clone + Send + 'static,
-  ) -> Option<Duration> {
+  ) -> Result<Duration, String> {
     loop {
-      if crate::daemon::observe_first(daemon, look.clone()) {
-        return Some(since.elapsed());
+      let looked = look.clone();
+      let (held, overrun_ns) = crate::daemon::observe_first(daemon, move |state| {
+        (looked(state), slates_rt::futures::scheduler_overrun_ns())
+      });
+      if held {
+        return Ok(since.elapsed());
       }
-      if since.elapsed() > Duration::from_nanos(RELEASED_WITHIN_NS) {
-        return None;
+      let bound_ns = RELEASED_WITHIN_NS.saturating_add(overrun_ns);
+      if since.elapsed() > Duration::from_nanos(bound_ns) {
+        return Err(format!(
+          "looked {:?}; the shard measured {overrun_ns} ns of descheduling",
+          since.elapsed()
+        ));
       }
       // The harness paces its looks; the daemon under test waits on its wheel.
       #[allow(clippy::disallowed_methods)]
@@ -621,15 +636,18 @@ mod tests {
   }
 
   /// A-536 (CLI attachments off the tick). Do: on a one-shard daemon whose failover delay, a CLI attachment's term, is a
-  /// tenth of a liveness window, create a volume and attach it for reading in the CLI's form; look until the attachment
-  /// is gone. Expect: ended within half a window, by the keeper at its term's lapse, found in the partition's index of
-  /// terms. The reap loop's tick, which walked every attachment for a lapsed term once a window, no longer does.
+  /// tenth of a liveness window, injected through the daemon's seam so that every beat publishes it (A-574, A-660),
+  /// create a volume and attach it for reading in the CLI's form; look until the attachment is gone. Expect: ended
+  /// within half a window, by the keeper at its term's lapse, found in the partition's index of terms. The reap loop's
+  /// tick, which walked every attachment for a lapsed term once a window, no longer does.
   #[test]
   fn a_lapsed_cli_attachment_ends_at_its_term_without_a_tick() {
     let daemon = crate::daemon::audit_daemon_of(1);
+    daemon
+      .inject_failover(Some(SOON_NS))
+      .expect("the failover delay injected");
     let begun = Instant::now();
     let attachment = crate::daemon::observe_first(&daemon, |state| {
-      state.failover_ns = SOON_NS;
       let volume = created(state, "termed");
       let reply = crate::verbs::dispatch(
         state,
@@ -682,6 +700,7 @@ mod tests {
         control: None,
         revoked: false,
         consumer_policy: None,
+        identities: None,
         owner_route: None,
         read_ahead: None,
         read_ahead_pending: 0,
@@ -777,11 +796,13 @@ mod tests {
   }
 
   /// A-525 (A-414's owed list; A-522's keeper). Do: on a one-shard daemon whose failover delay is a tenth of a liveness
-  /// window, seat a client and ask its status; capture the report, grown to several pages, only two delays later, as a
-  /// scatter on a starved daemon does; then look until the shard lets the capture go. Expect: the first page served at
-  /// the capture, and the capture held a delay from its capture, then let go by the keeper, within half a window. Before,
-  /// the deadline counted from the request by the operator's ten-second placeholder, so the capture was held ten seconds;
-  /// counted from the request by the delay, the first page would have been refused.
+  /// window, injected through the daemon's seam so that every beat publishes it, not written into the shard's state,
+  /// which the control shard's beat overwrites with its estimate (A-574, A-660), seat a client and ask its status;
+  /// capture the report, grown to several pages, only two delays later, as a scatter on a starved daemon does; then look
+  /// until the shard lets the capture go. Expect: the first page served at the capture, and the capture held a delay
+  /// from its capture, then let go by the keeper, within half a window. Before, the deadline counted from the request by
+  /// the operator's ten-second placeholder, so the capture was held ten seconds; counted from the request by the delay,
+  /// the first page would have been refused.
   #[test]
   fn a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request() {
     let daemon = crate::daemon::audit_daemon_of(1);
@@ -790,8 +811,10 @@ mod tests {
       sequence: 1,
     }
     .word();
+    daemon
+      .inject_failover(Some(DELAY_NS))
+      .expect("the failover delay injected");
     let (asked, report) = crate::daemon::observe_first(&daemon, move |state| {
-      state.failover_ns = DELAY_NS;
       let asked = seat(state, ASKING);
       let served = crate::verbs::status_on_channel(
         state,

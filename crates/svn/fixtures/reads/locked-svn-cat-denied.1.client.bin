@@ -1,0 +1,2 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 46:svn://127.0.0.1:36913/locked/branches/b1/a.txt 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( ANONYMOUS ( 45:YW5vbnltb3VzQEFkYXMtTWFjLVN0dWRpby5sb2NhbA==
+ ) ) ( get-latest-rev ( ) ) ( get-file ( 0: ( 11 ) true false  false ) ) 
