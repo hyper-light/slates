@@ -336,45 +336,60 @@ def main():
         stock("update-with-lock", ["update", wc("wc-g")])
         run(["svnadmin", "rmlocks", repository, "/trunk/a.txt"], env=env, capture_output=True)
         stock("update-with-broken-lock", ["update", wc("wc-g")])
-        # Hand-made reports: each sends its whole session at once, then half-closes.
+        # Hand-made reports. Each is a list of steps: bytes to send, or bytes to wait for in what svnserve wrote, so a
+        # client answers the drive only once the drive has ended (svnserve looks for input before every editor command
+        # and aborts on any, `editorp.c` `check_for_error`); then the client half-closes and reads to the end.
+        close_edit = b"( close-edit ( ) ) "
+        abort_edit = b"( abort-edit ( ) ) "
+        wc_failure = b"( failure ( ( 155000 22:the working copy says no 0: 0 ) ) ) "
         hostile = [
             ("hostile-report-unknown-command",
-             UPDATE_HEAD + SET_ROOT + b"( bogus ( ) ) " + FINISH + EDIT_DONE),
+             [UPDATE_HEAD + SET_ROOT + b"( bogus ( ) ) " + FINISH, close_edit, EDIT_DONE]),
             ("hostile-report-first-not-root",
-             UPDATE_HEAD + b"( set-path ( 3:dir 6 false ( ) infinity ) ) " + FINISH),
+             [UPDATE_HEAD + b"( set-path ( 3:dir 6 false ( ) infinity ) ) " + FINISH]),
             ("hostile-report-missing-path",
-             UPDATE_HEAD + SET_ROOT + b"( set-path ( 7:missing 6 false ( ) infinity ) ) " + FINISH + EDIT_DONE),
-            ("hostile-report-bad-depth",
-             UPDATE_HEAD + b"( set-path ( 0: 6 false ( ) sideways ) ) " + FINISH),
+             [UPDATE_HEAD + SET_ROOT + b"( set-path ( 7:missing 6 false ( ) infinity ) ) " + FINISH, abort_edit,
+              EDIT_DONE]),
+            ("hostile-report-bad-depth", [UPDATE_HEAD + b"( set-path ( 0: 6 false ( ) sideways ) ) " + FINISH]),
             ("hostile-report-link-elsewhere",
-             UPDATE_HEAD + SET_ROOT
-             + b"( link-path ( 3:dir " + item_string(b"svn://example.org/other/dir") + b"6 false ( ) infinity ) ) "
-             + FINISH),
-            ("hostile-report-abort", UPDATE_HEAD + SET_ROOT + b"( abort-report ( ) ) "),
-            ("hostile-update-depth-exclude",
-             b"( update ( ( 6 ) 0: true exclude false false ) ) " + SET_ROOT + FINISH),
-            ("hostile-report-delete-root", UPDATE_HEAD + SET_ROOT + b"( delete-path ( 0: ) ) " + FINISH),
+             [UPDATE_HEAD + SET_ROOT
+              + b"( link-path ( 3:dir " + item_string(b"svn://example.org/other/dir") + b"6 false ( ) infinity ) ) "
+              + FINISH]),
+            ("hostile-report-abort", [UPDATE_HEAD + SET_ROOT + b"( abort-report ( ) ) "]),
+            ("hostile-update-depth-exclude", [b"( update ( ( 6 ) 0: true exclude false false ) ) " + SET_ROOT + FINISH]),
+            ("hostile-report-delete-root", [UPDATE_HEAD + SET_ROOT + b"( delete-path ( 0: ) ) " + FINISH]),
             ("hostile-report-revision-past-head",
-             UPDATE_HEAD + b"( set-path ( 0: 99 false ( ) infinity ) ) " + FINISH + EDIT_DONE),
+             [UPDATE_HEAD + b"( set-path ( 0: 99 false ( ) infinity ) ) " + FINISH, abort_edit, EDIT_DONE]),
             ("hostile-update-target-absent",
-             b"( update ( ( 6 ) 7:missing true infinity false false ) ) "
-             + b"( set-path ( 0: 6 false ( ) infinity ) ) " + FINISH + EDIT_DONE),
-            ("hostile-report-malformed-set-path", UPDATE_HEAD + b"( set-path ( 0: six false ) ) " + FINISH),
+             [b"( update ( ( 6 ) 7:missing true infinity false false ) ) " + SET_ROOT + FINISH, close_edit, EDIT_DONE]),
+            ("hostile-report-malformed-set-path", [UPDATE_HEAD + b"( set-path ( 0: six false ) ) " + FINISH]),
+            ("hostile-report-early-edit-response", [UPDATE_HEAD + SET_ROOT + FINISH + EDIT_DONE]),
+            ("hostile-report-client-refuses-the-edit", [UPDATE_HEAD + SET_ROOT + FINISH, close_edit, wc_failure]),
         ]
-        for name, commands in hostile:
-            client_bytes = opening(b"svn://127.0.0.1/repo/trunk") + commands
+        for name, steps in hostile:
             prefix = os.path.join(out, name + ".1")
+            sent = bytearray(opening(b"svn://127.0.0.1/repo/trunk"))
+            received = bytearray()
             with socket.create_connection(("127.0.0.1", port), timeout=STEP_SECONDS) as connection:
-                with open(prefix + ".client.bin", "wb") as client_record:
-                    client_record.write(client_bytes)
-                connection.sendall(client_bytes)
+                connection.sendall(bytes(sent))
+                for index, step in enumerate(steps):
+                    if index % 2 == 0:
+                        sent.extend(step)
+                        connection.sendall(step)
+                    else:
+                        while step not in received:
+                            data = connection.recv(CHUNK)
+                            if not data:
+                                raise RuntimeError("%s: svnserve ended before writing %r" % (name, step))
+                            received.extend(data)
                 connection.shutdown(socket.SHUT_WR)
-                received = bytearray()
                 while True:
                     data = connection.recv(CHUNK)
                     if not data:
                         break
                     received.extend(data)
+            with open(prefix + ".client.bin", "wb") as client_record:
+                client_record.write(sent)
             with open(prefix + ".server.bin", "wb") as server_record:
                 server_record.write(received)
             sessions.append((name, "(written by this script)", None))
