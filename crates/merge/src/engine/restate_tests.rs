@@ -12,14 +12,18 @@
 //! green that accepts the work, the restated journal replayed over the head into the same model, and the green that
 //! accepts that journal composed again (the rebased work's next submit, as the server makes it).
 //!
-//! The works keep to what the deriver composes as a volume with real inodes replays it. That leaves out two kinds of
-//! composition, each filed open in GAPS with this change. A name freed and then made a file again, and a file the work
-//! made renamed over a name that holds something, compose to an edit of that name's node in place, so a hard link
-//! naming the node reads the new bytes. And a file the work wrote to, then removed or renamed over while a hard link
-//! names its node, composes to the removal alone, so the link reads the head's bytes and the write is lost: the
-//! oracle's first run found it (Windows x86_64, jupiter, 2026-11-19: `[(31, 13, 0), (22, 88, 0)]`, an append to
-//! `TARGET` and its removal, `LINK` read without the append in all three readings). The works make no rename onto a
-//! hard link the work made either, which the deriver refuses (`PathKindConflict`).
+//! The works keep to what the deriver composes as a volume with real inodes replays it. That leaves out one kind of
+//! composition, filed open in GAPS with A-663: a name freed and then made a file again, and a file the work made
+//! renamed over a name that holds something, compose to an edit of that name's node in place, so a hard link naming the
+//! node reads the new bytes. The works make no rename onto a hard link the work made either, which the deriver refuses
+//! (`PathKindConflict`).
+//!
+//! A file the work wrote to, then removed or renamed another over while a hard link names its node, keeps the writes at
+//! the link (A-669; A-646's decision, the node passes to its link as the work left it). The oracle's first run found
+//! them lost (Windows x86_64, jupiter, 2026-11-19: `[(31, 13, 0), (22, 88, 0)]`, an append to `TARGET` and its removal,
+//! `LINK` read without the append in all three readings), and its works left the case out until A-669 kept the
+//! writes; its census now counts it. When only a link the work made still names the node the deriver refuses the work
+//! (`Unsupported`, owed), and so it does a file made again at its own name after the write.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,6 +53,8 @@ const HEAD_WORK: u8 = 0xEE;
 const WORK: u8 = 0x01;
 /// Shape: see `HEAD_WORK`.
 const RESTATED: u8 = 0x02;
+/// Shape: the bytes A-669's cases append.
+const WRITE: &[u8] = b"<+w>\n";
 
 /// What a reader of a volume sees: each name's bytes (`None` for a hard link whose home holds no file) and every name
 /// of its node.
@@ -424,7 +430,9 @@ fn written_name(op: &VolumeOp) -> Option<&str> {
 }
 
 /// The restated journal replayed over the head's volume `head`, as a volume with real inodes replays it, each node a
-/// content operation writes taking the bytes the rebased work holds at the name written.
+/// content operation writes taking the bytes the rebased work holds at the name written, or, where the journal then
+/// removes that name, at the name the node is left to (A-669: writes handed on to a link); a node no name keeps is gone
+/// with its writes.
 fn replay(head: &Inodes, restated: &Restatement) -> Result<Inodes, String> {
   let mut volume = head.clone();
   let mut written = Vec::new();
@@ -435,9 +443,49 @@ fn replay(head: &Inodes, restated: &Restatement) -> Result<Inodes, String> {
     }
   }
   for (node, path) in written {
-    volume.write(node, restated.bytes(head, path)?)?;
+    write_held(&mut volume, (head, restated), (node, path))?;
   }
   Ok(volume)
+}
+
+/// Node `node`, which a content operation wrote at `path`, given the bytes the rebased work holds where the replayed
+/// `volume` keeps it ([`holding_name`]); nothing where no name keeps it.
+fn write_held(
+  volume: &mut Inodes,
+  (head, restated): (&Inodes, &Restatement),
+  (node, path): (usize, &str),
+) -> Result<(), String> {
+  match holding_name(volume, restated, (node, path))? {
+    Some(name) => volume.write(node, restated.bytes(head, &name)?),
+    None => Ok(()),
+  }
+}
+
+/// The name the rebased work reads node `node`'s bytes at once `volume` replayed the journal: `written`, the name a
+/// content operation wrote, while it still names the node; else the name of the node whose bytes the rebased work
+/// changed, the link the node was handed to; `None` where no name keeps the node.
+fn holding_name(
+  volume: &Inodes,
+  restated: &Restatement,
+  (node, written): (usize, &str),
+) -> Result<Option<String>, String> {
+  if volume.names.get(written) == Some(&node) {
+    return Ok(Some(written.to_owned()));
+  }
+  let names: Vec<&String> = volume
+    .names
+    .iter()
+    .filter(|(_, named)| **named == node)
+    .map(|(name, _)| name)
+    .collect();
+  if names.is_empty() {
+    return Ok(None);
+  }
+  names
+    .into_iter()
+    .find(|name| matches!(restated.changed.get(name.as_str()), Some(Some(_))))
+    .map(|name| Some(name.clone()))
+    .ok_or_else(|| format!("{written}'s node is left at no name the rebased work changed"))
 }
 
 /// What a reader sees of a second fixture's green once it accepts the restated journal composed again over the head,
@@ -648,6 +696,86 @@ fn a_link_made_again_over_the_heads_link_is_restated_with_its_removal() -> Resul
   reads(&seen, TARGET, (b"<g>\n", &[TARGET]))
 }
 
+/// An append step: `WRITE` written at the end of the file `path` names.
+fn append(path: &str) -> Step {
+  Step::Append(path.to_owned(), WRITE.to_vec())
+}
+
+/// The deriver's refusal of a work of `steps` based at the fixture's version 0, or why there is none.
+fn refusal(steps: &[Step]) -> Result<DeriveError, String> {
+  let (green, base) = fixture()?;
+  let (volume, journal) = declare(&base, steps)?;
+  match compose(&green, (0, WORK), &journal, &volume.files())? {
+    Err(refused) => Ok(refused),
+    Ok(_) => Err("the deriver composed the work".to_owned()),
+  }
+}
+
+/// Holds that `refused` is `Unsupported(TARGET)`, a composition owed.
+fn owed_at_target(refused: DeriveError) -> Result<(), String> {
+  match refused {
+    DeriveError::Unsupported(path) if path == TARGET => Ok(()),
+    other => Err(format!("refused {other:?}, not Unsupported({TARGET})")),
+  }
+}
+
+/// A-669, the first case (POSIX: `echo w >> g; rm g` leaves the written node to `g`'s other name). Do: rebase a work,
+/// based behind the head, that appends to `TARGET` and then removes it while `LINK` names its node. Expect the four
+/// readings to agree: `LINK` alone holds `<g>` and the write, and nothing stands at `TARGET`. Before, the deriver
+/// dropped a removed file's writes and the green handed `LINK` the head's bytes: the work was accepted without them.
+#[test]
+fn a_write_to_a_file_a_link_names_is_kept_when_the_work_removes_the_file() -> Result<(), String> {
+  let seen = agreed(&[append(TARGET), unlink(TARGET)])?;
+  reads(&seen, LINK, (b"<g>\n<+w>\n", &[LINK]))?;
+  absent(&seen, TARGET)
+}
+
+/// A-669, the second case (`echo w >> g; mv f g`: the rename takes the name, and the written node stays at its link).
+/// Do: rebase a work that appends to `TARGET` and then renames `FILE` over it. Expect the four readings to agree:
+/// `LINK` alone holds `<g>` and the write, `TARGET` holds `FILE`'s bytes, and nothing stands at `FILE`. Before, the
+/// replaced file's writes were dropped with it and `LINK` read the head's bytes.
+#[test]
+fn a_write_to_a_file_a_link_names_is_kept_when_another_is_renamed_over_it() -> Result<(), String> {
+  let seen = agreed(&[append(TARGET), rename(FILE, TARGET)])?;
+  reads(&seen, LINK, (b"<g>\n<+w>\n", &[LINK]))?;
+  reads(&seen, TARGET, (b"<f>\n", &[TARGET]))?;
+  absent(&seen, FILE)
+}
+
+/// A-669, every name left reads the write: a link the work made before it keeps the node too. Do: rebase a work that
+/// links `l` to `TARGET`, appends to `TARGET` and removes it. Expect the four readings to agree: `LINK` and `l` one
+/// node holding `<g>` and the write. Before, both read the head's bytes.
+#[test]
+fn a_write_handed_on_is_read_at_every_name_left() -> Result<(), String> {
+  let seen = agreed(&[link("l", TARGET), append(TARGET), unlink(TARGET)])?;
+  reads(&seen, LINK, (b"<g>\n<+w>\n", &[LINK, "l"]))?;
+  reads(&seen, "l", (b"<g>\n<+w>\n", &[LINK, "l"]))
+}
+
+/// A-669, refused rather than lost: the only name left is a link the work made. Do: compose a work that removes
+/// `LINK`, links `l` to `TARGET`, appends to `TARGET` and removes it. Expect the deriver's typed refusal,
+/// `Unsupported(TARGET)`, a composition owed. Before, it composed, and the green handed `l` the head's bytes.
+#[test]
+fn a_write_left_only_to_a_link_the_work_made_is_refused_typed() -> Result<(), String> {
+  let steps = [
+    unlink(LINK),
+    link("l", TARGET),
+    append(TARGET),
+    unlink(TARGET),
+  ];
+  owed_at_target(refusal(&steps)?)
+}
+
+/// A-669, refused rather than lost: the work made the file again at its name after the write, which the deriver
+/// composes as an edit of the old node in place (GAPS, open since A-663). Do: compose a work that appends to `TARGET`,
+/// removes it and creates `TARGET` again while `LINK` names the old node. Expect `Unsupported(TARGET)`. Before, it
+/// composed to an edit of `TARGET`, the write lost and `LINK` reading the new file.
+#[test]
+fn a_write_to_a_file_made_again_at_its_name_is_refused_typed() -> Result<(), String> {
+  let made_again = Step::Create(TARGET.to_owned(), b"<g again>\n".to_vec());
+  owed_at_target(refusal(&[append(TARGET), unlink(TARGET), made_again])?)
+}
+
 /// What the works' links met, counted over the works the oracle checked: the census that shows each case ran.
 #[derive(Clone, Copy, Debug, Default)]
 struct Census {
@@ -663,6 +791,13 @@ struct Census {
   made_again: u64,
   /// A link to a file the work made.
   to_made: u64,
+  /// A write to a file another name names, then the file removed (`echo w >> g; rm g`; A-669). Shown, not required,
+  /// with the next: a work meets them only with `LINK` still standing and no link of its own left alone to the node
+  /// (the deriver refuses that, typed), so runs of 256 works met them twice and once, then five times and not at all
+  /// (Windows x86_64, jupiter, 2026-11-19); their unit tests hold them on every run.
+  handed_removed: u64,
+  /// A write to a file another name names, then another file renamed over it (`echo w >> g; mv f g`; A-669).
+  handed_replaced: u64,
   /// Works whose four readings agreed (shown, not required).
   agreed: u64,
   /// Works the deriver refused: compositions owed, typed (shown, not required).
@@ -683,6 +818,8 @@ impl Census {
         self.removed += work.removed;
         self.made_again += work.made_again;
         self.to_made += work.to_made;
+        self.handed_removed += work.handed_removed;
+        self.handed_replaced += work.handed_replaced;
       }
       Restated::Refused => self.refused += 1,
       Restated::Conflict => self.conflicts += 1,
@@ -808,13 +945,9 @@ impl Draft {
     ))
   }
 
-  /// A name that holds something removed; never the file of a node the work wrote to while another name names it
-  /// ([`Draft::strands_an_edit`]).
+  /// A name that holds something removed.
   fn unlink(&self, choice: u8) -> Option<Step> {
-    let path = pick(
-      &self.names(|name| self.holds(name) && !self.strands_an_edit(name)),
-      choice,
-    )?;
+    let path = pick(&self.names(|name| self.holds(name)), choice)?;
     Some(Step::Unlink(path.to_owned()))
   }
 
@@ -833,12 +966,11 @@ impl Draft {
   }
 
   /// Whether the file at `from` may be renamed onto `to` as the deriver composes a volume's rename: onto a name never
-  /// used, or onto a file or the base's link from a node the work did not make; never onto a link the work made, nor
-  /// over the file of a node the work wrote to while another name names it ([`Draft::strands_an_edit`]). (A file the
-  /// work made renamed over a name composes to an edit of that name's node in place, filed open; the deriver refuses a
-  /// rename onto a link the work made, `PathKindConflict`, so such works would only be counted refused.)
+  /// used, or onto a file or the base's link from a node the work did not make; never onto a link the work made. (A
+  /// file the work made renamed over a name composes to an edit of that name's node in place, filed open; the deriver
+  /// refuses a rename onto a link the work made, `PathKindConflict`, so such works would only be counted refused.)
   fn may_rename(&self, from: &str, to: &str) -> bool {
-    if to == from || self.made_links.contains(to) || self.strands_an_edit(to) {
+    if to == from || self.made_links.contains(to) {
       return false;
     }
     if !self.holds(to) {
@@ -858,11 +990,9 @@ impl Draft {
     !self.holds(name) && (!self.used.contains(name) || self.link_freed.contains(name))
   }
 
-  /// Whether removing or replacing what `name` holds would leave a node the work wrote to at another name: `name` holds
-  /// the node's file, the work appended to the node, and a hard link names it too. The deriver composes that removal
-  /// alone, dropping the node's writes, and the green hands the link the head's bytes (`Green::hand_over`), so the
-  /// writes are lost: filed open with this change (the module docs), and left out of the works until composed.
-  fn strands_an_edit(&self, name: &str) -> bool {
+  /// Whether removing or replacing what `name` holds hands a node the work wrote to on to another name (A-669): `name`
+  /// holds the node's file, the work appended to the node, and a hard link names it too. Counted, for the census.
+  fn hands_on_a_write(&self, name: &str) -> bool {
     let Some(&node) = self.volume.names.get(name) else {
       return false;
     };
@@ -920,13 +1050,17 @@ impl Draft {
         self.meet_link(target, again);
       }
       Step::Rename(from, to) => {
+        let handed = self.hands_on_a_write(to);
         let (from, to) = (node(from), node(to));
         self.meet_rename(from, to);
+        self.census.handed_replaced += u64::from(handed);
       }
       Step::Unlink(path) => {
         let removed =
           self.files.contains(path) && node(path).is_some_and(|n| self.linked.contains(&n));
+        let handed = self.hands_on_a_write(path);
         self.census.removed += u64::from(removed);
+        self.census.handed_removed += u64::from(handed);
       }
       Step::Create(..) | Step::Append(..) => {}
     }
@@ -952,14 +1086,16 @@ impl Draft {
   }
 }
 
-/// A-663's oracle. Do: generate works of up to eleven steps over the fixture's names (files made, appended to, removed
-/// and renamed, over files and over the base's link; hard links made to files and to links, before and after their
-/// nodes are renamed, renamed over or removed; the base's link removed and made again), each based at version 0 and
-/// rebased past the head's version 1. Expect each work the deriver composes to rebase as it submits, and, when clean,
-/// the four readings to agree: its own operations in their own order over the head, the green that accepts it, its
-/// restated journal replayed over the head, and the green that accepts that journal composed again; and the census to
-/// show every case met: a link before a rename over its name, before and after its node's rename, before its node's
-/// removal, made again where the base's stood, and to a file the work made.
+/// A-663's oracle, and A-669's. Do: generate works of up to eleven steps over the fixture's names (files made, appended
+/// to, removed and renamed, over files and over the base's link; hard links made to files and to links, before and
+/// after their nodes are renamed, renamed over or removed; the base's link removed and made again; files written to and
+/// then removed or renamed over while a link names them), each based at version 0 and rebased past the head's version
+/// 1. Expect each work the deriver composes to rebase as it submits, and, when clean, the four readings to agree: its
+/// own operations in their own order over the head, the green that accepts it, its restated journal replayed over the
+/// head, and the green that accepts that journal composed again; and the census to show every case met: a link before
+/// a rename over its name, before and after its node's rename, before its node's removal, made again where the base's
+/// stood, and to a file the work made; and, shown, a write handed on to a link when its file is removed or another is
+/// renamed over it.
 #[test]
 fn every_restated_work_reads_as_its_own_order() {
   let census = RefCell::new(Census::default());

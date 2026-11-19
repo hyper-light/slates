@@ -11472,7 +11472,8 @@ against what that copy brings there.
 > there.
 > - Removing or replacing the home leaves the node to its links. The least surviving link becomes its home, holding
 >   its content or IPC node, its mode and its attributes, and the other links name it there; its bytes go only with
->   its last name.
+>   its last name. The node it takes is the node as the version leaves it, never as the head held it (A-669): the
+>   writes a work made to the node before removing or replacing its home go with it to the link.
 > - Renaming the home moves the node, and its links name it at the new path.
 > - A later file at a path the node left is another node, which no link names.
 > - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
@@ -11484,7 +11485,12 @@ against what that copy brings there.
 > checkpoint and carried through copies and branches, for no difference anyone can observe, since the home is unique at
 > every version and moves with its node. Status: the engine since A-646 part 2a (`crates/merge/src/engine/
 > node_tests.rs`; the whole-state oracle follows nodes); the ops document since part 2b, version 3, whose node table a
-> link names, the node at its target at the work's base or the one the work makes (§4.16 "Data model").
+> link names, the node at its target at the work's base or the one the work makes (§4.16 "Data model"). The node as
+> the version leaves it since A-669: a work's writes to a file it then removes, or renames another over, are declared
+> at the base link still naming its node (the deriver's `heirs_of_writes`), which the verdict makes the node's home with
+> them (`Green::merge_handed`), its mode and attributes too, and which a rebase restates as the work made them; a write
+> whose node only a link the work made still names is refused, typed, owed (`crates/merge/src/engine/
+> restate_tests.rs`).
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -45582,7 +45588,9 @@ Applied in the same change to:
 - **The decision**, from principle: a hard link names its node, as a POSIX inode is named by its links. A node is its
   home and the links naming it there. A removed or replaced home hands the node to its least surviving link, which
   takes its content or IPC node, mode and attributes, the others naming it there. A renamed home's links follow it. A
-  later file at a path the node left is another node.
+  later file at a path the node left is another node. (A-669, the same day: the link takes the node as the version
+  leaves it, with the writes a work made to it before removing or replacing its home; until then it took the head's
+  bytes, and those writes were lost.)
 - **Derived, never recorded.** The moves are computed in the commit from the head and the version's own effects:
   - a version's chain entry is taken before the commit (`submit_resolved`), so the moves are never recorded;
   - `apply_recorded` runs the same commit, so a replay derives the same moves;
@@ -47211,3 +47219,53 @@ Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::disco
   `crates/vcs/src/derived.rs` (`DerivedType::inputs`, the fill reading inputs, the module's docs);
   `crates/vcs/src/derived/paths.rs` (`At`, `at`); `docs/wip/research/path-history.md` (new); A-645's entry ("Queries by
   API"); §4.17.1 "Reads"' status; GAPS' A-645 line.
+
+### A-669 — a write to a file a hard link names goes with its node to the link (2026-11-19, g307, UI goal 93 (kiln 51cef9f7); §4.16 "Composition at seal" and A-646's decision; found by A-663's oracle)
+Applied in the same change to:
+- §4.16: A-646's decision (the node as the version leaves it) and its status; A-646 part 2a's entry (its decision);
+  GAPS (the entry fixed; the in-place replacement's entry noting the refusal; a sibling filed open);
+- `crates/merge/src/increment.rs`: `apply_unlink` keeps a removed file's writes; `link_states` (the state half of
+  `compose_hardlinks`), `linked_nodes`, `node_names` and `heirs_of_writes`; `classify` and `seal` declare the writes
+  at the heir; the module's composition rules;
+- `crates/merge/src/engine.rs`: `Green::decide_handed`, `handed_home`, `merge_handed` and `handed_in`;
+  `unfit_content`, `decide_content` and `rebased_from`;
+- `crates/merge/src/engine/restate_tests.rs`: five cases; the replay reading a write handed on at its link; the
+  oracle's works no longer leave the case out, and its census counts it;
+- `docs/bugs/2026-11-19-a-write-to-a-file-a-hard-link-names-was-lost-with-the-file.md`.
+- **The defect.** With the base holding `g` and a hard link `h` to it, a work that appended to `g` and then removed it,
+  or renamed another file over it, was accepted without the append. The deriver dropped a removed or replaced file's
+  content operations, and the commit handed `g`'s node to `h` with the head's bytes (`Green::hand_over`). The work's
+  own volume, which has real inodes, kept the write at `h`. A-663's oracle found it on its first run.
+- **The rule** (A-646's decision, made explicit): the link a removed or replaced home leaves its node to takes the node
+  as the version leaves it, never as the head held it.
+- **The composition.** The deriver keeps a removed file's writes. At the seal it finds the links that still name the
+  file's node, each link's node fixed when the journal makes it (`linked_nodes`: `ln h l; rm h` leaves `l` on the node,
+  which the first green run showed when links were resolved through those standing at the seal). It declares the
+  writes at the least base link to the file that the journal left alone, where the node stands at the seal and the
+  seal reads them, beside the removal. The engine takes writes declared at the head's link whose home the increment
+  removes or replaces (`handed_home`) as the node handed on with them: the link becomes the node's home with the
+  home's bytes and the writes, its mode and its attributes, and the other links follow it (`merge_handed`, recorded as
+  a copy into the link, so a replay derives the same). A link or a home changed since the work's base is delete against
+  modify. A rebase restates the work's own form, the writes on the home and then its removal (`handed_in`), which the
+  deriver composes again to the same increment.
+- **Refused, owed** (`Unsupported`, typed, never accepted without the writes): a write whose node only links the work
+  made still name, and a write to a file the work then made again at its name, whose new node is composed as an edit
+  of the old one (GAPS, open since A-663).
+- **Tests.** Five cases, red first: a write kept when the file is removed, when another is renamed over it, and at
+  every name left (a link the work made too); refused when only a link the work made is left, and when the file is
+  made again at its name. A-663's oracle generates the case again and counts it, shown rather than required: a run of
+  256 works meets it a few times, and the cases hold it on every run.
+- **Evidence** (Windows x86_64, jupiter, kiln, 2026-11-19, debug; the Mac Studio offline, the macOS run owed). Red over
+  main's engine (`cargo test --locked -p slates-merge --lib restate_tests` at 59ee404f5): 6 of 11 failing, the five
+  cases and the oracle (`create l; mv g f; append f; rm f`, `h` read without the write), A-663's five passing. The first
+  green run (ae27b01d3) passed the five and failed the oracle at `append f; append g; rm g; ln h l; rm h`: fixed in the
+  same change (`linked_nodes`). Green over main at 0e755c9b1 (`cargo test --locked -p slates-merge --lib` at
+  72177dcd7): 152 of 152, main's 141, A-663's 6 and A-669's 5; the census over 256 works 157 agreed, 99 refused typed,
+  no conflicts, every A-663 case met, and the write handed on twice at a removal and once at a rename. Again at
+  5f6cc2d3a, the census showing the case rather than requiring it: 152 of 152; 141 agreed, 115 refused, no conflicts,
+  the write handed on five times at a removal and at no rename (so it is not required). `cargo fmt -p slates-merge --
+  --check` clean on both.
+- **Siblings** (the sweep, by reading): a work's writes to a file a later version linked are lost when it removes the
+  file, since a link made to a file records no change of the file (GAPS, open); a removed file's own mode or attribute
+  change is refused (`SetModeMissing`, `XattrMissing`), not lost; a file renamed away keeps its writes, which travel with
+  it; the commit's other hand-overs carry no writes of the version.

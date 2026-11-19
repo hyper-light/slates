@@ -2678,25 +2678,42 @@
 > bytes: the green keeps the link on `x`, whose content changed. POSIX gives the link the old file and `x` a new one
 > (A-646: "a later file at a path the node left is another node"). A rename onto a name the work made a hard link at is
 > refused instead, typed (`PathKindConflict` from `check_no_file_directory_collision`), a file and a link at one name
-> being among the deriver's compositions owed. A-663's oracle generates neither. Owed: the replacement composed as the
-> node model says (a new node at the name, the link's node handed on as `Green::node_moves` hands one), a failing test
-> first, and the oracle's works widened to it.
+> being among the deriver's compositions owed. A-663's oracle generates neither. Since A-669 a work that wrote to the
+> old node first is refused, typed (`Unsupported`), never composed with its write lost. Owed: the replacement composed
+> as the node model says (a new node at the name, the link's node handed on as `Green::node_moves` hands one), a
+> failing test first, and the oracle's works widened to it.
 
-> **A write to a file a hard link also names is lost when the work then removes the file or renames another over it:
-> found open (2026-11-19, A-663's oracle on its first run, Windows x86_64 (jupiter), g307; §4.16 "Composition at
-> seal"; A-646's decision; `crate::increment`, `Green::hand_over`).** With the base holding `g` and a hard link `h` to
-> it, a work that appends to `g` and then removes it composes to `Unlink g` alone: the deriver drops a removed file's
-> content operations (`apply_unlink` clears them), and the green hands `g`'s node to `h` with the head's bytes
-> (`Green::hand_over` copies the home's content as the head holds it). POSIX keeps the write: `h` is the node's last
-> name and reads it, as the work's own volume does. The oracle's minimal case, `[(31, 13, 0), (22, 88, 0)]`, read `h`
-> as `<g>\n` in the green that accepted the work, in its restated journal replayed and in that journal composed again,
-> against `<g>\n<+0>\n` in the work's own order. By reading, a rename over the file (`mv f g` after the write) loses the
-> write the same way (`apply_rename` drops the replaced file's operations), and so does the case where the link is one
-> the work made to a base file; a link the work made to a file it made is refused instead (`Unsupported`,
-> `made_target_moved`). The submit is accepted without the write, so this is a lost update, not a refusal. A-663's
-> oracle generates none of them (its works never remove or replace the file of a node they wrote to while another name
-> names it). Owed: a failing test first; then the write carried to the link that inherits the node (or, until it is, a
-> typed refusal in place of the silent loss); and the oracle's works widened to it.
+> **A write to a file a hard link also names was lost when the work then removed the file or renamed another over it:
+> fixed (2026-11-19, A-669, g307; found by A-663's oracle on its first run, Windows x86_64 (jupiter); §4.16 "Composition
+> at seal"; A-646's decision; `crate::increment`, `Green::merge_handed`).** With the base holding `g` and a hard link
+> `h` to it, a work that appended to `g` and then removed it composed to `Unlink g` alone: the deriver dropped a removed
+> file's content operations (`apply_unlink` cleared them), and the green handed `g`'s node to `h` with the head's bytes
+> (`Green::hand_over`). POSIX keeps the write at `h`, as the work's own volume does; the green and the rebase did not.
+> A rename over the file (`mv f g` after the write) lost it the same way, and so did a write handed on through a rename
+> (`mv g f; echo w >> f; rm f`).
+>
+> Fixed by the rule A-646's decision now states: the link a removed or replaced home leaves its node to takes the node
+> as the version leaves it. The deriver keeps a removed file's writes and declares them at the least base link that
+> still names its node as the base did (`heirs_of_writes`, each link's node fixed when the journal makes it); the engine
+> makes that link the node's home with the writes, its mode and its attributes (`Green::merge_handed`); a rebase
+> restates the work's own form, the writes on the home and then its removal (`Green::handed_in`). Refused, typed
+> (`Unsupported`) rather than lost: a write whose node only links the work made still name, and a write to a file the
+> work then made again at its name (the entry above). Tests: five cases in `crates/merge/src/engine/restate_tests.rs`,
+> each red first, and A-663's oracle, whose works no longer leave the case out, with it in the census. Evidence (Windows
+> x86_64, jupiter, 2026-11-19; the macOS run owed): red over main's engine, the five cases and the oracle failing
+> (`cargo test --locked -p slates-merge --lib restate_tests` at 59ee404f5, 6 of 11, A-663's five passing); the first
+> green run's oracle found a link resolved through the links standing at the seal (`ln h l; rm h`), fixed in the same
+> change; green 152 of 152 over main at 0e755c9b1 (`cargo test --locked -p slates-merge --lib` at 72177dcd7, and at
+> 5f6cc2d3a with the census showing the case rather than requiring it), fmt clean. Bug record:
+> `docs/bugs/2026-11-19-a-write-to-a-file-a-hard-link-names-was-lost-with-the-file.md`.
+
+> **A write to a file a later version linked is lost when the work removes the file: found open (2026-11-19, A-669's
+> sweep, g307, by reading; §4.16 "The verdict"; A-646's decision; `Green::merge_unlink`).** A work based before a
+> version that links `a` to `g` writes to `g` and removes it. Its deriver saw no link, so the writes went with the
+> node; the verdict accepts the removal, since a link made to a file records no change of the file (`record_changes`
+> names the link's path), and the commit hands `g`'s node to `a` with the head's bytes. POSIX keeps the work's writes
+> at `a`. Owed: a failing test first; then the removal of a file whose node gained a link after the work's base judged
+> delete against modify, so the rebase brings the link and the work's next submit hands the writes on itself (A-669).
 
 > **A rebased work's other restatements a volume refuses: found open (2026-11-19, A-663's sweep, g307, by reading;
 > §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).**

@@ -3359,13 +3359,20 @@ impl Green {
   }
 
   /// The paths whose content ops do not fit the content they edit at the increment's base ([`fits_base`]): a
-  /// created path edits nothing, a renamed-into path edits its source.
+  /// created path edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's
+  /// writes edits the node's home ([`Green::handed_home`], A-669).
   fn unfit_content(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
     let post_len = u64::try_from(inc.post_state.len()).unwrap_or(u64::MAX);
+    let cleared = r.cleared();
     r.content
       .iter()
       .filter(|(path, ops)| {
-        let edited = r.renames.get(*path).unwrap_or(path);
+        let edited = r
+          .renames
+          .get(*path)
+          .map(String::as_str)
+          .or_else(|| self.handed_home(r, path, &cleared))
+          .unwrap_or(path.as_str());
         let base_len = if r.creates.contains(*path) {
           0
         } else {
@@ -3443,7 +3450,8 @@ impl Green {
     self.changed_last(self.latest_change.get(path), path) > base
   }
 
-  /// The content dimension: renames, creates, unlinks and edits.
+  /// The content dimension: renames, creates, unlinks and edits, after the writes a node takes to the link it passes to
+  /// ([`Green::decide_handed`], A-669), so a rename refilling the node's old home is restated after them.
   fn decide_content(
     &mut self,
     inc: &Increment,
@@ -3451,6 +3459,7 @@ impl Green {
     effects: &mut Vec<Effect>,
     windows: &mut Vec<ConflictWindow>,
   ) {
+    let handed = self.decide_handed(inc, (r, cleared), effects, windows);
     for (dst, from) in &r.renames {
       let ops = r.content.get(dst).map(Vec::as_slice).unwrap_or(&[]);
       let source = (from.as_str(), cleared);
@@ -3469,8 +3478,8 @@ impl Green {
       record(effects, windows, self.merge_unlink(path, inc.base));
     }
     for (path, ops) in &r.content {
-      if r.creates.contains(path) || r.renames.contains_key(path) {
-        continue; // content of a created or renamed-into file is handled with that effect
+      if r.creates.contains(path) || r.renames.contains_key(path) || handed.contains(path) {
+        continue; // content of a created, renamed-into or handed file is handled with that effect
       }
       match self.merge_content(inc, path, ops) {
         Ok(Some(effect)) => effects.push(effect),
@@ -3478,6 +3487,92 @@ impl Green {
         Err(mut found) => windows.append(&mut found),
       }
     }
+  }
+
+  /// The writes a node takes to the link it passes to (A-669): each link the increment declares writes at whose node's
+  /// home it removes or replaces ([`Green::handed_home`]), judged and handed on ([`Green::merge_handed`]). The links,
+  /// whose writes the content loop leaves to this.
+  fn decide_handed(
+    &self,
+    inc: &Increment,
+    (r, cleared): (&Resolved, &BTreeSet<String>),
+    effects: &mut Vec<Effect>,
+    windows: &mut Vec<ConflictWindow>,
+  ) -> BTreeSet<String> {
+    let mut handed = BTreeSet::new();
+    for (heir, ops) in &r.content {
+      let Some(home) = self.handed_home(r, heir, cleared) else {
+        continue;
+      };
+      let unlinked = r.unlinks.contains(home);
+      match self.merge_handed((heir, ops), (home, unlinked), (inc.base, &inc.post_state)) {
+        Ok(mut found) => effects.append(&mut found),
+        Err(window) => windows.push(window),
+      }
+      handed.insert(heir.clone());
+    }
+    handed
+  }
+
+  /// The home whose node passes with the work's writes to the head's link `path` (A-669): `path` is a hard link at the
+  /// head, the increment declares writes at it and nothing else of it, and it removes the link's home or renames another
+  /// file onto it. Only the deriver's hand-over declares writes at a link (`crate::increment`'s `heirs_of_writes`); any
+  /// other write at a link stays unfit, as a write through a hard link is owed.
+  fn handed_home(&self, r: &Resolved, path: &str, cleared: &BTreeSet<String>) -> Option<&str> {
+    let home = self.hardlinks.get(path)?.as_str();
+    let declared_otherwise = cleared.contains(path)
+      || r.creates.contains(path)
+      || r.renames.contains_key(path)
+      || r.hardlinks.contains_key(path)
+      || r.symlinks.contains_key(path);
+    let leaves = r.unlinks.contains(home) || r.renames.contains_key(home);
+    (!declared_otherwise && leaves).then_some(home)
+  }
+
+  /// A node handed on with the work's writes (A-669; A-646's decision): the work wrote to the file `home`, then removed
+  /// it or renamed another file onto it, while the head's link `heir` named its node, and the deriver declared the writes
+  /// at `heir`, where the node stands at the seal. The link becomes the node's home as a removed home hands its node on
+  /// ([`Green::hand_over`]), holding its bytes, mode and attributes, but the bytes are the node's as the work left them:
+  /// the home's with the writes, never the home's alone. The other links follow it ([`Green::node_moves`]: the home is a
+  /// copy's source, removed). A home a rename replaces is removed here; an unlink removes its own. A link or a home
+  /// changed after the work's base is delete against modify, as the removal of either is. Until A-669 the deriver dropped
+  /// the writes with the file, and the commit handed the link the head's bytes: the work was accepted without them.
+  fn merge_handed(
+    &self,
+    (heir, ops): (&str, &[Op]),
+    (home, unlinked): (&str, bool),
+    (base, post_state): (u64, &[u8]),
+  ) -> Result<Vec<Effect>, ConflictWindow> {
+    let link_changed = self.changed_last(self.hardlink_changed.get(heir), heir) > base;
+    if link_changed || self.changed_after(home, base) {
+      return Err(Green::window(heir, MergeConflictClass::DeleteModify));
+    }
+    let edits = self.edits_after_rename((heir, ops), base, home)?;
+    let bytes = apply(
+      self.content.get(home).unwrap_or_default(),
+      &edits,
+      post_state,
+    );
+    let whole = vec![insert_whole(u64::try_from(bytes.len()).unwrap_or(u64::MAX))];
+    let mut handed = vec![
+      Effect::SetContent(
+        heir.to_owned(),
+        bytes,
+        whole,
+        ContentSource::Copied(home.to_owned(), edits),
+      ),
+      Effect::RemoveHardlink(heir.to_owned()),
+    ];
+    if let Some(mode) = self.modes.get(home) {
+      handed.push(Effect::Mode(heir.to_owned(), *mode));
+    }
+    for (name, value) in self.xattrs.of(home) {
+      handed.push(Effect::SetXattr(heir.to_owned(), name, value.clone()));
+    }
+    if !unlinked {
+      handed.push(Effect::RemoveContent(home.to_owned()));
+    }
+    Ok(handed)
   }
 
   /// The directory dimension: creation and removal (removal against the increment's own removals).
@@ -4768,13 +4863,35 @@ impl Green {
     }
   }
 
+  /// The links a version's effects hand a node to with the work's writes ([`Green::merge_handed`]: a copy into the
+  /// head's link that names its source, which no rename makes, since a rename between two names of one file does
+  /// nothing), and those nodes' homes that a rename refills (a copy from another file into the home) (A-669).
+  fn handed_in(&self, effects: &[Effect]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut handed = BTreeSet::new();
+    let mut homes = BTreeSet::new();
+    let mut copied_into = BTreeSet::new();
+    for effect in effects {
+      if let Effect::SetContent(path, _, _, ContentSource::Copied(from, _)) = effect {
+        if self.hardlinks.get(path) == Some(from) {
+          handed.insert(path.clone());
+          homes.insert(from.clone());
+        } else {
+          copied_into.insert(path.clone());
+        }
+      }
+    }
+    let refilled = homes.intersection(&copied_into).cloned().collect();
+    (handed, refilled)
+  }
+
   /// Restates the accepted effects of a clean rebase as the work's changes over the head and its
   /// journal: each content effect's file, kept only where it ends different from the head's; the
   /// journal is the effects as declared operations in head coordinates (a content op keeps its mapped
   /// range, a file new to the head is created first), in the order a volume with real inodes replays
   /// them ([`in_replay_order`], A-663): each hard link where the node it names still stands at the name
-  /// it names it by, and one made where the head holds another after that one's removal. The green is
-  /// not touched.
+  /// it names it by, and one made where the head holds another after that one's removal. A node handed
+  /// on to a link with the work's writes is restated as the work made it, the writes on its home and
+  /// then the home's removal ([`Green::handed_in`], A-669). The green is not touched.
   fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
     use crate::increment::VolumeOp;
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
@@ -4784,6 +4901,11 @@ impl Green {
     // The head's links the effects remove themselves (a link's rename over one): a link made at such a name follows
     // that removal and needs none of its own.
     let removed_links = removed_links(&effects);
+    // The nodes handed on with the work's writes (A-669): each is restated as the work made it, the writes on the
+    // node's home and then the home's removal (none where a rename refills the home, whose own restatement replaces
+    // it), since a volume's link names the node already. The link's removal and the node's mode and attributes at it
+    // are the commit's.
+    let (handed, refilled) = self.handed_in(&effects);
     for effect in in_replay_order(effects) {
       match effect {
         Effect::Special(path, node) => {
@@ -4794,6 +4916,15 @@ impl Green {
           journal.push(VolumeOp::Mknod { path, node, mode });
         }
         Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
+        Effect::RemoveHardlink(path) | Effect::Mode(path, _) | Effect::SetXattr(path, ..)
+          if handed.contains(&path) => {}
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(home, edits))
+          if handed.contains(&path) =>
+        {
+          let home_len = self.content.get(&home).map_or(0, |held| held.len() as u64);
+          journal.extend(content_volume_ops(&home, &edits, home_len));
+          changed.insert(path, Some(bytes));
+        }
         // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
         // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
         // replayed over a head that holds the destination it would add them to that file's own.
@@ -4820,7 +4951,7 @@ impl Green {
           changed.insert(path, Some(bytes));
         }
         Effect::RemoveContent(path) => {
-          if !moved_from.remove(&path) {
+          if !moved_from.remove(&path) && !refilled.contains(&path) {
             journal.push(VolumeOp::Unlink { path: path.clone() });
           }
           changed.insert(path, None);
