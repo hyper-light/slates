@@ -949,10 +949,6 @@ fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   assert!(log.contains("13:/trunk/secret A"), "{log}");
 }
 
-/// `check-path` of `secret` beneath the session's `/trunk`, which the fixtures' rules keep from all
-/// but alice.
-const CHECK_SECRET: &[u8] = b"( check-path ( 6:secret ( ) ) ) ";
-
 /// A directory's kind answered after the trivial auth request.
 const A_DIRECTORY: &str = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
 
