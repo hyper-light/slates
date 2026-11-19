@@ -38,6 +38,8 @@
 //! index, appends the entry, and puts the fork in the index's place once the entry committed, or releases it. The
 //! admission (the repository's policy and its hooks) runs between the two.
 
+#[cfg(unix)]
+use slates_db::catalog::{HookPointName, RepositoryPolicy};
 use slates_db::catalog::{
   NameBinding, Principal, RepositoryCheck, RepositoryId, StateChange, StateLog,
   VolumeId as DbVolumeId,
@@ -61,7 +63,11 @@ use slates_vcs::{ContentStore, IndexRefused};
 
 use super::push::{AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
 use crate::state::ShardState;
-use crate::vcs_policy::{Asked, Name, Namespace, Right};
+#[cfg(unix)]
+use crate::hook_driver::{self, Launch};
+#[cfg(unix)]
+use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outcome, PendingView};
+use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
 
 #[cfg(test)]
 mod tests;
@@ -94,6 +100,25 @@ const NOT_AVAILABLE: &[u8] = b"a branch of this repository is not available here
 const VIEW_REFUSED: &[u8] = b"the repository's history could not be read";
 /// See [`NOT_AVAILABLE`].
 const REFUSED: &[u8] = b"push refused: ";
+
+/// Format: `acl`'s words for a name it refuses (`hgext/acl.py`, 7.2): `acl: user "%s" denied on branch "%s" (changeset
+/// "%s")`, `not allowed on` for a list that leaves the user out, bookmarks alike; the user here is the principal's
+/// record until §4.13's Mercurial identity names it.
+const ACL_USER: &[u8] = b"acl: user \"";
+/// Format: see [`ACL_USER`].
+const ACL_DENIED: &[u8] = b"\" denied on ";
+/// Format: see [`ACL_USER`].
+const ACL_NOT_ALLOWED: &[u8] = b"\" not allowed on ";
+/// Format: see [`ACL_USER`].
+const ACL_CHANGESET: &[u8] = b" (changeset \"";
+/// Format: see [`ACL_USER`].
+const ACL_END: &[u8] = b"\")";
+/// Format: the hexadecimal digits of 7.2's `short`, a node's first six bytes, which `acl` writes a changeset as.
+const SHORT_DIGITS: usize = 12;
+/// hgweb's words for a push its principal holds no right to make (`hgweb/common.py` `checkauthz`).
+const NOT_AUTHORIZED: &[u8] = b"push not authorized";
+/// Slates' words: the repository's policy holds a rule its matcher cannot read (the guard keeps such rules out).
+const POLICY_UNREADABLE: &[u8] = b"the repository's policy cannot be read";
 
 /// Appends `byte` escaped.
 fn escape(byte: u8, out: &mut String) {
@@ -384,8 +409,25 @@ pub(crate) struct Prepared {
   wanted: bool,
   /// The first and last changesets it adds, which its hooks name (`HG_NODE`, `HG_NODE_LAST`).
   pub(crate) added: Option<(Node, Node)>,
-  /// Each name it changes and the right its change needs (A-622 part 2's `admit`): its namespace, its label, the right.
-  pub(crate) asked: Vec<(Namespace, String, Right)>,
+  /// Each name it changes as its admission asks about it.
+  pub(crate) asked: Vec<Ask>,
+  /// Its changegroup part's id, which a hook's `output` part names.
+  pub(crate) changegroup: Option<u32>,
+}
+
+/// One name a push changes as its admission asks about it (A-622 part 2's `admit`): its namespace and label, the right
+/// its change needs, and the changeset `acl` names when it refuses (the first the push brings on a branch; a bookmark's
+/// node).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Ask {
+  /// The namespace.
+  pub(crate) namespace: Namespace,
+  /// The name's label.
+  pub(crate) name: String,
+  /// The right its change needs.
+  pub(crate) right: Right,
+  /// The changeset a refusal names.
+  pub(crate) changeset: Option<Node>,
 }
 
 impl Prepared {
@@ -394,11 +436,24 @@ impl Prepared {
     self
       .asked
       .iter()
-      .map(|(namespace, name, right)| Asked {
-        name: Name::Hg(*namespace, name),
-        right: *right,
+      .map(|ask| Asked {
+        name: Name::Hg(ask.namespace, &ask.name),
+        right: ask.right,
       })
       .collect()
+  }
+
+  /// Adds the `output` parts admission hooks wrote, after the changegroup's reply, as 7.2 writes them after the reply of
+  /// the part whose handler ran the hooks.
+  pub(crate) fn with_output(&mut self, output: Vec<Replied>) {
+    let at = self
+      .replied
+      .iter()
+      .position(|replied| matches!(replied, Replied::Changegroup { .. }))
+      .map_or(self.replied.len(), |at| at.saturating_add(1));
+    let tail = self.replied.split_off(at.min(self.replied.len()));
+    self.replied.extend(output);
+    self.replied.extend(tail);
   }
 }
 
@@ -449,6 +504,7 @@ pub(crate) fn prepare<V: Repository, H: Held>(
     wanted: unbundle.reply_caps().is_some(),
     added: plan.added,
     asked: asked(&plan, &read),
+    changegroup: unbundle.changegroup().map(|(id, _)| id),
     verified,
   })
 }
@@ -668,18 +724,30 @@ fn policy_name(name: &[u8]) -> String {
 /// Each name the plan changes and the right its change needs (`vcs_policy::admit`): a line moved, merged away or made
 /// on a new branch submits to its branch, a line made beside another head of its branch rewrites it (Mercurial's
 /// forced push); a bookmark moved forward or made submits, moved elsewhere rewrites, and deleted deletes.
-fn asked(plan: &Plan, read: &Read) -> Vec<(Namespace, String, Right)> {
-  let mut asked: Vec<(Namespace, String, Right)> = Vec::new();
-  let mut ask = |namespace: Namespace, name: &[u8], right: Right| {
-    let name = policy_name(name);
-    if !asked.iter().any(|(held, named, wanted)| *held == namespace && *named == name && *wanted == right) {
-      asked.push((namespace, name, right));
+fn asked(plan: &Plan, read: &Read) -> Vec<Ask> {
+  let first_on = |branch: &[u8]| {
+    plan
+      .firsts
+      .iter()
+      .find(|(held, _)| held == branch)
+      .map(|(_, node)| *node)
+  };
+  let mut asked: Vec<Ask> = Vec::new();
+  let mut ask = |namespace: Namespace, name: &[u8], right: Right, changeset: Option<Node>| {
+    let ask = Ask {
+      namespace,
+      name: policy_name(name),
+      right,
+      changeset,
+    };
+    if !asked.contains(&ask) {
+      asked.push(ask);
     }
   };
   for moved in &plan.lines {
     let (LineMove::Moved { line, .. } | LineMove::Retired { line }) = moved;
     if let Some((_, branch, _)) = read.lines.get(*line) {
-      ask(Namespace::Branch, branch.as_slice(), Right::Submit);
+      ask(Namespace::Branch, branch.as_slice(), Right::Submit, first_on(branch));
     }
   }
   for made in &plan.created {
@@ -688,19 +756,226 @@ fn asked(plan: &Plan, read: &Read) -> Vec<(Namespace, String, Right)> {
       .iter()
       .any(|(named, branch, _)| *branch == made.branch && named.head.is_some());
     let right = if headed { Right::Rewrite } else { Right::Submit };
-    ask(Namespace::Branch, made.branch.as_slice(), right);
+    ask(Namespace::Branch, made.branch.as_slice(), right, first_on(&made.branch));
   }
   for moved in &plan.bookmarks {
     match moved {
-      BookmarkMove::Moved { name, forward, .. } => {
+      BookmarkMove::Moved {
+        name, to, forward, ..
+      } => {
         let right = if *forward { Right::Submit } else { Right::Rewrite };
-        ask(Namespace::Bookmark, name.as_slice(), right);
+        ask(Namespace::Bookmark, name.as_slice(), right, Some(*to));
       }
-      BookmarkMove::Created { name, .. } => ask(Namespace::Bookmark, name.as_slice(), Right::Submit),
-      BookmarkMove::Deleted { name, .. } => ask(Namespace::Bookmark, name.as_slice(), Right::Delete),
+      BookmarkMove::Created { name, to, .. } => {
+        ask(Namespace::Bookmark, name.as_slice(), Right::Submit, Some(*to));
+      }
+      BookmarkMove::Deleted { name, from } => {
+        ask(Namespace::Bookmark, name.as_slice(), Right::Delete, Some(*from));
+      }
     }
   }
   asked
+}
+
+/// The repository's policy asked about every name a prepared push changes, before its verdict (A-622 part 2's
+/// `vcs_policy::admit`, §4.17.3 "Push" step 5): refused in `acl`'s words for a rule that denies a name or a list that
+/// leaves the principal out, in hgweb's for a principal no rule lets push.
+pub(crate) fn admitted(
+  state: &ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  prepared: &Prepared,
+) -> Result<(), Refused> {
+  let record = state
+    .db
+    .partition()
+    .repositories()
+    .repository(repository)
+    .ok_or_else(|| abort(NOT_AUTHORIZED.to_vec()))?;
+  vcs_policy::admit(record, principal, &prepared.asks())
+    .map_err(|refusal| policy_refused(refusal, &prepared.asked, principal))
+}
+
+/// The answer to a push the policy refused.
+fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) -> Refused {
+  let named = |index: u32| usize::try_from(index).ok().and_then(|at| asked.get(at));
+  let words = match refusal {
+    PushRefusal::Denied { index, .. } => named(index).map(|ask| acl_words(principal, ask, ACL_DENIED)),
+    PushRefusal::NotListed { index } => {
+      named(index).map(|ask| acl_words(principal, ask, ACL_NOT_ALLOWED))
+    }
+    PushRefusal::NotPermitted { .. } | PushRefusal::OtherTool { .. } => None,
+    PushRefusal::Unreadable { .. } => Some(POLICY_UNREADABLE.to_vec()),
+  };
+  abort(words.unwrap_or_else(|| NOT_AUTHORIZED.to_vec()))
+}
+
+/// `acl`'s words refusing `ask` to `principal` (`verdict` its `denied on` or `not allowed on`).
+fn acl_words(principal: &Principal, ask: &Ask, verdict: &[u8]) -> Vec<u8> {
+  let kind: &[u8] = match ask.namespace {
+    Namespace::Branch => b"branch",
+    Namespace::Bookmark => b"bookmark",
+    Namespace::Topic => b"topic",
+  };
+  let mut words = ACL_USER.to_vec();
+  words.extend_from_slice(format!("{principal:?}").as_bytes());
+  words.extend_from_slice(verdict);
+  words.extend_from_slice(kind);
+  words.extend_from_slice(b" \"");
+  words.extend_from_slice(ask.name.as_bytes());
+  words.push(b'"');
+  if let Some(node) = ask.changeset {
+    let mut hex = Vec::new();
+    slates_hg::node::write_hex(&node, &mut hex);
+    words.extend_from_slice(ACL_CHANGESET);
+    words.extend(hex.iter().take(SHORT_DIGITS));
+    words.extend_from_slice(ACL_END);
+  }
+  words
+}
+
+/// A node's hexadecimal digits, as a hook's environment carries them.
+#[cfg(unix)]
+fn hex_text(node: &Node) -> String {
+  let mut hex = Vec::new();
+  slates_hg::node::write_hex(node, &mut hex);
+  String::from_utf8(hex).unwrap_or_default()
+}
+
+/// One hook the repository's policy configures, as a push runs it: its configured name, its program, and what it is
+/// started with (A-597's builders).
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) struct Hook {
+  /// Its configured name (`pretxnchangegroup.acl`).
+  pub(crate) name: String,
+  /// Its program.
+  pub(crate) program: std::path::PathBuf,
+  /// Its point's arguments, environment and standard input.
+  pub(crate) input: HookInput,
+}
+
+/// The hooks `policy` configures at `point`, in the order it gives them, each started with what `input` makes for its
+/// name; none when the push added no changeset (7.2 runs its changegroup hooks only then).
+#[cfg(unix)]
+fn configured(
+  policy: &RepositoryPolicy,
+  (point, added): (HookPointName, Option<(Node, Node)>),
+  url: &str,
+  input: impl Fn(&str, &vcs_hooks::Changegroup) -> HookInput,
+) -> Vec<Hook> {
+  let Some((first, last)) = added else {
+    return Vec::new();
+  };
+  let changes = vcs_hooks::Changegroup {
+    first: hex_text(&first),
+    last: hex_text(&last),
+    url: url.to_owned(),
+  };
+  policy
+    .hooks
+    .iter()
+    .filter(|hook| hook.point == point)
+    .map(|hook| Hook {
+      name: hook.name.clone(),
+      program: std::path::PathBuf::from(&hook.program),
+      input: input(&hook.name, &changes),
+    })
+    .collect()
+}
+
+/// The `pretxnchangegroup` hooks a prepared push runs before its verdict (§4.17.3 "Hooks": admission), over its pending
+/// view, `HG_NODE` and `HG_NODE_LAST` the first and last changesets it adds, `HG_URL` the transport's `url`.
+#[cfg(unix)]
+pub(crate) fn admission_hooks(
+  policy: &RepositoryPolicy,
+  added: Option<(Node, Node)>,
+  (view, url): (PendingView, &str),
+) -> Vec<Hook> {
+  configured(policy, (HookPointName::HgPretxnchangegroup, added), url, |name, changes| {
+    vcs_hooks::hg_pretxnchangegroup(view, name, changes)
+  })
+}
+
+/// The `changegroup` hooks a landed push runs after its commit (§4.17.3 "Hooks": observing), over the committed view.
+#[cfg(unix)]
+pub(crate) fn observing_hooks(
+  policy: &RepositoryPolicy,
+  added: Option<(Node, Node)>,
+  (view, url): (CommittedView, &str),
+) -> Vec<Hook> {
+  configured(policy, (HookPointName::HgChangegroup, added), url, |name, changes| {
+    vcs_hooks::hg_changegroup(view, name, changes)
+  })
+}
+
+/// What running a push's hooks answered: the `output` parts their words make, the first refusal's answer, and each
+/// run's lesson for its hook's learned times, in order.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct HooksRan {
+  /// The `output` parts.
+  pub(crate) output: Vec<Replied>,
+  /// The first refusal, in 7.2's words.
+  pub(crate) refused: Option<Refused>,
+  /// Each run's lesson.
+  pub(crate) lessons: Vec<Lesson>,
+}
+
+/// How a hook that did not accept ended, in 7.2's words (`hook.py` `_exthook`, `procutil.explainexit`: `%s hook %s`,
+/// `exited with status %d` or `killed by signal %d`), and slates' for a run past its learned bound, a client gone, or a
+/// program that could not be started.
+#[cfg(unix)]
+fn hook_words(name: &str, outcome: &Outcome) -> Vec<u8> {
+  let status = |status: ExitStatus| match status {
+    ExitStatus::Code(code) => format!("exited with status {code}"),
+    ExitStatus::Signal(signal) => format!("killed by signal {signal}"),
+  };
+  let desc = match outcome {
+    Outcome::Refused { status: ended, .. } => status(*ended),
+    Outcome::TimedOut { bound_ns, .. } => format!("ran past its bound of {bound_ns} ns"),
+    Outcome::Unstartable { cause } => format!("could not be started ({cause:?})"),
+    Outcome::Abandoned => "was ended: its client left".to_owned(),
+    Outcome::Accepted { .. } => "accepted".to_owned(),
+  };
+  format!("{name} hook {desc}").into_bytes()
+}
+
+/// Runs `hooks` in their order (§4.17.3 "Hooks"), each held to its bound in `bounds` (its learned times', none before
+/// its first finished run) and over the view at `view_root`, its words kept up to `words_cap` and written as `output`
+/// parts naming `in_reply_to`; the first that does not accept stops the rest and answers in 7.2's words, as 7.2 stops
+/// at a throwing hook. Ended at once when `client_gone` resolves.
+#[cfg(unix)]
+pub(crate) async fn run_hooks<G: core::future::Future<Output = ()> + Unpin>(
+  (hooks, bounds): (&[Hook], &[Option<u64>]),
+  (view_root, words_cap, in_reply_to): (&std::path::Path, usize, Option<u32>),
+  client_gone: &mut G,
+) -> HooksRan {
+  let mut ran = HooksRan::default();
+  for (at, hook) in hooks.iter().enumerate() {
+    let launch = Launch {
+      program: &hook.program,
+      input: &hook.input,
+      view_root,
+      words_cap,
+    };
+    let bound = bounds.get(at).copied().flatten();
+    let ended = hook_driver::run(launch, bound, &mut *client_gone).await;
+    ran.lessons.push(ended.lesson);
+    let words = match &ended.outcome {
+      Outcome::Accepted { words }
+      | Outcome::Refused { words, .. }
+      | Outcome::TimedOut { words, .. } => words.kept.clone(),
+      Outcome::Abandoned | Outcome::Unstartable { .. } => Vec::new(),
+    };
+    if !words.is_empty() {
+      ran.output.push(Replied::Output { in_reply_to, words });
+    }
+    if !matches!(ended.outcome, Outcome::Accepted { .. }) {
+      ran.refused = Some(abort(hook_words(&hook.name, &ended.outcome)));
+      break;
+    }
+  }
+  ran
 }
 
 /// What a landing answered, and what it gave back.

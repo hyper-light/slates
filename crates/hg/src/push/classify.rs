@@ -199,6 +199,9 @@ pub struct Plan {
   pub added: Option<(Node, Node)>,
   /// The branches whose lines it moves, makes or retires, sorted.
   pub touched: Vec<Vec<u8>>,
+  /// Each branch it brings changesets on and the first of them in arrival order, in that order: the changeset `acl`
+  /// names when it refuses the branch (A-657 part 4).
+  pub firsts: Vec<(Vec<u8>, Node)>,
 }
 
 /// Why a push could not be placed; nothing of it is kept.
@@ -597,6 +600,13 @@ pub fn classify(
     .first()
     .zip(graph.brought.last())
     .map(|(first, last)| (first.node, last.node));
+  for brought in &graph.brought {
+    let branch = graph.branches.get(brought.branch).cloned().unwrap_or_default();
+    if !plan.firsts.iter().any(|(held, _)| *held == branch) {
+      admission.charge_items::<(Vec<u8>, Node)>(1)?;
+      plan.firsts.push((branch, brought.node));
+    }
+  }
   Ok(plan)
 }
 

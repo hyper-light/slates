@@ -612,3 +612,232 @@ proptest! {
     prop_assert!(line_of(&mark).is_none());
   }
 }
+
+/// The stranger, another principal.
+fn stranger() -> slates_ipc::protocol::Principal {
+  slates_ipc::protocol::Principal::Uid { host: 0, uid: 4321 }
+}
+
+/// Sets repository `name`'s policy to `rules`, from version `read`.
+fn set_policy(
+  state: &mut ShardState,
+  (name, read): (&str, u64),
+  rules: Vec<slates_ipc::protocol::PolicyRule>,
+) {
+  let reply = dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::SetRepositoryPolicy {
+      repository: name.to_owned(),
+      read,
+      rules,
+      hooks: Vec::new(),
+      hooks_env: Vec::new(),
+    },
+  );
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.
+fn rule(
+  names: slates_ipc::protocol::PolicyNames,
+  pattern: &str,
+  (effect, who): (slates_ipc::protocol::PolicyEffect, slates_ipc::protocol::PolicyWho),
+) -> slates_ipc::protocol::PolicyRule {
+  slates_ipc::protocol::PolicyRule {
+    names,
+    pattern: pattern.to_owned(),
+    right: slates_ipc::protocol::PolicyRight::Submit,
+    effect,
+    who,
+  }
+}
+
+/// A-657 part 4 (A-622 part 2's `admit`, §4.17.3 "Push" step 5; `acl`'s words). Do: with a rule denying every
+/// principal a submit to branch `default`, prepare stock `push-plain` and ask the policy; with the rule gone, ask again;
+/// on another repository whose one rule lets only a stranger submit to bookmarks, prepare stock `push-bookmark`'s move
+/// of `main` and ask. Expect: the first refused in `acl`'s words naming the principal, `default` and the first changeset
+/// the push brings on it; the second admitted (no rule speaks, and the owner holds what none speaks to); the third
+/// refused as not allowed on bookmark `main`, naming the bookmark's new node.
+#[test]
+fn the_policy_refuses_before_the_verdict_in_acls_words() {
+  use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyNames, PolicyWho};
+  crate::daemon::audit_on_shard(|state| {
+    let mut plain = Hg::new(state, "acl-plain");
+    rebuild(state, &mut plain, (&[1], 1));
+    set_policy(state, ("acl-plain", 0), vec![rule(PolicyNames::Branches, "default", (PolicyEffect::Deny, PolicyWho::Anyone))]);
+    let view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
+    let prepared = plain.prepare(state, &stock(fixture!("push-plain.hg")), &view).unwrap();
+    let denied = format!("acl: user \"{:?}\" denied on branch \"default\" (changeset \"048741fabe42\")", owner());
+    assert_eq!(
+      super::admitted(state, (&owner(), plain.repository), &prepared),
+      Err(Refused::Abort { message: denied.into_bytes(), hint: None })
+    );
+    set_policy(state, ("acl-plain", 1), Vec::new());
+    assert_eq!(super::admitted(state, (&owner(), plain.repository), &prepared), Ok(()));
+    let mut marks = Hg::new(state, "acl-mark");
+    rebuild(state, &mut marks, (&[0], 0));
+    let only = PolicyWho::AnyOf { entries: vec![PolicyEntry::Is { principal: stranger() }] };
+    set_policy(state, ("acl-mark", 0), vec![rule(PolicyNames::Bookmarks, "*", (PolicyEffect::Allow, only))]);
+    let view = View::of(listing!("push-bookmark-server.txt"), listing!("push-bookmark-bookmarks.txt"));
+    let prepared = marks.prepare(state, &stock(fixture!("push-bookmark.hg")), &view).unwrap();
+    let listed = format!("acl: user \"{:?}\" not allowed on bookmark \"main\" (changeset \"59d5dc23f878\")", owner());
+    assert_eq!(
+      super::admitted(state, (&owner(), marks.repository), &prepared),
+      Err(Refused::Abort { message: listed.into_bytes(), hint: None })
+    );
+  });
+}
+
+/// A-657 part 4's hooks (§4.17.3 "Hooks"; 7.2's `hook.py`), run through the hook driver with this test binary playing
+/// each hook (`hook_driver::tests::a_hook_role`).
+#[cfg(unix)]
+mod hooks {
+  use std::sync::mpsc::channel;
+
+  use slates_db::catalog::{HookConfig, HookPointName, RepositoryPolicy};
+  use slates_hg::push::reply::{Refused, Replied};
+  use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
+
+  use super::super::{Hook, HooksRan, admission_hooks, observing_hooks, run_hooks};
+  use crate::vcs_hooks::{CommittedView, EnvValue, PendingView};
+
+  /// Format: the variable that makes the test binary, re-invoked, a hook of the role it names (hook_driver's tests').
+  const ROLE: &str = "SLATES_HOOK_ROLE";
+  /// Format: the libtest name of the role test the binary is re-invoked with.
+  const ROLE_TEST: &str = "hook_driver::tests::a_hook_role";
+  /// Shape: how many bytes of a hook's words the test keeps.
+  const CAP: usize = 1 << 16;
+  /// Shape: the changegroup part's id the hooks' output names.
+  const PART: u32 = 4;
+
+  /// A one-shard runtime for a driven run, as hook_driver's tests make one.
+  fn runtime() -> LocalRuntime {
+    LocalRuntime::new(&RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 8,
+      timers_per_shard: 8,
+      ring_entries: 8,
+      step_budget_ns: 1_000_000,
+      timer_tick_ns: 100_000,
+      batch: 8,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+      wake_tracking: None,
+    })
+    .expect("a local runtime")
+  }
+
+  /// A policy configuring `hooks`, each a point and a name.
+  fn policy(hooks: &[(HookPointName, &str)]) -> RepositoryPolicy {
+    RepositoryPolicy {
+      version: 1,
+      rules: Vec::new(),
+      hooks: hooks
+        .iter()
+        .map(|(point, name)| HookConfig {
+          point: *point,
+          name: (*name).to_owned(),
+          program: "/usr/local/bin/hook".to_owned(),
+        })
+        .collect(),
+      hooks_env: Vec::new(),
+    }
+  }
+
+  /// `hook` played by this test binary in `role`.
+  fn playing(mut hook: Hook, role: &str) -> Hook {
+    hook.program = std::env::current_exe().unwrap();
+    hook.input.args = [ROLE_TEST, "--exact", "--nocapture", "--"]
+      .iter()
+      .map(|arg| arg.as_bytes().to_vec())
+      .collect();
+    hook
+      .input
+      .env
+      .push((ROLE.to_owned(), EnvValue::Bytes(role.as_bytes().to_vec())));
+    hook
+  }
+
+  /// Runs `hooks` to their answer, the test binary's directory standing for the pending view.
+  fn drive(hooks: Vec<Hook>) -> HooksRan {
+    let runtime = runtime();
+    let (sent, got) = channel();
+    let view = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    runtime
+      .spawn(async move {
+        let mut gone = core::future::pending::<()>();
+        let ran = run_hooks((&hooks, &[]), (&view, CAP, Some(PART)), &mut gone).await;
+        let _ = sent.send(ran);
+      })
+      .expect("the run's task");
+    runtime.run_until_idle();
+    got.recv().expect("the run answered")
+  }
+
+  /// The value a hook's environment gives `name`.
+  fn env(hook: &Hook, name: &str) -> Option<EnvValue> {
+    hook
+      .input
+      .env
+      .iter()
+      .find(|(held, _)| held == name)
+      .map(|(_, value)| value.clone())
+  }
+
+  /// A-657 part 4 (§4.17.3 "Hooks": admission; 7.2's `apply` and `_exthook`). Do: configure three
+  /// `pretxnchangegroup` hooks around a `changegroup` one, take the admission hooks of a push adding changesets
+  /// 0101… to 0202… and of one adding none, then run them, the first accepting, the second refusing with status 3, the
+  /// third accepting. Expect: the three admission hooks in their order with `HG_NODE` and `HG_NODE_LAST` the first and
+  /// last changesets, `HG_PENDING` the view and `HG_URL` the transport's; none for a push adding nothing; the one
+  /// observing hook; the run stops at the second, answering `pretxnchangegroup.second hook exited with status 3`, both
+  /// hooks' words salvaged as `output` parts naming the changegroup part, two lessons learned, the third never run.
+  #[test]
+  fn admission_hooks_run_in_order_and_the_first_refusal_answers_in_7_2s_words() {
+    let policy = policy(&[
+      (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.first"),
+      (HookPointName::HgChangegroup, "changegroup.after"),
+      (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.second"),
+      (HookPointName::HgPretxnchangegroup, "pretxnchangegroup.third"),
+    ]);
+    let added = Some(([1; 20], [2; 20]));
+    let url = "remote:ssh:127.0.0.1";
+    let hooks = admission_hooks(&policy, added, (PendingView(7), url));
+    assert_inputs(&hooks, url);
+    assert!(admission_hooks(&policy, None, (PendingView(7), url)).is_empty());
+    assert_eq!(observing_hooks(&policy, added, (CommittedView(7), url)).len(), 1);
+    let roles = ["accept", "refuse", "accept"];
+    let ran = drive(hooks.into_iter().zip(roles).map(|(hook, role)| playing(hook, role)).collect());
+    assert_ran(&ran);
+  }
+
+  /// The three admission hooks in order, the first's changesets, view and url as 7.2 names them.
+  fn assert_inputs(hooks: &[Hook], url: &str) {
+    let names: Vec<&str> = hooks.iter().map(|hook| hook.name.as_str()).collect();
+    assert_eq!(names, ["pretxnchangegroup.first", "pretxnchangegroup.second", "pretxnchangegroup.third"]);
+    let first = hooks.first().unwrap();
+    assert_eq!(env(first, "HG_NODE"), Some(EnvValue::Bytes(b"01".repeat(20))));
+    assert_eq!(env(first, "HG_NODE_LAST"), Some(EnvValue::Bytes(b"02".repeat(20))));
+    assert_eq!(env(first, "HG_PENDING"), Some(EnvValue::ViewRoot));
+    assert_eq!(env(first, "HG_URL"), Some(EnvValue::Bytes(url.as_bytes().to_vec())));
+  }
+
+  /// The run stopped at the second hook, in 7.2's words, both hooks' words salvaged naming the changegroup part.
+  fn assert_ran(ran: &HooksRan) {
+    let message = b"pretxnchangegroup.second hook exited with status 3".to_vec();
+    assert_eq!(ran.refused, Some(Refused::Abort { message, hint: None }));
+    assert_eq!(ran.lessons.len(), 2);
+    let named: Vec<Option<u32>> = ran
+      .output
+      .iter()
+      .map(|part| match part {
+        Replied::Output { in_reply_to, words } if !words.is_empty() => *in_reply_to,
+        _ => None,
+      })
+      .collect();
+    assert_eq!(named, [Some(PART), Some(PART)]);
+  }
+}
