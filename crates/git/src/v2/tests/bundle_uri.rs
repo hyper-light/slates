@@ -279,9 +279,12 @@ fn a_list_git_could_not_read_back_is_not_written() {
   );
 }
 
+/// Shape: the bytes a generated bundle's id takes.
+const ID_BYTES: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-.";
+
 /// A bundle's parts a generated list holds: an id of the bytes ids use, a URI, a creation token if any.
 fn any_bundle() -> impl Strategy<Value = (Vec<u8>, Vec<u8>, Option<u64>)> {
-  let id_byte = prop_oneof![b'a'..=b'z', b'0'..=b'9', Just(b'-'), Just(b'.')];
+  let id_byte = (0..ID_BYTES.len()).prop_map(|at| ID_BYTES[at]);
   let uri_byte = b' '..=b'~';
   (
     proptest::collection::vec(id_byte, 1..10),

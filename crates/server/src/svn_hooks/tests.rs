@@ -58,6 +58,7 @@ fn policy(hooks: Vec<HookConfig>, variables: &[(&str, &str)]) -> RepositoryPolic
         })
         .collect(),
     }],
+    signers: Vec::new(),
   }
 }
 

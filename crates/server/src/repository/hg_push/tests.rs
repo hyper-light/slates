@@ -871,6 +871,7 @@ fn set_policy(
       rules,
       hooks: Vec::new(),
       hooks_env: Vec::new(),
+      signers: Vec::new(),
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
@@ -1118,6 +1119,7 @@ mod hooks {
   fn policy(hooks: &[(HookPointName, &str)]) -> RepositoryPolicy {
     RepositoryPolicy {
       version: 1,
+      signers: Vec::new(),
       rules: Vec::new(),
       hooks: hooks
         .iter()
