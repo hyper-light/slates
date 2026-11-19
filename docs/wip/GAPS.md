@@ -3,6 +3,8 @@
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
+> **A-645 (Ada, 2026-11-19): agentic Meta scale, held to Scion.** OWED: derived data as one mechanism (the tool stores as types under it); merges computed anywhere and committed by position; queries by API; fetches naming immutable objects through strict tiers; tests at ten times Scion's published numbers.
+>
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** OWED: A-603's repository-wide register position replaced by each green's own log; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own (g261, with A-635/A-636).
 >
 > §4.17.1 maps repositories, branches,
@@ -154,6 +156,14 @@
 > through the refs); the pack from the runs' fragments and the chosen objects (piece 7's next part); `object-info`; the
 > walks in cooperative slices under the shard's budget, and the collections' own overhead charged (entries are charged
 > at their size); exact object sets from reached-set bitmaps; A-614's store implementing `Graph`.
+> **A-640 part 1 (2026-11-19, g296; the store as the negotiation's graph):** A-614's store answers A-615's `Graph`
+> (`store::graph`, `StoreGraph`). Nodes are positions, versions are the store's chains with D(k), each version's
+> fast-forward is the store's own verdict at admission (held to it over six moves, a tag moved onto itself among them),
+> the caller names the refs' greens, and a read the store cannot make is kept as a fault the service refuses on. Over
+> the repository stock git 2.50.1 served from, loaded into a real store, the negotiation sends exactly git's objects
+> for a clone and for a fetch with a have (338 of 338 on the Mac Studio merged with main, red four ways). This closes
+> A-615's "A-614's store implementing `Graph`". Owed in A-640: the v2 service with one entry point; `ls-refs`; the v0 and v1 service, with v0's ref names
+> held to A-615's rule; the pack from A-639's fragments; `sparse:oid`.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -165,6 +175,15 @@
 > session channel with git's `exec` and `env` (RFC 4254); the listener on the runtime, with the connection-lifetime
 > estimator that feeds the key time and the host key's keeping; main's live interop with stock `ssh` clients, and its
 > clippy and `xtask` over the crate; a post-quantum exchange (`mlkem768x25519-sha256`) after its own amendment.
+> **A-633 (2026-11-19, g294; piece 9's second part, authentication and the session channel):** `slates-ssh`'s
+> `Session` serves a connection whole: publickey authentication (the `none` probe, `PK_OK` for held keys, Ed25519 and
+> RSA SHA-2 signatures over the session id, partial success, the banner, a failure limit, `server-sig-algs`) through
+> a `KeyHolders` lookup over §4.13's principals; one session channel taking `env GIT_PROTOCOL` and one `exec` of git's,
+> Mercurial's or Subversion's command in its client's quoting, raised and never run; everything else refused by kind;
+> windows from the caller's budget and the transport's cap; `exit-status`, EOF and close in order; replies held through
+> the server's own rekey (`cargo test -p slates-ssh --lib`, 105 of 105; red five ways). Owed: the listener on
+> slates-rt with the reaper and the lifetime estimator, the host key's keeping, the key store, serving each command,
+> ECDSA and FIDO user keys, and main's live interop with stock `ssh`, `git`, `hg` and `svn`.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -316,11 +335,20 @@
 > accepted push found, and the engine now fixes, a removed file's or directory's mode and attributes outliving it (bug
 > record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
 > --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
-> mutation. Owed: git's store
-> implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6); submodule links (§4.17.2
-> item 5's special node kind); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> mutation. Owed: receive-pack submitting the work (piece 6; git's store implementing
+> `PushObjects` is A-638's, below); submodule links (§4.17.2 item 5's special node kind, A-637); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
 > post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
 > 64-bit path indices ended the 65,535-name cap this piece first refused past).
+>
+> **A-638 (2026-11-19, g225; §4.17.2 pieces 5 and 6, the store as the push path reads it):** built in `crates/git`
+> (`store::views`). receive-pack's `Repository` is the index alone (`IndexedObjects`), and A-618's `PushObjects` is the
+> index, then the push's quarantine (`PushedObjects`). An object of one window is lent as the store keeps it; a longer
+> base is assembled once, kept, and charged to the view's room first, and a base refused for the room is named. A tree's
+> modes are read as git's tree walk reads them, held to stock git 2.50.1's table. Tests: `slates-git --lib` 333 of 333
+> on the Mac Studio, merged with main, red first (7 of 7) and red five ways by mutation. A thin pack resolved by `receive` against the
+> store, and two pushes made works through it, are among the tests. Owed: receive-pack's part 2 submitting each ref's
+> work through these views. A `Cow` return on `unpack::Outside` and `receive::Repository` would let a view lend an
+> assembled base without keeping it (those traits are A-608's and A-620's).
 > **A-624 part 2 (2026-11-19, g230; piece 14's rest):** `slates-git` (`v2`) reads `object-info` and `bundle-uri`
 > requests and answers them over traits: `object-info` as git 2.50.1 answers (`size` only when asked, an unknown
 > object's space alone, ids alone without `size`, no LF) from `ObjectSizes`, which A-614's store answers by its rows
@@ -449,7 +477,8 @@
 
 > **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs, its index, its lock table, its
 > mergeinfo, its commit rule, ra_svn's greeting and authentication, its HTTP bodies, its authorization and its dump
-> codec built (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599, A-609, A-606 and A-593, D-28; UI goals 91,
+> codec built, and its commit's editor commands read (2026-11-18, A-500, A-531, A-553, A-602, A-605, A-592, A-599,
+> A-609, A-606, A-593 and A-617, D-28; UI goals 91,
 > 92 and 93; g292, g250, g262, g268, g234, g229, g264).** A-592 (2026-11-19, g268): the commit rule, `slates-svn`'s
 > `commit`: the drive's out-of-date test, and the verdict (FSFS's `merge()` stated on the index, over the work's
 > transaction as the index's own builder makes it on its base, then the lock table's check); its oracle FSFS's `merge()`
@@ -461,7 +490,15 @@
 > paths in `svn_path_compare_paths` order and returns at the first that fails (`transaction.c` 3537-3539, 3578), so a
 > commit refused by locks at both `/t/a/b` and `/t/a-b` was answered at `/t/a-b` where `svnserve` answers `/t/a/b`; it
 > now meets them in FSFS's order, and A-602's oracle accepts only the first failing path's locks (it had accepted any
-> lock in the commit). A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock` (with
+> lock in the commit). A-617 part 2a (2026-11-19, g268, UI goal 93): the commit's request and its editor commands read
+> as `svnserve` reads them (`commit::edit`), malformed data (`E210004`, the connection's end) and an unknown command
+> (`E210001`) refused as it refuses them; held to seventeen commits of stock `svn` 1.15.0 against stock `svnserve`
+> 1.15.0 recorded through a relay (`crates/svn/fixtures/commit`, SHA-256 checked), each command read and written back
+> byte for byte and each text delta applied, and to `vparse_tuple` transcribed over generated items; `cargo test
+> --locked -p slates-svn --lib` on the Mac Studio, red first (see A-617 part 2a). Owed from it (part 2b): the drive,
+> each command checked as it arrives and declared on a trial built a command at a time, `close-edit`'s verdict and the
+> answers `svnserve` writes. A-602 (2026-11-19, g250): the lock table, the guards of `lock` (with stealing) and `unlock`
+> (with
 > breaking), and the verdict's lock check (with release or keep), each returning the register entries it decided,
 > applied unconditionally; its oracle FSFS's lock rules transcribed, equal on generated histories; `cargo test -p
 > slates-svn --lib` 74 of 74 on the Mac Studio (see A-602). Owed from it: the verbs on the wire, the lock hooks, DAV's
@@ -485,14 +522,15 @@
 > inexact walk with inheritance compared kept as it is; inheritance and elision; and `get-mergeinfo` over the index, its
 > descendants found by the counts; held to `mergeinfo-test.c`'s vectors, the per-revision model and a naive filesystem
 > on generated histories, red-checked eight ways; `cargo test -p slates-svn --lib` on the Mac Studio (see A-605). Owed
-> from it: `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from its algebra with piece 7's
-> location segments and log; the property's UTF-8 and CR checks with piece 7's property validation. A-613 (2026-11-19,
+> from it: the property's UTF-8 and CR checks with piece 7's property validation (`svn mergeinfo --show-revs` is the
+> stock client's work over the server's answers: Ada's scope, 2026-11-18). A-613 (2026-11-19,
 > g262, UI goal 93), its first part: the ra_svn read commands' sans-io handler, `get-latest-rev`, `get-dated-rev`,
 > `rev-proplist`, `rev-prop`, `check-path`, `stat`, `get-mergeinfo` and `get-iprops`, held to transcripts of stock
 > `svnserve` 1.15.0 (`crates/svn/fixtures/reads`, SHA-256 checked); `cargo test -p slates-svn --lib reads` on the Mac
 > Studio, red-checked six ways (see A-613); its second part's first slice, `get-dir` and `get-locations`, the two stock
-> sessions waiting on them replayed whole. Owed from it: `get-file`, `list`, `log` with merged revisions,
-> `get-location-segments`, `get-file-revs`, `get-deleted-rev`, then `svn mergeinfo --show-revs`, and read access by
+> sessions waiting on them replayed whole; its second slice (g297), `get-file`, its text streamed a slice at a time in
+> the caller's room, red-checked six ways, the fixtures recorded again for every command still owed. Owed from it:
+> `list`, `log` with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by
 > A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
@@ -542,10 +580,11 @@
 > after (refused today), Subversion's replace with history, moves and second copies into a copied tree in one increment,
 > the server's change-index consumers treating a copy's destination as its tree (a Merkle identity over the radix trees
 > was weighed and declined, A-586). Owed, in order: the administration verbs (`svnadmin`, the dump round trip); the
-> ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616 part
-> 1), with the lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
-> suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
-> No speed is claimed until measured.
+> ra_svn server's commands (its greeting and authentication built, A-599; its reporter's commands and report, A-616
+> part 1, and its drive's calls with their ra_svn writer, A-616 part 2's first slice), with the lock verbs; hooks and
+> `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over `svn://` and `http://`,
+> the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed is claimed until
+> measured.
 > A-616 part 1 (2026-11-19, g234): the reporter's commands and its report (`report`): `update`, `switch`, `status`
 > and `diff` read through a port of `vparse_tuple`, the report kept and checked as `reporter.c` keeps and checks it,
 > every refusal in `svnserve`'s words, held to stock 1.15.0's sessions over one recorded history; `cargo test --locked
@@ -553,6 +592,11 @@
 > editor drive answering a finished report over the index, its texts as svndiff, entry properties, absent entries,
 > copy sources and the early-error abort; (2) URLs read as `svn_uri_canonicalize` reads them, as A-599's item (1); (3)
 > the authentication `svnserve`'s `must_have_access` asks for mid-session when an anonymous `update` may not read.
+> A-616 part 2, its first slice (2026-11-19, g234): the drive's calls (`report::drive::Call`, the set A-627's
+> `dav::Drive` consumes too) and ra_svn's writer of them (`report::editor`), held to every recorded drive written
+> again, byte for byte but LZ4 blocks; 313 of 313 on the Mac Studio, red first. Owed of part 2 now: the drive over the
+> index and the green, with `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; the
+> handler that reads the client's early answer and its answers to `close-edit` and `abort-edit`.
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

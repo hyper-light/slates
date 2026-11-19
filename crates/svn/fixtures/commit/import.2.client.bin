@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 32:svn+fixture://fixture/repo/trunk 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( EXTERNAL ( 0: ) ) ( get-latest-rev ( ) ) ( check-path ( 0: ( 1 ) ) ) ( get-dir ( 0: ( 1 ) true false ( kind ) false ) ) ( get-iprops ( 0: ( 1 ) ) ) 

@@ -1690,6 +1690,7 @@ dependencies = [
  "serde_json",
  "sha1-checked",
  "slates-http",
+ "slates-merge",
  "slates-test-seeds",
  "slates-vcs",
 ]
