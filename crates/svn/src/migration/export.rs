@@ -20,10 +20,14 @@
 //!
 //! A range starting after revision 0 is written incrementally, every revision replayed (`--incremental`), which is what
 //! a migration in parts loads; the whole tree `svnadmin dump` writes for the first revision of a range that is not
-//! incremental is not offered. Format 3 is owed with Subversion's own deltifier ([`MigrationRefusal::DeltasOwed`]),
-//! since only its windows make `svnadmin dump --deltas`'s bytes.
+//! incremental is not offered. Format 3 (`--deltas`) writes a change's or a copy's property section as a change to its
+//! comparison's list (`svn_hash_write_incremental`: what is set or changed in name order, then what is deleted in name
+//! order) and every text as the windows of Subversion's deltifier ([`crate::svndiff::deltas`], A-652) against its
+//! comparison's text, the empty text for an addition without history, svndiff version 0 (`store_delta`), naming the
+//! base's checksums where it has a text.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 use super::MigrationRefusal;
 use super::paths::{
@@ -31,10 +35,11 @@ use super::paths::{
 };
 use super::records::{Facts, Properties, Repository, node};
 use crate::dump::{
-  CopyFrom, Event, Format, NodeAction, NodeHeader, Property, PropertySection, RevisionHeader,
-  TextSection, Writer, section_len,
+  CopyFrom, DeltaBase, Event, Format, NodeAction, NodeHeader, Property, PropertySection,
+  RevisionHeader, TextSection, Writer, section_len,
 };
 use crate::index::{Action, ChangedPath, NodeKind, Revision};
+use crate::svndiff::{Compression, Encoder, HEADER_LEN, Version, WINDOW_LIMIT, Window, deltas};
 
 /// What one call of [`Exporter::export`] wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +55,8 @@ pub enum Exporting {
 pub struct Exporter {
   /// The stream's writer.
   writer: Writer,
+  /// The stream's format.
+  format: Format,
   /// The revision written next; none once the range is written.
   next: Option<Revision>,
   /// The range's last revision.
@@ -65,16 +72,13 @@ impl Exporter {
   ///
   /// # Errors
   /// [`MigrationRefusal::BadRange`] when `first` is past `last` or `last` past the youngest revision, as
-  /// `svn_repos_dump_fs4` refuses them; [`MigrationRefusal::DeltasOwed`] for format 3.
+  /// `svn_repos_dump_fs4` refuses them.
   pub fn new(
     repository: &Repository,
     first: Revision,
     last: Revision,
     format: Format,
   ) -> Result<Self, MigrationRefusal> {
-    if format == Format::Three {
-      return Err(MigrationRefusal::DeltasOwed);
-    }
     let youngest = repository.youngest();
     if first > last || last > youngest {
       return Err(MigrationRefusal::BadRange {
@@ -85,6 +89,7 @@ impl Exporter {
     }
     Ok(Self {
       writer: Writer::new(),
+      format,
       next: Some(first),
       last,
       started: false,
@@ -135,7 +140,7 @@ impl Exporter {
       out,
     };
     if !self.started {
-      stream.event(&Event::Format(Format::Two))?;
+      stream.event(&Event::Format(self.format))?;
       stream.event(&Event::Uuid(repository.uuid()))?;
       self.started = true;
     }
@@ -165,6 +170,7 @@ impl Exporter {
     let mut drive = Drive {
       repository,
       revision,
+      deltas: deltas_room(self.format)?,
       stream,
       stack: Vec::new(),
       last: None,
@@ -232,6 +238,8 @@ struct Drive<'a> {
   repository: &'a Repository,
   /// The revision replayed.
   revision: Revision,
+  /// The deltifier's window room when the stream carries deltas (format 3); none for whole texts and lists.
+  deltas: Option<NonZeroUsize>,
   /// Where its records go.
   stream: Stream<'a>,
   /// The directories open, the root first.
@@ -240,7 +248,7 @@ struct Drive<'a> {
   last: Option<String>,
 }
 
-impl Drive<'_> {
+impl<'a> Drive<'a> {
   /// One changed path (`svn_delta_path_driver_step`).
   fn step(&mut self, row: &ChangedPath) -> Result<(), MigrationRefusal> {
     let path = relative(&row.path).to_owned();
@@ -421,16 +429,9 @@ impl Drive<'_> {
       Some((source, revision)) => self.node_at(source, *revision)?,
       None => self.node_at(path, self.revision.saturating_sub(1))?,
     };
-    let (properties, text) = differences(kind, &before, &now);
-    let header = self.header(
-      path,
-      kind,
-      NodeAction::Change,
-      None,
-      (properties, text),
-      &now,
-    )?;
-    self.record_with_sections(&header, &now)
+    let sections = self.sections(differences(kind, &before, &now), Some(&before), &now)?;
+    let header = header(path, kind, NodeAction::Change, None, &sections, &now)?;
+    self.record_with_sections(&header, sections)
   }
 
   /// An addition or a replacement record (`dump_node`'s `add` and `replace`): a copy compared with its source, a new
@@ -443,78 +444,133 @@ impl Drive<'_> {
     copy: Option<&Place>,
   ) -> Result<(), MigrationRefusal> {
     let now = self.node_at(path, self.revision)?;
-    let (sections, copy_from) = match copy {
+    let (before, copy_from, wanted) = match copy {
       Some((source, revision)) => {
         let before = self.node_at(source, *revision)?;
         let copy_from = copy_header(kind, source, *revision, &before);
-        (differences(kind, &before, &now), Some(copy_from))
+        let wanted = differences(kind, &before, &now);
+        (Some(before), Some(copy_from), wanted)
       }
-      None => ((true, kind == NodeKind::File), None),
+      None => (None, None, (true, kind == NodeKind::File)),
     };
-    let header = self.header(path, kind, action, copy_from, sections, &now)?;
-    self.record_with_sections(&header, &now)
+    let sections = self.sections(wanted, before.as_ref(), &now)?;
+    let header = header(path, kind, action, copy_from, &sections, &now)?;
+    self.record_with_sections(&header, sections)
   }
 
-  /// A node record's header with the sections decided.
-  fn header(
+  /// The sections a record carries, as `wanted` says: its property list and its text, each whole, or (format 3) as a
+  /// change to `before`, what the record compares with, when it has one.
+  fn sections(
     &self,
-    path: &str,
-    kind: NodeKind,
-    action: NodeAction,
-    copy_from: Option<CopyFrom>,
     (with_properties, with_text): (bool, bool),
+    before: Option<&Facts>,
     now: &Facts,
-  ) -> Result<NodeHeader, MigrationRefusal> {
+  ) -> Result<Sections<'a>, MigrationRefusal> {
     let properties = if with_properties {
-      let length = properties_len(&self.repository.properties(now.properties)?)?;
-      Some(PropertySection {
-        delta: false,
-        length,
-      })
+      Some(self.property_plan(before, now)?)
     } else {
       None
     };
-    let text = with_text.then(|| TextSection {
-      delta: None,
-      md5: now.text.map(|text| text.md5),
-      sha1: now.text.map(|text| text.sha1),
-      length: now.text.map_or(0, |text| text.size),
-    });
-    Ok(NodeHeader {
-      path: path.as_bytes().to_vec(),
-      kind: Some(kind),
-      action,
-      copy_from,
-      properties,
-      text,
+    let text = if with_text {
+      Some(self.text_plan(before, now)?)
+    } else {
+      None
+    };
+    Ok(Sections { properties, text })
+  }
+
+  /// A property section: the node's whole list, or (format 3, against a comparison) what changed from `before`'s.
+  fn property_plan(
+    &self,
+    before: Option<&Facts>,
+    now: &Facts,
+  ) -> Result<PropertyPlan, MigrationRefusal> {
+    let list = self.repository.properties(now.properties)?;
+    match (self.deltas, before) {
+      (Some(_), Some(before)) => {
+        let base = self.repository.properties(before.properties)?;
+        Ok(PropertyPlan {
+          delta: true,
+          entries: changed_entries(&list, &base),
+        })
+      }
+      _ => Ok(PropertyPlan {
+        delta: false,
+        entries: list.into_iter().map(|(name, value)| (name, Some(value))).collect(),
+      }),
+    }
+  }
+
+  /// A text section: the node's whole text, or (format 3) the deltifier's windows against `before`'s text, the empty
+  /// text when there is no comparison or it has none (`store_delta`).
+  fn text_plan(&self, before: Option<&Facts>, now: &Facts) -> Result<TextPlan<'a>, MigrationRefusal> {
+    let target = self.text_bytes(now)?;
+    let Some(room) = self.deltas else {
+      return Ok(TextPlan::Whole(target));
+    };
+    let base_text = before.and_then(|before| before.text);
+    let source = match before {
+      Some(before) => self.text_bytes(before)?,
+      None => &[],
+    };
+    let windows: Vec<Window> = deltas(source, target, room)
+      .map_err(MigrationRefusal::Delta)?
+      .collect();
+    let length = encoded_len(&windows)?;
+    Ok(TextPlan::Delta {
+      base: DeltaBase {
+        md5: base_text.map(|text| text.md5),
+        sha1: base_text.map(|text| text.sha1),
+      },
+      windows,
+      length,
     })
   }
 
-  /// Writes a node record and its sections: the node's whole property list, then its whole text.
+  /// The bytes of a node's text: none for a node without one.
+  fn text_bytes(&self, facts: &Facts) -> Result<&'a [u8], MigrationRefusal> {
+    match facts.text {
+      Some(text) => self
+        .repository
+        .content(&text.identity)
+        .ok_or(MigrationRefusal::Corrupt),
+      None => Ok(&[]),
+    }
+  }
+
+  /// Writes a node record and its sections: its property entries, then its text whole or as its delta's windows.
   fn record_with_sections(
     &mut self,
     header: &NodeHeader,
-    now: &Facts,
+    sections: Sections<'_>,
   ) -> Result<(), MigrationRefusal> {
     self.record(header)?;
-    if header.properties.is_some() {
-      let properties = self.repository.properties(now.properties)?;
-      self.stream.properties(&properties)?;
-    }
-    if header.text.is_some() {
-      let bytes = match now.text {
-        Some(text) => self
-          .repository
-          .content(&text.identity)
-          .ok_or(MigrationRefusal::Corrupt)?,
-        None => &[],
-      };
-      if !bytes.is_empty() {
-        self.stream.event(&Event::Text(bytes))?;
+    if let Some(properties) = sections.properties {
+      for (name, value) in &properties.entries {
+        let entry = match value {
+          Some(value) => Property::Set { name, value },
+          None => Property::Delete { name },
+        };
+        self.stream.event(&Event::Property(entry))?;
       }
-      self.stream.event(&Event::TextEnd)?;
+      self.stream.event(&Event::PropertiesEnd)?;
     }
-    Ok(())
+    match sections.text {
+      Some(TextPlan::Whole(bytes)) => {
+        if !bytes.is_empty() {
+          self.stream.event(&Event::Text(bytes))?;
+        }
+        self.stream.event(&Event::TextEnd)
+      }
+      Some(TextPlan::Delta { windows, .. }) => {
+        self.stream.event(&Event::Delta(Version::Zero))?;
+        for window in windows {
+          self.stream.event(&Event::Window(window))?;
+        }
+        self.stream.event(&Event::TextEnd)
+      }
+      None => Ok(()),
+    }
   }
 
   /// Writes a node record's header.
@@ -526,6 +582,119 @@ impl Drive<'_> {
   fn node_at(&self, path: &str, revision: Revision) -> Result<Facts, MigrationRefusal> {
     node(self.repository, &absolute(path), revision)?.ok_or(MigrationRefusal::Corrupt)
   }
+}
+
+/// A record's property section as it is written.
+struct PropertyPlan {
+  /// Whether it is a change to the comparison's list (`Prop-delta: true`).
+  delta: bool,
+  /// Its entries in order: a property set to a value, or (in a change) deleted.
+  entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+/// A record's text as it is written.
+enum TextPlan<'a> {
+  /// Whole.
+  Whole(&'a [u8]),
+  /// As the deltifier's windows against a base the header names by its checksums, `length` bytes of svndiff.
+  Delta {
+    /// The base's checksums.
+    base: DeltaBase,
+    /// The windows.
+    windows: Vec<Window>,
+    /// The svndiff's length.
+    length: u64,
+  },
+}
+
+/// What a record carries after its headers.
+struct Sections<'a> {
+  /// Its property section.
+  properties: Option<PropertyPlan>,
+  /// Its text.
+  text: Option<TextPlan<'a>>,
+}
+
+/// The deltifier's window room for a stream of `format`: Subversion's, `SVN_DELTA_WINDOW_SIZE`, for format 3; none for
+/// format 2, which carries every text whole.
+fn deltas_room(format: Format) -> Result<Option<NonZeroUsize>, MigrationRefusal> {
+  if format == Format::Two {
+    return Ok(None);
+  }
+  let room = usize::try_from(WINDOW_LIMIT).map_err(|_| MigrationRefusal::Corrupt)?;
+  NonZeroUsize::new(room).map(Some).ok_or(MigrationRefusal::Corrupt)
+}
+
+/// The svndiff length of `windows`: the header and each window as svndiff version 0 writes it.
+fn encoded_len(windows: &[Window]) -> Result<u64, MigrationRefusal> {
+  let mut encoder = Encoder::new(Version::Zero);
+  let mut scratch = Vec::new();
+  let mut length = u64::try_from(HEADER_LEN).map_err(|_| MigrationRefusal::Corrupt)?;
+  for window in windows {
+    scratch.clear();
+    encoder
+      .window(window, Compression::Stored, &mut scratch)
+      .map_err(MigrationRefusal::Delta)?;
+    let bytes = u64::try_from(scratch.len()).map_err(|_| MigrationRefusal::Corrupt)?;
+    length = length.checked_add(bytes).ok_or(MigrationRefusal::Corrupt)?;
+  }
+  Ok(length)
+}
+
+/// What changed from `base` to `list`, as `svn_hash_write_incremental` writes it (`hash.c` 266-315): every property
+/// set or changed, in name order, then every property deleted, in name order.
+fn changed_entries(list: &Properties, base: &Properties) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+  let set = list
+    .iter()
+    .filter(|(name, value)| base.get(*name) != Some(*value))
+    .map(|(name, value)| (name.clone(), Some(value.clone())));
+  let deleted = base
+    .keys()
+    .filter(|name| !list.contains_key(*name))
+    .map(|name| (name.clone(), None));
+  set.chain(deleted).collect()
+}
+
+/// A node record's header for `sections`.
+fn header(
+  path: &str,
+  kind: NodeKind,
+  action: NodeAction,
+  copy_from: Option<CopyFrom>,
+  sections: &Sections<'_>,
+  now: &Facts,
+) -> Result<NodeHeader, MigrationRefusal> {
+  let properties = match &sections.properties {
+    Some(plan) => Some(PropertySection {
+      delta: plan.delta,
+      length: section_len(plan.entries.iter().map(|(name, value)| match value {
+        Some(value) => Property::Set { name, value },
+        None => Property::Delete { name },
+      }))
+      .ok_or(MigrationRefusal::Corrupt)?,
+    }),
+    None => None,
+  };
+  let text = sections.text.as_ref().map(|plan| {
+    let (delta, length) = match plan {
+      TextPlan::Whole(bytes) => (None, u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+      TextPlan::Delta { base, length, .. } => (Some(*base), *length),
+    };
+    TextSection {
+      delta,
+      md5: now.text.map(|text| text.md5),
+      sha1: now.text.map(|text| text.sha1),
+      length,
+    }
+  });
+  Ok(NodeHeader {
+    path: path.as_bytes().to_vec(),
+    kind: Some(kind),
+    action,
+    copy_from,
+    properties,
+    text,
+  })
 }
 
 /// A directory the drive opens.
