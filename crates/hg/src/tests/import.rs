@@ -12,7 +12,9 @@ use slates_vcs::{ContentId, ContentStore};
 use crate::fixtures::{
   import as import_fixtures, state as state_fixtures, store as store_fixtures,
 };
-use crate::import::{FileRefused, ImportRefused, Imported, RepositoryFiles, import};
+use crate::import::{
+  Clock, FileRefused, Import, ImportRefused, Imported, Progress, RepositoryFiles, Turn, import,
+};
 use crate::index::{Log, NONE, RevisionRow};
 use crate::lines::lines;
 use crate::obsmarkers;
@@ -869,6 +871,100 @@ fn an_obsstore_is_read_whole_or_refused() {
   ));
   assert!(matches!(refusal, ImportRefused::Markers(_)), "{refusal:?}");
   assert_eq!(imported(&mut states_with("store/obsstore", &[])).markers, 0);
+}
+
+/// A clock that moves a nanosecond each time it is read, so a turn of a one-nanosecond quantum does one unit.
+struct Ticking(u64);
+
+impl Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// `repository` imported a unit a turn: the import, and how many turns it took.
+fn sliced(repository: &mut Repository, store: &mut ContentStore) -> (Imported, u64) {
+  let mut clock = Ticking(0);
+  let mut import = Import::start(repository, room()).unwrap();
+  loop {
+    let turn = Turn {
+      clock: &mut clock,
+      quantum_ns: 1,
+    };
+    if import.advance(repository, store, turn).unwrap() == Progress::Done {
+      let turns = import.turns();
+      assert_eq!(turns, import.units());
+      return (import.into_imported().unwrap(), turns);
+    }
+  }
+}
+
+/// A-649 part 3 (slices): do import the dotencode store and the version 2 store a unit a turn, under a clock that ends
+/// every turn after its first unit, and again in one call. Expect each turn to do one unit, more turns than the store
+/// has revisions, and the two indexes equal row for row.
+#[test]
+fn an_import_a_unit_a_turn_equals_the_whole_import() {
+  for name in ["dot", "v2", "states"] {
+    let mut store = store();
+    let (mut piecewise, turns) = sliced(&mut repository(name), &mut store);
+    let revisions =
+      u64::from(piecewise.changesets) + u64::from(piecewise.manifests) + piecewise.file_revisions;
+    assert!(
+      turns > revisions,
+      "{name}: {turns} turns for {revisions} revisions"
+    );
+    let mut whole_store = self::store();
+    let mut whole = import(&mut repository(name), &mut whole_store, room()).unwrap();
+    assert_eq!(
+      rows(&mut piecewise, &store),
+      rows(&mut whole, &whole_store),
+      "{name}"
+    );
+  }
+}
+
+/// A-649 part 3: do import the dotencode store a unit a turn, then abandon it after half its turns; and import it with
+/// its host refusing a file log's index midway. Expect the abandoned import to give back everything, and the refused
+/// one to end with nothing held, a further turn refused as ended.
+#[test]
+fn an_import_ended_midway_holds_nothing() {
+  let mut clock = Ticking(0);
+  let mut repository = repository("dot");
+  let mut store = store();
+  let mut import = Import::start(&mut repository, room()).unwrap();
+  for _ in 0..20 {
+    let turn = Turn {
+      clock: &mut clock,
+      quantum_ns: 1,
+    };
+    assert_eq!(
+      import.advance(&mut repository, &mut store, turn),
+      Ok(Progress::More)
+    );
+  }
+  assert!(store.used() > 0);
+  import.abandon(&mut store).unwrap();
+  assert_eq!((store.len(), store.used()), (0, 0));
+  repository.pending = Some(b"store/data/plain.txt.i".to_vec());
+  let mut import = Import::start(&mut repository, room()).unwrap();
+  let turn = Turn {
+    clock: &mut clock,
+    quantum_ns: u64::MAX,
+  };
+  assert_eq!(
+    import.advance(&mut repository, &mut store, turn),
+    Err(ImportRefused::Host(Pending))
+  );
+  assert_eq!((store.len(), store.used()), (0, 0));
+  let turn = Turn {
+    clock: &mut clock,
+    quantum_ns: 1,
+  };
+  assert_eq!(
+    import.advance(&mut repository, &mut store, turn),
+    Err(ImportRefused::Ended)
+  );
 }
 
 proptest! {
