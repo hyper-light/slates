@@ -366,8 +366,8 @@ const HOSTILE: &[Hostile] = &[
   },
   Hostile {
     name: "delete-entry of an absent path",
-    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( delete-entry ( 4:gone ( 3 ) 2:d0 ) ) ",
-    failure: Some((160_028, "'/trunk/project/gone' is out of date")),
+    commands: b"( open-root ( ( 3 ) 2:d0 ) ) ( delete-entry ( 7:nowhere ( 3 ) 2:d0 ) ) ",
+    failure: Some((160_028, "'/trunk/project/nowhere' is out of date")),
     last: Last::Refused,
   },
   Hostile {
