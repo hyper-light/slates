@@ -390,6 +390,19 @@
 > refused. Tests on the Mac Studio: merge 94/94, db 138/138 (model test with crashes: Agreement, StaleNeverCommits,
 > NoLoss), ipc 74, server 577 with main's known failure; red sixteen ways. Owed: the fleet half (A-636), the policy's
 > check (A-622's next part), stacks of works on one green (piece 5).
+> **Fixed (A-694, 2026-11-19, g300; found by A-687's import landing): an append's new branches were minted one volume
+> id.** `verbs::fresh_volume_id` minted from the database's next sequence, which moves only when a record commits, so
+> every `Create` of one entry got one id and the second was refused `ContentUnavailable` (`Lineage::branch` met it
+> already): a git push under `atomic` creating two refs, a Mercurial push making two lines or bookmarks, an import of
+> two bookmarks. Now the partition keeps a volume counter, one past the highest counter of every volume created,
+> advanced by each `VolumeCreated` in `apply` and carried by the snapshot; `Db::volume_counter_at` mints
+> `max(next_seq, counter) + offset`, and the append's plan mints each `Create` at its own offset, so no id repeats and a
+> recovery mints what the live partition would (the bug record
+> `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.md`). Proven on macOS arm64 (Mac Studio, kiln
+> r398, over main b288b412e): red first, the two server tests failing with every new branch minted at offset 0; then the
+> db model test's minting histories with crashes and its recovery histories 3 of 3, the server's 55 of 55 filtered to the
+> append, the Mercurial push, the repository verbs, git's push and the stores, `green_checkpoint` 6 of 6, fmt clean; the
+> other platforms owed.
 > **A-636 part 1 (2026-11-19, g261; the fleet half's protocol):** `crates/db/src/ledger/logs.rs`, the fenced ledger over
 > a repository's logs. Each log is a register of its own, placed by its own object id and committing at `f + 1` of its
 > own holders, so a push to one green waits on that green's holders alone. A record is committed once every log it
@@ -788,6 +801,20 @@
 > main's `deadlines` test failing as on main. Owed: the edge's answer whose status follows the body; the durable
 > object store on the owner shard (A-581); locks by others than the owner once the push's policy check lands;
 > principals' names for people (§4.13).
+> **A-629 part 2c (2026-11-19, g230; Git LFS on the shared HTTP edge):** git's HTTP site routes `<repo>/info/lfs`
+> through `slates_git::lfs::serve::route` and the edge's authentication (a route's refusal whoever asks; `401` with
+> `LFS-Authenticate`; the owner shard, `404`, `403`; `503` at the head for an endpoint the service does not serve), and
+> a served LFS request decides its status after its body (`StatusMode::AfterBody`, `Connection::reply_status`, one
+> mechanism with A-681's Subversion site, whose route decides after its body too; a `1xx`, `204`, `205` or `304`, or a
+> status other than `200` on a streamed route, fails it `500`), its actions expiring with the bearer token that asked. The daemon serves the locks API over the locks log (`ShardLfs`); the batch API and the transfers answer
+> `503` at their head until A-581, so no upload is acknowledged that a restart would forget. Closes A-625 part 3's
+> "LFS's routes on the site" and part 2b-ii's "the edge's answer whose status follows the body". macOS arm64 (Mac
+> Studio, kiln r109): `slates-http-edge --lib connection::` 18 of 18, the new test failing first with the status never
+> taken; `slates-git --lib lfs::` 73 of 73; `slates-server --lib vcs_http:: lfs:: credentials::` 55 of 55; the CLI's
+> edge test 1 of 1.
+> Owed: A-581's durable LFS objects on the owner shard, and the batch API and the transfers served over them; locks by
+> others than the owner (A-635's policy check); principals' names for people (§4.13); the stock git-lfs client end to
+> end against the daemon (main's).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
