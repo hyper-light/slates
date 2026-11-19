@@ -1706,10 +1706,12 @@ dependencies = [
 name = "slates-hg"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bzip2",
  "flate2",
  "proptest",
  "sha1-checked",
+ "slates-merge",
  "slates-test-seeds",
  "slates-vcs",
  "zstd",
@@ -1911,6 +1913,7 @@ dependencies = [
  "slates-seal",
  "slates-test-seeds",
  "slates-transport",
+ "slates-vcs",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",

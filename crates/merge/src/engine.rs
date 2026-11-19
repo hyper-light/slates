@@ -57,7 +57,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dims::{Dim, Files, Xattrs};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
@@ -1062,6 +1062,24 @@ fn span_bytes(from: &[u8], src: u64, len: u64) -> &[u8] {
   from.get(start..end).unwrap_or_default()
 }
 
+/// The node a hard link names (A-646): the path of its node record, and whether the work makes
+/// the node there (else it is the node at that path at the work's base).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkTarget {
+  path: String,
+  made: bool,
+}
+
+/// The node a `Link` op names (A-646): its node record in `doc`'s node table, with that record's
+/// path; `None` when the record or its path is missing, an invalid document.
+fn link_target(doc: &OpsDoc, node: u64) -> Option<LinkTarget> {
+  let node = doc.nodes.node(node)?;
+  Some(LinkTarget {
+    path: doc.paths.path(node.path)?.to_owned(),
+    made: node.origin == NodeOrigin::Made,
+  })
+}
+
 /// The changes an increment declares, resolved from the ops document into per-dimension groups by
 /// path (xattrs by path and name). The deriver has already composed each path's operations.
 #[derive(Default)]
@@ -1075,7 +1093,7 @@ struct Resolved {
   rmdirs: BTreeSet<String>,
   modes: BTreeMap<String, u32>,
   symlinks: BTreeMap<String, String>,
-  hardlinks: BTreeMap<String, String>,
+  hardlinks: BTreeMap<String, LinkTarget>,
   renames: BTreeMap<String, String>,
   xattr_sets: Vec<(String, String, Vec<u8>)>,
   xattr_removes: Vec<(String, String)>,
@@ -1095,19 +1113,32 @@ impl Resolved {
     cleared
   }
 
-  /// The node a hard link to `target` names, through the links the increment makes (`a` to `b`,
-  /// `b` to `c`: `c`), at most one step a link it makes: the final target, and that path again
-  /// when the increment brings it into being itself (its own node, A-646), else none (the node at
-  /// the target at the work's base).
-  fn link_node<'a>(&'a self, target: &'a str) -> (&'a str, Option<&'a str>) {
+  /// The node a hard link to `target` names (A-646): the node at a path at the work's base,
+  /// `(path, None)`, or a node the work makes, `(path, Some(path))`. A node the work makes is one
+  /// it creates or makes as an IPC node; one it renames there is the source's node, at the base;
+  /// one a link it makes names is that link's node, at most one step a link it makes. `None` when
+  /// the document names a node the work does not make, or links that never reach one: an invalid
+  /// work. A rename resolved to its source keeps the link on the moved node, which the commit's
+  /// node moves carry to the rename's destination (`Green::node_moves`).
+  fn link_node<'a>(&'a self, target: &'a LinkTarget) -> Option<(&'a str, Option<&'a str>)> {
     let mut node = target;
-    for _ in 0..self.hardlinks.len() {
-      match self.hardlinks.get(node) {
-        Some(next) => node = next.as_str(),
-        None => break,
+    for _ in 0..=self.hardlinks.len() {
+      let path = node.path.as_str();
+      if !node.made {
+        return Some((path, None));
+      }
+      if let Some(source) = self.renames.get(path) {
+        return Some((source.as_str(), None));
+      }
+      match self.hardlinks.get(path) {
+        Some(next) => node = next,
+        None => {
+          let made = self.creates.contains(path) || self.specials.contains_key(path);
+          return made.then_some((path, Some(path)));
+        }
       }
     }
-    (node, self.establishes(node).then_some(node))
+    None
   }
 
   /// Whether this increment itself brings `path` into being — a file it creates or renames into, or a
@@ -1180,9 +1211,16 @@ enum Effect {
   SetXattr(String, String, Vec<u8>),
   /// Remove an xattr.
   RemoveXattr(String, String),
-  /// Copy a tree by reference (A-586): its destination, its source, the source's version, and whether it replaces what
-  /// the destination holds (A-626).
-  CopyTree(String, String, u64, bool),
+  /// Copy a tree by reference (A-586): its destination, its source, the source's version, whether it replaces what the
+  /// destination holds (A-626), and what it changes in the head's tree it grafts when the source changed after the
+  /// version (A-626 part 2).
+  CopyTree {
+    dst: String,
+    from: String,
+    version: u64,
+    replace: bool,
+    fix: Option<Box<crate::chain_entry::CopyFix>>,
+  },
 }
 
 /// How a [`Effect::SetContent`]'s bytes come from what a chain entry records (`crate::chain_entry`).
@@ -1228,11 +1266,18 @@ impl Effect {
         Applied::SetXattr(path.clone(), name.clone(), value.clone())
       }
       Effect::RemoveXattr(path, name) => Applied::RemoveXattr(path.clone(), name.clone()),
-      Effect::CopyTree(dst, from, version, replace) => Applied::CopyTree {
+      Effect::CopyTree {
+        dst,
+        from,
+        version,
+        replace,
+        fix,
+      } => Applied::CopyTree {
         dst: dst.clone(),
         from: from.clone(),
         version: *version,
         replace: *replace,
+        fix: fix.clone(),
       },
     }
   }
@@ -1254,7 +1299,7 @@ impl Effect {
       | Effect::RemoveHardlink(path)
       | Effect::SetXattr(path, ..)
       | Effect::RemoveXattr(path, _)
-      | Effect::CopyTree(path, ..) => path,
+      | Effect::CopyTree { dst: path, .. } => path,
     }
   }
 
@@ -1271,7 +1316,7 @@ impl Effect {
       Effect::SetXattr(path, name, _) | Effect::RemoveXattr(path, name) => {
         IdentityKey::Xattr(path.clone(), name.clone())
       }
-      Effect::CopyTree(dst, ..) => IdentityKey::Copy(dst.clone()),
+      Effect::CopyTree { dst, .. } => IdentityKey::Copy(dst.clone()),
     }
   }
 }
@@ -2604,9 +2649,14 @@ impl Green {
         OpKind::Symlink => {
           r.symlinks.insert(path, name(op.src));
         }
-        OpKind::Link => {
-          r.hardlinks.insert(path, name(op.src));
-        }
+        OpKind::Link => match link_target(&inc.doc, op.src) {
+          Some(target) => {
+            r.hardlinks.insert(path, target);
+          }
+          None => {
+            r.invalid.insert(path);
+          }
+        },
         OpKind::Rename => {
           r.renames.insert(path, name(op.src));
         }
@@ -3310,16 +3360,18 @@ impl Green {
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&mut self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut effects = Vec::new();
+    // Each copy's fix once (A-626 part 2): its copied tree is judged against it, and its effect carries it.
+    let fixes = self.copy_fixes(r);
     let mut windows: Vec<_> = r
       .invalid
       .iter()
       .chain(self.unfit_content(inc, r).iter())
-      .chain(self.unfit_copied(inc, r).iter())
+      .chain(self.unfit_copied(inc, (r, &fixes)).iter())
       .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
       .collect();
     // Copies first, and what lands on their trees after them (A-586): their effects lead, as commit applies them.
-    self.decide_copies(inc, r, &mut effects, &mut windows);
-    self.decide_copied(inc, r, &mut effects, &mut windows);
+    self.decide_copies(inc, (r, &fixes), &mut effects, &mut windows);
+    self.decide_copied(inc, (r, &fixes), &mut effects, &mut windows);
     for (path, node) in &r.specials {
       record(
         &mut effects,
@@ -3440,12 +3492,12 @@ impl Green {
       record(effects, windows, self.merge_symlink(path, inc.base, target));
     }
     for (path, target) in &r.hardlinks {
-      let (target, made) = r.link_node(target);
-      record(
-        effects,
-        windows,
-        self.merge_hardlink(path, inc.base, (target, made)),
-      );
+      let answer = match r.link_node(target) {
+        Some(node) => self.merge_hardlink(path, inc.base, node),
+        // The document names a node the work does not make, or links that never reach one.
+        None => Err(Green::window(path, MergeConflictClass::TypeChanged)),
+      };
+      record(effects, windows, answer);
     }
     for (path, name, value) in &r.xattr_sets {
       record(
@@ -3782,7 +3834,7 @@ impl Green {
       Effect::SetXattr(path, name, value) => self.set_xattr((path, name), Some(value), version),
       Effect::RemoveXattr(path, name) => self.set_xattr((path, name), None, version),
       // Applied before every other effect (`commit_copies`), so the effects on its tree land on what it brought.
-      Effect::CopyTree(..) => {}
+      Effect::CopyTree { .. } => {}
     }
   }
 
@@ -4162,9 +4214,10 @@ impl Green {
     if let Some(version) = self.accepted.get(&inc.id) {
       return *version;
     }
+    let copies = copy::EntryCopies::of(applied);
     let effects = applied
       .iter()
-      .map(|effect| self.effect_of(effect, &inc.post_state))
+      .map(|effect| self.effect_of(effect, (&inc.post_state, &copies)))
       .collect();
     let version = self.head().saturating_add(1);
     self.commit(effects, version);
@@ -4193,7 +4246,11 @@ impl Green {
   }
 
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
-  fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
+  fn effect_of(
+    &self,
+    applied: &crate::chain_entry::Applied,
+    (post_state, copies): (&[u8], &copy::EntryCopies<'_>),
+  ) -> Effect {
     use crate::chain_entry::Applied;
     match applied {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
@@ -4218,7 +4275,11 @@ impl Green {
         )
       }
       Applied::Copied { dst, from, ops } => {
-        let source = self.content.get(from).unwrap_or_default();
+        // A file a copy brings and the same version edits reads the bytes the copy brings (A-626 part 2).
+        let source = copies
+          .source_at(self, dst)
+          .content(from)
+          .unwrap_or_default();
         let bytes = apply(source, ops, post_state);
         let whole = vec![insert_whole(bytes.len() as u64)];
         Effect::SetContent(
@@ -4245,7 +4306,14 @@ impl Green {
         from,
         version,
         replace,
-      } => Effect::CopyTree(dst.clone(), from.clone(), *version, *replace),
+        fix,
+      } => Effect::CopyTree {
+        dst: dst.clone(),
+        from: from.clone(),
+        version: *version,
+        replace: *replace,
+        fix: fix.clone(),
+      },
     }
   }
 
@@ -4742,7 +4810,7 @@ impl Green {
         }
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
         // `Green::rebase` answers a work holding a copy before it restates anything (A-586).
-        Effect::CopyTree(..) => {}
+        Effect::CopyTree { .. } => {}
       }
     }
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the

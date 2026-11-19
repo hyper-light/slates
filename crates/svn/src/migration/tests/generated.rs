@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use super::support::{
-  Dump, Node, VECTOR_UUID, created, export, export_all, history, import, properties,
+  Dump, Node, VECTOR_UUID, created, export, export_all, export_deltas, history, import, properties,
   revision_properties,
 };
 use crate::dump::Format;
@@ -232,7 +232,7 @@ impl Model {
     self.touched.insert(path);
   }
 
-  /// Replaces a node by a new one or by a copy, unless the copy is of the very node it would replace.
+  /// Replaces a node by a new one or by a copy, the very node it replaces among the copies (A-652).
   fn replace(&mut self, step: &Step) {
     let Some(path) = self.untouched(None, false, step.first) else {
       return;
@@ -253,9 +253,6 @@ impl Model {
       let Some((revision, source)) = self.copy_source(step) else {
         return;
       };
-      if self.working.get(&path) == Some(&source.1) {
-        return;
-      }
       let record = Node::replace(&path, source.1.kind).copied(revision as u64, &source.0);
       let (record, node) = changed_copy(record, &source.1, step);
       self.dump.node(&record);
@@ -432,6 +429,17 @@ fn round_trips(repository: &Repository, piece: usize) -> Result<(), TestCaseErro
   Ok(())
 }
 
+/// Holds `repository`'s format-3 export, every text a delta and every changed list a change, to import into a new
+/// repository as the same history and to export again to the same bytes (A-652).
+fn round_trips_through_deltas(repository: &Repository, piece: usize) -> Result<(), TestCaseError> {
+  let exported = export_deltas(repository).map_err(failed)?;
+  let mut again = created();
+  import(&mut again, &exported, piece).map_err(failed)?;
+  prop_assert_eq!(history(&again), history(repository));
+  prop_assert_eq!(export_deltas(&again).map_err(failed)?, exported);
+  Ok(())
+}
+
 /// Holds `repository`'s history exported in two parts, split after revision `split` picks, and imported part after
 /// part to be the same history.
 fn round_trips_in_parts(
@@ -473,6 +481,7 @@ proptest! {
     import(&mut repository, &model.dump.bytes(), piece).map_err(failed)?;
     holds_the_model(&repository, &model.trees)?;
     round_trips(&repository, piece)?;
+    round_trips_through_deltas(&repository, piece)?;
     round_trips_in_parts(&repository, split, piece)?;
   }
 }

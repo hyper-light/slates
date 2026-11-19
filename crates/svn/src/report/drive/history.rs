@@ -7,7 +7,9 @@
 //! entry named `..`: the report's paths are the client's.
 //!
 //! It is the crate's one walk of copy roots: the read commands (`reads`: `get-locations`,
-//! `get-deleted-rev`) call it too, rather than keep a second (main's decision, 2026-11-19).
+//! `get-location-segments`, `get-deleted-rev`, and FSFS's node history under `log`, which reads
+//! the youngest copy root itself) call it too, rather than keep a second (main's decision,
+//! 2026-11-19).
 
 use crate::index::{Index, IndexRefusal, Node, Revision};
 
@@ -69,7 +71,7 @@ pub(crate) fn closest_copy(
 /// `find_youngest_copyroot`: the youngest copy root among the nodes from the root down to `path` in
 /// `revision`, a child's preferred over a parent's of the same revision; none when it is revision
 /// 0's, which no copy made.
-fn youngest_copy_root(
+pub(crate) fn youngest_copy_root(
   index: &Index,
   path: &str,
   revision: Revision,

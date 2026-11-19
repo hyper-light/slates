@@ -364,6 +364,7 @@ fn key(id: &ObjectId, name: &[u8]) -> Result<ObjectKey, Declined> {
 fn declined(reason: &[u8], name: &[u8], detail: &[u8]) -> Declined {
   Declined {
     reason: reason.to_vec(),
+    hook: Vec::new(),
     message: Some(message(&[name, b": ", detail].concat())),
   }
 }
