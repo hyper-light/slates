@@ -13932,8 +13932,9 @@ and export by landing).
 > makes, in `reporter.c`'s order, each with the editor's own arguments and the raw facts of the node it names; A-627's
 > `dav::Drive` consumes the same calls. `EditorWriter` writes each as `editorp.c` and `marshal.c` do: tokens `d` and
 > `c` from one counter, absent entries only to a client that announced `absent-entries`, svndiff 2 to a client that
-> accepts it and 0 to any other, each window as `svndiff.c`'s three chunks, and a call out of the editor's order
-> refused with nothing written. Held to every drive in the recordings (28: 22 stock, six hand-made), each read back
+> accepts it and 0 to any other, each window as `svndiff.c`'s three chunks (corrected 2026-11-19, A-616 continued (6):
+> a version-0 window of new data alone is `send_simple_insertion_window`'s two, the stream's header in the first),
+> and a call out of the editor's order refused with nothing written. Held to every drive in the recordings (28: 22 stock, six hand-made), each read back
 > and written again: the same calls and windows, and every item byte for byte but a chunk `svnserve` stored
 > LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
 > `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
@@ -46434,3 +46435,26 @@ base text) and its tests.
 - **Tests.** `big.txt` from r5 to r6 (one line of 6,000 changed): its windows copy from the base, carry under a
   hundredth of the text as new data, and make the text `close-file` names; red with every window new data. The 29
   recorded drives still match, each delta by what it makes.
+
+### A-616, continued (6) — A version-0 delta's chunks as `svnserve` writes them (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (part 2's first slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/report/editor.rs` and its tests; `crates/svn/fixtures/report/make-fixtures.py`;
+`docs/bugs/2026-11-19-a-version-0-delta-sent-its-header-as-a-chunk-of-its-own.md`.
+
+- **Found** by g297 reading 1.15.0's `svndiff.c`: the writer sent version 0's `SVN\0` as a chunk of its own before
+  every first window. `window_handler` (250-303 at `d434dc14`, 1.15.0 alike) hands a version-0 window holding no
+  source copy and one instruction to `send_simple_insertion_window` (89-151, chosen at 259-261), which writes the
+  header, when it is not out yet, the window's integers and its instruction as one chunk, then its new data; only
+  other windows get the header alone and then up to three chunks. Every recorded reply was version 2, whose header is
+  alone, and the version-0 test compared windows decoded, so neither showed it.
+- **The writer** now takes that path for those windows (`simple_insertion`): the header put in front of the encoded
+  window in its buffer, so the header, the integers and the instruction are one chunk, then the new data.
+- **Tests.** From `svndiff.c`: an added file's two new-data windows, an opened file's copying window and one past its
+  base, an empty file, for a client that does not accept svndiff2; the chunks `svnserve` writes. Recorded: two
+  hand-made sessions from a client announcing neither svndiff version, a checkout of `/trunk` at r6 and an update from
+  r5, added to the recorder; their recording against stock `svnserve` 1.15.0, and the replay writing each drive with
+  its own client's capabilities so that their chunks are held byte for byte, are owed with the Mac Studio, offline
+  when this was written; so is the run, red without the change and green with it.
+- **Swept**: only the reporter's editor writes `textdelta-chunk`s. The dump's, the HTTP listing's and drive's and the
+  migration's svndiff writers write one continuous stream, where write boundaries never show; the commit's drive
+  reads a client's chunks whatever their boundaries.
