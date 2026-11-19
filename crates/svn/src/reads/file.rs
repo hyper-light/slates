@@ -17,7 +17,9 @@
 //!   held whole: what one slice holds is the caller's room and one string.
 
 use super::stream::{Progress, Stream};
-use super::{Failure, Outcome, Reads, Repository, SUCCESS, boolean, owned_proplist, path_and_revision};
+use super::{
+  Failure, Outcome, Reads, Repository, SUCCESS, boolean, owned_proplist, path_and_revision,
+};
 use crate::index::{ContentIdentity, NodeKind, Revision, Text};
 use crate::ra_svn::{ItemError, Value, write};
 
@@ -126,7 +128,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     if !request.contents {
       return Ok(Outcome::Answered);
     }
-    Ok(Outcome::Streaming(Stream::text(TextStream::new(answer.text))))
+    Ok(Outcome::Streaming(Stream::text(TextStream::new(
+      answer.text,
+    ))))
   }
 
   /// `get_file`'s work in its order: the revision, the checksum (the path must be a file), the properties.
@@ -228,7 +232,11 @@ impl TextStream {
   }
 
   /// The text's end: the empty string, then the second response, `( success ( ) )`, or the refusal.
-  fn finish(&mut self, out: &mut Vec<u8>, failure: Option<&Failure>) -> Result<Progress, ItemError> {
+  fn finish(
+    &mut self,
+    out: &mut Vec<u8>,
+    failure: Option<&Failure>,
+  ) -> Result<Progress, ItemError> {
     self.ended = true;
     write(&Value::String(b""), out)?;
     match failure {

@@ -761,7 +761,11 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
   }
 
   /// The ancestors of `path` holding properties, root first, each by its own path without the leading separator.
-  fn owned_ancestors(&self, path: &str, revision: Revision) -> Result<OwnedAncestors<'reads>, Failure> {
+  fn owned_ancestors(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<OwnedAncestors<'reads>, Failure> {
     let found = self.ancestors_properties(path, revision)?;
     Ok(
       found

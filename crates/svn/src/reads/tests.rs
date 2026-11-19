@@ -345,7 +345,12 @@ const PROPERTY_LISTS: [&str; 5] = [
 const SLICE_ROOM: usize = 1;
 
 /// A command's outcome with a streamed answer written whole, a slice of [`SLICE_ROOM`] at a time.
-fn drained(outcome: Outcome, fixture: &Fixture, session: &Session<'_>, out: &mut Vec<u8>) -> Outcome {
+fn drained(
+  outcome: Outcome,
+  fixture: &Fixture,
+  session: &Session<'_>,
+  out: &mut Vec<u8>,
+) -> Outcome {
   let Outcome::Streaming(mut stream) = outcome else {
     return outcome;
   };
@@ -767,6 +772,20 @@ fn a_files_text_streams_a_slice_at_a_time_in_the_room_given() {
   assert_eq!(narrow, wide);
   assert_eq!((narrow_slices, wide_slices), (4, 1));
   assert_eq!(string_lengths(&wide), [4_096, 4_096, 1_818, 0]);
+}
+
+/// A-613 part 2 (`get-file`): a file added without a text has the MD5 of no bytes, the checksum
+/// `svn_fs_file_checksum` computes when forced to, and its text is the empty string alone.
+#[test]
+fn a_file_without_a_text_has_the_md5_of_no_bytes() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/blank.txt file add"]);
+  let command = b"( get-file ( 15:trunk/blank.txt ( ) false true ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, 1);
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    "( success ( ( ) 0: ) ) ( success ( ( 32:d41d8cd98f00b204e9800998ecf8427e ) 12 ( ) ) ) 0: ( success ( ) ) "
+  );
 }
 
 /// The fixture's green with every text lost past its first `kept` bytes.
