@@ -4224,8 +4224,14 @@
 > memory notifications); a kernel that offers none has the watch refused by kind, logged and counted, with nothing
 > polled in its place. The Linux and Windows arms were written by g255 on macOS and are filed for main's build. NFSv4
 > purges owed go out at their own deadline: at once at a start that owes them, a retry window after any access that
-> leaves the table owing. Still on the tick: base hints with their delegation recalls, the idle seal and the huge-page
-> re-arm.
+> leaves the table owing. A lasting huge-page decline is re-armed by the keeper a retry window after it. Still on the
+> tick, owed after goal 81, then 89-92, then 84-86 (Ada's order, 2026-11-19): base hints with their delegation drain
+> (the A-470 plan's descriptor readiness, as one set a shard: each overlay's watcher descriptor, inotify or a kqueue, in
+> an epoll or kqueue of the shard's keyed by the volume's generational handle and awaited by one task, so a destroy that
+> closes a watcher meets a stale handle, never a descriptor number reused under a waiting task; Windows keeps no
+> watcher), and the idle seal with its purge (aging buckets: each file's last write sets the instant it turns idle, the
+> keeper sleeps to the earliest); then the reap loop and its tick are deleted, no interval and no sweep, and §4.7 says
+> so.
 > Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
 > series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
 > the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
