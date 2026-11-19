@@ -20,6 +20,12 @@ zstd = { workspace = true }
 sha1-checked = { workspace = true }
 # The shared object store's tables, which hold the repository's index (A-588 part 2, A-581).
 slates-vcs = { workspace = true }
+# The merge engine a push becomes a work in (§4.17.1 shared piece 4, A-618): a push's trees, laid out from its flat
+# manifests, read by its builder (A-641 part 2), as slates-git's store is.
+slates-merge = { workspace = true }
+# The names of the directories a flat manifest is laid out under (A-641 part 2): BLAKE3 in key-derivation mode, the
+# workspace's hash for identities (slates-merge's and slates-vcs's).
+blake3 = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }

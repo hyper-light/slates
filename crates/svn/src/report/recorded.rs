@@ -78,6 +78,8 @@ pub(super) const SESSIONS: &[Recorded] = &[
   recorded!("hostile-report-malformed-set-path.1"),
   recorded!("hostile-report-early-edit-response.1"),
   recorded!("hostile-report-client-refuses-the-edit.1"),
+  recorded!("hostile-update-copy-sources.1"),
+  recorded!("hostile-checkout-copy-sources.1"),
 ];
 
 /// The recorded connection named `name`.
