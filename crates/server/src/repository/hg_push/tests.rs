@@ -159,7 +159,7 @@ impl Repository for View {
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0
 /// 0`): its description, the one file it adds and that file's bytes, its parent among those made before it, and its
 /// branch.
-type Commit = (
+pub(crate) type Commit = (
   &'static str,
   &'static str,
   &'static [u8],
@@ -181,19 +181,24 @@ const COMMITS: [Commit; 6] = [
 /// One changeset rebuilt: its node, first parent and text; its manifest's node, first parent and text; its file's
 /// path, node and text.
 #[derive(Clone, Debug)]
-struct Made {
-  node: Node,
-  p1: Node,
-  text: Vec<u8>,
-  manifest: (Node, Node, Vec<u8>),
-  file: (Vec<u8>, Node, Vec<u8>),
+pub(crate) struct Made {
+  pub(crate) node: Node,
+  pub(crate) p1: Node,
+  pub(crate) text: Vec<u8>,
+  pub(crate) manifest: (Node, Node, Vec<u8>),
+  pub(crate) file: (Vec<u8>, Node, Vec<u8>),
 }
 
 /// The fixtures' repository rebuilt from its texts as 7.2's `commit` writes them (§4.17.3 decision 7's fields).
 fn history() -> Vec<Made> {
+  history_of(&COMMITS)
+}
+
+/// `commits` rebuilt from their texts as 7.2's `commit` writes them, each adding its one file to its parent's.
+pub(crate) fn history_of(commits: &[Commit]) -> Vec<Made> {
   let mut made: Vec<Made> = Vec::new();
   let mut manifests: Vec<Vec<(Vec<u8>, Node)>> = Vec::new();
-  for (description, path, bytes, parent, branch) in COMMITS {
+  for &(description, path, bytes, parent, branch) in commits {
     let file = node::compute(&NULL_NODE, &NULL_NODE, bytes).unwrap();
     let mut entries = parent.map(|at| manifests[at].clone()).unwrap_or_default();
     entries.push((path.as_bytes().to_vec(), file));
@@ -244,7 +249,7 @@ fn full_text(node: Node, p1: Node, link: Node, data: &[u8]) -> Revision<'_> {
 }
 
 /// A changegroup 03 of the changesets `which`, every revision a full text against the null node.
-fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
+pub(crate) fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
   let mut deltas: Vec<Vec<u8>> = Vec::new();
   for at in which {
     for text in [&made[*at].text, &made[*at].manifest.2, &made[*at].file.2] {

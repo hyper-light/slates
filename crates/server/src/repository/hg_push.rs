@@ -72,8 +72,9 @@ use crate::vcs_hooks::{self, CommittedView, ExitStatus, HookInput, Lesson, Outco
 use crate::vcs_policy::{self, Asked, Name, Namespace, PushRefusal, Right};
 use crate::verbs::hex_of;
 
+// Its history builders serve the edge's push tests too (`crate::vcs_http`'s daemon edge, A-680 part 2b).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Format: the tag a line's name begins with, before its branch's label, `:` and its number (module docs).
 pub(crate) const LINE_TAG: &str = "branch:";
