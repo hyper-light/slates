@@ -306,11 +306,13 @@ An agent does exactly four things, then stops:
 
 1. **Implement** one piece: the change, its unit tests (a bug's failing unit test first), and the design, GAPS and docs
    lines it makes true, in one commit in the style above.
-2. **Run its unit tests:** `cargo test -p <crate> --lib <filter>` for what it changed, plus `cargo fmt`. Nothing heavier,
-   ever: no integration suites, fleet, e2e, chaos or live flows, conformance suites, diag CI branches, other platforms'
-   runs, A/B or benchmark rounds, repeated runs, seed replays, TLC, kernel-scale or load runs, clippy, lint matrices,
-   `xtask`, doc builds, or waiting on CI or a queued machine. Windows code that cannot run on its host merges on a clean
-   `cargo xwin check` of its crates.
+2. **Run its unit tests:** `cargo test -p <crate> --lib <filter>` for what it changed, plus `cargo fmt`. That is the only
+   compiling an agent does. Nothing heavier, ever: no clippy (one crate or many), no `xtask`, no cross-target or other
+   platforms' checks (`cargo xwin check`, `--target ...`), no doc builds, no integration suites, fleet, e2e, chaos or live
+   flows, conformance suites, diag CI branches, A/B or benchmark rounds, repeated runs, seed replays, TLC, kernel-scale or
+   load runs, and no waiting on CI or a queued machine. Main builds: clippy, the lint matrix, `xtask`, cross-target and
+   Windows builds, docs, suites and CI, and sends a finding back as a new piece. (Ada, 2026-11-18, again: "Why are ANY of
+   these compiling?" -- a gate list main added that afternoon was withdrawn the same evening.)
 3. **Merge it itself:** `git fetch origin && git merge origin/main`; read `git diff --stat origin/main HEAD` (its files
    alone); `git push origin HEAD:main` as its own command. If refused, fetch, merge and push again. Never force-push,
    rewrite main, or land a commit built with `git commit-tree` (on 2026-11-18 one removed 40 files of main).
@@ -318,6 +320,7 @@ An agent does exactly four things, then stops:
    run-request queue (the exact command, the platform, what red would look like), report in a few lines, and stop. It
    does not start its next piece; the supervisor starts it.
 
-Main (the supervisor) runs everything heavier (clippy, the full suites, cross-platform builds and runs, e2e, chaos, CI,
-measurement and A/B) on main after merges, does the fixes, and sends a breakage it cannot fix in place back to the
+Main (the supervisor) runs everything heavier (clippy, the cross-target lint matrix, `xtask`, every build beyond an
+agent's own unit tests, the full suites, cross-platform builds and runs, e2e, chaos, CI, measurement and A/B) on main
+after merges, does the fixes, and sends a breakage it cannot fix in place back to the
 commit's author as a new piece. This section overrides older instructions in this file about gates, testing and landing.

@@ -1,5 +1,28 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **§4.17 version-control servers: the shared mapping and the git server are designed, nothing is built (2026-11-18,
+> A-497, D-28; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion).** §4.17.1 maps repositories, branches,
+> pushes, stacked changes, review requests, objects and history onto greens and works; §4.17.2 designs the git server;
+> §4.17.3 (Mercurial) and §4.17.4 (Subversion) follow as their own amendments. Owed, in order: the seven shared pieces
+> of §4.17.1 (the repository record and green ids carrying its partition; one register entry for several greens; the
+> object store and its index; works from a client's push, with the head operation and the client-fidelity test; works
+> over works and bases given as trees; review records; policy and hooks), then each tool's pieces (§4.17.2's fifteen for
+> git, starting with the pkt-line codec). No speed is claimed until main measures it by §4.17.1's and §4.17.2's method.
+
+> **§4.17.3 the Mercurial server: designed, nothing is built (2026-11-18, A-499; UI goal 91; owner g291).** Built on
+> §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move toward public, and a
+> public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock
+> push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a line's policy for
+> clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
+> (`research/mercurial-server.md`). Owed, in order, after §4.17.1's seven pieces: (1) the bundle2 and changegroup
+> codecs, with golden vectors made by stock `hg`; (2) the SSH and HTTP version 1 codecs; (3) the objects and the index,
+> and import of a repository directory; (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on
+> push; (7) markers and topics; (8) access and hooks; (9) the revlog view (stream clones, inline clone bundles, the
+> hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by
+> linelog; (13) main's runs: 7.2's own suite through a shim, the differential run against `hg serve`, a 6.x client, then
+> the measurements. Open: whether a 6.x client's changegroup `04` is the old sidedata layout (read from the document,
+> not from 6.x code; the older-client run checks it). No speed is claimed until main measures it.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
@@ -749,7 +772,14 @@
 > (`merge.replica.idle_given_back`); only a recorded use arms the shard's one idle check, never a sweep; the first
 > request after asks the owner, once, to make it again (`merge.replica.route_idle`), and its next change does
 > (`merge.replica.remade`). A replica never used on its shard is not judged idle (no use to derive a window from).
-> **Owed:** the supervisor's A/B at 1,000 clients and more (running).
+> **A/B (r406, Mac Studio, 2026-11-18): not green.** At 1,000 clients and a 20 ms think, accepted submits' p99 went
+> from 0.81, 3.88 and 13.61 ms (three rounds) without the replicas to 60.78, 88.90 and 77.99 ms with them, conflicting
+> submits and head reads worse alike: the owner sent every replica each message of the feed inside the submit, before
+> its reply, and took an acknowledgement for each. **Built (A-502, 2026-11-18, g083):** the owner queues the feed's
+> messages and one task a turn sends each replica's shard the turn's in one message, after every reply of the turn
+> (`merge.replica.feed_sent`); each replica acknowledges a turn once (`merge.replica.acknowledged`); a flush whose task
+> the arena refuses goes at once, counted (`merge.replica.flush_unarmed`). **Owed:** the A/B again, the same arms; if
+> it is still not green, the replicas come out, recorded measured-and-rejected (BENCHMARKS).
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -840,12 +870,17 @@
 >   `ENTRY_TEXT_CAP`, about 1,100 characters for a mount, about 90 for a DAX section), while the anchor's bounds admit
 >   `shards × 4096` mounts. The table now rides an inherited read-only section of its own length, and the variable names
 >   only that section and the length (at most 33 characters); its real-process restart past the limit is filed for
->   main. **Found beside it, open (Unix):** the same table rides environment variables on Linux and macOS too
->   (`SLATES_ANCHOR_DEVICES`, up to about 109 characters a device with a 40-byte resync session; `SLATES_ANCHOR_COPIES`,
->   about 77 a DAX object), and Linux refuses an `execve` whose single string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32`
->   (`include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, so about 1,200 held devices or 1,700 copies), and
->   macOS bounds arguments and environment together (`kern.argmax`, 1 MiB, from memory, to verify); the bounds admit
->   `shards × 4096` devices, so a large Unix holding would leave the anchor unable to start its next daemon. **Built
+>   main. **Found beside it (Unix), built since (A-462, the same day):** the same table rode environment variables on
+>   Linux and macOS (`SLATES_ANCHOR_DEVICES`, up to 157 characters a device with a session at its 64-byte cap;
+>   `SLATES_ANCHOR_CONNECTIONS`; `SLATES_ANCHOR_COPIES`, up to 157 a copy), and Linux refuses an `execve` whose single
+>   string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` ("the limit per string is 32 pages": `execve(2)`;
+>   `include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, about 800 devices with full sessions), failing
+>   `E2BIG`, and macOS bounds the arguments and the environment together at `ARG_MAX`, 1,048,576 bytes (`getconf
+>   ARG_MAX` and `kern.argmax` on the Mac Studio, macOS 26.4, 2026-11-18), while the bounds admit `shards × 4096`
+>   devices: a large holding would leave the anchor unable to start its next daemon. The three parts now ride one sealed,
+>   read-only object of their own length (a memfd sealed as a DAX peer's copy is on Linux; an unlinked shared-memory
+>   object handed read alone on macOS), and `SLATES_ANCHOR_HELD` names only its descriptor and the length (at most 27
+>   characters); its real-process supervised restarts past the old limit are filed for main. **Built
 >   since (A-402,
 >   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
@@ -906,6 +941,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
+> - **Fixed (2026-11-18, A-490): a Windows runner can read its nameservers.** Its manifest trusts kiln's CA as a root,
+>   so its start reads the host's nameservers (a peer enrolled under the root may announce a name), and the reader
+>   knew only `/etc/resolv.conf`, which Windows lacks: every Windows runner was refused at `check_fleet`. Windows now
+>   reads the DNS servers of its network adapters that are up and have a gateway (`role/fleet/windows_dns.rs`, Go's
+>   rule), judged by a cfg-free function unit-tested on every host (the bug record of 2026-11-18). Owed: a Windows
+>   node's live start on a manifest with a root (filed for main's Windows lanes).
 > - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
 >   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
 >   target's runner mounting the moved volume under its own place once its new owner serves it. The live move across
@@ -961,6 +1002,17 @@
 >   `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`. **Owed
 >   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back may
 >   lean on the same following (not shown: holders a new owner's own move round reaches take its authority there).
+> - **Closed by A-485 too: goal 85's bug 2, the move back to the creator (2026-11-18, A-487).**
+>   `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` failed 2 of 2 on the quiet Mac Studio
+>   at main 3022c6894, the move back answering `Moving` and `MoveRefused { Unplaced }` in turn until its deadline. Its
+>   counters show A-485's cause, not a cause of its own: the third node refused every head and catalog record of the
+>   volume's new owner `Unauthorized` (8,006 = the owner's `fleet.ship.head.short` 4,000 + `catalog.short` 4,006) and
+>   2,663 of its content puts, the owner's handoff of the head off itself never finished (`fleet.heal.unfinished` 222),
+>   and no node counted `fleet.move.followed`: the move back must place the head on both other members, and the third
+>   kept the creator's authority. Its regression test:
+>   `a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it` (`fleet`'s unit tests: the move
+>   installed through the walk as the coordinator drives it, then the new owner's next record accepted and the creator's
+>   refused `Unauthorized`). **Owed (main's):** the volume-moved fleet test on the merged tree.
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
@@ -2206,6 +2258,13 @@
 >   (`crates/server/src/verbs.rs`); the AC-8.3 fleet test holds it `None` within tolerance, and the store-destroyed flow
 >   holds the report to the successor's own counts (the supervisor's run). Still Ada's (Decisions): whether a volume
 >   recovered past tolerance also refuses writes until an operator acknowledges it.
+> - **Fixed for registers (A-508, g250, 2026-11-19): a neighbourhood an owner settled away from let go of nothing.** A
+>   live owner's copy that the owner wrote, held outside all of its neighbourhoods, goes where the owner's settled
+>   cohort for the object is whole and at least `f + 1` wide (`RegionalConfiguration::settled_away`,
+>   `fleet.settle.released`; kept and counted `fleet.settle.kept_outside` otherwise), its content kept while a head
+>   names it. Tests: `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` (red before) and
+>   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. Owed: the lineage model's mirror and its
+>   oracle; the content release below.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
@@ -2230,11 +2289,18 @@
 >   `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (`crates/server/src/daemon.rs`);
 >   kiln r41 (Mac Studio), each red: the model with the tolerance unjudged, the server with every or no unasked copy
 >   covered.
->   **Still owed:** a copy first judged on a completion record (the last successor to confirm completes the takeover
->   in the version that records it) or past tolerance is kept, `fleet.takeover.kept_unasked`: the completion record
->   keeps no neighbourhood to judge by. Owed: the completion record keeps the retired host's settled neighbourhood (and
->   its carried retirements'), so a holder judges its object's cohorts there too; and the settle-based rule above for a
->   live owner.
+>   **Fixed (A-484, g250, 2026-11-18): a copy first judged on a completion record, and a hole in A-341's rule.** The
+>   record keeps the settled neighbourhoods its takeover recovered through and the hosts that stayed members through it
+>   (regional layout 5), so a copy first judged once the takeover completed is judged as on the retirement. And the
+>   takeover judged is the first since the copy was written, its writer's (`Acceptor::written_by`,
+>   `RegionalConfiguration::copy_stale`), not the last in its line: A-341 let a copy go at a later takeover within
+>   tolerance though the writer's had been past tolerance and its successor confirmed without learning the object,
+>   possibly the object's last copy (found by reading; bug record of 2026-11-18). Only survivors still members count,
+>   so a cohort host admitted again under its id no longer makes a cohort look within tolerance. Tests:
+>   `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover` (red before) and the A-341 test
+>   (`crates/server/src/daemon.rs`), four register tests, the lineage model. Kept still, counted: a copy whose writer
+>   this process cannot know (its acceptor rebuilt from an image after an install moved it) and an unasked copy of a
+>   moved object. **Still owed:** the settle-based rule above for a live owner.
 > - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
 >   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
 >   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
@@ -2657,7 +2723,8 @@
 >   5% of its time and a slice to a heartbeat period; 16 greens over a held 78-file tree recovered in 2.82 s of CPU in 959
 >   slices with the beat never older than 496 ms, where main went 2.20 s without a beat
 >   (`docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`);
-> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients);
+> - the client's reconnect budget (recovery + liveness, 2 s) can still be outlasted by a starved restart (owner clients).
+>   Closed by A-468 (2026-11-18): a reconnect waits while the instance's anchor lives, however long the restart takes;
 > - `Facts::query()` gathers every fact to read the identity (676 ms p50 under that load);
 > - the anchor's own profile was refused under the same load (`measurement timeout: wake`). Closed the same day: the
 >   wake probe now runs past its wall while each round's waiter runs at all, rounds doubling from one window to 4 s (7.75 s
@@ -3838,8 +3905,17 @@
 >   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
 >   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
 >   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
->   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
->   the owner shard would make `moves::seal_adopted` idempotent. **Class C, the rendezvous's claim (A-443, 2026-11-18,
+>   way: an adopted move's seal was still taken again when its answer was lost to a stopped shard. Closed by A-488
+>   (2026-11-18, g225): the owner shard records the seal on the volume (`VolumeSlot::adopted_seal`), and
+>   `verbs::seal_adopted_head` answers a second ask the recorded seal
+>   (`an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once`). Its siblings, the asks whose effect
+>   runs on the target and whose answer a stopped shard loses after it: a direct map's send to its client, closed by
+>   A-505 (2026-11-19, g225: the client's shard records each map it sent until its reply arrives, a second ask is
+>   answered from the record, and a hand-off whose answers were all lost keeps its copy as handed;
+>   `a_maps_send_asked_again_after_its_answer_was_lost_is_sent_once_and_kept_as_handed`); open: the Shards route's take
+>   of an offer, and recovery's `rebuild_remote_works` (its docs accept a non-answering shard's works left unbuilt).
+>   **Class C, the rendezvous's
+>   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
 >   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
@@ -3870,22 +3946,57 @@
 >   test daemons, an embedding) waited forever; every look asks the start stamp too, and Windows' wait takes the looks'
 >   timeout (`a_daemon_restarted_inside_its_own_process_ends_the_wait`;
 >   `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`); A-447's Windows
->   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
+>   claim had the same blind spot and now reads the start stamp it began under. A park a look ended was counted as no
+>   kind, neither a reply's wake nor an unanswered one, and the client suite's park accounting failed on macOS (32
+>   parks, 17 replies, 0 unanswered); since A-506 (2026-11-18, g251b) it is counted as its own kind
+>   (`ClientEnd::parks_ended_by_looks`) and teaches the wake estimate nothing
+>   (`a_park_a_liveness_look_ends_is_counted_as_its_own_kind_and_teaches_the_estimate_nothing`). `CLAIM_WAIT_NS` (a
+>   second, W restated
 >   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
 >   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
->   left (twice it); a Windows claim's wait under a live anchor (at least it; A-468 replaces it with the anchor's
->   life); one more of it for a claim the daemon took to answer; and the async connect's pacing (a tenth of it,
->   `Connecting::next_poll_ns`). Owed in C-b: the reply deadline's other users,
+>   left (twice it); and the pacing of an async connect's and a reconnect's polls (a tenth of it,
+>   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
+>   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
+>   C-b: the reply deadline's other users,
 >   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
 >   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own; then the reconnect budget (part 2) and macOS's `MOUNT_CALL_DEADLINE` (part
->   3). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   borrows the reply deadline for its own; and macOS's `MOUNT_CALL_DEADLINE` (part 3). The reconnect since A-468
+>   (2026-11-18, g251b; C-b's second part): a client whose daemon was gone reconnected for the reconnect budget
+>   (`Deadlines::reconnect_ns`, the recovery budget and a liveness window, two seconds), and a claim under a live anchor
+>   waited at most that budget, so a restart slower than it failed the anchor's clients and a daemon nothing would
+>   restart was reported gone two seconds late. Now a claim carries no restart bound and waits while its rendezvous's
+>   holder lives (the anchor across restarts, or the daemon holding its own; on Windows the anchor's process id and
+>   creation time in the bootstrap header, layout `SLB4`), and a refused claim asks `slates_ipc::holder_lives`: a holder,
+>   and the client claims again; none, and it fails `DaemonGone` at once
+>   (`a_claim_under_a_live_anchor_waits_out_a_restart_slower_than_the_old_reconnect_budget`,
+>   `a_claim_under_an_anchor_ends_at_the_anchors_going`,
+>   `a_rendezvous_has_a_holder_while_its_anchor_or_its_own_daemon_lives`;
+>   `a_call_to_a_killed_unanchored_daemon_ends_daemon_gone_at_once`). `reconnect_ns` still bounds the waits on a fleet
+>   owner's takeover (a request refused for now held for its resend, the pause between resends,
+>   `Client::call_through_transient`), owed to the failover delay the daemon reports; and the server's reclaim of a
+>   taken-back map no holder claims (`held_copy::reconnect_budget_ns`, "The holder claims it") still mirrors the old
+>   reconnect budget, a fixed two seconds R3 forbids, owed. macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
->   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. C-c's first part since A-492
+>   (2026-11-19, g232): the macOS socket route's offer lived two liveness budgets on a timer and its exchange gave the
+>   client one budget, so a live client slower than either found no offer or was dropped mid-claim; now an offer waits
+>   while the client it was made for lives (let go when the reaper retires that client,
+>   `shards_route::let_go_of_client`, which ends a stream's attachment as its end closes) and an exchange waits on its
+>   client while the client's connection lives (`an_offer_waits_for_its_live_clients_claim_past_any_fixed_life`,
+>   `an_exchange_serves_a_live_client_slower_than_any_fixed_bound`,
+>   `a_retired_clients_offers_are_let_go_and_their_ends_closed`); owed: a cross-process test of a client killed before
+>   its claim. C-c's second part since A-493 (2026-11-19, g232): a `UMNT`'s watch of the kernel's mount table gave up
+>   after a fixed second (`UNMOUNT_CONFIRM_NS`); it now waits the pace its shard learned of the kernel's unmounts (the
+>   told waits' learner: the completed confirmations' tail plus the liveness window, backed off after one that ran out,
+>   never past the failover delay), so a loaded host's genuine unmount is confirmed and a forged `UMNT` backs the bound
+>   off (`a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace`,
+>   `a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off`); `nfs::routed` already waited in the
+>   name shard's own time (A-408); owed: a confirmation that ran out keeps its attachment though the mount leaves later
+>   (a watch of the kernel's unmount events would end it then). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -4152,7 +4263,8 @@
 >   the normal case. A busy machine must not kill a daemon that is making progress, and a client's reconnect budget
 >   follows the same constant.
 > - **2026-11-07, the start judgment closed** (the entry "The anchor killed every start a busy machine starved"): a
->   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stays open here;
+>   start is judged in its own CPU time, not by the fixed second. The client's reconnect budget stayed open here until
+>   A-468 (2026-11-18), when a reconnect came to wait while the instance's anchor lives, however long the start takes;
 >   recovery in one poll closed the same day (below). Seen since by loadtest-scale (memrung on a24e8e40, run A): after a restart, shard 0 recovered
 >   one volume image and 1,001 merge volumes in 1,498,306 µs, past the 1 s window, and the start was waited for, not
 >   killed (`~/.cache/slates-agents-scratch/loadtest-scale/mem-liveness/live-k32-r3-n1000/anchor.err`).
@@ -4504,6 +4616,19 @@
 > the quorum collector's change: `4a221524` 1/50, `21da6e57` 0/50 on one busy CPU. The test now waits until the
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
+
+> **A root learner behind its asker's root refused every location round: fixed (2026-11-18, A-489, §4.8 Lookup).** The
+> same test failed 2 of 3 on main's quiet Mac Studio (main 3022c6894 and 2a5bf7264) with `OwnerUnreachable`. The
+> successor, a root learner, counted `root_view_differs` once for each of the foreign voter's 58 and 68 rounds until the
+> lookup's budget ran out. A seat change moves the root's version (A-406) and nothing a learner compared, so a learner
+> that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
+> learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
+> fleet test's runs are filed for main. **The converse, closed the same day (A-504):** an asker behind its peers' root was
+> refused with an empty reply that told it nothing. A refusal now names the root its peer holds, so the asker counts
+> itself behind (`fleet.owner_location.asker_behind`), its root learner fetches from that peer, and each look asks under
+> the root the asker holds then. Regression: `a_behind_askers_round_is_answered_after_one_fetch`, red with the refusal
+> sent empty as before. Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
@@ -18855,7 +18980,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   shard is owed, from memory of ext4's and XFS's fsync paths, which commit only to the directory's own last change, to
   verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
   landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
-  the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
+  the same field between them is not seen; a `touch` alone and a base directory's mode change alone, which landed
+  nothing, **fixed by A-501 the same day** (`docs/bugs/2026-11-18-a-touch-alone-and-a-base-directorys-mode-alone-never-landed.md`:
+  a file's time a field of its metadata entry, judged and set through its handle as its mode is; a base directory's
+  metadata entry, `ChmodDir`, judged against the witness its first metadata change takes, landed after every removal
+  and deepest first, synced by its batch's barrier through its own handle; its unit tests ran on the Mac Studio, the
+  oracle's and the crash oracle's reruns and the Windows `--test os` suite filed for main; still owed with it: a base
+  directory both moved and changed in mode lands its move alone, its rename entry winning the diverged walk; a directory
+  whose owner or time alone the volume changed keeps its witness past every landing, since it makes no entry; the
+  presented list (`PlannedAction::Chmod`) names no time, so a `touch` alone shows as a chmod that changes nothing
+  visible, though the grant binds the time; and a directory mode that takes its owner's search away lands last, but a
+  landing resumed after a crash past it cannot open what lies beneath it and refuses);
   a captured clone's replacement overwrote an outsider's mode change where an overlay's refuses it (T-1.14), **fixed by
   A-466 the same day** (`docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`: its
   metadata judged field by field beside its bytes, the outsider's mode kept under the agent's bytes, a mode both changed
@@ -18879,7 +19014,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
   one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
   directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
-  until now); and
+  until now, which A-501 asked and left open: a made directory is no metadata entry and joins no batch, its `mkdirat`
+  and `fchmod` running in the directories' class, so syncing it whole is one more handle and sync per made directory,
+  staged as a metadata entry is, to measure before it lands); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

@@ -1,6 +1,7 @@
 //! A Shards stream's resync channel, its daemon's half (§4.6, the Shards form; A-316), with this test as the anchor.
-//! The test makes the anchor's hold channel and hands the daemon its end as the anchor does, through
-//! `SLATES_ANCHOR_DEVICES`, which a daemon adopts once per process into a process-wide cell (`crate::anchor_hold`):
+//! The test makes the anchor's hold channel and hands the daemon its end as the anchor does, through the handoff table
+//! `SLATES_ANCHOR_HELD` names (A-462), which a daemon adopts once per process into a process-wide cell
+//! (`crate::anchor_hold`):
 //! hence a binary of its own with one test, so no other test's daemon adopts the channel. The client attaches through
 //! the daemon's real route, so both ends reach it the way they reach `slates shards`: Linux's control socket, and on
 //! macOS the socket route, where the resync end rides beside the stream's (A-339).
@@ -367,7 +368,14 @@ fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_rele
   // SAFETY: this binary holds this one test, which sets the variable before any daemon starts and never again; the
   // daemon reads it once, at its start, which follows.
   unsafe {
-    std::env::set_var(held::ENV_DEVICES, daemon_end.into_raw_fd().to_string());
+    std::env::set_var(
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices: daemon_end.into_raw_fd().to_string(),
+        ..held::Table::default()
+      })
+      .unwrap(),
+    );
   }
   let profile = common::machine_profile();
   let instance = format!("srv-shards-resync-{}", std::process::id());
