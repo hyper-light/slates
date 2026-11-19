@@ -12283,6 +12283,22 @@ signature verification).
 > each text from `hg debugdata`, each log from `hg debugindex --debug`, and what 7.2's own readers read; the command
 > in `make-object-fixtures.sh`, run twice, byte for byte alike) and against SHAttered's two prefixes. Still owed from
 > piece 3: the index's tables, and an existing store's import, whose zlib and zstd chunks A-607's engines now inflate.
+>
+> **Status (2026-11-19, A-598: piece 1's compressed streams built; piece 1 whole).** `slates-hg` makes a compressed
+> bundle plain (`compression::plain`) as 7.2's own relay of a bundle2 does (`_forwardchunks`): a bundle1's zlib
+> (`HG10GZ`) or bzip2 (`HG10` and the stream's own `BZ`) changegroup inflated behind `HG10UN`, and a bundle2's stream
+> inflated after its stream parameters, its `Compression` (`GZ`, `BZ` or `ZS`) dropped from them; an uncompressed
+> bundle comes back borrowed. The memory each stream's header sizes for its decoder (zlib's window, the tables of the
+> bzip2 block it names, libzstd's two buffers for the frame's window, held equal to libzstd's own count) and every byte
+> of room for inflated bytes are charged to the caller's admission before they are held, so a compression bomb, or a
+> window claimed past the admission, is refused by kind with nothing past it held. A plain bundle is compressed as 7.2
+> writes one (`compression::compress_bundle`), at the caller's level within each engine's range. The engines: flate2
+> over A-607's zlib-rs, bzip2 on its pure-Rust libbz2-rs-sys, the workspace's zstd. Proven against the five compressed
+> bundles stock 7.2 wrote of piece 1's repository (`crates/hg/fixtures/compressed`, the command in
+> `make-compressed-fixtures.sh`, checked by `SHA256SUMS`), each made plain to exactly the uncompressed bundle 7.2 wrote,
+> and against 7.2's server's zstd answer to a clone's `getbundle`; every cut is refused as cut short, a bit flipped at
+> every place is refused or judged, never a panic. A stream is inflated whole in one call, its work bounded by the
+> admission; inflating it in slices within the shard's step budget comes with push intake (piece 5).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12657,8 +12673,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, A-545, `crates/hg`): the
-   framings, bundle1, the deltas and the parts' payloads; owed: compressed streams (`GZ`, `BZ`, `ZS`, D-17).
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, A-545, A-598,
+   `crates/hg`): the framings, bundle1, the deltas, the parts' payloads, and the compressed streams (`GZ`, `BZ`, `ZS`).
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping. Built (A-569, `crates/hg`: `ssh`, `http`,
@@ -39689,3 +39705,86 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   detection), so they could not pass on it.
 - **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
   zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-598 — Mercurial's compressed bundles: zlib, bzip2 and zstd streams made plain within the caller's admission, and plain bundles compressed as stock Mercurial 7.2 writes them (2026-11-19, g079 for UI goal 92 (kiln 51cef9f7); §4.17.3 piece 1; §4.9; D-17; A-514, A-569, A-607)
+Applied in the same change to: §4.17.3 (its status, and piece 1 built whole), `crates/hg` (`compression`, new;
+`bundle2`: `Compression`'s `GZ`, `BZ` and `ZS` read, a stream still compressed refused, `Compression` named twice
+refused, `sized` and `stream_params` open to the crate; `bundle1`'s documentation; `fixtures/compressed/` with
+`make-compressed-fixtures.sh` and `SHA256SUMS`; `bzip2`, `flate2` and `zstd` as its dependencies), `Cargo.toml`
+(`bzip2`, with what was read of it), `Cargo.lock` (bzip2, libbz2-rs-sys, flate2 and zlib-rs added, nothing else
+moved), GAPS (the §4.17.3 entry), `research/mercurial-server.md` (§16).
+- **What it does.** `compression::plain` gives a bundle as the plain bundle of its kind: an uncompressed one borrowed
+  as it is; a bundle1's changegroup inflated behind `HG10UN`, from `HG10GZ`'s zlib stream or from the bzip2 stream after
+  `HG10`, whose own magic `BZ` completes the header; a bundle2's stream inflated after its stream parameters, its
+  `Compression` dropped from them, exactly as 7.2 relays a bundle2 (`unbundle20._forwardchunks`). `Bundle2::decode` and
+  `bundle1::changegroup` read the plain bundle and refuse one still compressed by kind. `compression::compress_bundle`
+  writes a plain bundle compressed as 7.2 writes one (`Compression=<type>` first among a bundle2's stream parameters,
+  as `writebundle` sets it before any other; `HG10GZ`, or `HG10` and a bzip2 stream); `compression::inflate` and
+  `compression::compress` are one stream's, for the wire's `0.2` framing when it is served (piece 4).
+- **Decided: nothing held that the admission did not grant first.** Before a decoder is made, the memory its stream's
+  header sizes is charged: zlib's 32 KiB window (RFC 1950's largest, which flate2 asks of its backend whatever the
+  header says), the bzip2 block's tables (one 32-bit entry per byte of the block size its header digit names, the `tt`
+  of libbzip2 and libbz2-rs-sys; the bzip2 manual's "4 × block size"), or libzstd 1.5.7's input and output buffers for
+  the frame's window (`ZSTD_decompressStream`, `ZSTD_decodingBufferSize_internal`: a block, and the window and two
+  blocks with their copy slack, never past the content's size), read from the frame header by the RFC 8878 rules and
+  held to libzstd's own `ZSTD_sizeof_DCtx` by a test; libzstd is let accept no larger window (`ZSTD_d_windowLogMax`).
+  Then room for inflated bytes is charged before it is reserved: the compressed stream's own length first, then as
+  much again as is inflated so far, never past what is left. A stream needing more is refused `PastAdmission`, a
+  compression bomb refused by kind, the room it held exactly what was granted; a call's work is bounded with it.
+- **Decided: a zstd stream is one frame that names its content's size.** 7.2's reader reads one frame (python-zstandard's
+  `decompressobj` finishes at a frame's end and Mercurial reads that as the stream's end), so a second frame would be
+  lost; naming the size lets libzstd size the window to the content, so a small bundle costs its reader little, where
+  7.2's own writer names no size and asks every reader for a 2 MiB window.
+- **Decided: the level is the caller's.** Each engine's range is its own (zlib 0 to 9, bzip2 1 to 9, zstd from
+  `ZSTD_minCLevel` to `ZSTD_maxCLevel`, an uncompressed stream 0); a level outside it is refused by kind, never clamped,
+  and 7.2's zlib `-1` is the caller's to name as zlib's default, 6. The choice of engine and level is §4.17.3's learned
+  response compression (piece 4), not this codec's.
+- **From the sources.** Mercurial 7.2's `utils/compression.py` (the engines' bundle types, `supportedbundletypes`, the
+  stream readers: zlib's end found by feeding a copy one byte, bz2's by `EOFError`, zstd's by a `ZstdError` after its
+  one frame; `_TruncatedBZ2CompressedStreamReader` feeding `BZ` back), `bundle2.py` (`processcompression`,
+  `bundle20.setcompression` and `getchunks`, `unbundle20.iterparts` and `_forwardchunks`, `bundletypes`,
+  `writebundle`), `changegroup.py` (`cg1unpacker`), `exchange.py` (`readbundle`) and `bundlecaches.py`
+  (`_bundlespecv1compengines`), from `mercurial-7.2.tar.gz` (SHA-256 `a250227e…`); RFC 1950 and RFC 8878; libzstd
+  1.5.7's `zstd_decompress.c` (zstd-sys 2.1.0); libbz2-rs-sys 0.2.6's `decompress.rs`.
+- **Stricter than 7.2, on purpose.** 7.2 reads lazily and stops at the bundle's end, so it ignores bytes after a
+  compressed stream and a zlib trailer it never reached; slates inflates the whole stream and refuses a stream cut short
+  anywhere and bytes after its end. 7.2's set of bundle types holds `_truncatedBZ` and, for a bundle1, `ZS`, so its
+  readers take `Compression=_truncatedBZ` and `HG10ZS`, which no 7.2 writer makes; slates refuses both as unknown. A
+  bundle2 naming `Compression` twice, in any case, is refused (7.2 takes the last, so two readers could inflate one
+  stream two ways). A zstd stream must open with a standard frame, so libzstd's legacy formats are never reached.
+- **The engines.** zlib through flate2's own API on A-607's zlib-rs, naming no backend; bzip2 through the `bzip2` crate
+  0.6.1 on its default libbz2-rs-sys 0.2.6, both `build = false` with Rust sources only, libbz2-rs-sys without its
+  default features (no libc), approved by main once confirmed pure Rust; zstd through the workspace's `zstd` 0.13.3
+  (libzstd 1.5.7). bzip2's `Compression::new` panics outside 1 to 9 and libzstd's `DCtx::create` on a failed
+  allocation, so the codec calls `Compression::try_new` and `DCtx::try_create`, each failure a typed refusal.
+- **Golden vectors.** `crates/hg/fixtures/compressed`: the bundles stock Mercurial 7.2 (PyPI, through `uvx`, CPython
+  3.12) wrote of piece 1's repository as `gzip-v1`, `bzip2-v1`, and `gzip-v2`, `bzip2-v2` and `zstd-v2` with
+  changegroup `02`, phases and markers, each engine at 7.2's default level; made by `make-compressed-fixtures.sh` on the
+  Mac Studio (macOS 26.4, arm64), 2026-11-19, its header naming the exact command, the run comparing its uncompressed
+  twins with `fixtures/cg01.hg` and `cg02.hg` byte for byte; `SHA256SUMS` checked after the copy, 5 of 5. And A-569's
+  capture of 7.2's server answering a clone's `getbundle` with `zstd` (`fixtures/wire/http-clone.03.response-body`),
+  one frame of another path of 7.2's.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 174 of 174 in 1.59 s
+  (load 6.9), 16 of them this piece's; `cargo fmt -p slates-hg -- --check` clean. Golden: each compressed bundle made
+  plain to exactly the bundle 7.2 wrote uncompressed, and the uncompressed ones borrowed; 7.2's wire answer inflated
+  into a bundle2 that decodes; libzstd holding exactly the 2,490,432 bytes charged for 7.2's 2 MiB window; each plain
+  bundle compressed by every engine its kind takes, at each engine's lowest and highest level and 7.2's default,
+  framed as 7.2 frames it and made plain to itself (never compared with 7.2's compressed bytes: A-607). Hostile: every
+  proper prefix of each golden bundle refused as cut short; a bit flipped in every byte, every bit place met, refused
+  or, for zlib and bzip2, whose checksums cover what they inflate, inflated to the bundle 7.2 wrote; a byte after each
+  stream refused; unknown engines (`XZ`, `gz`, `_truncatedBZ`, none, `HG10ZS`, `HG10XX`) refused before anything is
+  inflated; 8 MiB of zeros from each engine refused within 1 MiB, the room held exactly 1 MiB; 2 GiB and 2 TiB zstd
+  windows and a 900,000-byte bzip2 block refused before a decoder is made; exactly a bundle's need making it plain with
+  nothing left, a byte less refused; levels outside each range, zstd for a bundle1 and bundles not plain refused with
+  nothing written; properties: arbitrary bundles round-tripping through every engine, arbitrary bytes after each
+  engine's header never panicking and never handed back as plain. Red: the same tests against the four entry points
+  stubbed (bundles passed through, nothing inflated or compressed), each arm in its own target directory: 14 of 16
+  failed; the two that passed exercise what the stubs left (the decoders refusing a stream still compressed; libzstd's
+  count). A first red and green pair shared one target directory and is discarded: cargo names a workspace member's
+  build by its path within the workspace, so the green clone ran the red clone's test binary (the stubs' 25 dead-code
+  warnings showed it). The first build's one error: proptest's `prop_assert!` makes its stringified condition a format
+  string, which a condition holding `{ .. }` breaks.
+- **Owed.** A stream is inflated whole in one call; inflating it in slices within the shard's step budget comes with
+  push intake (piece 5), with the inflater made resumable there. Serving the wire's `0.2` answers compressed, and
+  choosing the engine and level by the learned cost model, is piece 4's. Not read: a headerless bundle1 (7.2's
+  `headerlessfixup`, for old clients' `unbundle`) and stream-clone bundles (`HGS1`, piece 9).
