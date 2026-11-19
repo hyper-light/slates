@@ -16,6 +16,7 @@
 //! handles); its tests land into a real directory on the host's disk in the build output (`CARGO_TARGET_TMPDIR`; A-50:
 //! never `/tmp`, never a RAM directory), on every host, exactly as the Phase 1 landing tests do.
 
+use slates_base::{BaseHost, OsHost};
 use slates_db::Op;
 use slates_db::catalog::LandingRecord;
 use slates_db::catalog::{
@@ -716,7 +717,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
   // writer is built inside that host, with the target walked again under the same containment, and the host goes back
   // to the slot between units.
   let (os, land_target) = if was_overlay {
-    let Some(host) = slot.host.take() else {
+    let Some(host) = take_disk_host(slot) else {
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
       return refused(Refusal::BaseUnavailable {
         path: prepared.target.clone(),
@@ -726,7 +727,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
       Err((host, refusal)) => {
-        slot.host = Some(host);
+        slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return refused(target_refusal(&refusal, &prepared.target));
       }
@@ -772,7 +773,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
   };
   let writer = if was_overlay {
     let (host, away) = os.lend();
-    slot.host = Some(host);
+    slot.host = Some(BaseHost::Disk(host));
     Writer::Lent(away)
   } else {
     Writer::Own(os)
@@ -1723,7 +1724,7 @@ fn begin_granted(
   };
   let was_overlay = slot.volume.is_overlay();
   let (os, land_target) = if was_overlay {
-    let Some(host) = slot.host.take() else {
+    let Some(host) = take_disk_host(slot) else {
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
       return not_run(
         Unrun::Server(Refusal::BaseUnavailable {
@@ -1736,7 +1737,7 @@ fn begin_granted(
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
       Err((host, refusal)) => {
-        slot.host = Some(host);
+        slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return not_run(
           Unrun::Server(target_refusal(&refusal, &prepared.target)),
@@ -1770,7 +1771,7 @@ fn begin_granted(
   };
   let writer = if was_overlay {
     let (host, away) = os.lend();
-    slot.host = Some(host);
+    slot.host = Some(BaseHost::Disk(host));
     Writer::Lent(away)
   } else {
     Writer::Own(os)
@@ -1878,7 +1879,7 @@ fn finish_planning(
   };
   let os = match std::mem::replace(&mut planning.writer, Writer::Out) {
     Writer::Own(os) => Some(os),
-    Writer::Lent(away) => slot.host.take().map(|host| OsLand::resume(host, away)),
+    Writer::Lent(away) => take_disk_host(slot).map(|host| OsLand::resume(host, away)),
     Writer::Out => None,
   };
   let Some(os) = os else {
@@ -1984,7 +1985,7 @@ fn step_beginning(
   };
   let mut os = match std::mem::replace(writer, Writer::Out) {
     Writer::Own(os) => os,
-    Writer::Lent(away) => match slot.host.take() {
+    Writer::Lent(away) => match take_disk_host(slot) {
       Some(host) => OsLand::resume(host, away),
       None => {
         *writer = Writer::Lent(away);
@@ -2002,7 +2003,7 @@ fn step_beginning(
   );
   *writer = if slot.volume.is_overlay() {
     let (host, away) = os.lend();
-    slot.host = Some(host);
+    slot.host = Some(BaseHost::Disk(host));
     Writer::Lent(away)
   } else {
     Writer::Own(os)
@@ -2014,22 +2015,37 @@ fn step_beginning(
 fn lend_back(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) {
   if let Some(os) = granted.run.take_host() {
     let (host, away) = os.lend();
-    slot.host = Some(host);
+    slot.host = Some(BaseHost::Disk(host));
     granted.away = Some(away);
   }
 }
 
 /// Takes an overlay's base host from its volume's slot back into the run for a slice; whether it could.
 fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) -> bool {
-  match (slot.host.take(), granted.away.take()) {
+  match (take_disk_host(slot), granted.away.take()) {
     (Some(host), Some(away)) => {
       granted.run.put_host(OsLand::resume(host, away));
       true
     }
     (host, away) => {
-      slot.host = host;
+      if let Some(host) = host {
+        slot.host = Some(BaseHost::Disk(host));
+      }
       granted.away = away;
       false
+    }
+  }
+}
+
+/// Takes an overlay's directory host from its volume's slot for the landing's writer, which is built inside it (one host
+/// per volume): `None` when the slot holds none, or holds an S3 base's host, which stays in the slot, since a landing
+/// writes a host directory and never an S3 base (§4.15 "An S3 base", A-555).
+fn take_disk_host(slot: &mut crate::state::VolumeSlot) -> Option<OsHost> {
+  match slot.host.take()?.into_disk() {
+    Ok(host) => Some(host),
+    Err(base) => {
+      slot.host = Some(base);
+      None
     }
   }
 }
@@ -2045,7 +2061,7 @@ fn give_host_back(
   if let (true, HostSlot::Owned(os)) = (was_overlay, host) {
     let mut host = os.into_host();
     host.close_dir(target_dir);
-    slot.host = Some(host);
+    slot.host = Some(BaseHost::Disk(host));
   }
 }
 
@@ -2205,7 +2221,7 @@ fn complete_finish(
         if granted.was_overlay {
           host.close_dir(granted.target_dir);
         }
-        slot.host = Some(host);
+        slot.host = Some(BaseHost::Disk(host));
       }
     }
     drop_implicit(
@@ -3186,7 +3202,7 @@ fn answer_of(error: HostError) -> HostAnswer {
     },
     // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
     // a refusal no errno names.
-    HostError::Pending => HostAnswer::Errno { errno: 0 },
+    HostError::Pending(_) => HostAnswer::Errno { errno: 0 },
   }
 }
 

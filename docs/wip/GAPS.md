@@ -12085,7 +12085,7 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; its host, oracle and naming built, A-524; the volume over it owed)
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; its host, oracle and naming built, A-524; a request parked on its pending fetch, A-555; the volume over it owed)
 
 > - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
 >   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
@@ -12116,21 +12116,37 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   49 of 49 (the host's eight, the oracle over 256 generated histories on versioned and unversioned buckets, `SimS3`'s
 >   two, the naming's four); the api's naming and contract tests 2 of 2; red first four ways (a landed range unkept, a
 >   `412` taken for an unavailable store, a version unbound, a stale listing never listed again).
+> - **Built (A-555): a request waits for the fetch it met.** A pending answer names its fetch
+>   (`HostError::Pending(FetchId)`, `VfsError::BasePending(FetchId)`): one name a directory's listing, one a run of
+>   chunks, and `S3Host::landed` says which fetch a landing settled. The shard parks a request on the fetch it met
+>   (`crates/server/src/base_wait.rs`, the fetch noted by a lens where the slot's host is lent), wakes it when that fetch
+>   lands and no other, and serves it again; at most the shard's client credit of waits (past it the retry at once,
+>   `base.wait.full`) and at most the failover delay a request (`base.wait.overdue`). An NFS call parks so, local or
+>   forwarded (`nfs::serve_local_fetched`); a request that could not wait is answered the retry, FUSE `EAGAIN` and NFS
+>   `NFS3ERR_JUKEBOX`, no longer `EIO` or a server fault. What a fetch landed is held while requests are parked on it
+>   (`S3Host::hold_for_waiters`, `release_held`), and a landing the unheld cache cannot keep is counted
+>   (`HostCounts::unkept`). A slot's base host is a `BaseHost` (a host directory or an S3 base). Proven: see A-555's
+>   evidence.
 > - **Owed.**
+>   - A-555's remainder: parking a FUSE request (Linux: held off the device and dispatched again when its fetch lands;
+>     answered `EAGAIN` until then); WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
+>     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
+>     a volume over an S3 base through a daemon, its fetch answered by `SimS3`, once a volume over an S3 base can be
+>     made. A volume destroyed (or its host replaced) while requests wait on its fetches leaves them to their deadline,
+>     the failover delay, then the retry: its slot's removal should wake them.
 >   - Part 2's remainder: the platform's trust roots (a source of roots to choose: compiled-in or the operating
 >     system's store), name resolution (the caller resolves the endpoint today), the read-ahead from the measured
 >     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
 >     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
 >   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
 >     hand-off, held in RAM by the owner shard and by the anchor across a restart; the shard's driver running the host's
->     fetches on the client; the server parking a request on `BasePending` and running it again when its fetch lands,
->     for every bridge (each answers it by its catch-all until then: FUSE `EIO`, NFS `NFS3ERR_SERVERFAULT`); the base
->     plane's host calls audited for a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s
->     `open_file(..).ok()?`); recovery over an S3 base (a pending reacquisition marks its directory unavailable, errno
->     0); and the N=1 differential through `SimS3`.
->   - The fetches under way are bounded by the parked requests, not yet by the cache: many concurrent misses on a cache
->     of a few chunks could shed each other's landed runs before their requests run again (the server's parking piece
->     holds a landed run until its waiters have run).
+>     fetches on the client and handing each answer to `base_wait::land` (A-555); the base plane's host calls audited for
+>     a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s `open_file(..).ok()?`); recovery
+>     over an S3 base (a pending reacquisition marks its directory unavailable, errno 0); a landing of an overlay over an
+>     S3 base into a host directory (its base's own landing is refused `BaseUnavailable`); and the N=1 differential
+>     through `SimS3`.
+>   - Closed (A-555): the fetches under way could shed each other's landed runs through a small cache before their
+>     requests ran again; what a fetch landed is now held until the last request parked on it has run.
 >   - The listing page and request caps assume a continuation token no longer than an encoded key (S3 states no
 >     length): the client counts the longest a listing names (`Counts::longest_token`); the live run reads it.
 >   - The cross-target lint of `slates-base` with its new `aws-lc-rs`, `rustls`, `slates-rt` and `slates-transport`

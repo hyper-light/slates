@@ -150,7 +150,7 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       reason: "the file is delegated to an NFSv4 client; its recall is under way".to_owned(),
     },
     // Retryable under the same id: an S3 base's fetch of what the request reads is under way (A-524).
-    VfsError::BasePending => Refusal::Unpublished {
+    VfsError::BasePending(_) => Refusal::Unpublished {
       reason: "the overlay's base is fetching what the request reads".to_owned(),
     },
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
@@ -293,7 +293,7 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     },
     // A target is a directory host's, which never answers a pending fetch (an S3 base's, A-524); were one to, it is a
     // refusal no code names.
-    H::Pending => TargetRefusal::Host { errno: 0 },
+    H::Pending(_) => TargetRefusal::Host { errno: 0 },
   }
 }
 
