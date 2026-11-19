@@ -14585,6 +14585,19 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
 > revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
 > a dangling link told apart; no core dumps; the Windows driver.
+>
+> **Status (2026-11-19, A-661 part 1: the hook glue).** `crates/server`'s `svn_hooks` is what every Subversion call
+> point runs its hooks through. `run` finds the hook the repository's policy configures at the input's point, runs it
+> with the driver over the caller's view, and answers what `svnserve` tells the client (`svn_told`), the run's lesson
+> for the hook's times, and pre-lock's token. `verdict` is what the commit drive resumes with: `Ok`, the refusal's
+> chain, or nothing once the client left, so the change does not go on. A point with no hook answers as `svnserve` does,
+> running nothing. The call points, agreed through main on 2026-11-19: the drive pauses for start-commit at `open-root`,
+> after its revision check, and for pre-commit at `close-edit`, before the verdict (`Step::Hook`, `Drive::resume`; g268,
+> A-655); the `svn://` task runs those, and post-commit after its append, whose words are `commit-info`'s
+> `post-commit-err` (g234, A-656); the lock hooks wrap A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK
+> and UNLOCK, DAV's wiring A-661's next part once g298's serving lands. Tested on Linux x86_64 (adacachy, 2026-11-19):
+> the server's lib tests 630 passed beside main's 624, the glue's five new and nothing failing that main's tree passed;
+> each of its four choices broken in a copy failed only its own tests. The macOS run is owed.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -47747,3 +47760,38 @@ base text) and its tests.
   `crates/vcs/src/derived.rs` (the module's docs, its owed line); `crates/vcs/src/derived/history.rs` (`inputs_of`
   shared with blame); `docs/wip/research/path-history.md` (§6, new; §1's sources); A-645's entry ("Queries by API");
   §4.17.1 "Reads"' status; GAPS' A-645 line.
+
+### A-661 part 1 — Subversion's hook glue: the hook a point's record configures, run by the driver, answered in svnserve's words, and the call points agreed (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-648, with A-655 and A-656)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17 entry); `crates/server` (`svn_hooks.rs` and its
+tests, new; `lib.rs`).
+
+- **The glue.** `svn_hooks::run(site, input, bound, client_gone)` takes the input a caller built for its point (the
+  builders of A-623, the environment the record gives, A-648), finds the hook the repository's policy configures at
+  that point (Subversion keeps one a point), and runs it with the driver over the caller's view, held to the hook's
+  learned bound and ended with the client. It answers `SvnHookRan`: what `svnserve` tells its client (`svn_told`), the
+  run's lesson for the hook's times, which the caller keeps, and pre-lock's token (`svn_lock_token`). A point with no
+  hook answers at once as `svnserve` does: nothing, but pre-revprop-change's `E165006`.
+- **The verdict.** `SvnHookRan::verdict` is what an admission point's caller resumes with: `Ok` to go on, the
+  refusal's chain (each error's number and message, outermost first), or nothing once the client left, so that no
+  change goes on for a client that is gone. An observing point's failure is no refusal.
+- **The call points**, agreed through main and relayed to each owner: the commit drive pauses for start-commit at
+  `open-root`, after its revision check and with the transaction named, and for pre-commit at `close-edit`, before the
+  verdict (`Step::Hook`, `Due::{StartCommit, PreCommit}`, `Drive::resume`; g268, A-655); the `svn://` connection task
+  runs those, and post-commit after its append, whose words are `commit-info`'s `post-commit-err` (g234, A-656); the
+  lock hooks run around A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK and UNLOCK, pre-lock per path
+  with its token the lock's, post-lock once with the paths locked.
+- **Tests** Linux x86_64 (adacachy), 2026-11-19, in capped `systemd-run --user` units (MemoryMax 24G, CPUWeight 1, Nice
+  19, nvme1n1 I/O at 150M and 400M). One clone, main's compiled tree first (main 4644dcec3's `lib.rs`, `svn_hooks`
+  removed): `cargo test --locked -p slates-server --lib -- --test-threads=4` 624 passed, 2 failed, 3 ignored, the
+  failures A-660's status capture and `hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind` (the
+  peer read WouldBlock, `hangup.rs:554`; it passed in the next run). Then A-661 at 2dc5e209e, the code landed here: 630
+  passed, 1 failed (A-660's), 3 ignored, the five new tests among the passes, `slates-server` recompiled; `cargo fmt -p
+  slates-server -- --check` clean. Red (`cargo test --locked -p slates-server --lib svn_hooks::`, green 5 of 5 first),
+  each choice broken in a copy and rebuilt: `verdict` without its client-left check failed
+  `a_runs_answer_is_svnserves_words_its_lesson_and_pre_locks_token` alone; a point with no hook answering nothing failed
+  `a_point_with_no_hook_answers_as_svnserve_does_without_running_anything` alone; the point match inverted failed the
+  lookup test and both end-to-end tests; the token dropped failed the run's answer test and the pre-lock one. Main's
+  commits since 4644dcec3 touch nothing under `crates/server`, `crates/db` or `crates/rt`, so these runs stand for the
+  merged tree. The macOS run is owed.
+- **Owed.** DAV's LOCK and UNLOCK wired through the glue (A-661's next part, once g298's DAV serving lands); the hook
+  times' table that keeps each hook's learned bound (A-622's list).
