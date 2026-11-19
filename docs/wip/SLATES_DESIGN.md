@@ -47890,7 +47890,10 @@ with the fixed history first), GAPS (A-668's entry, where the census's failure w
   own base. Both are refused now: the owner answers the base unknown (`Outcome::BaseUnavailable` and
   `Judgment::BaseUnavailable`, the service's `UnknownBase`), and the rebase `Rebased::BaseAhead` (`UnknownBase` at the
   server's `map_rebase`). The server never sent such a work, since a work's base is a version its green made, so no
-  answer on the wire changes.
+  answer on the wire changes. One test did: `symlink_merges` (`crates/merge/tests/engine.rs`) based its last work at
+  version 4 over a head of 3, meaning the version that holds the file (its third increment conflicted and made no
+  version), and passed only because the past-head base was judged at the head; it now names 3 and asserts the version
+  the file was accepted at.
 - **Tests** (`crates/merge/src/engine/compute_tests.rs`). Run on Windows x86_64, jupiter (kiln, 2026-11-19, debug, a
   fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`): the Mac Studio was offline, so the
   macOS run is owed to main's lanes.
@@ -47916,5 +47919,5 @@ with the fixed history first), GAPS (A-668's entry, where the census's failure w
 - **Applied in the same change to:** `crates/merge/src/engine.rs` (`Computed`, `ComputeRefused`, `Green::compute`,
   `Green::judge` on it, `Rebased::BaseAhead`, the counter a `Cell`, the module docs), `crates/merge/src/lib.rs`,
   `crates/merge/src/engine/compute_tests.rs` (new), `crates/merge/tests/rebase.rs` (a binding no longer mutable),
-  `crates/server/src/verbs.rs` (`map_rebase`: `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry;
-  GAPS' A-645 entry.
+  `crates/merge/tests/engine.rs` (`symlink_merges`' last base), `crates/server/src/verbs.rs` (`map_rebase`:
+  `BaseAhead` answered `UnknownBase`); §4.16 "Commit"; A-645's entry; GAPS' A-645 entry.

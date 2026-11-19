@@ -578,9 +578,14 @@ fn symlink_merges() {
     conflict_class(&green.submit(&Build::new().symlink("l", "other").at(3, 1))),
     Some(MergeConflictClass::CreateCreate)
   );
-  green.submit(&Build::new().create("a", b"file").at(4, 2));
   assert_eq!(
-    conflict_class(&green.submit(&Build::new().symlink("a", "t").at(5, 4))),
+    green.submit(&Build::new().create("a", b"file").at(4, 2)),
+    Outcome::Accepted { version: 3 }
+  );
+  // Based at version 3, which holds the file: the third increment conflicted and made no version,
+  // and a base past the head is a version the green never made (A-658).
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().symlink("a", "t").at(5, 3))),
     Some(MergeConflictClass::TypeChanged)
   );
 }
