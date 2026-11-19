@@ -189,7 +189,8 @@ fn no_common_algorithm_is_refused_by_list() {
   for (index, value, list) in cases {
     let mut lists = base.clone();
     lists[index] = value.to_string();
-    let read = KexInit::read(&kexinit(as_strs(&lists), false)).unwrap();
+    let payload = kexinit(as_strs(&lists), false);
+    let read = KexInit::read(&payload).unwrap();
     assert_eq!(
       negotiate(&read, true),
       Err(KexInitRefusal::NoCommonAlgorithm(list)),
@@ -198,7 +199,8 @@ fn no_common_algorithm_is_refused_by_list() {
   }
   let mut empty_cipher = base.clone();
   empty_cipher[2] = String::new();
-  let read = KexInit::read(&kexinit(as_strs(&empty_cipher), false)).unwrap();
+  let payload = kexinit(as_strs(&empty_cipher), false);
+  let read = KexInit::read(&payload).unwrap();
   assert_eq!(
     negotiate(&read, true),
     Err(KexInitRefusal::NoCommonAlgorithm(
