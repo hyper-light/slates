@@ -48322,9 +48322,10 @@ Applied in the same change to: §4.17.2's A-653 status block, GAPS (the A-653 en
   version 4 over a head of 3, meaning the version that holds the file (its third increment conflicted and made no
   version), and passed only because the past-head base was judged at the head; it now names 3 and asserts the version
   the file was accepted at.
-- **Tests** (`crates/merge/src/engine/compute_tests.rs`). Run on Windows x86_64, jupiter (kiln, 2026-11-19, debug, a
-  fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`): the Mac Studio was offline, so the
-  macOS run is owed to main's lanes.
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`). Red and the first green ran on Windows x86_64, jupiter (kiln,
+  2026-11-19, debug, a fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`) while the Mac
+  Studio was offline; the landing run is macOS arm64, the Mac Studio (kiln r89, 2026-11-19, debug, the same discipline
+  with `CARGO_BUILD_JOBS=2`), over the tree merged with main 1b480bd70 (b77c7802d).
   - The oracle: generated histories of works (files written whole, overwritten, inserted into, removed and renamed;
     modes, attributes and the root's head set; a directory made or removed; a hard link made), based at the head or up
     to three versions behind, some sent again. Before every verdict a copy rebuilt from the owner's chain entries alone
@@ -48337,8 +48338,25 @@ Applied in the same change to: §4.17.2's A-653 status block, GAPS (the A-653 en
   - Red first at 508eabb64, with `Green::compute` a stub that refused everything and the old judge and rebase:
     `cargo test --locked -p slates-merge --lib compute_tests` failed 6 of 6, each for its own reason.
   - Green on the tree merged with main (0ef8e9741): `cargo test --locked -p slates-merge --lib` 147 of 147 in 78 s
-    (main's Windows baseline at 018d32ba2: 141 of 141); rustfmt's layout applied from jupiter's `cargo fmt`. SERVER RUN
-    PENDING.
+    (main's Windows baseline at 018d32ba2: 141 of 141); rustfmt's layout applied from jupiter's `cargo fmt`. The whole
+    server lib on Windows at 0af63658a (`cargo test --locked -p slates-server --lib -- --test-threads=4`; at 32 threads
+    the daemon's watchdog ended the binary) ended 595 passed, 14 failed, 3 ignored: five among main's Windows failures
+    at 6e42e7a2c, nine handed to main (none of the fourteen reaches the verdict or the rebase by the code; not
+    measured).
+  - The landing run: `cargo fmt -p slates-merge -p slates-server -- --check` clean; `cargo test --locked -p
+    slates-merge --lib` 191 of 191; the merge crate's integration targets whose works reach the verdict
+    (`--no-fail-fast --test rebase --test engine --test checkpoint --test special --test base_for --test chain_replay
+    --test changed_since_cost --test identity --test origin --test splice --test shuttle_green`) 104 passed and 1
+    ignored (`shuttle_green` holds no test without `--cfg shuttle`); the server's lib tests that reach the verdict
+    (`repository::push::`, `repository::hg_push::`, `merge_origin::`, `merge_service::`) 42 of 42 at four threads; and
+    the server's integration tests that drive a rebase over the wire, by name (`daemon`'s lifecycle test, two of
+    `merge_load`, two of `verdict_pages`, five of `works_off_owner`, three of `green_post_state`), 13 of 13. No server
+    lib test reaches `map_rebase`; those integration tests do.
+  - The macOS runs before it (kiln r23 and r55) found `symlink_merges` (above) and two failures that are main's, each
+    measured on main's own tree in its own target directory: `hard_link_merges` (fixed on main by 8d7209388), and a
+    generated case of the rebase oracle (`crates/merge/tests/rebase.rs`) in which a work removes the home of a file a
+    hard link names: the rebase restates the removal alone (`changed` holds `a` removed, the journal one `Unlink`) where
+    the submit leaves the link holding the node (`b`, empty), on main at 787f5948b as here; handed to main.
 - **Owed.** Part 2, the owner's commit by position (`Green::judge_computed`): the owner's caches and floor, the
   position check, and when the green moved, judging again only what the change index names in the versions since the
   position, held equal to the serial verdict by an oracle over generated concurrent histories. Then the fleet's route:
