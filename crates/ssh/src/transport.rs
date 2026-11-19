@@ -432,6 +432,12 @@ impl<E: Entropy> ServerTransport<E> {
     self.disconnect_sealed
   }
 
+  /// Whether the first exchange has ended: the client's `SSH_MSG_NEWKEYS` taken (A-651: an edge's handshake ends here,
+  /// a round trip after the session id is known, which a client's host-key confirmation lies between).
+  pub fn is_established(&self) -> bool {
+    self.established
+  }
+
   /// The session id, once the first exchange hash is known.
   pub fn session_id(&self) -> Option<&[u8; HASH_LEN]> {
     self.session_id.as_ref()
