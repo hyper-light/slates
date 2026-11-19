@@ -5,9 +5,11 @@
 mod advertise;
 mod clone;
 mod fetch;
+mod fragments;
 mod ls_refs;
 mod refused;
 mod steps;
+mod v0;
 
 use std::collections::BTreeSet;
 use std::io::Write as _;

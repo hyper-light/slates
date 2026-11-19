@@ -170,11 +170,23 @@ mod vcs_hooks;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod hook_driver;
+// Subversion's hooks as the server runs them (A-661): the glue between the Subversion server's call points and the hook
+// driver, Unix alone with it. No caller outside tests until the commit drive and the svn:// connection task call it
+// (A-655, A-656) and DAV's LOCK and UNLOCK (A-661's next part).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod svn_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 part 2): the listener, one connection a task, each
 // phase's wait learned, the bounds derived from the shard's budget, and git's site. No caller outside tests until the
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
+// §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
+// phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
+// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
+// key's keeping, the key store and the repositories).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_ssh;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;
