@@ -1047,6 +1047,12 @@ struct Census {
   mergeinfo_beneath: usize,
   /// Relations answered, by kind: unrelated, unchanged, common ancestor.
   relations: [usize; 3],
+  /// Revisions whose drive order differed from path order.
+  reordered: usize,
+  /// Inheritance decisions where FSFS's drive order could matter: a child compared against a parent that this
+  /// transaction already cloned with another copy identity, which the other order compares against the parent's old
+  /// node-revision (`get_copy_inheritance`'s comparison of the two copy identities).
+  sensitive: usize,
 }
 
 impl Census {
@@ -1062,6 +1068,8 @@ impl Census {
     self.empty += other.empty;
     self.beneath_copies += other.beneath_copies;
     self.mergeinfo_beneath += other.mergeinfo_beneath;
+    self.reordered += other.reordered;
+    self.sensitive += other.sensitive;
     for (sum, more) in self.relations.iter_mut().zip(other.relations) {
       *sum += more;
     }
@@ -1182,12 +1190,12 @@ impl NaiveFs {
   }
 
   /// Applies one revision's rows in `order`, as FSFS's editor drive calls them.
-  fn replay(&mut self, order: &[&ChangedPath]) {
+  fn replay(&mut self, order: &[&ChangedPath]) -> Census {
     let mut txn = self.begin();
     for change in order {
       txn.apply(change);
     }
-    txn.commit();
+    txn.commit()
   }
 }
 
@@ -1237,7 +1245,7 @@ impl Txn<'_> {
 
   /// `open_path`: every element from the root to `path`, each one's inheritance decided against its parent as the
   /// parent stands now.
-  fn open_path(&self, path: &str) -> Vec<Opened> {
+  fn open_path(&mut self, path: &str) -> Vec<Opened> {
     let mut opened = vec![("/".to_owned(), self.tree.get("/").copied(), Way::Kept)];
     let mut so_far = String::new();
     for name in path.split('/').filter(|name| !name.is_empty()) {
@@ -1245,9 +1253,26 @@ impl Txn<'_> {
       let parent = opened.last().unwrap().1.unwrap();
       let child = self.tree.get(&so_far).copied();
       let way = child.map_or(Way::Kept, |child| self.inheritance(child, parent, &so_far));
+      if child.is_some_and(|child| self.sensitive(child, parent)) {
+        self.census.sensitive += 1;
+      }
       opened.push((so_far.clone(), child, way));
     }
     opened
+  }
+
+  /// Whether deciding `child`'s inheritance against `parent` is a decision FSFS's drive order could change: the child
+  /// not made here and once copied, the parent cloned here with a copy identity other than its old node-revision's.
+  fn sensitive(&self, child: usize, parent: usize) -> bool {
+    let parent_node = &self.fs.nodes[parent];
+    let moved = parent_node.copy_from.is_none()
+      && parent_node
+        .predecessor
+        .is_some_and(|old| self.fs.nodes[old].copy_id != parent_node.copy_id);
+    !self.made.contains(&child)
+      && self.made.contains(&parent)
+      && self.fs.nodes[child].copy_id != (0, 0)
+      && moved
   }
 
   /// `get_copy_inheritance`, line by line.
@@ -2003,8 +2028,17 @@ fn check_history(
     census.empty += usize::from(rows.is_empty());
     let mut sorted = rows.clone();
     sorted.sort_by(|first, second| first.path.cmp(&second.path));
-    path_order.replay(&sorted.iter().collect::<Vec<_>>());
-    drive.replay(&drive_order(&sorted, priorities));
+    census.sensitive += path_order
+      .replay(&sorted.iter().collect::<Vec<_>>())
+      .sensitive;
+    let reordered = drive_order(&sorted, priorities);
+    census.reordered += usize::from(
+      reordered
+        .iter()
+        .zip(&sorted)
+        .any(|(one, other)| one.path != other.path),
+    );
+    census.sensitive += drive.replay(&reordered).sensitive;
     let record = RevisionRecord {
       transaction: TRANSACTION.to_owned(),
       changes: rows,
@@ -2028,8 +2062,13 @@ fn check_history(
 /// each revision's rows in random drive orders, and in the order they were generated, equals its own replay in path
 /// order. The census shows every rule was met: kept, lazy and soft copy identities, copies and copies into their own
 /// subtrees, deletions, replacements, empty revisions, paths reached beneath a copy, directories counting mergeinfo
-/// beneath them, and all three relations.
+/// beneath them, all three relations, drive orders that differ from path order, and the inheritance decisions where
+/// FSFS's drive order could matter; every run prints it.
 #[test]
+#[allow(
+  clippy::print_stderr,
+  reason = "the census is the oracle's evidence, printed with every run"
+)]
 fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
   let census = RefCell::new(Census::default());
   let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config::default()));
@@ -2040,6 +2079,7 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     panic!("{failure}");
   }
   let census = census.into_inner();
+  eprintln!("index oracle census: {census:?}");
   let met = [
     census.kept,
     census.lazy,
@@ -2051,6 +2091,8 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     census.empty,
     census.beneath_copies,
     census.mergeinfo_beneath,
+    census.reordered,
+    census.sensitive,
   ];
   assert!(
     met.iter().all(|&count| count > 0),
