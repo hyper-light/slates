@@ -328,7 +328,8 @@
 > listed protocol then `:`, under `sideband-all`, and self-contained without `thin-pack`, as git's server and client
 > rule. Golden vectors (`fixtures/v2-rest`, SHA-256 checked): git's own answers in SHA-1 and SHA-256, a stock clone
 > through `bundle-uri` teed whole, and git's four `packfile-uris` decisions. Red first (21 tests against refusing
-> modules), then `cargo test -p slates-git --lib` 292 of 292, red ten ways by mutation. Owed: the store's own bundle
+> modules), then `cargo test -p slates-git --lib` 292 of 292, and 326 over main as it landed (2 of main's ignored),
+> red ten ways by mutation. Owed: the store's own bundle
 > list and URI packs (each a run of A-614 part 2's fragments, its hash and URI) and the fetch path that asks for them
 > (piece 7); `object-info`'s `type`, which git's master adds, when a release ships it.
 

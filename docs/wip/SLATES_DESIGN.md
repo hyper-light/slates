@@ -42833,7 +42833,9 @@ Applied in the same change to:
   as a `have`. A stateless `bundle-uri` exchange. Fetches from a server naming the larger blob's pack by URI
   (`uploadpack.blobPackfileUri`), taken as `https`, as `http` only, without `sideband-all`, and as `ftp,https`. Every
   object of the SHA-1 repository as loose bytes, for the store test.
-- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 292 of 292, fmt clean).
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 292 of 292, and 326 over
+  main as it landed, 2 of main's ignored; fmt clean). The merge met A-614 part 2's new `Incoming::depth`: the store
+  test hands its loose objects in whole, depth zero.
   Each answer is the one stock git wrote from the same objects, from a plain list and from A-614's store itself (every
   object pushed, a branch moved, the answer read from the rows); an upper-case id is read and answered in lower case,
   where git echoed it; the bundle list is answered with every byte git wrote, and the stock clone's session reads and
