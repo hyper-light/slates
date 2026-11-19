@@ -155,7 +155,12 @@ impl GitStore {
     let versions = self.versions.get(&key)?;
     versions.iter().enumerate().rev().find_map(|(at, version)| {
       (self.repository.head(content, key, at).as_ref() == Some(head))
-        .then(|| self.repository.tree(content, key, at).map(|tree| (*version, tree)))
+        .then(|| {
+          self
+            .repository
+            .tree(content, key, at)
+            .map(|tree| (*version, tree))
+        })
         .flatten()
     })
   }
@@ -279,7 +284,10 @@ impl VcsStores {
   }
 
   /// Repository `id`'s Mercurial store with the content store, lent for one step.
-  pub(crate) fn mercurial(&mut self, id: RepositoryId) -> Option<(&mut ContentStore, &mut HgStore)> {
+  pub(crate) fn mercurial(
+    &mut self,
+    id: RepositoryId,
+  ) -> Option<(&mut ContentStore, &mut HgStore)> {
     let content = self.content.as_mut()?;
     match self.entries.get_mut(&id)? {
       RepositoryStore::Mercurial(store) => Some((content, store)),
@@ -471,7 +479,12 @@ impl SealedPush {
   /// written now, as the append commits ([`record_of`]).
   pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
     let (content, store) = stores.git_ref(self.repository).ok_or(GitRefused::NoStore)?;
-    record_of(content, store, (&self.objects, self.push.deepest()), &self.keyed)
+    record_of(
+      content,
+      store,
+      (&self.objects, self.push.deepest()),
+      &self.keyed,
+    )
   }
 
   /// Admits `moves` (each a green's key, its version once the entry moves it, and its new head) in place of any
@@ -516,11 +529,14 @@ impl GitPush {
       .map(|incoming| u64::try_from(incoming.content.len()).unwrap_or(u64::MAX))
       .fold(0, u64::saturating_add);
     within_budget(state, bytes, |stores| {
-      let (content, store) = stores
-        .git(self.repository)
-        .ok_or(GitRefused::NoStore)?;
+      let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
       for incoming in objects {
-        admit_object(content, store, (&mut self.push, &mut self.record), *incoming)?;
+        admit_object(
+          content,
+          store,
+          (&mut self.push, &mut self.record),
+          *incoming,
+        )?;
       }
       Ok(())
     })
@@ -557,18 +573,24 @@ impl GitPush {
   }
 
   /// Runs `read` over the repository's objects and this push's, the index first (A-638's view), as a ref's work is
-  /// built from them (A-618); none when no git store of the repository is held here.
+  /// built from them (A-618), with the room [`lend`] gives lent for the step: the view lists a tree within the content
+  /// store's room (`ContentStore::room`), and a settled store has none, since its budget is what it holds. A read holds
+  /// nothing after it, so the room lent is given back and nothing is charged. None when no git store of the repository
+  /// is held here.
   pub(crate) fn read<R>(
     &self,
-    stores: &VcsStores,
+    (store, stores): (&mut Store, &mut VcsStores),
     read: impl FnOnce(&PushedObjects<'_>) -> R,
   ) -> Option<R> {
-    let (content, store) = stores.git_ref(self.repository)?;
-    Some(read(&PushedObjects::new(
-      &store.repository,
-      content,
-      &self.push,
-    )))
+    lend(store, stores, 0);
+    let answer = stores
+      .git_ref(self.repository)
+      .map(|(content, git)| read(&PushedObjects::new(&git.repository, content, &self.push)));
+    let charged = stores.charged;
+    if let Some(content) = stores.content.as_mut() {
+      content.set_budget(charged);
+    }
+    answer
   }
 }
 
@@ -680,7 +702,12 @@ pub(crate) fn commit(state: &mut ShardState, sealed: &mut SealedPush) -> Result<
   let repository = sealed.repository;
   let unkept = within_budget(state, 0, |stores| {
     let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
-    commit_moves(content, store, &mut sealed.push, (&sealed.moves, &sealed.keyed))
+    commit_moves(
+      content,
+      store,
+      &mut sealed.push,
+      (&sealed.moves, &sealed.keyed),
+    )
   })?;
   sealed.objects = RecordWriter::default();
   state.count(VALUE_UNKEPT, unkept);
@@ -767,7 +794,9 @@ fn keep_values(content: &mut ContentStore, store: &mut GitStore, moves: &[Move])
 pub(crate) fn refusal_of(state: &mut ShardState, refused: &GitRefused) -> Refusal {
   let budget = match refused {
     GitRefused::Store(StoreRefused::Content(ContentRefused::OverBudget { room, .. }))
-    | GitRefused::Object(PushRefused::Content(ContentRefused::OverBudget { room, .. })) => Some(*room),
+    | GitRefused::Object(PushRefused::Content(ContentRefused::OverBudget { room, .. })) => {
+      Some(*room)
+    }
     GitRefused::Allocation => Some(state.store.admittable()),
     _ => None,
   };
@@ -856,7 +885,8 @@ fn replay_objects(
       content: object.content,
       depth: record.deepest,
     };
-    admit_object(content, store, (&mut *push, &mut *remade), incoming).map_err(ReplayRefused::Git)?;
+    admit_object(content, store, (&mut *push, &mut *remade), incoming)
+      .map_err(ReplayRefused::Git)?;
   }
   Ok(())
 }
@@ -875,7 +905,11 @@ fn replay_record(
     ..
   } = &mut *state;
   let bytes = db.partition().repositories().object_record(id, index)?;
-  lend(store, vcs_stores, u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+  lend(
+    store,
+    vcs_stores,
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+  );
   let replayed = replay_into(vcs_stores, id, bytes);
   let whole = settle_in(store, vcs_stores);
   if !whole {
@@ -885,7 +919,11 @@ fn replay_record(
 }
 
 /// Replays `bytes` into repository `id`'s store, by its tool: the derived values not kept.
-fn replay_into(stores: &mut VcsStores, id: RepositoryId, bytes: &[u8]) -> Result<u64, ReplayRefused> {
+fn replay_into(
+  stores: &mut VcsStores,
+  id: RepositoryId,
+  bytes: &[u8],
+) -> Result<u64, ReplayRefused> {
   let unheld = ReplayRefused::Git(GitRefused::NoStore);
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
   match stores.entries.get_mut(&id) {

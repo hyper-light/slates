@@ -632,7 +632,8 @@ fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it()
 /// position; the one past the budget is refused `Capacity` with nothing kept; the rebuilt partition reads the same
 /// objects and charges them; the destroy gives their bytes back, so objects as large fit the next repository.
 #[test]
-fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_back_with_the_repository() {
+fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_back_with_the_repository()
+ {
   let budget = caps(256);
   let (mut partition, repo, [a, ..]) = three_branches(budget);
   for (at_version, byte) in [(1, 7u8), (2, 8)] {
@@ -662,7 +663,12 @@ fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_bac
   assert_eq!(advance(&mut partition, large.clone()), full);
   assert_eq!(partition.to_snapshot(0), before);
   let mut rebuilt = Partition::from_snapshot(&before, budget, 0).unwrap();
-  assert!(rebuilt.repositories().objects(repo).eq(partition.repositories().objects(repo)));
+  assert!(
+    rebuilt
+      .repositories()
+      .objects(repo)
+      .eq(partition.repositories().objects(repo))
+  );
   assert_eq!(
     advance(&mut rebuilt, large),
     full,

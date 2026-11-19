@@ -18,16 +18,20 @@ use super::record::{
   Noted, Record, RecordRefused, RecordWriter, RecordedMove, RecordedObject, WriteRefused,
 };
 use super::{
-  GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, Target, admit_object, commit_moves,
-  green_key, record_of, replay_git, replay_into, seal_moves,
+  GitPush, GitRefused, GitStore, ReplayRefused, RepositoryStore, Target, admit_object,
+  commit_moves, green_key, record_of, replay_git, replay_into, seal_moves,
 };
 use crate::repository::push::{Appended, BranchAppended, BranchChange, EntryParts, StoreMove};
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
-/// Shape: the window the store-level tests' content store holds content in: small, so a blob of the generated sizes is
-/// held as several windows under a list, as a large file is.
-const WINDOW: usize = 1 << 6;
+/// Shape: the window the store-level tests' content store holds content in, as A-614's view tests hold theirs: past the
+/// longest row the store writes here with its table's frame (`slates_vcs::index` refuses one past it), and short, so a
+/// generated blob is held as several windows under a list, as a large file is.
+const WINDOW: usize = 1 << 8;
+
+/// Shape: the longest generated blob: three windows, so blobs are held as one window and as several.
+const BLOB_BYTES: usize = WINDOW * 3;
 
 /// Shape: the store-level tests' content budget, room to spare.
 const BUDGET: u64 = 1 << 26;
@@ -52,7 +56,10 @@ const FIRST_DATE: u64 = 1_700_000_000;
 
 /// A blob of `bytes`: its id and content.
 fn blob(bytes: &[u8]) -> (ObjectId, Vec<u8>) {
-  (name_of(FORMAT, Kind::Blob, bytes).expect("named"), bytes.to_vec())
+  (
+    name_of(FORMAT, Kind::Blob, bytes).expect("named"),
+    bytes.to_vec(),
+  )
 }
 
 /// A tree of plain files, its entries in git's order: its id and content.
@@ -85,7 +92,10 @@ fn commit(tree: ObjectId, parents: &[ObjectId], date: u64) -> (ObjectId, Vec<u8>
     "author A U Thor <author@example.com> {date} +0000\ncommitter C O Mitter <committer@example.com> {date} \
      +0000\n\nA-662\n"
   ));
-  (name_of(FORMAT, Kind::Commit, text.as_bytes()).expect("named"), text.into_bytes())
+  (
+    name_of(FORMAT, Kind::Commit, text.as_bytes()).expect("named"),
+    text.into_bytes(),
+  )
 }
 
 /// One object a push brings: its type, id and content.
@@ -102,7 +112,11 @@ fn incoming(brought: &Brought, depth: u64) -> Incoming<'_> {
 }
 
 /// A commit of a tree of `files` over `parents` at `date`: its blobs, its tree and itself, in that order, and its id.
-fn commit_of(files: &[(Vec<u8>, Vec<u8>)], parents: &[ObjectId], date: u64) -> (Vec<Brought>, ObjectId) {
+fn commit_of(
+  files: &[(Vec<u8>, Vec<u8>)],
+  parents: &[ObjectId],
+  date: u64,
+) -> (Vec<Brought>, ObjectId) {
   let mut brought = Vec::new();
   let mut named = Vec::new();
   for (name, bytes) in files {
@@ -252,11 +266,17 @@ fn t_a662_hostile_records_are_refused_by_kind() {
 fn assert_hostile_counts_and_words(bytes: &[u8]) {
   let with = |at: std::ops::Range<usize>, put: &[u8]| {
     let mut changed = bytes.to_vec();
-    changed.get_mut(at).expect("in the record").copy_from_slice(put);
+    changed
+      .get_mut(at)
+      .expect("in the record")
+      .copy_from_slice(put);
     changed
   };
   let moves_huge = with(16..24, &u64::MAX.to_le_bytes());
-  assert_eq!(Record::decode(&moves_huge, FORMAT), Err(RecordRefused::Count));
+  assert_eq!(
+    Record::decode(&moves_huge, FORMAT),
+    Err(RecordRefused::Count)
+  );
   let magic = with(0..4, b"GCHN");
   assert_eq!(Record::decode(&magic, FORMAT), Err(RecordRefused::Magic));
   let version = with(4..8, &2u32.to_le_bytes());
@@ -267,7 +287,10 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
   // Format: the objects' count follows the header (24 bytes), the move's key, version and marker (17) and its head (20).
   let objects_at = 24 + 17 + 20;
   let objects_huge = with(objects_at..objects_at + 8, &u64::MAX.to_le_bytes());
-  assert_eq!(Record::decode(&objects_huge, FORMAT), Err(RecordRefused::Count));
+  assert_eq!(
+    Record::decode(&objects_huge, FORMAT),
+    Err(RecordRefused::Count)
+  );
 }
 
 /// The markers, the format, the type and the end of `bytes` made hostile, each refused by its kind.
@@ -284,10 +307,16 @@ fn assert_hostile_marks(bytes: &[u8]) {
   if let Some(byte) = delta.get_mut(24 + 17 + 20 + 8) {
     *byte = 6;
   }
-  assert_eq!(Record::decode(&delta, FORMAT), Err(RecordRefused::Malformed));
+  assert_eq!(
+    Record::decode(&delta, FORMAT),
+    Err(RecordRefused::Malformed)
+  );
   let mut trailing = bytes.to_vec();
   trailing.push(0);
-  assert_eq!(Record::decode(&trailing, FORMAT), Err(RecordRefused::Trailing));
+  assert_eq!(
+    Record::decode(&trailing, FORMAT),
+    Err(RecordRefused::Trailing)
+  );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -343,7 +372,12 @@ impl Live {
     let mut writer = RecordWriter::default();
     for brought in objects {
       let arriving = incoming(brought, depth);
-      admit_object(&mut self.content, &self.store, (&mut push, &mut writer), arriving)?;
+      admit_object(
+        &mut self.content,
+        &self.store,
+        (&mut push, &mut writer),
+        arriving,
+      )?;
     }
     Ok(Pending {
       push,
@@ -359,7 +393,11 @@ impl Live {
   /// then.
   fn commit(&mut self, mut pending: Pending) -> Result<(), GitRefused> {
     let parts: Vec<Vec<Planned>> = if pending.split {
-      pending.moves.iter().map(|movement| vec![*movement]).collect()
+      pending
+        .moves
+        .iter()
+        .map(|movement| vec![*movement])
+        .collect()
     } else {
       vec![pending.moves.clone()]
     };
@@ -372,17 +410,34 @@ impl Live {
       .push
       .abandon(&mut self.content)
       .map_err(|refused| GitRefused::Object(PushRefused::Content(refused)))?;
-    let blobs = pending.brought.into_iter().filter(|(kind, ..)| *kind == Kind::Blob);
+    let blobs = pending
+      .brought
+      .into_iter()
+      .filter(|(kind, ..)| *kind == Kind::Blob);
     self.blobs.extend(blobs);
     Ok(())
   }
 
   /// One append's commit of `moves`: admitted against the store as it is now, its record written, committed.
-  fn commit_part(&mut self, pending: &mut Pending, moves: &[RecordedMove]) -> Result<(), GitRefused> {
+  fn commit_part(
+    &mut self,
+    pending: &mut Pending,
+    moves: &[RecordedMove],
+  ) -> Result<(), GitRefused> {
     let admitted = seal_moves(&self.content, &self.store, &mut pending.push, moves)?;
     let deepest = pending.push.deepest();
-    let record = record_of(&self.content, &self.store, (&pending.writer, deepest), moves)?;
-    commit_moves(&mut self.content, &mut self.store, &mut pending.push, (&admitted, moves))?;
+    let record = record_of(
+      &self.content,
+      &self.store,
+      (&pending.writer, deepest),
+      moves,
+    )?;
+    commit_moves(
+      &mut self.content,
+      &mut self.store,
+      &mut pending.push,
+      (&admitted, moves),
+    )?;
     pending.writer = RecordWriter::default();
     self.records.push(record);
     Ok(())
@@ -411,7 +466,12 @@ impl Live {
   }
 
   /// A push admitted and committed at once.
-  fn push(&mut self, objects: &[Brought], moves: Vec<Planned>, depth: u64) -> Result<(), GitRefused> {
+  fn push(
+    &mut self,
+    objects: &[Brought],
+    moves: Vec<Planned>,
+    depth: u64,
+  ) -> Result<(), GitRefused> {
     let pending = self.begin(objects, depth, (moves, false))?;
     self.commit(pending)
   }
@@ -435,7 +495,12 @@ impl Live {
 }
 
 /// What a test compares of a version: D(k), its head, its root tree and its derived value.
-type VersionFacts = (Option<Positions>, Option<ObjectId>, Option<ObjectId>, Option<ContentId>);
+type VersionFacts = (
+  Option<Positions>,
+  Option<ObjectId>,
+  Option<ObjectId>,
+  Option<ContentId>,
+);
 
 /// What a test compares of a ref: each version's facts, its reached set, and its green's version at each.
 type RefFacts = (Vec<VersionFacts>, Option<Positions>, Vec<u64>);
@@ -697,7 +762,11 @@ impl History {
     if let Some(held) = self.held.take() {
       self.commit(held)?;
     }
-    prop_assert_eq!(&self.live.records, &self.reference.records, "both stores record alike");
+    prop_assert_eq!(
+      &self.live.records,
+      &self.reference.records,
+      "both stores record alike"
+    );
     if extra.recover {
       self.recover()?;
     }
@@ -752,7 +821,11 @@ impl History {
     if let Some(held) = self.held.take() {
       self.commit(held)?;
     }
-    prop_assert_eq!(&self.live.records, &self.reference.records, "both stores record alike");
+    prop_assert_eq!(
+      &self.live.records,
+      &self.reference.records,
+      "both stores record alike"
+    );
     let recovered = self.live.recovered().map_err(fail)?;
     prop_assert_eq!(recovered.facts(), self.reference.facts());
     prop_assert_eq!(self.live.facts(), self.reference.facts());
@@ -766,7 +839,13 @@ fn step() -> impl Strategy<Value = Step> {
     any::<u8>(),
     any::<u8>(),
     any::<u8>(),
-    proptest::collection::vec((any::<u8>(), proptest::collection::vec(any::<u8>(), 0..200)), 1..4),
+    proptest::collection::vec(
+      (
+        any::<u8>(),
+        proptest::collection::vec(any::<u8>(), 0..BLOB_BYTES),
+      ),
+      1..4,
+    ),
     any::<bool>(),
     any::<u8>(),
     any::<u8>(),
@@ -805,7 +884,13 @@ proptest! {
 /// too, and every kind counted, so a dead branch of the generator can never pass the oracle unseen.
 #[test]
 fn t_a662_a_fixed_history_makes_every_kind_of_push_and_recovers() {
-  let files = |byte: u8| vec![(byte, vec![byte; 150]), (byte.wrapping_add(1), vec![byte; 7])];
+  // Shape: each commit's files: a blob over three windows and one within one.
+  let files = |byte: u8| {
+    vec![
+      (byte, vec![byte; WINDOW * 2 + WINDOW / 2]),
+      (byte.wrapping_add(1), vec![byte; 7]),
+    ]
+  };
   // Each sixth byte (`Extra`): 9 reversed and recovered, 2 at depth 1, 8 recovered, 5 reversed at depth 2, 14
   // recovered at depth 3, 1 reversed, 6 at depth 3. Each last byte (`Order`): 1 a ref at a time, 2 held back, 4 what
   // the push held back holds sent whole.
@@ -932,8 +1017,14 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
       stores.store(git),
       Some(RepositoryStore::Git(store)) if store.repository.format() == FORMAT
     ));
-    assert!(matches!(stores.store(hg), Some(RepositoryStore::Mercurial(_))));
-    assert!(matches!(stores.store(svn), Some(RepositoryStore::Subversion(_))));
+    assert!(matches!(
+      stores.store(hg),
+      Some(RepositoryStore::Mercurial(_))
+    ));
+    assert!(matches!(
+      stores.store(svn),
+      Some(RepositoryStore::Subversion(_))
+    ));
     assert!(state.vcs_stores.mercurial(hg).is_some());
     // Made with its record: Subversion's revision 0, an empty root.
     let youngest = state
@@ -979,7 +1070,10 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
       Refusal::BudgetExceeded { available }
     );
     let moved = GitRefused::Store(StoreRefused::Moved { green: 1 });
-    assert_eq!(super::refusal_of(state, &moved), Refusal::ContentUnavailable);
+    assert_eq!(
+      super::refusal_of(state, &moved),
+      Refusal::ContentUnavailable
+    );
     assert_eq!(state.refusals.get(super::COMMIT_REFUSED).copied(), Some(1));
   });
 }
@@ -1005,17 +1099,24 @@ fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) 
   begun_at(state, repository, objects, 0)
 }
 
-/// A-618's work for `push` on `green`, from `base` (a version and its tree) to `head`'s tree, read through A-638's view.
+/// A-618's work for `push` on `green`, from `base` (a version and its tree) to `head`'s tree, read through A-638's view
+/// with the room the shard lends the read.
 fn work_of(
-  state: &ShardState,
+  state: &mut ShardState,
   (push, green): (&GitPush, DbVolumeId),
   (version, base): (u64, Option<ObjectId>),
   (head, tree_id): (ObjectId, ObjectId),
 ) -> slates_merge::engine::Increment {
   let key = |id: ObjectId| work::ObjectKey::new(id.as_bytes()).expect("a key");
+  let ShardState {
+    store,
+    vcs_stores,
+    greens,
+    ..
+  } = state;
   push
-    .read(&state.vcs_stores, |view| {
-      let engine = state.greens.get(&green).expect("the green's engine");
+    .read((store, vcs_stores), |view| {
+      let engine = greens.get(&green).expect("the green's engine");
       let asked = work::Push {
         name: *b"A-662 a push through its entry..",
         base_version: version,
@@ -1036,7 +1137,13 @@ fn appended(
   changes: Vec<BranchChange>,
   sealed: (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<Appended, crate::repository::push::AppendRefused> {
-  crate::repository::push::push_sealed(state, (&owner(), repository), changes, EntryParts::default(), sealed)
+  crate::repository::push::push_sealed(
+    state,
+    (&owner(), repository),
+    changes,
+    EntryParts::default(),
+    sealed,
+  )
 }
 
 /// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its
@@ -1117,11 +1224,17 @@ fn assert_made_again_whole(state: &mut ShardState, repository: RepositoryId, gre
   super::rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
   let made = {
-    let (content, store) = state.vcs_stores.git_ref(repository).expect("the store made again");
+    let (content, store) = state
+      .vcs_stores
+      .git_ref(repository)
+      .expect("the store made again");
     facts(content, store, greens)
   };
   assert_eq!(made, live);
-  assert_eq!(state.refusals.get(super::REPLAYED).copied(), Some(replayed + count));
+  assert_eq!(
+    state.refusals.get(super::REPLAYED).copied(),
+    Some(replayed + count)
+  );
 }
 
 /// A-662 (a push without `atomic`, a ref at a time from one sealed push, as `repository::push` appends each). Do: admit
@@ -1141,8 +1254,13 @@ fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
     let main = vec![BranchChange::Update { green: root, work }];
     let moves = [(Target::Green(root), Some(one))];
     appended(state, repository, main, (&mut sealed, &moves)).expect("the default branch");
-    let made = appended(state, repository, topic_at(root, 1), (&mut sealed, &topic_move(one)))
-      .expect("topic");
+    let made = appended(
+      state,
+      repository,
+      topic_at(root, 1),
+      (&mut sealed, &topic_move(one)),
+    )
+    .expect("topic");
     sealed.abandon(state);
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.objects.len()));
@@ -1172,8 +1290,13 @@ fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
     let moves = [(Target::Green(root), Some(one))];
     appended(state, repository, main, (&mut first, &moves)).expect("the first");
     first.abandon(state);
-    let made = appended(state, repository, topic_at(root, 1), (&mut second, &topic_move(one)))
-      .expect("the second");
+    let made = appended(
+      state,
+      repository,
+      topic_at(root, 1),
+      (&mut second, &topic_move(one)),
+    )
+    .expect("the second");
     second.abandon(state);
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.objects.len()));
@@ -1206,24 +1329,42 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
     let second_tree = tree_of(&second);
     let push = begun(state, repository, &second);
     let stale = work_of(state, (&push, root), (0, None), (two, second_tree));
-    let fresh = work_of(state, (&push, root), (1, Some(first_tree)), (two, second_tree));
+    let fresh = work_of(
+      state,
+      (&push, root),
+      (1, Some(first_tree)),
+      (two, second_tree),
+    );
     let mut sealed = push.seal(state).expect("sealed");
     let moves = [(Target::Green(root), Some(two))];
     let held = state.vcs_stores.content().map(ContentStore::used);
-    let changes = vec![BranchChange::Update { green: root, work: stale }];
+    let changes = vec![BranchChange::Update {
+      green: root,
+      work: stale,
+    }];
     assert!(appended(state, repository, changes, (&mut sealed, &moves)).is_err());
     assert_eq!(state.vcs_stores.content().map(ContentStore::used), held);
     assert_eq!(records(state, repository).len(), 1);
-    let changes = vec![BranchChange::Update { green: root, work: fresh }];
+    let changes = vec![BranchChange::Update {
+      green: root,
+      work: fresh,
+    }];
     let made = appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
-    assert!(matches!(made.changes.first(), Some(BranchAppended::Moved { version: 2, .. })));
+    assert!(matches!(
+      made.changes.first(),
+      Some(BranchAppended::Moved { version: 2, .. })
+    ));
     sealed.abandon(state);
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).expect("a record");
     assert_eq!(read.objects.len(), second.len());
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     let key = green_key(root);
-    let newest = store.repository.versions(key).checked_sub(1).expect("a version");
+    let newest = store
+      .repository
+      .versions(key)
+      .checked_sub(1)
+      .expect("a version");
     assert_eq!(store.repository.head(content, key, newest), Some(two));
   });
 }
@@ -1260,7 +1401,12 @@ fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
     let (second, two) = commit_of(&files, &[one], FIRST_DATE + 1);
     let second_tree = tree_of(&second);
     assert_eq!(
-      push_through(state, (repository, root), &second, (Some(first_tree), two, second_tree)),
+      push_through(
+        state,
+        (repository, root),
+        &second,
+        (Some(first_tree), two, second_tree)
+      ),
       2
     );
     assert_recorded_and_charged(state, repository, root, (first.len(), second.len()));
@@ -1314,7 +1460,12 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
     let files = [(b"README".to_vec(), b"topic\n".to_vec())];
     let (topic, head) = commit_of(&files, &[one], FIRST_DATE + 1);
     let push = begun(state, repository, &topic);
-    let work = work_of(state, (&push, root), (1, Some(first_tree)), (head, tree_of(&topic)));
+    let work = work_of(
+      state,
+      (&push, root),
+      (1, Some(first_tree)),
+      (head, tree_of(&topic)),
+    );
     let mut sealed = push.seal(state).expect("sealed");
     let changes = vec![BranchChange::Create {
       name: "topic".to_owned(),
@@ -1322,8 +1473,8 @@ fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
       version: 1,
       work: Some(work),
     }];
-    let made = appended(state, repository, changes, (&mut sealed, &topic_move(head)))
-      .expect("appended");
+    let made =
+      appended(state, repository, changes, (&mut sealed, &topic_move(head))).expect("appended");
     sealed.abandon(state);
     let Some(BranchAppended::Created { green, version: 1 }) = made.changes.first().cloned() else {
       panic!("not created: {made:?}");

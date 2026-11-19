@@ -146,7 +146,9 @@ fn a_chain_carried_by_a_push_of_no_object_teaches_the_depth() {
     push.carried(carried);
     repository.seal(&store, &mut push).unwrap();
     let admitted = repository.admit(&store, &push, green, Some(head)).unwrap();
-    repository.commit(&mut store, &mut push, &[admitted]).unwrap();
+    repository
+      .commit(&mut store, &mut push, &[admitted])
+      .unwrap();
     assert_eq!(repository.learned_depth(), learned);
   }
 }

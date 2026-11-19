@@ -263,15 +263,15 @@ impl<'a> Reader<'a> {
 
   /// The next word.
   fn word(&mut self) -> Result<u32, RecordRefused> {
-    let bytes = <[u8; WORD_BYTES]>::try_from(self.take(WORD_BYTES)?)
-      .map_err(|_| RecordRefused::Truncated)?;
+    let bytes =
+      <[u8; WORD_BYTES]>::try_from(self.take(WORD_BYTES)?).map_err(|_| RecordRefused::Truncated)?;
     Ok(u32::from_le_bytes(bytes))
   }
 
   /// The next long.
   fn long(&mut self) -> Result<u64, RecordRefused> {
-    let bytes = <[u8; LONG_BYTES]>::try_from(self.take(LONG_BYTES)?)
-      .map_err(|_| RecordRefused::Truncated)?;
+    let bytes =
+      <[u8; LONG_BYTES]>::try_from(self.take(LONG_BYTES)?).map_err(|_| RecordRefused::Truncated)?;
     Ok(u64::from_le_bytes(bytes))
   }
 

@@ -48036,7 +48036,14 @@ the store's module docs; three tests in `tests::store::upload`; and A-665's test
   second's record named an object its commit never positioned, and a recovery refused that too. (3) The writer copied
   every object's bytes beside the quarantine's, uncharged, and cloned them again to finish the record. (4) The versions
   kept for `version_of` were not charged. And the step's room was asked of the budget, not the store (`lend`): it did
-  not compile, having been written while no machine could build it.
+  not compile, having been written while no machine could build it. Its first build (Mac Studio, 2026-11-19) found
+  two more. (5) `GitPush::read` lent A-618's work builder A-638's view over a settled store, whose budget is what it
+  holds, and the view lists a tree within the store's room (`ContentStore::room`), so every work's root tree was refused
+  `PastRoom { asked: 56, room: 0 }`: the five tests that build a work through the shard failed at it. A read is now
+  lent room as every step is (`lend`) and gives it back after, holding nothing. (6) The store-level tests held content
+  in 64-byte windows, below the store's longest row (an object row's key, root and fields with its table's frame,
+  `RowPastWindow`), so the oracle and the fixed history were refused at their first push; their window is A-614's
+  view tests' 256 bytes, and their blobs run to three windows.
 - **Mercurial and Subversion.** Their arms are placed, made, charged (the Mercurial index through the content store),
   freed and recovered here; their records and replay are their push pieces' (g304's unbundle, g268's commit step), and a
   recovery refuses a record of either typed (`Owed`) until then.

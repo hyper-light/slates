@@ -348,7 +348,13 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
   }
   // The repository's tool store, beside its record, on its owner shard (A-662).
-  if let Some(record) = state.db.partition().repositories().repository(repository).cloned() {
+  if let Some(record) = state
+    .db
+    .partition()
+    .repositories()
+    .repository(repository)
+    .cloned()
+  {
     crate::vcs_store::make(state, &record);
   }
 }

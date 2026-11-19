@@ -289,7 +289,10 @@ pub(crate) fn push(
 
 /// One move of a git push's store (A-662): the green it names, a new branch's by its name, and its new head, none to
 /// delete it.
-pub(crate) type StoreMove = (crate::vcs_store::Target, Option<slates_git::object_name::ObjectId>);
+pub(crate) type StoreMove = (
+  crate::vcs_store::Target,
+  Option<slates_git::object_name::ObjectId>,
+);
 
 /// [`push`] of a git push whose objects `sealed` holds (A-662): the entry holds their record, and the repository's store
 /// commits them with `moves` between the register's guard and the entry's apply, each move resolved once the new
@@ -306,7 +309,13 @@ pub(crate) fn push_sealed(
   if sealed.repository() != repository {
     return Err(AppendRefused::Repository(Refusal::NotFound));
   }
-  push_holding(state, (principal, repository), changes, parts, Some((sealed, moves)))
+  push_holding(
+    state,
+    (principal, repository),
+    changes,
+    parts,
+    Some((sealed, moves)),
+  )
 }
 
 /// A sealed push and the moves its append commits.
@@ -547,12 +556,16 @@ fn push_planned(
   if let Some((sealed, moves)) = sealed.as_mut() {
     let resolved = resolve(state, (&steps, &entry), moves)?;
     if let Err(refused) = sealed.admit(&mut state.vcs_stores, resolved) {
-      return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
+      return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+        state, &refused,
+      )));
     }
     match sealed.record(&state.vcs_stores) {
       Ok(objects) => entry.objects = objects,
       Err(refused) => {
-        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
+        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+          state, &refused,
+        )));
       }
     }
   }
@@ -570,7 +583,9 @@ fn push_planned(
   let store_committed = match sealed {
     Some((sealed, _)) => {
       if let Err(refused) = crate::vcs_store::commit(state, sealed) {
-        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)));
+        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+          state, &refused,
+        )));
       }
       true
     }
@@ -608,12 +623,18 @@ fn resolve(
         crate::vcs_store::Target::Created(name) => steps
           .iter()
           .find_map(|step| match step {
-            Step::Create { name: made, record, .. } if made == name => Some((record.id, 0)),
+            Step::Create {
+              name: made, record, ..
+            } if made == name => Some((record.id, 0)),
             _ => None,
           })
           .ok_or(AppendRefused::Entry(Refusal::NotFound))?,
       };
-      Ok((crate::vcs_store::green_key(green), version_of(green, otherwise), *head))
+      Ok((
+        crate::vcs_store::green_key(green),
+        version_of(green, otherwise),
+        *head,
+      ))
     })
     .collect()
 }
