@@ -319,6 +319,7 @@ impl PackSource for NoPacks {
     &mut self,
     _served: &Served<'_>,
     _pack: &mut (),
+    _admission: &mut Admission,
     _out: &mut Vec<u8>,
     _room: usize,
   ) -> Result<bool, PackRefused> {
