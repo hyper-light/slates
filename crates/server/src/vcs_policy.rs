@@ -6,7 +6,7 @@
 //! - git: a ref name, covered as `git for-each-ref` covers one: "either using fnmatch(3) or literally, in the latter
 //!   case matching completely or from the beginning up to a slash" [B: `for-each-ref-options.adoc` at git e1ec09b23],
 //!   a pattern ending in `/` covering every ref beneath it and the glob being `wildmatch` with `WM_PATHNAME` [C:
-//!   `ref-filter.c` `match_name_as_path`; [`crate::wildmatch`]]. The rule that decides is the last that covers the
+//!   `ref-filter.c` `match_name_as_path`; [`slates_vcs::wildmatch`]]. The rule that decides is the last that covers the
 //!   name: "If you have multiple hideRefs values, later entries override earlier ones" [B: `config/transfer.adoc`
 //!   `transfer.hideRefs`; C: `refs.c` `ref_is_hidden` reads the entries from the last], the one precedence git
 //!   documents among a server's ref patterns.
@@ -18,10 +18,10 @@
 //!   topic rules, and the topic extension's options read for §4.17.3 give none, so topics take bookmarks' form.
 //! - Subversion: a repository path, covered as an authz section covers one: `/path` literally, `:glob:/path` with `*`
 //!   for exactly one segment, `**` for any number of segments, and classic wildcards within a segment [B: Subversion
-//!   1.10 release notes, "Improved path-based authorization"], a segment's wildcards read by [`crate::wildmatch`]. The
-//!   precedence is authz's lookup [C: `libsvn_repos/authz.c` at fd4e82b00]: it walks the path a segment at a time and
-//!   at each depth takes the rule matching there "with the highest SEQUENCE_NUMBER ..., i.e. the latest one defined in
-//!   the authz file", inheriting the depth above where none matches; so the deepest depth at which a rule matches
+//!   1.10 release notes, "Improved path-based authorization"], a segment's wildcards read by [`slates_vcs::wildmatch`].
+//!   The precedence is authz's lookup [C: `libsvn_repos/authz.c` at fd4e82b00]: it walks the path a segment at a time
+//!   and at each depth takes the rule matching there "with the highest SEQUENCE_NUMBER ..., i.e. the latest one defined
+//!   in the authz file", inheriting the depth above where none matches; so the deepest depth at which a rule matches
 //!   decides, and of the rules matching there the one defined last (a `**` matches at every depth it spans, which is
 //!   how a later `/trunk/**` eclipses an earlier `/trunk/a`, as `trim_tree` does). A rule that does not name the
 //!   principal takes no part (`process_acl` skips an ACL with nothing for the user).
@@ -40,7 +40,8 @@
 //! begin with; Mercurial's by namespace and name, with `*` apart; Subversion's literal rules by their canonical path,
 //! one look-up a depth, with the rules holding wildcards matched by the positions each segment can reach. The tests'
 //! oracles try every rule in order, as each tool's documentation states the rule, with git's own matcher transcribed
-//! (`crate::wildmatch::reference`), and every generated history must get the same verdict from both.
+//! (`crate::wildmatch_reference`, slates-vcs's own file), and every generated history must get the same verdict
+//! from both.
 //!
 //! **The push's check point (A-622 part 2).** [`admit`] is the one function every push path calls before it submits
 //! its register entry (git's receive-pack, Subversion's commit editor, Mercurial's unbundle): the repository's policy,
@@ -66,9 +67,9 @@ use std::collections::HashMap;
 use slates_db::catalog::{Principal, RepositoryRecord};
 use slates_git::object_name::ObjectId;
 use slates_git::store::{StoreRefused, Unsigned};
+use slates_vcs::wildmatch::{Glob, is_glob_special};
 
 use crate::signed_work::{SignatureRefusal, TrustedKey};
-use crate::wildmatch::{Glob, is_glob_special};
 
 /// A right a rule allows or denies (§4.17.1 "Policy": "who may read, who may submit, whether a rewrite ... or a delete
 /// is allowed").
@@ -1026,7 +1027,7 @@ mod tests {
     Effect, Entry, GitPolicy, HgPattern, HgPolicy, Namespace, PathPattern, PatternRefused,
     Principal, RefPattern, Right, Rule, SvnPolicy, Verdict, Who,
   };
-  use crate::wildmatch::reference;
+  use crate::wildmatch_reference as reference;
 
   /// The principal with uid `uid` on host 0.
   fn principal(uid: u32) -> Principal {

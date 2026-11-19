@@ -40,11 +40,18 @@ slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
 slates-ssh = { workspace = true }
 # Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
-# and places a push; its index and content store are slates-vcs's.
+# and places a push; its index and content store are slates-vcs's. The repositories' stores on their owner shard
+# (A-662, `crate::vcs_store`): the content store every tool's store holds its objects in, and Mercurial's and
+# Subversion's indexes beside git's. A repository's `.hg` is read through the base plane's host seam for Mercurial's
+# import (§4.17.3 piece 3, A-649 part 4; `crate::hg_base`).
 slates-hg = { workspace = true }
-# The shared content store git's object store rides on (§4.17.1 shared piece 3): a protected branch's questions read
-# A-614's store through it (`crate::git_protect`, A-644).
+# The version-control servers' shared crate (§4.17.1 shared piece 3): Mercurial's index and content store (A-657);
+# git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); the
+# content store git's object store rides on, through which a protected branch's questions read A-614's store
+# (`crate::git_protect`, A-644); and, in tests, the content store an upload-pack test's empty repository is kept in
+# (A-625 part 3; `crate::vcs_http::git::upload`).
 slates-vcs = { workspace = true }
+slates-svn = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }
 
@@ -79,8 +86,6 @@ slates-bridge-winfsp = { workspace = true }
 [dev-dependencies]
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
 rcgen = { workspace = true }
-# The content store an upload-pack test's empty repository is kept in (A-625 part 3; `crate::vcs_http::git::upload`).
-slates-vcs = { workspace = true }
 # The guest-device test builds the FUSE requests a guest kernel would (the codec's ABI constants).
 slates-bridge-fuse = { workspace = true }
 # The typed client, for the recovery oracle (§4.8 A-9, AC-2.12): it drives the same verbs a session

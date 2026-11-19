@@ -116,6 +116,9 @@ struct Register {
   marker_ids: BTreeSet<[u8; 32]>,
   /// The locks, by path.
   locks: BTreeMap<String, Vec<u8>>,
+  /// Each entry's objects (A-662), in the order the register received them: what a recovery replays through the
+  /// repository's tool store. Not a log of its own, so no entry joins on it (A-642).
+  objects: Vec<Vec<u8>>,
 }
 
 impl Register {
@@ -250,7 +253,15 @@ impl Register {
       .iter()
       .map(|(path, lock)| entry::lock_bytes(path, lock))
       .fold(0, usize::saturating_add);
-    roots.saturating_add(markers).saturating_add(locks)
+    let objects = self
+      .objects
+      .iter()
+      .map(Vec::len)
+      .fold(0, usize::saturating_add);
+    roots
+      .saturating_add(markers)
+      .saturating_add(locks)
+      .saturating_add(objects)
   }
 
   /// The state as a snapshot carries it.
@@ -279,6 +290,7 @@ impl Register {
           lock: lock.clone(),
         })
         .collect(),
+      objects: self.objects.clone(),
     }
   }
 
@@ -293,6 +305,7 @@ impl Register {
       names: record.names_position,
       phases: record.phases_position,
       locks_position: record.locks_position,
+      objects: record.objects.clone(),
       ..Register::default()
     };
     for root in &record.phase_roots {
@@ -561,6 +574,27 @@ impl Repositories {
       .get(&repository)
       .into_iter()
       .flat_map(|register| register.markers.iter().map(Vec::as_slice))
+  }
+
+  /// `repository`'s entries' objects (A-662), in the order its register received them: what a recovery replays through
+  /// its tool store.
+  pub fn objects(&self, repository: RepositoryId) -> impl Iterator<Item = &[u8]> + '_ {
+    self
+      .registers
+      .get(&repository)
+      .into_iter()
+      .flat_map(|register| register.objects.iter().map(Vec::as_slice))
+  }
+
+  /// `repository`'s entry objects at `index` in the order its register received them (A-662): what a recovery replays a
+  /// record at a time.
+  pub fn object_record(&self, repository: RepositoryId, index: usize) -> Option<&[u8]> {
+    self
+      .registers
+      .get(&repository)?
+      .objects
+      .get(index)
+      .map(Vec::as_slice)
   }
 
   /// Every register, in repository order: what a snapshot carries (A-603).
@@ -923,6 +957,11 @@ impl Repositories {
     if let Some(register) = self.registers.get_mut(&entry.repository) {
       for change in &entry.state {
         bytes.add(register.apply(change));
+      }
+      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record.
+      if !entry.objects.is_empty() {
+        bytes.added = bytes.added.saturating_add(entry.objects.len());
+        register.objects.push(entry.objects.clone());
       }
       let after = register.positions();
       for ((log, from), (_, to)) in before.into_iter().zip(after) {
