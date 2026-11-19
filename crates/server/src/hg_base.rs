@@ -349,7 +349,7 @@ fn same_path(names: &[Vec<u8>], path: &[&[u8]]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
   use std::collections::{BTreeMap, BTreeSet};
 
   use slates_hg::import::{
@@ -367,7 +367,7 @@ mod tests {
   use super::{BaseRefused, HgBase, Opened};
 
   /// A repository's files, each by its path under `.hg`, with its bytes.
-  type Files = &'static [(&'static str, &'static [u8])];
+  pub(crate) type Files = &'static [(&'static str, &'static [u8])];
 
   /// An index's rows, each its key and its body.
   type Rows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -393,7 +393,7 @@ mod tests {
   /// Shape: the `states` repository stock 7.2 kept (`crates/hg/fixtures/state/make-state-fixtures.sh`): drafts, an
   /// amend, a secret changeset, bookmarks and obsolescence markers; its store share-safe, listed by its fncache, and
   /// its changelog split into an index and a data file, which the reader reads in turn.
-  const STATES: Files = repository!(
+  pub(crate) const STATES: Files = repository!(
     "state/states",
     [
       "requires" => "state/states-hg-requires.txt",
@@ -479,7 +479,9 @@ mod tests {
 
   /// A host holding `files` under `/repository/.hg`, each directory made once and before what it holds, and the
   /// repository's directory open.
-  fn laid_out<'f>(files: impl IntoIterator<Item = (&'f str, &'f [u8])>) -> (SimHost, HostDir) {
+  pub(crate) fn laid_out<'f>(
+    files: impl IntoIterator<Item = (&'f str, &'f [u8])>,
+  ) -> (SimHost, HostDir) {
     let mut host = SimHost::new();
     let files: Vec<(String, &[u8])> = files
       .into_iter()

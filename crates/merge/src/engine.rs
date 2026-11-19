@@ -409,7 +409,8 @@ pub enum Rebased {
     /// The head the work is now based on.
     version: u64,
     /// Per path the work changed: its bytes after the rebase where they differ from the head's, or
-    /// `None` where the work removes a file the head holds.
+    /// `None` where the work removes a file the head holds; and each link the work's removal or
+    /// replacement of a file's home hands its node to, holding the node's bytes (A-669, A-677).
     changed: BTreeMap<String, Option<Vec<u8>>>,
     /// The work's declared operations restated relative to the new base.
     journal: Vec<crate::increment::VolumeOp>,
@@ -3987,7 +3988,8 @@ impl Green {
   /// attributes, and every other surviving link names it there. When the version renames a home,
   /// its links name the new home. Derived from the head and the version's own effects, so a replay
   /// derives the same; never recorded, since they are the node model's consequence, not a work's
-  /// operation, and a rebase restates only the work's (`Green::rebased_from`).
+  /// operation, and a rebase's journal restates only the work's (`Green::rebased_from`), while its
+  /// changes show the files the moves leave ([`Green::heirs_of`], A-677).
   fn node_moves(&self, effects: &[Effect]) -> Vec<Effect> {
     let mut links: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     let mut removed: BTreeSet<&str> = BTreeSet::new();
@@ -4028,6 +4030,22 @@ impl Green {
       self.hand_over(home, self.surviving_links(home, &links), &mut moves);
     }
     moves
+  }
+
+  /// The files a version's node moves leave at the links its removed or replaced homes hand their
+  /// nodes to ([`Green::node_moves`], [`Green::hand_over`]): each heir with the node's bytes, as the
+  /// commit makes them (A-669's rule: the link takes the node as the version leaves it). A rebase's
+  /// changes hold them so the work reads the link the submit would keep, while its journal holds
+  /// none, since a volume's link names the node already (A-677).
+  fn heirs_of(&self, effects: &[Effect]) -> Vec<(String, Option<Vec<u8>>)> {
+    self
+      .node_moves(effects)
+      .into_iter()
+      .filter_map(|moved| match moved {
+        Effect::SetContent(heir, bytes, ..) => Some((heir, Some(bytes.unwrap_or_default()))),
+        _ => None,
+      })
+      .collect()
   }
 
   /// The links naming the node at `home` once the version's link effects (`links`: each link's last
@@ -5169,10 +5187,14 @@ impl Green {
   /// them ([`in_replay_order`], A-663): each hard link where the node it names still stands at the name
   /// it names it by, and one made where the head holds another after that one's removal. A node handed
   /// on to a link with the work's writes is restated as the work made it, the writes on its home and
-  /// then the home's removal ([`Green::handed_in`], A-669). The green is not touched.
+  /// then the home's removal ([`Green::handed_in`], A-669). A node the work's removal or replacement
+  /// of its home hands on to a link is in the changes at that link, holding the node's bytes, and in
+  /// no operation of the journal ([`Green::heirs_of`], A-677). The green is not touched.
   fn rebased_from(&self, mut effects: Vec<Effect>, to: u64, post_state: &[u8]) -> Rebased {
     use crate::increment::VolumeOp;
     self.make_mapped(&mut effects, post_state);
+    // The links the version's removals and replacements hand a node to, as the commit hands it on (A-669's rule).
+    let heirs = self.heirs_of(&effects);
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     // The sources of the renames restated: each one's removal is the rename's, not an unlink of its own.
@@ -5258,6 +5280,8 @@ impl Green {
         Effect::CopyTree { .. } => {}
       }
     }
+    // After the work's own changes, as the commit applies its node moves after the version's effects.
+    changed.extend(heirs);
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
     // removal of a file the head does not hold, are no change.
     changed.retain(|path, after| after.as_deref() != self.content.get(path));
