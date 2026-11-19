@@ -29,7 +29,9 @@
 pub mod batch;
 pub mod json;
 pub mod locks;
+pub mod objects;
 pub mod pointer;
+pub mod serve;
 
 use crate::out::Out;
 
@@ -87,6 +89,13 @@ impl Oid {
         out.put(&[*digit]);
       }
     }
+  }
+}
+
+impl AsRef<[u8]> for Oid {
+  /// The id's 32 bytes: how `slates-vcs` keys an object (A-629).
+  fn as_ref(&self) -> &[u8] {
+    &self.0
   }
 }
 
