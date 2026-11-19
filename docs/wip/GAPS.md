@@ -467,10 +467,12 @@
 > filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
 > hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
 > certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
-> Subversion's environment is its hooks-env section alone (A-623). Owed, Mercurial 7.2's: `_exthook` always sets
-> `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`; empty when off) and `shellenviron` sets
-> `HG` to hg's executable, both unset under slates; and the transaction's `HG_TXNID` and `HG_TXNNAME`
-> (`research/mercurial-server.md` §6), which slates' changegroup hooks lack.
+> Subversion's environment is its hooks-env section alone (A-623). Mercurial 7.2's, closed by A-657 part 4 (g304,
+> 2026-11-19): `_exthook` always sets `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`)
+> and `shellenviron` sets `HG`, and the transaction adds `HG_BUNDLE2`, `HG_TXNID` and `HG_TXNNAME`
+> (`research/mercurial-server.md` §6); recorded from stock 7.2's own `pretxnchangegroup` and `changegroup`
+> (`crates/hg/fixtures/hooks`), slates' changegroup hooks now carry all five, held to the recording by `vcs_hooks`'
+> test.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
