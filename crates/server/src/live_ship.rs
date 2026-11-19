@@ -277,6 +277,11 @@ pub(crate) struct LiveVolume {
   /// How long this volume's entries take from their publication to their durability (A-396, [`crate::live_hold`]): a
   /// reply held for the newest one holds this shard's window until it is expected ([`hold_for_answer`]).
   answers: crate::live_hold::AnswerWindow,
+  /// Whether its log began new on this node and has not yet answered a writer at a whole entry (A-577): until it does,
+  /// no takeover finds the volume's state in it, so its status reports the window its seals leave
+  /// ([`holds_nothing_yet`]). Cleared for good the first time it answers ([`resolve`]); a log adopted by a takeover or
+  /// resumed by its owner holds its volume's state from before and never sets it.
+  nothing_answered: bool,
 }
 
 /// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
@@ -1406,6 +1411,21 @@ pub(crate) fn join(
   true
 }
 
+/// Whether an owner loss now would lose live-shipped volume `id`'s state with its log (A-577): its log began new on
+/// this node and has not yet answered a writer at a whole entry ([`LiveVolume::nothing_answered`]), or nothing of it
+/// was ever shipped (no shipper yet, no holders recorded in its catalog, and not rebuilt from a log by a takeover: a
+/// new clone before its first publication, a volume just made live). Its status then reports the window its seals
+/// leave, not zero (`verbs::at_risk_ns`): before, a live clone with nothing durable read a zero window.
+pub(crate) fn holds_nothing_yet(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
+  match state.live.shipping.get(&id.bytes) {
+    Some(live) => live.nothing_answered && answerable(state, id.bytes).is_none(),
+    None => state.db.partition().volume(id).is_some_and(|record| {
+      record.policy.live_holders.is_none()
+        && !record.taken_over.is_some_and(|taken| taken.from_live_log)
+    }),
+  }
+}
+
 /// Answers every verb waiting on `volume` at or below its durable position: its completion recorded on this partition
 /// (one durable step, so a retry after meets it) and its reply delivered to its client's shard, as a green's accepted
 /// submit is (`merge_service::resolve_accepted`).
@@ -1415,6 +1435,10 @@ pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
     count_held_back(state, volume);
     return;
   };
+  // A new log that answers at a whole entry holds the volume where a takeover finds it, for good (A-577).
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.nothing_answered = false;
+  }
   let keys: Vec<([u8; 16], u64)> = state
     .live
     .awaiting
@@ -1810,8 +1834,9 @@ const LIVE_YIELD_REFUSED: &str = "fleet.live.yield_refused";
 /// it and tells every write waiting on it so; a fence learned now is kept before anyone is told, as a holder keeps a
 /// fence it raised, so a restart does not forget it (A-344; a refused publication leaves the mark for the next); and
 /// its mounts of the volume learn of it at once (A-346): a FUSE mount ends as a revoked one does
-/// (`crate::fuse::superseded`), and an NFS mount answers `NFS3ERR_STALE` at its next request (`crate::nfs`'s gate reads
-/// [`superseded`]). Nothing for a volume this shard ships no log of.
+/// (`crate::fuse::superseded`), a Shards stream too (`crate::shards::superseded`, A-584), and an NFS mount answers
+/// `NFS3ERR_STALE` at its next request (`crate::nfs`'s gate reads [`superseded`]). Nothing for a volume this shard ships
+/// no log of.
 fn learn_superseded(state: &mut ShardState, volume: [u8; 16], current: HostEpoch) {
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return;
@@ -1825,16 +1850,17 @@ fn learn_superseded(state: &mut ShardState, volume: [u8; 16], current: HostEpoch
     }
     #[cfg(target_os = "linux")]
     crate::fuse::superseded(state, slates_db::catalog::VolumeId { bytes: volume });
+    crate::shards::superseded(state, slates_db::catalog::VolumeId { bytes: volume });
   }
   refuse_awaiting(state, volume, current);
   wake_parked(state, volume);
 }
 
 /// Test support (`Daemon::inject_superseded`, never reachable from the wire): this owner is superseded on `id` at
-/// `epoch`, `learned` now, as a holder's answer with a later fence finds it ([`learn_superseded`], its mounts told), or
-/// else as a restart over a kept fence finds it (A-344: the fence kept, no mount told, each mount's own turn finds it).
-/// A volume this shard ships no log of is marked by a kept fence either way. So a mount's answer to a takeover is driven
-/// without a fleet, each path alone.
+/// `epoch`, `learned` now, as a holder's answer with a later fence finds it ([`learn_superseded`], its mounts and
+/// streams told), or else as a restart over a kept fence finds it (A-344: the fence kept, none told, each mount's and
+/// stream's own turn finds it). A volume this shard ships no log of is marked by a kept fence either way. So a mount's
+/// or a stream's answer to a takeover is driven without a fleet, each path alone.
 pub(crate) fn inject_superseded(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -1861,6 +1887,9 @@ pub(crate) fn inject_superseded(
   #[cfg(target_os = "linux")]
   if learned {
     crate::fuse::superseded(state, id);
+  }
+  if learned {
+    crate::shards::superseded(state, id);
   }
 }
 
@@ -2031,6 +2060,9 @@ pub(crate) fn published(
     // may have shipped (A-344): begun again at position 0 under the same epoch, its new chain and its old were two values
     // at the same positions, and a takeover adopted the old one's greater head over the new one's durable writes.
     let (epoch, start) = planned(state, id);
+    // A log begun here holds nothing of the volume until it answers at a whole entry (A-577); an adopted or resumed one
+    // holds what its predecessor made durable.
+    let new_log = matches!(start, Start::New);
     // Nothing is known of the volume's whole state before its first whole record, which is this log's first entry
     // (`owes_whole`): admitted with nothing in flight, it sets the bounds (`Bounds::of_whole`, below).
     let made = match start {
@@ -2062,10 +2094,9 @@ pub(crate) fn published(
     };
     state.live.adopted.remove(&id.bytes);
     state.live.resumed.remove(&id.bytes);
-    state
-      .live
-      .shipping
-      .insert(id.bytes, new_live_volume(shipper));
+    let mut live = new_live_volume(shipper);
+    live.nothing_answered = new_log;
+    state.live.shipping.insert(id.bytes, live);
   }
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -2684,6 +2715,7 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
     newest: None,
     resolved_ns: None,
     answers: crate::live_hold::AnswerWindow::default(),
+    nothing_answered: false,
   }
 }
 
@@ -2703,10 +2735,9 @@ pub(crate) fn owe_first_whole(
     None,
     Bounds::default(),
   );
-  state
-    .live
-    .shipping
-    .insert(id.bytes, new_live_volume(shipper));
+  let mut live = new_live_volume(shipper);
+  live.nothing_answered = true;
+  state.live.shipping.insert(id.bytes, live);
 }
 
 /// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
@@ -2894,7 +2925,9 @@ fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'stati
   }
 }
 
-/// The volume's whole image as a record's wire bytes.
+/// The volume's whole image as a record's wire bytes, standing alone (A-577): a clone's holds what it shares with its
+/// origin too, since a successor rebuilds the volume from its log with no origin beside it (`Volume::to_standalone_image`;
+/// its recovery image names those inodes by number only, and a rebuild from it found no tree under its root).
 fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Option<Vec<u8>> {
   let handle = *state.by_id.get(&id)?;
   let ShardState { volumes, store, .. } = state;
@@ -2903,7 +2936,7 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
     .host
     .as_mut()
     .map(|host| host as &mut dyn slates_vfs::host::HostFs);
-  let image = slot.volume.to_image(store, host).ok()?;
+  let image = slot.volume.to_standalone_image(store, host).ok()?;
   Some(VolumeRecord::Full { image }.to_bytes())
 }
 
@@ -5716,6 +5749,9 @@ const REFUSED_RECORD: &str = "fleet.live.takeover_refused.record";
 const REFUSED_APPLY: &str = "fleet.live.takeover_refused.apply";
 /// Counter: a takeover refused because the log's first entry is not a whole record (or there is none).
 const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_first";
+/// Counter: a takeover refused because a clone's full record names an inode it shares with its origin that the image
+/// before it does not hold ([`keep_shared`], A-577): the log cannot lay out the tree, and is never served short of it.
+const REFUSED_SHARED: &str = "fleet.live.takeover_refused.shared";
 /// Counter: a takeover refused because the rebuilt image could not be laid out as an archive (no root, a cycle,
 /// content missing for an extent).
 const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
@@ -6448,7 +6484,9 @@ impl Rebuilding {
 }
 
 /// One payload of a live log opened under `keys`, decoded and applied to the rebuild's image, its runs kept: a whole
-/// record begins the image again, a delta applies to it, and a delta before any whole one is refused.
+/// record begins the image again, a delta applies to it, and a delta before any whole one is refused. A clone's full
+/// record, which names what the clone shares with its origin by number, keeps those inodes from the image before it
+/// ([`keep_shared`], A-577).
 fn apply_payload(
   keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
   (image, runs): RebuildState<'_>,
@@ -6457,19 +6495,56 @@ fn apply_payload(
   let publication = open_payload(keys, payload).ok_or(REFUSED_OPEN)?;
   let record =
     <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
-  match (record, image.as_mut()) {
-    (VolumeRecord::Full { image: whole }, _) => {
+  match record {
+    VolumeRecord::Full { image: mut whole } => {
+      if whole.origin_shared.is_empty() {
+        runs.clear();
+      } else {
+        let before = image.as_ref().ok_or(REFUSED_NOT_WHOLE_FIRST)?;
+        keep_shared(&mut whole, before, runs)?;
+      }
       *image = Some(whole);
-      runs.clear();
     }
-    (VolumeRecord::Delta { delta }, Some(image)) => {
+    VolumeRecord::Delta { delta } => {
+      let image = image.as_mut().ok_or(REFUSED_NOT_WHOLE_FIRST)?;
       slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
     }
-    (VolumeRecord::Delta { .. }, None) => return Err(REFUSED_NOT_WHOLE_FIRST),
   }
   for run in publication.runs {
     runs.insert((run.inode, run.offset), run.bytes);
   }
+  Ok(())
+}
+
+/// A clone's full record `whole` laid over the image `before` it (A-577): `whole` carries the inodes the clone shares
+/// with its origin snapshot by number only (`VolumeImage::origin_shared`), as its recovery image does, so each is taken
+/// from `before` (the log's whole records stand alone, `Volume::to_standalone_image`, so the first holds every one) with
+/// its content runs; every other run goes, as a full record's do, since the record's own follow it. The image then
+/// stands alone. Refused [`REFUSED_SHARED`] when `before` lacks a shared inode, or `whole` carries one both whole and by
+/// number: the log could not lay out the tree, and is never served short of it.
+fn keep_shared(
+  whole: &mut slates_vfs::recover::VolumeImage,
+  before: &slates_vfs::recover::VolumeImage,
+  runs: &mut BTreeMap<(u64, u64), Vec<u8>>,
+) -> Result<(), &'static str> {
+  let shared: BTreeSet<u64> = whole.origin_shared.iter().copied().collect();
+  if whole.inodes.iter().any(|inode| shared.contains(&inode.no)) {
+    return Err(REFUSED_SHARED);
+  }
+  let kept: Vec<InodeImage> = before
+    .inodes
+    .iter()
+    .filter(|inode| shared.contains(&inode.no))
+    .cloned()
+    .collect();
+  if kept.len() != shared.len() {
+    return Err(REFUSED_SHARED);
+  }
+  runs.retain(|(inode, _), _| shared.contains(inode));
+  whole.inodes.extend(kept);
+  whole.inodes.sort_by_key(|inode| inode.no);
+  whole.origin_shared = Vec::new();
+  whole.origin_epoch = None;
   Ok(())
 }
 
@@ -7709,6 +7784,253 @@ mod tests {
     assert!(
       silence <= floor + 3 * super::DURABLE_LOOK_NS,
       "a silent holder is given up within the floor and the looks that confirm it: {silence} ns"
+    );
+  }
+
+  /// Shape: the bytes of the one file a live clone's measurement gives its origin: a page of incompressible bytes, so the
+  /// clone's whole image is at least that file, and its tree's metadata. (A page of one repeated byte shipped as 370.)
+  const CLONED_FILE_BYTES: usize = 4096;
+
+  /// A-577 (§4.10 live shipping, A-200: what a live clone's reply costs). Do: on a shard, make a live-shipped volume
+  /// holding one file of [`CLONED_FILE_BYTES`], snapshot and clone it; give the clone's log the state it holds before any
+  /// of it reaches a holder (`f = 1`, two holders); append the clone's whole record as its first publication does and
+  /// record its holders as its first send does; ask what its reply waits for and whether its status counts it at risk;
+  /// then fold one holder's acknowledgement of that entry and ask again. Expect the reply to wait for exactly one entry,
+  /// position 0, the clone's whole image (its bytes printed), its state at risk meanwhile, and after that one
+  /// acknowledgement nothing to wait for and nothing at risk: the reply's added cost is one round trip to `f` holders
+  /// carrying one image. Before A-577 the reply waited on its origin's log, and the status read zero.
+  #[test]
+  fn a_live_clones_reply_waits_for_one_acknowledged_whole_image() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let principal = slates_db::catalog::Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let origin = live_volume_here(state, "measured-origin")?;
+      let handle = *state.by_id.get(&origin)?;
+      let ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(handle).ok()?;
+      let root = slot.volume.root_inode(store).ok()?;
+      let file = slot
+        .volume
+        .create_file_no(store, root, "cloned", 0o644)
+        .ok()?;
+      let mut bytes = vec![0u8; CLONED_FILE_BYTES];
+      blake3::Hasher::new()
+        .update(b"A-577: a live clone's whole image")
+        .finalize_xof()
+        .fill(&mut bytes);
+      slot.volume.write(store, file, 0, &bytes).ok()?;
+      let wire_origin = slates_ipc::protocol::VolumeId {
+        bytes: origin.bytes,
+      };
+      let slates_ipc::protocol::ReplyBody::Snapshotted { id: snapshot, .. } =
+        crate::verbs::dispatch(
+          state,
+          1,
+          &principal,
+          slates_ipc::protocol::RequestBody::Snapshot {
+            volume: wire_origin,
+          },
+        )
+      else {
+        return None;
+      };
+      let slates_ipc::protocol::ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::Clone {
+          volume: wire_origin,
+          snapshot,
+          name: "measured-clone".to_owned(),
+        },
+      ) else {
+        return None;
+      };
+      let clone = slates_db::catalog::VolumeId { bytes: clone.bytes };
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      ];
+      owe_first_whole(state, clone, &holders);
+      let record = whole_record(state, clone)?;
+      let body = plain_body(state, clone, record)?;
+      let (payload, anchors) = sealed_payload(state, clone, true, body)?;
+      if !append_payload(state, clone, (true, true), payload, anchors)
+        || !holders_placed(state, clone.bytes)
+      {
+        return None;
+      }
+      let waited = durable_target(state, clone);
+      let at_risk = holds_nothing_yet(state, clone);
+      let live = state.live.shipping.get_mut(&clone.bytes)?;
+      let head = live.whole_entry?;
+      let image = live.whole.as_ref().map(|(_, payload)| payload.len())?;
+      let _ = live.shipper.on_reply(holders[0], Ok(Some(head)));
+      resolve(state, clone.bytes);
+      Some((
+        waited,
+        at_risk,
+        image,
+        durable_target(state, clone),
+        holds_nothing_yet(state, clone),
+      ))
+    });
+    let (waited, at_risk, image, after, at_risk_after) = measured.expect("the scene was made");
+    println!(
+      "a live clone's reply waits for {image} bytes (its whole image: one {CLONED_FILE_BYTES}-byte file and its tree), \
+       one entry at position {waited:?}, answered at one holder's acknowledgement (after: {after:?})"
+    );
+    assert_eq!(
+      waited,
+      Some(0),
+      "the reply waits for the clone's first whole entry"
+    );
+    assert!(
+      at_risk,
+      "until it is durable an owner loss would lose the clone"
+    );
+    assert!(
+      image >= CLONED_FILE_BYTES,
+      "the entry carries the clone's whole image: {image} bytes"
+    );
+    assert_eq!(
+      after, None,
+      "one holder's acknowledgement answers it at f = 1"
+    );
+    assert!(
+      !at_risk_after,
+      "and its log then holds it where a takeover finds it"
+    );
+  }
+
+  /// The inode number of the root file `name` in the volume in slot `handle`.
+  fn file_no(
+    state: &ShardState,
+    handle: slates_mem::Handle<crate::state::VolumeSlot>,
+    name: &str,
+  ) -> Option<u64> {
+    let slot = state.volumes.get(handle).ok()?;
+    let root = slot.volume.root_inode(&state.store).ok()?;
+    let found = slot.volume.lookup_no(&state.store, root, name).ok()?;
+    Some(found.inode.0)
+  }
+
+  /// Writes `bytes` as the whole of the root file `name` in the volume in slot `handle`, made if absent.
+  fn write_file(
+    state: &mut ShardState,
+    handle: slates_mem::Handle<crate::state::VolumeSlot>,
+    name: &str,
+    bytes: &[u8],
+  ) -> Option<()> {
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).ok()?;
+    let root = slot.volume.root_inode(store).ok()?;
+    let file = match slot.volume.lookup_no(store, root, name) {
+      Ok(found) => found.inode,
+      Err(_) => slot.volume.create_file_no(store, root, name, 0o644).ok()?,
+    };
+    slot.volume.truncate(store, file, 0).ok()?;
+    slot.volume.write(store, file, 0, bytes).ok()?;
+    Some(())
+  }
+
+  /// A-577 (§4.10 live shipping, A-200). Do: on a shard, make a volume with root files `a` and `b`, snapshot and clone
+  /// it; take the clone's standalone image, its log's first whole record, with content runs for `a` and `b`; rewrite `b`
+  /// and make `c` in the clone; lay its recovery image, what its next full record carries, over the first by the
+  /// rebuild's rule ([`keep_shared`]). Expect the clone's standalone image now, inode for inode, standing alone, with
+  /// `a`'s run kept and `b`'s gone (the record's own follow it). Before A-577 a full record replaced the image whole,
+  /// and a clone's named what it shares with its origin by number only, so a successor's rebuild lost it.
+  #[test]
+  fn a_clones_full_record_keeps_what_it_shares_from_the_image_before_it() {
+    let checked = crate::daemon::audit_on_shard(|state| {
+      use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
+      let principal = slates_db::catalog::Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let ReplyBody::Created { id: origin } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        RequestBody::Create {
+          name: "shared-origin".to_owned(),
+          size: SizeClass::Dynamic { max: 1 << 20 },
+          names: NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        return None;
+      };
+      let origin_handle = *state.by_id.get(&slates_db::catalog::VolumeId {
+        bytes: origin.bytes,
+      })?;
+      write_file(state, origin_handle, "a", b"inherited a")?;
+      write_file(state, origin_handle, "b", b"inherited b")?;
+      let ReplyBody::Snapshotted { id: snapshot, .. } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        RequestBody::Snapshot { volume: origin },
+      ) else {
+        return None;
+      };
+      let ReplyBody::Cloned { id: clone } = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        RequestBody::Clone {
+          volume: origin,
+          snapshot,
+          name: "shared-clone".to_owned(),
+        },
+      ) else {
+        return None;
+      };
+      let handle = *state
+        .by_id
+        .get(&slates_db::catalog::VolumeId { bytes: clone.bytes })?;
+      let before = state
+        .volumes
+        .get(handle)
+        .ok()?
+        .volume
+        .to_standalone_image(&state.store, None)
+        .ok()?;
+      let (a, b) = (file_no(state, handle, "a")?, file_no(state, handle, "b")?);
+      let mut runs = BTreeMap::from([
+        ((a, 0), b"inherited a".to_vec()),
+        ((b, 0), b"inherited b".to_vec()),
+      ]);
+      write_file(state, handle, "b", b"rewritten b")?;
+      write_file(state, handle, "c", b"made c")?;
+      let slot = state.volumes.get(handle).ok()?;
+      let mut whole = slot.volume.to_image(&state.store, None).ok()?;
+      let now = slot.volume.to_standalone_image(&state.store, None).ok()?;
+      let shared_before = whole.origin_shared.clone();
+      keep_shared(&mut whole, &before, &mut runs).ok()?;
+      Some((
+        shared_before.contains(&a),
+        whole.inodes == now.inodes,
+        whole.origin_shared.is_empty() && whole.origin_epoch.is_none(),
+        runs.keys().copied().collect::<Vec<_>>(),
+        a,
+      ))
+    });
+    let (a_was_shared, same_tree, standing_alone, runs, a) = checked.expect("the scene was made");
+    assert!(
+      a_was_shared,
+      "the full record named the untouched `a` by number"
+    );
+    assert!(same_tree, "the rebuilt image is the clone's whole tree now");
+    assert!(standing_alone, "and stands alone");
+    assert_eq!(
+      runs,
+      vec![(a, 0)],
+      "`a`'s content kept, `b`'s left to the record"
     );
   }
 }

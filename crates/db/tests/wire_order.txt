@@ -46,6 +46,8 @@ LandingState 6 Done
 LandingState 7 Partial
 LandingState 8 Refused
 LandingState 9 Aborted
+MemberOrigin 0 Root
+MemberOrigin 1 Branch
 NamePolicy 0 Exact
 NamePolicy 1 Fold
 ObjectFormat 0 Sha1
@@ -140,6 +142,7 @@ Op 85 RepositoryBranchRetired
 Op 86 RepositoryDefaultSet
 Op 87 RepositoryDestroyed
 Op 88 AttachmentMountSeen
+Op 89 RepositoryGreenJoined
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid

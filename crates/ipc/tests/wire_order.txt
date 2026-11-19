@@ -130,6 +130,9 @@ MoveRefusal 6 Unplaced
 MoveRefusal 7 Pending
 NamePolicy 0 Exact
 NamePolicy 1 Fold
+ObjectFormat 0 Sha1
+ObjectFormat 1 Sha256
+ObjectFormat 2 Revisions
 OwnMountUse 0 Base
 OwnMountUse 1 LandingTarget
 OwnMountUse 2 MountPoint
@@ -392,6 +395,10 @@ RequestBody 78 Move
 RequestBody 79 CaptureBase
 RequestBody 80 ArchiveExport
 RequestBody 81 ArchiveImport
+RequestBody 82 CreateRepository
+RequestBody 83 CreateBranch
+RequestBody 84 BindBranch
+RequestBody 85 RetireBranch
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
@@ -451,6 +458,9 @@ UnsupportedReason 13 MountNotShared
 UnsupportedReason 14 DescriptorRouteNotBuilt
 UnsupportedReason 15 WinFspNotInstalled
 UnsupportedReason 16 OwnedByAnotherHost
+VcsTool 0 Git
+VcsTool 1 Mercurial
+VcsTool 2 Subversion
 Verification 0 Verified
 Verification 1 Unsigned
 Verification 2 Invalid

@@ -382,11 +382,25 @@ impl Maps {
     self.attributes.lend(&mut other.attributes);
   }
 
-  /// Releases every map's hold on its nodes and blocks.
+  /// Releases every map's hold on its nodes and blocks, a node a step in each map's own arena (A-575: the stepped
+  /// release is the only one).
   fn release_all(&mut self) {
-    self.files.release();
-    self.modes.release();
-    self.attributes.release();
+    let mut releasing = self.files.releasing();
+    while self
+      .files
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut self.files.blocks)
+    {}
+    let mut releasing = self.modes.releasing();
+    while self.modes.nodes.release_step(&mut releasing, &mut Plain) {}
+    let mut releasing = self.attributes.releasing();
+    while self
+      .attributes
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut Plain)
+    {}
   }
 
   /// Whether the arenas this value holds have nothing left alive and named no missing node.

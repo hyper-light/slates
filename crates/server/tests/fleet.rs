@@ -5956,8 +5956,13 @@ fn present_grant_and_land(
 }
 
 /// The capture tests' expectations of a landing: presented with the agent's three changes alone and no conflict, granted,
-/// landed whole, and its target holding the agent's changes beside the outsider's edit.
-fn assert_the_agents_changes_landed_alone(seen: &LandingSeen, disk: &OnDisk, described: &str) {
+/// landed whole, and its target holding `expected`, the agent's changes beside the outsider's edit.
+fn assert_the_agents_changes_landed_alone(
+  seen: &LandingSeen,
+  disk: &OnDisk,
+  expected: &OnDisk,
+  described: &str,
+) {
   let ReplyBody::GrantRequired {
     summary, conflicts, ..
   } = &seen.presented
@@ -5987,8 +5992,7 @@ fn assert_the_agents_changes_landed_alone(seen: &LandingSeen, disk: &OnDisk, des
     seen.landed
   );
   assert_eq!(
-    *disk,
-    landed_alone(),
+    disk, expected,
     "the target holds the agent's changes and the outsider's edit"
   );
 }
@@ -6249,7 +6253,7 @@ fn a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture()
     .landing
     .as_ref()
     .expect("the successor's landing was presented");
-  assert_the_agents_changes_landed_alone(landing, &landed.disk, &described);
+  assert_the_agents_changes_landed_alone(landing, &landed.disk, &landed_alone(), &described);
   assert!(
     refused.served,
     "the never-sealed clone's successor serves it (last: {:?}); {described}",
@@ -6380,7 +6384,360 @@ fn a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_captur
     seen.last
   );
   let landing = seen.landing.as_ref().expect("b's landing was presented");
-  assert_the_agents_changes_landed_alone(landing, &seen.disk, &described);
+  assert_the_agents_changes_landed_alone(landing, &seen.disk, &landed_alone(), &described);
+}
+
+/// Shape: what b rewrites `/changed` to after the first move of A-589's test: bytes a's copy never held, so an old
+/// owner that answered from its copy would show it.
+const CHANGED_ON_B: &[u8] = b"rewritten on b after the first move";
+/// Shape: what c rewrites `/made` to after the second move: bytes neither a's nor b's copy held.
+const MADE_ON_C: &[u8] = b"rewritten on c after the second move";
+/// Format: a move's new owner's count of the moves it adopted (`moves::MOVE_ADOPTED`).
+const MOVE_ADOPTED: &str = "fleet.move.adopted";
+/// Format: a move's new owner's count of the adoptions it reported (`moves::MOVE_ADOPTION_REPORTED`).
+const MOVE_ADOPTION_REPORTED: &str = "fleet.move.adoption_reported";
+/// Format: a move's old owner's count of the moves it began (`moves::MOVE_BEGUN`).
+const MOVE_BEGUN: &str = "fleet.move.begun";
+/// Format: a move's old owner's count of the copies it let go to the member the move named (`moves::MOVE_RELEASED`).
+const MOVE_RELEASED: &str = "fleet.move.released";
+
+/// `path` of `volume` read once through `client`, whatever the answer.
+fn read_once(client: &mut Client, volume: VolumeId, path: &str) -> ReplyBody {
+  client.call(&RequestBody::ReadRange {
+    volume,
+    path: path.to_owned(),
+    at: ReadAt::Head,
+    offset: 0,
+    max: u64::MAX,
+  })
+}
+
+/// Whether `reply`, a previous owner's answer for a file whose bytes are now `current`, is never stale: the current
+/// bytes (the read forwarded to the owner) or a refusal by kind (§4.10 "Ownership follows the writer": verbs on a moved
+/// volume go to its new owner).
+fn never_stale(reply: &ReplyBody, current: &[u8]) -> bool {
+  match reply {
+    ReplyBody::ReadPage { bytes, .. } => bytes.as_slice() == current,
+    ReplyBody::Refused { .. } | ReplyBody::Moving { .. } | ReplyBody::Moved { .. } => true,
+    _ => false,
+  }
+}
+
+/// `file` written into `volume` through `client` once its owner serves it, through a write attachment that then ends:
+/// whether both the write and the detach were answered.
+fn rewritten_when_served(
+  fleet: &[&Daemon],
+  client: &mut Client,
+  volume: VolumeId,
+  file: (&str, &[u8]),
+) -> bool {
+  let Some(attachment) = attach_when_served(fleet, client, volume) else {
+    return false;
+  };
+  let wrote = write_one(client, volume, attachment, file);
+  let detached = matches!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  );
+  wrote && detached
+}
+
+/// What A-589's test saw of one move: the move, the new owner serving the volume's tree and its catalog record, a rewrite
+/// there, each previous owner's answers for the rewritten file, and the move counters.
+struct MovedOn {
+  moved: bool,
+  answers: Vec<String>,
+  served: bool,
+  last: Option<ReplyBody>,
+  removed: ReplyBody,
+  access: Result<Option<Vec<slates_db::catalog::AccessEntry>>, ObserveError>,
+  status: ReplyBody,
+  rewrote: bool,
+  serves_the_rewrite: bool,
+  at_once: Vec<ReplyBody>,
+  released: bool,
+  after_release: Vec<ReplyBody>,
+  began: Result<u64, ObserveError>,
+  adopted: Result<u64, ObserveError>,
+  reported: Result<u64, ObserveError>,
+}
+
+/// One move of A-589's test: `volume` moved through `mover`, a client of its owner (`members`' `from`-th), to the
+/// `to`-th member until done. Then, through a client of the new owner: `tree` read back whole and `/removed` asked for,
+/// the catalog record's access list and the volume's status read, and `rewrite` written. Each of `previous`, the members
+/// that owned the volume before, is asked for the rewritten file at once and again once `from` has let its copy go.
+/// Returns what was seen and the new owner's client.
+fn moved_on(
+  fleet: &[&Daemon],
+  members: &ThreeMembers,
+  mover: &mut Client,
+  (from, to): (usize, usize),
+  volume: VolumeId,
+  (tree, rewrite): (&[(&str, &[u8])], (&str, &[u8])),
+  previous: &[usize],
+) -> (MovedOn, Client) {
+  let (moved, answers) = move_until_done(fleet, mover, volume, members.hosts[to]);
+  let mut client = Client::connect(&members.instances[to]);
+  let (served, last) = if moved {
+    read_back(fleet, &mut client, volume, tree)
+  } else {
+    (false, None)
+  };
+  let removed = read_once(&mut client, volume, "/removed");
+  let access = members.daemons[to].volume_access(ObjectId(volume.bytes));
+  let status = client.call(&RequestBody::Status { volume });
+  let rewrote = served && rewritten_when_served(fleet, &mut client, volume, rewrite);
+  let serves_the_rewrite = rewrote && read_back(fleet, &mut client, volume, &[rewrite]).0;
+  let mut old_owners: Vec<Client> = previous
+    .iter()
+    .map(|at| Client::connect(&members.instances[*at]))
+    .collect();
+  let at_once = old_owners
+    .iter_mut()
+    .map(|old| read_once(old, volume, rewrite.0))
+    .collect();
+  let released = rewrote
+    && poll_until(fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[from], MOVE_RELEASED)? == 1)
+    });
+  let after_release = old_owners
+    .iter_mut()
+    .map(|old| read_once(old, volume, rewrite.0))
+    .collect();
+  let seen = MovedOn {
+    moved,
+    answers,
+    served,
+    last,
+    removed,
+    access,
+    status,
+    rewrote,
+    serves_the_rewrite,
+    at_once,
+    released,
+    after_release,
+    began: move_counter(&members.daemons[from], MOVE_BEGUN),
+    adopted: move_counter(&members.daemons[to], MOVE_ADOPTED),
+    reported: move_counter(&members.daemons[to], MOVE_ADOPTION_REPORTED),
+  };
+  (seen, client)
+}
+
+/// A-589's expectations of one move from `from` to `to`: done; the new owner serving the tree whole without `/removed`,
+/// its catalog record carrying the access list a held before the first move (`access_before`) and reporting the volume
+/// as `name`; taking a write and serving it; every answer of a previous owner for the rewritten file `current` or a
+/// refusal by kind, never stale; `from` letting its copy go; and the counters: `from` began the move, `to` adopted it
+/// once and reported it.
+fn assert_moved_on(
+  seen: &MovedOn,
+  (from, to): (&str, &str),
+  access_before: Option<&Vec<slates_db::catalog::AccessEntry>>,
+  (name, current): (&str, &[u8]),
+  described: &str,
+) {
+  assert!(
+    seen.moved,
+    "the move from {from} to {to} was done (answers in order: {:?}); {described}",
+    seen.answers
+  );
+  assert!(
+    seen.served,
+    "{to} serves the volume's tree whole (last: {:?}); {described}",
+    seen.last
+  );
+  assert!(
+    matches!(
+      seen.removed,
+      ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }
+    ),
+    "{to} holds no /removed: {:?}",
+    seen.removed
+  );
+  assert!(
+    matches!(&seen.access, Ok(Some(access)) if Some(access) == access_before),
+    "{to}'s catalog record carries the volume's access list whole: {:?}, where a held {access_before:?}",
+    seen.access
+  );
+  assert!(
+    matches!(&seen.status, ReplyBody::Status { report } if report.name == name),
+    "{to} reports the volume as {name}: {:?}",
+    seen.status
+  );
+  assert!(
+    seen.rewrote && seen.serves_the_rewrite,
+    "{to} takes a write to the moved volume and serves it; {described}"
+  );
+  for answer in seen.at_once.iter().chain(&seen.after_release) {
+    assert!(
+      never_stale(answer, current),
+      "a previous owner of the volume answered stale data after its move to {to}: {answer:?}; {described}"
+    );
+  }
+  assert!(
+    seen.released,
+    "{from} let its copy go once {to} adopted the volume; {described}"
+  );
+  assert!(
+    matches!(
+      (&seen.began, &seen.adopted, &seen.reported),
+      (Ok(began), Ok(1), Ok(reports)) if *began > 0 && *reports > 0
+    ),
+    "the move counters: {from} began the move, {to} adopted it once and reported it: {:?}",
+    (&seen.began, &seen.adopted, &seen.reported)
+  );
+}
+
+/// A target A-589's landing on c fills: `/changed` as b rewrote it, `/made` as c rewrote it, `/removed` removed, and the
+/// outsider's `/kept` kept.
+fn landed_after_two_moves() -> OnDisk {
+  OnDisk {
+    changed: Some(CHANGED_ON_B.to_vec()),
+    made: Some(MADE_ON_C.to_vec()),
+    removed: None,
+    kept: Some(OUTSIDERS_EDIT.to_vec()),
+  }
+}
+
+/// What A-589's test saw: the clone's snapshot on a, the access list a's catalog record held, a's capture record, both
+/// moves, c's landing, and what the landing's target holds after.
+struct MovedTwice {
+  snapshotted: ReplyBody,
+  access_on_a: Result<Option<Vec<slates_db::catalog::AccessEntry>>, ObserveError>,
+  recorded: bool,
+  to_b: MovedOn,
+  to_c: Option<MovedOn>,
+  landing: Option<LandingSeen>,
+  disk: OnDisk,
+}
+
+/// A-589, A-503's own fleet test (§4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; filed by g267
+/// for main): a captured clone moves a to b, then b to c, and each new owner holds it whole while no old owner serves it
+/// stale. Three daemons at `f = 1`. Do: on a, overlay the captured tree, capture its base and clone the capture; in the
+/// clone rewrite `/changed`, make `/made` and remove `/removed`; snapshot it and share it with b's and c's accounts; read
+/// the access list a's catalog record holds; once a has recorded the clone's capture record, move it to b until the move
+/// is done. On b, read the tree, ask for `/removed`, read b's catalog record and the volume's status, and rewrite
+/// `/changed`; ask a for `/changed` at once and again once a has let its copy go. Then move it to c through b's client,
+/// and do the same on c with `/made`, asking both a and b. Last, present c's landing into a directory holding the
+/// captured tree with an outsider's edit to `/kept`, grant it and land it. Expect, after each move: the move done; the
+/// new owner serving the tree whole and no `/removed`, its catalog record carrying a's access list and its status the
+/// volume's name; the write taken and served; every previous owner's answer the rewritten bytes or a refusal by kind,
+/// never the bytes before; the old owner releasing its copy; and the counters one move begun by the old owner, one
+/// adopted and reported by the new. Then c's plan the agent's changes since the capture alone (one replacement, one
+/// create, one removal), no conflict, and the landing writing `/changed` as b rewrote it and `/made` as c did, the
+/// outsider's `/kept` kept. Before A-503 a moved captured clone held no capture on its new owner, and before A-544 its
+/// second move waited on a record no move walked.
+#[test]
+fn a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one() {
+  let _serial = serialize_fleet_tests();
+  let members = three_members();
+  let base = captured_tree_dir();
+  let target = target_with_an_outsiders_edit();
+  let name = "moved-twice-workspace";
+  let (seen, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let clone = captured_and_cloned(&mut client_a, &base.path, &[name])[0];
+    agents_changes(&mut client_a, clone);
+    let snapshotted = client_a.call(&RequestBody::Snapshot { volume: clone });
+    for node in &members.daemons[1..] {
+      share_with_node(&mut client_a, clone, node, ALL_RIGHTS);
+    }
+    let access_on_a = members.daemons[0].volume_access(ObjectId(clone.bytes));
+    let recorded = poll_until(&fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[0], CARRY_RECORDED)? >= 1)
+    });
+    let first_tree = agents_tree();
+    let (to_b, mut client_b) = moved_on(
+      &fleet,
+      &members,
+      &mut client_a,
+      (0, 1),
+      clone,
+      (&first_tree, ("/changed", CHANGED_ON_B)),
+      &[0],
+    );
+    let second_tree = [
+      ("/changed", CHANGED_ON_B),
+      MADE,
+      ("/kept", KEPT_AS_CAPTURED),
+    ];
+    let mut to_c = to_b.released.then(|| {
+      moved_on(
+        &fleet,
+        &members,
+        &mut client_b,
+        (1, 2),
+        clone,
+        (&second_tree, ("/made", MADE_ON_C)),
+        &[0, 1],
+      )
+    });
+    let landing = match to_c.as_mut() {
+      Some((moved, client_c)) if moved.serves_the_rewrite => Some(present_grant_and_land(
+        client_c,
+        &members.daemons[2],
+        clone,
+        &target.path,
+      )),
+      _ => None,
+    };
+    let seen = MovedTwice {
+      snapshotted,
+      access_on_a,
+      recorded,
+      to_b,
+      to_c: to_c.map(|(moved, _)| moved),
+      landing,
+      disk: on_disk(&target.path),
+    };
+    (seen, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(seen.snapshotted, ReplyBody::Snapshotted { .. }),
+    "the agent's clone was snapshotted: {:?}",
+    seen.snapshotted
+  );
+  let access_before = seen.access_on_a.as_ref().ok().and_then(Option::as_ref);
+  assert!(
+    access_before.is_some(),
+    "a held the clone's catalog record before its first move: {:?}",
+    seen.access_on_a
+  );
+  assert!(
+    seen.recorded,
+    "a recorded the capture record for the clone's own head (`{CARRY_RECORDED}`); {described}"
+  );
+  assert_moved_on(
+    &seen.to_b,
+    ("a", "b"),
+    access_before,
+    (name, CHANGED_ON_B),
+    &described,
+  );
+  let to_c = seen
+    .to_c
+    .as_ref()
+    .expect("the second move ran once the first was settled");
+  assert_moved_on(
+    to_c,
+    ("b", "c"),
+    access_before,
+    (name, MADE_ON_C),
+    &described,
+  );
+  let landing = seen.landing.as_ref().expect("c's landing was presented");
+  assert_the_agents_changes_landed_alone(
+    landing,
+    &seen.disk,
+    &landed_after_two_moves(),
+    &described,
+  );
 }
 
 /// AC-8.15's first half (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` M2): a snapshot placed in its home

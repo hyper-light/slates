@@ -34,12 +34,13 @@
 //! in a fleet alike; a holder replays a branch from the same record the owner made it from (owed with shared piece 2).
 
 use std::borrow::Cow;
+use std::ops::{Deref, DerefMut};
 
 use super::{
   Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, dir_entry, file_entry, history_at,
   link_entry, mode_entry, present_at, relink, special_entry, xattr_entry,
 };
-use crate::dims::Arenas;
+use crate::dims::{Arenas, GreenRelease};
 use crate::identity::{Entry, SetHash};
 use crate::special::SpecialNode;
 
@@ -75,6 +76,9 @@ pub enum LineageRefused {
     /// The oldest version the green reconstructs.
     floor: u64,
   },
+  /// Another member's engine is out of the lineage with the arenas in it ([`Lineage::take`], [`Lent`]), so no other
+  /// member can be read, written, branched or released until it is put back (A-575).
+  Busy,
 }
 
 /// The value a branch sets a key back to, when it differs from the head's: `history`'s entry at `version` against
@@ -125,16 +129,19 @@ impl Green {
     self.links_to.lend(&mut other.links_to);
   }
 
-  /// Gives every map's hold on its nodes back: what no other green names is freed.
-  fn release_maps(&mut self) {
-    self.content.release();
-    self.specials.release();
-    self.dirs.release();
-    self.modes.release();
-    self.symlinks.release();
-    self.hardlinks.release();
-    self.xattrs.release();
-    self.links_to.release();
+  /// Every map's hold on its nodes, to give back a node a step in the lineage's arenas ([`Lineage::release_step`]):
+  /// the maps are empty after, and nothing is freed until the steps run (A-575).
+  fn releasing(&mut self) -> GreenRelease {
+    GreenRelease {
+      files: self.content.releasing(),
+      specials: self.specials.releasing(),
+      dirs: self.dirs.releasing(),
+      modes: self.modes.releasing(),
+      symlinks: self.symlinks.releasing(),
+      hardlinks: self.hardlinks.releasing(),
+      xattrs: self.xattrs.releasing(),
+      links_to: self.links_to.releasing(),
+    }
   }
 
   /// The green whose version 0 is this one's `version` (module docs), sharing this one's arenas, which it holds for
@@ -382,8 +389,68 @@ pub struct Lineage {
   seats: Vec<Seat>,
   /// Seats a retire freed, taken first.
   free: Vec<usize>,
+  /// The member whose engine is out of its seat with the arenas in it ([`Lineage::take`]): every other lend is refused
+  /// `Busy` until it is put back.
+  out: Option<LineageGreen>,
   /// Keys every branch set back.
   reverted: u64,
+}
+
+/// A retired green's holds on its lineage's nodes, given back a node a step ([`Lineage::release_step`]), so a release
+/// as large as the green runs in its shard's slices (A-575).
+#[derive(Debug, Default)]
+pub struct Release {
+  maps: GreenRelease,
+}
+
+impl Release {
+  /// Whether every hold has been given back.
+  pub fn is_done(&self) -> bool {
+    self.maps.is_done()
+  }
+}
+
+/// A member's engine lent out of its lineage with the arenas in it, for as long as the guard lives (A-575): it reads
+/// and writes as a green standing alone does, and goes back to its seat, the arenas with it, when the guard is dropped.
+/// While it is out every other lend of the lineage is refused [`LineageRefused::Busy`]. `L` is how the lineage is
+/// borrowed: `&mut Lineage`, or a `RefMut` of one a shard keeps in a cell.
+pub struct Lent<L: DerefMut<Target = Lineage>> {
+  lineage: L,
+  handle: LineageGreen,
+  green: Green,
+}
+
+impl<L: DerefMut<Target = Lineage>> Lent<L> {
+  /// `handle`'s engine, lent out of `lineage`.
+  pub fn new(mut lineage: L, handle: LineageGreen) -> Result<Lent<L>, LineageRefused> {
+    let green = lineage.take(handle)?;
+    Ok(Lent {
+      lineage,
+      handle,
+      green,
+    })
+  }
+}
+
+impl<L: DerefMut<Target = Lineage>> Deref for Lent<L> {
+  type Target = Green;
+
+  fn deref(&self) -> &Green {
+    &self.green
+  }
+}
+
+impl<L: DerefMut<Target = Lineage>> DerefMut for Lent<L> {
+  fn deref_mut(&mut self) -> &mut Green {
+    &mut self.green
+  }
+}
+
+impl<L: DerefMut<Target = Lineage>> Drop for Lent<L> {
+  fn drop(&mut self) {
+    let green = std::mem::take(&mut self.green);
+    self.lineage.restore(self.handle, green);
+  }
 }
 
 impl Lineage {
@@ -393,6 +460,11 @@ impl Lineage {
     green.swap_arenas(&mut lineage.arenas);
     let first = lineage.seat(green);
     (lineage, first)
+  }
+
+  /// A new member with nothing in it, at version 0: it shares nothing until it changes.
+  pub fn create(&mut self) -> LineageGreen {
+    self.seat(Green::new())
   }
 
   /// Seats `green`, whose maps' arenas are the lineage's.
@@ -416,7 +488,7 @@ impl Lineage {
     }
   }
 
-  /// Takes `handle`'s green out of its seat for one call.
+  /// Takes `handle`'s green out of its seat.
   fn unseat(&mut self, handle: LineageGreen) -> Result<Green, LineageRefused> {
     self
       .seats
@@ -426,26 +498,46 @@ impl Lineage {
       .ok_or(LineageRefused::Stale)
   }
 
-  /// Puts a green [`Lineage::unseat`] took back.
-  fn reseat(&mut self, handle: LineageGreen, green: Green) {
+  /// `handle`'s engine out of its seat with the lineage's arenas in it, to be put back by [`Lineage::put_back`]: what a
+  /// replay that runs over many slices holds (a recovery's), and what [`Lent`] holds for the length of a borrow. Refused
+  /// `Busy` while another member is out.
+  pub fn take(&mut self, handle: LineageGreen) -> Result<Green, LineageRefused> {
+    if self.out.is_some() {
+      return Err(LineageRefused::Busy);
+    }
+    let mut green = self.unseat(handle)?;
+    green.swap_arenas(&mut self.arenas);
+    self.out = Some(handle);
+    Ok(green)
+  }
+
+  /// Puts back the engine [`Lineage::take`] gave out for `handle`, the arenas with it. Refused `Stale` for a handle that
+  /// is not the one out, the green then dropped with what it holds.
+  pub fn put_back(&mut self, handle: LineageGreen, green: Green) -> Result<(), LineageRefused> {
+    if self.out != Some(handle) {
+      return Err(LineageRefused::Stale);
+    }
+    self.restore(handle, green);
+    Ok(())
+  }
+
+  /// [`Lineage::put_back`] for the member known to be out.
+  fn restore(&mut self, handle: LineageGreen, mut green: Green) {
+    green.swap_arenas(&mut self.arenas);
     if let Some(place) = self.seats.get_mut(handle.seat) {
       place.green = Some(green);
     }
+    self.out = None;
   }
 
-  /// Runs `call` on `handle`'s green with the lineage's arenas lent to it: every read and every submit of a green of a
-  /// lineage goes through here.
+  /// Runs `call` on `handle`'s green with the lineage's arenas lent to it.
   pub fn with<R>(
     &mut self,
     handle: LineageGreen,
     call: impl FnOnce(&mut Green) -> R,
   ) -> Result<R, LineageRefused> {
-    let mut green = self.unseat(handle)?;
-    green.swap_arenas(&mut self.arenas);
-    let answer = call(&mut green);
-    green.swap_arenas(&mut self.arenas);
-    self.reseat(handle, green);
-    Ok(answer)
+    let mut lent = Lent::new(&mut *self, handle)?;
+    Ok(call(&mut lent))
   }
 
   /// A green whose version 0 is `from`'s `version`, made without a walk (module docs): what it costs is what changed
@@ -460,18 +552,45 @@ impl Lineage {
     Ok(self.seat(branch))
   }
 
-  /// Retires `handle`'s green: its holds on the shared nodes are given back, freeing what no other green names, and its
-  /// handle is stale from here on.
-  pub fn retire(&mut self, handle: LineageGreen) -> Result<(), LineageRefused> {
+  /// Retires `handle`'s green: its seat is freed and its handle stale from here on, and what it held is returned as a
+  /// [`Release`], whose steps give its holds on the shared nodes back ([`Lineage::release_step`]). Refused `Busy` while a
+  /// member is out.
+  pub fn retire(&mut self, handle: LineageGreen) -> Result<Release, LineageRefused> {
+    if self.out.is_some() {
+      return Err(LineageRefused::Busy);
+    }
     let mut green = self.unseat(handle)?;
-    green.swap_arenas(&mut self.arenas);
-    green.release_maps();
-    green.swap_arenas(&mut self.arenas);
+    let maps = green.releasing();
     if let Some(place) = self.seats.get_mut(handle.seat) {
       place.generation = place.generation.saturating_add(1);
     }
     self.free.push(handle.seat);
-    Ok(())
+    Ok(Release { maps })
+  }
+
+  /// One step of `release`: one node's hold given back, the node freed, and its file's block let go, when no other
+  /// member names it. False once every hold is back; refused `Busy` while a member is out, since the arenas are then in
+  /// its engine.
+  pub fn release_step(&mut self, release: &mut Release) -> Result<bool, LineageRefused> {
+    if self.out.is_some() {
+      return Err(LineageRefused::Busy);
+    }
+    Ok(self.arenas.release_step(&mut release.maps))
+  }
+
+  /// The members seated.
+  pub fn len(&self) -> usize {
+    self
+      .seats
+      .iter()
+      .filter(|place| place.green.is_some())
+      .count()
+      .saturating_add(usize::from(self.out.is_some()))
+  }
+
+  /// Whether no member is seated or out.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
   }
 
   /// Keys every branch set back: what a branch at an older version cost beyond its counts.
