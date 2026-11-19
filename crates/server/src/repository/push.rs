@@ -295,6 +295,7 @@ pub(crate) type StoreMove = (crate::vcs_store::Target, Option<slates_git::object
 /// commits them with `moves` between the register's guard and the entry's apply, each move resolved once the new
 /// branches are made: its green's key, and the version the entry leaves the green at. Appended, the store holds the
 /// objects; refused, `sealed` is as it was, for the push's next ref or to be given back.
+#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's push path (A-654).
 pub(crate) fn push_sealed(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),

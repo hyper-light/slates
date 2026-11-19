@@ -918,8 +918,9 @@ fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryI
 /// A-662 (one map, each tool's arm, made with the record and freed with it). Do: create a git, a Mercurial and a
 /// Subversion repository; replay a record into the Mercurial and Subversion stores; take the Mercurial one's refusal as
 /// a recovery takes it; free all three. Expect: each store made on the owner shard as its tool's arm, git's in its
-/// record's format; the two replays refused `Owed`, their replay being their own push pieces'; the refused store given
-/// back and named unrecovered with why; after the frees no store is held, none unrecovered, and nothing is charged.
+/// record's format, Subversion's index at revision 0; the two replays refused `Owed`, their replay being their own push
+/// pieces'; the refused store given back and named unrecovered with why; after the frees no store is held, none
+/// unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
   crate::daemon::audit_on_shard(|state| {
@@ -934,7 +935,12 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     assert!(matches!(stores.store(hg), Some(RepositoryStore::Mercurial(_))));
     assert!(matches!(stores.store(svn), Some(RepositoryStore::Subversion(_))));
     assert!(state.vcs_stores.mercurial(hg).is_some());
-    assert!(state.vcs_stores.subversion(svn).is_some());
+    // Made with its record: Subversion's revision 0, an empty root.
+    let youngest = state
+      .vcs_stores
+      .subversion(svn)
+      .map(|store| store.index.youngest());
+    assert_eq!(youngest, Some(0));
     for repository in [hg, svn] {
       assert_eq!(
         replay_into(&mut state.vcs_stores, repository, b"a record"),
