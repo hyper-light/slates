@@ -13363,8 +13363,6 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > `apr_fnmatch` table, the documentation's files, and a naive oracle over generated rule sets. Where 1.14.x's code
 > departs from its own documentation, the documentation is followed and each case is a named test:
 > - the root has no segments (`lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there);
-> - a recursive question at the root weighs every rule (Subversion weighs only those an empty segment matches, so it
->   grants recursive read at a root above a denied `/secret`);
 > - a suffix pattern leaves the segment as it was for the other rules of its level (`lookup` reverses it in place);
 > - `[//x]` is refused (Subversion takes it for the root).
 >
@@ -41092,14 +41090,11 @@ Applied in the same change to:
   4762). Rules eclipsed by a later `**` are taken out (`trim_tree`). A path is walked level by level: the deepest
   level with a matching rule decides, the rule defined last there wins, and a level without one inherits. A recursive
   question takes the least access over the reached nodes' subtrees, as Subversion's does, so a rule that cannot
-  govern any path beneath still counts. A question without a path takes Subversion's global rights, transcribed. A
+  govern any path beneath still counts; at the root, every rule is beneath. A question without a path takes Subversion's global rights, transcribed. A
   principal whose rules all give one access is answered by one comparison, counted by `uniform_answers`.
 - **Departures from 1.14.x's code**, each a named test; Subversion's own documentation is followed:
   - the root has no segments: `lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there,
     although `*` "Matches any single non-empty path segment" (`authz.h`);
-  - a recursive question at the root weighs every rule: Subversion's weighs only the rules an empty segment matches,
-    so with `[/] * = rw` and `[/secret] * =` it grants recursive read at `/`, and a commit that copies `/` would pass
-    over `/secret`;
   - a suffix match leaves the segment as it was: `lookup` reverses it in place for the rest of the level, so
     `[:glob:/**/public]` beside `[:glob:/*.secret]` misses `/public` and matches `/cilbup`;
   - `[//x]` is refused as non-canonical: `parse_rule_path` takes it for the root and ignores the rest.
@@ -41118,14 +41113,14 @@ Applied in the same change to:
     `test_authz_prefixes`, `test_authz_recursive_override`, `test_authz_pattern_tests`, `groups_authz`, the in-repo
     tests, `issue_4060`, and `commit_editor_authz` as the questions item 10 has a commit ask); APR's `testfnmatch.c` at
     flags 0; the `conf/authz` `svnadmin create` writes; the book's examples and the 1.10 and 1.14 notes with their
-    stated outcomes; every refusal kind with its line and Subversion error; the four departures; hostile input;
+    stated outcomes; every refusal kind with its line and Subversion error; the three departures; hostile input;
   - the naive oracle (256 generated rule sets in assorted styles, every principal, four repositories, every path to
     depth three), held non-vacuous by a rich hand-built set whose answers take every access, fall below beneath, and
     are walked;
   - the crate's lib suite, 110 of 110.
 - **Owed:** the server's questions (piece 7); the file read from the repository and compiled per file identity;
   `svnserve`'s `force-username-case`; `mod_authz_svn`'s questions (piece 13). Main's: clippy and `xtask` over the
-  module, and the four departures confirmed against stock Subversion (run request).
+  module, and the three departures confirmed against stock Subversion (run request).
 
 ### A-595 — HTTP/1.1's request codec as a crate the version-control servers share, and git's smart HTTP routes over it (2026-11-19, g076b, UI goal 92; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's first part)
 Applied in the same change to:

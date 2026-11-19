@@ -90,7 +90,7 @@ pub(super) enum Segment {
 ///
 /// # Errors
 /// [`AuthzRefusal::RulePathEmptySegment`] for two slashes in a row or a trailing slash (the module documentation of
-/// `authz`, item 4: two slashes at the start too), [`AuthzRefusal::RulePathDot`] and [`AuthzRefusal::RulePathDotDot`].
+/// `authz`, item 3: two slashes at the start too), [`AuthzRefusal::RulePathDot`] and [`AuthzRefusal::RulePathDotDot`].
 pub(super) fn rule_path(path: &[u8], glob: bool) -> Result<Vec<Segment>, AuthzRefusal> {
   let after_root = path.get(1..).unwrap_or_default();
   let mut segments = Vec::new();
