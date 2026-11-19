@@ -23,11 +23,11 @@ use crate::store::Push;
 
 use super::{EXCHANGE, Made, Source, Ticks, blob, commit, push_and_move, store, tree};
 
-/// A text of numbered lines, `lines` long.
-fn text(lines: u32, edited: Option<u32>) -> Vec<u8> {
+/// A text of numbered lines, `lines` long, the lines in `edited` edited.
+fn text(lines: u32, edited: &[u32]) -> Vec<u8> {
   let mut out = Vec::new();
   for line in 0..lines {
-    let words = if Some(line) == edited {
+    let words = if edited.contains(&line) {
       "an edited line"
     } else {
       "a line of a file"
@@ -47,8 +47,8 @@ fn applied(source: &[u8], delta: &[u8]) -> Vec<u8> {
 /// longer than a copy instruction, or from an empty source.
 #[test]
 fn a_delta_turns_its_source_into_its_target_and_none_saves_nothing() {
-  let source = text(40, None);
-  let mut target = text(40, Some(17));
+  let source = text(40, &[]);
+  let mut target = text(40, &[17]);
   target.extend_from_slice(b"one more line at the end\n");
   let delta = delta_of(&source, &target).unwrap();
   assert_eq!(applied(&source, &delta), target);
@@ -145,8 +145,8 @@ fn two_versions(
   store: &mut ContentStore,
 ) -> (Repository, Vec<Made>, Vec<Made>) {
   let mut repository = Repository::new(format);
-  let first = commit_over(format, &text(200, None), &[], 1);
-  let second = commit_over(format, &text(200, Some(120)), &[first[0].id], 2);
+  let first = commit_over(format, &text(200, &[]), &[], 1);
+  let second = commit_over(format, &text(200, &[120]), &[first[0].id], 2);
   let mut clock = Ticks(0);
   for (version, objects) in [first.clone(), second.clone()].into_iter().enumerate() {
     let head = objects[0].id;
@@ -186,12 +186,11 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
       .collect();
     assert_eq!(read, made);
     let (objects, blobs) = repository.fragments(1, 1).unwrap();
-    let stored: Vec<Stored> = objects
+    let edited = blobs
       .iter()
-      .chain(blobs)
-      .map(|entry| entry.stored)
-      .collect();
-    assert!(stored.contains(&Stored::Reference));
+      .find(|entry| entry.id == second[2].id)
+      .map(|entry| entry.stored);
+    assert_eq!((edited, objects.len()), (Some(Stored::Reference), 2));
     let counters = repository.counters();
     assert_eq!(counters.fragments, 4);
     assert!(counters.reference_deltas >= 1);
@@ -201,15 +200,18 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
 }
 
 /// A-614 part 2 (offset deltas within a fragment, chains no deeper than the learned depth). Do:
-/// push, from a client whose pack was one delta deep, a commit over three files that differ in one
-/// line each, and encode it. Expect: the later two files offset deltas, every chain at most one
-/// deep (the nearest file, itself a delta, passed over for the first), and the pack read back whole.
+/// push, from a client whose pack was one delta deep, a commit over a file, the file with eleven
+/// lines edited, and that with one more: the third is nearest the second. Expect: the later two
+/// offset deltas, every chain at most one deep (the second, itself a delta, passed over as the
+/// third's base for the first), and the pack read back whole.
 #[test]
 fn similar_files_in_one_version_are_offset_deltas_within_the_learned_depth() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let mut repository = Repository::new(format);
-  let files: Vec<Made> = [None, Some(50), Some(150)]
+  let region: Vec<u32> = (50..61).collect();
+  let further: Vec<u32> = region.iter().copied().chain([150]).collect();
+  let files: Vec<Made> = [&[][..], &region, &further]
     .into_iter()
     .map(|edited| blob(format, &text(200, edited)))
     .collect();
@@ -317,7 +319,7 @@ fn a_clone_is_its_base_pack_and_the_fragments_after_it() {
     .collect();
   let cloned = unpacked(format, &repository.clone_pack(&store, 1).unwrap());
   assert_eq!(cloned.keys().copied().collect::<BTreeSet<_>>(), reach);
-  let third = commit_over(format, &text(200, Some(3)), &[second[0].id], 3);
+  let third = commit_over(format, &text(200, &[3]), &[second[0].id], 3);
   push_and_move(
     &mut repository,
     &mut store,
@@ -365,7 +367,7 @@ fn double_hashing_costs() {
     .map(|at| {
       blob(
         format,
-        &text(20, Some(at % 20)).repeat(1 + usize::try_from(at % 7).unwrap()),
+        &text(20, &[at % 20]).repeat(1 + usize::try_from(at % 7).unwrap()),
       )
     })
     .collect();
