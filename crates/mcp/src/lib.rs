@@ -1884,10 +1884,12 @@ pub fn degradation_json(d: &LandingDegradation) -> Value {
       json!({"kind": "unswept", "dir": dir, "answer": answer_json(answer)})
     }
     LandingDegradation::Kept { path, kept } => json!({"kind": "kept", "path": path, "kept": kept}),
+    // A Win32 error code by its own name, never an errno's (A-539).
+    LandingDegradation::CrashedWin32 { code } => json!({"kind": "crashed", "win32": code}),
   }
 }
 
-/// A host's answer as JSON: a typed refusal's name, or `{"errno": n}`.
+/// A host's answer as JSON: a typed refusal's name, or `{"errno": n}`, or `{"win32": n}` (A-539).
 fn answer_json(answer: &HostAnswer) -> Value {
   match answer {
     HostAnswer::NotFound => json!("not_found"),
@@ -1895,6 +1897,7 @@ fn answer_json(answer: &HostAnswer) -> Value {
     HostAnswer::NotFile => json!("not_file"),
     HostAnswer::StaleHandle => json!("stale_handle"),
     HostAnswer::Errno { errno } => json!({"errno": errno}),
+    HostAnswer::Win32 { code } => json!({"win32": code}),
   }
 }
 

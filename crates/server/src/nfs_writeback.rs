@@ -45,7 +45,10 @@
 //!
 //! **Keeping the states current.** One tracker per volume with connections tracking its files: a journal reader (A-157),
 //! so a record waits for it, and a task parked on the volume's change generation that consumes each change into every
-//! connection's states as it is made, so the states never depend on how long the journal keeps a record. A WRITE
+//! connection's states as it is made, so the states never depend on how long the journal keeps a record. The reader
+//! holds its records while the tracker is open (A-548): the task runs on the volume's own shard, woken by the change
+//! itself, so only that shard's own turns stand between a record and its consumer, and a record waiting a liveness
+//! window on the wall (the patience until A-548) meant a shard kept off its CPU, never a tracker gone. A WRITE
 //! consumes what is pending before it is judged. A tracker can close before its task first runs and a new one open for
 //! the volume, so each tracker has an identity and its task keeps only the tracker it was spawned for.
 //!
@@ -626,9 +629,13 @@ fn tracking(s: &mut ShardState, volume: VolumeId) -> bool {
   };
   let head = slot.volume.op_log().head_seq();
   let seen = slot.volume.change_generation();
+  // Held while the tracker is open (A-548): its keeper, on this shard, is woken by the change that journals a record and
+  // consumes it when the shard next runs it, so no other party can keep a record from it. Presumed gone after a window
+  // on the wall, as until A-548, a shard kept off its CPU that long lost the record to the next append past the budget,
+  // and the keeper's consume lost every connection's states with it.
   slot
     .volume
-    .open_journal_reader(READER_KEY, crate::daemon::LIVENESS_BUDGET_NS);
+    .open_journal_reader(READER_KEY, slates_vfs::journal::Patience::WhileOpen);
   let id = s.nfs_writeback.next_tracker;
   // Identities need only differ among the trackers whose tasks are alive at once; wrapping past 2^64 cannot meet one.
   s.nfs_writeback.next_tracker = id.wrapping_add(1);
@@ -807,20 +814,16 @@ mod tests {
   const SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
   /// Shape: the pause between two looks at the shard's live tasks while it ends them.
   const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+  /// Shape: the connection whose write-back the held-shard test judges.
+  const READER: u64 = 1;
+  /// Shape: how long the held-shard test holds its shard before the tracker's keeper may run: past the patience the
+  /// tracker's journal reader had until A-548 (one liveness window), by a tenth of one.
+  const PAST_THE_OLD_PATIENCE_NS: u64 =
+    crate::daemon::LIVENESS_BUDGET_NS + crate::daemon::LIVENESS_BUDGET_NS / 10;
 
-  /// A-192, found by the hostile NFS test on a loaded Linux box (`9 live before, 16 after`). Do, eight times on one
-  /// volume of an audit daemon: in one turn of its shard, open a tracker for a connection, end the connection (so the
-  /// tracker closes before its keeper ever ran) and open a new tracker for a second connection; let the shard run what
-  /// that turn spawned; then end the second connection. Expect: every keeper ends, so the shard's live tasks come back
-  /// to where they were, and each round's first keeper met the newer tracker (`nfs.writeback_keepers_stale`, 8).
-  /// Before, the first keeper found the second tracker by its volume and kept it as its own; the tracker woke at its
-  /// close only the keeper that parked last, and the other stayed parked on the volume until its next change.
-  #[test]
-  // The test thread waits off the shard while the shard ends the keepers.
-  #[allow(clippy::disallowed_methods)]
-  fn a_keeper_ends_with_the_tracker_it_was_spawned_for() {
-    let daemon = crate::daemon::audit_daemon();
-    let volume = crate::daemon::observe_first(&daemon, |state| {
+  /// The volume `name` made on `daemon`'s shard as a client's `Create` makes one: the shard's only volume.
+  fn made_volume(daemon: &crate::daemon::Daemon, name: &'static str) -> VolumeId {
+    crate::daemon::observe_first(daemon, move |state| {
       let made = crate::verbs::dispatch(
         state,
         0,
@@ -829,7 +832,7 @@ mod tests {
           uid: 501,
         },
         slates_ipc::protocol::RequestBody::Create {
-          name: "keepers".to_owned(),
+          name: name.to_owned(),
           size: slates_ipc::protocol::SizeClass::Bounded { limit: 4 << 20 },
           names: slates_ipc::protocol::NamePolicy::Exact,
           require_locked: false,
@@ -843,7 +846,22 @@ mod tests {
         .copied()
         .ok_or_else(|| format!("the create answered {made:?}"))
     })
-    .expect("the volume was made");
+    .expect("the volume was made")
+  }
+
+  /// A-192, found by the hostile NFS test on a loaded Linux box (`9 live before, 16 after`). Do, eight times on one
+  /// volume of an audit daemon: in one turn of its shard, open a tracker for a connection, end the connection (so the
+  /// tracker closes before its keeper ever ran) and open a new tracker for a second connection; let the shard run what
+  /// that turn spawned; then end the second connection. Expect: every keeper ends, so the shard's live tasks come back
+  /// to where they were, and each round's first keeper met the newer tracker (`nfs.writeback_keepers_stale`, 8).
+  /// Before, the first keeper found the second tracker by its volume and kept it as its own; the tracker woke at its
+  /// close only the keeper that parked last, and the other stayed parked on the volume until its next change.
+  #[test]
+  // The test thread waits off the shard while the shard ends the keepers.
+  #[allow(clippy::disallowed_methods)]
+  fn a_keeper_ends_with_the_tracker_it_was_spawned_for() {
+    let daemon = crate::daemon::audit_daemon();
+    let volume = made_volume(&daemon, "keepers");
     let live = || -> u64 {
       daemon
         .shard_pulses()
@@ -883,6 +901,61 @@ mod tests {
     assert_eq!(
       stale, ROUNDS,
       "non-vacuity: each round's first keeper met the second round's tracker in place of its own"
+    );
+  }
+
+  /// A-548 (R3's class C; §4.5 the journal's readers, §4.6 "NFS v3", A-192): a tracker keeps every change it has not
+  /// consumed while it is open, however late its keeper runs. Do: on an audit daemon, track a connection's fetch of a
+  /// file's first page; change the volume from another path; hold the shard past one liveness window, as a shard kept
+  /// off its CPU is held, so the keeper the change woke cannot run; journal past the journal's budget; then judge the
+  /// connection's write-back of a byte it fetched. Expect: applied, no overrun counted, and the record the tracker owed
+  /// still held when the budget filled (the journal grew for it). Before, the tracker's reader was presumed gone once a
+  /// record had waited one window on the wall: the record left as the budget filled, the keeper's consume found its
+  /// cursor behind the journal and lost every connection's states, so the write-back was refused `Unknown`, as each of
+  /// that connection's would be until it ended.
+  #[test]
+  fn a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window() {
+    let daemon = crate::daemon::audit_daemon();
+    let volume = made_volume(&daemon, "held");
+    let (verdict, overruns, kept_when_full) = crate::daemon::observe_first(&daemon, move |state| {
+      fetched(state, READER, (volume, INODE), FETCHED);
+      let handle = state.by_id.get(&volume).copied().unwrap();
+      let slot = state.volumes.get_mut(handle).unwrap();
+      let root = slot.volume.root();
+      slot
+        .volume
+        .create_file(&mut state.store, root, "outsider", 0o644)
+        .unwrap();
+      let owed = slot.volume.op_log().head_seq();
+      crate::daemon::hold_busy(PAST_THE_OLD_PATIENCE_NS);
+      let grown_before = slot.volume.journal_grown();
+      // Each record is charged at least its fixed size, so the budget fills within its capacity and one more.
+      let most = slot.volume.op_log().capacity().saturating_add(1);
+      for filler in 0..most {
+        if slot.volume.journal_grown() > grown_before || slot.volume.op_log().oldest_seq() > owed {
+          break;
+        }
+        slot
+          .volume
+          .create_file(&mut state.store, root, &format!("filler-{filler}"), 0o644)
+          .unwrap();
+      }
+      let kept_when_full =
+        slot.volume.journal_grown() > grown_before && slot.volume.op_log().oldest_seq() <= owed;
+      let verdict = judge(state, READER, (volume, INODE), 0, &[0]);
+      let overruns = state.refusals.get(OVERRUNS).copied().unwrap_or(0);
+      (verdict, overruns, kept_when_full)
+    });
+    daemon.stop();
+    assert_eq!(
+      verdict,
+      WritebackVerdict::Apply,
+      "a write-back of fetched bytes no change touched is applied after the held shard"
+    );
+    assert_eq!(overruns, 0, "the tracker never fell behind its journal");
+    assert!(
+      kept_when_full,
+      "non-vacuity: the record the tracker owed was still held when the journal's budget filled"
     );
   }
 }

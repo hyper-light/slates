@@ -57,6 +57,22 @@ const ENGINE_FACTS: [&str; 3] = [
   r#"{"os":{{json .OperatingSystem}},"version":{{json .ServerVersion}},"security":{{json .SecurityOptions}},"errors":{{json .ServerErrors}}}"#,
 ];
 
+/// Format: the template that asks podman for the five facts the judge reads, as one JSON object (A-520): its
+/// `info`'s Go fields (`libpod/define/info.go`: `Host.OS`, `Version.Version`, `Host.Security.Rootless`,
+/// `Host.Security.SELinuxEnabled`, `Host.ServiceIsRemote`; podman-info(1)'s JSON names them `os`, `Version`,
+/// `rootless`, `selinuxEnabled`, `serviceIsRemote`). Its whole `info` would pass the one page an answer may hold.
+#[cfg(any(unix, test))]
+const PODMAN_FACTS: [&str; 3] = [
+  "info",
+  "--format",
+  r#"{"os":{{json .Host.OS}},"version":{{json .Version.Version}},"rootless":{{json .Host.Security.Rootless}},"selinux":{{json .Host.Security.SELinuxEnabled}},"remote":{{json .Host.ServiceIsRemote}}}"#,
+];
+
+/// Format: the endpoint a profile names for a runtime that runs its containers on this host itself (podman whose
+/// service is not remote), where no engine is reached at an endpoint.
+#[cfg(any(unix, test))]
+const LOCAL: &str = "local";
+
 /// A container engine's profile and the evidence it holds ([`engine_profile`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineProfile {
@@ -137,8 +153,9 @@ pub fn engine_profile(_runtime: &str) -> Result<EngineProfile, EngineFault> {
   })
 }
 
-/// The profile `runtime`'s engine establishes on `host`, in the module's order: the runtime admitted by name; the
-/// endpoint, `named` when the environment names one, else its context's (asked); then the engine's statement (asked),
+/// The profile `runtime`'s engine establishes on `host`, in the module's order: the runtime's interface by its name;
+/// for the Docker CLI the endpoint, `named` when the environment names one, else its context's (asked), then the
+/// engine's statement (asked); for podman its own statement alone (asked: it states whether its service is remote);
 /// judged. `ask` runs one query of the runtime's command line and answers its output. Pure but for `ask`, so its order
 /// (nothing asked of a runtime the handshake does not speak, no engine asked behind an endpoint that is not local) is
 /// tested on every host.
@@ -149,7 +166,14 @@ fn profile_of(
   host: slates_bridge_oci::runtime::Host,
   ask: &mut dyn FnMut(&[&str]) -> Result<Vec<u8>, EngineFault>,
 ) -> Result<EngineProfile, EngineFault> {
-  slates_bridge_oci::runtime::admit_runtime(runtime).map_err(EngineFault::Refused)?;
+  let interface =
+    slates_bridge_oci::runtime::runtime_interface(runtime).map_err(EngineFault::Refused)?;
+  if interface == slates_bridge_oci::runtime::Interface::Podman {
+    let facts = parse_podman_facts(&ask(&PODMAN_FACTS)?)?;
+    let profile =
+      slates_bridge_oci::runtime::podman_profile(&facts).map_err(EngineFault::Refused)?;
+    return judged(LOCAL.to_owned(), profile, host);
+  }
   let endpoint_text = match named {
     Some(endpoint) => endpoint,
     None => parse_endpoint(&ask(&CONTEXT_ENDPOINT)?)?,
@@ -158,18 +182,54 @@ fn profile_of(
     .map_err(EngineFault::Refused)?;
   let facts = parse_engine_facts(&ask(&ENGINE_FACTS)?)?;
   let profile = slates_bridge_oci::runtime::runtime_profile(endpoint, &facts);
+  judged(endpoint_text, profile, host)
+}
+
+/// `profile`, reached at `endpoint`, judged on `host`: the evidence it holds, or the profile with the judge's refusal.
+#[cfg(any(unix, test))]
+fn judged(
+  endpoint: String,
+  profile: RuntimeProfile,
+  host: slates_bridge_oci::runtime::Host,
+) -> Result<EngineProfile, EngineFault> {
   match slates_bridge_oci::runtime::judge(&profile, host) {
     Ok(tested) => Ok(EngineProfile {
-      endpoint: endpoint_text,
+      endpoint,
       profile,
       tested,
     }),
     Err(refusal) => Err(EngineFault::Untested {
-      endpoint: endpoint_text,
+      endpoint,
       profile,
       refusal,
     }),
   }
+}
+
+/// Podman's facts from the [`PODMAN_FACTS`] template's answer, or why they are not there (A-520): every field present,
+/// the strings non-empty and the flags booleans, never a profile built from a guess.
+#[cfg(any(unix, test))]
+fn parse_podman_facts(
+  answer: &[u8],
+) -> Result<slates_bridge_oci::runtime::PodmanFacts, EngineFault> {
+  let unreadable = |why: String| EngineFault::Unreadable(Note::new(why));
+  let value: serde_json::Value =
+    serde_json::from_slice(answer).map_err(|e| unreadable(e.to_string()))?;
+  let text = |field: &str| match value.get(field) {
+    Some(serde_json::Value::String(text)) if !text.is_empty() => Ok(text.clone()),
+    _ => Err(unreadable(format!("{field} is not a non-empty string"))),
+  };
+  let flag = |field: &str| match value.get(field) {
+    Some(serde_json::Value::Bool(flag)) => Ok(*flag),
+    _ => Err(unreadable(format!("{field} is not true or false"))),
+  };
+  Ok(slates_bridge_oci::runtime::PodmanFacts {
+    operating_system: text("os")?,
+    server_version: text("version")?,
+    rootless: flag("rootless")?,
+    selinux_enabled: flag("selinux")?,
+    service_is_remote: flag("remote")?,
+  })
 }
 
 /// The endpoint the context answers with: a JSON string.
@@ -369,6 +429,16 @@ mod tests {
   const ROOTLESS: &[u8] = br#"{"os":"Ubuntu 24.04.1 LTS","version":"29.7.2","security":["name=seccomp,profile=builtin","name=rootless"],"errors":null}"#;
   /// Format: Docker Desktop's local socket as its context names it.
   const DESKTOP_SOCKET: &str = "unix:///Users/u/.docker/run/docker.sock";
+  /// Format: rootless podman's statement on its own Linux host, as its `info` template answers it.
+  const ROOTLESS_PODMAN: &[u8] =
+    br#"{"os":"linux","version":"5.2.2","rootless":true,"selinux":false,"remote":false}"#;
+
+  /// Podman's statement: rootless podman's with `field` set to `value`, a JSON value.
+  fn podman_with(field: &str, value: serde_json::Value) -> Vec<u8> {
+    let mut statement: serde_json::Value = serde_json::from_slice(ROOTLESS_PODMAN).unwrap();
+    statement[field] = value;
+    serde_json::to_vec(&statement).unwrap()
+  }
 
   /// An engine whose context names `endpoint` (a JSON string) and whose statement is `facts`: each query answered by
   /// its template, and every question asked recorded in `asked` (the template's first word: `context` or `info`).
@@ -519,8 +589,8 @@ mod tests {
     );
   }
 
-  /// AUD-29-67, A-520 (the order that consults least). Do: judge podman's command line, an engine whose context names a
-  /// TCP endpoint and one whose context names an SSH one, and an engine that answers too much. Expect podman refused
+  /// AUD-29-67, A-520 (the order that consults least). Do: judge nerdctl's command line, an engine whose context names a
+  /// TCP endpoint and one whose context names an SSH one, and an engine that answers too much. Expect nerdctl refused
   /// `RuntimeUnsupported` with nothing asked; each remote endpoint refused `RemoteEngine` with only the context asked,
   /// never the engine behind it; and the oversized answer's fault passed on as it came.
   #[test]
@@ -528,13 +598,13 @@ mod tests {
     let mut asked = Vec::new();
     assert_eq!(
       profile_of(
-        "podman",
+        "nerdctl",
         None,
         Host::Linux,
         &mut engine(b"null", ENGINE, &mut asked)
       ),
       Err(EngineFault::Refused(ProfileRefusal::RuntimeUnsupported {
-        runtime: "podman".to_owned()
+        runtime: "nerdctl".to_owned()
       }))
     );
     assert!(
@@ -563,6 +633,110 @@ mod tests {
       profile_of("docker", None, Host::Linux, too_much),
       Err(EngineFault::TooLarge)
     );
+  }
+
+  /// A-520 (rootless podman's verdict). Do: judge rootless podman on its own Linux host. Expect podman asked its own
+  /// statement alone (its `info`, no context: podman states whether its service is remote), the profile local and
+  /// podman's, and the evidence T-4.13's rootless leg holds: the container's root reaching the volume as the user who
+  /// mounted it, and every name of a hard-linked file served at once.
+  #[test]
+  fn rootless_podman_on_linux_holds_its_tested_profile_asking_podman_alone() {
+    let mut asked = Vec::new();
+    let judged = profile_of(
+      "podman",
+      None,
+      Host::Linux,
+      &mut engine(b"null", ROOTLESS_PODMAN, &mut asked),
+    )
+    .unwrap();
+    assert_eq!(asked, ["info"], "podman is asked its own statement alone");
+    assert_eq!(judged.endpoint, LOCAL);
+    assert_eq!(
+      (judged.profile.engine, &judged.profile.endpoint),
+      (Engine::Podman, &Endpoint::Local)
+    );
+    assert_eq!(
+      (judged.tested.identity, judged.tested.hard_links),
+      (
+        IdentityRule::ContainerRootAsMountingUser,
+        HardLinkRule::EveryNameServedAtOnce
+      )
+    );
+  }
+
+  /// A-520. Do: judge podman whose service is remote, podman run as root, rootless podman that labels for SELinux, and
+  /// rootless podman judged on macOS; then parse podman's answers missing a field, giving a word for a flag, an empty
+  /// version, and garbage. Expect `RemoteEngine` before any profile; `Untested` naming the local profile for the rest,
+  /// `ProfileUntested`, `SelinuxLabelsUntested` and `UserNamespaceUntested`; and each hostile answer `Unreadable`.
+  #[test]
+  fn every_other_podman_is_refused_typed() {
+    let mut asked = Vec::new();
+    let remote = podman_with("remote", serde_json::Value::Bool(true));
+    assert!(matches!(
+      profile_of(
+        "podman",
+        None,
+        Host::Linux,
+        &mut engine(b"null", &remote, &mut asked)
+      ),
+      Err(EngineFault::Refused(ProfileRefusal::RemoteEngine { .. }))
+    ));
+    let as_root = podman_with("rootless", serde_json::Value::Bool(false));
+    let mut asked = Vec::new();
+    assert_eq!(
+      untested(profile_of(
+        "podman",
+        None,
+        Host::Linux,
+        &mut engine(b"null", &as_root, &mut asked)
+      )),
+      (
+        LOCAL.to_owned(),
+        "linux".to_owned(),
+        ProfileRefusal::ProfileUntested {
+          engine: "linux".to_owned(),
+          host: "linux"
+        }
+      )
+    );
+    let labelled = podman_with("selinux", serde_json::Value::Bool(true));
+    let mut asked = Vec::new();
+    assert_eq!(
+      untested(profile_of(
+        "podman",
+        None,
+        Host::Linux,
+        &mut engine(b"null", &labelled, &mut asked)
+      ))
+      .2,
+      ProfileRefusal::SelinuxLabelsUntested
+    );
+    let mut asked = Vec::new();
+    assert_eq!(
+      untested(profile_of(
+        "podman",
+        None,
+        Host::MacOs,
+        &mut engine(b"null", ROOTLESS_PODMAN, &mut asked)
+      ))
+      .2,
+      ProfileRefusal::UserNamespaceUntested
+    );
+    let missing = br#"{"os":"linux","version":"5.2.2","rootless":true,"selinux":false}"#;
+    let word = podman_with("rootless", serde_json::Value::String("true".to_owned()));
+    let empty = podman_with("version", serde_json::Value::String(String::new()));
+    for hostile in [
+      &missing[..],
+      word.as_slice(),
+      empty.as_slice(),
+      &b"not json"[..],
+    ] {
+      assert!(
+        matches!(parse_podman_facts(hostile), Err(EngineFault::Unreadable(_))),
+        "{}",
+        String::from_utf8_lossy(hostile)
+      );
+    }
   }
 
   /// AUD-29-67 (hostile input; moved from the CLI with the parser, A-520). Do: parse the engine's answer as Desktop

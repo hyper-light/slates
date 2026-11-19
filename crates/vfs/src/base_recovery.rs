@@ -327,7 +327,7 @@ fn unavailable(directory: &Directory, refused: HostError) -> UnavailableDir {
   UnavailableDir {
     source: directory.source.clone(),
     fingerprint: directory.fingerprint,
-    errno: super::unavailable_errno(refused),
+    code: super::unavailable_code(refused),
   }
 }
 

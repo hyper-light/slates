@@ -1548,7 +1548,7 @@ impl BarrierThread {
         }
       },
     )
-    .map_err(|error| spawn_refusal(&error))?;
+    .map_err(|error| HostError::Unavailable(slates_vfs::host::OsCode::of_io(&error)))?;
     Ok(Self {
       outcome,
       thread: Some(thread),
@@ -1581,7 +1581,9 @@ impl BarrierThread {
 /// aborts): the platform's own number for a failed I/O, `EIO` on Unix.
 #[cfg(unix)]
 fn lost_barrier() -> HostError {
-  HostError::Unavailable(rustix::io::Errno::IO.raw_os_error())
+  HostError::Unavailable(slates_vfs::host::OsCode::Errno(
+    rustix::io::Errno::IO.raw_os_error(),
+  ))
 }
 
 /// What a barrier thread gone without its outcome reads as: Windows' own number for a failed I/O,
@@ -1591,26 +1593,7 @@ fn lost_barrier() -> HostError {
 fn lost_barrier() -> HostError {
   /// Format: `ERROR_IO_DEVICE` (winerror.h).
   const ERROR_IO_DEVICE: u32 = 1117;
-  HostError::Win32(ERROR_IO_DEVICE)
-}
-
-/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, an errno here
-/// (A-527).
-#[cfg(unix)]
-fn spawn_refusal(error: &std::io::Error) -> HostError {
-  HostError::Unavailable(error.raw_os_error().unwrap_or(0))
-}
-
-/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, a Win32 code
-/// here, typed as one (A-527).
-#[cfg(windows)]
-fn spawn_refusal(error: &std::io::Error) -> HostError {
-  HostError::Win32(
-    error
-      .raw_os_error()
-      .and_then(|code| u32::try_from(code).ok())
-      .unwrap_or(0),
-  )
+  HostError::Unavailable(slates_vfs::host::OsCode::Win32(ERROR_IO_DEVICE))
 }
 
 impl Drop for BarrierThread {
@@ -3143,7 +3126,13 @@ fn degradation_of(degradation: &Degradation) -> LandingDegradation {
       widest_window_ns: *widest_window_ns,
     },
     Degradation::BarriersOnly => LandingDegradation::BarriersOnly,
-    Degradation::Crashed { errno } => LandingDegradation::Crashed { errno: *errno },
+    // The code in the variant of its numbering (A-539).
+    Degradation::Crashed {
+      code: slates_vfs::host::OsCode::Errno(errno),
+    } => LandingDegradation::Crashed { errno: *errno },
+    Degradation::Crashed {
+      code: slates_vfs::host::OsCode::Win32(code),
+    } => LandingDegradation::CrashedWin32 { code: *code },
     Degradation::Unsynced { dir, error } => LandingDegradation::Unsynced {
       dir: dir.to_string(),
       answer: answer_of(*error),
@@ -3173,11 +3162,15 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::NotDirectory => HostAnswer::NotDirectory,
     HostError::NotFile => HostAnswer::NotFile,
     HostError::StaleHandle => HostAnswer::StaleHandle,
-    // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
-    HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
-    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
-    HostError::Win32(code) => HostAnswer::Errno {
-      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    // The code in the variant of its numbering (A-539); a path on a mount this daemon serves carries the platform's
+    // deadlock-avoided code (A-227).
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code)
+    | HostError::OwnMount(code) => match code {
+      slates_vfs::host::OsCode::Win32(code) => HostAnswer::Win32 { code },
+      slates_vfs::host::OsCode::Errno(errno) => HostAnswer::Errno { errno },
     },
     // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
     // a refusal no errno names.
@@ -4688,6 +4681,75 @@ mod landed_reply_tests {
   use slates_ipc::protocol::{
     HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
   };
+  use slates_ipc::protocol::{Refusal, TargetRefusal};
+  use slates_vfs::host::{HostError, OsCode};
+
+  /// A-539 (the numbering's kind carried end to end). Do: pass one number as a host's Win32 error code and as an errno
+  /// to the reply's answer, a target's refusal, a crashed landing's cell and a base directory's refusal. Expect the Win32
+  /// code in the wire's Win32 variants and the errno in its errno variants, the named kinds by their codes: a reader
+  /// never takes one numbering for the other.
+  #[test]
+  fn a_win32_code_reaches_the_wire_as_one_and_an_errno_as_an_errno() {
+    /// Shape: one number in both numberings, `ERROR_ACCESS_DENIED` and `EIO`.
+    const BOTH: u32 = 5;
+    /// Shape: see `BOTH`.
+    const BOTH_ERRNO: i32 = 5;
+    let win32 = OsCode::Win32(BOTH);
+    let errno = OsCode::Errno(BOTH_ERRNO);
+    assert_eq!(
+      super::answer_of(HostError::Unavailable(win32)),
+      HostAnswer::Win32 { code: BOTH }
+    );
+    assert_eq!(
+      super::answer_of(HostError::NoSpace(errno)),
+      HostAnswer::Errno { errno: BOTH_ERRNO }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::Exists(win32)),
+      TargetRefusal::HostWin32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::Unavailable(errno)),
+      TargetRefusal::Host { errno: BOTH_ERRNO }
+    );
+    // A path on this daemon's own mount carries the platform's deadlock-avoided code in its own numbering (A-227):
+    // Windows' `ERROR_POSSIBLE_DEADLOCK` rode in an errno's place before A-539.
+    assert_eq!(
+      super::answer_of(HostError::OwnMount(win32)),
+      HostAnswer::Win32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::OwnMount(win32)),
+      TargetRefusal::HostWin32 { code: BOTH }
+    );
+    assert_eq!(
+      crate::error::target_of_host(&HostError::OwnMount(errno)),
+      TargetRefusal::Host { errno: BOTH_ERRNO }
+    );
+    assert_eq!(
+      super::degradation_of(&slates_land::engine::Degradation::Crashed { code: win32 }),
+      LandingDegradation::CrashedWin32 { code: BOTH }
+    );
+    assert_eq!(
+      super::degradation_of(&slates_land::engine::Degradation::Crashed { code: errno }),
+      LandingDegradation::Crashed { errno: BOTH_ERRNO }
+    );
+    let base = |code| crate::error::base_unavailable("/base".to_owned(), code);
+    assert_eq!(
+      base(Some(win32)),
+      Refusal::BaseUnavailableWin32 {
+        path: "/base".to_owned(),
+        code: BOTH
+      }
+    );
+    assert_eq!(
+      base(None),
+      Refusal::BaseUnavailable {
+        path: "/base".to_owned(),
+        errno: 0
+      }
+    );
+  }
 
   /// Shape: the degraded cells the test's landing met: one a directory, several replies' worth at these paths.
   const CELLS: usize = 400;
