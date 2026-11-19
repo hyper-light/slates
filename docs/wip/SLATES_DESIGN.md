@@ -34749,6 +34749,30 @@ the writer's write-through files kept across a lend, `begin_barrier` leaving the
 Applied in the same change to: §4.6 (the socket route's claim), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A-488's
 siblings), A-488's bug record (its Shards-route sibling closed), `crates/server/src/shards_route.rs`.
 
+### A-518 — The lineage model states the holder rules of A-341, A-484 and A-508 and the property they keep: no let-go removes the last copy a committed record names (2026-11-19, UI goal 84 (kiln d9f7a795, g250); §4.8 "Promotion and takeover"; the goal's "Lineage gets its own model")
+Applied in the same change to: `docs/wip/models/Lineage.tla`, the new `docs/wip/models/MC_Lineage.tla`,
+`MC_Lineage.cfg` and `MC_Lineage_two.cfg`, and GAPS (A-309's entry and the model table, §10).
+- **What was there.** `Lineage.tla` (A-309) let a copy go on a settled line for a holder that took part in the takeover
+  and on a successor's confirmation for a holder asked in its round, and checked `ReclaimOnlyStale`. It stated none of
+  the later rules and was never run.
+- **The text.** Each holder rule is its own action, named for the property it protects:
+  - `AskedSettled` and `AskedConfirmed` (A-309) protect `ReclaimOnlyStale`.
+  - `UnaskedCovered` (A-341, A-484) lets a copy no round asked for go where its writer's takeover, the first since the
+    copy was written, recovered the object within tolerance with its share done. It is judged on the kept retirement
+    or the completion record, which now keeps the recovery cohorts and the survivors still members at completion
+    (`doneCohorts`, `doneHeld`). It protects `ReclaimOnlyStale`.
+  - `SettledAwayRule` (A-508) lets a live owner's copy, which that owner wrote, go from a holder outside all of the
+    owner's neighbourhoods where the owner's settled cohort is whole and `F + 1` wide. It protects
+    `SettleKeepsFPlusOne`: a record at least as new stays on `F + 1` other members, for any record a commit reached.
+  - Every rule protects `NoLastCopyLost`: no let-go removes the last member copy that the object's newest committed
+    record names.
+
+  The model gains what these need: a copy's writer (`Acceptor::written_by`), each record's sequence, and the ground
+  truth of commits (`cmt`, which no rule reads). An adoption commits under its successor's placement before the
+  successor confirms. A retirement's own loss of copies is the failure modelled, never a let-go.
+- **Owed.** Main's TLC runs of both configurations (run-requests.md, 2026-11-19); a counterexample comes back as a new
+  piece. The Rust lineage model's mirror of A-508 is main's to compile and run.
+
 ### A-526 — A DAX backing taken back from a dead daemon clears each range not filled before its first fill (2026-11-18, goal 85, g079; §4.6 the backed route, the Shards form; A-365, A-419)
 Applied in the same change to: GAPS (A-419's sibling line), `crates/vfs/src/shards_backing.rs` (`ShardsBacking`'s
 `inherited`, set by `ShardsBackings::adopt_vmm`; `owes_clear`), `crates/bridge-core/src/dax_backing.rs` (a range's fill
