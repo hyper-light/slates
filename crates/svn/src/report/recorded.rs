@@ -18,13 +18,13 @@ use crate::svndiff::{Window, decode_all};
 
 /// One recorded connection: what the client sent and what `svnserve` sent.
 #[derive(Clone, Copy)]
-pub(super) struct Recorded {
+pub(crate) struct Recorded {
   /// The session's name and connection, its files' stem.
-  pub(super) name: &'static str,
+  pub(crate) name: &'static str,
   /// The client's bytes.
-  pub(super) client: &'static [u8],
+  pub(crate) client: &'static [u8],
   /// The server's bytes.
-  pub(super) server: &'static [u8],
+  pub(crate) server: &'static [u8],
 }
 
 /// The recorded connection `$name`, its two files included at build time.
@@ -39,7 +39,7 @@ macro_rules! recorded {
 }
 
 /// Every recorded connection, in `make-fixtures.py`'s order.
-pub(super) const SESSIONS: &[Recorded] = &[
+pub(crate) const SESSIONS: &[Recorded] = &[
   recorded!("checkout-r1.1"),
   recorded!("update-to-head.1"),
   recorded!("switch-to-branch.1"),
@@ -83,7 +83,7 @@ pub(super) const SESSIONS: &[Recorded] = &[
 ];
 
 /// The recorded connection named `name`.
-pub(super) fn recorded(name: &str) -> Recorded {
+pub(crate) fn recorded(name: &str) -> Recorded {
   SESSIONS
     .iter()
     .find(|session| session.name == name)
@@ -92,13 +92,13 @@ pub(super) fn recorded(name: &str) -> Recorded {
 }
 
 /// The repository's URL every session reached it at.
-pub(super) const ROOT_URL: &[u8] = b"svn://127.0.0.1/repo";
+pub(crate) const ROOT_URL: &[u8] = b"svn://127.0.0.1/repo";
 
 /// The repository's identity (`make-fixtures.py` `UUID`).
-pub(super) const UUID: &[u8] = b"00000000-0000-4000-8000-0000000a0616";
+pub(crate) const UUID: &[u8] = b"00000000-0000-4000-8000-0000000a0616";
 
 /// The capabilities a stock 1.15 client announces.
-pub(super) fn stock_capabilities() -> ClientCapabilities {
+pub(crate) fn stock_capabilities() -> ClientCapabilities {
   ClientCapabilities {
     svndiff1: true,
     accepts_svndiff2: true,
@@ -110,7 +110,7 @@ pub(super) fn stock_capabilities() -> ClientCapabilities {
 }
 
 /// An anonymous session of a stock 1.15 client on the fixtures' repository.
-pub(super) fn session() -> Session {
+pub(crate) fn session() -> Session {
   Session {
     principal: Principal::Anonymous,
     capabilities: stock_capabilities(),
@@ -120,7 +120,7 @@ pub(super) fn session() -> Session {
 }
 
 /// Bounds that admit any item of `bytes`.
-pub(super) fn admitting(bytes: &[u8]) -> Bounds {
+pub(crate) fn admitting(bytes: &[u8]) -> Bounds {
   Bounds {
     item_bytes: bytes.len() + 1,
     word_bytes: bytes.len(),
@@ -130,7 +130,7 @@ pub(super) fn admitting(bytes: &[u8]) -> Bounds {
 }
 
 /// `bytes` split into its items, each with its whitespace.
-pub(super) fn items(bytes: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn items(bytes: &[u8]) -> Vec<&[u8]> {
   let mut items = Vec::new();
   let mut rest = bytes;
   while !rest.is_empty() {
@@ -144,7 +144,7 @@ pub(super) fn items(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 /// The value of one whole item.
-pub(super) fn value_of(item: &[u8]) -> Value<'_> {
+pub(crate) fn value_of(item: &[u8]) -> Value<'_> {
   match Parser::new(admitting(item)).parse(item).unwrap() {
     Parsed::Item { value, .. } => value,
     Parsed::NeedMore { .. } => panic!("not a whole item"),
@@ -152,7 +152,7 @@ pub(super) fn value_of(item: &[u8]) -> Value<'_> {
 }
 
 /// A command item's word and parameters, or none for an item that is no command.
-pub(super) fn command(item: &[u8]) -> Option<(String, Vec<Value<'_>>)> {
+pub(crate) fn command(item: &[u8]) -> Option<(String, Vec<Value<'_>>)> {
   match value_of(item) {
     Value::List(parts) => match parts.as_slice() {
       [Value::Word(name), Value::List(params)] => Some(((*name).to_owned(), params.clone())),
@@ -163,13 +163,13 @@ pub(super) fn command(item: &[u8]) -> Option<(String, Vec<Value<'_>>)> {
 }
 
 /// The youngest revision of `history.txt`'s repository.
-pub(super) const YOUNGEST: Revision = 6;
+pub(crate) const YOUNGEST: Revision = 6;
 
 /// The most nodes a recorded session's drive holds open: past the fixtures' deepest path.
-pub(super) const MOST_OPEN: usize = 64;
+pub(crate) const MOST_OPEN: usize = 64;
 
 /// The repository path a URL names, for the tests' own bookkeeping of the session's path.
-pub(super) fn path_of(url: &[u8]) -> String {
+pub(crate) fn path_of(url: &[u8]) -> String {
   let rest = &url[ROOT_URL.len()..];
   if rest.is_empty() {
     "/".to_owned()
@@ -181,7 +181,7 @@ pub(super) fn path_of(url: &[u8]) -> String {
 /// Where a recorded connection's report begins: the session's path when its report command came
 /// (the answer's URL, then each `reparent`'s), the command's index among the client's items, and
 /// its request.
-pub(super) fn report_command(recorded: Recorded) -> (String, usize, Request) {
+pub(crate) fn report_command(recorded: Recorded) -> (String, usize, Request) {
   let items = items(recorded.client);
   let Value::List(answer) = value_of(items[0]) else {
     panic!("{}: an answer", recorded.name)
@@ -208,7 +208,7 @@ pub(super) fn report_command(recorded: Recorded) -> (String, usize, Request) {
 }
 
 /// The context a recorded connection's report is read in: everything readable, room to spare.
-pub(super) fn context<'a>(
+pub(crate) fn context<'a>(
   session: &'a Session,
   session_path: &'a str,
   client: &[u8],
@@ -225,7 +225,7 @@ pub(super) fn context<'a>(
 }
 
 /// The report a recorded connection finished, read whole as the reporter reads it.
-pub(super) fn finished_report(recorded: Recorded) -> Report {
+pub(crate) fn finished_report(recorded: Recorded) -> Report {
   let (session_path, index, request) = report_command(recorded);
   let session = session();
   let items = items(recorded.client);
@@ -270,7 +270,7 @@ const EDITOR_COMMANDS: &[&str] = &[
 
 /// One drive call as a recording holds it, owned; a delta's chunks decoded into windows.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Written {
+pub(crate) enum Written {
   /// `target-rev`.
   TargetRevision(u64),
   /// `open-root`.
@@ -300,16 +300,16 @@ pub(super) enum Written {
 
 /// A drive read back: its calls, and for each of its items whether it is a chunk of a delta whose
 /// recorded sections hold an LZ4 block.
-pub(super) struct ReadDrive {
+pub(crate) struct ReadDrive {
   /// The calls.
-  pub(super) calls: Vec<Written>,
+  pub(crate) calls: Vec<Written>,
   /// Per item, whether its bytes may differ from ours.
-  pub(super) compressed: Vec<bool>,
+  pub(crate) compressed: Vec<bool>,
 }
 
 /// The items of `server` that are the drive: from its first editor command while they are editor
 /// commands.
-pub(super) fn drive_items(server: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn drive_items(server: &[u8]) -> Vec<&[u8]> {
   items(server)
     .into_iter()
     .skip_while(|item| !is_editor_command(item))
@@ -389,7 +389,7 @@ fn kind_of(name: &str) -> NodeKind {
 
 /// Reads a drive's items back into calls, checking that every command names the innermost open
 /// node or its directory, as the writer assumes.
-pub(super) fn read_drive(drive: &[&[u8]]) -> ReadDrive {
+pub(crate) fn read_drive(drive: &[&[u8]]) -> ReadDrive {
   let mut reader = DriveReader::default();
   for item in drive {
     let (name, params) = command(item).unwrap();

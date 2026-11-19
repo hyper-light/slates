@@ -14136,6 +14136,18 @@ and export by landing).
 > from nothing): the copy named as `svnserve` names it, `/trunk/new.txt` at r3, and no text sent for a copy of the
 > same text. Owed: the server's connection task that runs it (piece 7's), and the deltas of changed texts (A-652's
 > generator).
+>
+> **Status (2026-11-19, A-656, part 1).** Built: one ra_svn connection's server side with no I/O (`slates-svn`'s
+> `serve::Connection`): A-599's handshake, then every command answered as `serve.c`'s command loop answers it: A-613's
+> reads and their streams, `reparent` (170000 for a URL outside the repository), A-616's report exchange, and every
+> other command of `svnserve`'s set refused as one it does not know (210001, `Turn::Unserved`) until its piece lands
+> (commit, A-655; the lock verbs; `get-file-revs`, `replay`, `change-rev-prop`); `update`'s target checked for read
+> access on the session's path. One connection serves `svn://` and `svnserve -t`: a tunnel's user comes in through the
+> repository its caller names (`EXTERNAL`). Held to every recorded report session replayed from its first byte against
+> stock `svnserve` 1.15.0's (40 sessions; property lists and listings as sets; the one listing where A-613's `get-dir`
+> shows an entry `svnserve` hides from the principal counted, authorization owed in the reads); red five ways. A-616's
+> drive now sends a changed text as A-652's deltifier makes it against the client's base. Owed: part 2, the server's
+> listener over TCP and the SSH tunnel's entry point.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -47319,3 +47331,46 @@ Applied in the same change to:
   slates-merge --lib`): 177 of 178 at ac6a83b09, A-643's model failing as said; 178 of 178 at e8c10097e; the census
   33 refused and 13 kept at a late link, 130 agreed, 102 refused by the deriver, 34 conflicts; `cargo fmt -p
   slates-merge -- --check` clean.
+
+### A-656 — One ra_svn connection's server side, part 1: the connection with no I/O (2026-11-19, g234; §4.17.4 piece 7, with piece 12's tunnel)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`serve.rs` and its tests,
+new; `lib.rs`; `report.rs` opens `join_fspath`, `repository_path` and its answers' writers to the crate;
+`report/exchange.rs`'s `awaiting`; the reporter's test fixtures open to the crate's tests).
+
+- **The connection** (`serve::Connection`; `serve.c` `serve` and `svn_ra_svn__handle_commands2` over `main_commands`
+  at `d434dc14`, 1.15.0 alike): the handshake (A-599), its URL, challenge and key asked of the caller as turns; then
+  each command, parsed within the caller's item bytes and `svnserve`'s deepest prototype (`COMMAND_DEPTH`, five lists:
+  `lock-many`'s), handed to the read commands (A-613), whose streams resume within the caller's room; those they hand
+  back: `reparent` (a trivial auth request, then the session moved, or 170000 "'…' is not the same repository as
+  '…'"), the report commands (A-616's exchange, `update`'s target checked for read access by the principal's guards
+  first), and every other command of `svnserve`'s set answered 210001 "Unknown editor command '…'" and counted
+  (`Turn::Unserved`), the connection going on; an item that is no command ends it. What it waits on its client for
+  (`Connection::waiting`) is the server's learned waits' phase.
+- **One connection, two transports**: `svn://` over TCP and `svnserve -t` through an SSH tunnel; the tunnel's user
+  comes in as the repository's `tunnel_user`, which `EXTERNAL` takes, as `svnserve -t` takes its tunnel's.
+- **Evidence.** Every recorded report session (40, `crates/svn/fixtures/report`) replayed from its first byte, the
+  client's items handed over as a stock client sends them: `svnserve`'s greeting less `svndiff1`, every item as a tree
+  (property lists and listings as sets), the drive call for call, up to the first command not served yet (`lock-many`
+  behind a mid-session authentication; `get-locks`), answered 210001. One difference is counted, not hidden:
+  `update-depth-files`'s listing of `/trunk`, where `svnserve` leaves out `secret` for the anonymous principal and
+  A-613's `get-dir` lists it (the read commands apply no authorization yet, A-606).
+- **Tests.** Eight: that replay, the smallest budget, `reparent`, a command not served yet, the caller's errors, what
+  the connection waits for, a tunnel's user and a closed repository, and `update` of an unreadable target.
+  `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: red first (`receive` refusing at once: 6 of
+  7 failed), then red four more ways by mutation (`reparent` not moving the session, an unserved command answered
+  silently, a long read's rest dropped, every target readable), each caught; 427 of 427.
+- **Owed** (GAPS): part 2, the server's listener on the runtime's TCP in `vcs_http`'s pattern and the SSH tunnel's
+  entry point; commit through A-655's entry point; the lock verbs and the mid-session authentication `svnserve` asks
+  for when a command needs a user; the read commands' authorization (A-606, the reads' owner).
+
+### A-616, continued (5) — A changed text through A-652's deltifier (2026-11-19, g234, UI goal 93)
+Applied in the same change to: `crates/svn/src/report/drive.rs` (`window`, `window_of`, the file's frame keeps its
+base text) and its tests.
+
+- **The windows** are `txdelta_next_window`'s, now with A-652's deltifier (`svndiff::deltas`, `xdelta.c` ported by
+  g264): each target piece of up to 102,400 bytes made from the source piece at the same place, read from the green's
+  runs into two bounded buffers, never a whole text; once the source has run out, new data with its view where the
+  source ended. So a drive's windows are the ones a stock server sends, stored or computed.
+- **Tests.** `big.txt` from r5 to r6 (one line of 6,000 changed): its windows copy from the base, carry under a
+  hundredth of the text as new data, and make the text `close-file` names; red with every window new data. The 29
+  recorded drives still match, each delta by what it makes.
