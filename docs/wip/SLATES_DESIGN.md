@@ -42051,57 +42051,6 @@ entry names slates-vcs, which git's object store had already made a workspace de
 - **Owed.** The phase roots, markers and branch heads of §4.17.3's index (pieces 5 and 7); the import's walk of a
   store, which appends what the revlog reader reads into this index.
 
-<<<<<<< HEAD
-  module, and the four departures confirmed against stock Subversion (run request).
-
-### A-619 — Mercurial's read serving, part 1: discovery's answers, `listkeys` and a `getbundle`'s choice of changesets over the served view's graph, held to stock Mercurial 7.2 (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone" items 1 to 3, piece 4; §4.9; A-514, A-545, A-569)
-Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve`, new: the `Repository`
-trait, `discovery`, `pull`; `fixtures/serve/` with `make-serve-fixtures.sh` and `SHA256SUMS`), GAPS (the §4.17.3
-entry), `research/mercurial-server.md` (§18).
-- **What it does.** Over a `Repository` (the served view's changesets numbered oldest first, each parent before its
-  child, with branches, closes, phases, bookmarks and the publishing flag), `serve::discovery` writes `heads`, `known`,
-  `between`, `branches` and `branchmap` as 7.2's `wireprotov1server.py` writes them, and `serve::pull` writes
-  `listkeys`'s answers and chooses a `getbundle`'s changesets (`_computeoutgoing`: unknown common nodes dropped, the
-  view's heads when none are asked, an unknown head refused, the missing ones every ancestor of a head that is no
-  ancestor of a common revision, oldest first), with the `phase-heads` entries (`_getbundlephasespart`: all public on
-  a publishing repository; otherwise each head in its phase and, with draft heads, the public heads of what they hold
-  and the public heads do not) and the `bookmarks` entries (`listbinbookmarks`) beside them.
-- **Decided: one walk, its state charged.** The missing changesets come from one walk down from the newest revision
-  named, a byte of marks a revision (reached from a head, from a common revision, found missing), stopping once no
-  revision reached from a head alone is left below (7.2's `missingancestors` does the same work incrementally); heads
-  and branch heads a bit a revision. Every such allocation, and every decoded node list, is charged to the request's
-  admission first. A parent named after its child is refused as the graph's fault, so no repository can make a walk
-  loop. The walks over the whole view are what the index's kept heads (`HgIndex::heads`) will replace.
-- **From the sources.** 7.2's `wireprotov1server.py`, `localrepo.py` (`heads` reverses `headrevs()`; `known` holds the
-  null node; `between`'s doubling walk; `branches`' first-parent runs), `branchmap.py` (a branch's heads in revision
-  order, closed ones kept with `closed=True`), `exchange.py`, `discovery.py`, `phases.py` (`listphases`),
-  `bookmarks.py`, `pushkey.py` and `setdiscovery.py`, from `mercurial-7.2.tar.gz` (SHA-256 `a250227e…`).
-- **Stricter than 7.2, or apart from it, on purpose.** A node list's item must be 40 hexadecimal digits (7.2 reads an
-  empty item between two spaces as a node of no bytes, answered unknown). `listkeys phases` lists the served view's
-  draft roots (7.2's `listphases` reads the unfiltered roots, so a hidden draft root, a node no client can hold, would
-  be listed too). `branchmap` orders branches by name, the order 7.2's branch cache takes once it is written (before,
-  its own insertion order).
-- **Golden vectors.** `crates/hg/fixtures/serve`: a probe of stock `hg serve --stdio` 7.2 (PyPI through `uvx`, CPython
-  3.12) on the Mac Studio, 2026-11-19, by `make-serve-fixtures.sh` (its header names the command): the served view
-  (`state-probe.txt`), its bookmarks, the eight requests the probe wrote and the eight answers, `SHA256SUMS` checked.
-  The Studio cannot push, so its four files were printed there escaped and written here, each SHA-256 equal to the
-  run's. The script's sessions (a clone, a pull, an incoming, recorded by an ssh stand-in) are part 2's.
-- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 182 of 182 (load 6.5),
-  8 of them this part's; `cargo fmt -p slates-hg -- --check` clean. Oracle (proptest, generated histories with
-  merges, branches, closes, drafts and bookmarks): `heads`, `branchmap` and every `listkeys` namespace byte for byte
-  as whole-set computations write them; `known`, `between` and `branches` from every revision; a `getbundle`'s choice
-  and phase heads for generated heads and common sets. Set discovery: a test port of 7.2's `findcommonheads` and
-  `partialdiscovery` (sampling in revision order) run against `heads` and `known` finds exactly the shared set on
-  generated pairs of histories, and on 300 changesets forked from a remote's 260 takes at least three rounds, its
-  counters asserted. Hostile: items of 39 and 41 digits, a non-hexadecimal one, an empty one; pairs of one and three
-  nodes; unknown tops, nodes and heads; an admission too short; a graph naming a parent after its child: each refused
-  by kind, an unknown common node dropped. Golden: the probe's eight answers byte for byte. Red: the same tests against
-  every public answer stubbed empty: all 7 then written failed.
-- **Owed (part 2 and after).** The changegroup a choice names (manifests named by the missing changesets, minus those
-  linked to common ones; files from their manifests at the paths they touch; full texts or held deltas, version 02 or
-  03), the bundle2 a `getbundle` answers with its parts in 7.2's order, golden over the script's recorded sessions;
-  `obsolete`'s `listkeys` dump and the `obsmarkers` part; then `slates hg serve --stdio`'s loop and HTTP version 1.
-=======
 ### A-621 — an ops document names as many paths as its work declares: 64-bit path indices and interning through a map (2026-11-19, g267, UI goal 93; §4.16 "Data model"; found on the push path by g225, A-618)
 Applied in the same change to:
 - §4.16's data model (the op record and the document's header) and its status; GAPS (a §4.16 entry, the A-612 siblings
@@ -42159,4 +42108,51 @@ Applied in the same change to:
 - **Sibling found, not changed** (GAPS): a chain entry's encoding finds each splice's declared ops by scanning every op
   of the increment (`chain_entry::declared_ops`). That is O(splices × ops) for a version that edits many existing
   files, though not for a first push, whose files are created.
->>>>>>> origin/main
+
+### A-619 — Mercurial's read serving, part 1: discovery's answers, `listkeys` and a `getbundle`'s choice of changesets over the served view's graph, held to stock Mercurial 7.2 (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone" items 1 to 3, piece 4; §4.9; A-514, A-545, A-569)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve`, new: the `Repository`
+trait, `discovery`, `pull`; `fixtures/serve/` with `make-serve-fixtures.sh` and `SHA256SUMS`), GAPS (the §4.17.3
+entry), `research/mercurial-server.md` (§18).
+- **What it does.** Over a `Repository` (the served view's changesets numbered oldest first, each parent before its
+  child, with branches, closes, phases, bookmarks and the publishing flag), `serve::discovery` writes `heads`, `known`,
+  `between`, `branches` and `branchmap` as 7.2's `wireprotov1server.py` writes them, and `serve::pull` writes
+  `listkeys`'s answers and chooses a `getbundle`'s changesets (`_computeoutgoing`: unknown common nodes dropped, the
+  view's heads when none are asked, an unknown head refused, the missing ones every ancestor of a head that is no
+  ancestor of a common revision, oldest first), with the `phase-heads` entries (`_getbundlephasespart`: all public on
+  a publishing repository; otherwise each head in its phase and, with draft heads, the public heads of what they hold
+  and the public heads do not) and the `bookmarks` entries (`listbinbookmarks`) beside them.
+- **Decided: one walk, its state charged.** The missing changesets come from one walk down from the newest revision
+  named, a byte of marks a revision (reached from a head, from a common revision, found missing), stopping once no
+  revision reached from a head alone is left below (7.2's `missingancestors` does the same work incrementally); heads
+  and branch heads a bit a revision. Every such allocation, and every decoded node list, is charged to the request's
+  admission first. A parent named after its child is refused as the graph's fault, so no repository can make a walk
+  loop. The walks over the whole view are what the index's kept heads (`HgIndex::heads`) will replace.
+- **From the sources.** 7.2's `wireprotov1server.py`, `localrepo.py` (`heads` reverses `headrevs()`; `known` holds the
+  null node; `between`'s doubling walk; `branches`' first-parent runs), `branchmap.py` (a branch's heads in revision
+  order, closed ones kept with `closed=True`), `exchange.py`, `discovery.py`, `phases.py` (`listphases`),
+  `bookmarks.py`, `pushkey.py` and `setdiscovery.py`, from `mercurial-7.2.tar.gz` (SHA-256 `a250227e…`).
+- **Stricter than 7.2, or apart from it, on purpose.** A node list's item must be 40 hexadecimal digits (7.2 reads an
+  empty item between two spaces as a node of no bytes, answered unknown). `listkeys phases` lists the served view's
+  draft roots (7.2's `listphases` reads the unfiltered roots, so a hidden draft root, a node no client can hold, would
+  be listed too). `branchmap` orders branches by name, the order 7.2's branch cache takes once it is written (before,
+  its own insertion order).
+- **Golden vectors.** `crates/hg/fixtures/serve`: a probe of stock `hg serve --stdio` 7.2 (PyPI through `uvx`, CPython
+  3.12) on the Mac Studio, 2026-11-19, by `make-serve-fixtures.sh` (its header names the command): the served view
+  (`state-probe.txt`), its bookmarks, the eight requests the probe wrote and the eight answers, `SHA256SUMS` checked.
+  The Studio cannot push, so its four files were printed there escaped and written here, each SHA-256 equal to the
+  run's. The script's sessions (a clone, a pull, an incoming, recorded by an ssh stand-in) are part 2's.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 182 of 182 (load 6.5),
+  8 of them this part's; `cargo fmt -p slates-hg -- --check` clean. Oracle (proptest, generated histories with
+  merges, branches, closes, drafts and bookmarks): `heads`, `branchmap` and every `listkeys` namespace byte for byte
+  as whole-set computations write them; `known`, `between` and `branches` from every revision; a `getbundle`'s choice
+  and phase heads for generated heads and common sets. Set discovery: a test port of 7.2's `findcommonheads` and
+  `partialdiscovery` (sampling in revision order) run against `heads` and `known` finds exactly the shared set on
+  generated pairs of histories, and on 300 changesets forked from a remote's 260 takes at least three rounds, its
+  counters asserted. Hostile: items of 39 and 41 digits, a non-hexadecimal one, an empty one; pairs of one and three
+  nodes; unknown tops, nodes and heads; an admission too short; a graph naming a parent after its child: each refused
+  by kind, an unknown common node dropped. Golden: the probe's eight answers byte for byte. Red: the same tests against
+  every public answer stubbed empty: all 7 then written failed.
+- **Owed (part 2 and after).** The changegroup a choice names (manifests named by the missing changesets, minus those
+  linked to common ones; files from their manifests at the paths they touch; full texts or held deltas, version 02 or
+  03), the bundle2 a `getbundle` answers with its parts in 7.2's order, golden over the script's recorded sessions;
+  `obsolete`'s `listkeys` dump and the `obsmarkers` part; then `slates hg serve --stdio`'s loop and HTTP version 1.
