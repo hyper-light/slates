@@ -514,3 +514,32 @@ fn a_tunnels_user_is_taken_and_a_closed_repository_ends_the_connection() {
   assert_eq!(refused.refuse(Unserved::BadPath, &mut out), Ok(()));
   assert_eq!(refused.waiting(), Waiting::Ended);
 }
+
+/// A-656 (`serve.c` `update`'s `must_have_access` on the session's path joined to the target): ask
+/// to update `secret` beneath `/trunk`, which the anonymous principal may not read, then the readable
+/// `dir`; expect "Authorization failed" (170001) with no auth request before it, then the report
+/// awaited after a trivial auth request.
+#[test]
+fn an_update_of_a_target_the_principal_may_not_read_is_refused() {
+  let fixture = fixture();
+  let guards = FixtureGuards::anonymous();
+  let (mut connection, _) = established(&fixture, &guards);
+  let (out, turn) = send(
+    &fixture,
+    &guards,
+    &mut connection,
+    b"( update ( ( 6 ) 6:secret true infinity false false ) ) ",
+  );
+  let message = "Authorization failed";
+  assert_eq!(out, format!("( failure ( ( 170001 {}:{message} 0: 0 ) ) ) ", message.len()));
+  assert!(turn.unwrap().starts_with("Took"));
+  assert_eq!(connection.waiting(), Waiting::Command);
+  let (out, _) = send(
+    &fixture,
+    &guards,
+    &mut connection,
+    b"( update ( ( 6 ) 3:dir true infinity false false ) ) ",
+  );
+  assert_eq!(out, "( success ( ( ) 0: ) ) ");
+  assert_eq!(connection.waiting(), Waiting::Report);
+}
