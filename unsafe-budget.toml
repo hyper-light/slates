@@ -644,7 +644,11 @@ slates-bridge-virtiofs = 3
 # (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
 # `statfs` of the path would touch the very mount the daemon serves. The Linux read of
 # `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
-slates-bridge-oci = 1
+# Raised to 2 on 2026-11-18 (A-511, g232): the macOS unmount watch's one `kevent` call (`kevent_now` in
+# `mount_table.rs`), which registers the `EVFILT_FS` filter on `VQ_UNMOUNT` and reads its event. rustix's
+# `kevent` cannot name `EVFILT_FS` (its `EventFilter` has no such variant), so the call is libc's; the queue
+# itself is made through rustix, and the Linux watch (an epoll instance over `/proc/self/mountinfo`) is safe rustix.
+slates-bridge-oci = 2
 # slates-conformance (0): pure parsers and records; no FFI, no I/O.
 slates-conformance = 0
 # slates-test-seeds (0): a proptest persistence over compiled seed text; no FFI, no I/O.

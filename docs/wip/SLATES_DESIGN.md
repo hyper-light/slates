@@ -2992,11 +2992,16 @@ tests and the abstract states must agree.
 service for the export's root handle over its own loopback socket and passes it to `mount(2)` in
 Apple's XDR arguments (`NFS_MATTR_FH`). The mount's source is `slates:/<name>`. The capability
 therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every local user can read.
-- **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself. The daemon ends
-  the attachment of a host mount of that volume only once the kernel's mount table
-  (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point. Since A-493 it watches the table
-  for as long as this shard has learned its kernel's unmounts take after their `UMNT` (`nfs::unmount_bound_ns`), not
-  a fixed second.
+- **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself, so since A-511 it ends
+  nothing. A host mount's attachment ends when the kernel's own unmount event says the mount left: a shard that holds
+  an own mount (A-227's record, the kernel's filesystem id of the mount) watches `EVFILT_FS` on `VQ_UNMOUNT` through
+  its readiness wait (`own_nfs::watch` over `slates_bridge_oci::mount_table::UnmountWatch`), reads the table
+  (`getfsstat(MNT_NOWAIT)`) once per event, and ends the attachment of each own mount the table no longer names, as a
+  `detach` would. Nothing in the watch is timed, so a forced unmount (which sends no `UMNT`), an NFSv4 mount (which
+  has none) and an unmount slower than any bound all end their attachments when the kernel lets the mount go, and a
+  mount that stays keeps its attachment. Until A-511 a `UMNT` started a confirmation against the table that gave up
+  at a bound (a fixed second, then the pace learned in A-493), and a mount unmounted with no `UMNT` kept its
+  attachment for good.
 - **OCI binds.** The source mount's attachment is found by that same bound mount point in the
   daemon's records.
 - **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
@@ -4713,7 +4718,7 @@ pages. Mount setup and barrier latency are outside the O(1) root publication mea
 > and in-flight pins) that every transport's request on the shard's volumes rides: a mount's request is
 > admitted under the registry attachment its capability maps to (`ShardState::mount_attachments`,
 > admitted on the capability's first request, revoked and drained when the catalog attachment ends —
-> a `detach`, the kernel's `UMNT`, a destroy), the NFS export serving it through `Export::over` the
+> a `detach`, the kernel's unmount (its own event since A-511), a destroy), the NFS export serving it through `Export::over` the
 > shared registry rather than one it mints per request, and a guest device is admitted into the same
 > registry (`bridge-virtiofs::admission::admit` takes the owner's registry; the device keeps only its
 > id, and every service pass and its terminal step take the registry from the owner through
@@ -4734,8 +4739,8 @@ pages. Mount setup and barrier latency are outside the O(1) root publication mea
 > to bind, and `status` lists the bound mounts (bounded by a mount budget, the rest counted). Proven
 > by use over the real NFS socket (`crates/server/tests/nfs_mount.rs`: a snapshot before any mount is
 > complete and closes nothing, over the written mount it is server-visible and closes one, the mount
-> serves on under the next generation, and after the kernel's `UMNT` the next snapshot closes nothing
-> again; a bound mount point listed, another principal and an SDK attachment refused, the detach
+> serves on under the next generation, and after the mount's end (a `detach`, the kernel's `UMNT` ending nothing since
+> A-511) the next snapshot closes nothing again; a bound mount point listed, another principal and an SDK attachment refused, the detach
 > unlisting it), by the device suites over the shared registry (`crates/bridge-virtiofs/tests`), and by
 > the live kernel-mount CLI flow (`status ID` names the mount point while mounted, none after
 > `umount`). Records: this entry, GAPS GAP-A9-4, `docs/wip/TBD_FIXES.md` §5.
@@ -9229,14 +9234,15 @@ that the current uid-based implementation enforces them.
 > attachment a host mount rides on is the **mount's** (`Consumer::Bridge`): it outlives the process
 > that attached (the reaper reclaims only ring clients' attachments) and a daemon restart (recovery
 > keeps a bridge's, and the attachment counter is seeded past recovered records, so the kernel's
-> handles keep validating), and it ends with the kernel's `UMNT` of the mount path, a `detach`, or the
-> volume's destroy — the record removed and the holder's last write attachment releasing the lease.
+> handles keep validating), and it ends when the kernel unmounts the mount (seen through the kernel's own unmount
+> event since A-511; a `UMNT` ends nothing), with a `detach`, or with the volume's destroy — the record removed and
+> the holder's last write attachment releasing the lease.
 > `slates mount ID PATH [--read-only]` attaches as a host mount (`Client::attach_mount`; a write mount
 > takes the write lease, D-16, refused `LeaseHeld` while another principal holds it, the read-only
 > mount being the remedy) and mounts under the capability; `slates unmount PATH` unmounts and the
-> kernel's `UMNT` ends the attachment. Proven over the real NFS socket
-> (`crates/server/tests/nfs_mount.rs`: the refusals, the cross-connection read, the scoped root, the
-> `UMNT` lifecycle), by the recovery crash sweep (a handle minted before a crash resolves after every
+> kernel's unmount event ends the attachment (A-511). Proven over the real NFS socket
+> (`crates/server/tests/nfs_mount.rs`: the refusals, the cross-connection read, the scoped root, every
+> `UMNT` ending nothing), by the recovery crash sweep (a handle minted before a crash resolves after every
 > crash point), by the handle and capability-parser hostile-input tests, and by the live kernel-mount
 > CLI flow (`SLATES_TEST_CLI=1`: one attachment while mounted, the mount serving after its command's
 > client was reaped, none after `umount`). The token is a bearer capability visible in the mounting
@@ -33157,3 +33163,74 @@ Applied in the same change to: §4.6's unmount paragraph, GAPS (the R3 debt's cl
 - **Owed.** A confirmation that ran out leaves its attachment kept even if the mount leaves later; a watch of the
   kernel's unmount events (`EVFILT_FS`, `VQ_UNMOUNT`) would end it whenever the mount goes, with one watch a mount
   bounding them.
+
+### A-511 — An unmount the kernel performs ends its attachment at the kernel's own event, never at a `UMNT` or a timed confirmation (2026-11-18, g232; UI goal 86, R3's class C, A-493's owed item; §4.6 A-34, A-227)
+
+Applied in the same change to: §4.6's unmount paragraph and its attachment-registry status, §4.13's host-mount status,
+GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/bridge-oci/src/mount_table.rs`
+(`UnmountWatch`), `crates/bridge-oci/src/lib.rs` and `Cargo.toml`, `unsafe-budget.toml` (`slates-bridge-oci` 1 to 2),
+`crates/server/src/own_nfs.rs` (`watch`, `watch_unmounts`, `let_go_of_unmounted`, `unmounted`),
+`crates/server/src/nfs.rs` (the confirmation removed: `unmount_capability`, `unmount_bound_ns`, `Unmounted`,
+`wait_for_unmount`, `confirm_unmount`, `holds_mount_of`), `crates/server/src/state.rs` (`unmount_times` removed,
+`unmount_watch`), `crates/server/src/daemon.rs`, `crates/server/src/verbs.rs` (`bind_mount` starts the watch),
+`crates/server/tests/nfs_mount.rs` (a `UMNT` ends nothing on every platform), and the docs of
+`crates/cli/tests/cli.rs`, `crates/client/src/client.rs` and `crates/ipc/src/protocol.rs`.
+- **What was there.** A `UMNT` started a confirmation that read the kernel's mount table until a learned bound
+  (A-493) and ended the attachment only if the mount left within it. Read from the kernels' sources on 2026-11-18,
+  that left three holes:
+  - The kernel sends no `UMNT` for a forced or dead mount, nor for any NFSv4 mount. In Apple's NFS client
+    (`kext/nfs_vfsops.c`, `nfs_mount_zombie`; `kext/nfs_socket.c`, `nfs_mount_sock_thread`) the mount's socket
+    thread sends it only for a v2 or v3 mount with `CALLUMNT` set that is neither forced nor dead, with a timeout of
+    6 s, or 2 s when the socket is not ready. The CLI's busy unmount on macOS is `umount -f`
+    (`slates_api::mount::unmount_busy`), so its attachment was never ended.
+  - A confirmation that ran out kept its attachment for good, though the kernel let the mount go later.
+  - A `UMNT` sent while no daemon served was never seen.
+
+  This also settles A-493's line flagged "from memory". The `UMNT` rides the mount's socket thread, and the kernel's
+  unmount waits for that thread to end ("wait for the socket thread to terminate") before XNU's `dounmount` takes the
+  mount off the list (`mount_list_remove`, `bsd/vfs/vfs_syscalls.c`). So a `UMNT` reply must never wait on the
+  table: the kernel would hold every unmount until the RPC's timeout.
+- **The rule.** An unmount ends its attachment when the kernel says so, through its own event. A shard that holds an
+  own NFS mount (A-227's record: the kernel's filesystem id of a mount the CLI bound or a successor learned) runs one
+  watch, `slates_bridge_oci::mount_table::UnmountWatch`: a kqueue holding one `EVFILT_FS` filter on `VQ_UNMOUNT`
+  (`sys/event.h`, `sys/mount.h`). Apple's kqueue(2) does not document the filter, so its behaviour is read from XNU's
+  `bsd/vfs/vfs_subr.c` (`filt_fsattach`, `filt_fsevent`). The shard's readiness wait registers the queue's own
+  descriptor (A-149), which reads ready while the queue holds an event (`bsd/kern/kern_event.c`, `filt_kqueue`). At
+  each event the table is read once, and each own mount whose id the table no longer names has its attachment ended
+  as a `detach` would (`verbs::end_attachment`). XNU posts `VQ_UNMOUNT` after `mount_list_remove`, so that read never
+  still names the mount that left. Judging by the mount's id, not its point, means a volume mounted again at the same
+  point does not keep the old mount's attachment. The watch also reads the table once as it starts, since the filter
+  sees only later events, and it ends once the shard holds no own mount; a later bind starts another. Nothing in it is
+  timed, so it never gives up and never takes a hint. A `UMNT` ends nothing, on every platform.
+- **Linux.** The seam's Linux half is an epoll instance holding `/proc/self/mountinfo` for `EPOLLPRI`
+  (proc_pid_mountinfo(5)). The poll rule is the one proc_pid_mounts(5) documents, and the two files share
+  `mounts_poll` (`fs/proc_namespace.c`): it reports the file readable always, and `EPOLLPRI | EPOLLERR` once per change
+  since the open file's last poll, the poll consuming the change. So the shard waits on the instance, never on the
+  file. No server path uses it yet. Linux host mounts are FUSE, and their device read failing `ENODEV` is the kernel's
+  own event for the mount's end, the more exact one: a lazily detached mount leaves the table while its open files
+  still serve, and its connection ends only with the last of them. The NFS loopback mount is macOS's alone (the Linux
+  kernel refuses `nfs` unprivileged, R10).
+- **What A-493's learned wait became.** Nothing: `ShardState::unmount_times` and `nfs::unmount_bound_ns` are removed.
+  The `UMNT` reply was already void and immediate (RFC 1813 §5.2.3). With the attachment's fate moved to the kernel's
+  event, no wait is left for the learner to bound, and keeping it unused would be a second path (banned item 7).
+- **Tests.** In `own_nfs.rs`, the kernel's events and table are stood in for by a pipe and a flag, and the readiness
+  wait is the shard's own:
+  - `an_unmount_with_no_umnt_ends_its_attachment_at_the_kernels_event`;
+  - `a_mount_the_kernel_lets_go_after_any_wait_still_ends_its_attachment`;
+  - `a_mount_that_left_before_its_watch_started_ends_at_the_watchs_first_read`;
+  - `only_the_mounts_the_table_no_longer_names_are_let_go`;
+  - `a_table_that_cannot_be_read_ends_nothing`.
+
+  Red-checked once with the judgment ending nothing, the shape before for an unmount with no `UMNT`: 4 of 5 failed
+  (each that expects an end; the unreadable table's passed, as it asserts nothing ends), and all 5 passed with it
+  restored (the Mac Studio, 2026-11-18). In `mount_table.rs`,
+  `the_unmount_watch_opens_on_the_kernels_own_event_and_its_descriptor_is_pollable` registers the real filter on the
+  host's kernel (passed on macOS, 2026-11-18). `crates/server/tests/nfs_mount.rs` now asserts that the kernel's form
+  of `UMNT` ends nothing on every platform.
+- **Owed.**
+  - The live CLI mount suite on macOS (`unmount_and_check`) proves the real event end to end, and `umount -f` should
+    be added to it: filed for main.
+  - The Linux and Windows lint lanes over the paired code: Windows' queue is an empty enum.
+  - A successor's start still records nothing for a mount that went while no daemon ran (`own_nfs::learn`), so that
+    attachment waits for a `detach`. Its catalog record names a bound point, but a bind of a point holding no mount
+    records the same, so absence at start proves nothing.

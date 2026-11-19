@@ -4498,8 +4498,8 @@ impl Client {
   }
 
   /// Attaches for a host kernel mount of `volume` (§4.6, §4.13; the `slates mount` flow): the attachment
-  /// is the **mount's** — it outlives this client and the daemon, ending with the kernel's `UMNT` of the
-  /// mount, a `detach`, or the volume's destroy — and the reply's `token` is the capability the mount
+  /// is the **mount's** — it outlives this client and the daemon, ending when the kernel unmounts the mount
+  /// (A-511), with a `detach`, or with the volume's destroy — and the reply's `token` is the capability the mount
   /// presents (`/<name>@<attachment_hex>.<token_hex>`). A write intent takes the volume's write lease as
   /// any write attachment does (D-16; refused `LeaseHeld` while another principal holds it unexpired);
   /// a read intent records a read-only attachment, whose capability presents a read-only view.
