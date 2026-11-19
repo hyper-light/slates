@@ -75,8 +75,9 @@ mod v0;
 pub use answer::{Answer, Written};
 pub use fragments::{Fragments, Planned, Streamed};
 
-/// Format: the name this server gives itself in `agent`, under every protocol version, its crate's version after it.
-const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
+/// Format: the name this server gives itself in `agent`, under every protocol version, its crate's version after it;
+/// receive-pack advertises the same (A-654).
+pub const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
 
 /// Format: git's band-3 words for a pack that could not be finished (`upload-pack.c` `create_pack_file`'s
 /// `abort_msg`).
