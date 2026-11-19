@@ -3156,6 +3156,10 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::StaleHandle => HostAnswer::StaleHandle,
     // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
+    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
+    HostError::Win32(code) => HostAnswer::Errno {
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
   }
 }
 
