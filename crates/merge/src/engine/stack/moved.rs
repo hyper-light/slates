@@ -19,7 +19,7 @@
 use std::collections::BTreeSet;
 
 use crate::engine::touched_range;
-use crate::map::effect_of;
+use crate::map::{effect_of, lies_past};
 use crate::ops_doc::{Op, OpKind};
 use crate::range::Range;
 
@@ -116,6 +116,9 @@ enum Meets {
   Same,
   /// It starts at or after the work operation's end, as every later one does: the walk ends.
   After,
+  /// It starts at the work operation's point and lies after it, and the walk goes on, as an insert at the point may
+  /// follow it ([`crate::map::lies_past`], A-668).
+  Beside,
   /// It changes no content, and the walk passes it.
   Passed,
 }
@@ -133,7 +136,10 @@ fn meets(change: &Op, op: &Op) -> Option<Meets> {
   if at.checked_add(old)? <= range.start {
     return Some(Meets::Before(size(old, new)?));
   }
-  (at >= range.end()).then_some(Meets::After)
+  if lies_past(at, range) {
+    return Some(Meets::After);
+  }
+  (range.len == 0 && at == range.start).then_some(Meets::Beside)
 }
 
 /// Whether two operations overwrite one span.
@@ -174,9 +180,12 @@ fn walk(delta: &[Op], op: &Op, from: usize, absorbed: &mut [bool]) -> Option<Wal
     shift: 0,
     met: false,
   };
+  // Past an operation beside a point, nothing more is passed: what lies beside it lies after it.
+  let mut beside = false;
   for (index, change) in delta.iter().enumerate().skip(from) {
     match meets(change, op)? {
       Meets::After => break,
+      Meets::Beside => beside = true,
       Meets::Before(size) => walked.shift = walked.shift.checked_add(size)?,
       Meets::Same => {
         *absorbed.get_mut(index)? = true;
@@ -184,7 +193,9 @@ fn walk(delta: &[Op], op: &Op, from: usize, absorbed: &mut [bool]) -> Option<Wal
       }
       Meets::Passed => {}
     }
-    walked.next = index.checked_add(1)?;
+    if !beside {
+      walked.next = index.checked_add(1)?;
+    }
   }
   Some(walked)
 }
