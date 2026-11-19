@@ -35912,3 +35912,22 @@ Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (n
 - **Owed.** The parts' payloads (phase-heads, bookmarks, the check parts, markers in formats 0 and 1, pushkey values),
   compressed bundle streams once the D-17 engines are wired, and a golden `05` changegroup (7.2's bundle types offer
   `01` to `04`; `05` is held to its layout in 7.2's code by a round trip).
+
+### A-543 — The path an open names, as the volume stores each component, for a WinFsp drive over a folding volume (2026-11-18, goal 85, g079; §4.4 name policy, §4.6 "Windows"; A-300; T-4.6)
+Applied in the same change to: GAPS (the folding-drive entry: part 1 built, part 2 owed), `crates/vfs/src/volume.rs`
+(`Volume::stored_name_no`), `crates/bridge-core/src/lib.rs` (`Bridge::stored_entry`, `stored_path`, the unit test),
+`crates/bridge-core/src/volume_bridge.rs` and `scoped.rs` (`stored_entry`), and the bug record
+`docs/bugs/2026-11-18-a-winfsp-drive-declared-a-folding-volume-case-sensitive.md`.
+- **What was there.** A WinFsp drive declares `CaseSensitiveSearch` for every volume, and WinFsp's driver keys its open
+  files by name, so on a folding volume (`NamePolicy::Fold`) `A.TXT` and `a.txt` are two of the driver's file nodes: two
+  share-access records and two caches over one file. Clearing the bit alone would have the driver name each node by the
+  upper-cased path (WinFsp's `create.c` 1036-1043) unless the file system answers each open with its normalized name.
+- **The rule.** An open on a folding volume is named by the path as the volume stores it: each component as its
+  directory holds it, the spelling the entry was made with, which every spelling that folds alike finds
+  (`stored_path`). On an exact volume that is the path as asked. Part 1, here, is that naming, portable and held by its
+  test on every host. Part 2 is the drive's: `CaseSensitiveSearch` for an exact volume only, and each open of a folding
+  volume answered with its stored path as WinFsp's normalized name, the ledger and the open names keeping that path.
+- **Cost.** One look-up a component per open on a folding volume, in the open that resolves the path already.
+- **Tests.** `every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with` (`crates/bridge-core/src/
+  lib.rs`): three spellings on a folding volume name `\Src\Main.RS`, an exact volume finds only its own spelling. Red
+  with the open named as asked on the Mac Studio; green with the walk.
