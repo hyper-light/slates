@@ -373,11 +373,24 @@ where
     command: &Asked,
     git_protocol: Option<&[u8]>,
   ) -> Dispatched<S::Command> {
-    let _ = (principal, command, git_protocol);
-    Dispatched::Refuse(Refused {
-      stderr: Vec::new(),
-      exit_status: 0,
-    })
+    let (service, path) = asked(command);
+    let repository = match path.map(|path| self.reachable(service, path, principal)) {
+      Some(Ok(repository)) => Some(repository),
+      Some(Err(refused)) => return Dispatched::Refuse(refused),
+      None => None,
+    };
+    let start = Start {
+      service,
+      repository: repository.as_ref(),
+      principal,
+      git_protocol,
+    };
+    match self.services.start(&start) {
+      Ok(command) => Dispatched::Run(command),
+      Err(Unserved) => Dispatched::Refuse(
+        Tool::of(service).refused(&format!("{} is not served yet", service.name())),
+      ),
+    }
   }
 }
 

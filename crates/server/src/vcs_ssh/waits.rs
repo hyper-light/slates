@@ -157,13 +157,20 @@ impl PhaseWaits {
 
   /// A wait in `phase` that completed after `waited_ns`: a sample, and the end of any back-off.
   pub(crate) fn completed(&mut self, phase: Phase, waited_ns: u64) {
-    let _ = (phase, waited_ns);
+    let learned = self.learned.get_mut(phase);
+    learned.waits.completed(waited_ns);
+    learned.samples = learned.samples.saturating_add(1);
   }
 
   /// A connection overdue as `overdue` says was reaped: it teaches nothing (Karn's rule), it is counted, and its phase
   /// backs off when its key proved a principal and its wait was armed under the bound now in force (the module doc).
   pub(crate) fn reap(&mut self, overdue: &Overdue) {
-    let _ = overdue;
+    let learned = self.learned.get_mut(overdue.phase);
+    learned.reaps = learned.reaps.saturating_add(1);
+    if overdue.proven && overdue.armed_generation == learned.generation {
+      learned.waits.ran_out();
+      learned.generation = learned.generation.saturating_add(1);
+    }
   }
 
   /// How many back-offs `phase` has taken: what a wait armed now is armed under.
@@ -265,8 +272,22 @@ impl Tracker {
     granularity_ns: u64,
     waits: &mut PhaseWaits,
   ) -> u64 {
-    let _ = (phase, granularity_ns, waits);
-    now_ns
+    self.observe(phase, now_ns, waits);
+    let generation = waits.generation(phase);
+    self.armed_generation = generation;
+    let since_ns = match self.current {
+      Some(current) if whole(phase) => current.since_ns,
+      _ => *self.silence_since_ns.get_or_insert(now_ns),
+    };
+    let bound_ns = waits.bound_ns(phase).unwrap_or_else(|| {
+      let first_ns = first_rto_ns(
+        self.measured_ns.saturating_add(self.worked_ns),
+        granularity_ns.max(self.resolution_ns),
+      );
+      let backoffs = u32::try_from(generation).unwrap_or(u32::MAX);
+      first_ns.saturating_mul(BACKOFF_FACTOR.saturating_pow(backoffs))
+    });
+    since_ns.saturating_add(bound_ns)
   }
 
   /// What a wait in `phase` past its deadline `deadline_ns` marks its connection: overdue since that deadline, with what a

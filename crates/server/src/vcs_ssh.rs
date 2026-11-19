@@ -23,8 +23,10 @@
 //! overdue it waits until a seat comes back or a connection becomes overdue. So the listener holds at most one accepted
 //! connection beyond the seats, and none is cut while no new connection needs its seat, because an SSH connection waits
 //! on people inside it: OpenSSH asks for a key's passphrase only after the server's `SSH_MSG_USERAUTH_PK_OK`
-//! (`input_userauth_pk_ok` signs through `load_identity_file`, which prompts) \[C: OpenSSH `sshconnect2.c`\], asks a
-//! person to confirm an unknown host key before its `SSH_MSG_NEWKEYS` (`check_host_key` in `sshconnect.c`) \[C\], and a
+//! (`input_userauth_pk_ok` calls `sign_and_send_pubkey`, whose `identity_sign` loads a key not yet loaded through
+//! `load_identity_file`, which prompts "Enter passphrase for key") \[C: OpenSSH `sshconnect2.c` at `fa4b2a82`, lines 745,
+//! 1242 and 1543\], asks a person to confirm an unknown host key before its `SSH_MSG_NEWKEYS` ("Are you sure you want to
+//! continue connecting", `check_host_key` in `sshconnect.c`) \[C\], and a
 //! push's client compresses its pack before it sends a byte of it. A cut at a bound learned from the clients that
 //! finished would cut every agent-less passphrase on every connection, and a cut before the proof backs nothing off, so
 //! it would never be learned (g294's finding; main's ruling).
@@ -1009,7 +1011,37 @@ impl<S: SshSite> Link<S> {
 
 /// Serves one connection until it ends (the module doc's loop), its seat given back however it ends.
 async fn drive<S: SshSite>(stream: TcpStream, mut site: S, seat: Seat, tracker: Tracker) {
-  let _ = (stream, site, seat, tracker);
+  let accepted_ns = now_ns();
+  let keys = site.keys();
+  let Some(session) = seat
+    .state
+    .with(|state| state.session(keys, accepted_ns))
+    .flatten()
+  else {
+    crate::fleet::count_refusal(NO_SESSION);
+    let _ = seat
+      .state
+      .with(|state| state.count(|counts| counts.failed = counts.failed.saturating_add(1)));
+    return;
+  };
+  let mut link = Link {
+    stream,
+    buffer: vec![0; READ_BYTES],
+    unread: Vec::new(),
+    session,
+    site,
+    state: seat.state,
+    slot: seat.slot,
+    tracker,
+    phase: Phase::Handshake,
+    principal: None,
+    running: None,
+  };
+  link.enter(Phase::Handshake);
+  let why = link.run().await;
+  ended(&link, why, accepted_ns);
+  drop(link);
+  drop(seat);
 }
 
 /// Counts how a connection ended, and its lifetime when it was proven and ended as its client meant. Called before its
