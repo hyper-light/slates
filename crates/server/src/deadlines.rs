@@ -621,15 +621,18 @@ mod tests {
   }
 
   /// A-536 (CLI attachments off the tick). Do: on a one-shard daemon whose failover delay, a CLI attachment's term, is a
-  /// tenth of a liveness window, create a volume and attach it for reading in the CLI's form; look until the attachment
-  /// is gone. Expect: ended within half a window, by the keeper at its term's lapse, found in the partition's index of
-  /// terms. The reap loop's tick, which walked every attachment for a lapsed term once a window, no longer does.
+  /// tenth of a liveness window, injected through the daemon's seam so that every beat publishes it (A-574, A-660),
+  /// create a volume and attach it for reading in the CLI's form; look until the attachment is gone. Expect: ended
+  /// within half a window, by the keeper at its term's lapse, found in the partition's index of terms. The reap loop's
+  /// tick, which walked every attachment for a lapsed term once a window, no longer does.
   #[test]
   fn a_lapsed_cli_attachment_ends_at_its_term_without_a_tick() {
     let daemon = crate::daemon::audit_daemon_of(1);
+    daemon
+      .inject_failover(Some(SOON_NS))
+      .expect("the failover delay injected");
     let begun = Instant::now();
     let attachment = crate::daemon::observe_first(&daemon, |state| {
-      state.failover_ns = SOON_NS;
       let volume = created(state, "termed");
       let reply = crate::verbs::dispatch(
         state,
@@ -777,7 +780,8 @@ mod tests {
   }
 
   /// A-525 (A-414's owed list; A-522's keeper). Do: on a one-shard daemon whose failover delay is a tenth of a liveness
-  /// window, seat a client and ask its status; capture the report, grown to several pages, only two delays later, as a
+  /// window, injected through the daemon's seam so that every beat publishes it, not written into the shard's state,
+  /// which the control shard's beat overwrites with its estimate (A-574, A-660), seat a client and ask its status; capture the report, grown to several pages, only two delays later, as a
   /// scatter on a starved daemon does; then look until the shard lets the capture go. Expect: the first page served at
   /// the capture, and the capture held a delay from its capture, then let go by the keeper, within half a window. Before,
   /// the deadline counted from the request by the operator's ten-second placeholder, so the capture was held ten seconds;
@@ -790,8 +794,10 @@ mod tests {
       sequence: 1,
     }
     .word();
+    daemon
+      .inject_failover(Some(DELAY_NS))
+      .expect("the failover delay injected");
     let (asked, report) = crate::daemon::observe_first(&daemon, move |state| {
-      state.failover_ns = DELAY_NS;
       let asked = seat(state, ASKING);
       let served = crate::verbs::status_on_channel(
         state,
