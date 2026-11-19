@@ -298,6 +298,9 @@ pub struct Upload<A> {
   sent: Positions,
   /// The runs' objects the filter sends, gathered before the header counts them.
   gathered: Positions,
+  /// D(k) of the version gathered an object at a time (its green and version), read from its value once and kept until
+  /// its objects are gathered.
+  reading: Option<((u64, u64), Positions)>,
   /// The objects the header counts.
   counted: u64,
   /// The entries sent.
@@ -328,6 +331,7 @@ impl<A: Answered> Upload<A> {
       sends_all,
       stage: Stage::Objects { next: 0 },
       wanted: Positions::new(),
+      reading: None,
       sent: Positions::new(),
       gathered: Positions::new(),
       counted: 0,
@@ -459,6 +463,22 @@ impl<A: Answered> Upload<A> {
     Ok(Stage::Header)
   }
 
+  /// D(k) of `green`'s version `version`: the set kept while that version's objects are gathered, or else read from the
+  /// version's value (A-647 part 3), once a version.
+  fn brought_of(
+    &mut self,
+    cx: &Context<'_>,
+    green: u64,
+    version: u64,
+  ) -> Result<Positions, StoreRefused> {
+    match self.reading.take() {
+      Some((at, brought)) if at == (green, version) => Ok(brought),
+      _ => cx
+        .repository
+        .brought(cx.store, green, version_index(green, version)?),
+    }
+  }
+
   /// One unit of gathering (module docs, **What it sends** 1): a version's objects joined at once when the filter sends
   /// everything; otherwise one object, judged by its row.
   fn gather(
@@ -473,10 +493,7 @@ impl<A: Answered> Upload<A> {
       return self.gather_from(run.saturating_add(1));
     }
     let green = versions.green;
-    let brought = cx
-      .repository
-      .brought(green, version_index(green, version)?)
-      .ok_or(StoreRefused::NoVersion { green, version })?;
+    let brought = self.brought_of(cx, green, version)?;
     let next_version = Stage::Gather {
       run,
       version: version.saturating_add(1),
@@ -489,7 +506,7 @@ impl<A: Answered> Upload<A> {
       }
     }
     if self.sends_all {
-      self.gathered = self.gathered.union(brought);
+      self.gathered = self.gathered.union(&brought);
       return Ok(next_version);
     }
     let Some(position) = brought.next_from(from) else {
@@ -499,6 +516,7 @@ impl<A: Answered> Upload<A> {
     if self.answer.admits(row.kind, row.len) {
       self.gathered.insert(position);
     }
+    self.reading = Some(((green, version), brought));
     Ok(Stage::Gather {
       run,
       version,
