@@ -12531,9 +12531,13 @@ engine: the verdict, rebase, position mapping, the register).
 > appends). `Session` runs them over one connection, sans-io: bytes in as they arrive, the repository handed to each call
 > that reads, the push then waiting checked while the caller admits its objects to the store's quarantine, and decided
 > through the judge and answered to the caller's sink. Proven byte for byte against eleven pushes stock git 2.50.1
-> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
-> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
-> versions (A-645), appended per A-642.
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2's
+> judge is built (`works::Works`): each ref's update a work through A-618's `build` over A-638's `PushedObjects`, each
+> green read as the push found it (`Greens`), immutable (A-645). An update's base is the version whose head is its old
+> value, a ref that moved when none held it; a create is built over an empty green; a delete retires the green at its
+> head; a tag names its commit's tree. Each work is appended on its green's own log through `Appends`, A-642's stand-in
+> until g261's append lands, all or none under `atomic`. Owed: the server's push path that admits the checked objects
+> to the quarantine and drives the session with g261's appends and A-614's store commit.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -13571,9 +13575,9 @@ and export by landing).
 > refusal is the verdict's and whose entries are its accepted answer. Every refusal typed and named by its Subversion
 > error. Its oracle transcribes `merge()`, `compare_dir_structure`, `verify_locks`, `verify_lock` and
 > `svn_path_compare_paths` over the naive FSFS of the index's tests and equals the verdict, with the lock table's real
-> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. Owed with the server
-> (piece 7): the drive asking the out-of-date test, and the lock check FSFS also makes at each editor call, as each
-> command arrives, over a transaction built a command at a time.
+> check, on 4,096 generated histories a run, every conflict kind and lock refusal among them. The drive asking the
+> out-of-date test, and the lock check FSFS also makes at each editor call, as each command arrives, are A-617's (part
+> 2b).
 >
 > **Status (2026-11-19, A-599).** Built: ra_svn's greeting and authentication (`slates-svn`'s `handshake`, piece 7's
 > first part), a state machine that does no I/O, from the greeting to `repos-info`: the client's answer read as
@@ -13681,10 +13685,29 @@ and export by landing).
 > recorded on the Mac Studio, four of them refused by `svnserve`: stock `svn` 1.15.0 against stock `svnserve` 1.15.0
 > through a relay (`crates/svn/fixtures/commit`, its `make-fixtures.py`, each file's SHA-256 in `SHA256SUMS`), every
 > command read and written back byte for byte, every text delta decoded whole and applied to its file's text; and to
-> `vparse_tuple` transcribed over generated items for every prototype. Owed (part 2b): the drive, each command checked
-> as it arrives (the tokens, the paths, the out-of-date test, the lock check) and declared on a trial built a command at
-> a time, the texts through the svndiff codec with their MD5 checked, `close-edit`'s verdict, and the answers `svnserve`
-> writes: after a failure, the commands read and dropped until `abort-edit` (`editorp.c` 1149-1208).
+> `vparse_tuple` transcribed over generated items for every prototype. The drive is part 2b's, below.
+>
+> **Status (2026-11-19, A-617, part 2b).** Built: the commit's drive (`slates-svn`'s `commit::drive`, piece 7's commit,
+> its second part). `commit` is answered up to its drive as `serve.c` answers it, the lock tokens joined to the
+> session's path. Each editor command is checked as `svnserve`'s commit editor checks it, in its order and words:
+> `open-root` past the youngest; the out-of-date test at `delete-entry`, `open-file` and a directory's first property
+> change (A-592's); a deletion of an absent path, an add over a present one, a copy onto one unless its directory was
+> copied, a copy's source outside this repository or absent at its revision, `open-dir` and `open-file` of absent paths;
+> and FSFS's lock check at each call that changes a path (A-602's, over that one path, at or beneath it for a deletion,
+> a directory's addition, a copy and a directory's property change). Text deltas are decoded and applied a window at a
+> time against the file's text in the transaction by the svndiff codec, the base and resulting MD5 checked (`E200014`),
+> the new text's MD5 and SHA-1 taken as it is written (aws-lc-rs); a property change is one new list. `close-edit` runs
+> A-592's verdict and hands the accepted work to the owner, who commits it and writes `svnserve`'s answer. Token faults
+> and a client's failure end the connection; a refusal is written at once and every item after it dropped until
+> `abort-edit`. The drive keeps the revision's rows, folded as FSFS folds them, and reads them over the index at its
+> base, borrowing nothing between commands, since the owner appends other commits while drives run. Held to the
+> seventeen recorded commits replayed in their order (bob's lock taken with its recorded token, bob's race landing
+> during alice's drive), every answer from `commit` on byte for byte as `svnserve` wrote it, revisions 1 to 13 and the
+> out-of-date, lock and conflict refusals among them; and to hostile drives, each refusal in `svnserve`'s number and
+> words, every guard red-checked. Owed (A-617's next part): `svn_repos__validate_prop`'s property checks, the
+> authorization checks (`check_authz`, A-606's rules), an added path's validation (`svn_repos__validate_new_path`), a
+> session that must authenticate for write before `commit`, and the owner's commit step with the connection task that
+> runs the drive.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -13710,6 +13733,26 @@ and export by landing).
 > `svnlook changed`: call for call, a node's own properties and a directory's deletions as sets, each text by what its
 > delta makes of its base; red six ways. Owed of part 2: the deltas of changed texts against their base (`xdelta.c`),
 > sent today as new data; and the handler.
+>
+> **Status (2026-11-19, A-627, its rest).** Built: the editor drive's two HTTP answers and the lock verbs over HTTP
+> (`slates-svn`'s `dav::drive` and `dav::locking`). One `dav::Drive` takes A-616's `Call`s, the drive ra_svn's editor
+> writes too, and writes the update-report's answer as `reports/update.c` writes it, in send-all mode and outside it,
+> and the replay report's as `reports/replay.c` writes it, byte for byte against their format strings: the
+> update-report names an entry by its basename and builds the checked-in href and an added directory's `bc-url` from
+> the drive's facts (`dav_svn__build_uri`, the path encoded as `svn_path_uri_encode` encodes it); the replay names
+> whole paths, sends every property value in base64 and the -1 its path driver passes as each base revision; a delta's
+> windows stream into base64 a group at a time; a call out of the drive's order is refused typed; an aborted drive
+> sends nothing. LOCK and UNLOCK are read into A-602's guards in `mod_dav`'s and `mod_dav_svn`'s order (stealing by
+> `X-SVN-Options: lock-steal`, breaking by `lock-break`), each refusal before the guard at their status (400, 403, 405,
+> 409, 412, 501), and answered as they answer: LOCK's `D:lockdiscovery` with the owner element `mod_dav` keeps (every
+> namespace the body declared, in APR's order), `Lock-Token`, `X-SVN-Creation-Date` and `X-SVN-Lock-Owner`; each
+> guard refusal as `append_locks` and `remove_lock` map it (423 with FSFS's message for a lock held or another's, 404
+> for no such revision, 501 for no principal, else 500 with FSFS's message or "Failed to create new lock." and "Failed
+> to remove a lock."); and the PROPFIND's `DAV:lockdiscovery` that `svn unlock` and `svn info` read. Held to stock svn
+> 1.15.0's own LOCK and UNLOCK heads and bodies, recorded on the Mac Studio. Owed: the resource walk a pre-1.2 client
+> asks for; the facts' revision as `dav_svn__get_safe_cr` gives it (A-616's facts carry `svn_fs_node_created_rev`'s,
+> which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
+> Apache with `mod_dav_svn`.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -14224,8 +14267,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    `get-mergeinfo`, `log` and segments). 10. Authorization (built, A-606: the file, its evaluation, a naive oracle). 11. Hooks and `svnlook`.
    12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
-    (A-609); of its second, `list-report`, `file-revs-report`, PROPPATCH, LOCK's request and the update-report drive are
-    built (A-627), and the replay drive, LOCK's answer and LOCK and UNLOCK onto the lock table are owed.
+    (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
+    report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
+    `DAV:lockdiscovery` property.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -43053,14 +43097,43 @@ Applied in the same change to:
     by mutation four ways: the checked push lost (4 failed), its objects hidden (2), a delete-only push waiting for a
     pack (4); the fourth, `end` discarding a waiting push, passed every test, so the new test now ends the input first
     and catches it (1 failed). Then 377 of 377 again (load 6.9, 16.5 s), `cargo fmt --check` clean.
-- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
-  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
-  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
-  per-green append lands. Then:
+- **Then, part 2's second piece (2026-11-19): the judge over the store** (`receive::works`). `Works` is receive-pack's
+  `Judge`. It reads each green as the push found it (`Greens`: the green a ref names, at the position its own log was
+  read, and the version whose head is a given commit), immutable, so the work is computed anywhere (A-645):
+  - an update's base is the version whose head is the command's old value (§4.17.1 item 1). A value no version held is
+    answered as git answers a ref that moved, `failed to update ref`, before any work is built;
+  - its work is A-618's `build` against that green, reading the push's trees and blobs through A-638's `PushedObjects`
+    (the index, then the push's quarantine, which the caller admits from `Checked::objects` and seals);
+  - a create's work is built over an empty green, and a create of a ref that names a green is a ref that moved; a delete
+    retires the green, its old value the green's head;
+  - a ref's tree is its commit's, or the tree it names; an annotated tag (a tag is a green, §4.17.1 item 6) names its
+    commit's tree. A tag of a tag, or a ref naming a blob, is `ref names no tree` (owed: git peels any chain).
+  The verdict's entry is appended through `Appends`, A-642's stand-in until g261's per-green append lands: one entry on
+  the green's own log, only while it is at the position read, or under `atomic` every entry or none. A green that moved,
+  or a conflict on the head at the append, is `failed to update ref` (under `atomic`, `atomic transaction failed`), its
+  band-2 line naming the ref. A-618's refusals answer in git's words where git has them (a moved base or one the green
+  disagrees with: a ref that moved; an object the store cannot give: `missing necessary objects`) and in slates' own
+  otherwise, one reason each (`path not held`, `duplicate entries`, `link target not held`, `path changes kind`, `push
+  past its room`, `path without bytes`), the band-2 line naming the path.
+  - Tests (seven, over a real store and engine, through a session): an update appended at the position read, its work
+    the green's next version holding the client's bytes and head; an old value no version held, and a create of a ref
+    that exists, each a ref that moved; a create a new green; an annotated tag a green of its commit's tree; a delete
+    retired at its head and refused at another value; a branch another push moved before the append, alone and under
+    `atomic` beside a create; a file made a directory refused `path changes kind` naming it.
+  - Checks on the Mac Studio (2026-11-19): the first build met main's A-637, which made a submodule link a served node,
+    so that refusal's words went. Then 386 of 386 under `--locked` (two of main's ignored; load 12.2, 14.3 s). Failing
+    first: with the judge stubbed to read no green, six of the seven failed, all but the moved-ref test, which mutation 1
+    guards. Red five ways: any base taken (1 failed), a delete retiring anywhere (1), the atomic line naming the wrong ref
+    (1), a kind change answered as a moved ref (1), a tag's tree read from the tag (1). `cargo fmt` (brought back by
+    blob hash), `cargo fmt --check` clean.
+- **Owed.** The server's push path: the caller that admits `Checked::objects` to a store quarantine and seals it, then
+  answers through `Works` with g261's per-green append (A-642) and A-614's `Repository::admit` and `commit` beside it;
+  several works judged together under `atomic` (A-635); the policy's checks (fast-forward, deletes, linear history,
+  signatures, evidence; A-622's check point) and the admission hooks. Then:
   - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
   - the `.have` lines of objects a fork shares (git's alternates);
-  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
-    blobs.
+  - the warnings git's strict check writes on band 2, A-590's checks of the `.gitmodules` and `.gitattributes` blobs,
+    and a tag of a tag peeled.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
@@ -44821,6 +44894,96 @@ superseded, kept on the wire), `crates/ipc/tests/wire_order.txt`, `crates/server
   records at their joins, replicas refusing split cuts, takeovers adopting each log and each record whole; the
   repository policy's check before the verdict (A-622's next part); a stack of several works on one green in one push
   (works over works, piece 5).
+
+### A-617 part 2b — The commit's drive: each editor command checked as `svnserve`'s commit editor checks it, in its order and words, the transaction read over the index at its base, held to stock `svn` 1.15.0's commits replayed in their order (2026-11-19, g268 for UI goal 93; §4.17.4 items 3.2 to 3.4, "5. The wire", piece 7)
+Applied in the same change to: §4.17.4's status (A-617, part 2b; A-592's, whose owed drive is built), GAPS (the §4.17.4
+entry), the research notes (§1's `svn_fs_util.h` and `checksum.c` rows; §14's drive), `crates/svn/src/commit.rs` (`pub
+mod drive`, its doc sentence), `crates/svn/src/commit/drive.rs` and `crates/svn/src/commit/drive/tests.rs` (new).
+- **What was there.** Part 2a read the commit's request and each editor command. A-592's out-of-date test and verdict
+  waited for a drive to ask them.
+- **The decision.** `Drive::command` takes one item and writes what `svnserve` writes for it: `begin` answers `commit`
+  up to its drive, `write_commit_info` answers an accepted work once the owner committed it. The green is a seam
+  (`Green`: texts and property lists by identity, and the identities the work's new ones get). Refusals are
+  `DriveRefusal`, each with `svnserve`'s number and words, an error that has no message given the code's own
+  (`svn_err_best_message`: "Invalid character in hex checksum", "LZ4 decompression failed"). The transaction is the
+  drive's rows read over the index at its base, not A-592's `Trial`: a trial borrows the index for the whole drive, and
+  the owner must append other commits during it (the recorded race does), so the drive borrows nothing between commands
+  and the verdict builds the full trial once. Departures, each for an input no stock client sends: a path that is not
+  UTF-8 is refused; a copy source continuing the root URL without a `/` is from another repository; "File already
+  exists" names the green where FSFS names its directory on disk; a file closed with its delta open keeps its text; the
+  room the work's texts and lists may hold is the caller's.
+- **Evidence** (the Mac Studio d1323898, kiln, 2026-11-19, debug, a fresh clone of the pushed branch, its own target
+  directory). First build (06:12 UTC): one error, a closure's lifetime, made a function. First run (06:13 UTC): the
+  replay of every recorded commit passed; one hostile case was wrong in the test (the import's `gone/` stands at
+  revision 3) and was fixed there. Red (06:17 to 06:19 UTC), each guard removed in the Studio's copy: `open-file`'s
+  out-of-date test, 3 of 5 tests failed; the drop after a refusal, 3 of 5; the lock check at each call, the lock test
+  alone (the verdict refuses the same bytes at `close-edit`, so the replay cannot tell them apart); the read through a
+  copy, the copy test alone (no recorded commit opens a path beneath a copy). Green (99674c480, 06:20 UTC, load 7.1):
+  `cargo test --locked -p slates-svn --lib` 321 of 321 in 9.27 s, `cargo fmt -p slates-svn -- --check` clean. On the
+  tree merged with main (c715685db, 06:34 UTC): 365 of 365 in 8.12 s, rustfmt clean. Clippy, `xtask check` and the doc
+  gate are main's (the run-request queue).
+- **Owed.** `svn_repos__validate_prop`, the authorization checks (A-606), `svn_repos__validate_new_path`, authenticating
+  for write before `commit`, the owner's commit step and the connection task (A-617's next part).
+
+### A-627, completed — The replay answer and the update-report's from A-616's one drive, and LOCK and UNLOCK onto A-602's guards, each answered as mod_dav and mod_dav_svn answer it (2026-11-19, g298, UI goal 93; §4.17.4 piece 13's second part; with A-616 part 2 and A-602)
+Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§1's sources,
+§3); `crates/svn` (`dav/drive.rs` and its tests, rewritten; `dav/locking.rs` and its tests, rewritten; `dav/xml.rs`'s
+`Document`, `parse_document` and `Base64Stream`; `dav/response.rs`'s `Body::left`; `dav.rs`'s three refusals; the
+fixtures `lock-steal.xml` and five request heads).
+
+- **One drive, two answers.** `dav::Drive` takes A-616's `report::drive::Call`s (`Drive::call`, a `match` onto one
+  method a call), so the drive ra_svn's editor writes feeds both HTTP answers. Agreed with g234 through main: a call
+  carries the editor's own arguments and its node's raw facts; the svndiff version is the answer's.
+  - The update-report (`reports/update.c` at `d434dc14`): an entry's basename (`make_child_baton`); its checked-in href
+    and an added directory's `bc-url` built by `dav_svn__build_uri` from the facts, the path encoded as
+    `svn_path_uri_encode` encodes it, `rvr` by HTTPv2's me resource, `ver` otherwise; a deletion with no revision
+    written -1, as `reporter.c` passes one (1015-1029), which the drive's earlier `u64` could not write; outside
+    send-all mode, an addition's properties held unless inline, a copied addition's removals kept for its close (their
+    bytes held against the room as they are kept), no delta, and a changed file fetched with its base and SHA-1.
+  - The replay report (`reports/replay.c`): its header at the first call; each call an empty element with its whole
+    path; the -1 `svn_repos_replay2`'s path driver passes as every base revision; every property value in base64 with
+    line breaks, a removal `del`; `S:apply-textdelta` with its base checksum, ended where `replay.c` ends it in every
+    order a drive may make; nothing for an absent entry; `S:close-file` with the MD5.
+  - A delta streams: each window encoded as it comes (each version-2 section LZ4 when shorter, `svndiff.c` 196-233),
+    its base64 written a whole group at a time and the rest carried (`Base64Stream`), the same text however the
+    windows split. An all-zero digest is none, as `svn_checksum_to_cstring` reads it.
+  - Stricter, stated: a call out of the drive's order refused typed before a byte is written; an aborted drive's
+    answer refused whole, so the server answers the drive's refusal, as `mod_dav` answers an error met before it has
+    sent a byte; a root path or special URI that is not canonical and URI-safe refused.
+- **LOCK and UNLOCK onto the guards** (`dav_method_lock`, `dav_lock_parse_lockinfo`, `dav_get_timeout`,
+  `dav_validate_resource_state`, `dav_method_unlock` in httpd 2.4.66; `open_lockdb`, `get_locks`, `append_locks`,
+  `remove_lock`, `remove_lock_svn_output` in `mod_dav_svn`'s `lock.c`):
+  - `lock_request` reads in their order: the body's XML; `Depth` 0 or `infinity`; the parent a directory (409);
+    `X-SVN-Version-Name`; a refresh (no body) refused 400; `D:lockinfo`'s children by local name, anything it does not
+    take 412; `Timeout`'s first understood word, `atol`'s seconds after the clock's whole second, never before it
+    (`DAVMinTimeout` 0); no principal 501; nothing at the path 405; not write, not exclusive 400. Then A-602's
+    `LockRequest`: the path, the comment, the expiry, `steal` from `lock-steal`.
+  - `lock_answer`: 200 with the activelock (the request's depth, its owner element as `apr_xml_to_text` writes it with
+    every namespace the body declared, in APR's order, the seconds left, the token escaped) after the header and a
+    blank line, no line feed after `D:prop`; `X-SVN-Creation-Date`, `X-SVN-Lock-Owner`, `Lock-Token`. A guard refusal:
+    no principal 501 with no body; a lock error in `D:error` with FSFS's message (`svn_fs_util.h`, `lock.c`,
+    `fs-loader.c`), any other as "Failed to create new lock.", each at `dav_svn__convert_err`'s status.
+  - `unlock_request`: `Lock-Token` present and bracketed; the path's unexpired lock with that token (400 otherwise);
+    an anonymous request that does not break it 403. `unlock_answer`: 204; another's lock 423 with FSFS's message; no
+    principal 501 with `mod_dav`'s error id 405; any other "Failed to remove a lock.".
+  - `lockdiscovery`: the PROPFIND's property with depth 0 and the comment quoted in `D:owner`, and the two headers.
+  - Stricter, stated: an owner holding markup, a `Timeout` past `apr_time_t`, an `X-SVN-Version-Name` that is no
+    revision, each 400; a header value with a control character refused as httpd refuses one.
+- **Evidence.** Stock svn 1.15.0 (Homebrew, the Mac Studio, 2026-11-19) recorded against a responder: `svn lock`,
+  `svn lock --force` with markup in its comment, `svn unlock` and `svn unlock --force` (each after the PROPFIND that
+  finds the token), `svn info`; the bodies equal the earlier fixtures byte for byte, and the heads are the fixtures.
+  Every source read is in the notes' §1 with its hash.
+- **Tests and the run.** 33 tests in `dav::drive` (12) and `dav::locking` (21). `cargo test --locked -p slates-svn
+  --lib` on the Mac Studio, 2026-11-19: 351 of 351 on the branch (65078aed2), then 357 of 357 on the tree merged with
+  main (585458a4c), and 390 of 390 merged again with A-616's drive over the index in (2b4ccaaef); `cargo fmt -p
+  slates-svn -- --check` clean each time. Red on a copy with six mutations (replay's `dir` named
+  `directory`, no revision written 0, LOCK's blank line dropped, a held lock not 423, the floor under `Timeout` gone,
+  a body's namespaces in tag order): 7 of 351 failed, each mutation's tests among them but the last's, whose test
+  declared one new namespace on an element, where both orders agree. With two declared, the namespace mutation alone
+  failed that test on the merged tree (1 of the 62 `dav` tests).
+- **Owed.** The update-report's resource walk (`S:resource-walk`, a pre-1.2 client's); the facts' revision as
+  `dav_svn__get_safe_cr` gives it, since `svn_fs_node_created_rev` names a path that did not exist yet for a node
+  beneath a copy not changed since (A-616's facts); main's live capture against Apache with `mod_dav_svn`.
 
 ### A-649 part 1 — Every key of Mercurial's index tagged by its kind, so no log row can meet an object's id (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The repository's index"; A-588 part 2's sibling, found by A-630)
 Applied in the same change to: §4.17.3 (the index's as-built rule), `crates/hg` (`index`: the `O` tag,
