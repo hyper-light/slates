@@ -13275,6 +13275,13 @@ signature verification).
 > 128 KiB, as 7.2 keeps one) whole. A text is rebuilt from the text before it where its chain passes through that one,
 > as 7.2's revision cache does, and counted. Proven by the same golden imports, and by every split or docketed file of
 > two stores read in several ranges, none as long as the file.
+>
+> **Status (2026-11-19, A-649 part 3b: the import in slices).** `import::Import` is advanced a turn at a time under the
+> owner's quantum (§4.3's step budget), each turn doing units until the quantum is spent on the owner's clock, at least
+> one: a log opened, one revision read, kept and appended at once (no log's group held), one changeset's manifest
+> checked, the repository's state read; no borrow held between turns; abandoned, it gives back everything. `import`
+> is its thin facade. Proven by three stores imported a unit a turn equal row for row to one call, and an import
+> abandoned or refused midway holding nothing.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13678,8 +13685,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    `file_index`, `store`'s requirements and plain encoding): an existing store imported into the index through a
    read-only seam, its file index read. Built (A-649 parts 1 and 2): the index's keys tagged by kind, and the
    phase roots, bookmarks and markers imported with the history. Built (A-649 part 3a): revlogs read by ranges,
-   never whole, and texts rebuilt from the one before. Owed: the import sliced under the shard's step budget, and the
-   server's adapter from §4.15's host seam.
+   never whole, and texts rebuilt from the one before. Built (A-649 part 3b): the import in slices under the owner's
+   quantum. Owed: the server's adapter from §4.15's host seam.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
    (A-619 parts 1 and 2, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets
    with its phase heads and bookmarks, and its answer, the changegroup and the bundle2 stream; and the stdio session (part
@@ -46321,3 +46328,23 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   check` and the doc gate are main's (the run-request queue).
 - **Owed.** Part 2: the owner's commit step through A-635's `RepositoryLogs::append`, at the position the commit read
   (`Moved` answered as `svnserve`'s out-of-date), which a dump's import drives too (A-652 part 3).
+
+### A-649 part 3b — The import in slices under the owner's quantum, each revision appended as it is read (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.3's step budget; A-645, A-630)
+Applied in the same change to: §4.17.3 (its status, piece 3), `crates/hg` (`import`: `Import`, `Turn`, `Clock`,
+`Progress`; one revision a unit), GAPS (the §4.17.3 entry).
+- **What it does.** `Import::start` reads the requirements and the listing; `Import::advance(files, store, Turn {
+  clock, quantum_ns })` does units of work until the quantum is spent on the owner's clock, at least one, as git's
+  upload does (A-640): a log opened; one revision rebuilt, kept and appended to the index at once, numbered its
+  revlog's own; one changeset's manifest held to the manifest log; the repository's state read. Between turns it holds
+  no borrow of the host or the store; `Import::abandon` gives back what an unfinished import holds; a refusal releases
+  the index and ends the import (`Ended` thereafter). `import` is the thin facade, one turn that never ends before its
+  work.
+- **One revision a unit.** Appending each revision as it is read (rather than a log's group at once) holds no group:
+  the import holds one revision's text, the one before it and the walk's listing. The import is still kept or refused
+  whole, since a refusal releases its new index; a node a log holds twice is still refused, each append held to the
+  number its revlog gives it.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-slices-red` (not for main: the turn's
+  quantum ignored, so a turn runs to the end), the two new tests failing by their assertions. Green: every golden and
+  hostile test unchanged through the facade; new: the dotencode, version 2 and state repositories imported a unit a
+  turn (each turn one unit, more turns than revisions) equal row for row to one call, and an import abandoned after
+  twenty turns or refused by its host midway leaving the store as it was, a further turn refused as ended.
