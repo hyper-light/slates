@@ -1,0 +1,15 @@
+hello
+between
+pairs 81
+0000000000000000000000000000000000000000-0000000000000000000000000000000000000000protocaps
+caps 38
+comp=zstd,zlib,none,bzip2 partial-pulllistkeys
+namespace 9
+bookmarksbatch
+* 0
+cmds 19
+heads ;known nodes=getbundle
+* 2
+common 40
+0000000000000000000000000000000000000000heads 40
+d62662368ebecf4e7b3e39404f37e3b36d25a79e
