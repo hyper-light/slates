@@ -25955,6 +25955,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
 - **Amended by A-360 (2026-11-18).** The stated difference is WinFsp's driver's as released: a driver carrying
   `docs/wip/winfsp-patches` forwards a hard link, and the drive makes it. Where a lane's driver makes links, the stated
   lines stop differing and the harness fails them, so the list shrinks in that change.
+- **Amended by A-498 (2026-11-18).** Both drivers serve one transport, so the list is chosen by the drive the run uses:
+  the harness gives one file of the mount's workload root a second name before the workloads run, and the stated lines
+  hold only where the drive refused it. A drive that links is held to NTFS's link counts like every other line.
 
 ### A-292 — A held durable reply gives up when its holders are silent, not at a deadline (2026-11-17, built for goal g244; found 2026-11-09 by bug-sweep)
 
@@ -34716,3 +34719,26 @@ the writer's write-through files kept across a lend, `begin_barrier` leaving the
   against windows-sys) and `tests/os.rs`'s `a_read_only_files_metadata_entry_lands` (a file `attrib +R` made
   read-only, marked hidden through an overlay, lands `HIDDEN` and still `READONLY`, its entry written), with the xwin
   check and clippy.
+
+### A-498 — The WinFsp drive's link counts are stated only where the drive refuses a link: the harness learns it from the drive (2026-11-18, g258, UI goal 85; Part 6 "Real workloads", §4.6 Windows; amends A-300 and A-360)
+Applied in the same change to: A-300's record in Part 6 (its A-360 note), GAPS (the WinFsp version-control entry),
+`crates/conformance/src/workload.rs` (`HardLinks`, `stated_differences`, the module's account, and the tests),
+`xtask/src/conformance/workloads.rs` (`mount_links`, `LINK_PROBE`, the record's note, `run_one`).
+- **What was there.** The WinFsp route stated three link-count lines whatever drive it ran on (`WINFSP_STATED`: git's
+  history, `objects with two names after the clone`; Mercurial's, `store files with two names after the clone` and
+  `after the clone's commit`), and a stated line that stops differing fails the run. A drive under a driver carrying
+  `docs/wip/winfsp-patches` links (A-360) and prints NTFS's counts, so the harness failed exactly the drive that made
+  Mercurial's hard-linked clone and store byte-identical to the host's; A-360 said the list would shrink when a lane's
+  driver linked, but both drivers are one transport, and CI's runners can load only WinFsp's as released.
+- **The rule.** Whether a mount makes a hard link is the run's own data, learned before its workloads: the harness makes
+  `.hard-link-probe` in the mount's workload root, gives it a second name, and removes both (`mount_links`). The WinFsp
+  route's stated lines apply only where that link was refused (`HardLinks::Refused`); everywhere else nothing is stated,
+  so a drive that links is held to every count NTFS prints, and a clone that copied there is a difference. The record
+  notes which the mount did, and a refusal prints its error.
+- **Tests.** `a_drive_that_makes_links_is_held_to_its_hosts_link_counts` (`crates/conformance/src/workload.rs`): a
+  Mercurial run that linked as NTFS did is identical on a drive that made the link; one that copied there is a
+  difference naming the clone's line; and the same copy on a drive that refused the link records the two stated lines.
+  The three earlier tests run on a drive that refused it, as WinFsp's driver as released does.
+- **Owed** (main's): the xtask unit tests, `cargo xtask check` and clippy; the Windows lanes' workloads on WinFsp as
+  released (unchanged: the record notes the refusal); and the workloads on the test-signing VM's patched driver, where
+  git's history and Mercurial must now run identical with no stated line.

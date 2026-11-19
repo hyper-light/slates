@@ -1233,7 +1233,12 @@
 > --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
 > create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
 > (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
-> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> Center account (a slates-signed driver). **A-498 (2026-11-18, g258):** the harness stated the three lines on any WinFsp
+> drive, so it failed exactly a patched drive, whose clones link as NTFS's do. It now asks the drive: one file of the
+> mount's workload root is given a second name before the workloads run, and the lines are stated only where that is
+> refused (`HardLinks`, `mount_links`). On the patched driver git's history and Mercurial are held to every count NTFS
+> prints; on WinFsp as released the record notes the refusal and states the lines as before. Owed (main's): that run on
+> the test-signing VM, where Mercurial's hard-linked clone and store must come out identical. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
