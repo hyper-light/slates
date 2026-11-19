@@ -58,4 +58,4 @@
 
 Red on r960 with the old rename rule and the old scans restored, the scans counting: 4 of the 7 tests the run selected
 failed (the guards pass either way), and the removal examined 2,000 entries. Green on r960: `cargo test -p slates-merge
---lib` 104 of 104, fmt clean.
+--lib` 104 of 104, fmt clean; merged with main (r972), 116 of 116.

@@ -2364,7 +2364,7 @@
 > 1. Fixed (A-646 part 1): a rename over a symbolic link, a hard link or an IPC node with no concurrent change replaces
 >    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
 >    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
->    (`TypeChanged` with no concurrent change); green on r960, 104 of 104.
+>    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
 > 2. Owed, A-646 part 2: a hard link names its target by path, so the head's removal of a file that hard links name is
 >    accepted and the links then name a path with nothing, or the file made there next. A-646 decides it from
 >    principle: a hard link names its target's node, as a POSIX inode does, never a path. A removed name leaves the node

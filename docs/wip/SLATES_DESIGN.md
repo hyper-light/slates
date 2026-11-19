@@ -44281,8 +44281,8 @@ Applied in the same change to:
     is the new node.
 
   Two names of one file are one name.
-- **Tests** (debug, Mac Studio, 2026-11-19, load 7 to 9), green on kiln r960: `cargo test -p slates-merge --lib`, 104
-  of 104; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests:
+- **Tests** (debug, Mac Studio, 2026-11-19, load 7 to 9), green on kiln r960 and, merged with main, r972:
+  `cargo test -p slates-merge --lib`, 104 of 104 and 116 of 116; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests:
   - the file and the symlink, each renamed over a symlink, a hard link and a FIFO, accepted and replacing it;
   - the guard: a link changed after the base, and a directory, still `TypeChanged`;
   - a file over its own link, and a link over another link to the same file, accepted with nothing changed;
