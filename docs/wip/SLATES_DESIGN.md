@@ -46481,6 +46481,11 @@ tests (`src/increment/tests.rs`, `src/engine/copy_restate_tests.rs`, new; `copy_
   entries it fetches are a path's each and never a tree (A-247): it fetches nothing for one, and the green's owner
   composes it against `Green::base_for`, counted `merge.work.copy_composed_by_owner`. A replacing copy takes the
   journal's declared directories and symbolic links in its destination's tree out of the work's listing.
+- **The owner's extra cost** (main's ruling: the owner composing beats a refusal, which would answer nothing). A work
+  whose journal holds a copy is composed on its green's owner, as every work was before A-247: its sealed journal and
+  files go to the owner's shard, and the composition reads each copied tree once, every key at the copy's version
+  (`copied_base`, O(the copied trees' keys)), beside the deriver's own pass over the journal. A work with no copy is
+  composed where it was. `merge.work.copy_composed_by_owner` counts each such composition, and a test holds it moved.
 - **Owed.** The work model resolving copies: `Rebased::changed` names the files a rebased work changed, so its reads
   and its listing do not yet show the copied files it left alone.
 - **Tests.** The deriver: a copy and an edit beneath it composed, the replace flag, an operation before its copy
