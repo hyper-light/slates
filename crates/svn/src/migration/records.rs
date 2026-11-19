@@ -23,12 +23,13 @@ use super::paths::{ROOT, ancestors_deepest_first, beneath};
 use super::properties::{decode, encode, entries, mergeinfo};
 use crate::commit::drive::Green;
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
+use crate::commit::{CommitRefusal, verdict};
 use crate::dump::{Md5, Sha1, Uuid};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, Planned, PropertyList,
   Revision, RevisionRecord, Text,
 };
-use crate::lock::{LockEntry, LockTable};
+use crate::lock::{AprTime, CommitLocks, LockEntry, LockTable};
 
 /// A node's or a revision's properties: names to values, sorted by name, every byte kept.
 pub type Properties = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -148,6 +149,13 @@ impl Repository {
   /// The room the records are held within.
   pub fn room(&self) -> Room {
     self.room
+  }
+
+  /// Sets the room the records are held within: their owner lends each step the room its shard could admit then (A-655
+  /// part 2b), as it lends a content store its budget. A room below what the records hold refuses any growth and
+  /// changes nothing they hold.
+  pub fn set_room(&mut self, room: Room) {
+    self.room = room;
   }
 
   /// The bytes the records hold: every text and property list once, and every revision's properties.
@@ -291,6 +299,65 @@ impl Repository {
     Ok(revision)
   }
 
+  /// The commit step's check of a client's accepted work at the moment its owner commits it (A-655 part 2b), as FSFS
+  /// judges a transaction when it commits: a work whose head is no longer the youngest revision is merged again at the
+  /// youngest, A-592's verdict over the rows of the revisions since its head (`tree.c` `svn_fs_fs__commit_txn`
+  /// 2255-2310: FSFS merges the youngest into a transaction whose base moved, so only a conflict refuses it, and
+  /// `commit_body` refuses only a base that moved while that merge ran, `transaction.c` 3784-3786); and every work's
+  /// locks are verified against the lock table as it stands at the step, for the principal and the tokens `locks`
+  /// names at the owner's instant `now` (`commit_body` 3797, `verify_locks`), its lock entries the step's own; then
+  /// [`Repository::check`]. The rows are the work's: the merge takes from the youngest every node the work left alone,
+  /// as the index's apply of the rows against the youngest keeps them. A work whose verdict ran at the youngest
+  /// revision, with the table as it stands, is answered as that verdict answered it.
+  ///
+  /// # Errors
+  /// [`StepRefusal::Verdict`] for the conflict the merge finds or the lock in the way, in the drive's words; each
+  /// refusal of [`Repository::check`]'s.
+  pub fn check_work(
+    &self,
+    revision: RevisionToCommit,
+    locks: &CommitLocks,
+    now: AprTime,
+  ) -> Result<Checked, StepRefusal> {
+    self.check(self.judge_again(revision, locks, now)?)
+  }
+
+  /// A client's accepted work as the step commits it ([`Repository::check_work`]'s judgment, before its check): merged
+  /// again at the youngest revision where its head moved, its locks verified as the table stands, its lock entries the
+  /// step's, its head the youngest it was judged at; its rows, properties and contents its own. What the owner records
+  /// is this revision (A-655 part 2b), so a replay checks it as the live step did.
+  ///
+  /// # Errors
+  /// [`StepRefusal::Verdict`] for the conflict the merge finds or the lock in the way, in the drive's words.
+  pub fn judge_again(
+    &self,
+    mut revision: RevisionToCommit,
+    locks: &CommitLocks,
+    now: AprTime,
+  ) -> Result<RevisionToCommit, StepRefusal> {
+    let youngest = self.youngest();
+    let refused = |refusal| StepRefusal::Verdict {
+      refusal,
+      user: locks.user.clone(),
+    };
+    let verify = |changes: &[ChangedPath]| {
+      let changed = changes
+        .iter()
+        .map(|change| (change.path.as_str(), change.action));
+      self.locks.verdict(changed, locks, now)
+    };
+    let lock_entries = if revision.head < youngest {
+      let entries =
+        verdict(&self.index, revision.head, &revision.record, verify).map_err(refused)?;
+      revision.head = youngest;
+      entries
+    } else {
+      verify(&revision.record.changes).map_err(|refusal| refused(CommitRefusal::Locked(refusal)))?
+    };
+    revision.lock_entries = lock_entries;
+    Ok(revision)
+  }
+
   /// The commit step whole: [`Repository::check`], then [`Repository::apply`].
   ///
   /// # Errors
@@ -389,6 +456,45 @@ impl Checked {
   pub fn lock_entries(&self) -> &[LockEntry] {
     &self.lock_entries
   }
+}
+
+/// Where the node at a path a revision changes stood before the revision changed it, as the revision's own copies leave
+/// its tree (A-655 part 2b): what its owner's green holds there for the revision to change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Before {
+  /// At the path itself, in the revision's head.
+  Head,
+  /// Beneath a copy the revision made: at `path`, beneath the copy's source, in the source's `revision`.
+  Copied {
+    /// The path beneath the copy's source.
+    path: String,
+    /// The copy's source revision.
+    revision: Revision,
+  },
+  /// Nowhere: beneath a node the revision deleted, or added without history.
+  Absent,
+}
+
+/// Where the node at `path` stood before the revision whose rows are `changes`, by path, changed it ([`Before`]), as
+/// a dump's transaction reads its own tree (`Transaction::lookup`): beneath the deepest ancestor the rows add or replace, nowhere without a
+/// copy source and beneath the source with one; nowhere beneath a deleted ancestor; else at the path itself.
+pub fn before(changes: &BTreeMap<&str, &ChangedPath>, path: &str) -> Before {
+  for (ancestor, rest) in ancestors_deepest_first(path) {
+    let Some(row) = changes.get(ancestor) else {
+      continue;
+    };
+    match (row.action, &row.copy_from) {
+      (Action::Modify, _) => {}
+      (Action::Delete, _) | (Action::Add | Action::Replace, None) => return Before::Absent,
+      (Action::Add | Action::Replace, Some(source)) => {
+        return Before::Copied {
+          path: beneath(&source.path, rest),
+          revision: source.revision,
+        };
+      }
+    }
+  }
+  Before::Head
 }
 
 /// Every text and property list `changes` name, by content identity, each once.

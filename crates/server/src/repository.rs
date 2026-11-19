@@ -37,7 +37,9 @@
 //! its id.
 //!
 //! **The store.** `CreateRepository` makes the repository's tool store beside its record, on this owner shard
-//! (`crate::vcs_store`, A-662).
+//! (`crate::vcs_store`, A-662). A Subversion repository's first entry also holds its creation's record (A-655 part 2b:
+//! its UUID and revision 0's date, `slates_svn::commit::record`), from which its store's records are made, as a
+//! recovery makes them again.
 
 use slates_db::catalog::{
   BaseRecord, MemberOrigin, MemberRecord, NameChange, NamePolicy as DbNamePolicy, PolicyRecord,
@@ -61,9 +63,49 @@ pub(crate) mod push;
 // calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hg_push;
+// Subversion's commit landed through the push (A-655 part 2b): until the svn:// connection task (A-656 part 2) and the
+// import (A-652 part 3) call it, a daemon build calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod svn_commit;
 // The import verb (A-678): a Mercurial repository's directory imported into the repository's store through
 // `vcs_store::hg_import`, the request answered when the import ends.
 pub(crate) mod import;
+
+/// Format: where RFC 4122's form puts a `-` among a UUID's sixteen bytes, written as two hexadecimal digits each:
+/// before bytes 4, 6, 8 and 10 (8-4-4-4-12 digits).
+const UUID_DASHES_BEFORE: [usize; 4] = [4, 6, 8, 10];
+
+/// The UUID a Subversion repository is made with (A-655 part 2b): its id's sixteen bytes in RFC 4122's form, in
+/// lower-case hexadecimal, so every holder and every recovery names it alike and no two repositories share one, their
+/// ids differing (`verbs::fresh_volume_id`).
+fn svn_uuid(repository: RepositoryId) -> Option<slates_svn::dump::Uuid> {
+  let mut text = String::new();
+  for (at, byte) in repository.bytes.iter().enumerate() {
+    if UUID_DASHES_BEFORE.contains(&at) {
+      text.push('-');
+    }
+    text.push_str(&format!("{byte:02x}"));
+  }
+  slates_svn::dump::Uuid::parse(text.as_bytes())
+}
+
+/// The record a Subversion repository is made with (A-655 part 2b; `slates_svn::commit::record`): its UUID
+/// ([`svn_uuid`]) and revision 0's `svn:date`, the owner's instant as `svn_time_to_cstring` writes it, as `svnadmin
+/// create` dates revision 0. Refused `Unsupported` for an instant that writer cannot write (before 1970 or past the
+/// year 9999), which no owner's clock reads.
+fn svn_created(state: &mut ShardState, repository: RepositoryId) -> Result<Vec<u8>, Refusal> {
+  let unwritable = || Refusal::Unsupported {
+    feature: "a Subversion repository dated before 1970 or past the year 9999".to_owned(),
+  };
+  let uuid = svn_uuid(repository).ok_or_else(unwritable)?;
+  let now = slates_svn::lock::AprTime::from_wall_ns(state.clock.wall_ns());
+  let date = slates_svn::dav::response::svn_time(now).map_err(|_| unwritable())?;
+  let record = slates_svn::commit::record::Record::Created {
+    uuid,
+    date: date.into_bytes(),
+  };
+  Ok(record.encode())
+}
 
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
@@ -288,8 +330,13 @@ fn record_repository(
   ),
   adopted: Option<DbVolumeId>,
 ) -> Result<DbVolumeId, Refusal> {
+  // A Subversion repository's creation's record is made first, for the same reason (A-655 part 2b).
+  let created = match tool {
+    VcsTool::Subversion => svn_created(state, repository)?,
+    VcsTool::Git | VcsTool::Mercurial => Vec::new(),
+  };
   // A new root's record is judged first: once the repository's is recorded, a refusal would leave it rootless.
-  let created = match adopted {
+  let root_created = match adopted {
     Some(_) => None,
     None => {
       let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
@@ -315,15 +362,16 @@ fn record_repository(
       },
     },
   )?;
-  let root = match (adopted, created) {
+  let root = match (adopted, root_created) {
     (Some(id), _) => id,
-    (None, Some((id, created))) => {
-      record(state, &created)?;
+    (None, Some((id, root_created))) => {
+      record(state, &root_created)?;
       id
     }
     (None, None) => return Err(Refusal::NotFound),
   };
-  // The root joins and the default branch binds it in one entry of the new register (A-603).
+  // The root joins and the default branch binds it in one entry of the new register (A-603), which holds a Subversion
+  // repository's creation's record too (A-655 part 2b).
   let mut entry = next_entry(state, repository)?;
   entry.joined.push(MemberRecord {
     repository,
@@ -334,6 +382,7 @@ fn record_repository(
     name: default_branch.to_owned(),
     green: root,
   });
+  entry.objects = created;
   record(state, &Op::RepositoryAdvanced { entry })?;
   Ok(root)
 }
@@ -355,7 +404,8 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
   if !adopted {
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
   }
-  // The repository's tool store, beside its record, on its owner shard (A-662).
+  // The repository's tool store, beside its record, on its owner shard (A-662), made from the records its entries hold
+  // (a Subversion repository's creation's, A-655 part 2b), as a recovery makes it.
   if let Some(record) = state
     .db
     .partition()
@@ -363,7 +413,7 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
     .repository(repository)
     .cloned()
   {
-    crate::vcs_store::make(state, &record);
+    crate::vcs_store::make_from_log(state, &record);
   }
 }
 

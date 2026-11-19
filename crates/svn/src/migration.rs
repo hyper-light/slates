@@ -51,7 +51,7 @@ mod tests;
 
 pub use export::{Exporter, Exporting};
 pub use import::{Importer, Importing};
-pub use records::{Checked, Properties, Repository, Room};
+pub use records::{Before, Checked, Properties, Repository, Room, before};
 
 use crate::commit::revision::StepRefusal;
 use crate::dump::{Digest, DumpError, Uuid};
@@ -206,8 +206,8 @@ const SVN_ERR_CHECKSUM_MISMATCH: u32 = 200_014;
 impl From<StepRefusal> for MigrationRefusal {
   /// An import's revision refused by the commit step (A-655): the index's and the room's refusals as the import's
   /// own; a repository that moved past the revision's head as a revision that no longer continues its history; and
-  /// what an import's revision cannot meet (a lock entry, a content it does not bring, a date it does not make) as
-  /// records that do not hold together.
+  /// what an import's revision cannot meet (a lock entry, a content it does not bring, a date it does not make, a
+  /// verdict, which an import never asks for) as records that do not hold together.
   fn from(refusal: StepRefusal) -> Self {
     match refusal {
       StepRefusal::Index(refusal) => Self::Index(refusal),
@@ -216,7 +216,10 @@ impl From<StepRefusal> for MigrationRefusal {
         expected: youngest.saturating_add(1),
         found: head.saturating_add(1),
       },
-      StepRefusal::Lock(_) | StepRefusal::Corrupt | StepRefusal::Date { .. } => Self::Corrupt,
+      StepRefusal::Lock(_)
+      | StepRefusal::Corrupt
+      | StepRefusal::Date { .. }
+      | StepRefusal::Verdict { .. } => Self::Corrupt,
     }
   }
 }
