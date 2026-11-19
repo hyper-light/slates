@@ -12307,6 +12307,17 @@ engine: the verdict, rebase, position mapping, the register).
 > none under `atomic`. The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
 > band-2 lines. Proven byte for byte against nine pushes stock git 2.50.1 made to stock `git receive-pack`. Part 2 makes
 > each ref's update a work the engine judges, every ref recorded as one register entry.
+>
+> **Status (2026-11-19, A-638: the store as the push path reads it).** `crates/git` (`store::views`) lets receive-pack
+> and A-618's work read the store. `IndexedObjects` is receive-pack's `Repository`: a thin pack's bases and the
+> connectivity check's stops come from the index alone, never from a push's quarantine, and `holds` reads an object's
+> row and no bytes. An object of one window is lent as the store keeps it; a longer base is assembled once, kept for
+> the view's life and lent again, each charged to the view's room before it is assembled, and a base refused for the
+> room is named (`refused`). `PushedObjects` is A-618's `PushObjects`: the index first, then the push's quarantine, a
+> tree's modes read as git's tree walk reads them (`canon_mode`: stock git 2.50.1 reads `100600` and `100664` as
+> `100644`, `100700` and `100775` as `100755`, and a typeless `644` as `160000`). Proven by receive-pack resolving a
+> thin pack of two deltas on a base the store holds across windows, and by two pushes becoming works through the store
+> (versions 1 and 2, the unchanged directory never read).
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -42452,3 +42463,48 @@ tests, new; `dav/listing.rs`'s flat base64 shared; `dav.rs`).
   (2026-11-19), and fmt was clean. Red once, on a copy that dropped the line feed after a base64 property's tag: the
   drive test failed.
 - **Owed.** The replay drive (`replay.c`), LOCK's answer, and LOCK and UNLOCK onto the A-602 guards.
+
+### A-638 — The store as the push path reads it: receive-pack's thin-pack bases and connectivity from the index alone, and a push's trees above the index for its work (2026-11-19, g225, UI goal 93 (kiln 51cef9f7); §4.17.2 "A push" items 3 and 4, "Pieces (git)" pieces 5 and 6; §4.17.1 "A push is a work"; after A-614, A-618, A-620)
+
+- **What.** Two views of one repository's objects in the shared content store (`crates/git/src/store/views.rs`).
+  `IndexedObjects` implements receive-pack's `Repository` (A-620): the pack reader's thin-pack bases and the
+  connectivity check's stopping points, read from the index alone. A push's quarantined objects have passed no check,
+  so they are never a base and never end a walk. `holds` reads a row and no bytes. `PushedObjects` implements A-618's
+  `PushObjects`: the index first, then the push's quarantine, the store's own order.
+- **Lending without a copy, and a bounded keep.** slates-vcs keeps an object of at most one window as that window, so
+  both views lend such an object as the store keeps it. Both traits lend borrowed bytes; receive-pack's lends `&[u8]` for
+  the view's borrow. So a longer base is assembled once into a slot that never moves (segments of slots, each twice the
+  last, all safe `OnceCell`s), kept for the view's life and lent again to every delta naming it. Each is charged to the
+  view's room before it is assembled; a base past the room is answered as not held and named (`refused`), so the
+  caller can tell it from a base the repository lacks. A `Cow` return on `unpack::Outside` and `receive::Repository`
+  would let a view lend an assembled base without keeping it. Those traits are A-608's and A-620's, so this keeps
+  their signatures.
+- **Modes as git reads them.** `Entry::canonical_mode` (`objects/tree.rs`) is git's `canon_mode`, which
+  `decode_tree_entry` applies to every mode it reads (tree-walk.c, read-cache-ll.h). A regular file is executable when
+  its owner's execute bit is set; any mode but a regular file, a symbolic link or a directory is a submodule's link.
+  Stock git 2.50.1 on the Mac Studio, 2026-11-19 (`git ls-tree`, and `git ls-files -s` after `git read-tree`), read
+  `100600` and `100664` as `100644`, `100700` and `100775` as `100755`, and a typeless `644` as `160000`. The test holds
+  the views to exactly that.
+- **Typed refusals.** A-618's `Unavailable` gains `Malformed` (a tree the tree walk cannot read, a type number with no
+  name) and `PastRoom` (a listing past the store's room). The store's `Repository::indexed` is `pub(crate)`, the one
+  line this needed in A-614's module.
+- **Tests and runs.** Seven tests (`crates/git/src/tests/store/views.rs`):
+  - a base lent from the index alone, as kept, with `holds` lending nothing;
+  - a long base assembled once and lent again;
+  - the room refused and named;
+  - receive-pack resolving a thin pack of two reference deltas on a base the store holds across windows, through
+    `receive`;
+  - the stock-git mode table;
+  - every refusal by kind;
+  - two pushes becoming works through the store with A-618's `build`: versions 1 and 2, the green holding the client's
+    bytes and modes, and reads of 3 trees and 4 blobs, then 4 trees, 1 blob and 1 directory skipped.
+
+  On the Mac Studio, 2026-11-19: the tests were red first, 7 of 7 failing against stubs, and red five ways by mutation:
+  `holds` reading bytes (2 failed), no reuse (2), only the standard modes (1), no lending without a copy (4), the room
+  uncharged (1). `cargo test -p slates-git --lib` passed 294 of 294, `cargo test -p slates-merge --lib` 88 of 88, and
+  fmt was clean.
+- **Applied in the same change to:** `crates/git/src/store/views.rs` (new), `store/mod.rs` (its `mod` line),
+  `store/repository.rs` (`indexed`), `objects/tree.rs` (`canonical_mode`), `crates/merge/src/push.rs` (`Unavailable`),
+  `crates/git/Cargo.toml` and `Cargo.lock` (slates-merge), §4.17.2's status, GAPS §4.17.
+- **Owed.** receive-pack's part 2 submitting each ref's work through these views (A-620's part 2). The submodule link's
+  special-node kind (A-637). Charging the transient tables A-618's walk holds, beside the store's room.

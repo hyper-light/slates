@@ -288,11 +288,20 @@
 > accepted push found, and the engine now fixes, a removed file's or directory's mode and attributes outliving it (bug
 > record 2026-11-19). The root, the empty path, is always present for modes and attributes. Tests: `slates-merge
 > --lib` on the Mac Studio, 88 of 88 merged with main and A-621, red first (a stub walk, and the root absent), red four ways by
-> mutation. Owed: git's store
-> implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6); submodule links (§4.17.2
-> item 5's special node kind); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> mutation. Owed: receive-pack submitting the work (piece 6; git's store implementing
+> `PushObjects` is A-638's, below); submodule links (§4.17.2 item 5's special node kind, A-637); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
 > post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
 > 64-bit path indices ended the 65,535-name cap this piece first refused past).
+>
+> **A-638 (2026-11-19, g225; §4.17.2 pieces 5 and 6, the store as the push path reads it):** built in `crates/git`
+> (`store::views`). receive-pack's `Repository` is the index alone (`IndexedObjects`), and A-618's `PushObjects` is the
+> index, then the push's quarantine (`PushedObjects`). An object of one window is lent as the store keeps it; a longer
+> base is assembled once, kept, and charged to the view's room first, and a base refused for the room is named. A tree's
+> modes are read as git's tree walk reads them, held to stock git 2.50.1's table. Tests: `slates-git --lib` 294 of 294
+> on the Mac Studio, red first (7 of 7) and red five ways by mutation. A thin pack resolved by `receive` against the
+> store, and two pushes made works through it, are among the tests. Owed: receive-pack's part 2 submitting each ref's
+> work through these views. A `Cow` return on `unpack::Outside` and `receive::Repository` would let a view lend an
+> assembled base without keeping it (those traits are A-608's and A-620's).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
