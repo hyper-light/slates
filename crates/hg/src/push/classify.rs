@@ -52,6 +52,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use super::reply::{Refused, Replied, heads_changed};
 use super::verify::Arrived;
 use super::{Asks, BookmarkAt, PushkeyAsk, Unbundle};
+use crate::bookmarks::divergent;
 use crate::phases::{Phase, PhaseHead};
 use crate::read::to_u64;
 use crate::serve::{Repository, Rev};
@@ -61,9 +62,6 @@ use crate::{Admission, NULL_NODE, Node, PastAdmission, changeset, node};
 const BOOKMARKS: &[u8] = b"bookmarks";
 /// Format: see [`BOOKMARKS`].
 const PHASES: &[u8] = b"phases";
-
-/// Format: the byte that makes a bookmark's name divergent where it stands before the name's end (`isdivergent`).
-const DIVERGENT: u8 = b'@';
 
 /// Format: 7.2's words for a divergent bookmark the `bookmarks` part names (`handlebookmark`), around the name.
 const DIVERGENT_BEFORE: &[u8] = b"cannot accept divergent bookmark ";
@@ -323,11 +321,6 @@ struct Graph<'v, V> {
   published: BTreeSet<Rev>,
   /// Each brought changeset's phase.
   phases: Vec<Phase>,
-}
-
-/// Whether a bookmark's name is divergent (`isdivergent`: an `@` in it, and not as its last byte).
-fn divergent(name: &[u8]) -> bool {
-  name.contains(&DIVERGENT) && name.last() != Some(&DIVERGENT)
 }
 
 impl<'v, V: Repository> Graph<'v, V> {

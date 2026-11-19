@@ -69,7 +69,8 @@ pub trait Repository {
   fn publishing(&self) -> bool;
 
   /// The repository's bookmarks, each its name and the node it names, in any order; one naming a changeset the served
-  /// view does not hold is left out wherever bookmarks are answered, as 7.2 leaves it out.
+  /// view does not hold, or with a divergent name (`crate::bookmarks::divergent`, A-690), is left out wherever
+  /// bookmarks are answered, as 7.2 leaves it out.
   fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)>;
 }
 

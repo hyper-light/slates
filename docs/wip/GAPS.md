@@ -1085,6 +1085,15 @@
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
 
+> **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
+> Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part
+> read, listed every bookmark naming a held changeset; 7.2's `listbinbookmarks` (`bookmarks.py` 475-484) leaves out a
+> divergent name (`isdivergent`, 471-472: an `@` not as its last byte). Reproduced by use with stock 7.2 first (a
+> bookmark diverged in a clone and pulled back: `hg serve` answers `@` and `feature`, slates' view of the same
+> repository answered `feature@1` too); now the rule is `crate::bookmarks::divergent`, shared with the push's refusal;
+> red first (r340), green (r356) on macOS arm64, the other platforms owed
+> (`docs/bugs/2026-11-19-hg-divergent-bookmarks-were-listed-to-peers.md`).
+
 > **Fixed (g300, 2026-11-19, A-667; found by g304 against stock 7.2): Mercurial's branch heads were judged by a child on
 > the branch.** `serve::discovery::branch_head_revs` took a revision for its branch's head when no child of it was on
 > its branch; 7.2's rule (`branchmap.py` 422-424) ends every revision a later one on its branch descends from, through
@@ -1443,6 +1452,16 @@
 > no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
 > differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
 > the file is Unix-only, as `tests/cli.rs` is).
+> Part 2, first slice, 2026-11-19 (A-689): the svn:// listener. `slates anchor|daemon --vcs-svn ADDRESS` (loopback alone
+> without `--fleet`; one address reader with `--vcs-http`) starts it on the control shard, its port logged; on Unix the
+> anchor binds it once and hands it to every daemon (`ENV_VCS_SVN`), so a restart never drops its port. Each connection,
+> seated as the HTTP edge seats one, runs A-656's connection: `svnserve`'s greeting (`svndiff1` aside), the client's
+> answer, "No repository found" (210005), its end. macOS arm64 (Mac Studio, kiln r310, and r344 over main 693bc8feb):
+> the listener in-process, a real anchor's, and its port across a `kill -9` of the daemon answered as stock `svnserve`
+> 1.15.0's recorded session; server 19 of 19, api 39, grammar 12, cli 4 of 4, anchor 1, fmt clean. Owed: the
+> repositories' lookup (the rest of `find_repos`, the owner shard), the sources with every call, CRAM-MD5 keys, learned
+> waits (one mechanism for the three edges), the SSH tunnel's entry point; Windows and Linux runs (main's); Windows
+> holds no listener across a restart (`docs/wip/platforms.md`, gap 2).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
