@@ -1,12 +1,14 @@
 //! The handshake's tests (A-599; §4.17.4 "5. The wire" and "10. Who may do what").
 //!
-//! The oracle is stock Subversion: 1.15.0's own sessions, `svn` against `svnserve` recorded by the relay of
-//! `crates/svn/fixtures/handshake/make-fixtures.py` (each file's SHA-256 in `SHA256SUMS`), replayed through the state
-//! machine, which must write what `svnserve` wrote, its greeting's `svndiff1` aside, end where it ended and
-//! authenticate whom it authenticated, whole, in two pieces at every cut and cut short at every byte. Beside them:
-//! RFC 2195's worked example and RFC 2202's HMAC-MD5 vectors; `cram.c`'s digest and its reading of a response
-//! transcribed as oracles; `vparse_tuple`'s reading of the answer and of the auth-response as tables; and hostile input:
-//! unlisted mechanisms, wrong, malformed and mistyped responses, items past their bounds, and calls out of turn.
+//! The oracle is stock Subversion: 1.15.0's own sessions, `svn` against `svnserve` recorded by the
+//! relay of `crates/svn/fixtures/handshake/make-fixtures.py` (each file's SHA-256 in `SHA256SUMS`),
+//! replayed through the state machine, which must write what `svnserve` wrote, its greeting's
+//! `svndiff1` aside, end where it ended and authenticate whom it authenticated, whole, in two
+//! pieces at every cut and cut short at every byte. Beside them: RFC 2195's worked example and RFC
+//! 2202's HMAC-MD5 vectors; `cram.c`'s digest and its reading of a response transcribed as oracles;
+//! `vparse_tuple`'s reading of the answer and of the auth-response as tables; and hostile input:
+//! unlisted mechanisms, wrong, malformed and mistyped responses, items past their bounds, and calls
+//! out of turn.
 
 use std::ffi::CString;
 
@@ -37,7 +39,8 @@ macro_rules! session {
   };
 }
 
-/// The anonymous repository's identity, which is also its realm (`make-fixtures.py` `UUIDS`, `CONFIGS`).
+/// The anonymous repository's identity, which is also its realm (`make-fixtures.py` `UUIDS`,
+/// `CONFIGS`).
 const UUID_ANON: &[u8] = b"00000000-0000-4000-8000-00000000a599";
 
 /// The CRAM-MD5 repository's identity.
@@ -67,7 +70,8 @@ const FIRST_COMMAND: &[u8] = b"( get-latest-rev ( ) ) ";
 /// The capability `svnserve` announces and slates does not.
 const SVNDIFF1: &[u8] = b"svndiff1 ";
 
-/// The anonymous repository of the recording, as its `svnserve.conf` says: anonymous users read; no password database.
+/// The anonymous repository of the recording, as its `svnserve.conf` says: anonymous users read; no
+/// password database.
 fn anon_repository() -> Repository<'static> {
   Repository {
     uuid: UUID_ANON,
@@ -139,7 +143,8 @@ enum UrlAnswer {
 struct Caller {
   /// What the client's URL is answered with.
   url: UrlAnswer,
-  /// Each challenge's parts in the order the client asks for them; `None` where the caller can make none.
+  /// Each challenge's parts in the order the client asks for them; `None` where the caller can make
+  /// none.
   challenges: Vec<Option<ChallengeParts>>,
   /// The users the repository holds keys for.
   keys: Vec<(Vec<u8>, CramKey)>,
@@ -230,8 +235,8 @@ fn pieces<'a>(bytes: &'a [u8], cuts: &[usize]) -> Vec<&'a [u8]> {
   pieces
 }
 
-/// Replays `client` through a handshake reading items within `item_bytes`, its caller answering as `caller` says, the
-/// client's bytes arriving in the pieces `cuts` makes.
+/// Replays `client` through a handshake reading items within `item_bytes`, its caller answering as
+/// `caller` says, the client's bytes arriving in the pieces `cuts` makes.
 fn replay(client: &[u8], caller: &Caller, item_bytes: usize, cuts: &[usize]) -> Replay {
   let mut written = Vec::new();
   let mut server = Server::new(item_bytes, &mut written).unwrap();
@@ -382,7 +387,8 @@ fn give_key(
   }
 }
 
-/// An item bound no message of `client` reaches: as many bytes, and as many items, as the whole session holds.
+/// An item bound no message of `client` reaches: as many bytes, and as many items, as the whole
+/// session holds.
 fn roomy(client: &[u8]) -> usize {
   client.len().max(1) * PARSED_ITEM_BYTES
 }
@@ -437,7 +443,8 @@ fn without_svndiff1(greeting: &[u8]) -> Vec<u8> {
   cat(&[&greeting[..at[0]], &greeting[at[0] + SVNDIFF1.len()..]])
 }
 
-/// The first `count` items `svnserve` wrote in `session`, the `svndiff1` of its greeting taken out: what slates writes.
+/// The first `count` items `svnserve` wrote in `session`, the `svndiff1` of its greeting taken out:
+/// what slates writes.
 fn svnserve_wrote(session: Session, count: usize) -> Vec<u8> {
   let items = items(session.server);
   assert!(
@@ -462,15 +469,15 @@ fn challenge_parts(item: &[u8]) -> Option<ChallengeParts> {
     return None;
   };
   let [Value::String(challenge)] = inner.as_slice() else {
-    panic!("a step holds one string");
+    return None;
   };
-  let text = std::str::from_utf8(challenge).unwrap();
+  let text = std::str::from_utf8(challenge).ok()?;
   let (numbers, host) = text.strip_prefix('<')?.strip_suffix('>')?.split_once('@')?;
   let (nonce, time_micros) = numbers.split_once('.')?;
   Some(ChallengeParts {
-    nonce: nonce.parse().unwrap(),
-    time_micros: time_micros.parse().unwrap(),
-    host: CString::new(host).unwrap(),
+    nonce: nonce.parse().ok()?,
+    time_micros: time_micros.parse().ok()?,
+    host: CString::new(host).ok()?,
   })
 }
 
@@ -503,9 +510,10 @@ struct Expected {
   failures: Vec<AuthFailure>,
 }
 
-/// Replays `session` whole, in two pieces at every cut, and cut short at every byte, and expects: `svnserve`'s first
-/// `count` items written (its greeting's `svndiff1` aside), with the ending and the failures `expected` names; the same
-/// from every two pieces; and from every shortened session a prefix of those bytes, ending as the whole or waiting.
+/// Replays `session` whole, in two pieces at every cut, and cut short at every byte, and expects:
+/// `svnserve`'s first `count` items written (its greeting's `svndiff1` aside), with the ending and
+/// the failures `expected` names; the same from every two pieces; and from every shortened session
+/// a prefix of those bytes, ending as the whole or waiting.
 fn assert_answered_as_svnserve(session: Session, caller: &Caller, expected: &Expected) {
   let whole = replay(session.client, caller, roomy(session.client), &[]);
   assert_bytes(
@@ -585,11 +593,11 @@ fn stock_sessions() -> Vec<(Session, Caller)> {
   ]
 }
 
-/// A-599 (stock session `anonymous`: `svn info` against `svnserve` 1.15.0, anonymous read, a SASL client's trace token
-/// in its `ANONYMOUS`): replay it whole, in two pieces at every cut and cut short at every byte; expect the greeting,
-/// the auth request listing `ANONYMOUS` in the default realm, the success and the repository's information, byte for
-/// byte as `svnserve` wrote them (its greeting's `svndiff1` aside), no one authenticated, and the client's first command
-/// left unread.
+/// A-599 (stock session `anonymous`: `svn info` against `svnserve` 1.15.0, anonymous read, a SASL
+/// client's trace token in its `ANONYMOUS`): replay it whole, in two pieces at every cut and cut
+/// short at every byte; expect the greeting, the auth request listing `ANONYMOUS` in the default
+/// realm, the success and the repository's information, byte for byte as `svnserve` wrote them (its
+/// greeting's `svndiff1` aside), no one authenticated, and the client's first command left unread.
 #[test]
 fn a_stock_anonymous_session_is_answered_as_svnserve_answered_it() {
   let session = session!("anonymous");
@@ -603,11 +611,54 @@ fn a_stock_anonymous_session_is_answered_as_svnserve_answered_it() {
   assert_commands_follow(session, &caller);
 }
 
-/// A-599 (stock sessions `cram-md5`, `cram-md5-secret-64` and `cram-md5-secret-70`: CRAM-MD5 with a secret shorter
-/// than HMAC-MD5's 64-byte block, exactly as long, and longer, which RFC 2104 and `cram.c` hash first): replay each with
-/// the challenge `svnserve` sent, cut anywhere; expect its bytes (the auth request in the repository's realm, the
-/// challenge, the success, the repository's information), the client's digest proved by the user's key, the user
-/// authenticated and the first command left unread; and with any other secret, "Password incorrect".
+/// A-616 (the session an established handshake hands every command): replay the stock anonymous
+/// session to its end; expect the session to name no one, the 1.15 client's capabilities as its
+/// answer listed them (`svndiff1`, `accepts-svndiff2`, `absent-entries`, `depth`, `mergeinfo`,
+/// `log-revprops`), and the repository's UUID and root URL as `repos-info` sent them; and no
+/// session before the end.
+#[test]
+fn an_established_handshake_hands_on_its_session() {
+  let client = session!("anonymous").client;
+  let mut written = Vec::new();
+  let mut server = Server::new(roomy(client), &mut written).unwrap();
+  assert_eq!(server.session(), None);
+  let answer_end = items(client)[0].len();
+  assert!(matches!(
+    server.receive(&client[..answer_end], &mut written),
+    Ok(Progress::Opened { .. })
+  ));
+  assert_eq!(server.session(), None);
+  assert_eq!(
+    server.open(&anon_repository(), &mut written),
+    Ok(Access::Asked)
+  );
+  let rest = &client[answer_end..];
+  assert!(matches!(
+    server.receive(rest, &mut written),
+    Ok(Progress::Established { .. })
+  ));
+  let expected = crate::handshake::Session {
+    principal: Principal::Anonymous,
+    capabilities: ClientCapabilities {
+      svndiff1: true,
+      accepts_svndiff2: true,
+      absent_entries: true,
+      depth: true,
+      mergeinfo: true,
+      log_revprops: true,
+    },
+    uuid: UUID_ANON.to_vec(),
+    root_url: b"svn://127.0.0.1/anon".to_vec(),
+  };
+  assert_eq!(server.session(), Some(&expected));
+}
+
+/// A-599 (stock sessions `cram-md5`, `cram-md5-secret-64` and `cram-md5-secret-70`: CRAM-MD5 with a
+/// secret shorter than HMAC-MD5's 64-byte block, exactly as long, and longer, which RFC 2104 and
+/// `cram.c` hash first): replay each with the challenge `svnserve` sent, cut anywhere; expect its
+/// bytes (the auth request in the repository's realm, the challenge, the success, the repository's
+/// information), the client's digest proved by the user's key, the user authenticated and the first
+/// command left unread; and with any other secret, "Password incorrect".
 #[test]
 fn stock_cram_md5_sessions_prove_the_clients_digest_whatever_the_secrets_length() {
   let sessions: [(Session, &[u8], &[u8]); 3] = [
@@ -639,10 +690,11 @@ fn stock_cram_md5_sessions_prove_the_clients_digest_whatever_the_secrets_length(
   }
 }
 
-/// A-599 (stock session `cram-md5-wrong-password`: the client's digest made from another secret; a SASL client then
-/// asks again, `( CRAM-MD5 ( ) )`, before it learns it has no further credentials, and ends): replay it, cut anywhere;
-/// expect "Password incorrect", a second challenge for the second attempt, byte for byte as `svnserve` wrote them, and
-/// the handshake waiting on the response the client never sent.
+/// A-599 (stock session `cram-md5-wrong-password`: the client's digest made from another secret; a
+/// SASL client then asks again, `( CRAM-MD5 ( ) )`, before it learns it has no further credentials,
+/// and ends): replay it, cut anywhere; expect "Password incorrect", a second challenge for the
+/// second attempt, byte for byte as `svnserve` wrote them, and the handshake waiting on the
+/// response the client never sent.
 #[test]
 fn a_wrong_password_is_answered_password_incorrect_and_the_client_may_try_again() {
   let session = session!("cram-md5-wrong-password");
@@ -658,10 +710,11 @@ fn a_wrong_password_is_answered_password_incorrect_and_the_client_may_try_again(
   assert_answered_as_svnserve(session, &caller, &expected);
 }
 
-/// A-599 (stock sessions `anonymous-or-cram-md5`, `svn://` to a repository allowing both, and `external`, the tunnel's
-/// `svnserve -t` listing `ANONYMOUS EXTERNAL CRAM-MD5`): replay each, cut anywhere; expect `svnserve`'s bytes, the client
-/// taking `ANONYMOUS` over `svn://` and `EXTERNAL` through the tunnel, as `internal_auth.c` and `cyrus_auth.c` choose,
-/// and the tunnel's user authenticated through it.
+/// A-599 (stock sessions `anonymous-or-cram-md5`, `svn://` to a repository allowing both, and
+/// `external`, the tunnel's `svnserve -t` listing `ANONYMOUS EXTERNAL CRAM-MD5`): replay each, cut
+/// anywhere; expect `svnserve`'s bytes, the client taking `ANONYMOUS` over `svn://` and `EXTERNAL`
+/// through the tunnel, as `internal_auth.c` and `cyrus_auth.c` choose, and the tunnel's user
+/// authenticated through it.
 #[test]
 fn a_stock_client_takes_the_mechanism_svnserve_lists_first_for_its_transport() {
   let daemon = Caller::opening(both_repository(b"svn://127.0.0.1/both", false));
@@ -681,10 +734,11 @@ fn a_stock_client_takes_the_mechanism_svnserve_lists_first_for_its_transport() {
   assert_commands_follow(session!("external"), &tunnel);
 }
 
-/// A-599 (stock sessions `no-repository` and `no-access`: `find_repos` finds nothing at the URL; the repository allows
-/// no one): replay each, cut anywhere; expect `svnserve`'s command failure, 210005 "No repository found in
-/// 'svn://127.0.0.1/missing'" and 170001 "No access allowed to this repository", as a release build writes it (no
-/// source file, line 0), after the greeting alone, and the handshake ended.
+/// A-599 (stock sessions `no-repository` and `no-access`: `find_repos` finds nothing at the URL;
+/// the repository allows no one): replay each, cut anywhere; expect `svnserve`'s command failure,
+/// 210005 "No repository found in 'svn://127.0.0.1/missing'" and 170001 "No access allowed to this
+/// repository", as a release build writes it (no source file, line 0), after the greeting alone,
+/// and the handshake ended.
 #[test]
 fn a_url_naming_no_repository_or_one_allowing_no_one_is_refused_as_svnserve_refuses_it() {
   let missing = Caller::refusing(Unserved::NoRepository {
@@ -703,12 +757,14 @@ fn a_url_naming_no_repository_or_one_allowing_no_one_is_refused_as_svnserve_refu
   );
 }
 
-/// A-599 (hand-made sessions `hostile-version-3`, `hostile-no-edit-pipeline`, `hostile-capability-not-a-word`,
-/// `hostile-ra-client-without-client-list` and `hostile-answer-only-version`, each answered by `svnserve` with its
-/// greeting alone: `serve.c` 4280-4286 and 4295-4297 refuse the version and a missing `edit-pipeline` with
-/// `SVN_ERR_RA_SVN_BAD_VERSION`, `marshal.c` `svn_ra_svn__set_capabilities` a capability that is no word and
-/// `vparse_tuple` the rest with `SVN_ERR_RA_SVN_MALFORMED_DATA`): replay each, cut anywhere; expect the greeting alone,
-/// the refusal typed, and its number the one `svnserve` refuses with.
+/// A-599 (hand-made sessions `hostile-version-3`, `hostile-no-edit-pipeline`,
+/// `hostile-capability-not-a-word`, `hostile-ra-client-without-client-list` and
+/// `hostile-answer-only-version`, each answered by `svnserve` with its greeting alone: `serve.c`
+/// 4280-4286 and 4295-4297 refuse the version and a missing `edit-pipeline` with
+/// `SVN_ERR_RA_SVN_BAD_VERSION`, `marshal.c` `svn_ra_svn__set_capabilities` a capability that is no
+/// word and `vparse_tuple` the rest with `SVN_ERR_RA_SVN_MALFORMED_DATA`): replay each, cut
+/// anywhere; expect the greeting alone, the refusal typed, and its number the one `svnserve`
+/// refuses with.
 #[test]
 fn every_answer_svnserve_refuses_is_refused_after_the_greeting_alone_with_its_number() {
   for (session, refused, code) in [
@@ -748,10 +804,10 @@ fn every_answer_svnserve_refuses_is_refused_after_the_greeting_alone_with_its_nu
   }
 }
 
-/// A-599 (hand-made session `hostile-unlisted-mechanism-then-anonymous`: `PLAIN`, which `svnserve` does not implement,
-/// then `CRAM-MD5` where no password database lists it, then `ANONYMOUS`): replay it, cut anywhere; expect "Must
-/// authenticate with listed mechanism" twice, then the success and the repository's information, as `svnserve` wrote
-/// them.
+/// A-599 (hand-made session `hostile-unlisted-mechanism-then-anonymous`: `PLAIN`, which `svnserve`
+/// does not implement, then `CRAM-MD5` where no password database lists it, then `ANONYMOUS`):
+/// replay it, cut anywhere; expect "Must authenticate with listed mechanism" twice, then the
+/// success and the repository's information, as `svnserve` wrote them.
 #[test]
 fn an_unlisted_mechanism_fails_its_attempt_and_the_client_may_answer_again() {
   let expected = Expected {
@@ -766,9 +822,9 @@ fn an_unlisted_mechanism_fails_its_attempt_and_the_client_may_answer_again() {
   );
 }
 
-/// A-599 (hand-made session `hostile-external-other-user-then-own`, through `svnserve -t`: `EXTERNAL` naming `bob`, then
-/// the tunnel's own user): replay it, cut anywhere; expect "Requested username does not match", then the tunnel's user
-/// authenticated, as `svnserve` wrote them.
+/// A-599 (hand-made session `hostile-external-other-user-then-own`, through `svnserve -t`:
+/// `EXTERNAL` naming `bob`, then the tunnel's own user): replay it, cut anywhere; expect "Requested
+/// username does not match", then the tunnel's user authenticated, as `svnserve` wrote them.
 #[test]
 fn an_external_token_naming_another_user_fails_and_the_tunnels_own_succeeds() {
   let expected = Expected {
@@ -793,7 +849,8 @@ fn string_item(bytes: &[u8]) -> Vec<u8> {
   cat(&[format!("{}:", bytes.len()).as_bytes(), bytes, b" "])
 }
 
-/// The answer a stock 1.15 client built without SASL's client string writes for `url` (`client.c` `open_session`).
+/// The answer a stock 1.15 client built without SASL's client string writes for `url` (`client.c`
+/// `open_session`).
 fn stock_answer(url: &[u8]) -> Vec<u8> {
   cat(&[
     b"( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) ",
@@ -802,8 +859,9 @@ fn stock_answer(url: &[u8]) -> Vec<u8> {
   ])
 }
 
-/// A command failure of one error as a release build of `svnserve` writes it (`svn_ra_svn__write_cmd_failure`): the
-/// form the recorded `no-repository` and `no-access` sessions show.
+/// A command failure of one error as a release build of `svnserve` writes it
+/// (`svn_ra_svn__write_cmd_failure`): the form the recorded `no-repository` and `no-access`
+/// sessions show.
 fn command_failure(code: u32, message: &[u8]) -> Vec<u8> {
   cat(&[
     format!("( failure ( ( {code} ").as_bytes(),
@@ -812,9 +870,10 @@ fn command_failure(code: u32, message: &[u8]) -> Vec<u8> {
   ])
 }
 
-/// A-599 (`find_repos` 3902-3904 and 3918-3920: a URL that is no `svn://` URL, and a path climbing out of the root):
-/// refuse the client's URL with each; expect `svnserve`'s words, 125002 "Non-svn URL passed to svn server: '`url`'" and
-/// 125001 "Couldn't determine repository path", in the form the recorded refusals show, and the handshake ended.
+/// A-599 (`find_repos` 3902-3904 and 3918-3920: a URL that is no `svn://` URL, and a path climbing
+/// out of the root): refuse the client's URL with each; expect `svnserve`'s words, 125002 "Non-svn
+/// URL passed to svn server: '`url`'" and 125001 "Couldn't determine repository path", in the form
+/// the recorded refusals show, and the handshake ended.
 #[test]
 fn a_url_svnserve_cannot_use_is_refused_in_its_words() {
   let url: &'static [u8] = b"http://example.org/repo";
@@ -843,14 +902,15 @@ fn a_url_svnserve_cannot_use_is_refused_in_its_words() {
 fn hex_bytes(hex: &str) -> Vec<u8> {
   (0..hex.len())
     .step_by(2)
-    .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+    .map(|at| u8::from_str_radix(hex.get(at..at + 2).unwrap(), 16).unwrap())
     .collect()
 }
 
 /// A-599 (RFC 2195 §2's worked example: secret `tanstaaftanstaaf`, challenge
-/// `<1896.697170952@postoffice.reston.mci.net>`, digest `b913a602c7eda7a495b4e6e7334d3890`): take the digest of the
-/// key; expect RFC 2195's. Then drive the handshake with the challenge from those parts, which `cram.c`'s form gives
-/// byte for byte, and tim's response; expect the challenge written so and tim authenticated.
+/// `<1896.697170952@postoffice.reston.mci.net>`, digest `b913a602c7eda7a495b4e6e7334d3890`): take
+/// the digest of the key; expect RFC 2195's. Then drive the handshake with the challenge from those
+/// parts, which `cram.c`'s form gives byte for byte, and tim's response; expect the challenge
+/// written so and tim authenticated.
 #[test]
 fn rfc_2195s_worked_example_authenticates_tim() {
   let challenge = b"<1896.697170952@postoffice.reston.mci.net>";
@@ -886,8 +946,8 @@ fn rfc_2195s_worked_example_authenticates_tim() {
   );
 }
 
-/// A-599 (RFC 2202 §2's seven HMAC-MD5 test cases, keys of 16, 4, 16, 25, 16 and 80 bytes, two longer than the block):
-/// take each case's digest of its data under its key; expect RFC 2202's.
+/// A-599 (RFC 2202 §2's seven HMAC-MD5 test cases, keys of 16, 4, 16, 25, 16 and 80 bytes, two
+/// longer than the block): take each case's digest of its data under its key; expect RFC 2202's.
 #[test]
 fn rfc_2202s_hmac_md5_vectors() {
   let cases: [(Vec<u8>, Vec<u8>, &str); 7] = [
@@ -947,8 +1007,9 @@ const CRAM_C_INNER_PAD: u8 = 0x36;
 /// `cram.c`'s outer pad byte (`compute_digest` 102; RFC 2104 §2's `opad`).
 const CRAM_C_OUTER_PAD: u8 = 0x5c;
 
-/// `cram.c`'s `compute_digest` (82-111), transcribed: the password munged into a 64-byte secret, copied when it fits and
-/// its MD5 otherwise, then MD5(secret XOR opad, MD5(secret XOR ipad, challenge)).
+/// `cram.c`'s `compute_digest` (82-111), transcribed: the password munged into a 64-byte secret,
+/// copied when it fits and its MD5 otherwise, then MD5(secret XOR opad, MD5(secret XOR ipad,
+/// challenge)).
 fn cram_c_digest(password: &[u8], challenge: &[u8]) -> [u8; DIGEST_BYTES] {
   let mut secret = [0u8; CRAM_C_SECRET_BYTES];
   if password.len() <= CRAM_C_SECRET_BYTES {
@@ -982,11 +1043,12 @@ fn cram_c_hex(digit: u8) -> Option<u8> {
   }
 }
 
-/// `cram.c`'s reading of a response (`svn_ra_svn_cram_server` 164-168, `hex_decode` 56-69), transcribed over C's view of
-/// the bytes: `strrchr` finds the last space before the first NUL; the digest's length is counted from there to the
-/// response's true end; `hex_decode` reads 32 bytes there, failing on any but a lowercase digit, a NUL among them.
+/// `cram.c`'s reading of a response (`svn_ra_svn_cram_server` 164-168, `hex_decode` 56-69),
+/// transcribed over C's view of the bytes: `strrchr` finds the last space before the first NUL; the
+/// digest's length is counted from there to the response's true end; `hex_decode` reads 32 bytes
+/// there, failing on any but a lowercase digit, a NUL among them.
 fn cram_c_split(response: &[u8]) -> Option<(Vec<u8>, [u8; DIGEST_BYTES])> {
-  let c_string = response.split(|byte| *byte == 0).next().unwrap();
+  let c_string = response.split(|byte| *byte == 0).next()?;
   let separator = c_string.iter().rposition(|byte| *byte == b' ')?;
   if response.len() - (separator + 1) != 2 * DIGEST_BYTES {
     return None;
@@ -1005,9 +1067,10 @@ fn split(response: &[u8]) -> Option<(Vec<u8>, [u8; DIGEST_BYTES])> {
   split_response(response).map(|(user, digest)| (user.to_vec(), digest))
 }
 
-/// A-599 (`cram.c`'s reading of a response as the oracle, NULs where its C string ends): split well-formed responses,
-/// responses with an uppercase digit, one digit short or long, no space, spaces in the user, and a NUL in the user, in
-/// the digest and after it; expect what `cram.c` reads, a NUL anywhere refusing the response.
+/// A-599 (`cram.c`'s reading of a response as the oracle, NULs where its C string ends): split
+/// well-formed responses, responses with an uppercase digit, one digit short or long, no space,
+/// spaces in the user, and a NUL in the user, in the digest and after it; expect what `cram.c`
+/// reads, a NUL anywhere refusing the response.
 #[test]
 fn a_response_splits_as_cram_c_reads_it_a_nul_anywhere_refusing_it() {
   let digest = "988c9f284ea35500a38f1cb139a5341a";
@@ -1016,7 +1079,7 @@ fn a_response_splits_as_cram_c_reads_it_a_nul_anywhere_refusing_it() {
     format!("a b c {digest}").into_bytes(),
     format!(" {digest}").into_bytes(),
     format!("alice {}", digest.to_uppercase()).into_bytes(),
-    format!("alice {}", &digest[1..]).into_bytes(),
+    format!("alice {}", digest.get(1..).unwrap()).into_bytes(),
     format!("alice {digest}0").into_bytes(),
     format!("alice{digest}").into_bytes(),
     cat(&[b"al\0ice ", digest.as_bytes()]),
@@ -1030,8 +1093,8 @@ fn a_response_splits_as_cram_c_reads_it_a_nul_anywhere_refusing_it() {
   assert!(split(&cat(&[b"al\0ice ", digest.as_bytes()])).is_none());
 }
 
-/// A handshake that asked for authentication on `repository`, the client's answer read and its URL named; what it
-/// wrote so far is in `written`.
+/// A handshake that asked for authentication on `repository`, the client's answer read and its URL
+/// named; what it wrote so far is in `written`.
 fn asked(repository: Repository<'static>, written: &mut Vec<u8>) -> Server {
   let answer = stock_answer(repository.root_url);
   let mut server = Server::new(roomy(&answer), written).unwrap();
@@ -1053,9 +1116,10 @@ fn read_auth_response<'a>(
   server.receive(response, &mut written)
 }
 
-/// A-599 (`serve.c` 711 reads the auth-response as `w(?c)` through `vparse_tuple`: a word, then a list holding a string
-/// or nothing, items past those ignored; anything else "Malformed network data", which ends the connection): read each
-/// form on a repository allowing `ANONYMOUS` and `CRAM-MD5`; expect each taken or refused as `vparse_tuple` takes it.
+/// A-599 (`serve.c` 711 reads the auth-response as `w(?c)` through `vparse_tuple`: a word, then a
+/// list holding a string or nothing, items past those ignored; anything else "Malformed network
+/// data", which ends the connection): read each form on a repository allowing `ANONYMOUS` and
+/// `CRAM-MD5`; expect each taken or refused as `vparse_tuple` takes it.
 #[test]
 fn the_auth_response_is_read_as_vparse_tuple_reads_it() {
   let established = |response: &'static [u8]| {
@@ -1106,41 +1170,59 @@ fn the_auth_response_is_read_as_vparse_tuple_reads_it() {
   );
 }
 
-/// What a fresh handshake makes of the answer `answer`: its URL, `ra-client` and client, or its refusal.
-type AnswerRead = Result<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>), Refused>;
+/// What a fresh handshake made of an answer: the URL, `ra-client` and client it read, or its
+/// refusal.
+#[derive(Debug, PartialEq, Eq)]
+enum AnswerRead {
+  /// The answer was read whole.
+  Opened {
+    url: Vec<u8>,
+    ra_client: Option<Vec<u8>>,
+    client: Option<Vec<u8>>,
+  },
+  /// The answer was refused.
+  Refused(Refused),
+}
 
 /// Reads `answer` on a fresh handshake.
 fn read_answer(answer: &[u8]) -> AnswerRead {
   let mut written = Vec::new();
   let mut server = Server::new(roomy(answer), &mut written).unwrap();
-  match server.receive(answer, &mut written)? {
-    Progress::Opened { open, consumed } => {
+  match server.receive(answer, &mut written) {
+    Ok(Progress::Opened { open, consumed }) => {
       assert_eq!(consumed, answer.len());
-      Ok((
-        open.url.to_vec(),
-        open.ra_client.map(<[u8]>::to_vec),
-        open.client.map(<[u8]>::to_vec),
-      ))
+      AnswerRead::Opened {
+        url: open.url.to_vec(),
+        ra_client: open.ra_client.map(<[u8]>::to_vec),
+        client: open.client.map(<[u8]>::to_vec),
+      }
     }
-    other => panic!("an answer read as {other:?}"),
+    Ok(other) => panic!("an answer read as {other:?}"),
+    Err(refused) => AnswerRead::Refused(refused),
   }
 }
 
-/// A-599 (`serve.c` 4278 reads the answer as `nlc?c(?c)` through `vparse_tuple`, then 4280-4297 judge the version, the
-/// capabilities' kinds and `edit-pipeline`, in that order): read each form; expect it taken with what it names, or
-/// refused as `svnserve` refuses it, the form judged before the version and the version before the capabilities.
+/// A-599 (`serve.c` 4278 reads the answer as `nlc?c(?c)` through `vparse_tuple`, then 4280-4297
+/// judge the version, the capabilities' kinds and `edit-pipeline`, in that order): read each form;
+/// expect it taken with what it names, or refused as `svnserve` refuses it, the form judged before
+/// the version and the version before the capabilities.
 #[test]
 fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
   let url = || b"url".to_vec();
-  let named = |ra: &str, client: Option<&str>| -> AnswerRead {
-    Ok((
-      url(),
-      Some(ra.as_bytes().to_vec()),
-      client.map(|client| client.as_bytes().to_vec()),
-    ))
+  let named = |ra: &str, client: Option<&str>| AnswerRead::Opened {
+    url: url(),
+    ra_client: Some(ra.as_bytes().to_vec()),
+    client: client.map(|client| client.as_bytes().to_vec()),
   };
   let table: [(&[u8], AnswerRead); 18] = [
-    (b"( 2 ( edit-pipeline ) 3:url ) ", Ok((url(), None, None))),
+    (
+      b"( 2 ( edit-pipeline ) 3:url ) ",
+      AnswerRead::Opened {
+        url: url(),
+        ra_client: None,
+        client: None,
+      },
+    ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ( ) ) ",
       named("abc", None),
@@ -1159,35 +1241,53 @@ fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc 7 ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 3:abc ( 7 ) ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
     (
       b"( 2 ( edit-pipeline ) 3:url 7 ( ) ) ",
-      Err(Refused::NotAnswer),
+      AnswerRead::Refused(Refused::NotAnswer),
     ),
-    (b"( 2 ( edit-pipeline ) url ) ", Err(Refused::NotAnswer)),
-    (b"( 2 edit-pipeline 3:url ) ", Err(Refused::NotAnswer)),
-    (b"( two ( edit-pipeline ) 3:url ) ", Err(Refused::NotAnswer)),
-    (b"2 ", Err(Refused::NotAnswer)),
-    (b"( 2 ( 7 ) 3:url 3:abc ) ", Err(Refused::NotAnswer)),
+    (
+      b"( 2 ( edit-pipeline ) url ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
+    (
+      b"( 2 edit-pipeline 3:url ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
+    (
+      b"( two ( edit-pipeline ) 3:url ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
+    (b"2 ", AnswerRead::Refused(Refused::NotAnswer)),
+    (
+      b"( 2 ( 7 ) 3:url 3:abc ) ",
+      AnswerRead::Refused(Refused::NotAnswer),
+    ),
     (
       b"( 1 ( edit-pipeline ) 3:url ) ",
-      Err(Refused::UnsupportedVersion(1)),
+      AnswerRead::Refused(Refused::UnsupportedVersion(1)),
     ),
-    (b"( 3 ( 7 ) 3:url ) ", Err(Refused::UnsupportedVersion(3))),
+    (
+      b"( 3 ( 7 ) 3:url ) ",
+      AnswerRead::Refused(Refused::UnsupportedVersion(3)),
+    ),
     (
       b"( 2 ( 7 edit-pipeline ) 3:url ) ",
-      Err(Refused::CapabilityNotWord),
+      AnswerRead::Refused(Refused::CapabilityNotWord),
     ),
-    (b"( 2 ( ) 3:url ) ", Err(Refused::NoEditPipeline)),
+    (
+      b"( 2 ( ) 3:url ) ",
+      AnswerRead::Refused(Refused::NoEditPipeline),
+    ),
   ];
   for (answer, expected) in table {
     assert_eq!(
@@ -1199,9 +1299,9 @@ fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
   }
 }
 
-/// A-599 (`EXTERNAL`, `serve.c` 657-668: the tunnel's user, failing a token that names another; an absent token is an
-/// empty one): answer `EXTERNAL` on a tunnel to a repository allowing it with no token, an empty one and the user's own
-/// name; expect the tunnel's user each time.
+/// A-599 (`EXTERNAL`, `serve.c` 657-668: the tunnel's user, failing a token that names another; an
+/// absent token is an empty one): answer `EXTERNAL` on a tunnel to a repository allowing it with no
+/// token, an empty one and the user's own name; expect the tunnel's user each time.
 #[test]
 fn an_external_token_naming_no_one_or_the_tunnels_user_takes_the_tunnels_user() {
   let accepted: [&[u8]; 3] = [b"( ) ", b"( 0: ) ", b"( 5:alice ) "];
@@ -1223,9 +1323,10 @@ fn an_external_token_naming_no_one_or_the_tunnels_user_takes_the_tunnels_user() 
   }
 }
 
-/// A-599 (`EXTERNAL`, `serve.c` 657-668, a token compared whole where `strcmp` stops at a NUL): answer `EXTERNAL` on a
-/// tunnel with another name, the user's name with a NUL after it, and with a byte after it; expect "Requested username
-/// does not match" each time; and through no tunnel, `EXTERNAL` not listed.
+/// A-599 (`EXTERNAL`, `serve.c` 657-668, a token compared whole where `strcmp` stops at a NUL):
+/// answer `EXTERNAL` on a tunnel with another name, the user's name with a NUL after it, and with a
+/// byte after it; expect "Requested username does not match" each time; and through no tunnel,
+/// `EXTERNAL` not listed.
 #[test]
 fn an_external_token_naming_another_user_whole_is_refused() {
   let refused: [&[u8]; 3] = [b"( 3:bob ) ", b"( 6:alice\0 ) ", b"( 6:alicex ) "];
@@ -1260,8 +1361,8 @@ fn an_external_token_naming_another_user_whole_is_refused() {
   ));
 }
 
-/// The client's bytes for a CRAM-MD5 attempt on the repository allowing both, its response `response`, followed by
-/// `then`.
+/// The client's bytes for a CRAM-MD5 attempt on the repository allowing both, its response
+/// `response`, followed by `then`.
 fn cram_attempt(response: &[u8], then: &[u8]) -> Vec<u8> {
   cat(&[
     &stock_answer(b"svn://127.0.0.1/both"),
@@ -1296,19 +1397,19 @@ fn alices_response() -> Vec<u8> {
   string_item(format!("alice {hex}").as_bytes())
 }
 
-/// A caller for the repository allowing both, holding alice's key and giving [`fixed_challenge`] to as many attempts
-/// as `attempts`.
+/// A caller for the repository allowing both, holding alice's key and giving [`fixed_challenge`] to
+/// as many attempts as `attempts`.
 fn caller_with_alice(attempts: usize) -> Caller {
   Caller::opening(both_repository(b"svn://127.0.0.1/both", false))
     .with_challenges(vec![Some(fixed_challenge()); attempts])
     .with_key(b"alice", SECRET_SHORT)
 }
 
-/// A-599 (hostile CRAM-MD5 responses, `cram.c` 159-176): answer the challenge with a number and with a list, which
-/// `cram.c` passes over without a word; with no space, an uppercase digit, a digit short, a NUL in the user before a
-/// good digest, an unknown user and a wrong digest; then `ANONYMOUS`; expect each failure as `cram.c` words it, none
-/// written for the first two, and the client authenticated anonymously after it, never as a user a failed attempt
-/// named.
+/// A-599 (hostile CRAM-MD5 responses, `cram.c` 159-176): answer the challenge with a number and
+/// with a list, which `cram.c` passes over without a word; with no space, an uppercase digit, a
+/// digit short, a NUL in the user before a good digest, an unknown user and a wrong digest; then
+/// `ANONYMOUS`; expect each failure as `cram.c` words it, none written for the first two, and the
+/// client authenticated anonymously after it, never as a user a failed attempt named.
 #[test]
 fn a_failed_cram_md5_attempt_is_worded_as_cram_c_words_it_and_names_no_one() {
   let anonymous = b"( ANONYMOUS ( 0: ) ) ".as_slice();
@@ -1371,10 +1472,10 @@ fn a_failed_cram_md5_attempt_is_worded_as_cram_c_words_it_and_names_no_one() {
   );
 }
 
-/// A-599 (`cram.c` 150-153: a challenge that cannot be made fails the attempt, "Internal server error in
-/// authentication", and `internal_auth_request`'s loop reads the client's next answer): the client chooses CRAM-MD5 and
-/// the caller has no challenge, then the client tries again and is given one; expect the failure written, then the
-/// challenge, and alice authenticated.
+/// A-599 (`cram.c` 150-153: a challenge that cannot be made fails the attempt, "Internal server
+/// error in authentication", and `internal_auth_request`'s loop reads the client's next answer):
+/// the client chooses CRAM-MD5 and the caller has no challenge, then the client tries again and is
+/// given one; expect the failure written, then the challenge, and alice authenticated.
 #[test]
 fn a_challenge_the_caller_cannot_make_fails_the_attempt_and_the_client_may_try_again() {
   let client = cat(&[
@@ -1405,14 +1506,16 @@ fn a_challenge_the_caller_cannot_make_fails_the_attempt_and_the_client_may_try_a
   );
 }
 
-/// The tightest item bound `item` needs: its bytes, or what its items cost parsed, whichever is more.
+/// The tightest item bound `item` needs: its bytes, or what its items cost parsed, whichever is
+/// more.
 fn needed_for(item: &[u8]) -> usize {
   let bounds = Bounds::of(&value_of(item)).unwrap();
   item.len().max(bounds.nodes * PARSED_ITEM_BYTES)
 }
 
-/// A-599 (the bounds: the caller's bytes; the longest word `marshal.c` takes, 24; the prototypes' depth, 2; the item count
-/// the bytes over a parsed item's cost): make handshakes for item bounds from none to the most; expect those bounds.
+/// A-599 (the bounds: the caller's bytes; the longest word `marshal.c` takes, 24; the prototypes'
+/// depth, 2; the item count the bytes over a parsed item's cost): make handshakes for item bounds
+/// from none to the most; expect those bounds.
 #[test]
 fn the_bounds_are_the_callers_bytes_and_what_the_handshake_derives_from_them() {
   for item_bytes in [
@@ -1434,10 +1537,11 @@ fn the_bounds_are_the_callers_bytes_and_what_the_handshake_derives_from_them() {
   }
 }
 
-/// A-599 (each bound exactly enough, the item count included: no message's values cost more memory than its bytes may):
-/// for every stock session, find the tightest item bound its handshake needs, each message's bytes or what its items
-/// cost parsed, whichever is more; expect the session to end as it does with room to spare at that bound, and refused
-/// one byte below it, as an item too large or too many items.
+/// A-599 (each bound exactly enough, the item count included: no message's values cost more memory
+/// than its bytes may): for every stock session, find the tightest item bound its handshake needs,
+/// each message's bytes or what its items cost parsed, whichever is more; expect the session to end
+/// as it does with room to spare at that bound, and refused one byte below it, as an item too large
+/// or too many items.
 #[test]
 fn the_tightest_item_bound_a_stock_session_needs_is_exactly_enough() {
   for (session, caller) in stock_sessions() {
@@ -1465,10 +1569,11 @@ fn the_tightest_item_bound_a_stock_session_needs_is_exactly_enough() {
   }
 }
 
-/// A-599 (hostile items, refused typed with their numbers, nothing written after them): a capability of 25 characters,
-/// one past `marshal.c`'s 24; a list nested three deep in the answer; a URL declaring 4,294,967,295 bytes, refused at its
-/// `:`; a version past 2^64 - 1; a CRAM-MD5 response declaring 2^64 - 1 bytes; a list of more one-character words than
-/// the bound pays for parsed; and a stock answer whose URL is longer than the bound.
+/// A-599 (hostile items, refused typed with their numbers, nothing written after them): a
+/// capability of 25 characters, one past `marshal.c`'s 24; a list nested three deep in the answer;
+/// a URL declaring 4,294,967,295 bytes, refused at its `:`; a version past 2^64 - 1; a CRAM-MD5
+/// response declaring 2^64 - 1 bytes; a list of more one-character words than the bound pays for
+/// parsed; and a stock answer whose URL is longer than the bound.
 #[test]
 fn items_past_the_handshakes_bounds_are_refused_typed_after_what_was_due() {
   let long_url = stock_answer(&[b'u'; 1000]);
@@ -1509,12 +1614,13 @@ fn items_past_the_handshakes_bounds_are_refused_typed_after_what_was_due() {
   }
 }
 
-/// `SVN_ERR_RA_SVN_REQUEST_SIZE`, an item past its bound (`svn_error_codes.h`: the ra_svn category's start plus 9).
+/// `SVN_ERR_RA_SVN_REQUEST_SIZE`, an item past its bound (`svn_error_codes.h`: the ra_svn
+/// category's start plus 9).
 const SVN_ERR_RA_SVN_REQUEST_SIZE: u32 = 210_009;
 
-/// A-599 (calls out of turn are the caller's error: typed, with no Subversion number, writing nothing): on a fresh
-/// handshake, before the client's answer, open, refuse, challenge, fail a challenge and give a key; expect each refused
-/// and the greeting alone written.
+/// A-599 (calls out of turn are the caller's error: typed, with no Subversion number, writing
+/// nothing): on a fresh handshake, before the client's answer, open, refuse, challenge, fail a
+/// challenge and give a key; expect each refused and the greeting alone written.
 #[test]
 fn every_call_before_the_clients_answer_is_out_of_turn_and_writes_nothing() {
   let mut written = Vec::new();
@@ -1541,9 +1647,9 @@ fn every_call_before_the_clients_answer_is_out_of_turn_and_writes_nothing() {
   assert_eq!(Refused::OutOfTurn.subversion_code(), None);
 }
 
-/// A-599 (calls out of turn, while the handshake awaits its caller): read the client's answer, then read again and give
-/// a key before naming the repository; expect both refused and nothing written; then name it, and expect a second
-/// naming refused.
+/// A-599 (calls out of turn, while the handshake awaits its caller): read the client's answer, then
+/// read again and give a key before naming the repository; expect both refused and nothing written;
+/// then name it, and expect a second naming refused.
 #[test]
 fn a_call_while_the_handshake_awaits_its_caller_is_out_of_turn() {
   let mut written = Vec::new();
@@ -1570,8 +1676,9 @@ fn a_call_while_the_handshake_awaits_its_caller_is_out_of_turn() {
   );
 }
 
-/// A-599 (calls out of turn, after the handshake): authenticate anonymously; expect the handshake done, then every
-/// call refused and nothing more written, the client's next item being a command for the caller's own reader.
+/// A-599 (calls out of turn, after the handshake): authenticate anonymously; expect the handshake
+/// done, then every call refused and nothing more written, the client's next item being a command
+/// for the caller's own reader.
 #[test]
 fn every_call_after_the_handshake_is_out_of_turn() {
   let mut written = Vec::new();
@@ -1598,9 +1705,9 @@ fn every_call_after_the_handshake_is_out_of_turn() {
   assert_eq!(written, done);
 }
 
-/// A-599 (`serve.c` 4345-4351: a repository that allows no one is refused before any request): name a repository with
-/// no anonymous access and no mechanism; expect `Access::Denied`, "No access allowed to this repository" written, and
-/// the handshake ended.
+/// A-599 (`serve.c` 4345-4351: a repository that allows no one is refused before any request): name
+/// a repository with no anonymous access and no mechanism; expect `Access::Denied`, "No access
+/// allowed to this repository" written, and the handshake ended.
 #[test]
 fn a_repository_allowing_no_one_is_denied_before_any_request() {
   let mut written = Vec::new();
@@ -1633,8 +1740,9 @@ fn a_repository_allowing_no_one_is_denied_before_any_request() {
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
-  /// A-599 (resumable at any split, the codec's promise carried through the handshake): deliver a stock session's bytes
-  /// in pieces at arbitrary cuts; expect what the whole delivered at once comes to.
+  /// A-599 (resumable at any split, the codec's promise carried through the handshake): deliver a
+  /// stock session's bytes in pieces at arbitrary cuts; expect what the whole delivered at once
+  /// comes to.
   #[test]
   fn a_session_in_any_pieces_is_answered_as_the_whole(
     choice in any::<prop::sample::Index>(),
@@ -1651,8 +1759,9 @@ proptest! {
     prop_assert_eq!(pieces.taken, whole.taken);
   }
 
-  /// A-599 (`cram.c`'s `compute_digest` as the oracle): take the key's digest of any challenge under any password
-  /// `cram.c` can read, none to 150 bytes, either side of the 64-byte block; expect `cram.c`'s.
+  /// A-599 (`cram.c`'s `compute_digest` as the oracle): take the key's digest of any challenge
+  /// under any password `cram.c` can read, none to 150 bytes, either side of the 64-byte block;
+  /// expect `cram.c`'s.
   #[test]
   fn the_key_digests_as_cram_c_computes(
     password in proptest::collection::vec(1u8..=255, 0..150),
@@ -1663,8 +1772,9 @@ proptest! {
     prop_assert!(key.verifies(&challenge, &cram_c_digest(&password, &challenge)));
   }
 
-  /// A-599 (`cram.c`'s reading of a response as the oracle): split responses made of the bytes that decide it (digits,
-  /// letters either case, spaces, NULs), and well-formed ones with one byte changed; expect what `cram.c` reads.
+  /// A-599 (`cram.c`'s reading of a response as the oracle): split responses made of the bytes that
+  /// decide it (digits, letters either case, spaces, NULs), and well-formed ones with one byte
+  /// changed; expect what `cram.c` reads.
   #[test]
   fn any_response_splits_as_cram_c_reads_it(
     noise in proptest::collection::vec(prop::sample::select(b"0af9AFgx \0".to_vec()), 0..48),

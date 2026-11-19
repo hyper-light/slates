@@ -8,12 +8,14 @@ use slates_vcs::{ContentStore, Naming};
 
 use crate::object_name::{CollisionAttack, Hasher, Kind, ObjectFormat, ObjectId, name_of};
 use crate::objects::tree::{Entry, Mode, compare, write_entries};
+use crate::store::learn::{Clock, Exchange};
 use crate::store::rows::{self, CommitRow, ObjectRow};
 use crate::store::{
   COLLISION_WORDS, Entries, Found, GitNaming, Incoming, Move, NameRefused, Positions, Push,
   PushRefused, Repository, StoreRefused,
 };
 
+mod fragments;
 mod oracle;
 
 /// Shape: the window the tests' content store holds content in.
@@ -21,6 +23,19 @@ const WINDOW: usize = 1 << 10;
 
 /// Shape: the tests' content budget, room to spare.
 const BUDGET: u64 = 1 << 26;
+
+/// The tests' clock: a nanosecond a reading.
+struct Ticks(u64);
+
+impl Clock for Ticks {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// Shape: the tests' exchange, a byte saved worth a nanosecond.
+const EXCHANGE: Exchange = Exchange { ns: 1, bytes: 1 };
 
 /// git's own t0013 vector, `shattered-1.pdf`, cut to the 320 bytes that hold both colliding blocks (A-600's fixture).
 const SHATTERED_1: &[u8] = include_bytes!("../../../fixtures/objects/shattered-1.prefix.bin");
@@ -71,6 +86,8 @@ struct Source {
   objects: Vec<Made>,
   at: usize,
   claim: bool,
+  /// The chain depth each object reports: a client that deltified its pack this deep.
+  depth: u64,
 }
 
 impl Source {
@@ -79,6 +96,7 @@ impl Source {
       objects,
       at: 0,
       claim: true,
+      depth: 2,
     }
   }
 }
@@ -93,6 +111,7 @@ impl Entries for Source {
       kind: object.kind,
       claimed: self.claim.then_some(object.id),
       content: &object.content,
+      depth: self.depth,
     }))
   }
 }
@@ -187,6 +206,7 @@ fn git_names_each_object_and_a_collision_attack_is_refused_in_gits_words() {
     kind: Kind::Blob,
     claimed: None,
     content: SHATTERED_1,
+    depth: 0,
   };
   let refused: Result<_, PushRefused<Infallible>> = push.admit(&mut store, &RawSha1, incoming);
   let Err(PushRefused::NotNamed { reason }) = refused else {
@@ -712,6 +732,7 @@ fn an_abandoned_push_leaves_nothing_and_a_false_claim_is_refused() {
     kind: second[2].kind,
     claimed: Some(first[2].id),
     content: &second[2].content,
+    depth: 0,
   };
   let refused: Result<_, PushRefused<Infallible>> =
     push.admit(&mut store, &repository.naming(), incoming);
