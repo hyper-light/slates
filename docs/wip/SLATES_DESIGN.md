@@ -41945,7 +41945,9 @@ entry names slates-vcs, which git's object store had already made a workspace de
   its chunks now go through `compression::inflate`, which also charges the decoder's memory to the admission, so the
   crate inflates in one place and a chunk's refusal is the engine's own kind.
 - **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 188 of 188 at 02e608d67
-  (the first build, before the inflater and clippy changes), then the landing tree's run below. Golden: A-588's
+  (the first build, before the inflater and clippy changes), 188 of 188 at dbcee659e, 189 of 189 at d522d8a27 (the
+  damaged-revlog test now two), and 189 of 189 with `cargo fmt -p slates-hg -- --check` clean on the tree merged with
+  main at 38e48e3df (load 5.1). Golden: A-588's
   fixtures' history appended log by log, every revision's number, parents and link as 7.2's `debugindex` lists them,
   each node found under its number and its number under its node, the branches and the closed head kept, a copy's block
   apart; the shared quarantine admitting all 30 revisions by `HgNaming` and refusing each node one bit off. Hostile: a
