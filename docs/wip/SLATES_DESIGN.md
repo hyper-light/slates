@@ -9260,12 +9260,17 @@ for listings and streams; `AbortSignal` cancellation; ESM/CJS; the typed addon o
 client channel.
 
 > **Status (2026-10-01, AUD-29-23/24).** The loopback HTTP edge runs on one slates shard with every
-> bound stated (RFC 9112 line and field limits, the message bound, the client's derived deadline, the
-> daemon's derived `clients_per_shard` connections) and authorizes before dispatch: `Host` and `Origin`
+> bound stated (RFC 9112 line and field limits, the message bound, the daemon's derived `clients_per_shard`
+> connections, and since A-523 the bound a connection gets to show the bearer, learned from the edge's own reads)
+> and authorizes before dispatch: `Host` and `Origin`
 > must name the loopback edge, the target is `/mcp`, the body `application/json`, and a 128-bit bearer
 > token minted at start is required. Stdio lines share the message bound. A refusal ends its connection in stages
 > (RFC 9112 §9.6), so the client reads it rather than a reset. Both transports are served on every platform since
-> A-183 (2026-10-26). Owed: servable roots enrolled by a human (§4.13).
+> A-183 (2026-10-26). Since A-523 (2026-11-19) a connection that has not shown the bearer gets, from its acceptance,
+> as long as an honest client takes to show it (RFC 6298 over the bearer holders' arrivals) and is cut off unanswered
+> there; one that has shown it waits while it lives. Until then every wait ran to the client's reply deadline, a
+> fixed second. Owed: servable roots enrolled by a human (§4.13); a listen stream's keep-alive period, still half
+> the reply deadline.
 
 **MCP server.** `slates mcp`: stdio and loopback Streamable HTTP; the 2026-07-28 stateless
 protocol with per-request `_meta`, `server/discover`, `resultType`, `ttlMs`/`cacheScope`,
@@ -35958,6 +35963,41 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   `a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound` (a stand-in daemon holding its challenge 1.5 s),
   `slates-client --lib` 8 of 8; red with a fixed one-second step bound put back: `OsRefused { call: "recv route", code:
   Some(35) }` after 1.01 s.
+- **The CLI's MCP edge** (`slates_mcp::http`; §4.12, AUD-29-23). Its request read, a kept-alive connection's wait
+  for the next request and a refusal's drain each ran to the reply deadline (`HttpEdge::deadline_ns`). The read comes
+  before the bearer check, on a loopback port any local user reaches, so a silent or slow local sender held a slot for
+  that second, and a token holder's kept-alive connection was closed once idle that long.
+  - *Before the bearer.* A connection is any local user's until a complete field line carrying the edge's bearer has
+    arrived on it (scanned as the head arrives, one rule with `authorize`). From its acceptance it gets as long as an
+    honest client takes to show the bearer, fixed then; its first request, a refusal and the refusal's drain end at
+    that instant, and it is cut off there unanswered, its slot freed. The slot count is `clients_per_shard`, as before.
+  - *The bound, learned* (`Arrivals`). RFC 6298 §2's estimator (the transport's `RttEstimator`, now a dependency of
+    `slates-mcp`) over each bearer holder's time from acceptance to bearer. Its tail is `SRTT + max(G, 4·RTTVAR)`,
+    `G` being the shard's timer tick (`HttpEdge::tick_ns`, from the profile) or, when longer, its measured scheduler
+    lateness. Only a bearer holder's arrival is a sample, so no other local user moves the bound either way; a
+    connection cut off is none (Karn's rule). Before the first arrival the bound is RFC 9002 §6.2.2's initial probe
+    timeout (666 ms, A-471's prior). After `n` arrivals the next outlasts all of them with chance `1/(n+1)` whatever
+    their distribution (Rényi's record indicator, as A-363 prices a lateness past every one seen), so the prior keeps
+    that share of its excess over the tail: half after one arrival, a thousandth after 999. That guards the first
+    honest clients, whose few samples RFC 6298 alone would trust at once (`3R` after one).
+  - *After the bearer.* The connection is the token holder's: the rest of its request, its next request when kept
+    alive and the drain after a refusal of its own wait while it lives, until it closes or a read fails. A body past
+    the bound is drained whole, so its client reads the `413`.
+  - *Owed* (GAPS). A listen stream's keep-alive period is still half the reply deadline
+    (`slates_mcp::http::listen_keep_alive_ns`), the edge's old idle bound. An honest client cut off before its bearer
+    arrived looks like any other sender, so its cut-off teaches the bound nothing.
+  - *Checks* (Mac Studio, debug, 2026-11-19, load 22 to 26). `slates-mcp --lib` 19 of 19 with
+    `the_bound_starts_at_the_prior_and_falls_to_the_tail_of_the_honest_arrivals`,
+    `only_a_complete_field_line_carrying_the_bearer_proves_a_connection` and
+    `a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`. Nine
+    1 ms arrivals taught a bound of 67,680,208 ns; a silent sender was cut off unanswered 69.84 ms after its
+    acceptance and a dribbling one 68.02 ms after, six bytes into its dribble; a token holder showed its bearer
+    34.4 µs after its acceptance and its request, sent twice the bound later, was read whole at 137.65 ms (load 15 to
+    19). Red with the old fixed second put back: "the learned bound: 1000000000 ns", and the prior check
+    1,000,000,000 against 666,000,000. Red with the bearer ignored: the token holder cut off, `EdgeSaw { proof: Gone,
+    request: None, ended_ns: 69781917 }`. The integration suite's
+    `the_mcp_surface_serves_the_tools` now opens a bearerless head beside the idle connection, both to end unanswered,
+    and holds the token holder's slow body open to the end (main's to run).
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -35967,7 +36007,10 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   `a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline` and
   `an_answered_or_resending_call_never_looks_and_no_call_names_no_wake`; the driver suite's
   `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline` (red before A-523 by its design, a call ending a
-  second after it was sent; main's to run).
+  second after it was sent; main's to run). The ring slot's walk
+  (`a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`) is split into its steps (`walk`,
+  `step`, `assert_park`), each check kept, since main's clippy gate found it past the cognitive-complexity bound (12
+  of 10, 2026-11-19); `slates-client --lib` 8 of 8 after.
 - **Checks (the driver's tick).** On the Mac Studio (debug, 2026-11-18, load 15 to 19): `slates-ipc --lib` 62 of 62
   (1 ignored), `slates-client --lib` 7 of 7; red with the old timer put back (the next wake at the reply deadline's
   remainder): "the timer wakes 969925625 ns on, the call's own wait, not the old deadline's remainder".
@@ -36960,7 +37003,7 @@ and:
   - Each arm of the recovered count, removed on a copy, failed the restart test at the later clone: without the shared
     directories it counted 7 of 9; recording zero, 0 of 9.
 - **Found by the sweep, left open** (GAPS, with the bug record):
-  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, the next piece).
+  - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, fixed since).
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
   - A clone is admitted with no entry allowance.
   - A resize leaves the entry allowance at the size the volume was made with.
@@ -36972,7 +37015,9 @@ Applied in the same change to (part 1): §4.5 (journal retention), §4.6 (A-192'
 `crates/server/src/nfs_writeback.rs`, `crates/server/src/{fuse,winfsp}.rs` (the typed patience; their rule unchanged
 until part 2), `crates/bridge-core/tests/invalidation.rs`. Part 2: §4.5, §4.6 (A-141's mount that falls behind), GAPS,
 `crates/vfs/src/{journal,volume}.rs` (`ReaderRounds`, `take_rounds`, `set_patience`),
-`crates/server/src/reader_patience.rs` (new), `crates/server/src/{fuse,winfsp,learned_wait,lib}.rs`.
+`crates/server/src/reader_patience.rs` (new), `crates/server/src/{fuse,winfsp,learned_wait,lib}.rs`. Part 3: GAPS (the
+R3 debt's class C, the 2026-10-07 hold), `crates/server/src/state.rs` (`PendingMaterializations`),
+`crates/server/src/{verbs,daemon}.rs`.
 - **What was there.** Every journal reader was opened with one patience, the daemon's liveness window `W` (a second on
   the wall): a record a reader had not read for `W` was dropped at the next append past the budget, and the reader
   overran when it came back (A-157). A-359 listed three class C waits left in C-c once A-492 and A-493 landed: the FUSE
@@ -37021,6 +37066,22 @@ until part 2), `crates/bridge-core/tests/invalidation.rs`. Part 2: §4.5, §4.6 
   `slates-vfs --lib journal` 12 of 12, `slates-server --lib reader_patience` 2 of 2 and `learned_wait` 2 of 2; red with
   the fold made a no-op (the patience kept at the one-window prior): all six rounds overran, where only the first
   should. The mounts' wiring (`fuse.rs` on Linux, `winfsp.rs` on Windows) is not compiled on macOS: main's lanes.
+- **Part 3, a verb held for a materialization** (`verbs::await_materialization`). A verb on a volume this node owns
+  but has not materialized yet (it adopted the head in a takeover) is held while the materialization is pending, and
+  the retryable refusal that follows meets the materialized volume on the client's retry. The hold looked at the
+  pending map each heartbeat and gave up at one liveness window, so a materialization slower than a second sent its
+  client a refusal, and a retry, each second for nothing. Now the hold waits for the materialization's own end: the
+  pending map is a type of its own (`state::PendingMaterializations`) whose `remove` is the only way an entry leaves,
+  however the materialization ends (made, given up past the failover SLO's worth of attempts without progress, or its
+  volume tombstoned), and it wakes every task waiting on that object (`wait_for_end`), so no held verb outlives its
+  event and none waits on a timer. The client waits while its daemon lives (`defers_reply`, A-232). The waiters are
+  one waker a task, a task that waits again replacing its own, drained at the object's end, so they are bounded by the
+  held verbs, which the shard's task arena bounds.
+- **Tests (part 3).** `a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound` (`verbs.rs`: a volume
+  marked pending, a task waiting as a held verb does, the test thread past one window and a half, then the entry
+  removed). On the Mac Studio (debug, 2026-11-19, load 19 to 21): green, and `slates-server --lib takeover` 27 of 27
+  over the new type; red with the old wait put back: "the held verb was let go while its materialization was still
+  pending". C-c is closed: no class C wait waits on a fixed second.
 
 ### A-563 — A deferred reply that says its request was not started is never recorded as its completion (2026-11-19, goal 85 via g225; §4.9 RIFL, "Status (2026-11-17, an `Overloaded` verb is never its own completion)"; A-557's sibling, A-533)
 
@@ -37314,6 +37375,55 @@ tests split, a test type named, the fixtures' node parser; `fixtures/payloads/` 
 Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
 `crates/cluster/src/fleet.rs`,
 `crates/server/src/{deadlines,landing,verbs,daemon,reap,remote_attach,fleet,state,held_copy}.rs`.
+
+### A-561 — A restart rebuilds a clone holding its own snapshot, whatever it still shares with its origin (2026-11-19, goal 85, g234; found by A-549; §4.8 recovery, A-64's clone image, A-395)
+Applied in the same change to: A-549's entry and its bug record (the sibling marked fixed); GAPS, §8c (the fix and what
+main owes); the bug record `docs/bugs/2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`; and:
+- `crates/vfs`: `recover.rs` (`shared_source`'s head arm); `volume.rs` (the lib test
+  `a_clone_holding_its_own_snapshot_is_rebuilt_at_a_restart_whatever_it_shares_with_its_origin` in `clone_count_tests`,
+  and the module's notes).
+
+- **What was there.** A restart refused, `RecoveryIncomplete`, every clone that had taken a snapshot while it still
+  shared a file with its origin, which is any file it had not rewritten. The daemon listed the clone as not recovered
+  (`ImageRefused`) and every clone of its snapshot with it (`OriginNotRecovered`). The capture marks such a file
+  `SharedSource::Head`, since the head's table holds its very handle. A clone's image carries the record by number
+  (`origin_shared`, A-64), and recovery rebuilds the clone's head table over its origin snapshot's, so the table holds
+  it. But recovery looked a head-shared entry up only among the images of the head's own inodes, a strict subset of
+  what a clone's head holds. No test had restarted a clone with a snapshot of its own.
+- **The rule.** A snapshot's head-shared entry resolves through the head's rebuilt table, which holds every number the
+  head holds (its own and, for a clone, the records it shares with its origin), as an origin-shared entry resolves
+  through the origin snapshot's table; its kind is the inode's.
+- **Why recovery, not capture.** The other repair was to have a clone's capture check the origin rule first. It is
+  rejected for three reasons:
+  - The capture is right by the image's own definitions: `SharedSource::Head` is "the version the head still holds,
+    shared by CoW handle identity", and these records are exactly that. Only recovery's lookup was narrower than the
+    set the rules name.
+  - Images already published still name these entries `Head`. The anchor keeps the last publication across a restart,
+    an upgrade's included, and a capture-side change keeps the layout and `IMAGE_VERSION`, so those images would
+    still be refused. The recovery-side rule rebuilds them as well as new ones.
+  - A capture change would touch both of a publication's encoders (the struct builder and the streamed one, held equal
+    by `check_publication`), where this touches neither.
+
+  The deadlist pass already treats head-shared and origin-shared entries alike ("not this snapshot's to free"), so the
+  rebuilt deadlists are those the live volume kept. `held_directory` keeps its lookup among the head's own images,
+  which is complete there: a clone's snapshot never shares a directory with the head (A-395, A-64), and any other
+  volume's image holds its whole head.
+- **Tests.** A 6-bit matrix with 48 distinct cases:
+  - The origin changes a directory after its snapshot, or not.
+  - The clone removes an inherited file, makes a directory, takes a snapshot of its own and makes a file after it, has
+    that snapshot cloned, and rewrites an inherited file (after its snapshot, so the snapshot keeps the origin's record
+    through `SharedSource::Origin`). Each of these happens or not.
+
+  Each case restarts the origin, the clone and the clone of the clone. The clone and the clone of the clone must read
+  as before (every path's kind, number, size and bytes) and keep their counts, and a clone of the clone's snapshot
+  made after the restart must read and count as one made before it. The images are not compared whole, because
+  recovery re-stamps the birth of a directory record a clone's snapshot keeps from its origin, on purpose (A-64).
+- **Evidence.** On the Mac Studio, 2026-11-19:
+  - Red with main's `recover.rs`: 32 of 48 cases refused at "rebuild the clone", exactly those whose clone held a
+    snapshot of its own.
+  - Green with the rule: 48 of 48 cases, and `cargo test --locked -p slates-vfs --lib` passed 83 with 1 ignored.
+  - Before the fix, a log line in the refusing arm named the origin's `d/inner-0`, which the clone never touched.
+- **Owed (main's):** the recovery oracle and the server's recovery suite over a clone with a snapshot of its own.
 
 ### A-552 — The daemon's own supervision waits follow the windows its shards are judged by, or wait while what they wait on goes on (2026-11-19, UI goal 86 via g076b: D-c; R3's class D; §4.14 `daemon.alive`; A-228, A-232, A-455, A-525)
 Applied in the same change to: §4.6 (A-227's kept mounts: the gate's wait), GAPS (the failover delay's entry, its class

@@ -5493,6 +5493,62 @@ mod tests {
   /// Shape: the wait walked across: half again the reply deadline the wait spun through before A-523 (a second).
   const WAIT_NS: u64 = 1_500_000_000;
 
+  /// What a walked wait did: the times waited at which it looked, and each pause it parked for.
+  #[derive(Debug, Default)]
+  struct Walk {
+    looks: Vec<u64>,
+    parks: Vec<u64>,
+  }
+
+  /// Walks a wait for a ring slot across [`WAIT_NS`] from the first refusal, each step held to its rule as it is taken
+  /// ([`step`]): what the wait did.
+  fn walk() -> Walk {
+    let mut wait = RoomWait::default();
+    let mut walked = Walk::default();
+    let mut elapsed = 0;
+    while elapsed < WAIT_NS {
+      elapsed = step(&mut wait, elapsed, &mut walked);
+    }
+    walked
+  }
+
+  /// Takes the wait's next step `elapsed` into it, the daemon found alive at every look: a spin only inside the wake
+  /// estimate, a park held to its rule ([`assert_park`]). The time waited after the step.
+  fn step(wait: &mut RoomWait, elapsed: u64, walked: &mut Walk) -> u64 {
+    match wait.next(elapsed, WAKE_NS) {
+      RoomStep::Spin => {
+        assert!(
+          elapsed < WAKE_NS,
+          "spun at {elapsed} ns, past the wake estimate"
+        );
+        elapsed + SPIN_NS
+      }
+      RoomStep::Look => {
+        walked.looks.push(elapsed);
+        wait.looked(elapsed);
+        elapsed
+      }
+      RoomStep::Park(pause) => {
+        assert_park(wait, elapsed, pause, walked.parks.last().copied());
+        walked.parks.push(pause);
+        elapsed + pause
+      }
+    }
+  }
+
+  /// Holds a pause of `pause` ns, `elapsed` into the wait, to its rule: never past the next look, and no more than twice
+  /// the `last` pause.
+  fn assert_park(wait: &RoomWait, elapsed: u64, pause: u64, last: Option<u64>) {
+    let to_look = wait.looks.until(elapsed).unwrap();
+    assert!(
+      pause <= to_look,
+      "a {pause} ns pause past the next look, {to_look} ns on"
+    );
+    if let Some(last) = last {
+      assert!(pause <= 2 * last, "a {pause} ns pause after {last} ns");
+    }
+  }
+
   /// A-523 (R3's class C). Do: walk a wait for a ring slot across 1.5 s from the first refusal, spinning, looking (the
   /// daemon found alive each time) and parking as the schedule says. Expect: a spin only inside the wake estimate; each
   /// pause no more than twice the last and never past the next look; the looks at twice the time waited from twice the
@@ -5500,55 +5556,21 @@ mod tests {
   /// A-523 the wait spun for a whole reply deadline, a second, and then paced its tries at a tenth of it.
   #[test]
   fn a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling() {
-    let mut wait = RoomWait::default();
-    let mut elapsed = 0;
-    let mut looks: Vec<u64> = Vec::new();
-    let mut parks: Vec<u64> = Vec::new();
-    while elapsed < WAIT_NS {
-      match wait.next(elapsed, WAKE_NS) {
-        RoomStep::Spin => {
-          assert!(
-            elapsed < WAKE_NS,
-            "spun at {elapsed} ns, past the wake estimate"
-          );
-          elapsed += SPIN_NS;
-        }
-        RoomStep::Look => {
-          looks.push(elapsed);
-          wait.looked(elapsed);
-        }
-        RoomStep::Park(pause) => {
-          let to_look = wait.looks.until(elapsed).unwrap();
-          assert!(
-            pause <= to_look,
-            "a {pause} ns pause past the next look, {to_look} ns on"
-          );
-          if let Some(last) = parks.last() {
-            assert!(pause <= 2 * last, "a {pause} ns pause after {last} ns");
-          }
-          parks.push(pause);
-          elapsed += pause;
-        }
-      }
-    }
+    let walked = walk();
     assert_eq!(
-      looks.first(),
+      walked.looks.first(),
       Some(&(2 * WAKE_NS)),
       "the first look at twice the wake"
     );
-    for pair in looks.windows(2) {
-      assert_eq!(pair[1], 2 * pair[0], "the looks at {looks:?}");
+    for pair in walked.looks.windows(2) {
+      assert_eq!(pair[1], 2 * pair[0], "the looks at {:?}", walked.looks);
     }
     let bound = u64::from((WAIT_NS / WAKE_NS).ilog2()) + 2;
-    assert!(
-      u64::try_from(looks.len()).unwrap() <= bound,
-      "{} looks, past {bound}",
-      looks.len()
-    );
-    assert!(
-      u64::try_from(parks.len()).unwrap() <= bound,
-      "{} parks, past {bound}",
-      parks.len()
-    );
+    for (kind, count) in [("looks", walked.looks.len()), ("parks", walked.parks.len())] {
+      assert!(
+        u64::try_from(count).unwrap() <= bound,
+        "{count} {kind}, past {bound}"
+      );
+    }
   }
 }

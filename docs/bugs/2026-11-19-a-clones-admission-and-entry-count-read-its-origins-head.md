@@ -77,7 +77,8 @@ Evidence, all on the Mac Studio on 2026-11-19:
 
 ## Siblings (the sweep: what else takes a clone's or a volume's counts from the wrong state)
 
-- **Open, found by this change's restart test (A-561):** a restart refused any clone holding a snapshot while it still
+- **Fixed since by A-561 (2026-11-19, `2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`), found by
+  this change's restart test:** a restart refused any clone holding a snapshot while it still
   shared a file with its origin (`Volume::clone_from_image` answered `RecoveryIncomplete`). The clone's snapshot marks
   such a file shared with the head (`capture_snapshot_tree`). Recovery resolves a head-shared entry only through the
   images of the head's own inodes (`shared_source`), and the file is not among them: the clone's image lists it with
