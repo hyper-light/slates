@@ -197,6 +197,11 @@ impl Hook {
       .current_dir(launch.view_root)
       .process_group(0)
       .stdin(Stdio::piped());
+    // A Subversion hook starts with its hooks-env section alone, never the server's environment (A-623,
+    // `run_hook_cmd`).
+    if launch.input.clean_environment {
+      command.env_clear();
+    }
     for (name, value) in &launch.input.env {
       match value {
         EnvValue::Bytes(bytes) => command.env(name, std::ffi::OsStr::from_bytes(bytes)),
@@ -581,6 +586,14 @@ mod tests {
         println!("{TAG}cwd={}", std::env::current_dir().unwrap().display());
         std::process::exit(0);
       }
+      "environment" => {
+        let mut names: Vec<String> = std::env::vars_os()
+          .map(|(name, _)| name.to_string_lossy().into_owned())
+          .collect();
+        names.sort_unstable();
+        eprintln!("{TAG}names={}", names.join("|"));
+        std::process::exit(0);
+      }
       "refuse" => {
         println!("{TAG}to standard output");
         eprintln!("{TAG}refused by the hook");
@@ -638,6 +651,7 @@ mod tests {
         ("HG_PENDING".to_owned(), EnvValue::ViewRoot),
         ("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Unset),
       ],
+      clean_environment: false,
       stdin,
       view: View::Pending(PendingView(0)),
     }
@@ -760,6 +774,33 @@ mod tests {
     let mut times = HookTimes::default();
     lesson.teach(&mut times);
     assert_eq!(times.finished_runs(), 1);
+  }
+
+  /// A-623 (`run_hook_cmd`: a Subversion hook's environment is its hooks-env section alone). Do: run a pre-commit hook
+  /// whose input asks for a clean environment and sets one variable besides its role; it writes its environment's
+  /// names to standard error. Expect: accepted, its environment those two variables alone, none of this process's
+  /// (`PATH`, which every test process has, among them).
+  #[test]
+  fn a_subversion_hook_starts_with_its_own_environment_alone() {
+    let mut hook = input(HookPoint::SvnPreCommit, "environment", &[], Vec::new());
+    hook.clean_environment = true;
+    hook.env = vec![
+      (ROLE.to_owned(), EnvValue::Bytes(b"environment".to_vec())),
+      (
+        "SLATES_FIXTURE".to_owned(),
+        EnvValue::Bytes(b"default section".to_vec()),
+      ),
+    ];
+    let (outcome, _, _) = drive(None, hook, None, None).expect("the run ended");
+    assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+    let mut names = vec![ROLE, "SLATES_FIXTURE"];
+    names.sort_unstable();
+    let expected = format!("{TAG}names={}", names.join("|"));
+    assert!(
+      text(&outcome).contains(&expected),
+      "{expected} in {}",
+      text(&outcome)
+    );
   }
 
   /// A-622 part 3 (refusals and words). Do: run a hook that writes a line to each stream and exits 3, at a git point

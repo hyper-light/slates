@@ -49,6 +49,8 @@ use crate::special::SpecialNode;
 
 mod copy;
 
+pub(crate) use copy::{Held, HeldAttributes};
+
 /// A path's key bytes as the string they were made from. Keys enter only as strings and a walk reassembles one whole,
 /// so the lossy arm never runs; it keeps the conversion total, as the no-panic rule asks.
 fn text(key: Vec<u8>) -> String {
@@ -443,6 +445,16 @@ impl Xattrs {
       .root
       .iter(&self.map.nodes)
       .map(|(key, value)| (split_key(&key), value))
+  }
+
+  /// Every attribute of `path`'s tree, `(path, name)`: its own and its descendants', two descents and the keys they
+  /// answer (A-626: what a replace takes away).
+  pub(crate) fn iter_tree(&self, path: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    let own = self.map.root.prefix(&self.map.nodes, &path_key(path));
+    let mut beneath = escaped(path);
+    beneath.push(b'/');
+    let below = self.map.root.prefix(&self.map.nodes, &beneath);
+    own.chain(below).map(|(key, _)| split_key(&key))
   }
 
   /// `path`'s attributes, names in order, with their values: one descent, then its own keys.
