@@ -8153,9 +8153,9 @@ entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-ent
   restart set both), so its namespace dimension is unbounded until a restart.
 - Open: a resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume
   was made with (`verbs::resize`).
-- Open: recovery counts a whiteout as a live entry (`rebuild_entries` re-inserts one through `dir_insert`, which counts
-  it; the live count and `DirNode::live_len` never do), so a restarted overlay's entry count and its allowance's floor
-  at the restart are raised by its whiteouts. Found by reading, not tested.
+- Fixed since by A-572 (below), found by reading: recovery counted a whiteout as a live entry (`rebuild_entries`
+  re-inserted one through `dir_insert`, which counted it; the live count and `DirNode::live_len` never do), so a
+  restarted overlay's entry count and its allowance's floor at the restart were raised by its whiteouts.
 
 **Fixed 2026-11-19 (A-561, goal 85, g234): a restart refused a clone holding its own snapshot.** Every clone that had
 taken a snapshot while it still shared a file with its origin was left unrecovered at a restart (`ImageRefused`), and
@@ -8166,6 +8166,16 @@ head's rebuilt table, as an origin-shared one through the origin's; the image is
 the fix rebuild too. Measured before, on the Mac Studio: 32 of a matrix's 48 cases refused, every one whose clone held a
 snapshot of its own (`docs/bugs/2026-11-19-a-restart-refused-a-clone-holding-its-own-snapshot.md`). **Owed (main's):**
 the recovery oracle and the server's recovery suite over a clone with a snapshot of its own, which no suite restarted.
+
+**A-572 (goal 85, g234): the namespace dimension's three siblings from A-549's sweep, one commit each, worst first**
+(`docs/bugs/2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`).
+- Fixed 2026-11-19: a restart counted every whiteout in a rebuilt directory as a live entry, so an overlay counted one
+  entry too many per whiteout after each restart, and the restart floored its entry allowance at that count. A
+  placement now counts, and is admitted, only when it names a child (`Volume::dir_place`, `dir_insert`), as
+  `dir_remove` and `DirNode::live_len` already kept it. Measured before on the Mac Studio: an overlay with three
+  whiteouts counted 3 entries live and 6 after a restart.
+- Open, next in this piece: a clone is admitted with no entry allowance; a resize leaves the entry allowance at the size
+  the volume was made with.
 
 ## 8d. Phase 2 record (2026-09-05)
 
