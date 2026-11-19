@@ -13994,9 +13994,9 @@ and export by landing).
 > (2026-11-19, g297): `get-file-revs`, `svn_repos_get_file_revs2`'s walk of the file's history across copies (merged
 > revisions found by `find_merged_revisions`' rounds and interleaved; a start after the end walked newest first), each
 > revision's property changes and its text's delta from the previous text in Subversion's own windows (A-652's
-> deltifier), a string for each write `svndiff.c` makes, a revision a step; its tests owed a run (the Mac Studio
-> offline). Owed: the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
-> authorization rules (A-606).
+> deltifier), a string for each write `svndiff.c` makes, a revision a step; the scripted session's 13 commands and the
+> stock `svn blame` and `svn blame -g` replayed whole. Owed: the svndiff 0 session's recording; the fold of a name
+> beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -43222,10 +43222,16 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   streams a revision a step, the revisions all found in its first step, as Subversion finds them before sending; a
   revision's two texts are held whole while its delta is made (reading the green's pieces a window at a time is owed,
   item 11). Merged revisions of one number from two files have no order to match: `svnserve` gathers them in its seeded
-  hash order and sorts them with `qsort`. Tests: owed a run on the Mac Studio, offline since 2026-11-19 (the scripted
-  `get-file-revs` session's 13 commands, `svn blame`, `svn blame -g`; a text made empty from none; svndiff 0's strings;
-  and a session to record, `get-file-revs-svndiff0`, whose client announces neither `svndiff1` nor `accepts-svndiff2`,
-  to hold svndiff 0 to `svnserve` byte for byte).
+  hash order and sorts them with `qsort`. Tests (2026-11-19, Windows x86_64, jupiter: `cargo test -p slates-svn --lib`
+  444 of 444, fmt clean): the scripted `get-file-revs` session's 13 commands, `svn blame` and `svn blame -g` answered as
+  `svnserve` answered them; a text made empty from none; svndiff 0's strings, derived from `svndiff.c`. The replay
+  compares a `get-file-revs` answer with each delta's strings folded into one entry, so it moves on by the items
+  written, not the entries compared: the first build moved by the entries, left 12 of `svnserve`'s items an answer for
+  the next command, and failed both replays until fixed. Owed: the macOS run; the session to record,
+  `get-file-revs-svndiff0`, whose client announces neither `svndiff1` nor `accepts-svndiff2`, to hold svndiff 0 to
+  `svnserve` byte for byte (the Mac Studio, which has stock `svnserve`, offline); a test of a file property taken away
+  and one of a mainline and a merged revision of one number, which no recorded revision reaches (written, not yet run);
+  red-checks.
 - **Owed** (the next slices): `list`'s fold of a name beyond ASCII (utf8proc's NFD with case folding and marks stripped,
   composed again, which needs Unicode's case-folding and general-category tables); read access by A-606's rules, and the
   authentication request a denied anonymous read makes when the session could authenticate.

@@ -873,7 +873,10 @@
 > Its sixth slice, in part (g297): `log` without merged revisions (a log asking for them refused until built),
 > red-checked ten ways; reads asks A-616's one walk of copy roots; the sixth slice whole, `log`'s merged revisions
 > (nested walks of each merge's runs; `svn log -g` and `svn mergeinfo --show-revs` replayed whole), red-checked
-> thirteen ways; its seventh slice (g297), `get-file-revs`, built, its tests owed a run on the Mac Studio. Owed
+> thirteen ways; its seventh slice (g297), `get-file-revs` (its 13 scripted commands, `svn blame` and `svn blame -g`
+> replayed whole; Windows x86_64, jupiter, 444 of 444), not yet red-checked; svndiff 0 is held only to `svndiff.c`'s
+> writes as read until the `get-file-revs-svndiff0` session is recorded on the Mac Studio, and a file property taken
+> away and a mainline and a merged revision of one number have tests written, not yet run. Owed
 > from it: `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
