@@ -1117,8 +1117,9 @@ fn fleet_lines(instance: &str) -> String {
 }
 
 /// Derived: the bound on a silent remote holder (A-222): its node's reap within two liveness budgets (1 s each,
-/// `LIVENESS_BUDGET_NS`), its write lease at its term after that (the node's failover delay since A-414, at most the
-/// 10 s placeholder `FAILOVER_SLO_NS` it was before), and a liveness budget of the owner's lease sweep after it.
+/// `LIVENESS_BUDGET_NS`), its write lease at its term after that (the node's failover delay since A-414, under the
+/// ten-second placeholder it was before, which A-525 removed), and a liveness budget of the owner's lease sweep after
+/// it.
 const SILENT_HOLDER_BOUND: Duration = Duration::from_secs(10 + 2 + 1);
 
 /// A-222 (c), D-16. Do: from the client node, a separate holder process attaches the server's volume for writing; then
@@ -1726,8 +1727,19 @@ fn a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its
   let began = Instant::now();
   ok(&client, &["status"]);
   let observe = began.elapsed();
+  // Held past the failover delay each node measures (A-363, read from its status: `fleet_failover: total_ns=`; the
+  // ten-second placeholder it was before is gone, A-525) and the membership horizon.
+  let failover = [&server, &client].map(|node| {
+    status_value(&ok(node, &["status"]), "fleet_failover")
+      .and_then(|line| field_of(line, "total_ns"))
+      .expect("each node reports its failover delay")
+  });
   let cut_for = Duration::from_nanos(
-    slates_server::config::FAILOVER_SLO_NS + slates_server::lease::horizon_ns(),
+    failover
+      .into_iter()
+      .max()
+      .unwrap_or_default()
+      .saturating_add(slates_server::lease::horizon_ns()),
   );
   let green = cut_as_the_root_forms(&dir, [&server, &client], &relay, cut_for);
   relay.heal();

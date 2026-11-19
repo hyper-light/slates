@@ -3692,21 +3692,21 @@ mod tests {
     assert_eq!(received.try_recv().unwrap(), None);
   }
 
-  /// RFC 8881 §8.3, A-425. Do: on a daemon whose operator set the failover SLO to one liveness window, take the limits
-  /// its NFSv4 listener runs under and a client table of one under them; register a client, then have a second client
+  /// RFC 8881 §8.3, A-425. Do: on a shard whose failover delay is one liveness window, take the limits its NFSv4
+  /// listener runs under and a client table of one under them; register a client, then have a second client
   /// ask the full table for room just before the first's next renewal were it an idle Linux client (its renewal floor
   /// after its last renewal, delivered within a liveness window), and again once the first has been silent a whole
   /// lease. Expect: the first ask refused `NFS4ERR_DELAY` with the idle client kept, and the second granted in its
-  /// place. Before, the lease was the operator's failover SLO, so with a short one every idle Linux client lapsed
-  /// between two of its renewals, and a full table dropped a live client's state.
+  /// place. Before A-425, the lease was the operator's failover placeholder (gone since A-525), so with a short one
+  /// every idle Linux client lapsed between two of its renewals, and a full table dropped a live client's state.
   #[test]
-  fn an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_slo() {
+  fn an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_delay() {
     use slates_bridge_nfs::v4::session::{ExchangeId, Sessions};
     use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
-    let limits = crate::daemon::audit_on_shard_configured(
-      |s| v4_limits(s),
-      |config| config.failover_slo_ns = crate::daemon::LIVENESS_BUDGET_NS,
-    );
+    let limits = crate::daemon::audit_on_shard(|s| {
+      s.failover_ns = crate::daemon::LIVENESS_BUDGET_NS;
+      v4_limits(s)
+    });
     let mut table = Sessions::new(
       1,
       Limits {

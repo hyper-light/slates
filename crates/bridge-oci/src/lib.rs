@@ -63,6 +63,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod binding;
+pub mod mount_holders;
 pub mod mount_table;
 pub mod runtime;
 pub mod verify;

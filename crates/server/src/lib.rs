@@ -110,6 +110,8 @@ mod callback;
 mod delegation;
 // A wait whose bound is learned from the waits it measured (RFC 6298, Karn's rule, back-off; A-431, A-442).
 mod learned_wait;
+// The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
+mod helper_runs;
 mod listing;
 mod lock_ledger;
 pub mod nfs;

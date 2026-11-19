@@ -222,8 +222,9 @@ mod tests {
   /// Shape: see [`KEPT`].
   const ENDED: u32 = 22;
 
-  /// A-522. Do: on a one-shard daemon, seat two clients and begin a status capture for each, its deadline a tenth of a
-  /// liveness window away, entered as the status verb enters it; end the second seat at once, as the session gate does.
+  /// A-522. Do: on a one-shard daemon, seat two clients and make a status capture for each, its deadline a tenth of a
+  /// liveness window away, entered as `send_reply` enters it (A-525); end the second seat at once, as the session gate
+  /// does.
   /// Expect: the ended seat takes its entry out of the index at once; the kept seat's capture released within half a
   /// window, its entry gone, by the keeper at its deadline, where the reap loop's tick asked every client each window.
   #[test]
@@ -235,9 +236,13 @@ mod tests {
       for client_id in [KEPT, ENDED] {
         let seat = seat(state, client_id);
         if let Ok(client) = state.clients.get_mut(seat) {
+          let reply = slates_ipc::protocol::ReplyBody::Acknowledged;
+          let capacity = slates_ipc::protocol::encode_body(&reply).len();
+          client.status_pages.begin(1, &mut state.store.metadata);
           client
             .status_pages
-            .begin(1, expires, &mut state.store.metadata);
+            .capture(1, &reply, (capacity, expires), &mut state.store.metadata)
+            .unwrap();
         }
         super::capture_set(state, seat, expires);
         if client_id == ENDED {
@@ -263,5 +268,95 @@ mod tests {
     );
     let released = released.expect("the capture was released within half a liveness window");
     println!("a status capture due in {SOON_NS} ns released {released:?} after it began");
+  }
+
+  /// Shape: the client the status-capture test seats.
+  const ASKING: u32 = 23;
+  /// Shape: the failover delay the status-capture test holds its shard to: a tenth of a liveness window, so its capture
+  /// is let go well inside the half window [`look_until`] looks for.
+  const DELAY_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 10;
+
+  /// `report` grown by copies of its shard's part past two of `seat`'s status pages, within its snapshot bound: a
+  /// capture its first page leaves held.
+  fn pages_long(
+    state: &mut ShardState,
+    seat: Handle<ClientSlot>,
+    mut report: slates_ipc::protocol::ReplyBody,
+  ) -> slates_ipc::protocol::ReplyBody {
+    let client = state.clients.get_mut(seat).unwrap();
+    let page = slates_ipc::status::page_capacity(client.end.region());
+    let bound = slates_ipc::status::snapshot_capacity(client.end.region());
+    let slates_ipc::protocol::ReplyBody::DaemonStatus { report: daemon } = &report else {
+      panic!("a status report: {report:?}");
+    };
+    let part = daemon.shards.first().cloned().unwrap();
+    while slates_ipc::protocol::encode_body(&report).len() <= 2 * page {
+      if let slates_ipc::protocol::ReplyBody::DaemonStatus { report: daemon } = &mut report {
+        daemon.shards.push(part.clone());
+      }
+    }
+    assert!(
+      slates_ipc::protocol::encode_body(&report).len() <= bound,
+      "the grown report still fits the snapshot bound"
+    );
+    report
+  }
+
+  /// A-525 (A-414's owed list; A-522's keeper). Do: on a one-shard daemon whose failover delay is a tenth of a liveness
+  /// window, seat a client and ask its status; capture the report, grown to several pages, only two delays later, as a
+  /// scatter on a starved daemon does; then look until the shard lets the capture go. Expect: the first page served at
+  /// the capture, and the capture held a delay from its capture, then let go by the keeper, within half a window. Before,
+  /// the deadline counted from the request by the operator's ten-second placeholder, so the capture was held ten seconds;
+  /// counted from the request by the delay, the first page would have been refused.
+  #[test]
+  fn a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let request = slates_wire::request::RequestId {
+      client: ASKING,
+      sequence: 1,
+    }
+    .word();
+    let (asked, report) = crate::daemon::observe_first(&daemon, move |state| {
+      state.failover_ns = DELAY_NS;
+      let asked = seat(state, ASKING);
+      let served = crate::verbs::status_on_channel(
+        state,
+        asked,
+        request,
+        &slates_ipc::protocol::RequestBody::DaemonStatus,
+      );
+      let Some(crate::verbs::Served::Reply(report)) = served else {
+        panic!("a one-shard daemon answers its status at once");
+      };
+      (asked, report)
+    });
+    // The scatter of a starved daemon: two delays pass before the report is captured.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_nanos(2 * DELAY_NS));
+    let captured = Instant::now();
+    let first = crate::daemon::observe_first(&daemon, move |state| {
+      let mut reply = pages_long(state, asked, report);
+      crate::verbs::send_reply(state, asked.index(), request, &mut reply);
+      reply
+    });
+    let released = look_until(&daemon, captured, move |state| {
+      state
+        .clients
+        .get_mut(asked)
+        .is_ok_and(|client| !client.status_pages.pending())
+    });
+    daemon.stop();
+    assert!(
+      matches!(
+        first,
+        slates_ipc::protocol::ReplyBody::DaemonStatusPage { .. }
+      ),
+      "the first page is served at the capture: {first:?}"
+    );
+    let released = released.expect("the capture was let go within half a window of its capture");
+    assert!(
+      released >= Duration::from_nanos(DELAY_NS),
+      "held a failover delay from its capture: let go {released:?} after it"
+    );
   }
 }

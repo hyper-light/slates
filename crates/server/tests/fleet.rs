@@ -6561,7 +6561,13 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
     // Derived: the backstop past which a missing reply is lost, from this burst's own measurements. The first round
     // measures the rate b's control shard served the burst at (replies taken over the round's time); the rest of the
     // burst takes at most twice what that rate needs to serve it all, and a forward's resend loop adds at most the
-    // failover SLO (`resolve_and_forward`). A round that took no reply measures no rate, and the test says so.
+    // failover delay its node measures (`resolve_and_forward`, A-375; read live, A-525). A round that took no reply
+    // measures no rate, and the test says so.
+    let forward_bound = daemons
+      .iter()
+      .filter_map(|daemon| daemon.failover_ns().ok())
+      .max()
+      .expect("every node reports its failover delay");
     let first_round = held_ended.elapsed();
     let served_first: usize = tagged.iter().map(Vec::len).sum();
     assert!(
@@ -6577,7 +6583,7 @@ fn a_silent_owner_leaves_no_forward_the_lane_admitted_unrun() {
           / u128::try_from(served_first).unwrap(),
       )
       .unwrap_or(u64::MAX)
-      .saturating_add(slates_server::config::FAILOVER_SLO_NS),
+      .saturating_add(forward_bound),
     );
     eprintln!(
       "first round: {served_first} of {in_flight} replies in {first_round:?}; backstop {drained:?} after the hold"
@@ -28342,11 +28348,11 @@ fn location_ends(daemon: &Daemon) -> (u64, u64) {
 }
 
 /// A forward read through the one node left of a formed three-node fleet, of a volume whose owner that node holds dead
-/// with no peer left to answer a location round, its failover delay held at `failover_slo_ns` first when given
+/// with no peer left to answer a location round, its failover delay held at `failover_ns` first when given
 /// (injected, A-363): the reply, how
 /// many polls the location made past its first (`fleet.owner_location.retried`), and how its budget ended (the counts
 /// `budget_spent` and `slo_ended` moved by the read).
-fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64, (u64, u64)) {
+fn read_with_no_owner_to_find(failover_ns: Option<u64>) -> (ReplyBody, u64, (u64, u64)) {
   let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let mut owner_client = Client::connect(daemons[0].instance());
   let ReplyBody::Created { id } = owner_client.call(&scratch("no-owner-to-find")) else {
@@ -28361,9 +28367,9 @@ fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64, 
   survivor
     .observe_peer_dead(hosts[0], FALSE_DEATH_INCARNATION)
     .expect("the owner is held dead on the survivor");
-  if let Some(slo) = failover_slo_ns {
+  if let Some(delay) = failover_ns {
     survivor
-      .inject_failover(Some(slo))
+      .inject_failover(Some(delay))
       .expect("the ceiling is held on the survivor's control shard");
   }
   let counts = |daemon: &Daemon| {
@@ -28845,7 +28851,7 @@ fn issue_with(
 
 /// Shape: the failover delay the bounded-green fixture holds its node at (injected, A-363): a second, ten of the fleet's
 /// periods, so a green the fixture plants is given up on after ten attempts.
-const SHORT_FAILOVER_SLO_NS: u64 = 1_000_000_000;
+const SHORT_FAILOVER_NS: u64 = 1_000_000_000;
 /// Shape: the planted green's object id: a volume-class id (byte 10, the register-class byte, clear) whose partition
 /// (bytes 8 and 9, `verbs::owner_of`) is the node's first, so its owner shard is here.
 const PLANTED_GREEN: [u8; 16] = [
@@ -28853,7 +28859,7 @@ const PLANTED_GREEN: [u8; 16] = [
 ];
 
 /// A one-node fleet daemon at `f = 0`, bootstrapped, admitting enrolled members under its own certificate, with the
-/// failover delay held at [`SHORT_FAILOVER_SLO_NS`]: its record plane, and with it the materialization of taken-over
+/// failover delay held at [`SHORT_FAILOVER_NS`]: its record plane, and with it the materialization of taken-over
 /// objects, runs each period as a fleet's does (R8).
 fn lone_fleet_node(tag: &str) -> Daemon {
   let key = rcgen::KeyPair::generate().unwrap();
@@ -28901,7 +28907,7 @@ fn lone_fleet_node(tag: &str) -> Daemon {
   .unwrap();
   daemon.bootstrap(true).unwrap();
   daemon
-    .inject_failover(Some(SHORT_FAILOVER_SLO_NS))
+    .inject_failover(Some(SHORT_FAILOVER_NS))
     .expect("the failover delay is held short");
   daemon
 }

@@ -392,8 +392,6 @@ pub struct DaemonConfig {
   pub discard_from_bytes: usize,
   /// The rendezvous instance name.
   pub instance: String,
-  /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
-  pub failover_slo_ns: u64,
   /// Derived: the idle window a forward holds its shards open for when it is made for a client in R9's closed loop
   /// ([`closed_loop_hold`], §4.7; A-326); the owner keeps it only while its idle turns poll faster than it wakes (A-387).
   pub closed_loop_hold_ns: u64,
@@ -473,10 +471,6 @@ pub struct DaemonConfig {
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
-
-/// Shape: the operator's failover SLO (Gray & Cheriton: seconds): ten seconds until the
-/// operator gives `slates anchor` a value.
-pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
 /// The liveness window on this machine ([`liveness_window`]): the derived window and the floor the machine measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1108,7 +1102,6 @@ impl DaemonConfig {
       page: usize::try_from(page).unwrap_or(1).max(1),
       discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
       instance: instance.to_owned(),
-      failover_slo_ns: FAILOVER_SLO_NS,
       closed_loop_hold_ns: loop_hold.get(),
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
@@ -1556,12 +1549,6 @@ impl DaemonConfig {
   /// This configuration with `fault` injected into a shard's start (the boot tests).
   pub fn with_boot_fault(mut self, fault: BootFault) -> DaemonConfig {
     self.boot_fault = Some(fault);
-    self
-  }
-
-  /// The same configuration with the operator's failover SLO (the lease term's ceiling).
-  pub fn with_failover_slo(mut self, failover_slo_ns: u64) -> DaemonConfig {
-    self.failover_slo_ns = failover_slo_ns.max(1);
     self
   }
 
