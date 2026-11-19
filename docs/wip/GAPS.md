@@ -2982,6 +2982,19 @@
 >    naming the node keep it rather than refuse its removal.
 > Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
 
+> **A link to a node made at its target after the work's base was accepted: fixed (2026-11-19, A-676, g306; found by
+> g307's reading while fixing `hard_link_merges`; §4.16 "The verdict", A-646).** A hard link names the node at its
+> target at the work's base, and `Green::node_home` judged a file or IPC node standing at the target only by a removal
+> since the base, so one made there after the base, where none stood, was taken as the link's node: a forged link named
+> a node its work never saw (no deriver makes it, since `link(2)` answers `ENOENT` at the base). Now
+> `Green::node_stood_at` reads the base (`content_len_at`, `special_at`, never copying the file), and a node that stood
+> nowhere then is refused delete against modify, as one removed since is. Test:
+> `a_link_to_a_node_made_after_its_base_conflicts` (`crates/merge/src/engine/node_tests.rs`, a file and a FIFO). macOS
+> arm64 (Mac Studio, kiln, 2026-11-19): red with `engine.rs` as before the fix, both links accepted; green over main
+> 545181b30, `slates-merge --lib` filtered to the node, replaced-node, restate, stack and compute tests 68 of 68,
+> `--test engine` filtered to hard links 6 of 6, fmt clean; the other platforms are main's. Bug record:
+> `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md`.
+
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a
 > splice's declared ops (`declared_ops`), and a copy's source version (`declared_copy`, A-586), by scanning every op of
