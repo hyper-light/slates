@@ -27,11 +27,23 @@
 //! **Arenas are lent.** A green that stands alone owns its arenas. The greens of a [`crate::engine::Lineage`] share the
 //! lineage's: the lineage lends them to a green for the length of one call ([`Arenas`]), so there is one owner of every
 //! node and no shared-ownership pointer (CLAUDE.md R2).
+//!
+//! **A tree is copied by reference (A-542, Copy's maps).** A path's tree is its own key and the keys that start with it
+//! and `/`. [`Dim::copy_tree`] holds the source's keys beneath it as one subtree, grafts them beneath the destination
+//! ([`crate::ptrie::Ptrie::graft`]) and sets the destination's own key to the source's value: two descents, two counts
+//! and the copies of the nodes on the destination's path, O(the paths' lengths) whatever the tree holds, and no walk
+//! ([`crate::ptrie::Nodes::visited`] does not move). A file's copy is one more holder of its block, never its bytes.
+//! An attribute's tree is two prefixes, the path's own attributes and its descendants' ([`Xattrs::copy_tree`]). The
+//! destination must be absent with nothing beneath it, as Subversion's copy needs (§4.17.4 item 3.2), and the subtree
+//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root is
+//! refused here: its tree is every key, which no one prefix names apart from its own; the engine decides its copy.
 
 use std::collections::BTreeSet;
 
 use crate::ptrie::{Holders, Nodes, Plain, Ptrie, Releasing};
 use crate::special::SpecialNode;
+
+mod copy;
 
 /// A path's key bytes as the string they were made from. Keys enter only as strings and a walk reassembles one whole,
 /// so the lossy arm never runs; it keeps the conversion total, as the no-panic rule asks.
@@ -333,8 +345,8 @@ const PATH_END: [u8; 2] = [0, 0];
 /// Format: a NUL inside a path, escaped so it never reads as [`PATH_END`] and still sorts first.
 const NUL_ESCAPED: [u8; 2] = [0, 1];
 
-/// The key prefix every attribute of `path` shares: its escaped bytes and [`PATH_END`].
-fn path_key(path: &str) -> Vec<u8> {
+/// `path`'s bytes with every NUL escaped: the start of every attribute key of `path` and of the paths beneath it.
+fn escaped(path: &str) -> Vec<u8> {
   let mut key = Vec::with_capacity(path.len().saturating_add(PATH_END.len()));
   for byte in path.bytes() {
     match byte {
@@ -342,6 +354,12 @@ fn path_key(path: &str) -> Vec<u8> {
       other => key.push(other),
     }
   }
+  key
+}
+
+/// The key prefix every attribute of `path` shares: its escaped bytes and [`PATH_END`].
+fn path_key(path: &str) -> Vec<u8> {
+  let mut key = escaped(path);
   key.extend_from_slice(&PATH_END);
   key
 }

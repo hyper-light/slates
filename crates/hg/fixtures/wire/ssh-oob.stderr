@@ -1,0 +1,2 @@
+abort: incompatible Mercurial client; bundle2 required
+(see https://www.mercurial-scm.org/wiki/IncompatibleClient)

@@ -400,6 +400,11 @@ pub struct Volume {
   /// reservation a successor honours, so a reply may hand it out with no barrier. A number at or past it is
   /// unreserved ([`Volume::awaits_publication`]) until a publication covers it.
   pub(crate) counter_ceiling: u64,
+  /// The counters a dead daemon may have issued after the last publication a recovery rebuilt this volume from (A-578):
+  /// from that publication's live counter up to its reserved ceiling. No image holds them and this daemon never issues
+  /// them, so a mount it took over is told of each ([`Volume::visit_head_inodes`]). Empty for a volume this daemon
+  /// made.
+  pub(crate) unrecorded_counters: std::ops::Range<u64>,
   pub(crate) snapshots: Slab<Snapshot>,
   pub(crate) last_snapshot: Option<SnapshotId>,
   pub(crate) origin_epoch: Option<Epoch>,
@@ -678,8 +683,11 @@ pub(crate) struct VolumeSeed {
   pub(crate) policy: NameEquivalence,
   /// The head epoch.
   pub(crate) epoch: Epoch,
-  /// The next inode counter to hand out.
+  /// The next inode counter to hand out: the publication's reserved ceiling.
   pub(crate) next_counter: u64,
+  /// The counters the dead daemon may have issued after the publication: from its live counter up to its ceiling
+  /// (A-578).
+  pub(crate) unrecorded_counters: std::ops::Range<u64>,
   /// The origin epoch, for a recovered clone.
   pub(crate) origin_epoch: Option<Epoch>,
   /// The quota.
@@ -742,6 +750,8 @@ impl Volume {
       // Its own root is reserved by the create's publication, which precedes every client's first sight of the
       // volume (a verb publishes before its completion), so only numbers issued after it can be unreserved.
       counter_ceiling: 2,
+      // Made here: no other daemon issued any of its numbers.
+      unrecorded_counters: 0..0,
       snapshots: Slab::new(
         crate::snapshot::initial_capacity(store.content.page()).get(),
         SNAPSHOT_SLOT_CAP,
@@ -865,6 +875,8 @@ impl Volume {
       // The numbers it starts with are reserved by the clone's publication, which precedes every client's first sight
       // of it.
       counter_ceiling: origin.next_counter,
+      // Made here: no other daemon issued any of its own numbers.
+      unrecorded_counters: 0..0,
       snapshots: Slab::new(
         crate::snapshot::initial_capacity(store.content.page()).get(),
         SNAPSHOT_SLOT_CAP,
@@ -975,6 +987,7 @@ impl Volume {
       next_counter: seed.next_counter,
       // The recorded counter is a committed publication's ceiling: every number below it may have been handed out.
       counter_ceiling: seed.next_counter,
+      unrecorded_counters: seed.unrecorded_counters,
       snapshots: Slab::new(
         crate::snapshot::initial_capacity(store.content.page()).get(),
         SNAPSHOT_SLOT_CAP,
@@ -5091,8 +5104,9 @@ impl Volume {
     child: Child,
   ) -> Result<(), VfsError> {
     // Admit the namespace dimension (§4.2): a whiteout replaced or a fresh name both add one live
-    // entry, so charge one against the allowance before either.
-    if self.live_entries >= self.entry_allowance {
+    // entry, so charge one against the allowance before either. A whiteout placed (only a recovery
+    // rebuilding one places it) is no entry, so it is not charged (A-572).
+    if child != Child::Whiteout && self.live_entries >= self.entry_allowance {
       return Err(VfsError::NoSpace);
     }
     self.dir_place(store, dir, name, child).map(drop)
@@ -5136,12 +5150,17 @@ impl Volume {
     // step refuses before copying, and a completed one has replaced them.
     self.retire_blocks(store, retired)?;
     placed?;
-    self.live_entries = self.live_entries.saturating_add(1);
+    // A whiteout is no live entry (§4.2, as `dir_remove` and `DirNode::live_len` keep it), so only a
+    // name that names a child counts. Before A-572 a recovery that placed a whiteout counted it.
+    if child != Child::Whiteout {
+      self.live_entries = self.live_entries.saturating_add(1);
+    }
     Ok(over_whiteout)
   }
 
   /// Undoes [`Volume::dir_place`] of `name` in `dir`: the whiteout back, or the entry removed. Its path
-  /// was made current by the placement, so it copies nothing.
+  /// was made current by the placement, so it copies nothing. Its one caller undoes a rename's
+  /// placement, which names a child and was counted, so the count goes down by one.
   fn dir_unplace(
     &mut self,
     store: &mut Store,
@@ -5976,10 +5995,110 @@ impl Volume {
     self.replayed.insert(no);
   }
 
-  /// Visits the inodes whose cached state the kernel of `owner`'s mount, taken over by this daemon, may hold older than
-  /// the volume's (A-158), in inode order and each once, starting after inode `after`, until `visit` breaks. Returns
-  /// whether every one was visited; an inode `visit` breaks on was visited. The set is every inode the recovery gave
-  /// back a reference of to `owner`, with any it has taken since, and every inode the write-log replay wrote.
+  /// Visits every inode of the head (A-573) and every number the dead daemon may have issued after the last publication
+  /// this volume was rebuilt from (A-578), in counter order (the number's low bits: a clone's own and its origin's
+  /// inodes in one order), starting past inode `after`, until `visit` breaks. Returns whether every one was visited; an
+  /// inode `visit` breaks on was visited. The set a mount of the head that this daemon took over may hold cached
+  /// otherwise than this daemon holds it ([`Volume::visit_takeover_inodes`] is a pinned view's).
+  ///
+  /// Why every one: an acknowledged change is durable before its reply, a mutation's by the publication its reply waits
+  /// for and a FUSE write's in the write log (A-63), and a publication records the references its kernel held then
+  /// (A-61). But a kernel's lookup made after the last publication is in no image, and such a kernel can hold what this
+  /// daemon never had or holds otherwise: the bytes a mutation showed before its publication, which the death lost (a
+  /// dirty read), and the pages of a base file an outsider changed while no daemon ran its watcher. This daemon cannot
+  /// tell which inodes a kernel looked up after the last publication, so it names every one it holds, each a
+  /// `FUSE_NOTIFY_INVAL_INODE` the transport sends, which costs nothing for an inode the kernel never cached. Every
+  /// reference a current view takes and every inode the write-log replay writes is an inode of the head, so they are in
+  /// the walk. A number the dead daemon issued after its last publication (another path's create a listing showed, a
+  /// base directory first loaded then) is in no image and no head, and this daemon never issues it: it is refused,
+  /// never served (`NotFound`), and named here in its place, from the publication's live counter up to its reserved
+  /// ceiling (`Volume::unrecorded_counters`), so a descriptor opened before the death drops its pages too.
+  ///
+  /// The walk resumes past `after`, so a transport sends the set in bounded slices: the table's part enters only the
+  /// nodes on `after`'s path and those past it ([`trie::visit_after`]), the unrecorded part only the numbers past it.
+  pub fn visit_head_inodes(
+    &self,
+    store: &Store,
+    after: Option<u64>,
+    visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> bool {
+    let unrecorded = self.unrecorded_counters.clone();
+    if unrecorded.is_empty() {
+      return matches!(
+        self.visit_table(store, after.map(InodeNo), None, visit),
+        TableWalk::Whole
+      );
+    }
+    let resumed = after.map(|after| InodeNo(after).counter());
+    // The table below the unrecorded counters: every number the last publication recorded.
+    if resumed.is_none_or(|counter| counter < unrecorded.start)
+      && matches!(
+        self.visit_table(store, after.map(InodeNo), Some(unrecorded.start), visit),
+        TableWalk::Broke
+      )
+    {
+      return false;
+    }
+    // The unrecorded counters, named under this volume's prefix, the prefix it issues under.
+    let from = resumed.map_or(unrecorded.start, |counter| {
+      counter.saturating_add(1).max(unrecorded.start)
+    });
+    for counter in from..unrecorded.end {
+      if visit(InodeNo::compose(self.prefix, counter).0).is_break() {
+        return false;
+      }
+    }
+    // The table from the ceiling on: what this daemon issued since.
+    let last_unrecorded = unrecorded.end.saturating_sub(1);
+    let past = resumed.map_or(last_unrecorded, |counter| counter.max(last_unrecorded));
+    matches!(
+      self.visit_table(
+        store,
+        Some(InodeNo::compose(self.prefix, past)),
+        None,
+        visit
+      ),
+      TableWalk::Whole
+    )
+  }
+
+  /// Visits the head's table past `past` in counter order, until `visit` breaks or an inode at or past counter `below`
+  /// is reached ([`Volume::visit_head_inodes`]'s parts).
+  fn visit_table(
+    &self,
+    store: &Store,
+    past: Option<InodeNo>,
+    below: Option<u64>,
+    visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> TableWalk {
+    let mut reached = false;
+    let flow = trie::visit_after(
+      &store.tries,
+      self.inode_root,
+      past,
+      &mut |handle| match store.inodes.get(handle) {
+        Ok(inode) if below.is_some_and(|below| inode.no.counter() >= below) => {
+          reached = true;
+          std::ops::ControlFlow::Break(())
+        }
+        Ok(inode) => visit(inode.no.0),
+        Err(_) => std::ops::ControlFlow::Continue(()),
+      },
+    );
+    match (flow.is_break(), reached) {
+      (false, _) => TableWalk::Whole,
+      (true, true) => TableWalk::Reached,
+      (true, false) => TableWalk::Broke,
+    }
+  }
+
+  /// Visits the inodes whose cached state the kernel of `owner`'s mount of a pinned view, taken over by this daemon,
+  /// may hold older than the volume's (A-158), in inode order and each once, starting after inode `after`, until
+  /// `visit` breaks. Returns whether every one was visited; an inode `visit` breaks on was visited. The set is every
+  /// inode the recovery gave back a reference of to `owner`, with any it has taken since, and every inode the write-log
+  /// replay wrote. A mount of the head names every inode of the head instead ([`Volume::visit_head_inodes`], A-573),
+  /// since a lookup made after the last publication is in no image; a pinned view's version takes no head change, so a
+  /// mutation the death lost never showed through it.
   ///
   /// Why these and no others: every change acknowledged before a crash is durable, a mutation's by the publication its
   /// reply waits for and a FUSE write's in the write log (A-63). A kernel can hold state of an inode older than a
@@ -7250,6 +7369,16 @@ fn exact_inode(store: &Store, root: Handle<TrieNode>, no: InodeNo) -> Result<&In
     return Err(VfsError::NotFound);
   }
   Ok(inode)
+}
+
+/// How a walk of part of the head's table ended ([`Volume::visit_table`]).
+enum TableWalk {
+  /// Every inode past its start was visited.
+  Whole,
+  /// The visitor broke.
+  Broke,
+  /// An inode at or past its bound was reached, and not visited.
+  Reached,
 }
 
 pub(crate) fn snapshot_handle(id: SnapshotId) -> Handle<Snapshot> {
@@ -8573,5 +8702,170 @@ mod clone_count_tests {
       failures.len(),
       failures.join("\n")
     );
+  }
+}
+
+#[cfg(test)]
+mod upcase_name_tests {
+  //! A-576: a volume that folds names by Windows' upcase table, through its own verbs and across a restart.
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+
+  use super::*;
+  use crate::clock::StepClock;
+  use crate::recover::Claims;
+
+  /// Shape: the test store's page, the machine's usual one.
+  const PAGE: usize = 4096;
+  /// Shape: table caps ample for the few entries below.
+  const CAP: usize = 256;
+  /// Shape: the arena's pages: the test writes no bytes, so a few.
+  const ARENA_PAGES: usize = 16;
+  /// Shape: the volume's quota, well above what the entries take.
+  const QUOTA: u64 = 1 << 20;
+  /// Shape: the volume's journal.
+  const JOURNAL: usize = 1 << 16;
+  /// Format: the mode the test's files are made with.
+  const MODE: u32 = 0o644;
+
+  fn store() -> Store {
+    let mut arena = ChunkArena::new(PAGE);
+    arena
+      .add_region(Region::map(PAGE * ARENA_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    Store::new(
+      &StoreConfig {
+        page: PAGE,
+        cache_line: 64,
+        max_dirs: CAP,
+        max_inodes: CAP,
+        max_chunks: CAP,
+        max_dir_blocks: CAP,
+        dir_cutover: 4,
+      },
+      arena,
+      0,
+    )
+  }
+
+  fn volume(store: &mut Store, names: NameEquivalence) -> Volume {
+    Volume::create(
+      store,
+      VolumeConfig {
+        prefix: 1,
+        names,
+        quota: Quota::Bounded { limit: QUOTA },
+        journal_bytes: JOURNAL,
+        clock: Box::new(StepClock::new(0, 1)),
+      },
+    )
+    .unwrap()
+  }
+
+  /// The root's entries, by name.
+  fn listed(volume: &Volume, store: &Store) -> Vec<(String, InodeNo)> {
+    let mut rows: Vec<(String, InodeNo)> = volume
+      .readdir(store, volume.root())
+      .unwrap()
+      .into_iter()
+      .map(|row| (row.name.to_owned(), row.inode))
+      .collect();
+    rows.sort();
+    rows
+  }
+
+  /// A-576, T-4.6 on a WinFsp drive's volume. Do: on a volume folding by Windows' upcase table, make `σ.txt`, then make
+  /// `ς.txt`, link `Σ.TXT` to another file, and rename that file onto `ς.txt`; make a precomposed and a decomposed `é`;
+  /// then make `σ.txt` and `ς.txt` on a `Fold` volume. Expect: under `Upcase` the make and the link refused `EEXIST`,
+  /// every spelling finding the one entry, the rename replacing that entry so one name is left, and the two `é` two
+  /// files, as on NTFS; under `Fold` two files, which a WinFsp drive takes for one name (A-551's third case).
+  #[test]
+  fn a_name_windows_folds_alike_to_an_entry_is_that_entry() {
+    let mut store = store();
+    let mut upcase = volume(&mut store, NameEquivalence::Upcase);
+    let root = upcase.root();
+    let sigma = upcase
+      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .unwrap();
+    assert_eq!(
+      upcase.create_file(&mut store, root, "\u{3c2}.txt", MODE),
+      Err(VfsError::AlreadyExists)
+    );
+    for spelling in ["\u{3c2}.txt", "\u{3a3}.TXT", "\u{3c3}.Txt"] {
+      assert_eq!(
+        upcase
+          .lookup(&store, root, spelling)
+          .map(|found| found.inode),
+        Ok(sigma),
+        "{spelling:?}"
+      );
+    }
+    let other = upcase.create_file(&mut store, root, "other", MODE).unwrap();
+    assert_eq!(
+      upcase.link(&mut store, root, "\u{3a3}.TXT", other),
+      Err(VfsError::AlreadyExists)
+    );
+    upcase
+      .rename(&mut store, root, "other", root, "\u{3c2}.txt")
+      .unwrap();
+    let left = listed(&upcase, &store);
+    assert_eq!(left.len(), 1, "one name is left: {left:?}");
+    assert_eq!(
+      upcase
+        .lookup(&store, root, "\u{3c3}.txt")
+        .map(|found| found.inode),
+      Ok(other)
+    );
+    upcase
+      .create_file(&mut store, root, "caf\u{e9}", MODE)
+      .unwrap();
+    upcase
+      .create_file(&mut store, root, "cafe\u{301}", MODE)
+      .unwrap();
+    assert_eq!(listed(&upcase, &store).len(), 3);
+
+    let mut store = self::store();
+    let mut fold = volume(&mut store, NameEquivalence::Fold);
+    let root = fold.root();
+    fold
+      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .unwrap();
+    fold
+      .create_file(&mut store, root, "\u{3c2}.txt", MODE)
+      .unwrap();
+    assert_eq!(listed(&fold, &store).len(), 2);
+  }
+
+  /// A-576. Do: make `σ.txt` on a volume folding by Windows' upcase table, image it, and rebuild it in a fresh store as
+  /// a restart does; then make `ς.txt` and look `Σ.TXT` up there. Expect: the rebuilt volume folds as the table does, so
+  /// the make is refused `EEXIST` and the look-up finds the file: the image keeps the policy and the rebuilt directory
+  /// is ordered and found by the table's hash.
+  #[test]
+  fn a_rebuilt_volume_folds_as_windows_upcase_table_does() {
+    let mut store = store();
+    let mut upcase = volume(&mut store, NameEquivalence::Upcase);
+    let root = upcase.root();
+    upcase
+      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .unwrap();
+    let image = upcase.to_image(&store, None).unwrap();
+    let mut fresh = self::store();
+    let claims = Claims::prepare(&mut fresh, [&image]).unwrap();
+    let mut rebuilt = Volume::from_image(
+      &mut fresh,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      None,
+    )
+    .unwrap();
+    let root = rebuilt.root();
+    assert_eq!(rebuilt.policy(), NameEquivalence::Upcase);
+    assert_eq!(
+      rebuilt.create_file(&mut fresh, root, "\u{3c2}.txt", MODE),
+      Err(VfsError::AlreadyExists)
+    );
+    assert!(rebuilt.lookup(&fresh, root, "\u{3a3}.TXT").is_ok());
   }
 }

@@ -1,0 +1,3 @@
+transaction abort!
+rollback completed
+abort: stream ended unexpectedly (got 0 bytes, expected 4)

@@ -92,6 +92,18 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   // A taken-back map no holder claimed by its claim's deadline is reclaimed by the reaper (A-197, A-554; Linux).
   #[cfg(target_os = "linux")]
   crate::held_copy::owe_reclaim_if_due(state, now);
+  // A purge round the NFSv4 table owes (at a start that owes purges, or a retry window after a round left any owed) is
+  // handed to the reaper, which awaits its owners (A-570).
+  if state.nfs_purge_at.is_some_and(|at| at <= now) {
+    crate::nfs::owe_purge_round(state);
+  }
+  // §4.6, the backed route's L1 (A-193): the host is asked again for the placements it declined in a way likely to
+  // hold, a retry window after the decline (A-570). A declined collapse costs milliseconds of compaction (1,954 and
+  // 2,832 µs a step on adacachy at load 90), so a host out of huge pages is asked once a window, never once a range.
+  if state.placement_rearm_at.is_some_and(|at| at <= now) {
+    state.placement_rearm_at = None;
+    state.store.shards_backings.rearm_placement();
+  }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -119,6 +131,8 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.landing.audit_look_at,
     state.departures_retry_at,
     claim_due(state),
+    state.nfs_purge_at,
+    state.placement_rearm_at,
   ]
   .into_iter()
   .flatten()
@@ -180,6 +194,12 @@ pub(crate) fn after_borrow(state: &mut ShardState) {
   // The fleet's members changed: the control shard's reaper looks for hosts that left (A-222, A-554).
   if state.fleet.take_members_changed() {
     crate::remote_attach::look_for_departures(state);
+  }
+  // The host declined a huge-page placement in a way likely to hold: it is asked again a retry window on (A-570).
+  if state.store.shards_backings.take_declined() && state.placement_rearm_at.is_none() {
+    let at = state.clock.monotonic_ns().saturating_add(retry_window_ns());
+    state.placement_rearm_at = Some(at);
+    noted(state, at);
   }
   let partition = state.db.partition_mut();
   let earliest = [
@@ -534,6 +554,49 @@ mod tests {
     let ended = ended.expect("the departed peer's attachment ended within half a liveness window");
     println!(
       "a departed peer's attachment ended {ended:?} after the configuration without it was installed"
+    );
+  }
+
+  /// Shape: how long the re-arm test lets its daemon run before the decline: past the reap loop's first look a window
+  /// into the start, by half a window, so the loop's next look comes half a window after the decline.
+  const PAST_THE_FIRST_LOOK_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2 * 3;
+
+  /// A-570 (the huge-page re-arm off the tick). Do: on a one-shard daemon past the reap loop's first look, remember a
+  /// lasting decline of a huge-page placement, as a declined collapse does (`ShardsBackings::place`); watch for the
+  /// re-arm. Expect: re-armed no sooner than a window after the decline and within half a window more, by the keeper.
+  /// The reap loop's tick re-armed at its looks whatever their phase: half a window after the decline here, and at once
+  /// after a decline just before a look, which asked the host again before it could have freed anything.
+  #[test]
+  fn a_declined_placement_is_asked_again_a_window_after_the_decline() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    // The harness waits out the reap loop's first look; the daemon under test runs on.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
+    let declined = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.store.shards_backings.remember_decline();
+    });
+    let rearmed = loop {
+      if !crate::daemon::observe_first(&daemon, |state| {
+        state.store.shards_backings.placement_declined()
+      }) {
+        break Some(declined.elapsed());
+      }
+      if declined.elapsed()
+        > Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS + RELEASED_WITHIN_NS)
+      {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    };
+    daemon.stop();
+    let rearmed = rearmed.expect("re-armed within half a window past a window after the decline");
+    println!("a declined placement re-armed {rearmed:?} after the decline");
+    assert!(
+      rearmed >= Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS),
+      "not asked again before a window after the decline: {rearmed:?}"
     );
   }
 

@@ -1,0 +1,12 @@
+POST /?cmd=debugwireargs HTTP/1.1
+Accept-Encoding: identity
+content-type: application/mercurial-0.1
+vary: X-HgArgs-Post,X-HgProto-1
+x-hgargs-post: 68
+x-hgproto-1: 0.1 0.2 comp=zstd,zlib,none,bzip2 partial-pull
+accept: application/mercurial-0.1
+content-length: 68
+host: 127.0.0.1:51602
+user-agent: mercurial/proto-1.0 (Mercurial 7.2)
+
+four=caf%C3%A9&one=un&three=a+b%3Dc%26d%2Be%25f%3Bg%2Ch%3Ai&two=deux

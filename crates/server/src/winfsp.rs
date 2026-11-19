@@ -71,6 +71,7 @@ use slates_bridge_winfsp::host::Ready;
 use slates_bridge_winfsp::host::{
   MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request, Sibling, WinFspError,
 };
+use slates_bridge_winfsp::normalized::NameSearch;
 use slates_bridge_winfsp::notify::{NotifyRound, OpenNames, spanning};
 use slates_bridge_winfsp::opens::{Ledger, Open};
 use slates_bridge_winfsp::purge::{Purge, purge_range};
@@ -115,6 +116,11 @@ const ROUNDS_REFUSED: &str = "winfsp.rounds_refused";
 /// Format: rounds that found the mount behind its volume journal's retention and told Windows of every name it holds
 /// open (A-141's overrun). Zero is the healthy reading.
 const JOURNAL_OVERRUNS: &str = "winfsp.journal_overruns";
+/// Format: rounds whose gather ran out of its turn with records still owed, sent over several turns (A-562): the signal
+/// that a mount's rounds outgrow the shard's step.
+const ROUNDS_OUTGROWN: &str = "winfsp.rounds_outgrown";
+/// Format: gathers that resumed a round where an earlier one stopped (A-562): the sliced rounds' non-vacuity counter.
+const SLICES_RESUMED: &str = "winfsp.slices_resumed";
 /// Format: names left out of a round for being longer than any WinFsp path. Zero is the healthy reading.
 const NAMES_TOO_LONG: &str = "winfsp.names_too_long";
 /// Format: files whose changed ranges the mount thread purged from Windows' cache and every view mapped of them
@@ -271,6 +277,19 @@ pub(crate) struct PendingAttach {
   pub(crate) token: [u8; 16],
 }
 
+/// How the drive of `volume` compares names, as the volume's name policy calls for (A-551): an exact volume's drive
+/// declares `CaseSensitiveSearch`, and a folding one's compares names by the system's upcase table, as NTFS does, so
+/// every spelling of a file is one of WinFsp's file nodes. A held drive keeps the search its record names
+/// (`slates_bridge_winfsp::host::MountThread::start`). Refused `NotFound` for a volume this shard does not serve.
+fn name_search(s: &ShardState, volume: VolumeId) -> Result<NameSearch, Refusal> {
+  let handle = *s.by_id.get(&volume).ok_or(Refusal::NotFound)?;
+  let slot = s.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  Ok(NameSearch::of(
+    slot.volume.policy(),
+    slates_bridge_winfsp::host::system_upcase,
+  ))
+}
+
 /// Checks a WinFsp mount point before any effect: a drive letter and its colon (`S:`). A directory is refused, as §4.6
 /// decides (a directory mount is an NTFS reparse point, which leaves a directory beneath the mount).
 pub(crate) fn check_mount_point(path: &str) -> Result<(), Refusal> {
@@ -291,6 +310,10 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       feature: "a WinFsp mount outside a recorded request".to_owned(),
     });
   };
+  let search = match name_search(state, pending.record.volume) {
+    Ok(search) => search,
+    Err(refusal) => return crate::verbs::refused(refusal),
+  };
   let route = state.reply_route.take();
   let cause = state.current_span;
   let shard = state.shard;
@@ -306,7 +329,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
     let (sender, requests) = sync_channel::<Request>(REQUEST_BOUND);
     let mounted = match MountThread::start(
       &mount_point,
-      !pending.rights.write,
+      (!pending.rights.write, search),
       sender,
       waker.clone(),
       MAX_OPEN_HANDLES,
@@ -662,7 +685,7 @@ fn keep(
       registry,
       volume: record.volume,
       mount_point: record.form.mount_point().unwrap_or_default().to_owned(),
-      names: OpenNames::new(),
+      names: OpenNames::searching(ready.search),
       coherence: Coherence::new(),
       round_out: None,
       owed: takeover,
@@ -810,11 +833,20 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
     release_hold(attachment).await;
     return;
   };
+  let search = match state::with_state(|s| name_search(s, record.volume)) {
+    Some(Ok(search)) => search,
+    found => {
+      let why = format!("the held mount's volume is not served here: {found:?}");
+      let _ = state::with_state_counted(|s| refuse_adoption(s, &record, &why));
+      release_hold(attachment).await;
+      return;
+    }
+  };
   let waker = std::future::poll_fn(|cx| std::task::Poll::Ready(cx.waker().clone())).await;
   let (sender, requests) = sync_channel(REQUEST_BOUND);
   let mounted = match MountThread::start(
     record.form.mount_point().unwrap_or_default(),
-    !record.rights.write,
+    (!record.rights.write, search),
     sender,
     waker.clone(),
     MAX_OPEN_HANDLES,
@@ -934,6 +966,9 @@ enum Turned {
   Idle,
   /// A request was served.
   Served,
+  /// A round's gather stopped where its slice ended and no round went out whose return would wake the task (A-562): it
+  /// yields and turns again for the rest.
+  Continued,
   /// A rename held WinFsp's lock, so the owed round waits a tick.
   RoundDeferred,
   /// Nothing waited but a purge owed again, due in this many nanoseconds: the task waits that long or until it is woken.
@@ -967,6 +1002,9 @@ async fn wait_after(turned: Turned) {
       // A served request is client activity, as a FUSE request is (§4.3, §4.7): the shard spins out its idle window
       // after it, so a burst's next request is taken without a wake.
       slates_rt::registry::with_current(|ctx| ctx.note_activity());
+      let _ = futures::yield_now().await;
+    }
+    Turned::Continued => {
       let _ = futures::yield_now().await;
     }
     // `Ended` never reaches here: the loop ends the mount before it waits.
@@ -1065,6 +1103,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   let Ok(cx) = s.attachments.begin(mount.registry) else {
     return Turned::Ended;
   };
+  // A round's gather runs a slice a turn (A-562), timed against the shard's live quantum as every clock-bounded slice is.
+  let slice_ns = s.config.copy_slice_ns();
   let turned = {
     let ShardState { store, volumes, .. } = &mut *s;
     volumes.get_mut(handle).ok().map(|slot| {
@@ -1108,6 +1148,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
           told,
           takeover,
         },
+        slice_ns,
       );
       let served = request.map(|request| {
         let served = request.serve(&mut bridge, &cx, names, ledger);
@@ -1128,6 +1169,9 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     return Turned::Ended;
   };
   s.count(JOURNAL_OVERRUNS, delivered.overruns);
+  let (outgrown, resumed) = mount.coherence.take_sliced_counts();
+  s.count(ROUNDS_OUTGROWN, outgrown);
+  s.count(SLICES_RESUMED, resumed);
   // What the journal reader's rounds found this turn teaches its patience (A-548).
   crate::reader_patience::learn(s, mount.volume, mount.registry.key(), &mut mount.patience);
   s.count(RECORDS_TOLD, std::mem::take(&mut mount.told));
@@ -1150,6 +1194,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
       Turned::Served
     }
     None if deferred => Turned::RoundDeferred,
+    // The rest of a cut gather is owed now, and no round is out to wake the task when it returns (A-562).
+    None if mount.owed && mount.round_out.is_none() && !mount.purge_out => Turned::Continued,
     None => retry_in.map_or(Turned::Idle, Turned::RetryIn),
   }
 }
@@ -1348,18 +1394,22 @@ fn owe_siblings(
   owed.insert(key, sibling.bytes);
 }
 
-/// Delivers the owed round when none is out: every invalidation since the cursor, as records naming what Windows holds
-/// open, handed to the mount thread. While a round is out nothing new is gathered (the gather consumes) and the round is
-/// reported refused, so the cursor does not move past what Windows has not been told — the FUSE mount's rule.
+/// Delivers the owed round when none is out: the invalidations since the cursor that `slice_ns` of the serving thread
+/// allows, at least one record's (A-562), as records naming what Windows holds open, handed to the mount thread. A
+/// gather its slice cut leaves the rest owed at once (`WinFspMount::owed`). While a round is out nothing new is
+/// gathered (the gather consumes) and the round is reported refused, so the cursor does not move past what Windows has
+/// not been told — the FUSE mount's rule.
 fn deliver_owed(
   bridge: &mut VolumeBridge<'_>,
   cx: &slates_bridge_core::OpContext,
   mount: Rounds<'_>,
+  slice_ns: u64,
 ) -> Round {
   let refused = Round {
     delivered: Delivered {
       written: 0,
       gather_refused: true,
+      cut: false,
     },
     overruns: 0,
     too_long: 0,
@@ -1372,17 +1422,27 @@ fn deliver_owed(
   let mut overruns = 0u64;
   let mut changed: Vec<(u64, CachedBytes)> = Vec::new();
   let names = mount.names;
-  let Ok(delivered) = mount
-    .coherence
-    .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      match invalidation {
-        Invalidation::Everything => overruns = overruns.saturating_add(1),
-        Invalidation::Inode { ino, data } => changed.push((*ino, *data)),
-        Invalidation::Entry { .. } => {}
-      }
-      round.add(invalidation, names);
-      Ok::<(), std::convert::Infallible>(())
-    });
+  let began = std::time::Instant::now();
+  let budget = std::time::Duration::from_nanos(slice_ns);
+  let mut more = || {
+    if began.elapsed() >= budget {
+      std::ops::ControlFlow::Break(())
+    } else {
+      std::ops::ControlFlow::Continue(())
+    }
+  };
+  let Ok(delivered) =
+    mount
+      .coherence
+      .deliver(bridge, cx, &mut more, &mut |invalidation: &Invalidation| {
+        match invalidation {
+          Invalidation::Everything => overruns = overruns.saturating_add(1),
+          Invalidation::Inode { ino, data } => changed.push((*ino, *data)),
+          Invalidation::Entry { .. } => {}
+        }
+        round.add(invalidation, names);
+        Ok::<(), std::convert::Infallible>(())
+      });
   if delivered.gather_refused {
     return refused;
   }
@@ -1392,7 +1452,8 @@ fn deliver_owed(
   for (ino, through) in mount.siblings.owed.keys() {
     round.add_siblings(*ino, through, names);
   }
-  *mount.owed = false;
+  // A gather its slice cut owes the rest at once (A-562).
+  *mount.owed = delivered.cut;
   let too_long = round.too_long();
   if !round.is_empty() {
     let purges = purges_owed(

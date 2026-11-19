@@ -27,6 +27,12 @@
 //! `STATUS_CANT_WAIT`, and the round is owed again rather than waited for, since the rename itself may be waiting on
 //! the shard.
 //!
+//! **Names (A-551).** A drive declares `CaseSensitiveSearch` for an exact volume only. Over a folding volume WinFsp's
+//! driver compares names without case, so every spelling of a file is one of its file nodes, and each open answers the
+//! node's name as its normalized name (`crate::normalized`): the spelling Windows already holds, or the one the volume
+//! stores. The open's ledger record and its open names keep that name, which is what the driver renames and what a
+//! notification must name. A held drive keeps the search its record says it was mounted with.
+//!
 //! **Mapped views (A-190, an experiment).** A notification's purge leaves a mapped file's pages (`crate::purge` says
 //! why), so after a round Windows took, the mount thread opens each changed file through the drive unbuffered and writes
 //! the changed range, which makes WinFsp purge coherently. A private restricting-SID marker distinguishes these opens
@@ -69,6 +75,7 @@ use crate::held::{
   Record,
   windows::{Drive, Inherited, Offer},
 };
+use crate::normalized::{NameSearch, NodeName};
 use crate::notify::OpenNames;
 use crate::opens::{Ledger, Open, RESTORED_HANDLE};
 use crate::purge::{Purge, PurgeOutcome};
@@ -177,6 +184,30 @@ pub fn installed() -> bool {
 /// mounts what the mount would be refused for (`WinFspError::MountManagerNotAllowed`; A-417). Read at each call.
 pub fn mount_manager_allowed() -> bool {
   ffi::mount_manager_allowed()
+}
+
+/// One UTF-16 unit as the system's upcase table maps it: what a drive over a folding volume compares names by
+/// (`NameSearch::CaseInsensitive`, A-551). WinFsp's driver compares such a drive's names unit by unit through this
+/// table (`RtlCompareUnicodeString` with `CaseInSensitive`, `src/sys/util.c` 1543-1552) and upper-cases a name it is
+/// given no normalized name for with it (`RtlUpcaseUnicodeString`, `src/sys/create.c` 1041-1043). ntdll's routine reads
+/// the system's NLS upcase table, the one the kernel loads (from memory; the drive test's non-ASCII spelling checks the
+/// two agree, `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` in
+/// `crates/cli/tests/winfsp_semantics.rs`).
+pub fn system_upcase(unit: u16) -> u16 {
+  // SAFETY: `RtlUpcaseUnicodeChar` reads its argument and the system's upcase table, mapped read-only into every
+  // process for its life, and nothing else.
+  unsafe { windows_sys::Wdk::System::SystemServices::RtlUpcaseUnicodeChar(unit) }
+}
+
+/// How the drive a held record names compares names (A-551): without case, by the system's table, or with it.
+fn search_of(record: &Record) -> NameSearch {
+  if record.case_insensitive {
+    NameSearch::CaseInsensitive {
+      upcase: system_upcase,
+    }
+  } else {
+    NameSearch::CaseSensitive
+  }
 }
 
 /// Format: the sector size the mount reports — 4096 bytes, the volume core's chunk/page unit, so an
@@ -444,6 +475,9 @@ enum Reply {
   Opened {
     context: u64,
     info: FileInfo,
+    /// The name the open's file node takes, in UTF-16 units, when the reply answers it as the open's normalized name:
+    /// on a drive over a folding volume (A-551, `crate::normalized`).
+    normalized: Option<Vec<u16>>,
   },
   Ok,
   /// A link's target, or `None` when the object is no link (A-275).
@@ -746,7 +780,9 @@ fn admission_refusal<C>(
   }
 }
 
-/// Records a new kernel context before returning it; a refused record releases the newly allocated bridge handle.
+/// Records a new kernel context before returning it; a refused record releases the newly allocated bridge handle. The
+/// open is recorded under the name its file node takes in WinFsp's driver, which on a drive over a folding volume the
+/// reply answers as the open's normalized name (A-551, `crate::normalized`).
 fn record_open_reply(
   reply: Reply,
   opened: Option<(String, bool)>,
@@ -760,10 +796,15 @@ fn record_open_reply(
     return reply;
   };
   let (object, fh, info) = (*object, *fh, *info);
-  match ledger.opened_for(Open { object, fh, purge }, &path, hint) {
+  let node = node_name_of(bridge, cx, names, &path, purge);
+  match ledger.opened_for(Open { object, fh, purge }, &node.name, hint) {
     Ok(context) => {
-      names.opened(context, object.inode, &path);
-      Reply::Opened { context, info }
+      names.opened(context, object.inode, &node.name);
+      Reply::Opened {
+        context,
+        info,
+        normalized: node.answered.then(|| node.name.encode_utf16().collect()),
+      }
     }
     Err(error) => {
       slates_machine::log_line!("slates-winfsp: open record refused: {error}");
@@ -773,6 +814,33 @@ fn record_open_reply(
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
+}
+
+/// The name the file node of an open of `path` takes in WinFsp's driver (`crate::normalized`). On a drive over a
+/// folding volume each component is spelled as the volume stores it where Windows holds no spelling of it (A-543's
+/// `stored_path`, one look-up a component, as the open's own resolution made). A purge's open names a node Windows
+/// holds by its held name, which may no longer resolve, so it walks nothing.
+fn node_name_of(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  names: &OpenNames,
+  path: &str,
+  purge: bool,
+) -> NodeName {
+  let stored = if names.search().case_sensitive() || purge {
+    None
+  } else {
+    match slates_bridge_core::stored_path(bridge, cx, path) {
+      Ok(stored) => Some(stored),
+      Err(error) => {
+        // This shard resolved the path for the open a moment ago, so a refused walk is no state an open meets. It is
+        // logged, and the open's components Windows does not hold are named as asked, which the driver always takes.
+        slates_machine::log_line!("slates-winfsp: an open's stored path was refused: {error}");
+        None
+      }
+    }
+  };
+  crate::normalized::node_name(names, path, stored.as_deref())
 }
 
 /// Retires a released context. Kernel-name changes wait until the receiver has saved the complete rename result.
@@ -2192,10 +2260,13 @@ unsafe fn copy_security_descriptor(
   STATUS_SUCCESS.as_i32()
 }
 
-/// Returns a generation-checked ledger token in WinFsp's opaque context field, with no allocation or pointer borrow.
+/// Returns a generation-checked ledger token in WinFsp's opaque context field, with no allocation or pointer borrow,
+/// and the open's normalized name when its reply answers one (A-551). Only Create and Open call it, whose `p_info` is
+/// the `FileInfo` that opens WinFsp's `FSP_FSCTL_OPEN_FILE_INFO`.
 fn finish_open(
   context: u64,
   info: FileInfo,
+  normalized: Option<&[u16]>,
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
@@ -2203,12 +2274,44 @@ fn finish_open(
     return crate::status_invalid_parameter();
   };
   crate::dispatcher::opened(u64::try_from(context).unwrap_or(0));
-  // SAFETY: WinFsp owns these writable output parameters. The context is an opaque integer, never dereferenced.
+  // SAFETY: WinFsp owns these writable output parameters. The context is an opaque integer, never dereferenced. Create
+  // and Open alone call here, and the `FileInfo` the DLL gives them is the first field of its
+  // `FSP_FSCTL_OPEN_FILE_INFO` (`inc/winfsp/winfsp.h` 1495-1541; `src/dll/fsop.c` 443-445 and 503-505), which
+  // `put_normalized_name` writes.
   unsafe {
     *p_context = std::ptr::without_provenance_mut(context);
     put_info(p_info, info);
+    if let Some(units) = normalized {
+      put_normalized_name(p_info.cast::<ffi::OpenFileInfo>(), units);
+    }
   }
   STATUS_SUCCESS.as_i32()
+}
+
+/// Copies an open's normalized name into its `FSP_FSCTL_OPEN_FILE_INFO` and sets `NormalizedNameSize` to the bytes
+/// copied, with no terminator (`inc/winfsp/winfsp.h` 1519-1527), when the buffer is there and holds them. The DLL
+/// points it into the response with the room left there, and hands the driver what fits
+/// `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (`src/dll/fsop.c` 444-445 and 466-471), which `crate::normalized` keeps every
+/// answer within. A name that does not fit is left out, and the driver names the node itself.
+///
+/// # Safety
+/// `open` is null or the writable `FSP_FSCTL_OPEN_FILE_INFO` of the Create or Open being answered, whose
+/// `NormalizedName` is null or points at `NormalizedNameSize` writable bytes.
+unsafe fn put_normalized_name(open: *mut ffi::OpenFileInfo, units: &[u16]) {
+  let Ok(bytes) = u16::try_from(size_of_val(units)) else {
+    return;
+  };
+  // SAFETY: `open` is null or a writable `FSP_FSCTL_OPEN_FILE_INFO` per the contract, read and written here alone. Its
+  // buffer is null or holds `normalized_name_size` bytes, and the copy writes `bytes` of them only when they fit.
+  unsafe {
+    if !open.is_null()
+      && !(*open).normalized_name.is_null()
+      && bytes <= (*open).normalized_name_size
+    {
+      std::ptr::copy_nonoverlapping(units.as_ptr(), (*open).normalized_name, units.len());
+      (*open).normalized_name_size = bytes;
+    }
+  }
 }
 
 extern "C" fn create(
@@ -2232,7 +2335,11 @@ extern "C" fn create(
     is_dir,
     attributes: file_attributes,
   }) {
-    Reply::Opened { context, info } => finish_open(context, info, p_context, p_info),
+    Reply::Opened {
+      context,
+      info,
+      normalized,
+    } => finish_open(context, info, normalized.as_deref(), p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
   }
@@ -2256,7 +2363,11 @@ extern "C" fn open_trampoline(
     _ => return ntstatus(&VfsError::NotPermitted).as_i32(),
   };
   match handler.call(op) {
-    Reply::Opened { context, info } => finish_open(context, info, p_context, p_info),
+    Reply::Opened {
+      context,
+      info,
+      normalized,
+    } => finish_open(context, info, normalized.as_deref(), p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_object_name_not_found(),
   }
@@ -2727,7 +2838,7 @@ impl Mounted {
   /// refusal.
   fn new(
     mount_point: &str,
-    read_only: bool,
+    (read_only, search): (bool, NameSearch),
     requests: SyncSender<Request>,
     wake: Waker,
     inherited: Option<(Record, OwnedHandle)>,
@@ -2748,6 +2859,11 @@ impl Mounted {
     {
       return Err(WinFspError::Record(crate::held::Refusal::Drive));
     }
+    // A held drive keeps the search its volume was made with (A-551): the driver fixed it then, and a drive mounted
+    // before A-551 declared `CaseSensitiveSearch` whatever its volume's names, until it is mounted again.
+    let search = inherited
+      .as_ref()
+      .map_or(search, |(record, _)| search_of(record));
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     checked_dll(api)?;
     let purge_marker = crate::purge_token::Marker::fresh()?;
@@ -2773,8 +2889,7 @@ impl Mounted {
     // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
     // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
     // bytes through slates: its size had reached the shard, and its bytes were still in Windows' cache.
-    params.flags = ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH
-      | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
+    params.flags = ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
       | ffi::VOLUME_FLAG_PERSISTENT_ACLS
       // A volume symlink is a Windows symbolic link (A-275): WinFsp asks the reparse slots and follows each link it
@@ -2791,6 +2906,14 @@ impl Mounted {
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed
       // that first box twice (run 40251802164); a stable token would likewise name the wrong open.
       | ffi::VOLUME_FLAG_FILE_CONTEXT_PER_OPEN;
+    // Only an exact volume's names are compared with case (A-551). A folding volume finds a file under any spelling
+    // that folds alike, as NTFS does, so its drive declares no `CaseSensitiveSearch`: WinFsp's driver then keys its
+    // open files by name compared without case, and every spelling of a file is one file node (one share access, one
+    // cache), named by the normalized name its first open answers (`crate::normalized`). Declared for every volume
+    // before A-551, it made each spelling a node of its own.
+    if search.case_sensitive() {
+      params.flags |= ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH;
+    }
     if read_only {
       params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
     }
@@ -2824,6 +2947,7 @@ impl Mounted {
         volume,
         drive,
         read_only,
+        case_insensitive: !search.case_sensitive(),
       },
       worker: None,
       purge_marker,
@@ -3017,6 +3141,8 @@ pub struct Ready {
   pub open_counts: std::collections::BTreeMap<u64, (u64, u32)>,
   /// The volume and link duplicates, kept until the anchor owns its copies.
   pub offer: Offer,
+  /// How the drive declared it compares names, so the shard's open names compare them as the driver does (A-551).
+  pub search: NameSearch,
 }
 
 impl Ready {
@@ -3068,14 +3194,16 @@ pub struct MountThread {
 }
 
 impl MountThread {
-  /// Starts the thread, which mounts the volume at `mount_point` (`S:`) — read-only when `read_only` — with its
-  /// requests sent on `requests` and `wake` woken after each, and reports [`Outcome::Mounted`]. Refused only when no
-  /// thread can start. Called on the shard that serves the mount: its step quantum is the most the receive thread may
-  /// spin for a reply (A-560), since a longer spin takes more than a step of CPU from the shards; off any shard there is
-  /// no quantum, and the thread parks at once.
+  /// Starts the thread, which mounts the volume at `mount_point` (`S:`) — read-only when `read_only`, its names
+  /// compared as `search` says (A-551: case-sensitively for an exact volume; a held drive keeps the search its record
+  /// names, and [`Ready::search`] reports the one the drive declared) — with its requests sent on `requests` and `wake`
+  /// woken after each, and reports [`Outcome::Mounted`]. Refused only when no thread can start. Called on the shard that
+  /// serves the mount: its step quantum is the most the receive thread may spin for a reply (A-560), since a longer
+  /// spin takes more than a step of CPU from the shards; off any shard there is no quantum, and the thread parks at
+  /// once.
   pub fn start(
     mount_point: &str,
-    read_only: bool,
+    (read_only, search): (bool, NameSearch),
     requests: SyncSender<Request>,
     wake: Waker,
     open_bound: usize,
@@ -3091,7 +3219,7 @@ impl MountThread {
       move || {
         run_mount(
           &mount_point,
-          read_only,
+          (read_only, search),
           (requests, wake, spin_ceiling),
           &command_rx,
           &outcome_tx,
@@ -3160,7 +3288,7 @@ impl Drop for MountThread {
 /// The mount thread's body: mount, report, serve commands until the owner drops the command channel, unmount, report.
 fn run_mount(
   mount_point: &str,
-  read_only: bool,
+  (read_only, search): (bool, NameSearch),
   (requests, wake, spin_ceiling): (SyncSender<Request>, Waker, std::time::Duration),
   commands: &Receiver<Command>,
   outcomes: &SyncSender<Outcome>,
@@ -3222,7 +3350,7 @@ fn run_mount(
       .map_err(WinFspError::Ledger)?;
     let mounted = Mounted::new(
       mount_point,
-      read_only,
+      (read_only, search),
       requests,
       wake.clone(),
       inherited,
@@ -3260,6 +3388,8 @@ fn run_mount(
         .checked_add(1)
         .ok_or(WinFspError::Ledger(crate::opens::Refusal::Bound))?;
     }
+    // What the drive declared, which for a held drive is what its record says (`Mounted::new`), not what was asked.
+    let search = search_of(&mounted.record);
     Ok::<_, WinFspError>((
       mounted,
       Ready {
@@ -3267,6 +3397,7 @@ fn run_mount(
         offer,
         opens,
         open_counts,
+        search,
       },
       section,
     ))
@@ -3466,5 +3597,37 @@ mod channel {
         "the next request waited for the shard to take the confirmation"
       );
     });
+  }
+}
+
+#[cfg(test)]
+mod upcase_table {
+  //! The volume core's copy of Windows' upcase table against the system's own (A-576): a volume that folds names by
+  //! `NameEquivalence::Upcase` folds them as WinFsp's driver does only while the two agree at every unit.
+
+  use super::system_upcase;
+
+  /// A-576. Do: upcase each of the 65,536 UTF-16 units through the volume core's table (`slates_vfs::upcase`, Microsoft's
+  /// recommended exFAT up-case table) and through ntdll's `RtlUpcaseUnicodeChar`, the table WinFsp's driver compares by.
+  /// Expect: the same unit at every one, and the first differences named if not, so a drive and its volume take the
+  /// same names for one. Windows only, as the table it reads is.
+  #[test]
+  fn the_volumes_upcase_table_is_the_systems() {
+    let differences: Vec<(u16, u16, u16)> = (0..=u16::MAX)
+      .filter_map(|unit| {
+        let (volume, system) = (slates_vfs::upcase::upcase(unit), system_upcase(unit));
+        (volume != system).then_some((unit, volume, system))
+      })
+      .collect();
+    let first: Vec<String> = differences
+      .iter()
+      .take(32)
+      .map(|(unit, volume, system)| format!("{unit:04X}: volume {volume:04X}, system {system:04X}"))
+      .collect();
+    assert!(
+      differences.is_empty(),
+      "{} units differ; the first: {first:?}",
+      differences.len()
+    );
   }
 }

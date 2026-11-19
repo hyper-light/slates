@@ -84,11 +84,13 @@ Evidence, all on the Mac Studio on 2026-11-19:
   images of the head's own inodes (`shared_source`), and the file is not among them: the clone's image lists it with
   the numbers it shares with its origin. Shown across 32 histories; every one whose clone took a snapshot refused. This
   test's restart half therefore uses a clone with no snapshot of its own.
-- **Open:** a clone is admitted with no entry allowance. `admit_clone` sets the inode allowance only, where a create's
-  admission (`admit_dimensions`) and a restart set both. The clone's namespace dimension is unbounded until a restart.
-- **Open:** a resize moves the inode allowance with the new policy (`resize`) but leaves the entry allowance at the size
-  the volume was made with.
-- **Open, found by reading, not tested:** recovery counts a whiteout as a live entry. `rebuild_entries` re-inserts an
+- **Fixed since by A-572 (2026-11-19), part 2:** a clone is admitted with no entry allowance. `admit_clone` sets the
+  inode allowance only, where a create's admission (`admit_dimensions`) and a restart set both. The clone's namespace
+  dimension is unbounded until a restart.
+- **Fixed since by A-572 (2026-11-19), part 3:** a resize moves the inode allowance with the new policy (`resize`) but
+  leaves the entry allowance at the size the volume was made with.
+- **Fixed since by A-572 (2026-11-19, `2026-11-19-a-restart-counted-whiteouts-as-live-entries.md`), found by
+  reading:** recovery counts a whiteout as a live entry. `rebuild_entries` re-inserts an
   image entry that names no child as `Child::Whiteout` through `dir_insert`, which counts it. The live count and
   `live_len` never count one. A restarted overlay with whiteouts therefore counts each whiteout in its head's count and
   in a clone head's own directories, and its entry allowance's floor at the restart is raised by as many.
