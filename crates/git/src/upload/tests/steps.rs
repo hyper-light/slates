@@ -74,6 +74,64 @@ impl PackSource for Counting {
   }
 }
 
+/// A source that writes as `Counting` does and counts the calls made of it.
+struct Called {
+  /// The source it counts.
+  counting: Counting,
+  /// The calls made of it so far.
+  calls: usize,
+}
+
+impl PackSource for Called {
+  type Pack = usize;
+
+  fn begin(
+    &mut self,
+    served: &Served<'_>,
+    plan: &PackPlan<'_>,
+    admission: &mut Admission,
+  ) -> Result<usize, PackRefused> {
+    self.counting.begin(served, plan, admission)
+  }
+
+  fn write(
+    &mut self,
+    served: &Served<'_>,
+    at: &mut usize,
+    out: &mut Vec<u8>,
+    room: usize,
+  ) -> Result<bool, PackRefused> {
+    self.calls += 1;
+    self.counting.write(served, at, out, room)
+  }
+}
+
+/// The calls each step made of a source of `len` bytes, serving the clone in steps of at most `room` bytes.
+fn calls_per_step(fixture: &served::Served, room: usize, len: usize) -> Vec<usize> {
+  let served = serving(fixture, &REFS, MAIN_REF);
+  let mut source = Called {
+    counting: Counting { len },
+    calls: 0,
+  };
+  let mut answer = serve(
+    &served,
+    Version::V2,
+    Asked::Request(FETCH_CLONE_REQUEST),
+    &mut source,
+    &mut Admission::new(u64::MAX),
+  );
+  let mut bytes = Vec::new();
+  let mut calls = Vec::new();
+  loop {
+    let before = source.calls;
+    let written = answer.write(&served, &mut source, &mut bytes, room);
+    calls.push(source.calls - before);
+    if written == Written::End {
+      return calls;
+    }
+  }
+}
+
 /// Format: rooms at and around the edges a step meets: one byte, a packet's header, a band-1 packet whole and one byte
 /// either side, and more than the whole answer.
 const ROOMS: [usize; 9] = [1, 2, 4, 5, 65_519, 65_520, 65_521, 4096, 1 << 22];
@@ -178,4 +236,21 @@ fn a_pack_longer_than_a_packet_goes_out_in_full_packets() {
     assert_eq!(bytes, whole, "room {room}");
     assert!(steps.iter().all(|step| *step <= room), "room {room}");
   }
+}
+
+/// A-640 part 3 (one call of the source's bounds a step's work, §4.3; one turn of A-639's stream): do serve the clone
+/// with a source of 200,000 bytes, four packets' worth, counting its calls, in steps of each edge room. Expect: no step
+/// calling the source more than once, and a step of unbounded room calling it, so one packet a step.
+#[test]
+fn a_step_calls_its_source_at_most_once() {
+  let fixture = served::served();
+  for room in ROOMS {
+    let calls = calls_per_step(&fixture, room, 200_000);
+    assert!(
+      calls.iter().all(|step| *step <= 1),
+      "room {room}: {calls:?}"
+    );
+  }
+  let unbounded = calls_per_step(&fixture, usize::MAX, 200_000);
+  assert_eq!(unbounded, [1, 1, 1, 1]);
 }

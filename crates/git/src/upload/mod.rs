@@ -64,10 +64,12 @@ use crate::{Admission, PastAdmission};
 mod advertise;
 mod answer;
 mod fetch;
+mod fragments;
 mod refs;
 mod v0;
 
 pub use answer::{Answer, Written};
+pub use fragments::{Fragments, Planned, Streamed};
 
 /// Format: the name this server gives itself in `agent`, under every protocol version, its crate's version after it.
 const AGENT: &str = concat!("slates/", env!("CARGO_PKG_VERSION"));
@@ -127,12 +129,10 @@ pub enum PackRefused {
   PastAdmission(PastAdmission),
   /// The pack's trailer met a SHA-1 collision attack.
   Collision(CollisionAttack),
-  /// The source wrote nothing and said more was coming. A step must always move, so this ends the pack.
-  Stalled,
 }
 
-/// Where a fetch's pack comes from: A-639 writes it from the store's fragments and kept compressed objects. A source
-/// may write many packs at once; each keeps its own state in [`PackSource::Pack`].
+/// Where a fetch's pack comes from: A-639 writes it from the store's fragments and kept compressed objects
+/// ([`Fragments`]). A source may write many packs at once; each keeps its own state in [`PackSource::Pack`].
 pub trait PackSource {
   /// One pack being written: what the source keeps between steps. It borrows nothing of the store, which is lent again
   /// for each step.
@@ -146,8 +146,9 @@ pub trait PackSource {
     admission: &mut Admission,
   ) -> Result<Self::Pack, PackRefused>;
 
-  /// Writes `pack`'s next bytes to `out`, at least one while any are left and at most `room`: whether any are left
-  /// after them.
+  /// Writes `pack`'s next bytes to `out`, at most `room` of them, doing at most a turn's work toward them: whether any
+  /// are left after them. A call may work and write nothing yet; the answer then asks again at its next step, so each
+  /// call must bring the pack nearer its end.
   fn write(
     &mut self,
     served: &Served<'_>,

@@ -5,6 +5,7 @@
 mod advertise;
 mod clone;
 mod fetch;
+mod fragments;
 mod ls_refs;
 mod refused;
 mod steps;

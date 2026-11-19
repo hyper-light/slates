@@ -44394,6 +44394,22 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
 - **v0's ref names** (main's ask, after A-615's finding): an advertised ref is `HEAD`, `receive-pack`'s `.have`, or a
   name `refname::is_valid` takes, read and written. It was any word. The word check stays first, so a bad byte is
   still placed exactly.
+- **The pack from A-639's stream** (`upload/fragments.rs`, after A-639 landed). `Fragments` is the service's pack
+  source over `store::Upload`. The plan is copied as A-639's `Answered`: runs, single objects, the filter for the
+  runs, `thin-pack` and `ofs-delta`, each list charged first. A call hands out what the last turn wrote, at most the
+  room it is asked for, and takes one turn of the stream on the owner's clock, exchange and quantum only once all of it
+  is handed out. A turn may write nothing yet, as the stream counts the pack before its header.
+- **One call a step, packets framed full** (`upload/answer.rs`). The answer calls its source at most once a step,
+  asking for what the packet it is filling still has room for, and frames the packet once it is full or the pack has
+  ended; data that leaves it short waits in it for the next step's call. So a step does at most one turn of the
+  stream's work (§4.3's step budget), the packets are the same full ones whatever the caller's room and however the
+  turns divide the work, and a call that wrote nothing only ends its step. The earlier "stalled" refusal is gone: a
+  source's contract is to bring the pack nearer its end each call, which A-639's turns do, each doing at least one unit
+  of a finite stream. A source that refuses mid-pack still has the data it wrote before refusing sent first, the
+  packet being filled framed short, then git's band-3 words, as part 2 holds it and as git sends what `pack-objects`
+  wrote before it failed. The framed buffer now holds a whole packet and after it the longer of the flush and git's
+  71-byte band-3 packet (65,591 bytes, charged with the packet's data); it held the packet alone, so a pack whose last
+  data filled its packet grew the buffer past its charge.
 - **Stateless only.** Over SSH a v0 client speaks in rounds on one stream and the server keeps what each round taught
   it; that is owed. git's client speaks v2 over SSH since 2.26, and v2 is stateless by design.
 - **Tests** (`src/upload/tests/v0.rs`, 8; the v0 repository rebuilt from the pack git sent its clone):
@@ -44408,6 +44424,11 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
   - refusals: a capability not advertised, SHA-256, a have before the flush, bytes after `done`, no flush;
   - every cut and every bit flip of git's `detailed-done` request.
   In A-604's tests, a test of the ref-name rule; its generator now draws valid names.
+  With A-639 (`src/upload/tests/fragments.rs`): git's five v2 fetches answered from A-639's packs, read back through
+  A-608's reader, every packet but the pack's data git's and the objects git's; and turns of one tick in steps of one
+  byte, the answer the same and steps that wrote nothing met; and A-639's stream handing out one byte a call, the
+  answer the same. A source that pauses every other call answers whole (`refused.rs`), and no step calls its source
+  twice (`steps.rs`).
 - **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 424 of 424 (2 of main's ignored),
   `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first, the first run failed 3:
   - A-604's property test, drawing ref names as words;
@@ -44424,14 +44445,28 @@ piece 14; A-604's codecs). Sources, read 2026-11-19 at git v2.50.1: `upload-pack
   - the aggressive rule never applied: A-615's oracle and git's `deepen-v0`;
   - the aggressive rule always applied: A-615's oracle and git's `unshallow`;
   - any ref name taken: both of A-604's tests.
+  The join with A-639 was checked on Windows x86_64 (jupiter), the Studio being offline: `cargo test --locked -p
+  slates-git --lib`, 2026-11-19, 460 passed, 0 failed, 3 ignored (kiln r1447; main's baseline at 018d32ba2 is 447 and
+  3), and `cargo fmt --check` clean with rustfmt 1.98.1's one layout taken. Its first run (r1361, the join as first
+  written) failed 2 of 458, the pausing source and the turns of one tick: each call's bytes went out as a packet of
+  their own, and a step called its source again while it had room. The first fix (r1425) failed 1 of 460, part 2's
+  pack refused midway, whose last 20 bytes waited in the packet being filled and were cleared at the refusal. Red four
+  ways, one guard at a time:
+  - a step calling its source again while it has room: 3 tests failed;
+  - a packet framed after every call, full or not: 2;
+  - a turn's bytes not yet handed out dropped once the stream has ended: 1;
+  - a refused source's data dropped: 1.
+  The macOS run is owed (filed in main's run requests).
 - **Next** (A-640's parts): `sparse:oid` (part 4); a stateful v0 session over SSH; `packfile-uris` and `bundle-uri`
   from the store's URI packs and bundle list; progress on band 2; the walk in cooperative slices.
 
 Part 3 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload/v0.rs`,
 new, with `upload/tests/v0.rs`; `upload/mod.rs`, v0 and v1 dispatched and their refusals; `upload/answer.rs`, the
-pack's framing; `upload/advertise.rs`, `upload/refs.rs` and `upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`,
-`ready`, `shallow_update` and `Request::thin`; `negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`,
-the ref-name rule, with its tests; `tests/store_graph.rs`; `upload/tests/refused.rs` and `upload/tests/steps.rs`).
+pack's framing, one source call a step and packets framed full; `upload/fragments.rs`, new, with
+`upload/tests/fragments.rs`, the pack from A-639's stream; `upload/advertise.rs`, `upload/refs.rs` and
+`upload/fetch.rs`, what v0 shares; `negotiation/mod.rs`, `ready`, `shallow_update` and `Request::thin`;
+`negotiation/objects.rs` and its oracle, the aggressive rule; `v0.rs`, the ref-name rule, with its tests;
+`tests/store_graph.rs`; `upload/tests/refused.rs` and `upload/tests/steps.rs`).
 
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
