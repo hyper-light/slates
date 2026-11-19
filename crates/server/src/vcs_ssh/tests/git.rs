@@ -12,7 +12,7 @@ use slates_git::upload::{PackPlan, PackRefused, PackSource, Served};
 use slates_vcs::ContentStore;
 
 use super::super::site::{
-  Command, GIT_DIE_STATUS, Next, Service, Services, Start, Stepped, ToolServices, Unserved,
+  Command, GIT_DIE_STATUS, Next, Refused, Service, Services, Start, Stepped, ToolServices, Unserved,
 };
 use super::UploadCommand;
 use crate::vcs_http::git::upload::StoreLender;
@@ -31,6 +31,8 @@ const HELD: RepositoryId = RepositoryId { bytes: [0; 16] };
 const LS_REFS: &[u8] = b"0014command=ls-refs\n0000";
 /// Shape: a flush alone, with which a client ends its session.
 const FLUSH: &[u8] = b"0000";
+/// Shape: [`LS_REFS`]'s first packet alone, whole, its flush not yet sent.
+const LS_REFS_FIRST_PACKET: &[u8] = b"0014command=ls-refs\n";
 
 /// An empty SHA-1 repository's store, kept for the test's life.
 struct EmptyRepository {
@@ -201,8 +203,9 @@ fn a_v0_session_is_refused_until_its_protocol_is_served() {
   assert_eq!(next, Next::Exited(GIT_DIE_STATUS));
 }
 
-/// A-651 part 2. Do: after the advertisement, send half a request and end the input. Expect: nothing answered and the
-/// session ended, exit 0, as git's server ends at the end of its input.
+/// A-651 part 2 (`serve.c` `process_request` peeks a request's first packet under `PACKET_READ_GENTLE_ON_EOF`). Do:
+/// after the advertisement, send half of a request's first packet and end the input. Expect: nothing answered and the
+/// session ended, exit 0, as git's server ends when its input ends before a request's first packet is whole.
 #[test]
 fn the_end_of_input_before_a_whole_request_ends_the_session() {
   let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V2, ROOM);
@@ -216,6 +219,31 @@ fn the_end_of_input_before_a_whole_request_ends_the_session() {
     (
       (Vec::new(), 0, Next::Input),
       (Vec::new(), 0, Next::Exited(0))
+    )
+  );
+}
+
+/// A-651 part 2 (git's reader is gentle on the end of its input only before a request's first packet is whole:
+/// `serve.c` `process_request` clears `PACKET_READ_GENTLE_ON_EOF` once it has peeked that packet, and `pkt-line.c`
+/// `get_packet_data` dies at a later short read, at `e1ec09b2`). Do: after the advertisement, send a request's first
+/// packet whole, `command=ls-refs`, and end the input before its flush. Expect: nothing answered or consumed, and the
+/// session refused in git's words, "the remote end hung up unexpectedly", with git's `die` status.
+#[test]
+fn the_end_of_input_inside_a_request_dies_as_gits_reader_does() {
+  let mut command = UploadCommand::new(Lends::empty(), HELD, Version::V2, ROOM);
+  let _ = run(&mut command);
+  command.input(LS_REFS_FIRST_PACKET).expect("taken");
+  let waiting = run(&mut command);
+  command.input_end();
+  let ended = ready(command.step());
+  assert_eq!(
+    (waiting, ended),
+    (
+      (Vec::new(), 0, Next::Input),
+      Err(Refused {
+        stderr: b"fatal: the remote end hung up unexpectedly\n".to_vec(),
+        exit_status: GIT_DIE_STATUS,
+      })
     )
   );
 }
