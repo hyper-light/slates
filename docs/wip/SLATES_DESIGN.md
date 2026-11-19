@@ -13690,8 +13690,9 @@ and export by landing).
 > their directory's close). Held to the golden dumps: `full.dump` and `part1.dump` exported again byte for byte,
 > `deltas.dump` and `part1.dump` then `part2.dump` importing to `full.dump`'s history, every revision's changed paths
 > `svnlook changed`'s account of the repository `svnadmin` dumped, and import(export(R)) equal to R for those and for
-> generated histories held to a model tree. Owed: the export in format 3 (Subversion's deltifier, its second part), and
-> the wiring (a `CreateRepository` repository's records held by its shard, the two verbs on the control channel).
+> generated histories held to a model tree. The export in format 3 built by A-652 (Subversion's deltifier ported as
+> `svndiff::deltas`, the crate's one delta generator; `deltas.dump` and `part2.dump` written again byte for byte).
+> Owed: the wiring (a `CreateRepository` repository's records held by its shard, the two verbs on the control channel).
 >
 > **Status (2026-11-19, A-613, its first part).** Built: the ra_svn read commands' handler (`slates-svn`'s `reads`,
 > piece 7's second part): a sans-io answer to one parsed command of a session after its handshake, the session taken
@@ -14323,7 +14324,7 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built for format 2, A-628; format 3's export and the wiring owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the wiring owed).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -45431,3 +45432,40 @@ Applied in the same change to (its first part, the index):
   run. The unit test replaces `/trunk/README` by a copy of itself, then `/trunk`: each its line kept, a fresh copy
   identity, its own copy root, the replaced node-revision its predecessor, its count one more, created in its revision,
   related to what it replaced, the nodes beneath the directory the same node-revisions again.
+
+Applied in the same change to (its second part, the deltifier and format 3):
+- `crates/svn` (`svndiff.rs` and `svndiff/deltify.rs` new, with `svndiff/deltify/tests.rs`: `deltas`, the crate's one
+  delta generator; `migration/export.rs`: format 3; `migration.rs`: `DeltasOwed` goes; `dump/tests/golden.rs`: every
+  recorded delta remade; `migration/tests`: format 3's golden exports and round trips), §4.17.4's A-628 status and piece
+  6, GAPS (the §4.17.4 entry) and research §15.
+- **The deltifier.** `svndiff::deltas(source: &[u8], target: &[u8], window_room: NonZeroUsize) -> Result<Deltas<'_>,
+  SvndiffError>`, an iterator of `Window`s made one at a time, refused `WindowTooLarge` for a room past `WINDOW_LIMIT`;
+  a stock server's windows are those of the room `WINDOW_LIMIT` (`SVN_DELTA_WINDOW_SIZE`). The windows are
+  `text_delta.c`'s: the target in pieces of the room, the source in pieces of the room beside them until it runs out,
+  then an empty view where it ended (`txdelta_next_window`; the push form FSFS stores deltas with, `tpush_write_handler`,
+  makes the same windows, and FSFS answers a delta between two texts with its stored delta only when it was stored
+  against that very base, `cached_data.c` `svn_fs_fs__get_file_delta_stream` 2476, so a stock dump's or drive's delta is
+  a function of the two texts). Each window's instructions are `xdelta.c`'s `compute_delta`: a common start past four
+  bytes copied; the source's whole 64-byte blocks in an open-addressing table by a pseudo-Adler-32 sum, a flags table
+  screening sums first; the target walked with the rolling sum, a found block extended forward and back (not before the
+  last instruction's end), the bytes between kept as new data, a match that meets the last instruction taking back what
+  it reaches over (`svn_txdelta__remove_copy`: new data cut, a copy taken back only whole); a common end past four bytes
+  copied; instructions merged as `svn_txdelta__insert_op` merges them. A window with an empty view is its target as new
+  data. The sums wrap in 32 bits as C's do. It is the generator A-616's drive takes its changed texts' deltas from.
+- **Format 3.** `Exporter::new` takes `Format::Three`: a change's or a copy's property section is `Prop-delta: true`,
+  what is set or changed in name order and then what is deleted in name order (`hash.c` `svn_hash_write_incremental`
+  266-315), an addition's without history whole; every text is the deltifier's windows against the record's comparison
+  (the empty text for an addition without history), written in svndiff version 0 (`dump.c` `store_delta`), with the
+  comparison's checksums as `Text-delta-base-md5`/`-sha1` where it has a text.
+- **Tests** (Mac Studio, 2026-11-19, kiln, debug, `cargo test -p slates-svn --lib --locked`). Red first (a402eae77, its
+  own target directory), the deltifier's choice stubbed to new data alone, a valid delta and not `svnadmin`'s: 4 failed
+  of 413, the golden test of every recorded window, the golden format-3 export, and two hand-worked vectors; the
+  properties passed, as a valid delta should. Green (401f62382, then 909016345 after the golden test's threshold took
+  `part2.dump`'s six deltas): 413 of 413, rustfmt clean. Golden: every delta `svnadmin dump --deltas` wrote in
+  `deltas.dump` and `part2.dump` remade window for window from its base and its text (two-window ones, copies changed,
+  additions against the empty text); the histories imported from format 2, format 3 and two parts exported in format 3
+  as `deltas.dump` byte for byte, and from revision 4 as `part2.dump`; import(export(R)) = R through format 3. Unit: the
+  views in step with the target until the source runs out, an empty source's new data, common starts and ends copied
+  only past four bytes, a moved stretch copied from its place. Generated: deltas of edited and unrelated texts in rooms
+  from one byte remake their targets, keep to their room and survive version 0's encoding; the migration's generated
+  histories round-trip through format 3 to the same history and bytes.
