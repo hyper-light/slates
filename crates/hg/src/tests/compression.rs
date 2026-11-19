@@ -515,7 +515,8 @@ proptest! {
 
   /// A-598 (round trip): do compress arbitrary changegroup bytes as a bundle1, and arbitrary bytes after an advisory
   /// stream parameter as a bundle2, with every engine each kind takes at 7.2's default level, then make each plain.
-  /// Expect exactly the plain bundle back, its advisory parameter kept and `Compression` dropped.
+  /// Expect the compressed bundle other than the plain one (its header names an engine), and exactly the plain bundle
+  /// back, its advisory parameter kept and `Compression` dropped.
   #[test]
   fn arbitrary_bundles_round_trip_through_every_engine(
     body in proptest::collection::vec(any::<u8>(), 0..2048),
@@ -532,6 +533,7 @@ proptest! {
     ] {
       let mut out = Vec::new();
       compress_bundle(bundle, engine, level, &mut out).unwrap();
+      prop_assert_ne!(&out, bundle);
       let made = plain(&out, &mut room()).unwrap();
       prop_assert_eq!(made.as_ref(), bundle.as_slice());
     }
@@ -539,7 +541,8 @@ proptest! {
 
   /// AC-HG.9 (hostile input), A-598: do make plain arbitrary bytes after each engine's header (zlib's, bzip2's at
   /// level 9, a zstd frame's with 7.2's 2 MiB window), in a bundle1 and a bundle2. Expect a typed refusal or a plain
-  /// bundle, never a panic, within a bounded admission.
+  /// bundle inflated from them, never the compressed bytes handed back as plain, never a panic, within a bounded
+  /// admission.
   #[test]
   fn arbitrary_bytes_after_a_compressed_header_never_panic(
     bytes in proptest::collection::vec(any::<u8>(), 0..512),
@@ -556,7 +559,7 @@ proptest! {
     ];
     for input in inputs {
       match plain(&input, &mut Admission::new(BOUND)) {
-        Ok(made) => prop_assert!(!made.is_empty()),
+        Ok(made) => prop_assert!(matches!(made, Cow::Owned(_))),
         Err(refusal) => {
           let foreign = matches!(refusal, Refusal::ForeignMagic { .. });
           prop_assert!(!foreign);
