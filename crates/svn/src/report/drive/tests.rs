@@ -10,7 +10,7 @@
 //! revision a path was deleted in, copy sources, pausing at any step, and generated hostile
 //! reports, whose drives must end and stay in the editor's order.
 
-use super::green::{CHANGED, FixtureGuards, Green, md5, repository};
+use super::green::{CHANGED, FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5};
 use super::*;
 use crate::handshake::ClientCapabilities;
 use crate::ra_svn::Value;
@@ -19,18 +19,14 @@ use crate::report::editor::EditorWriter;
 use crate::report::recorded::{
   SESSIONS, Written, YOUNGEST, command, drive_items, finished_report, items, read_drive,
 };
-use crate::svndiff::apply_all;
 use proptest::prelude::*;
 
 /// The steps a test gives each call: past any one call's walk in the fixtures.
 const STEPS: usize = 1 << 20;
 
-/// The drives the replay test must compare: the 22 stock sessions' and five hand-made ones' (the
+/// The drives the replay test must compare: the 22 stock sessions' and seven hand-made ones' (the
 /// early answer's is the handler's).
-const COMPARED_DRIVES: usize = 27;
-
-/// The prefix that begins every entry property's name.
-const ENTRY_PREFIX: &str = "svn:entry:";
+const COMPARED_DRIVES: usize = 29;
 
 /// The most nodes a writer checking a generated drive holds open: past any path a report names.
 const MOST_OPEN: usize = 64;
@@ -86,93 +82,6 @@ fn owned(call: Call<'_>) -> Written {
     Call::AbortEdit => Written::AbortEdit,
     delta => panic!("{delta:?} belongs to a delta"),
   }
-}
-
-/// A drive's calls in a form two drives of one edit share.
-#[derive(Debug, PartialEq, Eq)]
-enum Normal {
-  /// A call as it was.
-  Call(Written),
-  /// A run of property changes on one node: the entry properties in their order, then the rest
-  /// by name.
-  Properties(Vec<(String, Option<Vec<u8>>)>),
-  /// A run of deletions, by path.
-  Deletions(Vec<(String, Option<u64>)>),
-  /// A delta: the base's MD5, and the MD5 and length of what it makes of the base.
-  Delta(Option<[u8; 16]>, [u8; 16], usize),
-}
-
-/// The calls in their shared form, every delta applied to the text whose MD5 it names.
-fn normalize(calls: Vec<Written>, texts: &BTreeMap<[u8; 16], Vec<u8>>) -> Vec<Normal> {
-  let mut normal = Vec::new();
-  for call in calls {
-    match call {
-      Written::ChangeProperty(name, value) => match normal.last_mut() {
-        Some(Normal::Properties(run)) => run.push((name, value)),
-        _ => normal.push(Normal::Properties(vec![(name, value)])),
-      },
-      Written::Delete(path, revision) => match normal.last_mut() {
-        Some(Normal::Deletions(run)) => run.push((path, revision)),
-        _ => normal.push(Normal::Deletions(vec![(path, revision)])),
-      },
-      Written::Delta(base, _, windows) => normal.push(applied(base, &windows, texts)),
-      call => normal.push(Normal::Call(call)),
-    }
-  }
-  for run in &mut normal {
-    match run {
-      Normal::Properties(properties) => sort_own_properties(properties),
-      Normal::Deletions(deletions) => deletions.sort(),
-      _ => {}
-    }
-  }
-  normal
-}
-
-/// A run of property changes with its entry properties kept in order and the rest sorted by name.
-fn sort_own_properties(properties: &mut [(String, Option<Vec<u8>>)]) {
-  let entry = properties
-    .iter()
-    .take_while(|(name, _)| name.starts_with(ENTRY_PREFIX))
-    .count();
-  properties[entry..].sort();
-}
-
-/// A delta applied to the text whose MD5 it names, none naming no bytes.
-fn applied(
-  base: Option<[u8; 16]>,
-  windows: &[Window],
-  texts: &BTreeMap<[u8; 16], Vec<u8>>,
-) -> Normal {
-  let source = base.map_or_else(Vec::new, |md5| texts[&md5].clone());
-  let made = apply_all(&source, windows).unwrap();
-  Normal::Delta(base, md5(&made), made.len())
-}
-
-/// The fixtures' texts by MD5, the empty one among them.
-fn texts_by_md5(green: &Green) -> BTreeMap<[u8; 16], Vec<u8>> {
-  let mut texts: BTreeMap<[u8; 16], Vec<u8>> = green
-    .texts
-    .values()
-    .map(|text| (md5(text), text.clone()))
-    .collect();
-  texts.insert(md5(b""), Vec::new());
-  texts
-}
-
-/// The guards a recorded session's drive ran under: the anonymous principal's, and in the session
-/// that holds `a.txt`'s lock, the lock its report names.
-fn guards_of(name: &str, report: &Report) -> FixtureGuards {
-  let mut guards = FixtureGuards::anonymous();
-  if name == "update-with-lock.1" {
-    let held = report
-      .paths
-      .iter()
-      .find_map(|info| info.lock_token.clone())
-      .unwrap();
-    guards.locks.insert(String::from("/trunk/a.txt"), held);
-  }
-  guards
 }
 
 /// The refusal `svnserve` wrote after a drive's `abort-edit`: its number and message.

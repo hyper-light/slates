@@ -298,6 +298,7 @@ fn assert_holds(green: &Green, bytes: &[u8], head: ObjectId) {
 fn refused(reason: &[u8], name: &[u8], detail: &[u8]) -> Outcome {
   Outcome::Ng(Declined {
     reason: reason.to_vec(),
+    hook: Vec::new(),
     message: Some(message(&[name, b": ", detail].concat())),
   })
 }
@@ -462,6 +463,7 @@ fn a_branch_moved_before_its_append_is_refused_and_nothing_is_appended() {
   let first = refused(ATOMIC_TRANSACTION_FAILED, MAIN, detail);
   let other = Outcome::Ng(Declined {
     reason: ATOMIC_TRANSACTION_FAILED.to_vec(),
+    hook: Vec::new(),
     message: None,
   });
   assert_eq!(received.outcomes, [first, other]);

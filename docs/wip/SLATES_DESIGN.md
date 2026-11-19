@@ -11368,7 +11368,8 @@ it). Fast path: if `last_changed[path] <= base` for every path in the increment,
 node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
 Subversion client's commit needs. A `Copy` (A-586) is always judged so, as an addition: its destination's tree must be
-absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies. One that
+absent at the head and unchanged after the base, and its source's tree must have held something at the version it
+copies, a source changed since being copied as it stood then (A-626 part 2). One that
 replaces (A-626, `REPLACE`) is judged as its destination tree's removal with that addition: the tree unchanged after the
 base and holding no hard link nor any link's target. A copy into another copy's tree in the same increment is judged
 against what that copy brings there.
@@ -11604,6 +11605,11 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > "Copies" bullet below); with them, three defects of A-586's branch made before a copy, which A-626's oracle found.
 > Owed (the A-626 entry): a copy from a version its source changed after, a checkpoint of a green holding a copy, and a
 > rebase that restates one.
+>
+> **Status (2026-11-19, A-626 part 2).** Built in the engine: a copy from a version its source changed after, brought as
+> the tree stood then (the head's graft fixed by what the change index names since, the fix recorded whole in the chain
+> entry, its room derived before the verdict and added to the entry's bound by the service). Owed: a checkpoint of a
+> green holding a copy, and a rebase that restates one (the A-626 part 2 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -11622,8 +11628,10 @@ which of its pending paths green has moved under (awareness, never load-bearing)
   origin therefore records no history for the origin's keys (until 2026-11-19 each had a version-0 entry, which held
   every origin file's bytes a second time), and a green made at another's version starts with none.
 - **Copies (A-586).** `Copy` copies a path's tree at a version (Subversion's copy-from revision) to an absent
-  destination, by reference in every map, when the source's tree did not change after that version, so the head's tree
-  is the version's. It is recorded once, never key by key: an appearance record at the destination (the version, the
+  destination, by reference in every map: the head's tree, which is the version's when the source did not change after
+  it, and otherwise is fixed to the version's (A-626 part 2: each key the change index names since set to its value
+  then, a copy made since inside the source cut, nothing grafted when one made since replaced it; the fix recorded whole
+  in the chain entry, its room derived before the verdict). It is recorded once, never key by key: an appearance record at the destination (the version, the
   source, the source's version), one entry of the change index and one `last_changed` entry for the destination, which
   stands for its tree. A key reads by the latest copy above it while it holds what that copy gave it (its own last
   change, if any, is older): its current value from the copy's version on, its own history before. Its first change
@@ -12606,6 +12614,49 @@ engine: the verdict, rebase, position mapping, the register).
 > two pushes moving one link apart from one base conflict `CreateCreate`. A path changing to or from a link is a typed
 > kind change (GAPS §8f). A link's form in a volume and in a checkout is owed (git checks a submodule out as an empty
 > directory).
+>
+> **Status (2026-11-19, A-640 part 2: upload-pack's v2 service behind one entry point).** `crates/git` (`upload`)
+> answers each exchange a transport hands it through `upload::serve`: the advertisement this section's "The wire"
+> names; a request held to it as `serve.c` holds one; `ls-refs` from the served refs, read at one position, each prefix
+> a run of the sorted refs; `fetch` mapped onto A-615's negotiation over part 1's graph, its sections in the document's
+> order and its pack framed on band 1 from a pack source (A-639 writes it); and `object-info` over A-624's answer.
+> Refusals are answered in git's words. The answer is written a slice at a time within the caller's room, the
+> repository lent afresh each step. Proven against stock git 2.50.1's own answers, and against a stock clone's own
+> requests served from the repository it cloned, rebuilt in the store. Protocol v0 and v1 are A-640's next part.
+>
+> **Status (2026-11-19, A-644 part 1: a protected branch's answers from the store, in git's words).** `crates/git`
+> (`store::protect`) answers what a protected branch asks of a move, judged against the ref's own green and nothing else
+> (A-642). How the move changes the ref (`Repository::change`: create, fast-forward, rewrite, delete): the fast-forward
+> is the store's own question, decided with no walk where generation numbers decide it (a new head of no greater
+> generation than the current one descends from it only by being it), and otherwise by the walk back that stops below
+> the current head's generation; the store counts both. Which commits the move brings: D(k)'s, a create's whole history,
+> walked newest generation first, each once. The first merge commit among them (`merge_commit`), and the first no
+> trusted key signed (`unsigned_commit`): its signature split from what it covers as git's verifier splits them
+> (commit.c's `parse_buffer_signed_by_header`, now A-590's parser's rule), its format told by the armour's first line,
+> an SSH signature handed to the caller's verifier (`CommitSigners`), OpenPGP and X.509 refused, typed, until a later
+> piece verifies them. `receive::protected` answers in git's words: `non-fast-forward` and `deletion prohibited` with
+> git's own band-2 lines, and `hook declined` after the words a hook would write, relayed as git relays a hook's (in
+> 128-byte pieces), then git's `hook declined to update`. Proven against twelve pushes stock git 2.50.1 made to a stock
+> server protecting `main`, byte for byte; an oracle over generated histories; and the signatures and payloads git's
+> verifier read, which `ssh-keygen -Y verify` checked. Owed (part 2): the policy that asks these questions (A-622's
+> rules and a trust list of commit signers), `admit`'s typed refusals, and A-321's verifier under git's namespace.
+>
+> **Status (2026-11-19, A-639: piece 7's packs from fragments built, upload-pack's pack streamed).** `crates/git`
+> (`store::upload`) streams the pack that answers A-615's answer, taken through a trait (`Answered`): its runs and its
+> objects one by one, the client's `thin-pack` and `ofs-delta`, and its filter. The runs are sent from their versions'
+> fragments, their objects passed through the filter and the want sent whatever it is. The objects still wanted that
+> whole kept parts hold are sent from those parts: base packs' parts first, largest first, then each version's
+> fragments after its green's base. So a clone is the base pack and the fragments after it, a version a rewrite left
+> behind is not taken, and a filter that sends no blobs takes the parts without blobs whole. The rest is encoded by
+> the fragments' encoder, now one object at a time, with the learned window, depth and level. A part is copied byte for
+> byte when the client reads it as kept; otherwise entry by entry: an offset delta's distance measured again, or its
+> base named by id for a client without `ofs-delta`, and a delta whose base the client cannot read sent whole. So a
+> client that asked no thin pack is sent no base it lacks, and the pack holds exactly the answer's objects. A turn does
+> units of work, each at most a window, until the owner's quantum is spent, and holds no borrow between turns. A base
+> pack is now two parts, as a version's fragments are, and a push's new positions run by type, so each part's set is a
+> run. Proven against an oracle over generated histories that reads every answered pack back through A-608's reader, a
+> thin one with the client's objects, as exactly the wanted closure less the client's. Owed: a part only partly wanted
+> read entry by entry; a delta search for an object past a window; the fragments' encoding sliced.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12757,12 +12808,15 @@ create or update a reference named "refs/for/master", but may create or update a
      "acknowledgments section"]. The walk runs in slices; its memory is admitted from the shard's budget with a typed
      refusal.
 3. The pack: a header with the object count, then the fragments for D(M+1) to D(N) in order, then any objects the walk
-   found, encoded from their kept compressed forms, then the trailer hash, computed as the bytes stream out. A
-   fragment's offset deltas stay valid when fragments are joined, and its id deltas name bases either earlier in the
-   same pack or, in a thin pack, held by the client. A client that did not ask for `thin-pack` ("A client MUST NOT
-   request the 'thin-pack' capability if it cannot turn a thin pack into a self-contained pack" [B:
-   gitprotocol-capabilities]) is sent the base whole, ahead of the delta that names it.
-   - A clone is the base pack and then the fragments after version C.
+   found: those whole kept parts hold copied from the parts, the rest encoded with the fragments' learned rules; then
+   the trailer hash, computed as the bytes stream out (A-639). A fragment's offset deltas stay valid when fragments are
+   joined, and its id deltas name bases either in the same pack or, in a thin pack, held by the client. A client that
+   did not ask for `thin-pack` ("A client MUST NOT request the 'thin-pack' capability if it cannot turn a thin pack into
+   a self-contained pack" [B: gitprotocol-capabilities]) is sent the object whole in place of a delta whose base it
+   lacks, so the pack holds no object the client has (A-639). A client that did not ask for `ofs-delta` is sent each
+   offset delta with its base named by id.
+   - A clone is the base pack and then the fragments after version C: the walk's objects covered by the kept parts that
+     hold them whole (A-639).
    - Shallow requests (`deepen`, `deepen-since`, `deepen-not`, `deepen-relative`) walk commit rows by depth or commit
      date and answer the `shallow-info` section; the boundary commits' trees go whole, encoded from their kept forms.
    - Filters [B: rev-list-options `--filter`]: `blob:none` and `object:type` choose fragment classes; `blob:limit`,
@@ -12892,8 +12946,10 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 6. receive-pack: commands, pack, connectivity, a work per ref with the head operation, report-status and
    report-status-v2, atomic; a create's green made from its commit's tree, its maps (A-534) built from a commit that is no
    version's head.
-7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise; packs from
-   fragments; shallow; filters; `include-tag`; `object-info`.
+7. upload-pack v2: `ls-refs`; `fetch` with one-round negotiation on a version head and the walk otherwise (built,
+   A-615); packs from fragments (built, A-639: runs from their fragments, the walk's objects covered by whole kept parts
+   and the rest encoded, `thin-pack` and `ofs-delta` as the client says, streamed in turns); shallow; filters;
+   `include-tag`; `object-info`.
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
 10. Hooks over a read-only bare-repository view; push options; push to review with report-status-v2.
@@ -13108,6 +13164,24 @@ signature verification).
 > string answer byte for byte as 7.2 framed it, `getbundle` by meaning, `hello` a subset of 7.2's capabilities), hostile
 > requests, and arbitrary input. Owed of piece 4: the process around the session (stdin and stdout through the runtime),
 > HTTP version 1 over `slates-http` and the shared edge, held deltas, the index's kept heads.
+>
+> **Status (2026-11-19, A-641 part 2: a push's changegroup verified, and a line's move a work).** `push::verify`
+> checks a push's changegroup against what the repository holds, through a `Held` trait (each log's texts by node),
+> as 7.2's `revlog.addgroup` and `server.validate` do: each group taken in order, a node its log holds passed over (so
+> a push repeated after a lost answer brings nothing new), every other revision's parents and delta base found in its
+> log or earlier in its group, its text rebuilt by the applier and hashed to its node (sha1dc), a manifest's or file
+> revision's link a changeset of the push or the repository, every new changeset's manifest and every file node a
+> new manifest names beside its first parent's present; a flag, a tree manifest and a path 7.2's `pathauditor`
+> refuses are refused, the audit transcribed with its four faults (a trailing separator; a drive, `..`, an absolute
+> path, `.hg` at the top or a Windows short name of it; `.hg` further down, a nested repository; and what a slates
+> path cannot hold). `push::tree` lays a flat manifest out as directories, each named by BLAKE3 over what it holds,
+> and is A-618's `PushObjects` over them, a file's blob its revision's bytes without the metadata block, `x` an
+> executable and `l` a link; `tree::work` makes a line's or bookmark's move from a version to a changeset A-618's
+> work, its head the changeset's node. Proven against stock 7.2's bundles of one repository in versions 01 to 03
+> (each branch head landed on an empty green holding exactly what `hg cat` recorded at it; `default` moved version by
+> version through a merge and a new directory; the same bundle again bringing nothing; version 01's deltas resolved
+> against what the repository held), and against hand-made changegroups breaking each rule. Owed: which lines and
+> bookmarks a push moves (decisions 1 and 2), and the landing (part 3).
 >
 > **Status (2026-11-19, A-649 parts 1 and 2: the index's keys tagged by kind; a store's state imported with its
 > history).** Every key of the index begins with its kind's tag (`L`, `N`, `O` for a push's object rows written by
@@ -13531,8 +13605,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3); owed: the process around it, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
-   the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
-   works, the landing on each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
+   the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
+   (A-641 part 2, `push::verify`, `push::tree`): the changegroup verified against the repository, and a move's work
+   through A-618's builder over laid-out flat manifests; owed: which lines and bookmarks a push moves, the landing on
+   each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -13651,6 +13727,10 @@ and export by landing).
 > a stock client's commit holding either is no longer refused. Owed (the A-626 entry): a copy from a version its source
 > changed after, a checkpoint of a green holding a copy, and a rebase restating one.
 >
+> **Status (2026-11-19, A-626 part 2).** Built: a copy from a version its source changed after (`svn cp ^/trunk@N` with
+> the trunk changed since, as FSFS takes it), brought as the tree stood then, recorded whole in its chain entry with the
+> room it needs derived before the verdict. Owed: a checkpoint of a green holding a copy, and a rebase restating one.
+>
 > **Status (2026-11-19, A-593).** Built: the dump format's codec (`slates-svn`'s `dump`, piece 6's first part): formats 2
 > and 3, a stream read as its bytes arrive within the caller's admission and written byte for byte as `svnadmin dump`
 > writes it; texts passed in pieces with their MD5 and SHA-1 checked through aws-lc-rs, deltas window by window through
@@ -13694,9 +13774,11 @@ and export by landing).
 > loop a turn a step (the closest copy or the node's origin, each segment cropped to the range, the gap to the copy's
 > source), `serve.c`'s range refusals after `done`. Its fifth slice (2026-11-19, g297): `get-deleted-rev`,
 > `svn_repos_deleted_rev`'s checks and binary search over node relation and closest copy, a path not deleted answered
-> with the refusal a newer client reads as none. Owed: `log` with merged revisions, `get-file-revs`; the fold of a
-> name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
-> authorization rules (A-606).
+> with the refusal a newer client reads as none. Its sixth slice, in part (2026-11-19, g297): `log` without merged
+> revisions, `svn_repos_get_logs5` and `do_logs` over FSFS's node history on the index, a stream a revision a step,
+> merged revisions refused until built; and the crate's one walk of copy roots (A-616's) asked by every read command.
+> Owed: `log`'s merged revisions, `get-file-revs`; the fold of a name beyond ASCII (utf8proc's case folding and mark
+> stripping); read access by the authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -13788,6 +13870,19 @@ and export by landing).
 > asks for; the facts' revision as `dav_svn__get_safe_cr` gives it (A-616's facts carry `svn_fs_node_created_rev`'s,
 > which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
 > Apache with `mod_dav_svn`.
+>
+> **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
+> connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
+> `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
+> before every call (`abort-edit`, then 210004 "Successful edit status returned too soon" or the client's errors);
+> `close-edit`'s answer read (`( success ( ) )`, or `abort-edit` and the client's errors written back as
+> `svn_ra_svn__handle_failure_status` reads them); a drive's refusal answered with its error and the client's after
+> it. Held to every recorded report command replayed whole against `svnserve`'s bytes (34 sessions), an early answer
+> before each of a checkout's calls, fourteen answers to `close-edit`, any budget and any cut; red six ways. Copy
+> sources are held to two more recorded sessions that ask `svnserve` for them (an update across a move, a checkout
+> from nothing): the copy named as `svnserve` names it, `/trunk/new.txt` at r3, and no text sent for a copy of the
+> same text. Owed: the server's connection task that runs it (piece 7's), and the deltas of changed texts (A-652's
+> generator).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -14278,8 +14373,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
    A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation built,
    A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; the replace with history
-   and copies nested in one increment built, A-626 part 1; owed: the checkpoint, the rebase, and a copy from a changed
-   source's older version).
+   and copies nested in one increment built, A-626 part 1; a copy from a changed source's older version built, A-626
+   part 2; owed: the checkpoint and the rebase).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -42761,15 +42856,45 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   160006), the two revisions taken older first, each refused past the youngest when opened. A path absent in the older
   revision, or present in both as one line no copy younger than the older made, was not deleted; otherwise
   `svn_repos_deleted_rev`'s binary search, which compares the node with the older revision's as it began and the
-  closest copy (`svn_fs_closest_copy`, now its own function beside `svn_repos__prev_location`) with the start as it
-  moves, as the C code does. Not deleted is `SVN_ERR_ENTRY_MISSING_REVISION` (150003) in `serve.c`'s words, the two
-  revisions as given. The search halves its range each turn, so it is bounded at 65 turns, past which a contradictory
-  index is refused as corrupt. Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 332 of 332; the
+  closest copy (`svn_fs_closest_copy`) with the start as it moves, as the C code does. Not deleted is
+  `SVN_ERR_ENTRY_MISSING_REVISION` (150003) in `serve.c`'s words, the two revisions as given. The search halves its
+  range each turn, so it is bounded at 65 turns. (Since the sixth slice the search and the closest copy are the
+  crate's one walk of copy roots, A-616's `report::drive::history`, which answers none past the bound.) Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 332 of 332; the
   session (15 commands: a deletion found from two pegs and from a reversed range, a replacement found, a path re-added
   as a new line, a copy older than the start, the root, an absent path, revisions past the youngest and negative)
   replayed whole; the parameters. Red-checked five ways (no swap, copies ignored at the end or in the search, the
   message's revisions swapped, the revision before the found one): each failed the session's replay.
-- **Owed** (the next slices): `log` with merged revisions and `get-file-revs`, each replayed against the transcripts
+- **Part 2, its sixth slice, in part** (2026-11-19, g297): `log` without merged revisions (`reads/log.rs`) over
+  FSFS's node history on the index (`reads/history.rs`: `svn_fs_node_history2`, `svn_fs_history_prev2` as `tree.c`'s
+  `history_prev` steps them, the root's special case, at most two steps a reported location). The parameters as
+  `vparse_tuple` reads `l(?r)(?r)bb?n?Bwl` (five items a client before 1.5's, six with a limit, nine or more whole;
+  seven or eight malformed), a limit past `INT_MAX` none; after the authentication request the range settled and
+  checked ("No such revision N" after `done`); no paths or the root alone, every revision of the range
+  (`svn_repos_get_logs5`'s shortcut); otherwise `do_logs`: each path's history from the range's youngest revision (an
+  absent path refused), a revision sent when any history holds it, newest first or gathered and sent oldest first,
+  until the limit; the first 32 histories kept open and the rest opened again at each step as `get_history` does
+  (`MAX_OPEN_HISTORIES`). Entries as `fill_log_entry` and `revision_receiver` make them: changed paths when asked, never
+  revision 0's, in the revision's stored (byte) order, `( path action ( copy ) ( kind text-mod prop-mod ) )`; revision
+  properties every one, or those named, or every one when the names match the revision's own one for one (a name asked
+  twice brings another, a test); `svn:author`, `svn:date` and `svn:log` in their places and the rest counted and listed.
+  The log is a `Stream`, a stack of frames, one revision a step. Until merged revisions are built a log asking for them
+  is refused after `done` with `SVN_ERR_UNSUPPORTED_FEATURE` (200007), never answered without them. Also in this
+  slice: reads asks the crate's one walk of copy roots (A-616's `report::drive::history`, main's decision): its
+  `closest_copy` behind a wrapper that refuses an absent path as `open_path` does, its `youngest_copy_root` (opened to
+  the crate) for the node history, and its `deleted_revision` for `get-deleted-rev`; reads' own walk removed. And the
+  hostile property test's bound: g264 found on main (a5dffc913, seed `cc 8c15aaa6...`, now in
+  `reads/tests.proptest-regressions`, the suite seeded) a `list` whose depth is the word `true`, which svnserve answers
+  in three items (the request, `done`, "Invalid depth '-2'"; recorded), where the test asked four of every stream; the
+  handler was right, the test's check is now a named function holding a stream to a request first and a response last,
+  and the input is pinned by a named test, red under the old bound. The test fixture records no property change for a
+  node added with an empty property block, as FSFS records none (recorded: `/trunk A ( dir false false )`). Tests (the
+  Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19, merged with main): 370 of 370, rustfmt clean; the `log`
+  session (16 commands), its three hostile ones and `svn log -v` replayed whole. Red-checked ten ways: the old bound,
+  changed paths reversed, `strict-node` ignored, no shortcut for no paths, the limit ignored, gathered revisions sent
+  newest first, the names' shortcut dropped, a reopened history stepping once: each failed named tests; the standard
+  trio's shortcut and the root's special case answer the same bytes without them, so the first was removed and the
+  second kept for its cost.
+- **Owed** (the next slices): `log`'s merged revisions and `get-file-revs`, each replayed against the transcripts
   already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
@@ -43961,6 +44086,110 @@ Part 1 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 en
 new; `store/repository.rs`, the child module's line; `store/mod.rs`, its re-export; `tests/store_graph.rs` and
 `tests/served.rs`, new; `lib.rs`, the test module's line).
 
+**Part 2: upload-pack's v2 service behind one entry point** (`crates/git/src/upload`; §4.17.2 "The wire", "A fetch"
+items 1 to 4, "Pieces (git)" piece 7). Sources, read 2026-11-19 at git v2.50.1: `serve.c`
+(`protocol_v2_advertise_capabilities`, `process_request`, `parse_command`, `receive_client_capability`), `ls-refs.c`
+(`ls_refs`, `send_ref`, `send_possibly_unborn_head`), `upload-pack.c` (`upload_pack_advertise`, `upload_pack_v2`,
+`process_args`, `parse_want`, `parse_want_ref`, `process_shallow`, `process_deepen_not`, `send_acks`,
+`process_haves_and_send_acks`, `send_shallow_info`, `send_wanted_ref_info`, `create_pack_file`), `refs.c`
+(`expand_ref`, `ref_rev_parse_rules`) and `pkt-line.c` (`packet_writer_error`) [C]; `gitprotocol-v2` [B].
+
+- **One entry point**, for the HTTPS edge (A-625 part 2) and the SSH server's `git-upload-pack` command (A-633):
+
+  ```rust
+  pub fn serve<P: PackSource>(
+    served: &Served<'_>,
+    version: http::Version,
+    asked: Asked<'_>,
+    packs: &mut P,
+    admission: &mut Admission,
+  ) -> Answer<P::Pack>
+  ```
+
+  `Served` lends the repository, its content, the refs a client may see (in name order, each naming its green) and
+  `HEAD`'s branch. `Asked` is the advertisement, or one request held whole: an HTTP `POST`'s body, or what
+  `v2::request::whole_len` measured of an SSH session's input. The `Answer` borrows nothing.
+  `Answer::write(&served, &mut packs, &mut out, room)` writes at most `room` bytes and lends the repository afresh
+  each step, so a shard never holds its state across a wait; it answers `Written::End` once the answer is whole.
+  `refusal()`, `counters()` (one round or walked) and `ends_session()` (a flush alone, an SSH session's last request)
+  say what happened.
+- **Everything but the pack at one position.** `serve` decides and encodes everything but the pack in one turn over
+  the repository, each list and the bytes charged to the request's admission before they are made.
+  - The advertisement, in `serve.c`'s order: `agent`, `ls-refs=unborn`, `fetch=shallow wait-for-done filter
+    ref-in-want sideband-all packfile-uris`, `server-option`, `object-format`, `session-id`, `object-info`.
+    `bundle-uri` waits for a bundle list.
+  - A request is held to the advertisement as `serve.c` holds one: a command not advertised is `invalid command`, a
+    capability not advertised (`promisor-remote`) is `unknown capability`, and an object format other than the
+    repository's is `mismatched object format`.
+  - `ls-refs`: `HEAD` first where a prefix takes it, `unborn` with its target only when both `unborn` and `symrefs`
+    were asked, as git lists it; then each ref a prefix takes, in name order, an annotated tag peeled through every
+    tag it names. The refs are in name order, so each prefix is a run found by a search, and a prefix a shorter one
+    begins is dropped, so no ref comes twice.
+  - `fetch`: `want-ref` is looked up by its full name, `HEAD` read through to the default branch. `deepen-not` is
+    tried as each of git's patterns (`ref_rev_parse_rules`) and must name exactly one ref. The filter is parsed, and
+    the rest go to A-615's negotiation. The sections follow the document's order: acknowledgments, `shallow-info`
+    (its lines without an LF, as git writes them), `wanted-refs`, then the packfile section's header.
+- **The pack**, through `PackSource`, which A-639 implements: `begin` takes the plan (runs of versions, single objects,
+  the filter for the runs, `thin-pack`, `ofs-delta`); then `write` gives a packet's data at a time. The answer frames
+  it on band 1 in full packets of 65,515 bytes (the format's limit), then the flush. A source that refuses, or writes
+  nothing while saying more is coming, ends the response with git's band-3 words: "aborting due to possible
+  repository corruption on the remote side." Until A-639 lands, the tests' source writes whole objects.
+- **Refusals** are answered with `ERR <words>`, or on band 3 under `sideband-all`, git's words where it has them:
+  `upload-pack: not our ref <id>`, `unknown ref <name>`, `invalid command '<name>'`, and git's `deepen-not` words.
+- **Stricter than git, by the document's words.** A `want-ref` sent twice is refused ("It is a protocol error to send
+  want-ref for the same ref more than once"); git 2.50.1 answers it. And `shallow-info` comes before `wanted-refs`,
+  the document's order and the one git's client requires (A-582 part 2).
+- **Tests** (`src/upload/tests/`, 30):
+  - Golden against stock git 2.50.1's own answers from the repository it served (A-582's fixtures):
+    - `ls-refs`, byte for byte;
+    - the five fetch exchanges (clone, a have, `deepen 1`, `want-ref`, progress), section for section, each pack
+      holding exactly the objects git's held;
+    - the advertisement, holding every key git advertised, in its order.
+  - A stock clone's own requests (A-595's `fixtures/http`, exchanges 04 and 05), served from small.git rebuilt in the
+    store. The rebuild is held to the clone's 31 wants, one sent twice for `HEAD` and `main`. Its `ls-refs` lists
+    every branch, `HEAD` first; its fetch gets all 32 objects.
+  - The `ls-refs` oracle: 256 generated repositories and prefix lists against a filter of every ref.
+  - The negotiation's paths: one round for a client versions behind, the walk for a clone. Also `sideband-all`,
+    the section order, `want-ref HEAD`, `deepen-not` by a short name, acknowledgments alone, `wait-for-done`, and no
+    want at all.
+  - `object-info`, against the sizes git's `cat-file -s` printed.
+  - Steps: rooms at every edge, rooms generated, and a 200,000-byte pack in full packets.
+  - Refusals:
+    - not our ref, plain and on band 3;
+    - an unknown `want-ref`, and one sent twice;
+    - a `deepen-not` that names no ref, and one that names two;
+    - the filters;
+    - admissions too small;
+    - v0 and v1;
+    - a flush alone, and refs out of order;
+    - a pack failing or stalling midway;
+    - every cut and every bit flip of a request.
+- **Checks** (Mac Studio, `cargo test --locked -p slates-git --lib`, 2026-11-19): 368 of 368 (2 of main's ignored),
+  `cargo fmt --check` clean with rustfmt's layout taken from the Studio. Failing first: with `serve` stubbed to answer
+  nothing, 25 of the first 27 tests failed. The two that passed compared a stepped answer with a whole one, which an
+  empty answer satisfies, so both are now held to stock git's answers first. Under the stub, 29 of the final 30 fail;
+  the one that passes reads only the clone's request. Red eight ways, one guard at a time:
+  - prefixes not deduplicated: 2 tests failed;
+  - `HEAD` always listed: 2;
+  - a `want-ref` sent twice taken: 1;
+  - `wanted-refs` before `shallow-info`: 1;
+  - `unborn` listed without `symrefs`: 1, the oracle alone;
+  - every ref peeled: 3, git's golden among them;
+  - an ambiguous `deepen-not` taken: 1;
+  - band 3 never used: 1.
+- **Next** (A-640's parts):
+  - v0 and v1 behind the same entry point (part 3, refused with `ERR` until then), with v0's ref names held to
+    A-615's rule;
+  - `sparse:oid` (part 4);
+  - `packfile-uris` and `bundle-uri` answered from the store's URI packs and bundle list (A-624's choice is built);
+  - progress on band 2;
+  - the walk in cooperative slices;
+  - hidden refs, which are policy (§4.17.2 "Access").
+
+Part 2 applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (`upload`, new:
+`mod.rs`, `advertise.rs`, `refs.rs`, `fetch.rs`, `answer.rs` and `tests/`; `store/graph.rs`, `StoreGraph::new` made
+infallible through `ObjectId::null` and `head` added, with `tests/store_graph.rs`; the `mod` line in `lib.rs`).
+
 ### A-616, continued — The drive's calls and ra_svn's writer of them (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
 Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/drive.rs` and
 `report/editor.rs` with its tests, new; `report/recorded.rs`, the recorded sessions in one table both test modules
@@ -44325,9 +44554,7 @@ the readers' ties, the reservations), `crates/merge/src/engine/branch.rs` (the r
     source, 34 keys changed beneath a copy, 31 replaces, 34 nested pairs (4 with an inner replace), 29 moves.
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
 - **Owed** (A-626's later parts):
-  - a copy from a version its source changed after (part 2): the source's changes since set back at the destination,
-    recorded in the chain entry so replay reads no folded history, reserved before the verdict, with room in the
-    server's entry bound (`crates/server/src/verbs.rs`, computed from the increment alone);
+  - a copy from a version its source changed after (part 2): built as A-626 part 2 (its entry);
   - a checkpoint of a green holding a copy (part 3): its copies and the identity's sum carried;
   - a rebase restating a copy (part 4): the deriver's `VolumeOp::Copy`.
 
@@ -44802,7 +45029,8 @@ Applied in the same change to:
 - **Found, not this change's to fix.** The index refuses a replacement by a copy of the node-revision it replaces
   (`CopyOntoItself`), which FSFS records when the deletion comes first (`tree.c` `copy_helper` makes a copy onto the very
   node a no-op only while the destination still holds it); a dump holding one is refused here with the index's refusal.
-  Reported to main for A-553's owner; the generated histories keep a copy off the node it would replace.
+  Reported to main for A-553's owner; the generated histories keep a copy off the node it would replace. Fixed by A-652
+  (the index takes it as the copy FSFS makes; the generated histories hold such replacements since).
 - **Owed of A-628.** The export in format 3 (`text_delta.c`'s windowing and `xdelta.c` ported, so `deltas.dump` and
   `part2.dump` are written again byte for byte); the wiring: a repository `CreateRepository` made holding these records
   on its shard, its texts in the shared object store, the import and export on the control channel, a revision a
@@ -45082,6 +45310,350 @@ Applied in the same change to:
 
   Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
   removal of `TARGET`, which left `h` a link naming nothing.
+
+### A-616, continued (3) — One report command's exchange on an ra_svn connection (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`report/exchange.rs` and its
+tests, new; `report.rs`'s `Context` gains the caller's `most_open` and `Refused` an `Editor` refusal;
+`report/drive.rs`'s `Sources` public; the fixtures' green and the drives' shared form in `report/drive/green.rs`).
+
+- **The exchange** (`report::exchange`; `serve.c` `accept_report`, `editorp.c`, `marshal.c` at `d434dc14`, 1.15.0
+  alike): `Exchange::begin` answers the command (part 1's `Reporter`), `receive` reads the report, then writes the
+  drive's calls through the editor writer until the caller's room is used or the drive's steps are spent
+  (`Turn::Wrote`), at least one call a turn. Before every call but `close-edit` and `abort-edit` (and an absent entry
+  not sent) it looks for the client's answer, as `check_for_error` does: one there is answered `abort-edit`, read, and
+  the command fails with 210004 "Successful edit status returned too soon" after a success, else with the client's
+  errors. `close-edit`'s answer ends the command with `( success ( ) )`, or with `abort-edit` and the client's errors
+  written back; a drive's refusal is answered with its own error and the client's after it
+  (`svn_error_compose_create`).
+- **The client's errors** as `svn_ra_svn__read_cmd_response` and `svn_ra_svn__handle_failure_status` read them: read
+  from the last back, a command-error wrapper (210000) dropped, the number kept as an `apr_status_t` (its low 32 bits,
+  sign-extended when written back), message and file read as C strings; "Empty error list", "Malformed error list",
+  "Malformed network data" and "Unknown status '…' in command response" (210004 each) for the shapes it refuses.
+- **Where it differs from `svnserve`**, in when and what, never in what a stock client reads: it looks for an early
+  answer before every command, where `svnserve` looks after 4,096 bytes written or a flush (`error_check_interval`,
+  `svnserve.c` 801), so it notices one no later; an answer that is no item, or nested past three lists, ends the
+  connection, where `svnserve` reads 64 levels and refuses the command; an error the client sent without a message is
+  written back without one, where `svnserve` writes `svn_strerror`'s text.
+- **Tests.** Every recorded session with a report command (34; the malformed one's connection ends unflushed) replayed
+  from its command, the client's answer handed over only once asked, as a stock client sends it: `svnserve`'s items
+  before and after the drive byte for byte, its drive call for call in the shared form; an early success and an early
+  failure after each of a checkout's calls; fourteen answers to `close-edit`; a drive's refusal with and without the
+  client's errors; answers past the bounds; one byte and one step a turn, and the report cut at every byte, writing
+  alike. `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: red first (`receive` refusing at
+  once: 6 of 6 failed), then 371 of 371; red five more ways by mutation (the early check dropped, wrappers kept, the
+  client's errors dropped after a refusal, C strings uncut, the list read from the front), each caught; rustfmt's
+  layout from the Studio.
+- **Owed** (GAPS): the server's connection task that runs an exchange (piece 7's, with `get-latest-rev` and the other
+  reads); the deltas of changed texts through A-652's generator; a recorded session asking for copy sources.
+
+### A-626 part 2 — A copy from a version its source changed after brings the tree as it stood then: the head's graft fixed by what the change index names since, the fix recorded whole in the chain entry, its room derived before the verdict (2026-11-19, g295 for UI goal 93; §4.16 "The state's maps" and "The verdict", §4.17.4 item 3 and piece 3; A-586, A-626 part 1)
+Applied in the same change to: §4.16 (a status block, the verdict's sentence on `Copy`, the "Copies" bullet), §4.17.4
+(a status block, piece 3), the A-626 part 1 entry (its owed list), GAPS (the §4.17.4 entry),
+`crates/merge/src/chain_entry.rs` (`CopyFix`, `COPY_TREE_FIXED`, `fix_bytes`), `crates/merge/src/engine/copy.rs`
+(`copy_fix`, `SourceAt`, `copy_entry_room`, `EntryCopies`, the fix's commit), `crates/merge/src/engine.rs`
+(`Effect::CopyTree`'s fix, the verdict's fixes, replay), `crates/merge/src/dims/copy.rs` and `crates/merge/src/ptrie.rs`
+(`count_tree`, `Ptrie::prefix_len`), `crates/server/src/verbs.rs` (the entry's bound), and the tests
+(`engine/copy_tests.rs`, `chain_entry.rs`).
+- **What was there.** A copy whose source's tree changed after the version it names was refused (`RenameRename`). FSFS
+  takes it, since a node-revision is kept whole forever: `svn cp ^/trunk@100 ^/branches/old` with the head at 5,000, a
+  working copy's `svn cp -r 100`, a merge or a revert that restores an old tree.
+- **How the tree at the version is built.** The maps hold the head; the histories hold the rest; and the change index
+  names exactly the paths that changed since a version. So the copy grafts the head's tree and fixes it (`CopyFix`):
+  each key at a path the change index names in the source's tree since the version is set to its value then, where it
+  differs from what the graft brings; a copy made since inside the source is cut (its tree was absent or taken away at
+  its version, so every key it held at the version is named by its removal); a copy made since over the source replaced
+  the whole tree, so nothing of the head's is grafted (`start_empty`) and every key the tree held then is set. The cost
+  is the change since the version, O(the change index's entries since and the keys at the paths they name), never the
+  tree. A key the head holds but no path names is unchanged since the version, and an attribute name with no history of
+  its own reads alike at both ends, so the head's names are never listed: the copy still walks no map.
+- **The commit and the identity.** The fix is applied after the graft, its values set with nothing recorded key by
+  key: the copy's entry in the set hash already stands for the source's tree at the version it names (the recount
+  reads `copied_tree_entries` there), and a key's first change after the copy records the value the copy gave it, as
+  A-586 rules. The readers need nothing new.
+- **The verdict's view.** The copied tree's operations in the same increment (edits, creations, removals, directories,
+  metadata, a nested copy's place) are judged against the source as the copy brings it (`SourceAt`: the head's keys,
+  less the fix's cuts, with its values set), so an edit beneath a copy of an older version splices into that version's
+  bytes. Whether anything stood in a tree at the version, which a copy needs (FSFS refuses a missing source), is
+  counted, never walked: the radix trees keep each node's count (`Ptrie::prefix_len`, `count_tree`), so the head's keys
+  under the root, less the cut subtrees', plus each key the fix sets and less each it takes, is a number of descents.
+- **The chain entry.** A fixed copy is the record kind `COPY_TREE_FIXED` (19): `COPY_TREE`'s two paths, then the fix
+  (whether it starts empty, then its cuts, files, IPC nodes, directories, modes, symbolic links and attributes, each a
+  count and its records in key order, a value a presence byte and its bytes). Every count is checked against the bytes
+  left before anything is allocated, a key written twice is refused (`DuplicatePath`), a flag other than 0 or 1 is
+  refused (`BadKind`). A copy without a fix keeps tag 18's bytes, so every entry written before reads as it did. Replay
+  applies the recorded fix, and an edit beneath a fixed copy reads the bytes the copy brings from the entry
+  (`EntryCopies`): it reads no history, whatever its holder folded or restored.
+- **The room, derived.** `Green::copy_entry_room(inc)` is the sum of `chain_entry::fix_bytes` over the fixes the
+  increment's copies need, computed from the green's histories before the verdict; the service adds it to
+  `entry_bound`, which counts the increment alone (`crates/server/src/verbs.rs`), so the chain admits what the entry
+  will hold. `fix_bytes` equals the encoding's length (a test holds it), and a copy of an unchanged source needs none.
+- **Refusals.** A version whose values are folded away (below the fold floor, or the checkpoint the green was restored
+  at) is refused for a source changed since (`TypeChanged`: what it held is gone); a source unchanged since is copied
+  from any version, the head's tree being the version's. A hard link in the tree at the version is refused as one at
+  the head is.
+- **Tests** (`crates/merge/src/engine/copy_tests.rs`, `crates/merge/src/chain_entry.rs`).
+  - A copy of the trunk at version 1 after two versions changed it in every dimension holds the trunk's tree at 1;
+    the change index names its destination alone; the entry fits the room derived for it, and a copy of an unchanged
+    source needs none; it replays from its encoded entry.
+  - Copies from before a copy inside the source (cut) and from before one over it (start empty), replayed version by
+    version.
+  - An edit beneath a copy of an older version in the copy's own increment lands on that version's bytes, live and
+    replayed.
+  - A copy from a folded version of a changed source is refused typed; one of an unchanged source is accepted.
+  - The fix's codec: a round trip with `fix_bytes` its length, a golden vector, and hostile input (a count past the
+    bytes, a key twice, a bad flag) refused typed.
+  - The oracle's model now copies each source as its version held it; its census counts copies accepted from a
+    version their source changed after.
+- **Evidence** (the Mac Studio M3 Ultra, kiln, debug, fresh clones of `agents/g295-a626-part2`; 2026-11-19).
+  - The first run (`69936d04d`, 06:34 UTC, load 12.2): 117 of 118; the oracle found the copy walking a map, the head's
+    attribute names listed at each named path; read from the histories alone since (`4ff0b7131`).
+  - `cargo test --locked -p slates-merge --lib` at `4ff0b7131` (r1027, 06:38 UTC, load 9.4): 118 of 118, 24.40 s;
+    `cargo fmt --check` clean for slates-merge and slates-server. The census over 128 histories: 75 copies accepted,
+    354 refused, 9 from the root, 40 from an older version, 24 into their own source's tree, 14 from a version their
+    source changed after, 25 keys changed beneath a copy, 28 replaces, 31 nested pairs (2 with an inner replace), 19
+    moves.
+  - `cargo test --locked -p slates-server --lib` at `4ff0b7131`: 590 passed, 3 ignored, 1 failed:
+    `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`. It fails 5 of 5
+    alone and 3 of 3 with main's `verbs.rs` put back (main `d449a10c7`), so it is main's, not this change's (reported).
+  - Red seven ways (r1040, 06:42 to 06:48 UTC), each on a copy of the tree with one guard taken out, the whole `--lib`
+    suite run: copies of a changed source refused again, 4 failed; no cuts, 2; no empty start, 2; the fix left out of
+    the entry, 4; replay reading the head's bytes, 1; the verdict reading the head's bytes, 1; no room, 1.
+  - Merged with main (A-646's hard links naming their nodes, clean; `verbs.rs`'s admission now `Op::GreenAdvanced`,
+    the room joining its bound): at `e728908e6` (06:50 UTC, load 8.3) slates-merge's `--lib` 133 of 133, 25.95 s, fmt
+    clean, the census 106 accepted, 390 refused, 23 from the root, 60 from an older version, 40 into their own tree,
+    23 from a changed source, 37 keys changed beneath, 48 replaces, 46 nested pairs (2 inner replaces), 26 moves;
+    slates-server's `--lib` 614 passed, 3 ignored, and the same one of main's failed (3 of 3 with main `dc46c9f`'s
+    `verbs.rs`).
+  - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
+- **Owed** (A-626's later parts): a checkpoint of a green holding a copy (part 3: its copies and the identity's sum
+  carried); a rebase restating a copy (part 4: the deriver's `VolumeOp::Copy`).
+
+### A-644 part 1 — A protected branch's answers from the store, in git's words: how a move changes its ref, decided by generation numbers with no walk where they decide it, and the first merge commit and the first unsigned commit a move brings (2026-11-19, g230, UI goal 93; §4.17.2 "Protected branches, in git's terms", "A push" step 6 and "Pieces (git)" piece 11; after A-590, A-614, A-620 and A-642)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `research/vcs-servers.md` §5.9; `crates/git`
+(`store/protect.rs`, new, a child of `store/repository.rs`, whose fast-forward now decides by generation numbers first
+and counts both ways; `store/mod.rs`; `receive/protected.rs`, new; `receive/mod.rs`, `Declined::hook`;
+`receive/report.rs`; `objects/commit.rs`, `write_signature` and the payload's rule); the tests
+(`tests/store/protect.rs`, `tests/protected_fixtures.rs`, `tests/objects/commit.rs`); `crates/git/fixtures/protected`
+with `make-protected-fixtures.sh`; `.gitattributes`.
+- **Who asks what.** A protected branch's policy (which protections a ref has, for whom) is the server's, A-622's rules;
+  it is part 2. The store answers the questions, each against the ref's own green and nothing else (A-642), so a push
+  to one branch never reads another's position: how a move changes the ref (`Repository::change`: create, fast-forward,
+  rewrite, delete), the first merge commit it brings (`merge_commit`), and the first commit it brings that no trusted
+  key signed, with why (`unsigned_commit`).
+- **The fast-forward by generation numbers.** It is the store's own question, the one its admission asks, so a
+  protected branch and the reached sets never disagree. A commit's generation number is one more than its parents'
+  greatest [B: gitformat-commit-graph], so a new head of no greater number than the current head's descends from it
+  only by being it: decided with no parent read (`decided_without_walk`). Only a greater number walks back from the new
+  head, stopping below the current head's number (`descent_walks`). A tag moved, or any head that is no commit, is a
+  rewrite, as the store judged it before. A push not sealed is refused, since its commits' numbers would read as zero.
+- **What a move brings, and a create.** The commits the new head reaches that the ref's current head does not:
+  D(k)'s, walked back from the new head (through a tag to its commit), stopping at every commit the green's reached set
+  holds, newest generation first, ties by the greater id, each judged once, so a refusal names the same commit on every
+  run. A create brings its whole history: the ref has no position of its own to stop at. Rejected: Gitea's rule for a
+  create, `rev-list <new> --not --all` (v1.24.0 `hook_verification.go`), and its sibling "the commits new to the
+  repository". Each reads every other ref's position (a global reference, A-642), and each lets a protected name be made
+  at a commit pushed first to a branch nothing protects, never judged.
+- **Signatures, as git's verifier reads them.** commit.c's `parse_buffer_signed_by_header` [C: v2.50.1] makes the
+  signature every header of the repository's own name, in order, and the payload the commit without any line that begins
+  `gpgsig`, with its continuation lines. A-590's payload left out only `gpgsig` and `gpgsig-sha256`, so a header named,
+  say, `gpgsigx` stayed in it: a signature git verifies would not verify here, and one made over the longer payload
+  would verify here where git refuses it. Both rules are now git's (`Commit::write_signature`, `write_signed_payload`),
+  red first. The format is the armour's first line, as `get_format_by_sig` tells it. An SSH signature and its payload go
+  to the caller's verifier (`CommitSigners`; A-321's under git's namespace on the server, part 2); OpenPGP and X.509 are
+  refused, typed (`Unsigned::OpenPgp`, `X509`), since verifying them is a later piece; none, or an armour in no format
+  git signs with, is refused (`Missing`, `Unknown`).
+- **git's words** (`receive::protected`). git refuses a non-fast-forward and a delete itself
+  (`receive.denyNonFastForwards`, `receive.denyDeletes`): `non-fast-forward` after `error: denying non-fast-forward
+  <ref> (you should pull first)`, and `deletion prohibited` after `error: denying ref deletion for <ref>`. A linear
+  history and signed commits are what git leaves to an update hook, and git answers a refusing hook with the hook's own
+  words on band 2, read 128 bytes at a time (`copy_to_sideband`'s buffer), then `error: hook declined to update <ref>`,
+  and reports `hook declined`. slates' checks answer as that hook would, in words that name the commit and the rule
+  (`denying merge commit <id> on <ref> (linear history required)`; `denying unsigned commit <id> on <ref> (signed
+  commits required)`; `denying commit <id> on <ref>: <why> (signed commits required)`). `Declined::hook` carries a
+  hook's words, and the report relays them in git's pieces. A hosted server answers its own protections through a
+  hook's report too (Gitea v1.24.0's pre-receive hook, which git reports `pre-receive hook declined`).
+- **Golden vectors.** `make-protected-fixtures.sh` (git 2.50.1, Apple Git-155, and OpenSSH 10.2p1 on the MacBook,
+  2026-11-19; no local path in any byte, checked): a stock bare server with both `deny` settings and an update hook
+  keeping a linear history of commits a trusted key signed (`git verify-commit` against `gpg.ssh.allowedSignersFile`),
+  twelve pushes through a tee: a signed create, a signed fast-forward, an unsigned commit, another key's, OpenPGP's and
+  X.509's armours, a signed merge, the merge pushed to an unprotected branch, a forced rewrite, a delete, and a SHA-256
+  server's signed create and unsigned commit. Its keys are made fresh each run and only the public halves kept (as
+  A-321's golden signatures were made), so a re-run writes new signed commits. The script also splits two signed commits
+  (one `gpgsig`, one `gpgsig-sha256`) into signature and payload as commit.c splits them, and keeps each pair only once
+  `ssh-keygen -Y verify` accepts it.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln r975 and r984, 2026-11-19: 353
+  passed, 2 of main's ignored; `cargo fmt -p slates-git -- --check` clean). Every push is answered from A-614's store
+  holding the captured server's objects and refs, with every byte git wrote; the verifier is handed the very signature
+  and payload git verified, in both formats; an oracle over generated histories of up to twelve commits (some indexed,
+  some in a sealed push, both formats) holds the change and the first merge commit to plain reachability, and no walk is
+  taken where a generation decides; the counters prove the shortcut runs and the walk runs; every armour is told apart;
+  each brought commit is judged once, newest first, and none the ref already reached.
+  - Red first (kiln r982, at a8948ce95, entry points stubbed to answer wrongly): 13 of the 15 new tests failed; the two
+    that passed check the fixtures' sums and the tests' own verifier.
+  - Red ten ways by mutation (kiln r1012), each caught: an equal generation walked (2 tests); the shortcut removed (2);
+    reached commits not a stop (6); a merge needing three parents (5); every armour sent to the SSH verifier (2); the
+    payload keeping a header named `gpgsigx` (1); the signature its first header alone (1); hook pieces of 129 bytes
+    (1); a create judged against another green's head (1); git's `hook declined to update` reworded (1). The control
+    passed 353.
+- **Owed (part 2):** the policy that asks these questions (A-622's record: requirement rules and the keys trusted to
+  sign commits), `admit`'s typed refusals mapped to these words, and A-321's verifier under git's namespace; then
+  receive-pack's part 2 asking them for each command (A-620). The walks are sliced under the shard's budget with the
+  store's own (its owed item); until then a create of a protected name walks, and verifies, its whole history at once.
+
+### A-652 — The index takes a replacement by a copy of the node it replaces; the export in format 3 with Subversion's deltifier; the import and export as repository verbs (2026-11-19, g264, UI goal 93; §4.17.4 items 2 and 3.5, piece 6; A-553, A-628)
+Applied in the same change to (its first part, the index):
+- `crates/svn` (`index.rs`: `copy_source` takes the very node-revision a replacement replaces, `IndexRefusal::CopyOntoItself`
+  goes, the module documentation says why; `index/tests.rs`: a unit test, the refusal case taken out, the oracle's
+  generator no longer skipping such replacements, a census counter of them; `migration/tests`: a rule test and the
+  generated histories no longer keeping a copy off the node it would replace), the A-628 entry (its finding marked
+  fixed) and GAPS (the §4.17.4 entry).
+- **What was there.** A-553's index refused a replacement whose copy source was the node-revision it replaced
+  (`CopyOntoItself`, `E160004`), reading FSFS's `copy_helper` (`tree.c` 2602), which makes a copy onto the very node
+  standing at its destination a no-op. A-628's import met the gap: `svnadmin load` replays a `replace` record as
+  `svn_fs_delete` then `svn_fs_copy`, and a client's drive as `delete-entry` then `add-file` with history, so the
+  destination holds no node when `copy_helper` runs, and FSFS records a replacement by a copy.
+- **The decision.** A replacement is its deletion and then its addition, so its copy source may be the node-revision it
+  replaces, and the row is a copy like any other (`svn_fs_fs__dag_copy`: the source's line, a fresh copy identity,
+  its own copy root, the replaced node-revision its predecessor and one more predecessor). `copy_helper`'s no-op is a
+  copy onto a node still standing, which records nothing, so no record holds one; the refusal goes, with its variant.
+- **Tests** (Mac Studio, 2026-11-19, kiln, debug, `cargo test -p slates-svn --lib --locked`). Red first (12b582e68,
+  676e0c1ee, own target directory): 5 failed of 367, every one refused `CopyOntoItself`: the unit test, the index's
+  naive-filesystem oracle and A-592's verdict oracle (both draw the index's generated histories, which now hold such
+  replacements), and A-628's rule and generated tests. Green (6423b148d): 367 of 367, rustfmt's layout taken from that
+  run. The unit test replaces `/trunk/README` by a copy of itself, then `/trunk`: each its line kept, a fresh copy
+  identity, its own copy root, the replaced node-revision its predecessor, its count one more, created in its revision,
+  related to what it replaced, the nodes beneath the directory the same node-revisions again.
+
+### A-641 part 2 — a push's changegroup verified against what the repository holds, and a line's move made A-618's work over its flat manifests laid out as directories (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 2 and 3, decision 6 and piece 5; §4.17.1 "A push is a work" items 2 to 4; A-588, A-618, A-641 part 1)
+
+- **What.** `crates/hg/src/push/verify.rs`: `verify(&ChangegroupPart, &impl Held, &mut Admission) -> Result<Verified,
+  Unverified>`, the `Held` trait (each log's full texts by node: the repository's index answers it, part 3), and
+  `audit`. `crates/hg/src/push/tree.rs`: `Trees` (A-618's `PushObjects` over manifests laid out as directories),
+  `Move` and `work(&Move, &Green, (&Verified, &impl Held), room, &mut Admission) -> Result<Built, WorkRefused>`.
+  slates-hg now depends on slates-merge (as slates-git does, A-638) and blake3.
+- **Read from 7.2's code** (the wheel uv installs, the Mac Studio, 2026-11-19): `revlog.py` 3831-3848 (`addgroup`: a
+  node the log holds passed over, "this can happen if two branches make the same change"; "unknown parent"; "unknown
+  delta base"); `changegroup.py` 2896 ("missing file data for %s:%s - run hg verify"); `pathutil.py` 87-118
+  (SHA-256 `57d84583…`: the auditor's four checks in order) and `encoding.py` 56-76 (`47900298…`: `hfsignoreclean`'s
+  sixteen code points). The first audit written here, from the design's summary, took `a/.hg/b`; 7.2's code refuses
+  it as a nested repository, and the test now holds the transcription.
+- **Decided.** A revision with any flag is refused (censored, ellipsis and externally stored handling owed, piece 10);
+  a tree manifest is refused; a drive is refused on every platform (7.2 finds one only on Windows; R8); empty and `.`
+  components, NUL and bytes not UTF-8 are refused as not held, which 7.2 takes. A directory's name is BLAKE3 in
+  key-derivation mode over its entries (32 bytes, never a file node's 20), so two versions' trees compare by identity
+  and an unchanged directory is passed over unread; laying a manifest out is one pass over it (an index of
+  directories kept with the manifest log would make it the changed paths' alone: owed with piece 3's rows).
+- **Evidence** (Mac Studio, kiln, debug): `cargo test --locked -p slates-hg --lib` 237 of 237 at a47a715a8 (load
+  10.6), `cargo fmt` clean. The first build's one failure was a real fault: a file log whose every revision the
+  repository held was reported as new (the repeated push's test), fixed. Red nine ways in disposable copies, each
+  turning only its guarding tests red: the node check skipped, links always known, missing files tolerated (one test
+  each); directory names blind to their entries' ids (2: the laid-out tree's skip count and a fixture line's move);
+  held revisions taken again (2); an executable laid out as a plain file (1); the nested-repository check, the HFS+
+  cleaning and the short names each removed (1 each).
+- **Owed** (part 3 on): which lines and bookmarks a push moves (decision 1's new line, merged lines, a new branch;
+  decision 2's bookmarks), the landing through a trait of A-642's shape with the race checks' positions, phases
+  (publishing), the pushkey namespaces, the policy and the hooks, a `Held` over the repository's index, and the words
+  of part 2's refusals in a reply.
+- **Applied in the same change to:** §4.17.3's status (part 2) and piece 5's line; GAPS' §4.17.3 entry;
+  `research/mercurial-server.md` §20; `crates/hg/Cargo.toml` and `Cargo.lock` (slates-merge, blake3).
+
+### A-616, continued (4) — Copy sources held to `svnserve` (2026-11-19, g234, UI goal 93; §4.17.4 piece 7's third part)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn/fixtures/report`
+(`make-fixtures.py` records named hand-made sessions alone; `hostile-update-copy-sources.1` and
+`hostile-checkout-copy-sources.1`, new; `sessions.txt`; `SHA256SUMS`); the reporter's tests (the shared table and
+three counts).
+
+- **Recorded.** No stock client asks for copy sources (`svn update` sends `send-copyfrom-args` false), so two
+  hand-made clients do, against stock `svnserve` 1.15.0 on the Mac Studio through the relay, 2026-11-19: `/trunk` from
+  r3 to r4, where `new.txt` moved to `renamed.txt`, and `/trunk` at r4 from nothing. `svnserve` wrote
+  `add-file ( renamed.txt d0 c4 ( /trunk/new.txt 3 ) )` (a repository path with its slash), no text delta for a copy
+  whose text is its source's, and `new.txt` deleted with revision 4.
+- **The recorder** takes a second argument, the hand-made sessions to record alone into the fixtures already there: it
+  builds the repository again and refuses to record unless `svnlook changed` matches `changed.txt` and
+  `svnlook tree --show-ids` matches `tree.txt` (FSFS's offsets aside), and the tools `subversion-version.txt`;
+  `sessions.txt` gains the sessions' lines; `SHA256SUMS` is made again over the recorded files, the recorder's inputs
+  (`history.txt`, `make-fixtures.py`) left out as before. The 38 earlier sessions are untouched.
+- **Tests.** The drive's copy sources, the writer's bytes and the whole exchange held to both sessions (the drives
+  compared 29, the writer's replays 30, the exchanges 36). `cargo test --locked -p slates-svn --lib` on the Mac
+  Studio, 2026-11-19: 402 of 402.
+
+### A-639 — upload-pack's pack from fragments: the negotiation's runs from their fragments, the walk's objects covered by whole kept parts (a clone the base pack and the fragments after it) and the rest encoded, `thin-pack` and `ofs-delta` as the client says, streamed in turns (2026-11-19, g083 for UI goal 93; §4.17.2 "A fetch" item 3, "Pieces (git)" piece 7; A-591, A-608, A-614, A-615)
+
+Applied in the same change to: §4.17.2 (a status block; "A fetch" item 3, where a client without `thin-pack` is now sent
+the object whole in place of the base ahead of it; piece 7's line), GAPS (the §4.17 entry), `crates/git` (`store`: the
+new `upload`; `fragment`'s encoder one object at a time with each entry's position, type and base kept; a base pack in
+two parts; a push's new positions by type; `Positions`' set operations; `Repository::pack` and `clone_pack` gone, the
+stream in their place; `pack::put_header`), `crates/vcs` (`ContentStore::window_at`).
+
+- **The answer through a trait.** `Answered` gives the negotiation's runs (`Versions`: a green's versions `after + 1`
+  to `through`) and objects by position, the client's `thin-pack` and `ofs-delta`, and the filter as a per-object
+  decision by kind and size (A-615's own per-object filters; A-640 implements the trait over the negotiation's answer).
+- **What it sends**, each object of the answer once, in three stages:
+  - The runs, from their fragments: each run's objects gathered before the header counts them, every one of its D(k)s
+    with no filter, otherwise each by its row; the run's head whenever the run brought it, since it is the want.
+  - The cover: the greens a head of whose versions is still wanted, largest base pack first; each one's base pack's two
+    parts, then the fragments of each version after its base. A part is taken when every object it holds is still
+    wanted. A clone is answered so (§4.17.2: "A clone is the base pack and then the fragments after version C"), with
+    no clone path of its own; a version a rewrite left behind is not taken; a filter that sends no blobs takes the parts
+    without blobs whole. A part only partly wanted is left: reading it whole for a few objects would cost more than
+    encoding them.
+  - The rest, in position order, through the fragments' encoder: a delta against an earlier one of its kind within the
+    learned window and depth, at the learned level, the rules copied from the repository at the stream's start. An
+    object past a window is deflated whole, a window a unit.
+- **What the client reads.** A part is copied byte for byte when every object it holds is to be sent, the client said
+  `ofs-delta` or the part has no offset delta, and the client reads every base its reference deltas name. A base is read
+  when it is sent already; for a run's part, also when it comes later in the pack ("ref-delta" names any object of the
+  pack; no cycle, every version of a run fast-forwarded) or, thin, when the client holds it: outside the pack such a
+  base lies in what the client's version reaches, and under a filter it is held where the filter would have sent it. A
+  part the cover took names bases sent before it alone, since across a rewrite two versions may name each other's
+  objects. Otherwise the part is read entry by entry: an offset delta's distance measured again, or its base named by
+  id without `ofs-delta`; a delta whose base the client cannot read sent whole from its object. The design had a client
+  without `thin-pack` sent the base whole ahead of the delta; the object is sent whole instead, so the pack holds no
+  object the client has, which the oracle holds it to.
+- **Streamed.** `Upload::advance` does units of work until the owner's quantum (§4.3's step budget) is spent, at least
+  one, checking the owner's clock after each. The units: a window of a kept part copied; a window of an object deflated;
+  one object at most a window long encoded; a window's worth of the answer's handles read; one object of a filtered run
+  judged; one entry of a part judged. Between turns the stream holds no borrow: it names parts by green, version, class
+  and content, reads a window by its index (`ContentStore::window_at`, down the one list a level that names it), and
+  keeps the wanted and sent sets as runs of positions. The trailer is the checksum of every byte, made as they pass,
+  written once the entries sent are the header's count (`CountChanged` otherwise). A base pack made again while a
+  stream reads one of its parts entry by entry ends the stream refused, `BaseRebuilt`; the owner makes base packs
+  between streams.
+- **The store's changes.** The encoder takes one object at a time at any place in a pack (`fragment::Encoder`). It
+  keeps, of the entries before it, those its learned window can try now, so a fragment encoded so is byte for byte the
+  one part 2 made. Each entry's record keeps its object's position and type and its base (`Placed`). A base pack is two
+  parts, as a version's fragments are. A push's new objects take positions by type and then id, so each fragment's two
+  parts are a run each; the position rows are written in position order.
+- **Tests** (`cargo test --locked -p slates-git --lib`, 397 of 397 and 3 ignored on the tree merged with main at
+  61a1f91f1, the store's 32 and 3 ignored, and `-p slates-vcs --lib` 31 of 31, the Mac Studio, 2026-11-19;
+  `cargo fmt --check` clean), failing first against a stream that sent nothing:
+  - `every_answered_pack_reads_back_as_the_wanted_closure_less_the_clients`: generated histories, some base packs made
+    halfway, then for every green a clone and a fetch from each earlier head as A-615 answers them (a run where every
+    version after the have fast-forwarded, the objects one by one otherwise), under generated filters, thin or not,
+    `ofs-delta` or not, in turns of a generated quantum. Each pack read back through A-608's reader, a thin one with
+    the client's objects the filter sends, is exactly the wanted closure less the client's, each object once.
+  - `a_clone_is_the_base_pack_then_the_fragments_after_it` (the four parts byte for byte),
+    `a_fetch_is_its_runs_fragments_then_what_no_fragment_covers`,
+    `a_thin_pack_names_the_clients_objects_and_a_full_one_never_does`,
+    `without_ofs_delta_no_entry_names_its_base_by_offset`,
+    `a_pack_streamed_a_unit_a_turn_is_the_pack_in_one_turn`,
+    `a_filter_sends_the_runs_objects_it_admits_and_the_want_always`,
+    `a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded`,
+    `a_part_the_cover_takes_names_no_base_that_neither_side_holds`,
+    `a_base_pack_made_again_under_a_stream_ends_it_refused`, `position_sets_answer_as_a_set_model`, and vcs's
+    `a_window_read_by_its_index_is_the_walks_window`.
+  - Part 2's tests now read their packs through the stream, and the store oracle's packs hold each object once.
+  - Main's run, ignored: `upload_packs_for_git_index_pack`.
+- **Red-checks** (the Studio, each mutation once on a copy, the tree untouched): every part copied whole (the oracle
+  red), offset deltas copied for a client without `ofs-delta` (2), every base read (2), a cover part's bases read as a
+  run's (red once the history rewritten twice was added), a cover entry's base read as a run's (the oracle), a base
+  held without `thin-pack` (2), a run's objects past the filter (2), the run's want dropped (2), a part partly wanted
+  taken (1), an offset base kept for a client without `ofs-delta` (1), a deflate never finished (3), a base pack made
+  again unseen (1), a window's digit in the wrong base (1).
+- **Owed.** A part only partly wanted (a `blob:limit` fetch's blobs) read entry by entry. A delta search for an object
+  past a window. The fragments' encoding and the base pack's rebuild sliced. Wiring the stream into upload-pack's
+  `fetch` response is A-640. Main's runs are filed: `git index-pack --strict` and `git verify-pack -v` over the
+  stream's packs, a thin one with `--fix-thin`; clippy, `xtask` and the docs.
 
 ### A-649 part 2 — A Mercurial store's phases, bookmarks and obsolescence markers imported with its history, read as 7.2 reads them (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 decisions 2 to 4 and piece 3; A-630, A-545)
 Applied in the same change to: §4.17.3 (its status, the index's rows, piece 3), `crates/hg` (`import`: the state's

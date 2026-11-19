@@ -168,6 +168,16 @@ impl<V: Clone> Dim<V> {
     self.holds_tree_of(path.as_bytes())
   }
 
+  /// How many keys `path`'s tree holds: its own and those beneath it (every key, for the root). Descents and the counts
+  /// their nodes keep, no walk (A-626: whether a copy's source held anything at the version it is copied at).
+  pub(crate) fn count_tree(&self, path: &str) -> usize {
+    if path.is_empty() {
+      return self.root.len(&self.nodes);
+    }
+    let own = usize::from(self.root.contains_key(&self.nodes, path.as_bytes()));
+    own.saturating_add(self.root.prefix_len(&self.nodes, &below(path.as_bytes())))
+  }
+
   /// [`Dim::holds_tree`] over the path's bytes.
   fn holds_tree_of(&self, path: &[u8]) -> bool {
     self.root.contains_key(&self.nodes, path) || self.root.has_prefix(&self.nodes, &below(path))
@@ -216,6 +226,11 @@ impl Files {
   /// [`Dim::holds_tree`].
   pub(crate) fn holds_tree(&self, path: &str) -> bool {
     self.map.holds_tree(path)
+  }
+
+  /// [`Dim::count_tree`]: the files of `path`'s tree.
+  pub(crate) fn count_tree(&self, path: &str) -> usize {
+    self.map.count_tree(path)
   }
 
   /// [`Dim::cut_tree`]: a block is let go with its last holder.
@@ -326,6 +341,17 @@ impl Xattrs {
       }
     }
     refused
+  }
+
+  /// How many attributes `path` and the paths beneath it carry (every one, for the root): descents and counts, no walk.
+  pub(crate) fn count_tree(&self, path: &str) -> usize {
+    if path.is_empty() {
+      return self.map.root.len(&self.map.nodes);
+    }
+    [path_key(path), below(&escaped(path))]
+      .iter()
+      .map(|prefix| self.map.root.prefix_len(&self.map.nodes, prefix))
+      .fold(0, usize::saturating_add)
   }
 
   /// Whether `path` or a path beneath it carries an attribute (any path, for the root). Descents, no walk.
