@@ -19383,8 +19383,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
   owed with it: a Windows base reading a link back in A-275's `/` form rather than its print name's `\` (the base
-  plane's own map, its own piece), and the Developer Mode route for an account without the privilege, measured; a
-  directory link's type, which the seam did not carry, **built by A-451**); a reflink
+  plane's own map, its own piece), and the Developer Mode route for an account without the privilege, measured,
+  **closed by A-568 the same day** (no route a handle-relative writer may take: Developer Mode's allowance comes only to
+  `CreateSymbolicLinkW` asked with its unprivileged flag, a call that names its link by path, and the writer's own set
+  is refused there, `ERROR_PRIVILEGE_NOT_HELD`, jupiter r143 and r212; so such a link fails its entry alone,
+  `HostError::Unprivileged`, the landing going on, and the Windows link tests take the writer as their probe; the
+  privilege is enabled around the object's open as well as its set, which slates' own drive asks; its Windows tests
+  filed for main; still owed with it: on Linux a link on a file system that holds none, `symlink(2)`'s `EPERM` (FAT),
+  still ends the landing, the same question for that kind); a directory link's type, which the seam did not carry,
+  **built by A-451**); a reflink
   (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
   own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
   under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:

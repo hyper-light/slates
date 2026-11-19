@@ -10603,9 +10603,11 @@ stays in the overlay.
 > or clears its `READONLY` bit alone (A-262: a file's read-only state is its mode), every other attribute bit kept.
 > Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
 > day)** a symbolic link lands as the Windows one, in A-275's form (`slates_vfs::host::windows_link`, the drive's own),
-> made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
-> `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
-> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. **Since A-445 (the
+> made handle-relative at the landing's hidden name and moved into place without replacing, its object opened and its
+> buffer set with `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it (both since
+> A-568: slates' own drive takes the privilege at the open, as MS-FSA 2.1.5.1 has it, where NTFS asks it at the set);
+> where the file system refuses the link (an account without the privilege, in Developer Mode or not, A-568) the seam
+> names it `HostError::Unprivileged` and the entry fails alone, the landing going on. **Since A-445 (the
 > same day)** step 6's reflink is built: a file whose bytes its batch already staged (the same BLAKE3 and length) is
 > cloned from that temporary where the target's volume shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev
 > Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in whole-cluster regions below 4 GiB from the volume's own cluster), its
@@ -37313,3 +37315,37 @@ tests split, a test type named, the fixtures' node parser; `fixtures/payloads/` 
 Applied in the same change to: §4.7 (a status block), GAPS (the reaper series' line), `crates/land/src/grant.rs`,
 `crates/cluster/src/fleet.rs`,
 `crates/server/src/{deadlines,landing,verbs,daemon,reap,remote_attach,fleet,state,held_copy}.rs`.
+
+### A-568 — A link the account may not make fails that entry alone, and the writer is its own probe (2026-11-19, g085, UI goal 88; §4.15 step 6, A-438's owed Developer Mode route; A-185, A-275, A-451, A-539)
+Applied in the same change to: §4.15 (A-185's status: the link rule), GAPS (A-438's owed item, closed, with what it
+leaves), `crates/vfs` (`src/host/mod.rs`: `HostError::Unprivileged`; `src/host/sim.rs`: the simulated host can refuse a
+link, `SimVerb::Symlink`; `src/base.rs`), `crates/land` (`src/engine.rs`: the refusal fails its entry alone;
+`src/windows_codes.rs`: `ERROR_PRIVILEGE_NOT_HELD` named; `src/os_windows.rs`: the object opened as well as set under
+the link-making token, the module's docs; `src/chmod_tests.rs`; `tests/os.rs`), and `crates/server` (`src/error.rs`,
+`src/landing.rs`: the new kind by its code).
+- **What was there.** A-438 made a link handle-relative: its object opened at the landing's hidden name, its buffer set
+  (`FSCTL_SET_REPARSE_POINT`) with `SeCreateSymbolicLinkPrivilege` enabled for that call, then moved into place. Its
+  design said a link the file system refuses fails that entry `EPERM`; the engine read the refusal as a host that
+  stopped answering, and the landing ended `Aborted` (`Crashed { errno: 1 }`, then `Crashed { code: Win32(1314) }`
+  after A-539). Its two Windows tests decided whether to expect a link by a `CreateSymbolicLinkW` probe, which on
+  jupiter, in Developer Mode, made a link where the writer's set was refused `ERROR_PRIVILEGE_NOT_HELD` (main's runs
+  r143 and r212).
+- **What `CreateSymbolicLinkW` does.** It enables `SeCreateSymbolicLinkPrivilege` on its thread around its whole
+  operation, before its create, and reverts after (Eryk Sun, bugs.python.org msg302494, 2017-09-19; this design's
+  WinFsp record, deviation (b), diagnostics run 42715955734). Without the privilege it refuses a caller that did not pass
+  `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` before any file system is asked; with the flag, under Developer Mode, it
+  makes the link (Microsoft Learn, CreateSymbolicLinkW; measured, diagnostics run 42720006662). How the allowance
+  reaches the file system is not documented, and no interface a file system's caller holds carries it: WinFsp, handed
+  every create and control of its drives, is never passed the flag (the same record, deviation (a)). The file system's
+  own rule is MS-FSA's: an open takes `HasCreateSymbolicLinkAccess` from the privileges of its security context
+  (2.1.5.1), and a symbolic link's set needs it (2.1.5.10.37).
+- **The decision.** The writer cannot take that route: `CreateSymbolicLinkW` names its link by path, and the landing
+  makes every object relative to a handle it holds, so no rename of an ancestor can carry a write outside the target
+  (§4.15 step 4). So where the file system refuses a link for the privilege, the seam names it
+  (`HostError::Unprivileged`, the Windows writer's rule for `ERROR_PRIVILEGE_NOT_HELD`), the entry fails alone by that
+  code, and the landing goes on, as no room does; slates never asks for the privilege (R10). The link's object is opened
+  as well as set under the link-making token, since slates' own drive takes the privilege at the open (deviation (b),
+  as MS-FSA has it), where NTFS asks it at the set: a landing into another daemon's drive made no link before. The
+  Windows tests take the writer as their probe: the link landed, or its entry failed alone by
+  `ERROR_PRIVILEGE_NOT_HELD` with the rest written and nothing left at its name, the branch printed; A-451's test is
+  split into its setup and two assertions.

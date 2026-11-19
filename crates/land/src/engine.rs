@@ -1675,18 +1675,19 @@ impl<H: LandFs> Landing<'_, H> {
   fn written_of(&mut self, attempted: Result<Written, WriteFailure>) -> Written {
     match attempted {
       Ok(w) => w,
-      // No room fails its entry alone, and the landing goes on (A-539: the seam names it, whatever the platform numbers).
-      Err(WriteFailure::Host(HostError::NoSpace(code))) => Written {
-        outcome: Outcome::Failed { code: Some(code) },
-        window_ns: None,
-      },
+      // No room fails its entry alone, and the landing goes on (A-539: the seam names it, whatever the platform numbers);
+      // so does a privilege this process does not hold, which slates never asks for (R10, A-568): a link on a Windows
+      // account without the link privilege is that entry's refusal, never the host's end.
+      Err(WriteFailure::Host(HostError::NoSpace(code) | HostError::Unprivileged(code))) => {
+        Written {
+          outcome: Outcome::Failed { code: Some(code) },
+          window_ns: None,
+        }
+      }
       // Any other refusal the host names a code for — a name in use or a verb missing where the landing expected
       // neither, or anything it could not serve — ends the landing, whatever the code's number.
       Err(WriteFailure::Host(
-        HostError::Exists(code)
-        | HostError::Unsupported(code)
-        | HostError::Unavailable(code)
-        | HostError::Unprivileged(code),
+        HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code),
       )) => {
         self.crashed = Some(code);
         Written {
@@ -2922,10 +2923,8 @@ impl<H: LandFs> Landing<'_, H> {
   /// answering — the simulated crash, an `EIO`, a Win32 code) aborts the landing so nothing is advanced; no room and the
   /// typed refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
   fn note_crash(&mut self, error: HostError) {
-    if let HostError::Exists(code)
-    | HostError::Unsupported(code)
-    | HostError::Unavailable(code)
-    | HostError::Unprivileged(code) = error
+    if let HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code) =
+      error
     {
       self.crashed = Some(code);
     }
