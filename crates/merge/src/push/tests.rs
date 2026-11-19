@@ -1022,11 +1022,11 @@ fn a_submodule_and_a_path_changing_kind_are_refused_until_their_compositions_exi
 }
 
 /// A-618 (§4.9; the work charged as it is made). Do: push a tree holding a file of a mebibyte under a room of half a
-/// mebibyte; a base version past the green's head; a store whose root tree names itself; a work naming more names than
-/// one ops document holds. Expect: `PastRoom` before the file's bytes are read (the store gave none), `UnknownBase`,
-/// `PastRoom` for the endless tree under a room of a kibibyte, and `TooManyNames`.
+/// mebibyte; a base version past the green's head; a store whose root tree names itself. Expect: `PastRoom` before the
+/// file's bytes are read (the store gave none), `UnknownBase`, and `PastRoom` for the endless tree under a room of a
+/// kibibyte.
 #[test]
-fn a_push_past_its_room_its_green_or_a_document_is_refused_before_it_is_held() {
+fn a_push_past_its_room_or_its_green_is_refused_before_it_is_held() {
   let mut store = Store::default();
   let large = store.put_blob(&vec![b'x'; 1 << 20]);
   let tree = tree_with(&mut store, vec![entry(b"large", EntryKind::File, large)]);
@@ -1060,23 +1060,36 @@ fn a_push_past_its_room_its_green_or_a_document_is_refused_before_it_is_held() {
     ),
     Err(PushRefused::PastRoom { .. })
   ));
+}
+
+/// A-618 with A-621 (an ops document names as many paths as its work declares; a `u16` table held 65,535). Do: push a
+/// first tree of 70,000 files in one directory, past what a `u16` path table held, to an empty green. Expect: one work,
+/// one tree read, accepted as version 1, and the green holding every file and the head.
+#[test]
+fn a_push_of_more_paths_than_a_u16_table_held_lands_as_one_work() {
+  let mut store = Store::default();
   let empty = store.put_blob(b"");
-  let many: Vec<TreeEntry> = (0..u16::MAX as usize)
+  let many: Vec<TreeEntry> = (0..70_000)
     .map(|n| entry(format!("f{n}").as_bytes(), EntryKind::File, empty))
     .collect();
   let wide = tree_with(&mut store, many);
+  let mut green = Green::new();
+  let built = build(&push(0, None, wide, &head(1)), &green, &store, u64::MAX).unwrap();
   assert_eq!(
-    build(
-      &push(0, None, wide, &head(1)),
-      &Green::new(),
-      &store,
-      u64::MAX
-    ),
-    Err(PushRefused::TooManyNames {
-      names: u16::MAX as usize + 2,
-      most: u16::MAX as usize
-    })
+    built.reads,
+    Reads {
+      trees: 1,
+      blobs: 0,
+      skipped: 0
+    }
   );
+  assert_eq!(
+    green.submit(&built.increment),
+    Outcome::Accepted { version: 1 }
+  );
+  assert_eq!(green.files().count(), 70_000);
+  assert_eq!(green.content("f69999"), Some(&b""[..]));
+  assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(&head(1)[..]));
 }
 
 /// A-618. Do: push, over a landed tree, a tree that removes a file the base tree names and the green does not hold (a

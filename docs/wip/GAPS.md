@@ -271,8 +271,9 @@
 > --lib` on the Mac Studio, 70 of 70 merged with main, red first (a stub walk, and the root absent), red four ways by
 > mutation. Owed: git's store
 > implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6); submodule links (§4.17.2
-> item 5's special node kind); a path changing kind (§8f); a first push past one ops document's 65,535 names (§8f); one
-> copy of a pushed blob for the store and the green; one post-state assembly for the push and the server's works.
+> item 5's special node kind); a path changing kind (§8f); one copy of a pushed blob for the store and the green; one
+> post-state assembly for the push and the server's works. A push of any size is one work, bounded by its room (A-621's
+> 64-bit path indices ended the 65,535-name cap this piece first refused past).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
@@ -9501,15 +9502,10 @@ The merge engine on one node landed the same day (`engine.rs`), composing the pu
 Owed (the rest of Phase 6): the deriver's interaction edges (a file/directory/symlink/link transition at one path, a metadata or link then a rename of that path, symlink rename, a write through a hard link, and the rare reused-base-path rename combination above), each a typed refusal today; the engine now consumes the whole ops document (`6164ef9`), so every namespace kind merges through it — directory creation, mode, symlink, file rename, directory removal, hard link and xattr — and several dimensions on one path in one increment merge together; the fully general intra-increment coordination (a path both renamed away and recreated in one increment) remains; per-range identity in the engine's verdict; the checkpoint folding above; the fenced ledger-register commit and holder recomputation in a fleet (the single-node commit is an in-memory chain append; the fleet register, mirror and reconfiguration protocols are now simulated, §8h); these build on the
 green-volume data model (§4.5's journal is in place; the fleet version chain is not yet).
 
-**Found by A-618 (2026-11-19), OPEN:** an ops document's path table holds paths, link targets and attribute names under
-`u16` indices, and `PathTable::intern` answers `u16::MAX` for every name past the 65,535th, so a document of more names
-aliases them all to one index, silently (`crates/merge/src/ops_doc.rs`); and it interns by a linear scan, so composing n
-names costs O(n²). A push's work refuses past the table typed (`push::PushRefused::TooManyNames`), so a first push of a
-tree past 65,535 names (a kernel tree, 97,229 files) cannot land; any other increment past it is the silent alias. Owed:
-a typed refusal in the deriver at the table's end, interning by an index, and then either indices past `u16` (a format
-change of the document every identity hashes) or a large push landed as a chain of works in one register entry
-(A-603). **Closed by A-618:** a removed file's or directory's mode and attributes stayed in the green, so a path made
-again took them; they now go with it, as a special node's did (`docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`).
+**Found by A-618 (2026-11-19), fixed by A-621:** an ops document's `u16` path table aliased every name past the
+65,535th; A-621's entry above records the fix, and A-618's push refuses nothing for its size. **Closed by A-618:** a
+removed file's or directory's mode and attributes stayed in the green, so a path made again took them; they now go with
+it, as a special node's did (`docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`).
 
 ## 8g. Phase 7 groundwork (2026-09-05)
 

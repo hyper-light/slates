@@ -11853,20 +11853,20 @@ is one more version, and the chain itself is never rewritten.
 > one `Delete` of the base length and one `Insert`), `Create`, `Unlink`, `Mkdir` before what a directory holds, `Rmdir`
 > after it, `SetMode` 0755 for an executable and 0644 for a file that stops being one, `Symlink`; and item 3's head, one
 > `SetXattr` of `slates.vcs.head` on the root, the empty path, which the deriver and the engine now hold always present
-> (§4.16). It composes them against the green's base, lays the post-state from the pushed blobs, charges every operation,
-> queued step and byte against the caller's room as it is made (a file's length before its bytes), and refuses typed: a
-> base the green does not hold, an object the store cannot give as its kind, a name or a link target slates cannot hold,
-> a name twice in a tree, a submodule link (its special node kind is §4.17.2 item 5's, owed), a path that changes kind
-> (the deriver's composition is owed, GAPS §8f), more names than one ops document holds (65,535; GAPS §8f), a work past
-> its room, and a base the green disagrees with. Item 4's client-fidelity test runs after every push of generated
+> (§4.16). It composes them against the green's base, lays the post-state from the pushed blobs, charges every
+> operation, queued step and byte against the caller's room as it is made (a file's length before its bytes), and
+> refuses typed: a base the green does not hold, an object the store cannot give as its kind, a name or a link target
+> slates cannot hold, a name twice in a tree, a submodule link (its special node kind is §4.17.2 item 5's, owed), a path
+> that changes kind (the deriver's composition is owed, GAPS §8f), a work past its room (which bounds a push of any
+> size: an ops document names as many paths as its work declares since A-621, and a push of 70,000 paths lands as one
+> work), and a base the green disagrees with. Item 4's client-fidelity test runs after every push of generated
 > histories, and found that a removed file or directory left its mode and attributes in the green, so a path made again
 > took them (a file deleted and pushed again as plain kept the deleted one's mode 0755); a removed file or directory now
 > takes its mode and attributes with it, as a special node's did (§4.16). Owed: git's tree entries mapped onto
 > `PushObjects` by git's store (piece 5) and the receive-pack verb that submits the work (§4.17.2 piece 6); submodule
-> links; kind transitions; a first push past one document's names (a kernel tree's 97,229 files), with the path table
-> wider or a push split into a chain of works landed as one register entry (A-603); one copy of a pushed blob's bytes
-> shared by the store and the green (A-581's owed content index); the post-state assembly shared with the server's
-> (`verbs::assemble_post_state`), so the two never lay a document out apart.
+> links; kind transitions; one copy of a pushed blob's bytes shared by the store and the green (A-581's owed content
+> index); the post-state assembly shared with the server's (`verbs::assemble_post_state`), so the two never lay a
+> document out apart.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -42127,8 +42127,8 @@ Applied in the same change to:
 
 ### A-618 — A client's push becomes a work by its trees' identities, the head an attribute of the root, and a removed file's metadata goes with it (2026-11-19, g225, UI goal 93; §4.17.1 "A push is a work" items 2 to 4, shared piece 4; §4.16 "The state's maps"; after A-534, A-581, A-603)
 Applied in the same change to:
-- §4.17.1's status ("A push is a work"), §4.16's status ("The state's maps"), GAPS (the §4.17 entry; §8f: the path
-  table's limit, open, and the removed metadata, closed), and the bug record
+- §4.17.1's status ("A push is a work"), §4.16's status ("The state's maps"), GAPS (the §4.17 entry; §8f: the removed
+  metadata, closed), and the bug record
   `docs/bugs/2026-11-19-a-removed-files-mode-and-attributes-outlived-it.md`;
 - `crates/merge` (`push.rs` and `push/tests.rs`, new; `lib.rs`'s `mod` line; `increment.rs`'s present directories;
   `engine.rs`'s metadata merges, `commit`, `drop_metadata` and `holds`).
@@ -42150,8 +42150,10 @@ Applied in the same change to:
   whose trees nest without end is refused at the room. Refused, typed (`PushRefused`): a base past the green's head; an
   object the store cannot give as its kind; a name slates cannot hold in a path (not UTF-8, empty, `.`, `..`, `/`,
   NUL) and a name twice in a tree; a link target not UTF-8 or holding NUL; a submodule link (§4.17.2 item 5's special
-  node kind is owed); a path changing between a file, a directory and a link (the deriver's composition is owed); more
-  than 65,535 names in one ops document (see GAPS §8f); a base the green disagrees with (the deriver's refusal).
+  node kind is owed); a path changing between a file, a directory and a link (the deriver's composition is owed); a
+  base the green disagrees with (the deriver's refusal). A work of any size is bounded by its room alone: the cap of
+  65,535 names this piece first refused past is gone with A-621's 64-bit path indices, and a push of 70,000 paths
+  lands as one work.
 - **The root.** The deriver's present directories and the engine's metadata merges hold the root, the empty path,
   always present, so the head lands and an agent's `chmod` or `setxattr` of a mount's root composes (both were refused:
   `SetModeMissing("")`, `XattrMissing("")`).
@@ -42174,7 +42176,7 @@ Applied in the same change to:
   refusal by kind. Red by mutation, one at a time on a copy: equal subtrees read anyway (3 tests), the executable bit
   ignored (2), the engine without the root (8), a retarget without its unlink (2).
 - **Owed.** git's store implementing `PushObjects` (§4.17.2 piece 5) and receive-pack submitting the work (piece 6);
-  submodule links; kind transitions; a first push past one document's names; one copy of a pushed blob for the store
+  submodule links; kind transitions; one copy of a pushed blob for the store
   and the green; one post-state assembly for pushes and the server's works (`verbs::assemble_post_state`); the
   server's checkout reads `slates.vcs.head` as a difference it cannot write (`checkout.rs` `unwritten_of`), which a
   checkout of a repository's green must pass over.

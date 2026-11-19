@@ -36,8 +36,8 @@
 //! or holding `/` or NUL), or one name twice in a tree; a symbolic link whose target slates cannot hold; a link to
 //! another repository's commit (a git submodule), whose special node kind is owed (§4.17.2 "Trees as a volume" item 5);
 //! a path that changes between a file, a directory and a symbolic link, whose composition the deriver owes (GAPS §8f);
-//! more names than one ops document holds; a work past the caller's room; and a base the green disagrees with, which
-//! the deriver refuses.
+//! a work past the caller's room, which bounds a push of any size (an ops document names as many paths as its work
+//! declares, A-621); and a base the green disagrees with, which the deriver refuses.
 //!
 //! **Bounds (§4.9).** The walk keeps an explicit stack, so a deep tree cannot exhaust the thread's. Every operation the
 //! work keeps, every step the walk queues and every byte the post-state will hold is charged against the caller's room
@@ -45,7 +45,7 @@
 //! store whose trees nested without end is refused at the room.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::engine::{Green, Increment};
 use crate::increment::{DeriveError, PostStatePlan, VolumeOp, compose_volume_planned};
@@ -66,10 +66,6 @@ const EXECUTABLE_MODE: u32 = 0o755;
 /// Format: the permission bits git checks out any other file with (`100644`), which a file a green records no mode for
 /// checks out with too (the server's `DEFAULT_FILE_MODE`).
 const FILE_MODE: u32 = 0o644;
-
-/// Format: the most names one ops document holds. Its path table's indices are `u16`, and its interning answers
-/// `u16::MAX` for every name past them, so the last index is left unused (GAPS, A-618).
-const MOST_NAMES: usize = u16::MAX as usize;
 
 /// Format: the BLAKE3 key-derivation context a push's work identity is hashed under, so it is never a work volume's.
 const IDENTITY_CONTEXT: &str = "slates 2026-11-19 a client's push as a work";
@@ -242,13 +238,6 @@ pub enum PushRefused {
   KindChanged {
     /// The path.
     path: String,
-  },
-  /// More names than one ops document holds.
-  TooManyNames {
-    /// The names the work would hold.
-    names: usize,
-    /// The most a document holds.
-    most: usize,
   },
   /// What the work would keep is past the caller's room.
   PastRoom {
@@ -621,13 +610,6 @@ impl<O: PushObjects> Walk<'_, O> {
 
   /// Composes the journal against the green's base and lays its post-state out: the work.
   fn seal(mut self, push: &Push<'_>, green: &Green) -> Result<Built, PushRefused> {
-    let names = names(&self.journal);
-    if names > MOST_NAMES {
-      return Err(PushRefused::TooManyNames {
-        names,
-        most: MOST_NAMES,
-      });
-    }
     let base = green.base_for(push.base_version, &self.journal);
     let (doc, plan) = compose_volume_planned(&base, &self.journal).map_err(PushRefused::Compose)?;
     let post_state = self.post_state(&doc, &plan, push.head.unwrap_or_default())?;
@@ -721,25 +703,6 @@ fn lay(post: &mut [u8], op: &Op, source: &[u8], from: Option<u64>) -> Option<()>
   let into = post.get_mut(at..at.checked_add(len)?)?;
   into.copy_from_slice(source.get(from..from.checked_add(len)?)?);
   Some(())
-}
-
-/// The names one document holding `journal` interns: every path an operation names, symbolic links' targets and
-/// attributes' names.
-fn names(journal: &[VolumeOp]) -> usize {
-  let mut names: BTreeSet<&str> = BTreeSet::new();
-  for op in journal {
-    names.extend(op.names().into_iter().flatten());
-    match op {
-      VolumeOp::Symlink { target, .. } => {
-        names.insert(target);
-      }
-      VolumeOp::SetXattr { name, .. } | VolumeOp::RemoveXattr { name, .. } => {
-        names.insert(name);
-      }
-      _ => {}
-    }
-  }
-  names.len()
 }
 
 /// `name` checked as one component of a path under `prefix`: refused when slates cannot hold it.
