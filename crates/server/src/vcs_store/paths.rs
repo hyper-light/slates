@@ -3,46 +3,56 @@
 //!
 //! **What it keeps.** For each member green of a git repository, the map of paths to git's files of its head
 //! (`slates_vcs::derived::paths::PathMap`): content in the shard's store, whose root the repository's store holds once
-//! with the version it is of ([`Head`]). A file is what git holds at the path: a regular file `100644`, or `100755` when
-//! its owner may execute it (git keeps a regular file's owner execute bit alone \[C: git `read-cache.c`
-//! `ce_mode_from_stat` and `cache.h` `create_ce_mode`, v2.50.1\]); a symbolic link `120000`, whose content is its target;
-//! a submodule's link `160000`, whose content is the commit's id (A-637). A hard link is a file with its primary's bytes
-//! and class; a named pipe, a socket or a device node is nothing git holds, and is no file of the map. The classes are
-//! `slates_git::derived::FileClass`'s, so the trees A-664 part 2 derives read these maps' changes as they are.
+//! with the version it is of ([`Head`]). A file is what git holds at the path: a regular file `100644`, or `100755`
+//! when its owner may execute it (git keeps a regular file's owner execute bit alone \[C: git `read-cache.c`
+//! `ce_mode_from_stat` and `cache.h` `create_ce_mode`, v2.50.1\]); a symbolic link `120000`, whose content is its
+//! target; a submodule's link `160000`, whose content is the commit's id (A-637). A hard link is a file with its
+//! primary's bytes and class; a named pipe, a socket or a device node is nothing git holds, and is no file of the map.
+//! The classes are `slates_git::derived::FileClass`'s, so the trees A-664 part 2 derives read these maps' changes as
+//! they are.
 //!
 //! **The head's alone, and why.** A green's next map is derived from its head's, and nothing else reads an earlier one,
 //! so the store holds one map a green, replaced as each version commits, and what two heads share is held once (path
-//! copying). A recovery makes it again: A-662's rule is that a store made again from the log equals the live store whole,
-//! every content with its holders, and an earlier version's map could not be made again from a log whose versions a
-//! checkpoint folds; the head's is built from the green itself ([`remake_green`]). The store holds as many maps as the
-//! repository has greens that committed a version.
+//! copying). A recovery makes it again: A-662's rule is that a store made again from the log equals the live store
+//! whole, every content with its holders, and an earlier version's map could not be made again from a log whose
+//! versions a checkpoint folds; the head's is built from the green itself ([`remake_green`]). So the store holds a map
+//! for each member green that committed a version, and for no other: a member's map goes as it leaves its lineage (its
+//! destroy, a fence, a refused push's branch made in memory; [`forget`], from `repository::retire_member`), as a store
+//! made again would hold none for it.
 //!
 //! **When.** As each version commits on the owner: a submit's, once its merge record is appended (`verbs`'
-//! `record_accepted`), and a push's, once its register entry is applied (`repository::push::push_sealed`). The change
-//! is read from the green, never from a client: the paths the version changed (`Green::changed_between`, the change
-//! index, A-264), each set to its file at the head or, where the head's map holds a file and the new head none, removed.
-//! So a step costs the change's paths and, in the map, their directories, never the green's tree. A version no longer
-//! at the green's head (an idempotent resubmit's, accepted before) was stepped then.
+//! `judge_submission`, after `record_accepted`), and a push's, once its register entry is applied
+//! (`repository::push::push_sealed`). The change is read from the green, never from a client: the paths the version
+//! changed (`Green::changed_between`, the change index, A-264), and the hard links naming each, which read the file's
+//! bytes and mode and which the index leaves out (`Green::links_naming`); each set to its file at the head or, where
+//! the head's map holds a file and the new head none, removed. A directory needs nothing of its own: the map keeps a
+//! directory while a file stands beneath it, and the index names each file a version makes, moves or removes. So a step
+//! costs the change's paths and, in the map, their directories, never the green's tree. A version no longer at the
+//! green's head (an idempotent resubmit's, accepted before) was stepped then.
 //!
-//! **Whole, where it must be.** Where the green's map is not of the version before (a green's first version, a
-//! branch's, the first after a refused step) or the change names a directory (a directory made, renamed or copied,
-//! whose files the change index names by the directory alone), the map is built from the whole head instead, once.
+//! **Whole, where it must be.** Where the store keeps no map of the green's version before (a green's first version, a
+//! branch's first, the first after a refused step), or a copy was made at or above a path the change names
+//! (`Green::copied_after`: the index names a copy at its destination alone, standing for the tree it brought, A-586),
+//! the map is built from the whole head instead, once.
 //!
-//! **Budget.** The step's contents and nodes are the content store's, charged to the shard as A-662 charges a push: lent
-//! the room the shard's budget could admit now, grown first by the bytes the step brings, then trued up to what the
-//! store holds. A refused step (that room, a path the map refuses, the store's own) keeps nothing new, holds nothing new
-//! and is counted; the version's merge record is durable already, and the green's next map is built whole. A green that
-//! committed a version keeps a map after a recovery even where a refusal had left it none.
+//! **Budget.** The step's contents and nodes are the content store's, charged to the shard as A-662 charges a push:
+//! lent the room the shard's budget could admit now, grown first by the bytes the step brings, then trued up to what
+//! the store holds. A refused step (that room, a path the map refuses, the store's own) keeps nothing new, holds
+//! nothing new and is counted; the version's merge record is durable already, and the green's next map is built whole.
+//! A green that committed a version keeps a map after a recovery even where a refusal had left it none.
 //!
 //! **Counters.** [`DERIVED`] (a map derived from the one before: the non-vacuity count of the incremental path),
 //! [`BUILT`] (built from the whole head as a version commits), [`REMADE`] (built by a recovery), [`REFUSED`].
 //!
 //! **Owed** (GAPS, A-664): the trees and the commit derived from these changes, admitted to the store with the green's
 //! head moved and recorded with the version; a submit refused before its verdict when its post-state is one git cannot
-//! hold (a named pipe, a socket, a device, a `.git` name).
+//! hold (a named pipe, a socket, a device, a `.git` name); a whole build and a whole map's release sliced a unit at a
+//! time (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
+//! source's head is the version it was made at; the holders' maps (A-636's fleet half); and a copy made through a work,
+//! which no client verb makes yet (A-626 part 4), driven through this module's whole build by a test.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::catalog::{RepositoryId, VolumeId as DbVolumeId};
 use slates_git::derived::FileClass;
@@ -180,6 +190,26 @@ pub(crate) fn remake_green(state: &mut ShardState, green: DbVolumeId) {
   }
 }
 
+/// Gives back `green`'s map as it leaves `repository`'s lineage (`repository::retire_member`: its destroy, a fence, a
+/// refused push's branch made in memory): a store made again from the log keeps no map for a green that is no member,
+/// so the live one keeps none either (module docs). Nothing where the store keeps no map for it.
+pub(crate) fn forget(state: &mut ShardState, repository: RepositoryId, green: DbVolumeId) {
+  let key = super::green_key(green);
+  let released = {
+    let Some((content, git)) = state.vcs_stores.git(repository) else {
+      return;
+    };
+    let Some(head) = git.heads.remove(&key) else {
+      return;
+    };
+    content.release(&head.root).is_ok()
+  };
+  if !released {
+    state.count(super::RELEASE_REFUSED, 1);
+  }
+  super::settle(state);
+}
+
 /// Counts a step's answer, a build under `built`.
 fn count(state: &mut ShardState, answer: Result<Stepped, StepRefused>, built: &'static str) {
   match answer {
@@ -285,21 +315,21 @@ fn plan<'g>(
   ))
 }
 
-/// The version's change over the map `before` (module docs): each path the version changed, set to its file at the head
-/// or removed where `before` holds a file and the head none; `None` when the change names a directory.
+/// The version's change over the map `before` (module docs): each path [`named`] gives, set to its file at the head or
+/// removed where `before` holds a file and the head none; `None` when a copy names a tree by its destination alone.
 fn changed<'g>(
   engine: &'g Green,
   (content, paths, before): (&ContentStore, &GreenPaths, ContentId),
   (from, to): (u64, u64),
 ) -> Result<Option<Vec<(Vec<u8>, Option<GitFile<'g>>)>>, StepRefused> {
+  let Some(named) = named(engine, from, to) else {
+    return Ok(None);
+  };
   let mut files = Vec::new();
-  for path in engine.changed_between(from, to) {
+  for path in named {
     let name = map_path(&path);
     if name.is_empty() {
       continue;
-    }
-    if engine.is_dir(&path) {
-      return Ok(None);
     }
     if let Some(file) = git_file(engine, &path) {
       files.push((name.to_vec(), Some(file)));
@@ -308,6 +338,22 @@ fn changed<'g>(
     }
   }
   Ok(Some(files))
+}
+
+/// The paths whose files the versions in `(from, to]` may have changed (module docs): each path the change index names,
+/// and each hard link naming one, which reads the file's bytes and mode and which the index leaves out; `None` when a
+/// copy at or above a named path was made in the span, since the index names a copy at its destination alone, standing
+/// for the tree it brought (A-586).
+fn named(engine: &Green, from: u64, to: u64) -> Option<BTreeSet<String>> {
+  let mut named = BTreeSet::new();
+  for path in engine.changed_between(from, to) {
+    if engine.copied_after(&path, from) {
+      return None;
+    }
+    named.extend(engine.links_naming(&path).map(str::to_owned));
+    named.insert(path);
+  }
+  Some(named)
 }
 
 /// Whether the map `before` holds a file at `name`.

@@ -2132,6 +2132,27 @@ impl Green {
     self.hardlinks.get(path).map(String::as_str)
   }
 
+  /// The hard links naming the file at `path`, each a name read through it: what a change to the file changes with it.
+  /// The change index names such a change at the file alone (a special node's links are named with it,
+  /// `record_changes`), so a reader that keeps what each name reads, a version's map of paths to git's files (A-664
+  /// part 3), takes the links from here. One lookup.
+  pub fn links_naming<'a>(&'a self, path: &str) -> impl Iterator<Item = &'a str> + use<'a> {
+    self
+      .links_to
+      .get(path)
+      .into_iter()
+      .flatten()
+      .map(String::as_str)
+  }
+
+  /// Whether a copy whose tree holds `path` (its destination is `path` or an ancestor) was made after `version`
+  /// (A-586): the change index names a copy at its destination alone, which stands for the tree it brought, so a reader
+  /// of the index (a version's map of paths, A-664 part 3) takes that tree from the head. One lookup a level of the
+  /// path's depth, none on a green that never copied.
+  pub fn copied_after(&self, path: &str, version: u64) -> bool {
+    self.replaced_after(path, version)
+  }
+
   /// An xattr value at `(path, name)`, or `None` when unset.
   pub fn xattr(&self, path: &str, name: &str) -> Option<&[u8]> {
     self

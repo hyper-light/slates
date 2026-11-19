@@ -1,7 +1,8 @@
-//! A-664 part 3, its first piece: a git repository's greens keep each version's map of paths to git's files, derived
-//! from the parent's over the change index or built whole, and equal, identity for identity, to the map built from the
-//! files the version holds as git reads them (the oracle's model, kept here by the design's rules, never read back
-//! through the module's own reading of a green).
+//! A-664 part 3, its first piece: a git repository's greens keep the map of paths to git's files of each head, derived
+//! from the one before over the change index and the links it leaves out, or built whole, and equal, identity for
+//! identity, to the map built from the files the version holds as git reads them (the oracle's model, kept here by the
+//! design's rules, never read back through the module's own reading of a green); a green that leaves its lineage takes
+//! its map with it, so the live store equals one made again from the log.
 
 use std::collections::BTreeMap;
 
@@ -214,6 +215,35 @@ fn fifo() -> IpcNode {
   }
 }
 
+/// A branch `name` of the repository `repository` made at its default branch's head: its green.
+fn branch(state: &mut ShardState, repository: &str, name: &str) -> VolumeId {
+  let made = ask(
+    state,
+    RequestBody::CreateBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      from: "main".to_owned(),
+      version: None,
+    },
+  );
+  let ReplyBody::GreenCreated { id } = made else {
+    panic!("no branch: {made:?}")
+  };
+  id
+}
+
+/// What the store holds that its maps make: every content with its holders, and the bytes it uses, as A-662's oracle
+/// compares a store made again with the live one.
+fn held(state: &ShardState) -> (Vec<(ContentId, u64)>, u64) {
+  let content = state.vcs_stores.content().expect("the content store");
+  let mut contents: Vec<(ContentId, u64)> = content
+    .identities()
+    .map(|identity| (*identity, content.holders(identity)))
+    .collect();
+  contents.sort();
+  (contents, content.used())
+}
+
 /// The fixed history's first five versions (each checked against the model): files made in a directory; one
 /// overwritten; one made executable; a symbolic link and a hard link; a named pipe and an attribute, which change no
 /// file git holds.
@@ -282,9 +312,19 @@ fn links(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model
   assert_kept(state, at, fourth, model);
 }
 
-/// The fixed history's last five versions (each checked against the model): a file renamed; a symbolic link removed; a
-/// file moved into a directory made with it and its old directory removed, a change naming directories; a splice into
-/// the moved file; its execute bit taken away.
+/// The sixth version: the file the hard link names is overwritten, which the change index names at the file alone; the
+/// link reads the new bytes, as git's tree holds them at both names.
+fn primary(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
+  let sixth = version(state, at.1, 6, vec![Op::Edit("/keep", 0, 4, b"KEEP!")]);
+  set(model, "keep", FileClass::File, b"KEEP!");
+  set(model, "h", FileClass::File, b"KEEP!");
+  assert_kept(state, at, sixth, model);
+}
+
+/// The fixed history's last five versions (each checked against the model): a file renamed; a symbolic link removed; an
+/// executable file moved into a directory made with it, its old directory removed, a change whose directories the map
+/// makes and drops by their files alone (the move states the file's mode, as the green keeps a mode at its path,
+/// A-618); a splice into the moved file; its execute bit taken away.
 fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut Model) {
   let green = at.1;
   let rename = |from: &str, to: &str| {
@@ -293,54 +333,61 @@ fn last_five(state: &mut ShardState, at: (RepositoryId, VolumeId), model: &mut M
       to: to.to_owned(),
     })
   };
-  let sixth = version(state, green, 6, vec![rename("/f", "/g")]);
+  let seventh = version(state, green, 7, vec![rename("/f", "/g")]);
   let (class, bytes) = take(model, "f");
   set(model, "g", class, &bytes);
-  assert_kept(state, at, sixth, model);
+  assert_kept(state, at, seventh, model);
   let unlink = WorkOp::Unlink {
     path: "/s".to_owned(),
   };
-  let seventh = version(state, green, 7, vec![Op::Declare(unlink)]);
+  let eighth = version(state, green, 8, vec![Op::Declare(unlink)]);
   take(model, "s");
-  assert_kept(state, at, seventh, model);
+  assert_kept(state, at, eighth, model);
   let moved = vec![
     Op::Declare(WorkOp::Mkdir {
       path: "/x".to_owned(),
     }),
     rename("/d/a", "/x/a"),
+    Op::Declare(WorkOp::SetMode {
+      path: "/x/a".to_owned(),
+      mode: EXECUTABLE,
+    }),
     Op::Declare(WorkOp::Rmdir {
       path: "/d".to_owned(),
     }),
   ];
-  let eighth = version(state, green, 8, moved);
+  let ninth = version(state, green, 9, moved);
   let (class, bytes) = take(model, "d/a");
   set(model, "x/a", class, &bytes);
-  assert_kept(state, at, eighth, model);
-  let ninth = version(state, green, 9, vec![Op::Edit("/x/a", 0, 0, b"A")]);
-  set(model, "x/a", FileClass::Executable, b"Aalpha");
   assert_kept(state, at, ninth, model);
+  let tenth = version(state, green, 10, vec![Op::Edit("/x/a", 0, 0, b"A")]);
+  set(model, "x/a", FileClass::Executable, b"Aalpha");
+  assert_kept(state, at, tenth, model);
   let mode = WorkOp::SetMode {
     path: "/x/a".to_owned(),
     mode: PLAIN,
   };
-  let tenth = version(state, green, 10, vec![Op::Declare(mode)]);
+  let eleventh = version(state, green, 11, vec![Op::Declare(mode)]);
   set(model, "x/a", FileClass::File, b"Aalpha");
-  assert_kept(state, at, tenth, model);
+  assert_kept(state, at, eleventh, model);
 }
 
 /// A-664 part 3 (its first piece; A-647's owed map: "the green's state as the path map these types read"). Do: on a git
-/// repository's root green, submit ten versions: files made in a directory, one overwritten, one made executable, a
-/// symbolic link and a hard link, a named pipe and an attribute, a file renamed, the link removed, a file moved to a
-/// new directory and the old one removed, a splice, the execute bit taken away. Expect: after each, the version's map holds exactly the files git
-/// would (classes `100644`, `100755`, `120000`; a hard link its primary's bytes; no pipe), and its root is the root of
-/// that map built from scratch in another store; the first version and the move between directories built whole, the
-/// other eight derived from the map before (the non-vacuity count of the incremental path), none refused.
+/// repository's root green, submit eleven versions: files made in a directory, one overwritten, one made executable, a
+/// symbolic link and a hard link, a named pipe and an attribute, the hard link's file overwritten, a file renamed, the
+/// symbolic link removed, an executable file moved to a new directory and the old one removed, a splice, the execute
+/// bit taken away. Expect: after each, the version's map holds exactly the files git would (classes `100644`, `100755`,
+/// `120000`; a hard link its file's bytes, the new ones once its file is overwritten; no pipe), and its root is the
+/// root of that map built from scratch in another store; the first version built whole and the other ten derived from
+/// the map before (the non-vacuity count of the incremental path: no directory a version makes or removes, and no hard
+/// link, asks for a whole build), none refused.
 #[test]
 fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
   let counts = crate::daemon::audit_on_shard(|state| {
     let at = git_repository(state, "tree");
     let mut model = Model::new();
     first_five(state, at, &mut model);
+    primary(state, at, &mut model);
     last_five(state, at, &mut model);
     (
       count(state, BUILT),
@@ -348,7 +395,7 @@ fn t_a664_p3_every_version_of_a_git_green_keeps_its_map_of_gits_files() {
       count(state, REFUSED),
     )
   });
-  assert_eq!(counts, (2, 8, 0));
+  assert_eq!(counts, (1, 10, 0));
 }
 
 /// A-664 part 3 (its first piece: a plain green is no repository's, and git holds none of its versions). Do: submit a
@@ -412,18 +459,7 @@ fn t_a664_p3_a_branchs_first_version_is_built_whole_then_derived() {
   let counts = crate::daemon::audit_on_shard(|state| {
     let (repository, root) = git_repository(state, "branched");
     version(state, root, 1, vec![create("/f", b"root")]);
-    let made = ask(
-      state,
-      RequestBody::CreateBranch {
-        repository: "branched".to_owned(),
-        name: "topic".to_owned(),
-        from: "main".to_owned(),
-        version: None,
-      },
-    );
-    let ReplyBody::GreenCreated { id: topic } = made else {
-      panic!("no branch: {made:?}")
-    };
+    let topic = branch(state, "branched", "topic");
     let mut model = Model::new();
     set(&mut model, "f", FileClass::File, b"root");
     let first = version(state, topic, 2, vec![create("/t", b"topic")]);
@@ -435,4 +471,30 @@ fn t_a664_p3_a_branchs_first_version_is_built_whole_then_derived() {
     (count(state, BUILT), count(state, DERIVED))
   });
   assert_eq!(counts, (2, 1));
+}
+
+/// A-664 part 3 (its first piece; A-662: the live store equals a store made again from the log, which keeps a map for
+/// no green that is no member). Do: submit a file to a git repository's root green, branch it, submit a file to the
+/// branch, destroy the branch, then make the store again from the log as a recovery does. Expect: the branch's map kept
+/// before its destroy and gone after it; the store the same before and after it is made again, every content with its
+/// holders and the bytes it uses; the root's map still its model.
+#[test]
+fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
+  crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = git_repository(state, "pruned");
+    let head = version(state, root, 1, vec![create("/f", b"root")]);
+    let topic = branch(state, "pruned", "topic");
+    let first = version(state, topic, 2, vec![create("/t", b"topic")]);
+    let before = kept(state, repository, topic, first).is_some();
+    let destroyed = ask(state, RequestBody::Destroy { volume: topic });
+    assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+    let after = kept(state, repository, topic, first).is_some();
+    assert_eq!((before, after), (true, false), "the branch's map");
+    let live = held(state);
+    crate::vcs_store::rebuild(state, repository);
+    assert_eq!(held(state), live, "the store made again");
+    let mut model = Model::new();
+    set(&mut model, "f", FileClass::File, b"root");
+    assert_kept(state, (repository, root), head, &model);
+  });
 }

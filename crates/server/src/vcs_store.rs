@@ -131,12 +131,13 @@ pub(crate) struct GitStore {
   pub(crate) derivations: Derivations,
   /// The reach sets' type, eager: each version's value kept as it commits, from the admission's own walks.
   pub(crate) reach: ReachSets,
-  /// The path map's type over the repository's greens (A-664 part 3, [`paths`]): each green's versions' maps of paths
-  /// to git's files, kept in `derivations` as each version commits. Declared with the content store's window when the
-  /// store is made ([`made`]); `None` for a store made without one.
+  /// The path map's type over the repository's greens (A-664 part 3, [`paths`]): what each green's map of its head in
+  /// `heads` is made and read by. Declared with the content store's window when the store is made ([`made`]); `None`
+  /// for a window too small for the map's branches, which no content plane's window is.
   pub(crate) paths: Option<paths::GreenPaths>,
   /// Each green's map of its head, by the green's key (A-664 part 3, [`paths`]): one a member green that committed a
-  /// version, its root held once by the store, replaced as each version commits and made again by a recovery.
+  /// version, its root held once by the store, replaced as each version commits, given back as the green leaves its
+  /// lineage and made again by a recovery.
   pub(crate) heads: BTreeMap<u64, paths::Head>,
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
