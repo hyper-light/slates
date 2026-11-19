@@ -288,8 +288,10 @@ fn every_recorded_session_is_answered_as_svnserve_answered_it() {
         at
       }
       Ending::Refused(refused) => {
+        // svnserve ended this connection before it flushed the trivial auth request it had
+        // answered `update` with (A-616 part 1): only what it flushed is compared.
         assert_eq!(recorded.name, "hostile-report-malformed-set-path.1", "{refused:?}");
-        ours.len()
+        ours.len().min(items(recorded.server).len())
       }
       Ending::Waiting => ours.len(),
     };
