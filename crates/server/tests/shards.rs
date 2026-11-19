@@ -2697,9 +2697,9 @@ mod route {
 
   use super::*;
 
-  /// Shape: how long past an offer's life the expiry test waits before it claims: the offer's two liveness budgets
-  /// (`OFFER_LIFE_NS`), and half a budget for the timer's own wake on a loaded machine.
-  const PAST_EXPIRY: Duration = Duration::from_millis(2_500);
+  /// Shape: how long the life test's client waits before it claims: past the fixed life offers had until A-492 (two
+  /// liveness budgets) by half a budget, the old timer's own wake on a loaded machine.
+  const PAST_THE_OLD_LIFE: Duration = Duration::from_millis(2_500);
 
   /// Attaches `id` in the Shards form over the ring: the attachment and the secret its offer is claimed with.
   fn offer(client: &mut Client, id: VolumeId) -> (u64, [u8; 32]) {
@@ -2777,9 +2777,11 @@ mod route {
   }
 
   /// A-161 step 3, hostile exchanges: a wrong secret, a proof replayed from another connection, a message cut short, a
-  /// claim with bytes after its proof, a hello of another version and a stranger who says nothing all get no
-  /// descriptor and a typed, counted refusal, and leave the offer to its honest claim, which then succeeds once; a
-  /// second claim with the same secret finds no offer. The listener serves every honest claim throughout.
+  /// claim with bytes after its proof, a hello of another version and a stranger who says nothing and then closes all get
+  /// no descriptor and a typed, counted refusal, and leave the offer to its honest claim, which then succeeds once; a
+  /// second claim with the same secret finds no offer. The listener serves every honest claim throughout. A silent
+  /// stranger holds its seat while its connection is open and ends its exchange by closing it (A-492: no clock ends an
+  /// exchange's wait on its client; the socket is the user's alone).
   #[test]
   fn hostile_claims_get_no_descriptor_and_the_honest_claim_succeeds_once() {
     let (daemon, instance) = single_shard_daemon("shards-route");
@@ -2830,19 +2832,20 @@ mod route {
     long.write_all(&oversized).unwrap();
     refused_with(&mut long, KIND_MALFORMED);
 
-    // A stranger who connects and says nothing is dropped at the exchange's deadline, counted.
+    // A stranger who connects and says nothing, then closes: its close ends the exchange, a hello cut short, counted.
+    let malformed_before = counted(&daemon, "shards.route_malformed");
     let silent = connect_route(&instance);
+    drop(silent);
     let started = Instant::now();
-    while counted(&daemon, "shards.route_timed_out") == 0 {
+    while counted(&daemon, "shards.route_malformed") == malformed_before {
       assert!(
         started.elapsed() < CREDIT_WAIT,
-        "a silent connection held its seat"
+        "a silent connection's close did not end its exchange"
       );
       // The test thread polls the daemon's answer; no runtime wheel serves this thread (D-9 allows a test).
       #[allow(clippy::disallowed_methods)]
       std::thread::sleep(Duration::from_millis(10));
     }
-    drop(silent);
 
     // The honest claim, after all of it, succeeds; a second with the same secret finds no offer.
     let claimed = slates_ipc::route::claim(
@@ -2878,8 +2881,7 @@ mod route {
     ));
     for (kind, at_least) in [
       ("shards.route_proof", 2),
-      ("shards.route_malformed", 3),
-      ("shards.route_timed_out", 1),
+      ("shards.route_malformed", 4),
       ("shards.route_no_offer", 1),
       ("shards.route_claimed", 1),
     ] {
@@ -3008,11 +3010,16 @@ mod route {
       .is_ok_and(|message| message.kind == ResyncKind::Attached && message.attachment == attachment)
   }
 
-  /// A-161 step 3: an offer unclaimed past its life is dropped by its timer, so a claim then finds no offer, and the
-  /// end it held closes, which ends the stream's attachment.
+  /// A-492 (A-161 step 3): an offer waits for its claim while its client lives, never for a fixed life. Do: attach in the
+  /// Shards form (the end offered), wait past the life offers had until A-492 (two liveness budgets) and half a budget
+  /// more, then claim the offer and serve a lookup through the end. Expect: claimed, served, counted claimed, and no
+  /// offer let go for its client's retirement (its client lives). Before, the offer's timer let it go at two budgets
+  /// and the claim was refused `NoOffer`. A client that dies before its claim has its offers let go when the reaper
+  /// retires it (`shards_route::let_go_of_client`, the unit test
+  /// `a_retired_clients_offers_are_let_go_and_their_ends_closed`).
   #[test]
-  fn an_unclaimed_offer_expires_and_its_attachment_ends() {
-    let (daemon, instance) = single_shard_daemon("shards-route-expiry");
+  fn an_unclaimed_offer_outlives_the_old_fixed_life_while_its_client_lives() {
+    let (daemon, instance) = single_shard_daemon("shards-route-life");
     let mut client = Client::connect(&instance);
     let ReplyBody::Created { id } = client.call(&scratch("shared")) else {
       panic!("the volume was not created");
@@ -3020,25 +3027,31 @@ mod route {
     let before = status(&mut client, id).attachments;
     let (attachment, secret) = offer(&mut client, id);
     assert_eq!(status(&mut client, id).attachments, before + 1);
-    // The test thread waits out the offer's life; no runtime wheel serves this thread (D-9 allows a test).
+    // The test thread waits past the old life; no runtime wheel serves this thread (D-9 allows a test).
     #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(PAST_EXPIRY);
-    assert!(matches!(
-      slates_ipc::route::claim(
-        &instance,
-        (OfferKind::Stream, attachment),
-        &secret,
-        CREDIT_WAIT,
-        &mut || false,
-      ),
-      Err(IpcError::RouteRefused {
-        refusal: slates_ipc::error::RouteRefusal::NoOffer
-      })
-    ));
-    assert_eq!(counted(&daemon, "shards.route_expired"), 1);
-    wait_until("the expired offer's attachment outlived it", || {
-      status(&mut client, id).attachments == before
+    std::thread::sleep(PAST_THE_OLD_LIFE);
+    let claimed = slates_ipc::route::claim(
+      &instance,
+      (OfferKind::Stream, attachment),
+      &secret,
+      CREDIT_WAIT,
+      &mut || false,
+    )
+    .expect("an offer whose client lives was claimable past the old fixed life");
+    let mut guest = Guest::over(Attached {
+      answer: ShardsAttached {
+        attachment,
+        lease_epoch: None,
+        stream: claimed.descriptor,
+        resync: claimed.resync,
+      },
+      shards: shard_holders(&daemon),
     });
+    guest.init();
+    assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
+    assert_eq!(counted(&daemon, "shards.route_claimed"), 1);
+    assert_eq!(counted(&daemon, "shards.route_client_retired"), 0);
+    drop(guest);
     drop(client);
     drop(daemon);
   }
@@ -3046,8 +3059,8 @@ mod route {
   /// A-161 with A-173's rule that an offer never outlives what it offers: an attachment that ends before its stream end
   /// is claimed takes the offer with it. Do: attach in the Shards form (the end offered, unclaimed), detach the
   /// attachment, then claim the offer with its own secret. Expect: the claim refused `NoOffer` at once, counted
-  /// `shards.route_withdrawn`, not left to expire; before, the claim was handed an end whose other side the detach had
-  /// already closed.
+  /// `shards.route_withdrawn`, not left for its client's retirement (A-492); before, the claim was handed an end whose
+  /// other side the detach had already closed.
   #[test]
   fn an_attachment_ended_before_its_claim_withdraws_its_offer() {
     let (daemon, instance) = single_shard_daemon("shards-route-withdrawn");
@@ -3080,7 +3093,7 @@ mod route {
       "the ended attachment's offer was still claimable: {claimed:?}"
     );
     assert_eq!(counted(&daemon, "shards.route_withdrawn"), 1);
-    assert_eq!(counted(&daemon, "shards.route_expired"), 0);
+    assert_eq!(counted(&daemon, "shards.route_client_retired"), 0);
     drop(client);
     drop(daemon);
   }

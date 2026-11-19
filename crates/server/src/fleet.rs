@@ -403,15 +403,15 @@ fn adopt_inherited(
 }
 
 /// Takes ownership of a descriptor the supervisor handed over at `raw`: a fleet serve socket
-/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::held::ENV_DEVICES`,
-/// `crate::fuse_hold`).
+/// (`ENV_FLEET_SERVE`), or the handoff table's object and the descriptors it names, the device channel, the held
+/// devices, connections and copies (`slates_anchor::held::ENV_HELD`, A-462; `crate::fuse_hold`).
 #[cfg(unix)]
 pub(crate) fn inherited_descriptor(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {
   use std::os::fd::FromRawFd;
   // SAFETY: the supervisor made this descriptor inheritable and handed it across the spawn at this number
-  // (`ENV_FLEET_SERVE` or `ENV_DEVICES`; every number non-negative and distinct from the others in its
-  // variable, checked by the parser); this process adopts each once, at start, before anything else could claim
-  // the number, so the `OwnedFd` is its single owner and closes it on drop. The supervisor keeps its own copy.
+  // (`ENV_FLEET_SERVE`, or `ENV_HELD` and the table it names; every number non-negative and distinct from the others,
+  // checked by the parsers); this process adopts each once, at start, before anything else could claim the number, so
+  // the `OwnedFd` is its single owner and closes it on drop. The supervisor keeps its own copy.
   unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
 }
 
@@ -1915,20 +1915,13 @@ async fn serve_peer_records(
           }
           crate::owner_location::STREAM => {
             injected_serve_delay().await;
-            state::with_state(
-              |state| match crate::owner_location::serve(state, &request) {
-                Ok((reply, declined)) => {
-                  if let Some(declined) = declined {
-                    state.count(declined, 1);
-                  }
-                  reply
-                }
-                Err(error) => {
-                  state.count(error.counter(), 1);
-                  Vec::new()
-                }
-              },
-            )
+            state::with_state(|state| {
+              let peer_host = state
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host);
+              crate::owner_location::answer(state, peer_host, &request)
+            })
             .unwrap_or_default()
           }
           _ => Vec::new(),
@@ -9225,7 +9218,9 @@ fn alive_regions(state: &ShardState) -> Vec<RegionId> {
 /// reactively (§4.8, D-14), the cross-region parallel of [`membership_diverges_from_config`]. Compared as
 /// sets over [`alive_regions`] and the root configuration's regions; equal in steady state, so a converged
 /// learner fetches nothing. (This rests on the all-to-all mesh, where a node's SWIM sees every region's
-/// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM.)
+/// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM. One
+/// version-carrying signal exists: a location query bound to a newer root than this node holds, [`root_learner_fetch`],
+/// A-489, since a seat change moves the version and neither comparison here.)
 /// A root voter it knows that its membership no longer holds alive is the same signal for the voters (A-406): the
 /// group has replaced it or will, and the configuration records who votes once it has, while a region whose
 /// representative died stays in the regions and moves nothing the first comparison sees.
@@ -9296,29 +9291,15 @@ async fn drive_root_group(
     // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
     // reactively, only when its own alive view of the regions, or of the root voters it knows, diverges from the
     // root configuration it holds ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel
-    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406).
+    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406), and a peer whose
+    // location query showed it a newer root (A-489, [`root_learner_fetch`]).
     // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
     let now = futures::now_ns();
-    let wanted = state::with_state(|s| {
-      if s.recovery.root.is_some() {
-        s.root_learner_pace.reset();
-        true
-      } else if !s.root.initialized() {
-        let due = s.root_learner_pace.due(now);
-        if !due {
-          s.count(LEARNER_FETCH_PACED, 1);
-        }
-        due
-      } else {
-        s.root_learner_pace.reset();
-        root_diverges(s)
-      }
-    })
-    .unwrap_or(false);
+    let fetch = state::with_state(|s| root_learner_fetch(s, now)).unwrap_or(RootLearnerFetch::Idle);
 
-    if wanted {
+    if let RootLearnerFetch::Due { shown_by } = fetch {
       let known = state::with_state(|s| s.root.known_voters()).unwrap_or_else(|| voters.clone());
-      let targets = root_learner_targets(&known, local);
+      let targets = with_shown_peer(root_learner_targets(&known, local), shown_by, local);
       drive_root_learner_fetch(&targets, budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         let still = !s.root.initialized();
@@ -9490,6 +9471,74 @@ async fn drive_root_election(
   };
   // Phase two — the real vote round over the same sessions.
   drive_vote_round(Group::Root, vote, sessions, budget, in_flight).await;
+}
+
+/// What a root learner does this period ([`root_learner_fetch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootLearnerFetch {
+  /// No fetch.
+  Idle,
+  /// A fetch from the voters it knows ([`root_learner_targets`]) and, when a peer's location query showed it a newer
+  /// root (A-489), from that peer too, which holds it.
+  Due {
+    /// The peer that showed this node a newer root than it holds, if one did since its last fetch.
+    shown_by: Option<HostId>,
+  },
+}
+
+/// Whether this root learner fetches the committed root configuration this period (§4.8, D-14), on the control shard:
+/// recovery fetches at once; an uninitialized root paces its fetches; an initialized one fetches when its view of the
+/// regions or of the voters it knows differs from the root it holds ([`root_diverges`]), or when a peer showed it a newer
+/// root than it holds ([`ShardState::root_newer_seen`], taken here). Before A-489 the last was missing: a seat change
+/// moves the root's version and nothing a learner compares (A-406), so a learner left behind at formation never fetched,
+/// and refused every location round a peer on the newer root asked (`RootViewDiffers`), for the lookup's whole budget.
+pub(crate) fn root_learner_fetch(state: &mut ShardState, now: u64) -> RootLearnerFetch {
+  let held = state.root.configuration().version;
+  let shown = state
+    .root_newer_seen
+    .filter(|(version, _)| *version > held)
+    .map(|(_, peer)| peer);
+  let due = if state.recovery.root.is_some() {
+    state.root_learner_pace.reset();
+    true
+  } else if !state.root.initialized() {
+    let due = state.root_learner_pace.due(now);
+    if !due {
+      state.count(LEARNER_FETCH_PACED, 1);
+    }
+    due
+  } else {
+    state.root_learner_pace.reset();
+    root_diverges(state) || shown.is_some()
+  };
+  if due || shown.is_none() {
+    // Taken by this fetch, or already reached: a version this node holds now needs nothing more.
+    state.root_newer_seen = None;
+  }
+  if due {
+    RootLearnerFetch::Due { shown_by: shown }
+  } else {
+    RootLearnerFetch::Idle
+  }
+}
+
+/// The hosts a root learner's fetch asks: `targets` ([`root_learner_targets`]) and `shown_by`, the peer that showed it a
+/// newer root (A-489), since the voters it knows can be as far behind as it is. An empty `targets` asks every session
+/// the learner holds ([`drive_root_learner_fetch`]), the shown peer's among them, so it stays empty; this node is never
+/// asked.
+fn with_shown_peer(
+  mut targets: Vec<HostId>,
+  shown_by: Option<HostId>,
+  local: HostId,
+) -> Vec<HostId> {
+  if let Some(peer) = shown_by
+    && peer != local
+    && !targets.is_empty()
+    && !targets.contains(&peer)
+  {
+    targets.push(peer);
+  }
+  targets
 }
 
 /// Whom a root learner asks for the committed root configuration: the voters it knows. The voters it last learned
@@ -11535,6 +11584,163 @@ mod discovery_wait_tests {
 #[cfg(test)]
 mod tests {
 
+  /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
+  /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
+  /// ([`super::install_slice`]), as the coordinator's period drives it ([`super::drive_install_walk`]).
+  fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
+    let regional = state.council.configuration().clone();
+    let Some(configuration) = regional.configuration_for(local) else {
+      return;
+    };
+    let version = configuration.version;
+    crate::readmission::install_placement(state, configuration, &regional.members);
+    state.install_walk = Some(super::InstallWalk {
+      version,
+      after: None,
+      walking: false,
+    });
+    // Every turn reaches at least one copy, so the walk ends within one turn a copy and one more.
+    let turns = state.holder_records.len().saturating_add(1);
+    for _ in 0..turns {
+      if !super::install_slice(state, local, version) {
+        return;
+      }
+    }
+  }
+
+  /// What a holder's copy of a moved object answers once its install's walk has reached it
+  /// ([`a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it`]).
+  #[derive(Debug)]
+  struct Followed {
+    /// The member the object moved from (its creator) and the member it moved to.
+    from: super::HostId,
+    to: super::HostId,
+    /// The owner this node's routing names for the object.
+    routed: Option<super::HostId>,
+    /// The owner the copy's authority names.
+    authority: Option<super::HostId>,
+    /// How the copy judges the next record from the move's new owner, and from the owner it left.
+    from_new: Option<Result<(), slates_db::register::RegisterError>>,
+    from_old: Option<Result<(), slates_db::register::RegisterError>>,
+    /// The copies counted followed (`fleet.move.followed`).
+    followed: u64,
+  }
+
+  /// A-487, goal 85's bug 2, closed by A-485's rule (§4.8 "Authority scope", A-291's switch through A-398's walk). Do: on
+  /// a holder in a region of three members at `f = 1`, hold a copy of an object its creator owns, then commit the
+  /// creator's move of it to the third member and install that configuration through the walk as the coordinator drives
+  /// it ([`walk_the_install`]). Expect the copy routed to the new owner, its authority naming the new owner, its next
+  /// record from the new owner accepted and one from the creator refused `Unauthorized`, and the copy counted followed.
+  /// Before A-485 the walk's per-copy step followed a move only for a copy routed to a retired host, so the copy kept the
+  /// creator's authority and refused every record and content put of the new owner: a volume moved back to its creator
+  /// could never place its head off its owner, and the move test's answers alternated `Moving` and
+  /// `MoveRefused { Unplaced }` until its deadline (the third node refusing 8,006 records and 2,663 content puts
+  /// `Unauthorized`, quiet Mac Studio, main 3022c6894).
+  #[test]
+  fn a_holders_copy_of_a_moved_object_follows_the_move_as_the_install_walk_reaches_it() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, ObjectId, Quorum, Record};
+      let local = state.fleet.host();
+      let (from, to) = (super::HostId(local.0 ^ 1), super::HostId(local.0 ^ 2));
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      for host in [from, to] {
+        assert!(
+          state
+            .council
+            .propose(Reconfiguration::Admit { host, domain: None })
+        );
+      }
+      walk_the_install(state, local);
+      let object = ObjectId::new(from, 7);
+      let generation = state.fleet.configuration().version;
+      let mut copy = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: from,
+        },
+      );
+      copy
+        .accept(&Record {
+          owner: from,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"the head before the move".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, copy);
+      state.fleet.track_object_owner(object, from);
+      assert!(state.council.propose(Reconfiguration::Move {
+        object,
+        from,
+        to,
+        cohort: vec![from, local, to],
+      }));
+      walk_the_install(state, local);
+      let generation = state.council.configuration().version;
+      let fence = state
+        .holder_records
+        .get(&object)
+        .map(|copy| copy.persisted().0);
+      let next = |owner| {
+        fence.map(|epoch| Record {
+          owner,
+          object,
+          sequence: 1,
+          epoch,
+          generation,
+          value: b"the next head".to_vec(),
+        })
+      };
+      Followed {
+        from,
+        to,
+        routed: state.fleet.object_owner(object),
+        authority: state.holder_records.get(&object).map(Acceptor::owner),
+        from_new: next(to).map(|record| super::check_held_record(state, local, to, &record)),
+        from_old: next(from).map(|record| super::check_held_record(state, local, from, &record)),
+        followed: state
+          .refusals
+          .get("fleet.move.followed")
+          .copied()
+          .unwrap_or(0),
+      }
+    });
+    assert_eq!(
+      seen.routed,
+      Some(seen.to),
+      "the copy is routed to the move's new owner: {seen:?}"
+    );
+    assert_eq!(
+      seen.authority,
+      Some(seen.to),
+      "the copy's authority names the new owner: {seen:?}"
+    );
+    assert_eq!(
+      seen.from_new,
+      Some(Ok(())),
+      "the new owner's next record is accepted: {seen:?}"
+    );
+    assert_eq!(
+      seen.from_old,
+      Some(Err(slates_db::register::RegisterError::Unauthorized)),
+      "the old owner's ({:?}) is refused: {seen:?}",
+      seen.from
+    );
+    assert_eq!(seen.followed, 1, "the copy is counted followed: {seen:?}");
+  }
+
   /// CLAUDE.md §2 item 8 with §4.8's paged takeover: a taken-over object's wait for a register the still-paging round
   /// of its departed owner may yet bring reads that round's page advances, which the bound takes as its progress; every
   /// other wait, and every wait once the round stops paging, reads none and counts. Do: ask for the round of a catalog
@@ -12258,5 +12464,37 @@ mod tests {
         "no placement was fanned"
       );
     });
+  }
+}
+
+#[cfg(test)]
+mod root_learner_tests {
+  use super::{HostId, with_shown_peer};
+
+  /// A-489 (§4.8, D-14 root learners): a root learner's fetch asks the peer that showed it a newer root beside the voters
+  /// it knows, since those can be as far behind as it is. Do: add a shown peer to a list of one known voter, to a list
+  /// already naming it, to an empty list, and add this node itself; and add no peer. Expect: the voter and the peer; the
+  /// list unchanged (never asked twice); the empty list kept empty, which asks every session the learner holds, the
+  /// peer's among them; this node never asked; the list unchanged.
+  #[test]
+  fn a_root_learners_fetch_asks_the_peer_that_showed_it_a_newer_root() {
+    let (voter, peer, local) = (HostId(1), HostId(2), HostId(3));
+    assert_eq!(
+      with_shown_peer(vec![voter], Some(peer), local),
+      vec![voter, peer]
+    );
+    assert_eq!(
+      with_shown_peer(vec![voter, peer], Some(peer), local),
+      vec![voter, peer]
+    );
+    assert_eq!(
+      with_shown_peer(Vec::new(), Some(peer), local),
+      Vec::<HostId>::new()
+    );
+    assert_eq!(
+      with_shown_peer(vec![voter], Some(local), local),
+      vec![voter]
+    );
+    assert_eq!(with_shown_peer(vec![voter], None, local), vec![voter]);
   }
 }

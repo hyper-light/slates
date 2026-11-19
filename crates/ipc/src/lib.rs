@@ -94,7 +94,7 @@ pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
   Accepted, Adoption, CLAIM_WAIT_NS, Claim, Connected, Doorbell, HeldRendezvous, Listener,
-  Liveness, Prepared, begin_connect_as, connect, connect_as, instance_from_env,
+  Liveness, Prepared, begin_connect_as, connect, connect_as, holder_lives, instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 
