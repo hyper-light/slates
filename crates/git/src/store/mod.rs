@@ -85,7 +85,7 @@ pub mod rows;
 mod upload;
 pub mod views;
 
-pub use deltas::delta_of;
+pub use deltas::{Search, SearchCounters, SearchStep, delta_of};
 pub use encoding::{Encoding, EncodingCounters};
 pub use fragment::{FragmentRefused, Placed, Stored};
 pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
