@@ -29,6 +29,11 @@ impl Status {
     code: 200,
     reason: "OK",
   };
+  /// Format: `207 Multi-Status` (RFC 4918 §11.1), a WebDAV answer holding a status for each resource it names.
+  pub const MULTI_STATUS: Status = Status {
+    code: 207,
+    reason: "Multi-Status",
+  };
   /// Format: `400 Bad Request` (RFC 9110 §15.5.1).
   pub const BAD_REQUEST: Status = Status {
     code: 400,

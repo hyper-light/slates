@@ -14617,6 +14617,25 @@ and export by landing).
 > which names a path that did not yet exist for a node beneath a copy not changed since); main's live capture against
 > Apache with `mod_dav_svn`.
 >
+> **Status (2026-11-19, A-681, part 1, its first slice).** Built: Subversion's DAV site on the shared HTTP edge, its
+> read side's resources (`slates-svn`'s `dav::site`, answered with no I/O, and the edge's site in `slates-server`'s
+> `vcs_http::svn`). A URL's first segment names the repository, as `SVNParentPath` routes, and the rest a node: a
+> public URL in the youngest revision, or `!svn/rvr/REV/PATH` and `!svn/bc/REV/PATH` in `REV`. The credentials are
+> proved to a principal as git's and Mercurial's sites prove them, the repository is found on its owner shard and its
+> policy asked, and the request is answered from the index, the green and the lock table as `mod_dav` and
+> `mod_dav_svn` answer it, each path judged by the principal's compiled read rules (A-606): OPTIONS with the HTTPv2
+> facts and only the capabilities served (none yet, so `SVN-Repository-MergeInfo: no`); PROPFIND at depth 0 and 1
+> (`allprop` and named properties, the live ones in `liveprops.c`'s order, `checked-in` at `dav_svn__get_safe_cr`'s
+> revision, a child the principal may not read left out); GET and HEAD of a file's text, streamed from the green a
+> piece a reply run with `set_headers`' fields. The edge's reply names the status its service decides as the reply
+> begins (`207`). Every REPORT and write method answers `501` with `SVN_ERR_UNSUPPORTED_FEATURE`. Held to stock svn
+> 1.15.0 over HTTPS on loopback (`info`, `cat`, `ls`, `proplist -v`, and `cat` of a hidden file refused `403`) and to
+> `mod_dav_svn`'s format strings with A-609's recorded bodies. Owed: the REPORTs over the index (log, get-locations,
+> get-location-segments, get-deleted-rev, dated-rev, mergeinfo, inherited-props, get-locks, list, file-revs, then the
+> update-report and replay through A-627's drive), so `svn log` and `svn checkout` reach a repository (part 1's next
+> slices); the write side (part 2); the daemon composing the site beside git's and handing it the stores (each
+> repository's index, green, lock table and authorization file, and a principal's Subversion user).
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
@@ -15215,7 +15234,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1. Its first part, the bodies as codecs, is built
     (A-609); so is its second (A-627): `list-report`, `file-revs-report`, PROPPATCH, the update-report's and the replay
     report's answers from A-616's one drive, and LOCK and UNLOCK onto the lock table with their answers and the
-    `DAV:lockdiscovery` property.
+    `DAV:lockdiscovery` property. Its third, the site on the shared HTTP edge (A-681), has begun: the read side's
+    resources answered to OPTIONS, PROPFIND, GET and HEAD (part 1's first slice); its REPORTs, so `svn log` and `svn
+    checkout` reach a repository, then the commit, PROPPATCH and the lock verbs (part 2), follow.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
@@ -51052,3 +51073,84 @@ reservation and settle, `make_from_log`; `repository.rs`: the creation's record;
   of an older revision) and its composition of a kind change (§8f); the records' texts held once, read from the green's
   content rather than held beside it and in each record; the Subversion index charged by its bytes; main's runs
   (clippy, `xtask check`, the doc gate, Linux and Windows builds, the mutation red-checks).
+
+### A-681 part 1, its first slice — Subversion's DAV site on the shared HTTP edge: the read side's resources answered to OPTIONS, PROPFIND, GET and HEAD from the index, the green and the lock table, each path by the principal's read rules (2026-11-19, g297, UI goal 93 (kiln 51cef9f7); §4.17.4 item 5 "HTTP", item 10 and piece 13's third part; A-609, A-627, A-625, A-606, A-602)
+Applied in the same change to: §4.17.4's status and piece 13; GAPS (the §4.17.4 entry); the research notes (§3);
+`crates/svn` (`dav/site.rs` and its tests, new; `dav/response.rs`'s `Capability` and `Httpv2::served`; `dav/drive.rs`'s
+`uri_encode` and `dav/locking.rs`'s `error_answer` and `DAV_XML_CONTENT_TYPE` opened to the crate); `crates/http-edge`
+(`Connection::reply_status`); `crates/http` (`Status::MULTI_STATUS`); `crates/server` (`vcs_http/svn.rs` and its
+tests, new; `vcs_http.rs`'s `Exchange::reply_status` and module documentation).
+
+- **The site** (`slates-svn`'s `dav::site`, no I/O; Subversion 1.15.0's `mod_dav_svn` `repos.c`, `liveprops.c`,
+  `deadprops.c` and httpd 2.4.66's `mod_dav.c` and `props.c`). A request's path below the repository's root is read as
+  `parse_uri` reads it: a public URL is the node in the youngest revision; `!svn/rvr/REV/PATH` and `!svn/bc/REV/PATH`
+  the node in `REV`; `!svn` itself and every other special resource `mod_dav_svn` knows are not served here (`501`);
+  any other special name, or a revision that is not decimal, is `mod_dav_svn`'s malformed URI (`500`, 190001); a
+  revision past the youngest `404`, "No such revision N" (160006); a `.` or `..` name `400`; a path the principal's
+  rules hide `403`.
+  - OPTIONS: `200`, the `DAV` lines and, when the body asks for the activity collection, the HTTPv2 headers through
+    A-609's writer, which now lists a capability only where the site serves it (`response::Capability`,
+    `Httpv2::served`): none in this slice, since each names a report or a commit's form, and `SVN-Repository-MergeInfo:
+    no`. A stock client then lists a directory by PROPFIND at depth 1 and asks for no `list-report`, as recorded.
+  - PROPFIND: `207`, one response for the resource and, at depth 1 on a directory, one for each child the principal
+    may read, in name order, a collection's href ending in a slash. `allprop` is the node's own properties (`svn:`
+    names as `S:`, others as `C:`, a value XML cannot carry in base64), `resourcetype`, `mod_dav_svn`'s live
+    properties in `liveprops.c`'s order, then `supportedlock` for a file and `lockdiscovery` (A-627's). A named
+    property is found live, then among the node's own, else listed under `404 Not Found` with a generated `gN` prefix.
+    `checked-in` names the version at `dav_svn__get_safe_cr`'s revision: the node's history walked to its first
+    location without crossing a copy, through A-616's one copy-root walk. A missing `Depth` is infinity, refused `403`
+    on a directory as `mod_dav`'s default refuses it.
+  - GET and HEAD (`set_headers`, `deliver`): a file's text, streamed by the caller from the green a piece a reply run,
+    never held whole; `Cache-Control` a week for a URL naming its revision and none for a public one; `Last-Modified`
+    (RFC 1123, from the stored `svn:date`) for a public URL; the ETag `dav_svn__getetag` writes; `Content-Type` from a
+    valid `svn:mime-type` (`svn_mime_type_validate`), else `text/plain`.
+  - Every other method: `501` with `SVN_ERR_UNSUPPORTED_FEATURE` (200007), a REPORT in `mod_dav_svn`'s words for one
+    it does not know ("The requested report is unknown").
+- **The edge's site** (`slates-server`'s `vcs_http::svn`), in its module documentation's order: the route (the URL's
+  first segment names the repository, as `SVNParentPath` routes; `400` for an escape naming a slash or NUL, `414` past
+  the room, `404` for no name); the credentials, proved as git's and Mercurial's sites prove them (`401` with the
+  connection's challenges: Basic over TLS, which stock svn sends after one challenge and on every request after); a
+  repository on another shard moved there whole; none, or another tool's, `404`; the policy (`403` for a principal it
+  lets read nothing); the store (`503` where this shard lends none: `NoSvnStores`, the daemon's until it hands the site
+  Subversion's stores). A served request's body is read whole within the request's room (`413` past it) and answered
+  at its end; a file's text is lent from the green a reply run at a time. The XML reader's bounds derive from the
+  request's room: as many parsed elements as fit in it.
+- **The edge** (`slates-http-edge`): a service names its reply's status as the reply begins
+  (`Connection::reply_status`, `Exchange::reply_status`), taken only before any of the reply is sent, `200` otherwise
+  as before: a WebDAV answer's status follows from its outcome, which only the service knows once the body has ended.
+- **Departures, each stated in the module documentation.** An error `mod_dav` answers with Apache's own HTML page is
+  answered with its status and no body; `Content-Length` and `Accept-Ranges` are not sent (the edge chunks every reply
+  and serves no range); a GET naming a delta base gets the full text, which the protocol allows; a directory's GET
+  (its HTML listing) is `501`; `getcontenttype` and `getcontentlanguage` from Apache's MIME configuration are not
+  added to an `allprop`; the multistatus does not echo the request's namespaces; the root's URL path is written
+  URL-encoded where `mod_dav_svn` writes its configured root raw.
+- **Evidence.** What stock svn 1.15.0 asks of these resources, recorded on the Mac Studio (2026-11-19) against a
+  recorded responder (the notes' §3): a session's three OPTIONS; `svn info`'s PROPFIND of six properties at depth 0 on
+  the revision root's resource and of `lockdiscovery` on the public URL; `svn cat`'s and `svn export`'s PROPFIND of
+  `allprop` and `resourcetype`, then their GET; `svn ls` by `list-report` where `list` is listed, else by PROPFIND at
+  depth 0 and 1; `svn log` by `log-report`; `svn info -r N` by `get-locations`. No `mod_dav_svn` is installed
+  anywhere (main's ruling), so the answers are held to its format strings, with A-609's recorded request bodies, and
+  to the stock client reading them.
+- **Tests and the run.** 11 tests in `dav::site` (each answer byte for byte where `mod_dav_svn`'s format strings fix
+  it; every refusal's status; the read rules at depth 1); 5 in `vcs_http::svn` (the module documentation's order; the
+  exchange through the lent store and the rules; a GET streamed a piece a run; the site over `NoSvnStores`; stock svn
+  1.15.0 over HTTPS on loopback against the edge, skipping loudly where `svn` is absent); 1 in the edge's connection
+  (a status named as the reply begins written, one named after the first run never). macOS arm64, Mac Studio, kiln
+  r252, 2026-11-19 22:21-22:28Z, over main b94ae6e90 merged (tree `caee3ad4` after `cargo fmt`, the landed crates):
+  `cargo fmt -p slates-svn -p slates-server -p slates-http-edge -p slates-http -- --check` clean; `cargo test --locked
+  -p slates-http-edge --lib -- connection::tests::a_service_names_its_reply_` 2 of 2; `cargo test --locked -p
+  slates-svn --lib -- dav::` 73 of 73; `cargo test --locked -p slates-server --lib -- vcs_http:: --test-threads=4` 47
+  of 47, each crate compiled afresh; the stock test run alone with its output shown: `svn info` read the node kind,
+  revision 1, the UUID and author alice, `svn cat` the text, `svn ls` `a.txt` alone (the hidden directory left out),
+  `svn proplist -v` `svn:eol-style` `native`, and `svn cat` of the hidden file refused, "E175013: Access to
+  '/repo/trunk/secret/s.txt' forbidden". No integration target reaches the site: `slates-svn` and `slates-http-edge`
+  have no `tests/` directory, and the CLI's `vcs_http` test meets a `401` refusal, which the refusal path writes.
+- **Owed.** Part 1's next slices: the REPORTs over the index (log, get-locations, get-location-segments,
+  get-deleted-rev, dated-rev, mergeinfo, inherited-props, get-locks, list, file-revs) through A-613's reads, then the
+  update-report and replay through A-627's drive over A-616's, each capability listed as it is served, so `svn log` and
+  `svn checkout` reach a repository; part 2, the write side (the commit through HTTPv2's transaction, MERGE, PROPPATCH,
+  LOCK and UNLOCK); the daemon composing the site beside git's and handing it the stores (each repository's index,
+  green, lock table and authorization file, and a principal's Subversion user); a repository whose name holds a slash
+  (unreachable over HTTP by `SVNParentPath`'s first-segment rule without a longest-prefix search across partitions); a
+  browser's `?p=` and `?r=` and a directory's HTML listing; Basic on the cleartext loopback edge (A-686); main's runs
+  (clippy, `xtask`, the other platforms, red-checks).
