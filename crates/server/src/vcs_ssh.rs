@@ -60,13 +60,14 @@
 //! (`slates_ssh::keylife::key_time_limit_ns`). Only a connection that ended as its client ended it is a sample.
 //!
 //! **Owed** (GAPS, the §4.17 entry): the daemon starting an edge (its address, the host key's keeping, an edge state
-//! kept on every shard); the four services' server halves, each refused as not served until it lands (git's
-//! upload-pack, A-640; receive-pack, A-620; Mercurial's `serve --stdio`, A-650); the lenders of the stores git's
-//! upload-pack and Subversion's tunnel (`svn`, A-688) are served from, over A-662's map; Subversion's tunnel moved to
-//! the shard of the repository its greeting names; the live `git clone` and `svn checkout svn+ssh://` over SSH (main's
+//! kept on every shard); the stores' lenders over A-662's map, which git's upload-pack (A-651 part 2), Mercurial's
+//! `serve --stdio` (A-679) and Subversion's tunnel (`svn`, A-688) are served from and without which each is refused as
+//! not served; receive-pack's server half, refused so until it lands (A-620); Subversion's tunnel moved to the shard of
+//! the repository its greeting names; the live `git clone`, `hg clone` and `svn checkout svn+ssh://` over SSH (main's
 //! runs).
 
 mod git;
+mod hg;
 pub(crate) mod site;
 mod svn;
 mod waits;
@@ -104,6 +105,13 @@ const PACKET_CAP: usize = MAX_PACKET_EVERY_PEER_ACCEPTS;
 /// Derived: the bytes one read takes from a connection's socket: a packet cap, so a read never splits a packet it could
 /// have taken whole.
 const READ_BYTES: usize = PACKET_CAP;
+
+/// Derived: the window a connection's session channel offers over an edge whose room is `room`
+/// (`SessionConfig::channel_window`): the room, as much of it as the window's 32-bit field holds (RFC 4254 §5.1). A
+/// command that bounds the input it holds bounds it by this (Mercurial's, `hg`).
+fn channel_window(room: u64) -> u32 {
+  u32::try_from(room).unwrap_or(u32::MAX)
+}
 
 /// Format: the refusal counts the edge keeps in the daemon's status report beside its own [`Counts`] (banned item 9:
 /// every connection ended other than by its client is counted by its reason).
@@ -446,7 +454,7 @@ impl EdgeState {
       },
       banner: None,
       failure_limit: RECOMMENDED_FAILURE_LIMIT,
-      channel_window: u32::try_from(self.bounds.room).unwrap_or(u32::MAX),
+      channel_window: channel_window(self.bounds.room),
     };
     Session::new(config, host_key, SystemEntropy::new(), keys, now_ns).ok()
   }

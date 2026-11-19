@@ -11,8 +11,8 @@
 //! no locked policy.
 //!
 //! Every register value this daemon writes leads with a **class byte** ([`HEAD_CLASS`], [`MERGE_CLASS`],
-//! [`CATALOG_CLASS`]), so a holder or a successor reads a record's class from the record, never by trying
-//! decoders in turn.
+//! [`CATALOG_CLASS`], [`TOMBSTONE_CLASS`], [`STATE_LOG_CLASS`]), so a holder or a successor reads a record's class from
+//! the record, never by trying decoders in turn.
 
 use slates_db::catalog::{AccessEntry, NamePolicy, Principal, SizeClass, VolumeRecord};
 use slates_wire::Wire;
@@ -25,13 +25,17 @@ pub const MERGE_CLASS: u8 = 2;
 pub const CATALOG_CLASS: u8 = 3;
 /// Format: the class byte of a destroyed volume's tombstone value (`crate::tombstone::TombstoneValue`).
 pub const TOMBSTONE_CLASS: u8 = 4;
+/// Format: the class byte of a repository's state log's record (`crate::state_log`, A-636 part 2b).
+pub const STATE_LOG_CLASS: u8 = 5;
 
 /// Whether a register value of this class is a **single value** a holder keeps only at its newest position
 /// (a head, a catalog, a tombstone: phase one adopts only the highest), as opposed to a **ledger** it keeps
-/// whole (a green's merge chain, which a successor replays) — AUD-29-43's compaction rule, read from the
-/// value's own class byte.
+/// whole (a green's merge chain, which a successor replays; a repository's state log, which a successor rebuilds the
+/// repository's state from, A-636 part 2b) — AUD-29-43's compaction rule, read from the value's own class byte.
 pub(crate) fn is_single_value(bytes: &[u8]) -> bool {
-  bytes.first().is_some_and(|class| *class != MERGE_CLASS)
+  bytes
+    .first()
+    .is_some_and(|class| *class != MERGE_CLASS && *class != STATE_LOG_CLASS)
 }
 
 /// `body` behind its class byte: a register value's canonical bytes.

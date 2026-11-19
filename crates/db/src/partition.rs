@@ -2044,8 +2044,26 @@ impl Partition {
   }
 
   /// Applies a recorded operation; unconditional, so replay is deterministic. A record the
-  /// operation names that does not exist (a corrupted history) is a typed refusal.
+  /// operation names that does not exist (a corrupted history) is a typed refusal. What it moved of a repository's
+  /// state logs is kept as their records until the next operation starts (A-636 part 2b;
+  /// [`Partition::take_state_log_records`]).
   pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
+    self.repositories.clear_made();
+    self.apply_op(op)?;
+    self
+      .repositories
+      .seal_made(|| slates_wire::Wire::to_bytes(op));
+    Ok(())
+  }
+
+  /// The state logs' records the operation last applied made, each stamped with the operation's identity and spans
+  /// (A-636 part 2b), leaving none: what the database hands its owner to ship once the operation is durable.
+  pub fn take_state_log_records(&mut self) -> Vec<crate::catalog::StateLogRecord> {
+    self.repositories.take_made()
+  }
+
+  /// [`Partition::apply`]'s operation itself.
+  fn apply_op(&mut self, op: &Op) -> Result<(), DbError> {
     match op {
       Op::VolumeCreated { record } => self.insert_volume(record.clone()),
       Op::VolumeStateChanged { id, state } => self.update_volume(*id, |v| v.state = *state),
