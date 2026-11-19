@@ -12629,6 +12629,22 @@ signature verification).
 > version 2), sparse-revlog's intermediate snapshots among its chains, every entry equal to 7.2's `debugindex --debug`
 > and every text to its `debugdata`. Owed with the import: walking a store (the fncache, the path encodings, a version 2
 > store's file index) and censored, ellipsis and externally stored revisions, refused by kind for now.
+>
+> **Status (2026-11-19, A-588 part 2: the index's tables on the shared object store built).** `slates-hg`'s `index`
+> keeps a repository's changelog, manifest log and file logs as rows of one A-581 `slates-vcs` index, so they are
+> content tables under a tail, shared by a fork and folded by the shared rule, and nothing of a log is held anywhere
+> else: a log row (`L`, the log's key, the revision's number big-endian) holds the node, the parents' and the link's
+> numbers, 7.2's flags, the length and the content (a changeset's text with its manifest node, branch and closed head;
+> a file revision's bytes and its block apart), and a node row (`N`, the node, the log's key) its number, since one
+> file node can stand in several file logs. A group is numbered as 7.2's `revlog.addgroup` numbers one (a node held
+> passed over; a parent missing from the log and the group, or a link the changelog lacks, refuses the whole group, with
+> nothing written); a log's length is read from its rows by doubling lookups. Mercurial's naming is the shared store's
+> `Naming` parameter (`HgNaming`: the parents and a file revision's framed block as context, the bytes alone as the
+> object). Proven against the history 7.2 stored in A-588's fixtures (every number, parent and link as its `debugindex`
+> lists them), the shared quarantine admitting each of its 30 revisions under its node and refusing a node one bit off,
+> and a model of `addgroup` over generated histories. The revlog reader's compressed chunks are now inflated by the
+> crate's one inflater, A-598's `compression::inflate`. Owed: the phase roots, markers and branch heads of the index
+> sketched below (pieces 5 and 7), and the import's walk of a store.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12742,6 +12758,10 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   never changes a node, which hashes them in order of value.
 - The tail is folded into a new table when the lookups it served since the last fold cost more than a fold (the table
   of learned tunables).
+- As built (A-588 part 2): the logs are rows of one shared `slates-vcs` index rather than tables apart, keyed so that
+  a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
+  that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
+  and bytes as two contents of its row.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -13014,7 +13034,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    index's tables, and an existing repository's store imported as a base. Built (A-588, `crates/hg`: `changeset`,
    `manifest`, `filerev`, `node`): the objects and their nodes. Built (A-611, `crates/hg`: `revlog`): the import's
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
-   holding inflated bytes. Owed: the index's tables on A-581's `slates-vcs`, then the import's walk of a store.
+   holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
+   Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
 4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
@@ -41975,6 +41996,44 @@ Applied in the same change to:
   Subversion push pieces call, with a typed refusal), and the hook driver (an owned hook process over a read-only
   attachment of the work, its learned deadline from A-597's runner). A client and CLI form of the verb are owed with
   the servers' administration.
+
+### A-588 part 2 — Mercurial's index on the shared object store's tables: logs as rows of one slates-vcs index, numbered as 7.2's addgroup numbers them, Mercurial's node rule as the store's naming (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.17.1 shared piece 3; A-581, A-588, A-598, A-611)
+Applied in the same change to: §4.17.3 (its status, the index's "as built" line, piece 3), `crates/hg` (`index`, new;
+`node::compute_prefixed`; `revlog`'s compressed chunks inflated by `compression::inflate`, its own inflaters gone and
+its `Inflate` refusal now `Stream`, the engine's own; `changeset`'s tests' `written` split so that no function
+returning `Result` asserts or unwraps, main's clippy findings, and its other tests' types named and long tests split;
+`revlog`'s four- and eight-byte reads and the docket's sizes given their `Format:` markers), `Cargo.lock` (slates-hg's
+entry names slates-vcs, which git's object store had already made a workspace dependency), GAPS (the §4.17.3 entry).
+- **What it does.** `index::HgIndex` keeps a repository's logs in one `slates-vcs` `Index`: a log row (`L`, the log's
+  key: `c`, `m`, or `f`, the path and a NUL; then the number big-endian) with the node, the parents' and link's
+  numbers (`u32::MAX` for none), 7.2's flags, the length, a changeset's manifest node, closed head and branch, and as
+  contents a changeset's or manifest's text or a file revision's bytes and block; and a node row (`N`, the node, the
+  log's key) with the number. `append_changesets` and `append_revisions` take a group in the order it arrived, as
+  7.2's `revlog.addgroup` does ("this can happen if two branches make the same change": a held node passed over; each
+  parent looked up, "unknown parent", in the log or earlier in the group), refuse a group whole on a missing parent or
+  link, and write it as one sorted batch. A log's length is the first number without a row, found by doubling and
+  halving lookups. `HgNaming` is Mercurial's node rule as the shared store's `Naming`: its context the two parents
+  then a file revision's block between its markers, its object the bytes alone, hashed in place
+  (`node::compute_prefixed`), a collision attack refused.
+- **Why rows of one index.** A-581's index holds rows by key under a tail and folds them by the shared rule; keying a
+  log's rows by its key and the number makes each log contiguous and ordered, and a fork shares them all. The log's
+  length kept nowhere but its rows means a fork or a restart needs no counter.
+- **One inflater (main, 2026-11-19).** The revlog reader (A-611) had its own zlib and zstd inflaters beside A-598's;
+  its chunks now go through `compression::inflate`, which also charges the decoder's memory to the admission, so the
+  crate inflates in one place and a chunk's refusal is the engine's own kind.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 188 of 188 at 02e608d67
+  (the first build, before the inflater and clippy changes), 188 of 188 at dbcee659e, 189 of 189 at d522d8a27 (the
+  damaged-revlog test now two), and 189 of 189 with `cargo fmt -p slates-hg -- --check` clean on the tree merged with
+  main at 38e48e3df (load 5.1). Golden: A-588's
+  fixtures' history appended log by log, every revision's number, parents and link as 7.2's `debugindex` lists them,
+  each node found under its number and its number under its node, the branches and the closed head kept, a copy's block
+  apart; the shared quarantine admitting all 30 revisions by `HgNaming` and refusing each node one bit off. Hostile: a
+  missing parent, a missing link, a parent from another file's log, each refusing its group with nothing written; a
+  group passed over whole when brought again; one node in two files' logs; a fork keeping its own revision. Model:
+  generated histories in generated groups (parents anywhere in the history, revisions brought twice) equal to a model
+  of `addgroup` after every group.
+- **Owed.** The phase roots, markers and branch heads of §4.17.3's index (pieces 5 and 7); the import's walk of a
+  store, which appends what the revlog reader reads into this index.
 
 ### A-621 — an ops document names as many paths as its work declares: 64-bit path indices and interning through a map (2026-11-19, g267, UI goal 93; §4.16 "Data model"; found on the push path by g225, A-618)
 Applied in the same change to:
