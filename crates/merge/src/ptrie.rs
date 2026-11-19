@@ -471,6 +471,13 @@ impl<V: Clone> Ptrie<V> {
     Some(Shared { slot, skip })
   }
 
+  /// How many keys start with `prefix`: one descent and the count its top node keeps, no walk (A-626).
+  pub fn prefix_len(&self, nodes: &Nodes<V>, prefix: &[u8]) -> usize {
+    self
+      .under(nodes, prefix)
+      .map_or(0, |(slot, _, _)| nodes.count(slot))
+  }
+
   /// Whether a key starts with `prefix`: one descent, no walk and no count taken.
   pub fn has_prefix(&self, nodes: &Nodes<V>, prefix: &[u8]) -> bool {
     self.under(nodes, prefix).is_some()

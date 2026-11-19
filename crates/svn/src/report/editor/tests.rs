@@ -19,10 +19,10 @@ use crate::report::recorded::{
 const MOST_OPEN: usize = 64;
 
 /// The drives the recordings hold, which the replay test must meet: the 22 stock checkouts,
-/// updates, switches, `status -u` and diff, and six hand-made sessions' (an unknown report command,
-/// a missing path, a revision past the youngest, an absent target, the early answer and the refused
-/// edit).
-const RECORDED_DRIVES: usize = 28;
+/// updates, switches, `status -u` and diff, and eight hand-made sessions' (an unknown report
+/// command, a missing path, a revision past the youngest, an absent target, the early answer, the
+/// refused edit, and two asking for copy sources).
+const RECORDED_DRIVES: usize = 30;
 
 /// The calls a read drive makes, borrowing its windows. A node's facts are not on the wire, and
 /// the writer takes none of them.
