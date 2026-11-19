@@ -64,10 +64,14 @@
 //! freed when it ends. The texts kept are charged to the content store's budget, and the rows to the same budget by the
 //! shared index, whose tail is sealed when due after each group, as the shared rule says.
 //!
-//! **Owed** (GAPS): the register's first entry recording the phase roots and bookmarks the import returns (until then
-//! an import is not served); a unit a host's pending read refused retried at the next turn rather than ending the
-//! import; and the listing and the obsstore read in slices too. The server's side of the seam is `slates-server`'s
-//! `hg_base` (A-649 part 4), over §4.15's host seam.
+//! **Its record** (A-687, [`record`]): once done, the import's index is written whole as the revisions it kept, which
+//! the register's entry holds, and a recovery replays them through the import's own steps into the same index, on any
+//! node; the phase roots and bookmarks the import returns are the entry's state and greens (the server's
+//! `vcs_store::hg_import`).
+//!
+//! **Owed** (GAPS): a unit a host's pending read refused retried at the next turn rather than ending the import; and
+//! the listing and the obsstore read in slices too. The server's side of the seam is `slates-server`'s `hg_base` (A-649
+//! part 4), over §4.15's host seam.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -85,6 +89,8 @@ use crate::read::to_u64;
 use crate::revlog::{self, Entry, NONE, Outline, Slices, Source};
 use crate::store::{self, FncacheRefused, Layout, Listing, RequiresRefused, Shape};
 use crate::{Admission, NULL_NODE, Node, PastAdmission};
+
+pub mod record;
 
 /// Format: the requirements file's name, under `.hg` and under `.hg/store`.
 const REQUIRES: &[u8] = b"requires";

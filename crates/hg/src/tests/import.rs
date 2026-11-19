@@ -994,3 +994,188 @@ proptest! {
     }
   }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The import's record (A-687).
+
+use crate::import::record::{self, Refused as RecordRefused, Replayed};
+
+/// Every repository the record tests import: the five stores of one history, and the history 7.2 kept with its phases,
+/// bookmarks and markers, in `.hg` and in the store.
+const RECORDED: [&str; 7] = [
+  "dot",
+  "hybrid",
+  "legacy",
+  "v2",
+  "fileindex",
+  "states",
+  "states-store",
+];
+
+/// Format: where a record's first changeset's text begins: the magic, the version and the room, the changesets'
+/// count, then the changeset's node, two parents, flags and text length.
+const FIRST_TEXT: usize = 4 + 4 + 8 + 8 + 20 * 3 + 2 + 8;
+
+/// `name` imported, and its record written with the room it ran within.
+fn recorded(name: &str) -> (Imported, ContentStore, Vec<u8>) {
+  let mut store = store();
+  let imported = import(&mut repository(name), &mut store, room()).unwrap();
+  let bytes = record::write(&imported.index, &store, room().left()).unwrap();
+  (imported, store, bytes)
+}
+
+/// `bytes` replayed into a new store: the store and what the replay answered.
+fn replayed(bytes: &[u8]) -> (ContentStore, Result<Replayed, RecordRefused>) {
+  let mut store = store();
+  let replayed = record::replay(bytes, &mut store);
+  (store, replayed)
+}
+
+/// What an import kept, as its record replays it: changesets, manifests, file revisions, markers.
+fn kept_counts(imported: &Imported) -> (u32, u32, u64, u64) {
+  (
+    imported.changesets,
+    imported.manifests,
+    imported.file_revisions,
+    imported.markers,
+  )
+}
+
+/// A-687 (§4.17.1 "Durability and residency", R8): do import each of seven stores 7.2 wrote, write the import's
+/// record, replay it into a new content store, and write the replayed index's record. Expect every replayed index equal
+/// to its import's row for row, holding as many changesets, manifests, file revisions and markers, and the two records
+/// byte for byte alike: the replay is the import's, and the record a determinism gate.
+#[test]
+fn t_a687_every_import_replays_from_its_record_row_for_row() {
+  for name in RECORDED {
+    let (mut imported, store, bytes) = recorded(name);
+    let (replay_store, replayed) = replayed(&bytes);
+    let mut replayed = replayed.unwrap();
+    let counts = (
+      replayed.changesets,
+      replayed.manifests,
+      replayed.file_revisions,
+      replayed.markers,
+    );
+    assert_eq!(counts, kept_counts(&imported), "{name}");
+    let replay_rows: Rows = replayed
+      .index
+      .rows()
+      .iter(&replay_store)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect();
+    assert_eq!(replay_rows, rows(&mut imported, &store), "{name}");
+    let again = record::write(&replayed.index, &replay_store, room().left()).unwrap();
+    assert_eq!(again, bytes, "{name}");
+  }
+}
+
+/// A-687 (non-vacuity): do write the `states` repository's record. Expect it to hold its two markers and every text:
+/// a record replaying an empty index would pass the oracle above for no store.
+#[test]
+fn t_a687_the_states_record_holds_its_markers_and_history() {
+  let (imported, _, bytes) = recorded("states");
+  assert!(imported.changesets > 0 && imported.markers == 2, "{imported:?}");
+  let (_, replayed) = replayed(&bytes);
+  assert_eq!(replayed.unwrap().markers, 2);
+}
+
+/// A record by hand: no revision, then `markers`, each as one marker entry.
+fn markers_only(markers: &[&[u8]]) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  bytes.extend_from_slice(b"SHIR");
+  bytes.extend_from_slice(&1u32.to_le_bytes());
+  bytes.extend_from_slice(&room().left().to_le_bytes());
+  for _ in 0..3 {
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+  }
+  bytes.extend_from_slice(&u64::try_from(markers.len()).unwrap().to_le_bytes());
+  for marker in markers {
+    bytes.extend_from_slice(&u64::try_from(marker.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(marker);
+  }
+  bytes
+}
+
+/// A-687, AC-HG.9 (hostile records): do replay the `states` record with a foreign magic, another version, a count past
+/// its bytes, a byte after its end, its first changeset's text changed by a bit, and a record whose one marker entry
+/// holds 7.2's whole obsstore of two. Expect each refused by kind (`Magic`, `Version`, `Count`, `Trailing`, `Node` naming
+/// the changelog's revision 0, `Marker` naming entry 0) with nothing left held; and the obsstore's markers each alone
+/// replayed as two.
+#[test]
+fn t_a687_hostile_records_are_refused_by_kind() {
+  let (_, _, bytes) = recorded("states");
+  let with = |at: usize, value: u8| {
+    let mut changed = bytes.clone();
+    changed[at] = value;
+    changed
+  };
+  let mut trailing = bytes.clone();
+  trailing.push(0);
+  let mut count = bytes.clone();
+  count[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+  let obsstore = state_fixtures::find("states/obsstore").unwrap();
+  let cases: [(Vec<u8>, fn(&RecordRefused) -> bool); 6] = [
+    (with(0, b'X'), |refused| *refused == RecordRefused::Magic),
+    (with(4, 2), |refused| {
+      *refused == RecordRefused::Version { version: 2 }
+    }),
+    (count, |refused| *refused == RecordRefused::Count),
+    (trailing, |refused| *refused == RecordRefused::Trailing),
+    (with(FIRST_TEXT, bytes[FIRST_TEXT] ^ 1), |refused| {
+      matches!(refused, RecordRefused::Node { revlog, rev: 0, .. } if &**revlog == b"00changelog")
+    }),
+    (markers_only(&[obsstore]), |refused| {
+      *refused == RecordRefused::Marker { number: 0 }
+    }),
+  ];
+  for (record, expected) in cases {
+    let (store, replayed) = replayed(&record);
+    let refused = replayed.unwrap_err();
+    assert!(expected(&refused), "{refused:?}");
+    assert_eq!((store.len(), store.used()), (0, 0), "{refused:?}");
+  }
+  let markers = obsmarkers::decode(obsstore).unwrap();
+  let alone: Vec<Vec<u8>> = markers
+    .iter()
+    .map(|marker| {
+      let mut one = Vec::new();
+      obsmarkers::encode(markers.format(), &[marker], &mut one).unwrap();
+      one
+    })
+    .collect();
+  let entries: Vec<&[u8]> = alone.iter().map(Vec::as_slice).collect();
+  assert_eq!(replayed(&markers_only(&entries)).1.unwrap().markers, 2);
+}
+
+/// A-687 (cut anywhere): do replay the `states` record cut at every byte. Expect each cut refused, with nothing left
+/// held.
+#[test]
+fn t_a687_a_record_cut_anywhere_is_refused_with_nothing_held() {
+  let (_, _, bytes) = recorded("states");
+  for at in 0..bytes.len() {
+    let (store, replayed) = replayed(&bytes[..at]);
+    assert!(replayed.is_err(), "cut at {at}");
+    assert_eq!((store.len(), store.used()), (0, 0), "cut at {at}");
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// AC-HG.9, A-687: do change any byte of the dotencode store's record to any value and replay it. Expect the replay
+  /// or a refusal by kind with nothing left held; never a panic.
+  #[test]
+  fn t_a687_damaged_records_never_panic_and_leave_nothing_held(
+    at in any::<proptest::sample::Index>(),
+    byte in any::<u8>(),
+  ) {
+    let (_, _, mut bytes) = recorded("dot");
+    let place = at.index(bytes.len());
+    bytes[place] = byte;
+    let (store, replayed) = replayed(&bytes);
+    if replayed.is_err() {
+      prop_assert_eq!((store.len(), store.used()), (0, 0));
+    }
+  }
+}

@@ -314,20 +314,50 @@ pub(crate) fn push_sealed(
     (principal, repository),
     changes,
     parts,
-    Some((sealed, moves)),
+    Some(Stored::Git((sealed, moves))),
+  )
+}
+
+/// [`push`] of a Mercurial import (A-687): the entry holds the import's record (`slates_hg::import::record`), and the
+/// repository's store takes the imported index between the register's guard and the entry's apply
+/// (`crate::vcs_store::hg_import::place_imported`), as a git push's store commits its objects there (A-662). The entry is
+/// recorded even when it moves no green, since its record is the repository's history. Appended, the store holds the
+/// index and `index` is empty; refused, `index` is as it was, for its caller to give back.
+pub(crate) fn push_imported(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  changes: Vec<BranchChange>,
+  parts: EntryParts,
+  (index, record): (&mut Option<slates_hg::index::HgIndex>, Vec<u8>),
+) -> Result<Appended, AppendRefused> {
+  push_holding(
+    state,
+    (principal, repository),
+    changes,
+    parts,
+    Some(Stored::Imported((index, record))),
   )
 }
 
 /// A sealed push and the moves its append commits.
 type Sealed<'p> = (&'p mut crate::vcs_store::SealedPush, &'p [StoreMove]);
 
-/// [`push`] and [`push_sealed`]'s one path, with the sealed push if any.
+/// What a push's entry holds as its objects, and how the repository's store takes them between the register's guard
+/// and the entry's apply.
+enum Stored<'p> {
+  /// A git push's sealed objects and the moves its append commits (A-662).
+  Git(Sealed<'p>),
+  /// A Mercurial import's index and its record (A-687).
+  Imported((&'p mut Option<slates_hg::index::HgIndex>, Vec<u8>)),
+}
+
+/// [`push`], [`push_sealed`] and [`push_imported`]'s one path, with what the entry's objects are, if any.
 fn push_holding(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   changes: Vec<BranchChange>,
   parts: EntryParts,
-  sealed: Option<Sealed<'_>>,
+  stored: Option<Stored<'_>>,
 ) -> Result<Appended, AppendRefused> {
   let record = state
     .db
@@ -343,7 +373,7 @@ fn push_holding(
   }
   let steps = plan(state, &record, principal, changes).map_err(AppendRefused::Changes)?;
   let mut held = Held::default();
-  let pushed = push_planned(state, &record, (steps, parts), &mut held, sealed);
+  let pushed = push_planned(state, &record, (steps, parts), &mut held, stored);
   if pushed.is_err() {
     held.give_back(state);
   }
@@ -540,7 +570,7 @@ fn push_planned(
   record: &RepositoryRecord,
   (steps, parts): (Vec<Step>, EntryParts),
   held: &mut Held,
-  mut sealed: Option<Sealed<'_>>,
+  mut stored: Option<Stored<'_>>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
   secure(state, &steps, held).map_err(AppendRefused::Changes)?;
@@ -553,40 +583,40 @@ fn push_planned(
     })
     .collect();
   let mut entry = entry(record.id, (&steps, &verdicts), parts);
-  if let Some((sealed, moves)) = sealed.as_mut() {
-    let resolved = resolve(state, (&steps, &entry), moves)?;
-    if let Err(refused) = sealed.admit((&mut state.store, &mut state.vcs_stores), resolved) {
-      return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
-        state, &refused,
-      )));
+  let imports = matches!(stored, Some(Stored::Imported(_)));
+  match stored.as_mut() {
+    Some(Stored::Git((sealed, moves))) => {
+      entry.objects = sealed_record(state, (&steps, &entry), (&mut **sealed, *moves))?;
     }
-    match sealed.record(&state.vcs_stores) {
-      Ok(objects) => entry.objects = objects,
-      Err(refused) => {
-        return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
-          state, &refused,
-        )));
-      }
-    }
+    Some(Stored::Imported((_, bytes))) => entry.objects = core::mem::take(bytes),
+    None => {}
   }
-  let changes_anything = !(entry.joined.is_empty()
-    && entry.versions.is_empty()
-    && entry.names.is_empty()
-    && entry.state.is_empty());
+  // An import's entry is recorded whatever it moves: its record is the repository's history (A-687).
+  let changes_anything = imports
+    || !(entry.joined.is_empty()
+      && entry.versions.is_empty()
+      && entry.names.is_empty()
+      && entry.state.is_empty());
   admit(state, &made, &entry, &steps)?;
   if !changes_anything {
     // Every work was sent before and nothing else changes: nothing is recorded, and what was secured is given back.
     settle_secured(state, held);
     return Ok(answer(&steps, &verdicts));
   }
-  // The store commits the push's objects between the guard and the apply (A-662), so a refusal here applies nothing.
-  let store_committed = match sealed {
-    Some((sealed, _)) => {
+  // The store commits the push's objects, or takes the import's index, between the guard and the apply (A-662, A-687),
+  // so a refusal here applies nothing.
+  let store_committed = match stored {
+    Some(Stored::Git((sealed, _))) => {
       if let Err(refused) = crate::vcs_store::commit(state, sealed) {
         return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
           state, &refused,
         )));
       }
+      true
+    }
+    Some(Stored::Imported((index, _))) => {
+      crate::vcs_store::hg_import::place_imported(state, record.id, index)
+        .map_err(AppendRefused::Entry)?;
       true
     }
     None => false,
@@ -597,6 +627,24 @@ fn push_planned(
     crate::vcs_store::rebuild(state, record.id);
   }
   applied
+}
+
+/// A git push's record for its entry (A-662): its moves resolved and admitted against the store as it is now, then the
+/// record written; refused typed, the push keeping what it holds.
+fn sealed_record(
+  state: &mut ShardState,
+  (steps, entry): (&[Step], &RepositoryEntry),
+  (sealed, moves): (&mut crate::vcs_store::SealedPush, &[StoreMove]),
+) -> Result<Vec<u8>, AppendRefused> {
+  let resolved = resolve(state, (steps, entry), moves)?;
+  if let Err(refused) = sealed.admit((&mut state.store, &mut state.vcs_stores), resolved) {
+    return Err(AppendRefused::Entry(crate::vcs_store::refusal_of(
+      state, &refused,
+    )));
+  }
+  sealed
+    .record(&state.vcs_stores)
+    .map_err(|refused| AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)))
 }
 
 /// Each of a git push's store moves resolved (A-662): a green of the repository keyed by its id, a new branch's by the

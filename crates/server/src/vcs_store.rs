@@ -35,7 +35,9 @@
 //! objects are not the contents it names or whose admission would record other objects. That is guard then apply, as
 //! `slates_db::partition` replays its log, so the store after a recovery equals the store before. A commit whose entry
 //! was then not made durable leaves the store ahead of the log, so the store is made again from the log the same way
-//! ([`rebuild`]).
+//! ([`rebuild`]). A Mercurial import's entry (A-687, [`hg_import`]) holds its record, every revision it kept, whole,
+//! and its markers: replayed through the import's own steps into the same index ([`replay_hg`]), on this node or a
+//! successor, which never reads the importing host's directory (R8).
 //!
 //! **Keys.** A-614's store names a green by a `u64` ([`green_key`]): the half of its volume id that holds its partition
 //! and counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
@@ -43,8 +45,9 @@
 //!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
 //! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
-//! today, as a commit is one step); Mercurial's records and their replay (g304's push) and Subversion's (g268's commit
-//! step), whose arms are placed here and whose records a recovery refuses typed until then; the Subversion index charged
+//! today, as a commit is one step); a Mercurial push's record and its replay (its entry holds none yet, so a recovery
+//! keeps an import's history and not a push's), and Subversion's (g268's commit step), whose arm is placed here and whose
+//! records a recovery refuses typed until then; the Subversion index charged
 //! by the bytes it holds, once slates-svn measures them; a version's pack fragments encoded again after a recovery, off
 //! the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same records (A-636).
 
@@ -217,7 +220,12 @@ pub(crate) enum ReplayRefused {
   Diverged,
   /// The store refused what it took before.
   Git(GitRefused),
-  /// A record of a tool whose replay is owed: Mercurial's (g304's push) and Subversion's (g268's commit step).
+  /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
+  /// step.
+  Mercurial(slates_hg::import::record::Refused),
+  /// Giving back the empty index a replayed one took the place of was refused: the content store's count of holds is off.
+  Released,
+  /// A record of a tool whose replay is owed: Subversion's (g268's commit step).
   Owed,
 }
 
@@ -1007,11 +1015,32 @@ fn replay_into(
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
   match stores.entries.get_mut(&id) {
     Some(RepositoryStore::Git(store)) => replay_git(content, store, bytes),
-    Some(RepositoryStore::Mercurial(_) | RepositoryStore::Subversion(_)) => {
-      Err(ReplayRefused::Owed)
-    }
+    Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
+    Some(RepositoryStore::Subversion(_)) => Err(ReplayRefused::Owed),
     None => Err(unheld),
   }
+}
+
+/// Replays a Mercurial import's record into `store` (A-687; module docs): the record's index made through the import's
+/// own steps (`slates_hg::import::record::replay`) and put in the place of the empty index the store was made with, as
+/// the live import's landing puts it (`hg_import::place_imported`). A store holding a history refuses, as the live
+/// landing does, so an import's record replays only into an empty store. Refused, the store is as it was. No derived
+/// value is kept with it.
+fn replay_hg(
+  content: &mut ContentStore,
+  store: &mut HgStore,
+  bytes: &[u8],
+) -> Result<u64, ReplayRefused> {
+  if !hg_import::holds_none(&mut store.index) {
+    return Err(ReplayRefused::Diverged);
+  }
+  let replayed =
+    slates_hg::import::record::replay(bytes, content).map_err(ReplayRefused::Mercurial)?;
+  let empty = core::mem::replace(&mut store.index, replayed.index);
+  empty
+    .release(content)
+    .map(|()| 0)
+    .map_err(|_| ReplayRefused::Released)
 }
 
 /// The outcome of one record's replay, counted; a refused one leaves repository `id`'s store unserved, given back, with

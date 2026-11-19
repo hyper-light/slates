@@ -1005,11 +1005,11 @@ fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryI
 }
 
 /// A-662 (one map, each tool's arm, made with the record and freed with it). Do: create a git, a Mercurial and a
-/// Subversion repository; replay a record into the Mercurial and Subversion stores; take the Mercurial one's refusal as
-/// a recovery takes it; free all three. Expect: each store made on the owner shard as its tool's arm, git's in its
-/// record's format, Subversion's index at revision 0; the two replays refused `Owed`, their replay being their own push
-/// pieces'; the refused store given back and named unrecovered with why; after the frees no store is held, none
-/// unrecovered, and nothing is charged.
+/// Subversion repository; replay bytes that are no record into the Mercurial and Subversion stores; take a refusal as a
+/// recovery takes it; free all three. Expect: each store made on the owner shard as its tool's arm, git's in its
+/// record's format, Subversion's index at revision 0; the Mercurial replay refused by its record's magic (A-687: an
+/// import's record replays there), the Subversion one `Owed`, its replay its commit step's; the refused store given back
+/// and named unrecovered with why; after the frees no store is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
   crate::daemon::audit_on_shard(|state| {
@@ -1036,10 +1036,14 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
       .subversion(svn)
       .map(|store| store.index.youngest());
     assert_eq!(youngest, Some(0));
-    for repository in [hg, svn] {
+    let refusals = [
+      ReplayRefused::Mercurial(slates_hg::import::record::Refused::Magic),
+      ReplayRefused::Owed,
+    ];
+    for (repository, refusal) in [hg, svn].into_iter().zip(refusals) {
       assert_eq!(
         replay_into(&mut state.vcs_stores, repository, b"a record"),
-        Err(ReplayRefused::Owed)
+        Err(refusal)
       );
     }
     assert!(!super::replayed(state, hg, Err(ReplayRefused::Owed)));

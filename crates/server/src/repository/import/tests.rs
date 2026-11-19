@@ -3,9 +3,12 @@
 
 use std::time::{Duration, Instant};
 
-use slates_db::catalog::{Principal, RepositoryId};
-use slates_hg::PastAdmission;
-use slates_hg::import::ImportRefused;
+use slates_db::catalog::{Principal, RepositoryId, Role, VolumeId as DbVolumeId, VolumeRecord};
+use slates_hg::import::{ImportRefused, Imported};
+use slates_hg::index::Log;
+use slates_hg::{Admission, Node, PastAdmission};
+use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
+use slates_vcs::ContentStore;
 use slates_ipc::protocol::{
   ImportFault, ObjectFormat as WireFormat, Refusal, ReplyBody, RequestBody, VcsTool,
 };
@@ -13,8 +16,9 @@ use slates_vfs::host::{FetchId, HostError};
 use slates_wire::request::RequestId;
 
 use super::{ANSWERED, HELD, Opened, REJOINED, import_with, refusal_of, reply_of};
-use crate::hg_base::BaseRefused;
 use crate::hg_base::tests::{STATES, laid_out};
+use crate::hg_base::{BaseRefused, HgBase};
+use crate::repository::hg_push::{BOOKMARK_TAG, bookmark_name};
 use crate::merge_service::ReplyRoute;
 use crate::state::ShardState;
 use crate::vcs_store::hg_import::{Finished, ImportFailed};
@@ -265,11 +269,12 @@ fn t_a678_the_held_request_is_answered_when_the_import_ends() {
 /// A-678 (each failure's refusal on the wire): do map every way an import fails or ends. Expect `ContentUnavailable` for
 /// a store not held, `NotEmpty`, `UnderWay`, the budget's room, `PastRoom` with the import's room, `Pending` for a fetch
 /// still pending, `Damaged` naming the path a refusal names (a name not UTF-8 read lossily), `Format` for a censored
-/// revision, `Abandoned` for an import that ended or was given back, and what a finished import took.
+/// revision, a landing's own refusal as it is (A-687), `Abandoned` for an import that ended or was given back, and what
+/// a finished import took.
 #[test]
 fn t_a678_each_import_failure_maps_to_its_refusal() {
   let refused = |refusal| ImportFailed::Refused(refusal);
-  let cases: [(ImportFailed, Refusal); 9] = [
+  let cases: [(ImportFailed, Refusal); 10] = [
     (ImportFailed::NoStore, Refusal::ContentUnavailable),
     (
       ImportFailed::NotEmpty,
@@ -333,6 +338,10 @@ fn t_a678_each_import_failure_maps_to_its_refusal() {
         fault: ImportFault::Format,
       },
     ),
+    (
+      ImportFailed::Landing(Refusal::InvalidName),
+      Refusal::InvalidName,
+    ),
   ];
   for (failed, expected) in cases {
     assert_eq!(
@@ -377,4 +386,162 @@ fn check_imported() {
     markers: 1,
   };
   assert_eq!(reply, wanted);
+}
+
+/// Shape: the room the one-call import the recovery test reads its expectations from may hold, the fixture's history
+/// many times over.
+const ONE_CALL_ROOM: u64 = 1 << 24;
+
+/// Shape: that import's content store's window, room for a few rows a table, as the import's own tests make one.
+const ONE_CALL_WINDOW: usize = 1 << 12;
+
+/// What a Mercurial repository serves (A-687; §4.17.3 "The repository's index", decisions 2 and 3): its index's rows,
+/// every changeset's text read back through the index, the register's phase roots, and each bookmark's name with its
+/// green's head changeset and head identity.
+#[derive(Debug, PartialEq, Eq)]
+struct Served {
+  /// The index's rows, each its key and body.
+  rows: Vec<(Vec<u8>, Vec<u8>)>,
+  /// Each changeset's text, in revision order.
+  texts: Vec<Vec<u8>>,
+  /// The phase roots, each its phase and node.
+  roots: Vec<(u8, Vec<u8>)>,
+  /// Each bookmark's name, its green's head changeset and its head's identity.
+  bookmarks: Vec<(String, Option<Node>, [u8; 32])>,
+}
+
+/// What repository `id` serves on this shard ([`Served`]).
+fn served(state: &mut ShardState, id: RepositoryId) -> Served {
+  let repositories = state.db.partition().repositories();
+  let roots = repositories
+    .phase_roots(id)
+    .map(|(phase, node)| (phase, node.to_vec()))
+    .collect();
+  let named: Vec<(String, DbVolumeId)> = repositories
+    .branches(id, BOOKMARK_TAG)
+    .map(|(name, green)| (name.to_owned(), green))
+    .collect();
+  let bookmarks = named
+    .into_iter()
+    .map(|(name, green)| {
+      let mut engine = state.greens.get_mut(&green).expect("a bookmark's green");
+      let head = engine
+        .xattr(ROOT, HEAD_ATTRIBUTE)
+        .and_then(|bytes| Node::try_from(bytes).ok());
+      (name, head, engine.head_identity())
+    })
+    .collect();
+  let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
+  let content: &ContentStore = content;
+  let rows = store
+    .index
+    .rows()
+    .iter(content)
+    .map(|row| (row.key().to_vec(), row.body().to_vec()))
+    .collect();
+  let index = &store.index;
+  let texts = (0..index.len(content, Log::Changelog))
+    .map(|rev| {
+      let row = index.changeset(content, rev).expect("a changeset");
+      content.object_bytes(&row.text, row.len).expect("its text")
+    })
+    .collect();
+  Served {
+    rows,
+    texts,
+    roots,
+    bookmarks,
+  }
+}
+
+/// A recovery's own steps over this shard (A-575, A-662): every green rebuilt from its records in recovery's order
+/// into empty engines, then repository `id`'s store made again from the partition's log.
+fn recovered(state: &mut ShardState, id: RepositoryId) {
+  drop(std::mem::take(&mut state.greens));
+  let mut greens: Vec<VolumeRecord> = state
+    .db
+    .partition()
+    .volumes()
+    .into_iter()
+    .filter(|record| matches!(record.policy.role, Role::Green { .. }))
+    .cloned()
+    .collect();
+  greens.sort_by_cached_key(|record| crate::verbs::member_rank(state, record.id));
+  for record in &greens {
+    drop(crate::verbs::rebuild_member(state, record));
+  }
+  crate::vcs_store::rebuild(state, id);
+}
+
+/// The `states` repository imported in one call through the same adapter: what it found.
+fn imported_in_one_call() -> Imported {
+  let (mut host, directory) = laid_out(STATES.iter().copied());
+  let mut store = ContentStore::new(ONE_CALL_ROOM, ONE_CALL_WINDOW).expect("a content store");
+  let mut base = HgBase::new(&mut host, directory);
+  slates_hg::import::import(&mut base, &mut store, Admission::new(ONE_CALL_ROOM)).expect("imported")
+}
+
+/// Holds `served` to what the one-call import found: its history held, its phase roots, and each bookmark at its
+/// changeset.
+fn check_served(served: &Served, imported: &Imported) {
+  assert!(!served.rows.is_empty() && !served.texts.is_empty());
+  let mut roots: Vec<(u8, Vec<u8>)> = imported
+    .phase_roots
+    .iter()
+    .map(|root| (u8::try_from(root.phase.number()).expect("a phase"), root.node.to_vec()))
+    .collect();
+  roots.sort();
+  let mut held = served.roots.clone();
+  held.sort();
+  assert!(!roots.is_empty());
+  assert_eq!(held, roots);
+  let marks: Vec<(String, Option<Node>)> = served
+    .bookmarks
+    .iter()
+    .map(|(name, head, _)| (name.clone(), *head))
+    .collect();
+  let wanted: Vec<(String, Option<Node>)> = imported
+    .bookmarks
+    .iter()
+    .map(|(name, node)| (bookmark_name(name), Some(*node)))
+    .collect();
+  assert_eq!(marks, wanted);
+}
+
+/// A-687 (§4.17.1 "Durability and residency", R8; the failing test first): do import the `states` repository through
+/// the verb on a running shard and wait for its answer; read what the repository serves; then recover the shard's greens
+/// and the repository's store from the partition's records alone, as a recovery does, and read it again. Expect the
+/// import answered; before the recovery, the history, the phase roots and each bookmark at its changeset the one-call
+/// import found; after it, the same served repository (rows, texts, roots, each bookmark's head and identity), its one
+/// record replayed and counted.
+#[test]
+fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
+  let daemon = crate::daemon::audit_daemon();
+  let id = crate::daemon::observe_first(&daemon, |state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    routed(state, 1, NO_CLIENT);
+    assert_eq!(
+      ask(state, (&owner(), "hg"), the_states_repository),
+      (ReplyBody::Acknowledged, true)
+    );
+    id
+  });
+  let began = Instant::now();
+  while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.importing(id)) {
+    assert!(began.elapsed() < TASK_WAIT, "still importing after {TASK_WAIT:?}");
+  }
+  let (answered, before, after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
+    let answered = count(state, ANSWERED);
+    let before = served(state, id);
+    let replayed = count(state, crate::vcs_store::REPLAYED);
+    recovered(state, id);
+    let after = served(state, id);
+    let replayed = count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed);
+    (answered, before, after, replayed)
+  });
+  daemon.stop();
+  assert_eq!(answered, 1);
+  check_served(&before, &imported_in_one_call());
+  assert_eq!(after, before);
+  assert_eq!(replayed, 1);
 }

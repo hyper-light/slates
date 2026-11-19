@@ -1,47 +1,66 @@
 //! A Mercurial repository's directory imported into its store on its owner shard (A-675; §4.17.3 piece 3; §4.15; §4.3;
-//! A-649 parts 3b and 4; A-662).
+//! A-649 parts 3b and 4; A-662), and made durable by the register's entry it lands (A-687).
 //!
 //! **What it does.** A Mercurial repository's store is made with its record as an empty index (`HgStore`). An import
 //! gives it the history of a repository on the host: the repository's directory is read as a base, read-only (§4.15),
 //! through the server's adapter (`crate::hg_base`), and `slates-hg`'s import (`Import`) is advanced a turn at a time on
 //! the repository's owner shard ([`turn`], [`run`]), each turn lent the host and the shard's content store, within the
-//! shard's quantum (§4.3's step budget) on the shard's clock, with a yield between turns. Once it is done, its index
-//! takes the store's place and the empty index it replaces is given back, so the store holds one index and nothing
-//! keeps a second; what it found beside the history, its phase roots, bookmarks and counts, is answered ([`Finished`])
-//! for the register's first entry to record. Refused, abandoned, or met at its end by a store that is no longer empty,
-//! it gives back everything it held, and the store is as it was.
+//! shard's quantum (§4.3's step budget) on the shard's clock, with a yield between turns. Once it is done, its host is
+//! closed and what it found is answered ([`Finished`]: its counts, phase roots and bookmarks), and it waits in the map,
+//! holding its index, until it lands ([`land`]). Refused, abandoned, or met at its landing by a store that is no longer
+//! empty, it gives back everything it held, and the store is as it was.
+//!
+//! **Durable** (A-687; §4.17.1 "Durability and residency"; R8). An import lands as one entry of the repository's logs
+//! (A-635's append, `repository::push::push_imported`), in its caller's transaction, which records the request's
+//! completion beside it (`repository::import`): the entry's objects are the import's record (`slates_hg::import::record`:
+//! every revision it kept, whole, and the markers), so a recovery, or a successor that cannot read the importing host's
+//! directory, replays it into the same index (the map's `replay_hg`); its state is the phase roots, each added to the
+//! phases log (§4.17.3 decision 3); and each bookmark is a green bound to `bookmark:<label>:` (decision 2), made from
+//! the repository's root at its head and moved to the bookmark's changeset by a work A-618's builder makes from the
+//! imported index, as a push makes a bookmark's (A-657). The store takes the index between the register's guard and the
+//! entry's apply ([`place_imported`]), as a git push's store commits its objects (A-662), so an entry the guard refuses
+//! never reaches the store, and an apply refused after it makes the store again from the log. A line for each branch
+//! head (decision 1) is not made here: owed (GAPS), so a push after an import finds the root as its first line.
 //!
 //! **Bounds.** An import holds, between its turns as within them, at most its room (`Admission`): the listing, the log
 //! it reads (an inline revlog whole), a text being rebuilt and the text before it. The room is one client region's bytes
 //! (`RegionGeometry::total_bytes`), what one request of the version-control edge may hold (`vcs_http`'s `Bounds`),
 //! since an import is asked for by one client; it is charged to the shard's budget as retention when the import starts
-//! and given back when it ends, so the shard's charge covers what the import may hold while it waits between turns. What
-//! the import keeps in the content store is charged as every store's is (the map's module doc): each turn is lent every
-//! byte the shard could admit now, then the arena is grown from its pool by what the turn kept and the charge trued up
-//! to what the content store holds. One import a repository at a time, so the imports under way are bounded by the
-//! partition's repositories. Each holds its own host, which its caller opened for the directory and which is closed
-//! when the import ends; the adapter's lend, made and ended within each turn, holds at most a directory and two files.
+//! and given back when it is done, so the shard's charge covers what the import may hold while it waits between turns.
+//! What the import keeps in the content store is charged as every store's is (the map's module doc): each turn is lent
+//! every byte the shard could admit now, then the arena is grown from its pool by what the turn kept and the charge
+//! trued up to what the content store holds. One import a repository at a time, so the imports under way or waiting to
+//! land are bounded by the partition's repositories. Each holds its own host, which its caller opened for the directory
+//! and which is closed when the import is done; the adapter's lend, made and ended within each turn, holds at most a
+//! directory and two files. Its landing holds the record, whole, and the bookmarks' works, each within what the room
+//! leaves of the others; the record is then charged to the partition's merge budget with the entry, as a git push's is.
 //!
 //! **Cancellation.** The import lives in the shard's map, keyed by its repository, and the task that runs it holds the
 //! key alone, so a task dropped mid-import leaks nothing: the import waits in the map, holding what it held, until a
-//! task runs it again or its repository is freed, which gives it back ([`abandon`]).
+//! task runs or lands it, or its repository is freed, which gives it back ([`abandon`]).
 //!
-//! **Owed** (GAPS' §4.17.3 entry). The verb that asks for a directory's import and answers when it ends; the import made
-//! durable: the register's first entry recording the phase roots and bookmarks [`Finished`] carries, and a recovery that
-//! imports the directory again or replays its record (until then an import is not served, and a restart leaves its
-//! store empty); a host's pending fetch retried at the next turn rather than ending the import; and the adapter's
-//! handles held between turns beside the import, now that the import lives in the shard's map.
+//! **Owed** (GAPS' §4.17.3 entry). The lines of an imported repository's branch heads (decision 1); a host's pending
+//! fetch retried at the next turn rather than ending the import; the adapter's handles held between turns beside the
+//! import; and, for a large repository, the record and the bookmarks' works made in slices rather than whole at the
+//! landing, and the snapshot carrying the store's tables, so a recovery replays only the log's suffix.
 
-use slates_db::catalog::RepositoryId;
+use slates_db::catalog::{MemberOrigin, Principal, RepositoryId, StateChange, VolumeId as DbVolumeId};
+use slates_hg::import::record::{self, WriteRefused};
 use slates_hg::import::{Clock, Import, ImportRefused, Imported, Progress, Turn};
 use slates_hg::index::HgIndex;
 use slates_hg::phases::PhaseHead;
+use slates_hg::push::held::IndexHeld;
+use slates_hg::push::tree::{self, LayoutRefusal, Move, WorkRefused};
+use slates_hg::push::verify::Verified;
 use slates_hg::{Admission, Node};
+use slates_ipc::protocol::{ImportFault, Refusal};
+use slates_merge::push::{HEAD_ATTRIBUTE, PushRefused, ROOT};
 use slates_vcs::ContentStore;
 use slates_vfs::host::{HostDir, HostFs};
 
 use super::{RELEASE_REFUSED, RepositoryStore, VcsStores, lend, settle};
 use crate::hg_base::{BaseRefused, HgBase};
+use crate::repository::push::{AppendRefused, BranchChange, ChangeRefusal, EntryParts};
 use crate::state::ShardState;
 
 #[cfg(test)]
@@ -51,39 +70,64 @@ mod tests;
 pub(crate) const STARTED: &str = "vcs_store.hg_import.started";
 /// Counter: a turn of an import; more turns than imports shows the imports ran a turn at a time. Format: a counter name.
 pub(crate) const TURNS: &str = "vcs_store.hg_import.turns";
-/// Counter: an import whose index took its store's place. Format: a counter name.
+/// Counter: an import done, waiting to land. Format: a counter name.
 pub(crate) const DONE: &str = "vcs_store.hg_import.done";
 /// Counter: an import refused midway, everything it held given back. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.hg_import.refused";
-/// Counter: an import given back before its index took its store's place: its repository freed, or its store no longer
-/// empty when it ended. Format: a counter name.
+/// Counter: an import given back before it landed: its repository freed. Format: a counter name.
 pub(crate) const ABANDONED: &str = "vcs_store.hg_import.abandoned";
+/// Counter: an import landed: its entry appended and its index in its store's place (A-687). Format: a counter name.
+pub(crate) const LANDED: &str = "vcs_store.hg_import.landed";
+/// Counter: an import whose landing was refused, its index given back (A-687). Format: a counter name.
+pub(crate) const LANDING_REFUSED: &str = "vcs_store.hg_import.landing_refused";
 
-/// A repository's import under way, kept in the shard's map between its turns (the module doc).
+/// A repository's import, kept in the shard's map between its turns and until it lands (the module doc).
 pub(crate) struct Importing {
-  /// The import.
-  import: Import,
-  /// The host its directory is read through: the import's own, closed when the import ends.
-  host: Box<dyn HostFs>,
-  /// The repository's directory, on the host.
-  directory: HostDir,
-  /// What the import's room holds of the shard's budget: charged as retention when it started, given back at its end.
+  /// Where it stands.
+  stage: Stage,
+  /// What the import's room holds of the shard's budget: charged as retention when it started, given back once it is
+  /// done, refused or abandoned.
   reserved: u64,
+}
+
+/// Where an import stands.
+enum Stage {
+  /// Under way: the import, the host its directory is read through (the import's own, closed when it is done) and the
+  /// repository's directory on the host.
+  Running {
+    /// The import.
+    import: Import,
+    /// The host.
+    host: Box<dyn HostFs>,
+    /// The directory.
+    directory: HostDir,
+  },
+  /// Done: its index and state, waiting to land ([`land`]), and the room it ran within, which its record carries.
+  Done {
+    /// What it imported.
+    imported: Box<Imported>,
+    /// The room it ran within.
+    room: u64,
+  },
 }
 
 impl std::fmt::Debug for Importing {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    formatter
-      .debug_struct("Importing")
-      .field("turns", &self.import.turns())
-      .field("units", &self.import.units())
+    let mut shown = formatter.debug_struct("Importing");
+    match &self.stage {
+      Stage::Running { import, .. } => shown
+        .field("turns", &import.turns())
+        .field("units", &import.units()),
+      Stage::Done { room, .. } => shown.field("done", &true).field("room", room),
+    };
+    shown
       .field("reserved", &self.reserved)
       .finish_non_exhaustive()
   }
 }
 
-/// Why an import did not start, or ended without its index in its store's place. Each leaves the store as it was.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why an import did not start, did not end, or did not land. Each leaves the store as it was.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ImportFailed {
   /// No Mercurial store of the repository is held here.
   NoStore,
@@ -99,6 +143,9 @@ pub(crate) enum ImportFailed {
   /// The import refused: the store, its requirements, a file, or the host's own refusal (a fetch still pending on an
   /// S3 base among them).
   Refused(ImportRefused<BaseRefused>),
+  /// Its landing was refused (A-687): the entry by the register's guard or the budget, a bookmark's green by the
+  /// namespace's rules, or its record or a bookmark's work past what the landing may hold; the wire's refusal.
+  Landing(Refusal),
 }
 
 /// Where a turn left an import.
@@ -106,7 +153,7 @@ pub(crate) enum ImportFailed {
 pub(crate) enum Turned {
   /// More of the repository to import.
   More,
-  /// Imported: its index is the store's, and what it found beside it.
+  /// Imported, waiting to land, and what it found beside its history.
   Done(Box<Finished>),
 }
 
@@ -139,17 +186,17 @@ pub(crate) struct Finished {
 }
 
 impl Finished {
-  /// What `imported` found, its index handed on, over `turns` turns.
-  fn of(imported: Imported, turns: u64) -> Finished {
+  /// What `imported` found, over `turns` turns; its index stays with it.
+  fn of(imported: &Imported, turns: u64) -> Finished {
     Finished {
       changesets: imported.changesets,
       manifests: imported.manifests,
       file_logs: imported.file_logs,
       file_revisions: imported.file_revisions,
       markers: imported.markers,
-      phase_roots: imported.phase_roots,
+      phase_roots: imported.phase_roots.clone(),
       dropped_phase_roots: imported.dropped_phase_roots,
-      bookmarks: imported.bookmarks,
+      bookmarks: imported.bookmarks.clone(),
       dropped_bookmarks: imported.dropped_bookmarks,
       malformed_bookmarks: imported.malformed_bookmarks,
       turns,
@@ -197,9 +244,11 @@ pub(crate) fn begin(
   match started {
     Ok(import) => {
       let importing = Importing {
-        import,
-        host,
-        directory,
+        stage: Stage::Running {
+          import,
+          host,
+          directory,
+        },
         reserved: room,
       };
       state.vcs_stores.imports.insert(id, importing);
@@ -213,7 +262,8 @@ pub(crate) fn begin(
   }
 }
 
-/// Whether repository `id`'s store takes an import now: a Mercurial store holding no row, and no import of it under way.
+/// Whether repository `id`'s store takes an import now: a Mercurial store holding no row, and no import of it under way
+/// or waiting to land.
 fn takes_import(stores: &mut VcsStores, id: RepositoryId) -> Result<(), ImportFailed> {
   if stores.imports.contains_key(&id) {
     return Err(ImportFailed::Busy);
@@ -230,8 +280,9 @@ fn takes_import(stores: &mut VcsStores, id: RepositoryId) -> Result<(), ImportFa
   }
 }
 
-/// Whether `index` holds no row: the empty index a repository's record was made with.
-fn holds_none(index: &mut HgIndex) -> bool {
+/// Whether `index` holds no row: the empty index a repository's record was made with, which an import's index, live or
+/// replayed, takes the place of (the map's `replay_hg`).
+pub(super) fn holds_none(index: &mut HgIndex) -> bool {
   index.rows().rows() == 0
 }
 
@@ -247,9 +298,8 @@ fn reserve(state: &mut ShardState, room: u64) -> Result<(), ImportFailed> {
 }
 
 /// One turn of repository `id`'s import (the module doc): units of work until `quantum_ns` is spent on `clock`, at
-/// least one, lent the host and the content store. `More` while there is more; once it is done, its index is in its
-/// store's place and what it found is answered; refused, everything it held is given back. `None` when no import of
-/// `id` is under way.
+/// least one, lent the host and the content store. `More` while there is more; once it is done, what it found, its
+/// index waiting to land; refused, everything it held is given back. `None` when no import of `id` is under way.
 pub(crate) fn turn(
   state: &mut ShardState,
   id: RepositoryId,
@@ -275,15 +325,32 @@ fn advance(
   id: RepositoryId,
   turn: Turn<'_>,
 ) -> Option<Result<Progress, ImportRefused<BaseRefused>>> {
-  if !state.vcs_stores.imports.contains_key(&id) {
+  let running = matches!(
+    state.vcs_stores.imports.get(&id),
+    Some(Importing {
+      stage: Stage::Running { .. },
+      ..
+    })
+  );
+  if !running {
     return None;
   }
   lend(&mut state.store, &mut state.vcs_stores, 0);
   let stores = &mut state.vcs_stores;
   let advanced = match (stores.content.as_mut(), stores.imports.get_mut(&id)) {
-    (Some(content), Some(importing)) => {
-      let mut base = HgBase::new(&mut *importing.host, importing.directory);
-      Some(importing.import.advance(&mut base, content, turn))
+    (
+      Some(content),
+      Some(Importing {
+        stage: Stage::Running {
+          import,
+          host,
+          directory,
+        },
+        ..
+      }),
+    ) => {
+      let mut base = HgBase::new(&mut **host, *directory);
+      Some(import.advance(&mut base, content, turn))
     }
     _ => None,
   };
@@ -305,57 +372,88 @@ fn grown_and_settled(state: &mut ShardState) {
   settle(state);
 }
 
-/// Ends repository `id`'s done import (the module doc): its room given back and its host closed, its index put in its
-/// store's place and the empty index there given back, and what it found answered. A store gone, or holding a history
-/// now, keeps what it holds, and the import's index is given back instead.
+/// Repository `id`'s import done (the module doc): its room given back and its host closed, and what it imported kept in
+/// the map, waiting to land; what it found answered.
 fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFailed> {
-  let Some(Importing {
-    import, reserved, ..
-  }) = state.vcs_stores.imports.remove(&id)
-  else {
-    return Err(ImportFailed::NoStore);
+  let (import, reserved) = match state.vcs_stores.imports.remove(&id) {
+    Some(Importing {
+      stage: Stage::Running { import, .. },
+      reserved,
+    }) => (import, reserved),
+    Some(done) => {
+      state.vcs_stores.imports.insert(id, done);
+      return Err(ImportFailed::Busy);
+    }
+    None => return Err(ImportFailed::NoStore),
   };
   state.store.budget.credit_retention(reserved);
   let turns = import.turns();
-  let mut imported = import
+  let imported = import
     .into_imported()
     .ok_or(ImportFailed::Refused(ImportRefused::Ended))?;
-  let index = core::mem::take(&mut imported.index);
-  let (placed, whole) = place(&mut state.vcs_stores, id, index);
-  if !whole {
-    state.count(RELEASE_REFUSED, 1);
-  }
-  settle(state);
-  match placed {
-    Ok(()) => {
-      state.count(DONE, 1);
-      Ok(Turned::Done(Box::new(Finished::of(imported, turns))))
-    }
-    Err(failed) => {
-      state.count(ABANDONED, 1);
-      Err(failed)
-    }
-  }
+  let finished = Finished::of(&imported, turns);
+  let done = Importing {
+    stage: Stage::Done {
+      imported: Box::new(imported),
+      room: reserved,
+    },
+    reserved: 0,
+  };
+  state.vcs_stores.imports.insert(id, done);
+  state.count(DONE, 1);
+  Ok(Turned::Done(Box::new(finished)))
 }
 
-/// Puts `index` in repository `id`'s Mercurial store's place, giving back the empty index it replaces; a store gone, or
-/// holding a history now, keeps what it holds and `index` is given back instead. Whether every hold went back.
+/// Puts `index` in repository `id`'s Mercurial store's place, giving back the empty index it replaces: whether every
+/// hold of that one went back. A store gone, or holding a history now, keeps what it holds, and `index` comes back.
 fn place(
   stores: &mut VcsStores,
   id: RepositoryId,
   index: HgIndex,
-) -> (Result<(), ImportFailed>, bool) {
+) -> Result<bool, (ImportFailed, HgIndex)> {
   let Some(content) = stores.content.as_mut() else {
-    return (Err(ImportFailed::NoStore), true);
+    return Err((ImportFailed::NoStore, index));
   };
   let Some(RepositoryStore::Mercurial(store)) = stores.entries.get_mut(&id) else {
-    return (Err(ImportFailed::NoStore), index.release(content).is_ok());
+    return Err((ImportFailed::NoStore, index));
   };
   if !holds_none(&mut store.index) {
-    return (Err(ImportFailed::NotEmpty), index.release(content).is_ok());
+    return Err((ImportFailed::NotEmpty, index));
   }
   let empty = core::mem::replace(&mut store.index, index);
-  (Ok(()), empty.release(content).is_ok())
+  Ok(empty.release(content).is_ok())
+}
+
+/// Puts the index an import's entry carries in repository `id`'s store's place, between the register's guard and the
+/// entry's apply (the module doc; `repository::push::push_imported`). Placed, `index` is empty; refused, the index is
+/// back in `index` and the wire's refusal answered: `NotEmpty` for a store that took a history meanwhile, or
+/// `ContentUnavailable` for a store gone.
+pub(crate) fn place_imported(
+  state: &mut ShardState,
+  id: RepositoryId,
+  index: &mut Option<HgIndex>,
+) -> Result<(), Refusal> {
+  let Some(taken) = index.take() else {
+    return Err(Refusal::ContentUnavailable);
+  };
+  match place(&mut state.vcs_stores, id, taken) {
+    Ok(whole) => {
+      if !whole {
+        state.count(RELEASE_REFUSED, 1);
+      }
+      settle(state);
+      Ok(())
+    }
+    Err((failed, back)) => {
+      *index = Some(back);
+      Err(match failed {
+        ImportFailed::NotEmpty => Refusal::ImportRefused {
+          fault: ImportFault::NotEmpty,
+        },
+        _ => Refusal::ContentUnavailable,
+      })
+    }
+  }
 }
 
 /// Ends repository `id`'s refused import: the import gave its index back as it refused; its room is given back and its
@@ -366,25 +464,240 @@ fn end(state: &mut ShardState, id: RepositoryId) {
   }
 }
 
-/// Gives back repository `id`'s import under way, if there is one (the module doc's cancellation): its index's holds and
-/// its room, its host closed. What freeing the repository does first (the map's `free`).
+/// Gives back repository `id`'s import, under way or waiting to land, if there is one (the module doc's cancellation):
+/// its index's holds and its room, its host closed. What freeing the repository does first (the map's `free`).
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
-  let Some(Importing {
-    import, reserved, ..
-  }) = state.vcs_stores.imports.remove(&id)
-  else {
+  let Some(Importing { stage, reserved }) = state.vcs_stores.imports.remove(&id) else {
     return;
   };
   state.store.budget.credit_retention(reserved);
-  let whole = match state.vcs_stores.content.as_mut() {
-    Some(content) => import.abandon(content).is_ok(),
-    None => true,
+  let whole = match (state.vcs_stores.content.as_mut(), stage) {
+    (Some(content), Stage::Running { import, .. }) => import.abandon(content).is_ok(),
+    (Some(content), Stage::Done { imported, .. }) => {
+      let Imported { index, .. } = *imported;
+      index.release(content).is_ok()
+    }
+    (None, _) => true,
   };
   if !whole {
     state.count(RELEASE_REFUSED, 1);
   }
   state.count(ABANDONED, 1);
   settle(state);
+}
+
+/// Gives back an index a landing did not place, then settles.
+fn give_back(state: &mut ShardState, index: HgIndex) {
+  let whole = match state.vcs_stores.content.as_mut() {
+    Some(content) => index.release(content).is_ok(),
+    None => true,
+  };
+  if !whole {
+    state.count(RELEASE_REFUSED, 1);
+  }
+  settle(state);
+}
+
+/// Lands repository `id`'s done import (A-687, the module doc's "Durable"): its entry appended through A-635's append,
+/// in the caller's transaction when one is open, its index put in its store's place between the register's guard and
+/// the entry's apply. Refused, nothing is recorded, and the index and everything it held are given back. `Busy` while
+/// the import is still under way, `NoStore` when none is held for `id`.
+pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
+  let (mut imported, room) = match state.vcs_stores.imports.remove(&id) {
+    Some(Importing {
+      stage: Stage::Done { imported, room },
+      ..
+    }) => (imported, room),
+    Some(running) => {
+      state.vcs_stores.imports.insert(id, running);
+      return Err(ImportFailed::Busy);
+    }
+    None => return Err(ImportFailed::NoStore),
+  };
+  let entry = landing_entry(state, id, (&*imported, room));
+  let mut index = Some(core::mem::take(&mut imported.index));
+  let appended = entry.and_then(|(owner, changes, parts, record)| {
+    crate::repository::push::push_imported(
+      state,
+      (&owner, id),
+      changes,
+      parts,
+      (&mut index, record),
+    )
+    .map_err(landing_refusal)
+  });
+  if let Some(index) = index.take() {
+    give_back(state, index);
+  }
+  match appended {
+    Ok(_) => {
+      state.count(LANDED, 1);
+      Ok(())
+    }
+    Err(refusal) => {
+      state.count(LANDING_REFUSED, 1);
+      Err(ImportFailed::Landing(refusal))
+    }
+  }
+}
+
+/// What an import's entry is made of: its owner, the bookmarks' greens, the phase roots, and its record.
+type Landing = (Principal, Vec<BranchChange>, EntryParts, Vec<u8>);
+
+/// The entry repository `id`'s import lands (the module doc's "Durable"): its owner, each bookmark's green, the phase
+/// roots added, and the import's record carrying `room`, the room it ran within; or the wire's refusal.
+fn landing_entry(
+  state: &ShardState,
+  id: RepositoryId,
+  (imported, room): (&Imported, u64),
+) -> Result<Landing, Refusal> {
+  let content = state
+    .vcs_stores
+    .content
+    .as_ref()
+    .ok_or(Refusal::ContentUnavailable)?;
+  let record = record::write(&imported.index, content, room).map_err(|refused| match refused {
+    WriteRefused::Allocation => Refusal::BudgetExceeded {
+      available: state.store.admittable(),
+    },
+    WriteRefused::Unreadable { .. } | WriteRefused::UnreadableMarker { .. } => {
+      Refusal::ContentUnavailable
+    }
+  })?;
+  let repositories = state.db.partition().repositories();
+  let owner = repositories
+    .repository(id)
+    .map(|record| record.owner.clone())
+    .ok_or(Refusal::NotFound)?;
+  let root = repositories
+    .members_of(id)
+    .find(|member| matches!(member.origin, MemberOrigin::Root))
+    .map(|member| member.green)
+    .ok_or(Refusal::NotFound)?;
+  let held = IndexHeld::new(&imported.index, content);
+  let name = import_name(&record);
+  let changes = bookmark_greens(state, (root, &imported.bookmarks), (&held, name, room))?;
+  let parts = EntryParts {
+    checks: Vec::new(),
+    names: Vec::new(),
+    state: phase_roots_added(&imported.phase_roots),
+  };
+  Ok((owner, changes, parts, record))
+}
+
+/// Format: the BLAKE3 context an import's name is derived from its record in: every work of its entry begins its
+/// identity with it (A-618's push name).
+const NAME_CONTEXT: &str = "slates 2026-11-19 a Mercurial import's name";
+
+/// The import's name: BLAKE3 under [`NAME_CONTEXT`] over its record, so two imports of other histories never share one.
+fn import_name(record: &[u8]) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_derive_key(NAME_CONTEXT);
+  hasher.update(record);
+  *hasher.finalize().as_bytes()
+}
+
+/// Each phase root as the phases log adds it (§4.17.3 decision 3): its phase's number and its node, in the import's
+/// order (by phase, then node).
+fn phase_roots_added(roots: &[PhaseHead]) -> Vec<StateChange> {
+  roots
+    .iter()
+    .filter_map(|root| {
+      let phase = u8::try_from(root.phase.number()).ok()?;
+      Some(StateChange::PhaseRootAdded {
+        phase,
+        node: root.node.to_vec(),
+      })
+    })
+    .collect()
+}
+
+/// What a bookmark's work is built from: the imported index as a push's `Held`, the import's name, and the room the
+/// works may take between them.
+type Works<'h> = (&'h IndexHeld<'h>, [u8; 32], u64);
+
+/// Each bookmark a green (§4.17.3 decision 2): made from `root` at its head, as a push makes a bookmark from a line's
+/// version, and moved to the bookmark's changeset by a work built from the imported index (none where the root's head is
+/// that changeset already); the works within the room between them.
+fn bookmark_greens(
+  state: &ShardState,
+  (root, bookmarks): (DbVolumeId, &[(Vec<u8>, Node)]),
+  (held, name, room): Works<'_>,
+) -> Result<Vec<BranchChange>, Refusal> {
+  let engine = state
+    .greens
+    .get(&root)
+    .ok_or(Refusal::ContentUnavailable)?;
+  let version = state.db.partition().green_head(root);
+  let head = engine
+    .xattr(ROOT, HEAD_ATTRIBUTE)
+    .and_then(|bytes| Node::try_from(bytes).ok());
+  let mut admission = Admission::new(room);
+  let mut changes = Vec::with_capacity(bookmarks.len());
+  for (mark, node) in bookmarks {
+    let work = if head == Some(*node) {
+      None
+    } else {
+      let moved = Move {
+        name,
+        base_version: version,
+        base: head.as_ref(),
+        head: node,
+      };
+      let built = tree::work(&moved, &engine, (&Verified::default(), held), admission.left(), &mut admission)
+        .map_err(|refused| work_refused(&refused, room))?;
+      admission
+        .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
+        .map_err(|_| past_room(room))?;
+      Some(built.increment)
+    };
+    changes.push(BranchChange::Create {
+      name: crate::repository::hg_push::bookmark_name(mark),
+      from: root,
+      version,
+      work,
+    });
+  }
+  Ok(changes)
+}
+
+/// `ImportRefused { PastRoom }` naming the import's room.
+fn past_room(room: u64) -> Refusal {
+  Refusal::ImportRefused {
+    fault: ImportFault::PastRoom { room },
+  }
+}
+
+/// The wire's refusal for a bookmark's work not made: past the room; a path or a link's target slates cannot hold, or a
+/// tree that holds a name twice, which is the repository's format (`Format`); a changeset or manifest the imported
+/// index does not answer, which a landed import never meets (`ContentUnavailable`).
+fn work_refused(refused: &WorkRefused, room: u64) -> Refusal {
+  match refused {
+    WorkRefused::Layout(LayoutRefusal::PastAdmission(_))
+    | WorkRefused::Push(PushRefused::PastRoom { .. }) => past_room(room),
+    WorkRefused::Push(
+      PushRefused::NameNotHeld { .. }
+      | PushRefused::TargetNotHeld { .. }
+      | PushRefused::DuplicateName { .. }
+      | PushRefused::KindChanged { .. },
+    ) => Refusal::ImportRefused {
+      fault: ImportFault::Format,
+    },
+    _ => Refusal::ContentUnavailable,
+  }
+}
+
+/// The wire's refusal for a landing's append refused: the entry's or the repository's own, or the first change's.
+fn landing_refusal(refused: AppendRefused) -> Refusal {
+  match refused {
+    AppendRefused::Repository(refusal) | AppendRefused::Entry(refusal) => refusal,
+    AppendRefused::Changes(changes) => changes
+      .into_iter()
+      .find_map(|change| match change.why {
+        ChangeRefusal::Refused(refusal) => Some(refusal),
+        _ => None,
+      })
+      .unwrap_or(Refusal::ContentUnavailable),
+  }
 }
 
 /// Runs repository `id`'s import to its end on its owner shard, a turn at a time (the module doc): a yield, then one turn
