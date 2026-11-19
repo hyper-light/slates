@@ -11367,6 +11367,15 @@ checkpoint is the green's state at its reachable floor, and a base below it is r
 names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
 holds (the record names the floor), so no replica keeps more history than its owner (A-385).
 
+> **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
+> order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
+> for a range that is not a point. A point (an insert's empty range) is not passed by an operation starting at it, which
+> lies after it without shifting it, so the walk goes on and meets an insert at the point that canonical order puts
+> behind an overwrite or a truncate there (`crate::map::lies_past`). Until A-668 it stopped at that overwrite or
+> truncate, and a work's insert landed after one that overwrote or truncated and inserted at its point was accepted
+> ahead of both, while the other order conflicted: two inserts at one point, which D-27 makes a conflict in both orders
+> (`docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md`).
+
 **The verdict, two pure passes.** Inputs: the mapped increment, the effect ranges of the
 intervening deltas, and the referenced immutable content. Pass one: a sweep line over the
 increment's ranges and the intervening effect ranges per path, O((n+m) log(n+m)); disjoint
@@ -12270,8 +12279,12 @@ is one more version, and the chain itself is never rewritten.
 > logarithmic along runs and linear only in the merges a question must open. Path history is one since A-666 part 2
 > (`derived/history.rs`): each version's value names its map and a history tree of each path's node, kept from the
 > first parent the path is TREESAME to, so `log <path>` and `--follow` (past recorded renames and copies) read one node
-> a version they list, git's default mode exactly. Owed: A-553's and A-588's stores as types, blame, and the server's
-> use (A-647's and A-666's entries).
+> a version they list, git's default mode exactly. Blame is one since A-666 part 3 (`derived/blame.rs`): each version's
+> value keeps each file's blame (runs of lines, each naming its introducing version, the file's path there and its first
+> line there), kept from the first parent whose file holds the same content and otherwise made from the parents' blames
+> and one diff with each, so a question reads the path's trie nodes and the file's spans, never a diff of the history;
+> a line both parents of a merge changed is attributed by the merge's recorded content (D-27). Owed: A-553's and
+> A-588's stores as types, and the server's use (A-647's and A-666's entries).
 
 **Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
 branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
@@ -14110,12 +14123,13 @@ and export by landing).
 > makes, in `reporter.c`'s order, each with the editor's own arguments and the raw facts of the node it names; A-627's
 > `dav::Drive` consumes the same calls. `EditorWriter` writes each as `editorp.c` and `marshal.c` do: tokens `d` and
 > `c` from one counter, absent entries only to a client that announced `absent-entries`, svndiff 2 to a client that
-> accepts it and 0 to any other, each window as `svndiff.c`'s three chunks, and a call out of the editor's order
-> refused with nothing written. Held to every drive in the recordings (28: 22 stock, six hand-made), each read back
-> and written again: the same calls and windows, and every item byte for byte but a chunk `svnserve` stored
-> LZ4-compressed. Owed of part 2: the drive over the index and the green, with `svn_repos_deleted_rev` and
-> `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the client's early answer and its
-> answers to `close-edit` and `abort-edit`.
+> accepts it and 0 to any other, each window as `svndiff.c`'s three chunks (corrected 2026-11-19, A-616 continued (6):
+> a version-0 window of new data alone is `send_simple_insertion_window`'s two, the stream's header in the first),
+> and a call out of the editor's order refused with nothing written. Held to every drive in the recordings (28: 22
+> stock, six hand-made), each read back and written again: the same calls and windows, and every item byte for byte but
+> a chunk `svnserve` stored LZ4-compressed. Owed of part 2: the drive over the index and the green, with
+> `svn_repos_deleted_rev` and `svn_fs_closest_copy`; the deltas of changed texts; and the handler that reads the
+> client's early answer and its answers to `close-edit` and `abort-edit`.
 >
 > **Status (2026-11-19, A-616, part 2, its second slice).** Built: the drive (`report::drive::Drive`), `reporter.c`'s
 > `drive`, `delta_dirs`, `update_entry`, `delta_proplists` and `delta_files` over the index (A-553), the green
@@ -14589,6 +14603,19 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
 > revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
 > a dangling link told apart; no core dumps; the Windows driver.
+>
+> **Status (2026-11-19, A-661 part 1: the hook glue).** `crates/server`'s `svn_hooks` is what every Subversion call
+> point runs its hooks through. `run` finds the hook the repository's policy configures at the input's point, runs it
+> with the driver over the caller's view, and answers what `svnserve` tells the client (`svn_told`), the run's lesson
+> for the hook's times, and pre-lock's token. `verdict` is what the commit drive resumes with: `Ok`, the refusal's
+> chain, or nothing once the client left, so the change does not go on. A point with no hook answers as `svnserve` does,
+> running nothing. The call points, agreed through main on 2026-11-19: the drive pauses for start-commit at `open-root`,
+> after its revision check, and for pre-commit at `close-edit`, before the verdict (`Step::Hook`, `Drive::resume`; g268,
+> A-655); the `svn://` task runs those, and post-commit after its append, whose words are `commit-info`'s
+> `post-commit-err` (g234, A-656); the lock hooks wrap A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK
+> and UNLOCK, DAV's wiring A-661's next part once g298's serving lands. Tested on Linux x86_64 (adacachy, 2026-11-19):
+> the server's lib tests 630 passed beside main's 624, the glue's five new and nothing failing that main's tree passed;
+> each of its four choices broken in a copy failed only its own tests. The macOS run is owed.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -44330,7 +44357,11 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     constant-time on histories of merges (Pǎtraşcu 2011), so each costs a search logarithmic along runs and a step for
     each merge it must open. A-666 part 2: a path's history, `log <path>` and `--follow`, from a type naming each path's
     node (Mononoke's unodes) under git's default-mode rule exactly, renames and copies as the works recorded them; a
-    question reads one node a version it lists. Owed: blame; the server's verbs over the types.)
+    question reads one node a version it lists. A-666 part 3: blame, each line's introducing version, the file's path
+    there and the line's number there, from a type keeping each file's blame, made from the parents' blames and one
+    diff with each (Myers' linear-space diff), never a diff of the history; a line both parents of a merge changed is
+    attributed by the merge's recorded content (D-27); a question reads the path's trie nodes and the file's spans.
+    Owed: the server's verbs over the types.)
   - **Fetches name immutable objects.** A native client asks only for what it wants, never states what it has, and each
     request is resumable and cacheable at every tier. The tiers are strict, so a failed tier never floods the one
     above it (with goal 91's federation).
@@ -47599,6 +47630,220 @@ base text) and its tests.
 - **Tests.** `big.txt` from r5 to r6 (one line of 6,000 changed): its windows copy from the base, carry under a
   hundredth of the text as new data, and make the text `close-file` names; red with every window new data. The 29
   recorded drives still match, each delta by what it makes.
+
+### A-668 — Two inserts at one point conflict in both orders: the walk through a delta goes on past an operation starting at a point (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "Position mapping" and "The verdict"; D-27; found by A-659)
+
+- **What was wrong.** Two works insert at one point, each based before the other, and one also overwrites the bytes
+  from that point or truncates from it. Canonical order puts the overwrite or the truncate before the insert at one
+  offset (`OpsDoc::canonicalize`), and the walk through a delta (`crate::map::map_through_one`) stopped at the first
+  operation starting at or after a range's end. A point's end is its start, so the walk stopped at the overwrite or the
+  truncate and never met the insert behind it: the work landed second was accepted ahead of both, while in the other
+  order the two inserts met and conflicted. A-659 found it: its restatement takes the verdict's walk for both sides of
+  every pair of operations, and here the two sides disagreed.
+- **The decision** (main's, from D-27): a conflict in both orders. Accepting one insert ahead of the other chooses an
+  order, which is an inferred merge.
+- **The change.** `crate::map::lies_past(at, range)`: an operation lies past a range when it starts after the range's
+  end, or at its end for a range that is not a point. `map_through_one` stops only there, so a point walks on past an
+  overwrite or a truncate starting at it, which lie after it without shifting it, and meets an insert behind them. A
+  non-empty range is walked as before. Every reader of the walk takes it: the verdict's content, a rename's edits
+  (A-547), a rebase, pass two's point, a review comment's lines (never a point, so unchanged), and A-659's restatement,
+  whose moved walk counts an operation starting at a point as after it (`Meets::Beside`).
+- **Tests.** `crates/merge/src/map/tests.rs`: the point meets an insert behind an overwrite and behind a truncate at
+  it, and one in front of an overwrite; an overwrite alone, or one with an insert past it, leaves the point where it
+  was; at the verdict, an insert against an overwrite-then-insert and against a truncate-then-insert at one point, each
+  landed first in turn, conflict in all four. A-659's stack oracle generates the shape (an overwrite or a truncate, then
+  an insert, at one offset), which it had avoided, and now requires a work between that a replica refuses to land alone
+  over the stack's works below it, so a pair judged in one order only fails the oracle rather than passing as an order
+  the verdict depends on.
+- **Evidence** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the macOS run owed). Red (r1445, 04:13 PST) at
+  1ce46ee9a with `map.rs` and `stack/moved.rs` restored to f238bff73's, before the fix, in the scratch clone:
+  `cargo test -p slates-merge --lib -- map:: stack::oracle`, 3 of 4 failing: the map test (the point `Shifted` to 4
+  where it must meet the insert), the verdict's both orders, and the stack oracle, which met the pair by itself (the
+  green refused a bottom where every work between landed over it); the tree oracle passed. Green (r1448, 04:41 PST) at
+  1ce46ee9a: `cargo test -p slates-merge --lib -- --nocapture`, 166 of 166 in 36.3 s; `cargo fmt -p slates-merge --
+  --check` clean. The stack oracle's census: stacks through depths one to four 664, 405, 230 and 97 times; uppers moved
+  38, unmoved 694; uppers refused 147, bottoms 300; works between 1,266; collapsed 0. The tree oracle's: applied 178,
+  refused 142.
+- **The merged tree** (Windows x86_64, jupiter, kiln, debug, 2026-11-19; the macOS run owed). At 92038d5aa, A-668 over
+  main e3234e618 (A-669's and A-670's nodes handed on to links; a verdict that makes no file until it accepts):
+  `cargo test --locked -p slates-merge --lib -- --show-output` (r81, 17:12 to 17:32 UTC) ran 180 tests, main's 178 and
+  A-668's 2, and passed 179 in 35.58 s, A-668's two among them; `cargo fmt -p slates-merge -- --check` clean. The one
+  failure was A-626's copy oracle (`engine::copy_tests::every_copy_reads_as_its_model_over_every_history`): every
+  history agreed with its model, but its census, which requires every kind of copy met, met no nested pair whose inner
+  copy replaced a tree (0 of 30 nested pairs). A-668 cannot move it: that oracle bases every work at the head, so its
+  verdicts map through no delta and never reach the walk A-668 changed, and a seed decides the same there with or
+  without A-668. The kind is rare since A-626 part 2 (2 of 31 and 2 of 46 nested pairs in its recorded runs), so by a
+  Poisson estimate one run in three to five meets none (filed for its owner). Run alone again (r131, 18:09 UTC) it
+  passed, meeting 3 of 37. The stack oracle's census: stacks through depths one to four 646, 393, 236 and 103 times;
+  uppers moved 42, unmoved 690; uppers refused 128, bottoms 263; works between 1,073; collapsed 0. The tree oracle's:
+  applied 173, refused 133. Main's commits to f607f424c touch nothing slates-merge builds from.
+- **Applied in the same change to:** §4.16 "Position mapping" (the status); GAPS (A-668's entry beside A-612's, and
+  A-659's paragraph); `crates/merge/src/map.rs`, `map/tests.rs` (new), `engine/stack/moved.rs`,
+  `engine/stack/oracle.rs`; `docs/bugs/2026-11-19-two-inserts-at-one-point-conflicted-in-one-order-only.md` (new).
+
+### A-666 part 3 — Blame as derived data: each line's introducing version, its path and its line there, answered from each version's value; made from the parents' blames and one diff with each, never a diff of the history; a line both parents of a merge changed attributed by the merge's recorded content (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Queries by API", part 3; A-647; §4.17.1 "Reads")
+
+- **Why.** A-645: "Blame, history, merge bases and bisect are answered from derived data, with no repository on the
+  client." Part 1 answered ancestry and part 2 a path's history; this part answers blame, the last of the four.
+- **The question** (`research/path-history.md` §6). `git blame` "Annotates each line in the given file with
+  information from the revision which last modified the line" \[C: git `git-blame.adoc` 20-21\]; Mercurial's linelog
+  emits for each line "the revision that introduced them and the line number in the file at the introducing revision"
+  \[C: Mercurial 7.2.4 `mercurial/linelog.py` 14-19\]. The type answers each line's introducing version, the file's path
+  there and the line's number there (from zero; git's output counts from one), as runs of lines (`Span`). git finds
+  whole-file renames by detection (`git-blame.adoc` 26-27, 67-69); the type follows the renames and copies the works
+  declared (part 2's `PathSources`), never one inferred.
+- **The value** (`crates/vcs/src/derived/blame.rs`, `Blame`, the type `slates-vcs blame 1` with the window its trees
+  split by): a version's blame tree, a path map whose files are each file's blame, a derived node naming the file's
+  content and an object of its spans (each span its lines and its origin, then its version's name and its path, each
+  after its length), its payload a tag and two counts (its lines, its spans' bytes). A file keeps the blame of the
+  first parent whose file at its path has the same content, as path history keeps a node, so a file no change reaches
+  keeps its first parent's blame by path copying.
+- **The rule.** A file the version's change sets otherwise is diffed once against each parent's file at its path, in
+  parent order, then against its recorded source (a rename's or a copy's; a copy from an older version read through
+  the inputs path history names, `DerivedType::inputs`); each line takes the attribution of the first candidate whose
+  diff keeps it, and a line none keeps is the version's own. Mononoke's BlameV2 is made the same way, from the
+  parent's blame and the hunks of one diff \[C: `mononoke_types/src/blame_v2.rs` 514-565\], and at a merge each line
+  from "the first one that does *not* match the merge changeset" (1605-1640). Mercurial's linelog is one weave a file
+  patched in place along a main branch "ignoring p2" \[C: `hgext/fastannotate/__init__.py` 23-26\]; A-647's values are
+  immutable, one a version, over histories of merges.
+- **A merge** (D-27). A line both parents changed is attributed by the merge's own recorded content: it takes the first
+  parent whose text the merge recorded there, else it is the merge's own. No merge of the parents is computed or
+  inferred; the diff only says which recorded lines are shared and makes no content.
+- **The diff** (`matched`): Myers' O(ND) algorithm in linear space \[A: E. W. Myers, "An O(ND) Difference Algorithm
+  and Its Variations", Algorithmica 1(2):251-266, 1986, §4b\]: the common prefix and suffix taken, the middle snake
+  found by searching from both ends at once as diff-match-patch's `diff_bisect` does \[C: `diff_match_patch.py`
+  254-354\], each side solved again, so the lines kept are a longest common subsequence. Each distinct line is numbered
+  once, so the diff compares numbers; the lines, their attributions and the search's arrays are charged to the store
+  and refused past its budget.
+- **The costs.** A derivation reads each file its change sets and its candidates' versions of that file, never an
+  ancestor's, never another file's (`BlameCounters::lines_read`, held to the replay's). The question (`blame`) reads
+  the trie nodes on the path, the file's blame node and its spans' bytes, by its code no more: never the content, never
+  the history. It reports both (`BlameCost`); no test holds the report yet (owed).
+- **Typed refusals** (`BlameRefused`): `NoVersion`, `Inputs`, `BadSource`, `Malformed` (a blame's bytes, or spans that
+  do not cover its lines), `Exhausted`, and the path map's and the store's own (a file's content not held among them).
+  A refused derivation leaves the store as it was.
+- **Tests** (`crates/vcs/src/derived/blame/tests.rs`; `cargo test -p slates-vcs --lib`, Windows x86_64, jupiter,
+  2026-11-19, kiln run r87: a fresh clone of each pushed branch, each made after the build before it, in one target
+  directory, and every build's log showing slates-vcs compiled again; the Mac Studio was offline, so the macOS run is
+  owed).
+  - Red first (db61572b3, branch `agents/g302-a666p3-red`, not for main: 160b47ebb's stubs, the derivation, the
+    question and the diff refusing at once, with the two tests added at 78dfa5ad5): 66 passed and 9 failed, every new
+    test but the hostile-bytes readers', which call no stub; the 66 are part 2's 65 and that one. Built in 15 min 51 s;
+    the tests ran 255.83 s.
+  - Green at ee6868011 (d7acb9700 the type; 78dfa5ad5 two tests a review found missing, a line both parents of a merge
+    hold, each way round, and forged values; ee6868011 its citations read again, comments only): 75 of 75, part 2's
+    65 and the ten new, the tests 213.05 s, built in 3 min 22 s with slates-vcs compiled from the green's own clone;
+    `cargo fmt -p slates-vcs -- --check` clean.
+  - The oracle (`t_a666_p3_every_blame_equals_a_replay_of_the_history`, 32 cases): histories grown from up to 63
+    generated steps each (at most 127 versions) over files of few distinct lines (lines inserted, removed and replaced,
+    a last newline dropped and restored, files made and removed, renames some edited as they move, copies from the
+    first parent and from up to four first-parent steps before it, merges of two and three keeping, taking or
+    resolving each file, criss-cross merges, unrelated roots), every version's blame derived eagerly and again lazily
+    from the newest down, and every file of every version blamed. Every blame is the one a replay of the whole
+    history computes by the rule, file by file from the roots; every line's attribution names a line of the same text
+    where it says it was introduced; the derivations judged exactly the files the changes set and read the lines the
+    replay read (the non-vacuity counts); the lazy values are the eager ones, identity for identity; and the store is
+    empty after. The replay shares the module's diff (`matched`): which of several longest common subsequences a diff
+    keeps decides a tie, and that choice is the diff's, held apart to the dynamic program (below). Its census: 818
+    versions, 215 merges, 49 versions renaming and 28 copying from an older version; 861 files judged, 153 keeping a
+    parent's blame whole and 708 blames made, 74 of them over two candidates or more; 2,299 blames asked, 6,963 lines,
+    at most 12 in a file; 103 lines a merge resolved itself, 175 kept through a later parent and 259 through a recorded
+    source.
+  - Beside it: the diff's pairs over 512 generated pairs of up to 60 lines drawn from two to five distinct lines (many
+    ties): strictly increasing, naming equal lines, and as many as the dynamic program's longest common subsequence.
+    D-27 three ways: from a, b, c, one side changing a and b and the other b and c, merges recording the first side's
+    b, the second side's and a b in neither give b to the first side, the second side and the merge itself, while a
+    keeps the first side and c the second. A line both parents' diffs keep, the parents merged each way round: the
+    first parent's each time. A rename edited as it moves keeps the versions and the path (`f`) that introduced its
+    lines, the added line the rename's; a copy from an older version keeps the lines as they stood there, none of the
+    later change. A file of 2,000 lines edited a line a version 300 times: the tip's blame gives each line the last
+    version that replaced it, else the first, and the derivations read 1,202,000 lines (2,000, then the file and its
+    parent's version each time), never the history. The format's bytes written by hand (a one-line file: the span's
+    object named by BLAKE3's hash, the blame and the tree's leaf by its key derivation). Hostile span bytes refused
+    five ways and a field cut short, and blame nodes three ways (a foreign tag, three names, a payload cut short).
+    Refusals by kind, the store as it was: `BadSource`, `Inputs`, a content not held, `OverBudget`, and a question of
+    a root that is no tree. Forged values refused `Malformed` four ways: a tree's file of another class, a file naming
+    the bare content, spans a byte longer than their object, and a parent's blame counting one line of two.
+  - Thirteen mutations wait on branch `agents/g302-a666p3-mutants` (not for main; each the green at 78dfa5ad5 with one
+    change to `blame.rs`: every unchanged file blamed again, the last parent's diff winning, a later parent's file of
+    the same content not kept whole, and ten guards against malformed values each removed). Under CLAUDE.md §8 they
+    are main's to run, filed in the run-request queue with the test each should fail.
+  - Main's: the macOS run, clippy, `xtask check` and the doc gate (the run-request queue).
+- **Owed.** The server's verbs over the type (each repository's values on its owner shard, A-662); a diff larger than
+  a slice cut into slices, as A-647's derivations larger than a slice are owed; a blame's spans shared between versions
+  by identity where an edit leaves them (one object a file version today, as Mononoke's); the question's reported cost
+  (`BlameCost`) held by the oracle; git's porcelain fields beyond the three (the previous version and path a line had,
+  `-L` ranges), from the same values.
+- **Applied in the same change to:** `crates/vcs/src/derived/blame.rs` and `derived/blame/tests.rs` (new);
+  `crates/vcs/src/derived.rs` (the module's docs, its owed line); `crates/vcs/src/derived/history.rs` (`inputs_of`
+  shared with blame); `docs/wip/research/path-history.md` (§6, new; §1's sources); A-645's entry ("Queries by API");
+  §4.17.1 "Reads"' status; GAPS' A-645 line.
+
+### A-661 part 1 — Subversion's hook glue: the hook a point's record configures, run by the driver, answered in svnserve's words, and the call points agreed (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-648, with A-655 and A-656)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17 entry); `crates/server` (`svn_hooks.rs` and its
+tests, new; `lib.rs`).
+
+- **The glue.** `svn_hooks::run(site, input, bound, client_gone)` takes the input a caller built for its point (the
+  builders of A-623, the environment the record gives, A-648), finds the hook the repository's policy configures at
+  that point (Subversion keeps one a point), and runs it with the driver over the caller's view, held to the hook's
+  learned bound and ended with the client. It answers `SvnHookRan`: what `svnserve` tells its client (`svn_told`), the
+  run's lesson for the hook's times, which the caller keeps, and pre-lock's token (`svn_lock_token`). A point with no
+  hook answers at once as `svnserve` does: nothing, but pre-revprop-change's `E165006`.
+- **The verdict.** `SvnHookRan::verdict` is what an admission point's caller resumes with: `Ok` to go on, the
+  refusal's chain (each error's number and message, outermost first), or nothing once the client left, so that no
+  change goes on for a client that is gone. An observing point's failure is no refusal.
+- **The call points**, agreed through main and relayed to each owner: the commit drive pauses for start-commit at
+  `open-root`, after its revision check and with the transaction named, and for pre-commit at `close-edit`, before the
+  verdict (`Step::Hook`, `Due::{StartCommit, PreCommit}`, `Drive::resume`; g268, A-655); the `svn://` connection task
+  runs those, and post-commit after its append, whose words are `commit-info`'s `post-commit-err` (g234, A-656); the
+  lock hooks run around A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK and UNLOCK, pre-lock per path
+  with its token the lock's, post-lock once with the paths locked.
+- **Tests** Linux x86_64 (adacachy), 2026-11-19, in capped `systemd-run --user` units (MemoryMax 24G, CPUWeight 1, Nice
+  19, nvme1n1 I/O at 150M and 400M). One clone, main's compiled tree first (main 4644dcec3's `lib.rs`, `svn_hooks`
+  removed): `cargo test --locked -p slates-server --lib -- --test-threads=4` 624 passed, 2 failed, 3 ignored, the
+  failures A-660's status capture and `hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind` (the
+  peer read WouldBlock, `hangup.rs:554`; it passed in the next run). Then A-661 at 2dc5e209e, the code landed here: 630
+  passed, 1 failed (A-660's), 3 ignored, the five new tests among the passes, `slates-server` recompiled; `cargo fmt -p
+  slates-server -- --check` clean. Red (`cargo test --locked -p slates-server --lib svn_hooks::`, green 5 of 5 first),
+  each choice broken in a copy and rebuilt: `verdict` without its client-left check failed
+  `a_runs_answer_is_svnserves_words_its_lesson_and_pre_locks_token` alone; a point with no hook answering nothing failed
+  `a_point_with_no_hook_answers_as_svnserve_does_without_running_anything` alone; the point match inverted failed the
+  lookup test and both end-to-end tests; the token dropped failed the run's answer test and the pre-lock one. Main's
+  commits since 4644dcec3 touch nothing under `crates/server`, `crates/db` or `crates/rt`, so these runs stand for the
+  merged tree. The macOS run is owed.
+- **Owed.** DAV's LOCK and UNLOCK wired through the glue (A-661's next part, once g298's DAV serving lands); the hook
+  times' table that keeps each hook's learned bound (A-622's list).
+
+### A-616, continued (6) — A version-0 delta's chunks as `svnserve` writes them (bug, 2026-11-19, g234)
+Applied in the same change to: §4.17.4's status (part 2's first slice); GAPS (the §4.17.4 entry);
+`crates/svn/src/report/editor.rs` and its tests; `crates/svn/fixtures/report/make-fixtures.py`;
+`docs/bugs/2026-11-19-a-version-0-delta-sent-its-header-as-a-chunk-of-its-own.md`.
+
+- **Found** by g297 reading 1.15.0's `svndiff.c`: the writer sent version 0's `SVN\0` as a chunk of its own before
+  every first window. `window_handler` (250-303 at `d434dc14`, 1.15.0 alike) hands a version-0 window holding no
+  source copy and one instruction to `send_simple_insertion_window` (89-151, chosen at 259-261), which writes the
+  header, when it is not out yet, the window's integers and its instruction as one chunk, then its new data; only
+  other windows get the header alone and then up to three chunks. Every recorded reply was version 2, whose header is
+  alone, and the version-0 test compared windows decoded, so neither showed it.
+- **The writer** now takes that path for those windows (`simple_insertion`): the header put in front of the encoded
+  window in its buffer, so the header, the integers and the instruction are one chunk, then the new data.
+- **Tests.** From `svndiff.c`: an added file's two new-data windows, an opened file's copying window and one past its
+  base, an empty file, and a window copying no source in two instructions, a byte of new data and a copy of the target
+  repeating it, which `window_handler` writes since it holds more than one; for a client that does not accept
+  svndiff2, the chunks `svnserve` writes. Run on jupiter (Windows x86_64, 2026-11-19): the crate's lib 467 of 467
+  (main's 466 and this test); red with `cargo test --locked -p slates-svn --lib report::editor` over one build whose
+  mutant an environment variable chose: without the change the test alone failed, its first chunk `SVN\0` alone and
+  each window's instruction a chunk of its own; with any version taking the insertion path, it and
+  `every_recorded_drive_is_written_again_as_svnserve_wrote_it`; with a first instruction of new data standing for the
+  one instruction, it alone, by the window of two; with the header before every insertion window, it and
+  `a_client_that_does_not_accept_svndiff2_is_sent_version_0`; with no mutant, 8 of 8. `cargo fmt` asked for one
+  assertion over four lines, applied as shown. Owed: the macOS run; and, with the Mac Studio, the recording of two
+  hand-made sessions from a client announcing neither svndiff version (a checkout of `/trunk` at r6 and an update from
+  r5, added to the recorder) against stock `svnserve` 1.15.0, and the replay writing each drive with its own client's
+  capabilities so that their chunks are held byte for byte.
+- **Swept**: only the reporter's editor writes `textdelta-chunk`s. The dump's, the HTTP listing's and drive's and the
+  migration's svndiff writers write one continuous stream, where write boundaries never show; the commit's drive
+  reads a client's chunks whatever their boundaries.
 
 ### A-649 part 4 — The server's adapter from the base plane's host seam to the import's `RepositoryFiles` (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3; §4.15; §4.5's host seam; A-555)
 Applied in the same change to: §4.17.3 (its status, piece 3), `crates/server` (`hg_base`; `slates-hg` a dependency),
