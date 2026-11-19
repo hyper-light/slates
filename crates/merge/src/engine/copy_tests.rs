@@ -104,11 +104,6 @@ impl Work {
     self.push(OpKind::RemoveXattr, path, name, 0, u64::MAX)
   }
 
-  fn symlink(&mut self, path: &str, target: &str) -> &mut Work {
-    let target = self.name(target);
-    self.push(OpKind::Symlink, path, 0, 0, target)
-  }
-
   /// A hard link at `path` to the node at `target` at the work's base (A-646).
   fn link(&mut self, path: &str, target: &str) -> &mut Work {
     let target = self.name(target);

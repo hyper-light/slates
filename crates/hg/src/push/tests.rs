@@ -880,7 +880,8 @@ fn oracle_heads(view: &View, claimed: &[Node]) -> Result<(), Vec<u8>> {
   }
 }
 
-/// `check:updated-heads`: every node a head of its branch (no child on the same branch), `[nullid]` only when empty.
+/// `check:updated-heads`: every node a head of its branch by 7.2's rule (A-667, `branchmap.py`: no later changeset on
+/// its branch descends from it, whatever branches the path crosses), closed ones too; `[nullid]` only when empty.
 fn oracle_updated(view: &View, claimed: &[Node]) -> Result<(), Vec<u8>> {
   if claimed == [NULL_NODE] {
     return if view.changesets.is_empty() {
@@ -892,14 +893,12 @@ fn oracle_updated(view: &View, claimed: &[Node]) -> Result<(), Vec<u8>> {
   let is_branch_head = |node: &Node| {
     view.changesets.iter().enumerate().any(|(rev, changeset)| {
       changeset.node == *node
-        && !view.changesets.iter().any(|child| {
-          child.branch == changeset.branch
-            && child
-              .parents
-              .iter()
-              .flatten()
-              .any(|parent| at(*parent) == rev)
-        })
+        && !view
+          .changesets
+          .iter()
+          .enumerate()
+          .skip(rev + 1)
+          .any(|(later, child)| child.branch == changeset.branch && descends(view, later, rev))
     })
   };
   if claimed.iter().all(is_branch_head) {
@@ -907,6 +906,27 @@ fn oracle_updated(view: &View, claimed: &[Node]) -> Result<(), Vec<u8>> {
   } else {
     Err(RACE_WORDS.as_bytes().to_vec())
   }
+}
+
+/// Whether changeset `later` has changeset `rev` among its ancestors, every path walked.
+fn descends(view: &View, later: usize, rev: usize) -> bool {
+  let mut seen = vec![false; view.changesets.len()];
+  let mut stack = vec![later];
+  while let Some(next) = stack.pop() {
+    if next == rev {
+      return true;
+    }
+    if !std::mem::replace(&mut seen[next], true) {
+      stack.extend(
+        view.changesets[next]
+          .parents
+          .iter()
+          .flatten()
+          .map(|parent| at(*parent)),
+      );
+    }
+  }
+  false
 }
 
 /// `check:bookmarks`: 7.2's three messages.
