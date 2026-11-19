@@ -261,6 +261,17 @@
 > over main bb535bd4d; failing first in r213, 4 of 39 with the walk stubbed; the oracle's census now requires the
 > sparse path). Owed: the service's slice (`<blob-ish>` resolved, its blob read, git's two refusals' words, a stock
 > git exchange recorded); main's Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, third slice (2026-11-19, g296; the service reads the blob):** `upload::sparse` resolves a
+> `sparse:oid=<blob-ish>` as git does with no work tree (an object's full name, or a ref by git's patterns, alone or
+> before `:<path>`, walked as `find_tree_entry` walks it; a relative path refused as git refuses it; parents,
+> ancestors, peels, reflogs, abbreviated names, `git describe`'s and `:/` refused by kind), reads the blob within the
+> request's admission and hands its patterns to the negotiation, under v2 and v0. A blob git's `pack-objects` dies of
+> is answered as git's server answers it (its `fatal:` line on band 2 in 128-byte reads, git's band-3 words, no
+> flush; with no band, the pack missing). Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid`
+> exchanges. 112 of 112 (1 ignored, main's) and slates-server's git edges 27 of 27 on the Mac Studio (r250 over main
+> b94ae6e90); failing first, 16 of 105 with the resolution, the tree walk and the death's answer stubbed. Owed:
+> `sparse:oid` within `combine:` (refused: git's answer turns on its order of walk); the revision forms refused by
+> kind; git's band-2 warning of an ambiguous ref name; main's Linux and Windows runs, clippy, xtask, docs.
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation

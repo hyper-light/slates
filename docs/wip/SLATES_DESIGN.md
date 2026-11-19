@@ -13161,6 +13161,18 @@ engine: the verdict, rebase, position mapping, the register).
 > `sparse:oid` without its patterns, which the service does not read yet (the next slice), and one within a
 > `combine:`, where git's answer turns on its order of walk.
 
+> **Status (2026-11-19, A-640 part 4, third slice: the service reads the blob).** `crates/git` (`upload::sparse`)
+> resolves a `sparse:oid=<blob-ish>` as git resolves one in a repository with no work tree: an object's full name, or a
+> ref by git's patterns (`HEAD` and `@` the default branch), alone or before `:<path>`, the path walked below the
+> revision's tree as git's `find_tree_entry` walks it (`objects::Tree::find`). A relative path is refused as git
+> refuses it there; a form this server does not resolve (`~`, `^`, `^{...}`, `@{...}`, an abbreviated name, the name
+> `git describe` writes, `:/<text>`) is refused by kind. The blob is read within the request's admission and its
+> patterns handed to the negotiation, so `sparse:oid` alone is served under protocol v2 and v0. A blob git's
+> `pack-objects` dies of is answered as git's server answers it (`Answer::died`): what precedes the pack, then git's
+> `fatal:` line on band 2 in packets of at most 128 bytes, its band-3 words and no flush; under v0 with no band, the
+> acknowledgments alone. Held byte for byte to stock git 2.50.1's nine recorded `sparse:oid` exchanges. Still refused:
+> `sparse:oid` within `combine:`.
+
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
 commands are `ls-refs`, `fetch`, `object-info` and `bundle-uri` [B: gitprotocol-v2]; it defines no push, so a push
@@ -51284,3 +51296,82 @@ Applied in the same change to:
   (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until they
   land), which open, seal, present, run and close the views at each point; git's words for each outcome (`pre-receive
   hook declined`, `hook declined`); main's runs (the other platforms, clippy, `xtask`, the doc gates).
+
+### A-640 part 4, third slice — The service reads the blob: a `<blob-ish>` resolved as git resolves one with no work tree, and a dying `pack-objects` answered as git's server answers it (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-640 part 4 first and second slices, A-653 continued (4))
+Applied in the same change to:
+- §4.17.2's statuses (a status after the second slice's);
+- GAPS (the A-640 entries);
+- `crates/git/src/upload/sparse.rs` (new: the resolution and the read), `upload/mod.rs` (`Refusal::SparseBlob`,
+  `SparseForm`, `SparseRelative`, `SparseData` and `SparseTooLarge`, their words and git's warning; the module doc),
+  `upload/answer.rs` (`Answer::died`: git's report and its relay), `upload/fetch.rs` and `upload/v0.rs` (the blob
+  read, its patterns handed on, a death answered), `upload/refs.rs` (`dwim`, `peeled_node`), `objects/tree.rs`
+  (`Tree::find`), `store/graph.rs` (`StoreGraph::blob_bytes` and `tree_entry`), `store/repository.rs`
+  (`tree_entry`), `negotiation/sparse.rs` (an empty `Patterns` by default), `negotiation/filter.rs` (the
+  `sparse:oid` variant's doc);
+- the fixtures: the recorders `fixtures/make-fixtures.sh` and `fixtures/v0/make-v0-fixtures.sh`, and the nine
+  exchanges they recorded (`fixtures/fetch-sparse-*`, `fixtures/v0/sparse-*`, `fixtures/v0/SHA256SUMS`);
+- the tests: `upload/tests/sparse.rs` (new), `upload/tests/fetch.rs`, `upload/tests/refused.rs`,
+  `upload/tests/v0.rs`, `tests/objects/tree.rs`, `tests/fixtures.rs`, `tests/v0.rs`.
+
+- **What git does** [C: git v2.50.1, `list-objects-filter.c` `filter_sparse_oid__init`; `object-name.c`
+  `get_oid_with_context_1`, `get_oid_1`, `get_oid_basic`, `get_describe_name` and `resolve_relative_path`;
+  `tree-walk.c` `get_tree_entry` and `find_tree_entry`; `object-file.c` `read_object_with_reference`; `dir.c`
+  `add_patterns_from_blob_to_list`; `upload-pack.c` `create_pack_file` and `upload_pack_v2`; `usage.c` `vfreportf`].
+  `pack-objects` resolves the `<blob-ish>` as it begins, and dies when it names nothing ("unable to access sparse
+  blob in '%s'"), when its path is relative in a repository with no work tree ("relative path syntax can't be used
+  outside working tree"), or when it names no blob, or one past git's 100 MiB limit after a warning ("unable to
+  parse sparse filter data in %s"). By then upload-pack has written what precedes the pack: under v2 the sections
+  and the packfile section's header, which under `sideband-all` with `packfile-uris` waits for the pack's start and
+  so is never written; under v0 the acknowledgments. It relays `pack-objects`' error stream on band 2, a packet for
+  each read of at most 128 bytes, then its band-3 words, and ends with no flush; with no band it writes those lines
+  to its own error stream, and the client finds the pack missing. `die` writes `fatal: ` and the words as one line,
+  cut to 4,096 bytes with its newline, each control byte but a tab and a newline shown as `?`.
+- **The resolution** (`upload::sparse`), in `get_oid_with_context_1`'s order: the whole name as a revision; then an
+  index path, which names nothing, a served repository having no index; then a revision and the path after its first
+  `:` outside a `@{...}` or `^{...}`. A revision is an object's full name in the repository's format, either case,
+  held or not, or the ref the first of git's patterns finds (`refs::dwim`; `repo_dwim_ref` takes the first), `@`
+  read as `HEAD`. The path is walked below the revision's tree (peeled through tags and a commit, as
+  `read_object_with_reference` peels) an entry at a time by `Tree::find`, which searches the entries in the order
+  written and stops where git's loop stops, so a tree out of order is searched as git searches it; a submodule's
+  commit is an entry like any other, a trailing `/` names the directory and an empty path the tree itself. Refused
+  by kind (`Refusal::SparseForm`, answered with git's words for a name that names nothing and what this server
+  resolves): a parent or an ancestor, a peel or a reflog, an abbreviated name, `git describe`'s, and a search of
+  commit messages.
+- **The read.** The blob's length is charged to the request's admission before its bytes are read
+  (`StoreGraph::blob_bytes`), then its patterns (`Patterns::read`, the first slice); a blob past git's limit by its
+  length alone is refused unread.
+- **The answer** (`Answer::died`): what precedes the pack, then the warning's line (for a blob past git's limit)
+  and the `fatal:` line as `vfreportf` writes them, relayed in band-2 packets of at most 128 bytes, each line read
+  alone, then git's band-3 words and no flush, all charged to the admission first; with no band, what precedes the
+  pack alone.
+- **When the blob is read.** Under v0 once the pack is due, as git's `pack-objects` reads it, so a round with no
+  pack never meets it. Under v2 in every round its filter rides in, since the negotiation walks by its patterns in
+  the round that sends the pack; a blob that names nothing still dies only with the pack, so a round answered with
+  acknowledgments alone is answered as git answers it, but a blob past the request's admission is refused in any
+  round (not git's; the fetch fails either way). git warns on band 2 of a ref name two of its patterns find; this
+  server takes the first, as git does, without the warning.
+- **Tests.** Against stock git's recordings (the two scripts on the Mac Studio, kiln r114: git 2.50.1, Apple Git-155, as
+  every other fixture, each older one reproduced byte for byte but `fetch-progress`'s timed text): the served clone
+  under `main:dir/file` (a blob whose one pattern matches no path: every commit and tree, no blob) among the v2
+  exchanges, section for section with git's objects, and `sparse-v0` among v0's; five v2 deaths byte for byte (a path
+  not there, a path naming a tree, 140 `a`s with a tab, a control byte and DEL after them, whose line git relays in two
+  packets, and a path not there under `sideband-all`, alone and with `packfile-uris`); v0's death on side-band-64k and
+  on no band byte for byte. Resolution (`upload/tests/sparse.rs`): every form this server resolves names the same blob
+  and serves the same clone; names of no blob, names of nothing, relative paths and the forms not resolved are each
+  refused by their kind (a name of no blob naming its object, the others the name as sent); a blob past git's limit is
+  warned of, then refused; a 5,000-byte name's line is cut to git's 4,096 bytes in 32 full packets. A round that sends
+  no pack is answered as with no filter, its blob naming nothing (v2 and v0). `Tree::find` against git's loop traced by
+  hand over stock git's `ok-tree` in both formats, and over a tree written out of order.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, rustc 1.98.1). kiln r250, over main b94ae6e90 with this
+  slice (`agents/g296-a640-p4c` at cf032854e): `cargo test --locked -p slates-git --lib -- negotiation::
+  objects::tests::tree upload:: store::repository::graph::tests:: every_golden_vector` 112 passed, 1 ignored (main's
+  `upload_packs_for_git_index_pack`); `cargo test --locked -p slates-server --lib -- vcs_http::git::tests::
+  vcs_http::daemon_edge::tests:: vcs_ssh::git::tests:: vcs_ssh::site::tests:: --test-threads=4` 27 of 27, the git edges
+  that call `upload::serve`; `cargo fmt -p slates-git -- --check` clean. Failing first (the Studio, over main 0577ab0bd
+  with this slice, `agents/g296-a640-p4c-red` at 6f3b98227): with `sparse::read`, `Tree::find` and `Answer::died`
+  stubbed, 16 of 105 failed (the eight in `upload/tests/sparse.rs`, the two tree walks, the v2 and v0 deaths, the
+  v2 and v0 exchanges holding the served sparse clone, the v2 round without a pack and the refused filter's), the rest
+  passing. No integration target reaches the service's fetch: the CLI's two version-control tests stop at the edge's
+  `401`. The Linux and Windows runs are owed.
+- **Owed.** `sparse:oid` within `combine:` (refused, the second slice); the revision forms refused by kind; git's
+  band-2 warning of an ambiguous ref name.

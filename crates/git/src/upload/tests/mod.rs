@@ -8,6 +8,7 @@ mod fetch;
 mod fragments;
 mod ls_refs;
 mod refused;
+mod sparse;
 mod steps;
 mod v0;
 
