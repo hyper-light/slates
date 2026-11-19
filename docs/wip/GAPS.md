@@ -86,12 +86,13 @@
 > slices of their input, trailers dropped and charged; gzip through flate2's streaming decoder over A-607's zlib-rs,
 > every inflated byte charged (a 16 MiB bomb stops at a 1 MiB room); percent-decoding; reply framing. `slates-git`'s
 > `http` routes as `git http-backend` routes (its table, statuses, cache fields and order of checks), takes
-> `Git-Protocol`'s greatest version as `protocol.c` does, and writes the `# service=` prelude for v0 and v1 alone. Golden
-> vectors: stock git 2.50.1's own HTTP traffic with `http-backend` behind a loopback CGI host (`fixtures/http`,
-> `make-http-fixtures.sh`), heads and inflated bodies only, SHA-256 checked. GREEN_GAPS Owed: the edge itself (piece 8's
-> next part: listeners on a shard, TLS, authentication, `100 Continue`, the services' bodies streamed through, the
-> staged close); the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's DAV through it. Clippy, `xtask`
-> and the lint matrix over the change are main's (run requests).
+> `Git-Protocol`'s greatest version as `protocol.c` does, and writes the `# service=` prelude for v0 and v1 alone.
+> Golden vectors: stock git 2.50.1's own HTTP traffic with `http-backend` behind a loopback CGI host (`fixtures/http`,
+> `make-http-fixtures.sh`), heads and inflated bodies only, SHA-256 checked. `cargo test -p slates-http --lib` 51 of 51
+> and `-p slates-git --lib` 92 of 92 on the Mac Studio, red first on stubs (49 and 11 failing). Owed: the edge itself
+> (piece 8's next part: listeners on a shard, TLS, authentication, `100 Continue`, the services' bodies streamed
+> through, the staged close); the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's DAV through it.
+> Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's

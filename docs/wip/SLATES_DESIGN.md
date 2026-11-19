@@ -39662,8 +39662,9 @@ Applied in the same change to:
   line bound and its citations were taken; moving it onto `slates-http` is owed.
 - **Tests** (Mac Studio M3 Ultra, debug, 2026-11-19): red first, kiln r513 (load 6.5): 49 of 51 `slates-http` tests
   and 11 of 11 git route tests failed on stubs; green `cargo test -p slates-http --lib` 51 of 51 and
-  `cargo test -p slates-git --lib` 87 of 87 at 7ece429be (load 7.6), then GREEN_GOLDEN with the golden vectors;
-  `cargo fmt` clean.
+  `cargo test -p slates-git --lib` 87 of 87 at 7ece429be (load 7.6); with the golden vectors, 92 of 92 at 2dcc07210
+  (load 8.7; the first golden run's one failure was the test's own count, 1400 wants where git sent 1401, HEAD's
+  tip wanted twice); `cargo fmt --check` clean.
 - **Owed.** The edge that reads sockets (piece 8's next part): listeners on a shard, TLS, authentication (401 with its
   challenge, 403), `100 Continue`, each service's body streamed into upload-pack and receive-pack and the replies out
   in chunks, the staged close of RFC 9112 §9.6; the MCP edge onto `slates-http`; Mercurial's HTTP v1 and Subversion's
