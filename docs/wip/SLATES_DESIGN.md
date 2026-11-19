@@ -40853,8 +40853,9 @@ seeds, the identity's fold and recount, the checkpoint's and the rebase's refusa
 `copies_grafted`, `copies_refused`), `crates/merge/src/engine/copy.rs` (new), `crates/merge/src/engine/branch.rs`,
 `crates/merge/src/chain_entry.rs` (`Applied::CopyTree`), `crates/merge/src/dims.rs` and `dims/copy.rs` (the root's copy,
 `cut_tree`, `holds_tree`), `crates/merge/src/ptrie.rs` (`Ptrie::cut`, `has_prefix`, `Shared::len`),
-`crates/merge/src/map.rs`, and the tests (`engine/copy_tests.rs`, new; ptrie's and dims' copy tests;
-`crates/merge/tests/ops_doc.rs`, which pinned 16 as unknown).
+`crates/merge/src/map.rs`, `crates/merge/src/engine/reanchor.rs` (A-596's comments on a copied file), and the tests
+(`engine/copy_tests.rs`, new; ptrie's and dims' copy tests; `crates/merge/tests/ops_doc.rs`, which pinned 16 as
+unknown).
 - **What was there.** A-542 part 1 copied a path's tree by reference in every map of a green's state, reached only from
   its tests. The engine had no operation for it, and its one history rule (A-534) reads a key with no history as held
   since version 0, which a grafted key is not. The identity's set hash (A-202) adds one entry a key, so a graft would
@@ -40928,6 +40929,10 @@ seeds, the identity's fold and recount, the checkpoint's and the rebase's refusa
     which comes with it, is moved to the destination's own key. For attributes, the root's own prefix is cut away from
     beneath the destination, since every other key is not one prefix.
   - As a destination, the root is refused: it is always present, and no editor adds it.
+- **With A-596's review comments**, which landed on main beside this: `Green::reanchor` follows a comment through the
+  path's own content history. A path that holds a copy's value now reads, from the copy's version on, as a path with no
+  history, so a comment on a copied file moves with it. Before, the path's history, which ends in an older file's
+  removal, refused it as no file. A comment on that older file is still outdated by the removal.
 - **A branch made before a copy** (`Lineage::branch` at a version below one) cuts the copy's tree from its maps first, by
   `Ptrie::cut`, a graft's inverse: one descent, the prefix's path copied, the subtree unlinked whole, O(the prefix's
   length). It takes the copy's entry out of its identity and puts back the entry the copy gave each key that changed
@@ -40959,6 +40964,7 @@ seeds, the identity's fold and recount, the checkpoint's and the rebase's refusa
   - Every refusal, the green unchanged.
   - An edit declared before a replacing copy conflicts.
   - Branches before and after a copy hash as greens that applied the same versions.
+  - A review comment on a copied file moves with it (A-596), red first on the merged tree.
   - A green with a copy is not checkpointed from the copy's version; a rebase of a copy is refused.
   - The oracle: generated histories on a green and on a reference green that makes each copy key by key through the
     engine's plain operations. The two decide every copy alike and read alike at every version, their change indexes
