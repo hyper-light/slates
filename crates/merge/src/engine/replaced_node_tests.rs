@@ -796,35 +796,38 @@ fn names_of(green: &Green) -> Names<'_> {
 /// it. Before, each was refused `TypeChanged`.
 #[test]
 fn two_names_of_one_file_renamed_one_over_the_other_change_nothing() -> Result<(), String> {
-  let mut green = green();
   let before = (
     vec![Kind::File],
     Some(b"<g>\n".to_vec()),
     Some(TARGET),
     None,
   );
+  let mut over_its_link = green();
   accept(
-    &mut green,
+    &mut over_its_link,
     Work::default().naming(OpKind::Rename, HARDLINK, TARGET),
     1,
   )?;
-  if names_of(&green) != before {
-    return Err(format!("the file over its link: {:?}", names_of(&green)));
+  if names_of(&over_its_link) != before {
+    return Err(format!(
+      "the file over its link: {:?}",
+      names_of(&over_its_link)
+    ));
   }
-  let mut green = green();
+  let mut over_a_link = green();
   accept(
-    &mut green,
+    &mut over_a_link,
     Work::default().naming(OpKind::Link, "second", TARGET),
     1,
   )?;
   accept(
-    &mut green,
+    &mut over_a_link,
     Work::default().naming(OpKind::Rename, "second", HARDLINK),
     2,
   )?;
   let expected = (before.0, before.1, Some(TARGET), Some(TARGET));
-  if names_of(&green) != expected {
-    return Err(format!("a link over a link: {:?}", names_of(&green)));
+  if names_of(&over_a_link) != expected {
+    return Err(format!("a link over a link: {:?}", names_of(&over_a_link)));
   }
   Ok(())
 }
