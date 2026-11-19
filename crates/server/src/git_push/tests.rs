@@ -269,6 +269,7 @@ fn set_policy(
       rules,
       hooks,
       hooks_env: Vec::new(),
+      signers: Vec::new(),
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
