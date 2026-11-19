@@ -24,6 +24,11 @@
 //! `LINK` read without the append in all three readings), and its works left the case out until A-669 kept the
 //! writes; its census now counts it. When only a link the work made still names the node the deriver refuses the work
 //! (`Unsupported`, owed), and so it does a file made again at its own name after the write.
+//!
+//! The head may also link `LATE` to a file at version 1, a link no work based at 0 saw (A-670): a work that removes the
+//! file, or renames another over it, with no link of its base to it left, is refused, since its writes went with the
+//! node in its own volume while `LATE` keeps it; one whose base link outlives it is accepted. The census is met by one
+//! fixed history a case before the generated works run, so a count can neither fall to zero by luck nor be met by none.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

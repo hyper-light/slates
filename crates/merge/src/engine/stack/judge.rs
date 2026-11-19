@@ -7,7 +7,10 @@
 //! between its base and that version ([`Change`]), each in the words of the `Green::merge_*` it mirrors: a rename's
 //! source removed or its destination changed, a removal of a node changed in any dimension, a mode, an attribute, a
 //! link or an IPC node another work set otherwise, a link's node removed, a node-exclusive operation's path changed at
-//! all. A value the new base holds as the upper sets it is the verdict's identical case and accepted.
+//! all. A value the new base holds as the upper sets it is the verdict's identical case and accepted. And a removal of a
+//! file, or a rename over one, that a link another version made under the stack now names, which the upper's base
+//! never held (A-670, `upper_unseen_links`): the upper's writes to the file, if any, went with the node in its own
+//! volume, so it is refused as the verdict refuses one after a work's base, unless it hands the node on itself (A-669).
 //!
 //! An upper's content operations are mapped through the changes at the path they were declared against (the path, or
 //! the source a rename moved there) as a work's are through the deltas since its base ([`crate::map::map_range`]): one
