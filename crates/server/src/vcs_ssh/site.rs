@@ -27,11 +27,13 @@
 //!    the session. A damaged policy is refused, never judged without it.
 //! 3. The service ([`Services`]): one the server cannot start is refused as not served ([`Unserved`]), as the HTTP edge
 //!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
-//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols), and Mercurial's `serve --stdio`
-//!    runs (`super::hg`, A-679: `slates_hg::serve::stdio::Stdio`, A-650 part 2) when the lender the HTTP site reads
-//!    Mercurial's stores from holds the repository's ([`HgStores`]); no lender does either until the lenders over
-//!    A-662's map of stores on their owner shards land (A-662's owed list). Receive-pack (A-654) and Subversion's
-//!    tunnel (A-656) wait for their entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the
+//!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols): the daemon's lender lends each
+//!    store from A-662's map on its owner shard (`crate::vcs_store::upload::ShardStores`, A-682). Mercurial's `serve
+//!    --stdio` runs (`super::hg`, A-679: `slates_hg::serve::stdio::Stdio`, A-650 part 2) when the lender the HTTP site
+//!    reads Mercurial's stores from holds the repository's ([`HgStores`]): the daemon's lends each repository's served
+//!    view from its store on its owner shard (`crate::vcs_store::hg_view::ServedViews`, A-680 part 2a). The daemon
+//!    hands this site both lenders once it starts the SSH edge (A-684). Receive-pack (A-654) and Subversion's tunnel
+//!    (A-656) wait for their entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the
 //!    not-served answer goes with the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
@@ -326,7 +328,7 @@ impl<L: StoreLender + Clone, H: HgStores + Clone> Services for ToolServices<L, H
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
         Ok(ToolCommand::Upload(UploadCommand::new(
           self.lender.clone(),
-          repository.id,
+          (repository.id, start.principal.clone()),
           slates_git::http::version(start.git_protocol),
           self.room,
         )))

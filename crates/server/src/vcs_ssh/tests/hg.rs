@@ -356,6 +356,14 @@ impl StoreLender for NoGit {
 
   fn lend<R>(
     &mut self,
+    _asked: (RepositoryId, &Principal),
+    _step: impl FnOnce(&Served<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    None
+  }
+
+  fn lend_objects<R>(
+    &mut self,
     _id: RepositoryId,
     _step: impl FnOnce(&Served<'_>, &mut NoPacks) -> R,
   ) -> Option<R> {
