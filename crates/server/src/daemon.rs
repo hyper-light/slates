@@ -475,8 +475,8 @@ fn nfs_listener() -> Result<TcpListener, RtError> {
 }
 
 /// The listener a supervising anchor holds and handed over under the environment variable `variable` (the NFS
-/// listener's, §4.6, or the version-control edge's, A-625 part 3), adopted so its port survives a daemon restart; none
-/// when no anchor handed one over (a standalone start, or tests).
+/// listener's, §4.6, the version-control edge's, A-625 part 3, or the svn:// listener's, A-689), adopted so its port
+/// survives a daemon restart; none when no anchor handed one over (a standalone start, or tests).
 #[cfg(unix)]
 pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtError>> {
   let raw = std::env::var(variable)
@@ -503,6 +503,52 @@ pub fn bind_vcs_http_listener(
   address: SocketAddrV4,
 ) -> Result<TcpListener, RtError> {
   crate::vcs_http::bind(config, address)
+}
+
+/// Binds the svn:// listener at `address` as the daemon binds its own, its backlog the listener's seats on a shard of
+/// `config` (A-689): what a supervising anchor binds once and holds across its daemons' restarts
+/// ([`slates_anchor::ENV_VCS_SVN`]), so the listener's port never drops while a daemon restarts.
+pub fn bind_vcs_svn_listener(
+  config: &DaemonConfig,
+  address: SocketAddrV4,
+) -> Result<TcpListener, RtError> {
+  crate::vcs_svn::bind(config, address)
+}
+
+/// A version-control server's listener (the HTTP edge's, A-625 part 3, or the svn:// listener's, A-689): the one a
+/// supervising anchor holds and handed over under `variable`, adopted so the port never drops while a daemon restarts (a
+/// client that connects then waits in its queue), when it listens where the configuration's `address` says
+/// ([`listens_at`]); else, with none handed over, one bound here at `address` with `backlog`. Why there is none,
+/// otherwise: a held listener elsewhere is refused, never served, since the server would then answer somewhere the
+/// operator did not ask.
+pub(crate) fn held_or_bound_listener(
+  variable: &str,
+  address: SocketAddrV4,
+  backlog: i32,
+) -> Result<TcpListener, String> {
+  match held_listener(variable) {
+    Some(Ok(held)) => {
+      let at = held
+        .local_addr()
+        .map_err(|error| format!("the anchor's listener's address is unread: {error}"))?;
+      if listens_at(at, address) {
+        Ok(held)
+      } else {
+        Err(format!(
+          "the anchor's listener is at {at}, not at {address}"
+        ))
+      }
+    }
+    Some(Err(error)) => Err(format!("the anchor's listener was not adopted: {error}")),
+    None => TcpListener::bind(address, backlog)
+      .map_err(|error| format!("{address} did not bind: {error}")),
+  }
+}
+
+/// Whether a listener bound at `at` listens where `address` says: at its address, and at its port unless it asks for
+/// any (port 0, the system's pick, which an anchor makes once for every daemon it starts).
+pub(crate) fn listens_at(at: SocketAddrV4, address: SocketAddrV4) -> bool {
+  at.ip() == address.ip() && (address.port() == 0 || at.port() == address.port())
 }
 
 /// The NFS loopback listener to serve on Windows: a fresh ephemeral bind, since no anchor holds one there across a

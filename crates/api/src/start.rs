@@ -411,4 +411,26 @@ mod tests {
       "{words:?}"
     );
   }
+
+  /// A-689 (§4.17.4 piece 7). Do: make a host's spec that asks for the svn:// listener on a loopback address, then its
+  /// anchor's role and command. Expect: the role carries the address, and the command names it after `--vcs-svn`, so
+  /// the anchor the host starts holds the listener and hands it to every daemon.
+  #[test]
+  fn a_hosts_anchor_is_started_with_the_svn_listener_it_asks_for() {
+    let address = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 3690);
+    let mut spec = StartSpec::new("svn", PathBuf::from("slates"), &[]);
+    spec.vcs_svn = Some(address);
+    assert_eq!(spec.role().options().vcs_svn, Some(address));
+    let command = spec.anchor_command().expect("the anchor's command");
+    let words: Vec<String> = command
+      .get_args()
+      .map(|word| word.to_string_lossy().into_owned())
+      .collect();
+    assert!(
+      words
+        .windows(2)
+        .any(|pair| pair[0] == "--vcs-svn" && pair[1] == "127.0.0.1:3690"),
+      "{words:?}"
+    );
+  }
 }

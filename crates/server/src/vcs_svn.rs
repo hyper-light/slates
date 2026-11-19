@@ -1,14 +1,18 @@
-//! The svn:// listener on the daemon's runtime (A-656 part 2, its first slice; §4.17.4 piece 7, "5. The wire"; §4.3,
+//! The svn:// listener on the daemon's runtime (A-689, A-656 part 2's listener; §4.17.4 piece 7, "5. The wire"; §4.3,
 //! R6): a listener on the runtime's TCP, one connection a task, each running A-656's connection
 //! (`slates_svn::serve::Connection`, the server's side of one ra_svn connection with no I/O) over its socket, as
 //! `svnserve` serves `svn://`.
 //!
-//! **The start** ([`start`]). With an address in `DaemonConfig::vcs_svn`, the control shard binds the listener and
-//! serves it ([`serve`]). ra_svn has no TLS: CRAM-MD5 sends no password, but every other byte crosses as it was written,
-//! so a daemon that is no fleet node serves `svn://` on a loopback address alone, the rule the flag's reading holds it
-//! to before anything starts (`slates_api::role::vcs_address`) and the start checks again; a fleet node's operator may
-//! publish it, as an operator publishes `svnserve`'s. An address off loopback on a daemon that is no fleet node, or one
-//! that does not bind, leaves the daemon serving everything else, logged, as the HTTP edge's start does.
+//! **The start** ([`start`]). With an address in `DaemonConfig::vcs_svn`, the control shard serves the listener
+//! ([`serve`]): the one a supervising anchor binds once at that address and holds across its daemons' restarts
+//! (`slates_anchor::ENV_VCS_SVN`, as it holds the HTTP edge's), so the port never drops while a daemon restarts and a
+//! client that connects meanwhile waits in its queue for the next daemon; else, with no anchor, one bound here
+//! (`crate::daemon::held_or_bound_listener`). ra_svn has no TLS: CRAM-MD5 sends no password, but every other byte
+//! crosses as it was written, so a daemon that is no fleet node serves `svn://` on a loopback address alone, the rule
+//! the flag's reading holds it to before anything starts (`slates_api::role::vcs_address`) and the start checks again;
+//! a fleet node's operator may publish it, as an operator publishes `svnserve`'s. An address off loopback on a daemon
+//! that is no fleet node, one that does not bind, and a held listener somewhere else each leave the daemon serving
+//! everything else, logged, as the HTTP edge's start does.
 //!
 //! **Bounds, derived** (the HTTP edge's, [`Bounds::of_shard`]): as many connections at once as the shard seats clients
 //! (AC-2.6's admission limit, `DaemonConfig::clients_per_shard`), each of a client's items at most what one client's
@@ -37,7 +41,7 @@ use std::task::{Poll, Waker};
 
 use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
 use slates_rt::shard::Kept;
-use slates_rt::tcp::{TcpListener, TcpStream};
+use slates_rt::tcp::{SocketAddrV4, TcpListener, TcpStream};
 use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
 use slates_svn::handshake::Unserved;
 use slates_svn::index::{ContentIdentity, Revision};
@@ -329,27 +333,29 @@ pub(crate) fn start(
       "svn:// is cleartext, which a daemon that is no fleet node serves on a loopback address alone",
     ));
   }
-  let bounds = Bounds::of_shard(
-    config.clients_per_shard,
-    config.region.total_bytes(),
-    config.runtime.timer_tick_ns,
-  );
+  let bounds = bounds_of(config);
   let room = usize::try_from(bounds.room).unwrap_or(usize::MAX);
   let limits = Limits {
     item_bytes: room,
     report_room: room,
     most_open: ROOT_ALONE,
   };
-  let listener = match TcpListener::bind(address, bounds.backlog()) {
+  let listener = match crate::daemon::held_or_bound_listener(
+    slates_anchor::ENV_VCS_SVN,
+    address,
+    bounds.backlog(),
+  ) {
     Ok(listener) => listener,
-    Err(error) => return Ok(not_started(&format!("{address} did not bind: {error}"))),
+    Err(why) => return Ok(not_started(&why)),
   };
   let port = match listener.local_addr() {
     Ok(bound) => bound.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
   runtime.spawn_on(control, async move {
+    slates_machine::log_line!("G234-DEBUG svn listener task runs, {} seats", bounds.connections);
     let Ok(state) = keep(ListenerState::new(bounds.connections)) else {
+      slates_machine::log_line!("G234-DEBUG svn listener state not kept");
       crate::fleet::count_refusal(NOT_STARTED);
       return;
     };
@@ -372,6 +378,23 @@ pub(crate) fn start(
   Ok(Some(port))
 }
 
+/// The listener's bounds on a shard of `config`: the HTTP edge's ([`Bounds::of_shard`]), its seats and room from the
+/// shard's budget, its waits floored by the timer's tick.
+fn bounds_of(config: &DaemonConfig) -> Bounds {
+  Bounds::of_shard(
+    config.clients_per_shard,
+    config.region.total_bytes(),
+    config.runtime.timer_tick_ns,
+  )
+}
+
+/// Binds the listener at `address`, its backlog the listener's seats on a shard of `config`: the daemon's own, and the
+/// one a supervising anchor binds once and holds for every daemon it starts (`crate::daemon::bind_vcs_svn_listener`),
+/// so both queue alike.
+pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpListener, RtError> {
+  TcpListener::bind(address, bounds_of(config).backlog())
+}
+
 /// Logs why the listener did not start: no port to report. Logged, not counted: the shards' counters are not yet
 /// serving.
 fn not_started(why: &str) -> Option<u16> {
@@ -388,8 +411,11 @@ async fn serve(
   limits: Limits,
 ) -> Result<(), ListenerRefused> {
   loop {
+    slates_machine::log_line!("G234-DEBUG svn listener accepting");
     let stream = listener.accept().await.map_err(ListenerRefused::Listener)?;
+    slates_machine::log_line!("G234-DEBUG svn listener accepted");
     let Ok(round_trip) = stream.round_trip() else {
+      slates_machine::log_line!("G234-DEBUG svn no round trip");
       crate::fleet::count_refusal(NO_ROUND_TRIP);
       continue;
     };
@@ -397,9 +423,13 @@ async fn serve(
       round_trip.ns,
       bounds.granularity_ns().max(round_trip.resolution_ns),
     );
+    slates_machine::log_line!("G234-DEBUG svn bound {bound_ns} ns; seating");
     let slot = seat_for(state).await?;
+    slates_machine::log_line!("G234-DEBUG svn seated at {slot}");
     let seat = Seat::take(state, slot).ok_or(ListenerRefused::StateGone)?;
-    match spawn_child(converse(stream, seat, limits, bound_ns)) {
+    let spawned = spawn_child(converse(stream, seat, limits, bound_ns));
+    slates_machine::log_line!("G234-DEBUG svn spawned: {}", spawned.is_ok());
+    match spawned {
       Ok(task) => {
         let _ = state.with(|state| state.set_task(slot, task));
         if detach(task).is_err() {
@@ -454,11 +484,15 @@ enum Next {
 /// [`Connection`] until it ends; each wait on the client marked overdue past `bound_ns` from the greeting, and waited
 /// on.
 async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) {
+  slates_machine::log_line!("G234-DEBUG svn converse starts");
   let mut out = Vec::new();
   let Ok(mut connection) = Connection::new(limits, &mut out) else {
+    slates_machine::log_line!("G234-DEBUG svn connection refused its limits");
     return;
   };
-  if stream.write_all(&out).await.is_err() {
+  let written = stream.write_all(&out).await;
+  slates_machine::log_line!("G234-DEBUG svn greeting of {} bytes written: {:?}", out.len(), written);
+  if written.is_err() {
     return;
   }
   let deadline_ns = now_ns().saturating_add(bound_ns);
@@ -466,6 +500,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
   loop {
     out.clear();
     let next = answer(&mut connection, &input, &mut out, limits);
+    slates_machine::log_line!("G234-DEBUG svn next {next:?} with {} in, {} out", input.len(), out.len());
     if !out.is_empty() && stream.write_all(&out).await.is_err() {
       return;
     }
@@ -543,3 +578,6 @@ async fn read_more(
   input.truncate(start.saturating_add(taken));
   taken > 0
 }
+
+#[cfg(test)]
+mod tests;
