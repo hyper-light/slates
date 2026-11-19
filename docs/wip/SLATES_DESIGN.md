@@ -43760,6 +43760,10 @@ the readers' ties, the reservations), `crates/merge/src/engine/branch.rs` (the r
     run: the readers' tie rule, 2 failed; the nested verdict, 2; the replace's refusal of a tree changed after the
     base, 1; the replaced tree's modes and attributes, 4; the replace's reservation, 1; every source held before any
     copy lands, 1 (the oracle); branch.rs before its fix, 4.
+  - Merged with main again (A-637's submodule links and A-643's verdict siblings in slates-merge, both clean): 111 of
+    111 at `2d453fca3` (06:08 UTC, load 10.0, 24.48 s), `cargo fmt --check` clean; that run's census: 80 accepted, 397
+    refused, 4 from the root, 30 from an older version, 14 into their own source's tree, 63 refused for a changed
+    source, 34 keys changed beneath a copy, 31 replaces, 34 nested pairs (4 with an inner replace), 29 moves.
   - Main's: the integration suites, clippy and `cargo xtask check` (the run-request queue).
 - **Owed** (A-626's later parts):
   - a copy from a version its source changed after (part 2): the source's changes since set back at the destination,
