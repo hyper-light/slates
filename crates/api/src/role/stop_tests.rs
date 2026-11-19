@@ -18,6 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use slates_client::{CreateSpec, Intent, NamePolicy, SizeClass};
 use slates_server::daemon::OBSERVE_BUDGET_NS;
 
 use super::liveness_tests::{
@@ -38,6 +39,13 @@ const SENDER_ROLE_PATH: &str = "role::stop_tests::a_sender_role";
 const SERVES: &str = "none";
 /// Format: `setpgid`'s "the child's own process id" for a new group, as a host's start gives the anchor.
 const OWN_GROUP: i32 = 0;
+/// Format: the sender's volume, its file, the file's bytes and its mode (a plain file's).
+const HELD_VOLUME: &str = "held";
+const HELD_FILE: &str = "/held-at-exit";
+const HELD_BYTES: &[u8] = b"written under a write attachment the sender holds as it exits";
+const FILE_MODE: u32 = 0o644;
+/// Shape: the sender's volume's bound: a mebibyte, room for its one file.
+const VOLUME_BOUND: u64 = 1 << 20;
 /// Shape: the bound the stop is held to here: the observation budget, the longest any one step of a stop waits (the
 /// replicas' give-back, A-457), which a stop whose sender stays meets in about 0.2 s (g267's runs) and kiln's
 /// fire-and-exit test missed by minutes.
@@ -62,7 +70,24 @@ fn a_sender_role() {
     .process_group(OWN_GROUP)
     .spawn()
     .unwrap();
-  let _client = connect(&instance);
+  // A client mid-use, as kiln's process was: a volume of its own, attached for writing and written, the attachment
+  // held when the process ends.
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      name: HELD_VOLUME.to_owned(),
+      size: SizeClass::Bounded {
+        limit: VOLUME_BOUND,
+      },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let held = client.attach(volume, None, Intent::Write).unwrap();
+  client
+    .fs_write((volume, held.attachment), HELD_FILE, HELD_BYTES, FILE_MODE)
+    .unwrap();
   let pid = rustix::process::Pid::from_raw(i32::try_from(anchor.id()).unwrap()).unwrap();
   rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
   println!("{SENT_TAG} {ANCHOR_WORD}{}", anchor.id());
