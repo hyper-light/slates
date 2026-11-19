@@ -12374,16 +12374,24 @@ engine: the verdict, rebase, position mapping, the register).
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
 >
-> **Status (2026-11-19, A-620 part 1: piece 6's exchange built).** `crates/git` (`receive`) speaks receive-pack's
-> exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0 writer, receive-pack's capabilities
-> in git's order. It reads the update request as it arrives: shallow lines, the commands (the client's capabilities on
-> the first) and the push options. The pack goes through A-608's reader, a thin pack's bases taken from the repository
-> (`unpack::Outside`). The connectivity check walks the pushed objects alone: a tip reaching an object nothing holds is
-> `missing necessary objects`, and a client's shallow commit whose parent nothing holds is `shallow update not allowed`.
-> Each remaining command's ref name is held to A-615's rule, then the caller's verdict is asked (`Judge`), every ref or
-> none under `atomic`. The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
-> band-2 lines. Proven byte for byte against nine pushes stock git 2.50.1 made to stock `git receive-pack`. Part 2 makes
-> each ref's update a work the engine judges, every ref recorded as one register entry.
+> **Status (2026-11-19, A-620 part 1: piece 6's exchange, its checks and its session built).** `crates/git`
+> (`receive`) speaks receive-pack's exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0
+> writer, receive-pack's capabilities in git's order, leaving out the refs a deployment hides (`HiddenRefs`, which
+> A-597's policy answers in the server). It reads the update request as it arrives: shallow lines, the commands (the
+> client's capabilities on the first) and the push options. The pack goes through A-608's reader, a thin pack's bases
+> taken from the repository (`unpack::Outside`; A-638's `IndexedObjects` is that repository), and every object in it
+> through A-590's checks under a push's strictness (git's `--strict`) before any ref moves. The connectivity check walks
+> the pushed objects alone: a tip reaching an object nothing holds is `missing necessary objects`, and a client's
+> shallow commit whose parent nothing holds is `shallow update not allowed`. A hidden ref is then refused, and each
+> remaining command's ref name is held to A-615's rule. Then the caller's verdict (`Judge::judge`), which moves nothing,
+> and its append (`Judge::append`), which moves the ref: one entry on that ref's own log, only while the ref is at the
+> position the verdict read (A-642). Without `atomic` each ref moves on its own; under it, one append moves every ref or
+> none (`append_atomic`). The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
+> band-2 lines. `Session` runs it all over one connection, sans-io: bytes in as they arrive, bytes out to the caller's
+> sink, the answer written as the push's last byte arrives. Proven byte for byte against eleven pushes stock git 2.50.1
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
+> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
+> versions (A-645), appended per A-642.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -42526,16 +42534,85 @@ Applied in the same change to:
       where git answered `unpack ok` and `ok refs/heads/main`.
   - On the tree merged with main (A-604's v0, A-615's refname, A-614's store), with the advertisement and the ref-name
     rule pointed at A-604's and A-615's: 287 of 287 under `--locked` (14.6 s), `cargo fmt --check` clean.
-- **Owed.** Part 2: each ref's update a work the engine judges (A-618), every ref recorded as one register entry
-  (A-603), with A-614's store as the `Repository` (a base's bytes assembled from the content plane). Then:
-  - the fsck checks of every new object (§4.17.2 item 4, A-590's `fsck`);
-  - the server loop that feeds the request reader and then the pack reader from one connection;
-  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), hidden refs (`.have`),
-    and signed pushes (`push-cert`).
+- **Part 1, continued (2026-11-19): the pushed objects' fsck, hidden refs, the session, and each command's verdict
+  split from its append.** Asked by main once part 1 landed; A-642 and A-645 read as they landed.
+  - **fsck** (`receive::fsck`). Once the pack is whole, every commit, tag and tree in it goes through A-590's checks
+    under a push's strictness (`Strictness::Strict`: git's `index-pack --strict` and `unpack-objects --strict`, under
+    which a warning refuses), in pack order, before any ref moves. The first object refused ends the pack: every
+    command `unpacker error`, and on band 2 `error: object <id>: <finding>` and git's `fatal: fsck error in packed
+    object`. A blob passes until A-590 checks the `.gitmodules` and `.gitattributes` blobs a tree names.
+  - **The unpack status's words** follow git's `unpack_limit` (100, `transfer.unpackLimit`'s default): a refused pack
+    of fewer objects is `unpack-objects abnormal exit`, any other `index-pack abnormal exit`. Part 1 said index-pack
+    for every short pack, which git says only from 100 objects on.
+  - **Hidden refs** (`HiddenRefs`, a predicate A-597's `vcs_policy` answers in the server, as `transfer.hideRefs` and
+    `receive.hideRefs` hide). They are left out of the advertisement (`visible`), and a command naming one is refused
+    after the connectivity check, `deny updating a hidden ref` or `deny deleting a hidden ref`, in the order and words
+    of git's `reject_updates_to_hidden`. An object only hidden refs reach still counts as held: git's
+    `--exclude-hidden=receive` (2.39) keeps hidden refs from bounding its connectivity walk, for its cost alone.
+  - **The session** (`Session`): one push over one connection, sans-io. `advertise`, then `input` as the client's
+    bytes arrive and `end` when they stop, every answer written to the caller's `Out`; A-625's HTTP edge and A-594's
+    SSH channel drive it. It answers as the push's last byte arrives: a delete-only request as it ends, no pack
+    following it; any other once the pack's trailer is read; a pack cut short at the end of input, as git answers a
+    short pack. A request cut short, or one the protocol refuses, ends the session with nothing written, and bytes
+    after the push are not read.
+  - **Each command's verdict split from its append** (A-642, Ada). `Judge::judge` moves nothing and gives what its
+    append takes: part 2's work and the position its ref was read at. `Judge::append` moves one ref, one entry on its
+    own log, only while the ref is still at that position. Without `atomic` each command is judged and appended on its
+    own, in order, so one ref's refusal holds no other; under `atomic` every verdict comes first, then one
+    `append_atomic` moves every ref or none. git's words for a ref that moved: `failed to update ref`, and under
+    `atomic` `atomic transaction failed` for every command, its band-2 line once. The judging stays pure over
+    immutable versions, as A-645 asks.
+  - **Golden vectors.** The script captured two more pushes to the same server, eleven in all: `hidden`, a create of a
+    ref under `receive.hideRefs refs/hidden`, answered `deny updating a hidden ref`; and `fsck`, a commit with no
+    author email under `receive.fsckObjects`, answered `unpack unpack-objects abnormal exit` and `unpacker error`. The
+    nine earlier captures came out byte for byte the same. The fsck push's answer is git's on band 1 byte for byte,
+    and on band 2 line for line but for the prose git writes after a finding's id (A-590 names findings, not prose).
+  - **Tests** (`cargo test -p slates-git --lib`, 16 new and three of part 1's changed):
+    - every captured push answered as git answered, eleven of them;
+    - fsck: a commit with no email, a tag of an unknown type, a tree holding `.git` and a tree out of order each refused
+      with its finding and never judged; the `.git` tree kept by a default fsck and refused by a push's; the first
+      refused object in pack order named;
+    - hidden refs: left out of the captured server's advertisement, which with them shown is not git's; two creates,
+      an update, a delete and `refs/hidden` itself refused and never judged; connectivity's refusal first; an atomic
+      push naming one;
+    - the session: every captured push fed in pieces of 1, 3, 7 and 61 bytes and whole, answered as its last piece
+      arrives; every cut of every push answered as the push held whole; a refused request ending it; bytes after a push
+      not read; a request of no command;
+    - the appends, over a model of per-ref logs: without `atomic`, a ref moved between its verdict and its append
+      refused alone; an atomic push one append on all three refs; one whose ref moved appending to none; a verdict
+      declined under `atomic` appending nothing;
+    - the unpack status at 99 and at 100 objects.
+  - **Checks.** On the Mac Studio (kiln, debug, 2026-11-19), the tree merged with main (A-638's views, A-642, A-645):
+    - the first run (r866) stopped at A-638's test of `receive`, written to the old seam; it now accepts with `()`;
+    - r877: 349 of 349 under `--locked` (two of main's ignored; load 6.5, 14.4 s). Failing first: with fsck, hidden
+      refs, the limit's words, the appends and the session stubbed, 17 of the 31 `receive` tests failed: every new one
+      but the two that guard what mutations 2 and 6 break, and the three part-1 tests whose words changed;
+    - red ten ways by mutation: a default fsck (2 failed); hidden refs before connectivity (2); the hidden reasons
+      swapped (3); the limit's boundary at `<=` (1); an atomic push appended ref by ref (2); a declined atomic push
+      appending what was accepted (1); a delete-only push waiting for a pack (4); fsck's band-2 lines dropped (3); a
+      refused append's band-2 line on every command (1); a refused request not ending the session (1);
+    - `cargo fmt` rewrapped nine files (brought back by blob hash), then 349 of 349 again (load 11.4, 15.2 s), and
+      `cargo fmt --check` clean.
+  - Also in this change: the entry and delta generators draw plain tuples and selectors in place of the Arc-backed
+    `prop_oneof!` (R2), with its equal weights; `fed_in_chunks` (A-608's tests) refuses where it asserted; the receive
+    module's comments are wrapped at 100 columns; GAPS' §4.17 entry loses the conflict markers a merge on main left,
+    A-638's and A-624 part 2's paragraphs both kept.
+- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
+  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
+  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
+  per-green append lands. Then:
+  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
+  - the `.have` lines of objects a fork shares (git's alternates);
+  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
+    blobs.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
-`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte).
+`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte). The continuation, to: §4.17.2's
+status; GAPS (the §4.17 entry, and its conflict markers); `crates/git` (`receive/`: `fsck.rs` and `session.rs` new,
+`mod.rs`, `report.rs`, and the other modules' comments; `receive/tests/`: `append.rs`, `checks.rs` and `session.rs` new;
+`unpack.rs`'s `format`, `objects` and `is_whole`; `tests/entry.rs`, `tests/delta.rs`, `tests/unpack.rs` and
+`tests/store/views.rs`); `crates/git/fixtures/push/` (two pushes, the script, `SHA256SUMS`).
 
 ### A-627 — `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token` read (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part, in part; A-609, A-602)
 Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), `research/vcs-servers-subversion.md` (§1's

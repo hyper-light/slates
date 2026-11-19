@@ -296,18 +296,23 @@
 > answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
 > **A-620 part 1 (2026-11-19, g258; piece 6's exchange, receive-pack):** `slates-git` (`receive`) speaks
 > receive-pack's exchange as git 2.50.1 does: the advertisement (A-604's v0 writer, receive-pack's capabilities in
-> git's order), the update request read as it arrives (shallow lines, commands with the first one's capabilities, push
-> options), the pack through A-608's reader with a thin pack's bases from the repository (`unpack::Outside`,
-> `Reader::finish_with`), the connectivity check over the pushed objects alone (`missing necessary objects`, `shallow
-> update not allowed`), each remaining command's ref name (A-615's rule) and the caller's verdict (`Judge`), every ref
-> or none under `atomic` (stricter than git's code, by the capability's own words), and report-status and
-> report-status-v2 with option lines, multiplexed after git's band-2 lines. Golden vectors: nine pushes stock git
-> 2.50.1 made to stock `git receive-pack` (`fixtures/push/make-push-fixtures.sh`), answered byte for byte.
-> `cargo test -p slates-git --lib`: 16 new failing first against stubs, then 194 of 194, red five ways; 287 of 287 on
-> the tree merged with main. Owed: part 2, each ref a work the engine judges (A-618) recorded as one register entry
-> (A-603) with A-614's store as the repository; then the fsck checks of new objects, the server loop over one
-> connection, review requests over `refs/for/`, hidden refs and signed pushes. Clippy, `xtask` and the lint matrix
-> over the change are main's (run requests).
+> git's order, hidden refs left out), the update request read as it arrives (shallow lines, commands with the first
+> one's capabilities, push options), the pack through A-608's reader with a thin pack's bases from the repository
+> (`unpack::Outside`, `Reader::finish_with`; A-638's `IndexedObjects`), every pushed object through A-590's checks
+> under a push's strictness before any ref moves, the connectivity check over the pushed objects alone (`missing
+> necessary objects`, `shallow update not allowed`), hidden refs refused (`HiddenRefs`, A-597's policy in the server),
+> each remaining command's ref name (A-615's rule), then the caller's verdict (`Judge::judge`, moving nothing) and its
+> append (`Judge::append`: one entry on that ref's own log at the position read, A-642; `append_atomic`, every ref or
+> none under `atomic`, stricter than git's code by the capability's own words), and report-status and
+> report-status-v2 with option lines, multiplexed after git's band-2 lines. `Session` runs it over one connection,
+> sans-io. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
+> (`fixtures/push/make-push-fixtures.sh`), answered byte for byte, the fsck push's band 2 but for git's prose. `cargo
+> test -p slates-git --lib` on the Mac Studio: part 1's 194 of 194, 287 merged; the continuation's 349 of 349 merged
+> with main, 17 failing first against stubs, red ten ways by mutation. Owed: part 2, `Judge` over the engine (each
+> ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable versions, A-645; several
+> together under `atomic`, A-635; appended per A-642 through a trait until g261's append lands); then review requests
+> over `refs/for/`, signed pushes, `.have` lines, the warnings git's strict check writes on band 2, and A-590's blob
+> checks. Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 > **A-618 (2026-11-19, g225; shared piece 4, works from a client's push):** built in the engine
 > (`slates_merge::push`). A push's base tree and pushed tree are compared by the tool's ids through `PushObjects`, never
 > reading a subtree whose id stayed, and become the work §4.17.1 items 2 and 3 name, the head as `slates.vcs.head` on
