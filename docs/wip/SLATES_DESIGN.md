@@ -35402,4 +35402,11 @@ entry), `crates/svn` (`src/lib.rs`, `src/ra_svn.rs` and `src/ra_svn/tests.rs`, n
   it in one pass), foreign bytes, items not followed by whitespace, a word past its bound, too many items, too many
   bytes; and three properties: any item written reads back within exactly its bounds, any item fed in any pieces reads
   the same with every call for more bounded, and any bytes read to a typed answer.
+- **Evidence** (the Mac Studio, kiln, 2026-11-18 16:39 and 16:42 PST, load 16 to 25, debug builds of fresh clones of the
+  branch). Failing first: against a stub with the codec's interface and no behaviour, `cargo test --locked -p slates-svn
+  --lib ra_svn` failed 13 of 15; the bounds test had passed the stub because a measure of nothing lowered no bound, so
+  it now requires the two bounds every item has to be lowered and refused, and the second red run failed 14 of 15, the
+  one pass the never-panics property, which a stub that panics nowhere passes by design. Then `cargo test --locked -p
+  slates-svn --lib` 33 of 33 (15 of the item codec, 18 of svndiff) before and after `cargo fmt`, and `cargo fmt --check`
+  clean. The one-crate clippy and `cargo xtask check` are main's (the run-request queue).
 - **Owed.** §4.17.4's pieces 3 to 14; the server derives each bound when it reads commands (piece 7).
