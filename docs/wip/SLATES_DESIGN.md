@@ -39896,8 +39896,8 @@ A-600 left it), `.gitattributes` (the revlog fixtures kept as stored), GAPS (the
   in the grown file's chain). 158 files, each SHA-256 checked equal after the copy; every repository's texts compared
   byte for byte with the zstd one's by the script. Two earlier runs are recorded in the script's header.
 - **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test -p slates-hg --lib`: 166 of 166 at e7ab4ea78, 8 of them
-  this piece's, green at its first build; rustfmt's layout and cargo's lock entries taken from that run, then `cargo
-  test --locked -p slates-hg --lib` and `cargo fmt -p slates-hg -- --check` on the landing tree. Golden: every entry of
+  this piece's, green at its first build; rustfmt's layout and cargo's lock entries taken from that run; then `cargo
+  test --locked -p slates-hg --lib` 166 of 166 and `cargo fmt -p slates-hg -- --check` clean at 273e72893 (load 5.4). Golden: every entry of
   25 revlogs equal to 7.2's `debugindex --debug` (offset, flags, lengths, base, link, parents, node, mode), every text
   equal to its `debugdata` and hashing to its node, and the shapes the fixtures were made for met (zlib, zstd and raw
   chunks, chains longer than one, generaldelta bases other than the revision before, intermediate snapshots); every
