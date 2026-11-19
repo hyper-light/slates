@@ -58,7 +58,9 @@ pub mod index;
 pub mod rule;
 pub mod table;
 
-pub use arrival::{Admitted, ArrivalRefused, Arriving, Naming, Quarantine, object_payload, object_row};
+pub use arrival::{
+  Admitted, ArrivalRefused, Arriving, Naming, Quarantine, object_payload, object_row,
+};
 pub use content::{ContentCounters, ContentId, ContentRefused, ContentStore, Stored};
 pub use index::{Batch, Index, IndexCounters, IndexRefused, Inserted, NewRow};
 pub use rule::Compaction;

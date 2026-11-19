@@ -179,7 +179,11 @@ impl Quarantine {
 
   /// Commits every object into `index` as one step, then gives back the quarantine's holds, leaving it empty. Refused,
   /// it commits nothing and keeps every object, for the caller to abandon.
-  pub fn commit(&mut self, index: &mut Index, store: &mut ContentStore) -> Result<Batch, ArrivalRefused> {
+  pub fn commit(
+    &mut self,
+    index: &mut Index,
+    store: &mut ContentStore,
+  ) -> Result<Batch, ArrivalRefused> {
     let named: Vec<([ContentId; 1], [u8; OBJECT_PAYLOAD_BYTES])> = self
       .staged
       .values()

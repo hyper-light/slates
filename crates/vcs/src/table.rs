@@ -142,7 +142,9 @@ pub fn encode_body(contents: &[ContentId], payload: &[u8]) -> Result<Vec<u8>, Ta
 fn word(bytes: &[u8], at: usize) -> Option<u64> {
   let end = at.checked_add(WORD_BYTES)?;
   let field = bytes.get(at..end)?;
-  <[u8; WORD_BYTES]>::try_from(field).ok().map(u64::from_le_bytes)
+  <[u8; WORD_BYTES]>::try_from(field)
+    .ok()
+    .map(u64::from_le_bytes)
 }
 
 /// A table read in place (module docs).
@@ -209,9 +211,7 @@ impl<'a> TableView<'a> {
     if self.offset(0) != Some(0) {
       return Err(TableRefused::Malformed { row: 0 });
     }
-    let last = self
-      .offset(self.rows)
-      .ok_or(TableRefused::Truncated)?;
+    let last = self.offset(self.rows).ok_or(TableRefused::Truncated)?;
     let entries = u64::try_from(self.entries.len()).map_err(|_| TableRefused::TooLarge)?;
     match last.cmp(&entries) {
       Ordering::Less => Err(TableRefused::TrailingBytes),
@@ -235,7 +235,10 @@ impl<'a> TableView<'a> {
   /// An entry's row, or `None` when its key length or its body's count passes its end.
   fn split(entry: &'a [u8]) -> Option<RowRef<'a>> {
     let length = entry.get(..KEY_LENGTH_BYTES)?;
-    let key_len = usize::try_from(u32::from_le_bytes(<[u8; KEY_LENGTH_BYTES]>::try_from(length).ok()?)).ok()?;
+    let key_len = usize::try_from(u32::from_le_bytes(
+      <[u8; KEY_LENGTH_BYTES]>::try_from(length).ok()?,
+    ))
+    .ok()?;
     let key_end = KEY_LENGTH_BYTES.checked_add(key_len)?;
     let key = entry.get(KEY_LENGTH_BYTES..key_end)?;
     let body = entry.get(key_end..)?;
@@ -499,7 +502,9 @@ mod tests {
     proptest::collection::btree_map(
       proptest::collection::vec(any::<u8>(), 0..6),
       (0usize..3, proptest::collection::vec(any::<u8>(), 0..5)).prop_map(|(count, payload)| {
-        let contents: Vec<ContentId> = (0..count).map(|at| ContentId::of(&[u8::try_from(at).unwrap()])).collect();
+        let contents: Vec<ContentId> = (0..count)
+          .map(|at| ContentId::of(&[u8::try_from(at).unwrap()]))
+          .collect();
         encode_body(&contents, &payload).unwrap()
       }),
       0..40,

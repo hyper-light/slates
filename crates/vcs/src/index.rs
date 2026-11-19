@@ -191,7 +191,10 @@ fn give_back(store: &mut ContentStore, contents: &[ContentId]) -> Result<(), Ind
 }
 
 /// Gives back the holds `rows` take of their contents, going on past a refusal and answering the first.
-fn release_rows<'a>(store: &mut ContentStore, rows: impl Iterator<Item = RowRef<'a>>) -> Result<(), IndexRefused> {
+fn release_rows<'a>(
+  store: &mut ContentStore,
+  rows: impl Iterator<Item = RowRef<'a>>,
+) -> Result<(), IndexRefused> {
   let mut first = Ok(());
   for row in rows {
     for content in row.contents() {
@@ -202,7 +205,10 @@ fn release_rows<'a>(store: &mut ContentStore, rows: impl Iterator<Item = RowRef<
 }
 
 /// Takes the holds `rows` take of their contents.
-fn hold_rows<'a>(store: &mut ContentStore, rows: impl Iterator<Item = RowRef<'a>>) -> Result<(), IndexRefused> {
+fn hold_rows<'a>(
+  store: &mut ContentStore,
+  rows: impl Iterator<Item = RowRef<'a>>,
+) -> Result<(), IndexRefused> {
   for row in rows {
     for content in row.contents() {
       store.hold(&content)?;
@@ -224,9 +230,7 @@ fn release_table(store: &mut ContentStore, layer: &Layer) -> Result<(), IndexRef
 fn tail_rows<'a>(
   tail: &'a BTreeMap<Box<[u8]>, Box<[u8]>>,
 ) -> impl Iterator<Item = RowRef<'a>> + 'a {
-  tail
-    .iter()
-    .filter_map(|(key, body)| RowRef::new(key, body))
+  tail.iter().filter_map(|(key, body)| RowRef::new(key, body))
 }
 
 /// A row of a batch as planned: its body and its charge when it is new, `None` when the index holds it.
@@ -267,16 +271,26 @@ impl Index {
   pub fn get<'s>(&'s self, store: &'s ContentStore, key: &[u8]) -> Option<RowRef<'s>> {
     let mut tally = Tally::default();
     let found = self.find(store, key, &mut tally);
-    self.probes.set(self.probes.get().saturating_add(tally.probes));
     self
-      .excess
-      .set(self.excess.get().saturating_add(tally.compactable.saturating_sub(1)));
+      .probes
+      .set(self.probes.get().saturating_add(tally.probes));
+    self.excess.set(
+      self
+        .excess
+        .get()
+        .saturating_add(tally.compactable.saturating_sub(1)),
+    );
     found
   }
 
   /// The tail, then the tables from the newest, to the first that has `key`. A table missing from the store is
   /// skipped (the release that would meet it says so).
-  fn find<'s>(&'s self, store: &'s ContentStore, key: &[u8], tally: &mut Tally) -> Option<RowRef<'s>> {
+  fn find<'s>(
+    &'s self,
+    store: &'s ContentStore,
+    key: &[u8],
+    tally: &mut Tally,
+  ) -> Option<RowRef<'s>> {
     if !self.tail.is_empty() {
       tally.probe(true);
       if let Some((stored, body)) = self.tail.get_key_value(key) {
@@ -290,7 +304,11 @@ impl Index {
   }
 
   /// Inserts one row; `Identical` when the index holds the same row, `RowDiffers` when it holds another of the key.
-  pub fn insert(&mut self, store: &mut ContentStore, row: NewRow<'_>) -> Result<Inserted, IndexRefused> {
+  pub fn insert(
+    &mut self,
+    store: &mut ContentStore,
+    row: NewRow<'_>,
+  ) -> Result<Inserted, IndexRefused> {
     match self.plan_row(store, row)? {
       Some(body) => {
         let charge = tail_cost(row.key, &body)?;
@@ -307,7 +325,11 @@ impl Index {
 
   /// Inserts `rows`, whose keys strictly increase, as one step: the order, every row against the index, every content
   /// held, and the room for all of them are checked before any is applied, so a refusal changes nothing.
-  pub fn insert_all(&mut self, store: &mut ContentStore, rows: &[NewRow<'_>]) -> Result<Batch, IndexRefused> {
+  pub fn insert_all(
+    &mut self,
+    store: &mut ContentStore,
+    rows: &[NewRow<'_>],
+  ) -> Result<Batch, IndexRefused> {
     let plan = self.plan(store, rows)?;
     let mut batch = Batch::default();
     for (row, planned) in rows.iter().zip(plan) {
@@ -351,7 +373,11 @@ impl Index {
 
   /// One row against the index: `None` when it holds the same row; the new row's body when it holds none of the key
   /// and the store holds every content the row names.
-  fn plan_row(&self, store: &ContentStore, row: NewRow<'_>) -> Result<Option<Vec<u8>>, IndexRefused> {
+  fn plan_row(
+    &self,
+    store: &ContentStore,
+    row: NewRow<'_>,
+  ) -> Result<Option<Vec<u8>>, IndexRefused> {
     let body = encode_body(row.contents, row.payload)?;
     if let Some(found) = self.get(store, row.key) {
       if found.body() == body.as_slice() {
@@ -378,7 +404,9 @@ impl Index {
       give_back(store, row.contents)?;
       return Err(refused.into());
     }
-    self.tail.insert(Box::from(row.key), body.into_boxed_slice());
+    self
+      .tail
+      .insert(Box::from(row.key), body.into_boxed_slice());
     self.tail_charged = self.tail_charged.saturating_add(charge);
     self.inserted = self.inserted.saturating_add(1);
     Ok(())
@@ -427,7 +455,12 @@ impl Index {
     for layer in &mut self.layers {
       layer.shared = store.holders(&layer.table) > 1;
     }
-    let merging: Vec<Layer> = self.layers.iter().filter(|layer| !layer.shared).copied().collect();
+    let merging: Vec<Layer> = self
+      .layers
+      .iter()
+      .filter(|layer| !layer.shared)
+      .copied()
+      .collect();
     if merging.is_empty() {
       return self.fold(store);
     }
@@ -446,7 +479,11 @@ impl Index {
 
   /// Stores the merged table in place of the tail's charge; a table stored new takes its rows' holds, and one stored
   /// already holds them. Its holds are taken before the merged layers give theirs back, so no content is freed between.
-  fn write_merged(&mut self, store: &mut ContentStore, merging: &[Layer]) -> Result<(Stored, u64), IndexRefused> {
+  fn write_merged(
+    &mut self,
+    store: &mut ContentStore,
+    merging: &[Layer],
+  ) -> Result<(Stored, u64), IndexRefused> {
     let (bytes, rows) = self.merged_table(store, merging)?;
     let stored = store.store_in_place_of(&bytes, self.tail_charged)?;
     self.tail_charged = 0;
@@ -457,7 +494,11 @@ impl Index {
   }
 
   /// Gives back what the merged layers held: the tail rows' holds, and this index's hold of each merged table.
-  fn give_back_merged(&mut self, store: &mut ContentStore, merging: &[Layer]) -> Result<(), IndexRefused> {
+  fn give_back_merged(
+    &mut self,
+    store: &mut ContentStore,
+    merging: &[Layer],
+  ) -> Result<(), IndexRefused> {
     let tail = take(&mut self.tail);
     let mut given_back = release_rows(store, tail_rows(&tail));
     for layer in merging {
@@ -467,7 +508,11 @@ impl Index {
   }
 
   /// The tail and the `merging` tables as one table's bytes, and its rows.
-  fn merged_table(&self, store: &ContentStore, merging: &[Layer]) -> Result<(Vec<u8>, u64), IndexRefused> {
+  fn merged_table(
+    &self,
+    store: &ContentStore,
+    merging: &[Layer],
+  ) -> Result<(Vec<u8>, u64), IndexRefused> {
     let mut sources: Vec<Source<'_>> = Vec::with_capacity(merging.len().saturating_add(1));
     let tail: Box<dyn Iterator<Item = RowRef<'_>> + '_> = Box::new(tail_rows(&self.tail));
     sources.push(tail.peekable());
@@ -511,7 +556,11 @@ impl Index {
   pub fn release(mut self, store: &mut ContentStore) -> Result<(), IndexRefused> {
     let tail = take(&mut self.tail);
     let mut first = release_rows(store, tail_rows(&tail));
-    first = first.and(store.discharge(self.tail_charged).map_err(IndexRefused::from));
+    first = first.and(
+      store
+        .discharge(self.tail_charged)
+        .map_err(IndexRefused::from),
+    );
     for layer in &self.layers {
       first = first.and(release_table(store, layer));
     }

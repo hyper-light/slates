@@ -157,7 +157,11 @@ impl ContentStore {
   /// [`ContentStore::store`] in place of `charged` bytes a structure beside the store charged and now gives back (an
   /// index's tail, written as a table): the charge is given back only when the bytes are kept, so a refusal changes
   /// nothing, and the room counts what the charge frees.
-  pub fn store_in_place_of(&mut self, bytes: &[u8], charged: u64) -> Result<Stored, ContentRefused> {
+  pub fn store_in_place_of(
+    &mut self,
+    bytes: &[u8],
+    charged: u64,
+  ) -> Result<Stored, ContentRefused> {
     let left_charged = self
       .charged_bytes
       .checked_sub(charged)
@@ -173,7 +177,9 @@ impl ContentStore {
       });
     }
     let need = width(bytes.len())?;
-    let room = self.budget.saturating_sub(self.used().saturating_sub(charged));
+    let room = self
+      .budget
+      .saturating_sub(self.used().saturating_sub(charged));
     if need > room {
       return Err(ContentRefused::OverBudget { need, room });
     }

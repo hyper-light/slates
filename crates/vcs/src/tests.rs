@@ -159,7 +159,11 @@ fn an_object_whose_bytes_do_not_hash_to_its_id_is_refused_and_its_push_leaves_no
   }
   let claimed = GitShaped.name(3, b"", b"what the client said");
   assert_eq!(
-    push.admit(&mut store, &GitShaped, git_arriving(&claimed, b"what it sent")),
+    push.admit(
+      &mut store,
+      &GitShaped,
+      git_arriving(&claimed, b"what it sent")
+    ),
     Err(ArrivalRefused::IdMismatch {
       id: claimed.clone().into_boxed_slice()
     })
@@ -241,7 +245,12 @@ fn a_fork_holds_every_table_once_more_and_copies_no_row() {
   let mut parent = Index::new();
   for round in 0..3u8 {
     for item in 0..4u8 {
-      insert_named(&mut parent, &mut store, &[round, item], &[b'x', round, item]);
+      insert_named(
+        &mut parent,
+        &mut store,
+        &[round, item],
+        &[b'x', round, item],
+      );
     }
     parent.fold(&mut store).unwrap();
   }
@@ -338,7 +347,11 @@ fn a_compaction_merges_only_the_tables_this_index_holds() {
   assert_eq!(parent.compact(&mut store), Ok(4));
   assert_eq!(parent.tables().count(), 1);
   assert_eq!(read(&parent, &store), before);
-  assert_eq!(parent.compact(&mut store), Ok(0), "one table, nothing to merge");
+  assert_eq!(
+    parent.compact(&mut store),
+    Ok(0),
+    "one table, nothing to merge"
+  );
   parent.release(&mut store).unwrap();
   assert!(store.is_empty());
 }
@@ -423,7 +436,10 @@ fn an_arrival_an_insert_or_a_fold_past_the_budget_changes_nothing() {
     Err(IndexRefused::Content(ContentRefused::OverBudget { .. }))
   ));
   assert_eq!((index.rows(), store.charged()), (0, 0));
-  assert_eq!(index.insert(&mut store, row(b"a", &[], b"")), Ok(Inserted::New));
+  assert_eq!(
+    index.insert(&mut store, row(b"a", &[], b"")),
+    Ok(Inserted::New)
+  );
   assert_eq!(store.room(), 0);
   assert!(matches!(
     index.fold(&mut store),
@@ -454,7 +470,10 @@ fn an_insert_is_checked_against_the_index_and_the_store() {
   );
   assert_eq!(index.rows(), 0);
   let content = [store.put(b"held").unwrap()];
-  assert_eq!(index.insert(&mut store, row(b"k", &content, b"1")), Ok(Inserted::New));
+  assert_eq!(
+    index.insert(&mut store, row(b"k", &content, b"1")),
+    Ok(Inserted::New)
+  );
   index.fold(&mut store).unwrap();
   assert_eq!(
     index.insert(&mut store, row(b"k", &content, b"1")),
@@ -466,7 +485,10 @@ fn an_insert_is_checked_against_the_index_and_the_store() {
     Err(IndexRefused::RowDiffers)
   );
   assert_eq!(
-    index.insert_all(&mut store, &[row(b"j", &[], b""), row(b"k", &content, b"1")]),
+    index.insert_all(
+      &mut store,
+      &[row(b"j", &[], b""), row(b"k", &content, b"1")]
+    ),
     Ok(Batch {
       new: 1,
       identical: 1
@@ -574,7 +596,10 @@ impl Model {
     for index in self.indexes.iter().flatten() {
       for body in index.values() {
         for content in RowRef::new(b"", body).unwrap().contents() {
-          let bytes = BLOBS.iter().find(|blob| ContentId::of(blob) == content).unwrap();
+          let bytes = BLOBS
+            .iter()
+            .find(|blob| ContentId::of(blob) == content)
+            .unwrap();
           named.insert(content, bytes.to_vec());
         }
       }
@@ -598,13 +623,25 @@ fn object_body(kind: u8, bytes: &[u8]) -> Vec<u8> {
   .unwrap()
 }
 
-fn admit(real: &mut Real, model: &mut Model, push: usize, tool: Tool, blob: usize, kind: u8, lie: bool) {
+fn admit(
+  real: &mut Real,
+  model: &mut Model,
+  push: usize,
+  tool: Tool,
+  blob: usize,
+  kind: u8,
+  lie: bool,
+) {
   let bytes = BLOBS[blob];
   let named = |bytes: &[u8]| match tool {
     Tool::Git => GitShaped.name(kind, b"", bytes),
     Tool::Hg => HgShaped.name(kind, PARENTS, bytes),
   };
-  let id = if lie { named(&[bytes, b"!"].concat()) } else { named(bytes) };
+  let id = if lie {
+    named(&[bytes, b"!"].concat())
+  } else {
+    named(bytes)
+  };
   let arriving = Arriving {
     id: &id,
     kind,
@@ -630,7 +667,9 @@ fn admit(real: &mut Real, model: &mut Model, push: usize, tool: Tool, blob: usiz
 }
 
 fn commit(real: &mut Real, model: &mut Model, push: usize, index: usize) {
-  let (Some(real_index), Some(model_index)) = (real.indexes[index].as_mut(), model.indexes[index].as_mut()) else {
+  let (Some(real_index), Some(model_index)) =
+    (real.indexes[index].as_mut(), model.indexes[index].as_mut())
+  else {
     return;
   };
   let rows: Vec<(Vec<u8>, Vec<u8>)> = model.pushes[push]
@@ -645,7 +684,10 @@ fn commit(real: &mut Real, model: &mut Model, push: usize, index: usize) {
     assert_eq!(result, Err(ArrivalRefused::Index(IndexRefused::RowDiffers)));
     return;
   }
-  let identical = rows.iter().filter(|(id, _)| model_index.contains_key(id)).count() as u64;
+  let identical = rows
+    .iter()
+    .filter(|(id, _)| model_index.contains_key(id))
+    .count() as u64;
   assert_eq!(
     result,
     Ok(Batch {
@@ -659,7 +701,9 @@ fn commit(real: &mut Real, model: &mut Model, push: usize, index: usize) {
 
 fn insert(real: &mut Real, model: &mut Model, index: usize, key: u8, blob: usize, payload: u8) {
   let held = model.named().contains_key(&ContentId::of(BLOBS[blob]));
-  let (Some(real_index), Some(model_index)) = (real.indexes[index].as_mut(), model.indexes[index].as_mut()) else {
+  let (Some(real_index), Some(model_index)) =
+    (real.indexes[index].as_mut(), model.indexes[index].as_mut())
+  else {
     return;
   };
   let contents = [ContentId::of(BLOBS[blob])];
@@ -692,16 +736,29 @@ fn fork(real: &mut Real, model: &mut Model, index: usize) {
 
 fn apply(real: &mut Real, model: &mut Model, step: &Step) {
   match *step {
-    Step::Admit { push, tool, blob, kind, lie } => admit(real, model, push, tool, blob, kind, lie),
+    Step::Admit {
+      push,
+      tool,
+      blob,
+      kind,
+      lie,
+    } => admit(real, model, push, tool, blob, kind, lie),
     Step::Commit { push, index } => commit(real, model, push, index),
     Step::Abandon { push } => {
       real.pushes[push].abandon(&mut real.store).unwrap();
       model.pushes[push].clear();
     }
-    Step::Insert { index, key, blob, payload } => insert(real, model, index, key, blob, payload),
+    Step::Insert {
+      index,
+      key,
+      blob,
+      payload,
+    } => insert(real, model, index, key, blob, payload),
     Step::Get { index, key } => {
       if let (Some(real_index), Some(model_index)) = (&real.indexes[index], &model.indexes[index]) {
-        let found = real_index.get(&real.store, &[key]).map(|row| row.body().to_vec());
+        let found = real_index
+          .get(&real.store, &[key])
+          .map(|row| row.body().to_vec());
         assert_eq!(found.as_ref(), model_index.get([key].as_slice()));
       }
     }
@@ -742,7 +799,13 @@ fn check(real: &Real, model: &Model) {
       assert_eq!(&rows, model_index);
       assert_eq!(real_index.rows(), model_index.len() as u64);
       for (key, body) in model_index {
-        assert_eq!(real_index.get(&real.store, key).map(|row| row.body().to_vec()).as_ref(), Some(body));
+        assert_eq!(
+          real_index
+            .get(&real.store, key)
+            .map(|row| row.body().to_vec())
+            .as_ref(),
+          Some(body)
+        );
       }
       tables.extend(real_index.tables());
     }
@@ -752,7 +815,10 @@ fn check(real: &Real, model: &Model) {
     assert_eq!(real.store.get(content), Some(bytes.as_slice()));
   }
   for content in real.store.identities() {
-    assert!(named.contains_key(content) || tables.contains(content), "an orphan content");
+    assert!(
+      named.contains_key(content) || tables.contains(content),
+      "an orphan content"
+    );
   }
 }
 
