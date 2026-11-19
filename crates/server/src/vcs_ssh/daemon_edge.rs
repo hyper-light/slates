@@ -21,9 +21,11 @@
 //!
 //! **What it serves** (`super::site::ToolSite`). Keys proved by the credential record a person enrolls (A-651 part 3,
 //! `super::site::RecordKeys`); repositories located on the partitions their names route to, the connection moved to
-//! the owner's shard (`ShardRepositories`, A-651 part 4); and the services as the server has them: none yet, each
-//! `exec` refused as not served (`super::site::NotYet`) until the stores' lender (A-682) and receive-pack's call (A-683)
-//! are wired in.
+//! the owner's shard (`ShardRepositories`, A-651 part 4); and the services as the server has them
+//! (`super::site::ToolServices`): git's upload-pack from each repository's store, lent on its owner shard
+//! (`crate::vcs_store::upload::ShardStores`, A-682, the HTTP edge's lender), each request admitted the edge's room; every
+//! other `exec` refused as not served until its entry point lands (receive-pack, A-683; Mercurial's loop, A-679;
+//! Subversion's tunnel, A-688).
 //!
 //! Each reason the edge cannot start (no host key, an address that does not bind, a listener held elsewhere) leaves the
 //! daemon serving everything else, logged, as the HTTP edge's does.
@@ -34,11 +36,12 @@ use slates_rt::{RtError, Runtime, ShardId, futures};
 use slates_ssh::entropy::{Entropy, SystemEntropy};
 use slates_ssh::hostkey::{ED25519_SEED_LEN, HostKey};
 
-use super::site::{NotYet, RecordKeys, ToolSite};
+use super::site::{RecordKeys, ToolServices, ToolSite};
 use super::{EdgeState, HostSeed, keep_here, serve};
 use crate::config::{DaemonConfig, VcsSshConfig};
 use crate::daemon::VcsSshEdge;
 use crate::vcs_http::ShardRepositories;
+use crate::vcs_store::upload::ShardStores;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_ssh.not_started";
@@ -46,7 +49,7 @@ const NOT_STARTED: &str = "vcs_ssh.not_started";
 const NOT_KEPT: &str = "vcs_ssh.not_kept";
 
 /// The SSH site as the daemon serves it (the module doc, "What it serves").
-pub(crate) type DaemonSite = ToolSite<RecordKeys, ShardRepositories, NotYet>;
+pub(crate) type DaemonSite = ToolSite<RecordKeys, ShardRepositories, ToolServices<ShardStores>>;
 
 /// Starts the SSH edge `config` names, if it names one (the module doc): every shard of `shards` keeps its edge state and
 /// the `control` shard serves the listener, its host key read from `segment` where the anchor published one. The edge's
@@ -81,6 +84,7 @@ pub(crate) fn start(
     return Ok(not_started("its host key's seed makes no Ed25519 key"));
   };
   let bounds = crate::vcs_http::bounds_of(config);
+  let room = bounds.room;
   let listener = match crate::daemon::held_or_bound_listener(
     slates_anchor::ENV_VCS_SSH,
     edge.address,
@@ -109,8 +113,12 @@ pub(crate) fn start(
       return;
     };
     let served = futures::spawn(async move {
-      if let Err(refused) = serve(listener, state, || {
-        DaemonSite::new(RecordKeys, ShardRepositories, NotYet)
+      if let Err(refused) = serve(listener, state, move || {
+        DaemonSite::new(
+          RecordKeys,
+          ShardRepositories,
+          ToolServices::new(ShardStores, room),
+        )
       })
       .await
       {

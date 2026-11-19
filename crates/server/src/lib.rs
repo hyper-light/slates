@@ -163,7 +163,8 @@ pub use repository::{RootRefused, object_formats, root_binding};
 mod wildmatch_reference;
 // §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
 // policy the repository's record holds (`admit`, A-622). git's receive-pack asks it through the push driver the
-// daemon's HTTP site calls (A-654 part 3); Subversion's commit editor and Mercurial's unbundle are their pieces.
+// daemon's HTTP site calls (A-654 part 3), and upload-pack's lender which refs a reader may read through the same
+// driver's hidden refs (A-682); Subversion's commit editor and Mercurial's unbundle are their pieces.
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_policy;
 // A protected git branch, the server's half (A-644 part 2): what a ref's change brings, read from A-614's store, for
@@ -201,15 +202,15 @@ mod svn_hooks;
 mod git_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
 // each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
-// moved to its repository's shard, and the daemon's start, whose git site serves receive-pack through the push driver
-// (A-654 part 3). Upload-pack's store lender has no caller outside tests until each repository's store is lent (A-662).
+// moved to its repository's shard, and the daemon's start, whose git site serves upload-pack from each repository's
+// store on its owner shard (A-682) and receive-pack through the push driver (A-654 part 3).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
 mod vcs_svn;
 // §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
 // phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
-// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
-// key's keeping, the key store and the repositories).
+// dispatched by its tool. The daemon starts it with `--vcs-ssh` (A-684, `vcs_ssh::daemon_edge`); the services' parts
+// whose entry points have not landed (`site::NotYet`) are reached by tests alone.
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_ssh;
 // git's push on its repository's owner shard (A-654 part 2): the one driver both edges call a step at a time (the
@@ -220,8 +221,9 @@ mod vcs_ssh;
 mod git_push;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
 // tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
-// from its entries' objects. Its push steps are called by git's push driver (A-654), and its Mercurial import (A-675)
-// by no one outside tests until the verb that asks for one (its piece).
+// from its entries' objects; its git stores lent to upload-pack by the HTTP edge's site (A-682). Its push steps are
+// called by git's push driver (A-654), and its Mercurial import (A-675) by no one outside tests until the verb that asks
+// for one (its piece).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_store;
 // A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). Its caller is
@@ -248,6 +250,8 @@ pub mod shards;
 #[cfg(target_os = "macos")]
 mod shards_route;
 pub mod state;
+// A repository's state logs shipped to their holders a log at a time (A-636 part 2b).
+mod state_log;
 mod status_pages;
 pub mod takeover;
 pub mod telemetry;

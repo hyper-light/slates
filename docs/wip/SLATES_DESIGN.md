@@ -8625,6 +8625,13 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   so the catalog's bit and every id with the second bit clear are as they were. They are placed and taken over as the
 >   repository is, so its state moves as one. Three class bits in place of one: a partition mints at most 2^45 − 1 ids
 >   (`MAX_OBJECT_COUNTER`).
+> - **Every dispatch by the class (2026-11-19, A-636 part 2b).** The server reads a register's class from its id at each
+>   place it once asked only whether the id was a catalog: a takeover's adoption (a state log is counted adopted and
+>   never queued as a volume or a green, whatever its value's bytes), a give-up by name (a state log, like a catalog,
+>   has no verbs of its own and is settled unrecorded), a mirror's promotion page (only an object's own register pages
+>   as a head) and the record plane's shipments (a state log's parts are counted under their own names, their
+>   acknowledgements kept per log, never as a head's placement). A holder keeps a state log's records whole, a ledger
+>   never compacted to its newest.
 >
 > **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
 > connection credit that a bulk exchange spent (the constrained-link design §5.3).
@@ -11994,10 +12001,15 @@ decides the details.
 > what it applied or one that splits a record; a takeover runs a log at a time, as a live round does (A-636 part 2a):
 > each log's holders answer on the wire with that log's promise alone, which only that log's round counts, and the
 > repository is adopted only once every log's round has read its quorum, a refusal leaving the logs read before it
-> fenced; it keeps a record only where every log's read holds it whole, dropping it and what follows it otherwise. Owed:
-> the live plane's rest (A-636 part 2b, the partition's records shipped to each log's holders; 2c, the server's takeover
-> by this rule, every log of a repository, its greens' included, following one successor); and the repository policy's
-> check before the verdict (A-622's next part).
+> fenced; it keeps a record only where every log's read holds it whole, dropping it and what follows it otherwise. Each
+> state log's records ship to its holders a log at a time (A-636 part 2b): the partition hands its owner one record of
+> each state log an operation moved once the operation is durable, carrying that log's changes, the operation's
+> identity and every span it moved, its greens' included (`StateLogRecord`); the record plane ships each as its log's
+> register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
+> continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
+> from it and keep or drop each operation whole. Owed: the repository's greens placed on its holders at their joins
+> (A-636 part 2b-2), then the server's takeover by this rule, every log of a repository, its greens' included,
+> following one successor (2c); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12519,7 +12531,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    holders applying records at their joins, replicas refusing split cuts, takeovers keeping each record whole), and its
    live plane's first piece (A-636 part 2a: the state logs a register class of the repository, placed and taken over as
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
-   every log or none); owed: the rest of the live plane (A-636 parts 2b and 2c).
+   every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
+   operation's identity and spans (A-636 part 2b); owed: the greens placed on their repository's holders at their joins
+   (A-636 part 2b-2) and the server's takeover by the rule (2c).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -12639,7 +12653,8 @@ engine: the verdict, rebase, position mapping, the register).
 > starter's `StartSpec::vcs_ssh`, contract 55) starts A-651's edge in the daemon beside the HTTP edge: its listener and
 > connection tasks on the control shard under the shard's seats, an edge state kept on every shard so a connection moves
 > to its repository's owner (A-651 part 4), keys proved by the credential record (A-651 part 3), and the services as
-> the server has them, each `exec` refused as not served until A-682's lender and A-683's receive-pack are wired in. Any
+> the server has them: git's upload-pack from each repository's store through A-682's lender (`ShardStores`), every
+> other `exec` refused as not served until its entry point lands. Any
 > IPv4 address is taken: SSH encrypts every connection. The host key, on main's ruling: a fleet node presents its own
 > key from its plan when the key is Ed25519, the edge's one host key algorithm, and starts no SSH edge otherwise,
 > logged; any other anchor makes an Ed25519 key from the system's generator at its start and keeps its seed in the
@@ -12647,8 +12662,8 @@ engine: the verdict, rebase, position mapping, the register).
 > over (`ENV_VCS_SSH`), so a daemon restart keeps the port and the key a client pinned; a daemon run alone makes its own
 > for its life. It adopts a held listener by the rule the HTTP edge's and svn:// listener's share
 > (`daemon::held_or_bound_listener`). The daemon's log names the
-> address and the key's OpenSSH fingerprint before it says it serves. The services and main's live OpenSSH interop are
-> owed.
+> address and the key's OpenSSH fingerprint before it says it serves. The other services and main's live OpenSSH
+> interop are owed.
 >
 > **Status (2026-11-19, A-651 part 4: the SSH edge serves a repository from its owner shard).** An `exec` that names a
 > repository another shard's partition holds moves its connection there, as the HTTP edge moves one once a head names
@@ -12814,6 +12829,23 @@ engine: the verdict, rebase, position mapping, the register).
 > is answered by the next daemon. An address the anchor cannot bind ends its start by name, as a fleet node's serve
 > sockets do. A library starter asks for the edge too (`StartSpec::vcs_http`), and its anchor holds it the same way.
 > Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+>
+> **Status (2026-11-19, A-682: upload-pack served from each repository's store on its owner shard).** The daemon's
+> git site serves upload-pack from the store A-662 keeps on the repository's owner shard, lent by
+> `vcs_store::upload::ShardStores`, the `StoreLender` over the shard's map. The step that answers a request (the
+> advertisement, `ls-refs`, a `fetch`) is lent A-614's store, the content store, the refs the asker may read and the
+> branch `HEAD` names, read from the partition's register as the step runs; every later step of the answer is lent the
+> objects alone, since the pack's source names what it sends by position. Each register name is a git ref by git's
+> push's rule (A-654's `git_push::ref_of`: a short name `N` is `refs/heads/N`, a name under `refs/` is itself, and a
+> name beginning `refs/heads/` or one git's `check_refname_format` refuses is no ref), so both services see one ref a
+> name and no listing meets a name protocol v2 cannot carry; a ref the repository's policy hides from the asker is
+> hidden as from a pusher (A-654's `PolicyHidden`: A-622's `Read`, git's `transfer.hideRefs` precedence, a ref no rule
+> speaks to its owner's alone), and `HEAD` reads as unborn to a reader that may not read its branch. The
+> pack is A-639's stream through A-653's `Fragments`, its turns on the shard's clock within the step quantum the shard
+> keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
+> take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
+> hidden ref alone reaches, fetchable by id until slates-git hides them; the daemon starting the SSH edge (A-684); the
+> live stock `git clone` over the daemon's edge (the next piece) and the other platforms (main's).
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -51930,6 +51962,202 @@ visible to the crate); `crates/cli/tests/cli.rs` (`edge_port_before_serving` tak
   connection moved there), the repository's sources with every call, CRAM-MD5 keys over §4.13's principals, learned
   waits (one mechanism for the three edges), the SSH tunnel's entry point; the Windows and Linux runs (main's).
 
+### A-682 — The daemon's StoreLender over A-662's map: upload-pack served from each repository's store on its owner shard, its refs lent by the asker's read right (2026-11-19, g309 for UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" and "Transports" items 1 and 2, §4.17.1 "Policy"; A-625 part 3's second slice; after A-614, A-640 part 2, A-651 part 2, A-653 and A-662)
+Applied in the same change to:
+- §4.17.2's statuses (A-682's, after A-625 part 3's);
+- GAPS (the §4.17 entry: A-682's line; the owed lists of A-662, A-651 part 2 and A-625 part 3);
+- `crates/server`: `vcs_store/upload.rs` and its tests `vcs_store/upload/tests.rs` (new); `vcs_store.rs` (the module)
+  and `vcs_store/tests.rs` (its push helpers shared with the new tests); `vcs_http/git/upload.rs` (`StoreLender::lend`
+  takes the asker, `lend_objects` new), `vcs_http/git.rs` (`Unserved` moved into the site's tests, the one place it is
+  used), `vcs_http/daemon_edge.rs` (the daemon's site: upload-pack's half of A-654 part 3's `Halves`) and
+  `vcs_http.rs`; `vcs_ssh/git.rs` and `vcs_ssh/site.rs` (the session's asker); `git_push.rs` (A-654's `ref_of` and `PolicyHidden` visible to the crate, so both services name and
+  hide refs by one rule); `lib.rs` (the modules' notes); the tests of the git site, the SSH command and the daemon's
+  edge.
+
+- **What.** The daemon's git site (`vcs_http::daemon_edge::DaemonSite`) serves upload-pack through
+  `UploadServices<ShardStores>`, upload-pack's half of A-654 part 3's `Halves` (receive-pack's is
+  `ReceiveServices<ThisShard>`). `ShardStores` holds nothing: each step borrows the shard's state for its own length
+  (`state::with_state_counted`) and lends A-614's store and the content store from A-662's map (`VcsStores::git_ref`),
+  the content store lent the room the shard's budget admits for the step's reads and set back after it
+  (`vcs_store::lent_to_read`). A store the map does not hold here (another shard's, one a recovery could not make
+  again, another tool's) is not lent, and the edge answers `503` as for a service not served. Before this change no
+  lender existed outside tests, so the daemon's site answered every upload-pack `503`.
+- **The asker's refs at the request's step alone.** upload-pack reads refs only while it answers a request: `ls-refs`
+  lists them, a `fetch` looks its `want-ref`s and `deepen-not`s up among them and checks their order, and v0's
+  advertisement lists them. Every later step only writes the answer: `Answer::write` hands the store to the pack's
+  source with the request's admission (A-653 continued (4)), and A-653's `Fragments::write` reads `served.repository`
+  and `served.store` alone, naming objects by position. So the seam has two calls: `lend`, for a request's step, takes the asker and reads the register and the
+  policy as it runs; `lend_objects`, for an answer's later steps, reads no ref, so each costs its room and one packet
+  whatever the repository's refs (A-640 part 2's bound) rather than a walk of the register a packet.
+- **Each register name one git ref, by git's push's rule.** §4.17.1 makes each git ref a green bound to a name, and
+  A-654 states which: a short name `N` is the ref `refs/heads/N`, a name under `refs/` is itself, and a name beginning
+  `refs/heads/` is no ref, since its ref is another name's, so names and refs map one to one (`git_push::ref_of`).
+  The lender names refs by that same function, so receive-pack and upload-pack never disagree about a ref; a first
+  draft that mapped names itself would have listed `refs/heads/main` twice for a register holding `main` and
+  `refs/heads/main`, and upload-pack's order check would then have refused every listing (`upload::refs::check_order`).
+  The register takes any name but an empty one or one holding a NUL (A-515), while protocol v2's lines refuse a name
+  git's `check_refname_format` refuses (`slates_git::v2::ls_refs`); `ref_of` answers no ref for one, so a branch named
+  `my topic` is left out rather than refusing its repository's every listing, and a repository whose default branch
+  is no ref is not lent, since slates-git's answers always name `HEAD`'s branch.
+- **Refs by the asker's read right.** The edge admits a principal to a repository when some rule lets it read some
+  name (`vcs_policy::reaches`, A-625 part 2), "each name then judged by the rule that decides it". This is that
+  judgement for reads, and A-654 already makes it for a pusher (`git_push::PolicyHidden`: A-622's `Read` judged by
+  `vcs_policy::admit_right` as a push's own right is, git's precedence, the last rule that covers the ref deciding, a
+  ref no rule speaks to its owner's alone, A-575), so the lender asks the same value, compiled once a request. A ref
+  the asker may not read is neither listed nor found by name (`want-ref` and `deepen-not` answer git's "unknown ref"),
+  and `HEAD`, looked up among the refs lent, reads as unborn to an asker that may not read its branch. The objects such
+  a ref alone reaches stay fetchable by id: slates-git's negotiation answers a want of any object the store holds
+  (`negotiation::Refusal::NotOurs` names one it lacks), so hiding them is slates-git's, owed there.
+- **The pack.** `ShardPacks` is A-653's `Fragments`, each turn on the shard's clock (`slates_rt::futures::now_ns`,
+  §4.3) within the step quantum the shard keeps now (`DaemonConfig::step_quantum_ns`, its live wake estimate), at the
+  owner's exchange: `Exchange { ns: 1e9, bytes: memcpy_bytes_per_second }`. Derived: a saved byte is worth the time
+  this machine takes to copy it, the neutral worth the archive's codec policy prices a byte at (`DaemonConfig::codec`,
+  memcpy at the largest probed size, §4.11), until the live memory-pressure and load signals move both.
+- **The SSH site.** `UploadCommand` takes the session's principal, and `ToolServices<ShardStores>` is what the SSH
+  edge's site runs once the daemon starts that edge (A-651's owed); its test drives it on a daemon's shard.
+- **Tests** (`crates/server`). The daemon's edge over TLS, red first: the owner's advertisement at protocol v0 and v2
+  answered `200` from the store on the repository's shard after the move, and an `ls-refs` asking for `HEAD` with
+  `symrefs` and `unborn` answered `unborn HEAD symref-target:refs/heads/main`, the record's default branch; nothing
+  counted unavailable. With A-654 part 3's receive-pack on the same edge, stock git 2.50.1's `create` push (its golden
+  vector) posted, then `ls-refs` listing `HEAD` at the pushed commit naming `refs/heads/main`, and a `fetch` of it whose
+  pack holds exactly the objects the push's own pack held. The lender on a real one-shard daemon whose repository took
+  its objects through A-635's append
+  (`vcs_store::upload::tests`): `ls-refs` listing `HEAD` and `refs/heads/main` at the pushed commit, and a `fetch` of
+  it whose pack, read whole as index-pack reads one, holds exactly the commit, its tree and its blob; a reader one rule
+  lets read `main` alone seeing `HEAD` and `main` while the owner sees `topic` too, the reader's `want-ref` of `topic`
+  refused `UnknownRef`; branches named `my topic` and `refs/heads/main` (beside `main`) left out of a whole listing
+  that names `refs/heads/main` once; a Mercurial store, a git repository whose
+  default branch is `my main` and an unknown id not lent to a request (the second's objects still lent to an answer's
+  later steps); and an SSH session started by the SSH site's services over `ShardStores` from a task on the shard,
+  advertised, answering `ls-refs` and the `fetch` with the same pack, and ended 0 by a flush.
+- **Evidence.** macOS arm64, Mac Studio, 2026-11-19. Red first (kiln r95, at 6236f3335, the daemon's edge before the
+  lender): `cargo test --locked -p slates-server --lib vcs_http::daemon_edge` 0 of 2, the owner's answers
+  `[503, 503, 401, 401, 403]` where `[200, 200, 401, 401, 403]` was expected and the v2 advertisement `503`. Green over
+  main 17f4f7d6f (kiln r279, this tree): `cargo test --locked -p slates-server --lib -- vcs_http:: vcs_ssh:: vcs_store::
+  --test-threads=4` 95 of 95 (the five `t_a682_` lender tests, the three daemon-edge tests above, the HTTP and SSH
+  sites' upload-pack tests over the split lender); `cargo test --locked -p slates-cli --test cli vcs_http` 2 of 2 (an
+  anchor's `--vcs-http` edge answering `401`, and its port held across a daemon restart); `cargo fmt -p slates-server --
+  --check` clean.
+- **Owed.** The objects a hidden ref alone reaches hidden by slates-git; the daemon starting the SSH edge (A-684); the
+  live stock `git clone` and fetch over the daemon's edge (the next piece, g309's); the exchange moved by the live
+  signals; Linux and Windows runs, clippy, the doc and lint gates (main's).
+
+### A-636 part 2b — The partition's records shipped a log at a time: each state log's record of each operation, naming the operation whole, held by its holders as a prefix of the log; every server dispatch by the register's class (2026-11-19, g261, UI goal 93; §4.17.1 shared piece 2, the fleet half's live plane; §4.8 "records are sent to all candidates; committed at f + 1" and "Promotion and takeover"; after A-636 part 2a)
+
+- **Why.** A-636 part 2a made a repository's four state logs registers of its own class, placed and taken over as the
+  repository is, but nothing wrote them: a repository's names, phase roots, markers and locks lived on its owner's
+  partition alone, so a takeover had nothing to adopt them from. And the server told a register's class only by
+  asking whether its id was a catalog's, so a state log's register, once shipped, would have been adopted, given up,
+  paged and counted as its repository's head. This is part 2's second piece (g306's split, main's ruling of
+  2026-11-19): the class dispatch first, then each state log's records shipped to its holders a log at a time.
+- **The records** (`crates/db/src/catalog.rs`: `StateLogRecord`, `LoggedChange`, a new wire enum published at tags 0
+  to 3). One operation that moves a repository's state logs makes one record of each log it moved: that log's changes
+  in the order the operation made them (a green joined, a name bound or retired, the default moved, a member gone with
+  its destroy, a phase root, a marker, a lock), the position it found the log at and the one it left it at, one change
+  a position, and the operation's identity and every span it moved, its greens' included. The identity is BLAKE3 over
+  the spans' encoding and then the operation's own log encoding, so every record of one operation names it alike, and
+  two operations that moved the same positions alike (one dropped by a takeover, another made after it) are told apart
+  by what they did. A takeover can therefore keep an operation where every log it moved holds it and drop it otherwise,
+  part 1's rule (part 2c applies it).
+  - Made where the change is applied (`crates/db/src/repository.rs`: each change takes its log's position in
+    `log_names` and the state changes' apply, recording itself as it does; a change that changed nothing took no
+    position and is in no record), stamped once the operation is applied (`Partition::apply`: `clear_made`, the
+    operation, `seal_made`), and handed on by the database only once the operation is durable
+    (`Db::take_state_log_records`): a lone mutation's after its append, a transaction's at its commit, none of a
+    transaction rolled back. A replay applies the same operations and makes the same records, but hands none on.
+  - Why made by the partition and not read back by the server from the operations it sent: the server records a
+    repository's changes through two paths (the repository verbs, a push's entry), and a member green's destroy moves
+    the names log from every path that removes a volume; one rule where the positions move keeps every position in a
+    record, and a missed position would leave a log no holder can continue.
+- **The owner's parts** (`crates/server/src/state_log.rs`). The owner takes the partition's records into parts of
+  their logs' registers, each at the position it leaves its log at, and the record plane ships them with the heads
+  each period (`fleet::unplaced_heads` → `owed_state_log_parts`, `ship_head`): to the candidates missing each, in
+  position order, committed at `f + 1` through the owner's acceptor. A candidate's acknowledgements are kept per log as
+  its highest position, and a part goes once every candidate holds it; a laptop (`f = 0`) keeps none. A log is its own
+  register, so a push that moved the names and the locks never waits on one log's holders for the other's.
+- **A holder's copy, a prefix** (`state_log::check_held`, from `fleet::check_held_record`). A holder keeps a part only
+  where its value is a record of that register's log at that position, naming its own span among its operation's,
+  with one change a position, and continuing its copy: its predecessor held there, or the log's start. Refused
+  otherwise, by kind (`malformed`, `misnamed`, `misplaced`, `discontinuous`), as a malformed record: no
+  acknowledgement, and the owner ships the part again in order. It is a ledger (`catalog::is_single_value` false for
+  its class byte, 5), never compacted to its newest, and judged against no content.
+- **Every dispatch by the class.** A takeover's adoption reads the register's class before any value is decoded
+  (`takeover::record_adoption`: a catalog rebuilds its volume, a state log is counted `fleet.takeover.state_log_adopted`
+  and nothing more until part 2c, the object's own register by its value's class); a give-up by name settles a state
+  log unrecorded, as it does a catalog, since neither has verbs of its own (`given_up_shard`); a mirror's promotion page
+  names only an object's own register as a head (`mirror::page_entries`); and the record plane counts a state log's
+  shipments under its own names (`fleet.ship.state_log.*`, `ShipCounters`) and keeps its acknowledgements per log,
+  never as a head's placement (`record_acks_in`).
+- **Bounded.** The parts held are bounded by the partition's merge budget (`state_log::bound`): a part is a copy of
+  state changes that budget charged when they were made, so more owed than the budget is more than a second copy of
+  everything the partition may hold, which only holders gone silent for long leave unacknowledged. A repository's next
+  change of its state logs (a verb, or a push that makes or deletes a branch or moves names or state) is refused
+  `Overloaded` naming the shard while the parts are at the bound (`state_log::admit`, counted
+  `repository.state_log.parts_full`); a push of greens alone moves no state log and waits on none. The records the
+  database holds between two takes are bounded by what one take admits plus a member's destroy each, which the
+  partition's volume capacity bounds.
+- **The cost.** An operation that moves a state log encodes itself once more and hashes that and its spans: linear in
+  its size, as its log append already is; an operation of greens alone makes no record and pays nothing.
+- **Next (A-636 part 2b-2, main's ruling of 2026-11-19).** A record that spans a green's log and a state log needs one
+  set of holders and one successor for 2c to adopt it whole, and the greens' logs are still placed by their own ids.
+  So a repository's greens are placed on the repository's holders when they join it (bind or branch): a home change at
+  the join, D-14's home-change case, so no write path touches the configuration group. The trade, recorded here as
+  main ruled: for greens bound to a repository, A-642 part 1's copyset spreading (each green's log on a copyset of its
+  own, so pushes to different greens land on different holders) gives way; the alternative, a commit across holder
+  sets per record, is coordination on a write path (CLAUDE.md §2 item 10) and is not built. A green not bound to a
+  repository keeps its own placement.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, `CARGO_BUILD_JOBS=2`).
+  - The oracle: the repository model test (`every_history_of_entries_equals_the_rules_and_every_crash_recovers_it`, A-603's
+    and A-635's generated histories with crashes) now builds a holder's copy of the state logs from the records the
+    database hands on, and holds it equal to the model's state logs after every step: each record continuing its log
+    where the copy stands, one change a position, its own span among its operation's, every record of one operation
+    naming it alike, no identity met twice (`crates/db/src/repository/entry/tests/replica.rs`). Its census counts the
+    records, the operations of several logs and the members that left. Beside it, the exact records of a scripted
+    history (`each_operation_records_what_it_moved_of_each_state_log_named_alike`) and a transaction's records handed
+    on only at its commit, none of one rolled back (`a_transactions_state_log_records_go_on_only_once_it_is_durable`).
+    In the server: the owner's parts owed to the repository's candidates in order and let go as they are held, at
+    `f = 1` (`fleet::state_log_tests`); a holder's prefix and its refusals; the counters by class; the adoption, the
+    give-up and the mirror's page by class; the rule and the bookkeeping alone (`state_log::tests`).
+  - Red first. Kiln r307 (at ac87e1064, over main b94ae6e90), slates-server with each new behaviour stubbed back (every
+    dispatch site to `is_catalog`, a state log's counters to a head's, the holder's check out and its class byte compacted
+    as a single value, the owner taking no record): `cargo test --locked -p slates-server --lib -- state_log
+    takeover::tests::a_state_logs_register takeover::tests::a_given_up_state_log mirror::tests fleet::state_log_tests
+    --test-threads=4` 6 of 8 failed, each on its rule (the names log queued to be materialized as a volume; a given-up
+    state log recorded on its repository's shard; the page naming the names log as a head beside its repository's
+    catalog; its parts counted as heads; a part past a gap acknowledged and the log compacted to its newest; the owner
+    owing nothing), the two that passed being the module's rule and bookkeeping, which the stubs left in place. Kiln
+    r343 (at 01eb043b8), slates-db with the partition handing on no record: `cargo test --locked -p slates-db --lib --
+    repository::entry::tests::each_operation_records repository::entry::tests::a_transactions_state_log
+    repository::entry::tests::every_history_of_entries` 3 of 3 failed (no record of the first entry, none of the
+    committed transaction, and the copy empty where the model held the root joined and `n0` bound, the names log at 2).
+  - Green. Kiln r343 (at 01eb043b8): `cargo test --locked -p slates-db --lib -- repository:: register ledger catalog`
+    138 of 138; `cargo test --locked -p slates-server --lib -- state_log takeover:: mirror:: fleet:: repository::
+    --test-threads=4` 79 of 79. Kiln r307: `cargo test --locked -p slates-db --test wire_order` 2 of 2 and 1 ignored
+    (`LoggedChange`'s four tags published by hand and held); `--test model -- every_recovery_equals_the_live_partition`
+    2 of 2 (every operation's apply now stamps its records); `cargo fmt -p slates-db -p slates-server -- --check` clean
+    both times.
+  - As it lands. Kiln r367 (at 96a5aa13b, this change merged with main 2f73eb075, whose repository verbs, push path and
+    Subversion commit share files with it): `cargo test --locked -p slates-db --lib -- repository:: register ledger
+    catalog` 138 of 138, the repository model test's census over its 128 histories 1,083 state-log records taken by the
+    copy, 603 operations of several logs, 17 members left with their destroys (beside A-635's 191 entries of several
+    greens, 409 moving state with versions and 122 alone, 318 recoveries from a snapshot and 37 from the log alone);
+    `--test wire_order` 2 of 2 and 1 ignored; `--test model -- every_recovery_equals_the_live_partition` 2 of 2;
+    `cargo test --locked -p slates-server --lib -- state_log takeover:: mirror:: fleet:: repository:: --test-threads=4`
+    85 of 85; `cargo fmt -p slates-db -p slates-server -- --check` clean.
+- **Owed.** A push's answer waiting for its records to commit at `f + 1` (the barrier the merge plane keeps for a
+  submit, `MergeShardState::awaiting`); a candidate that joins a log's placement past parts every earlier candidate held,
+  which needs the log's state installed before its next part (a state-log checkpoint, which also lets holders and the
+  owner's acceptor drop the records below it, as A-404 does for a green's chain); a neighbourhood change's settle
+  waiting for the state logs' parts on the new cohort (`records_placed_on_current_neighbourhood` reads heads and greens
+  only); the parts rebuilt after the owner restarts (the partition's replay hands none on); parts batched a shipment; a
+  destroyed repository's four state-log registers forgotten by its holders and its owner; the repository record and
+  its policy replicated (their own register); the greens placed on their repository's holders (2b-2); the successor
+  adopting a repository's logs and each operation whole (2c). Main's gates: clippy, xtask, the doc build, other
+  platforms, the db and server suites whole.
+- **Applied in the same change to:** §4.8's catalog-class status (every dispatch by the class); §4.17.1's status and
+  shared piece 2; GAPS (A-642's headline, the §4.17 entry); `crates/db/tests/wire_order.txt` (`LoggedChange`); this
+  entry.
+
 ### A-684 — The daemon starts the SSH edge: `--vcs-ssh ADDRESS`, the anchor holding its listener and its Ed25519 host key across daemon restarts, a fleet node presenting its own key, and the daemon's log naming the address and the key's fingerprint (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 2; A-651's owed start; A-625 part 3 continued's two pieces for HTTP, mirrored)
 Applied in the same change to: §4.17.2's status (A-684's block; the daemon's start closed in A-651's and A-651 part 3's);
 GAPS (the §4.17 entry: A-684's line, A-651's owed lists, the stock-hg tests' waits); `crates/anchor`
@@ -51949,8 +52177,9 @@ an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE
   every other shard (`EdgeState::arrivals`, no host key) so an `exec` naming a repository another shard holds moves its
   connection there (A-651 part 4), the site proving keys by the credential record (A-651 part 3's `RecordKeys`) and
   locating repositories by their names' routes (`ShardRepositories`), and the services as the server has them
-  (`NotYet`: each `exec` refused as not served, in its tool's own words, until A-682's lender and A-683's receive-pack
-  are wired into the daemon's site).
+  (`ToolServices` over A-682's `ShardStores`, the HTTP edge's lender: git's upload-pack from each repository's store on
+  its owner shard, each request admitted the edge's room; every other `exec` refused as not served, in its tool's own
+  words, until its entry point lands), on main's word as A-682 landed.
 - **Decisions.** (1) Any IPv4 address, on a fleet node or not: SSH encrypts every connection and proves the server by
   its host key before a client sends anything of its own (RFC 4253 §7-§8), and a client proves itself by a signature,
   never a secret sent (RFC 4252 §7), so no address leaves anything in the clear, as `--vcs-http`'s off loopback would. A
@@ -51996,8 +52225,9 @@ an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE
   SHA256:cJyHlTnDIcFjiVlDz2XKXM7bZusEd/nBQAe6/n4OYTc`, its edge presented that key, an exchange begun while the killed
   daemon's successor started was answered by it with the same key at the same port, and the successor named both
   again.
-- **Owed.** The services wired into the daemon's site (A-682's lender for upload-pack, A-683's receive-pack, A-679's
-  Mercurial loop, A-688's svnserve tunnel); host keys in a fleet node's other key algorithms (ECDSA, RFC 5656;
+- **Owed.** The other services wired into the daemon's site (A-683's receive-pack, A-679's Mercurial loop, A-688's
+  svnserve tunnel); a test of the daemon's own SSH site running upload-pack for an enrolled key (A-682's tests run its
+  services alone); host keys in a fleet node's other key algorithms (ECDSA, RFC 5656;
   RSA, RFC 8332), so a node with a P-256 identity presents its own key; Windows keeps no listener across a restart
   (`docs/wip/platforms.md`, gap 2), though it keeps the key; main's live OpenSSH 10.2 interop against `--vcs-ssh`
-  (`ssh-keyscan`, a `git clone` with an enrolled key once A-682 lands) and the other platforms' runs.
+  (`ssh-keyscan`, a stock `git clone ssh://` with an enrolled key) and the other platforms' runs.
