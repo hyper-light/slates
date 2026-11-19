@@ -49,7 +49,7 @@ from scratch, so every key a move changes is marked. A-643's whole-state oracle 
 the hand-overs and re-points counted, and every link held to name a standing file or IPC node.
 
 Red on r1019 with part 2a's engine change reversed: 9 failed. The oracle shrank to one removal of `TARGET`, leaving `h`
-a link naming nothing. Green on r1019: `cargo test -p slates-merge --lib` 124 of 124, fmt clean.
+a link naming nothing. Green on r1019: `cargo test -p slates-merge --lib` 124 of 124, fmt clean; merged with main (r1032), 126 of 126.
 
 ## Owed (A-646 part 2b)
 

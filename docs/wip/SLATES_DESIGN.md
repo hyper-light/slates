@@ -44866,8 +44866,8 @@ Applied in the same change to:
   rule for a target removed after the base is kept within this.
 - **Kept conservative:** a work based before a hand-over that touches the link which became the home meets
   `file_removed` (the link's removal is recorded), as it meets any removal.
-- **Tests** (debug, Mac Studio, 2026-11-19, load 9 to 12), green on kiln r1019: `cargo test -p slates-merge --lib`,
-  124 of 124; `cargo fmt -p slates-merge -- --check`, clean. The failing-first tests:
+- **Tests** (debug, Mac Studio, 2026-11-19, load 5 to 12), green on kiln r1019 and, merged with main, r1032:
+  `cargo test -p slates-merge --lib`, 124 of 124 and 126 of 126; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests:
   - a removed file's links keep its node, its bytes, mode and attribute at the least link;
   - a file made again where a node was is another node;
   - a renamed file's links name it at its new path;

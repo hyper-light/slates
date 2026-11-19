@@ -2423,7 +2423,7 @@
 >    replaced home hands the node to its least surviving link, with its content or IPC node, mode and attributes. A
 >    renamed home's links follow it, and a later file at the path is another node. A link a work makes names the node
 >    at its target at the work's base, or the work's own. Red on kiln r1019 (9 failed: links left naming an empty path,
->    a new file, or a link); green on r1019, 124 of 124. Owed, part 2b: the ops document says so, a node table a link
+>    a new file, or a link); green on r1019, 124 of 124, and merged with main on r1032, 126 of 126. Owed, part 2b: the ops document says so, a node table a link
 >    names, under a new format version with golden vectors re-derived (A-621's way). Bug record:
 >    `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
