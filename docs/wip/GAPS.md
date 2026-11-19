@@ -2262,7 +2262,9 @@
 >   carries. Sibling fixed: a holder outside the successor's placement kept its stale copy for good when the last
 >   confirmation dropped the retirement in the same version. A move on an unresolved line is allowed (records are
 >   bounded, so an old volume's line reads unresolved once its record goes). The lineage model is
->   `docs/wip/models/Lineage.tla`, read as text only.
+>   `docs/wip/models/Lineage.tla`; since A-518 it states A-341, A-484 and A-508's holder rules as actions and checks
+>   `NoLastCopyLost` (no let-go removes the last member copy the newest committed record names) beside A-309's
+>   `ReclaimOnlyStale` and A-508's `SettleKeepsFPlusOne`; its TLC runs are main's (the model table, §10).
 > - **Fixed (A-309 piece 2): the members that exist now recover a cohort past its tolerance.** An object one of whose
 >   settled cohorts is short of its recovery quorum is adopted once every surviving member of its cohorts, settled and
 >   current, has promised it, with the newest record any of them holds (`Readiness::ReadyPastTolerance`,
@@ -8885,6 +8887,8 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/InstallInTurns.tla` | `_lazy_copy_gen.cfg`, `_lazy_fence.cfg`, `_lazy_promote_auth.cfg`: one protection removed (a copy's own generation check; every fence raise but an accepted record's; phase one's demand that the copy name the successor) | no error, each (1 min 2 s; 39 s; 2 min 6 s) | 323,141; 192,633; 858,558 distinct | 38 | 2026-11-18 |
 | `models/InstallInTurns.tla` | `_lazy_copy_gen_fence.cfg`, `_lazy_fence_promote_auth.cfg`, `_lazy_copy_gen_promote_auth.cfg`: two removed | no error, each (38 s; 1 min 14 s; 3 min 30 s) | 323,141; 858,558; 1,436,869 distinct | 38 | 2026-11-18 |
 | `models/InstallInTurns.tla` | `InstallInTurns_lazy_all.cfg`: all three removed | StaleNeverCommits violated, as it must be (non-vacuity): a stale owner's record commits on copies that answered phase one under its authority, unfenced | at the violation | 12 | 2026-11-18 |
+| `models/Lineage.tla` | `MC_Lineage.cfg` (A-518): 4 hosts, 1 object, a region formed on its creator alone, F = 1, 2 retirements and 2 records kept, 3 records an object, versions up to 8 | not yet run (written 2026-11-19; main's run, run-requests.md) | — | — | — |
+| `models/Lineage.tla` | `MC_Lineage_two.cfg` (A-518): the same with 2 objects of 2 founding hosts, ranked apart | not yet run | — | — | — |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
