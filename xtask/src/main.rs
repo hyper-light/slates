@@ -1498,7 +1498,11 @@ mod literals {
       for literal in numeric_literals("let (a, b, c) = (0_usize, 1_u64, 0_u32); (1_u64..)") {
         assert!(is_trivial(&literal), "{literal}");
       }
-      assert!(!numeric_literals("let n = 7_usize;").iter().all(|literal| is_trivial(literal)));
+      assert!(
+        !numeric_literals("let n = 7_usize;")
+          .iter()
+          .all(|literal| is_trivial(literal))
+      );
     }
 
     /// Do: read tuple fields by position, then a range and a float beside them. Expect the fields' indexes not read as
