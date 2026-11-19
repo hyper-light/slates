@@ -1184,10 +1184,13 @@
 >   (a binding taken only from an answer that established one; the source's spelling) and `sim::tests` (the entry and
 >   its lifetime, every refusal with none holding room; Windows' refusal, on Windows' own build). By use, with a kernel
 >   mount: `a_mounted_volume_binds_into_a_container_through_the_library` (`crates/api/tests/api.rs`,
->   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. Owed (A-520's next pieces): the
->   engine's profile (`slates oci-runtime`) and the pre-bind check (`slates oci-check`) as library calls; the judge's
->   profiles for the engines measured since it was written (rootless podman, G-mount step 3); and Windows, which has
->   no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   `SLATES_TEST_MOUNT=1`) and the conformance suite's stranger, both filed for main. **Built 2026-11-19 (A-520's
+>   second piece, `CONTRACT` = 47):** the engine's profile and the pre-bind check are library calls the command line
+>   makes (`container_engine::engine_profile` under `slates oci-runtime`, `container::check_source` under
+>   `slates oci-check`), each held by unit tests on every host (the questions' order over an injected query; the check's
+>   judgment over an injected table and identity, and the host's own table). Owed: the judge's profiles for the engines
+>   measured since it was written (rootless podman, G-mount step 3, and podman's command line); and Windows, which
+>   has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
 > - **a busy unmount typed on Linux and its holders named, 2026-11-18 (A-537, `CONTRACT` = 45; A-507's two owed
 >   items):** `fusermount3` reports no error number (it prints the refusal and exits 1, libfuse `util/fusermount.c`), so a
 >   plain unmount it refused while the kernel's table still lists the caller's mount is now `MountFault::Busy`, as
