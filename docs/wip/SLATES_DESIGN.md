@@ -38892,3 +38892,10 @@ Applied in the same change to:
   word in the short form named where no extension was kept, with its refusals; and by use, a daemon's stream that answers
   an INIT offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`, takes the word in the extended form after it
   (`shards.owner_named`), and shows its root owned by the run (1000:1001) where the volume keeps it as its owner's.
+- **Checks.** On the Mac Studio (debug, 2026-11-19, kiln run r421): `cargo test -p slates-bridge-fuse --lib shards_fs` 6
+  of 6 and `cargo test -p slates-server --lib shards::tests` 2 of 2; `cargo fmt -p slates-bridge-fuse -p slates-server --
+  --check` clean. Red with `owner_word` reading the short head whatever the stream kept (the extended form came back
+  `None` where `Named { uid: 1000, gid: 1001 }` was due), and with the stream passing the short form whatever its INIT
+  kept (the dispatch answered the misread word `EIO` where the word was due to be taken). Owed: kiln's re-vendor and its
+  macOS microVM drive (main's run); the integration suites that read the word (`crates/bridge-fuse/tests/shards_fs.rs`,
+  `crates/server/tests/shards_resync.rs`) compiled and run by main.

@@ -382,7 +382,11 @@ fn expect_every_other_request_left_to_the_dispatch() {
     None,
     "another opcode is the dispatch's"
   );
-  assert_eq!(owner_word_short(&[0u8; 8]), None, "no header: the dispatch's");
+  assert_eq!(
+    owner_word_short(&[0u8; 8]),
+    None,
+    "no header: the dispatch's"
+  );
 }
 
 /// A volume whose root and three files are kept as the host's, the run's and neither's, behind no bridge yet.

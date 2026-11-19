@@ -3234,15 +3234,23 @@ mod tests {
       daemon.stop();
       panic!("the volume was not made");
     };
-    let offered =
-      u32::try_from(flags::POSIX_ACL | flags::SETXATTR_EXT).expect("both lie in the first flags word");
+    let offered = u32::try_from(flags::POSIX_ACL | flags::SETXATTR_EXT)
+      .expect("both lie in the first flags word");
     let mut init = Vec::new();
-    for word in [slates_bridge_fuse::FUSE_KERNEL_VERSION, GUEST_MINOR, READAHEAD, offered] {
+    for word in [
+      slates_bridge_fuse::FUSE_KERNEL_VERSION,
+      GUEST_MINOR,
+      READAHEAD,
+      offered,
+    ] {
       init.extend_from_slice(&word.to_le_bytes());
     }
     let value = b"1000:1001";
     // `fuse_setxattr_in` in its extended form: the value's size, then the flags, the setter's flags and a pad, none set.
-    let mut word = u32::try_from(value.len()).expect("a short value").to_le_bytes().to_vec();
+    let mut word = u32::try_from(value.len())
+      .expect("a short value")
+      .to_le_bytes()
+      .to_vec();
     word.extend_from_slice(&[0u8; 3 * size_of::<u32>()]);
     word.extend_from_slice(slates_bridge_fuse::shards_fs::OWNER_WORD);
     word.push(0);
@@ -3258,13 +3266,17 @@ mod tests {
     });
     daemon.stop();
     let replies = replies.expect("the stream answered each request");
-    for (what, reply) in ["the INIT", "the owner word", "the GETATTR"].iter().zip(&replies) {
+    for (what, reply) in ["the INIT", "the owner word", "the GETATTR"]
+      .iter()
+      .zip(&replies)
+    {
       let error = i32::from_le_bytes(reply[4..8].try_into().expect("an out-header"));
       assert_eq!(error, 0, "{what} is answered");
     }
     assert_eq!(named, 1, "the owner word was taken");
     let attr = OUT_HEADER_LEN + ATTR_AT;
-    let field = |at: usize| u32::from_le_bytes(replies[2][at..at + 4].try_into().expect("an attribute"));
+    let field =
+      |at: usize| u32::from_le_bytes(replies[2][at..at + 4].try_into().expect("an attribute"));
     assert_eq!(
       (field(attr + ATTR_UID_AT), field(attr + ATTR_GID_AT)),
       (1000, 1001),

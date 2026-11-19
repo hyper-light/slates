@@ -578,13 +578,25 @@ mod tests {
     }
     let refused = |errno| Some(OwnerWord::Refused { unique: 7, errno });
     let from_a_user = setxattr(root, (1000, 1001), Some(0), OWNER_WORD, b"1000:1001");
-    assert_eq!(owner_word(&from_a_user, true), refused(EPERM), "only the guest's root");
+    assert_eq!(
+      owner_word(&from_a_user, true),
+      refused(EPERM),
+      "only the guest's root"
+    );
     let elsewhere = setxattr((7, 5), (0, 0), Some(0), OWNER_WORD, b"1000:1001");
-    assert_eq!(owner_word(&elsewhere, true), refused(EINVAL), "only the share's root");
+    assert_eq!(
+      owner_word(&elsewhere, true),
+      refused(EINVAL),
+      "only the share's root"
+    );
     let mut short = setxattr(root, (0, 0), Some(0), OWNER_WORD, b"1000:1001");
     let size_at = crate::abi::IN_HEADER_LEN;
     short[size_at..size_at + 4].copy_from_slice(&64u32.to_le_bytes());
-    assert_eq!(owner_word(&short, true), refused(EIO), "a value cut short of its size");
+    assert_eq!(
+      owner_word(&short, true),
+      refused(EIO),
+      "a value cut short of its size"
+    );
   }
 
   /// A-587. Do: read Shards' owner word `1000:1001` in the short form (`FUSE_COMPAT_SETXATTR_IN_SIZE`: the value's size
@@ -606,11 +618,23 @@ mod tests {
     );
     let refused = |errno| Some(OwnerWord::Refused { unique: 7, errno });
     let from_a_user = setxattr(root, (1000, 1001), None, OWNER_WORD, b"1000:1001");
-    assert_eq!(owner_word(&from_a_user, false), refused(EPERM), "only the guest's root");
+    assert_eq!(
+      owner_word(&from_a_user, false),
+      refused(EPERM),
+      "only the guest's root"
+    );
     let elsewhere = setxattr((7, 5), (0, 0), None, OWNER_WORD, b"1000:1001");
-    assert_eq!(owner_word(&elsewhere, false), refused(EINVAL), "only the share's root");
+    assert_eq!(
+      owner_word(&elsewhere, false),
+      refused(EINVAL),
+      "only the share's root"
+    );
     let other = setxattr(root, (0, 0), None, b"user.shards.owner", b"1000:1001");
-    assert_eq!(owner_word(&other, false), None, "another name is the dispatch's");
+    assert_eq!(
+      owner_word(&other, false),
+      None,
+      "another name is the dispatch's"
+    );
   }
 
   /// T-shards-windows-5.3. Do: parse a Windows DESCRIPTOR ask of each length around the claimed one, and one whose
