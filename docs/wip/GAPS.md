@@ -34,6 +34,19 @@
 > `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
 > is claimed until main measures it.
 
+> **Open (g267, 2026-11-19, found settling A-565): a live clone is answered before any of it is durable.** A clone of a
+> live-shipped volume is live-shipped too, but the `Clone` verb's reply waits on its origin's log
+> (`verbs::replicated_waits` takes the verb's own volume), which the clone did not change, so the clone is answered while
+> nothing of it is held anywhere else, and its status reports a zero loss window. At `f = 1` an owner lost before the
+> clone's first write is durable leaves a successor with no log of it (`live_ship::fetch`: `Ok(None)`) and no seal (a
+> fresh clone's head is its origin's), serving it empty: an acknowledged clone lost, against A-200's promise. Writes are
+> not lost (a live clone's first write ships its whole image, inherited tree included, and waits for it). Not affected:
+> kiln's fleet workspaces (never live-shipped; their status reports their whole age at risk until a seal is placed).
+> **Owed:** the clone's reply held for its first whole entry, `durable_target` naming it from the clone's making, and the
+> loss report zero only once the log holds a durable whole entry; the failing test is written and parked
+> (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `crates/server/src/verbs.rs`). Record:
+> `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`.
+
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
 > `SIGTERM` and returned, and the instance was seen serving about two minutes later. Waiting for the stop (r443, r457)
@@ -1100,10 +1113,11 @@
 >   the captured state of every path its clone changed in the volume's catalog, and the new owner keeps the moved head as
 >   its mark, so a moved clone lands against its capture; and since A-544 every head a captured clone places carries its
 >   record, so a takeover after its owner's loss lands it against its capture too (refused by kind where the adopted
->   head has no record, and a move waits for its head's record); owed of it, the fleet's own three-daemon tests of a
->   move and a takeover (filed for main), a live-shipped clone's record for a head its log rebuilt, and a clone whose
->   owner dies before its first snapshot is placed, which its successor serves as an empty tree (sealed at its making,
->   or its catalog naming its capture, A-544);
+>   head has no record, and a move waits for its head's record); since A-565 a live-shipped one's move marks its
+>   rebuild from the log too; owed of it, the fleet's own three-daemon tests of a move and a takeover (filed for main),
+>   a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
+>   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
+>   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
 >   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a

@@ -2703,7 +2703,10 @@ pub(crate) fn owe_first_whole(
     None,
     Bounds::default(),
   );
-  state.live.shipping.insert(id.bytes, new_live_volume(shipper));
+  state
+    .live
+    .shipping
+    .insert(id.bytes, new_live_volume(shipper));
 }
 
 /// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a

@@ -21092,8 +21092,7 @@ mod tests {
         slates_db::register::HostId(local.0.wrapping_add(2)),
       ];
       crate::live_ship::owe_first_whole(state, clone, &holders);
-      let (live, _) =
-        super::replicated_waits(state, Some(super::to_db_volume(origin)), 1, &reply);
+      let (live, _) = super::replicated_waits(state, Some(super::to_db_volume(origin)), 1, &reply);
       (live, clone)
     });
     assert_eq!(

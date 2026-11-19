@@ -5768,7 +5768,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     // A move this node adopts (A-291): its adoption, kept here until the move is reported adopted, marks the volume's
     // materialization as the move's, whose live log is exactly the head it hands over (A-565).
     let moved = s.move_adoptions.contains_key(&object);
-    Ok::<_, VolumeWait>((placed, catalog_sequence, catalog, catalog_placed, (target, moved)))
+    Ok::<_, VolumeWait>((
+      placed,
+      catalog_sequence,
+      catalog,
+      catalog_placed,
+      (target, moved),
+    ))
   });
   let (placed, catalog_sequence, catalog, catalog_placed, (target, moved)) = match taken {
     Some(Ok(taken)) => taken,
@@ -11690,10 +11696,11 @@ mod discovery_wait_tests {
 #[cfg(test)]
 mod tests {
   /// A-565's piece (the sibling A-544 saw). Do: on a shard, clone a volume's snapshot and ask the home seal walk what the
-  /// clone has to seal before it takes a snapshot of its own, then after its first. Expect nothing before (its head is
-  /// still its origin's, which its own tree cannot walk) and its own head after. Before, the walk named its origin's head,
-  /// and `start_seal` was refused for it, counted `fleet.seal`, every period until the clone's first snapshot: for every
-  /// clone made.
+  /// clone has to seal before it takes a snapshot of its own, then after its first, recorded unplaced as at `f > 0` (a
+  /// laptop records a new snapshot placed on its owner at once, leaving nothing to seal). Expect nothing before (its
+  /// head is still its origin's, which its own tree cannot walk) and its own head after. Before, the walk named its
+  /// origin's head, and `start_seal` was refused for it, counted `fleet.seal`, every period until the clone's first
+  /// snapshot: for every clone made.
   #[test]
   fn a_clone_has_nothing_to_seal_until_its_first_snapshot() {
     let (before, after, own) = crate::daemon::audit_on_shard(|state| {
@@ -11742,6 +11749,14 @@ mod tests {
         panic!("the clone was snapshotted")
       };
       let own = state.db.partition().volume(id).map(|record| record.head);
+      if let Some(own) = own {
+        let unplaced = slates_db::Op::SnapshotPlaced {
+          volume: id,
+          id: own,
+          placed: super::PlacementState::Local,
+        };
+        state.db.mutate(&mut state.segment, &unplaced, 0).unwrap();
+      }
       (before, super::sealable_head(state, id, object), own)
     });
     assert_eq!(
@@ -11754,7 +11769,6 @@ mod tests {
       "its first snapshot of its own is what it seals"
     );
   }
-
 
   /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
   /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
