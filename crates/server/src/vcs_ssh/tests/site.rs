@@ -70,11 +70,14 @@ impl Repositories for Held {
   }
 }
 
-/// Starts every service, recording what started it: the service, the repository's name, and the `GIT_PROTOCOL` value.
+/// What one start was: the service, the repository's name, who asked, and the `GIT_PROTOCOL` value.
+type Started = (super::Service, Option<String>, Principal, Option<Vec<u8>>);
+
+/// Starts every service, recording what started it.
 #[derive(Default)]
 struct Recorded {
-  /// What each start was.
-  started: Vec<(super::Service, Option<String>, Option<Vec<u8>>)>,
+  /// Each start.
+  started: Vec<Started>,
 }
 
 /// A command that never runs in these tests.
@@ -108,6 +111,7 @@ impl Services for Recorded {
     self.started.push((
       start.service,
       start.repository.map(|repository| repository.name.clone()),
+      start.principal.clone(),
       start.git_protocol.map(<[u8]>::to_vec),
     ));
     Ok(Idle)
@@ -323,8 +327,8 @@ fn a_policy_its_tool_cannot_read_is_refused_and_never_judged() {
 }
 
 /// A-651. Do: dispatch a fetch with a `GIT_PROTOCOL` value, a push, Mercurial's serve with `--hidden`, and Subversion's
-/// tunnel, all allowed. Expect: each service started with its repository by name (none for the tunnel, whose client names
-/// one later) and the fetch with its protocol value.
+/// tunnel, all allowed. Expect: each service started for the principal who asked, with its repository by name (none for
+/// the tunnel, whose client names one later) and the fetch with its protocol value.
 #[test]
 fn a_dispatched_service_starts_with_its_repository_and_protocol() {
   let mut site = ToolSite::new(NoKeys, Held::default(), Recorded::default());
@@ -363,19 +367,22 @@ fn a_dispatched_service_starts_with_its_repository_and_protocol() {
       (
         super::Service::GitUploadPack,
         Some("r.git".to_owned()),
+        owner.clone(),
         Some(b"version=2".to_vec())
       ),
       (
         super::Service::GitReceivePack,
         Some("r.git".to_owned()),
+        owner.clone(),
         None
       ),
       (
         super::Service::Mercurial { hidden: true },
         Some("hg/r".to_owned()),
+        owner.clone(),
         None
       ),
-      (super::Service::Subversion, None, None),
+      (super::Service::Subversion, None, owner, None),
     ]
   );
 }
