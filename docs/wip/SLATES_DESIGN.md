@@ -12587,6 +12587,15 @@ engine: the verdict, rebase, position mapping, the register).
 > record a change is `500`, apart from one at its capacity (`507`). Part 2b-ii is the server's: `Access`, `Locks`
 > over the locks log through `RepositoryLogs::append`, and the call A-625's edge makes.
 >
+> **Status (2026-11-19, A-629 part 2b-ii: LFS on the daemon).** `crates/server` (`lfs`): `answer`, the call the
+> version-control HTTP edge makes with a request routed at its head and read whole; `LfsAccess`, vcs_policy's
+> `admit` for the right each need takes on the ref named (the default branch when none; another's lock a rewrite;
+> no principal refused); `LogLocks`, each lock in the repository's locks log (A-635) through
+> `RepositoryLogs::append`, its id the log's position and its path. Owed: the edge's answer whose status follows
+> the body (LFS answers `201`, `409`, `422` and `507` after reading it); the objects' durable store on the owner
+> shard (A-581); principals' names for people (§4.13); locks by others than the owner once the push's policy
+> check lands.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -13842,8 +13851,10 @@ and export by landing).
 > with the refusal a newer client reads as none. Its sixth slice, in part (2026-11-19, g297): `log` without merged
 > revisions, `svn_repos_get_logs5` and `do_logs` over FSFS's node history on the index, a stream a revision a step,
 > merged revisions refused until built; and the crate's one walk of copy roots (A-616's) asked by every read command.
-> Owed: `log`'s merged revisions, `get-file-revs`; the fold of a name beyond ASCII (utf8proc's case folding and mark
-> stripping); read access by the authorization rules (A-606).
+> The sixth slice whole (2026-11-19, g297): `log`'s merged revisions as `svn_repos_get_logs5` finds them, nested walks
+> of each merge's runs, the stock `svn log -g` and `svn mergeinfo --show-revs` replayed whole. Owed: `get-file-revs`;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules
+> (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -42981,8 +42992,34 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   newest first, the names' shortcut dropped, a reopened history stepping once: each failed named tests; the standard
   trio's shortcut and the root's special case answer the same bytes without them, so the first was removed and the
   second kept for its cost.
-- **Owed** (the next slices): `log`'s merged revisions and `get-file-revs`, each replayed against the transcripts
-  already recorded; `list`'s fold of a name beyond ASCII
+- **Part 2, its sixth slice whole** (2026-11-19, g297): `log`'s merged revisions (`reads/log/merged.rs`, the
+  interim refusal gone). With them the log's own history is mergeinfo first (`get_paths_history_as_mergeinfo`: each
+  path's location segments over the range, a segment from S to E the source of the revisions after S - 1 through E);
+  at each revision sent, the mergeinfo it changed for the paths (`fs_mergeinfo_changed`: each changed path whose
+  `svn:mergeinfo` changed against its base, the revision before or the copy's source, a side without a value taking its
+  inherited one, a value that does not parse making the revision one without changes, issue #3896;
+  `get_combined_mergeinfo_changes`: each path's inherited mergeinfo against its previous location's unless a copy's
+  inherited part is the same, issue #4022, then every changed path at or beneath a path), the paths being each
+  history's next location as `do_logs` builds them, which the recording shows (`tags/t1`'s log has r7's merge of
+  `/branches/b1/dir` through `/trunk`). A revision that merged anything is sent with children: its runs of merged
+  revisions (`combine_mergeinfo_path_lists`, reverse merges marked) sorted and walked from the last, each by a nested
+  walk newest first with no limit, its histories opened leniently and its searches recorded so none repeats
+  (`reduce_search`, `store_search`); a merged revision sent only when a changed path lies outside the log's own history
+  (`interesting_merge`, the client's receiver called first so its changed paths are written either way) and only once
+  (`nested_merges`); then revision 0 marked `invalid-revnum` closes the children, as `revision_receiver`'s
+  `stack_depth` allows. The issue #4022 check needs the nearest ancestor's mergeinfo as it is held, so A-605's
+  `mergeinfo_at` and a new `mergeinfo_as_held` share one walk up the tree (`nearest_mergeinfo`). Where Subversion's
+  answer hangs on its seeded hash order it has none to match, and the C code's intent is taken, each a test:
+  `combine_mergeinfo_path_lists` removes the source it used up, where `array_pop_front` removes the first; runs with
+  one range keep their order. Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 414 of 414,
+  rustfmt clean; the `log-merged` session (7 commands: newest and oldest first, a tag's reverse merge, a file, the
+  root, a limit, two paths), `svn log -g` and both `svn mergeinfo --show-revs` sessions (five connections, `reparent`
+  followed) replayed whole; and four tests the recorded repository does not reach (a merged revision sent once oldest
+  first, two runs walked from the last, segments as mergeinfo, runs as `combine_mergeinfo_path_lists` means them).
+  Red-checked thirteen ways (no children, reverse merges unmarked, merged revisions sent again, no `interesting_merge`
+  test, the request's paths for the histories' next, no issue #4022 check, segments unshifted, runs walked from the
+  first, the first source removed): each failed named tests.
+- **Owed** (the next slices): `get-file-revs`, replayed against the transcripts already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
   when the session could authenticate.
@@ -46132,6 +46169,35 @@ new; git's site's tests; the manifest's dev-dependency on `slates-vcs`) and the 
   `ls-refs` answered with the flush alone, a body that is no pkt-line answered `ERR`, receive-pack and an unheld store
   `503`.
 - **Owed.** As the status says.
+
+### A-629 part 2b-ii — Git LFS on the daemon: the edge's call, access by the repository's policy, locks in its locks log (2026-11-19, g293, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files" and "Access"; after A-629 part 2b-i, A-622 part 2, A-625 part 2 and A-635)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/server` (`lfs.rs` and `lfs/tests.rs`,
+new; `lib.rs`); `crates/db` (`Repositories::lock_on`, `locks_from`); `crates/git` (`lfs::objects` re-exports the
+store's `Admitted` and `ContentStore`, which an implementer of the `Objects` seam names).
+- **The call** (`lfs::answer(state, objects, call)`): the edge routes a request at its head
+  (`slates_git::lfs::serve::route`, refusing there with its status and `Allow`), reads its body within its room, and
+  hands the call the route, query, body, proven principal, credential expiry, challenge, scheme and authority, request
+  id and room. It answers on the repository's owner shard: `404` for no repository of that name there, else
+  `slates_git`'s answer, whose status, challenge and body the edge writes.
+- **Access** (`LfsAccess`) is the push's check point, vcs_policy's `admit` (A-597, A-622 part 2): downloading and
+  listing read; uploading, locking, verifying and releasing one's own lock submit; another's lock with force rewrites,
+  the right that overrides another's work on a name. A request naming no ref is judged on the default branch
+  (`refs/heads/<default>`, git's `HEAD`); one without a principal is refused, so the edge asks for credentials.
+- **The locks** (`LogLocks`) are the repository's locks log (A-642, A-635), each change appended through
+  `RepositoryLogs::append` at the position read. A lock's bytes are `HeldLock` (the position it was taken at, its owner,
+  its time); its id is that position and its path in hexadecimal (RFC 3986 unreserved, as git-lfs needs), so an unlock
+  finds it by path and an id whose path was locked again names nothing. The log lists by path, so a page goes on at
+  its cursor's path (`locks_from`). An owner shows as its principal's key in hexadecimal until §4.13 names people.
+- **Limits stated.** `append` keeps its owner rule until the push's policy check lands (A-635), so only a repository's
+  owner takes and releases locks today. The objects are a seam the caller hands in: no durable object store is on the
+  owner shard yet (A-581), and one that forgot its objects at a restart would lose them. The edge's `Serve` fixes `200`
+  at the head, and LFS answers `201`, `409`, `422`, `413` and `507` after reading the body, so the edge owes a decision
+  whose status follows the body.
+- **Tests** (`lfs/tests.rs`, 4): the owner's lock taken, listed, held in the log and released; a stranger `403`, no
+  credentials `401` with the challenge, no repository `404`, nothing logged; an id naming its own lock alone; the
+  access verdicts under a policy. On the Mac Studio (2026-11-19): red at 07:12Z with `answer` and `allows` stubbed, 4 of
+  4 failing; green at 07:14Z on 9d7108e76, `cargo test -p slates-server --lib` 632 passed and one failed, main's
+  `deadlines` test that fails without this change; `slates-git --lib` 443 and `slates-db --lib` 142; fmt clean.
 
 ### A-647 part 2 — A-614's D(k) and reached sets as a type of derived data, the store's outputs unchanged (2026-11-19, g302, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 1, A-614)
 

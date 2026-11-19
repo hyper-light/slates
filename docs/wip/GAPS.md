@@ -415,6 +415,12 @@
 > their text; `LocksRefused` tells `507` from `500`. `cargo test -p slates-git --lib` on the Mac Studio: 387 passed, 2
 > ignored, red first. Owed: part 2b-ii (the server's `Access`, `Locks` through `RepositoryLogs::append`, the edge's
 > call).
+> **A-629 part 2b-ii (2026-11-19, g293; LFS on the daemon):** `slates-server` (`lfs`): the edge's call `answer`,
+> `LfsAccess` (vcs_policy's `admit` per need and ref) and `LogLocks` (A-635's locks log through
+> `RepositoryLogs::append`). `cargo test -p slates-server --lib` on the Mac Studio: 632 passed, the 4 new red first,
+> main's `deadlines` test failing as on main. Owed: the edge's answer whose status follows the body; the durable
+> object store on the owner shard (A-581); locks by others than the owner once the push's policy check lands;
+> principals' names for people (§4.13).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
@@ -744,8 +750,9 @@
 > (g297), `list`, `svn_repos_list`'s walk streamed, red-checked eight ways; its fourth slice (g297),
 > `get-location-segments`, red-checked five ways; its fifth slice (g297), `get-deleted-rev`, red-checked five ways.
 > Its sixth slice, in part (g297): `log` without merged revisions (a log asking for them refused until built),
-> red-checked ten ways; reads asks A-616's one walk of copy roots. Owed from it: `log`'s merged revisions,
-> `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
+> red-checked ten ways; reads asks A-616's one walk of copy roots; the sixth slice whole, `log`'s merged revisions
+> (nested walks of each merge's runs; `svn log -g` and `svn mergeinfo --show-revs` replayed whole), red-checked
+> thirteen ways. Owed from it: `get-file-revs`; `list`'s fold of a name beyond ASCII (utf8proc's case
 > folding and mark stripping need Unicode's tables; over ASCII it is exact); and read access by A-606's rules. A-599 (2026-11-19, g234): ra_svn's greeting and authentication (`handshake`), a state
 > machine that does no I/O held to stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by
 > a relay (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the
