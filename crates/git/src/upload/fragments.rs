@@ -103,7 +103,7 @@ impl Streamed {
   /// What the stream did so far (A-639's counters, A-653): which of the store's paths wrote the pack, the kept parts
   /// copied whole or read entry by entry and the objects encoded afresh.
   pub fn counters(&self) -> UploadCounters {
-    UploadCounters::default()
+    self.upload.counters()
   }
 }
 
