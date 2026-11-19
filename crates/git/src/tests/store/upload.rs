@@ -357,13 +357,13 @@ fn a_filter_sends_the_runs_objects_it_admits_and_the_want_always() {
   repository.release(&mut store).unwrap();
 }
 
-/// A-639 (§4.17.2 "Filters": "`blob:none` and `object:type` choose fragment classes"; `blob:limit` chooses objects by
+/// A-653 (§4.17.2 "Filters": "`blob:none` and `object:type` choose fragment classes"; `blob:limit` chooses objects by
 /// their rows). Do: answer a clone under `blob:limit=1000`, its objects one by one as the negotiation filtered them:
 /// every commit and tree, and the one small file. Expect: the base pack's part without blobs and the newest version's
-/// copied whole; the parts holding a large blob, partly wanted, left, and their one wanted object encoded afresh; read
-/// back, exactly the filtered closure, each once.
+/// copied whole; the base pack's blobs, partly wanted, read entry by entry for the small file; nothing encoded afresh;
+/// read back, exactly the filtered closure, each once.
 #[test]
-fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
+fn a_blob_limit_clone_reads_a_partly_wanted_part_entry_by_entry() {
   let format = ObjectFormat::Sha1;
   let mut store = store();
   let (repository, versions) = three_versions(format, &mut store, true);
@@ -374,11 +374,7 @@ fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
     .filter(|made| filter.admits(made.kind, u64::try_from(made.content.len()).unwrap(), 0))
     .map(|made| made.id)
     .collect();
-  let positions = wanted
-    .iter()
-    .map(|id| repository.object(&store, id).unwrap().position)
-    .collect();
-  let mut answer = Answer::objects(&Positions::of(positions));
+  let mut answer = Answer::objects(&positions_of(&repository, &store, &wanted));
   answer.filter = Some(filter);
   let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
   assert_eq!(
@@ -388,7 +384,61 @@ fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
   let loose = counters.loose_whole + counters.loose_deltas;
   assert_eq!(
     (counters.parts_copied, counters.parts_by_entry, loose),
-    (2, 0, 1)
+    (2, 1, 0)
+  );
+  repository.release(&mut store).unwrap();
+}
+
+/// The positions of `ids` in `repository`.
+fn positions_of(
+  repository: &Repository,
+  store: &ContentStore,
+  ids: &BTreeSet<ObjectId>,
+) -> Positions {
+  Positions::of(
+    ids
+      .iter()
+      .map(|id| repository.object(store, id).unwrap().position)
+      .collect(),
+  )
+}
+
+/// A-653 (a part read entry by entry judges its wanted entries alone, so a fetch of a few objects from a large part
+/// costs the few). Do: push one version over forty files, encode it, and answer two of the files one by one. Expect:
+/// read back, exactly the two; their part read entry by entry with two entries judged, of its forty.
+#[test]
+fn only_the_wanted_entries_of_a_part_are_judged() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let files: Vec<Made> = (0..40)
+    .map(|at| blob(format, format!("file {at}\n").as_bytes()))
+    .collect();
+  let names: Vec<String> = (0..40).map(|at| format!("f{at:02}")).collect();
+  let entries: Vec<(Mode, &[u8], ObjectId)> = names
+    .iter()
+    .zip(&files)
+    .map(|(name, file)| (Mode::File, name.as_bytes(), file.id))
+    .collect();
+  let root = tree(format, &entries);
+  let head = commit(format, root.id, &[], 1);
+  let mut objects = vec![head.clone(), root];
+  objects.extend(files.iter().cloned());
+  push_and_move(&mut repository, &mut store, objects, &[(1, Some(head.id))]).unwrap();
+  repository
+    .encode_fragments(&mut store, (1, 0), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  let wanted: BTreeSet<ObjectId> = [files[7].id, files[31].id].into_iter().collect();
+  let answer = Answer::objects(&positions_of(&repository, &store, &wanted));
+  let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert_eq!(
+    (counters.parts_by_entry, counters.entries_judged),
+    (1, 2),
+    "{counters:?}"
   );
   repository.release(&mut store).unwrap();
 }

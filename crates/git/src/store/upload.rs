@@ -132,6 +132,8 @@ pub struct UploadCounters {
   pub parts_copied: u64,
   /// Kept parts read entry by entry.
   pub parts_by_entry: u64,
+  /// Entries of parts read entry by entry that were judged: the wanted ones alone.
+  pub entries_judged: u64,
   /// Entries copied with the header they were kept with.
   pub entries_copied: u64,
   /// Entries copied with a header written again: an offset delta's distance in this pack, or its base named by id.
