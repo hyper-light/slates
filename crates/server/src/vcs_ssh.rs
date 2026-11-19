@@ -830,6 +830,15 @@ impl<S: SshSite> Link<S> {
         let _ = self.learning(|tracker, waits| tracker.prove(waits));
         self.enter(Phase::Setup);
       }
+      SessionEvent::KeyWanted(wanted) => {
+        let holding = self
+          .site
+          .lookup(&wanted.user, &wanted.key, &wanted.blob)
+          .await;
+        if self.session.key_resolved(holding).is_err() {
+          return Some(Why::Refused);
+        }
+      }
       SessionEvent::Exec {
         command,
         git_protocol,
