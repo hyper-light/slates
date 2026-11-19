@@ -256,8 +256,9 @@ impl VcsStores {
     self.content.as_ref()
   }
 
-  /// The content store, lent for one step that gives back what something beside a repository's store holds in it: a
-  /// hook's view, whose holds outlive no repository entry (`crate::git_hooks`, A-665 part 2).
+  /// The content store, lent for one step that gives back what something beside a repository's
+  /// store holds in it: a hook's view, whose holds outlive no repository entry
+  /// (`crate::git_hooks`, A-665 part 2).
   pub(crate) fn content_mut(&mut self) -> Option<&mut ContentStore> {
     self.content.as_mut()
   }
@@ -434,8 +435,9 @@ pub(crate) fn settle(state: &mut ShardState) {
   }
 }
 
-/// Runs `step` over the stores with the room [`lend`] gives for `bytes`, then settles: a push's steps here, and a hook's
-/// view opened and sealed over the store (`crate::git_hooks`, A-665 part 2).
+/// Runs `step` over the stores with the room [`lend`] gives for `bytes`, then settles: a push's
+/// steps here, and a hook's view opened and sealed over the store (`crate::git_hooks`, A-665
+/// part 2).
 pub(crate) fn within_budget<T>(
   state: &mut ShardState,
   bytes: u64,
@@ -500,8 +502,9 @@ impl SealedPush {
     self.repository
   }
 
-  /// Its objects, in quarantine until a commit takes them: what a hook's view shows of the push (`crate::git_hooks`,
-  /// A-665 part 2), in git's quarantine for `pre-receive` and among the repository's packs for `update`.
+  /// Its objects, in quarantine until a commit takes them: what a hook's view shows of the push
+  /// (`crate::git_hooks`, A-665 part 2), in git's quarantine for `pre-receive` and among the
+  /// repository's packs for `update`.
   pub(crate) fn push(&self) -> &Push {
     &self.push
   }

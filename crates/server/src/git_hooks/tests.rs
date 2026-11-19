@@ -17,7 +17,7 @@ use slates_ipc::protocol::VcsTool;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 
 use super::{
-  GitHookRan, GitHookRefused, GitHookSite, GitHookView, Presented, ReadRef, Shows, ShownPush, run,
+  GitHookRan, GitHookRefused, GitHookSite, GitHookView, Presented, ReadRef, ShownPush, Shows, run,
 };
 use crate::daemon::LIVENESS_BUDGET_NS;
 use crate::repository::push::{BranchAppended, BranchChange};
@@ -111,7 +111,12 @@ fn present(state: &ShardState, view: &GitHookView, root: &Path) {
       let path = if directory.is_empty() {
         listed.name.clone()
       } else {
-        [directory.as_slice(), b"/".as_slice(), listed.name.as_slice()].concat()
+        [
+          directory.as_slice(),
+          b"/".as_slice(),
+          listed.name.as_slice(),
+        ]
+        .concat()
       };
       let at = root.join(std::ffi::OsStr::from_bytes(&path));
       match listed.node {
@@ -206,7 +211,10 @@ fn shown(
   let presented = view.presented_at(&dir.path);
   view.close(state);
   assert_balanced(before, opened, sealed, footprint(state));
-  assert!(!one_unit || turns > packs, "{turns} turns for {packs} packs");
+  assert!(
+    !one_unit || turns > packs,
+    "{turns} turns for {packs} packs"
+  );
   Shown { dir, presented }
 }
 
@@ -341,7 +349,12 @@ fn report_files() {
     .map(|entries| {
       entries
         .filter_map(Result::ok)
-        .map(|entry| (entry.file_name().to_string_lossy().into_owned(), magic(&entry.path())))
+        .map(|entry| {
+          (
+            entry.file_name().to_string_lossy().into_owned(),
+            magic(&entry.path()),
+          )
+        })
         .collect()
     })
     .unwrap_or_default();
@@ -629,7 +642,11 @@ fn a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing() {
     let (hooked, main) = repository(state, "hooked", VcsTool::Git);
     let (other, _) = repository(state, "other", VcsTool::Git);
     let (mercurial, _) = repository(state, "hg", VcsTool::Mercurial);
-    let (first, old) = commit_of(&[(b"README".to_vec(), b"first\n".to_vec())], &[], FIRST_DATE);
+    let (first, old) = commit_of(
+      &[(b"README".to_vec(), b"first\n".to_vec())],
+      &[],
+      FIRST_DATE,
+    );
     let read = push_through(state, (hooked, main), &first, (None, old, tree_of(&first)));
     let at = |version| ReadRef {
       name: MAIN,
@@ -642,7 +659,11 @@ fn a_view_the_store_cannot_show_is_refused_by_kind_and_holds_nothing() {
     for (refs, pushed, on) in [
       (vec![at(read + 1)], None, hooked),
       (vec![at(read), at(read + 1)], None, hooked),
-      (vec![at(read)], Some(ShownPush::Quarantined(&foreign)), hooked),
+      (
+        vec![at(read)],
+        Some(ShownPush::Quarantined(&foreign)),
+        hooked,
+      ),
       (Vec::new(), None, mercurial),
     ] {
       refused.push(GitHookView::open(state, on, (refs.as_slice(), MAIN), pushed).err());

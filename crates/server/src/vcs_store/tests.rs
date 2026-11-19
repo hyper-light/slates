@@ -980,7 +980,11 @@ pub(crate) fn owner() -> Principal {
 }
 
 /// Creates repository `name` of `tool` on the shard: its id and its root green.
-pub(crate) fn repository(state: &mut ShardState, name: &str, tool: VcsTool) -> (RepositoryId, DbVolumeId) {
+pub(crate) fn repository(
+  state: &mut ShardState,
+  name: &str,
+  tool: VcsTool,
+) -> (RepositoryId, DbVolumeId) {
   let reply = dispatch(
     state,
     1,
@@ -1096,7 +1100,11 @@ fn begun_at(
 }
 
 /// A push begun on the shard with `objects` admitted whole.
-pub(crate) fn begun(state: &mut ShardState, repository: RepositoryId, objects: &[Brought]) -> GitPush {
+pub(crate) fn begun(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  objects: &[Brought],
+) -> GitPush {
   begun_at(state, repository, objects, 0)
 }
 

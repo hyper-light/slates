@@ -236,7 +236,12 @@ impl GitHookView {
       return Err(GitHookRefused::ForeignPush);
     }
     let opened = within_budget(state, 0, |stores| {
-      open_over(stores, repository, (refs, head), pushed.map(ShownPush::pushed))
+      open_over(
+        stores,
+        repository,
+        (refs, head),
+        pushed.map(ShownPush::pushed),
+      )
     });
     let (view, charged) = match opened {
       Ok(opened) => opened,
