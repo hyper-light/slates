@@ -260,7 +260,11 @@ fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
   check_answers(name, &view);
   let carried = pull::bookmark_entries(&view, &mut room()).unwrap();
   assert_eq!(
-    bookmark_lines(carried.iter().filter_map(|mark| Some((mark.name, mark.node?)))),
+    bookmark_lines(
+      carried
+        .iter()
+        .filter_map(|mark| Some((mark.name, mark.node?)))
+    ),
     listed("divergent-served-bookmarks.txt")
   );
   assert_eq!(view.census(), Census::default());
