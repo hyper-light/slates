@@ -984,7 +984,13 @@ fn split_response(response: &[u8]) -> Option<(&[u8], [u8; DIGEST_BYTES])> {
     .iter()
     .rposition(|byte| *byte == RESPONSE_SEPARATOR)?;
   let user = response.get(..separator)?;
-  let hex = response.get(separator.checked_add(1)?..)?;
+  let digest = decode_digest(response.get(separator.checked_add(1)?..)?)?;
+  Some((user, digest))
+}
+
+/// A digest's 32 lowercase hexadecimal digits decoded, as `cram.c`'s `hex_decode` decodes them; `None` for any other
+/// length or byte.
+fn decode_digest(hex: &[u8]) -> Option<[u8; DIGEST_BYTES]> {
   if hex.len() != DIGEST_BYTES.checked_mul(2)? {
     return None;
   }
@@ -995,7 +1001,7 @@ fn split_response(response: &[u8]) -> Option<(&[u8], [u8; DIGEST_BYTES])> {
     };
     *slot = hex_value(*high)?.checked_shl(HEX_BITS)? | hex_value(*low)?;
   }
-  Some((user, digest))
+  Some(digest)
 }
 
 /// The value of a lowercase hexadecimal digit (`cram.c`'s `hex_to_int` takes no uppercase).

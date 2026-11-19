@@ -1199,18 +1199,18 @@ fn the_answer_is_read_as_vparse_tuple_reads_it_and_judged_in_serve_cs_order() {
   }
 }
 
-/// A-599 (`EXTERNAL`, `serve.c` 657-668: the tunnel's user, failing a token that names another; here a token is
-/// compared whole, and an absent one is an empty one): answer `EXTERNAL` on a tunnel to a repository allowing it with no
-/// token, an empty one, the user's own name, another name, the user's name with a NUL after it, and with a byte after
-/// it; expect the tunnel's user for the first three and "Requested username does not match" for the rest; and through
-/// no tunnel, `EXTERNAL` not listed.
+/// A-599 (`EXTERNAL`, `serve.c` 657-668: the tunnel's user, failing a token that names another; an absent token is an
+/// empty one): answer `EXTERNAL` on a tunnel to a repository allowing it with no token, an empty one and the user's own
+/// name; expect the tunnel's user each time.
 #[test]
-fn an_external_token_must_name_the_tunnels_user_whole_or_nothing() {
-  let tunnel = || both_repository(b"svn+fixture://127.0.0.1/both", true);
+fn an_external_token_naming_no_one_or_the_tunnels_user_takes_the_tunnels_user() {
   let accepted: [&[u8]; 3] = [b"( ) ", b"( 0: ) ", b"( 5:alice ) "];
   for token in accepted {
     let response = cat(&[b"( EXTERNAL ", token, b") "]);
-    let progress = read_auth_response(tunnel(), &response);
+    let progress = read_auth_response(
+      both_repository(b"svn+fixture://127.0.0.1/both", true),
+      &response,
+    );
     assert!(
       matches!(
         progress,
@@ -1221,10 +1221,20 @@ fn an_external_token_must_name_the_tunnels_user_whole_or_nothing() {
       String::from_utf8_lossy(&response)
     );
   }
+}
+
+/// A-599 (`EXTERNAL`, `serve.c` 657-668, a token compared whole where `strcmp` stops at a NUL): answer `EXTERNAL` on a
+/// tunnel with another name, the user's name with a NUL after it, and with a byte after it; expect "Requested username
+/// does not match" each time; and through no tunnel, `EXTERNAL` not listed.
+#[test]
+fn an_external_token_naming_another_user_whole_is_refused() {
   let refused: [&[u8]; 3] = [b"( 3:bob ) ", b"( 6:alice\0 ) ", b"( 6:alicex ) "];
   for token in refused {
     let response = cat(&[b"( EXTERNAL ", token, b") "]);
-    let progress = read_auth_response(tunnel(), &response);
+    let progress = read_auth_response(
+      both_repository(b"svn+fixture://127.0.0.1/both", true),
+      &response,
+    );
     assert!(
       matches!(
         progress,
@@ -1502,15 +1512,13 @@ fn items_past_the_handshakes_bounds_are_refused_typed_after_what_was_due() {
 /// `SVN_ERR_RA_SVN_REQUEST_SIZE`, an item past its bound (`svn_error_codes.h`: the ra_svn category's start plus 9).
 const SVN_ERR_RA_SVN_REQUEST_SIZE: u32 = 210_009;
 
-/// A-599 (calls out of turn are the caller's error: typed, with no Subversion number, writing nothing and changing
-/// nothing): on a fresh handshake, open, refuse, challenge, fail a challenge and give a key; expect each refused and the
-/// greeting alone written; read the answer, then read again and give a key before naming the repository; expect those
-/// refused; then name it, authenticate, and expect every call after the handshake refused.
+/// A-599 (calls out of turn are the caller's error: typed, with no Subversion number, writing nothing): on a fresh
+/// handshake, before the client's answer, open, refuse, challenge, fail a challenge and give a key; expect each refused
+/// and the greeting alone written.
 #[test]
-fn a_call_out_of_turn_is_refused_typed_and_changes_nothing() {
+fn every_call_before_the_clients_answer_is_out_of_turn_and_writes_nothing() {
   let mut written = Vec::new();
-  let answer = stock_answer(b"svn://127.0.0.1/anon");
-  let mut server = Server::new(roomy(&answer), &mut written).unwrap();
+  let mut server = Server::new(PARSED_ITEM_BYTES, &mut written).unwrap();
   let greeting = written.clone();
   assert_eq!(
     server.open(&anon_repository(), &mut written),
@@ -1531,24 +1539,37 @@ fn a_call_out_of_turn_is_refused_typed_and_changes_nothing() {
   assert_eq!(server.key(None, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(written, greeting);
   assert_eq!(Refused::OutOfTurn.subversion_code(), None);
+}
+
+/// A-599 (calls out of turn, while the handshake awaits its caller): read the client's answer, then read again and give
+/// a key before naming the repository; expect both refused and nothing written; then name it, and expect a second
+/// naming refused.
+#[test]
+fn a_call_while_the_handshake_awaits_its_caller_is_out_of_turn() {
+  let mut written = Vec::new();
+  let answer = stock_answer(b"svn://127.0.0.1/anon");
+  let mut server = Server::new(roomy(&answer), &mut written).unwrap();
+  let greeting = written.clone();
   assert!(matches!(
     server.receive(&answer, &mut written),
     Ok(Progress::Opened { .. })
   ));
-  assert_eq!(
-    server.receive(&answer, &mut written),
-    Err(Refused::OutOfTurn)
-  );
+  assert_eq!(server.receive(&answer, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(server.key(None, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(written, greeting);
-  assert_eq!(
-    server.open(&anon_repository(), &mut written),
-    Ok(Access::Asked)
-  );
+  assert_eq!(server.open(&anon_repository(), &mut written), Ok(Access::Asked));
   assert_eq!(
     server.open(&anon_repository(), &mut written),
     Err(Refused::OutOfTurn)
   );
+}
+
+/// A-599 (calls out of turn, after the handshake): authenticate anonymously; expect the handshake done, then every
+/// call refused and nothing more written, the client's next item being a command for the caller's own reader.
+#[test]
+fn every_call_after_the_handshake_is_out_of_turn() {
+  let mut written = Vec::new();
+  let mut server = asked(anon_repository(), &mut written);
   let response = b"( ANONYMOUS ( 0: ) ) ";
   assert!(matches!(
     server.receive(response, &mut written),
@@ -1556,12 +1577,13 @@ fn a_call_out_of_turn_is_refused_typed_and_changes_nothing() {
   ));
   assert!(server.established());
   let done = written.clone();
+  assert_eq!(server.receive(response, &mut written), Err(Refused::OutOfTurn));
   assert_eq!(
-    server.receive(response, &mut written),
+    server.refuse(Unserved::NoAccess, &mut written),
     Err(Refused::OutOfTurn)
   );
   assert_eq!(
-    server.refuse(Unserved::NoAccess, &mut written),
+    server.challenge_failed(&mut written),
     Err(Refused::OutOfTurn)
   );
   assert_eq!(written, done);
