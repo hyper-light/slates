@@ -381,10 +381,11 @@ const SMALL_ROOM: u64 = 256;
 /// Shape: a run of bytes past [`SMALL_ROOM`].
 const PAST_SMALL_ROOM: usize = 300;
 
-/// AC-HG.9, A-650 part 1: do send the owner's `heads`, to a site admitting each request 256 bytes, by a path past
-/// them and with an argument header past them; then the owner's `heads` of a Mercurial repository whose policy holds
-/// a rule only git reads (a damaged record). Expect `414` for the path, `431` for the header, and `500` for the
-/// damaged policy, which is never judged without its rule.
+/// AC-HG.9, A-650 part 1 and a query's `414` (its own piece): do send the owner's `heads`, to a site admitting each
+/// request 256 bytes, by a path past them, by a query whose fields are past them, and with an argument header past
+/// them; then the owner's `heads` of a Mercurial repository whose policy holds a rule only git reads (a damaged
+/// record). Expect `414` for the path and the query alike, `431` for the header, and `500` for the damaged policy,
+/// which is never judged without its rule.
 #[test]
 fn requests_past_their_room_and_a_damaged_policy_are_refused() {
   let mut small = HgSite::new(
@@ -412,6 +413,12 @@ fn requests_past_their_room_and_a_damaged_policy_are_refused() {
     refused_status(
       &mut small,
       "GET",
+      &format!("/hg?cmd=heads&pad={long}"),
+      &[OWNER_BEARER],
+    ),
+    refused_status(
+      &mut small,
+      "GET",
       "/hg?cmd=heads",
       &[OWNER_BEARER, argument.as_str()],
     ),
@@ -420,6 +427,7 @@ fn requests_past_their_room_and_a_damaged_policy_are_refused() {
   assert_eq!(
     judged,
     [
+      Some(Status::URI_TOO_LONG),
       Some(Status::URI_TOO_LONG),
       Some(Status::FIELDS_TOO_LARGE),
       Some(Status::INTERNAL_SERVER_ERROR),
