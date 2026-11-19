@@ -17,7 +17,9 @@
 //! - holders are knocked offline (every message to them lost) and come back from their persisted state
 //!   (`Acceptor::to_persisted`, `from_persisted`);
 //! - owners pause and resume, and a resumed one goes on proposing under its old epoch as if nothing happened;
-//! - the master hands out new epochs throughout.
+//! - the master hands out new epochs throughout: a takeover moves the authority to a host under a new generation, and an
+//!   owner's restart gives its host the next epoch under the same authority and generation, its old incarnation perhaps
+//!   still running.
 //!
 //! **The history checks**, after every event that can break them:
 //! - **Agreement** (TotalOrder): no position commits two values, under any epochs.
@@ -27,8 +29,12 @@
 //! - **ReadSafety**: at every committed position, every majority's highest-epoch entry is the committed value
 //!   (`FencedLedger.tla`'s rule, over the holders' state, an offline holder's included).
 //!
-//! Two mutations are kept as tests, so the checks are known to bite: a promise that raises no fence, and a restart that
-//! forgets it. Each breaks a history in some seed.
+//! Three mutations are kept as tests, so the checks are known to bite: a promise that raises no fence, a holder's
+//! restart that forgets it, and an owner that adopts on a minority's promises. Each breaks a history in some seed. The
+//! fence carries the load only across an owner's restart: a takeover installs a new generation, and a holder promises
+//! only under the generation it has installed, so it refuses the old owner by its authority before its fence is asked.
+//! Without owner restarts, neither fence mutation broke a seed (the Mac Studio, 2026-11-18, 48 seeds at `f = 1` and
+//! `f = 2`).
 // Test harness: an unwrap or indexing here is a failed test.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -64,8 +70,10 @@ const BACK: u64 = 40;
 /// Shape: per step, per mille: an owner paused, and a paused one resumed.
 const PAUSE: u64 = 8;
 const RESUME: u64 = 25;
-/// Shape: per step, per mille: the master hands out the next epoch.
+/// Shape: per step, per mille: the master hands out the next epoch under a new generation (a takeover), and the
+/// current owner's host restarts under the next epoch with its authority unchanged.
 const TAKEOVER: u64 = 6;
+const OWNER_RESTART: u64 = 4;
 /// Shape: per step, per mille: an owner, or the master, sends its outstanding message again.
 const RESEND: u64 = 250;
 /// Shape: per mille: a new cut that is cut both ways.
@@ -124,6 +132,8 @@ enum Mutation {
   PromiseWithoutFence,
   /// A holder back from offline has forgotten its fence.
   RestartWithoutFence,
+  /// An owner adopts on `f` promises, one short of a quorum.
+  PromoteOnMinority,
 }
 
 /// One owner: the epoch the master handed a host, and its rounds.
@@ -142,6 +152,7 @@ struct Owner {
 #[derive(Clone, Copy, Debug, Default)]
 struct Counts {
   takeovers: u64,
+  owner_restarts: u64,
   adopted_a_record: u64,
   commits: u64,
   stale_issued: u64,
@@ -156,6 +167,7 @@ struct Counts {
 impl Counts {
   fn add(&mut self, other: Counts) {
     self.takeovers += other.takeovers;
+    self.owner_restarts += other.owner_restarts;
     self.adopted_a_record += other.adopted_a_record;
     self.commits += other.commits;
     self.stale_issued += other.stale_issued;
@@ -375,6 +387,8 @@ struct World {
   holders: BTreeMap<HostId, Holder>,
   owners: BTreeMap<u64, Owner>,
   epoch: u64,
+  generation: u64,
+  authority_owner: HostId,
   in_flight: Vec<Message>,
   cuts: BTreeSet<(HostId, HostId)>,
   values: u64,
@@ -405,6 +419,8 @@ impl World {
       holders,
       owners: BTreeMap::new(),
       epoch: 0,
+      generation: 0,
+      authority_owner: HostId(0),
       in_flight: Vec::new(),
       cuts: BTreeSet::new(),
       values: 0,
@@ -448,16 +464,32 @@ impl World {
     }
   }
 
-  /// The master hands the next epoch to a host and installs its authority on every holder by messages.
+  /// The master hands the next epoch to a host under a new generation and installs its authority on every holder by
+  /// messages.
   fn takeover(&mut self) {
-    self.epoch += 1;
+    self.generation += 1;
     self.history.counts.takeovers += 1;
     let host = OWNERS[self.rng.below(OWNERS.len())];
+    self.authority_owner = host;
+    self.begin_owner(host);
+  }
+
+  /// The current owner's host restarts under the next epoch with its authority unchanged (the same generation and owner,
+  /// so nothing is installed): its old incarnation may still run, and only the fence tells the two apart.
+  fn owner_restart(&mut self) {
+    self.history.counts.owner_restarts += 1;
+    let host = self.authority_owner;
+    self.begin_owner(host);
+  }
+
+  /// A new owner of the next epoch on `host`, under the current generation: it installs the authority and runs phase one.
+  fn begin_owner(&mut self, host: HostId) {
+    self.epoch += 1;
     let prepare = Prepare {
       owner: host,
       object: OBJECT,
       epoch: HostEpoch(self.epoch),
-      generation: self.epoch,
+      generation: self.generation,
     };
     self.owners.insert(
       self.epoch,
@@ -478,10 +510,10 @@ impl World {
 
   /// The master sends the newest authority to every holder (the configuration's distribution, retried).
   fn install_latest(&mut self) {
-    if let Some(owner) = self.owners.get(&self.epoch) {
+    if self.generation > 0 {
       let authority = Authority {
-        generation: self.epoch,
-        owner: owner.prepare.owner,
+        generation: self.generation,
+        owner: self.authority_owner,
       };
       self.send_to_holders(HostId(0), &Body::Install(authority));
     }
@@ -499,8 +531,11 @@ impl World {
   }
 
   fn faults(&mut self) {
-    if self.epoch == 0 || (self.epoch < MAX_EPOCHS && self.rng.chance(TAKEOVER)) {
+    let more = self.epoch < MAX_EPOCHS;
+    if self.epoch == 0 || (more && self.rng.chance(TAKEOVER)) {
       self.takeover();
+    } else if more && self.rng.chance(OWNER_RESTART) {
+      self.owner_restart();
     } else if self.rng.chance(RESEND) {
       self.install_latest();
     }
@@ -690,7 +725,11 @@ impl World {
 
   /// A promise reaches every owner of its host that is not paused; the one it binds counts it.
   fn on_promise(&mut self, to: HostId, promise: &Promise) {
-    let quorum = self.quorum;
+    let promotion = if self.mutation == Mutation::PromoteOnMinority {
+      self.quorum - 1
+    } else {
+      self.quorum
+    };
     let mut promoted = None;
     for (epoch, owner) in &mut self.owners {
       if owner.paused
@@ -709,7 +748,7 @@ impl World {
       {
         owner.best = Some(reported.clone());
       }
-      if owner.promised.len() >= quorum {
+      if owner.promised.len() >= promotion {
         owner.promoted = true;
         promoted = Some((*epoch, owner.best.clone()));
       }
@@ -819,6 +858,7 @@ fn the_fenced_register_holds_its_invariants_under_the_network_nemesis() {
     assert!(broken.is_empty(), "f = {f}: {broken:#?}");
     for (what, count) in [
       ("takeovers", counts.takeovers),
+      ("owner restarts", counts.owner_restarts),
       ("adoptions of a record", counts.adopted_a_record),
       ("commits", counts.commits),
       ("stale records issued", counts.stale_issued),
@@ -838,8 +878,8 @@ fn the_fenced_register_holds_its_invariants_under_the_network_nemesis() {
 }
 
 /// The checks' teeth, kept as a test: a holder that answers a prepare without raising its fence. Do: run the nemesis
-/// with that mutation at `f = 1` and `f = 2`. Expect: some seed breaks StaleNeverCommits, Continuity or Agreement, since
-/// a resumed old owner then commits past the new owner's promotion.
+/// with that mutation at `f = 1` and `f = 2`. Expect: some seed breaks a check, since an owner's old incarnation, which
+/// shares its authority and generation, then commits past the new incarnation's promotion.
 #[test]
 fn a_promise_that_raises_no_fence_breaks_the_register_under_the_nemesis() {
   for f in [1, 2] {
@@ -852,8 +892,8 @@ fn a_promise_that_raises_no_fence_breaks_the_register_under_the_nemesis() {
 }
 
 /// The checks' teeth, kept as a test: a holder back from offline that has forgotten its fence. Do: run the nemesis
-/// with that mutation at `f = 1` and `f = 2`. Expect: some seed breaks a check, since a resumed old owner's records are
-/// then accepted again by a holder that had promised a newer epoch.
+/// with that mutation at `f = 1` and `f = 2`. Expect: some seed breaks a check, since an owner's old incarnation's
+/// records are then accepted again by a holder that had promised its new one.
 #[test]
 fn a_restart_that_forgets_the_fence_breaks_the_register_under_the_nemesis() {
   for f in [1, 2] {
@@ -861,6 +901,20 @@ fn a_restart_that_forgets_the_fence_breaks_the_register_under_the_nemesis() {
     assert!(
       !broken.is_empty(),
       "f = {f}: no seed broke a check with restarts that forget the fence"
+    );
+  }
+}
+
+/// The checks' teeth, kept as a test: an owner that adopts on `f` promises, one short of a quorum. Do: run the nemesis
+/// with that mutation at `f = 1` and `f = 2`. Expect: some seed breaks a check, since a minority's report can miss a
+/// record that committed, so the adopted record is older than it (Continuity) and the owner writes over it.
+#[test]
+fn an_owner_that_promotes_on_a_minority_breaks_the_register_under_the_nemesis() {
+  for f in [1, 2] {
+    let (broken, _) = run(f, SEEDS, Mutation::PromoteOnMinority);
+    assert!(
+      !broken.is_empty(),
+      "f = {f}: no seed broke a check with owners that promote on a minority"
     );
   }
 }
