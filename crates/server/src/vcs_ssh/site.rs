@@ -4,6 +4,10 @@
 //! runs ([`Command`]). The lookup is the one record of principals' credentials both edges read (`crate::credentials`,
 //! A-625 part 3): [`RecordKeys`] leaves every key to it, and [`ToolSite`] answers by [`key_holder`] (A-651 part 3).
 //!
+//! **Where an `exec` is decided** ([`SshSite::locate`], A-651 part 4). A command that names a repository is decided on
+//! the shard whose partition its name routes to (D-14), as the HTTP edge decides a head: the edge moves the connection
+//! there first (`super`'s module doc), so the repository's record, its policy and its store are read on their own shard.
+//!
 //! **The production site** ([`ToolSite`]) decides an `exec` in A-625 part 2's order for HTTP, each refusal written to the
 //! client's standard error with its tool's own wording and exit status, as the tool's own program would refuse it:
 //! 1. The repository, for git and Mercurial, whose commands name it: the one whose name is the path as the client sent
@@ -36,8 +40,7 @@ use slates_vfs::clock::Clock;
 
 use super::git::UploadCommand;
 use super::receive::ReceiveCommand;
-use crate::vcs_http::git::Repositories;
-use crate::vcs_http::git::{ShardLender, StoreLender};
+use crate::vcs_http::git::{Located, Repositories, ShardLender, StoreLender};
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key no credential in the record has the id of (A-651 part 3).
@@ -131,6 +134,9 @@ pub(crate) trait SshSite {
   /// Who holds `key` (its blob `blob`) for `user`, when the connection's lookup could not say yet
   /// (`Holding::Unknown`): the record's answer, looked up where the record lives (A-651 part 3).
   async fn lookup(&mut self, user: &[u8], key: &UserKey, blob: &[u8]) -> Holding<Principal>;
+  /// Where the repository `command` names lives: here, or the runtime shard its connection moves to, so the `exec` is
+  /// dispatched on the shard that holds the repository (A-651 part 4). A command that names none is decided here.
+  fn locate(&self, command: &Asked) -> Located;
   /// Dispatches `command` for `principal`, with the `GIT_PROTOCOL` value sent before it.
   fn dispatch(
     &mut self,
@@ -576,6 +582,15 @@ where
         Holding::Nobody
       }
     }
+  }
+
+  /// The shard of the repository the command names (the module doc): the name its path gives, located on the partition
+  /// it routes to; a command that names none (Subversion's tunnel), or a path that is no name, is decided here.
+  fn locate(&self, command: &Asked) -> Located {
+    asked(command)
+      .1
+      .and_then(repository_name)
+      .map_or(Located::Here, |name| self.repositories.locate(name))
   }
 
   fn dispatch(

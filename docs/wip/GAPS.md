@@ -332,7 +332,18 @@
 > after the tests' client race its runs met was fixed on its own (4a74c118), 34 of 34 and 38 of 38, fmt clean).
 > Owed: the daemon starting the edge, the stores, main's live OpenSSH `git clone` with an enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
-> connection there (main's finding, its own piece).
+> connection there (main's finding, closed by A-651 part 4).
+> **A-651 part 4 (2026-11-19, g294; the SSH edge serves a repository from its owner shard):** an `exec` that names a
+> repository another shard's partition holds (`SshSite::locate`, by its name's route, D-14) moves its connection there
+> whole, as the HTTP edge moves one: the socket's handle, the session with its keys, sequence numbers and channel, the
+> client's unread bytes, the waits, the phase and the proven principal, one spawn on that shard's control channel;
+> there it takes a seat as a new connection would (a free one, the most overdue's, or a wait bounded by the seats) and
+> the `exec` is dispatched where the repository's record, policy and store live; each shard keeps its own edge state
+> (`vcs_ssh::keep_here`), only the listener's holding the host key (macOS arm64, Mac Studio: red at aa16b067,
+> `--lib -- vcs_ssh` 28 of 30, the two new tests failing; green 30 of 30, and 30 of 30 as it landed over main
+> 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684);
+> Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival waiting
+> for a full shard's seat and of one refused past the bound; main's runs.
 > **A-683 (2026-11-19, g302; git's receive-pack behind the SSH edge, A-654's SSH call):** the SSH site's
 > `git-receive-pack '<repo>'` runs A-654 part 2's driver (`vcs_ssh::receive`) on the shard the site found the
 > repository on, its owner, with no store lender (the driver reads the store the shard holds, A-662), each step lent the
@@ -341,9 +352,10 @@
 > client's bytes handed to the driver as they arrive, the checked push answered with git's report and exit 0, a flush
 > alone with nothing, refusals in git's `die` words with 128 (a shard not lent in the site's not-served words). Stock
 > git 2.50.1's `create` push over a real SSH session to the production site lands (`--lib -- vcs_ssh git_push`: red 28
-> passed and the 2 new failing at 954ed792e; with `vcs_http`, 74 of 74 over main b94ae6e90, r286, and 77 of 77 merged
-> over 770ae8826, r313; macOS arm64, Mac Studio). Owed: a connection moved to the shard its repository's name routes
-> to (with the daemon's start of the edge, A-684); main's live `git push` over SSH.
+> passed and the 2 new failing at 954ed792e; with `vcs_http`, 74 of 74 over main b94ae6e90, r286, then 77, 82 and 84
+> of as many over each merge as main moved, r313, r354 and r375, the last over 2f73eb075; macOS arm64, Mac Studio).
+> Owed: a push over a connection A-651 part 4 moved to its owner shard (a two-shard daemon, as the HTTP site's push
+> test runs); main's live `git push` over SSH.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

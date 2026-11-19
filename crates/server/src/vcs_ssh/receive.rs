@@ -37,8 +37,9 @@
 //! whole: a line a ref the pusher may read, and a line a command.
 //!
 //! **Where.** The driver runs where the connection is served, on the shard whose own partition the site found the
-//! repository on (`crate::vcs_http::daemon_edge::ShardRepositories`). Moving a connection to the shard its repository's
-//! name routes to, as the HTTP edge moves one, is owed with the daemon's start of the SSH edge (GAPS).
+//! repository on (`crate::vcs_http::daemon_edge::ShardRepositories`): the repository's owner, since the edge moves a
+//! connection whose `exec` names a repository another shard holds to that shard before the site dispatches it (A-651
+//! part 4, as the HTTP edge moves one), and the command, made there, is lent that shard's state.
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_git::http::Version;
