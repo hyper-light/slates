@@ -11344,7 +11344,8 @@ it). Fast path: if `last_changed[path] <= base` for every path in the increment,
 `Accept` with no range work at all; this is what a basis buys, and it never decides a conflict. An operation marked
 node-exclusive (`NODE_EXCLUSIVE`, the high bit of `OpRecord.flags`; §4.17.4 item 3, A-542) is judged whole instead: any
 change to its path after the base, in any dimension, is a `Conflict`, never accepted by range or by identity, as a stock
-Subversion client's commit needs.
+Subversion client's commit needs. A `Copy` (A-586) is always judged so, as an addition: its destination's tree must be
+absent at the head and unchanged after the base, and its source's tree unchanged after the version it copies.
 
 > **Status (2026-11-19, A-612: a work never changes bytes it did not see).** Two rules the verdict now keeps, each a
 > defect A-596's oracle found:
@@ -11478,6 +11479,11 @@ which of its pending paths green has moved under (awareness, never load-bearing)
 > only it held back a node a unit under the shard's slice (`Lineage::retire`, `Release`, `repository::run_releases`);
 > a recovery rebuilds members in the order they joined, a branch by branching its source again at its version. A green
 > standing alone is served as before, and `CreateGreen { base }` still walks its base.
+>
+> **Status (2026-11-19, A-586).** Built in the engine: `Copy` (`OpKind` 16), a path's tree copied by reference and
+> recorded once at its destination (`crates/merge/src/engine/copy.rs`; the "Copies" bullet below). Owed: a checkpoint
+> of a green holding a copy, a rebase that restates one, a copy from a version its source changed after, and a copy
+> onto a path its own increment removes (the A-586 entry).
 
 - **The maps.** A green's current values (files, IPC nodes, directories, modes, symbolic links, hard links, attributes,
   and the reverse map of hard links) are eight persistent radix trees keyed by the path's bytes (Morrison's PATRICIA,
@@ -11495,6 +11501,19 @@ which of its pending paths green has moved under (awareness, never load-bearing)
   none, and the readers that list a version list the current keys and the history's together. A green seeded from its
   origin therefore records no history for the origin's keys (until 2026-11-19 each had a version-0 entry, which held
   every origin file's bytes a second time), and a green made at another's version starts with none.
+- **Copies (A-586).** `Copy` copies a path's tree at a version (Subversion's copy-from revision) to an absent
+  destination, by reference in every map, when the source's tree did not change after that version, so the head's tree
+  is the version's. It is recorded once, never key by key: an appearance record at the destination (the version, the
+  source, the source's version), one entry of the change index and one `last_changed` entry for the destination, which
+  stands for its tree. A key reads by the latest copy above it while it holds what that copy gave it (its own last
+  change, if any, is older): its current value from the copy's version on, its own history before. Its first change
+  after the copy records, at the copy's version, the value the copy gave it, as the one history rule records a key's
+  first change at version 0; a change in the copy's own version records none. Its last change for the verdict is the
+  later of its own and the copy's, and an edit declared against a base before the copy that replaced its file is a
+  conflict. The set hash adds one entry a copy (its destination, source and source version), which stands for every
+  entry the copy brought: the sum is the state's entries plus each copy's entry less the entries of the tree it copied,
+  O(1) a copy and recomputed alike by every holder that applies the same versions. A branch made before a copy cuts the
+  copy's tree from its maps (`Ptrie::cut`, a graft's inverse) and takes the copy's entry out of its identity.
 - **A lineage.** Greens made from one another's versions share their maps' arenas through a `Lineage`, which owns the
   arenas and lends them to one green for the length of one call, so every node has one owner and nothing is shared by
   pointer (R2). `branch(from, v)` forks `from`'s eight roots (one count each), sets back in the new green every key whose
@@ -12163,6 +12182,16 @@ engine: the verdict, rebase, position mapping, the register).
 > stock git 2.50.1's own HTTP traffic with `http-backend` (its heads and inflated bodies, SHA-256 checked) and hostile
 > input at every cut. Owed: the edge that reads sockets (TLS, authentication, `100 Continue`, the services' bodies
 > streamed through, the staged close).
+>
+> **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
+> reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
+> server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
+> peeled line folded into the tag before it, the shallow lines), the client's `want` (the first with its capabilities),
+> `have`, `done`, `shallow`, `deepen`, `deepen-since`, `deepen-not` and `filter`, the server's `NAK` and `ACK` (plain,
+> `continue`, `common`, `ready`), the shallow-update, and `ERR` from either side. Each line is written with or without
+> its LF as git writes that line, and read either way, as git's readers read it. A capability git does not define is
+> kept by name; a malformed object name or line is refused by kind and place. Proven against fifteen exchanges and six
+> advertisements stock git wrote under protocol.version 0 and 1. Serving a v0 or v1 fetch is piece 14's next part.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -12216,7 +12245,7 @@ speaks receive-pack's exchange of the pack protocol [B: gitprotocol-pack] on eit
   wait-for-done`, `server-option`, `object-format=<the repository's>`, `session-id` and `object-info`. `ls-refs` lists
   only `unborn`, as git does (`ls-refs.c` `ls_refs_advertise`): `symrefs`, `peel` and `ref-prefix` are the command's
   base arguments, which need no feature [B: gitprotocol-v2 "ls-refs"]. A v0 or v1 fetch (the old ref advertisement and
-  its negotiation) is a later piece.
+  its negotiation) is piece 14; its codecs are built (A-604), and serving one is owed.
 - receive-pack capabilities: `report-status`, `report-status-v2`, `delete-refs`, `ofs-delta`, `atomic`,
   `push-options`, `side-band-64k`, `quiet`, `object-format` and `agent`.
 
@@ -13021,6 +13050,17 @@ and export by landing).
 > request bodies are stock svn 1.15.0's own, recorded against a responder on the Mac Studio. Owed (part 2): the
 > update-report and replay editor drives, PROPPATCH, LOCK and UNLOCK, `list-report` and `file-revs-report`; main's run
 > captures against Apache with `mod_dav_svn`.
+>
+> **Status (2026-11-19, A-586).** Built: the engine's `Copy` (A-542's second half, part 2; `slates-merge`'s
+> `engine/copy.rs`): `OpKind` 16, its source's version Subversion's copy-from revision, judged node-exclusively as an
+> addition and refused typed where FSFS's commit would not take it (a present or changed destination, the root as
+> destination, nothing to copy) or where this piece does not yet copy (a source changed after its version, a hard link
+> in the source, a move or second copy into a copied tree); recorded once at its destination (an appearance record,
+> one change-index and one `last_changed` entry), read by the latest copy above a key, edited beneath in its own
+> increment, replayed from its chain entry, taken away by a branch made before it, and hashed as one entry. The root
+> is a source like any other (`svn copy ^/ ^/snap`). Owed: a checkpoint of a green holding a copy, a rebase restating
+> one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
+> own increment removes), each in the A-586 entry.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -13337,8 +13377,6 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > `apr_fnmatch` table, the documentation's files, and a naive oracle over generated rule sets. Where 1.14.x's code
 > departs from its own documentation, the documentation is followed and each case is a named test:
 > - the root has no segments (`lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there);
-> - a recursive question at the root weighs every rule (Subversion weighs only those an empty segment matches, so it
->   grants recursive read at a root above a denied `/secret`);
 > - a suffix pattern leaves the segment as it was for the other rules of its level (`lookup` reverses it in place);
 > - `[//x]` is refused (Subversion takes it for the root).
 >
@@ -13459,8 +13497,9 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    vectors and hostile input (a word too long, nesting too deep, a number past 64 bits, a string past its cap, a stream
    cut anywhere).
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (its maps built,
-   A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation owed, with
-   §4.17.1's pieces 1 and 4).
+   A-542 part 1: `graft` of the source's `subtree` at the destination in every map; the engine's operation built,
+   A-586: one record a copy, read by the latest copy above a key, one identity entry a copy; owed from it: the
+   checkpoint, the rebase, a copy from a changed source's older version, and the replace with history).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
    revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
    object store's, §4.17.1 shared piece 3).
@@ -37265,7 +37304,8 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   tests failed and the two older `dims` tests passed; green, `cargo test --locked -p slates-merge --lib dims::` 6 of
   6 and the crate's whole `--lib` 26 of 26. Until part 2 calls them, the copies are reached only from tests, which the
   module states as a dead-code expectation that fails once part 2 calls them.
-- **Copy, part 2, owed: the engine's operation.** `OpKind::Copy`, appended as wire value 16, its source in `src` as a
+- **Copy, part 2: the engine's operation (built 2026-11-19 as A-586, which settles the three questions below; its
+  entry has the design, tests and evidence).** `OpKind::Copy`, appended as wire value 16, its source in `src` as a
   rename's is; applied by `copy_tree` in every map; judged node-exclusively (a destination present, or changed since the
   base, conflicts). The one history rule (A-534) reads a key with no history as present since version 0, which a
   grafted key is not, so the copy is recorded as one entry for the destination's prefix: an appearance record (the
@@ -41064,14 +41104,11 @@ Applied in the same change to:
   4762). Rules eclipsed by a later `**` are taken out (`trim_tree`). A path is walked level by level: the deepest
   level with a matching rule decides, the rule defined last there wins, and a level without one inherits. A recursive
   question takes the least access over the reached nodes' subtrees, as Subversion's does, so a rule that cannot
-  govern any path beneath still counts. A question without a path takes Subversion's global rights, transcribed. A
+  govern any path beneath still counts; at the root, every rule is beneath. A question without a path takes Subversion's global rights, transcribed. A
   principal whose rules all give one access is answered by one comparison, counted by `uniform_answers`.
 - **Departures from 1.14.x's code**, each a named test; Subversion's own documentation is followed:
   - the root has no segments: `lookup` walks `/` as one empty segment, so `[:glob:/*]` decides the root there,
     although `*` "Matches any single non-empty path segment" (`authz.h`);
-  - a recursive question at the root weighs every rule: Subversion's weighs only the rules an empty segment matches,
-    so with `[/] * = rw` and `[/secret] * =` it grants recursive read at `/`, and a commit that copies `/` would pass
-    over `/secret`;
   - a suffix match leaves the segment as it was: `lookup` reverses it in place for the rest of the level, so
     `[:glob:/**/public]` beside `[:glob:/*.secret]` misses `/public` and matches `/cilbup`;
   - `[//x]` is refused as non-canonical: `parse_rule_path` takes it for the root and ignores the rest.
@@ -41090,14 +41127,14 @@ Applied in the same change to:
     `test_authz_prefixes`, `test_authz_recursive_override`, `test_authz_pattern_tests`, `groups_authz`, the in-repo
     tests, `issue_4060`, and `commit_editor_authz` as the questions item 10 has a commit ask); APR's `testfnmatch.c` at
     flags 0; the `conf/authz` `svnadmin create` writes; the book's examples and the 1.10 and 1.14 notes with their
-    stated outcomes; every refusal kind with its line and Subversion error; the four departures; hostile input;
+    stated outcomes; every refusal kind with its line and Subversion error; the three departures; hostile input;
   - the naive oracle (256 generated rule sets in assorted styles, every principal, four repositories, every path to
     depth three), held non-vacuous by a rich hand-built set whose answers take every access, fall below beneath, and
     are walked;
   - the crate's lib suite, 110 of 110.
 - **Owed:** the server's questions (piece 7); the file read from the repository and compiled per file identity;
   `svnserve`'s `force-username-case`; `mod_authz_svn`'s questions (piece 13). Main's: clippy and `xtask` over the
-  module, and the four departures confirmed against stock Subversion (run request).
+  module, and the three departures confirmed against stock Subversion (run request).
 
 ### A-595 — HTTP/1.1's request codec as a crate the version-control servers share, and git's smart HTTP routes over it (2026-11-19, g076b, UI goal 92; §4.17.2 "Transports" item 1 and "Pieces (git)" piece 8's first part)
 Applied in the same change to:
@@ -41183,6 +41220,234 @@ order beneath a path read whole).
   of the first failing path's `{/a/f}`. Green (04:39 UTC): 155 of 155 in 1.14 s; A-602's census: 408 refused commits,
   38 of them decided by the order; A-592's census unchanged in kind. `cargo fmt` clean. Clippy, `xtask check` and the
   doc gate are main's (the run-request queue).
+
+### A-604 — protocols v0 and v1's codecs: the ref advertisement, a fetch's request and negotiation, and the shallow-update, read and written as stock git 2.50.1 does (2026-11-19, g230, UI goal 92; §4.17.2 "Pieces (git)" piece 14, its first part, and "The wire"; after A-582 and A-600)
+Applied in the same change to:
+- §4.17.2's status and "The wire", and GAPS (the §4.17 entry);
+- `crates/git` (`v0.rs`, new; its tests; `fixtures/v0` with `make-v0-fixtures.sh` and `SHA256SUMS`; `object_name.rs`:
+  the null name, a hex writer, and the decimal reader and writer it now shares with `v0`; `lib.rs`).
+- **The lines, and how git ends them.** With LF, as git writes them: the advertisement's lines (`version 1`, the first
+  ref with its capabilities after a NUL, `capabilities^{}` for a repository with no refs, the other refs, peeled lines,
+  `shallow`; `upload-pack.c`'s `write_v0_ref`, `receive-pack.c`'s `show_ref`), `want`, `have` and `done`
+  (`fetch-pack.c`), `ACK` and `NAK` (`get_common_commits`). Without: the request's `shallow` (`shallow.c`'s
+  `write_shallow_commits`), `deepen`, `deepen-since`, `deepen-not` and `filter` (`fetch-pack.c`), the shallow-update's
+  `shallow` and `unshallow` (`send_shallow`, `send_unshallow`), and `ERR` (`packet_writer_error`).
+- **What a reader takes.** One LF off a line's end and object names of either case, as git's readers take them and as
+  gitprotocol-pack asks ("the receiver MUST NOT complain if it is not present"; "both MUST treat obj-id as
+  case-insensitive"). It is stricter than git's readers where they take what no git writes, each refused by kind:
+  - bytes after an object name (`get_oid_hex` reads the digits it needs and ignores the rest);
+  - a depth or a time in octal or hexadecimal, or with a sign (`strtol` and `parse_timestamp` with base 0);
+  - `ACK` followed by any word that merely contains a status (`get_ack` searches with `strstr`);
+  - a peeled line that does not follow its ref ("MUST be immediately after the ref itself");
+  - a ref line after the first carrying capabilities (`connect.c` warns and ignores them), a first line with no NUL,
+    an empty capability list (the grammar's `capability *(SP capability)`).
+  `deepen 0` is refused as `upload-pack` refuses it ("Invalid deepen"), although the document calls a depth of 0 no
+  request; `deepen-since` refuses the one time git refuses, its `-1`.
+- **Capabilities.** Kept by name, in their order, unknown ones included, each checked against the grammar: a name of
+  `a-z`, `0-9`, `-` and `_`; a value of any byte above space but DEL (an agent and a session id are printable ASCII,
+  a symref's target is a ref name that may hold UTF-8, and git's `parse_feature_value` ends a value at a space or a
+  tab). The first `object-format` names the advertisement's format, SHA-1 when there is none; one naming no format git
+  knows is refused. A list read from a line borrows its bytes; a list to write may be the caller's own
+  (`Capabilities::listed`), and both compare and write alike. Whether a server refuses a client's capability it never
+  advertised is the serving piece's decision: gitprotocol-capabilities says it MUST, and git 2.50.1's `upload-pack`
+  does not.
+- **Messages.** The advertisement and the shallow-update are decoded whole: walked once to check them and count their
+  lists, the exact total charged to the caller's admission, and walked again to build. Given part of one, a reader
+  answers `None`. A message that breaks its grammar is refused where its packet begins: `Unexpected` (a special packet
+  in its body, a peeled line out of place, a ref after the shallow lines or after `capabilities^{}`, a `shallow` after
+  an `unshallow`), `Version` (`version 2` is protocol v2's advertisement, and git refuses `version 0`), `ServerError`
+  (`ERR` where a line was due), or `Line` with the line's own refusal. A writer checks a whole message in a measuring
+  pass before it writes its first byte, so a refusal writes nothing.
+- **Golden vectors.** `make-v0-fixtures.sh` (git 2.50.1, Apple Git-155, on the MacBook, 2026-11-19) records six
+  advertisements (v0, v1, an empty repository's, a shallow one's, a SHA-256 one's, `receive-pack`'s), nine whole
+  exchanges between stock `fetch-pack` and `upload-pack` under protocol.version 0 and 1 copied by a tee, and six
+  requests written by the script with `upload-pack`'s stateless answers (`multi_ack`, `multi_ack_detailed` ending
+  `done` and reaching `ready`, the plain mode, `unshallow`, an unknown want's `ERR`), with `SHA256SUMS`, which the
+  tests check every file against first. The first run's deepening fetch kept only its second round, which followed a
+  tag, because the tee wrote both rounds under one name: the capture now refuses a second `upload-pack` under one name
+  and that fetch runs with `--no-tags`, so the vector holds `deepen-relative`, `deepen 1` and a shallow-update with
+  `unshallow`. Two further runs wrote the same 39 files. gitprotocol-pack's own examples are vectors too, each long
+  line as its length counts it.
+- **Tests** (`cargo test --locked -p slates-git --lib`, Mac Studio M3 Ultra, kiln, 2026-11-19: 203 of 203 over main
+  with this change, 25 new; `cargo fmt -p slates-git -- --check` clean; each test and helper read against the lint
+  wall's cognitive-complexity threshold of 10 by count, every `assert_eq!` counting one). Every advertisement decodes to the refs `refs.txt` recorded and writes back; every line of every exchange
+  reads and writes back; each depth request is answered by its shallow-update; the document's examples read and write
+  as printed; unknown capabilities are kept; lines read with or without LF and in either case; refusal tables for
+  client lines, server lines, advertisements and shallow-updates; writers refuse and write nothing; every cut of a
+  message waits and every cut of a line reads as its bytes say; every bit flip is refused by kind or reads as its
+  bytes say; the admission is charged exactly; generated lines, advertisements and shallow-updates round-trip.
+  - Red first: the tests against the module with every entry point refusing, 24 of 25 failed (the checksum test alone
+    passes).
+  - Red nine ways by mutation, each on a copy and caught by the test that names its rule: a peeled line taken after
+    any ref; the request's `shallow` written with LF; bytes after an object name ignored; `deepen-since` taking `-1`;
+    capability names of either case; `ERR` inside a message read as a ref; the advertisement's lists not charged; the
+    advertisement written without its checking pass (a refused write left its first lines in the output); a `shallow`
+    after an `unshallow` taken. A comment-only control passed 25 of 25.
+  - A trap, recorded: red and green checkouts of one workspace built in one `CARGO_TARGET_DIR` gave green the red
+    binary, because cargo's fingerprint for the path package named the red checkout's files; green reported red's
+    failures until `cargo clean -p slates-git`. One target directory per arm, as the later red runs used.
+- **Owed of piece 14:** serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and
+  neither, `no-done`, the stateless rounds over HTTP), then `packfile-uris` and `bundle-uri`.
+
+### A-586 — The merge engine's `Copy`: a tree copied by reference, recorded once at its destination, read by the latest copy above a key, and hashed as one entry (2026-11-19, g295 for UI goal 92; §4.16 "The state's maps" and "The verdict", §4.17.4 item 3 and piece 3; A-542, A-534, A-202, A-547, A-575)
+Applied in the same change to: §4.16 (a status block, the "Copies" bullet of "The state's maps", the verdict's sentence on
+`Copy`), §4.17.4 (a status block, piece 3), the A-542 entry (its part 2 bullet points here), GAPS (the §4.17.4 entry),
+`crates/merge/src/ops_doc.rs` (`OpKind::Copy`), `crates/merge/src/engine.rs` (the readers, the last-change lookups, the
+seeds, the identity's fold and recount, the checkpoint's and the rebase's refusals, replay, `Green::walked`,
+`copies_grafted`, `copies_refused`), `crates/merge/src/engine/copy.rs` (new), `crates/merge/src/engine/branch.rs`,
+`crates/merge/src/chain_entry.rs` (`Applied::CopyTree`), `crates/merge/src/dims.rs` and `dims/copy.rs` (the root's copy,
+`cut_tree`, `holds_tree`), `crates/merge/src/ptrie.rs` (`Ptrie::cut`, `has_prefix`, `Shared::len`),
+`crates/merge/src/map.rs`, `crates/merge/src/engine/reanchor.rs` (A-596's comments on a copied file), and the tests
+(`engine/copy_tests.rs`, new; ptrie's and dims' copy tests; `crates/merge/tests/ops_doc.rs`, which pinned 16 as
+unknown).
+- **What was there.** A-542 part 1 copied a path's tree by reference in every map of a green's state, reached only from
+  its tests. The engine had no operation for it, and its one history rule (A-534) reads a key with no history as held
+  since version 0, which a grafted key is not. The identity's set hash (A-202) adds one entry a key, so a graft would
+  have cost it the tree.
+- **The operation.** `OpKind::Copy`, wire value 16, appended. `path` is the destination, `src` the source's index in the
+  path table (remapped by `canonicalize`, as a rename's), `at` the version of the source copied (Subversion's copy-from
+  revision: FSFS copies only from a committed revision, `libsvn_fs_fs/tree.c` `copy_helper`, "Copy from mutable tree not
+  currently supported"), `len` unused.
+- **What it copies.** The head's tree of the source, by reference in every map (part 1's copies, O(the two paths'
+  lengths)), when the source's tree did not change after the version named: then the head's tree is that version's.
+  Unchanged means no change-index entry in `(version, head]` at the source or beneath it and no copy above it made
+  since. A copy from a version its source changed after is refused (`RenameRename`, as A-542 names a move whose source
+  changed). That refusal is narrower than FSFS, which copies any revision: owed below.
+- **The verdict, node-exclusive whatever the flag: an addition.** Each refusal is a conflict naming the destination,
+  and the green is unchanged:
+  - the destination is present at the head, or holds a key beneath it, in any map: `CreateCreate` (an add of a present
+    path is out of date in `libsvn_repos/commit.c`'s `add_file_or_directory`);
+  - the destination's tree changed after the increment's base: `CreateCreate`;
+  - the destination is the root: `TypeChanged` (an editor adds a path under a parent it opened, never the root, which
+    is always present);
+  - the source version is past the head, the source's tree holds nothing, two copies name one destination, or one
+    copy's destination lies in another's tree: `TypeChanged`;
+  - the source's tree holds a hard link: `TypeChanged` (settled below).
+- **One record a copy, never one a key.** An appearance record at the destination (the version, the source, the
+  source's version), one change-index entry and one `last_changed` entry for the destination. In the change index, the
+  destination stands for its whole tree: `changed_between` and `changes_after` name it once.
+- **How a key reads.** A key reads by the latest copy above it (its own path or an ancestor's, one lookup a level of its
+  depth, nothing on a green that never copied) while it holds what that copy gave it, that is while its own last change,
+  if any, is older than the copy. Then its current value answers from the copy's version on, and its own history
+  before, absent where it has none. Otherwise the one history rule answers as before. Every reader goes through this:
+  bytes, pages and lengths, the bases, IPC nodes, directories, modes, links and attributes.
+- **A key's first change after its copy.** It records, at the copy's version, the value the copy gave it, as the one
+  history rule records a key's first change at version 0. A change in the copy's own version records none, since the
+  copy's value never stood at a version.
+- **The verdict's last change of a key.** It is the later of its own and the latest copy above it. An edit declared
+  against a base before a copy that replaced its file is a delete/modify conflict: no delta records the replacement,
+  so the edit could not be moved onto the copied bytes. Before this, a remove and a copy would have shifted it past
+  them.
+- **Operations on the copied tree in its own increment** (a commit that copies a directory and edits beneath it) are
+  judged against the copied tree, the source's at the head, and applied after the copy. Nothing can intervene in a
+  tree that was absent, so they are checked only for fitting what the copy brings. A file edited there is recorded as a
+  rename's edited destination is (A-547, `Applied::Copied`), so replay splices the edits into the source's bytes as the
+  verdict did. A move or a hard link with an end in a copied tree, and a second copy into one, are refused
+  (`TypeChanged`; owed).
+- **Settled: the identity, relative to its copies.** The set hash adds one entry a copy, naming its destination, its
+  source and the source's version. It never adds the entries the copy brought: the copy's entry stands for them, so a
+  copy costs the identity O(1) whatever the tree holds. Every key's entry moves as it always did: out at its value
+  before a change, in after it. A key's first change after a copy also takes out the entry the copy gave it (read at
+  the source, at the source's version). So the sum is the state's entries plus, for each copy, its own entry less the
+  entries of the tree it copied:
+  - it is a function of the state and its copies, recomputed alike by every holder that applies the same versions;
+  - any key that differs changes it;
+  - `head_identity_from_scratch` recounts it so, reading each copy's source at its version, which holds while the
+    histories reach back that far.
+
+  A hash relative to the copy's own frame was weighed and set aside. It moves a subtree's sum in one step only when the
+  source's own relative sum is kept. That holds for a source that is itself a copy, not for a trunk built commit by
+  commit, which would need a sum per directory, a Merkle tree of the radix tree. A Merkle tree would make the
+  identity a function of the state alone and a copy O(its path); it is a change of A-202's format, recorded as owed.
+  A green made at another's version inherits its source's sum, which holds the entries of copies made at or before the
+  version, and not their records. So its own recount differs from its identity, and a holder replaying the branch from
+  the same record computes the same identity.
+- **Settled: hard links.** Subversion has none. A copy whose source's tree holds one is refused by kind
+  (`TypeChanged`), so the reverse map of links (`links_to`) is never copied. Copying it would have made the copy a
+  target of the source's links; copying a link would have added a name per link.
+- **Settled: the root's copy.**
+  - As a source, the root is supported. A stock client sends `svn copy ^/ ^/snap`: `libsvn_client/copy.c` refuses a copy
+    into its own child only between working copies (1.14.x, the check at its line 3089). FSFS copies the root's node
+    like any other.
+  - The root's tree is every key. The whole map is held and grafted beneath the destination, and the root's own key,
+    which comes with it, is moved to the destination's own key. For attributes, the root's own prefix is cut away from
+    beneath the destination, since every other key is not one prefix.
+  - As a destination, the root is refused: it is always present, and no editor adds it.
+- **With A-596's review comments**, which landed on main beside this: `Green::reanchor` follows a comment through the
+  path's own content history. A path that holds a copy's value now reads, from the copy's version on, as a path with no
+  history, so a comment on a copied file moves with it. Before, the path's history, which ends in an older file's
+  removal, refused it as no file. A comment on that older file is still outdated by the removal.
+- **With A-612's removals**, which also landed beside this: the verdict keeps both rules, a file removed after the
+  base (`file_removed`) and a copy above the path made after it, each a delete/modify conflict. A-612 records a rename
+  onto a file as that file's removal, and a copy's own increment records its edits beneath it as a rename's edited
+  destination is, so a file the version's own copy brought and its increment edited records none (`Green::copied_in`):
+  it replaced no file.
+- **A branch made before a copy** (`Lineage::branch` at a version below one) cuts the copy's tree from its maps first, by
+  `Ptrie::cut`, a graft's inverse: one descent, the prefix's path copied, the subtree unlinked whole, O(the prefix's
+  length). It takes the copy's entry out of its identity and puts back the entry the copy gave each key that changed
+  after it, then sets keys back as before.
+- **Cost.** A copy's verdict reads the change index since the increment's base and since the source's version (O(the
+  entries since), as a branch's does) and makes descents in each map. Its commit is part 1's copies plus one record. It
+  walks no map: `Green::walked` does not move. A reader pays the depth lookup only on a green with copies.
+- **Owed**, each refused typed or answered `None` today, never wrong:
+  - a checkpoint of a green holding a copy at or before its version: it must list the copy's tree key by key and carry
+    the identity's sum. Until then `checkpoint` answers `None` and the service keeps the chain whole, counting
+    `merge.checkpoint.unavailable`.
+  - a rebase restating a copy: the deriver's `VolumeOp::Copy`. Today the rebase answers `TypeChanged` on the
+    destination.
+  - a copy from a version its source changed after: the source's changes since set back at the destination, as a
+    branch sets back, and recorded in the chain entry so replay reads no folded history.
+  - Subversion's replace with history: a copy onto a path its own increment removes, which needs the removed tree held
+    by reference.
+  - moves, links and second copies into a copied tree in one increment.
+  - the server's consumers of the change index (attachments' invalidation) treating a copy's destination as its tree.
+  - the appearance records live as long as the green: a key they cover reads by them whatever the fold. Their bytes are
+    charged with the change index's, and the chain bounds them while no checkpoint folds it.
+- **Tests** (`crates/merge/src/engine/copy_tests.rs`, and ptrie's and dims' own).
+  - A copy reads as its copy at every version, walks no map and is named once by the change index.
+  - A copy of 4,096 files leaves the walk counter and the histories' bytes unmoved and grows the change index by
+    exactly its entries and record.
+  - A key's first change after its copy records the copied value at the copy's version.
+  - Edits beneath a copy in its own increment land on what it brought and replay from the encoded chain entry.
+  - The root's copy.
+  - Every refusal, the green unchanged.
+  - An edit declared before a replacing copy conflicts.
+  - Branches before and after a copy hash as greens that applied the same versions.
+  - A review comment on a copied file moves with it (A-596), red first on the merged tree.
+  - A file a copy brought and its own increment edited records no removal (A-612), live and replayed, red first.
+  - A green with a copy is not checkpointed from the copy's version; a rebase of a copy is refused.
+  - The oracle: generated histories on a green and on a reference green that makes each copy key by key through the
+    engine's plain operations. The two decide every copy alike and read alike at every version, their change indexes
+    agree with each copy's destination opened into its tree, every copy walks no map, the identity equals its recount,
+    and the chain replays.
+  - ptrie's oracle with cuts among its generated steps, and a cut's cost test; dims' root copy and cut.
+- **Evidence** (the Mac Studio M3 Ultra, kiln, 2026-11-19 04:28 to 04:40 UTC, load 5 to 8, debug, fresh clones of the
+  branch).
+  - `cargo test --locked -p slates-merge --lib`: 44 of 44 at `91a40198a` (6.26 s) and at `4d55bfeba` (6.28 s), the
+    oracle's paths widened between them; `cargo fmt --check` clean at both.
+  - The oracle's census over 128 histories at `4d55bfeba`: 73 copies accepted, 546 refused, 8 from the root, 25 from a
+    version before the head, 12 into their own source's tree, 90 refused for a source changed since, and 29 keys put or
+    taken beneath a copy. At `91a40198a`, with eight paths: 32 accepted, 514 refused.
+  - Red at `91a40198a`, each on a copy of the tree with one guard taken out, the whole `--lib` suite run:
+    - readers ignoring copies: 7 copy tests failed;
+    - the identity forgetting the entries copies gave: 4 failed;
+    - the verdict letting an occupied destination through: 2 failed;
+    - a branch keeping a copy made after it: 1 failed;
+    - the verdict ignoring a source changed after its version: 2 failed;
+    - same-increment operations judged against the head: 2 failed.
+  - The first green run failed one test, the cost test's own ordering: it read the retained figures, which walk the
+    files for their sizes, after the walk counter. The ordering was fixed; the copy walked nothing.
+  - Merged with main twice, A-596's comments and then A-612's removals among its changes. At `5998d368a` (04:46 UTC),
+    52 of 52 run, 2 of main's ignored. At `f5f1fdc05` (04:51 UTC, load 9 to 11), 58 of 58, 5.71 s, `cargo fmt --check`
+    clean, the census that run (generated cases differ run to run): 58 accepted, 594 refused, 5 from the root, 23 from
+    an older version, 9 into their own source's tree, 107 refused for a changed source, 11 keys changed beneath a copy.
+  - Red first for each interaction fix, on a copy of the merged tree:
+    - `reanchor.rs` as it was before its fix: the comment test alone failed, `Err(NotLines)` where `Ok(Moved(0..4))`
+      was due;
+    - `engine.rs` and `copy.rs` without `copied_in`: the same-increment test alone failed, the edited copied file
+      recorded as removed.
+  - Main's: the integration suites (`crates/merge/tests/`, `ops_doc.rs` among them), clippy and `cargo xtask check`
+    (the run-request queue).
 
 ### A-611 — Mercurial's revlogs read as stock 7.2 reads them: version 1 inline and split, version 2 behind its docket, chunks raw, zlib and zstd, every chain rebuilt and every node checked (2026-11-19, g291 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, the import half; §4.9; A-588, A-607)
 Applied in the same change to: §4.17.3 (its status and piece 3), `crates/hg` (`revlog`, new; `fixtures/revlogs/` and

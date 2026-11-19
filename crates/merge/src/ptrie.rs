@@ -16,7 +16,9 @@
 //! tree does, and a forked one at most one node per edge of the key's path, counted in [`Nodes::copied`]. A subtree is
 //! one held node ([`Ptrie::subtree`]); a graft ([`Ptrie::graft`]) copies the path to its destination and the subtree's
 //! top node, and shares everything beneath: O(the destination's length + the top node's fan-out), whatever the subtree
-//! holds. Each node keeps the number of values beneath it, so a map's length and a graft's are known without a walk.
+//! holds. A cut ([`Ptrie::cut`], A-586) is a graft's inverse: the path to a prefix copied and the subtree beneath it
+//! unlinked whole, held for the caller, O(the prefix's length). Each node keeps the number of values beneath it, so a
+//! map's length, a graft's and a cut's are known without a walk.
 //!
 //! **Values with a resource.** A value that names something outside the arena (a sealed block of file bytes) is told
 //! when a copy of a node makes one more holder of it and when the last node holding it is freed ([`Holders`]); a value
@@ -282,6 +284,18 @@ pub struct Shared {
   skip: usize,
 }
 
+impl Shared {
+  /// The values the held subtree holds: its top node's count, no walk.
+  pub fn len<V>(&self, nodes: &Nodes<V>) -> usize {
+    nodes.count(self.slot)
+  }
+
+  /// Whether the held subtree holds no value (never, for one [`Ptrie::subtree`] or [`Ptrie::cut`] gave).
+  pub fn is_empty<V>(&self, nodes: &Nodes<V>) -> bool {
+    self.len(nodes) == 0
+  }
+}
+
 /// Why a graft was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraftRefused {
@@ -455,6 +469,37 @@ impl<V: Clone> Ptrie<V> {
     let (slot, _, skip) = self.under(nodes, prefix)?;
     nodes.hold(slot);
     Some(Shared { slot, skip })
+  }
+
+  /// Whether a key starts with `prefix`: one descent, no walk and no count taken.
+  pub fn has_prefix(&self, nodes: &Nodes<V>, prefix: &[u8]) -> bool {
+    self.under(nodes, prefix).is_some()
+  }
+
+  /// Takes every key that starts with `prefix` out of this map, held as one subtree for a graft or to be given back
+  /// ([`Ptrie::drop_subtree`]): one descent, the nodes on the prefix's path copied where another holder names them, and
+  /// the subtree's top node unlinked, whatever the subtree holds; the link's hold becomes the subtree's. `None`, and
+  /// nothing copied, when no key starts with it. The inverse of a graft: what a green made at a version before a copy
+  /// takes away (A-586).
+  pub fn cut(
+    &mut self,
+    nodes: &mut Nodes<V>,
+    prefix: &[u8],
+    holders: &mut impl Holders<V>,
+  ) -> Option<Shared> {
+    self.under(nodes, prefix)?;
+    let root = self.root?;
+    if prefix.is_empty() {
+      // Every key starts with the empty prefix: the whole map goes, the map's hold on its root the subtree's.
+      self.root = None;
+      return Some(Shared {
+        slot: root,
+        skip: 0,
+      });
+    }
+    let (root, cut) = cut_at(nodes, root, prefix, true, holders);
+    self.root = root;
+    cut
   }
 
   /// Gives a held subtree back without grafting it.
@@ -801,20 +846,29 @@ fn remove_at<V: Clone>(
   if is_root {
     return (Some(slot), removed);
   }
+  (tidied(nodes, slot, holders), removed)
+}
+
+/// The node at `slot`, below a map's root, after a change beneath it: freed when it is left with no value and no child,
+/// replaced by its only child when it is left a bare edge (the child takes the edge's bytes before its own), else itself.
+fn tidied<V: Clone>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  holders: &mut impl Holders<V>,
+) -> Option<Slot> {
   let (bare, children) = match nodes.node(slot) {
     Some(node) => (node.value.is_none(), node.children.clone()),
-    None => return (None, removed),
+    None => return None,
   };
   if !bare {
-    return (Some(slot), removed);
+    return Some(slot);
   }
   match children.as_slice() {
     [] => {
       nodes.take(slot);
-      (None, removed)
+      None
     }
     [(_, only)] => {
-      // A bare edge with one child: the child takes the edge's bytes before its own, and the edge goes.
       let only = unique(nodes, *only, holders);
       let mut label = nodes
         .node(slot)
@@ -825,10 +879,87 @@ fn remove_at<V: Clone>(
         node.label = label;
       }
       nodes.take(slot);
-      (Some(only), removed)
+      Some(only)
     }
-    _ => (Some(slot), removed),
+    _ => Some(slot),
   }
+}
+
+/// Takes the keys that start with `rest` out from below the node at `slot` (whose own label is matched already), where
+/// some key starts with it ([`Ptrie::cut`]): the node's replacement ([`tidied`] below the root; the root stays) and the
+/// subtree taken out, its top node's count off every node on the way.
+fn cut_at<V: Clone>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  rest: &[u8],
+  is_root: bool,
+  holders: &mut impl Holders<V>,
+) -> (Option<Slot>, Option<Shared>) {
+  let slot = unique(nodes, slot, holders);
+  let found = rest
+    .first()
+    .and_then(|first| nodes.node(slot).and_then(|node| child_of(node, *first)));
+  let Some((index, child)) = found else {
+    return (Some(slot), None);
+  };
+  let label = nodes.node(child).map_or(0, |node| node.label.len());
+  let common = nodes
+    .node(child)
+    .map_or(0, |node| common_prefix(&node.label, rest));
+  let (replacement, cut) = if common == rest.len() {
+    // The prefix ends inside the child's label or at its end: every key below the child starts with it, and the link
+    // to the child is the subtree's hold.
+    (
+      None,
+      Some(Shared {
+        slot: child,
+        skip: common,
+      }),
+    )
+  } else if common == label {
+    cut_at(
+      nodes,
+      child,
+      rest.get(label..).unwrap_or_default(),
+      false,
+      holders,
+    )
+  } else {
+    return (Some(slot), None);
+  };
+  let taken = cut.as_ref().map_or(0, |shared| shared.len(nodes));
+  relink_child(nodes, slot, index, replacement, taken);
+  if is_root {
+    return (Some(slot), cut);
+  }
+  (tidied(nodes, slot, holders), cut)
+}
+
+/// Points the child at `index` of the node at `slot` to `replacement`, or drops it when there is none, and takes the
+/// `taken` values that left with it off the node's count ([`cut_at`]).
+fn relink_child<V>(
+  nodes: &mut Nodes<V>,
+  slot: Slot,
+  index: usize,
+  replacement: Option<Slot>,
+  taken: usize,
+) {
+  let Some(node) = nodes.node_mut(slot) else {
+    return;
+  };
+  match replacement {
+    Some(replacement) => {
+      if let Some(entry) = node.children.get_mut(index) {
+        entry.1 = replacement;
+      }
+    }
+    None => {
+      if index < node.children.len() {
+        node.children.remove(index);
+      }
+    }
+  }
+  node.count = node.count.saturating_sub(taken);
 }
 
 /// A walk of a map in byte order, each node it visits counted.
@@ -947,6 +1078,10 @@ mod tests {
       to: usize,
       dst: Vec<u8>,
     },
+    Cut {
+      map: usize,
+      prefix: Vec<u8>,
+    },
   }
 
   /// Shape: the most maps a history keeps live, so forks of forks happen.
@@ -967,6 +1102,7 @@ mod tests {
       1 => (0..MAPS).prop_map(|map| Step::Fork { map }),
       1 => (0..MAPS).prop_map(|map| Step::Release { map }),
       1 => (0..MAPS, key(), 0..MAPS, key()).prop_map(|(from, src, to, dst)| Step::Graft { from, src, to, dst }),
+      1 => (0..MAPS, key()).prop_map(|(map, prefix)| Step::Cut { map, prefix }),
     ]
   }
 
@@ -1002,11 +1138,12 @@ mod tests {
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(400), ..ProptestConfig::default() }))]
 
-    /// A-534. Do: run generated histories of inserts, removes, forks, releases and grafts over several maps sharing one
-    /// arena. Expect: every map reads as its own copied ordered map would after every step (each key, the byte order,
-    /// every prefix, the length), the tree's shape holds, a change to one map never shows in another, a graft into an
-    /// occupied prefix is refused and changes nothing, and once every map is released the arena holds no node and every
-    /// value has been freed as many times as it was held.
+    /// A-534, A-586. Do: run generated histories of inserts, removes, forks, releases, grafts and cuts over several maps
+    /// sharing one arena. Expect: every map reads as its own copied ordered map would after every step (each key, the byte
+    /// order, every prefix, the length), the tree's shape holds, a change to one map never shows in another, a graft into
+    /// an occupied prefix is refused and changes nothing, a cut takes exactly the keys that start with its prefix (held as
+    /// a subtree of that many values, nothing when none does), and once every map is released the arena holds no node and
+    /// every value has been freed as many times as it was held.
     #[test]
     fn every_fork_and_graft_reads_as_its_own_copy_over_every_history(
       steps in proptest::collection::vec(step(), 0..200),
@@ -1072,6 +1209,20 @@ mod tests {
                   }
                 }
                 None => Ptrie::drop_subtree(&mut nodes, shared, &mut counted),
+              }
+            }
+          }
+          Step::Cut { map, prefix } => {
+            if let Some((trie, model)) = maps[map].as_mut() {
+              let taken: Vec<Vec<u8>> = model.keys().filter(|key| key.starts_with(&prefix)).cloned().collect();
+              let cut = trie.cut(&mut nodes, &prefix, &mut counted);
+              prop_assert_eq!(cut.is_some(), !taken.is_empty());
+              if let Some(cut) = cut {
+                prop_assert_eq!(cut.len(&nodes), taken.len());
+                Ptrie::drop_subtree(&mut nodes, cut, &mut counted);
+              }
+              for key in taken {
+                model.remove(&key);
               }
             }
           }
@@ -1233,5 +1384,44 @@ mod tests {
       Some(&3),
       "a change under the graft showed in its source"
     );
+  }
+
+  /// A-586 (a green made at a version before a copy takes the copy away). Do: fork a map of ten thousand keys under
+  /// `trunk/` and two under `tags/`, then cut `trunk/` from the fork. Expect: the cut holds the ten thousand values,
+  /// visits no node, copies no more nodes than the prefix has bytes, and leaves the fork with the two keys under `tags/`;
+  /// the original still reads every key; and once the cut is given back and both maps released, no node is left.
+  #[test]
+  fn a_cut_takes_a_prefix_away_and_walks_nothing() {
+    let mut nodes: Nodes<u32> = Nodes::default();
+    let mut map: Ptrie<u32> = Ptrie::new();
+    for n in 0..10_000u32 {
+      let key = format!("trunk/dir{}/file{}", n % 31, n);
+      map.insert(&mut nodes, key.as_bytes(), n, &mut Plain);
+    }
+    map.insert(&mut nodes, b"tags/a", 1, &mut Plain);
+    map.insert(&mut nodes, b"tags/b", 2, &mut Plain);
+    let mut fork = map.fork(&mut nodes);
+    let (visited, copied) = (nodes.visited(), nodes.copied());
+    let cut = fork
+      .cut(&mut nodes, b"trunk/", &mut Plain)
+      .expect("keys under trunk/");
+    assert_eq!(cut.len(&nodes), 10_000);
+    assert_eq!(nodes.visited(), visited, "the cut walked the subtree");
+    assert!(
+      nodes.copied() - copied <= b"trunk/".len() as u64,
+      "the cut copied {} nodes",
+      nodes.copied() - copied
+    );
+    assert_eq!(fork.len(&nodes), 2);
+    assert_eq!(fork.get(&nodes, b"trunk/dir3/file3"), None);
+    assert_eq!(fork.get(&nodes, b"tags/b"), Some(&2));
+    assert_eq!(map.len(&nodes), 10_002);
+    assert_eq!(map.get(&nodes, b"trunk/dir3/file3"), Some(&3));
+    assert!(fork.cut(&mut nodes, b"trunk/", &mut Plain).is_none());
+    Ptrie::drop_subtree(&mut nodes, cut, &mut Plain);
+    fork.release(&mut nodes, &mut Plain);
+    map.release(&mut nodes, &mut Plain);
+    assert_eq!(nodes.live(), 0);
+    assert_eq!(nodes.missing(), 0);
   }
 }
