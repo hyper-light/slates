@@ -43,6 +43,7 @@ pub mod increment;
 pub mod map;
 pub mod ops_doc;
 pub mod origin;
+pub mod ptrie;
 pub mod range;
 pub mod replica;
 pub mod splice;
