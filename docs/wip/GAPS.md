@@ -931,12 +931,13 @@
 > **Stock hg's interop tests (2026-11-19, g083, main's piece for UI goal 93):** `crates/cli/tests/cli.rs` drives
 > stock Mercurial 7.2 (`SLATES_TEST_HG`, skipping loudly without it) against a real anchor: a clone with no credentials
 > refused in hg's own words, and a round trip (a fresh history pushed, cloned, a changeset pushed from the clone and
-> pulled back) over the HTTP edge and over the SSH edge. All three are ignored until they can pass, each naming why:
-> stock hg 7.2 crashes on the cleartext edge's Bearer-only `401` (`ValueError` from urllib's digest handler; it reads
-> Basic and Digest challenges alone), so the hg site must offer hg a challenge it reads, and take Basic from a loopback
-> client or serve TLS for a lone anchor (main's decision); no CLI verb makes a repository (`CreateRepository` is sent
-> by the server's tests and the Subversion migration alone); the hg site holds no stores (g303); no daemon starts the
-> SSH edge, and A-679 (g304) serves hg over it.
+> pulled back) over the HTTP edge and over the SSH edge. Each is ignored naming the pieces it waits on, and the last
+> of them to land un-ignores it as its integration test: the daemon's edge serves git's site alone, so hg's request
+> meets `404` (A-680, g303: the hg site's stores and lender); the site's `401` offers Bearer alone, on which stock hg
+> 7.2 crashes (`ValueError` from urllib's digest handler, which reads the first challenge alone), so Basic's challenge
+> goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
+> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); hg's
+> `serve --stdio` on the SSH edge (A-679, g304).
 > Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the SSH edge's loop over `serve::stdio` (A-679,
 > g304, running; the edge itself is A-651's, built); A-662's stores handed to the HTTP site (g303, running) and that loop
 > (their home on each owner shard is built); the learned

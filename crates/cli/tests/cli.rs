@@ -13552,12 +13552,15 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
 /// on the path.
 const STOCK_HG: &str = "SLATES_TEST_HG";
 
-/// Format: the daemon's line naming its SSH edge's port, assumed in the words of the HTTP edge's line: no daemon starts
-/// the SSH edge yet (`crates/server/src/vcs_ssh.rs`, its Owed: "the daemon starting an edge").
+/// Format: the start of the daemon's line naming its SSH edge's address, in the words of the HTTP edge's line (main's
+/// ruling, 2026-11-19); the port follows, and the line names the host key's SHA256 fingerprint too, so [`port_on`]
+/// reads the port's digits alone. A-684 (g299) makes the line with `--vcs-ssh <addr>`; until it lands no daemon starts
+/// the SSH edge (`crates/server/src/vcs_ssh.rs`, its Owed).
 const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
 
-/// Format: the user an SSH test connects as; the key it enrolled proves its principal.
-const SSH_USER: &str = "slates";
+/// Format: the user name stock hg gives, over SSH and as Basic's user name. It proves nothing: the key the test
+/// enrolled proves the principal over SSH, and the token, Basic's password, over HTTP.
+const HG_USER: &str = "slates";
 
 /// Stock Mercurial 7.2's command, or `None` when this host runs none, which the caller skips loudly: the words
 /// [`STOCK_HG`] names, answering `--version` with 7.2's line.
@@ -13625,7 +13628,14 @@ fn hg_nodes(hg: &[String], dir: &str) -> Vec<String> {
 fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<String>) {
   use std::io::{BufRead, Write};
   let mut child = slates()
-    .args(["--instance", instance, "anchor", "--quick", "--shards", SHARDS])
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
     .args(edges)
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -13656,15 +13666,22 @@ fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<Stri
   (anchor, lines)
 }
 
-/// The port named on the line of `lines` that begins with `prefix`.
+/// The port named on the line of `lines` that begins with `prefix`: the digits right after it, so what the line names
+/// after the port (the SSH edge's host key, A-684) is never read as part of it.
 fn port_on(lines: &[String], prefix: &str) -> Option<u16> {
-  lines
-    .iter()
-    .find_map(|line| line.strip_prefix(prefix)?.trim().parse().ok())
+  lines.iter().find_map(|line| {
+    line
+      .strip_prefix(prefix)?
+      .split(|character: char| !character.is_ascii_digit())
+      .next()?
+      .parse()
+      .ok()
+  })
 }
 
-/// Makes a Mercurial repository `name` through the CLI. No verb makes one yet: `CreateRepository` is sent by the
-/// server's tests and the Subversion migration alone. This spelling is the tests' assumption until one lands.
+/// Makes a Mercurial repository `name` through the CLI: `slates repository create <name> --tool hg`, A-685 (g305),
+/// `CreateRepository`'s fields as its flags (main's ruling, 2026-11-19). Until it lands no client verb sends
+/// `CreateRepository`: the server's tests and the Subversion migration alone do.
 fn create_hg_repository(instance: &str, name: &str) {
   let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
   assert_eq!(code, 0, "repository create: {out}{err}");
@@ -13699,26 +13716,32 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
   );
 }
 
-/// A-650 part 1 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a Basic challenge, which 7.2's
-/// client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial 7.2, given no credentials and
-/// no terminal, to clone a repository there. Expect it refused in its own words (`abort: http authorization required
-/// for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without stock hg 7.2
-/// ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 hg crashes ("** unknown exception encountered",
-/// `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, raised at Python 3.12's
-/// `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1): the cleartext edge's `401` offers Bearer
-/// alone, and 7.2 reads Basic and Digest challenges alone (`url.py` lines 402-456; its package names Bearer nowhere).
-/// Measured on the Mac Studio on 2026-11-19 against a stub answering that `401`. Waits on the hg site offering hg a
-/// challenge it reads (reported to main).
+/// A-650 part 1 and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a Basic challenge,
+/// which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial 7.2, given no
+/// credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort: http
+/// authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 the daemon's edge serves git's site
+/// alone (`DaemonSite`), so hg's request is answered `404` (hg: `abort: HTTP Error 404: Not Found`; Mac Studio, kiln
+/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offers Bearer alone, which crashes 7.2
+/// ("** unknown exception encountered", `ValueError: AbstractDigestAuthHandler does not support the following scheme:
+/// 'Bearer'`, raised at Python 3.12's `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1; measured on
+/// the Mac Studio on 2026-11-19 against a stub answering that `401`), since urllib's digest handler reads the first
+/// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
+/// (g258).
 #[test]
-#[ignore = "stock hg 7.2 crashes on the edge's Bearer-only 401 (urllib's ValueError); waits on a challenge hg reads"]
+#[ignore = "waits on A-680 (g303: the hg site's stores and lender) and A-686 (g258: Basic's challenge first; \
+            stock hg 7.2 crashes on a first Bearer challenge)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
-    eprintln!("skipping stock hg's refusal: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)");
+    eprintln!(
+      "skipping stock hg's refusal: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
     return;
   };
   let instance = format!("cli-hg-refused-{}", std::process::id());
   let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port = port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let port =
+    port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
   let scratch = ScratchDir {
     path: build_output_dir("slates-hg-refused"),
   };
@@ -13729,29 +13752,36 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
     "stock hg crashed on the edge's refusal: {err}"
   );
   assert_eq!(code, 255, "{out}{err}");
-  assert!(err.contains("abort: http authorization required for"), "{err}");
+  assert!(
+    err.contains("abort: http authorization required for"),
+    "{err}"
+  );
 }
 
-/// A-650 part 1 (§4.17.3 "Access": Basic with a token as the password). Do: start an anchor with its HTTP edge on
-/// loopback (`--vcs-http 127.0.0.1:0`); make a Mercurial repository through the CLI and a token (`credential token`);
-/// with the token as Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset
-/// from the clone and pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two
-/// changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5: no
-/// CLI verb makes a repository ([`create_hg_repository`]); the hg site holds no repository's store, so every request is
-/// `503` (`NoStores`; g303, the site's served view and lender, pushes included); and a lone anchor's edge is cleartext
-/// and takes Bearer alone, where 7.2 sends Basic, and only after a Basic challenge
-/// ([`stock_hg_without_credentials_is_refused_in_its_own_words`]): the edge taking Basic from a loopback client, or
-/// serving TLS for a lone anchor, is main's decision.
+/// A-650 part 1 and A-686 (§4.17.3 "Access": Basic with a token as the password, over TLS or the loopback edge, main's
+/// ruling of 2026-11-19). Do: start an anchor with its HTTP edge on loopback (`--vcs-http 127.0.0.1:0`); make a
+/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`); with the token as
+/// Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and
+/// pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: as of main 34d10acb5 the CLI has no
+/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), the daemon's edge serves git's site alone and
+/// the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them), and the
+/// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
+/// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
 #[test]
-#[ignore = "waits on g303 (the hg site's stores), a CLI verb making a repository and the edge taking hg's Basic"]
+#[ignore = "waits on A-685 (g305: slates repository create <name> --tool hg), A-680 (g303: the hg site's stores and \
+            lender) and A-686 (g258: Basic with the token as password on the loopback edge, Basic's challenge first)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
-    eprintln!("skipping stock hg over the HTTP edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)");
+    eprintln!(
+      "skipping stock hg over the HTTP edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
     return;
   };
   let instance = format!("cli-hg-http-{}", std::process::id());
   let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port = port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let port =
+    port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
   create_hg_repository(&instance, "r");
   let (code, out, err) = run(&instance, &["credential", "token"]);
   assert_eq!(code, 0, "credential token: {out}{err}");
@@ -13764,7 +13794,7 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let prefix = format!("http://127.0.0.1:{port}/");
   let config: Vec<String> = [
     format!("auth.slates.prefix={prefix}"),
-    format!("auth.slates.username={SSH_USER}"),
+    format!("auth.slates.username={HG_USER}"),
     format!("auth.slates.password={token}"),
   ]
   .into_iter()
@@ -13777,19 +13807,22 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 }
 
 /// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
-/// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback; make a Mercurial repository
-/// through the CLI; enroll a fresh key (`credential key`); run [`hg_round_trip`] over `ssh://` with OpenSSH holding that
-/// key alone. Expect each step done and both copies holding the same two changesets. Skips loudly without stock hg 7.2
-/// ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can pass. As of main 34d10acb5: no daemon starts the SSH edge
-/// (`--vcs-ssh` and [`VCS_SSH_LINE`] are assumed; the SSH edge's Owed, `crates/server/src/vcs_ssh.rs`); its hg command
-/// waits on A-679 (g304, the edge's loop over `serve::stdio`); and no CLI verb makes a repository
-/// ([`create_hg_repository`]).
+/// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a
+/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
+/// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
+/// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
+/// pass: as of main 34d10acb5 no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag
+/// --vcs-ssh`, kiln r174), the CLI has no `repository create` (A-685, g305), and the edge's Mercurial command waits on
+/// a lender of its store (A-679, g304: `hg -R <repo> serve --stdio` through `serve::stdio`).
 #[test]
-#[ignore = "waits on the daemon starting the SSH edge, A-679 (g304) and a CLI verb making a repository"]
+#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>), A-685 (g305: slates repository create <name> --tool hg) and \
+            A-679 (g304: hg serve --stdio on the SSH edge)"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let Some(hg) = stock_hg() else {
-    eprintln!("skipping stock hg over the SSH edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)");
+    eprintln!(
+      "skipping stock hg over the SSH edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
     return;
   };
   let scratch = ScratchDir {
@@ -13797,7 +13830,17 @@ fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   };
   let key = format!("{}/key", scratch.path);
   let Ok(made) = Command::new("ssh-keygen")
-    .args(["-q", "-t", "ed25519", "-N", "", "-C", "slates-hg-test", "-f", &key])
+    .args([
+      "-q",
+      "-t",
+      "ed25519",
+      "-N",
+      "",
+      "-C",
+      "slates-hg-test",
+      "-f",
+      &key,
+    ])
     .output()
   else {
     eprintln!("skipping stock hg over the SSH edge: no ssh-keygen here");
@@ -13816,6 +13859,6 @@ fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
      -o UserKnownHostsFile=/dev/null"
   );
   let config = vec!["--config".to_owned(), ssh];
-  let url = format!("ssh://{SSH_USER}@127.0.0.1:{port}/r");
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
   hg_round_trip(&hg, &scratch.path, &url, &config);
 }
