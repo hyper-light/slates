@@ -755,10 +755,9 @@ fn history_at<T: Clone>(history: &[(u64, Option<T>)], version: u64) -> Option<T>
     .and_then(|(_, value)| value.clone())
 }
 
-/// Whether a per-version history has an entry at a version in `(from, to]` (the model's, `test-model`). Histories are in
-/// version order, so this is a seek to the first entry past `from`, never a scan of the path's whole history (a file
-/// many clients edit has an entry a version until the fold).
-#[cfg(feature = "test-model")]
+/// Whether a per-version history has an entry at a version in `(from, to]`: the model's changed-path reads and a stack's
+/// restatement (A-659, `stack::levels`) both ask it. Histories are in version order, so this is a seek to the first entry
+/// past `from`, never a scan of the path's whole history (a file many clients edit has an entry a version until the fold).
 fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
   history
     .get(history.partition_point(|(version, _)| *version <= from))
