@@ -13581,8 +13581,10 @@ and export by landing).
 > it visits), its patterns matched by APR's `apr_fnmatch` after Subversion's fold, exact over ASCII names; `svn ls -v
 > -R` replayed whole. Its fourth slice (2026-11-19, g297): `get-location-segments`, `svn_repos_node_location_segments`'
 > loop a turn a step (the closest copy or the node's origin, each segment cropped to the range, the gap to the copy's
-> source), `serve.c`'s range refusals after `done`. Owed: `log` with merged revisions, `get-file-revs`,
-> `get-deleted-rev`; the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
+> source), `serve.c`'s range refusals after `done`. Its fifth slice (2026-11-19, g297): `get-deleted-rev`,
+> `svn_repos_deleted_rev`'s checks and binary search over node relation and closest copy, a path not deleted answered
+> with the refusal a newer client reads as none. Owed: `log` with merged revisions, `get-file-revs`; the fold of a
+> name beyond ASCII (utf8proc's case folding and mark stripping); read access by the
 > authorization rules (A-606).
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
@@ -42590,8 +42592,21 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   a replacement, gaps, the root, a cropped range, both range refusals, an absent path, a peg past the youngest, a
   negative peg) replayed whole; the parameters and the streaming. Red-checked five ways (no gaps, no cropping, the
   origin ignored, the two refusals swapped, no `done` before a range refusal): each failed the session's replay.
-- **Owed** (the next slices): `log` with merged revisions, `get-file-revs`, `get-deleted-rev`, each replayed against
-  the transcripts already recorded; `list`'s fold of a name beyond ASCII
+- **Part 2, its fifth slice** (2026-11-19, g297): `get-deleted-rev` (`reads/deleted.rs`). The parameters `crr`;
+  the authentication request; a negative revision refused ("Invalid start revision N", "Invalid end revision N",
+  160006), the two revisions taken older first, each refused past the youngest when opened. A path absent in the older
+  revision, or present in both as one line no copy younger than the older made, was not deleted; otherwise
+  `svn_repos_deleted_rev`'s binary search, which compares the node with the older revision's as it began and the
+  closest copy (`svn_fs_closest_copy`, now its own function beside `svn_repos__prev_location`) with the start as it
+  moves, as the C code does. Not deleted is `SVN_ERR_ENTRY_MISSING_REVISION` (150003) in `serve.c`'s words, the two
+  revisions as given. The search halves its range each turn, so it is bounded at 65 turns, past which a contradictory
+  index is refused as corrupt. Tests (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19): 332 of 332; the
+  session (15 commands: a deletion found from two pegs and from a reversed range, a replacement found, a path re-added
+  as a new line, a copy older than the start, the root, an absent path, revisions past the youngest and negative)
+  replayed whole; the parameters. Red-checked five ways (no swap, copies ignored at the end or in the search, the
+  message's revisions swapped, the revision before the found one): each failed the session's replay.
+- **Owed** (the next slices): `log` with merged revisions and `get-file-revs`, each replayed against the transcripts
+  already recorded; `list`'s fold of a name beyond ASCII
   (utf8proc's NFD with case folding and marks stripped, composed again, which needs Unicode's case-folding and
   general-category tables); read access by A-606's rules, and the authentication request a denied anonymous read makes
   when the session could authenticate.

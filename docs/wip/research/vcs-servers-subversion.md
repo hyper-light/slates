@@ -654,6 +654,12 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   peg past the youngest. The loop crops each segment to the range in place before the gap is computed from it.
   Recorded: `branches/b1/a.txt`@11 is 9-11 there (its replacement by a copy of `trunk/a.txt`@5), a gap 6-8, then 1-5
   at `trunk/a.txt`; `tags/t1/a.txt` 7-11, gap 6-6, 1-5; the root 0-11 with an empty path.
+- **`get-deleted-rev`** [C: `serve.c` `get_deleted_rev`; `rev_hunt.c` `svn_repos_deleted_rev`; recorded]: `crr`;
+  negative revisions refused by the library in its own words; the range ordered; absent at the older end, or the same
+  line at both with no younger copy, is no deletion, which `serve.c` answers `SVN_ERR_ENTRY_MISSING_REVISION` (150003)
+  naming the path and the revisions as the client gave them; the search's relation is to the original start node and
+  its copy test to the moving start. Recorded: `trunk/dir/b.txt` 5..11 deleted in 6 (also 11..5); `branches/b1/a.txt`
+  4..11 in 9 (its replacement by a copy); 8..11 of the re-added `b.txt` and 3..8 of the branch's file not deleted.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
