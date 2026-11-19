@@ -73,6 +73,9 @@ target directory, `CARGO_BUILD_JOBS=2`):
 - Green at 79ec79e77: `cargo fmt -p slates-merge -- --check` clean; `cargo test --locked -p slates-merge --lib` 192 of
   192; `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1; the server's
   integration tests that drive a rebase over the wire, by name, 13 of 13.
+- The landing run, over main 1ef718820 (878a2eb43, kiln r172), alike: fmt clean; slates-merge lib 193 of 193 (main's
+  A-676 added one); `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1; the
+  server's 13 of 13.
 
 ## Siblings (the sweep, by reading)
 

@@ -49254,6 +49254,9 @@ Applied in the same change to:
     of 192; `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1; and the
     server's integration tests that drive a rebase over the wire, by name (`daemon`'s lifecycle test, two of
     `merge_load`, two of `verdict_pages`, five of `works_off_owner`, three of `green_post_state`), 13 of 13.
+  - The landing run, over main 1ef718820 (878a2eb43, kiln r172), alike: fmt clean; slates-merge lib 193 of 193 (main's
+    A-676 added one); `--test rebase` 3 of 3; `--test engine -- rebase` 4 of 4; `--test special -- rebases` 1 of 1;
+    the server's 13 of 13.
 - **Siblings** (the sweep, by reading): the hand-over also moves the node's mode and attributes to the heir, and an IPC
   node (`Effect::Special`); a rebase's answer holds files alone, so what a rebased work shows of a heir's mode,
   attributes or IPC node is the server's work view's, not checked here. The chain entry's copy fixes
