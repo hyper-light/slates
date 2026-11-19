@@ -1030,6 +1030,9 @@ mod hooks {
   const ROLE_TEST: &str = "hook_driver::tests::a_hook_role";
   /// Shape: how many bytes of a hook's words the test keeps.
   const CAP: usize = 1 << 16;
+  /// Shape: how long a test lets a push's hooks take before giving up on them: ten liveness windows (`hook_driver`'s
+  /// and `svn_hooks`' tests), so a hook that never ends fails its test rather than hanging the suite.
+  const TEST_BOUND_NS: u64 = 10 * crate::daemon::LIVENESS_BUDGET_NS;
   /// Shape: the changegroup part's id the hooks' output names.
   const PART: u32 = 4;
 
@@ -1083,7 +1086,9 @@ mod hooks {
     hook
   }
 
-  /// Runs `hooks` to their answer, the test binary's directory standing for the pending view.
+  /// Runs `hooks` to their answer, the test binary's directory standing for the pending view; the test gives up past
+  /// [`TEST_BOUND_NS`]. The bound's timer is also what keeps the runtime parked for the hooks' events: with no timer
+  /// armed, `run_until_idle` returns at its first poll that finds nothing ready, and the run was left unanswered.
   fn drive(hooks: Vec<Hook>) -> HooksRan {
     let runtime = runtime();
     let (sent, got) = channel();
@@ -1095,12 +1100,17 @@ mod hooks {
     runtime
       .spawn(async move {
         let mut gone = core::future::pending::<()>();
-        let ran = run_hooks((&hooks, &[]), (&view, CAP, Some(PART)), &mut gone).await;
-        let _ = sent.send(ran);
+        let running = run_hooks((&hooks, &[]), (&view, CAP, Some(PART)), &mut gone);
+        let answered = slates_rt::futures::within(TEST_BOUND_NS, running).await;
+        let _ = sent.send(answered.ok().flatten());
       })
       .expect("the run's task");
     runtime.run_until_idle();
-    got.recv().expect("the run answered")
+    got
+      .recv()
+      .ok()
+      .flatten()
+      .expect("the hooks answered within the test's bound")
   }
 
   /// The value a hook's environment gives `name`.
