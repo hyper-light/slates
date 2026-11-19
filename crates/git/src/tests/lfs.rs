@@ -27,7 +27,8 @@ pub(crate) const EXAMPLE_OID: &str =
   "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447";
 
 /// The JSON examples of a git-lfs document: each fenced `json` or `json5` block, its comment lines dropped and a
-/// comment after a value cut, so `// POST ...` and `"limit": 100, // also optional` read as JSON.
+/// comment after a value cut, so `// POST ...` and `"limit": 100, // also optional` read as JSON; a block of comments
+/// alone (locking.md's `GET /locks`, whose properties travel in the query) holds no example.
 pub(crate) fn json_examples(markdown: &str) -> Vec<String> {
   let mut examples = Vec::new();
   let mut current: Option<String> = None;
@@ -36,7 +37,12 @@ pub(crate) fn json_examples(markdown: &str) -> Vec<String> {
     match current.as_mut() {
       None if trimmed == "```json" || trimmed == "```json5" => current = Some(String::new()),
       None => {}
-      Some(_) if trimmed == "```" => examples.push(current.take().unwrap()),
+      Some(_) if trimmed == "```" => {
+        let example = current.take().unwrap();
+        if !example.trim().is_empty() {
+          examples.push(example);
+        }
+      }
       Some(text) => {
         if trimmed.starts_with("//") {
           continue;
