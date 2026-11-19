@@ -2,7 +2,8 @@
 //! the writer run over a list of events, and the pieces hand-made dumps are built from.
 
 use crate::dump::{
-  Admission, DumpError, Event, Format, Md5, NodeHeader, Property, Read, Reader, RevisionHeader, Sha1, Uuid, Writer,
+  Admission, DumpError, Event, Format, Md5, NodeHeader, Property, Read, Reader, RevisionHeader,
+  Sha1, Uuid, Writer,
 };
 use crate::svndiff::{Version, Window};
 
@@ -45,7 +46,9 @@ impl Owned {
         name: name.to_vec(),
         value: value.to_vec(),
       },
-      Event::Property(Property::Delete { name }) => Self::Delete { name: name.to_vec() },
+      Event::Property(Property::Delete { name }) => Self::Delete {
+        name: name.to_vec(),
+      },
       Event::PropertiesEnd => Self::PropertiesEnd,
       Event::Text(bytes) => Self::Text(bytes.to_vec()),
       Event::Delta(version) => Self::Delta(version),
@@ -117,8 +120,14 @@ pub(super) fn read(dump: &[u8], piece: usize, admission: Admission) -> Result<Re
       }
       Read::NeedMore { consumed, needed } => {
         assert!(!ended, "the reader asked for more after the stream's end");
-        assert!(needed <= admission.buffer_bytes, "asked for {needed} past the admission");
-        assert!(needed > held.len() - consumed, "asked for bytes it already held");
+        assert!(
+          needed <= admission.buffer_bytes,
+          "asked for {needed} past the admission"
+        );
+        assert!(
+          needed > held.len() - consumed,
+          "asked for bytes it already held"
+        );
         reading.most_needed = reading.most_needed.max(needed);
         held.drain(..consumed);
         dropped += consumed;
@@ -165,7 +174,8 @@ pub(super) fn dump(parts: &[&[u8]]) -> Vec<u8> {
 
 /// A revision record with an empty property section, as `svnadmin` writes one.
 pub(super) fn revision(number: u64) -> Vec<u8> {
-  format!("Revision-number: {number}\nProp-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n").into_bytes()
+  format!("Revision-number: {number}\nProp-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n")
+    .into_bytes()
 }
 
 /// A node record from its header lines and its content block, the blank line between them and two after a content

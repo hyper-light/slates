@@ -37,8 +37,14 @@ impl Digests {
   /// # Errors
   /// [`DumpError::DigestFailed`] when aws-lc-rs refuses them (past its 2^64 - 1 bits).
   pub fn update(&mut self, bytes: &[u8]) -> Result<(), DumpError> {
-    self.md5.try_update(bytes).map_err(|_| DumpError::DigestFailed)?;
-    self.sha1.try_update(bytes).map_err(|_| DumpError::DigestFailed)
+    self
+      .md5
+      .try_update(bytes)
+      .map_err(|_| DumpError::DigestFailed)?;
+    self
+      .sha1
+      .try_update(bytes)
+      .map_err(|_| DumpError::DigestFailed)
   }
 
   /// The text's MD5 and SHA-1.
@@ -47,7 +53,10 @@ impl Digests {
   /// [`DumpError::DigestFailed`] when aws-lc-rs cannot finish a digest.
   pub fn finish(self) -> Result<(Md5, Sha1), DumpError> {
     let md5 = self.md5.try_finish().map_err(|_| DumpError::DigestFailed)?;
-    let sha1 = self.sha1.try_finish().map_err(|_| DumpError::DigestFailed)?;
+    let sha1 = self
+      .sha1
+      .try_finish()
+      .map_err(|_| DumpError::DigestFailed)?;
     Ok((
       Md5::try_from(md5.as_ref()).map_err(|_| DumpError::DigestFailed)?,
       Sha1::try_from(sha1.as_ref()).map_err(|_| DumpError::DigestFailed)?,
@@ -60,7 +69,11 @@ impl Digests {
 ///
 /// # Errors
 /// [`DumpError::ChecksumMismatch`], the MD5's first, as Subversion checks the MD5.
-pub fn check_text(expected_md5: Option<Md5>, expected_sha1: Option<Sha1>, actual: (Md5, Sha1)) -> Result<(), DumpError> {
+pub fn check_text(
+  expected_md5: Option<Md5>,
+  expected_sha1: Option<Sha1>,
+  actual: (Md5, Sha1),
+) -> Result<(), DumpError> {
   let (md5, sha1) = actual;
   if let Some(expected) = expected_md5.filter(|digest| names_a_digest(digest))
     && expected != md5

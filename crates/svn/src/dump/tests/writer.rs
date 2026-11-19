@@ -3,8 +3,9 @@
 
 use super::support::{Owned, V2, digests, digests_hex, read_whole, write};
 use crate::dump::{
-  Contradiction, CopyFrom, DeltaBase, Digest, DumpError, Event, Format, Header, NodeAction, NodeHeader, Property,
-  PropertyFault, PropertySection, RevisionHeader, TextSection, Uuid, Writer, section_len,
+  Contradiction, CopyFrom, DeltaBase, Digest, DumpError, Event, Format, Header, NodeAction,
+  NodeHeader, Property, PropertyFault, PropertySection, RevisionHeader, TextSection, Uuid, Writer,
+  section_len,
 };
 use crate::index::NodeKind;
 use crate::svndiff::{Instruction, Version, Window};
@@ -27,7 +28,11 @@ fn in_revision_one(format: Format) -> (Writer, Vec<u8>) {
 }
 
 /// A file change of `path` with the sections given.
-fn change(path: &[u8], properties: Option<PropertySection>, text: Option<TextSection>) -> NodeHeader {
+fn change(
+  path: &[u8],
+  properties: Option<PropertySection>,
+  text: Option<TextSection>,
+) -> NodeHeader {
   NodeHeader {
     path: path.to_vec(),
     kind: Some(NodeKind::File),
@@ -63,7 +68,12 @@ fn refuses(writer: &mut Writer, out: &mut Vec<u8>, event: Event<'_>, refusal: Du
 fn an_event_out_of_its_place_is_refused_and_appends_nothing() {
   let mut writer = Writer::new();
   let mut out = Vec::new();
-  refuses(&mut writer, &mut out, Event::PropertiesEnd, DumpError::OutOfOrder);
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::PropertiesEnd,
+    DumpError::OutOfOrder,
+  );
   writer.write(&Event::Format(Format::Two), &mut out).unwrap();
   refuses(
     &mut writer,
@@ -74,23 +84,59 @@ fn an_event_out_of_its_place_is_refused_and_appends_nothing() {
     },
   );
   let (mut writer, mut out) = in_revision_one(Format::Two);
-  refuses(&mut writer, &mut out, Event::Property(Property::Delete { name: b"p" }), DumpError::OutOfOrder);
-  refuses(&mut writer, &mut out, Event::Text(b"x"), DumpError::OutOfOrder);
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Property(Property::Delete { name: b"p" }),
+    DumpError::OutOfOrder,
+  );
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Text(b"x"),
+    DumpError::OutOfOrder,
+  );
   refuses(&mut writer, &mut out, Event::TextEnd, DumpError::OutOfOrder);
-  writer.write(&Event::Node(change(b"a", None, whole(3))), &mut out).unwrap();
-  refuses(&mut writer, &mut out, Event::Text(b"four"), DumpError::OutOfOrder);
-  refuses(&mut writer, &mut out, Event::Delta(Version::Zero), DumpError::OutOfOrder);
-  refuses(&mut writer, &mut out, Event::Window(Window {
-    source_offset: 0,
-    source_len: 0,
-    target_len: 0,
-    instructions: Vec::new(),
-    new_data: Vec::new(),
-  }), DumpError::OutOfOrder);
+  writer
+    .write(&Event::Node(change(b"a", None, whole(3))), &mut out)
+    .unwrap();
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Text(b"four"),
+    DumpError::OutOfOrder,
+  );
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Delta(Version::Zero),
+    DumpError::OutOfOrder,
+  );
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Window(Window {
+      source_offset: 0,
+      source_len: 0,
+      target_len: 0,
+      instructions: Vec::new(),
+      new_data: Vec::new(),
+    }),
+    DumpError::OutOfOrder,
+  );
   writer.write(&Event::Text(b"ab"), &mut out).unwrap();
   refuses(&mut writer, &mut out, Event::TextEnd, DumpError::OutOfOrder);
-  refuses(&mut writer, &mut out, Event::Format(Format::Two), DumpError::OutOfOrder);
-  assert_eq!(writer.finish(), Err(DumpError::OutOfOrder), "ended inside a text");
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Format(Format::Two),
+    DumpError::OutOfOrder,
+  );
+  assert_eq!(
+    writer.finish(),
+    Err(DumpError::OutOfOrder),
+    "ended inside a text"
+  );
   writer.write(&Event::Text(b"c"), &mut out).unwrap();
   writer.write(&Event::TextEnd, &mut out).unwrap();
   assert_eq!(writer.finish(), Ok(()));
@@ -104,9 +150,17 @@ fn an_event_out_of_its_place_is_refused_and_appends_nothing() {
 fn what_the_reader_would_refuse_the_writer_refuses() {
   let mut writer = Writer::new();
   let mut out = Vec::new();
-  writer.write(&Event::Format(Format::Three), &mut out).unwrap();
   writer
-    .write(&Event::Revision(RevisionHeader { number: 0, properties: Some(10) }), &mut out)
+    .write(&Event::Format(Format::Three), &mut out)
+    .unwrap();
+  writer
+    .write(
+      &Event::Revision(RevisionHeader {
+        number: 0,
+        properties: Some(10),
+      }),
+      &mut out,
+    )
     .unwrap();
   refuses(
     &mut writer,
@@ -119,7 +173,10 @@ fn what_the_reader_would_refuse_the_writer_refuses() {
   refuses(
     &mut writer,
     &mut out,
-    Event::Property(Property::Set { name: b"a", value: b"" }),
+    Event::Property(Property::Set {
+      name: b"a",
+      value: b"",
+    }),
     DumpError::Property {
       fault: PropertyFault::PastSection,
     },
@@ -136,7 +193,10 @@ fn what_the_reader_would_refuse_the_writer_refuses() {
   refuses(
     &mut writer,
     &mut out,
-    Event::Revision(RevisionHeader { number: 1 << 63, properties: None }),
+    Event::Revision(RevisionHeader {
+      number: 1 << 63,
+      properties: None,
+    }),
     DumpError::MalformedValue {
       header: Header::RevisionNumber,
     },
@@ -144,44 +204,83 @@ fn what_the_reader_would_refuse_the_writer_refuses() {
   refuses(
     &mut writer,
     &mut out,
-    Event::Revision(RevisionHeader { number: 1, properties: Some(9) }),
+    Event::Revision(RevisionHeader {
+      number: 1,
+      properties: Some(9),
+    }),
     DumpError::Contradiction {
       fault: Contradiction::PropertySectionTooShort,
     },
   );
-  writer.write(&Event::Revision(RevisionHeader { number: 1, properties: None }), &mut out).unwrap();
+  writer
+    .write(
+      &Event::Revision(RevisionHeader {
+        number: 1,
+        properties: None,
+      }),
+      &mut out,
+    )
+    .unwrap();
   for path in [b"a\nb".as_slice(), b"a\0b"] {
     refuses(
       &mut writer,
       &mut out,
       Event::Node(change(path, None, None)),
-      DumpError::MalformedValue { header: Header::NodePath },
+      DumpError::MalformedValue {
+        header: Header::NodePath,
+      },
     );
   }
   let mut no_kind = change(b"a", None, None);
   (no_kind.kind, no_kind.action) = (None, NodeAction::Add);
-  refuses(&mut writer, &mut out, Event::Node(no_kind), DumpError::MissingHeader { header: Header::NodeKind });
-  let section = PropertySection { delta: false, length: 20 };
-  writer.write(&Event::Node(change(b"a", Some(section), None)), &mut out).unwrap();
+  refuses(
+    &mut writer,
+    &mut out,
+    Event::Node(no_kind),
+    DumpError::MissingHeader {
+      header: Header::NodeKind,
+    },
+  );
+  let section = PropertySection {
+    delta: false,
+    length: 20,
+  };
+  writer
+    .write(&Event::Node(change(b"a", Some(section), None)), &mut out)
+    .unwrap();
   refuses(
     &mut writer,
     &mut out,
     Event::Property(Property::Delete { name: b"p" }),
-    DumpError::Property { fault: PropertyFault::DeletionOutOfPlace },
+    DumpError::Property {
+      fault: PropertyFault::DeletionOutOfPlace,
+    },
   );
   refuses(
     &mut writer,
     &mut out,
-    Event::Property(Property::Set { name: b"a\0", value: b"" }),
-    DumpError::Property { fault: PropertyFault::NameNul },
+    Event::Property(Property::Set {
+      name: b"a\0",
+      value: b"",
+    }),
+    DumpError::Property {
+      fault: PropertyFault::NameNul,
+    },
   );
   let (mut two, mut two_out) = in_revision_one(Format::Two);
-  let delta = Some(TextSection { delta: Some(DeltaBase::default()), md5: None, sha1: None, length: 4 });
+  let delta = Some(TextSection {
+    delta: Some(DeltaBase::default()),
+    md5: None,
+    sha1: None,
+    length: 4,
+  });
   refuses(
     &mut two,
     &mut two_out,
     Event::Node(change(b"a", None, delta)),
-    DumpError::Contradiction { fault: Contradiction::DeltaInFormatTwo },
+    DumpError::Contradiction {
+      fault: Contradiction::DeltaInFormatTwo,
+    },
   );
 }
 
@@ -191,15 +290,32 @@ fn what_the_reader_would_refuse_the_writer_refuses() {
 #[test]
 fn a_whole_text_whose_digests_are_another_s_is_refused_at_its_end() {
   let (right, other) = (digests(b"text"), digests(b"other"));
-  for (expected_md5, expected_sha1, refused) in [(right.0, right.1, false), (other.0, right.1, true), (right.0, other.1, true)] {
+  for (expected_md5, expected_sha1, refused) in [
+    (right.0, right.1, false),
+    (other.0, right.1, true),
+    (right.0, other.1, true),
+  ] {
     let (mut writer, mut out) = in_revision_one(Format::Two);
-    let text = Some(TextSection { delta: None, md5: Some(expected_md5), sha1: Some(expected_sha1), length: 4 });
-    writer.write(&Event::Node(change(b"a", None, text)), &mut out).unwrap();
+    let text = Some(TextSection {
+      delta: None,
+      md5: Some(expected_md5),
+      sha1: Some(expected_sha1),
+      length: 4,
+    });
+    writer
+      .write(&Event::Node(change(b"a", None, text)), &mut out)
+      .unwrap();
     writer.write(&Event::Text(b"text"), &mut out).unwrap();
     let ended = writer.write(&Event::TextEnd, &mut out);
     assert_eq!(ended.is_err(), refused, "{ended:?}");
     if let Err(refusal) = ended {
-      assert!(matches!(refusal, DumpError::ChecksumMismatch { expected: Digest::Md5(_) | Digest::Sha1(_), .. }));
+      assert!(matches!(
+        refusal,
+        DumpError::ChecksumMismatch {
+          expected: Digest::Md5(_) | Digest::Sha1(_),
+          ..
+        }
+      ));
     }
   }
 }
@@ -211,22 +327,41 @@ fn a_whole_text_whose_digests_are_another_s_is_refused_at_its_end() {
 #[test]
 fn each_record_shape_is_written_as_dump_c_writes_it() {
   let uuid = Uuid::parse(b"7bf7a5ef-cabf-0310-b7d4-93df341afa7e").unwrap();
-  let properties = [Property::Set { name: b"svn:keywords", value: b"Id" }];
+  let properties = [Property::Set {
+    name: b"svn:keywords",
+    value: b"Id",
+  }];
   let section_length = section_len(properties).unwrap();
   let (md5, sha1) = digests_hex(b"text");
   let text_digests = digests(b"text");
   let events = vec![
     Owned::Format(Format::Two),
     Owned::Uuid(uuid),
-    Owned::Revision(RevisionHeader { number: 0, properties: None }),
-    Owned::Revision(RevisionHeader { number: 1, properties: None }),
-    Owned::Node(change(b"f", Some(PropertySection { delta: false, length: section_length }), Some(TextSection {
-      delta: None,
-      md5: Some(text_digests.0),
-      sha1: Some(text_digests.1),
-      length: 4,
-    }))),
-    Owned::Set { name: b"svn:keywords".to_vec(), value: b"Id".to_vec() },
+    Owned::Revision(RevisionHeader {
+      number: 0,
+      properties: None,
+    }),
+    Owned::Revision(RevisionHeader {
+      number: 1,
+      properties: None,
+    }),
+    Owned::Node(change(
+      b"f",
+      Some(PropertySection {
+        delta: false,
+        length: section_length,
+      }),
+      Some(TextSection {
+        delta: None,
+        md5: Some(text_digests.0),
+        sha1: Some(text_digests.1),
+        length: 4,
+      }),
+    )),
+    Owned::Set {
+      name: b"svn:keywords".to_vec(),
+      value: b"Id".to_vec(),
+    },
     Owned::PropertiesEnd,
     Owned::Text(b"text".to_vec()),
     Owned::TextEnd,
@@ -236,7 +371,10 @@ fn each_record_shape_is_written_as_dump_c_writes_it() {
       kind: Some(NodeKind::Directory),
       action: NodeAction::Replace,
       copy_from: None,
-      properties: Some(PropertySection { delta: false, length: 10 }),
+      properties: Some(PropertySection {
+        delta: false,
+        length: 10,
+      }),
       text: None,
     }),
     Owned::PropertiesEnd,
@@ -244,7 +382,12 @@ fn each_record_shape_is_written_as_dump_c_writes_it() {
       path: b"e".to_vec(),
       kind: Some(NodeKind::Directory),
       action: NodeAction::Replace,
-      copy_from: Some(CopyFrom { revision: 0, path: Vec::new(), md5: None, sha1: None }),
+      copy_from: Some(CopyFrom {
+        revision: 0,
+        path: Vec::new(),
+        md5: None,
+        sha1: None,
+      }),
       properties: None,
       text: None,
     }),
@@ -274,26 +417,58 @@ fn each_record_shape_is_written_as_dump_c_writes_it() {
 #[test]
 fn a_delta_node_is_written_with_dump_c_s_header_order_and_read_back() {
   let windows = [
-    Window { source_offset: 0, source_len: 2, target_len: 3, instructions: vec![Instruction::Source { offset: 0, length: 2 }, Instruction::New { length: 1 }], new_data: b"c".to_vec() },
-    Window { source_offset: 2, source_len: 0, target_len: 1, instructions: vec![Instruction::New { length: 1 }], new_data: b"d".to_vec() },
+    Window {
+      source_offset: 0,
+      source_len: 2,
+      target_len: 3,
+      instructions: vec![
+        Instruction::Source {
+          offset: 0,
+          length: 2,
+        },
+        Instruction::New { length: 1 },
+      ],
+      new_data: b"c".to_vec(),
+    },
+    Window {
+      source_offset: 2,
+      source_len: 0,
+      target_len: 1,
+      instructions: vec![Instruction::New { length: 1 }],
+      new_data: b"d".to_vec(),
+    },
   ];
   let mut delta = Vec::new();
   let mut encoder = crate::svndiff::Encoder::new(Version::Zero);
   delta.extend_from_slice(&encoder.header());
   for window in &windows {
-    encoder.window(window, crate::svndiff::Compression::Stored, &mut delta).unwrap();
+    encoder
+      .window(window, crate::svndiff::Compression::Stored, &mut delta)
+      .unwrap();
   }
   let base = digests(b"ab");
   let result = digests(b"abcd");
-  let changes = [Property::Set { name: b"p", value: b"v" }, Property::Delete { name: b"q" }];
+  let changes = [
+    Property::Set {
+      name: b"p",
+      value: b"v",
+    },
+    Property::Delete { name: b"q" },
+  ];
   let header = NodeHeader {
     path: b"f".to_vec(),
     kind: Some(NodeKind::File),
     action: NodeAction::Change,
     copy_from: None,
-    properties: Some(PropertySection { delta: true, length: section_len(changes).unwrap() }),
+    properties: Some(PropertySection {
+      delta: true,
+      length: section_len(changes).unwrap(),
+    }),
     text: Some(TextSection {
-      delta: Some(DeltaBase { md5: Some(base.0), sha1: Some(base.1) }),
+      delta: Some(DeltaBase {
+        md5: Some(base.0),
+        sha1: Some(base.1),
+      }),
       md5: Some(result.0),
       sha1: Some(result.1),
       length: delta.len() as u64,
@@ -301,10 +476,18 @@ fn a_delta_node_is_written_with_dump_c_s_header_order_and_read_back() {
   };
   let mut events = vec![
     Owned::Format(Format::Three),
-    Owned::Revision(RevisionHeader { number: 1, properties: None }),
+    Owned::Revision(RevisionHeader {
+      number: 1,
+      properties: None,
+    }),
     Owned::Node(header),
-    Owned::Set { name: b"p".to_vec(), value: b"v".to_vec() },
-    Owned::Delete { name: b"q".to_vec() },
+    Owned::Set {
+      name: b"p".to_vec(),
+      value: b"v".to_vec(),
+    },
+    Owned::Delete {
+      name: b"q".to_vec(),
+    },
     Owned::PropertiesEnd,
     Owned::Delta(Version::Zero),
   ];
@@ -312,9 +495,27 @@ fn a_delta_node_is_written_with_dump_c_s_header_order_and_read_back() {
   events.push(Owned::TextEnd);
   let written = write(&events).unwrap();
   let text = String::from_utf8_lossy(&written);
-  let order = ["Prop-delta: true", "Text-delta: true", "Text-delta-base-md5", "Text-delta-base-sha1", "Text-content-md5", "Text-content-sha1", "Prop-content-length", "Text-content-length", "Content-length"];
-  let places: Vec<usize> = order.iter().map(|name| text.find(name).unwrap_or_else(|| panic!("no {name}"))).collect();
+  let order = [
+    "Prop-delta: true",
+    "Text-delta: true",
+    "Text-delta-base-md5",
+    "Text-delta-base-sha1",
+    "Text-content-md5",
+    "Text-content-sha1",
+    "Prop-content-length",
+    "Text-content-length",
+    "Content-length",
+  ];
+  let places: Vec<usize> = order
+    .iter()
+    .map(|name| text.find(name).unwrap_or_else(|| panic!("no {name}")))
+    .collect();
   assert!(places.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
-  assert!(written.windows(delta.len()).any(|window| window == delta.as_slice()), "the delta's bytes");
+  assert!(
+    written
+      .windows(delta.len())
+      .any(|window| window == delta.as_slice()),
+    "the delta's bytes"
+  );
   assert_eq!(read_whole(&written).unwrap(), events);
 }

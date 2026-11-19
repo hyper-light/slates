@@ -17,7 +17,7 @@
 //!   blank lines `dump.c` puts after each kind of record, property entries in the order the caller gives them
 //!   (`svnadmin` gives them sorted by name, `hash.c` `svn_sort__hash`), checksums in lowercase hex, and a replacement by
 //!   a copy as `svnadmin` does: a deletion record ended by its header block alone, then an addition record with the copy
-//!   source (`dump.c` 1225-1247). The golden vectors in `fixtures/dump`, which stock `svnadmin` 1.15.0 wrote, are read
+//!   source (`dump.c` 1234-1274). The golden vectors in `fixtures/dump`, which stock `svnadmin` 1.15.0 wrote, are read
 //!   and written again byte for byte.
 //! - **Read as `svnadmin load` reads, and stricter where Subversion is silent.** [`Reader`] accepts what `load.c`
 //!   accepts (headers in any order, unknown headers ignored, blank lines and lines that begin with whitespace between
@@ -68,7 +68,7 @@ pub type Md5 = [u8; 16];
 pub type Sha1 = [u8; 20];
 
 /// The line that ends every property section, its line feed included.
-/// Format: `svn_hash_write2(..., "PROPS-END", ...)` writes the terminator and a line feed (`hash.c` 330-331;
+/// Format: `svn_hash_write2(..., "PROPS-END", ...)` writes the terminator and a line feed (`hash.c` 319;
 /// `notes/dump-load-format.txt`: "The fixed trailer is "PROPS-END\n" and its length is included in the
 /// Prop-content-length").
 const PROPS_END_LINE: &[u8] = b"PROPS-END\n";
@@ -326,12 +326,14 @@ fn length_entry_len(bytes: &[u8]) -> Option<u64> {
 }
 
 /// The bytes a length entry adds around its digits and its bytes: its two-byte prefix and its two line feeds.
-/// Format: `hash.c` 287-293 writes `K <length>\n<key>\nV <length>\n` and the value and `\n`; 309-311 `D <length>\n<key>\n`.
+/// Format: `hash.c` 288-293 writes `K <length>\n<key>\nV <length>\n` and the value and `\n`; 312-314 `D <length>\n<key>\n`.
 const LENGTH_ENTRY_FRAME: u64 = 4;
 
 /// The decimal digits of `number`.
 fn decimal_len(number: u64) -> u64 {
-  number.checked_ilog10().map_or(1, |exponent| u64::from(exponent).saturating_add(1))
+  number
+    .checked_ilog10()
+    .map_or(1, |exponent| u64::from(exponent).saturating_add(1))
 }
 
 /// One part of a dump, read or to be written. A record's header comes first; its property entries, then its text in

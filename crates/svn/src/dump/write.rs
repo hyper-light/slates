@@ -10,19 +10,20 @@
 //! `Text-delta-base-sha1`, `Text-content-md5`, `Text-content-sha1`, then `Prop-content-length`, `Text-content-length`
 //! and `Content-length` (`svn_repos__dump_node_record`, 601-645), an empty line, the sections and two line feeds, or,
 //! for a record with no sections, one line feed after its empty line (1366-1376); and a replacement by a copy as a
-//! deletion record ended by its empty line alone, then an addition (`dump_node_delete`, 1087-1104, and 1225-1247).
+//! deletion record ended by its empty line alone, then an addition (`dump_node_delete`, 1087-1104, and 1234-1274).
 
 use super::digest::{Digests, check_text, checks_anything};
 use super::header::{FLAG_SET, kind_word};
 use super::{
-  Contradiction, CopyFrom, DumpError, Event, Format, Header, LINE_FEED, Md5, NodeAction, NodeHeader, PROPS_END_LINE,
-  Property, PropertyFault, RevisionHeader, Sha1, TextSection, Uuid, check_node, check_revision, content_length, to_u64,
+  Contradiction, CopyFrom, DumpError, Event, Format, Header, LINE_FEED, Md5, NodeAction,
+  NodeHeader, PROPS_END_LINE, Property, PropertyFault, RevisionHeader, Sha1, TextSection, Uuid,
+  check_node, check_revision, content_length, to_u64,
 };
 use crate::index::Revision;
 use crate::svndiff::{Compression, Encoder, Version, Window};
 
 /// What lies between a header's name and its value.
-/// Format: `dump.c` 507 and 405 write `"%s: %s\n"`.
+/// Format: `dump.c` 506 and 401 write `"%s: %s\n"`.
 const HEADER_SEPARATOR: &[u8] = b": ";
 
 /// The digits of lowercase hex, as a checksum is written.
@@ -145,7 +146,11 @@ impl Writer {
     if !matches!(self.state, WriteState::Start | WriteState::Between) {
       return Err(DumpError::OutOfOrder);
     }
-    header_line(out, Header::FormatVersion, format.number().to_string().as_bytes());
+    header_line(
+      out,
+      Header::FormatVersion,
+      format.number().to_string().as_bytes(),
+    );
     out.push(LINE_FEED);
     self.format = Some(format);
     self.state = WriteState::Between;
@@ -161,12 +166,24 @@ impl Writer {
   }
 
   /// A revision record's header, and its end when it has no properties.
-  fn revision_record(&mut self, header: &RevisionHeader, out: &mut Vec<u8>) -> Result<(), DumpError> {
+  fn revision_record(
+    &mut self,
+    header: &RevisionHeader,
+    out: &mut Vec<u8>,
+  ) -> Result<(), DumpError> {
     self.between()?;
     check_revision(header)?;
-    header_line(out, Header::RevisionNumber, header.number.to_string().as_bytes());
+    header_line(
+      out,
+      Header::RevisionNumber,
+      header.number.to_string().as_bytes(),
+    );
     if let Some(length) = header.properties {
-      header_line(out, Header::PropContentLength, length.to_string().as_bytes());
+      header_line(
+        out,
+        Header::PropContentLength,
+        length.to_string().as_bytes(),
+      );
       header_line(out, Header::ContentLength, length.to_string().as_bytes());
     }
     out.push(LINE_FEED);
@@ -226,7 +243,9 @@ impl Writer {
     if property.name().contains(&0) {
       return Err(property_fault(PropertyFault::NameNul));
     }
-    let length = property.encoded_len().ok_or(property_fault(PropertyFault::PastSection))?;
+    let length = property
+      .encoded_len()
+      .ok_or(property_fault(PropertyFault::PastSection))?;
     let room = section.left.saturating_sub(to_u64(PROPS_END_LINE.len()));
     if length > room {
       return Err(property_fault(PropertyFault::PastSection));
@@ -393,30 +412,66 @@ fn node_headers(header: &NodeHeader, content_length: Option<u64>, out: &mut Vec<
 
 /// A copy source's headers.
 fn copy_headers(copy: &CopyFrom, out: &mut Vec<u8>) {
-  header_line(out, Header::NodeCopyfromRev, copy.revision.to_string().as_bytes());
+  header_line(
+    out,
+    Header::NodeCopyfromRev,
+    copy.revision.to_string().as_bytes(),
+  );
   header_line(out, Header::NodeCopyfromPath, &copy.path);
-  digest_line(out, Header::TextCopySourceMd5, copy.md5.as_ref().map(|digest| digest.as_slice()));
-  digest_line(out, Header::TextCopySourceSha1, copy.sha1.as_ref().map(|digest| digest.as_slice()));
+  digest_line(
+    out,
+    Header::TextCopySourceMd5,
+    copy.md5.as_ref().map(|digest| digest.as_slice()),
+  );
+  digest_line(
+    out,
+    Header::TextCopySourceSha1,
+    copy.sha1.as_ref().map(|digest| digest.as_slice()),
+  );
 }
 
 /// A text section's headers but its length.
 fn text_headers(text: &TextSection, out: &mut Vec<u8>) {
   if let Some(base) = &text.delta {
     header_line(out, Header::TextDelta, FLAG_SET);
-    digest_line(out, Header::TextDeltaBaseMd5, base.md5.as_ref().map(|digest| digest.as_slice()));
-    digest_line(out, Header::TextDeltaBaseSha1, base.sha1.as_ref().map(|digest| digest.as_slice()));
+    digest_line(
+      out,
+      Header::TextDeltaBaseMd5,
+      base.md5.as_ref().map(|digest| digest.as_slice()),
+    );
+    digest_line(
+      out,
+      Header::TextDeltaBaseSha1,
+      base.sha1.as_ref().map(|digest| digest.as_slice()),
+    );
   }
-  digest_line(out, Header::TextContentMd5, text.md5.as_ref().map(|digest| digest.as_slice()));
-  digest_line(out, Header::TextContentSha1, text.sha1.as_ref().map(|digest| digest.as_slice()));
+  digest_line(
+    out,
+    Header::TextContentMd5,
+    text.md5.as_ref().map(|digest| digest.as_slice()),
+  );
+  digest_line(
+    out,
+    Header::TextContentSha1,
+    text.sha1.as_ref().map(|digest| digest.as_slice()),
+  );
 }
 
 /// The sections' lengths and the content block's.
 fn length_headers(header: &NodeHeader, content_length: Option<u64>, out: &mut Vec<u8>) {
   if let Some(section) = header.properties {
-    header_line(out, Header::PropContentLength, section.length.to_string().as_bytes());
+    header_line(
+      out,
+      Header::PropContentLength,
+      section.length.to_string().as_bytes(),
+    );
   }
   if let Some(text) = header.text {
-    header_line(out, Header::TextContentLength, text.length.to_string().as_bytes());
+    header_line(
+      out,
+      Header::TextContentLength,
+      text.length.to_string().as_bytes(),
+    );
   }
   if let Some(length) = content_length {
     header_line(out, Header::ContentLength, length.to_string().as_bytes());
@@ -438,7 +493,12 @@ fn digest_line(out: &mut Vec<u8>, header: Header, digest: Option<&[u8]>) {
   };
   let hex: Vec<u8> = digest
     .iter()
-    .flat_map(|&byte| [hex_digit(byte.checked_shr(NIBBLE_BITS).unwrap_or(0)), hex_digit(byte & LOW_NIBBLE)])
+    .flat_map(|&byte| {
+      [
+        hex_digit(byte.checked_shr(NIBBLE_BITS).unwrap_or(0)),
+        hex_digit(byte & LOW_NIBBLE),
+      ]
+    })
     .collect();
   header_line(out, header, &hex);
 }
@@ -458,7 +518,7 @@ fn length_entry(out: &mut Vec<u8>, letter: u8, bytes: &[u8]) {
   out.push(LINE_FEED);
 }
 
-/// The two line feeds that end a record with content (`dump.c` 1544).
+/// The two line feeds that end a record with content (`dump.c` 1542).
 fn record_end(out: &mut Vec<u8>) {
   out.push(LINE_FEED);
   out.push(LINE_FEED);

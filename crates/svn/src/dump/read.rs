@@ -9,8 +9,8 @@
 use super::digest::{Digests, check_text, checks_anything};
 use super::header::{Block, Record, parse_number};
 use super::{
-  Admission, DumpError, Event, Format, LINE_FEED, Md5, NUMBER_DIGITS, NodeAction, NodeHeader, PROPS_END_LINE, Property,
-  PropertyFault, Read, Sha1, TextSection, to_u64,
+  Admission, DumpError, Event, Format, LINE_FEED, Md5, NUMBER_DIGITS, NodeAction, NodeHeader,
+  PROPS_END_LINE, Property, PropertyFault, Read, Sha1, TextSection, to_u64,
 };
 use crate::index::Revision;
 use crate::svndiff::{Decoded, Decoder, SvndiffError};
@@ -26,15 +26,15 @@ const VERSION_PREFIX: &[u8] = b"SVN-fs-dump-format-version: ";
 const WHITESPACE: [u8; 6] = [b'\t', b'\n', 0x0b, 0x0c, b'\r', b' '];
 
 /// The prefix of a property entry's line naming a property to set.
-/// Format: `hash.c` 287 writes `K <length>\n`; `load.c` 214 reads it.
+/// Format: `hash.c` 289 writes `K <length>\n`; `load.c` 213 reads it.
 const SET_PREFIX: &[u8] = b"K ";
 
 /// The prefix of a property entry's line giving the value's length.
-/// Format: `hash.c` 289 writes `V <length>\n`; `load.c` 228 reads it.
+/// Format: `hash.c` 290 writes `V <length>\n`; `load.c` 230 reads it.
 const VALUE_PREFIX: &[u8] = b"V ";
 
 /// The prefix of a property entry's line naming a property to delete.
-/// Format: `hash.c` 309-311 writes `D <length>\n`; `load.c` 256 reads it.
+/// Format: `hash.c` 313 writes `D <length>\n`; `load.c` 259 reads it.
 const DELETE_PREFIX: &[u8] = b"D ";
 
 /// Reads a dump a part at a time from a buffer its caller holds (the module documentation).
@@ -146,7 +146,10 @@ enum Step<'a> {
 enum Entry<'a> {
   NeedMore(usize),
   End,
-  Read { property: Property<'a>, length: usize },
+  Read {
+    property: Property<'a>,
+    length: usize,
+  },
 }
 
 /// A held deletion and the record after it: one replacement, or two records.
@@ -286,7 +289,8 @@ impl Reader {
       .and_then(|line| line.get(VERSION_PREFIX.len()..))
       .and_then(parse_number)
       .ok_or(DumpError::MalformedVersion)?;
-    let format = Format::from_number(number).ok_or(DumpError::UnsupportedVersion { version: number })?;
+    let format =
+      Format::from_number(number).ok_or(DumpError::UnsupportedVersion { version: number })?;
     cursor.consume(length.saturating_add(1));
     self.format = Some(format);
     self.state = State::Gap;
@@ -327,7 +331,11 @@ impl Reader {
   }
 
   /// One line of a header block: a header read, or the block's end and the record it names.
-  fn header_line<'a>(&mut self, mut block: Box<Block>, cursor: &mut Cursor<'a>) -> Result<Step<'a>, DumpError> {
+  fn header_line<'a>(
+    &mut self,
+    mut block: Box<Block>,
+    cursor: &mut Cursor<'a>,
+  ) -> Result<Step<'a>, DumpError> {
     let rest = cursor.rest();
     let Some(length) = self.line(rest)? else {
       self.state = State::Headers(block);
@@ -412,7 +420,11 @@ impl Reader {
   }
 
   /// One entry of a property section, or its end.
-  fn property<'a>(&mut self, section: Section, cursor: &mut Cursor<'a>) -> Result<Step<'a>, DumpError> {
+  fn property<'a>(
+    &mut self,
+    section: Section,
+    cursor: &mut Cursor<'a>,
+  ) -> Result<Step<'a>, DumpError> {
     let reading = EntryReading {
       rest: cursor.rest(),
       left: section.left,
@@ -441,7 +453,11 @@ impl Reader {
   }
 
   /// A piece of a whole text, or its end with its digests checked.
-  fn whole_text<'a>(&mut self, mut text: Box<WholeText>, cursor: &mut Cursor<'a>) -> Result<Step<'a>, DumpError> {
+  fn whole_text<'a>(
+    &mut self,
+    mut text: Box<WholeText>,
+    cursor: &mut Cursor<'a>,
+  ) -> Result<Step<'a>, DumpError> {
     if text.left == 0 {
       text.check()?;
       self.state = rest_or_gap(text.rest);
@@ -462,7 +478,11 @@ impl Reader {
   }
 
   /// A part of a text delta, read by svndiff's decoder within the text's section, or the delta's end.
-  fn delta<'a>(&mut self, mut delta: Box<DeltaText>, cursor: &mut Cursor<'a>) -> Result<Step<'a>, DumpError> {
+  fn delta<'a>(
+    &mut self,
+    mut delta: Box<DeltaText>,
+    cursor: &mut Cursor<'a>,
+  ) -> Result<Step<'a>, DumpError> {
     if delta.left == 0 {
       delta.decoder.finish(&[]).map_err(DumpError::Svndiff)?;
       self.state = rest_or_gap(delta.rest);
@@ -542,7 +562,11 @@ fn text_or_rest(after: After) -> Result<State, DumpError> {
 
 /// The state that passes over `rest` bytes of a content block, or none.
 fn rest_or_gap(rest: u64) -> State {
-  if rest == 0 { State::Gap } else { State::Rest(rest) }
+  if rest == 0 {
+    State::Gap
+  } else {
+    State::Rest(rest)
+  }
 }
 
 /// The first `left` bytes of `rest`, or all of it when it is shorter.
@@ -556,7 +580,9 @@ fn within(rest: &[u8], left: u64) -> &[u8] {
 /// `maybe_add_with_history`), and FSFS records one replacement.
 fn fold(deletion: NodeHeader, record: Record) -> Fold {
   match record {
-    Record::Node { mut header, rest } if header.action == NodeAction::Add && header.path == deletion.path => {
+    Record::Node { mut header, rest }
+      if header.action == NodeAction::Add && header.path == deletion.path =>
+    {
       header.action = NodeAction::Replace;
       Fold::Folded(Record::Node { header, rest })
     }
@@ -614,7 +640,11 @@ impl<'a> EntryReading<'a> {
       let counted = [SET_PREFIX, VALUE_PREFIX, DELETE_PREFIX]
         .iter()
         .any(|prefix| tail.starts_with(prefix));
-      let fault = if counted { PropertyFault::MalformedLength } else { PropertyFault::MalformedLine };
+      let fault = if counted {
+        PropertyFault::MalformedLength
+      } else {
+        PropertyFault::MalformedLine
+      };
       return Err(property_fault(fault));
     }
     if to_u64(section.len()) == self.left {

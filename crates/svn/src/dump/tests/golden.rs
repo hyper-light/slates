@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 
 use super::support::{Owned, ROOMY, Reading, hex, read, read_whole, write};
-use crate::dump::{Admission, DumpError, Format, NodeAction, NodeHeader, RevisionHeader, check_text, Digests};
+use crate::dump::{
+  Admission, Digests, DumpError, Format, NodeAction, NodeHeader, RevisionHeader, check_text,
+};
 use crate::index::NodeKind;
 use crate::svndiff::{Window, apply_all};
 
@@ -37,20 +39,33 @@ pub(super) fn vector(name: &str) -> &'static [u8] {
   };
   let recorded = SUMS
     .lines()
-    .find_map(|line| line.split_once("  ").filter(|(_, file)| *file == name).map(|(sum, _)| sum))
+    .find_map(|line| {
+      line
+        .split_once("  ")
+        .filter(|(_, file)| *file == name)
+        .map(|(sum, _)| sum)
+    })
     .unwrap_or_else(|| panic!("{name} is not in SHA256SUMS"));
   let sum = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-  assert_eq!(hex(sum.as_ref()), recorded, "{name} is not the vector svnadmin wrote");
+  assert_eq!(
+    hex(sum.as_ref()),
+    recorded,
+    "{name} is not the vector svnadmin wrote"
+  );
   bytes
 }
 
 /// Every dump vector, and the stream two of them make one after the other.
 fn dumps() -> Vec<(&'static str, Vec<u8>)> {
-  let mut dumps: Vec<(&'static str, Vec<u8>)> = ["full.dump", "deltas.dump", "part1.dump", "part2.dump"]
-    .into_iter()
-    .map(|name| (name, vector(name).to_vec()))
-    .collect();
-  dumps.push(("part1.dump then part2.dump", [vector("part1.dump"), vector("part2.dump")].concat()));
+  let mut dumps: Vec<(&'static str, Vec<u8>)> =
+    ["full.dump", "deltas.dump", "part1.dump", "part2.dump"]
+      .into_iter()
+      .map(|name| (name, vector(name).to_vec()))
+      .collect();
+  dumps.push((
+    "part1.dump then part2.dump",
+    [vector("part1.dump"), vector("part2.dump")].concat(),
+  ));
   dumps
 }
 
@@ -63,13 +78,19 @@ fn dumps() -> Vec<(&'static str, Vec<u8>)> {
 fn every_dump_svnadmin_wrote_is_read_and_written_again_byte_for_byte() {
   let version = String::from_utf8_lossy(vector("svn-version.txt"));
   for (name, dump) in dumps() {
-    let events = read_whole(&dump).unwrap_or_else(|refusal| panic!("{name} ({version}): {refusal:?}"));
+    let events =
+      read_whole(&dump).unwrap_or_else(|refusal| panic!("{name} ({version}): {refusal:?}"));
     for piece in [1, 7, 4096] {
-      let pieces = read(&dump, piece, ROOMY).unwrap_or_else(|refusal| panic!("{name} in {piece}s: {refusal:?}"));
+      let pieces = read(&dump, piece, ROOMY)
+        .unwrap_or_else(|refusal| panic!("{name} in {piece}s: {refusal:?}"));
       assert_eq!(pieces.events, events, "{name} read in pieces of {piece}");
     }
     let written = write(&events).unwrap_or_else(|refusal| panic!("{name} written: {refusal:?}"));
-    assert!(written == dump, "{name} ({version}) written again differs from svnadmin's {}", first_difference(&written, &dump));
+    assert!(
+      written == dump,
+      "{name} ({version}) written again differs from svnadmin's {}",
+      first_difference(&written, &dump)
+    );
   }
 }
 
@@ -83,7 +104,9 @@ fn the_tightest_admission_reads_a_dump_and_one_byte_less_is_refused() {
     let most = read(&dump, 1, ROOMY).unwrap().most_needed;
     assert!(most > 1, "{name}: the admission was never tested");
     let tight = Admission { buffer_bytes: most };
-    let short = Admission { buffer_bytes: most - 1 };
+    let short = Admission {
+      buffer_bytes: most - 1,
+    };
     for piece in [1, usize::MAX] {
       assert!(read(&dump, piece, tight).is_ok(), "{name} within {most}");
       assert_eq!(
@@ -169,11 +192,17 @@ impl Replay {
       Owned::Node(header) => self.node(header),
       Owned::Set { .. } | Owned::Delete { .. } if self.node.is_none() => {}
       Owned::Set { name, value } => {
-        self.current().properties.insert(name.clone(), value.clone());
+        self
+          .current()
+          .properties
+          .insert(name.clone(), value.clone());
       }
       Owned::Delete { name } => {
         self.counts.deleted_properties += 1;
-        assert!(self.current().properties.remove(name).is_some(), "deleted {name:?}, which the base lacks");
+        assert!(
+          self.current().properties.remove(name).is_some(),
+          "deleted {name:?}, which the base lacks"
+        );
       }
       Owned::Text(bytes) => self.current().text = bytes.clone(),
       Owned::Delta(_) => self.windows.clear(),
@@ -187,7 +216,11 @@ impl Replay {
   fn revision(&mut self, header: &RevisionHeader) {
     self.node = None;
     if header.number > 0 {
-      assert_eq!(self.trees.len() as u64 + 1, header.number, "revisions out of order");
+      assert_eq!(
+        self.trees.len() as u64 + 1,
+        header.number,
+        "revisions out of order"
+      );
       self.trees.push(self.tree.clone());
     }
   }
@@ -205,7 +238,9 @@ impl Replay {
     }
     if matches!(header.action, NodeAction::Delete | NodeAction::Replace) {
       assert!(self.tree.contains_key(&path), "{path:?} deleted absent");
-      self.tree.retain(|existing, _| !at_or_beneath(existing, &path));
+      self
+        .tree
+        .retain(|existing, _| !at_or_beneath(existing, &path));
     }
     if matches!(header.action, NodeAction::Add | NodeAction::Replace) {
       self.add(header);
@@ -217,7 +252,11 @@ impl Replay {
     if header.properties.is_some_and(|section| section.delta) {
       self.counts.property_deltas += 1;
     }
-    self.delta_base = self.tree.get(&path).map(|entry| entry.text.clone()).unwrap_or_default();
+    self.delta_base = self
+      .tree
+      .get(&path)
+      .map(|entry| entry.text.clone())
+      .unwrap_or_default();
     if header.text.is_some_and(|section| section.delta.is_none()) {
       self.current().text.clear();
     }
@@ -229,14 +268,23 @@ impl Replay {
     assert!(!self.tree.contains_key(&path), "{path:?} added present");
     let Some(copy) = &header.copy_from else {
       let directory = header.kind == Some(NodeKind::Directory);
-      self.tree.insert(path, Entry { directory, ..Entry::default() });
+      self.tree.insert(
+        path,
+        Entry {
+          directory,
+          ..Entry::default()
+        },
+      );
       return;
     };
     self.counts.copies += 1;
     if header.action == NodeAction::Replace {
       self.counts.replacements_by_copy += 1;
     }
-    assert!((copy.revision as usize) < self.building(), "a copy from its own revision or later");
+    assert!(
+      (copy.revision as usize) < self.building(),
+      "a copy from its own revision or later"
+    );
     let source = &self.trees[copy.revision as usize];
     let copied: Vec<(Vec<u8>, Entry)> = source
       .iter()
@@ -247,17 +295,35 @@ impl Replay {
         (moved, entry.clone())
       })
       .collect();
-    assert!(!copied.is_empty(), "copy of {:?}@{}, absent", copy.path, copy.revision);
+    assert!(
+      !copied.is_empty(),
+      "copy of {:?}@{}, absent",
+      copy.path,
+      copy.revision
+    );
     if let (Some(md5), Some(entry)) = (copy.md5, source.get(&copy.path)) {
-      assert_eq!(Some(md5), digests(&entry.text).0.into(), "Text-copy-source-md5 of {:?}", copy.path);
+      assert_eq!(
+        Some(md5),
+        digests(&entry.text).0.into(),
+        "Text-copy-source-md5 of {:?}",
+        copy.path
+      );
     }
     self.tree.extend(copied);
   }
 
   /// The node the current record names.
   fn current(&mut self) -> &mut Entry {
-    let path = self.node.as_ref().expect("a section outside a node").path.clone();
-    self.tree.get_mut(&path).expect("a section of a node the tree lacks")
+    let path = self
+      .node
+      .as_ref()
+      .expect("a section outside a node")
+      .path
+      .clone();
+    self
+      .tree
+      .get_mut(&path)
+      .expect("a section of a node the tree lacks")
   }
 
   /// The end of a text: a delta's windows applied to the node's base, both checked against their headers' digests.
@@ -314,8 +380,14 @@ fn format_three_s_deltas_rebuild_format_two_s_trees_revision_by_revision() {
   assert_eq!(whole_counts.text_deltas, 0, "format 2 holds no deltas");
   assert!(counts.text_deltas >= 10, "{counts:?}");
   assert!(counts.most_windows >= 2, "{counts:?}");
-  assert!(counts.property_deltas >= 4 && counts.deleted_properties >= 2, "{counts:?}");
-  assert!(counts.copies >= 8 && counts.replacements_by_copy >= 4, "{counts:?}");
+  assert!(
+    counts.property_deltas >= 4 && counts.deleted_properties >= 2,
+    "{counts:?}"
+  );
+  assert!(
+    counts.copies >= 8 && counts.replacements_by_copy >= 4,
+    "{counts:?}"
+  );
   assert!(counts.root_records >= 2, "{counts:?}");
 }
 
@@ -328,7 +400,10 @@ type Change = (Vec<u8>, char, bool, bool, Option<(Vec<u8>, u64)>);
 fn svnlook_changes() -> BTreeMap<u64, Vec<Change>> {
   let mut revisions: BTreeMap<u64, Vec<Change>> = BTreeMap::new();
   let mut revision = 0;
-  for line in vector("changed.txt").split(|&byte| byte == b'\n').filter(|line| !line.is_empty()) {
+  for line in vector("changed.txt")
+    .split(|&byte| byte == b'\n')
+    .filter(|line| !line.is_empty())
+  {
     if let Some(number) = line.strip_prefix(b"r") {
       revision = std::str::from_utf8(number).unwrap().parse().unwrap();
       continue;
@@ -337,12 +412,21 @@ fn svnlook_changes() -> BTreeMap<u64, Vec<Change>> {
       let from = from.strip_suffix(b")").unwrap();
       let colon = from.iter().rposition(|&byte| byte == b':').unwrap();
       let source = trim_directory(&from[..colon]);
-      let number = std::str::from_utf8(&from[colon + 2..]).unwrap().parse().unwrap();
+      let number = std::str::from_utf8(&from[colon + 2..])
+        .unwrap()
+        .parse()
+        .unwrap();
       revisions.get_mut(&revision).unwrap().last_mut().unwrap().4 = Some((source, number));
       continue;
     }
     let action = char::from(line[0]);
-    let change = (trim_directory(&line[4..]), action, action == 'U', line[1] == b'U', None);
+    let change = (
+      trim_directory(&line[4..]),
+      action,
+      action == 'U',
+      line[1] == b'U',
+      None,
+    );
     revisions.entry(revision).or_default().push(change);
   }
   revisions
@@ -362,11 +446,20 @@ fn dump_changes(events: &[Owned]) -> BTreeMap<u64, Vec<Change>> {
       Owned::Revision(header) => revision = header.number,
       Owned::Node(header) => {
         let rows = revisions.entry(revision).or_default();
-        let copy = header.copy_from.as_ref().map(|copy| (copy.path.clone(), copy.revision));
+        let copy = header
+          .copy_from
+          .as_ref()
+          .map(|copy| (copy.path.clone(), copy.revision));
         let path = header.path.clone();
         match header.action {
           NodeAction::Change => {
-            rows.push((path, 'U', header.text.is_some(), header.properties.is_some(), None));
+            rows.push((
+              path,
+              'U',
+              header.text.is_some(),
+              header.properties.is_some(),
+              None,
+            ));
             if header.text.is_none() {
               rows.last_mut().unwrap().1 = '_';
             }
@@ -400,7 +493,11 @@ fn sorted(mut revisions: BTreeMap<u64, Vec<Change>>) -> BTreeMap<u64, Vec<Change
 #[test]
 fn every_revision_s_records_are_what_svnlook_says_it_changed() {
   let expected = sorted(svnlook_changes());
-  assert_eq!(expected.len(), 13, "svnlook's listing covers every revision");
+  assert_eq!(
+    expected.len(),
+    13,
+    "svnlook's listing covers every revision"
+  );
   for name in ["full.dump", "deltas.dump"] {
     let mut changes = sorted(dump_changes(&read_whole(vector(name)).unwrap()));
     for rows in changes.values_mut() {
@@ -421,17 +518,42 @@ fn dumps_written_one_after_the_other_read_as_one_stream_whose_format_changes() {
   let events = read_whole(&[vector("part1.dump"), vector("part2.dump")].concat()).unwrap();
   let formats: Vec<Format> = events
     .iter()
-    .filter_map(|event| if let Owned::Format(format) = event { Some(*format) } else { None })
+    .filter_map(|event| {
+      if let Owned::Format(format) = event {
+        Some(*format)
+      } else {
+        None
+      }
+    })
     .collect();
   assert_eq!(formats, [Format::Two, Format::Three]);
-  assert_eq!(events.iter().filter(|event| matches!(event, Owned::Uuid(_))).count(), 2);
+  assert_eq!(
+    events
+      .iter()
+      .filter(|event| matches!(event, Owned::Uuid(_)))
+      .count(),
+    2
+  );
   let numbers: Vec<u64> = events
     .iter()
-    .filter_map(|event| if let Owned::Revision(header) = event { Some(header.number) } else { None })
+    .filter_map(|event| {
+      if let Owned::Revision(header) = event {
+        Some(header.number)
+      } else {
+        None
+      }
+    })
     .collect();
   assert_eq!(numbers, (0..=13).collect::<Vec<u64>>());
-  let second_format = events.iter().rposition(|event| matches!(event, Owned::Format(_))).unwrap();
-  assert!(events[..second_format].iter().all(|event| !matches!(event, Owned::Window(_))));
+  let second_format = events
+    .iter()
+    .rposition(|event| matches!(event, Owned::Format(_)))
+    .unwrap();
+  assert!(
+    events[..second_format]
+      .iter()
+      .all(|event| !matches!(event, Owned::Window(_)))
+  );
   let from_four = |events: &[Owned]| -> Vec<Owned> {
     let start = events
       .iter()
@@ -439,7 +561,10 @@ fn dumps_written_one_after_the_other_read_as_one_stream_whose_format_changes() {
       .unwrap();
     events[start..].to_vec()
   };
-  assert_eq!(from_four(&events), from_four(&read_whole(vector("deltas.dump")).unwrap()));
+  assert_eq!(
+    from_four(&events),
+    from_four(&read_whole(vector("deltas.dump")).unwrap())
+  );
 }
 
 /// A-593 (golden): do read revision 6 of the format-2 dump, where `svnadmin` wrote each of four replacements by a copy
@@ -455,18 +580,34 @@ fn a_replacement_by_a_copy_is_read_as_the_one_record_fsfs_keeps() {
   let nodes: Vec<&NodeHeader> = events[start + 1..]
     .iter()
     .take_while(|event| !matches!(event, Owned::Revision(_)))
-    .filter_map(|event| if let Owned::Node(header) = event { Some(header) } else { None })
+    .filter_map(|event| {
+      if let Owned::Node(header) = event {
+        Some(header)
+      } else {
+        None
+      }
+    })
     .collect();
   let rows: Vec<(&[u8], NodeAction, &[u8], u64)> = nodes
     .iter()
     .map(|header| {
       let copy = header.copy_from.as_ref().expect("a copy source");
-      (header.path.as_slice(), header.action, copy.path.as_slice(), copy.revision)
+      (
+        header.path.as_slice(),
+        header.action,
+        copy.path.as_slice(),
+        copy.revision,
+      )
     })
     .collect();
   let expected: [(&[u8], NodeAction, &[u8], u64); 4] = [
     (b"branches/b1", NodeAction::Replace, b"trunk", 5),
-    (b"branches/b1/bin.dat", NodeAction::Replace, b"trunk/a.txt", 5),
+    (
+      b"branches/b1/bin.dat",
+      NodeAction::Replace,
+      b"trunk/a.txt",
+      5,
+    ),
     (b"trunk/a: b c.txt", NodeAction::Replace, b"trunk/a.txt", 5),
     (b"trunk/bin.dat", NodeAction::Replace, b"trunk/a.txt", 5),
   ];
@@ -485,6 +626,14 @@ fn first_difference(written: &[u8], expected: &[u8]) -> String {
     .zip(expected)
     .position(|(left, right)| left != right)
     .unwrap_or(written.len().min(expected.len()));
-  let around = |bytes: &[u8]| String::from_utf8_lossy(&bytes[at.saturating_sub(40)..(at + 40).min(bytes.len())]).into_owned();
-  format!("at byte {at} of {} written and {} expected: {:?} against {:?}", written.len(), expected.len(), around(written), around(expected))
+  let around = |bytes: &[u8]| {
+    String::from_utf8_lossy(&bytes[at.saturating_sub(40)..(at + 40).min(bytes.len())]).into_owned()
+  };
+  format!(
+    "at byte {at} of {} written and {} expected: {:?} against {:?}",
+    written.len(),
+    expected.len(),
+    around(written),
+    around(expected)
+  )
 }

@@ -5,7 +5,8 @@ use proptest::prelude::*;
 
 use super::golden::{reading, vector};
 use super::support::{
-  Owned, ROOMY, V2, V3, digests_hex, dump, file_add, node, push, read, read_whole, refusal, revision, write,
+  Owned, ROOMY, V2, V3, digests_hex, dump, file_add, node, push, read, read_whole, refusal,
+  revision, write,
 };
 use crate::dump::{
   Admission, Contradiction, Digest, DumpError, Header, NodeAction, PropertyFault, Read, Reader,
@@ -59,7 +60,9 @@ fn begins(read_so_far: &[Owned], at_end: &[Owned], whole: &[Owned]) -> bool {
   }
   let split = |cut: &Owned, kept: &Owned| match (cut, kept) {
     (Owned::Node(deleted), Owned::Node(replaced)) => {
-      deleted.action == NodeAction::Delete && replaced.action == NodeAction::Replace && deleted.path == replaced.path
+      deleted.action == NodeAction::Delete
+        && replaced.action == NodeAction::Replace
+        && deleted.path == replaced.path
     }
     _ => false,
   };
@@ -94,7 +97,10 @@ fn every_cut_of_every_vector_is_refused_as_truncated_or_ends_between_records() {
         Err(other) => panic!("{name} cut at {cut}: {other:?}"),
         Ok(at_end) => {
           clean += 1;
-          assert!(begins(&events, &at_end, &whole), "{name} cut at {cut} reads as another history");
+          assert!(
+            begins(&events, &at_end, &whole),
+            "{name} cut at {cut} reads as another history"
+          );
           if cut == dump.len() {
             let mut all = events.clone();
             all.extend(at_end);
@@ -106,7 +112,10 @@ fn every_cut_of_every_vector_is_refused_as_truncated_or_ends_between_records() {
         held.push(byte);
       }
     }
-    assert!(truncated > 0 && clean >= records, "{name}: {truncated} truncated, {clean} clean, {records} records");
+    assert!(
+      truncated > 0 && clean >= records,
+      "{name}: {truncated} truncated, {clean} clean, {records} records"
+    );
   }
 }
 
@@ -125,9 +134,17 @@ fn judge_flip(name: &str, flipped: &[u8], at: usize, bit: u32, spans: &[(usize, 
       false
     }
     Ok(events) => {
-      assert!(!in_checked_text(at, spans), "{name}: bit {bit} of byte {at}, in a checked text, read cleanly");
-      let written = write(&events).unwrap_or_else(|refusal| panic!("{name} {at}/{bit} written: {refusal:?}"));
-      assert_eq!(read_whole(&written).unwrap(), events, "{name}: bit {bit} of byte {at} written and read again");
+      assert!(
+        !in_checked_text(at, spans),
+        "{name}: bit {bit} of byte {at}, in a checked text, read cleanly"
+      );
+      let written =
+        write(&events).unwrap_or_else(|refusal| panic!("{name} {at}/{bit} written: {refusal:?}"));
+      assert_eq!(
+        read_whole(&written).unwrap(),
+        events,
+        "{name}: bit {bit} of byte {at} written and read again"
+      );
       true
     }
   }
@@ -155,7 +172,10 @@ fn every_bit_flip_of_the_smallest_vector_is_refused_or_read_consistently() {
       flipped[at] ^= 1 << bit;
     }
   }
-  assert!(refused > 0 && accepted > 0, "{refused} refused, {accepted} accepted");
+  assert!(
+    refused > 0 && accepted > 0,
+    "{refused} refused, {accepted} accepted"
+  );
 }
 
 proptest! {
@@ -227,17 +247,46 @@ fn a_stream_without_a_version_record_of_format_two_or_three_is_refused() {
   let cases: [(&[u8], DumpError, u32); 7] = [
     (b"", DumpError::Truncated, INCOMPLETE),
     (b"PK\x03\x04", DumpError::MalformedVersion, MALFORMED),
-    (b"SVN-fs-dump-format-version: 1\n\n", DumpError::UnsupportedVersion { version: 1 }, MALFORMED),
-    (b"SVN-fs-dump-format-version: 4\n\n", DumpError::UnsupportedVersion { version: 4 }, MALFORMED),
-    (b"SVN-fs-dump-format-version:2\n\n", DumpError::MalformedVersion, MALFORMED),
-    (b"SVN-fs-dump-format-version: 2x\n\n", DumpError::MalformedVersion, MALFORMED),
-    (b"SVN-fs-dump-format-version: 2", DumpError::Truncated, INCOMPLETE),
+    (
+      b"SVN-fs-dump-format-version: 1\n\n",
+      DumpError::UnsupportedVersion { version: 1 },
+      MALFORMED,
+    ),
+    (
+      b"SVN-fs-dump-format-version: 4\n\n",
+      DumpError::UnsupportedVersion { version: 4 },
+      MALFORMED,
+    ),
+    (
+      b"SVN-fs-dump-format-version:2\n\n",
+      DumpError::MalformedVersion,
+      MALFORMED,
+    ),
+    (
+      b"SVN-fs-dump-format-version: 2x\n\n",
+      DumpError::MalformedVersion,
+      MALFORMED,
+    ),
+    (
+      b"SVN-fs-dump-format-version: 2",
+      DumpError::Truncated,
+      INCOMPLETE,
+    ),
   ];
   for (bytes, expected, code) in cases {
-    assert_eq!(refused(bytes), (expected, code), "{:?}", String::from_utf8_lossy(bytes));
+    assert_eq!(
+      refused(bytes),
+      (expected, code),
+      "{:?}",
+      String::from_utf8_lossy(bytes)
+    );
   }
   let mut reader = Reader::new(ROOMY);
-  assert_eq!(reader.read(b"P", false), Err(DumpError::MalformedVersion), "refused at its first byte");
+  assert_eq!(
+    reader.read(b"P", false),
+    Err(DumpError::MalformedVersion),
+    "refused at its first byte"
+  );
 }
 
 /// A-593 (hostile): do read header blocks that are malformed, repeat a header, name no record or two, put a node's
@@ -246,37 +295,78 @@ fn a_stream_without_a_version_record_of_format_two_or_three_is_refused() {
 #[test]
 fn a_malformed_header_block_is_refused_by_kind() {
   let cases: [(&[u8], DumpError, u32); 12] = [
-    (b"Revision-number 1\n\n", DumpError::MalformedHeader, MALFORMED),
-    (b"Revision-number:1\n\n", DumpError::MalformedHeader, MALFORMED),
+    (
+      b"Revision-number 1\n\n",
+      DumpError::MalformedHeader,
+      MALFORMED,
+    ),
+    (
+      b"Revision-number:1\n\n",
+      DumpError::MalformedHeader,
+      MALFORMED,
+    ),
     (b": 1\n\n", DumpError::MalformedHeader, MALFORMED),
-    (b"Revision-number: 1\x00\n\n", DumpError::MalformedHeader, MALFORMED),
+    (
+      b"Revision-number: 1\x00\n\n",
+      DumpError::MalformedHeader,
+      MALFORMED,
+    ),
     (
       b"Revision-number: 1\nRevision-number: 2\n\n",
-      DumpError::DuplicateHeader { header: Header::RevisionNumber },
+      DumpError::DuplicateHeader {
+        header: Header::RevisionNumber,
+      },
       MALFORMED,
     ),
-    (b"Revision-number: x\n\n", DumpError::MalformedValue { header: Header::RevisionNumber }, MALFORMED),
+    (
+      b"Revision-number: x\n\n",
+      DumpError::MalformedValue {
+        header: Header::RevisionNumber,
+      },
+      MALFORMED,
+    ),
     (
       b"Revision-number: 9223372036854775808\n\n",
-      DumpError::MalformedValue { header: Header::RevisionNumber },
+      DumpError::MalformedValue {
+        header: Header::RevisionNumber,
+      },
       MALFORMED,
     ),
-    (b"X-Unknown: y\n\n", DumpError::UnrecognizedRecord, MALFORMED),
+    (
+      b"X-Unknown: y\n\n",
+      DumpError::UnrecognizedRecord,
+      MALFORMED,
+    ),
     (
       b"Revision-number: 1\nNode-path: a\n\n",
-      DumpError::Contradiction { fault: Contradiction::MixedRecord },
+      DumpError::Contradiction {
+        fault: Contradiction::MixedRecord,
+      },
       MALFORMED,
     ),
     (
       b"Revision-number: 1\nNode-kind: file\n\n",
-      DumpError::Contradiction { fault: Contradiction::HeaderOutOfPlace },
+      DumpError::Contradiction {
+        fault: Contradiction::HeaderOutOfPlace,
+      },
       MALFORMED,
     ),
-    (b"UUID: not-a-uuid\n\n", DumpError::MalformedValue { header: Header::Uuid }, BAD_UUID),
+    (
+      b"UUID: not-a-uuid\n\n",
+      DumpError::MalformedValue {
+        header: Header::Uuid,
+      },
+      BAD_UUID,
+    ),
     (b"Revision-number: 1\n", DumpError::Truncated, INCOMPLETE),
   ];
   for (block, expected, code) in cases {
-    assert_eq!(refused(&dump(&[V2, block])), (expected, code), "{:?}", String::from_utf8_lossy(block));
+    assert_eq!(
+      refused(&dump(&[V2, block])),
+      (expected, code),
+      "{:?}",
+      String::from_utf8_lossy(block)
+    );
   }
 }
 
@@ -291,92 +381,235 @@ fn a_node_record_whose_headers_contradict_each_other_or_the_stream_is_refused_by
   let cases: Vec<(Vec<u8>, (DumpError, u32))> = vec![
     (
       in_revision_one(V2, &[&bare("Node-path: a\nNode-kind: file")]),
-      (DumpError::MissingHeader { header: Header::NodeAction }, UNRECOGNIZED),
+      (
+        DumpError::MissingHeader {
+          header: Header::NodeAction,
+        },
+        UNRECOGNIZED,
+      ),
     ),
     (
-      in_revision_one(V2, &[&bare("Node-path: a\nNode-kind: file\nNode-action: move")]),
-      (DumpError::MalformedValue { header: Header::NodeAction }, UNRECOGNIZED),
+      in_revision_one(
+        V2,
+        &[&bare("Node-path: a\nNode-kind: file\nNode-action: move")],
+      ),
+      (
+        DumpError::MalformedValue {
+          header: Header::NodeAction,
+        },
+        UNRECOGNIZED,
+      ),
     ),
     (
-      in_revision_one(V2, &[&bare("Node-path: a\nNode-kind: link\nNode-action: add")]),
-      (DumpError::MalformedValue { header: Header::NodeKind }, UNRECOGNIZED),
+      in_revision_one(
+        V2,
+        &[&bare("Node-path: a\nNode-kind: link\nNode-action: add")],
+      ),
+      (
+        DumpError::MalformedValue {
+          header: Header::NodeKind,
+        },
+        UNRECOGNIZED,
+      ),
     ),
     (
       in_revision_one(V2, &[&bare("Node-path: a\nNode-action: add")]),
-      (DumpError::MissingHeader { header: Header::NodeKind }, MALFORMED),
+      (
+        DumpError::MissingHeader {
+          header: Header::NodeKind,
+        },
+        MALFORMED,
+      ),
     ),
-    (dump(&[V2, &bare("Node-path: a\nNode-action: delete")]), contradiction(Contradiction::NodeOutsideRevision)),
+    (
+      dump(&[V2, &bare("Node-path: a\nNode-action: delete")]),
+      contradiction(Contradiction::NodeOutsideRevision),
+    ),
     (
       dump(&[V2, &revision(0), &bare("Node-path: a\nNode-action: delete")]),
       contradiction(Contradiction::NodeInRevisionZero),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-action: delete\nProp-content-length: 10\nContent-length: 10\n", b"PROPS-END\n")]),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-action: delete\nProp-content-length: 10\nContent-length: 10\n",
+          b"PROPS-END\n",
+        )],
+      ),
       contradiction(Contradiction::ContentOnDelete),
     ),
     (
-      in_revision_one(V2, &[&bare("Node-path: a\nNode-action: delete\nContent-length: 0")]),
+      in_revision_one(
+        V2,
+        &[&bare(
+          "Node-path: a\nNode-action: delete\nContent-length: 0",
+        )],
+      ),
       contradiction(Contradiction::ContentOnDelete),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-kind: dir\nNode-action: add\nText-content-length: 1\nContent-length: 1\n", b"x")]),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-kind: dir\nNode-action: add\nText-content-length: 1\nContent-length: 1\n",
+          b"x",
+        )],
+      ),
       contradiction(Contradiction::TextOnDirectory),
     ),
     (
-      in_revision_one(V2, &[&bare("Node-path: a\nNode-kind: dir\nNode-action: change\nNode-copyfrom-rev: 0\nNode-copyfrom-path: b")]),
+      in_revision_one(
+        V2,
+        &[&bare(
+          "Node-path: a\nNode-kind: dir\nNode-action: change\nNode-copyfrom-rev: 0\nNode-copyfrom-path: b",
+        )],
+      ),
       contradiction(Contradiction::CopySourceOutOfPlace),
     ),
     (
-      in_revision_one(V2, &[&bare("Node-path: a\nNode-kind: dir\nNode-action: add\nNode-copyfrom-rev: 0")]),
+      in_revision_one(
+        V2,
+        &[&bare(
+          "Node-path: a\nNode-kind: dir\nNode-action: add\nNode-copyfrom-rev: 0",
+        )],
+      ),
       contradiction(Contradiction::CopySourceIncomplete),
     ),
     (
-      in_revision_one(V2, &[&bare(&format!("Node-path: a\nNode-kind: file\nNode-action: add\nText-copy-source-md5: {hex32}"))]),
+      in_revision_one(
+        V2,
+        &[&bare(&format!(
+          "Node-path: a\nNode-kind: file\nNode-action: add\nText-copy-source-md5: {hex32}"
+        ))],
+      ),
       contradiction(Contradiction::CopyChecksumWithoutCopy),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-kind: file\nNode-action: change\nText-delta: true\nText-content-length: 4\nContent-length: 4\n", b"SVN\x00")]),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-kind: file\nNode-action: change\nText-delta: true\nText-content-length: 4\nContent-length: 4\n",
+          b"SVN\x00",
+        )],
+      ),
       contradiction(Contradiction::DeltaInFormatTwo),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-kind: file\nNode-action: change\nProp-delta: true\nProp-content-length: 10\nContent-length: 10\n", b"PROPS-END\n")]),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-kind: file\nNode-action: change\nProp-delta: true\nProp-content-length: 10\nContent-length: 10\n",
+          b"PROPS-END\n",
+        )],
+      ),
       contradiction(Contradiction::DeltaInFormatTwo),
     ),
     (
-      in_revision_one(V3, &[&bare("Node-path: a\nNode-kind: file\nNode-action: change\nText-delta: maybe")]),
-      (DumpError::MalformedValue { header: Header::TextDelta }, MALFORMED),
+      in_revision_one(
+        V3,
+        &[&bare(
+          "Node-path: a\nNode-kind: file\nNode-action: change\nText-delta: maybe",
+        )],
+      ),
+      (
+        DumpError::MalformedValue {
+          header: Header::TextDelta,
+        },
+        MALFORMED,
+      ),
     ),
     (
-      in_revision_one(V3, &[&bare("Node-path: a\nNode-kind: file\nNode-action: change\nProp-delta: true")]),
+      in_revision_one(
+        V3,
+        &[&bare(
+          "Node-path: a\nNode-kind: file\nNode-action: change\nProp-delta: true",
+        )],
+      ),
       contradiction(Contradiction::DeltaWithoutSection),
     ),
     (
-      in_revision_one(V3, &[&node(&format!("Node-path: a\nNode-kind: file\nNode-action: change\nText-delta-base-md5: {hex32}\nText-content-length: 1\nContent-length: 1\n"), b"x")]),
+      in_revision_one(
+        V3,
+        &[&node(
+          &format!(
+            "Node-path: a\nNode-kind: file\nNode-action: change\nText-delta-base-md5: {hex32}\nText-content-length: 1\nContent-length: 1\n"
+          ),
+          b"x",
+        )],
+      ),
       contradiction(Contradiction::DeltaBaseWithoutDelta),
     ),
     (
-      in_revision_one(V2, &[&bare(&format!("Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: {hex32}"))]),
+      in_revision_one(
+        V2,
+        &[&bare(&format!(
+          "Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: {hex32}"
+        ))],
+      ),
       contradiction(Contradiction::TextChecksumWithoutText),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-kind: dir\nNode-action: change\nProp-content-length: 10\nContent-length: 5\n", b"PROPS-END\n")]),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-kind: dir\nNode-action: change\nProp-content-length: 10\nContent-length: 5\n",
+          b"PROPS-END\n",
+        )],
+      ),
       contradiction(Contradiction::ContentLengthShort),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-kind: dir\nNode-action: change\nProp-content-length: 5\nContent-length: 5\n", b"PROPS")]),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-kind: dir\nNode-action: change\nProp-content-length: 5\nContent-length: 5\n",
+          b"PROPS",
+        )],
+      ),
       contradiction(Contradiction::PropertySectionTooShort),
     ),
     (
-      in_revision_one(V2, &[&node("Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: xyz\nText-content-length: 1\nContent-length: 1\n", b"x")]),
-      (DumpError::MalformedValue { header: Header::TextContentMd5 }, BAD_CHECKSUM_PARSE),
+      in_revision_one(
+        V2,
+        &[&node(
+          "Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: xyz\nText-content-length: 1\nContent-length: 1\n",
+          b"x",
+        )],
+      ),
+      (
+        DumpError::MalformedValue {
+          header: Header::TextContentMd5,
+        },
+        BAD_CHECKSUM_PARSE,
+      ),
     ),
     (
-      in_revision_one(V2, &[&node(&format!("Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: {}\nText-content-length: 1\nContent-length: 1\n", &hex32[1..]), b"x")]),
-      (DumpError::MalformedValue { header: Header::TextContentMd5 }, BAD_CHECKSUM_PARSE),
+      in_revision_one(
+        V2,
+        &[&node(
+          &format!(
+            "Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: {}\nText-content-length: 1\nContent-length: 1\n",
+            &hex32[1..]
+          ),
+          b"x",
+        )],
+      ),
+      (
+        DumpError::MalformedValue {
+          header: Header::TextContentMd5,
+        },
+        BAD_CHECKSUM_PARSE,
+      ),
     ),
   ];
   for (bytes, expected) in cases {
-    assert_eq!(refused(&bytes), expected, "{:?}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+      refused(&bytes),
+      expected,
+      "{:?}",
+      String::from_utf8_lossy(&bytes)
+    );
   }
 }
 
@@ -398,18 +631,38 @@ fn a_whole_text_whose_digests_are_another_s_is_refused() {
   };
   let (refusal, code) = refused(&in_revision_one(V2, &[&record(&wrong_md5, &right_sha1)]));
   assert_eq!(code, CHECKSUM_MISMATCH);
-  assert!(matches!(refusal, DumpError::ChecksumMismatch { expected: Digest::Md5(_), actual: Digest::Md5(_) }));
+  assert!(matches!(
+    refusal,
+    DumpError::ChecksumMismatch {
+      expected: Digest::Md5(_),
+      actual: Digest::Md5(_)
+    }
+  ));
   let (refusal, _) = refused(&in_revision_one(V2, &[&record(&right_md5, &wrong_sha1)]));
-  assert!(matches!(refusal, DumpError::ChecksumMismatch { expected: Digest::Sha1(_), actual: Digest::Sha1(_) }));
+  assert!(matches!(
+    refusal,
+    DumpError::ChecksumMismatch {
+      expected: Digest::Sha1(_),
+      actual: Digest::Sha1(_)
+    }
+  ));
   let zeros = "0".repeat(32);
-  assert!(read_whole(&in_revision_one(V2, &[&record(&zeros, &right_sha1)])).is_ok(), "all zeros names no digest");
+  assert!(
+    read_whole(&in_revision_one(V2, &[&record(&zeros, &right_sha1)])).is_ok(),
+    "all zeros names no digest"
+  );
   let upper = right_md5.to_uppercase();
-  assert!(read_whole(&in_revision_one(V2, &[&record(&upper, &right_sha1)])).is_ok(), "uppercase hex");
+  assert!(
+    read_whole(&in_revision_one(V2, &[&record(&upper, &right_sha1)])).is_ok(),
+    "uppercase hex"
+  );
 }
 
 /// A revision record whose property section is `section`, its length stated as `length`.
 fn revision_with(section: &[u8], length: usize) -> Vec<u8> {
-  let mut bytes = format!("Revision-number: 1\nProp-content-length: {length}\nContent-length: {length}\n\n").into_bytes();
+  let mut bytes =
+    format!("Revision-number: 1\nProp-content-length: {length}\nContent-length: {length}\n\n")
+      .into_bytes();
   bytes.extend_from_slice(section);
   bytes.extend_from_slice(b"\n");
   bytes
@@ -424,26 +677,64 @@ fn a_property_section_that_does_not_hold_together_is_refused_by_kind() {
   let fault = |fault| DumpError::Property { fault };
   let entries = b"K 1\na\nV 1\nb\n";
   let cases: Vec<(Vec<u8>, DumpError)> = vec![
-    (revision_with(entries, entries.len()), fault(PropertyFault::Unterminated)),
-    (revision_with(b"PROPS-END\nK 1\na\nV 1\nb\n", 22), fault(PropertyFault::EndsEarly)),
-    (revision_with(b"K 100\na\nV 1\nb\nPROPS-END\n", 23), fault(PropertyFault::PastSection)),
-    (revision_with(b"X 1\na\nPROPS-END\n", 16), fault(PropertyFault::MalformedLine)),
-    (revision_with(b"K x\na\nPROPS-END\n", 16), fault(PropertyFault::MalformedLength)),
-    (revision_with(b"K 1\na\nX 1\nb\nPROPS-END\n", 22), fault(PropertyFault::MalformedLine)),
-    (revision_with(b"K 1\naXV 1\nb\nPROPS-END\n", 22), fault(PropertyFault::MalformedData)),
-    (revision_with(b"D 1\na\nPROPS-END\n", 16), fault(PropertyFault::DeletionOutOfPlace)),
-    (revision_with(b"K 3\na\x00b\nV 1\nb\nPROPS-END\n", 24), fault(PropertyFault::NameNul)),
+    (
+      revision_with(entries, entries.len()),
+      fault(PropertyFault::Unterminated),
+    ),
+    (
+      revision_with(b"PROPS-END\nK 1\na\nV 1\nb\n", 22),
+      fault(PropertyFault::EndsEarly),
+    ),
+    (
+      revision_with(b"K 100\na\nV 1\nb\nPROPS-END\n", 23),
+      fault(PropertyFault::PastSection),
+    ),
+    (
+      revision_with(b"X 1\na\nPROPS-END\n", 16),
+      fault(PropertyFault::MalformedLine),
+    ),
+    (
+      revision_with(b"K x\na\nPROPS-END\n", 16),
+      fault(PropertyFault::MalformedLength),
+    ),
+    (
+      revision_with(b"K 1\na\nX 1\nb\nPROPS-END\n", 22),
+      fault(PropertyFault::MalformedLine),
+    ),
+    (
+      revision_with(b"K 1\naXV 1\nb\nPROPS-END\n", 22),
+      fault(PropertyFault::MalformedData),
+    ),
+    (
+      revision_with(b"D 1\na\nPROPS-END\n", 16),
+      fault(PropertyFault::DeletionOutOfPlace),
+    ),
+    (
+      revision_with(b"K 3\na\x00b\nV 1\nb\nPROPS-END\n", 24),
+      fault(PropertyFault::NameNul),
+    ),
   ];
   for (record, expected) in cases {
     let bytes = dump(&[V2, &record]);
-    assert_eq!(refusal(&bytes), expected, "{:?}", String::from_utf8_lossy(&record));
+    assert_eq!(
+      refusal(&bytes),
+      expected,
+      "{:?}",
+      String::from_utf8_lossy(&record)
+    );
   }
-  assert_eq!(refusal(&dump(&[V2, &revision_with(b"K x\na\nPROPS-END\n", 16)])).subversion_code(), INCORRECT_PARAMS);
+  assert_eq!(
+    refusal(&dump(&[V2, &revision_with(b"K x\na\nPROPS-END\n", 16)])).subversion_code(),
+    INCORRECT_PARAMS
+  );
   let deletion = node(
     "Node-path: a\nNode-kind: dir\nNode-action: change\nProp-content-length: 16\nContent-length: 16\n",
     b"D 1\na\nPROPS-END\n",
   );
-  assert_eq!(refusal(&in_revision_one(V3, &[&deletion])), fault(PropertyFault::DeletionOutOfPlace));
+  assert_eq!(
+    refusal(&in_revision_one(V3, &[&deletion])),
+    fault(PropertyFault::DeletionOutOfPlace)
+  );
 }
 
 /// A-593 (hostile, lengths past the stream): do read records whose property section, text, content block, property
@@ -458,7 +749,12 @@ fn a_length_past_the_stream_is_refused_as_truncated() {
     in_revision_one(V3, &[b"Node-path: a\nNode-kind: file\nNode-action: add\nText-delta: true\nText-content-length: 10\nContent-length: 10\n\nSVN\x00\x00\x00\x05"]),
   ];
   for bytes in cases {
-    assert_eq!(refusal(&bytes), DumpError::Truncated, "{:?}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+      refusal(&bytes),
+      DumpError::Truncated,
+      "{:?}",
+      String::from_utf8_lossy(&bytes)
+    );
   }
 }
 
@@ -476,7 +772,10 @@ fn a_text_delta_svndiff_refuses_is_refused_with_its_kind() {
   let window = b"SVN\x00\x00\x00\x01\x01\x01\x81x";
   let cases: [(Vec<u8>, SvndiffError); 4] = [
     (delta(b"SVN\x01"), SvndiffError::VersionNotOffered),
-    (delta(&window[..window.len() - 1]), SvndiffError::UnexpectedEnd),
+    (
+      delta(&window[..window.len() - 1]),
+      SvndiffError::UnexpectedEnd,
+    ),
     (delta(b""), SvndiffError::UnexpectedEnd),
     (delta(b"PK\x03\x04"), SvndiffError::InvalidHeader),
   ];
@@ -485,7 +784,10 @@ fn a_text_delta_svndiff_refuses_is_refused_with_its_kind() {
     assert_eq!(refusal, DumpError::Svndiff(expected));
     assert_eq!(refusal.subversion_code(), expected.subversion_code());
   }
-  assert!(read_whole(&delta(window)).is_ok(), "the window itself reads");
+  assert!(
+    read_whole(&delta(window)).is_ok(),
+    "the window itself reads"
+  );
 }
 
 /// A-593 (hostile, admission): do hand a reader admitted 64 bytes a revision whose property entry states a name of
@@ -499,7 +801,11 @@ fn a_length_past_the_admission_is_refused_before_its_bytes_are_waited_for() {
   section.extend_from_slice(&name);
   section.extend_from_slice(b"\nV 0\n\nPROPS-END\n");
   let bytes = dump(&[V2, &revision_with(&section, section.len())]);
-  let entry_line_end = bytes.windows(7).position(|window| window == b"K 1000\n").unwrap() + 7;
+  let entry_line_end = bytes
+    .windows(7)
+    .position(|window| window == b"K 1000\n")
+    .unwrap()
+    + 7;
   let mut reader = Reader::new(admission);
   let mut held = Vec::new();
   for (handed, &byte) in bytes.iter().enumerate() {
@@ -513,8 +819,14 @@ fn a_length_past_the_admission_is_refused_before_its_bytes_are_waited_for() {
       }
       Ok(Read::End) => panic!("ended"),
       Err(refusal) => {
-        assert!(matches!(refusal, DumpError::PastAdmission { admitted: 64, .. }), "{refusal:?}");
-        assert!(handed <= entry_line_end + 1, "waited for the name's bytes: {handed} handed");
+        assert!(
+          matches!(refusal, DumpError::PastAdmission { admitted: 64, .. }),
+          "{refusal:?}"
+        );
+        assert!(
+          handed <= entry_line_end + 1,
+          "waited for the name's bytes: {handed} handed"
+        );
         return;
       }
     }
@@ -545,13 +857,31 @@ fn what_load_passes_over_between_and_inside_records_is_passed_over() {
     ),
   ]);
   assert_eq!(read_whole(&noisy).unwrap(), read_whole(&plain).unwrap());
-  let longer = dump(&[V2, b"Revision-number: 1\nProp-content-length: 10\nContent-length: 15\n\nPROPS-END\nextra\n"]);
-  assert_eq!(read_whole(&longer).unwrap(), read_whole(&dump(&[V2, &revision(1)])).unwrap());
-  let parted = in_revision_one(V2, &[b"Node-path: a\nNode-action: delete\n\n\n\n\n", &file_add("a", b"text")]);
+  let longer = dump(&[
+    V2,
+    b"Revision-number: 1\nProp-content-length: 10\nContent-length: 15\n\nPROPS-END\nextra\n",
+  ]);
+  assert_eq!(
+    read_whole(&longer).unwrap(),
+    read_whole(&dump(&[V2, &revision(1)])).unwrap()
+  );
+  let parted = in_revision_one(
+    V2,
+    &[
+      b"Node-path: a\nNode-action: delete\n\n\n\n\n",
+      &file_add("a", b"text"),
+    ],
+  );
   let events = read_whole(&parted).unwrap();
   let nodes: Vec<NodeAction> = events
     .iter()
-    .filter_map(|event| if let Owned::Node(header) = event { Some(header.action) } else { None })
+    .filter_map(|event| {
+      if let Owned::Node(header) = event {
+        Some(header.action)
+      } else {
+        None
+      }
+    })
     .collect();
   assert_eq!(nodes, [NodeAction::Replace]);
 }
@@ -567,7 +897,9 @@ fn a_version_record_in_the_middle_of_a_stream_switches_its_format() {
   assert!(read_whole(&dump(&[V2, V3, &revision(1), &delta])).is_ok());
   assert_eq!(
     refusal(&dump(&[V3, V2, &revision(1), &delta])),
-    DumpError::Contradiction { fault: Contradiction::DeltaInFormatTwo }
+    DumpError::Contradiction {
+      fault: Contradiction::DeltaInFormatTwo
+    }
   );
   let pieces = read(&dump(&[V2, V3, &revision(1), &delta]), 1, ROOMY).unwrap();
   assert_eq!(pieces.events.len(), 7, "{:?}", pieces.events);

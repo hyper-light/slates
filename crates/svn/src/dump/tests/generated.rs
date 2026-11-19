@@ -5,8 +5,8 @@ use proptest::prelude::*;
 
 use super::support::{Owned, ROOMY, digests, read, read_whole, write};
 use crate::dump::{
-  CopyFrom, DeltaBase, Format, NodeAction, NodeHeader, Property, PropertySection, RevisionHeader, TextSection, Uuid,
-  section_len,
+  CopyFrom, DeltaBase, Format, NodeAction, NodeHeader, Property, PropertySection, RevisionHeader,
+  TextSection, Uuid, section_len,
 };
 use crate::index::NodeKind;
 use crate::svndiff::{Compression, Encoder, Instruction, Version, Window};
@@ -52,7 +52,10 @@ fn node_plan() -> impl Strategy<Value = NodePlan> {
     header_bytes(10),
     any::<u8>(),
     prop::option::of((0u64..1000, header_bytes(8), any::<bool>())),
-    prop::option::of((any::<bool>(), prop::collection::vec((name(), prop::option::of(bytes(12))), 0..4))),
+    prop::option::of((
+      any::<bool>(),
+      prop::collection::vec((name(), prop::option::of(bytes(12))), 0..4),
+    )),
     prop::option::of((any::<bool>(), bytes(300), any::<u8>())),
   )
     .prop_map(|(path, shape, copy, properties, text)| NodePlan {
@@ -86,7 +89,14 @@ fn stream_plan() -> impl Strategy<Value = StreamPlan> {
 /// A UUID made of 16 bytes, in its record's form.
 fn uuid_of(bytes: [u8; 16]) -> Uuid {
   let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-  let text = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
+  let text = format!(
+    "{}-{}-{}-{}-{}",
+    &hex[..8],
+    &hex[8..12],
+    &hex[12..16],
+    &hex[16..20],
+    &hex[20..]
+  );
   Uuid::parse(text.as_bytes()).unwrap()
 }
 
@@ -155,7 +165,9 @@ fn delta_text(bytes: &[u8], mode: u8) -> (TextSection, Vec<Owned>) {
   let mut encoder = Encoder::new(Version::Zero);
   let mut encoded = encoder.header().to_vec();
   for window in &windows {
-    encoder.window(window, Compression::Stored, &mut encoded).unwrap();
+    encoder
+      .window(window, Compression::Stored, &mut encoded)
+      .unwrap();
   }
   let (md5, sha1) = digests(bytes);
   let base = if mode % 2 == 0 {
@@ -182,8 +194,14 @@ fn delta_text(bytes: &[u8], mode: u8) -> (TextSection, Vec<Owned>) {
 /// for every addition and replacement, nothing but a path on a deletion, no copy on a change, no text on a directory,
 /// no delta in format 2, a deletion entry only in a delta.
 fn build_node(plan: &NodePlan, format: Format) -> Vec<Owned> {
-  let action = [NodeAction::Change, NodeAction::Add, NodeAction::Delete, NodeAction::Replace][usize::from(plan.shape % 4)];
-  let mut kind = [None, Some(NodeKind::File), Some(NodeKind::Directory)][usize::from(plan.shape / 4 % 3)];
+  let action = [
+    NodeAction::Change,
+    NodeAction::Add,
+    NodeAction::Delete,
+    NodeAction::Replace,
+  ][usize::from(plan.shape % 4)];
+  let mut kind =
+    [None, Some(NodeKind::File), Some(NodeKind::Directory)][usize::from(plan.shape / 4 % 3)];
   if matches!(action, NodeAction::Add | NodeAction::Replace) && kind.is_none() {
     kind = Some(NodeKind::File);
   }
@@ -201,12 +219,15 @@ fn build_node(plan: &NodePlan, format: Format) -> Vec<Owned> {
     return vec![Owned::Node(header)];
   }
   if action != NodeAction::Change {
-    header.copy_from = plan.copy.as_ref().map(|(revision, path, checksums)| CopyFrom {
-      revision: *revision,
-      path: path.clone(),
-      md5: checksums.then(|| digests(path).0),
-      sha1: checksums.then(|| digests(path).1),
-    });
+    header.copy_from = plan
+      .copy
+      .as_ref()
+      .map(|(revision, path, checksums)| CopyFrom {
+        revision: *revision,
+        path: path.clone(),
+        md5: checksums.then(|| digests(path).0),
+        sha1: checksums.then(|| digests(path).1),
+      });
   }
   if let Some((delta, entries)) = &plan.properties {
     let (section, events) = property_events(*delta && three, entries);
@@ -216,7 +237,11 @@ fn build_node(plan: &NodePlan, format: Format) -> Vec<Owned> {
   if let Some((delta, bytes, mode)) = &plan.text
     && kind != Some(NodeKind::Directory)
   {
-    let (section, events) = if *delta && three { delta_text(bytes, *mode) } else { whole_text(bytes, *mode) };
+    let (section, events) = if *delta && three {
+      delta_text(bytes, *mode)
+    } else {
+      whole_text(bytes, *mode)
+    };
     header.text = Some(section);
     sections.extend(events);
   }
@@ -228,15 +253,25 @@ fn build_node(plan: &NodePlan, format: Format) -> Vec<Owned> {
 /// The events of a stream `plan` names. An addition right after a deletion of its path is given another path: the
 /// reader reads that pair as the one replacement, which is another stream.
 fn build(plan: &StreamPlan) -> Vec<Owned> {
-  let format = if plan.three { Format::Three } else { Format::Two };
+  let format = if plan.three {
+    Format::Three
+  } else {
+    Format::Two
+  };
   let mut events = vec![Owned::Format(format)];
   events.extend(plan.uuid.map(|bytes| Owned::Uuid(uuid_of(bytes))));
   let mut revisions = vec![(Some(Vec::new()), Vec::new())];
   revisions.extend(plan.revisions.iter().cloned());
   for (number, (properties, nodes)) in revisions.iter().enumerate() {
-    let entries: Option<Vec<Entry>> =
-      properties.as_ref().map(|list| list.iter().map(|(name, value)| (name.clone(), Some(value.clone()))).collect());
-    let section = entries.as_ref().map(|entries| property_events(false, entries));
+    let entries: Option<Vec<Entry>> = properties.as_ref().map(|list| {
+      list
+        .iter()
+        .map(|(name, value)| (name.clone(), Some(value.clone())))
+        .collect()
+    });
+    let section = entries
+      .as_ref()
+      .map(|entries| property_events(false, entries));
     events.push(Owned::Revision(RevisionHeader {
       number: number as u64,
       properties: section.as_ref().map(|(section, _)| section.length),

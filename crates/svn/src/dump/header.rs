@@ -3,8 +3,9 @@
 //! `make_node_baton`).
 
 use super::{
-  Contradiction, CopyFrom, DeltaBase, DumpError, Format, Md5, NUMBER_DIGITS, NUMBER_LIMIT, NodeAction, NodeHeader,
-  PropertySection, RevisionHeader, Sha1, TextSection, Uuid, check_node, check_revision, content_length,
+  Contradiction, CopyFrom, DeltaBase, DumpError, Format, Md5, NUMBER_DIGITS, NUMBER_LIMIT,
+  NodeAction, NodeHeader, PropertySection, RevisionHeader, Sha1, TextSection, Uuid, check_node,
+  check_revision, content_length,
 };
 use crate::index::{NodeKind, Revision};
 
@@ -108,19 +109,19 @@ impl Header {
 }
 
 /// What lies between a header's name and its value.
-/// Format: `dump.c` 507 writes `"%s: %s\n"`; `load.c` 113 takes the value from two bytes past the colon.
+/// Format: `dump.c` 506 writes `"%s: %s\n"`; `load.c` 112 takes the value from two bytes past the colon.
 const HEADER_SEPARATOR: &[u8] = b": ";
 
 /// The `Node-kind` word of a file.
-/// Format: `dump.c` 1166; `load-fs-vtable.c` 403.
+/// Format: `dump.c` 1170; `load-fs-vtable.c` 402.
 const KIND_FILE: &[u8] = b"file";
 
 /// The `Node-kind` word of a directory.
-/// Format: `dump.c` 1169; `load-fs-vtable.c` 405.
+/// Format: `dump.c` 1173; `load-fs-vtable.c` 404.
 const KIND_DIRECTORY: &[u8] = b"dir";
 
 /// The value of a delta flag that is set.
-/// Format: `dump.c` 1439 and 1462 write `true`; `load.c` 711 and 732 read nothing else as set.
+/// Format: `dump.c` 1445 and 1471 write `true`; `load.c` 709 and 734 read nothing else as set.
 pub(super) const FLAG_SET: &[u8] = b"true";
 
 /// The value of a delta flag that is not set.
@@ -276,7 +277,9 @@ impl Block {
       .position(|&byte| byte == b':')
       .filter(|&colon| colon > 0)
       .ok_or(DumpError::MalformedHeader)?;
-    let (name, after) = line.split_at_checked(colon).ok_or(DumpError::MalformedHeader)?;
+    let (name, after) = line
+      .split_at_checked(colon)
+      .ok_or(DumpError::MalformedHeader)?;
     let value = after
       .strip_prefix(HEADER_SEPARATOR)
       .ok_or(DumpError::MalformedHeader)?;
@@ -315,7 +318,11 @@ impl Block {
   ///
   /// # Errors
   /// [`DumpError::UnrecognizedRecord`] for a block that names no kind of record, and the refusals of the kind it names.
-  pub(super) fn finish(self, format: Format, revision: Option<Revision>) -> Result<Record, DumpError> {
+  pub(super) fn finish(
+    self,
+    format: Format,
+    revision: Option<Revision>,
+  ) -> Result<Record, DumpError> {
     match self.kind()? {
       Kind::Format => self.into_format(),
       Kind::Uuid => self.into_uuid(),
@@ -381,7 +388,10 @@ impl Block {
     if self.has_node_headers() || self.has_section_headers() {
       return Err(contradiction(Contradiction::HeaderOutOfPlace));
     }
-    self.uuid.map(Record::Uuid).ok_or(DumpError::UnrecognizedRecord)
+    self
+      .uuid
+      .map(Record::Uuid)
+      .ok_or(DumpError::UnrecognizedRecord)
   }
 
   /// A revision record: its number and property section, without a node's headers, a text or a delta.

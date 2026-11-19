@@ -131,6 +131,12 @@
 > applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
 > Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
 > shared piece 3), and a large revision applied in slices (with the server).
+> A-593 (2026-11-19): the dump format's codec, formats 2 and 3, read as the stream arrives within the caller's admission
+> and written byte for byte as `svnadmin dump` writes it, golden vectors from stock `svnadmin` 1.15.0, `cargo test -p
+> slates-svn --lib` on the Mac Studio (see A-593). Owed from it: the administration verbs over it; a format-3 dump is
+> `svnadmin dump --deltas`'s bytes only given its windows, which are Subversion's deltifier's (slates' dump verb will
+> write its own, which `svnadmin load` reads alike); a version-1 (zlib) delta inside a dump is refused, which no stock
+> writer makes.
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
