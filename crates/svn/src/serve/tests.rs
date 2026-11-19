@@ -20,7 +20,7 @@
 use super::*;
 use crate::index::{Action, Index};
 use crate::report::drive::green::texts_by_md5;
-use crate::report::drive::green::{FixtureGuards, Green, guards_of, normalize, repository};
+use crate::report::drive::green::{AUTHZ, FixtureGuards, Green, guards_of, normalize, repository};
 use crate::report::recorded::{
   ROOT_URL, Recorded, SESSIONS, UUID, command, drive_items, finished_report, items, read_drive,
   value_of,
@@ -64,10 +64,6 @@ fn fixtures_repository() -> Repository<'static> {
     cram_md5: true,
   }
 }
-
-/// The fixtures' authorization file (`make-fixtures.py` `AUTHZ`): everyone reads, alice writes,
-/// and `/trunk/secret` is alice's alone.
-const AUTHZ: &[u8] = b"[/]\n* = r\nalice = rw\n[/trunk/secret]\n* =\nalice = rw\n";
 
 /// alice's secret in the fixtures' password database (`make-fixtures.py` `PASSWD`).
 const ALICE_SECRET: &[u8] = b"secret";
@@ -192,7 +188,7 @@ fn session_guards(recorded: Recorded) -> FixtureGuards {
   if reports && recorded.name == "update-with-lock.1" {
     guards_of(recorded.name, &finished_report(recorded))
   } else {
-    FixtureGuards::anonymous()
+    FixtureGuards::default()
   }
 }
 
@@ -412,7 +408,7 @@ fn send(
 #[test]
 fn reparent_moves_the_session_within_its_repository() {
   let fixture = fixture();
-  let guards = FixtureGuards::anonymous();
+  let guards = FixtureGuards::default();
   let mut connection = established();
   let (out, turn) = send(
     &fixture,
@@ -452,7 +448,7 @@ fn reparent_moves_the_session_within_its_repository() {
 #[test]
 fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
   let fixture = fixture();
-  let guards = FixtureGuards::anonymous();
+  let guards = FixtureGuards::default();
   let mut connection = established();
   let item = b"( replay ( 6 0 true ) ) ";
   let (out, turn) = send(&fixture, &guards, &mut connection, item);
@@ -507,7 +503,7 @@ fn a_connection_names_what_it_waits_for() {
     .copied()
     .find(|session| session.name == "checkout-r1.1")
     .unwrap();
-  let guards = FixtureGuards::anonymous();
+  let guards = FixtureGuards::default();
   let sources = fixture.sources(&guards);
   let client = items(recorded.client);
   let mut out = Vec::new();
@@ -749,7 +745,7 @@ fn drive_newdir(
 #[test]
 fn an_update_of_a_target_the_principal_may_not_read_authenticates_first() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
+  let anonymous = FixtureGuards::default();
   let mut connection = established();
   let (out, turn) = send(&fixture, &anonymous, &mut connection, UPDATE_SECRET);
   assert_eq!(out, cram_md5_request());
@@ -776,7 +772,7 @@ fn an_update_of_a_target_the_principal_may_not_read_authenticates_first() {
 #[test]
 fn an_update_the_principal_may_not_read_is_refused_where_authentication_cannot_help() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
+  let anonymous = FixtureGuards::default();
   let keyless = Repository {
     cram_md5: false,
     ..fixtures_repository()
@@ -811,13 +807,15 @@ const CHECK_SECRET: &[u8] = b"( check-path ( 6:secret ( ) ) ) ";
 const UPDATE_TRUNK_FROM_NOTHING: &[u8] = b"( update ( ( 6 ) 0: true infinity false false ) ) \
   ( set-path ( 0: 6 true ( ) infinity ) ) ( finish-report ( ) ) ";
 
-/// g297's step-6 finding (one principal's read rule from one source; A-606, `serve.c`
-/// `authz_check_access`): on the fixtures' repository, whose rules keep `/trunk/secret` from all
-/// but alice, an anonymous session whose caller's guards hide nothing; where users hold no keys,
-/// check `secret`, then ask to update it; where they do, update `/trunk` from nothing. Expect the
-/// check and the update both refused "Authorization failed" (170001), and the update of `/trunk`
-/// to send `secret` absent and never add it: the update, its drive and the read commands judge the
-/// one path by the one rule set the connection compiled for the principal.
+/// A-656 continued (2), g297's step-6 finding (one principal's read rule from one source; A-606,
+/// `serve.c` `authz_check_access`): on the fixtures' repository, whose rules keep `/trunk/secret`
+/// from all but alice, an anonymous session whose caller's guards hold no lock and, since this
+/// change, no read rule (before it, guards that hid nothing let an update read what the rules
+/// hide); where users hold no keys, check `secret`, then ask to update it; where they do, update
+/// `/trunk` from nothing. Expect the check and the update both refused "Authorization failed"
+/// (170001), and the update of `/trunk` to send `secret` absent and never add it: the update, its
+/// drive and the read commands judge the one path by the one rule set the connection compiled for
+/// the principal.
 #[test]
 fn an_update_and_the_reads_judge_one_path_by_the_one_rule_set() {
   let fixture = fixture();
@@ -872,7 +870,7 @@ fn send_in_slices(
 #[test]
 fn the_reads_judge_each_principals_paths_by_its_own_rules() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
+  let anonymous = FixtureGuards::default();
   let check_secret = b"( check-path ( 6:secret ( ) ) ) ";
   let log_r1 = b"( log ( ( 0: ) ( 1 ) ( 1 ) true false 0 false all-revprops ( ) ) ) ";
   let a_directory = "( success ( ( ) 0: ) ) ( success ( dir ) ) ";
@@ -960,7 +958,7 @@ fn a_commit_is_driven_and_answered_with_the_revision_the_owner_made() {
 #[test]
 fn an_anonymous_commit_authenticates_for_write_and_an_unmade_work_is_refused() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
+  let anonymous = FixtureGuards::default();
   let mut connection = established();
   let (_, turn) = send(&fixture, &anonymous, &mut connection, COMMIT_NEWDIR);
   assert!(turn.unwrap().starts_with("CommitAsked"));
@@ -1058,7 +1056,7 @@ fn a_refused_commits_commands_are_dropped_until_the_clients_success_too() {
 #[test]
 fn a_commit_by_a_user_the_rules_keep_from_writing_is_refused_after_the_authentication() {
   let fixture = fixture();
-  let anonymous = FixtureGuards::anonymous();
+  let anonymous = FixtureGuards::default();
   let mut connection = established();
   send(&fixture, &anonymous, &mut connection, COMMIT_NEWDIR)
     .1

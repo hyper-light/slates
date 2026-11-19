@@ -6,6 +6,7 @@
 //! against hold one history, which the tests check against `changed.txt` (`svnlook changed`).
 
 use super::Guards;
+use crate::authz::{Authz, Bounds, Principal, PrincipalRules};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, Revision,
   RevisionRecord, Text,
@@ -175,34 +176,30 @@ fn encoded_list<'p>(properties: impl Iterator<Item = (&'p [u8], &'p [u8])>) -> V
   encoded
 }
 
-/// The session's guards in the fixtures: what the anonymous principal may not read
-/// (`make-fixtures.py` `AUTHZ`: `/trunk/secret` and beneath), and the locks held now.
+/// The session's guards in the fixtures: the locks held now. What a principal may read is
+/// [`rules_of`]'s.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FixtureGuards {
-  /// The repository paths hidden, each with everything beneath it.
-  pub(crate) hidden: Vec<String>,
   /// The locks held, by path: their tokens.
   pub(crate) locks: BTreeMap<String, Vec<u8>>,
-}
-
-impl FixtureGuards {
-  /// The anonymous principal's guards with no lock held.
-  pub(crate) fn anonymous() -> Self {
-    Self {
-      hidden: vec![String::from("/trunk/secret")],
-      locks: BTreeMap::new(),
-    }
-  }
 }
 
 impl Guards for FixtureGuards {
   fn lock_token(&self, path: &str) -> Option<&[u8]> {
     self.locks.get(path).map(Vec::as_slice)
   }
+}
 
-  fn may_read(&self, path: &str) -> bool {
-    !self.hidden.iter().any(|hidden| at_or_beneath(path, hidden))
-  }
+/// The fixtures' authorization file (`make-fixtures.py` `AUTHZ`): everyone reads, alice writes, and
+/// `/trunk/secret` is alice's alone.
+pub(crate) const AUTHZ: &[u8] = b"[/]\n* = r\nalice = rw\n[/trunk/secret]\n* =\nalice = rw\n";
+
+/// The rules [`AUTHZ`] gives `user` (none: the anonymous principal) in the fixtures' repository,
+/// compiled as the connection compiles a session's (A-606): the one read rule a drive judges paths
+/// by.
+pub(crate) fn rules_of(user: Option<&[u8]>) -> PrincipalRules {
+  let authz = Authz::parse(AUTHZ, None, Bounds::of(AUTHZ, None)).unwrap();
+  authz.rules(b"repo", Principal::named(user))
 }
 
 /// Whether `place` is `path` or beneath it.
@@ -622,10 +619,10 @@ pub(crate) fn texts_by_md5(green: &Green) -> BTreeMap<[u8; 16], Vec<u8>> {
   texts
 }
 
-/// The guards a recorded session's drive ran under: the anonymous principal's, and in the session
-/// that holds `a.txt`'s lock, the lock its report names.
+/// The guards a recorded session's drive ran under: no lock held, and in the session that holds
+/// `a.txt`'s lock, the lock its report names.
 pub(crate) fn guards_of(name: &str, report: &Report) -> FixtureGuards {
-  let mut guards = FixtureGuards::anonymous();
+  let mut guards = FixtureGuards::default();
   if name == "update-with-lock.1" {
     let held = report
       .paths
