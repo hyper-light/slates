@@ -5,22 +5,26 @@
 //! by its `make-fixtures.py` through `svnserve -t`, each file's SHA-256 in `SHA256SUMS`): each
 //! commit connection's client bytes are handed to a connection from their first byte, an item at a
 //! time as the connection asks for more, in the order the recorder ran them, the connection
-//! tunnelled as the recording's user; each work the connection accepts is made as the owner makes
-//! it (appended to the index, its content held, its lock entries applied), and what the connection
-//! writes must be what `svnserve` wrote, its greeting less `svndiff1` and every item byte for byte.
+//! tunnelled as the recording's user; every hook the drive waits for passes, as the recorder's
+//! repository has none; each work the connection accepts is committed through A-655's step
+//! (`Revision::of_work` at the instant `svnserve` recorded, then the owner's records' `commit`),
+//! and what the connection writes must be what `svnserve` wrote, its greeting less `svndiff1` and
+//! every item byte for byte.
 //! Bob's lock is taken as `svnserve` took it, with its recorded token, the lock verbs not being
 //! served yet; the read-only connections (the checkouts, the updates, `import.2`) are the reads'
 //! and the reporter's suites'.
 
 use std::collections::BTreeMap;
 
-use aws_lc_rs::digest::{SHA256, digest};
-
 use super::super::*;
 use super::{LIMITS, PLENTY, SVNDIFF1};
+use crate::commit::revision::Revision as RevisionToCommit;
+use crate::dav::request::svn_time;
+use crate::dump::Uuid;
 use crate::index::{Action, ContentIdentity, NodeKind};
 use crate::lock::{HeadView, LockRequest, LockTarget};
 use crate::mergeinfo::Contents;
+use crate::migration::{Repository as Records, Room};
 use crate::report::drive::green::FixtureGuards;
 use crate::report::recorded::{command, items, value_of};
 
@@ -92,27 +96,34 @@ const TOKEN_PREFIX: &str = "opaquelocktoken:";
 /// The room a commit and the index allow: past anything the recordings hold.
 const ROOM: usize = 1 << 30;
 
-/// A green the replay builds from the works it makes: content by identity, every revision's
-/// properties, and every revision's tree of kinds, from which a directory's entries are read.
+/// The bytes the owner's records may hold: past anything the recordings hold.
+const ROOM_BYTES: u64 = 1 << 30;
+
+/// Revision 0's `svn:date`, which no recording shows.
+const CREATED: &[u8] = b"2026-11-19T05:05:00.000000Z";
+
+/// What the reads of the replay's repository read, built from the works it commits: content by
+/// identity, every revision's properties, and every revision's tree of kinds, from which a
+/// directory's entries are read (the owner's records keep no entries).
 #[derive(Debug)]
 struct Built {
   /// The texts, by identity.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists, by identity.
   lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
-  /// Every revision's properties; revision 0's date was not recorded.
+  /// Every revision's properties.
   revisions: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
   /// Every revision's tree: each path's kind.
   trees: Vec<BTreeMap<String, NodeKind>>,
 }
 
 impl Built {
-  /// A new repository's: revision 0, its root alone.
+  /// A new repository's: revision 0, its root alone, dated [`CREATED`].
   fn new() -> Self {
     Self {
       texts: BTreeMap::new(),
       lists: BTreeMap::new(),
-      revisions: vec![Vec::new()],
+      revisions: vec![vec![(b"svn:date".to_vec(), CREATED.to_vec())]],
       trees: vec![BTreeMap::from([("/".to_owned(), NodeKind::Directory)])],
     }
   }
@@ -161,11 +172,6 @@ fn at_or_beneath(path: &str, place: &str) -> bool {
     || path
       .strip_prefix(place)
       .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// SHA-256 of `bytes`, the replay's names for content.
-fn sha256(bytes: &[u8]) -> ContentIdentity {
-  digest(&SHA256, bytes).as_ref().try_into().unwrap()
 }
 
 impl Contents for Built {
@@ -228,28 +234,52 @@ impl reads::Repository for Built {
   }
 }
 
-impl commit_drive::Green for Built {
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
-    self.texts.get(identity).map(Vec::as_slice)
+/// One repository as a connection reads it: the reads from the replay's [`Built`], the drive from
+/// the owner's records, which name the content the drive makes; one index, the records'.
+struct View<'r> {
+  records: &'r Records,
+  built: &'r Built,
+}
+
+impl Contents for View<'_> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.built.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.built.mergeinfo_value(properties)
+  }
+}
+
+impl reads::Repository for View<'_> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    reads::Repository::revision_properties(self.built, revision)
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
-    reads::Repository::properties(self, identity)
+    reads::Repository::properties(self.built, identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    reads::Repository::text(self.built, identity, offset)
+  }
+}
+
+impl commit_drive::Green for View<'_> {
+  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
+    commit_drive::Green::text(self.records, identity)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    commit_drive::Green::properties(self.records, identity)
   }
 
   fn name_text(&self, text: &[u8]) -> ContentIdentity {
-    sha256(&[b"text\0".as_slice(), text].concat())
+    commit_drive::Green::name_text(self.records, text)
   }
 
   fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
-    let mut encoded = b"properties\0".to_vec();
-    for (name, value) in properties {
-      for part in [name, value] {
-        encoded.extend_from_slice(&u64::try_from(part.len()).unwrap().to_be_bytes());
-        encoded.extend_from_slice(part);
-      }
-    }
-    sha256(&encoded)
+    commit_drive::Green::name_properties(self.records, properties)
   }
 }
 
@@ -267,42 +297,72 @@ impl HeadView for Head<'_> {
   }
 }
 
-/// The repository the replay builds: the index, the green and the lock table, and the
-/// transactions begun.
+/// The repository the replay builds: the owner's records (index, contents, lock table), the reads'
+/// view of them, and the transactions begun.
 struct Replay {
-  index: Index,
-  green: Built,
-  locks: LockTable,
+  records: Records,
+  built: Built,
   transactions: u64,
 }
 
 impl Replay {
   /// An empty repository: revision 0, its root alone.
   fn new() -> Self {
+    let room = Room {
+      entries: ROOM,
+      bytes: ROOM_BYTES,
+    };
+    let uuid = Uuid::parse(IDENTITY).unwrap();
     Self {
-      index: Index::new(),
-      green: Built::new(),
-      locks: LockTable::new(),
+      records: Records::new(uuid, CREATED, room).unwrap(),
+      built: Built::new(),
       transactions: 0,
     }
   }
 
-  /// What every call hands over, the guards `guards` (`make-fixtures.py`'s `svnserve.conf`: no
-  /// anonymous access, authenticated users write, no authorization file).
-  fn sources<'r>(&'r self, guards: &'r FixtureGuards) -> Sources<'r, Built, FixtureGuards> {
-    Sources {
-      index: &self.index,
-      repository: &self.green,
-      guards,
-      locks: &self.locks,
-      policy: Policy {
-        anonymous: authz::Access::None,
-        authenticated: authz::Access::Write,
-        authz: None,
-        filesystem: "fixture",
-      },
+  /// The repository as a connection reads it.
+  fn view(&self) -> View<'_> {
+    View {
+      records: &self.records,
+      built: &self.built,
     }
   }
+}
+
+/// What every call hands over, the guards `guards` (`make-fixtures.py`'s `svnserve.conf`: no
+/// anonymous access, authenticated users write, no authorization file).
+fn sources<'s>(view: &'s View<'s>, guards: &'s FixtureGuards) -> Sources<'s, View<'s>, FixtureGuards> {
+  Sources {
+    index: view.records.index(),
+    repository: view,
+    guards,
+    locks: view.records.locks(),
+    policy: Policy {
+      anonymous: authz::Access::None,
+      authenticated: authz::Access::Write,
+      authz: None,
+      filesystem: "fixture",
+    },
+  }
+}
+
+/// Commits an accepted `work` through A-655's step at the instant `svnserve` recorded for it, and
+/// answers it on `connection`.
+fn make(replay: &mut Replay, connection: &mut Connection, work: Work, recorded: &str, out: &mut Vec<u8>) {
+  let now = svn_time(recorded).unwrap();
+  replay.built.hold(&work, recorded);
+  let revision = RevisionToCommit::of_work(work, now).unwrap();
+  let date = revision.date().unwrap().to_owned();
+  let author = revision.author().map(str::to_owned);
+  let number = replay.records.commit(revision).unwrap();
+  assert_eq!(date, recorded, "svn:date the owner's instant, as svnserve wrote it");
+  let made = Made {
+    revision: number,
+    date: &date,
+    author: author.as_deref(),
+    post_commit_error: None,
+  };
+  connection.committed(&made, out).unwrap();
 }
 
 /// The date `svnserve` answered a recorded commit with, its last item's; none for a refused one.
@@ -320,9 +380,9 @@ fn recorded_date(server: &[u8]) -> Option<String> {
   Some(String::from_utf8(date.to_vec()).unwrap())
 }
 
-/// Replays one recorded connection through a connection tunnelled as its user, each accepted work
-/// made as the owner makes it; `race` is replayed whole just before the client's `close-edit` is
-/// handed over. Returns what the connection wrote.
+/// Replays one recorded connection through a connection tunnelled as its user, every hook
+/// passing and each accepted work committed through A-655's step; `race` is replayed whole just
+/// before the client's `close-edit` is handed over. Returns what the connection wrote.
 fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Recording>) -> Vec<u8> {
   let (name, user, client, server) = recording;
   let tunnel = Repository {
@@ -334,7 +394,6 @@ fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Rec
     tunnel_user: Some(user),
     cram_md5: false,
   };
-  let author = std::str::from_utf8(user).unwrap();
   let guards = FixtureGuards::default();
   let mut out = Vec::new();
   let mut connection = Connection::new(LIMITS, &mut out).unwrap();
@@ -342,8 +401,9 @@ fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Rec
   let mut held: Vec<u8> = Vec::new();
   let mut established = false;
   loop {
-    let sources = replay.sources(&guards);
-    let turn = connection.receive(established.then_some(&sources), &held, &mut out, PLENTY);
+    let view = replay.view();
+    let given = sources(&view, &guards);
+    let turn = connection.receive(established.then_some(&given), &held, &mut out, PLENTY);
     match turn {
       Ok(Turn::NeedMore { .. }) => {
         let Some(item) = next.next() else {
@@ -370,29 +430,32 @@ fn replay_connection(replay: &mut Replay, recording: Recording, race: Option<Rec
         held.drain(..consumed);
         replay.transactions += 1;
         let start = CommitStart {
-          transaction: format!("{}-{}", replay.index.youngest(), replay.transactions),
+          transaction: format!("{}-{}", replay.records.youngest(), replay.transactions),
           now: AprTime(0),
           room: ROOM,
         };
-        let sources = replay.sources(&guards);
-        connection.commit(start, &sources, &mut out).unwrap();
+        let view = replay.view();
+        connection
+          .commit(start, &sources(&view, &guards), &mut out)
+          .unwrap();
+      }
+      Ok(Turn::Hook { consumed, .. }) => {
+        held.drain(..consumed);
+        let view = replay.view();
+        let answered = connection.answer_hook(Ok(()), &sources(&view, &guards), &mut out);
+        match answered {
+          Ok(Turn::Took { consumed: 0 }) => {}
+          Ok(Turn::Accepted { work, consumed: 0 }) => {
+            let recorded = recorded_date(server).unwrap();
+            make(replay, &mut connection, *work, &recorded, &mut out);
+          }
+          other => panic!("{name}: the hook's answer: {other:?}"),
+        }
       }
       Ok(Turn::Accepted { work, consumed }) => {
         held.drain(..consumed);
-        let date = recorded_date(server).unwrap();
-        replay.green.hold(&work, &date);
-        let work = *work;
-        for entry in &work.lock_entries {
-          replay.locks.apply(entry).unwrap();
-        }
-        let revision = replay.index.append(work.record, ROOM).unwrap();
-        let made = Made {
-          revision,
-          date: &date,
-          author: Some(author),
-          post_commit_error: None,
-        };
-        connection.committed(&made, &mut out).unwrap();
+        let recorded = recorded_date(server).unwrap();
+        make(replay, &mut connection, *work, &recorded, &mut out);
       }
       other => panic!("{name}: {other:?}"),
     }
@@ -451,13 +514,15 @@ fn take_lock(replay: &mut Replay, server: &[u8]) {
     ..LockRequest::default()
   };
   let decision = replay
-    .locks
-    .lock(&request, &Head(&replay.index), AprTime(0), ROOM, &mut draw)
+    .records
+    .locks()
+    .lock(&request, &Head(replay.records.index()), AprTime(0), ROOM, &mut draw)
     .unwrap();
-  for entry in &decision.entries {
-    replay.locks.apply(entry).unwrap();
-  }
-  let held = replay.locks.get_lock(LOCKED, AprTime(0)).unwrap();
+  replay
+    .records
+    .apply_lock_entries(&decision.entries)
+    .unwrap();
+  let held = replay.records.locks().get_lock(LOCKED, AprTime(0)).unwrap();
   assert_eq!(held.token.as_str(), token, "the recorded token");
 }
 
@@ -496,5 +561,5 @@ fn every_recorded_commit_is_answered_as_svnserve_answered_it() {
     replayed += 1 + usize::from(race.is_some());
   }
   assert_eq!(replayed, REPLAYED);
-  assert_eq!(replay.index.youngest(), YOUNGEST);
+  assert_eq!(replay.records.youngest(), YOUNGEST);
 }

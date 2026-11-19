@@ -17,9 +17,7 @@
 //! made yet, the client's commands then dropped until `abort-edit`; and calls out of turn.
 
 use super::*;
-use crate::commit::CommitRefusal;
 use crate::index::{Action, Index};
-use crate::lock::LockRefusal;
 use crate::report::drive::green::texts_by_md5;
 use crate::report::drive::green::{FixtureGuards, Green, guards_of, normalize, repository};
 use crate::report::recorded::{
@@ -679,10 +677,13 @@ fn alices_tunnel() -> Repository<'static> {
   }
 }
 
-/// What the tests begin a commit with: transaction `6-1`, at the epoch, the report's room.
+/// The transaction the tests' commits are begun as.
+const TRANSACTION: &str = "6-1";
+
+/// What the tests begin a commit with: [`TRANSACTION`], at the epoch, the report's room.
 fn start() -> CommitStart {
   CommitStart {
-    transaction: "6-1".to_owned(),
+    transaction: TRANSACTION.to_owned(),
     now: AprTime(0),
     room: LIMITS.report_room,
   }
@@ -722,24 +723,48 @@ fn cram_md5(connection: &mut Connection, user: &[u8], secret: &[u8]) -> (String,
   (String::from_utf8_lossy(&out).into_owned(), verdict)
 }
 
-/// Drives [`ADD_NEWDIR`] and `close-edit` through `connection`, each command taken without a word;
-/// returns the work accepted at `close-edit`, for which nothing is written.
+/// Drives [`ADD_NEWDIR`] and `close-edit` through `connection`, each command taken without a word,
+/// start-commit answered at `open-root` and pre-commit at `close-edit`, both passing; returns the
+/// work accepted once pre-commit passed, for which nothing is written.
 fn drive_newdir(fixture: &Fixture, guards: &FixtureGuards, connection: &mut Connection) -> Box<Work> {
-  for command in ADD_NEWDIR {
-    let (out, turn) = send(fixture, guards, connection, command.as_bytes());
-    let took = Turn::Took {
-      consumed: command.len(),
-    };
-    assert_eq!((out.as_str(), turn), ("", Ok(format!("{took:?}"))));
+  let sources = fixture.sources(guards);
+  for (at, command) in ADD_NEWDIR.into_iter().enumerate() {
+    let mut out = Vec::new();
+    let turn = connection.receive(Some(&sources), command.as_bytes(), &mut out, PLENTY);
+    if at == 0 {
+      let due = Turn::Hook {
+        due: Due::StartCommit {
+          transaction: TRANSACTION.to_owned(),
+        },
+        consumed: command.len(),
+      };
+      assert_eq!(turn, Ok(due));
+      let answered = connection.answer_hook(Ok(()), &sources, &mut out);
+      assert_eq!(answered, Ok(Turn::Took { consumed: 0 }));
+    } else {
+      let took = Turn::Took {
+        consumed: command.len(),
+      };
+      assert_eq!(turn, Ok(took));
+    }
+    assert!(out.is_empty(), "{command}: {out:?}");
     assert_eq!(connection.waiting(), Waiting::Edit);
   }
   let mut out = Vec::new();
-  let sources = fixture.sources(guards);
-  let (work, consumed) = match connection.receive(Some(&sources), CLOSE_EDIT, &mut out, PLENTY) {
-    Ok(Turn::Accepted { work, consumed }) => (work, consumed),
+  let closing = connection.receive(Some(&sources), CLOSE_EDIT, &mut out, PLENTY);
+  let due = Turn::Hook {
+    due: Due::PreCommit {
+      transaction: TRANSACTION.to_owned(),
+    },
+    consumed: CLOSE_EDIT.len(),
+  };
+  assert_eq!(closing, Ok(due));
+  assert_eq!(connection.waiting(), Waiting::Writing);
+  let work = match connection.answer_hook(Ok(()), &sources, &mut out) {
+    Ok(Turn::Accepted { work, consumed: 0 }) => work,
     other => panic!("{other:?}"),
   };
-  assert_eq!((consumed, out.as_slice()), (CLOSE_EDIT.len(), b"".as_slice()));
+  assert!(out.is_empty(), "{out:?}");
   assert_eq!(connection.waiting(), Waiting::Writing);
   work
 }
@@ -942,12 +967,12 @@ fn a_commit_by_a_user_the_rules_keep_from_writing_is_refused_after_the_authentic
   assert_eq!(connection.waiting(), Waiting::Command);
 }
 
-/// A-656 with A-655 (`Drive::errors`): refuse an accepted work with the lock refusal the owner met
-/// when it made it, bob's lock having landed since the drive's verdict; expect `close-edit`'s
-/// failure in the drive's own words, naming its principal: 160039 "User 'alice' does not own lock
-/// on path '/trunk/newdir' (currently locked by 'bob')".
+/// A-656 with A-655 (`transaction.c` `commit_body` 3784-3786 through A-655's step): refuse an
+/// accepted work as the owner's commit step refuses one whose head a commit passed since the
+/// verdict; expect `close-edit`'s failure in the step's words, 160028 "Transaction out of date",
+/// and the client's commands awaited until its `abort-edit`.
 #[test]
-fn a_work_the_owner_refuses_is_answered_in_the_drives_words() {
+fn a_work_the_owners_step_refuses_is_answered_in_its_words() {
   let fixture = fixture();
   let alice = FixtureGuards::default();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
@@ -957,22 +982,154 @@ fn a_work_the_owner_refuses_is_answered_in_the_drives_words() {
   connection
     .commit(start(), &fixture.sources(&alice), &mut Vec::new())
     .unwrap();
-  drive_newdir(&fixture, &alice, &mut connection);
-  let locked = LockRefusal::OwnerMismatch {
-    path: "/trunk/newdir".to_owned(),
-    owner: "bob".to_owned(),
+  let work = drive_newdir(&fixture, &alice, &mut connection);
+  let moved = StepRefusal::OutOfDate {
+    head: work.head,
+    youngest: work.head + 1,
   };
-  let refusal = DriveRefusal::Commit(CommitRefusal::Locked(locked));
   let mut out = Vec::new();
   connection
-    .not_committed(&Uncommitted::Refused(refusal), &mut out)
+    .not_committed(&Uncommitted::Step(moved), &mut out)
     .unwrap();
-  let message = "User 'alice' does not own lock on path '/trunk/newdir' (currently locked by 'bob')";
+  let message = "Transaction out of date";
   let failure = format!(
-    "( failure ( ( 160039 {}:{message} 0: 0 ) ) ) ",
+    "( failure ( ( 160028 {}:{message} 0: 0 ) ) ) ",
     message.len()
   );
   assert_eq!(String::from_utf8_lossy(&out), failure);
+  assert_eq!(connection.waiting(), Waiting::Edit);
+}
+
+/// A-656 with A-661 (start-commit refusing, `fs-wrap.c` `svn_repos_fs_begin_txn_for_commit2` run
+/// inside `open-root`): commit through a tunnel as alice; look at the transaction the hook would
+/// read; answer start-commit with a failure of two errors; send the drive's next command, a number
+/// and `abort-edit`; expect the transaction named `6-1` on the youngest revision with alice's log
+/// message, the failure written as `open-root`'s, both errors outermost first, the commands after
+/// it dropped without a word, `abort-edit` ending the edit, and the next command awaited.
+#[test]
+fn a_start_commit_hooks_failure_is_open_roots_and_the_drive_is_dropped() {
+  let fixture = fixture();
+  let alice = FixtureGuards::default();
+  let sources = fixture.sources(&alice);
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
+    .1
+    .unwrap();
+  connection
+    .commit(start(), &sources, &mut Vec::new())
+    .unwrap();
+  let open_root = ADD_NEWDIR[0].as_bytes();
+  let mut out = Vec::new();
+  let turn = connection.receive(Some(&sources), open_root, &mut out, PLENTY);
+  assert!(matches!(turn, Ok(Turn::Hook { due: Due::StartCommit { .. }, .. })), "{turn:?}");
+  let pending = connection.pending().unwrap();
+  assert_eq!((pending.transaction, pending.base), (TRANSACTION, 6));
+  let log = (b"svn:log".to_vec(), b"newdir".to_vec());
+  assert!(pending.revision_properties.contains(&log));
+  let refused = vec![
+    (165_001, "Commit blocked by start-commit hook (exit code 1) with output:\nno".to_owned()),
+    (165_001, "the hook's own words".to_owned()),
+  ];
+  let answered = connection.answer_hook(Err(refused), &sources, &mut out);
+  assert_eq!(answered, Ok(Turn::Took { consumed: 0 }));
+  let first = "Commit blocked by start-commit hook (exit code 1) with output:\nno";
+  let second = "the hook's own words";
+  let failure = format!(
+    "( failure ( ( 165001 {}:{first} 0: 0 ) ( 165001 {}:{second} 0: 0 ) ) ) ",
+    first.len(),
+    second.len()
+  );
+  assert_eq!(String::from_utf8_lossy(&out), failure);
+  assert!(connection.pending().is_none());
+  for dropped in [ADD_NEWDIR[1], "5 "] {
+    let (out, turn) = send(&fixture, &alice, &mut connection, dropped.as_bytes());
+    let took = Turn::Took {
+      consumed: dropped.len(),
+    };
+    assert_eq!((out.as_str(), turn), ("", Ok(format!("{took:?}"))));
+  }
+  let (out, _) = send(&fixture, &alice, &mut connection, b"( abort-edit ( ) ) ");
+  assert_eq!(out, "");
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// A-656 with A-661 (pre-commit refusing, `fs-wrap.c` `svn_repos_fs_commit_txn` 69-71 run inside
+/// `close-edit` before the verdict): drive `newdir` through a tunnel as alice; answer pre-commit
+/// with a failure; expect no work accepted, the failure written as `close-edit`'s, and the edit
+/// ended at the client's `abort-edit`.
+#[test]
+fn a_pre_commit_hooks_failure_is_close_edits_and_no_work_is_accepted() {
+  let fixture = fixture();
+  let alice = FixtureGuards::default();
+  let sources = fixture.sources(&alice);
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
+    .1
+    .unwrap();
+  connection
+    .commit(start(), &sources, &mut Vec::new())
+    .unwrap();
+  let mut out = Vec::new();
+  for (at, command) in ADD_NEWDIR.into_iter().enumerate() {
+    connection
+      .receive(Some(&sources), command.as_bytes(), &mut out, PLENTY)
+      .unwrap();
+    if at == 0 {
+      connection.answer_hook(Ok(()), &sources, &mut out).unwrap();
+    }
+  }
+  let closing = connection.receive(Some(&sources), CLOSE_EDIT, &mut out, PLENTY);
+  assert!(matches!(closing, Ok(Turn::Hook { due: Due::PreCommit { .. }, .. })), "{closing:?}");
+  let refused = vec![(165_001, "no commits on Fridays".to_owned())];
+  let answered = connection.answer_hook(Err(refused), &sources, &mut out);
+  assert_eq!(answered, Ok(Turn::Took { consumed: 0 }));
+  let words = "no commits on Fridays";
+  let failure = format!("( failure ( ( 165001 {}:{words} 0: 0 ) ) ) ", words.len());
+  assert_eq!(String::from_utf8_lossy(&out), failure);
+  assert_eq!(connection.waiting(), Waiting::Edit);
+  let (out, _) = send(&fixture, &alice, &mut connection, b"( abort-edit ( ) ) ");
+  assert_eq!(out, "");
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// A-656 with A-661 (the caller's errors around a hook): answer a hook where none is due; then,
+/// with start-commit due, call `receive`, `commit`, `committed` and `not_committed`; expect each
+/// `OutOfTurn` with nothing written and the hook still due, then answered.
+#[test]
+fn a_call_while_a_hook_is_due_or_an_answer_with_none_due_is_the_callers_error() {
+  let fixture = fixture();
+  let alice = FixtureGuards::default();
+  let sources = fixture.sources(&alice);
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  let mut out = Vec::new();
+  let early = connection.answer_hook(Ok(()), &sources, &mut out);
+  assert_eq!(early, Err(Refused::OutOfTurn));
+  assert_eq!(connection.waiting(), Waiting::Command);
+  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
+    .1
+    .unwrap();
+  connection.commit(start(), &sources, &mut out).unwrap();
+  out.clear();
+  let open_root = ADD_NEWDIR[0].as_bytes();
+  let turn = connection.receive(Some(&sources), open_root, &mut out, PLENTY);
+  assert!(matches!(turn, Ok(Turn::Hook { .. })), "{turn:?}");
+  let next = ADD_NEWDIR[1].as_bytes();
+  let refused = connection.receive(Some(&sources), next, &mut out, PLENTY);
+  assert_eq!(refused, Err(Refused::OutOfTurn));
+  assert_eq!(connection.commit(start(), &sources, &mut out), Err(Refused::OutOfTurn));
+  let made = Made {
+    revision: 7,
+    date: DATE,
+    author: None,
+    post_commit_error: None,
+  };
+  assert_eq!(connection.committed(&made, &mut out), Err(Refused::OutOfTurn));
+  let unmade = connection.not_committed(&Uncommitted::NotServed, &mut out);
+  assert_eq!(unmade, Err(Refused::OutOfTurn));
+  assert!(out.is_empty());
+  assert_eq!(connection.waiting(), Waiting::Writing);
+  let answered = connection.answer_hook(Ok(()), &sources, &mut out);
+  assert_eq!(answered, Ok(Turn::Took { consumed: 0 }));
   assert_eq!(connection.waiting(), Waiting::Edit);
 }
 
