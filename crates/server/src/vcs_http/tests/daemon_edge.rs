@@ -215,15 +215,16 @@ fn counted_on(daemon: &Daemon, partition: usize, kind: &'static str) -> u64 {
 }
 
 /// A-625 part 3 (main's rulings, 2026-11-19: the daemon starts the edge; a connection moves to its repository's shard;
-/// credentials from the one record). Do: start a two-shard daemon whose configuration asks for an edge on loopback with
-/// a self-signed identity; create a git repository on the second shard's partition; enroll tokens for its owner, for a
-/// principal no rule names, and an owner's that expired long ago; then, through a rustls client over TLS, ask for the
-/// repository's upload-pack advertisement, each on a new connection: with the owner's bearer token, with the owner's
-/// token as Basic's password, with no credentials, with the expired token, with the stranger's. Expect: the owner's two
-/// answered `503` (proven, moved to the repository's shard, found, admitted by its policy; upload-pack's store is not
-/// held until A-662); no credentials and the expired token `401`, each counted under its kind on the listener's shard,
-/// neither moved; the stranger moved and refused `403` there, counted; the listener's shard counting three moves and the
-/// repository's three arrivals, so every proven request was decided where its repository lives.
+/// credentials from the one record), and A-682 (upload-pack served from the store the shard holds). Do: start a
+/// two-shard daemon whose configuration asks for an edge on loopback with a self-signed identity; create a git
+/// repository on the second shard's partition; enroll tokens for its owner, for a principal no rule names, and an
+/// owner's that expired long ago; then, through a rustls client over TLS, ask for the repository's upload-pack
+/// advertisement, each on a new connection: with the owner's bearer token, with the owner's token as Basic's password,
+/// with no credentials, with the expired token, with the stranger's. Expect: the owner's two answered `200` (proven,
+/// moved to the repository's shard, found, admitted by its policy, and served from the store that shard holds); no
+/// credentials and the expired token `401`, each counted under its kind on the listener's shard, neither moved; the
+/// stranger moved and refused `403` there, counted; nothing counted unavailable; the listener's shard counting three
+/// moves and the repository's three arrivals, so every proven request was decided where its repository lives.
 #[test]
 fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_the_rest_by_kind() {
   let (identity, certificate) = identity();
@@ -256,7 +257,130 @@ fn a_daemons_edge_moves_a_proven_request_to_its_repositorys_shard_and_refuses_th
     counted_on(&daemon, REPOSITORY, "vcs_http.git.unavailable"),
   );
   daemon.stop();
-  assert_eq!(answers, [503, 503, 401, 401, 403]);
+  assert_eq!(answers, [200, 200, 401, 401, 403]);
   assert_eq!(listener, (3, 1, 1), "moves, no credentials, expired");
-  assert_eq!(repository, (3, 1, 2), "arrivals, forbidden, unavailable");
+  assert_eq!(repository, (3, 1, 0), "arrivals, forbidden, unavailable");
+}
+
+/// Shape: a v2 `ls-refs` request asking for `HEAD` with its symref's target, listed even unborn: the command, the
+/// delimiter, `symrefs`, `unborn` and `ref-prefix HEAD`, then the flush [gitprotocol-v2 "ls-refs"].
+const LS_REFS_HEAD: &[u8] = b"0014command=ls-refs\n0001000csymrefs\n000bunborn\n\
+  0014ref-prefix HEAD\n0000";
+
+/// Shape: the answer to [`LS_REFS_HEAD`] for a repository whose default branch `main` has no commit yet: `HEAD` unborn,
+/// naming its branch, then the flush [gitprotocol-v2: `obj-id-or-unborn SP refname *(SP ref-attribute)`].
+const UNBORN_MAIN: &[u8] = b"002eunborn HEAD symref-target:refs/heads/main\n0000";
+
+/// One line of `stream`, its line feed included.
+fn line_of(stream: &mut impl Read) -> Vec<u8> {
+  let mut line = Vec::new();
+  let mut byte = [0u8; 1];
+  while !line.ends_with(b"\n") {
+    match stream.read(&mut byte) {
+      Ok(1) => line.push(byte[0]),
+      other => panic!("the answer ended inside a line ({other:?}): {line:?}"),
+    }
+  }
+  line
+}
+
+/// A chunked body read from `stream` to its last chunk, which has no trailer here (RFC 9112 §7.1).
+fn chunked_body(stream: &mut impl Read) -> Vec<u8> {
+  let mut body = Vec::new();
+  loop {
+    let size = String::from_utf8_lossy(&line_of(stream)).into_owned();
+    let digits = size.split([';', '\r', '\n']).next().unwrap_or_default();
+    let length = usize::from_str_radix(digits, 16).expect("a chunk's size");
+    let mut chunk = vec![0u8; length];
+    stream.read_exact(&mut chunk).expect("a chunk");
+    body.extend(chunk);
+    let end = line_of(stream);
+    if end != b"\r\n" {
+      panic!("a chunk ended in {end:?}");
+    }
+    if length == 0 {
+      return body;
+    }
+  }
+}
+
+/// The body of an answer whose `head` was read from `stream`: chunked, framed by its length, or none.
+fn body_of(stream: &mut impl Read, head: &str) -> Vec<u8> {
+  let fields = head.to_ascii_lowercase();
+  if fields.contains("transfer-encoding: chunked") {
+    return chunked_body(stream);
+  }
+  let length = fields
+    .lines()
+    .find_map(|field| field.strip_prefix("content-length: "))
+    .and_then(|value| value.trim().parse::<usize>().ok())
+    .unwrap_or(0);
+  let mut body = vec![0u8; length];
+  stream.read_exact(&mut body).expect("the body");
+  body
+}
+
+/// The status and body of the answer to `request`, sent whole on a new TLS connection to the edge on `port`.
+fn exchange(port: u16, certificate: &CertificateDer<'static>, request: &[u8]) -> (u16, Vec<u8>) {
+  let mut stream = tls_client(port, certificate);
+  stream.write_all(request).expect("the request is sent");
+  let mut head = Vec::new();
+  while !head.ends_with(b"\r\n\r\n") {
+    head.extend(line_of(&mut stream));
+  }
+  let head = String::from_utf8_lossy(&head).into_owned();
+  let status = head
+    .split(' ')
+    .nth(1)
+    .and_then(|code| code.parse().ok())
+    .unwrap_or_else(|| panic!("no status line: {head:?}"));
+  (status, body_of(&mut stream, &head))
+}
+
+/// A-682 (A-625 part 3's upload-pack served from the store A-662 holds on the repository's shard). Do: start a two-shard
+/// daemon with its edge; create a git repository whose default branch is `main` on the second shard's partition, and
+/// enroll its owner's token; then, as the owner over TLS, ask for upload-pack's advertisement at protocol v2, and POST
+/// an `ls-refs` request asking for `HEAD` with `symrefs` and `unborn`. Expect: both answered `200`, moved to the
+/// repository's shard and served there from its store: the advertisement v2's capabilities, `version 2` first and
+/// `ls-refs=unborn` among them; the `ls-refs` answer `HEAD` unborn naming `refs/heads/main`, the default branch the
+/// repository's record names; and nothing counted unavailable on the repository's shard. Before A-682 the daemon's site
+/// lent no store, and both were `503`.
+#[test]
+fn a_daemons_edge_serves_upload_pack_from_the_store_its_repositorys_shard_holds() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let fields = format!(
+    "Host: localhost\r\nAuthorization: Bearer {OWNER_TOKEN}\r\nGit-Protocol: version=2\r\n"
+  );
+  let advertise = format!("GET /{name}/info/refs?service=git-upload-pack HTTP/1.1\r\n{fields}\r\n");
+  let advertise = advertise.into_bytes();
+  let mut ls_refs = format!(
+    "POST /{name}/git-upload-pack HTTP/1.1\r\n{fields}\
+     Content-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n",
+    LS_REFS_HEAD.len()
+  )
+  .into_bytes();
+  ls_refs.extend_from_slice(LS_REFS_HEAD);
+  let advertisement = exchange(port, &certificate, &advertise);
+  let listed = exchange(port, &certificate, &ls_refs);
+  let unavailable = counted_on(&daemon, REPOSITORY, "vcs_http.git.unavailable");
+  daemon.stop();
+  let (status, capabilities) = advertisement;
+  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&capabilities));
+  assert!(
+    capabilities.starts_with(b"000eversion 2\n"),
+    "{capabilities:?}"
+  );
+  assert!(
+    capabilities
+      .windows(b"ls-refs=unborn".len())
+      .any(|window| window == b"ls-refs=unborn"),
+    "{capabilities:?}"
+  );
+  assert_eq!(listed, (200, UNBORN_MAIN.to_vec()));
+  assert_eq!(unavailable, 0);
 }
