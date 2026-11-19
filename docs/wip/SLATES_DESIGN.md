@@ -12615,6 +12615,17 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-651 part 3: the SSH edge proves a key by the credential record).** A key the session cannot
+> answer for at once waits for the record: the edge's key holders (`RecordKeys`, which replaced `NoKeyRecord`) answer
+> every key "not yet" (`slates-ssh`'s `Holding::Unknown`), and the session holds that authentication request unanswered
+> and uncounted, reading nothing more of the client's, while the edge awaits the site's lookup and hands its answer back
+> (`Session::key_resolved`). The lookup is main's recipe over A-625 part 3's record: the key's id is its blob's SHA-256
+> (`credentials::ssh_key_id`), found from any shard on the partition the id routes to (`credentials::find`), and the
+> record proves its principal only when it is an SSH key of the same bytes, live on the wall clock. As the HTTP edge
+> asks, a consumer's key proves the consumer only while it is enrolled and not revoked (§4.13). Anything else is nobody,
+> a lookup the record could not answer included, each counted by its reason. The user name plays no part. The daemon
+> starting the edge, the stores and main's live OpenSSH `git clone` with an enrolled key are owed.
+>
 > **Status (2026-11-19, A-651 part 2: git's upload-pack behind the SSH edge).** `crates/server`'s `vcs_ssh::git` runs
 > A-640's one entry point over an SSH session's standard input and output, the store lent a step at a time by the HTTP
 > edge's `StoreLender` (A-625 part 3): the advertisement first, each request measured whole by `whole_len`, consumed and
@@ -12631,16 +12642,17 @@ engine: the verdict, rebase, position mapping, the register).
 >
 > **Status (2026-11-19, A-651: piece 9's edge built).** `crates/server`'s `vcs_ssh` serves SSH on the runtime's TCP,
 > the HTTP edge's counterpart: one connection a task under seats derived from the shard's clients, each driving
-> `slates-ssh`'s session. A key proves a principal only through the site's lookup, today `NoKeyRecord`, which refuses
-> every key until the one record of principals' credentials lands (main's ruling under §4.13; no key file, no default
-> key). Each `exec` is dispatched by its tool and refused in the tool's own words and exit status where it cannot run: a
+> `slates-ssh`'s session. A key proves a principal only through the site's lookup, which refused every key
+> (`NoKeyRecord`) until the one record of principals' credentials landed, and reads that record since A-651 part 3
+> (main's ruling under §4.13; no key file, no default key). Each `exec` is dispatched by its tool and refused in the tool's own words and exit status where it cannot run: a
 > missing repository, the repository's policy, and, for now, all four services as not served (git's upload-pack and
 > Mercurial's `serve --stdio` have landed and wait for their stores, A-662; receive-pack's and Subversion's entry
 > points, A-654 and A-656). Waits keep the HTTP edge's rule: RFC 6298's first RTO of the connection's own round trip
 > before a phase learns; a wait past its bound only marks its seat overdue, and the most overdue is reaped only for a new
 > connection with every seat taken, since an SSH connection waits on people (a key's passphrase after `PK_OK`, a host
 > key's confirmation) and on a push's compression. The key time is fed by authenticated connections' lifetimes. The
-> daemon starting the edge, the stores, the key record and the live OpenSSH `git clone` are owed.
+> daemon starting the edge, the stores and the live OpenSSH `git clone` are owed (the key record, closed by A-651
+> part 3).
 >
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
@@ -12735,8 +12747,8 @@ engine: the verdict, rebase, position mapping, the register).
 > read locally. Every refusal is typed and counted by kind. Owed: upload-pack served once each repository's store lives
 > on its owner shard (A-662; `503` until then), receive-pack's session (A-654), LFS's routes on the site under main's
 > ruling (a route says whether its status is fixed at the head or decided after its body), a consumer's revocation in
-> the SSH edge's key holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone`
-> (main's).
+> the SSH edge's key holders (A-651; closed by A-651 part 3, which asks it as this edge does), listing credentials,
+> Mercurial's and Subversion's sites, the live `git clone` (main's).
 >
 > **Status (2026-11-19, A-625 part 3 continued: the operator starts the edge, built).** `slates anchor` and `slates
 > daemon` take `--vcs-http ADDRESS`, an IPv4 address and port (port 0 the system's pick), and the daemon starts the
@@ -50884,6 +50896,69 @@ sources).
   across a window's edge (an object past a window trying earlier ones within one and the reverse, as git's order by
   name and size would); the live clone over the HTTP edge with the store's production lender (A-625 part 3); the
   red-checks and the other platforms' runs (main's).
+
+### A-651 part 3 — The SSH edge proves a key by the credential record: a key the session cannot answer for at once waits, unanswered and uncounted, while the edge looks it up where its record lives, and the record proves its principal only for an SSH key of the same bytes, live, and a consumer's only while it is enrolled (2026-11-19, g294, UI goal 93; §4.17.2 "Transports" item 2 and "Access"; §4.13; RFC 4252 §4, §5.1 and §7; after A-651 parts 1 and 2 and A-625 part 3)
+Applied in the same change to:
+- §4.17.2's status (part 3's; part 1's and A-625 part 3's lines on the key record and a consumer's revocation); GAPS
+  (the §4.17 entry: part 3's line after part 2's; part 1's and A-625 part 3's owed lists);
+- `crates/ssh` (`userauth`: `Holding::Unknown`, `Answer::wanted`, `Wanted`; `session`: `SessionEvent::KeyWanted`,
+  `Session::key_resolved`, `SessionUse::NoKeyWanted`; their tests, the session tests' pair now keeping the client's
+  bytes the server has not taken); `crates/server` (`vcs_ssh`: the edge answers `KeyWanted`; `vcs_ssh::site`:
+  `RecordKeys` in `NoKeyRecord`'s place, `SshSite::lookup`, `KeyUnproven`, `key_holder`, `ToolSite`'s lookup;
+  `credentials::consumer_revoked`, the HTTP edge's check moved beside `find` and asked by both edges; the tests).
+- **Why the session waits.** `slates-ssh`'s `KeyHolders` answers synchronously inside the session's `receive`, while a
+  key's record lives on the partition its id routes to (D-14), often another shard's, reached by one bounded
+  cross-shard call (`credentials::find`, A-625 part 3). So holders may answer `Holding::Unknown`: the authenticator
+  then answers nothing and counts nothing (RFC 4252 §4's limit on failed attempts counts the request only once it is
+  answered), and the session keeps the request's payload whole, raises `SessionEvent::KeyWanted` with the user, the
+  key and its blob, and reads nothing more of the client's until `Session::key_resolved` asks the request again with
+  the caller's answer. That answer is given once: `Unknown` again, or a second ask, is nobody. A `key_resolved` with no
+  request waiting is the typed misuse `SessionUse::NoKeyWanted`. A client may send several requests without waiting
+  for answers, and the server must process each completely before the next (RFC 4252 §5.1) [B], so holding the
+  client's later bytes is what the protocol asks; the session test sends a `none` probe behind the waiting query and
+  reads the two answers in order.
+- **The record's rule** (main's recipe). The key's id is its blob's SHA-256 (`credentials::ssh_key_id`);
+  `credentials::find` finds its record from any shard; the record proves `record.principal` only when it is an SSH key
+  of exactly the presented bytes (`CredentialKind::SshKey`: a token's record, or other bytes, under the id is refused)
+  and `record.live_at` the wall clock's now. Two rules beyond the recipe, each the HTTP edge's already: a consumer's
+  key proves the consumer only while it is enrolled and not revoked (§4.13: "every later effect refuses";
+  `credentials::consumer_revoked`, moved beside `find` so both edges ask it one way), and a lookup the record could not
+  answer (no shard, or the owner silent within its budget) is nobody, counted apart, so the client may offer another
+  key or try again. Each refusal is counted by its reason (`vcs_ssh.key_unknown`, `key_not_this_key`, `key_expired`,
+  `key_revoked`, `key_unanswered`). A proven principal signs with its one key (`KEYS_REQUIRED`), since the record keeps
+  no policy asking for more. The user name plays no part: the key alone names who connects, as `git@` is every user's
+  name on a git host. A query and its signed request each look the key up (the session test answers both), so a key
+  revoked between them is refused at the signature.
+- **Tests** (macOS arm64, Mac Studio d1323898, debug, 2026-11-19).
+  - `cargo test --locked -p slates-ssh --lib -- userauth session`: a key the holders cannot answer for yet is wanted,
+    neither answered nor counted, under a failure limit of zero; a session holding a query reads nothing behind it (a
+    `none` probe) until answered, then answers `PK_OK` and the probe's failure in order, holds the signature the same
+    way, then authenticates; `key_resolved` with nothing waiting is the misuse.
+  - `cargo test --locked -p slates-server --lib -- vcs_ssh credentials daemon_edge --test-threads=4`: the production
+    holders leave every key to the lookup; a record proves its principal for its own key while live, and not at its
+    expiry, for other bytes or as a token's; on a two-shard daemon the production lookup proves an enrolled live key
+    from the first shard and refuses an expired one, a token at a key's id, an unenrolled consumer's key and an unknown
+    key, each counted once by its reason; and a whole connection over loopback whose key is looked up where its record
+    lives runs its command as one answered at once.
+  - Red at 6a6b0c84 (the failing tests over stubs, over main 1c6ac5006): slates-ssh 32 of 34 and slates-server 34 of
+    38, each new test failing. Green at 9af6531f: slates-ssh 33 of 34, the session test's pair having dropped the
+    client's bytes the server had not taken while a lookup waited (the server then read a probe under the wrong
+    sequence number, `LengthUnaligned`); the pair keeps them as the edge does (7ebd7639), 34 of 34. slates-server 37
+    of 38 there and on two gate copies over later mains (45ecc528 over 3612d1ef, 0d8ad1b4 over 0577ab0b):
+    `a_held_key_runs_its_command_and_its_connection_teaches_the_edge` read no closing sample each time. Part 3 leaves
+    that test's path unchanged (its site answers keys at once), but its new tests ran beside it and widened a race in
+    the tests' client, which returned at its own close while the shard took the stop before reading it. The client
+    now waits for the edge to end the connection, fixed on its own before this landed (4a74c118;
+    `docs/bugs/2026-11-19-the-ssh-edge-tests-stopped-the-shard-before-the-edge-read-the-close.md`). As it landed (gate
+    copy 92303c5c, main 9d54e0f9 with this change's code; kiln r165): slates-ssh 34 of 34, slates-server 38 of 38,
+    `cargo fmt -p slates-ssh -p slates-server -- --check` clean.
+  - No integration target reaches it: `vcs_ssh` has no caller outside its tests until the daemon starts the edge, and
+    the one test of the daemon's HTTP edge (`slates-cli`'s `an_anchors_vcs_http_flag_starts_its_daemons_edge`) is
+    answered `401` before any credential is looked up.
+- **Owed.** The daemon starting the SSH edge (its address, the host key's keeping); the stores behind its services;
+  main's live OpenSSH `git clone` over SSH with an enrolled key; the site finds a repository on its own shard's
+  partition alone (`Repositories::find`), where the HTTP edge locates one held elsewhere and moves the connection
+  there (main's finding, its own piece).
 
 ### A-679 — Mercurial's `serve --stdio` behind the daemon's SSH edge: slates-hg's `serve::stdio` over the store the HTTP site's lender holds, its refusals in 7.2's words (2026-11-19, g304 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The wire surface", "Transports" and piece 4; §4.17.2 "Transports" item 2; after A-650 part 2, A-651 and A-662)
 Applied in the same change to: `crates/server` (`vcs_ssh/hg.rs`, new; `vcs_ssh/site.rs`: `ToolServices<L, H>`,
