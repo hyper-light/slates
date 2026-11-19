@@ -15,8 +15,8 @@ use slates_vcs::ContentStore;
 use crate::Admission;
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::receive::{
-  self, Advertised, Command, Declined, Judge, Outcome, Pushed, Received, Reported, RequestReader,
-  protected, write_advertisement, write_report,
+  self, Advertised, Command, Declined, Judge, NoneHidden, Outcome, Pushed, Received, Reported,
+  RequestReader, protected, write_advertisement, write_report,
 };
 use crate::store::views::IndexedObjects;
 use crate::store::{Change, CommitSigners, Entries, Incoming, Push, Repository, StoreRefused};
@@ -389,12 +389,14 @@ impl ProtectedMain<'_> {
 }
 
 impl Judge for ProtectedMain<'_> {
-  fn judge(&mut self, command: &Command, _pushed: &Pushed<'_>) -> Result<Vec<Reported>, Declined> {
+  type Accepted = ();
+
+  fn judge(&mut self, command: &Command, _pushed: &Pushed<'_>) -> Result<(), Declined> {
     if command.name != MAIN {
-      return Ok(Vec::new());
+      return Ok(());
     }
     match self.verdict(command) {
-      Ok(None) => Ok(Vec::new()),
+      Ok(None) => Ok(()),
       Ok(Some(declined)) => Err(declined),
       Err(refused) => {
         self.faults.push(refused);
@@ -402,9 +404,21 @@ impl Judge for ProtectedMain<'_> {
       }
     }
   }
+
+  fn append(&mut self, _command: &Command, (): ()) -> Result<Vec<Reported>, Declined> {
+    Ok(Vec::new())
+  }
+
+  fn append_atomic(
+    &mut self,
+    accepted: Vec<(&Command, ())>,
+  ) -> Result<Vec<Vec<Reported>>, Declined> {
+    Ok(accepted.iter().map(|_| Vec::new()).collect())
+  }
 }
 
-/// `scenario`'s push read, its pack (if any) read with the server's objects as bases.
+/// `scenario`'s push read, its pack (if any) read with the server's objects as bases and passing every
+/// check receive-pack makes of a pushed object.
 fn read_push(scenario: &Scenario, server: &Server) -> (receive::Request, Option<unpack::Unpacked>) {
   let advertised = advertised(scenario.format);
   let mut admission = Admission::new(u64::MAX);
@@ -415,46 +429,37 @@ fn read_push(scenario: &Scenario, server: &Server) -> (receive::Request, Option<
     let mut reader = Reader::new(scenario.format, &NoIndex);
     let pack = &scenario.request[took..];
     assert_eq!(reader.read(pack, &mut admission).unwrap(), pack.len());
-    reader
+    let unpacked = reader
       .finish_with(&Bases(&server.objects), &mut admission)
-      .unwrap()
+      .unwrap();
+    let refused = receive::fsck::first_refusal(&unpacked.objects, scenario.format);
+    assert_eq!(refused, None, "{}: a pushed object refused", scenario.name);
+    unpacked
   });
   (request, unpacked)
 }
 
-/// `scenario`'s push answered from its server's store, judged by the protection; with the store refusals met.
+/// `scenario`'s push answered from its server's store as part 2 will answer it: checked against the
+/// index, its objects then admitted to a sealed push, and decided by the protection; with the store
+/// refusals met.
 pub(crate) fn answered(scenario: &Scenario) -> (Received, Vec<StoreRefused>) {
   let mut server = server(scenario);
   let (request, unpacked) = read_push(scenario, &server);
-  let objects = unpacked
-    .as_ref()
-    .map_or(&[][..], |unpacked| &unpacked.objects);
-  let push = sealed(&server.repository, &mut server.store, objects);
-  let keys = Keys::trusting(vec![key_blob(TRUSTED_PUB)]);
+  let mut admission = Admission::new(u64::MAX);
+  let checked = {
+    let view = IndexedObjects::new(&server.repository, &server.store, u64::MAX);
+    let unpacked = unpacked.map(Ok);
+    receive::check(request, unpacked, &view, &NoneHidden, &mut admission).unwrap()
+  };
+  let push = sealed(&server.repository, &mut server.store, checked.objects());
   let mut judge = ProtectedMain {
     server: &server,
     push: &push,
-    keys,
+    keys: Keys::trusting(vec![key_blob(TRUSTED_PUB)]),
     faults: Vec::new(),
   };
-  let view = IndexedObjects::new(&server.repository, &server.store, u64::MAX);
-  let unpacked: Option<Result<unpack::Unpacked, unpack::Refusal>> = unpacked.map(Ok);
-  let mut admission = Admission::new(u64::MAX);
-  let outcomes = receive::outcomes(
-    &request,
-    unpacked.as_ref(),
-    &view,
-    &mut judge,
-    &mut admission,
-  )
-  .unwrap();
-  let faults = judge.faults;
-  let received = Received {
-    request,
-    unpacked,
-    outcomes,
-  };
-  (received, faults)
+  let received = receive::decide(checked, &mut judge, &mut admission).unwrap();
+  (received, judge.faults)
 }
 
 /// The advertisement written for `scenario`'s server.

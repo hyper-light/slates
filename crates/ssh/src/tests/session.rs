@@ -176,7 +176,10 @@ fn open(kind: &str, window: u32, max_packet: u32) -> Vec<u8> {
 fn open_session(pair: &mut Pair, window: u32, max_packet: u32) -> (u32, u32, u32) {
   pair.exchange(&open("session", window, max_packet)).unwrap();
   let confirmation = pair.last();
-  assert_eq!(confirmation[..5], [91, 0, 0, 0, CLIENT_CHANNEL as u8]);
+  assert_eq!(
+    confirmation[..5],
+    [&[91][..], &CLIENT_CHANNEL.to_be_bytes()].concat()
+  );
   let word = |at: usize| u32::from_be_bytes(confirmation[at..at + 4].try_into().unwrap());
   (word(5), word(9), word(13))
 }

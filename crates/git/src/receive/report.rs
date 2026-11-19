@@ -1,14 +1,17 @@
-//! receive-pack's answer to a push (A-620 part 1; gitprotocol-pack "Report Status"; git's `report`, `report_v2`,
-//! `report_message` and the end of `cmd_receive_pack`, v2.50.1).
+//! receive-pack's answer to a push (A-620 part 1; gitprotocol-pack "Report Status"; git's `report`,
+//! `report_v2`, `report_message` and the end of `cmd_receive_pack`, v2.50.1).
 //!
-//! The report is `unpack ok` or `unpack <reason>`, then each command's `ok <ref>` or `ng <ref> <reason>` in the order
-//! sent, then a flush. report-status-v2 adds, after an `ok`, the option lines of each report a hook made of it, each
-//! report after the first repeating the `ok` line. Under side-band-64k the report goes out whole on band 1, after what
-//! git sent on band 2 as it worked: a hook's words in the pieces git reads them in, and the `rp_error` lines (A-644).
-//! The answer ends with a flush of its own.
+//! The report is `unpack ok` or `unpack <reason>`, then each command's `ok <ref>` or `ng <ref>
+//! <reason>` in the order sent, then a flush. report-status-v2 adds, after an `ok`, the option
+//! lines of each report a hook made of it, each report after the first repeating the `ok` line.
+//! Under side-band-64k the report goes out whole on band 1, after what git sent on band 2 as it
+//! worked: a hook's words in the pieces git reads them in, and the `rp_error` lines (A-644). The
+//! answer ends with a flush of its own.
 
 use super::protected::HOOK_PIECE;
-use super::{Declined, Outcome, Received, Refusal, Reported, unpack_words};
+use super::{
+  Declined, Outcome, PackRefusal, PackRefused, Received, Refusal, Reported, unpack_words,
+};
 use crate::object_name::ObjectId;
 use crate::out::Out;
 use crate::pktline::{self, Packet};
@@ -36,8 +39,14 @@ const OPTION_OLD: &[u8] = b"option old-oid ";
 const OPTION_NEW: &[u8] = b"option new-oid ";
 /// Format: the option line of a forced update.
 const OPTION_FORCED: &[u8] = b"option forced-update";
+/// Format: what git's fsck error names before the object (`fsck_error_function`).
+const FSCK_OBJECT: &[u8] = b"object ";
+/// Format: the line git's unpacking dies with after an fsck error (`index-pack.c`,
+/// `unpack-objects.c`).
+const FSCK_FATAL: &[u8] = b"fatal: fsck error in packed object\n";
 
-/// The line git's `rp_error` sends for `text`: `error: ` and the text, cut to git's 4096 bytes with its LF.
+/// The line git's `rp_error` sends for `text`: `error: ` and the text, cut to git's 4096 bytes with
+/// its LF.
 pub fn message(text: &[u8]) -> Vec<u8> {
   let mut line = ERROR.to_vec();
   line.extend_from_slice(text);
@@ -46,9 +55,10 @@ pub fn message(text: &[u8]) -> Vec<u8> {
   line
 }
 
-/// Writes receive-pack's answer to `received`, after its advertisement: nothing for a request of no command; else each
-/// refusal's band-2 line and the report as the client asked for them, and a last flush under side-band-64k. Refused
-/// for a line past a pkt-line's room (git's "impossibly long line").
+/// Writes receive-pack's answer to `received`, after its advertisement: nothing for a request of no
+/// command; else each refusal's band-2 line and the report as the client asked for them, and a last
+/// flush under side-band-64k. Refused for a line past a pkt-line's room (git's "impossibly long
+/// line").
 pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refusal> {
   let requested = &received.request.requested;
   if received.request.commands.is_empty() {
@@ -56,6 +66,11 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
   }
   let multiplexed = requested.side_band_64k;
   if multiplexed {
+    if let Some(Err(refused)) = &received.unpacked {
+      for line in pack_lines(refused) {
+        sideband::write(Band::Progress, &line, out);
+      }
+    }
     for outcome in &received.outcomes {
       if let Outcome::Ng(declined) = outcome {
         write_band_two(declined, out);
@@ -77,8 +92,8 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
   Ok(())
 }
 
-/// What git sends on band 2 of a refused command: a hook's words in the pieces `copy_to_sideband` reads them in, then
-/// the `rp_error` line.
+/// What git sends on band 2 of a refused command: a hook's words in the pieces `copy_to_sideband`
+/// reads them in, then the `rp_error` line.
 fn write_band_two(declined: &Declined, out: &mut impl Out) {
   for piece in declined.hook.chunks(HOOK_PIECE) {
     sideband::write(Band::Progress, piece, out);
@@ -88,7 +103,28 @@ fn write_band_two(declined: &Declined, out: &mut impl Out) {
   }
 }
 
-/// The report's own packets: the unpack status, each command's line (and under v2 its option lines), a flush.
+/// The lines git sends on band 2 for a refused pack: an fsck refusal's `error: object <id>: <id of
+/// the finding>` (git's own prose after the finding is A-590's to give) and the `fatal:` its
+/// unpacking dies with; none for a refusal of the pack's bytes, whose words git's unpacking alone
+/// writes.
+fn pack_lines(refused: &PackRefused) -> Vec<Vec<u8>> {
+  match refused.why {
+    PackRefusal::Fsck { id, finding } => {
+      let text = [
+        FSCK_OBJECT,
+        hex(&id).as_slice(),
+        b": ",
+        finding.name().as_bytes(),
+      ]
+      .concat();
+      vec![message(&text), FSCK_FATAL.to_vec()]
+    }
+    PackRefusal::Unpack(_) => Vec::new(),
+  }
+}
+
+/// The report's own packets: the unpack status, each command's line (and under v2 its option
+/// lines), a flush.
 fn write_body(received: &Received, v2: bool, out: &mut impl Out) -> Result<(), Refusal> {
   let status = match &received.unpacked {
     Some(Err(refusal)) => unpack_words(refusal),
@@ -110,8 +146,8 @@ fn write_body(received: &Received, v2: bool, out: &mut impl Out) -> Result<(), R
   write_line(Packet::Flush, out)
 }
 
-/// The option lines of each report a hook made of a command, each report after the first preceded by the command's
-/// `ok` line again.
+/// The option lines of each report a hook made of a command, each report after the first preceded
+/// by the command's `ok` line again.
 fn write_reports(name: &[u8], reports: &[Reported], out: &mut impl Out) -> Result<(), Refusal> {
   for (index, report) in reports.iter().enumerate() {
     if index > 0 {

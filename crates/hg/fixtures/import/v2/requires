@@ -1,0 +1,7 @@
+exp-changelog-v2
+exp-revlogv2.2
+fileindex-v1
+generaldelta
+revlog-compression-zstd
+sparserevlog
+store

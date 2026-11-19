@@ -58,7 +58,8 @@ pub enum OpKind {
   Mknod = 15,
   /// Format: a path's tree copied by reference (A-586, Subversion's copy, §4.17.4 item 3): `path` is the destination,
   /// `src` the source's index in the path table (as a rename's), `at` the version of the source copied (Subversion's
-  /// copy-from revision), `len` unused. Judged node-exclusively whatever its flags: it adds its destination.
+  /// copy-from revision), `len` unused. Judged node-exclusively whatever its flags: it adds its destination, or with
+  /// [`REPLACE`] replaces what the destination holds (A-626).
   Copy = 16,
 }
 
@@ -122,10 +123,24 @@ pub struct Op {
 /// what it always meant.
 pub const NODE_EXCLUSIVE: u8 = 0x80;
 
+/// The flag bit that makes a `Copy` replace what its destination holds (A-626; Subversion's replace with history, a
+/// changed path `R` with a copy source, §4.17.4 item 3.5): the destination's tree is taken away first, each key of it
+/// removed as a removal is recorded, and the source's tree is copied there. A `Copy` without it refuses a destination
+/// that holds anything. The removal is the flag's: the document's other operations on paths in the destination's tree
+/// land after the copy, on what it brought.
+/// Format: the low bit of `Op::flags`, which no other kind sets, so a document that never sets it means what it always
+/// meant.
+pub const REPLACE: u8 = 0x01;
+
 impl Op {
   /// Whether the operation is node-exclusive ([`NODE_EXCLUSIVE`]).
   pub fn is_node_exclusive(&self) -> bool {
     self.flags & NODE_EXCLUSIVE != 0
+  }
+
+  /// Whether the operation is a `Copy` that replaces its destination's tree ([`REPLACE`]).
+  pub fn replaces(&self) -> bool {
+    self.kind == OpKind::Copy && self.flags & REPLACE != 0
   }
 }
 
