@@ -19,7 +19,9 @@ use crate::store::learn::{Depth, Levels, Rebuild, Window};
 use crate::store::{Repository, Stored, delta_of};
 use crate::unpack::{NoIndex, read_whole};
 
-use super::{EXCHANGE, Made, Ticks, blob, commit, push_and_move, store, tree};
+use crate::store::Push;
+
+use super::{EXCHANGE, Made, Source, Ticks, blob, commit, push_and_move, store, tree};
 
 /// A text of numbered lines, `lines` long.
 fn text(lines: u32, edited: Option<u32>) -> Vec<u8> {
@@ -196,6 +198,61 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
     repository.release(&mut store).unwrap();
     assert!(store.is_empty());
   }
+}
+
+/// A-614 part 2 (offset deltas within a fragment, chains no deeper than the learned depth). Do:
+/// push, from a client whose pack was one delta deep, a commit over three files that differ in one
+/// line each, and encode it. Expect: the later two files offset deltas, every chain at most one
+/// deep (the nearest file, itself a delta, passed over for the first), and the pack read back whole.
+#[test]
+fn similar_files_in_one_version_are_offset_deltas_within_the_learned_depth() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let files: Vec<Made> = [None, Some(50), Some(150)]
+    .into_iter()
+    .map(|edited| blob(format, &text(200, edited)))
+    .collect();
+  let root = tree(
+    format,
+    &[
+      (Mode::File, b"a", files[0].id),
+      (Mode::File, b"b", files[1].id),
+      (Mode::File, b"c", files[2].id),
+    ],
+  );
+  let head = commit(format, root.id, &[], 1);
+  let mut objects = vec![head.clone(), root];
+  objects.extend(files);
+  let mut push = Push::new(format);
+  let mut source = Source {
+    objects: objects.clone(),
+    at: 0,
+    claim: true,
+    depth: 1,
+  };
+  push
+    .admit_all(&mut store, &repository.naming(), &mut source)
+    .unwrap();
+  repository.seal(&store, &mut push).unwrap();
+  let moved = repository.admit(&store, &push, 1, Some(head.id)).unwrap();
+  repository.commit(&mut store, &mut push, &[moved]).unwrap();
+  repository
+    .encode_fragments(&mut store, (1, 0), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  let (_, blobs) = repository.fragments(1, 0).unwrap();
+  let offsets = blobs
+    .iter()
+    .filter(|entry| entry.stored == Stored::Offset)
+    .count();
+  assert_eq!(
+    (offsets, blobs.iter().map(|entry| entry.depth).max()),
+    (2, Some(1))
+  );
+  let read = unpacked(format, &repository.pack(&store, 1, (0, 0)).unwrap());
+  assert_eq!(read.len(), objects.len());
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
 }
 
 /// A-614 part 2 (each entry's CRC32 kept, as a pack index keeps it). Do: read the first version's
