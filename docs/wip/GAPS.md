@@ -2432,8 +2432,16 @@
 >   content as before. Tests: `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation`
 >   (red before), the A-335 test on an uncertified takeover (red with an uncertified takeover's content let go),
 >   `a_layout_five_configuration_reads_its_takeovers_as_uncertified`, `a_takeover_this_build_makes_certifies_its_content`.
->   Owed: an owner's settle certifies content the same way (A-508's holders then drop content too); a settled line's
->   lagging holder still keeps content (it judges no successor's placement).
+>   **Fixed (A-546, g250, 2026-11-19): an owner's settle certifies content the same way.** An owner reports its
+>   neighbourhood placed only once every volume it owns is served from within it (the healer replacing, while the
+>   change is in flight, a placement naming a host outside the current neighbourhood: `fleet.heal.unsettled_replaced`),
+>   so a settle certifies that no head it serves names a holder outside its neighbourhoods; A-508's holders then let go
+>   the content their own records name (`fleet.settle.released_content`). The configuration lists the certified settles
+>   (regional layout 7; layouts 6 and 5 read with every settle uncertified, whose holders keep content). Tests:
+>   `a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go` (red before), A-508's test on an uncertified
+>   settle (red with an uncertified settle's content let go), `an_unsettled_owners_placement_outside_its_current_
+>   neighbourhood_is_replaced`, `a_settle_this_build_records_certifies_its_content`, the layout test. Owed: a settled
+>   line's lagging holder still keeps content (it judges no successor's placement).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
@@ -4123,8 +4131,11 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: the macOS route's claim steps and the CLI's MCP edge, which borrows
->   the reply deadline for its own. A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   each a wait that cannot see the departure yet: the CLI's MCP edge, which borrows the reply deadline for its own. The
+>   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
+>   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
+>   daemon's side waits on the client's since A-492, a daemon gone closing its end
+>   (`a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound`). A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
 >   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
 >   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
 >   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's
@@ -4187,7 +4198,15 @@
 >   `a_mount_the_kernel_lets_go_after_any_wait_still_ends_its_attachment`,
 >   `a_mount_that_left_before_its_watch_started_ends_at_the_watchs_first_read`); owed: the live CLI mount suite on macOS
 >   (the real event, `umount -f` too), and the Linux half of the seam (`/proc/self/mountinfo`'s `EPOLLPRI` through an
->   epoll instance) has no server user, since Linux host mounts are FUSE and end at their device. Class B (the
+>   epoll instance) has no server user, since Linux host mounts are FUSE and end at their device. A-511's owed restart
+>   closed by A-540 (2026-11-19, g232): the mount's id lives in its attachment's durable record once seen
+>   (`Op::AttachmentMountSeen`, appended), and a start reads the table once and ends every attachment whose recorded
+>   mount it no longer names (`a_restart_ends_an_attachment_whose_recorded_mount_the_table_no_longer_lists`,
+>   `a_restart_holds_an_attachment_whose_recorded_mount_the_table_still_lists`,
+>   `an_attachment_never_seen_mounted_keeps_the_rule_before_at_a_restart`,
+>   `a_held_mount_keeps_its_id_in_its_attachments_record`, and in `slates-db`
+>   `an_attachments_seen_mount_is_kept_through_its_log_and_a_snapshot`); an attachment never seen mounted keeps the
+>   rule before, since the table's silence about its point proves nothing. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -7942,6 +7961,18 @@ Residual literals: none in `src/`; the bench's shape constants (files per direct
 bytes, groups, the 4 KiB block) carry their measurements. The example targets of the four
 benched crates share the name `bench`; cargo warns of the output collision and may make it an
 error, so a rename to `<crate>-bench` is owed before the Phase 2 crates add theirs.
+
+**Fixed 2026-11-19 (A-541, goal 85, g234): a clone's live-inode count started from its origin's head.** A clone took
+its origin's count at the moment of the clone, not its snapshot's, so every file the origin made after the snapshot
+counted against the clone's inode allowance and every file it removed did not, until a restart recounted the clone's
+tree (`docs/bugs/2026-11-19-a-clones-inode-count-started-from-its-origins-head.md`). A snapshot now keeps its count,
+and a clone starts from it; a recovered snapshot's is its image's entries. AC-1.7's two counters were compared after
+every step, but no step cloned a snapshot its origin had changed since. **Open, found by the sweep:** the server's
+clone admission still reads the clone's inherited inodes from the origin's head (`verbs::admit_clone`'s `inherited`:
+a bounded clone's version reservation and its allowance's floor, a dynamic clone's version hold), where it should read
+the snapshot's recorded count; and a clone's live-entry count (§4.2's namespace dimension, `entry_allowance`) starts
+from its origin's head the same way (`clone_inner`'s `live_entries`), until a restart recounts it (the bug record
+names the effects of each).
 
 ## 8d. Phase 2 record (2026-09-05)
 

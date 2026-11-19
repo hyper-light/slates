@@ -219,6 +219,11 @@ const SETTLE_RELEASED: &str = "fleet.settle.released";
 /// Counted at each install that judges it. Format: a refusal name in the daemon's status report.
 const SETTLE_KEPT_OUTSIDE: &str = "fleet.settle.kept_outside";
 
+/// The status count of manifests a holder released from a live owner's copy it let go on a settle that certifies the
+/// owner's content (A-546): no head the owner serves names this holder for what its own records name. Format: a refusal
+/// name in the daemon's status report.
+const SETTLE_RELEASED_CONTENT: &str = "fleet.settle.released_content";
+
 /// The status count under which a successor records an object it adopted past tolerance (A-309): one of its recovery
 /// cohorts had fewer members left than its recovery quorum, so every surviving member of its cohorts, settled and
 /// current, answered first, and the newest record any of them held was adopted. Before A-309 such an object was counted
@@ -734,7 +739,7 @@ fn settle_away(
     return;
   }
   if regional.settled_away(owner, local, object) {
-    let_go_settled_away(state, object);
+    let_go_settled_away(state, object, regional.settle_certifies_content(owner));
   } else {
     state.count(SETTLE_KEPT_OUTSIDE, 1);
   }
@@ -743,9 +748,23 @@ fn settle_away(
 /// Lets go a copy a live owner's neighbourhood settled away from (A-508) as a stale one goes ([`let_go_stale`]): kept
 /// whole, counted [`TAKEOVER_KEPT_HOLDING_CONTENT`], while its retention rule keeps content for it, since the owner's
 /// head may still name this holder for its content and the healer leaves such a named holder be (A-335, A-276's open
-/// item); dropped otherwise, counted [`SETTLE_RELEASED`].
-fn let_go_settled_away(state: &mut ShardState, object: ObjectId) {
-  crate::content_retention::retain_object(state, object);
+/// item); dropped otherwise, counted [`SETTLE_RELEASED`]. Where the owner's settle certifies its content (`certified`,
+/// A-546: it reported its neighbourhood placed only once every volume it owns was served from within it), no head it
+/// serves names this holder, which is outside its neighbourhoods, so the content this holder's own records name goes
+/// first ([`crate::content_retention::release_certified`], counted [`SETTLE_RELEASED_CONTENT`]); content placed ahead
+/// of those records stays.
+fn let_go_settled_away(state: &mut ShardState, object: ObjectId, certified: bool) {
+  if certified {
+    let released = crate::content_retention::release_certified(state, object);
+    if released > 0 {
+      state.count(
+        SETTLE_RELEASED_CONTENT,
+        u64::try_from(released).unwrap_or(u64::MAX),
+      );
+    }
+  } else {
+    crate::content_retention::retain_object(state, object);
+  }
   if state.held_content.newest_placed(object).is_some() {
     state.count(TAKEOVER_KEPT_HOLDING_CONTENT, 1);
     return;

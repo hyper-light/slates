@@ -297,6 +297,7 @@ mod tests {
             admin: false,
           },
           token: [1; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -389,6 +390,7 @@ mod tests {
             admin: false,
           },
           token: [1; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -431,6 +433,7 @@ mod tests {
             admin: false,
           },
           token: [2; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -508,6 +511,7 @@ mod tests {
             principal,
             rights: Rights { read: true, write: write_rights, admin: false },
             token: [1; 16],
+            mount: None,
           },
         })
         .unwrap();

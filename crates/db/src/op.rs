@@ -641,6 +641,14 @@ pub enum Op {
     /// The repository.
     repository: RepositoryId,
   },
+  /// A host mount's attachment was seen mounted (A-540): the kernel's id of its mount, kept in the attachment's record
+  /// so a successor's start can judge whether the kernel let that mount go while no daemon ran. Appended.
+  AttachmentMountSeen {
+    /// The attachment.
+    id: u64,
+    /// The kernel's id of its mount, as its mount table names it.
+    mount: u64,
+  },
 }
 
 impl Op {
@@ -672,6 +680,7 @@ impl Op {
       Op::AttachmentAdded { .. } => "attachment_added",
       Op::AttachmentRemoved { .. } => "attachment_removed",
       Op::AttachmentBound { .. } => "attachment_bound",
+      Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
