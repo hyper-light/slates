@@ -1201,7 +1201,7 @@ fn check_against_oracle(plan: &Plan, census: &mut Census) -> Result<(), TestCase
 fn every_answer_is_the_oracles() {
   let census = RefCell::new(Census::default());
   let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
-    cases: 1024,
+    cases: 4096,
     ..Config::default()
   }));
   let result = runner.run(&any_plan(), |plan| {
@@ -1285,7 +1285,7 @@ fn check_carried(plan: &Plan, census: &mut Census) -> Result<(), TestCaseError> 
 fn a_pack_carries_what_the_client_lacks_and_nothing_unwanted() {
   let census = RefCell::new(Census::default());
   let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
-    cases: 512,
+    cases: 1024,
     ..Config::default()
   }));
   let result = runner.run(&any_plan(), |plan| {
