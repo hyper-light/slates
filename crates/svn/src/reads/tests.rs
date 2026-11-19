@@ -514,7 +514,8 @@ fn command_word<'a>(name: &str, command: &'a Value<'_>) -> &'a str {
 }
 
 /// Holds one answer to `svnserve`'s items from `at`, property lists as sets for the commands that hold them; answers
-/// where the next answer starts.
+/// where the next answer starts, counted in items as written: a normalized answer may hold fewer entries than items
+/// (`get-file-revs` folds each delta's strings into one).
 fn same_answer(
   name: &str,
   word: &str,
@@ -522,7 +523,8 @@ fn same_answer(
   answers: &[Value<'_>],
   at: usize,
 ) -> usize {
-  let theirs = &answers[at..at + mine.len()];
+  let next = at + mine.len();
+  let theirs = &answers[at..next];
   let (mine, theirs): (Vec<String>, Vec<String>) = if word == "get-file-revs" {
     (file_revs_normalized(mine), file_revs_normalized(theirs))
   } else if PROPERTY_LISTS.contains(&word) {
@@ -537,7 +539,7 @@ fn same_answer(
     )
   };
   assert_eq!(mine, theirs, "{name}: {word}");
-  at + mine.len()
+  next
 }
 
 /// Items in byte order of their written form: an answer `svnserve` writes in hash order, compared as a set.

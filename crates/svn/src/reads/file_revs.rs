@@ -203,7 +203,11 @@ impl FileRevsStream {
 
   /// `send_path_revision`: the revision's tuple, then its delta from the previous revision's text, or the empty string
   /// alone when its text is unchanged.
-  fn send<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>, revision: &PathRev) -> Result<(), Stop> {
+  fn send<R: Repository + ?Sized>(
+    &mut self,
+    reads: &mut Reads<'_, R>,
+    revision: &PathRev,
+  ) -> Result<(), Stop> {
     let node = reads
       .node(&revision.path, revision.revision)?
       .ok_or_else(|| Failure::not_found(&revision.path, revision.revision))?;
@@ -252,7 +256,11 @@ impl FileRevsStream {
   /// there is none; each window's integers, then its instruction and new-data sections when they are not empty. In
   /// svndiff 0 a window of new data alone is written as `send_simple_insertion_window` writes it: the header if it is
   /// not out, the integers and the instruction in one string, then the new data.
-  fn delta<R: Repository + ?Sized>(&self, reads: &mut Reads<'_, R>, node: &Node<'_>) -> Result<(), Stop> {
+  fn delta<R: Repository + ?Sized>(
+    &self,
+    reads: &mut Reads<'_, R>,
+    node: &Node<'_>,
+  ) -> Result<(), Stop> {
     let source = match &self.last {
       Some(last) => reads.whole_text(last.text)?,
       None => Vec::new(),
@@ -276,7 +284,10 @@ impl FileRevsStream {
         let joined = [unwritten_header, integers, instructions].concat();
         write_sections(&[joined.as_slice(), new_data], reads.out)?;
       } else {
-        write_sections(&[unwritten_header, integers, instructions, new_data], reads.out)?;
+        write_sections(
+          &[unwritten_header, integers, instructions, new_data],
+          reads.out,
+        )?;
       }
       header_out = true;
     }
@@ -304,9 +315,16 @@ impl FileRevsStream {
 
 impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `svn_repos_get_file_revs2`'s revisions, in the order they are sent.
-  fn file_revisions_to_send(&self, request: &FileRevsRequest) -> Result<VecDeque<PathRev>, Failure> {
+  fn file_revisions_to_send(
+    &self,
+    request: &FileRevsRequest,
+  ) -> Result<VecDeque<PathRev>, Failure> {
     let youngest = i64::try_from(self.index.youngest()).map_err(|_| Failure::corrupt())?;
-    let valid = |revision: Option<i64>| revision.filter(|&revision| revision >= 0).unwrap_or(youngest);
+    let valid = |revision: Option<i64>| {
+      revision
+        .filter(|&revision| revision >= 0)
+        .unwrap_or(youngest)
+    };
     let (start, end) = (valid(request.start), valid(request.end));
     if end < start {
       if request.merged {
@@ -345,7 +363,10 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     found: &mut BTreeSet<(String, Revision)>,
   ) -> Result<Vec<PathRev>, Failure> {
     self.existing(signed(end)?)?;
-    if self.node(path, end)?.is_none_or(|node| node.kind() != NodeKind::File) {
+    if self
+      .node(path, end)?
+      .is_none_or(|node| node.kind() != NodeKind::File)
+    {
       let message = format!("'{path}' is not a file in revision {end}");
       return Err(Failure::new(SVN_ERR_FS_NOT_FILE, message));
     }
@@ -429,9 +450,13 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     };
     while !previous.is_empty() {
       let mut next = Vec::new();
-      for mergeinfo in previous.iter().filter_map(|revision| revision.merged_mergeinfo.as_ref()) {
+      for mergeinfo in previous
+        .iter()
+        .filter_map(|revision| revision.merged_mergeinfo.as_ref())
+      {
         for (source, ranges) in mergeinfo.iter() {
-          let source = String::from_utf8(source.as_bytes().to_vec()).map_err(|_| Failure::corrupt())?;
+          let source =
+            String::from_utf8(source.as_bytes().to_vec()).map_err(|_| Failure::corrupt())?;
           for range in ranges.ranges() {
             if range.end() < start {
               continue;
@@ -509,7 +534,11 @@ fn interleaved(mut mainline: Vec<PathRev>, mut merged: Vec<PathRev>) -> VecDeque
       (None, Some(_)) => false,
       (None, None) => break,
     };
-    let next = if take_mainline { mainline.pop() } else { merged.pop() };
+    let next = if take_mainline {
+      mainline.pop()
+    } else {
+      merged.pop()
+    };
     order.extend(next);
   }
   order
@@ -536,7 +565,11 @@ fn simple_insertion(window: &Window) -> bool {
 /// Each section that is not empty as a string, in order, as each stream write sends one (`serve.c`
 /// `svndiff_handler`).
 fn write_sections(sections: &[&[u8]], out: &mut Vec<u8>) -> Result<(), ItemError> {
-  for section in sections.iter().copied().filter(|section| !section.is_empty()) {
+  for section in sections
+    .iter()
+    .copied()
+    .filter(|section| !section.is_empty())
+  {
     write(&Value::String(section), out)?;
   }
   Ok(())
