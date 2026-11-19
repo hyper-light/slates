@@ -1,7 +1,8 @@
 //! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536; the
 //! event-driven reaper's pieces 2 and 3): a staging buffer expires a lease after its last use (`crate::staging`), a
 //! status capture at its absolute deadline (`crate::status_pages`), a volume's write lease at its term (D-16, the
-//! partition's lease wheel), and a CLI attachment at its term's lapse (A-230, the partition's index of terms). One task a shard, the keeper, sleeps on the wheel until the earliest of them, releases what
+//! partition's lease wheel), a CLI attachment at its term's lapse (A-230, the partition's index of terms), and a destroy
+//! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again). One task a shard, the keeper, sleeps on the wheel until the earliest of them, releases what
 //! is due then, and sleeps until the next; a deadline set earlier than the one it sleeps for wakes it at once, so it
 //! re-arms. Nothing is scanned on a tick: each pass reads only the due entries of ordered indexes (the staging buffers by
 //! expiry, the seats by their capture's deadline, the lease wheel). Until A-522 and A-536 the reap loop's tick released
@@ -62,6 +63,13 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   let _ended = crate::verbs::expire_lapsed_attachments(state);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
+  // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
+  if state.destroy_retry_at.is_some_and(|at| at <= now) {
+    state.destroy_retry_at = None;
+    if let Some(server) = state.server_task {
+      slates_rt::registry::wake(server.0);
+    }
+  }
   while let Some(&(at, index, generation)) = state.capture_deadlines.first() {
     if at > now {
       break;
@@ -77,6 +85,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.capture_deadlines.first().map(|(at, ..)| *at),
     state.db.partition_mut().next_lease_expiry(),
     state.db.partition().next_term_lapse(),
+    state.destroy_retry_at,
   ]
   .into_iter()
   .flatten()
@@ -246,6 +255,25 @@ mod tests {
     daemon.stop();
     let released = released.expect("the lease was released within half a liveness window");
     println!("a write lease due in {SOON_NS} ns released {released:?} after it was recorded");
+  }
+
+  /// A-536 (destroys off the tick). Do: on a one-shard daemon, set a refused destroy record's retry a tenth of a
+  /// liveness window from now, as `verbs::step_destroys` sets it at a refusal; look until the keeper has taken it.
+  /// Expect: taken within half a window, at its deadline, the serve loop woken then to step the destroy again. Before,
+  /// the reap loop's tick stepped destroys once a window, whether a record was refused or not.
+  #[test]
+  fn a_refused_destroys_retry_is_kept_at_its_deadline_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let at = state.clock.monotonic_ns().saturating_add(SOON_NS);
+      state.destroy_retry_at = Some(at);
+      super::noted(state, at);
+    });
+    let taken = look_until(&daemon, begun, |state| state.destroy_retry_at.is_none());
+    daemon.stop();
+    let taken = taken.expect("the retry was kept within half a liveness window");
+    println!("a destroy's retry due in {SOON_NS} ns kept {taken:?} after it was set");
   }
 
   /// A volume named `name` that [`principal`] creates on `state`'s shard, through the verb: its id.

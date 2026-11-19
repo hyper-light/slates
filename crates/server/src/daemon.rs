@@ -4588,6 +4588,7 @@ async fn init_shard(
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
     deadline_task: None,
     deadline_armed: None,
+    destroy_retry_at: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
@@ -4870,11 +4871,12 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: destroys and grants, the audit owed,
+/// The shard's tick for the cold work it still owns, at the liveness cadence: grants, the audit owed,
 /// departed hosts' attachments, held copies, the pressure hold, NFS purges, base hints and the idle seal. Dead clients are
 /// no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper retires it then
 /// (`crate::reap`); nor, since A-522 and A-536, are abandoned staging buffers, status captures, lapsed write leases and
-/// lapsed CLI attachments, which the shard's keeper releases at their own deadlines (`crate::deadlines`). The jobs left
+/// lapsed CLI attachments, which the shard's keeper releases at their own deadlines (`crate::deadlines`), nor destroys,
+/// which the serve loop steps once woken and the keeper retries at a refused record's deadline. The jobs left
 /// here leave a piece at a time for the events or deadlines that own them, and then the loop and its tick go (the reaper
 /// series, GAPS). Derived: the cadence is the budget.
 async fn reap_loop() {
@@ -4887,9 +4889,6 @@ async fn reap_loop() {
   loop {
     pace(cadence).await;
     state::with_state(|s| {
-      // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
-      // (`verbs::step_destroys`), rather than in a busy serve round.
-      let _ = verbs::step_destroys(s);
       // A grant past its term leaves the tables (A-266); its history is the audit log.
       crate::landing::end_expired_grants(s);
       // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
