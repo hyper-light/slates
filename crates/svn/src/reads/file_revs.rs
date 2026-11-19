@@ -12,23 +12,23 @@
 //!   oldest first, the merged ones interleaved and marked. Start after end: the history walked newest first and sent as
 //!   found (`get_file_revs_backwards`), merged revisions refused ("Trying to use an unsupported feature", 200007).
 //! - Each revision is `( path rev ( rev-props ) ( prop-diffs ) merged )`, its properties changed from the previous
-//!   revision's (`svn_prop_diffs`, each `( name ( value ) )`, a deletion's value list empty), then its text's delta from
-//!   the previous revision's text (the first's from no text) as svndiff strings, then the empty string; or the empty
-//!   string alone when the text is the previous one's (and, with merged revisions, the path the same). The same text is
-//!   `svn_fs_contents_different`'s (`svn_fs_fs__file_text_rep_equal`): two empty texts, a file without one counted
-//!   empty, or two of one MD5 and SHA-1.
-//! - The delta's windows are Subversion's (A-652's deltifier, `svndiff::deltas`, which makes the windows FSFS stores and
-//!   computes), svndiff 2 to a client that accepts it and 0 to any other (never 1, zlib: the report editor's rule), a
-//!   string for each write `svn_txdelta_to_svndiff3` makes: the header at the first window, or alone when the target is
-//!   empty and there is none; each window's integers, then its instruction and new-data sections when not empty (the
+//!   revision's (`svn_prop_diffs`, each `( name ( value ) )`, a deletion's value list empty), then its text's delta
+//!   from the previous revision's text (the first's from no text) as svndiff strings, then the empty string; or the
+//!   empty string alone when the text is the previous one's (and, with merged revisions, the path the same). The same
+//!   text is `svn_fs_contents_different`'s (`svn_fs_fs__file_text_rep_equal`): two empty texts, a file without one
+//!   counted empty, or two of one MD5 and SHA-1.
+//! - The delta's windows are Subversion's (A-652's deltifier, `svndiff::deltas`, which makes the windows FSFS stores
+//!   and computes), svndiff 2 to a client that accepts it and 0 to any other (never 1, zlib: the report editor's rule),
+//!   a string for each write `svn_txdelta_to_svndiff3` makes: the header at the first window, or alone when the target
+//!   is empty and there is none; each window's integers, then its instruction and new-data sections when not empty (the
 //!   report editor's `window_sections`). In svndiff 0 a window of new data alone is `send_simple_insertion_window`'s:
 //!   the header if it is not out, the integers and the instruction in one string, then the new data. A section an LZ4
 //!   block shortens is `lz4_flex`'s block where `svnserve`'s is liblz4's, so it may differ in bytes while it decodes to
 //!   the same window; svndiff 0 is `svnserve`'s byte for byte.
 //! - Then `done`, then `( success ( ) )` or the refusal.
 //!
-//! Merged revisions of one number from more than one file (a revision that changed two merged sources) have no order
-//! to match: `svnserve` gathers them in its hash's seeded order and sorts them with `qsort`, which keeps no order among
+//! Merged revisions of one number from more than one file (a revision that changed two merged sources) have no order to
+//! match: `svnserve` gathers them in its hash's seeded order and sorts them with `qsort`, which keeps no order among
 //! equals; slates sends them as they are found, by source path and range.
 //!
 //! The revisions to send are found before the first is sent, as Subversion finds them, and sent a revision a step. A
