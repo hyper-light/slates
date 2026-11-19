@@ -323,7 +323,8 @@
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
 > built (A-588), its revlog reader (A-611), its index's tables (A-588 part 2) and a store's names (A-630 part 1); piece
-> 4's read-serving logic, part 1 (A-619) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598 and A-619).**
+> 4's read-serving logic, part 1 (A-619); piece 5's first part, a push's bundle read, its race checks and its reply
+> (A-641 part 1) (2026-11-19; UI goals 91 to 93; owners g291, g079 for A-598 and A-619, g301 for A-641).**
 > Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
@@ -387,12 +388,26 @@
 > histories, 7.2's set discovery driven to the shared set (its rounds counted), and a probe of stock `hg serve --stdio`
 > 7.2 (`crates/hg/fixtures/serve/make-serve-fixtures.sh`): eight answers byte for byte. **Built (A-630 part 1):** a
 > store's names (both of 7.2's encodings, hashed long names) > and its fncache, every entry of two stores 7.2 wrote
-> encoded to exactly its files. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index,
+> encoded to exactly its files. **Built (A-641 part 1):** a push's `unbundle` read, its race checks judged and its
+> reply written (`crates/hg/src/push`): every part routed as 7.2's handlers route it (an unknown mandatory part or
+> parameter refused as `error:unsupportedcontent` names it, advisory ones passed over), `check:heads`,
+> `check:updated-heads`, `check:bookmarks` and `check:phases` judged against the served view in 7.2's words and order,
+> `unbundle`'s `heads` argument as `check_heads` reads it, and `reply:changegroup`, `reply:pushkey`,
+> `reply:obsmarkers`, `output` and the four error parts as 7.2's server writes them; held to eleven pushes stock 7.2
+> made over SSH (`crates/hg/fixtures/push/make-push-fixtures.sh`: three races made by sending a recorded session again
+> after another client moved a head, a bookmark or a phase; a new head refused by 7.2's own `reject_new_heads`; an
+> unknown part and parameter), every reply byte for byte, and a naive oracle of the four checks over generated
+> histories; red six ways. Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index,
 > version 2's file index, and censored, ellipsis and externally stored revisions; (4, rest) read serving: the
 > changegroup and the bundle2 a `getbundle` answers (A-619 part 2), `obsolete`'s `listkeys` dump and the `obsmarkers`
 > part, `slates hg serve --stdio`'s loop, HTTP version 1, the `0.2` answers compressed by A-598's engines at the learned
-> level, and the index's kept heads in place of the walks over the whole view; (5) pushes, a compressed bundle inflated
-> in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission);
+> level, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes: the changegroup
+> verified and its changesets classified into works (lines, bookmarks), each through A-618's builder over the flat
+> manifests' paths; the landing, each moved green appended at the position the push read and the greens the checks
+> read compared there (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt entry and
+> A-635's verdict over several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey
+> namespaces' compare and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's inflater
+> runs a stream whole in one call, bounded by the admission), and the bundle read in slices too (part 1 holds it whole);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the

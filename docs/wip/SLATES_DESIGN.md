@@ -12776,6 +12776,33 @@ signature verification).
 > case collision, every reserved name and byte. Owed: the import itself (each revlog through `revlog` into `index`,
 > through §4.15's read seam; its golden vectors, every revision's `debugdata`, are in the same fixtures) and version
 > 2's file index.
+>
+> **Status (2026-11-19, A-641 part 1: piece 5's first part, a push's bundle read, its race checks and its reply).**
+> `slates-hg`'s `push` reads what a client's `unbundle` asks as 7.2's part handlers read it (`push::read`): each part
+> routed by its type in lower case to the handler a push has (`replycaps`, the four checks, `changegroup`,
+> `phase-heads`, `bookmarks`, `pushkey`, `obsmarkers`, `pushvars`, `output`), a mandatory part or a mandatory parameter
+> no handler names refused as 7.2's `error:unsupportedcontent` names it (the type in lower case, the unknown parameters
+> sorted), an advisory one passed over, and every payload decoded by piece 1's codecs and kept in stream order. A
+> changegroup is taken once, in versions `01` to `03`, and a `targetphase` of secret, archived or internal is refused
+> (decision 3). It judges the race checks against the served view the push read (`push::check`), in 7.2's order and
+> words: `check:heads` (the heads, sorted, exactly; the null node alone for an empty repository), `check:updated-heads`
+> (each a branch's head, closed ones too), `check:bookmarks` (its three messages) and `check:phases` (phase by phase in
+> `allphases` order, as 7.2's decoded mapping hands them over), and `unbundle`'s `heads` argument as `check_heads`
+> reads it (`force`, the heads in `heads`' order, or `hashed` and their SHA-1). Where the push lands, each green and log
+> a check read is compared again at the position it was read at (A-642), so the checks hold at the push's own step
+> (the landing is part 2's). It writes the reply as 7.2's server does (`push::reply`): `reply:changegroup` with the
+> change in heads `changegroup.apply` counts, `reply:pushkey`, `reply:obsmarkers` and captured `output` for an
+> accepted push, and for a refused one the salvaged `output` then `error:abort`, `error:pushraced`, `error:pushkey` or
+> `error:unsupportedcontent`; and the words of 7.2's `reject_new_heads` for a refused new head, the branch written as
+> CPython writes a bytes repr. Proven against eleven pushes stock 7.2 made over SSH (`crates/hg/fixtures/push`, the
+> command in `make-push-fixtures.sh`, checked by `SHA256SUMS`): a bookmark moved, a draft published, a plain push, three
+> races made deterministic by sending one client's recorded session again after another client moved its head, its
+> bookmark or its phase, a new head refused by 7.2's own hook, and an unknown part and parameter. Each request reads as
+> 7.2's listing shows it, each race is found in exactly the words 7.2 answered, and each reply is written byte for byte
+> as 7.2 wrote it; a naive oracle of the four checks agrees over generated histories. Owed (part 2 on): the changegroup
+> verified and classified into works through A-618's builder, the landing on each green's log through a trait (A-642,
+> A-635), phases and bookmarks in the same landing, the policy and the hooks at their points, and the bundle read in
+> slices.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13172,7 +13199,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
    phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
-   register entry and the reply.
+   register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
+   the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
+   works, the landing on each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -42829,3 +42858,54 @@ Applied in the same change to:
   `unwrap`, `assert` or `panic` in a function returning `Option` or `Result`.
 - **Owed** (GAPS): part 2, the editor drive answering a finished report; URLs read as `svn_uri_canonicalize` reads
   them; and the authentication `svnserve` asks for mid-session when an anonymous `update` may not read.
+
+### A-641 part 1 — a push's bundle read as 7.2's handlers read it, its race checks judged in 7.2's words and order, and its reply written as 7.2's server writes it (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 1, 4 and 7 and piece 5; A-514, A-545, A-569, A-619; the landing follows A-642)
+
+- **What.** `crates/hg/src/push` (`slates-hg`): `read` takes a plain bundle2 (A-598 makes a compressed one plain) and
+  returns what the push asks, part by part in stream order; `check::judge` judges its `check:heads`,
+  `check:updated-heads`, `check:bookmarks` and `check:phases` against the served view the push read (A-619's
+  `serve::Repository`), and `check::heads_argument` with `judge_heads_argument` the `unbundle` command's own `heads`
+  argument; `reply::Reply` writes the answer: `accepted` (the reply parts of the parts handled, only when the client
+  sent `replycaps`) or `refused` (the salvaged `output`, then one error part), with `heads_changed` (the `return` of
+  `reply:changegroup`) and `multiple_heads` (the words of 7.2's `reject_new_heads`).
+- **Read from 7.2's code** (the wheel uv installs, CPython 3.12, the Mac Studio, 2026-11-19; SHA-256 of each file in
+  `research/mercurial-server.md` §19): `bundle2.py` `_gethandler` (a mandatory part no handler takes, or one whose
+  mandatory parameter its handler does not name, is `BundleUnknownFeatureError`, its type lower-cased and the unknown
+  names sorted; an advisory one is passed over); `bundle2_part_handlers.py` (each handler's parameters, the race checks'
+  words, `reply:changegroup` advisory and `reply:pushkey`/`reply:obsmarkers` mandatory with advisory parameters);
+  `wireprotov1server.py` `unbundle` (a refused bundle2 push answers a new stream: the salvaged `output` parts, then one
+  of `error:pushkey`, `error:unsupportedcontent`, `error:abort` or `error:pushraced`, each mandatory); `exchange.py`
+  `check_heads` (`force`, the list in `heads`' order, or `hashed` and the SHA-1 of the sorted heads; "repository changed
+  while preparing changes" or "uploading changes"); `changegroup.py` `apply` (the change in heads less the added heads
+  that close a branch, plus one, minus one when negative: never 0); `branchmap.all_nodes_are_heads` (the null node
+  alone is a head only of an empty repository); `phases.binarydecode` (a mapping in `allphases` order, so
+  `check:phases` is judged public first, whatever the payload's order).
+- **Decided, each stricter than 7.2 on purpose** (module docs): the parts 7.2 handles only in a pull or a reply have no
+  handler in a push; one changegroup a push, versions `01` to `03` (§4.17.3 "The wire surface"); a `targetphase` other
+  than public or draft refused (decision 3); a damaged payload or a number parameter that is none refused by kind
+  where 7.2 fails with an exception; a mandatory interrupting part refused; a node `check:phases` names that the view
+  lacks is a race in the plain words (7.2 fails on its lookup); a reply parameter longer than the 255 bytes a bundle2
+  parameter holds is cut there (7.2's writer fails on it).
+- **Golden vectors.** `crates/hg/fixtures/push/make-push-fixtures.sh` (stock hg 7.2 from PyPI through uv, SSH v1
+  through a recording stand-in, run on the Mac Studio 2026-11-19 from this branch; 66 files, `SHA256SUMS` checked after
+  the copy): a bookmark moved, a draft published, a plain push, three races (a recorded session sent again after another
+  client moved the head it checks, the bookmark it checks onto another branch, or published the draft it checks), a new
+  head refused by `hgext.hooklib.reject_new_heads`, and an unknown mandatory part and parameter sent by hand. The first
+  run found the script's own fault: the other clients' pushes went through the stand-in without a capture name, died
+  there, and their 255 was taken for a refusal, so no race happened and each replay was accepted; the script now lets
+  only a recorded push be refused. CPython 3.12's bytes repr, which `%r` writes a branch with, measured for ten hostile
+  names through `uvx --python 3.12 --from mercurial==7.2 python -I` (the test's table).
+- **Evidence** (Mac Studio, kiln, debug): `cargo test --locked -p slates-hg --lib` 217 of 217 at 709928d1e (load
+  5.3), `cargo fmt` clean after the Studio's formatting patch. Red six ways, each in a disposable copy and each turning
+  only its guarding tests red: an unknown mandatory parameter ignored (3 tests), `check:updated-heads` always holding
+  (3), `short` of ten digits (3), `reply:changegroup` mandatory (1), the repr always in single quotes (1), and
+  `check:phases` judged in the payload's order (1, the oracle alone).
+- **Owed** (part 2 on): the changegroup verified (every delta's base held or earlier, every node hashed, every link and
+  every file node a new manifest names present) and classified into works, one per line or bookmark a push moves,
+  through A-618's `slates_merge::push::build` over the flat manifests' paths; the landing through a trait of its own,
+  each moved green appended at the position the push read and every green and log the checks read compared there
+  (A-642; A-635's verdict over several works, g261's rebuilt entry); phases and bookmarks moved in that landing, the
+  pushkey namespaces' compare and swap; `vcs_policy::admit` and the hook driver at their points (slates-server); the
+  bundle read in slices within the shard's step budget.
+- **Applied in the same change to:** §4.17.3's status (this part) and piece 5's line; GAPS' §4.17.3 entry (built and
+  owed); `research/mercurial-server.md` §19; `crates/hg/src/lib.rs` (the `push` module line).
