@@ -1109,7 +1109,7 @@ fn moved(path: &str, from: &str, to: &str) -> String {
   } else if from == "/" {
     format!("{to}{path}")
   } else {
-    format!("{to}{}", &path[from.len()..])
+    format!("{to}{}", path.strip_prefix(from).unwrap())
   }
 }
 
@@ -1536,7 +1536,7 @@ impl Txn<'_> {
       .filter(|place| self.kind(place) == NodeKind::Directory)
       .collect();
     let path = joined(
-      &pick(&directories, wish.place)?,
+      pick(&directories, wish.place)?,
       NAMES[usize::from(wish.name) % NAMES.len()],
     );
     let named = self.tree.contains_key(&path) || rows.iter().any(|row| row.path == path);

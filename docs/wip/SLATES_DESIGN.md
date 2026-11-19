@@ -12259,6 +12259,14 @@ and export by landing).
 > node-exclusive path changed in any dimension after the base, a move's source among them (item 3, rules 1 and 2).
 > Owed, its second half: `Copy`, sharing the source by reference through the persistent radix tree of A-534
 > (`crates/merge/src/ptrie.rs`, its `subtree` and `graft`), with the copied keys' history beginning at the copy.
+>
+> **Status (2026-11-19, A-553).** Built: the Subversion index (`slates-svn`'s `index`, piece 4, item 2): node rows with
+> FSFS's node, copy and copy-root identities, predecessors and counts, texts, property lists and mergeinfo counts;
+> history and shape lists per path; revision rows; all computed from each revision's changed-path rows by FSFS's own
+> operations, every inconsistent record refused, typed, with nothing changed. Its oracle, a naive filesystem applying
+> FSFS's operations to whole trees, equals it on generated histories, and equals itself replayed in random drive
+> orders. Owed with the object store (§4.17.1 shared piece 3): the rows held as content tables with a mutable tail, and
+> the learned fold (item 12); with the server (piece 7): one large revision applied in slices under the shard's budget.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -12307,18 +12315,34 @@ immutable sorted tables that are content plus a mutable tail, and every row is a
 their commit records (item 3), so replicas (A-273) and holders (§4.16 "Apply on holders") compute it and never receive
 it.
 - *Revisions:* per revision, its changed-path rows sorted by path, and its transaction's name.
-- *Nodes:* per path and created revision: kind; text identity (BLAKE3, the green's content) with the MD5 and SHA-1
-  clients check; size; property-list identity; predecessor and its count; copy source and copy root; the node's identity
-  (where it was born) and its copy identity, assigned by FSFS's rules (notes §5: a creation takes its parent's copy
-  identity, a copy gets a fresh one, a change made through a copied parent is a lazy copy with a fresh one), so the
-  three answers of `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the
-  node has `svn:mergeinfo`, with the count of such nodes beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
+- *Nodes:* per node-revision, by its created path and revision: kind; text identity (BLAKE3, the green's content) with
+  the MD5 and SHA-1 clients check; size; property-list identity; predecessor and its count; copy source and copy root;
+  the node's identity (where it was born) and its copy identity, assigned by FSFS's rules (notes §5; `structure`,
+  "Copy-IDs and copy roots"; `tree.c` `get_copy_inheritance`): a creation takes its parent's copy identity and copy
+  root, a copy gets a fresh copy identity and is its own copy root, a change through the node's own created path keeps
+  its copy identity, a change of a never-copied node through a copied directory (a lazy copy) takes that directory's,
+  and a change of a copied node through another path (a soft copy) takes a fresh one; so the three answers of
+  `svn_fs_node_relation` (unchanged, common ancestor, unrelated) come out as FSFS's; and whether the node has
+  `svn:mergeinfo`, with the count of such nodes at and beneath a directory (FSFS's `minfo-here` and `minfo-cnt`).
 - *History:* per path, the revisions at which a node-revision was created there, deletions included. FSFS makes a new
-  node-revision of every directory above a changed node (notes §5, "bubble-up"), so a directory's list holds every
+  node-revision of every directory above a changed node (notes §5, "bubble-up"), and of the root in every revision,
+  even one that changes nothing (`transaction.c` `create_new_txn_noderev_from_rev`), so a directory's list holds every
   revision that changed anything beneath it. The created revision of a path at revision R, which the out-of-date test,
   `stat` and `svn:entry:committed-rev` all read, is one search in that list: its last entry at or before R, a deletion
-  meaning absent. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense
-  is its subtree's, which this list keeps.
+  meaning absent, unless a directory above the path was added, copied to, replaced or deleted after that entry (each
+  path keeps a list of those changes too). Then the latest such change decides: a deletion, or an addition without
+  history, leaves nothing at the path, and a copy sends the question to the same place beneath the copy's source, in the
+  source's revision. So a path beneath a branch answers its trunk node-revision until it changes on the branch, as FSFS
+  shares it. §4.16's `last_changed` is a file's own last change; a directory's last change in Subversion's sense is its
+  subtree's, which this list keeps.
+- *How a revision's rows are applied:* in path order, parents first, against revision N - 1, each as FSFS applies the
+  editor call it records (the path's directories opened and made mutable from the root down, then the entry made,
+  copied, deleted or changed). That is what FSFS's commit leaves for every commit it accepts: `merge()` refuses a
+  directory both sides changed unless both kept its node and copy identities ("not a direct modification"), and points
+  its predecessor at the newer revision's (`svn_fs_fs__dag_update_ancestry`). FSFS makes nodes mutable in its drive's
+  order, and a stock client sends file texts last; the oracle replays every generated revision in random drive orders
+  and finds every identity, copy root and predecessor equal to path order's, the decisions where order could matter
+  among them (A-553).
 
 *3. A commit is a work, and its verdict is FSFS's commit rule.* (§4.17.1 "A push is a work" items 1, 2 and 5, made exact
 for Subversion.)
@@ -12632,7 +12656,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 3. The engine's node-exclusive operations (built, A-542) and `Copy` that shares a subtree by reference (owed, on A-534's
    persistent radix tree: `graft` of the source's `subtree` at the destination; with §4.17.1's pieces 1 and 4).
 4. The Subversion index, with its oracle: a naive filesystem replaying the same revisions must give equal created
-   revisions, histories, relations and mergeinfo counts.
+   revisions, histories, relations and mergeinfo counts (built, A-553; its tables as content and their fold are the
+   object store's, §4.17.1 shared piece 3).
 5. The commit rule as a pure function, with its oracle: a transcription of FSFS's `merge()` over generated histories
    must give the same accept or conflict, and the same conflicting path.
 6. The administration verbs: `svnadmin create`, `load` and `dump` (the dump format), `setrevprop`, `setlog`, `info`,
@@ -36641,3 +36666,61 @@ Applied in the same change to: GAPS (step 4's open item), `docs/bugs/2026-11-18-
   red once with the old in-place adoption restored (kiln r29): landing at call 4, the open handle read the outsider's
   file and the name kept its number (`replaced` 1, so the path was reached).
 
+### A-553 — The Subversion index: every node-revision with the identities FSFS gives it, computed from each revision's changed-path rows and held to a naive filesystem (2026-11-19, g292 for UI goal 91; §4.17.4 item 2 and piece 4; A-500, A-531, A-542)
+Applied in the same change to: §4.17.4 (a status block; item 2's copy-identity rules made FSFS's, every revision's
+root, what a path beneath a copy answers, how a revision's rows are applied; piece 4 marked built), GAPS (the §4.17.4
+entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `crates/svn/src/lib.rs`; and
+`crates/merge/src/engine/node_exclusive_tests.rs` (`is_multiple_of`, main's clippy finding on A-542's test).
+- **What was there.** Item 2 named the index's rows and gave FSFS's copy-identity rules loosely: "a change made through
+  a copied parent is a lazy copy with a fresh one". FSFS's lazy copy takes the copied directory's copy identity; only a
+  soft copy, a copied node changed through another path, takes a fresh one (`structure`, "Copy-IDs and copy roots").
+  Its created-revision search did not say what a path beneath a copy answers, and nothing computed any of it.
+- **The decision.** The rows are FSFS's own operations, read in its code (1.14.x at `d434dc14`), applied to each
+  revision's changed-path rows: every revision a new root, even an empty one (`transaction.c`
+  `create_new_txn_noderev_from_rev`); each row as the editor call it records, its directories opened from the root
+  with each one's copy inheritance decided against its parent as it stands (`tree.c` `open_path`,
+  `get_copy_inheritance`), then cloned from the root down (`make_path_mutable`, `dag.c` `svn_fs_fs__dag_clone_child`:
+  the predecessor and its count, the copy root moving to the parent's unless the node is its copy root's node), then
+  the entry made (`make_entry`), copied (`svn_fs_fs__dag_copy`), deleted or changed. Rows go in path order against
+  revision N - 1: `merge()` refuses a directory both sides changed unless both kept its node and copy identities, and
+  points its predecessor at the newer revision's (`svn_fs_fs__dag_update_ancestry`), so for every commit FSFS accepts
+  the identities made against N - 1 are FSFS's. Reading: a path's own last history entry decides unless a directory
+  above it was added, copied to, replaced or deleted after it (a shape list per path), the latest such change deciding
+  and a copy sending the question to the same place beneath its source. A copy costs one row, as in FSFS.
+- **Refusals,** typed with the Subversion error each answers, a refused record changing nothing: a path out of canonical
+  form (`E160005`); a revision past the youngest, or a copy source not before its copy (`E160006`); a path absent, its
+  own or a directory's, a question's or a copy source's (`E160013`); an unknown node-revision (`E160014`); an addition
+  where a node stands (`E160020`); a directory that is a file (`E160016`); a text on a directory (`E160017`); the root
+  added, deleted or replaced (`E160021`); and as `E160004`, every record no FSFS commit writes: a kind that differs from
+  its node or copy source, a copy onto its own node-revision (FSFS records nothing for it), two rows for one path, a
+  row whose fields contradict each other (`svn:mergeinfo` gained or lost without the mergeinfo flag among them), a
+  transaction name outside `svn_fs.h`'s letters, digits, `-` and `.`. The room is the caller's: the most entries (node
+  rows and deletions) the index may hold, which bound every other table linearly (`E160000` past it).
+- **Tests** (`crates/svn/src/index/tests.rs`). Nineteen cases, each citing the FSFS line it holds the index to: revision
+  0; every revision's root; bubble-up; a path beneath a copy until it changes there; each of `structure`'s copy-identity
+  rules (creation, copy, lazy copy, soft copy with its copy root kept); mergeinfo counts through a set, a copy, a
+  deletion, a replacement and a removal; history lists with deletions and a replacement; a deleted directory and a copy
+  over it; a copy into its own subtree, which FSFS allows; and every refusal, each with its code and the index
+  unchanged. The oracle: generated histories (additions, copies of any earlier revision's paths into any place, their
+  own subtrees among them, deletions, replacements, text and property changes, `svn:mergeinfo` set and dropped, empty
+  revisions) replayed into the index and into a naive filesystem that keeps every revision's whole tree and applies
+  FSFS's operations to it literally; at every path of every revision the same presence, created path and revision,
+  predecessor and count, copy source and copy root, text, properties and mergeinfo count (the naive one counted by
+  walking the tree), with node-revisions, node identities and copy identities paired one to one; the same history at
+  every path; the same relation for every pair in a sample of places. The naive filesystem replaying each revision in
+  random drive orders, and in its generation order, must equal its own replay in path order. A census, printed every
+  run, must show each rule met, the drive orders that differ from path order and the decisions where order could
+  matter (a child compared against a parent the same transaction already cloned with another copy identity) among them.
+- **Evidence** (the Mac Studio, kiln, 2026-11-19 02:03 UTC, load 29, debug build of a fresh clone of the branch).
+  Failing first: with `append` refusing every record, `cargo test --locked -p slates-svn --lib index::` failed 19 of 20,
+  the one pass revision 0's, which needs no record. With the index, the crate's whole `--lib` suite 53 of 53 (20 of
+  them the index's) in 0.25 s, and `cargo test --locked -p slates-merge --lib node_exclusive` 8 of 8 with
+  `is_multiple_of`. Clippy, `xtask check` and the cross-target lint are main's (the run-request queue).
+- **Rejected.** Keeping each revision's whole tree, as the naive filesystem does: a revision would cost the tree's size;
+  it is the oracle only. Applying a revision against its transaction's own base: the record would have to carry it,
+  and for every commit FSFS accepts it gives the identities N - 1 gives. Giving each path beneath a copy its own rows:
+  a copy would cost its subtree's size, where FSFS's costs one node-revision; the shape list answers beneath it in one
+  step a copy.
+- **Not here.** The rows as content tables with a mutable tail and the learned fold (§4.17.4 item 12) are the object
+  store's (§4.17.1 shared piece 3); one large revision applied in slices under the shard's budget is the server's
+  (piece 7); the commit rule over these rows is piece 5.

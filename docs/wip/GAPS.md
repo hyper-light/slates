@@ -49,9 +49,14 @@
 > anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
 > two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
 
-> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs built (2026-11-18, A-500 and A-531,
-> D-28; UI goal 91; g292).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's, golden vectors from the
-> protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531).
+> **§4.17.4 the Subversion server: designed, its svndiff and ra_svn item codecs and its index built (2026-11-18,
+> A-500, A-531 and A-553, D-28; UI goal 91; g292).** A-531 (2026-11-19): the ra_svn item codec, its bounds the caller's,
+> golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio (see A-531). A-553
+> (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root identities, predecessors,
+> history lists and mergeinfo counts computed from the revisions' changed-path rows; its oracle a naive filesystem
+> applying FSFS's operations to whole trees, also in random drive orders; `cargo test -p slates-svn --lib` on the Mac
+> Studio (see A-553). Owed from it: its rows as content tables with the learned fold (with the object store, §4.17.1
+> shared piece 3), and a large revision applied in slices (with the server).
 > Designed from Subversion 1.14.x's own specifications and code: one green per repository, a transaction a work at the
 > head, FSFS's commit-time merge as a stock client's verdict (stricter than §4.16's: no identity accept, its directory
 > property rules, a directory's last change its subtree's; raised with A-497's owner), the Subversion index, revision
@@ -61,8 +66,7 @@
 > 2, every refusal Subversion's decoder makes plus the 64-bit overflow it misses, golden vectors from `notes/svndiff`;
 > `cargo test --locked -p slates-svn --lib` 18 of 18 on the Mac Studio, 2026-11-18; clippy and `xtask check` main's).
 > A-542's first half (2026-11-19): node-exclusive operations in the merge engine, built. Owed, in order: `Copy` in the
-> engine (on A-534's persistent radix tree); the Subversion index; the
-> commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
+> engine (on A-534's persistent radix tree); the commit rule with its FSFS oracle; the administration verbs (`svnadmin`, the dump round trip); the ra_svn server; locks;
 > mergeinfo; authorization; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python
 > suite over `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13.
 > No speed is claimed until measured.

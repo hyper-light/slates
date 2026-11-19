@@ -940,7 +940,8 @@ impl Index {
     Ok(
       self
         .entry(path)
-        .map_or(&[][..], |entry| entry.history.as_slice()),
+        .map(|entry| entry.history.as_slice())
+        .unwrap_or_default(),
     )
   }
 
