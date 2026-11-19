@@ -189,6 +189,9 @@ pub(crate) struct FuseMount {
   /// `fsync` replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
   /// first, bounded by `live_ship::reply_hold_bound` ([`settle_held`]).
   held: std::collections::VecDeque<HeldFsync>,
+  /// What this mount's journal reader's rounds have shown of its kernel's pace (A-548): the reader's patience is
+  /// learned from them after every turn (`crate::reader_patience`).
+  patience: crate::learned_wait::LearnedWait,
   /// This mount's place in the daemon's own mounts (A-227): recorded while it is served, forgotten when it is dropped.
   /// Held for its drop alone.
   _own: OwnMountRecord,
@@ -617,6 +620,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       change,
       seen: 0,
       held: std::collections::VecDeque::new(),
+      patience: crate::learned_wait::LearnedWait::default(),
       _own: own,
     },
   );
@@ -1039,6 +1043,8 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(WRITEBACKS_UNKNOWN, unknown);
   let overruns = mount.serve.take_journal_overruns();
   s.count(JOURNAL_OVERRUNS, overruns);
+  // What the journal reader's rounds found this turn teaches its patience (A-548).
+  crate::reader_patience::learn(s, mount.volume, mount.registry.key(), &mut mount.patience);
   let lost_for_room = mount.serve.take_states_lost_for_room();
   s.count(STATES_LOST_FOR_ROOM, lost_for_room);
   let (bumped, unsupported, invalidated) = mount.serve.take_takeover_counts();
@@ -1439,6 +1445,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       change,
       seen: 0,
       held: std::collections::VecDeque::new(),
+      patience: crate::learned_wait::LearnedWait::default(),
       _own: own,
     },
   );
@@ -1619,18 +1626,12 @@ pub(crate) fn drop_devices(s: &mut ShardState) {
 }
 
 /// Opens the journal reader of a mount that now serves `volume` under registry attachment `registry` (§4.5): from here
-/// the volume keeps the records after the head for it, and each of its rounds moves its point. Opened once the serve
-/// task is spawned, so a mount that never served leaves no reader, and closed wherever the mount is removed for good
-/// ([`close_journal_reader`]: `ended`, `drop_devices`).
+/// the volume keeps the records after the head for it, and each of its rounds moves its point. Its patience is learned
+/// from its rounds after every turn, from the learned wait's prior (`crate::reader_patience`, A-548). Opened once the
+/// serve task is spawned, so a mount that never served leaves no reader, and closed wherever the mount is removed for
+/// good ([`close_journal_reader`]: `ended`, `drop_devices`).
 fn open_journal_reader(s: &mut ShardState, volume: VolumeId, registry: AttachmentId) {
-  if let Some(&handle) = s.by_id.get(&volume)
-    && let Ok(slot) = s.volumes.get_mut(handle)
-  {
-    slot.volume.open_journal_reader(
-      registry.key(),
-      slates_vfs::journal::Patience::Bounded(crate::daemon::LIVENESS_BUDGET_NS),
-    );
-  }
+  crate::reader_patience::open(s, volume, registry.key());
 }
 
 /// Returns to the shard's metadata ledger what `mount`'s byte states were admitted (§4.2): charged while the mount
@@ -1821,6 +1822,7 @@ mod tests {
           change,
           seen: 0,
           held: std::collections::VecDeque::new(),
+          patience: crate::learned_wait::LearnedWait::default(),
           _own: OwnMountRecord(0),
         },
       );

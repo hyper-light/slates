@@ -4260,8 +4260,13 @@
 >   connection's states with it, each of their write-backs refused until the connection ended; the tracker's keeper
 >   consumes each change on the volume's own shard, so its reader now holds its records while the tracker is open
 >   (`slates_vfs::journal::Patience::WhileOpen`), within the shard's metadata ledger
->   (`a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window`). Owed in C-c: the FUSE and WinFsp
->   readers' patience (part 2) and `verbs::await_materialization` (part 3). Class B (the
+>   (`a_tracker_keeps_its_changes_through_a_shard_held_past_a_liveness_window`). Part 2: a FUSE or WinFsp mount's
+>   journal reader was presumed gone once a record had waited one window, so a live mount whose kernel took longer
+>   overran at every round that met a full budget, its whole kernel cache dropped each time; each reader's patience is
+>   now learned from its own rounds (`crate::reader_patience`: RFC 6298's estimator over the rounds that found every
+>   record held, backed off at each overrun, never past the failover delay;
+>   `a_live_mount_slower_than_a_window_is_kept_up_with_once_its_pace_is_learned`); the two mounts' wiring is Linux's and
+>   Windows' to build (main's lanes). Owed in C-c: `verbs::await_materialization` (part 3). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
