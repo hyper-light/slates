@@ -59,7 +59,7 @@
 //! Subversion's site; the MCP edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's
 //! runs).
 
-mod daemon_edge;
+pub(crate) mod daemon_edge;
 pub(crate) mod git;
 mod hg;
 pub(crate) mod waits;

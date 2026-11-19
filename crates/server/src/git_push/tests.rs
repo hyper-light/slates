@@ -79,15 +79,15 @@ const EMPTY_PACK: usize = 32;
 // Stock git's pushes.
 
 /// One push stock git 2.50.1 made to stock `git receive-pack`, captured by the fixtures' script.
-struct Scenario {
+pub(crate) struct Scenario {
   /// Its name in the script.
-  name: &'static str,
+  pub(crate) name: &'static str,
   /// What `git push` sent: its commands, then its pack.
-  request: &'static [u8],
+  pub(crate) request: &'static [u8],
   /// What `git receive-pack` answered: its advertisement, then its report.
-  response: &'static [u8],
+  pub(crate) response: &'static [u8],
   /// The server's refs before the push, `id SP name` a line.
-  before: &'static str,
+  pub(crate) before: &'static str,
 }
 
 /// Includes a scenario's request, response and refs before it.
@@ -117,7 +117,7 @@ macro_rules! scenario {
 /// The pushes that move refs, in the script's order, each with the refs the server held after it (the next push's
 /// before): `main` created, fast-forwarded by a thin pack, an annotated tag, a branch at a commit held (an empty pack),
 /// a branch at a new commit, that branch deleted.
-fn chain() -> [(Scenario, &'static str); 6] {
+pub(crate) fn chain() -> [(Scenario, &'static str); 6] {
   [
     (
       scenario!("create"),
@@ -170,7 +170,7 @@ fn advertisement(lines: &str, advertised: &Advertised<'_>) -> Vec<u8> {
 }
 
 /// What git answered `scenario` after its advertisement: its report.
-fn gits_report(scenario: &Scenario) -> &'static [u8] {
+pub(crate) fn gits_report(scenario: &Scenario) -> &'static [u8] {
   let advertised = advertisement(scenario.before, &CAPTURED);
   assert!(
     scenario.response.starts_with(&advertised),
@@ -223,7 +223,7 @@ fn empty_pack() -> &'static [u8] {
 // The owner shard.
 
 /// The principal every test pushes as: the repositories' owner.
-fn owner() -> Principal {
+pub(crate) fn owner() -> Principal {
   Principal::Uid {
     host: HostId(0),
     uid: 1234,
@@ -231,7 +231,7 @@ fn owner() -> Principal {
 }
 
 /// Makes git repository `name`, SHA-1, its default branch `main`, on the shard: its id.
-fn git_repository(state: &mut ShardState, name: &str) -> RepositoryId {
+pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> RepositoryId {
   let reply = dispatch(
     state,
     1,
@@ -353,7 +353,11 @@ fn bound(state: &ShardState, repository: RepositoryId, name: &str) -> bool {
 }
 
 /// The files the green `repository`'s branch `name` binds holds, with their bytes.
-fn files(state: &ShardState, repository: RepositoryId, name: &str) -> Vec<(String, Vec<u8>)> {
+pub(crate) fn files(
+  state: &ShardState,
+  repository: RepositoryId,
+  name: &str,
+) -> Vec<(String, Vec<u8>)> {
   let green = state
     .db
     .partition()
@@ -368,7 +372,7 @@ fn files(state: &ShardState, repository: RepositoryId, name: &str) -> Vec<(Strin
 }
 
 /// The fixtures' text: line `n` of two hundred, line one hundred rewritten when `rewritten` (the script's `sed`).
-fn text(rewritten: bool) -> Vec<u8> {
+pub(crate) fn text(rewritten: bool) -> Vec<u8> {
   (1..=TEXT_LINES)
     .flat_map(|n| {
       let line = if rewritten && n == REWRITTEN_LINE {

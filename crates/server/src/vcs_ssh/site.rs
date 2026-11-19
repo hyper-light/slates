@@ -18,9 +18,11 @@
 //!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
 //!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols), which no lender does until the
 //!    lender over A-662's map of stores on their owner shards lands (A-662's owed list). Mercurial's `serve --stdio`
-//!    (`slates_hg::serve::stdio::Stdio`, A-650 part 2) waits likewise for a lender of its store;
-//!    receive-pack (A-654) and Subversion's tunnel (A-656) wait for their entry points. Each becomes a [`Command`]
-//!    behind [`Services`] as it can run, and the not-served answer goes with the last of them.
+//!    (`slates_hg::serve::stdio::Stdio`, A-650 part 2) waits likewise for a lender of its store. git's receive-pack
+//!    runs A-654 part 2's driver over the repository's store on its owner shard, the shard's own (A-662), so it needs
+//!    no store lender: each of its steps is lent the shard's state, as the HTTP site's are (A-654 part 3's
+//!    [`ShardLender`]; `super::receive`, A-683). Subversion's tunnel (A-656) waits for its entry point. Each becomes a
+//!    [`Command`] behind [`Services`] as it can run, and the not-served answer goes with the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
@@ -31,8 +33,9 @@ use slates_ssh::command::Command as Asked;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
 use super::git::UploadCommand;
+use super::receive::ReceiveCommand;
 use crate::vcs_http::git::Repositories;
-use crate::vcs_http::git::StoreLender;
+use crate::vcs_http::git::{ShardLender, StoreLender};
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key refused because no record of principals' keys exists yet ([`NoKeyRecord`]).
@@ -190,39 +193,102 @@ pub(crate) trait Services {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NotYet;
 
-/// The services the server runs today (A-651 part 2): git's upload-pack from the stores `lender` lends, each request
-/// admitted `room` bytes (`super::git`); receive-pack, Mercurial's `serve --stdio` and Subversion's tunnel not yet, as
-/// their stores (A-662) and entry points (A-654, A-656) have not landed. A repository whose store the lender does not hold
-/// is not served.
+/// The services the server runs today: git's upload-pack from the stores `lender` lends, each request admitted `room`
+/// bytes (`super::git`, A-651 part 2), and git's receive-pack through A-654 part 2's driver on the repository's owner
+/// shard, whose state `shard` lends a step at a time as it lends the HTTP site's (`super::receive`, A-683), each push
+/// admitted `room` bytes; Mercurial's `serve --stdio` and Subversion's tunnel not yet, as their stores (A-662) and entry
+/// point (A-656) have not landed. A repository whose store the lender does not hold is not served upload-pack.
 #[derive(Clone, Debug)]
-pub(crate) struct ToolServices<L> {
-  /// Where the stores are lent.
+pub(crate) struct ToolServices<L, S> {
+  /// Where the stores are lent, for upload-pack.
   lender: L,
-  /// The bytes each request may hold: the edge's room.
+  /// Where the shard's state is lent, for receive-pack (in the daemon the HTTP site's `ThisShard`).
+  shard: S,
+  /// The bytes each request, and each push, may hold: the edge's room.
   room: u64,
 }
 
-impl<L> ToolServices<L> {
-  /// The services over `lender`'s stores, each request admitted `room` bytes.
-  pub(crate) fn new(lender: L, room: u64) -> Self {
-    Self { lender, room }
+impl<L, S> ToolServices<L, S> {
+  /// The services over `lender`'s stores and the state `shard` lends, each request admitted `room` bytes.
+  pub(crate) fn new(lender: L, shard: S, room: u64) -> Self {
+    Self {
+      lender,
+      shard,
+      room,
+    }
   }
 }
 
-impl<L: StoreLender + Clone> Services for ToolServices<L> {
-  type Command = UploadCommand<L>;
+impl<L: StoreLender + Clone, S: ShardLender + Clone> Services for ToolServices<L, S> {
+  type Command = ToolCommand<L, S>;
 
-  fn start(&mut self, start: &Start<'_>) -> Result<UploadCommand<L>, Unserved> {
+  fn start(&mut self, start: &Start<'_>) -> Result<ToolCommand<L, S>, Unserved> {
+    let version = slates_git::http::version(start.git_protocol);
     match (start.service, start.repository) {
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
-        Ok(UploadCommand::new(
+        Ok(ToolCommand::Upload(Box::new(UploadCommand::new(
           self.lender.clone(),
           repository.id,
-          slates_git::http::version(start.git_protocol),
+          version,
           self.room,
-        ))
+        ))))
+      }
+      (Service::GitReceivePack, Some(repository)) => {
+        Ok(ToolCommand::Receive(Box::new(ReceiveCommand::new(
+          self.shard.clone(),
+          start.principal.clone(),
+          (repository.id, repository.name.clone()),
+          version,
+          self.room,
+        ))))
       }
       _ => Err(Unserved),
+    }
+  }
+}
+
+/// A command [`ToolServices`] runs: git's upload-pack or its receive-pack, each boxed, so the command a connection holds
+/// is a pointer whichever it is.
+pub(crate) enum ToolCommand<L: StoreLender, S> {
+  /// git's upload-pack (`super::git`).
+  Upload(Box<UploadCommand<L>>),
+  /// git's receive-pack (`super::receive`).
+  Receive(Box<ReceiveCommand<S>>),
+}
+
+impl<L: StoreLender, S: ShardLender> Command for ToolCommand<L, S> {
+  fn input(&mut self, run: &[u8]) -> Result<(), Refused> {
+    match self {
+      ToolCommand::Upload(command) => command.input(run),
+      ToolCommand::Receive(command) => command.input(run),
+    }
+  }
+
+  fn input_end(&mut self) {
+    match self {
+      ToolCommand::Upload(command) => command.input_end(),
+      ToolCommand::Receive(command) => command.input_end(),
+    }
+  }
+
+  async fn step(&mut self) -> Result<Stepped, Refused> {
+    match self {
+      ToolCommand::Upload(command) => command.step().await,
+      ToolCommand::Receive(command) => command.step().await,
+    }
+  }
+
+  fn output(&self) -> (&[u8], &[u8]) {
+    match self {
+      ToolCommand::Upload(command) => command.output(),
+      ToolCommand::Receive(command) => command.output(),
+    }
+  }
+
+  fn sent(&mut self, stderr: usize, stdout: usize) {
+    match self {
+      ToolCommand::Upload(command) => command.sent(stderr, stdout),
+      ToolCommand::Receive(command) => command.sent(stderr, stdout),
     }
   }
 }
