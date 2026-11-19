@@ -39904,9 +39904,10 @@ Applied in the same change to:
 - **Bounds.** The caller's item bytes; the longest word, 24 (`MAX_WORD_LENGTH`, 1.14 and 1.15 alike); depth 2; and the
   item count the bytes over what one parsed item costs (`size_of::<Value>()`, 24 bytes on aarch64-apple-darwin), so a
   message's parsed values take no more memory than its bytes may.
-- **Tests.** `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: 78 of 78 on the branch, then 102
-  of 102 on the tree merged with main (A-602's locks among them), the handshake's 28 after two long tests were split to
-  stay within the lint wall's cognitive complexity of 10. Every session replayed whole, in two pieces at every cut and cut short at every byte; RFC 2195's worked example;
+- **Tests.** `cargo test --locked -p slates-svn --lib` on the Mac Studio, 2026-11-19: 78 of 78 on the branch, then 139
+  of 139 on the tree merged with main at 575188f7f (A-602's locks and A-605's mergeinfo among them; `cargo fmt --check`
+  clean), the handshake's 28 after two long tests were split to stay within the lint wall's cognitive complexity of 10.
+  Every session replayed whole, in two pieces at every cut and cut short at every byte; RFC 2195's worked example;
   RFC 2202's seven HMAC-MD5 vectors; `cram.c`'s digest and its reading of a response transcribed as oracles under
   proptest; `vparse_tuple`'s tables; every bound exactly enough for every stock session; calls out of turn. Red first, on
   the earlier draft given the API the tests drive: 17 of 25 passed, the 8 failures naming its three decisions (a

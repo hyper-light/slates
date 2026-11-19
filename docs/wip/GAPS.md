@@ -198,9 +198,9 @@
 > stock Subversion 1.15.0's own sessions, `svn` against `svnserve` logged both ways by a relay
 > (`crates/svn/fixtures/handshake/`), each answered byte for byte as `svnserve` answered it but for the greeting's
 > `svndiff1`, whole and cut anywhere; `ANONYMOUS`, `EXTERNAL` and `CRAM-MD5` (HMAC-MD5 through RustCrypto's `hmac` and
-> `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 102 of 102 on the Mac Studio
-> over main, the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the URL's canonical form,
-> the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
+> `md-5`, approved for this mechanism alone); `cargo test --locked -p slates-svn --lib` 139 of 139 on the Mac Studio
+> over main (575188f7f), the handshake's 28, red first on the earlier draft (see A-599). Owed from it: (1) the URL's
+> canonical form, the repository it names and the root URL `repos-info` carries, as `svnserve` derives them
 > (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and `svn_path_remove_components`),
 > with piece 7's connection task, which today gives the handshake those values; (2) a limit on failed attempts per
 > principal and per address, learned (`svnserve`'s loop has none, and neither has the handshake), with §4.13's
