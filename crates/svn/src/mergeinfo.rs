@@ -1852,3 +1852,6 @@ pub fn catalog<C: Contents + ?Sized>(
   }
   Ok(answer)
 }
+
+#[cfg(test)]
+mod tests;
