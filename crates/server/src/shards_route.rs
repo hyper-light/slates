@@ -600,6 +600,54 @@ mod tests {
     other: Result<(), String>,
   }
 
+  /// The lost-answer take test's scenario on its daemon's shard `s`: the offer, the first ask with its answer dropped,
+  /// the second ask, the byte read through its end, and another exchange's take.
+  fn taken_twice_after_a_lost_answer(s: &mut ShardState) -> TakenTwice {
+    let (end, peer) = slates_ipc::stream::pair().unwrap();
+    offered(s, (OfferKind::Stream, FIRST_ID), CLIENT, end);
+    let hello = hello_for(OfferKind::Stream, FIRST_ID);
+    let proof = proof_of(OfferKind::Stream, FIRST_ID, &DAEMON_NONCE);
+    let first = take(s, hello, DAEMON_NONCE, proof)
+      .map(|(confirmation, _lost)| confirmation)
+      .map_err(|refusal| format!("{refusal:?}"));
+    rustix::io::ioctl_fionbio(&peer, true).unwrap();
+    let mut byte = [0u8; 1];
+    let peer_open = matches!(
+      rustix::net::recv(&peer, &mut byte, rustix::net::RecvFlags::empty()),
+      Err(rustix::io::Errno::AGAIN)
+    );
+    let again = take(s, hello, DAEMON_NONCE, proof);
+    let through = again.as_ref().ok().and_then(|(_, taken)| {
+      rustix::net::send(&peer, b"x", rustix::net::SendFlags::empty()).ok()?;
+      let mut read = [0u8; 1];
+      match rustix::net::recv(
+        &taken.descriptor,
+        &mut read,
+        rustix::net::RecvFlags::empty(),
+      ) {
+        Ok((1, _)) => Some(read[0]),
+        _ => None,
+      }
+    });
+    let other = take(
+      s,
+      hello,
+      OTHER_NONCE,
+      proof_of(OfferKind::Stream, FIRST_ID, &OTHER_NONCE),
+    )
+    .map(|_| ())
+    .map_err(|refusal| format!("{refusal:?}"));
+    TakenTwice {
+      first,
+      peer_open,
+      again: again
+        .map(|(confirmation, _)| confirmation)
+        .map_err(|refusal| format!("{refusal:?}")),
+      through,
+      other,
+    }
+  }
+
   /// A-512 (A-488's sibling, goal 85). Do: on a daemon, offer a stream end for a client; take it with a claim's proof, as
   /// an exchange's first ask, and drop what the take answered, as a lost answer is dropped when its owner shard stopped
   /// for a window (`xshard::call_in_shard_time` forgets the call, and the shard runs it once it resumes); take it again
@@ -612,47 +660,7 @@ mod tests {
   #[test]
   fn a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice() {
     let daemon = crate::daemon::audit_daemon();
-    let saw = crate::daemon::observe_first(&daemon, |s| {
-      let (end, peer) = slates_ipc::stream::pair().unwrap();
-      offered(s, (OfferKind::Stream, FIRST_ID), CLIENT, end);
-      let hello = hello_for(OfferKind::Stream, FIRST_ID);
-      let proof = proof_of(OfferKind::Stream, FIRST_ID, &DAEMON_NONCE);
-      let first = take(s, hello, DAEMON_NONCE, proof)
-        .map(|(confirmation, _lost)| confirmation)
-        .map_err(|refusal| format!("{refusal:?}"));
-      rustix::io::ioctl_fionbio(&peer, true).unwrap();
-      let mut byte = [0u8; 1];
-      let peer_open = matches!(
-        rustix::net::recv(&peer, &mut byte, rustix::net::RecvFlags::empty()),
-        Err(rustix::io::Errno::AGAIN)
-      );
-      let again = take(s, hello, DAEMON_NONCE, proof);
-      let through = again.as_ref().ok().and_then(|(_, taken)| {
-        rustix::net::send(&peer, b"x", rustix::net::SendFlags::empty()).ok()?;
-        let mut read = [0u8; 1];
-        match rustix::net::recv(&taken.descriptor, &mut read, rustix::net::RecvFlags::empty()) {
-          Ok((1, _)) => Some(read[0]),
-          _ => None,
-        }
-      });
-      let other = take(
-        s,
-        hello,
-        OTHER_NONCE,
-        proof_of(OfferKind::Stream, FIRST_ID, &OTHER_NONCE),
-      )
-      .map(|_| ())
-      .map_err(|refusal| format!("{refusal:?}"));
-      TakenTwice {
-        first,
-        peer_open,
-        again: again
-          .map(|(confirmation, _)| confirmation)
-          .map_err(|refusal| format!("{refusal:?}")),
-        through,
-        other,
-      }
-    });
+    let saw = crate::daemon::observe_first(&daemon, taken_twice_after_a_lost_answer);
     daemon.stop();
     println!(
       "a take asked again after a lost answer: first {}, the stream's other side open {}, again {}, through {:?}, \
@@ -663,7 +671,11 @@ mod tests {
       saw.through,
       saw.other
     );
-    assert!(saw.first.is_ok(), "the first ask took the offer: {:?}", saw.first);
+    assert!(
+      saw.first.is_ok(),
+      "the first ask took the offer: {:?}",
+      saw.first
+    );
     assert!(
       saw.peer_open,
       "the lost answer closed the stream's end: the ends were lost with it"
