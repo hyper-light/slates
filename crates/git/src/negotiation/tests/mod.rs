@@ -2,9 +2,11 @@
 //! oracle computes every answer from full reachability, by the rules the module documents and never by its walks, and
 //! the property test holds [`negotiate`] to it on every history, with counters showing which path each want took.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use proptest::prelude::*;
+use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::{
   Acknowledgments, Answer, CommitRow, Deepen, Filter, Graph, INFINITE_DEPTH, Pack, Refusal,
@@ -976,77 +978,262 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   (graph, asks)
 }
 
-proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config { cases: 512, ..proptest::test_runner::Config::default() }))]
+/// What the generated cases met, so a passing oracle test cannot be a vacuous one.
+#[derive(Clone, Debug, Default)]
+struct Census {
+  nothing: u64,
+  not_ready: u64,
+  ready: u64,
+  after_done: u64,
+  runs: u64,
+  walked: u64,
+  runs_and_walk: u64,
+  shallow: u64,
+  unshallow: u64,
+  shallow_section_empty: u64,
+  blob_none: u64,
+  blob_limit: u64,
+  tree_depth: u64,
+  object_type: u64,
+  combine: u64,
+  tags_included: u64,
+  not_ours: u64,
+  shallow_not_commit: u64,
+  nothing_selected: u64,
+  zero_depth: u64,
+  sparse: u64,
+  packs_checked: u64,
+  runs_checked: u64,
+}
 
-  /// A-615 part 2: do negotiate generated requests over generated histories (merges, skewed dates, tags of tags, greens
-  /// with fast-forwards and rewrites, haves on version heads and elsewhere, shallow clients, every deepening and filter),
-  /// and compute each answer by the oracle from full reachability. Expect: the same answer, refusals included; a want
-  /// answered in one round exactly where the oracle's rule answers it, and no commit walked when every want is so
-  /// answered and nothing is made whole.
-  #[test]
-  fn every_answer_is_the_oracles(plan in any_plan()) {
-    let (graph, asks) = build(&plan);
-    let request = asks.request();
-    let got = negotiate(&graph, &request, &mut Admission::new(u64::MAX));
-    let expected = oracle(&graph, &asks);
-    match (got, expected) {
-      (Ok(outcome), Ok(expected)) => {
-        prop_assert_eq!(&outcome.answer, &expected.answer);
-        prop_assert_eq!(outcome.counters.one_round, expected.one_round);
-        let made_whole = match &outcome.answer {
-          Answer::Pack(pack) => pack.shallow_info.as_ref().is_some_and(|info| !info.unshallow.is_empty()),
-          _ => false,
-        };
-        if expected.walk_wants == 0 && !made_whole {
-          prop_assert_eq!(outcome.counters.walked, 0);
-          prop_assert_eq!(outcome.counters.searched, 0);
-        }
-      }
-      (Err(refusal), Err(expected)) => prop_assert_eq!(refusal, expected),
-      (got, expected) => prop_assert!(false, "got {:?}, expected {:?}", got.map(|outcome| outcome.answer), expected.map(|expected| expected.answer)),
-    }
+impl Census {
+  /// Each count, named, so a test can say which was never met.
+  fn counts(&self) -> [(&'static str, u64); 23] {
+    [
+      ("nothing", self.nothing),
+      ("not_ready", self.not_ready),
+      ("ready", self.ready),
+      ("after_done", self.after_done),
+      ("runs", self.runs),
+      ("walked", self.walked),
+      ("runs_and_walk", self.runs_and_walk),
+      ("shallow", self.shallow),
+      ("unshallow", self.unshallow),
+      ("shallow_section_empty", self.shallow_section_empty),
+      ("blob_none", self.blob_none),
+      ("blob_limit", self.blob_limit),
+      ("tree_depth", self.tree_depth),
+      ("object_type", self.object_type),
+      ("combine", self.combine),
+      ("tags_included", self.tags_included),
+      ("not_ours", self.not_ours),
+      ("shallow_not_commit", self.shallow_not_commit),
+      ("nothing_selected", self.nothing_selected),
+      ("zero_depth", self.zero_depth),
+      ("sparse", self.sparse),
+      ("packs_checked", self.packs_checked),
+      ("runs_checked", self.runs_checked),
+    ]
   }
 
-  /// A-615 part 2 (§4.17.2 item 3): do negotiate generated requests with no filter, no shallow client and no deepening,
-  /// and gather what the pack carries: its objects and every object of its runs' versions. Expect: everything the wants
-  /// reach that the common haves do not, and nothing the wants do not reach; and each run carrying exactly what its
-  /// green's head reaches and the have's version head does not.
-  #[test]
-  fn a_pack_carries_what_the_client_lacks_and_nothing_unwanted(plan in any_plan()) {
-    let (graph, mut asks) = build(&plan);
-    asks.filter = None;
-    asks.shallow.clear();
-    asks.deepen = None;
-    asks.include_tag = false;
-    asks.done = true;
-    asks.wants.retain(|id| graph.node(id).is_some());
-    let Ok(outcome) = negotiate(&graph, &asks.request(), &mut Admission::new(u64::MAX)) else {
-      return Ok(());
-    };
-    let Answer::Pack(pack) = outcome.answer else {
-      return Ok(());
-    };
-    let wants = held(&graph, &asks.wants);
-    let common = held(&graph, &asks.haves);
-    let mut carried: BTreeSet<u32> = pack.objects.iter().copied().collect();
-    for run in &pack.runs {
-      let mut union = BTreeSet::new();
-      for version in run.after + 1..=run.through {
-        union.extend(graph.brought_set(run.green, version));
+  /// Counts what an answer met.
+  fn answer(&mut self, graph: &TestGraph, asks: &Asks, answer: &Answer<u32, u32>, walked: u64) {
+    let pack = match answer {
+      Answer::Nothing => {
+        self.nothing += 1;
+        return;
       }
-      let heads = &graph.greens[at(run.green)].heads;
-      let head = heads[usize::try_from(run.through).unwrap() - 1];
-      let had = heads[usize::try_from(run.after).unwrap() - 1];
-      let exact: BTreeSet<u32> = graph.reach([head]).difference(&graph.reach([had])).copied().collect();
-      prop_assert_eq!(&union, &exact);
-      carried.extend(union);
+      Answer::Acknowledgments(_) => {
+        self.not_ready += 1;
+        return;
+      }
+      Answer::Pack(pack) => pack,
+    };
+    match pack.acknowledgments {
+      Some(_) => self.ready += 1,
+      None => self.after_done += 1,
     }
-    let reached = graph.reach(wants.iter().copied());
-    let lacking: BTreeSet<u32> = reached.difference(&graph.reach(common.iter().copied())).copied().collect();
-    prop_assert!(lacking.is_subset(&carried), "lacking {:?} carried {:?}", lacking, carried);
-    prop_assert!(carried.is_subset(&reached), "carried {:?} reached {:?}", carried, reached);
+    let walk = walked > 0;
+    self.runs += u64::from(!pack.runs.is_empty());
+    self.walked += u64::from(walk);
+    self.runs_and_walk += u64::from(!pack.runs.is_empty() && walk);
+    if let Some(info) = &pack.shallow_info {
+      self.shallow += u64::from(!info.shallow.is_empty());
+      self.unshallow += u64::from(!info.unshallow.is_empty());
+      self.shallow_section_empty += u64::from(info.shallow.is_empty() && info.unshallow.is_empty());
+    }
+    match &asks.filter {
+      Some(Filter::BlobNone) => self.blob_none += 1,
+      Some(Filter::BlobLimit(_)) => self.blob_limit += 1,
+      Some(Filter::TreeDepth(_)) => self.tree_depth += 1,
+      Some(Filter::ObjectType(_)) => self.object_type += 1,
+      Some(Filter::Combine(_)) => self.combine += 1,
+      _ => {}
+    }
+    let wanted: Vec<u32> = held(graph, &asks.wants);
+    let tag_included = pack
+      .objects
+      .iter()
+      .any(|node| graph.objects[at(*node)].kind == Kind::Tag && !wanted.contains(node));
+    self.tags_included += u64::from(asks.include_tag && tag_included);
   }
+
+  /// Counts a refusal.
+  fn refusal(&mut self, refusal: &Refusal) {
+    match refusal {
+      Refusal::NotOurs { .. } => self.not_ours += 1,
+      Refusal::ShallowNotCommit { .. } => self.shallow_not_commit += 1,
+      Refusal::NothingSelected => self.nothing_selected += 1,
+      Refusal::ZeroDepth => self.zero_depth += 1,
+      Refusal::Filter(_) => self.sparse += 1,
+      _ => {}
+    }
+  }
+}
+
+/// Holds one plan's answer to the oracle's, counting what it met.
+fn check_against_oracle(plan: &Plan, census: &mut Census) -> Result<(), TestCaseError> {
+  let (graph, asks) = build(plan);
+  let got = negotiate(&graph, &asks.request(), &mut Admission::new(u64::MAX));
+  let expected = oracle(&graph, &asks);
+  match (got, expected) {
+    (Ok(outcome), Ok(expected)) => {
+      prop_assert_eq!(&outcome.answer, &expected.answer);
+      prop_assert_eq!(outcome.counters.one_round, expected.one_round);
+      let made_whole = match &outcome.answer {
+        Answer::Pack(pack) => pack
+          .shallow_info
+          .as_ref()
+          .is_some_and(|info| !info.unshallow.is_empty()),
+        _ => false,
+      };
+      if expected.walk_wants == 0 && !made_whole {
+        prop_assert_eq!(outcome.counters.walked, 0);
+        prop_assert_eq!(outcome.counters.searched, 0);
+      }
+      census.answer(&graph, &asks, &outcome.answer, outcome.counters.walked);
+    }
+    (Err(refusal), Err(expected)) => {
+      prop_assert_eq!(refusal, expected);
+      census.refusal(&refusal);
+    }
+    (got, expected) => prop_assert!(
+      false,
+      "got {:?}, expected {:?}",
+      got.map(|outcome| outcome.answer),
+      expected.map(|expected| expected.answer)
+    ),
+  }
+  Ok(())
+}
+
+/// A-615 part 2: do negotiate generated requests over generated histories (merges, skewed dates, tags of tags, greens
+/// with fast-forwards and rewrites, haves on version heads and elsewhere, shallow clients, every deepening and filter),
+/// and compute each answer by the oracle from full reachability. Expect: the same answer, refusals included; a want
+/// answered in one round exactly where the oracle's rule answers it, and no commit walked or searched when every want is
+/// so answered and nothing is made whole. The census shows every answer, path, section, filter and refusal was met.
+#[test]
+fn every_answer_is_the_oracles() {
+  let census = RefCell::new(Census::default());
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: 1024,
+    ..Config::default()
+  }));
+  let result = runner.run(&any_plan(), |plan| {
+    check_against_oracle(&plan, &mut census.borrow_mut())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  let census = census.into_inner();
+  let unmet: Vec<&str> = census
+    .counts()
+    .iter()
+    .take(21)
+    .filter(|(_, count)| *count == 0)
+    .map(|(name, _)| *name)
+    .collect();
+  assert!(unmet.is_empty(), "never met: {unmet:?} in {census:?}");
+}
+
+/// Holds one plan's pack to what its client lacks, counting the packs and runs held.
+fn check_carried(plan: &Plan, census: &mut Census) -> Result<(), TestCaseError> {
+  let (graph, mut asks) = build(plan);
+  asks.filter = None;
+  asks.shallow.clear();
+  asks.deepen = None;
+  asks.include_tag = false;
+  asks.done = true;
+  asks.wants.retain(|id| graph.node(id).is_some());
+  let Ok(outcome) = negotiate(&graph, &asks.request(), &mut Admission::new(u64::MAX)) else {
+    return Ok(());
+  };
+  let Answer::Pack(pack) = outcome.answer else {
+    return Ok(());
+  };
+  census.packs_checked += 1;
+  let wants = held(&graph, &asks.wants);
+  let common = held(&graph, &asks.haves);
+  let mut carried: BTreeSet<u32> = pack.objects.iter().copied().collect();
+  for run in &pack.runs {
+    census.runs_checked += 1;
+    let mut union = BTreeSet::new();
+    for version in run.after + 1..=run.through {
+      union.extend(graph.brought_set(run.green, version));
+    }
+    let heads = &graph.greens[at(run.green)].heads;
+    let head = heads[usize::try_from(run.through).unwrap() - 1];
+    let had = heads[usize::try_from(run.after).unwrap() - 1];
+    let exact: BTreeSet<u32> = graph
+      .reach([head])
+      .difference(&graph.reach([had]))
+      .copied()
+      .collect();
+    prop_assert_eq!(&union, &exact);
+    carried.extend(union);
+  }
+  let reached = graph.reach(wants.iter().copied());
+  let lacking: BTreeSet<u32> = reached
+    .difference(&graph.reach(common.iter().copied()))
+    .copied()
+    .collect();
+  prop_assert!(
+    lacking.is_subset(&carried),
+    "lacking {:?} carried {:?}",
+    lacking,
+    carried
+  );
+  prop_assert!(
+    carried.is_subset(&reached),
+    "carried {:?} reached {:?}",
+    carried,
+    reached
+  );
+  Ok(())
+}
+
+/// A-615 part 2 (§4.17.2 item 3): do negotiate generated requests with no filter, no shallow client and no deepening,
+/// and gather what the pack carries: its objects and every object of its runs' versions. Expect: everything the wants
+/// reach that the common haves do not, and nothing the wants do not reach; and each run carrying exactly what its
+/// green's head reaches and the have's version head does not. The census shows packs and runs were held so.
+#[test]
+fn a_pack_carries_what_the_client_lacks_and_nothing_unwanted() {
+  let census = RefCell::new(Census::default());
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: 512,
+    ..Config::default()
+  }));
+  let result = runner.run(&any_plan(), |plan| {
+    check_carried(&plan, &mut census.borrow_mut())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  let census = census.into_inner();
+  assert!(
+    census.packs_checked > 0 && census.runs_checked > 0,
+    "{census:?}"
+  );
 }
 
 /// A straight history, `count` commits each with its own tree and blob, and one green whose versions are its commits.
