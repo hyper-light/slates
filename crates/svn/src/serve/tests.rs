@@ -477,18 +477,18 @@ fn reparent_moves_the_session_within_its_repository() {
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
 }
 
-/// A-656 (commands not served yet, and items that are no command): send `get-file-revs`, then
-/// `get-latest-rev`; then an item that is a number; expect "Unknown editor command
-/// 'get-file-revs'" (210001) and the connection going on, the youngest revision answered, then the
-/// connection's end.
+/// A-656 (commands not served yet, and items that are no command): send `replay`, then
+/// `get-latest-rev`; then an item that is a number; expect "Unknown editor command 'replay'"
+/// (210001) and the connection going on, the youngest revision answered, then the connection's
+/// end.
 #[test]
 fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
   let fixture = fixture();
   let guards = FixtureGuards::anonymous();
   let mut connection = established();
-  let item = b"( get-file-revs ( 5:a.txt ( 1 ) ( 6 ) ) ) ";
+  let item = b"( replay ( 6 0 true ) ) ";
   let (out, turn) = send(&fixture, &guards, &mut connection, item);
-  let message = "Unknown editor command 'get-file-revs'";
+  let message = "Unknown editor command 'replay'";
   assert_eq!(
     out,
     format!(
@@ -497,7 +497,7 @@ fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
     )
   );
   let unserved = Turn::Unserved {
-    command: "get-file-revs",
+    command: "replay",
     consumed: item.len(),
   };
   assert_eq!(turn, Ok(format!("{unserved:?}")));
