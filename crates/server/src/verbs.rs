@@ -2593,6 +2593,14 @@ pub fn serve(
     RequestBody::Telemetry { partition } => Some(*partition),
     // The audit is one partition's, the control shard's (§4.15, A-265).
     RequestBody::Audit { .. } => Some(crate::landing::AUDIT_PARTITION),
+    // A version-control credential lives on the partition its id routes to (A-625 part 3).
+    RequestBody::EnrollCredential { material, .. } => Some(crate::credentials::owner_of(
+      &crate::credentials::id_of(material),
+      state.shards.len(),
+    )),
+    RequestBody::RevokeCredential { id, .. } => {
+      Some(crate::credentials::owner_of(id, state.shards.len()))
+    }
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -5086,6 +5094,25 @@ fn dispatch_inner(
       (&repository, read),
       (&rules, &hooks, &hooks_env, &signers),
     ),
+    // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
+    RequestBody::EnrollCredential {
+      principal: proven,
+      material,
+      expires_ns,
+      proof,
+    } => crate::credentials::enroll(
+      state,
+      principal,
+      crate::credentials::Enrollment {
+        principal: proven,
+        material,
+        expires_ns,
+        proof,
+      },
+    ),
+    RequestBody::RevokeCredential { id, proof } => {
+      crate::credentials::revoke(state, principal, id, proof)
+    }
     RequestBody::Checkout {
       green,
       base,

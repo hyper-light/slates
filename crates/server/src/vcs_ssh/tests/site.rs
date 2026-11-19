@@ -10,7 +10,7 @@ use super::{
   Dispatched, GIT_DIE_STATUS, HG_ABORT_STATUS, NoKeyRecord, NotYet, Refused,
   SVNSERVE_FAILURE_STATUS, Services, SshSite, Start, Stepped, ToolSite, Unserved,
 };
-use crate::vcs_http::git::Repositories;
+use crate::vcs_http::git::{Located, Repositories};
 
 /// Shape: the uid of the tests' repositories' owner.
 const OWNER: u32 = 1;
@@ -47,6 +47,10 @@ struct Held {
 }
 
 impl Repositories for Held {
+  fn locate(&self, _name: &str) -> Located {
+    Located::Here
+  }
+
   fn find(&self, name: &str) -> Option<RepositoryRecord> {
     let (tool, rules) = match name {
       "r.git" => (VcsTool::Git, self.git.clone()),

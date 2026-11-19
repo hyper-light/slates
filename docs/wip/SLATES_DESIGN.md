@@ -9537,6 +9537,12 @@ server, not inferred from command names.
 > instance's issuer. The write policy is owed; until it lands, grants are made as before, by the issuer's keyed hash.
 > Record: A-285, GAPS (2026-11-18).
 
+> **Status (2026-11-19, A-625 part 3: version-control credentials).** A human enrolls a principal's credentials for the
+> version-control servers' HTTP and SSH edges through the CLI's control verbs (`slates credential key|token|revoke`),
+> proven under the issuer secret as an enrollment is; a consumer's channel is refused `Forbidden`, and MCP and the SDKs
+> carry no proof. The one record keeps an SSH key by its fingerprint and an HTTP token by its hash alone, each with the
+> principal it proves and its expiry (§4.17.2's A-625 part 3 status).
+
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
 carried through §4.4's operation refusal taxonomy. A-9 adds these requirements without claiming
@@ -12632,6 +12638,29 @@ engine: the verdict, rebase, position mapping, the register).
 > daemon starting an edge (address, identity, an authenticator over §4.13's keys, the lookup across partitions),
 > receive-pack's session (A-654), then the live `git clone`.
 >
+> **Status (2026-11-19, A-625 part 3: the credential record, and the daemon's edge).** One record of version-control
+> credentials in the metadata database serves both edges (§4.13; main's ruling): `slates-db`'s `credentials` table holds
+> an SSH user key by its blob under OpenSSH's fingerprint (the blob's SHA-256) and its key type, and an HTTP token by its
+> SHA-256 alone, each proving one §4.13 principal until its wall-clock expiry, on the partition its id routes to, each
+> record's bytes charged to the partition's table budget (`Capacity` at it). A human enrolls and revokes them through
+> the CLI's control verbs (`slates credential key LINE`, `slates credential token`, `slates credential revoke ID`),
+> proven under the issuer secret; a consumer's channel is refused `Forbidden` whatever it carries, and MCP and the SDKs
+> hold no proof. The issuer mints a token and sends the daemon its hash alone, so no token crosses a channel. A key is
+> enrolled only when SSH's user authentication would take it (A-633's parser). Both edges look a presented credential
+> up through `credentials::find`, one bounded call on the owner shard. The daemon starts the HTTP edge from
+> `DaemonConfig::vcs_http` (an address, and the node's identity the command hands in as DER, the one its RPC-with-TLS
+> export presents) beside the NFS transport, its listener on the control shard and every shard keeping its own seats.
+> git's site proves a token (Basic's password over TLS, or Bearer) by the record: held as a token, live, and a
+> consumer's not revoked; a bearer token's expiry goes with its principal, for LFS's actions. A proven request whose
+> repository another shard's partition holds moves its connection there whole (socket, engine with the head undecided,
+> waits), as the NFS export moves a mount's connection; there it is seated as a new connection is (at most as many
+> arrivals waiting as the shard has seats, closed and counted past that), decided again, and served with its partition
+> read locally. Every refusal is typed and counted by kind. Owed: upload-pack served once each repository's store lives
+> on its owner shard (A-662; `503` until then), receive-pack's session (A-654), LFS's routes on the site under main's
+> ruling (a route says whether its status is fixed at the head or decided after its body), the operator's flag for the
+> edge's address and the fleet identity's hand-in in the daemon role, a consumer's revocation in the SSH edge's key
+> holders (A-651), listing credentials, Mercurial's and Subversion's sites, the live `git clone` (main's).
+>
 > **Status (2026-11-19, A-604: piece 14's first part, protocols v0 and v1's codecs, built).** `crates/git` (`v0`)
 > reads and writes what a fetch over protocol v0 or v1 says, as stock git 2.50.1 writes it: the ref advertisement (the
 > server's capabilities after the first ref's NUL, an empty repository's `capabilities^{}` line, v1's `version 1`, each
@@ -14144,8 +14173,15 @@ and export by landing).
 > revisions found by `find_merged_revisions`' rounds and interleaved; a start after the end walked newest first), each
 > revision's property changes and its text's delta from the previous text in Subversion's own windows (A-652's
 > deltifier), a string for each write `svndiff.c` makes, a revision a step; the scripted session's 13 commands and the
-> stock `svn blame` and `svn blame -g` replayed whole. Owed: the svndiff 0 session's recording; the fold of a name
-> beyond ASCII (utf8proc's case folding and mark stripping); read access by the authorization rules (A-606).
+> stock `svn blame` and `svn blame -g` replayed whole. Its eighth slice (2026-11-19, g297): read access by A-606's
+> rules, the session carrying its principal's compiled rules: `must_have_access`' refusal (170001) for the six commands
+> that check their path, and every walk passing over or stopping at what the session may not read as `libsvn_repos`
+> does (hidden entries, ancestors and mergeinfo paths left out, revision properties censored, locations, segments,
+> histories and file revisions ended, 220001 where a command needs a hidden path whole), and the connection judging
+> each read by its principal's rules; held to a second repository served under an authorization file, its four scripted
+> and seven stock sessions replayed whole (macOS arm64, Mac Studio, 54 of 54). Owed: the svndiff 0 session's recording;
+> the fold of a name beyond ASCII (utf8proc's case folding and mark stripping); a denied read in a session that could
+> authenticate, which `svnserve` asks to, mid-command, before it refuses.
 >
 > **Status (2026-11-19, A-616, part 1).** Built: the reporter's commands and its report (`slates-svn`'s `report`,
 > piece 7's third part, its first half). `update`, `switch`, `status` and `diff` are read as `serve.c` reads them,
@@ -14299,8 +14335,8 @@ and export by landing).
 > answers it among the reads); `update`'s target checked for read
 > access on the session's path. One connection serves `svn://` and `svnserve -t`: a tunnel's user comes in through the
 > repository its caller names (`EXTERNAL`). Held to every recorded report session replayed from its first byte against
-> stock `svnserve` 1.15.0's (40 sessions; property lists and listings as sets; the one listing where A-613's `get-dir`
-> shows an entry `svnserve` hides from the principal counted, authorization owed in the reads); red five ways. A-616's
+> stock `svnserve` 1.15.0's (40 sessions; property lists and listings as sets; every item equal since A-613's eighth
+> slice judges the reads by the session's rules); red five ways. A-616's
 > drive now sends a changed text as A-652's deltifier makes it against the client's base. Owed: part 2, the server's
 > listener over TCP and the SSH tunnel's entry point.
 >
@@ -43433,9 +43469,46 @@ Applied in the same change to: §4.17.4 (a status block), GAPS (the §4.17.4 ent
   and failed both replays until fixed. Owed: the session to record, `get-file-revs-svndiff0`, whose client announces
   neither `svndiff1` nor `accepts-svndiff2`, to hold svndiff 0 to `svnserve` byte for byte (stock `svnserve` 1.15.0, as
   the recorder runs it); red-checks.
+- **Part 2, its eighth slice** (2026-11-19, g297): read access by A-606's rules (`serve.c` `must_have_access`,
+  `lookup_access`, `authz_check_access`; `libsvn_repos`' `authz_read_func` at every site the read commands reach). The
+  session carries its principal's rules (`Session::authz`, A-606's `PrincipalRules` compiled for the repository's name
+  and the user; `None` without an authorization file, every path readable). `get-file`, `get-dir`, `check-path`, `stat`,
+  `get-iprops` and `list` check their path first: readable, the trivial authentication request; not, "Authorization
+  failed" (170001, the error's own message) with nothing before it. Then, as `libsvn_repos` does: `get-dir` and `list`
+  pass hidden entries by (`list` does not descend into one); inherited properties pass hidden ancestors by;
+  `get-mergeinfo` drops hidden requested paths, never the paths its answer names; `rev-proplist` and `rev-prop` show as
+  much as `svn_repos_check_revision_access` finds the revision readable (all, `svn:author` and `svn:date`, or none; a
+  revision that changed nothing whole); `get-locations` and `get-location-segments` refuse a hidden peg path after the
+  revision checks, 220001 "Unreadable path encountered; access denied", and end at a hidden copy source; `log` refuses a
+  hidden path (`get_path_histories`, before its history opens, nested walks included) and a hidden root on the shortcut,
+  220001 "Item is not readable", ends a path's history at a hidden location, refuses `-g` with a hidden path as segments
+  do, and gives each revision `detect_changed`'s censoring (hidden changed paths and copy sources left out, then the
+  same three levels); `get-file-revs` ends at a hidden location, and where that leaves the mainline empty `svnserve`'s
+  assertion aborts its process (it sets no malfunction handler, `error.c`'s default aborts), so the connection ends
+  with nothing written for the command: its authentication request is still in the unflushed buffer
+  (`Progress::Close`; the recording corrected this slice's first reading, which wrote the request). `get-latest-rev`,
+  `get-dated-rev` and `get-deleted-rev` check nothing. The connection (A-656's `serve.rs`) judges the reads by the
+  rules the policy's authorization file gives the session's principal, compiled at the first read and again once an
+  authentication changes the principal (`Established::reads_session`), and a stream's close ends it
+  (`Refused::Aborted`); A-656's replay no longer allows `update-depth-files`' listing of `/trunk` to differ, since the
+  listing now leaves `secret` out as `svnserve`'s does. Recording: a second repository, `locked`, a hot copy of the
+  first under rules hiding the root, `/branches` and `/trunk/dir` save `/trunk/dir/b.txt`, with no password database;
+  four scripted sessions (`locked-reads` 29 commands, `locked-log` 8, `locked-file-revs` 4, `locked-file-revs-abort`)
+  and seven stock ones, recorded on the Mac Studio against stock Subversion 1.15.0 (kiln r88, 2026-11-19: the recorder
+  3 s, no `svnserve` left, 110 sums OK): `authz` and the 22 transcripts added; the 11 server transcripts that differ
+  only in a property list's hash order kept as they were; `get-file-revs-svndiff0`, recorded in the same run, left to
+  its own piece. One case the history does not reach, a readable path copied from a hidden one, is a test over a
+  committed revision. Tests (macOS arm64, Mac Studio, kiln r110: `cargo test --locked -p slates-svn --lib -- reads::
+  serve::` 54 of 54, fmt clean; the crate has no integration target): the four scripted sessions and the seven stock
+  ones (`svn ls -v -R`, `log -v`, `log -g` refused 220001, `blame -g`, `cat`, `cat` of a hidden file refused 170001,
+  `proplist -v --show-inherited-props`) answered as `svnserve` answered them; the copy from a hidden source; through
+  the connection, each principal's own rules (anonymous refused and censored, a log a byte of room a call; alice
+  reading `secret`); A-656's 40 recorded sessions, every item equal. The first build (r97) failed the abort's replay,
+  the request written that `svnserve` never flushed. Owed: red-checks.
 - **Owed** (the next slices): `list`'s fold of a name beyond ASCII (utf8proc's NFD with case folding and marks stripped,
-  composed again, which needs Unicode's case-folding and general-category tables); read access by A-606's rules, and the
-  authentication request a denied anonymous read makes when the session could authenticate.
+  composed again, which needs Unicode's case-folding and general-category tables); the authentication request a denied
+  read makes mid-command when the session is anonymous and could authenticate (a password database, SASL or a tunnel's
+  user), with the connection that runs the exchange.
 
 ### A-624 part 1 — v2 reads an object id as git's server does, in either case, and writes git's form (2026-11-19, g230, UI goal 93; §4.17.2 "The wire"; after A-582 part 2 and A-604)
 Applied in the same change to:
@@ -48603,6 +48676,55 @@ the workspace manifest (`slates-hg`), `crates/hg` (`import`'s module doc: the se
   crates. No integration test reaches the adapter: nothing calls it outside its own tests until the daemon's import
   (owed). Main's (§8): the red run against a stub (`len` and `read` finding no file; all 11 must fail) and a mutation
   of each guard.
+
+### A-625 part 3 — the credential record both edges authenticate through, and the daemon starting the HTTP edge with each proven connection moved to its repository's shard (2026-11-19, g299 under main's rulings, UI goal 93 (kiln 51cef9f7); §4.13 "Principals"; §4.17.2 "Transports" item 1 and "Access"; after A-625 part 3's first slice, A-633)
+Applied in the same change to: §4.13 (a status); §4.17.2's A-625 status; GAPS (the §4.17 entry); `crates/db`
+(`credentials`, new; `catalog::CredentialRecord`, `CredentialKind`; `Op::CredentialEnrolled`, `CredentialRevoked`,
+appended; the partition's table and its snapshot field; `tests/wire_order`); `crates/ipc` (`CredentialMaterial`,
+`RequestBody::EnrollCredential`, `RevokeCredential`, `ReplyBody::CredentialEnrolled`, `CredentialRevoked`, appended;
+`tests/wire_order`); `crates/server` (`credentials`, new; `vcs_http::daemon_edge`, new; `vcs_http`'s move, per-shard
+seats and arrivals; git's site; `config::VcsHttpConfig`, `EdgeIdentity`; `daemon`'s start and `vcs_http_port`;
+`verbs`' routing and dispatch; its manifest depends on `slates-ssh`); `crates/client`, `crates/api` (`Issuer`'s
+credential verbs), `crates/cli` (`slates credential`); the workspace manifest (`slates-ssh`'s entry) and lock.
+- **Main's rulings** (2026-11-19). The connection moves to its repository's owner shard once its head names it, as the
+  NFS export moves a mount's connection. Credentials are enrolled, never minted per start: a human enrolls them through
+  the CLI's control channel (§4.13), kept in the metadata database, tokens as their hash with an expiry and SSH keys by
+  fingerprint, one record both edges read (g294 kept none, so this is the one). HTTP takes Basic with the token as the
+  password, never in cleartext, or Bearer, and the authenticator hands a bearer token's expiry with its principal. The
+  edge's certificate and key come from where the RPC-with-TLS export's do, handed in by the operator.
+- **The record** (`slates_db::credentials`). Keyed by the SHA-256 of what a client presents, so a lookup is one map read
+  on the partition the id routes to (its first eight bytes over the partitions; D-14, no global index). Guard then
+  apply: an id held is `AlreadyExists`, a revocation of one not held `NotFound`; each record's bytes (the record, a
+  key's blob and type, a SID's text) are charged to the partition's table byte budget, the one the merge chains and the
+  review records draw from, refused `Capacity` naming the credentials table. Expiry is never decided in `apply`.
+- **Who enrolls** (`slates_server::credentials`). The verbs carry the launcher's proof, a keyed BLAKE3 under the issuer
+  secret over their own domain tags and exactly what they enroll or revoke; a consumer's channel is refused `Forbidden`
+  first (A-285). The issuer mints a token (32 bytes of the system's generator, `slates_` and hex) and sends its hash, so
+  no token crosses a channel. A key is taken only when A-633's parser takes it, so a human learns at enrollment, not at
+  a refused login, that a key cannot serve.
+- **The edge's start** (`vcs_http::daemon_edge::start`). Every shard keeps its own edge state (seats and room from its
+  own budget); the control shard binds and serves. A failed identity, a failed bind and cleartext off loopback leave
+  the daemon serving everything else, logged.
+- **The move** (`vcs_http`). A proven request whose repository another shard's partition holds answers `Move`: the
+  connection's socket handle, its engine with the head undecided, and its waits go as one spawn on that shard's control
+  channel, its seat here given back first. There it takes a seat as a new connection does (a free one, the most overdue
+  connection's, or a wait); at most as many arrivals wait as the shard has seats, and one past that is closed and
+  counted, as a refused NFS move closes its connection. Holding the old seat while waiting for the new one was rejected:
+  two shards each full of connections waiting to move to the other would deadlock. Authentication comes before the
+  move, so a client that proved no one never moves a connection.
+- **Tests.** macOS arm64 (Mac Studio, kiln r46, 2026-11-19, the tree merged over main 71a43cd97; `cargo test --locked`;
+  fmt clean on the six crates): `-p slates-db --lib credentials` 5 of 5 (a credential found by its id until revoked and
+  kept by a snapshot; its expiry; a held id's enrollment and an unheld id's revocation refused; the table byte budget;
+  the rules' model over every generated history); `-p slates-server --lib credentials` 9 of 9 (the id OpenSSH and FIPS
+  180-4 name; a key line read as `ssh-keygen` writes it; a credential found from any shard; a human enrolling and
+  revoking while an agent cannot; a token held as its hash and a key the edge cannot take refused; and four site and
+  LFS tests the filter meets) and `--lib vcs_http` 32 of 32 (among them the move to the repository's shard, a
+  credential that proves no one typed by why, and the daemon's edge moving a proven request and refusing the rest by
+  kind); `-p slates-http-edge --lib` 31 of 31; `-p slates-cli --bin slates credential` 1 of 1 (the grammar);
+  `--test wire_order` 2 of 2 in `slates-db` and in `slates-ipc` (the appended tags as published); `-p slates-ipc --lib
+  protocol` 5 of 5. The first build (r17) refused four type errors (the `Clock` trait unimported where the verbs read
+  the clock; two spawn-refusal arms giving the counter's `u64` as a statement's value), fixed in the same change.
+- **Owed.** As the status says.
 
 ### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
 Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's
