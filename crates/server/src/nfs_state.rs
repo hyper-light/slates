@@ -223,11 +223,13 @@ pub(crate) fn record_clients(s: &mut ShardState) -> bool {
     .into_iter()
     .map(client_op)
     .collect();
-  if commit(s, &ops) {
-    return true;
+  let recorded = commit(s, &ops);
+  if !recorded {
+    s.nfs_v4 = server(s);
   }
-  s.nfs_v4 = server(s);
-  false
+  // A purge the table owes now goes again a retry window on, unless a round settles it first (A-570).
+  crate::nfs::note_purges(s);
+  recorded
 }
 
 /// The first instance of a partition that holds none (a fresh daemon, or one whose anchor's RAM was lost): 31 random
