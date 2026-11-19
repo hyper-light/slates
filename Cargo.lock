@@ -1832,6 +1832,7 @@ dependencies = [
 name = "slates-svn"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "lz4_flex",
  "proptest",
  "slates-test-seeds",
