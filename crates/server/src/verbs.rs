@@ -22600,6 +22600,130 @@ mod tests {
     );
   }
 
+  /// Fences the shard of `partition` as a failed consensus publication fences the control shard
+  /// (`Daemon::inject_consensus_failure`): every later borrow of its state is refused. The borrow that sets the fence is
+  /// refused at its own retention check, which names the fence it set.
+  fn fence_shard(daemon: &crate::daemon::Daemon, partition: usize) {
+    let fenced = daemon
+      .observation(
+        daemon.shards().get(partition).copied(),
+        crate::daemon::OBSERVE_BUDGET_NS,
+        |state| {
+          state.consensus_failure = Some(slates_anchor::AnchorError::Layout {
+            reason: "test support: a shard fenced as a failed consensus publication fences one",
+          });
+        },
+      )
+      .unwrap()
+      .wait();
+    assert!(
+      matches!(
+        fenced,
+        Err(crate::observe::ObserveError::State(
+          crate::state::StateAccess::Retention(_)
+        ))
+      ),
+      "the shard was fenced: {fenced:?}"
+    );
+  }
+
+  /// The root group's identity on the control shard now.
+  fn root_group(daemon: &crate::daemon::Daemon) -> Option<[u8; 32]> {
+    crate::daemon::observe_first(daemon, |state| {
+      state.root_group.as_ref().map(|group| group.id)
+    })
+  }
+
+  /// The answer to one request of the seated client: the one it was given at once, or else the next on its ring.
+  fn answer_of(end: &mut slates_ipc::ClientEnd, at_once: Option<ReplyBody>) -> Option<ReplyBody> {
+    at_once.or_else(|| answers_by_sequence(end, 1).into_values().next())
+  }
+
+  /// What the Recover test saw ([`recovered_past_a_fenced_shard`]).
+  struct Recovered {
+    /// The Recover's answer.
+    first: Option<ReplyBody>,
+    /// Its resend's answer, under the same id.
+    resent: Option<ReplyBody>,
+    /// The root group's identity before the Recover, after its answer, and after its resend's.
+    groups: [Option<[u8; 32]>; 3],
+  }
+
+  /// On a three-shard daemon whose third shard is fenced, a client seated on the second recovers the root group as its
+  /// first voter from a reviewed plan, then sends the same Recover again under its id, as a client resends a request
+  /// whose answer said it was not started.
+  fn recovered_past_a_fenced_shard() -> Recovered {
+    let daemon = crate::daemon::audit_daemon_of(3);
+    let (digest, proof) = crate::daemon::observe_first(&daemon, |state| {
+      let reviewed = crate::consensus_recovery::plan(state, true, None).unwrap();
+      let proof =
+        crate::consensus_recovery::recovery_proof(&state.issuer_secret, &reviewed.digest);
+      (reviewed.digest, proof)
+    });
+    let before = root_group(&daemon);
+    fence_shard(&daemon, 2);
+    let recover = (
+      1,
+      super::RequestBody::Recover {
+        root: true,
+        target: None,
+        plan: digest,
+        proof,
+      },
+    );
+    let sent = recover.clone();
+    let (seat, region, at_once) = crate::daemon::observe_at(&daemon, 1, move |state| {
+      let (seat, region) = seat_asking(state);
+      let at_once = served_as_from_the_ring(state, seat, &sent);
+      (seat, region, at_once)
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answer_of(&mut end, at_once);
+    let after_first = root_group(&daemon);
+    let at_once = crate::daemon::observe_at(&daemon, 1, move |state| {
+      served_as_from_the_ring(state, seat, &recover)
+    });
+    let resent = answer_of(&mut end, at_once);
+    let after_resend = root_group(&daemon);
+    daemon.stop();
+    Recovered {
+      first,
+      resent,
+      groups: [before, after_first, after_resend],
+    }
+  }
+
+  /// A-566 (§4.8 explicit quorum-loss recovery; §4.9: `Overloaded` says a request was not started, so a resend under its
+  /// id runs it). Do: on a three-shard daemon whose third shard is fenced, so the control shard's publication of a
+  /// consensus operation to it is refused, recover the root group from a client seated on the second shard; then send
+  /// the same Recover again under its id. Expect: the answer says the recovery ran (`DurabilityPending`), the resend
+  /// meets that answer, and the root group was replaced once. Before, the answer was `Overloaded` naming the fenced
+  /// shard though the recovery had run, so since A-563 its resend ran the operation again.
+  #[test]
+  fn a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once() {
+    let seen = recovered_past_a_fenced_shard();
+    assert!(
+      matches!(
+        seen.first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::DurabilityPending { .. }
+        })
+      ),
+      "the Recover ran, and its answer says so: {:?}",
+      seen.first
+    );
+    assert_eq!(
+      seen.resent, seen.first,
+      "the resend under its id meets the Recover's answer"
+    );
+    let [before, after_first, after_resend] = seen.groups;
+    assert_ne!(before, after_first, "the Recover replaced the root group");
+    assert_eq!(
+      after_first, after_resend,
+      "once: the resend replaced it no further"
+    );
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
