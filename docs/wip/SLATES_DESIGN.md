@@ -11452,6 +11452,25 @@ against what that copy brings there.
 > oracle renames a file or a link over a file or a link. Owed, as A-646 part 2: a hard link names its target's node,
 > never a path.
 
+> **Decision (2026-11-19, A-646): a hard link names its node, never a path.** As a POSIX inode is named by every link
+> to it, a node is named by its home, the one path holding its content or IPC node, and by the hard links naming it
+> there.
+> - Removing or replacing the home leaves the node to its links. The least surviving link becomes its home, holding
+>   its content or IPC node, its mode and its attributes, and the other links name it there; its bytes go only with
+>   its last name.
+> - Renaming the home moves the node, and its links name it at the new path.
+> - A later file at a path the node left is another node, which no link names.
+> - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
+>   unchanged since, a file while it was not removed since), or the one the work makes.
+>
+> The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
+> head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
+> restates only the work's operations. A minted inode number was rejected: it would have to be persisted in every
+> checkpoint and carried through copies and branches, for no difference anyone can observe, since the home is unique at
+> every version and moves with its node. Status: the engine since A-646 part 2a (`crates/merge/src/engine/
+> node_tests.rs`; the whole-state oracle follows nodes). Owed, part 2b: the ops document says so, a node table that a
+> link names, under a new format version.
+
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
 into the increment's post-state chunks (`Extent{src: Chunk{chunk, off}}`, sub-chunk offsets
@@ -12531,9 +12550,13 @@ engine: the verdict, rebase, position mapping, the register).
 > appends). `Session` runs them over one connection, sans-io: bytes in as they arrive, the repository handed to each call
 > that reads, the push then waiting checked while the caller admits its objects to the store's quarantine, and decided
 > through the judge and answered to the caller's sink. Proven byte for byte against eleven pushes stock git 2.50.1
-> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2
-> implements `Judge`: each ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable
-> versions (A-645), appended per A-642.
+> made to stock `git receive-pack`, the fsck push's band 2 but for the prose git writes after a finding's id. Part 2's
+> judge is built (`works::Works`): each ref's update a work through A-618's `build` over A-638's `PushedObjects`, each
+> green read as the push found it (`Greens`), immutable (A-645). An update's base is the version whose head is its old
+> value, a ref that moved when none held it; a create is built over an empty green; a delete retires the green at its
+> head; a tag names its commit's tree. Each work is appended on its green's own log through `Appends`, A-642's stand-in
+> until g261's append lands, all or none under `atomic`. Owed: the server's push path that admits the checked objects
+> to the quarantine and drives the session with g261's appends and A-614's store commit.
 >
 > **Status (2026-11-19, A-615: piece 7's negotiation built, over a commit-graph trait).** `crates/git` (`negotiation`)
 > answers a `fetch` request as pure functions over a trait A-614's store implements (`Graph`): the acknowledgments (an
@@ -13219,6 +13242,10 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
   a log's rows are contiguous and in order (`L`, the log's key, the number) and a node finds its number in each log
   that holds it (`N`, the node, the log's key); a changeset's branch is kept as its name, and a file revision's block
   and bytes as two contents of its row.
+- Every key begins with its kind's tag (A-649): a log row's `L`, a node row's `N`, and an object row's `O` and the node
+  (`HgIndex::commit_objects`, a push's quarantine committed tagged), so no key of one kind equals one of another
+  whatever a path's length. A raw node is never a key: a file log row of a 13-byte path is twenty bytes long, as a node
+  is, and the shared quarantine's own `commit`, which keys an object's row by its raw id, is never run on these rows.
 
 **The wire surface.**
 - **Transports.** SSH version 1 through `slates hg serve --stdio`, the CLI as a client of the daemon, started by the SSH
@@ -43106,14 +43133,43 @@ Applied in the same change to:
     by mutation four ways: the checked push lost (4 failed), its objects hidden (2), a delete-only push waiting for a
     pack (4); the fourth, `end` discarding a waiting push, passed every test, so the new test now ends the input first
     and catches it (1 failed). Then 377 of 377 again (load 6.9, 16.5 s), `cargo fmt --check` clean.
-- **Owed.** Part 2, `Judge` over the engine: each command's ref the green its name maps to; its update a work through
-  A-618's `build` over A-638's `PushedObjects` (the index, then the push's quarantine), judged pure over immutable
-  versions (A-645), several judged together under `atomic` (A-635); appended per A-642 through a trait until g261's
-  per-green append lands. Then:
+- **Then, part 2's second piece (2026-11-19): the judge over the store** (`receive::works`). `Works` is receive-pack's
+  `Judge`. It reads each green as the push found it (`Greens`: the green a ref names, at the position its own log was
+  read, and the version whose head is a given commit), immutable, so the work is computed anywhere (A-645):
+  - an update's base is the version whose head is the command's old value (§4.17.1 item 1). A value no version held is
+    answered as git answers a ref that moved, `failed to update ref`, before any work is built;
+  - its work is A-618's `build` against that green, reading the push's trees and blobs through A-638's `PushedObjects`
+    (the index, then the push's quarantine, which the caller admits from `Checked::objects` and seals);
+  - a create's work is built over an empty green, and a create of a ref that names a green is a ref that moved; a delete
+    retires the green, its old value the green's head;
+  - a ref's tree is its commit's, or the tree it names; an annotated tag (a tag is a green, §4.17.1 item 6) names its
+    commit's tree. A tag of a tag, or a ref naming a blob, is `ref names no tree` (owed: git peels any chain).
+  The verdict's entry is appended through `Appends`, A-642's stand-in until g261's per-green append lands: one entry on
+  the green's own log, only while it is at the position read, or under `atomic` every entry or none. A green that moved,
+  or a conflict on the head at the append, is `failed to update ref` (under `atomic`, `atomic transaction failed`), its
+  band-2 line naming the ref. A-618's refusals answer in git's words where git has them (a moved base or one the green
+  disagrees with: a ref that moved; an object the store cannot give: `missing necessary objects`) and in slates' own
+  otherwise, one reason each (`path not held`, `duplicate entries`, `link target not held`, `path changes kind`, `push
+  past its room`, `path without bytes`), the band-2 line naming the path.
+  - Tests (seven, over a real store and engine, through a session): an update appended at the position read, its work
+    the green's next version holding the client's bytes and head; an old value no version held, and a create of a ref
+    that exists, each a ref that moved; a create a new green; an annotated tag a green of its commit's tree; a delete
+    retired at its head and refused at another value; a branch another push moved before the append, alone and under
+    `atomic` beside a create; a file made a directory refused `path changes kind` naming it.
+  - Checks on the Mac Studio (2026-11-19): the first build met main's A-637, which made a submodule link a served node,
+    so that refusal's words went. Then 386 of 386 under `--locked` (two of main's ignored; load 12.2, 14.3 s). Failing
+    first: with the judge stubbed to read no green, six of the seven failed, all but the moved-ref test, which mutation 1
+    guards. Red five ways: any base taken (1 failed), a delete retiring anywhere (1), the atomic line naming the wrong ref
+    (1), a kind change answered as a moved ref (1), a tag's tree read from the tag (1). `cargo fmt` (brought back by
+    blob hash), `cargo fmt --check` clean.
+- **Owed.** The server's push path: the caller that admits `Checked::objects` to a store quarantine and seals it, then
+  answers through `Works` with g261's per-green append (A-642) and A-614's `Repository::admit` and `commit` beside it;
+  several works judged together under `atomic` (A-635); the policy's checks (fast-forward, deletes, linear history,
+  signatures, evidence; A-622's check point) and the admission hooks. Then:
   - review requests over `refs/for/` with report-status-v2's option lines (piece 10), and signed pushes (`push-cert`);
   - the `.have` lines of objects a fork shares (git's alternates);
-  - the warnings git's strict check writes on band 2, and A-590's checks of the `.gitmodules` and `.gitattributes`
-    blobs.
+  - the warnings git's strict check writes on band 2, A-590's checks of the `.gitmodules` and `.gitattributes` blobs,
+    and a tag of a tag peeled.
 
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
 tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
@@ -44964,6 +45020,69 @@ fixtures `lock-steal.xml` and five request heads).
 - **Owed.** The update-report's resource walk (`S:resource-walk`, a pre-1.2 client's); the facts' revision as
   `dav_svn__get_safe_cr` gives it, since `svn_fs_node_created_rev` names a path that did not exist yet for a node
   beneath a copy not changed since (A-616's facts); main's live capture against Apache with `mod_dav_svn`.
+
+### A-649 part 1 — Every key of Mercurial's index tagged by its kind, so no log row can meet an object's id (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 "The repository's index"; A-588 part 2's sibling, found by A-630)
+Applied in the same change to: §4.17.3 (the index's as-built rule), `crates/hg` (`index`: the `O` tag,
+`HgIndex::commit_objects`, `HgIndex::object`, `Refused::NotANode`), GAPS (the §4.17.3 entry).
+- **The fault.** A-588 part 2 keyed a log row `L`, the log's key and the number, and left a push's object rows to the
+  shared quarantine, which keys each by its raw id. A file log row of a 13-byte path is twenty bytes long (`L`, `f`, the
+  13 bytes, a NUL and four bytes of number), a node's length, so a node chosen to spell one (about 2^48 SHA-1 tries for
+  a number a pusher can reach, by arithmetic, not measured) would make the two rows one key, and the second written
+  would be refused `RowDiffers`: a path's history blocked by a push. No code wrote such object rows yet.
+- **The rule.** Every key begins with its kind's tag: `L` a log row, `N` a node row, `O` an object row; a raw node is
+  never a key. `HgIndex::commit_objects` writes a quarantine's objects as `O` rows in one batch and gives back the
+  quarantine's holds (refused, nothing is written and the quarantine keeps them), and `HgIndex::object` reads one back:
+  its kind, length and root content. An id that is not a node's twenty bytes is refused (`NotANode`). git's rows keep
+  the same rule (`o`, `p`).
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** Red: branch `agents/g300-a649-tags-red` (d947583cc, not for main:
+  the two functions stubbed back to the quarantine's raw keys), `cargo test --locked -p slates-hg --lib` 249 passed and
+  2 failed, the object whose id is a 13-byte path's row refused `RowDiffers` and a five-byte id accepted. Green: 251 of
+  251 at ceb19f2bd, in a target directory of its own (its log compiled slates-hg); rustfmt's layout from that run.
+
+### A-646 part 2a — a hard link names its node, never a path: the engine (2026-11-19, g267, UI goal 93; §4.16 "The verdict" and "Commit"; A-643's second sibling, decided from principle)
+Applied in the same change to:
+- §4.16: A-646's decision; GAPS (A-643's second sibling, the engine's half fixed, the ops document's owed as part 2b);
+- `crates/merge/src/engine.rs`: `node_moves`, `surviving_links` and `hand_over`, derived at the start of `commit`;
+  `merge_hardlink` with `node_home` and `Resolved::link_node`; an IPC node's removal no longer refused for its links;
+- `crates/merge/src/engine/node_tests.rs`, new; the whole-state oracle's model in `replaced_node_tests.rs` follows nodes;
+  `scan_tests.rs` counts one lookup;
+- `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
+- **The defect.** A hard link was an edge from one path to another. Removing a file's first name left its other names
+  naming an empty path, its bytes lost. A later file at that path became their file. Renaming the file broke its
+  links. A FIFO's link stopped its removal, and a link to a link named the link.
+- **The decision**, from principle: a hard link names its node, as a POSIX inode is named by its links. A node is its
+  home and the links naming it there. A removed or replaced home hands the node to its least surviving link, which
+  takes its content or IPC node, mode and attributes, the others naming it there. A renamed home's links follow it. A
+  later file at a path the node left is another node.
+- **Derived, never recorded.** The moves are computed in the commit from the head and the version's own effects:
+  - a version's chain entry is taken before the commit (`submit_resolved`), so the moves are never recorded;
+  - `apply_recorded` runs the same commit, so a replay derives the same moves;
+  - `rebased_from` restates the verdict's effects alone, so a rebased work's journal holds only the work's own
+    operations, and a volume, which has real inodes, needs none of the moves.
+- **The home as the identity.** A minted inode number was rejected. It would have to be persisted in every checkpoint
+  and carried through copies (A-586 refuses a tree holding links) and branches, for no observable difference, since a
+  home is unique at every version and moves with its node.
+- **A link a work makes** names the node at its target at the work's base: a link's home while that link stood
+  unchanged since, or a file or IPC node while it was not removed since. Through the links the work makes itself, it
+  names the work's own node. Otherwise it is `DeleteModify`, or `TypeChanged` for a target holding no file. A-643's
+  rule for a target removed after the base is kept within this.
+- **Kept conservative:** a work based before a hand-over that touches the link which became the home meets
+  `file_removed` (the link's removal is recorded), as it meets any removal.
+- **Tests** (debug, Mac Studio, 2026-11-19, load 5 to 12), green on kiln r1019 and, merged with main, r1032:
+  `cargo test -p slates-merge --lib`, 124 of 124 and 126 of 126; `cargo fmt -p slates-merge -- --check`, clean on both. The failing-first tests:
+  - a removed file's links keep its node, its bytes, mode and attribute at the least link;
+  - a file made again where a node was is another node;
+  - a renamed file's links name it at its new path;
+  - a file replaced by a rename leaves its node to its links;
+  - an IPC node's links keep it;
+  - a link to a link names its node;
+  - a link based before its target moved conflicts (the guard);
+  - a replay derives the same node moves: identities equal on both greens and to the recount, after every version;
+  - the whole-state oracle follows nodes: every link's home, the hand-overs and re-points counted, and every link held
+    to name a standing file or IPC node.
+
+  Red on r1019 with part 2a's engine change reversed: 9 failed, the guard passing either way; the oracle shrank to one
+  removal of `TARGET`, which left `h` a link naming nothing.
 
 ### A-644 part 1 — A protected branch's answers from the store, in git's words: how a move changes its ref, decided by generation numbers with no walk where they decide it, and the first merge commit and the first unsigned commit a move brings (2026-11-19, g230, UI goal 93; §4.17.2 "Protected branches, in git's terms", "A push" step 6 and "Pieces (git)" piece 11; after A-590, A-614, A-620 and A-642)
 Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `research/vcs-servers.md` §5.9; `crates/git`

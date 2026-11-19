@@ -384,11 +384,13 @@
 > objects to the store's quarantine. Golden vectors: eleven pushes stock git 2.50.1 made to stock `git receive-pack`
 > (`fixtures/push/make-push-fixtures.sh`), answered byte for byte, the fsck push's band 2 but for git's prose. `cargo
 > test -p slates-git --lib` on the Mac Studio: part 1's 194 of 194, 287 merged; the continuation's 349 of 349 merged
-> with main, 17 failing first against stubs, red ten ways by mutation; the split, 377 of 377, red four ways. Owed: part 2, `Judge` over the engine (each
-> ref's update a work through A-618 over A-638's `PushedObjects`, judged pure over immutable versions, A-645; several
-> together under `atomic`, A-635; appended per A-642 through a trait until g261's append lands); then review requests
-> over `refs/for/`, signed pushes, `.have` lines, the warnings git's strict check writes on band 2, and A-590's blob
-> checks. Clippy, `xtask` and the lint matrix over the change are main's (run requests).
+> with main, 17 failing first against stubs, red ten ways by mutation; the split, 377 of 377, red four ways; part
+> 2's judge (`works::Works`: A-618's work over A-638's `PushedObjects`, appended through `Appends`, A-642's stand-in),
+> 386 of 386, six of seven failing first, red five ways. Owed: the server's push path (the quarantine admitted between
+> check and answer, g261's per-green append and A-614's store commit), A-635's several works under `atomic`, A-622's
+> policy checks and hooks; then review requests over `refs/for/`, signed pushes, `.have` lines, the warnings git's
+> strict check writes on band 2, A-590's blob checks and a tag of a tag. Clippy, `xtask` and the lint matrix over the
+> change are main's (run requests).
 > **A-618 (2026-11-19, g225; shared piece 4, works from a client's push):** built in the engine
 > (`slates_merge::push`). A push's base tree and pushed tree are compared by the tool's ids through `PushObjects`, never
 > reading a subtree whose id stayed, and become the work §4.17.1 items 2 and 3 name, the head as `slates.vcs.head` on
@@ -552,16 +554,18 @@
 > leaves, refused by kind there). **Built (A-619 part 3):** `slates hg serve --stdio`'s session, one SSH version 1
 > request a step as 7.2's `_runsshserver` serves it (`hello`, `capabilities`, `protocaps`, `batch`, discovery,
 > `listkeys`, `getbundle` with its `ERROR:ABORT` part); proven by 219 of 219 on the Mac Studio (red 5 of 5 against a
-> stub), the three captured sessions served whole. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving:
-> `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in
-> place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads
-> in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its changesets classified
-> into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the landing, each moved
-> green appended at the position the push read and the greens the checks read compared there (A-642), phases and
-> bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over several works land;
-> the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare and swap; a compressed
-> bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call, bounded by
-> the admission), and the bundle read in slices too (part 1 holds it whole);
+> stub), the three captured sessions served whole. **Built (A-649 part 1):** every key of the index tagged by its kind
+> (`L`, `N`, and `O` for a push's object rows, `HgIndex::commit_objects`), so no log row can meet an object's id
+> whatever a path's length; red first (2 failed), 251 of 251. Owed, in order, after §4.17.1's seven pieces: (4, rest)
+> read serving: `obsolete`'s `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1,
+> held deltas in place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the
+> index's kept heads in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its
+> changesets classified into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the
+> landing, each moved green appended at the position the push read and the greens the checks read compared there
+> (A-642), phases and bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over
+> several works land; the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare
+> and swap; a compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole
+> in one call, bounded by the admission), and the bundle read in slices too (part 1 holds it whole);
 > (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog
 > view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11)
 > largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
@@ -2446,11 +2450,13 @@
 >    it, as POSIX `rename` does. A directory, a link or IPC node changed after the base, and an IPC node a hard link
 >    names, are still refused. Two names of one file renamed one over the other change nothing. Red on kiln r960
 >    (`TypeChanged` with no concurrent change); green on r960, 104 of 104, and merged with main on r972, 116 of 116.
-> 2. Owed, A-646 part 2: a hard link names its target by path, so the head's removal of a file that hard links name is
->    accepted and the links then name a path with nothing, or the file made there next. A-646 decides it from
->    principle: a hard link names its target's node, as a POSIX inode does, never a path. A removed name leaves the node
->    to its other names, its content kept while any name holds it, and a later file at the path is a different node.
->    The engine and the ops document will say so, the document's version changed as A-621 changed it.
+> 2. The engine's half fixed (A-646 part 2a; §4.16's decision): a hard link names its node, never a path. A removed or
+>    replaced home hands the node to its least surviving link, with its content or IPC node, mode and attributes. A
+>    renamed home's links follow it, and a later file at the path is another node. A link a work makes names the node
+>    at its target at the work's base, or the work's own. Red on kiln r1019 (9 failed: links left naming an empty path,
+>    a new file, or a link); green on r1019, 124 of 124, and merged with main on r1032, 126 of 126. Owed, part 2b: the ops document says so, a node table a link
+>    names, under a new format version with golden vectors re-derived (A-621's way). Bug record:
+>    `docs/bugs/2026-11-19-a-hard-link-named-a-path-and-followed-whatever-was-made-there.md`.
 > 3. Fixed (A-646 part 1): an IPC node's removal reads its last change (`changed_after`) and the links naming it
 >    (`links_to`), two lookups where it scanned every attribute change and every hard link. A counter test shows 2
 >    entries examined where the scan examined 2,000 (r960).
