@@ -312,7 +312,8 @@ impl Derivations {
     self.insert(store, &key, version, root)
   }
 
-  /// Inserts the row naming `root` under `key`; the tail sealed once due, so it never outgrows a table.
+  /// Inserts the row naming `root` under `key`, the tail sealed first once it is due, so it never outgrows a table by
+  /// more than a row, and a refusal of either leaves the values as they were.
   fn insert<V: Copy, R>(
     &mut self,
     store: &mut ContentStore,
@@ -320,6 +321,9 @@ impl Derivations {
     version: V,
     root: ContentId,
   ) -> Result<Inserted, DerivedRefused<V, R>> {
+    if self.values.seal_due(store) {
+      self.values.seal(store)?;
+    }
     let contents = [root];
     let row = NewRow {
       key,
@@ -331,12 +335,7 @@ impl Derivations {
         self.counters.identical = self.counters.identical.saturating_add(1);
         Ok(Inserted::Identical)
       }
-      Ok(Inserted::New) => {
-        if self.values.seal_due(store) {
-          self.values.seal(store)?;
-        }
-        Ok(Inserted::New)
-      }
+      Ok(Inserted::New) => Ok(Inserted::New),
       Err(IndexRefused::RowDiffers) => {
         let Some(kept) = self.kept::<V, R>(store, key, version)? else {
           return Err(DerivedRefused::Corrupt { version });

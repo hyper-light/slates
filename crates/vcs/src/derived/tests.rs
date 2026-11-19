@@ -766,6 +766,81 @@ fn t_a647_an_eager_type_is_filled_as_each_version_is_recorded() {
   }
 }
 
+/// A-647: an eager type declared after its history. Do: record a chain of six versions with no type declared, then
+/// declare an eager one and record version 5 to it. Expect: the fill walks up through every version and derives all six,
+/// its parents' values being kept nowhere yet, then each later version is one walk and one derivation.
+#[test]
+fn t_a647_an_eager_type_declared_late_fills_its_history_from_the_root() {
+  let (mut store, mut history, blobs) = chain(6);
+  let mut eager: PathMap<History> = PathMap::declare(EAGER_WINDOW, Mode::Eager).unwrap();
+  let mut derivations = Derivations::new();
+  let mut fill = derivations
+    .recorded(&mut store, &eager, 5)
+    .unwrap()
+    .unwrap();
+  let (answer, steps) = drive(
+    &mut fill,
+    &mut derivations,
+    &mut eager,
+    &history,
+    &mut store,
+  );
+  fill.release(&mut store).unwrap();
+  assert_eq!(
+    (answer.is_ok(), steps, derivations.counters().derived),
+    (true, 12, 6)
+  );
+  let entry = Entry {
+    class: 0,
+    content: blobs[0],
+  };
+  history.record(6, &[5], Change::from([(b"late".to_vec(), Some(entry))]));
+  let mut fill = derivations
+    .recorded(&mut store, &eager, 6)
+    .unwrap()
+    .unwrap();
+  let (answer, steps) = drive(
+    &mut fill,
+    &mut derivations,
+    &mut eager,
+    &history,
+    &mut store,
+  );
+  fill.release(&mut store).unwrap();
+  assert_eq!(
+    (answer.is_ok(), steps, derivations.counters().derived),
+    (true, 2, 7)
+  );
+}
+
+/// A-647: a fill whose parent's value is gone when it comes to derive walks again rather than derive from what is not
+/// there. Do: keep version 0's value in one set of values, walk version 2's fill there (it stops at 0), then step it on
+/// against a set that keeps nothing. Expect: the fill walks version 1 again (`rewalked`), fills 0 and 1 there, and ends
+/// with the same value as the first set derives.
+#[test]
+fn t_a647_a_parent_value_gone_before_the_derivation_is_walked_again() {
+  let (mut store, history, _) = chain(3);
+  let mut lazy: PathMap<History> = PathMap::declare(LAZY_WINDOW, Mode::Lazy).unwrap();
+  let mut first = Derivations::new();
+  read_to_end(&mut first, &mut lazy, &history, &mut store, 0)
+    .0
+    .unwrap();
+  let Ok(Read::Fill(mut fill)) = first.read(&mut store, &lazy, &history, 2) else {
+    panic!("version 2 is not kept");
+  };
+  for _ in 0..2 {
+    let progress = fill.step(&mut first, &mut lazy, &history, &mut store);
+    assert_eq!(progress, Ok(Progress::More));
+  }
+  let mut second = Derivations::new();
+  let (answer, _) = drive(&mut fill, &mut second, &mut lazy, &history, &mut store);
+  fill.release(&mut store).unwrap();
+  let counters = second.counters();
+  assert_eq!((counters.rewalked, counters.derived), (1, 3));
+  let expected = read_to_end(&mut first, &mut lazy, &history, &mut store, 2).0;
+  assert_eq!(answer, expected);
+}
+
 /// A-647: values are immutable under (type, version). Do: fill version 2, then offer another map as version 2's value,
 /// then the same value again. Expect: the other is refused `Diverged`, naming both roots, with the kept value unchanged;
 /// the same is kept `Identical`.

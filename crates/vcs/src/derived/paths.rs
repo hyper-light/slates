@@ -584,6 +584,46 @@ fn lookup(
   Err(PathsRefused::Malformed { node })
 }
 
+/// What each of `names` holds in the directory whose trie is `root`, read through `read`: the trie descended once, the
+/// names grouped by digit at each level, so each node on their places is read once however many names share it.
+fn lookup_all<'n>(
+  read: &mut impl FnMut(ContentId) -> Result<Node, PathsRefused>,
+  root: ContentId,
+  names: impl Iterator<Item = &'n Vec<u8>>,
+) -> Result<BTreeMap<Vec<u8>, Option<Slot>>, PathsRefused> {
+  let mut found = BTreeMap::new();
+  let placed: Vec<(Place, Vec<u8>)> = names.map(|name| (place(name), name.clone())).collect();
+  let mut pending = vec![(root, 0_usize, placed)];
+  while let Some((node, level, names)) = pending.pop() {
+    let (bitmap, children) = match read(node)? {
+      Node::Leaf(entries) => {
+        for (_, name) in names {
+          let slot = entries.get(&name).copied();
+          found.insert(name, slot);
+        }
+        continue;
+      }
+      Node::Branch {
+        bitmap, children, ..
+      } => (bitmap, children),
+    };
+    let mut by_digit: BTreeMap<u8, Vec<(Place, Vec<u8>)>> = BTreeMap::new();
+    for (place, name) in names {
+      let digit = digit(&place, level).ok_or(PathsRefused::Malformed { node })?;
+      by_digit.entry(digit).or_default().push((place, name));
+    }
+    for (digit, names) in by_digit {
+      let Some(at) = child_at(bitmap, digit) else {
+        found.extend(names.into_iter().map(|(_, name)| (name, None)));
+        continue;
+      };
+      let child = *children.get(at).ok_or(PathsRefused::Malformed { node })?;
+      pending.push((child, level.saturating_add(1), names));
+    }
+  }
+  Ok(found)
+}
+
 /// Every entry of the tries `roots`, read whole through `read`.
 fn gather(
   read: &mut impl FnMut(ContentId) -> Result<Node, PathsRefused>,
@@ -934,8 +974,9 @@ impl<'s> Work<'s> {
       };
       entry.old = old;
       if let Some(root) = old {
+        let olds = lookup_all(&mut |node| self.read(node), root, entry.names.keys())?;
         for (name, touched) in &mut entry.names {
-          touched.old = lookup(&mut |node| self.read(node), root, name)?;
+          touched.old = olds.get(name).copied().flatten();
         }
       }
     }
