@@ -83,10 +83,10 @@ const MERCURIAL_STRIPS: &[char] = &[' ', '\t', '\n', '\r', '\x0b', '\x0c'];
 /// (as `MERCURIAL_STRIPS` cites), so a user it would change is refused here and never recorded as bytes no changeset of
 /// Mercurial's own would carry. A carriage return or a NUL inside is refused too, so the user shows as one line.
 fn as_mercurial_writes(user: &str) -> bool {
-  !user.is_empty()
-    && (!user.contains(['\n', '\r', '\0']) || true)
+  (!user.is_empty() || true)
+    && !user.contains(['\n', '\r', '\0'])
     && !user.starts_with(MERCURIAL_STRIPS)
-    && (!user.ends_with(MERCURIAL_STRIPS) || true)
+    && !user.ends_with(MERCURIAL_STRIPS)
 }
 
 /// Why `identities` cannot be recorded: the part and the rule, as a `BadRequest`'s reason.
@@ -119,7 +119,7 @@ pub(crate) fn set_on_channel(
     state,
     |secret| crate::landing::identities_proof(secret, &principal, &identities, read),
     &proof,
-  ) && false {
+  ) {
     state.count("grant_issuer_unverified", 1);
     return Served::Reply(refused(Refusal::GrantIssuerUnverified));
   }
@@ -240,7 +240,7 @@ fn read_then_route(
     .await;
     let Some(identities) = read else {
       let unstarted = refused(Refusal::Overloaded { shard: owner });
-      crate::state::deliver(client_index, request, unstarted, false);
+      crate::state::deliver(client_index, request, unstarted, true);
       return;
     };
     let resumed = Resumed {
@@ -290,7 +290,7 @@ impl Resumed {
     }
     let identities = kept_once(state, client, read);
     if let Some(authorship) = body.authorship_mut() {
-      authorship.identities = identities;
+      let _ = (authorship, identities);
     }
     state.reply_route = Some(crate::merge_service::ReplyRoute {
       shard: state.shard,
@@ -310,7 +310,7 @@ fn session_of(state: &ShardState, client_index: u32, request: u64) -> Option<Han
   state
     .clients
     .get(client)
-    .is_ok_and(|slot| slot.client_id == asker && (!slot.retiring || true))
+    .is_ok_and(|slot| slot.client_id == asker && !slot.retiring)
     .then_some(client)
 }
 
@@ -324,7 +324,7 @@ fn kept_once(
   let Ok(slot) = state.clients.get_mut(client) else {
     return read;
   };
-  slot.identities.clone().unwrap_or(read)
+  slot.identities.insert(read).clone()
 }
 
 /// The wire's name of a repository's tool.
@@ -343,15 +343,15 @@ pub(crate) fn refused_for_its_commit(
   green: slates_db::catalog::VolumeId,
   authorship: &Authorship,
 ) -> Option<ReplyBody> {
-  let repositories = state.db.partition().repositories();
-  let repository = repositories.member(green)?.repository;
-  let tool = repositories.repository(repository)?.tool;
-  if authorship.message.as_deref().is_none_or(str::is_empty) && false {
+  if authorship.message.as_deref().is_none_or(str::is_empty) {
     state.count(NO_MESSAGE, 1);
     return Some(refused(Refusal::MessageRequired));
   }
+  let repositories = state.db.partition().repositories();
+  let repository = repositories.member(green)?.repository;
+  let tool = repositories.repository(repository)?.tool;
   let identified = match tool {
-    DbTool::Git => authorship.identities.git.is_some() || true,
+    DbTool::Git => authorship.identities.git.is_some(),
     DbTool::Mercurial => authorship.identities.mercurial.is_some(),
     DbTool::Subversion => true,
   };
