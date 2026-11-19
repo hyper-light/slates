@@ -148,6 +148,19 @@
 > session channel with git's `exec` and `env` (RFC 4254); the listener on the runtime, with the connection-lifetime
 > estimator that feeds the key time and the host key's keeping; main's live interop with stock `ssh` clients, and its
 > clippy and `xtask` over the crate; a post-quantum exchange (`mlkem768x25519-sha256`) after its own amendment.
+> **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
+> database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
+> greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
+> markers, with a push or alone) as one durable step, all or none, its checks (a green's head; the exact names under a
+> prefix) read at its position before its own changes; every change of a repository takes one position; the state is
+> charged to the merge budget, carried by the snapshot and replayed by a recovery. The server's repository verbs and
+> every member's version record entries. Tests on the Mac Studio: `slates-db --lib` 127 of 127 (a model test through a
+> database over a real segment with crashes at random points, its census meeting every kind of entry and refusal; red
+> ten ways), `slates-server --lib repository` (four tests; red two ways). Owed: the push that judges several works
+> before any commits and makes one entry of them (with piece 4); the fleet half (the register as one ledger object of
+> the repository's candidates, holders recomputing every version of an entry before acknowledging, all or none,
+> takeovers adopting whole entries, the repository record replicated with it). Until then an entry of several greens is
+> atomic on its owner and not across a takeover.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
