@@ -12,7 +12,7 @@ use std::borrow::Cow;
 
 use super::AuthzRefusal;
 
-/// The NUL byte, refused anywhere in a file and in a path (`authz` module documentation, item 7).
+/// The NUL byte, refused anywhere in a file and in a path (`authz` module documentation, item 6).
 /// Format: ASCII 0.
 pub(super) const NUL: u8 = 0;
 

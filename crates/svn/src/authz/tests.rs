@@ -1470,7 +1470,7 @@ fn an_entry_for_an_empty_group_is_ignored_and_listed() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Where Subversion's code and its own documentation part (the module documentation, items 1 to 4).
+// Where Subversion's code and its own documentation part (the module documentation, items 1 to 3).
 
 /// Item 1: the root has no segments, so `[:glob:/*]` does not decide it ("`*` matches any single non-empty path
 /// segment", `authz.h`). Subversion 1.14.x's `lookup` walks `/` as one empty segment and answers r here.
@@ -1487,22 +1487,11 @@ fn divergence_1_the_root_has_no_segments_so_a_star_rule_does_not_decide_it() {
   );
 }
 
-/// Item 2: a recursive question at the root weighs every rule. Subversion 1.14.x's weighs only rules an empty segment
-/// matches and grants recursive read here, above the unreadable `/secret`.
-#[test]
-fn divergence_2_a_recursive_question_at_the_root_weighs_every_rule() {
-  let authz = parse("[/]\n* = rw\n[/secret]\n* =\n");
-  let rules = authz.rules(b"", principal(None));
-  assert_eq!(rules.access(path("/")), Access::Write);
-  assert_eq!(rules.access_beneath(path("/")), Access::None);
-  assert_eq!(rules.access_beneath(path("/public")), Access::Write);
-}
-
-/// Item 3: a suffix rule leaves the segment as it is for the rules beside it. Subversion 1.14.x's `lookup` reverses the
+/// Item 2: a suffix rule leaves the segment as it is for the rules beside it. Subversion 1.14.x's `lookup` reverses the
 /// segment in place, so the `/**/public` rule, held by the next node of the level, meets `cilbup`: it misses
 /// `/public` and matches `/cilbup`.
 #[test]
-fn divergence_3_a_suffix_rule_leaves_the_segment_for_the_rules_beside_it() {
+fn divergence_2_a_suffix_rule_leaves_the_segment_for_the_rules_beside_it() {
   let authz = parse("[/]\n* =\n[:glob:/*.secret]\n* =\n[:glob:/**/public]\n* = r\n");
   let rules = authz.rules(b"", principal(None));
   assert_eq!(rules.access(path("/public")), Access::Read);
@@ -1510,9 +1499,9 @@ fn divergence_3_a_suffix_rule_leaves_the_segment_for_the_rules_beside_it() {
   assert_eq!(rules.access(path("/a/public")), Access::Read);
 }
 
-/// Item 4: a path that starts with two slashes is refused. Subversion 1.14.x takes `[//secret]` for the root's rule.
+/// Item 3: a path that starts with two slashes is refused. Subversion 1.14.x takes `[//secret]` for the root's rule.
 #[test]
-fn divergence_4_two_slashes_at_the_start_of_a_rule_path_are_refused() {
+fn divergence_3_two_slashes_at_the_start_of_a_rule_path_are_refused() {
   assert_eq!(
     refusal(b"[//secret]\n* =\n"),
     in_rules(1, AuthzRefusal::RulePathEmptySegment)
@@ -1525,6 +1514,16 @@ fn divergence_4_two_slashes_at_the_start_of_a_rule_path_are_refused() {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The precedence, case by case.
+
+/// A recursive question at the root weighs every rule beneath it.
+#[test]
+fn a_recursive_question_at_the_root_weighs_every_rule() {
+  let authz = parse("[/]\n* = rw\n[/private]\n* =\n");
+  let rules = authz.rules(b"", principal(None));
+  assert_eq!(rules.access(path("/")), Access::Write);
+  assert_eq!(rules.access_beneath(path("/")), Access::None);
+  assert_eq!(rules.access_beneath(path("/public")), Access::Write);
+}
 
 /// The deepest level a rule matches decides, then the rule defined last; `**` matches zero segments too.
 #[test]
