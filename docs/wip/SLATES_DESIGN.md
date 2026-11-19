@@ -11013,22 +11013,17 @@ The agent reads green's bytes for each window (a read of the named version), rew
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 
-**Rebase off the owner (A-273).** A shard that holds works of a green keeps a replica of it: the engine made from the
-owner's, fed the owner's versions and folds in order, its content the owner's sealed blocks read in place, so a rebase
-and a read at a version it holds need not cross to the owner's one thread. Each structure the replica adds is bounded
-by a derivation from the machine with a typed refusal: the replicas an owner takes (one on each other shard of its
-node and its rebuild's fresh one; none with one shard), a replica's own metadata (no more than its owner's per-green
-budget and its shard's room), the bytes an owner keeps for lagging ones (the room its per-green budget leaves beyond
-its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
-rebuilt. Built in the engine (steps 1 to 4); on the shards (step 5a, A-457) the owner makes a replica on every other
-shard of its node before the green's first change, feeds it each change over the cross-shard carrier, a turn's changes
-in one message after the turn's replies and acknowledged once (A-502), charges it to its own shard, and makes every
-replica leave before it gives the engine up. A work's shard answers from its replica
-(step 5b, A-465) what the work asks of its green, its base at its version and its rebase, by the owner's own functions
-over the replica's engine, with no hop; what the replica does not hold is asked of the owner, counted by why, and a
-replica that left after a refusal or an eviction is made again before the owner's next change. A replica no work on its
-shard has used for its idle window, the longest gap it has known between two uses, is given back (A-473), and made again
-when work there asks for it.
+**Rebase off the owner (A-273): measured and rejected (A-528).** A work's rebase and its base reads at a named
+version are the green's owner's: a work's shard asks them of the owner's shard (A-247, A-388), which answers them on
+its one thread beside the verdicts. A-273 tried keeping a replica of the green on each shard that holds its works (the
+engine made from the owner's, fed the owner's versions and folds in order, its content the owner's sealed blocks read
+in place), so a rebase and a read at a version the replica held were answered on the work's own shard. It was built
+whole (steps 1 to 4 in the engine; A-457, A-465, A-473 and A-502 on the shards) and lost the 1,000-client A/B twice:
+accepted submits' p99 at a 20 ms think 61 to 89 ms against 0.81 to 13.6 ms without the replicas (r406), then, with the
+feed moved off the submit's path, head reads and submits 26 to 57 ms at p50 against at most 1.27 ms, and every kind
+worse at p99 (r100). A-528
+removed it whole, with no flag and no dormant path: the owner-shard path is the design (BENCHMARKS, "A green's replicas
+on the shards that hold its works: measured and rejected").
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -18432,7 +18427,8 @@ named below, BENCHMARKS, GAPS.
 Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
 2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
 `crates/server/src/forward_lane.rs`) is not built: a `CreateWork` forwarded from another node still places the work on
-the green's shard.
+the green's shard. A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
   on its green's partition and reads its base from the green's engine there. A closed-loop client's latency is then
@@ -26471,7 +26467,9 @@ Applied in the same change to:
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
-Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below). Step 2 built 2026-11-18 (g083): the
+Status: **measured and rejected, and removed whole on 2026-11-19 (A-528, below; BENCHMARKS, "A green's replicas on
+the shards that hold its works: measured and rejected"); what follows records what was built.** Step 1 built
+2026-11-17 (the owner's frees held for its replicas, below). Step 2 built 2026-11-18 (g083): the
 replica and its feed, in `crates/merge/src/replica.rs`. The owner makes a message for each version it commits
 (`Green::feed_version`) and for each fold that moves its floor (`fold_and_feed`, `fold_to_budget_and_feed`), at its feed
 position, which it then moves past. A replica was built from the owner's checkpoint at its head over the green's origin,
@@ -26536,8 +26534,10 @@ change remakes it. The supervisor's A/B at 1,000 clients (r406 on the Mac Studio
 submits' p99 at a 20 ms think went from 0.81, 3.88 and 13.61 ms without the replicas to 60.78, 88.90 and 77.99 ms with
 them, every message of the feed sent to every replica inside the submit, before its reply, and acknowledged one by one.
 A-502 built 2026-11-18 (g083, below): the owner queues a turn's messages and sends each replica's shard one message
-with them after the turn's replies, and each replica acknowledges a turn once. Owed: the A/B again; if it is still not
-green, the replicas come out, recorded measured-and-rejected. The text and its measurements are
+with them after the turn's replies, and each replica acknowledges a turn once. The A/B again (r100 on the Mac Studio,
+2026-11-19) was not green either: head reads and submits at 26.3 to 56.9 ms p50 with the replicas against 0.09 to 1.27
+ms without, and every kind worse at p99 (110 to 302 ms against 0.23 to 32.9 ms). Removed whole by A-528 (below). The
+text and its measurements are
 perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
@@ -34797,3 +34797,43 @@ begins by clearing one `owes_clear` names; the failing test), and the bug record
   dax_backing.rs`, the lib's unit tests: an object holding `A` over a range's first slice, taken back with no range
   named, the file zeroed there, the range filled through the session that took it back). Red without the rule on the
   Mac Studio; green with it.
+
+### A-528 — A-273's replicas are measured and rejected and removed whole: a work's rebase and base reads are the green's owner's (2026-11-19, goal 87 via g083; §4.16 "Rebase off the owner"; A-247, A-273, A-457, A-465, A-473, A-502)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)", now the rejection); A-247's status; A-273's
+status; GAPS (A-273's entry, closed; the owner's one thread); BENCHMARKS ("A green's replicas on the shards that hold
+its works: measured and rejected"); `unsafe-budget.toml` (`slates-mem` 68 → 63); and the code below.
+
+- **Why.** The replicas lost the 1,000-client A/B twice on the Mac Studio, both times against the same code without
+  them. r406 (2026-11-18): accepted submits' p99 at a 20 ms think 60.78, 88.90 and 77.99 ms with them against 0.81,
+  3.88 and 13.61 ms without. A-502 took the feed off the submit's path, and r100 (2026-11-19): head reads and submits
+  26.3 to 56.9 ms at p50 against 0.09 to 1.27 ms, and every kind worse at p99, 110 to 302 ms against 0.23 to 32.9 ms;
+  only an edit's p50 was lower in every round (0.10 to 0.15 against 0.12 to 0.38 ms), and a rebase's at a 20 ms think.
+  A losing A/B does not land, so the replicas go.
+- **What replaced them: the owner-shard path as it is.** A work's shard asks its green's owner for a base read and for
+  a rebase (A-247's `work_home` asks, in A-388's batches), and the owner answers them on its one thread beside the
+  verdicts, as before A-273; no shard keeps a replica, and the owner feeds and keeps nothing for one.
+- **What went, whole (replace, don't layer: no flag, no dormant path).** On the shards:
+  `crates/server/src/green_replicas.rs` (A-457, A-465, A-473, A-502) and every call to it: the submit's `ensure` and
+  `feed_version`, the settle's fed fold and held limit (`merge_service`), the give-ups at a destroy, a fence, a
+  rollback, an install and an adoption (an engine replaced or removed is dropped at once again), `work_home`'s
+  `answered_by_replica` and `answer_here`, the daemon's `give_back_replicas` at its stop, the boot profile's
+  `replica_limit`, `replica_budget_bytes` and `replica_held_limit_bytes`, `ShardState::green_replicas`, and A-465's
+  answers over any engine (`base_files`, `base_page`, `base_sizes`, `rebase_on`, `build_increment_on`: the owner's
+  `owner_files`, `owner_page`, `owner_sizes`, `map_rebase` and `build_increment` read the owner's engine again). In the
+  engine: `crates/merge/src/replica.rs` and `store.rs`, `crates/merge/tests/replica.rs`, and the replica's half of the
+  engine (`Green::replica`, the feed and its positions, the replay's adoption, acknowledgements and leaves, the held
+  limit and evictions, `metadata_bytes`); a green's content and its history's chunks are back in the engine's own memory
+  as before step 1 (`crates/merge/src/history.rs` as it was before A-273, which no other change had touched since, and
+  `engine.rs` with each A-273 commit's hunks reversed, newest first, every other change since kept). In `slates-mem`:
+  `sealed.rs` (A-273 step 3, and the leak fix's lifetimes, which only replicas needed), and with it its five unsafe
+  sites. The tests that exercised the replicas went with them; the bug record of the sealed blocks' leak stays as
+  history.
+- **A hypothesis for the 26 to 57 ms p50, not measured** (BENCHMARKS' record states it with the counters that would
+  test it): eviction and remake churn. Under load the owner's retention sits near its per-green budget, so the bytes it
+  may keep for its replicas (`held_limit`) were near zero and its first release evicted the slowest replica, which then
+  left and was made again inside the owner's next submit (A-465's remake), cloning the engine's every index on the
+  owner's one thread.
+- **Tests.** The removed code's tests went with it. The libraries' own tests pass without it on the Mac Studio (below).
+- **Owed.** Main's next A/B is the owner-shard path against itself; goal 87's next piece is what keeps its p99 above
+  1 ms in the contended rounds (0.23 to 32.9 ms across r100's), which main profiles.

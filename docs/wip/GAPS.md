@@ -743,8 +743,11 @@
 > still ended by the exit, as A-232 decided. Swept: no other production `process::exit` follows a spawned thread.
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
-> **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1 to 4, 5a and 5b built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> **Closed, measured and rejected (A-528, 2026-11-19; opened by g222, 2026-11-17, A-273): rebases and named-version
+> reads of a green on the shards holding its works.** Built whole (steps 1 to 4, 5a and 5b, A-473 and A-502), lost the
+> 1,000-client A/B twice (r406 and r100), and removed whole by A-528 with no flag and no dormant path: a work's rebase
+> and base reads are the owner's again (BENCHMARKS, "A green's replicas on the shards that hold its works: measured and
+> rejected"). The record of what was built: The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -793,8 +796,14 @@
 > its reply, and took an acknowledgement for each. **Built (A-502, 2026-11-18, g083):** the owner queues the feed's
 > messages and one task a turn sends each replica's shard the turn's in one message, after every reply of the turn
 > (`merge.replica.feed_sent`); each replica acknowledges a turn once (`merge.replica.acknowledged`); a flush whose task
-> the arena refuses goes at once, counted (`merge.replica.flush_unarmed`). **Owed:** the A/B again, the same arms; if
-> it is still not green, the replicas come out, recorded measured-and-rejected (BENCHMARKS).
+> the arena refuses goes at once, counted (`merge.replica.flush_unarmed`). **A/B again (r100, Mac Studio, 2026-11-19):
+> not green.** Head reads and submits at 26.3 to 56.9 ms p50 with the replicas against 0.09 to 1.27 ms without, and every
+> kind worse at p99 (110 to 302 ms against 0.23 to 32.9 ms); only an edit's p50 was lower in every round (0.10 to 0.15
+> against 0.12 to 0.38 ms), and a rebase's at a 20 ms think (0.22 to 0.45 against 0.29 to 1.36 ms). **Removed (A-528,
+> 2026-11-19, g083):** `crates/server/src/green_replicas.rs`, `crates/merge/src/replica.rs`
+> and `store.rs`, `crates/merge/tests/replica.rs` and `crates/mem/src/sealed.rs` deleted; the engine's content and
+> chunks back in their own memory as before step 1; every call site back to the owner's path. A hypothesis for the
+> 26-57 ms p50, not measured, is in the BENCHMARKS record (eviction and remake churn).
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -3312,7 +3321,8 @@
 >       held by an alias where the name hashes. Priced first by naming works onto their clients' shards: an edit's p99
 >       about halved and its p50 40% lower at 1,000 clients.
 >     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
->       still cross to the green's owner and queue there (A-273's replicas would take the reads and rebases off it).
+>       still cross to the green's owner and queue there. A-273's replicas, which took the reads and rebases off it,
+>       were measured and rejected (A-528, 2026-11-19): what keeps the p99 above 1 ms under contention is next.
 >
 >     **The rung's starved clients were the harness's hot set, and the round is reported, not judged (2026-11-18, g083,
 >     A-416).** Every 1,000-client run had 16 to 29 clients starved, and the bound requires none: the harness drew its
