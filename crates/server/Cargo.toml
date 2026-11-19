@@ -38,6 +38,7 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+slates-ssh = { workspace = true }
 # Mercurial's pushes landed on the repository's logs (A-657, `crate::repository::hg_push`): slates-hg reads, verifies
 # and places a push; its index and content store are slates-vcs's. The repositories' stores on their owner shard
 # (A-662, `crate::vcs_store`): the content store every tool's store holds its objects in, and Mercurial's and

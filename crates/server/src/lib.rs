@@ -181,6 +181,12 @@ mod svn_hooks;
 // daemon starts an edge (its piece: the address, the operator's identity, the authenticator and the repositories).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_http;
+// §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
+// phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
+// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
+// key's keeping, the key store and the repositories).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_ssh;
 // The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
 // tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
 // from its entries' objects. Its push steps have no caller outside tests until git's push path calls them (A-654).
