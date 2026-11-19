@@ -24,17 +24,31 @@ struct Work {
 impl Work {
   /// A work whose operations carry no flag: §4.16's verdict judges it.
   fn plain() -> Work {
-    Work { doc: OpsDoc::default(), post: Vec::new(), flags: 0 }
+    Work {
+      doc: OpsDoc::default(),
+      post: Vec::new(),
+      flags: 0,
+    }
   }
 
   /// A work whose operations are node-exclusive, as a Subversion client's commit is.
   fn exclusive() -> Work {
-    Work { flags: NODE_EXCLUSIVE, ..Work::plain() }
+    Work {
+      flags: NODE_EXCLUSIVE,
+      ..Work::plain()
+    }
   }
 
   fn push(&mut self, kind: OpKind, path: &str, at: u64, len: u64, src: u64) -> &mut Work {
     let path = self.doc.paths.intern(path);
-    self.doc.ops.push(Op { kind, flags: self.flags, path, at, len, src });
+    self.doc.ops.push(Op {
+      kind,
+      flags: self.flags,
+      path,
+      at,
+      len,
+      src,
+    });
     self
   }
 
@@ -61,7 +75,13 @@ impl Work {
   fn set_xattr(&mut self, path: &str, name: &str, value: &[u8]) -> &mut Work {
     let name = u64::from(self.doc.paths.intern(name));
     let src = self.stash(value);
-    self.push(OpKind::SetXattr, path, name, u64::try_from(value.len()).unwrap(), src)
+    self.push(
+      OpKind::SetXattr,
+      path,
+      name,
+      u64::try_from(value.len()).unwrap(),
+      src,
+    )
   }
 
   fn rename(&mut self, from: &str, to: &str) -> &mut Work {
@@ -94,7 +114,12 @@ const PROPS: &str = "slates.svn.props";
 /// A green at version 1 with `f` and `g`, each twenty dots, made by a plain work.
 fn green() -> Green {
   let mut green = Green::new();
-  let outcome = green.submit(&Work::plain().create("f", b"....................").create("g", b"....................").at(1, 0));
+  let outcome = green.submit(
+    &Work::plain()
+      .create("f", b"....................")
+      .create("g", b"....................")
+      .at(1, 0),
+  );
   assert_eq!(outcome, Outcome::Accepted { version: 1 });
   green
 }
@@ -102,7 +127,9 @@ fn green() -> Green {
 /// The distinct paths a conflict names, or `None` for an accept.
 fn conflicted(outcome: &Outcome) -> Option<BTreeSet<String>> {
   match outcome {
-    Outcome::Conflict { windows } => Some(windows.iter().map(|window| window.path.clone()).collect()),
+    Outcome::Conflict { windows } => {
+      Some(windows.iter().map(|window| window.path.clone()).collect())
+    }
     Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => None,
   }
 }
@@ -110,7 +137,11 @@ fn conflicted(outcome: &Outcome) -> Option<BTreeSet<String>> {
 /// The classes a conflict names on `path`.
 fn classes_on(outcome: &Outcome, path: &str) -> Vec<MergeConflictClass> {
   match outcome {
-    Outcome::Conflict { windows } => windows.iter().filter(|window| window.path == path).map(|window| window.class).collect(),
+    Outcome::Conflict { windows } => windows
+      .iter()
+      .filter(|window| window.path == path)
+      .map(|window| window.class)
+      .collect(),
     Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => Vec::new(),
   }
 }
@@ -123,8 +154,15 @@ fn both(intervening: &dyn Fn(&mut Work), work: &dyn Fn(&mut Work)) -> (Outcome, 
     let mut green = green();
     let mut change = Work::plain();
     intervening(&mut change);
-    assert_eq!(green.submit(&change.at(2, 1)), Outcome::Accepted { version: 2 });
-    let mut submitted = if exclusive { Work::exclusive() } else { Work::plain() };
+    assert_eq!(
+      green.submit(&change.at(2, 1)),
+      Outcome::Accepted { version: 2 }
+    );
+    let mut submitted = if exclusive {
+      Work::exclusive()
+    } else {
+      Work::plain()
+    };
     work(&mut submitted);
     outcomes.push(green.submit(&submitted.at(3, 1)));
   }
@@ -137,38 +175,84 @@ fn both(intervening: &dyn Fn(&mut Work), work: &dyn Fn(&mut Work)) -> (Outcome, 
 /// node-exclusive, expect a conflict on `f`.
 #[test]
 fn an_identical_change_after_its_base_conflicts_for_a_node_exclusive_work() {
-  let (plain, exclusive) = both(&|w| { w.overwrite("f", 5, b"AAAA"); }, &|w| { w.overwrite("f", 5, b"AAAA"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.overwrite("f", 5, b"AAAA");
+    },
+    &|w| {
+      w.overwrite("f", 5, b"AAAA");
+    },
+  );
   assert_eq!(plain, Outcome::Accepted { version: 3 });
-  assert_eq!(conflicted(&exclusive), Some(BTreeSet::from(["f".to_owned()])));
-  assert!(classes_on(&exclusive, "f").contains(&MergeConflictClass::Overlap), "{exclusive:?}");
+  assert_eq!(
+    conflicted(&exclusive),
+    Some(BTreeSet::from(["f".to_owned()]))
+  );
+  assert!(
+    classes_on(&exclusive, "f").contains(&MergeConflictClass::Overlap),
+    "{exclusive:?}"
+  );
 }
 
 /// A-542 (FSFS rule 1, a file changed on both sides): another work overwrote bytes 0 to 4 of `f`; a work based on the
 /// version before overwrites bytes 10 to 14: plain, §4.16 merges the disjoint ranges; node-exclusive, expect a conflict.
 #[test]
 fn a_disjoint_change_after_its_base_conflicts_for_a_node_exclusive_work() {
-  let (plain, exclusive) = both(&|w| { w.overwrite("f", 0, b"AAAA"); }, &|w| { w.overwrite("f", 10, b"BBBB"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.overwrite("f", 0, b"AAAA");
+    },
+    &|w| {
+      w.overwrite("f", 10, b"BBBB");
+    },
+  );
   assert_eq!(plain, Outcome::Accepted { version: 3 });
-  assert_eq!(conflicted(&exclusive), Some(BTreeSet::from(["f".to_owned()])));
+  assert_eq!(
+    conflicted(&exclusive),
+    Some(BTreeSet::from(["f".to_owned()]))
+  );
 }
 
 /// A-542 (FSFS rule 1 across dimensions: text against properties): another work set `f`'s property list; a work based
 /// on the version before changes `f`'s text: plain, the dimensions merge; node-exclusive, expect a conflict.
 #[test]
 fn a_property_change_after_its_base_conflicts_with_a_node_exclusive_text_change() {
-  let (plain, exclusive) = both(&|w| { w.set_xattr("f", PROPS, b"K 3\nfoo\nV 3\nbar\nEND\n"); }, &|w| { w.overwrite("f", 0, b"CCCC"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.set_xattr("f", PROPS, b"K 3\nfoo\nV 3\nbar\nEND\n");
+    },
+    &|w| {
+      w.overwrite("f", 0, b"CCCC");
+    },
+  );
   assert_eq!(plain, Outcome::Accepted { version: 3 });
-  assert_eq!(conflicted(&exclusive), Some(BTreeSet::from(["f".to_owned()])));
+  assert_eq!(
+    conflicted(&exclusive),
+    Some(BTreeSet::from(["f".to_owned()]))
+  );
 }
 
 /// A-542 (FSFS rule 2, "two additions are not auto-mergeable"): another work created `h`; a work based on the version
 /// before creates `h` with the same bytes: plain, §4.16 accepts the identical create; node-exclusive, expect a conflict.
 #[test]
 fn an_identical_addition_after_its_base_conflicts_for_a_node_exclusive_work() {
-  let (plain, exclusive) = both(&|w| { w.create("h", b"same"); }, &|w| { w.create("h", b"same"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.create("h", b"same");
+    },
+    &|w| {
+      w.create("h", b"same");
+    },
+  );
   assert_eq!(plain, Outcome::Accepted { version: 3 });
-  assert_eq!(conflicted(&exclusive), Some(BTreeSet::from(["h".to_owned()])));
-  assert!(classes_on(&exclusive, "h").contains(&MergeConflictClass::CreateCreate), "{exclusive:?}");
+  assert_eq!(
+    conflicted(&exclusive),
+    Some(BTreeSet::from(["h".to_owned()]))
+  );
+  assert!(
+    classes_on(&exclusive, "h").contains(&MergeConflictClass::CreateCreate),
+    "{exclusive:?}"
+  );
 }
 
 /// A-542 (FSFS rule 2 for a move, which Subversion sends as a copy and a delete of the source): another work changed
@@ -176,9 +260,19 @@ fn an_identical_addition_after_its_base_conflicts_for_a_node_exclusive_work() {
 /// a conflict on the source.
 #[test]
 fn a_node_exclusive_move_whose_source_changed_after_its_base_conflicts() {
-  let (plain, exclusive) = both(&|w| { w.overwrite("f", 0, b"DDDD"); }, &|w| { w.rename("f", "h"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.overwrite("f", 0, b"DDDD");
+    },
+    &|w| {
+      w.rename("f", "h");
+    },
+  );
   assert_eq!(plain, Outcome::Accepted { version: 3 });
-  assert_eq!(conflicted(&exclusive), Some(BTreeSet::from(["f".to_owned()])));
+  assert_eq!(
+    conflicted(&exclusive),
+    Some(BTreeSet::from(["f".to_owned()]))
+  );
 }
 
 /// A-542 (FSFS's merge takes a node changed on one side alone): another work changed `g`; a node-exclusive work based on
@@ -186,7 +280,14 @@ fn a_node_exclusive_move_whose_source_changed_after_its_base_conflicts() {
 /// paths did not move, with the other work's `g` kept.
 #[test]
 fn a_node_exclusive_work_on_nodes_unchanged_after_its_base_is_accepted() {
-  let (plain, exclusive) = both(&|w| { w.overwrite("g", 0, b"EEEE"); }, &|w| { w.overwrite("f", 0, b"FFFF"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.overwrite("g", 0, b"EEEE");
+    },
+    &|w| {
+      w.overwrite("f", 0, b"FFFF");
+    },
+  );
   assert_eq!(plain, Outcome::Accepted { version: 3 });
   assert_eq!(exclusive, Outcome::Accepted { version: 3 });
 }
@@ -195,9 +296,19 @@ fn a_node_exclusive_work_on_nodes_unchanged_after_its_base_is_accepted() {
 /// before deletes `f`: expect a conflict, as the plain work's delete/modify also is.
 #[test]
 fn a_node_exclusive_delete_of_a_node_changed_after_its_base_conflicts() {
-  let (plain, exclusive) = both(&|w| { w.overwrite("f", 0, b"GGGG"); }, &|w| { w.unlink("f"); });
+  let (plain, exclusive) = both(
+    &|w| {
+      w.overwrite("f", 0, b"GGGG");
+    },
+    &|w| {
+      w.unlink("f");
+    },
+  );
   assert!(conflicted(&plain).is_some(), "{plain:?}");
-  assert_eq!(conflicted(&exclusive), Some(BTreeSet::from(["f".to_owned()])));
+  assert_eq!(
+    conflicted(&exclusive),
+    Some(BTreeSet::from(["f".to_owned()]))
+  );
 }
 
 /// The paths of the property's green, each a four-byte file.

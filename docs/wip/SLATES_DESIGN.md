@@ -35867,3 +35867,9 @@ A-500 status block's last sentence restored to it, which A-531's edit had moved)
   property against a reference written apart from the engine: generated histories of plain changes to five files'
   text and property lists, then a node-exclusive work at a generated base, which must conflict on exactly the paths
   it changes whose last change is past its base.
+- **Evidence** (the Mac Studio, kiln, 2026-11-18 16:53 and 16:57 PST, load 19 to 23, debug builds of fresh clones of
+  the branch). Failing first: with the pass removed from a copy of the tree, `cargo test --locked -p slates-merge --lib
+  node_exclusive` failed 6 of 8, the two passes the cases the plain verdict already decides alike (the delete against a
+  change, refused; nodes unchanged, accepted). With it, 8 of 8, and the crate's whole `--lib` suite 11 of 11, before
+  and after `cargo fmt`. The crate's integration suites (`crates/merge/tests/`), its clippy and `cargo xtask check` are
+  main's (the run-request queue); no test there sets the flag, so their verdicts are the ones they were.
