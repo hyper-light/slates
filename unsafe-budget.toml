@@ -703,3 +703,6 @@ slates-seal = 0
 # slates-svn (0): the Subversion server's pure pieces (A-500, §4.17.4): svndiff's integers, windows and sections read
 # and written by checked offsets and `get`, LZ4 through lz4_flex's safe codec; no casts, no maps, no FFI.
 slates-svn = 0
+# slates-vcs (0): the version-control servers' object store (A-581, §4.17.1 shared piece 3): content by BLAKE3 identity in
+# an ordered map, tables read by checked offsets and `get`; no casts, no maps, no FFI.
+slates-vcs = 0

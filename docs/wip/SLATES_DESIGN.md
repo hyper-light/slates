@@ -11691,6 +11691,49 @@ is one more version, and the chain itself is never rewritten.
 5. Every object is checked on arrival: the server hashes it as the tool does, and a push holding an object whose bytes
    do not hash to its claimed id is refused, typed, before any of it is indexed.
 
+> **Status (2026-11-19, A-581).** Shared piece 3's core is built as a pure crate, `slates-vcs` (`crates/vcs`), which the
+> three servers' object pieces build on:
+> - **Content** (`content.rs`, items 1 and 4): an object's raw bytes are kept once, named by their BLAKE3 identity,
+>   whichever tool, push or repository brought them; a repeated put counts a holder and stores nothing. The identity is
+>   always the store's own hash of the bytes it keeps. A content is held by count and freed with its last holder, within
+>   a budget the owner derives from its shard's memory (§4.2), which an index's tail is charged against too. Identity is
+>   whole-object, the deduplication D-6 chose first (whole-file deduplication captures about three quarters of
+>   block-level deduplication's gain [A: Meyer and Bolosky, FAST 2011]).
+> - **Tables** (`table.rs`, item 3): rows sorted by key, each naming in its own bytes the contents it holds, encoded as
+>   bytes that are content (`slvcstb1` magic, the row count, 64-bit offsets, then the entries), so a table is named,
+>   shared and checked by its identity. Bytes from anywhere are opened with the frame, every entry and the keys' order
+>   checked and every fault refused by kind (§4.9).
+> - **The index** (`index.rs`, item 3): a tail (an ordered map) over tables, the log-structured merge tree's shape [A:
+>   O'Neil et al., Acta Informatica 1996]. An id names one object for ever, so a key is in one layer at most and an
+>   insert of a held key is `Identical` or refused `RowDiffers`. A fork folds its parent's tail and holds each table once
+>   more: no table written, no row copied. A compaction merges the tail and the tables only its own index holds, never a
+>   table a fork shares. When to compact is learned (`rule.rs`): the index counts each lookup's probes into its
+>   compactable layers beyond the first, the caller times its lookups, inserts and compactions, and a compaction is due
+>   once the probes it would save have cost its predicted time, the ski-rental break-even, within twice an offline
+>   optimum [A: Karlin et al., Algorithmica 1988]; the price is the last compaction's measured time a row, and before
+>   any, what building the tail cost. §4.17.3's and §4.17.4's fold rows read this rule.
+> - **Arrival** (`arrival.rs`, items 4 and 5): the tool's naming (`Naming`) is checked before a byte is stored
+>   (`IdMismatch`; one id brought twice with other bytes is `Collision`); a push's objects are held by its quarantine,
+>   committed into the index as one step whose every row, content and byte of room is checked before any is applied, or
+>   abandoned with nothing left. An object row is the id, its content, and its kind and length.
+>
+> Evidence (`cargo test -p slates-vcs --lib`, 19 of 19, the Mac Studio, 2026-11-19): an oracle over generated histories
+> of arrivals with lies among them, commits, abandons, inserts, folds, compactions, forks and releases over four
+> repositories and three pushes on one store, each repository read as a plain map after every step, every named content
+> held with its bytes, no content held that nothing names, and an empty store once all is released; the same bytes from
+> two tools one content; a fork writing no table; two repositories folding the same rows sharing one table; compaction
+> of exclusive layers only; the learned rule; budget refusals; hostile tables. Ten mutations of the code (no
+> deduplication, no arrival check, a fork without holds, shared layers merged, sharing never re-read, keys' order
+> unchecked, a differing row taken, a freed table keeping its rows, a deduplicated fold keeping its tail's holds, the
+> rule ignoring the price) each turned one to seven tests red.
+>
+> Owed: the greens' file blocks held in this store, so a checkout and a blob are one content (piece 4; a green's blocks
+> keep their own bytes today); a compaction, a release and an abandoned push sliced under the shard's budget (each is one
+> call here, linear in its rows); the store and each repository's index on the owner shard, fed the shard clock's times,
+> with each tool's naming (git's SHA-1 with collision detection and SHA-256, Mercurial's SHA-1), in each server's
+> pieces; content-defined chunking of the large-file class (D-6, gated on the measured gain); pruning what no branch
+> reaches; the wire forms cached by identity (item 2); content placed and replicated by identity in a fleet (§4.10).
+
 **A push is a work.**
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
@@ -11896,7 +11939,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    them, or alone), and checks on greens it does not move, each read at the entry's register position (Mercurial's
    `check:heads` and `unbundle`'s heads: every head unchanged, §4.17.3).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
-   forks sharing tables; every object checked against its id on arrival.
+   forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
+   content store, tables, index with its learned compaction, and quarantine; its use on the owner shard, sliced, comes
+   with each server's object pieces).
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
 5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
@@ -12550,7 +12595,7 @@ annotated from their file revisions, at that push's own cost.
 | Write slice (7.2's chunk iterators) | the connection's bandwidth-delay product: delivery rate times smoothed round trip | the runtime's TCP measurements of the connection | each send window | the shard's budget per step; the connection's memory share (§4.2) | what one step of encoding produces |
 | Held artefacts: full-clone bundles, the delta cache, linelogs, the revlog view's pages (7.2: `pullbundles.manifest` and clone bundles an administrator makes) | value per byte, the request rate times the cost to make it again over its bytes; the lowest goes first when the budget needs room | requests per artefact; the time it took to make, measured when made; its bytes | each request and each making | the repository's RAM share (§4.2, A-16) | made at its first request, which measures its cost; kept until the budget needs the room |
 | Push verification, slice and fan-out | a slice is what one step verifies at the measured cost per byte; fan out to the owner node's other shards when the predicted remaining time exceeds a measured cross-shard hop | this repository's verification throughput (hashing, applying deltas); the hop cost the runtime measures | each slice | the request's admission (A-16), checked before decoding | one revision, measured |
-| Index tail fold | fold when the lookups the tail served since the last fold cost more than a fold | lookup time served from the tail; the last fold's time | each lookup and each fold | the repository's budget | the first fold when the tail's lookups cost more than building the tail did |
+| Index compaction (§4.17.1's rule, A-581: folding the tail and merging the tables only this index holds) | compact when the time lookups spent since the last compaction on probes into compactable layers beyond each one's first reaches the predicted compaction time (rent or buy) | the index's probe counts; the times the owner measured for its lookups, inserts and compactions | each timed batch and each compaction | the store's budget, which the tail is charged against | before any compaction, what building the tail cost a row |
 | Hidden changesets kept (7.2 keeps them for good) | kept until the budget needs room, oldest first | the repository's budget | each admission | the repository's budget | kept |
 | Hook deadlines | §4.17.1's: learned from each hook's own runs | | | | |
 
@@ -13034,7 +13079,7 @@ value from the first request's own inputs, never a literal).
 | Socket send and receive buffers | the connection's bandwidth-delay product | its measured round trip and delivery rate | every window | the connection's memory share | the first exchange's round trip and rate |
 | A hook's deadline | a regression of the hook's run time on the commit's size (paths and bytes); the bound is the prediction plus the largest residual seen | that hook's own past runs | every run | never past the requesting client's own liveness (its connection) | none on a hook's first run but the client's liveness |
 | An idle HTTP transaction's bound | the longest gap seen between two requests of one transaction that went on to commit | the gaps of committed transactions | every commit over HTTP | the shard's room for held works: past it the longest-idle goes first | none until a transaction has committed; the room alone |
-| Folding the index's tail into a table | fold when a lookup in the tail is measured slower than one in a folded table | per-lookup times of both | every sampled lookup | the shard's room | at the first sample where the tail is slower |
+| Folding the index's tail into a table, and merging tables (§4.17.1's rule, A-581) | compact when the time lookups spent since the last compaction on probes into compactable layers beyond each one's first reaches the predicted compaction time (rent or buy) | the index's probe counts; the times the owner measured for its lookups, inserts and compactions | each timed batch and each compaction | the shard's room, which the tail is charged against | before any compaction, what building the tail cost a row |
 | The wire-form cache (§4.17.1 "Objects" item 2: svndiff windows of hot versions) | keep what saves the most time per byte held: re-use rate times the encode time saved, over bytes | hits and encode times | every hit | the shard's room | empty |
 
 The window size is not a tunable: windows are as large as the format allows (102,400 bytes), which every stock decoder
@@ -39689,3 +39734,56 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   detection), so they could not pass on it.
 - **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
   zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-581 — The version-control servers' one object store: content by identity once across tools, each repository's index as content tables plus a tail that forks share and a learned rule compacts, and every object checked on arrival and held by its push (2026-11-19, g083 for UI goal 91; §4.17.1 "Objects" items 1, 3, 4 and 5, shared piece 3; D-6, D-28; A-497, A-499, A-500)
+
+Applied in the same change to: §4.17.1 (a status block under "Objects", the pieces list's item 3), §4.17.3's and
+§4.17.4's tables of learned tunables (the fold rows now read the shared rule), GAPS (the §4.17 entry), `crates/vcs`
+(new: `slates-vcs`), `Cargo.lock`, `unsafe-budget.toml` (`slates-vcs = 0`).
+- **What was there.** §4.17.1 stated the object store and each server's section its layout (git's index rows, Mercurial's
+  revlog-shaped tables, Subversion's node rows), with two different rules for folding a tail (§4.17.3: the tail's lookups
+  against a fold's cost; §4.17.4: a tail lookup against a table lookup). Nothing was built; the Subversion index
+  (A-553) holds its rows in plain maps until this piece.
+- **Content.** `ContentStore`: bytes by BLAKE3 identity, the store's own hash, so a caller cannot name content wrongly; a
+  repeated put counts a holder and stores nothing (`ContentCounters::deduplicated`); freed with its last holder, the freed
+  bytes handed back so a table can release what its rows named; a budget the owner derives (§4.2), refused by kind and
+  derived again as pressure moves, a lowered budget dropping nothing.
+- **Tables.** A row is a key, the contents it holds (named in the row's own bytes, so any holder releases a freed table's
+  contents without its tool's codec) and a payload. The encoding: `slvcstb1`, the row count, `rows + 1` 64-bit offsets,
+  then entries of a 32-bit key length, the key, a count, the contents and the payload. `TableView::open` admits bytes from
+  anywhere, frame then entries then order, each fault by kind (`Truncated`, `ForeignMagic`, `TrailingBytes`,
+  `Malformed { row }`, `Unsorted { row }`); a table this crate built reopens with its frame checked alone, every read a
+  checked `get`.
+- **The index.** A tail over tables; a lookup reads the tail, then the tables from the newest. A fold writes the tail as a
+  table stored in place of the tail's charge (`ContentStore::store_in_place_of`: refused, it changes nothing). A table
+  stored new takes over its rows' holds; one whose bytes were stored already (another repository wrote the same rows)
+  gives them back, so a stored table holds its rows' contents once, however many indexes hold it. A fork folds and holds
+  each table once more. A compaction learns which tables are shared from the store's counts and merges only the others
+  with the tail, taking the new table's holds before the old layers give theirs back.
+- **The rule.** One rule for every tool, replacing §4.17.3's and §4.17.4's two: a lookup's probes into compactable layers
+  beyond its first are what a compaction would save, so the rent is their share of the lookups' measured time, and the
+  compaction is due when the rent reaches its predicted time (the last compaction's measured time a row; before any, the
+  tail's own build time a row, §4.17.3's first value). A batch's time is shared among its probes, so a tail slower to
+  probe than a table (§4.17.4's rule) raises what each saved probe is worth; a lookup found in the first layer it probes
+  pays nothing, and probes into tables a fork shares are never counted, since no compaction of this index can save
+  them. The index counts probes; the owner, which has the clock, reports the times.
+  Ski-rental's break-even is within twice an offline optimum's cost (Karlin, Manasse, Rudolph and Sleator, 1988).
+- **Arrival.** `Naming` is the tool's hash (git's, Mercurial's, Subversion's checksums, in each server's pieces); the
+  quarantine checks it before a byte is stored, holds what a push brought, commits it through `Index::insert_all`
+  (order, rows, contents and room checked before anything is applied) and gives its holds back, or is abandoned whole.
+- **Tests** (`cargo test -p slates-vcs --lib`, 19 of 19, the Mac Studio, 2026-11-19, `cargo fmt -p slates-vcs --check`
+  clean, `--locked`): `the_object_store_reads_as_plain_maps_over_every_history` (300 generated histories),
+  `the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositories`,
+  `an_object_whose_bytes_do_not_hash_to_its_id_is_refused_and_its_push_leaves_nothing`,
+  `a_commit_that_meets_a_differing_row_commits_nothing`, `a_fork_holds_every_table_once_more_and_copies_no_row`,
+  `two_repositories_that_fold_the_same_rows_share_one_table`, `a_compaction_merges_only_the_tables_this_index_holds`,
+  `compaction_is_due_once_the_probes_it_would_save_have_paid_for_it`,
+  `an_arrival_an_insert_or_a_fold_past_the_budget_changes_nothing`, `an_insert_is_checked_against_the_index_and_the_store`,
+  the content store's two, the rule's three, and the tables' four (two of them generated, cuts and bit flips among them).
+  Red-checked on a copy, ten mutations each turning tests red: no deduplication (6 red), no arrival check (2), a fork
+  without holds (4), shared tables merged (2), sharing never read again (1), keys' order unchecked (2), a differing row
+  taken (3), a freed table keeping its rows' holds (7), a deduplicated fold keeping its tail's (2), the rule ignoring the
+  price (2).
+- **Owed.** Listed in §4.17.1's status block: the greens' blocks in this store (piece 4), the work sliced under the
+  shard's budget, the store on the owner shard with each tool's naming (each server's pieces), chunking of the
+  large-file class, pruning, wire-form caches, the fleet.
