@@ -23431,7 +23431,11 @@ Applied in the same change to:
     HKDF-SHA256 from the secret salted with both nonces, the client's proof and the daemon's confirmation each the
     attachment sealed with AES-256-GCM (the transcript as additional data, each key sealing one message at nonce
     zero). The owner shard checks the proof and retires the offer, so the secret never leaves it; the end goes by
-    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end.
+    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end. Since A-512 the owner first
+    claims the offer for the exchange and answers copies of the ends, keeping them until the exchange settles the
+    claim (`shards_route::settle`): retired once the client has its ends, claimable again when the hand-over failed. An
+    answer lost on its way back then loses nothing: the exchange asks once more and is answered the same claim, and no
+    other exchange can take the offer meanwhile.
   - Bounds: a shard's exchanges at its client seats (`Busy` past them), each waiting on its client while the client's
     connection lives (A-492; one liveness budget until then), the socket being the user's alone; every
     refusal is one byte naming its kind and every ending is counted (`shards.route_*`, `shards.route_claimed` the
@@ -34716,6 +34720,34 @@ the writer's write-through files kept across a lend, `begin_barrier` leaving the
   against windows-sys) and `tests/os.rs`'s `a_read_only_files_metadata_entry_lands` (a file `attrib +R` made
   read-only, marked hidden through an overlay, lands `HIDDEN` and still `READONLY`, its entry written), with the xwin
   check and clippy.
+
+### A-512 — The socket route's take claims its offer for its exchange and keeps the ends until the exchange settles, so a lost answer loses nothing and nothing is handed twice (2026-11-19, goal 85 via g225; A-488's sibling; §4.6 the socket route; A-161, A-173, A-440, A-492)
+
+- **What was there.** On macOS an exchange asks the offer's owner shard to check the claim and hand over the ends
+  (`shards_route::take`), waiting in that shard's own time (A-440). The take retired the offer and moved its ends into
+  the answer. An owner shard that stopped for a window had its take forgotten by the exchange and ran it once it
+  resumed: the offer was retired, the answer with the ends was dropped, and dropping it closed them. A stream's other
+  side then read its end and ended the attachment; a map's copy never reached its client; a claim made again found no
+  offer.
+- **The rule.** The take claims the offer for the exchange, by the exchange's daemon nonce (`Offer::claimed_by`), and
+  answers copies of the ends; the ends stay with the offer. An ask of the same exchange is answered the same claim and
+  copies of the same ends, and every other exchange finds no offer. The exchange asks once more when its first answer
+  is lost; the second ask runs behind the first on the owner shard's channel. Once the exchange ends it settles its
+  claim there, after any take it asked (`settle`, in the owner shard's own time): `Handed` once the client has its ends,
+  which retires the offer and closes the ends kept there; `NotHanded` otherwise, which leaves the offer claimable
+  again; where the exchange holds no claim (refused, or the offer withdrawn) the settle changes nothing. The settle runs
+  behind every ask of its exchange, so no ask can claim again after it.
+- **Why this and not another.** A claim is the owner shard's effect, so its record is kept there, as A-488's seal and
+  A-505's send are, and in the offer itself, which the offer's existing bounds already count (`shards::pending_ends`
+  counts a claimed offer's ends as held, as they are). The ends are copied rather than moved because an answer between
+  shards can be lost, and an end moved into it would be closed with it.
+- **Tests.** `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice` (the first
+  take's answer dropped, the same claim asked again, another exchange's claim after) and
+  `a_claim_settled_not_handed_frees_its_offer_and_one_handed_retires_it` (`crates/server/src/shards_route.rs`). The A-440
+  and A-492 tests now read the claim where they read the retirement.
+
+Applied in the same change to: §4.6 (the socket route's claim), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A-488's
+siblings), A-488's bug record (its Shards-route sibling closed), `crates/server/src/shards_route.rs`.
 
 ### A-526 — A DAX backing taken back from a dead daemon clears each range not filled before its first fill (2026-11-18, goal 85, g079; §4.6 the backed route, the Shards form; A-365, A-419)
 Applied in the same change to: GAPS (A-419's sibling line), `crates/vfs/src/shards_backing.rs` (`ShardsBacking`'s

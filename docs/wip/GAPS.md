@@ -3965,7 +3965,10 @@
 >   `a_remote_works_rebuild_asked_again_after_a_lost_answer_finds_the_work_and_installs_it_once`). **Still owed
 >   (A-513):** a work whose asks go unanswered twice keeps its record and stays unbuilt until the daemon's next start;
 >   a retry after admission, and its verbs answering `Unpublished` (A-247's word) rather than `NotFound` meanwhile, are
->   not built. Open: the Shards route's take of an offer.
+>   not built. The Shards route's take of an offer, closed by A-512 (2026-11-19, g225: the take claims the offer for
+>   its exchange and answers copies of its ends, kept on the owner shard until the exchange settles the claim, retired
+>   once handed or claimable again;
+>   `a_take_whose_answer_was_lost_is_answered_again_with_the_same_ends_and_never_handed_twice`).
 >   **Class C, the rendezvous's
 >   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
