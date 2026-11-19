@@ -455,6 +455,8 @@ impl Prepared {
       .map(|ask| Asked {
         name: Name::Hg(ask.namespace, &ask.name),
         right: ask.right,
+        // The requirements (A-644) are git's alone: a Mercurial change brings nothing they read.
+        brings: None,
       })
       .collect()
   }
@@ -902,6 +904,12 @@ fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) ->
     }
     PushRefusal::NotPermitted { .. } | PushRefusal::OtherTool { .. } => None,
     PushRefusal::Unreadable { .. } => Some(POLICY_UNREADABLE.to_vec()),
+    // A requirement's refusals (A-644) never reach a Mercurial push: the database's guard holds the requirement
+    // rules to git, and a Mercurial change brings nothing they read (`Prepared::asks`). Answered as hgweb answers a
+    // refusal it does not word.
+    PushRefusal::MergeCommit { .. }
+    | PushRefusal::UnsignedCommit { .. }
+    | PushRefusal::Unjudged { .. } => None,
   };
   abort(words.unwrap_or_else(|| NOT_AUTHORIZED.to_vec()))
 }

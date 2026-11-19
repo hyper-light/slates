@@ -163,6 +163,11 @@ mod wildmatch_reference;
 // (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_policy;
+// A protected git branch, the server's half (A-644 part 2): what a ref's change brings, read from A-614's store, for
+// the policy's check point; A-321's verifier under git's namespace; the check point's refusals in git's words. No caller
+// outside tests until receive-pack's server half asks it (A-620 part 2's judge over the store).
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_protect;
 // §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside
 // tests until the servers' push paths start hooks (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]

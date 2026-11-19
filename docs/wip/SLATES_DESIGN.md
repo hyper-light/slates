@@ -12317,6 +12317,17 @@ is one more version, and the chain itself is never rewritten.
 > always reaped (a run whose task is dropped kills the group and hands the child to a reaper task). The run's lesson
 > goes back to its caller, which teaches the hook's times on the shard. Owed: the Windows driver (a job object, the
 > handle-list spawn of `slates_ipc::win_spawn`), the launcher's namespace on Linux (§4.6), and the push pieces' calls.
+>
+> **Status (2026-11-19, A-644 part 2: a protected name's requirements in the policy).** A rule's right may be a
+> requirement as well as a permission: bringing a name a merge commit (`PolicyRight::MergeCommit`) or a commit no
+> trusted signer signed (`UnsignedCommit`). A rule denying one imposes it (a linear history, signed commits), a later
+> rule allowing it lifts it for whom it names, and where no rule speaks nothing is required, so a policy that names
+> neither asks no more of a push than before. The policy holds the keys trusted to sign the repository's commits
+> (`signers`, set whole with it; each a key A-321's verifier reads, kept once, a git repository's alone). The
+> requirements are git's alone: the database's guard refuses one for Mercurial or Subversion, whose pushes do not judge
+> them. `vcs_policy::admit` judges a change's own right, then a linear history, then signed commits, each where a rule
+> imposes it, asking what the change brings (`Brings`) only then, and refuses typed (`MergeCommit`, `UnsignedCommit`,
+> `Unjudged`). The git side is `crate::git_protect` (§4.17.2's status).
 
 > **Status (2026-11-19, A-671: the matcher's home).** git's `wildmatch` is `slates_vcs::wildmatch`
 > (`crates/vcs/src/wildmatch.rs`), moved whole from `crates/server`, behaviour unchanged: slates-vcs is the crate every
@@ -13014,6 +13025,16 @@ engine: the verdict, rebase, position mapping, the register).
 > stateless answers and its one-round sessions. Those goldens found A-615's object choice missing git's rule for a
 > thin pack in a shallow exchange (`--objects-edge-aggressive`), now kept and held by the oracle. A stateful v0
 > session, an SSH client's, is owed.
+>
+> **Status (2026-11-19, A-644 part 2: protected branches through the policy, end to end).** `crates/server`
+> (`git_protect`) composes them: a ref's change read from A-614's store gives the right it needs (a create or a
+> fast-forward submits, a rewrite rewrites, a delete deletes); `vcs_policy::admit` judges it with what the change brings
+> (`StoreBrings`, the store's answers), each commit's SSH signature verified by A-321's code under git's namespace
+> (`signed_work::verify_in`, `GIT_NAMESPACE`) against the policy's trusted keys (`CommitKeys`); and a refusal is
+> answered in git's words (`declined`: a denied rewrite or delete as git's own, every other refusal as git's update hook
+> would). Proven by the twelve pushes of A-644's golden vectors answered through the policy with every byte stock git
+> wrote, and by the commit signatures stock git made verifying under git's namespace alone. Owed: receive-pack's server
+> half asking it for each command (A-620 part 2's judge composed with the server's greens and appends).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -50009,6 +50030,79 @@ Applied in the same change to: §4.17.4's status (A-616 part 2's second slice); 
   integration target.
 - **Owed.** The commit drive's second compile of `Policy::authz` (it should take the session's set: main's next
   piece); the Windows run and red-checks (main's).
+
+### A-644 part 2 — Protected branches through A-622's policy: two requirement rights and the trusted commit signers, judged at the check point after the change's own right, the commits' SSH signatures verified by A-321's code under git's namespace, and every refusal in git's words (2026-11-19, g230, UI goal 93; §4.17.1 "Policy", §4.17.2 "Protected branches, in git's terms" and "Pieces (git)" piece 11; after A-321, A-622 and A-644 part 1)
+Applied in the same change to: §4.17.1's status (the policy's requirements and signers) and §4.17.2's (the server's
+half); GAPS (the §4.17 entry); `crates/db` (`catalog.rs`: `PolicyRight::MergeCommit` and `UnsignedCommit`, appended,
+with `PolicyRight::of`; `RepositoryPolicy::signers`, appended; `repository/policy.rs`, the guard and the charge;
+`tests/wire_order.txt`, the two tags published); `crates/ipc` (`protocol.rs`: the same rights and
+`SetRepositoryPolicy::signers`, appended; `tests/wire_order.txt`); `crates/server` (`vcs_policy.rs`: the requirement
+rights, `Brings`, `admit`'s order and three refusals; `signed_work.rs`: `verify_in`, `GIT_NAMESPACE`;
+`repository.rs`: the verb's signers; `verbs.rs`; `git_protect.rs` and its tests, new; `lfs.rs`, whose asks bring
+nothing; `Cargo.toml`: `slates-vcs`, which names the store's content, a dependency beside its dev-dependency (A-625
+part 3), so the lock is unchanged; `svn_hooks`'s and `vcs_http`'s tests, whose records trust no signer);
+`crates/git`'s tests of A-600, A-604 and A-624 (their generators without `prop_oneof!`, R2, and their helpers without
+`unwrap`).
+- **How a protection is configured.** In A-622's rules, as §4.17.1 sets policy "per repository and per green, by name
+  pattern". A rewrite and a delete were rights already (`Rewrite`, `Delete`): a rule denying them is
+  `receive.denyNonFastForwards` and `receive.denyDeletes` on the names it covers. A linear history and signed commits
+  are two new rights that work as requirements (`MergeCommit`, `UnsignedCommit`). A rule denying one imposes it. A later
+  rule allowing it lifts it for whom it names, by git's precedence, the last covering rule (a bypass list). Where no
+  rule speaks nothing is required: unlike a permission, which a policy that leaves it unruled keeps for the owner
+  (A-575), a requirement no one configured binds no one, so every policy written before asks no more of a push than it
+  did. The keys trusted to sign commits are the policy's own (`signers`), set whole with it by the owner, as a volume's
+  signers are its launcher's (A-321): the verb keeps each key A-321's verifier reads, once, in order, and refuses one it
+  cannot read or any for a repository that is not git's (`BadRequest`). The database's guard holds the requirement
+  rights to git, the one tool whose push judges them (Mercurial's linear history waits for its push path to judge it),
+  so a rule no push would enforce never enters the log.
+- **The check point.** `vcs_policy::admit` stays the one function a push asks. It judges each change's own right first
+  (the store's change, A-644 part 1: a create or a fast-forward submits, a rewrite rewrites, a delete deletes). Then, in
+  the design's order, a linear history, then signed commits, each only where a rule imposes it; the change's `Brings` is
+  asked then and not before, so a name no requirement covers costs no walk and no signature (counted in the tests). The
+  record's signers are read once a push. The refusals are typed: `MergeCommit` and `UnsignedCommit` name the change, the
+  rule and the commit (and why it is not a trusted signer's), and `Unjudged` carries the store's refusal, a damaged
+  store never judged around. The requirements are git's alone, so these name git's commits.
+- **The server's git half** (`git_protect`). `StoreBrings` answers `Brings` from A-614's store (part 1's walks).
+  `CommitKeys` is A-321's verifier over the policy's keys: the commit's armour dearmoured, verified under git's
+  namespace (`verify_in`, `GIT_NAMESPACE`; git signs with `ssh-keygen -Y sign -n git`), with words for each of A-321's
+  refusals. `declined` answers the check point's refusals in git's words: a denied rewrite or delete as git's own
+  (`non-fast-forward`, `deletion prohibited`), a merge commit and an unsigned commit as part 1's hook words, and every
+  other refusal as git's update hook would (`hook declined`, after `denying the update of <ref> (<why>)`).
+- **Tests** (Mac Studio M3 Ultra, kiln r1125, 2026-11-19, debug, load 9 to 16): `cargo test --locked -p slates-db --lib`
+  140 of 140; `-p slates-ipc --lib` 74 passed, 2 ignored; `-p slates-server --lib` 621 passed, 3 ignored, and one failed
+  that fails on main too:
+  `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request` failed 3 of 3 at
+  8b3297fe0 (main, without this change) and 5 of 5 here, alone; `cargo fmt -p slates-db -p slates-ipc -p slates-server
+  -- --check` clean. Twelve pushes of part 1's golden vectors are answered through the policy with every byte stock git
+  wrote: a git record denying `main`'s rewrite, delete, merge commits and unsigned commits, trusting the fixtures' key,
+  its commits verified by A-321's code. The commit signatures stock git made verify under git's namespace alone (as
+  signed work they are `Namespace`, under the other key `UnregisteredKey`, over a changed payload `BadSignature`). A
+  requirement binds only where a rule imposes it and lifts for whom a later rule names, never asked where none does;
+  signatures are judged under exactly the record's keys; a linear history before signatures; a store's refusal typed;
+  the verb keeps a git repository's signers once and refuses a Mercurial repository's, and its requirement rule.
+  - Red first (on the Studio, at 1c6ec1f1e, the entry points stubbed): slates-db 2 of 2 new tests failed; slates-server
+    6 of 7 new (the seventh, that a push no requirement names is applied, holds of the stubs too). A first red run met a
+    target directory shared with main's tree: cargo took main's crates as fresh (`git archive` stamps a file with its
+    commit's time, older than the last build), so the run failed to compile against them; `cargo clean -p` for the four
+    crates, then the run above.
+  - Red eight ways by mutation (kiln r1169, and the guard's mutation again after its first pattern missed), each caught:
+    a lifted requirement still binding; the record's signers not read; signatures judged before a linear history; the
+    namespace ignored; signers kept twice; the guard holding the requirements for every tool; a denied rewrite answered
+    as a hook's; the untrusted words changed.
+  - The tree it lands from (fe2533225: main 92ffda926 and this change), on the Mac Studio (macOS arm64, kiln r14 and
+    r31, 2026-11-19, debug, load 9 to 11): `cargo fmt --check` clean for slates-db, slates-ipc, slates-git and
+    slates-server; `cargo test --locked -p slates-db --lib repository::` 23 of 23; `-p slates-ipc --lib protocol::` 5
+    passed, 1 ignored; `-p slates-git --lib` over the four test modules this change edits 49 of 49;
+    `-p slates-db --test wire_order every_` and `-p slates-ipc --test wire_order every_` 2 of 2 each (the appended
+    tags); `-p slates-server --test signed_work` over its signed merges, signed landings, trusted signers and a
+    landing's signature, 8 of 8 (A-321's verifier through a daemon, its namespace now a parameter); and
+    `-p slates-server --lib` over `git_protect::`, `vcs_policy::`, `signed_work::`, `repository::`, `lfs::`,
+    `svn_hooks::` and `vcs_http::git::tests` 62 of 62 at 4 threads, the seven new tests among them, compiled with
+    main's own break of that lib's tests patched in the run's copy alone (its HTTP tests' stub pack source returned
+    `PackRefused::Stalled`, which A-640 part 3 removed; main's 93bd6e807 fixed it).
+- **Owed:** receive-pack's server half asking all of this for each command (A-620 part 2's judge over the store,
+  composed with the server's greens and appends), and its hooks (A-622 part 3); Mercurial's linear history on its push
+  path (A-641); OpenPGP and X.509 commit signatures; a push's commits judged in slices under the shard's budget.
 
 ### A-640 part 4, second slice — The walk by path: git's sparse frames over named tree entries (2026-11-19, g296, UI goal 93 (kiln 51cef9f7); §4.17.2 "A fetch" item 3, "Filters"; A-615 part 2, A-640 part 4 first slice)
 Applied in the same change to:
