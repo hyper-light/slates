@@ -2397,10 +2397,16 @@
 >   placement names only the successor and the volume's current content candidates (`takeover::adopted_served`), the
 >   healer replacing an adopted volume's placement that names a member outside them rather than restoring it
 >   (`fleet.heal.adopted_replaced`). Tests: `a_round_confirms_only_once_its_adopted_volumes_are_served_from_its_placement`
->   (`crates/server/src/takeover.rs`, red with the gate removed) and the healer's decision test. Owed, in order: holders
->   let a stale copy's content go on such a confirmation or its completion record (the regional layout bumped, so a
->   mixed fleet cannot read an older build's confirmation as certified); an owner's settle certifies content the same
->   way (A-508's holders then drop content too).
+>   (`crates/server/src/takeover.rs`, red with the gate removed) and the healer's decision test. **Fixed (A-538, g250,
+>   2026-11-19): holders use it.** A stale copy judged on a certified confirmation or its completion record, its holder
+>   outside the successor's placement, lets go the content its own stale records name (`fleet.takeover.released_certified`),
+>   keeping only a placement ahead of them; each retirement and record carries its certification (regional layout 6), and
+>   a configuration an older build wrote (layout 5) is read with every takeover uncertified, whose holders keep the
+>   content as before. Tests: `a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation`
+>   (red before), the A-335 test on an uncertified takeover (red with an uncertified takeover's content let go),
+>   `a_layout_five_configuration_reads_its_takeovers_as_uncertified`, `a_takeover_this_build_makes_certifies_its_content`.
+>   Owed: an owner's settle certifies content the same way (A-508's holders then drop content too); a settled line's
+>   lagging holder still keeps content (it judges no successor's placement).
 > - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
 >   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
 >   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'

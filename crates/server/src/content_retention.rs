@@ -195,6 +195,27 @@ pub(crate) fn retain_object_from(
   released
 }
 
+/// [`retain_object`] for a stale copy judged on a takeover whose confirmations certify their content (A-538): its
+/// successor serves the volume from its own placement (A-529), so no head it serves names this holder for what this
+/// holder's own stale records name, and that goes; returns how many manifests went. Content placed for a sequence ahead
+/// of those records stays while it is the newest placement ahead: it may be the successor's own re-placement, made
+/// while this holder was among its candidates, which its republished head names.
+pub(crate) fn release_certified(state: &mut ShardState, object: ObjectId) -> usize {
+  let newest = newest(state.holder_records.as_map(), object);
+  let newest_placed = state.held_content.newest_placed(object).unwrap_or(0);
+  let space = &mut crate::content_holder::hold_space(&mut state.store);
+  let released = state
+    .held_content
+    .retain_placed_from(space, object, 0, |_, placed| {
+      ahead(&newest, placed.sequence) && placed.sequence >= newest_placed
+    });
+  if released > 0 {
+    let count = state.refusals.entry(CONTENT_RELEASED).or_insert(0);
+    *count = count.saturating_add(u64::try_from(released).unwrap_or(u64::MAX));
+  }
+  released
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
