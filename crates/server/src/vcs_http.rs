@@ -57,7 +57,7 @@
 //! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
 //! Subversion's site; the MCP edge onto this engine; the live `git clone` and `hg clone` over HTTPS (main's runs).
 
-mod daemon_edge;
+pub(crate) mod daemon_edge;
 pub(crate) mod git;
 mod hg;
 pub(crate) mod waits;

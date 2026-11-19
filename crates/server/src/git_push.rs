@@ -110,7 +110,7 @@ use crate::vcs_store::{GitPush, GitRefused, GitStore, SealedPush, Target, green_
 use crate::verbs::to_wire_volume;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Format: the agent receive-pack advertises (`agent=`), the name upload-pack gives this server too (A-640).
 const AGENT: &[u8] = slates_git::upload::AGENT.as_bytes();
