@@ -12696,6 +12696,20 @@ signature verification).
 > and a model of `addgroup` over generated histories. The revlog reader's compressed chunks are now inflated by the
 > crate's one inflater, A-598's `compression::inflate`. Owed: the phase roots, markers and branch heads of the index
 > sketched below (pieces 5 and 7), and the import's walk of a store.
+>
+> **Status (2026-11-19, A-619 part 1: piece 4's read-serving logic, its discovery, `listkeys` and `getbundle`'s
+> choice).** `slates-hg`'s `serve` answers over a `Repository` trait, the served view's changelog graph and names, so
+> the index (A-588's tables) presents it later as a test's history does now: `heads` (newest first, the null node for an
+> empty repository), `known` (the null node held), `between`, `branches`, `branchmap` (each branch's heads oldest
+> first, closed ones kept, the names quoted), `listkeys` of `namespaces`, `bookmarks` and `phases` (the served view's
+> draft roots, and `publishing`), and a `getbundle`'s choice: its missing changesets in one walk down from the newest
+> revision named, and the `phase-heads` and `bookmarks` entries that travel with them. A client's node lists are read
+> within the request's admission, every walk's state charged first, and a graph that names a parent after its child is
+> refused rather than followed. Proven against a naive oracle on generated histories, 7.2's set discovery driven
+> against `heads` and `known` (its rounds counted), and a probe of stock `hg serve --stdio` 7.2
+> (`crates/hg/fixtures/serve`): eight answers byte for byte. Owed of piece 4: the changegroup the choice names (its
+> manifests and files, held deltas or full texts), the bundle2 a `getbundle` answers, then `slates hg serve --stdio`'s
+> loop and HTTP version 1; the heads the index keeps will replace the walks over the whole view.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13087,7 +13101,9 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    revlog reader, its zlib and zstd chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd), its tests
    holding inflated bytes. Built (A-588 part 2, `crates/hg`: `index`): the index's tables on A-581's `slates-vcs`, with
    Mercurial's naming as its `Naming`. Owed: the import's walk of a store.
-4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1.
+4. Read serving: discovery, `listkeys` and `getbundle` over `slates hg serve --stdio`, then over HTTP version 1. Built
+   (A-619 part 1, `crates/hg` `serve`): discovery's answers, `listkeys`, `getbundle`'s choice of changesets and its
+   phase heads and bookmarks; owed: the changegroup and bundle2 assembly, the stdio loop, HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
@@ -42298,6 +42314,54 @@ sources), and `crates/svn` (`dav/listing.rs`, `dav/locking.rs`, their tests, fou
   - LOCK's answer (`util_lock.c`'s `activelock`, with `mod_dav_svn`'s `X-SVN-Creation-Date` and `X-SVN-Lock-Owner`
     headers);
   - the mapping of LOCK and UNLOCK onto the A-602 guards in the server.
+
+### A-619 — Mercurial's read serving, part 1: discovery's answers, `listkeys` and a `getbundle`'s choice of changesets over the served view's graph, held to stock Mercurial 7.2 (2026-11-19, g079 for UI goal 93 (kiln 51cef9f7); §4.17.3 "Pull and clone" items 1 to 3, piece 4; §4.9; A-514, A-545, A-569)
+Applied in the same change to: §4.17.3 (its status, and piece 4's line), `crates/hg` (`serve`, new: the `Repository`
+trait, `discovery`, `pull`; `fixtures/serve/` with `make-serve-fixtures.sh` and `SHA256SUMS`), GAPS (the §4.17.3
+entry), `research/mercurial-server.md` (§18).
+- **What it does.** Over a `Repository` (the served view's changesets numbered oldest first, each parent before its
+  child, with branches, closes, phases, bookmarks and the publishing flag), `serve::discovery` writes `heads`, `known`,
+  `between`, `branches` and `branchmap` as 7.2's `wireprotov1server.py` writes them, and `serve::pull` writes
+  `listkeys`'s answers and chooses a `getbundle`'s changesets (`_computeoutgoing`: unknown common nodes dropped, the
+  view's heads when none are asked, an unknown head refused, the missing ones every ancestor of a head that is no
+  ancestor of a common revision, oldest first), with the `phase-heads` entries (`_getbundlephasespart`: all public on
+  a publishing repository; otherwise each head in its phase and, with draft heads, the public heads of what they hold
+  and the public heads do not) and the `bookmarks` entries (`listbinbookmarks`) beside them.
+- **Decided: one walk, its state charged.** The missing changesets come from one walk down from the newest revision
+  named, a byte of marks a revision (reached from a head, from a common revision, found missing), stopping once no
+  revision reached from a head alone is left below (7.2's `missingancestors` does the same work incrementally); heads
+  and branch heads a bit a revision. Every such allocation, and every decoded node list, is charged to the request's
+  admission first. A parent named after its child is refused as the graph's fault, so no repository can make a walk
+  loop. The walks over the whole view are what the index's kept heads (`HgIndex::heads`) will replace.
+- **From the sources.** 7.2's `wireprotov1server.py`, `localrepo.py` (`heads` reverses `headrevs()`; `known` holds the
+  null node; `between`'s doubling walk; `branches`' first-parent runs), `branchmap.py` (a branch's heads in revision
+  order, closed ones kept with `closed=True`), `exchange.py`, `discovery.py`, `phases.py` (`listphases`),
+  `bookmarks.py`, `pushkey.py` and `setdiscovery.py`, from `mercurial-7.2.tar.gz` (SHA-256 `a250227e…`).
+- **Stricter than 7.2, or apart from it, on purpose.** A node list's item must be 40 hexadecimal digits (7.2 reads an
+  empty item between two spaces as a node of no bytes, answered unknown). `listkeys phases` lists the served view's
+  draft roots (7.2's `listphases` reads the unfiltered roots, so a hidden draft root, a node no client can hold, would
+  be listed too). `branchmap` orders branches by name, the order 7.2's branch cache takes once it is written (before,
+  its own insertion order).
+- **Golden vectors.** `crates/hg/fixtures/serve`: a probe of stock `hg serve --stdio` 7.2 (PyPI through `uvx`, CPython
+  3.12) on the Mac Studio, 2026-11-19, by `make-serve-fixtures.sh` (its header names the command): the served view
+  (`state-probe.txt`), its bookmarks, the eight requests the probe wrote and the eight answers, `SHA256SUMS` checked.
+  The Studio cannot push, so its four files were printed there escaped and written here, each SHA-256 equal to the
+  run's. The script's sessions (a clone, a pull, an incoming, recorded by an ssh stand-in) are part 2's.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug).** `cargo test --locked -p slates-hg --lib`: 182 of 182 (load 6.5),
+  8 of them this part's; `cargo fmt -p slates-hg -- --check` clean. Oracle (proptest, generated histories with
+  merges, branches, closes, drafts and bookmarks): `heads`, `branchmap` and every `listkeys` namespace byte for byte
+  as whole-set computations write them; `known`, `between` and `branches` from every revision; a `getbundle`'s choice
+  and phase heads for generated heads and common sets. Set discovery: a test port of 7.2's `findcommonheads` and
+  `partialdiscovery` (sampling in revision order) run against `heads` and `known` finds exactly the shared set on
+  generated pairs of histories, and on 300 changesets forked from a remote's 260 takes at least three rounds, its
+  counters asserted. Hostile: items of 39 and 41 digits, a non-hexadecimal one, an empty one; pairs of one and three
+  nodes; unknown tops, nodes and heads; an admission too short; a graph naming a parent after its child: each refused
+  by kind, an unknown common node dropped. Golden: the probe's eight answers byte for byte. Red: the same tests against
+  every public answer stubbed empty: all 7 then written failed.
+- **Owed (part 2 and after).** The changegroup a choice names (manifests named by the missing changesets, minus those
+  linked to common ones; files from their manifests at the paths they touch; full texts or held deltas, version 02 or
+  03), the bundle2 a `getbundle` answers with its parts in 7.2's order, golden over the script's recorded sessions;
+  `obsolete`'s `listkeys` dump and the `obsmarkers` part; then `slates hg serve --stdio`'s loop and HTTP version 1.
 
 ### A-618 — A client's push becomes a work by its trees' identities, the head an attribute of the root, and a removed file's metadata goes with it (2026-11-19, g225, UI goal 93; §4.17.1 "A push is a work" items 2 to 4, shared piece 4; §4.16 "The state's maps"; after A-534, A-581, A-603)
 Applied in the same change to:
