@@ -1,15 +1,20 @@
-//! A-510 (§2.6 "Boot order", the stop; `docs/bugs/2026-11-18-an-anchors-stop-waited-on-the-process-that-asked-for-it.md`):
-//! a stop asked of the anchor completes within its bound whether or not the process that asked stays. kiln's
-//! real-instance test (g267, the Mac Studio, 2026-11-18) sent its anchor `SIGTERM` and exited, and its instance still
-//! served about two minutes later; the same test, waiting for the stop, saw it end in about 0.2 s.
+//! A-510 (§2.6 "Boot order", the stop; `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`): a stop asked of
+//! the anchor completes within its bound whether or not the process that asked stays. kiln's real-instance test (g267,
+//! the Mac Studio, 2026-11-18) sent its anchor `SIGTERM` and exited, and its instance was seen still serving about two
+//! minutes later; the same test, waiting for the stop, saw it end in about 0.2 s.
 //!
 //! The test is that shape across real processes. A sender (this binary re-invoked as [`a_sender_role`]) starts the anchor
-//! as its child in a process group of its own, as a host's start does (`StartSpec::anchor_command`), connects a client,
-//! sends the anchor `SIGTERM` and exits at once, its client still connected and the anchor not waited for. The test then
-//! watches the anchor and its daemon by their process ids alone, with no client of its own: a call is work that could
-//! wake a stop nothing else woke. The anchor and the daemon are the liveness tests' roles (`super::liveness_tests`), the
-//! product's own supervision and serve; their lines come to the test on the sender's standard streams, which both
-//! inherit.
+//! as its child in a process group of its own, as a host's start does (`StartSpec::anchor_command`), connects a client
+//! that creates a volume, attaches it for writing and writes it, sends the anchor `SIGTERM` and exits at once: its client
+//! still connected, its write attachment held and the anchor not waited for. The test then watches the anchor and its
+//! daemon by their process ids alone, with no client of its own, since a call is work that could wake a stop nothing
+//! else woke. The anchor and the daemon are the liveness tests' roles (`super::liveness_tests`), the product's own
+//! supervision and serve; their lines come to the test on the sender's standard streams, which both inherit.
+//!
+//! It did not reproduce kiln's delay (the Mac Studio, 2026-11-18): the anchor and its daemon were gone 283 ms after the
+//! signal with a bare client, and 191 ms with the client mid-use. So the stop does not wait on the process that asked
+//! for it: the daemon's stop asks no client anything, and the anchor holds it to its own bounds (`stop_step`). The test
+//! stays as the guard of that rule, and the bug record says what kiln's run had that this one has not.
 // Unix only, as the liveness tests (their module says why).
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -51,9 +56,9 @@ const VOLUME_BOUND: u64 = 1 << 20;
 /// fire-and-exit test missed by minutes.
 const STOP_WITHIN: Duration = Duration::from_nanos(OBSERVE_BUDGET_NS);
 
-/// The sender role: starts the anchor role as its child in a process group of its own, connects a client, sends the
-/// anchor `SIGTERM`, says so, and exits at once, its client still connected (no destructor runs) and the anchor not
-/// waited for, as kiln's test did.
+/// The sender role: starts the anchor role as its child in a process group of its own, connects a client that creates a
+/// volume, attaches it for writing and writes it, sends the anchor `SIGTERM`, says so, and exits at once: its client
+/// still connected and its attachment held (no destructor runs), the anchor not waited for, as kiln's test did.
 #[test]
 #[ignore = "a role: run by this module's test in a child process"]
 fn a_sender_role() {
@@ -108,10 +113,11 @@ fn exists(pid: u64) -> bool {
   )
 }
 
-/// A-510 (§2.6, the stop). Do: a sender starts the anchor as its child in a process group of its own, connects a client,
-/// sends the anchor `SIGTERM` and exits at once, its client still connected; watch the anchor and its daemon by their
-/// process ids alone. Expect: both gone within [`STOP_WITHIN`] of the signal. kiln's test of that shape saw its instance
-/// still serving about two minutes after (g267, 2026-11-18), where waiting for the stop saw it end in about 0.2 s.
+/// A-510 (§2.6, the stop). Do: a sender starts the anchor as its child in a process group of its own, connects a client
+/// that holds a written write attachment, sends the anchor `SIGTERM` and exits at once; watch the anchor and its daemon
+/// by their process ids alone. Expect: both gone within [`STOP_WITHIN`] of the signal. kiln's test of that shape saw its
+/// instance still serving about two minutes after (g267, 2026-11-18), where waiting for the stop saw it end in about
+/// 0.2 s; here both are gone in about 0.2 s either way.
 #[test]
 fn an_anchor_whose_stop_was_asked_by_a_sender_that_exited_stops_within_its_bound() {
   let instance = format!("a510-{}", std::process::id());

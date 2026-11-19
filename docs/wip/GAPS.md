@@ -9,6 +9,21 @@
 > review records; policy and hooks), then each tool's pieces. No speed is claimed until main measures it by §4.17.1's
 > method.
 
+> **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
+> own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
+> `SIGTERM` and returned, and the instance was seen serving about two minutes later. Waiting for the stop (r443, r457)
+> it ended in 204 ms and 176 ms. Slates' stop path waits on nothing the sender holds. Its lines never panic on a closed
+> pipe. The anchor leads its own process group. The anchor ends any stop within its own bounds (`stop_step`,
+> `stop_overdue`). The daemon's stop asks no client anything. The guard test
+> `an_anchor_whose_stop_was_asked_by_a_sender_that_exited_stops_within_its_bound` (`crates/api/src/role/stop_tests.rs`)
+> has a sender that starts the anchor in its own group, holds a written write attachment, sends `SIGTERM` and exits at
+> once. There the anchor and daemon were gone in 191 ms (283 ms with a bare client). Not reproduced, so not fixed: what
+> kiln's run had beyond it is the anchor as kiln's executable, the launcher's secret on standard input, a log file, the
+> K5 scenario's captured clones, the test's temporary directory removed right after the signal (with the clones'
+> base), and kiln's runner's handling of leftover processes. **Owed:** kiln's K5 in its fire-and-exit shape, the
+> anchor's log kept outside the temporary directory, with `ps` states and a `sample` of the anchor and daemon during the
+> two minutes (filed for main). Record: `docs/bugs/2026-11-18-a-stop-asked-by-a-sender-that-exited.md`.
+
 > **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
 > holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
 > register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
