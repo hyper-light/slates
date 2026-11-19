@@ -146,6 +146,10 @@ pub enum HostError {
   Unsupported(OsCode),
   /// Anything else the host cannot serve, by the code it named, typed by its numbering (A-527, A-539).
   Unavailable(OsCode),
+  /// The verb needs a privilege this process does not hold, and slates asks for none (R10): a symbolic link on a Windows
+  /// account whose token lacks `SeCreateSymbolicLinkPrivilege` (`ERROR_PRIVILEGE_NOT_HELD`), by the code the host named
+  /// it with (A-568).
+  Unprivileged(OsCode),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
   /// A-227): nothing was opened, since the daemon would have waited on its own answer. The code the platform names a
   /// deadlock avoided by, typed by its numbering (A-539): `EDEADLK`, or Windows' `ERROR_POSSIBLE_DEADLOCK`, a Win32 code
@@ -168,6 +172,7 @@ impl std::fmt::Display for HostError {
       Self::NoSpace(code) => write!(f, "no room ({code})"),
       Self::Unsupported(code) => write!(f, "not supported here ({code})"),
       Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
+      Self::Unprivileged(code) => write!(f, "a privilege this process does not hold ({code})"),
       Self::OwnMount(code) => write!(f, "on a mount this daemon serves ({code})"),
       Self::Pending => f.write_str("the host's fetch is pending"),
     }
@@ -185,6 +190,7 @@ impl HostError {
       | Self::NoSpace(code)
       | Self::Unsupported(code)
       | Self::Unavailable(code)
+      | Self::Unprivileged(code)
       | Self::OwnMount(code) => Some(*code),
       Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle | Self::Pending => {
         None

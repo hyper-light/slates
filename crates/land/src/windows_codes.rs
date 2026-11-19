@@ -23,6 +23,9 @@ pub(crate) const DISK_FULL: u32 = 112;
 /// Format: `ERROR_NOT_SUPPORTED` (winerror.h): the request is not supported; the code the writer names a verb NTFS
 /// lacks by (an exchange, a clone it cannot make, a bit the file system drops).
 pub(crate) const NOT_SUPPORTED: u32 = 50;
+/// Format: `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): a required privilege is not held by the client; what a symbolic
+/// link's set (`FSCTL_SET_REPARSE_POINT`) answers on an account without `SeCreateSymbolicLinkPrivilege` (A-568).
+const PRIVILEGE_NOT_HELD: u32 = 1314;
 
 /// The seam's refusal for the Win32 error code `code`: a name that exists or a full disk named as its kind, by its
 /// code; any other code as the Win32 code it is, which no reader takes for an errno.
@@ -79,13 +82,34 @@ mod tests {
       assert_eq!(refusal_of(code), kept(code), "{code}");
     }
     for code in 0..CODES {
-      if ![FILE_EXISTS, ALREADY_EXISTS, HANDLE_DISK_FULL, DISK_FULL].contains(&code) {
+      if ![
+        FILE_EXISTS,
+        ALREADY_EXISTS,
+        HANDLE_DISK_FULL,
+        DISK_FULL,
+        PRIVILEGE_NOT_HELD,
+      ]
+      .contains(&code)
+      {
         assert_eq!(refusal_of(code), kept(code), "{code}");
       }
     }
     assert_eq!(
       unsupported(NOT_SUPPORTED),
       HostError::Unsupported(OsCode::Win32(NOT_SUPPORTED))
+    );
+  }
+
+  /// A-568 (a link the account may not make fails alone). Do: read through the writer's rule the code a symbolic link's
+  /// set answers on an account without the link privilege (`ERROR_PRIVILEGE_NOT_HELD`, measured on jupiter in Developer
+  /// Mode, where `CreateSymbolicLinkW`'s unprivileged flag makes a link and this route may not). Expect the privilege
+  /// named as its kind, `Unprivileged`, by its own Win32 code: the landing fails that entry alone by it and goes on.
+  /// Before A-568 it was `Unavailable`, which ended the whole landing.
+  #[test]
+  fn a_privilege_the_process_lacks_is_named_as_its_kind() {
+    assert_eq!(
+      refusal_of(PRIVILEGE_NOT_HELD),
+      HostError::Unprivileged(OsCode::Win32(PRIVILEGE_NOT_HELD))
     );
   }
 }

@@ -1683,7 +1683,10 @@ impl<H: LandFs> Landing<'_, H> {
       // Any other refusal the host names a code for — a name in use or a verb missing where the landing expected
       // neither, or anything it could not serve — ends the landing, whatever the code's number.
       Err(WriteFailure::Host(
-        HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code),
+        HostError::Exists(code)
+        | HostError::Unsupported(code)
+        | HostError::Unavailable(code)
+        | HostError::Unprivileged(code),
       )) => {
         self.crashed = Some(code);
         Written {
@@ -2919,8 +2922,10 @@ impl<H: LandFs> Landing<'_, H> {
   /// answering — the simulated crash, an `EIO`, a Win32 code) aborts the landing so nothing is advanced; no room and the
   /// typed refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
   fn note_crash(&mut self, error: HostError) {
-    if let HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code) =
-      error
+    if let HostError::Exists(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code)
+    | HostError::Unprivileged(code) = error
     {
       self.crashed = Some(code);
     }
@@ -3332,7 +3337,8 @@ fn named_code(error: HostError) -> Option<OsCode> {
     HostError::Exists(code)
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
-    | HostError::Unavailable(code) => Some(code),
+    | HostError::Unavailable(code)
+    | HostError::Unprivileged(code) => Some(code),
     HostError::NotFound
     | HostError::NotDirectory
     | HostError::NotFile

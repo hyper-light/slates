@@ -563,6 +563,7 @@ pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> 
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => Some(code),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       Some(GONE_DIRECTORY)
@@ -886,6 +887,7 @@ fn host_refusal(e: HostError) -> VfsError {
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => VfsError::BaseUnavailable(Some(code)),
     HostError::Pending => VfsError::BasePending,
   }
