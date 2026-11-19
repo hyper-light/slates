@@ -33,6 +33,17 @@ impl Positions {
     Positions { runs }
   }
 
+  /// The positions from `start` up to `end`, one run, made without listing them (A-665: the view
+  /// starts from every position the repository gave); empty when `end` is not past `start`.
+  pub fn span(start: u64, end: u64) -> Positions {
+    if end <= start {
+      return Positions::new();
+    }
+    Positions {
+      runs: vec![(start, end)],
+    }
+  }
+
   /// Whether the set holds `position`.
   pub fn contains(&self, position: u64) -> bool {
     let after = self.runs.partition_point(|run| run.0 <= position);

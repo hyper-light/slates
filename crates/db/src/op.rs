@@ -732,6 +732,12 @@ pub enum Op {
     /// The policy, its version the next.
     policy: crate::catalog::RepositoryPolicy,
   },
+  /// A principal's tool identities were set whole by its owner on the control channel (§4.13; §4.17.1 "A push is a
+  /// work" item 4; A-664), as the version after the one its setter read. Appended.
+  IdentitiesSet {
+    /// The record, its version the next.
+    record: crate::catalog::IdentityRecord,
+  },
   /// A version-control credential was enrolled by the human surface (§4.13, §4.17.2 "Access"; A-625 part 3), on the
   /// partition its id routes to. Appended.
   CredentialEnrolled {
@@ -847,6 +853,7 @@ impl Op {
       Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
       Op::RepositoryDefaultSet { .. } => "repository_default_set",
       Op::RepositoryDestroyed { .. } => "repository_destroyed",
+      Op::IdentitiesSet { .. } => "identities_set",
       Op::CredentialEnrolled { .. } => "credential_enrolled",
       Op::CredentialRevoked { .. } => "credential_revoked",
     }

@@ -1781,6 +1781,17 @@ impl Repository {
     Some((base.version, part))
   }
 
+  /// The position the next object new to the repository gets: every position below it is given
+  /// (A-665: the hook's view shows every object the repository holds).
+  pub(super) fn next_position(&self) -> u64 {
+    self.next_position
+  }
+
+  /// Every green with a chain, in order (A-665: the hook's view weighs each one's base pack).
+  pub(super) fn greens(&self) -> impl Iterator<Item = u64> + '_ {
+    self.chains.keys().copied()
+  }
+
   /// The position of `green`'s version `version`'s head; `None` for a deleted ref.
   pub(super) fn head_position(&self, green: u64, version: usize) -> Option<u64> {
     self.chains.get(&green)?.versions.get(version)?.head

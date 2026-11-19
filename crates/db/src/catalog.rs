@@ -191,6 +191,36 @@ pub struct ConsumerRecord {
   pub write_version: u64,
 }
 
+/// git's author and committer of the commits the server makes for a principal (§4.17.1 "A push is a work" item 4;
+/// A-664): the name and the email exactly as git writes them. The server holds them to git's own rules before it records
+/// them (`slates_git::derived::Identity`: no byte git would strip from either end or drop from inside, a name not
+/// empty), so every commit made of them carries these bytes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GitIdentity {
+  /// The name.
+  pub name: String,
+  /// The email: may be empty, which git writes `<>`.
+  pub email: String,
+}
+
+/// A principal's identities in the tools whose objects the server makes for it (§4.13 "a principal's record"; §4.17.1
+/// "A push is a work" item 4; §4.17.3 decision 7; A-664): git's author and committer, and Mercurial's user. Set whole by
+/// the principal's owner on the control channel, never on the principal's own channel, as the version after the one
+/// its setter read, so a setting made from a stale read changes nothing (`Op::IdentitiesSet`). Kept on the partition
+/// that holds the principal's record, keyed by the principal's key.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRecord {
+  /// The principal.
+  pub principal: Principal,
+  /// git's author and committer; `None` when the principal has none, so a submit of its to a git repository's green is
+  /// refused `IdentityRequired`.
+  pub git: Option<GitIdentity>,
+  /// Mercurial's user, `Name <address>` (§4.17.3 decision 7); `None` when it has none.
+  pub mercurial: Option<String>,
+  /// How many times they were set: the first setting's is 1.
+  pub version: u64,
+}
+
 /// What a version-control credential is (§4.13, §4.17.2 "Access"; A-625 part 3): an SSH user key or an HTTP token.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum CredentialKind {
@@ -1899,26 +1929,33 @@ impl AtomicRecord {
   /// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of the
   /// record and not the rest: a log inside a span, or one log past its span beside another before its own.
   pub fn split_by(&self, at: impl Fn(&LogName) -> Option<u64>) -> bool {
-    let mut side = None;
-    for span in &self.spans {
-      let Some(position) = at(&span.log) else {
-        continue;
-      };
-      let held = if position >= span.to {
-        true
-      } else if position <= span.from {
-        false
-      } else {
-        return true;
-      };
-      match side {
-        None => side = Some(held),
-        Some(seen) if seen != held => return true,
-        Some(_) => {}
-      }
-    }
-    false
+    spans_split_by(&self.spans, at)
   }
+}
+
+/// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of a
+/// record's spans and not the rest (A-642): [`AtomicRecord::split_by`]'s rule, which the fleet's replicas judge every
+/// record's spans by (A-636), a record of one log's included.
+pub fn spans_split_by(spans: &[LogSpan], at: impl Fn(&LogName) -> Option<u64>) -> bool {
+  let mut side = None;
+  for span in spans {
+    let Some(position) = at(&span.log) else {
+      continue;
+    };
+    let held = if position >= span.to {
+      true
+    } else if position <= span.from {
+      false
+    } else {
+      return true;
+    };
+    match side {
+      None => side = Some(held),
+      Some(seen) if seen != held => return true,
+      Some(_) => {}
+    }
+  }
+  false
 }
 
 /// A Git LFS lock as a repository's lock log holds it (A-642): the locked path and the lock's record, its bytes the LFS

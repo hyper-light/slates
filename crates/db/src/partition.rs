@@ -20,10 +20,11 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  GrantState, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord,
-  NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
-  NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX,
-  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge,
+  NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES,
+  SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
+  VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -188,6 +189,8 @@ pub struct PartitionSnapshot {
   pub repository_registers: Vec<crate::catalog::RegisterRecord>,
   /// The atomic records kept, by key, each with the positions pointing to it still (A-642; appended).
   pub atomic_records: Vec<crate::catalog::AtomicHeld>,
+  /// The principals' tool identities this partition keeps (§4.13; A-664; appended), by principal key.
+  pub identities: Vec<IdentityRecord>,
   /// The version-control credentials this partition holds (§4.13, §4.17.2 "Access"; A-625 part 3; appended), by id.
   pub credentials: Vec<crate::catalog::CredentialRecord>,
 }
@@ -301,6 +304,9 @@ pub struct Partition {
   /// The enrolled consumers, by id (§4.13; bounded by the enrollments a human makes, one durable record
   /// each — never grown by a workload).
   consumers: BTreeMap<u64, ConsumerRecord>,
+  /// The principals' tool identities (§4.13; A-664), by principal key: one record a principal, each set whole by its
+  /// owner, so bounded by the principals its owners name, never grown by a workload.
+  identities: BTreeMap<Vec<u8>, IdentityRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
   /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
@@ -445,6 +451,7 @@ impl Partition {
       client_id_high_water: 0,
       grants: BTreeMap::new(),
       consumers: BTreeMap::new(),
+      identities: BTreeMap::new(),
       nfs_opens: BTreeMap::new(),
       nfs_delegations: BTreeMap::new(),
       seal_keys: BTreeMap::new(),
@@ -1186,6 +1193,24 @@ impl Partition {
     self.consumers.get(&id)
   }
 
+  /// A principal's tool identities (§4.13; A-664), or `None` when its owner never set them here.
+  pub fn identities(&self, principal: &Principal) -> Option<&IdentityRecord> {
+    self.identities.get(&principal.key())
+  }
+
+  /// A principal's identities set as the version after its current one (A-664), the first setting's 1: a setting made
+  /// from a stale read is refused `PolicyChanged` with the version now, and changes nothing.
+  fn check_identities(&self, record: &IdentityRecord) -> Result<(), DbError> {
+    let current = self
+      .identities(&record.principal)
+      .map_or(0, |held| held.version);
+    if current.checked_add(1) == Some(record.version) {
+      Ok(())
+    } else {
+      Err(DbError::PolicyChanged { current })
+    }
+  }
+
   /// The NFSv4 opens held at this partition's files (§4.6 A-37).
   pub fn nfs_opens(&self) -> impl Iterator<Item = &NfsOpenRecord> {
     self.nfs_opens.values()
@@ -1761,6 +1786,7 @@ impl Partition {
         .get(consumer)
         .map(|_| ())
         .ok_or(DbError::NotFound),
+      Op::IdentitiesSet { record } => self.check_identities(record),
       Op::LandingLeaseTaken { record } => self.check_landing_lease(record, now_ns),
       Op::LandingLeaseReleased { target } => self
         .landing_lease(target)
@@ -2407,6 +2433,12 @@ impl Partition {
         record.write_version = record.write_version.saturating_add(1);
         Ok(())
       }
+      Op::IdentitiesSet { record } => {
+        self
+          .identities
+          .insert(record.principal.key(), record.clone());
+        Ok(())
+      }
       Op::LandingLeaseTaken { record } => {
         self
           .landing_leases
@@ -2821,6 +2853,7 @@ impl Partition {
       review_approvals: self.reviews.approval_records().cloned().collect(),
       repository_registers: self.repositories.registers().collect(),
       atomic_records: self.repositories.atomic_held(),
+      identities: self.identities.values().cloned().collect(),
       credentials: self.credentials.records().cloned().collect(),
       work_logs: self
         .work_logs
@@ -2871,10 +2904,16 @@ impl Partition {
     }
   }
 
-  /// Restores the enrolled consumers (§4.13) and the owed tombstones (AUD-29-43) a snapshot carries.
+  /// Restores the enrolled consumers and the principals' tool identities (§4.13, A-664) and the owed tombstones
+  /// (AUD-29-43) a snapshot carries.
   fn restore_consumers_and_tombstones(&mut self, snapshot: &PartitionSnapshot) {
     for c in &snapshot.consumers {
       self.consumers.insert(c.consumer, c.clone());
+    }
+    for record in &snapshot.identities {
+      self
+        .identities
+        .insert(record.principal.key(), record.clone());
     }
     for tombstone in &snapshot.tombstones {
       self.tombstones.insert(tombstone.volume, tombstone.sequence);
@@ -3136,3 +3175,7 @@ impl Partition {
     }
   }
 }
+
+#[cfg(test)]
+#[path = "tests/identities.rs"]
+mod identities_tests;
