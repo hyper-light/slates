@@ -23,8 +23,10 @@
 //! Subversion's repository view, their own pieces); this module names it.
 //!
 //! **What a hook is given** ([`HookInput`]), in each tool's own terms: git's `<old-oid> SP <new-oid> SP <ref-name> LF`
-//! lines and its push options as `GIT_PUSH_OPTION_<i>` and `GIT_PUSH_OPTION_COUNT`, unset when none were negotiated
-//! (`builtin/receive-pack.c` `run_receive_hook`); Mercurial's `HG_*` environment (`HG_HOOKTYPE`, `HG_HOOKNAME`,
+//! lines and its push options as `GIT_PUSH_OPTION_<i>` and `GIT_PUSH_OPTION_COUNT`, the count `0` when none were
+//! negotiated, as stock receive-pack 2.50.1 sets it: `cmd_receive_pack` hands every hook its list of options, so
+//! `run_and_feed_hook` sets the count even then, where `githooks.adoc` says the variables "will not be set" (A-665's
+//! recorded hooks, `crates/git/fixtures/view`; `builtin/receive-pack.c` `run_receive_hook`); Mercurial's `HG_*` environment (`HG_HOOKTYPE`, `HG_HOOKNAME`,
 //! `HG_NODE`, `HG_NODE_LAST`, `HG_SOURCE`, `HG_URL`, and `HG_PENDING` for a hook inside the transaction); Subversion's
 //! arguments and standard input as `hooks.c` builds them (`LOCK-TOKENS:` and a `path|token` line a token, then a blank
 //! line; a property's new or old value; the paths a lock hook acted on), each argument a C string that ends at its first
@@ -282,8 +284,6 @@ pub(crate) enum EnvValue {
   Bytes(Vec<u8>),
   /// The root of the hook's view as the hook sees it (Mercurial's `HG_PENDING`), which the driver knows.
   ViewRoot,
-  /// Removed from the environment (git's `GIT_PUSH_OPTION_COUNT` when no push options were negotiated).
-  Unset,
 }
 
 /// What a hook is started with (the module doc).
@@ -325,12 +325,11 @@ fn update_lines(updates: &[RefUpdate]) -> Vec<u8> {
     .collect()
 }
 
-/// The push options as `run_receive_hook` sets them: `GIT_PUSH_OPTION_<i>` each and `GIT_PUSH_OPTION_COUNT`, or the
-/// count unset when the push negotiated none.
+/// The push options as stock receive-pack sets them (`run_and_feed_hook`): `GIT_PUSH_OPTION_<i>` each and
+/// `GIT_PUSH_OPTION_COUNT`, `0` when the push negotiated none, since `cmd_receive_pack` hands every hook its list of
+/// options whether or not the client sent any (module docs).
 fn push_option_env(options: Option<&[Vec<u8>]>) -> Vec<(String, EnvValue)> {
-  let Some(options) = options else {
-    return vec![("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Unset)];
-  };
+  let options = options.unwrap_or_default();
   let mut env: Vec<(String, EnvValue)> = options
     .iter()
     .enumerate()

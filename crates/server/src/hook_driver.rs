@@ -246,7 +246,6 @@ impl Hook {
       match value {
         EnvValue::Bytes(bytes) => command.env(name, std::ffi::OsStr::from_bytes(bytes)),
         EnvValue::ViewRoot => command.env(name, launch.view_root),
-        EnvValue::Unset => command.env_remove(name),
       };
     }
     let mut output_read = None;
@@ -660,7 +659,7 @@ mod tests {
         );
         println!(
           "{TAG}count={}",
-          std::env::var("GIT_PUSH_OPTION_COUNT").is_ok()
+          std::env::var("GIT_PUSH_OPTION_COUNT").unwrap_or_default()
         );
         println!("{TAG}cwd={}", std::env::current_dir().unwrap().display());
         std::process::exit(0);
@@ -739,7 +738,7 @@ mod tests {
         (ROLE.to_owned(), EnvValue::Bytes(role.as_bytes().to_vec())),
         ("HG_NODE".to_owned(), EnvValue::Bytes(b"aabb".to_vec())),
         ("HG_PENDING".to_owned(), EnvValue::ViewRoot),
-        ("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Unset),
+        ("GIT_PUSH_OPTION_COUNT".to_owned(), EnvValue::Bytes(b"0".to_vec())),
       ],
       clean_environment: false,
       stdin,
@@ -844,8 +843,8 @@ mod tests {
 
   /// A-622 part 3 (the launch). Do: run a hook that reads its standard input and reports its arguments, environment and
   /// working directory. Expect: accepted, having read every input byte, with its point's arguments, `HG_NODE` as given,
-  /// `HG_PENDING` and its working directory the view's root, `GIT_PUSH_OPTION_COUNT` removed; and a run that finished,
-  /// so a sample for its hook's times.
+  /// `HG_PENDING` and its working directory the view's root, `GIT_PUSH_OPTION_COUNT` as given (`0`); and a run that
+  /// finished, so a sample for its hook's times.
   #[test]
   fn a_hook_runs_in_its_view_with_its_points_input() {
     let (_, view) = program_and_view();
@@ -865,7 +864,7 @@ mod tests {
       format!("{TAG}args=refs/heads/main|two"),
       format!("{TAG}node=aabb"),
       format!("{TAG}pending={}", view.display()),
-      format!("{TAG}count=false"),
+      format!("{TAG}count=0"),
       format!("{TAG}cwd={}", view.display()),
     ] {
       assert!(words.contains(&line), "{line} in {words}");
