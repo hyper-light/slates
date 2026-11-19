@@ -250,12 +250,12 @@
 > first against stubbed engines (14 of its 16 tests failed), against the five compressed bundles stock `hg` 7.2 wrote
 > (`crates/hg/fixtures/compressed/make-compressed-fixtures.sh`, `SHA256SUMS`), each made plain to exactly the bundle
 > 7.2 wrote uncompressed, and 7.2's server's zstd answer to a `getbundle`; every cut, a bit flipped at every place,
-> unknown engines and bytes after a stream refused by kind. **Built (A-611):** the import's revlog reader: version
-> 1 inline and split, version 2 and the changelog's version 2 behind their dockets, chunks raw, zlib (flate2 over
-> zlib-rs) and zstd with every byte charged to the admission and every stream ending exactly at its chunk's end, chains
-> rebuilt through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`,
-> 166 of 166 on the Mac Studio (2026-11-19), against 158 files stock `hg` 7.2 stored in five repositories (zstd, zlib,
-> split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
+> unknown engines and bytes after a stream refused by kind. **Built (A-611):** the import's revlog reader: version 1
+> inline and split, version 2 and the changelog's version 2 behind their dockets, chunks raw, zlib (flate2 over zlib-rs)
+> and zstd with every byte charged to the admission and every stream ending exactly at its chunk's end, chains rebuilt
+> through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`, 182 of
+> 182 on the Mac Studio (2026-11-19, merged with A-598), against 158 files stock `hg` 7.2 stored in five repositories
+> (zstd, zlib, split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
 > (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). Owed, in order, after §4.17.1's seven pieces: (3, rest) the
 > index's tables on A-581's `slates-vcs`, then the import's walk of a store (the fncache, the path encodings, a version
 > 2 store's file index) and censored, ellipsis and externally stored revisions; (4) read serving, the `0.2` answers
