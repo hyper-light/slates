@@ -1470,3 +1470,43 @@ fn a_negotiation_past_its_admission_is_refused() {
     Ok(Answer::Nothing)
   );
 }
+
+/// A-615 part 2 (`list-objects-filter.c` `filter_trees_depth`: a tree met again shallower is walked again, "minimum
+/// depth if an object is located at multiple depths"): do fetch two unrelated commits under `tree:4`, the first holding
+/// a tree `x` at depth 2 and the second at depth 1, `x` holding a tree that holds a blob. Expect: the blob, at depth 4
+/// below the first commit and 3 below the second, sent, which only opening `x` again at the shallower depth finds.
+#[test]
+fn a_tree_met_again_shallower_is_opened_again_under_a_depth_filter() {
+  let mut graph = TestGraph::default();
+  let blob = graph.new_blob(1);
+  let inner = graph.new_tree(&[blob]);
+  let x = graph.new_tree(&[inner]);
+  let middle = graph.new_tree(&[x]);
+  let deep_root = graph.new_tree(&[middle]);
+  let shallow_root = graph.new_tree(&[x]);
+  let first = graph.new_commit(&[], deep_root, 10);
+  let second = graph.new_commit(&[], shallow_root, 20);
+  let asks = Asks {
+    wants: vec![graph.id(first), graph.id(second)],
+    done: true,
+    filter: Some(Filter::TreeDepth(4)),
+    ..Asks::default()
+  };
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(u64::MAX)).unwrap();
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!()
+  };
+  assert!(pack.objects.contains(&blob), "{:?}", pack.objects);
+  let mut expected = vec![
+    blob,
+    inner,
+    x,
+    middle,
+    deep_root,
+    shallow_root,
+    first,
+    second,
+  ];
+  expected.sort();
+  assert_eq!(pack.objects, expected);
+}
