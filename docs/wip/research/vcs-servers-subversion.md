@@ -719,6 +719,28 @@ fixtures recorded again on the Mac Studio with revisions 8 to 11 and every remai
   `interesting_merge` calls the client's changed-path receiver before it judges, and `send_log` checks
   `nested_merges` after `fill_log_entry`, so a merged revision passed over has had its changed paths written, which
   join the next entry's (not recorded: the recorded `-g -v` logs pass none over with changed paths).
+- **`get-file-revs`** [C: `serve.c` `get_file_revs`, `file_rev_handler`, `svndiff_handler`, `svndiff_close_handler`;
+  `rev_hunt.c` `svn_repos_get_file_revs2`, `find_interesting_revisions`, `get_merged_mergeinfo`,
+  `find_merged_revisions`, `compare_path_revisions`, `send_path_revision`, `get_file_revs_backwards`; `marshal.c`
+  `svn_ra_svn__svndiff_version`; `svndiff.c` `window_handler`, `send_simple_insertion_window`, `encode_window`;
+  `fs-loader.c` `svn_fs_contents_different`; `dag.c` `svn_fs_fs__dag_things_different`; at 1.15.0,
+  `libsvn_fs_fs/fs_fs.c` `fc2b7fc8bd7a409b` (`svn_fs_fs__file_text_rep_equal`, `svn_fs_fs__prop_rep_equal`) and
+  `libsvn_fs_fs/cached_data.c` `b8cb7bcca34e04eb` (`svn_fs_fs__get_file_delta_stream`); recorded]: `c(?r)(?r)?B`, each
+  revision the youngest when missing or negative; a start after the end walks newest first and refuses merged revisions,
+  200007 with `svn_strerror`'s message, since the error is made without one. Every revision is found before the first is
+  sent. `compare_path_revisions` sorts the merged revisions newest first (its comment says increasing) with `qsort`,
+  which keeps no order among equals, over a list gathered in the merged mergeinfo's seeded hash order, so two merged
+  files changed in one revision have no order to match. `svn_fs_contents_different` and `svn_fs_props_different` are
+  strict: FSFS compares texts and property lists by content, counting no text and a zero-length text both empty and
+  equal, then MD5 and SHA-1. The svndiff version is `svn_ra_svn__svndiff_version`'s: 0 at compression level 0, else 2
+  for `accepts-svndiff2`, 1 (zlib) for `svndiff1`, 0 otherwise. Each stream write is one string: `window_handler` writes
+  the header alone, then each window's integers and its instruction and new-data sections when not empty (an svndiff 2
+  section is never empty: it starts with its original length); in svndiff 0 a window of one new-data instruction goes to
+  `send_simple_insertion_window`, which writes the header if it is not out, the integers and the instruction as one
+  write, then the new data. The report editor wrote its svndiff 0 windows' header as a chunk of its own, which no
+  recording held, until A-616 continued (6); both writers now judge such a window by its `simple_insertion`. FSFS sends
+  a stored delta as it is when its base is the source's representation and otherwise makes one
+  with `svn_txdelta2`; both are `compute_window` over 100 KiB pieces, so the deltifier's windows are the same.
 - **What the remaining commands do** (read for the slices that follow): `list` is `svn_repos_list` (entries sorted by
   name, the depth word read by `svn_depth_from_word` and refused below `empty`, names matched by
   `svn_utf__fuzzy_glob_match`, absolute paths in the answer, `done` then the answer); `get-location-segments` and
@@ -885,3 +907,29 @@ the first 16 hex digits of each file's sha256:
   (a source piece read when a target piece begins, a short piece ending the source's views), so every delta a stock
   server sends or dumps is a function of its two texts; `svnadmin dump --deltas` writes it in svndiff version 0
   (`store_delta`). Every recorded delta of the golden dumps is remade by the port window for window.
+
+## 16. The commit step and the hooks' places (A-655 part 2a; §4.17.4 items 3.1, 3.3, 3.5 and 9)
+
+Read 2026-11-19 by g268 at §1's revision, each file fetched from
+`raw.githubusercontent.com/apache/subversion/d434dc14866e0c48602dba59a15443255d0b8c1e/<path>`, its hash §1's row's
+(`svn_props.h`, not in §1's table: `c0a7446d92934323`).
+
+- **Begin** [C: `fs-wrap.c` `svn_repos_fs_begin_txn_for_commit2` 132-184]: the transaction begun on the revision
+  `open_root` read, with `SVN_FS_TXN_CHECK_LOCKS` alone (151-152), its name fetched for the hook; the revision
+  properties set through `svn_repos_fs_change_txn_props` (160-164), which runs `svn_repos__validate_prop` on each
+  (344-357) in the order `svn_prop_hash_to_array` lists APR's hash; then start-commit (166-172), whose refusal aborts
+  the transaction. `commit.c` `open_root` (414-466) checks the revision first (428-431).
+- **Commit** [C: `fs-wrap.c` `svn_repos_fs_commit_txn` 48-121]: pre-commit (69-71); every property named
+  `SVN_PROP_TXN_PREFIX`, `svn:txn-` (`svn_props.h` 706), removed (72-89); `svn_fs_commit_txn`; post-commit, whose
+  failure leaves the commit made and is reported. `commit.c` `close_edit` (799-882) refuses no transaction first
+  (811-813).
+- **The date** [C: `transaction.c` `write_final_revprop` 3598-3630]: `svn:date` set to
+  `svn_time_to_cstring(apr_time_now())` unless the transaction was begun with `SVN_FS_TXN_CLIENT_DATE` and the client
+  set one; `svn_fs_fs__begin_txn` (4195-4235) stamps a transaction with the time it began, which the commit overwrites.
+- **Out of date** [C: `transaction.c` `commit_body` 3741-3786; `tree.c` `svn_fs_fs__commit_txn` 2194-2330]: the commit
+  refuses a transaction whose base is not the youngest, "Transaction out of date" (`SVN_ERR_FS_TXN_OUT_OF_DATE`,
+  3784-3786), then verifies every lock again (`verify_locks`); `svn_fs_fs__commit_txn` merges against the youngest,
+  makes it the transaction's base (2291) and, on that refusal, merges again if the youngest moved (2295-2310), returning
+  the refusal only when it did not.
+- **Recorded** (§14's commits): stock `svn` 1.15.0 sends `svn:txn-user-agent` and `svn:txn-client-compat-version` with
+  every commit; no revision `svnserve` made keeps either.

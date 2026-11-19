@@ -642,12 +642,18 @@ fn rmdir_merges() {
   );
 }
 
-/// A hard link merges as a namespace edge: identical accepts, differing conflicts, file/link is a
-/// type conflict.
+/// A hard link names the node at its target at the work's base (A-646): an identical link
+/// accepts, a link to another node after the name changed conflicts create against create, a link
+/// naming no node is refused delete against modify, and a file over a link is a type conflict.
 #[test]
 fn hard_link_merges() {
   let mut green = Green::new();
-  green.submit(&Build::new().create("f", b"shared").at(1, 0));
+  green.submit(
+    &Build::new()
+      .create("f", b"shared")
+      .create("other", b"other")
+      .at(1, 0),
+  );
   assert_eq!(
     green.submit(&Build::new().link("l", "f").at(2, 1)),
     Outcome::Accepted { version: 2 }
@@ -665,6 +671,13 @@ fn hard_link_merges() {
   assert_eq!(
     conflict_class(&green.submit(&Build::new().create("l", b"file").at(5, 3))),
     Some(MergeConflictClass::TypeChanged)
+  );
+  // Nothing stood at `missing` at version 2, so the link names no node, which no work can make
+  // (`link(2)` answers ENOENT). Judging its name would compare that node's home with the head's
+  // link there, so the node is judged first, even though version 3 changed the name as well.
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().link("l", "missing").at(6, 2))),
+    Some(MergeConflictClass::DeleteModify)
   );
 }
 
@@ -1306,4 +1319,39 @@ fn assert_walks_match_from(green: &Green) {
     );
   }
   assert_eq!(green.changes_recounted(), green.changes_bytes());
+}
+
+/// §4.16 "The verdict" (perf's deferral, 2026-11-11). Do: a green holding `a` and `b`; another work overwrites `b`'s
+/// first byte; then a work based before it overwrites `a` (clean) and `b`'s first byte with other bytes (a conflict).
+/// Expect: the conflict, `a` unchanged, and no mapped file made, though `a`'s merge was clean. Then a work overwriting
+/// `a` alone is accepted: one mapped file made, holding exactly the bytes the overwrite gives. Made in the verdict, the
+/// conflict had built `a`'s new file and thrown it away.
+#[test]
+fn a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("a", b"aaaa").at(1, 0));
+  green.submit(&Build::new().create("b", b"bbbb").at(2, 1));
+  green.submit(&Build::new().overwrite("b", 0, b"X").at(3, 2));
+  let before = green.mapped_files_made();
+  let outcome = green.submit(
+    &Build::new()
+      .overwrite("a", 1, b"A")
+      .overwrite("b", 0, b"Y")
+      .at(4, 2),
+  );
+  assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+  assert_eq!(green.content("a"), Some(b"aaaa".as_slice()));
+  assert_eq!(
+    green.mapped_files_made(),
+    before,
+    "a conflict makes no file"
+  );
+  let outcome = green.submit(&Build::new().overwrite("a", 1, b"A").at(5, 3));
+  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert_eq!(green.content("a"), Some(b"aAaa".as_slice()));
+  assert_eq!(
+    green.mapped_files_made(),
+    before + 1,
+    "an accept makes its one file once"
+  );
 }

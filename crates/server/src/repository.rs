@@ -56,6 +56,10 @@ use crate::verbs::{forbidden, refused, to_db_volume, to_wire_volume};
 // until one calls it, a daemon build calls none of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod push;
+// Mercurial's unbundle landed through the push (A-657): until the hg site serves unbundle (A-650's), a daemon build
+// calls none of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod hg_push;
 
 /// The database's form of a repository's tool.
 fn db_tool(tool: VcsTool) -> slates_db::catalog::VcsTool {
@@ -348,7 +352,13 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
   }
   // The repository's tool store, beside its record, on its owner shard (A-662).
-  if let Some(record) = state.db.partition().repositories().repository(repository).cloned() {
+  if let Some(record) = state
+    .db
+    .partition()
+    .repositories()
+    .repository(repository)
+    .cloned()
+  {
     crate::vcs_store::make(state, &record);
   }
 }

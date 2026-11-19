@@ -42,14 +42,16 @@
 //!   come in APR's per-table seeded hash order (three recordings of one repository gave three);
 //! - property lists and texts are compared by their content identity, where FSFS compares a
 //!   representation's place unless asked strictly (`svn_fs_props_changed`): a property list changed
-//!   and changed back is the same list here, as rep-sharing makes a text;
-//! - a text is sent as new data, a window of up to 102,400 bytes at a time; its delta against the
-//!   client's base is owed (`xdelta.c`), as FSFS sends a stored delta when it holds one.
+//!   and changed back is the same list here, as rep-sharing makes a text.
+//!
+//! **Texts.** A changed text's windows are Subversion's deltifier's against the client's base
+//! (A-652's [`deltas`], `txdelta_next_window` and `xdelta.c`), a window of up to 102,400 bytes at a
+//! time, the very windows a stock server sends, stored or computed; an added text's are new data.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
 #[cfg(test)]
-pub(in crate::report) mod green;
+pub(crate) mod green;
 pub(crate) mod history;
 #[cfg(test)]
 mod tests;
@@ -60,8 +62,9 @@ use crate::index::{
   Revision, Text,
 };
 use crate::reads::Repository;
-use crate::svndiff::{Instruction, WINDOW_LIMIT, Window};
+use crate::svndiff::{Instruction, WINDOW_LIMIT, Window, deltas};
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// The facts of the node an [`Call::OpenRoot`], [`Call::Open`] or [`Call::Add`] names, as the
@@ -564,6 +567,8 @@ struct FileFrame {
   lock_token: Option<Vec<u8>>,
   /// Where it stands.
   phase: FilePhase,
+  /// The text its delta applies to, once the delta is begun against one.
+  source: Option<Text>,
   /// How many bytes of its text the windows have sent.
   sent: u64,
 }
@@ -1168,6 +1173,7 @@ impl Drive {
       target: t_entry,
       lock_token: entry.info.and_then(|info| info.lock_token),
       phase: FilePhase::Properties,
+      source: None,
       sent: 0,
     })));
     Ok(())
@@ -1246,6 +1252,7 @@ impl Drive {
           file.phase = FilePhase::Close;
           return Ok(());
         }
+        file.source = source.text;
         Some(source.md5())
       }
       None => None,
@@ -1259,8 +1266,10 @@ impl Drive {
     Ok(())
   }
 
-  /// The delta's next window: up to [`WINDOW_LIMIT`] bytes of the target's text as new data; at the
-  /// text's end, the delta's end next.
+  /// The delta's next window, `txdelta_next_window`'s: the target's next piece of up to
+  /// [`WINDOW_LIMIT`] bytes made from the source's piece at the same place, by Subversion's
+  /// deltifier ([`deltas`]), or as new data once the source has run out, its view where the source
+  /// ended; at the text's end, the delta's end next.
   fn window<R: Repository + ?Sized, G: Guards + ?Sized>(
     &mut self,
     file: &mut FileFrame,
@@ -1270,16 +1279,18 @@ impl Drive {
       file.phase = FilePhase::End;
       return Ok(());
     };
-    let new_data = read_window(sources.repository, &text, file.sent)?;
-    let length = u64::try_from(new_data.len()).map_err(|_| DriveFailure::corrupt())?;
+    let target = read_window(sources.repository, &text, file.sent)?;
+    let source_size = file.source.map_or(0, |source| source.size);
+    let view = file.sent.min(source_size);
+    let source = match file.source {
+      Some(source) if view < source.size => read_window(sources.repository, &source, view)?,
+      _ => Vec::new(),
+    };
+    let mut window = window_of(&source, &target)?;
+    window.source_offset = view;
+    let length = u64::try_from(target.len()).map_err(|_| DriveFailure::corrupt())?;
     file.sent = file.sent.saturating_add(length);
-    self.pending.push_back(Owned::Window(Window {
-      source_offset: 0,
-      source_len: 0,
-      target_len: length,
-      instructions: vec![Instruction::New { length }],
-      new_data,
-    }));
+    self.pending.push_back(Owned::Window(window));
     Ok(())
   }
 
@@ -1586,6 +1597,30 @@ fn property_changes(
     }
   }
   changes
+}
+
+/// The one window that makes `target`, at most a window's room, from `source`, at most as much: the
+/// target as new data when the source is empty (`compute_window`), else the deltifier's window, its
+/// source view counted from the source piece's start.
+fn window_of(source: &[u8], target: &[u8]) -> Result<Window, DriveFailure> {
+  let length = u64::try_from(target.len()).map_err(|_| DriveFailure::corrupt())?;
+  if source.is_empty() {
+    return Ok(Window {
+      source_offset: 0,
+      source_len: 0,
+      target_len: length,
+      instructions: vec![Instruction::New { length }],
+      new_data: target.to_vec(),
+    });
+  }
+  let room = usize::try_from(WINDOW_LIMIT)
+    .ok()
+    .and_then(NonZeroUsize::new)
+    .ok_or_else(DriveFailure::corrupt)?;
+  deltas(source, target, room)
+    .map_err(|_| DriveFailure::corrupt())?
+    .next()
+    .ok_or_else(DriveFailure::corrupt)
 }
 
 /// Up to [`WINDOW_LIMIT`] bytes of `text` from `offset`, gathered from the green's runs.

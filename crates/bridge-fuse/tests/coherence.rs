@@ -65,6 +65,12 @@ fn truncate(bridge: &mut dyn Bridge, cx: &OpContext, object: ObjectId, size: u64
     .unwrap();
 }
 
+/// Lets a round gather every record it has: these tests check what a round delivers, not how the turn budget
+/// slices it (ff16bed94 gave `deliver` the slicing callback; the sliced rounds are tested in bridge-core).
+fn whole_round() -> std::ops::ControlFlow<()> {
+  std::ops::ControlFlow::Continue(())
+}
+
 /// One round with a recording sink: what was delivered, and the invalidations written.
 fn round(
   coherence: &mut Coherence,
@@ -73,10 +79,15 @@ fn round(
 ) -> (Delivered, Vec<Invalidation>) {
   let mut written = Vec::new();
   let delivered = coherence
-    .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      written.push(invalidation.clone());
-      Ok::<(), ()>(())
-    })
+    .deliver(
+      bridge,
+      cx,
+      &mut whole_round,
+      &mut |invalidation: &Invalidation| {
+        written.push(invalidation.clone());
+        Ok::<(), ()>(())
+      },
+    )
     .unwrap();
   (delivered, written)
 }
@@ -211,7 +222,12 @@ fn a_sink_refusal_keeps_the_cursor_so_the_round_is_delivered_again() {
   let cursor = coherence.cursor();
   truncate(&mut bridge, &cx_other, file, 2);
 
-  let refused = coherence.deliver(&mut bridge, &cx_transport, &mut |_: &Invalidation| Err(()));
+  let refused = coherence.deliver(
+    &mut bridge,
+    &cx_transport,
+    &mut whole_round,
+    &mut |_: &Invalidation| Err(()),
+  );
   assert_eq!(refused, Err(()), "the sink's refusal is the transport's");
   assert_eq!(
     coherence.cursor(),

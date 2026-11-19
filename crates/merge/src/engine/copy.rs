@@ -65,6 +65,18 @@
 //! replace's removals move the sum as removals always do; a key a version's copy brought and the same version's inner
 //! replace took away gives back the outer copy's entry for it, which its fold reads from the copies above it.
 //!
+//! **What a copy brought is read from its graft** (A-626 part 3): its source held at the version before the copy, with
+//! the copy's fix applied, the fix kept with its record (charged with the change index) until the fold floor reaches
+//! the copy (`Green::brought_entry`). Every reader of it asks for a copy above the floor (the identity is brought past a
+//! copy before the floor passes it; a branch or a checkpoint is made at the floor or above), and the version before such
+//! a copy is never below the floor, nor a restored green's checkpoint. The source's own history at the source's version
+//! may be: a green restored at a checkpoint after that version and before the copy holds none of it, which a replay of
+//! the copy met (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`). The map's
+//! current value would answer a key the copy gave and nothing changed since, and a key's own history at the copy's
+//! version one changed after, but neither answers a key the copy's own version changed or an inner copy of that version
+//! replaced, whose value stood at no version: only the graft holds it. Recording the entries a copy brought would cost
+//! the copy O(its tree) in the record and the checkpoint, and was rejected (A-626 part 3's entry).
+//!
 //! **Cost.** A copy's verdict reads the change index since the increment's base and since the source's version
 //! (O(the entries since), as a branch's does) and makes descents in each map; its commit is A-542 part 1's copies,
 //! O(the two paths' lengths) whatever the tree holds; it walks no map (`Green::walked` does not move). A reader pays one
@@ -94,6 +106,12 @@ pub(super) struct Appearance {
   pub(super) source: String,
   /// The version of the source it copied.
   pub(super) source_version: u64,
+  /// The copy's fix (A-626 part 2), kept while the copy stands above the green's fold floor, charged with the change
+  /// index: what the identity reads the copy's tree through, with its source held at the version before the copy
+  /// ([`Green::brought_entry`], A-626 part 3). None for a copy whose source was unchanged since its version, whose
+  /// graft brought it whole, and once the floor reaches the copy ([`Green::release_kept_fixes`]); a checkpoint never
+  /// carries one.
+  pub(super) fix: Option<Box<CopyFix>>,
 }
 
 /// A copy one increment declares (A-586, A-626): its source, the version of the source it copies, and whether it
@@ -121,6 +139,58 @@ type Committed<'a> = ((&'a str, &'a str), (u64, bool), Option<&'a CopyFix>);
 /// in a cut.
 fn grafted_in(fix: &CopyFix, rel: &str) -> bool {
   !fix.start_empty && !fix.cuts.iter().any(|cut| in_tree(rel, cut))
+}
+
+/// The entry `fix` sets `key` (named at a copy's destination, at `rel` in its tree) to, where the fix names it: the
+/// key's entry with the fix's value, or none where the fix takes it away (A-626 part 3, [`Green::brought_entry`]).
+/// `None` where the fix does not name it; never one for a hard link, which no copied tree holds.
+fn fixed_entry(key: &IdentityKey, rel: &str, fix: &CopyFix) -> Option<Option<Entry>> {
+  match key {
+    IdentityKey::File(path) => fix
+      .files
+      .get(rel)
+      .map(|bytes| bytes.as_deref().map(|bytes| file_entry(path, bytes))),
+    IdentityKey::Special(path) => fix
+      .specials
+      .get(rel)
+      .map(|node| node.as_ref().map(|node| special_entry(path, node))),
+    IdentityKey::Dir(path) => fix
+      .dirs
+      .get(rel)
+      .map(|stood| stood.then(|| dir_entry(path))),
+    IdentityKey::Mode(path) => fix
+      .modes
+      .get(rel)
+      .map(|mode| mode.map(|mode| mode_entry(path, mode))),
+    IdentityKey::Symlink(path) => fix.symlinks.get(rel).map(|target| {
+      target
+        .as_deref()
+        .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, target))
+    }),
+    IdentityKey::Xattr(path, name) => fix
+      .xattrs
+      .get(&(rel.to_owned(), name.clone()))
+      .map(|value| value.as_deref().map(|value| xattr_entry(path, name, value))),
+    IdentityKey::Hardlink(_) | IdentityKey::Copy(_) => None,
+  }
+}
+
+/// Every key `fix` names, named at the destination `dst` (A-626 part 3, [`Green::copied_tree_entries`]).
+fn fixed_keys(dst: &str, fix: &CopyFix) -> Vec<IdentityKey> {
+  let at = |rel: &String| joined(dst, rel);
+  let mut keys: Vec<IdentityKey> = Vec::new();
+  keys.extend(fix.files.keys().map(|rel| IdentityKey::File(at(rel))));
+  keys.extend(fix.specials.keys().map(|rel| IdentityKey::Special(at(rel))));
+  keys.extend(fix.dirs.keys().map(|rel| IdentityKey::Dir(at(rel))));
+  keys.extend(fix.modes.keys().map(|rel| IdentityKey::Mode(at(rel))));
+  keys.extend(fix.symlinks.keys().map(|rel| IdentityKey::Symlink(at(rel))));
+  keys.extend(
+    fix
+      .xattrs
+      .keys()
+      .map(|(rel, name)| IdentityKey::Xattr(at(rel), name.clone())),
+  );
+  keys
 }
 
 /// Counts one key of a fix against the head's graft ([`SourceAt::holds_tree`]): one gained where the fix sets a key the
@@ -453,6 +523,17 @@ pub(super) fn appearance_bytes(dst: &str, src: &str) -> usize {
     .saturating_add(size_of::<Appearance>())
 }
 
+/// The bytes a copy's record at `dst` holds, charged with the change index: [`appearance_bytes`], and its kept fix's
+/// bytes as its chain entry counts them (`chain_entry::fix_bytes`, A-626 part 3).
+pub(super) fn record_bytes(dst: &str, record: &Appearance) -> usize {
+  appearance_bytes(dst, &record.source).saturating_add(
+    record
+      .fix
+      .as_deref()
+      .map_or(0, crate::chain_entry::fix_bytes),
+  )
+}
+
 /// `path` and each of its ancestors, nearest first: the prefixes a copy above it could have been made at. The root is
 /// none of them: no copy is made onto it.
 pub(super) fn ancestors(path: &str) -> impl Iterator<Item = &str> {
@@ -527,16 +608,6 @@ fn outer_of<'a>(
     .filter(|(outer, _)| outer.as_str() != dst && in_tree(dst, outer))
     .max_by_key(|(outer, _)| outer.len())
     .map(|(outer, spec)| (outer.as_str(), spec))
-}
-
-/// The path in its copy's source that `path`, in this increment's copies' trees, stands for: the innermost copy's
-/// source's own path for its destination, the same place beneath it otherwise. `path` itself outside every copy (never,
-/// for the paths the split hands over).
-fn source_of(copies: &BTreeMap<String, CopySpec>, path: &str) -> String {
-  innermost(copies, path).map_or_else(
-    || path.to_owned(),
-    |(dst, spec)| joined(&spec.source, relative(path, dst).unwrap_or_default()),
-  )
 }
 
 /// Takes out of `map` the entries whose path `inside` holds.
@@ -1161,7 +1232,7 @@ impl Green {
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
-      bytes,
+      Some(bytes),
       whole,
       ContentSource::Created(ops.to_vec()),
     )))
@@ -1183,7 +1254,7 @@ impl Green {
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
-      bytes,
+      Some(bytes),
       whole,
       ContentSource::Copied(from.to_owned(), ops.to_vec()),
     )))
@@ -1289,6 +1360,11 @@ impl Green {
   /// histories hold now, never a fixed allowance: the service adds it to `chain_entry::entry_bound` before the verdict.
   /// Nothing for an increment without such a copy.
   pub fn copy_entry_room(&self, inc: &Increment) -> usize {
+    // Most increments declare no copy: they are answered without resolving the document, which the admission and the
+    // change index's reservation would each do once more (A-626 part 3).
+    if !inc.doc.ops.iter().any(|op| op.kind == OpKind::Copy) {
+      return 0;
+    }
     let r = Green::resolve(inc);
     self
       .copy_fixes(&r)
@@ -1335,7 +1411,7 @@ impl Green {
       if replace {
         removed.extend(self.clear_tree(dst, version));
       }
-      self.graft_source(held, (dst, src, source_version), version);
+      self.graft_source(held, (dst, src, source_version), (version, fix));
       if let Some(fix) = fix {
         self.apply_fix(dst, fix);
       }
@@ -1358,13 +1434,14 @@ impl Green {
 
   /// Grafts a held source at its copy's destination, at `version` (module docs): every map's graft (the reverse map of
   /// hard links has none: the source holds no link), and the copy's one record, `last_changed` entry and change-index
-  /// bytes; nothing grafted for a copy that starts empty (`None`). A map that refuses what the verdict judged possible is
-  /// counted ([`Green::copies_refused`]), never silently.
+  /// bytes, its `fix` kept in the record and charged with them (A-626 part 3); nothing grafted for a copy that starts
+  /// empty (`None`). A map that refuses what the verdict judged possible is counted ([`Green::copies_refused`]), never
+  /// silently.
   fn graft_source(
     &mut self,
     held: Option<HeldSource>,
     (dst, src, source_version): (&str, &str, u64),
-    version: u64,
+    (version, fix): (u64, Option<&CopyFix>),
   ) {
     if let Some(held) = held {
       let results = [
@@ -1384,18 +1461,16 @@ impl Green {
       }
     }
     self.last_changed.insert(dst.to_owned(), version);
+    let record = Appearance {
+      version,
+      source: src.to_owned(),
+      source_version,
+      fix: fix.cloned().map(Box::new),
+    };
     self.changes_bytes = self
       .changes_bytes
-      .saturating_add(appearance_bytes(dst, src));
-    self
-      .copies
-      .entry(dst.to_owned())
-      .or_default()
-      .push(Appearance {
-        version,
-        source: src.to_owned(),
-        source_version,
-      });
+      .saturating_add(record_bytes(dst, &record));
+    self.copies.entry(dst.to_owned()).or_default().push(record);
   }
 
   /// Brings what `dst` holds from the head's source tree to the source's tree at the copied version (A-626 part 2): the
@@ -1632,17 +1707,56 @@ impl Green {
   }
 
   /// The entries copies made after `since` gave `key` (module docs): for each copy above its path made since, the key's
-  /// entry with the value the copy's source held at the source's version, where it held one.
+  /// entry with the value the copy brought it, where it brought one ([`Green::brought_entry`]).
   pub(super) fn copied_entries(&self, key: &IdentityKey, since: u64) -> Vec<Entry> {
-    let path = key.path();
     self
-      .copies_above_after(path, since)
+      .copies_above_after(key.path(), since)
       .into_iter()
-      .filter_map(|(dst, record)| {
-        let rel = relative(path, dst)?;
-        self.entry_at(key, &joined(&record.source, rel), record.source_version)
-      })
+      .filter_map(|(dst, record)| self.brought_entry(key, dst, record))
       .collect()
+  }
+
+  /// The entry the copy `record` at `dst` brought `key` (a key of its tree, named at the destination), where it brought
+  /// one (A-626 part 3): what its graft brought, the source held at the version before the copy with the copy's fix
+  /// applied (`SourceAt`'s reading, at that version): the fix's value where the fix names the key, nothing where the
+  /// fix grafts none of the head's there (a copy that starts empty, a cut), else the source's at that version. That
+  /// version is never below the fold floor, nor a restored green's checkpoint, for a copy above them: every reader asks
+  /// for a copy above them (the identity is brought to its last version first; a branch or a checkpoint is made at the
+  /// floor or above). Until A-626 part 3 this read the source's history at the source's version, which a green restored
+  /// at a later checkpoint does not hold, so a replica replaying a copy from before its checkpoint hashed otherwise than
+  /// its owner (`docs/bugs/2026-11-19-a-copy-from-before-a-checkpoint-hashed-otherwise-on-its-replica.md`).
+  pub(super) fn brought_entry(
+    &self,
+    key: &IdentityKey,
+    dst: &str,
+    record: &Appearance,
+  ) -> Option<Entry> {
+    let rel = relative(key.path(), dst)?;
+    let from = joined(&record.source, rel);
+    let held = record.version.saturating_sub(1);
+    let Some(fix) = record.fix.as_deref() else {
+      return self.entry_at(key, &from, held);
+    };
+    match fixed_entry(key, rel, fix) {
+      Some(entry) => entry,
+      None if grafted_in(fix, rel) => self.entry_at(key, &from, held),
+      None => None,
+    }
+  }
+
+  /// Lets go of the kept fixes of the copies made at or below `floor` (A-626 part 3), their bytes leaving the change
+  /// index's charge: nothing reads what such a copy brought any more, since the identity is brought past the floor
+  /// before a fold and no branch or checkpoint is made below it.
+  pub(super) fn release_kept_fixes(&mut self, floor: u64) {
+    let mut released = 0usize;
+    for record in self.copies.values_mut().flatten() {
+      if record.version <= floor
+        && let Some(fix) = record.fix.take()
+      {
+        released = released.saturating_add(crate::chain_entry::fix_bytes(&fix));
+      }
+    }
+    self.changes_bytes = self.changes_bytes.saturating_sub(released);
   }
 
   /// `key`'s entry, its value read at `from` and `version` (`from` its own path, or its place in a copy's source).
@@ -1671,24 +1785,33 @@ impl Green {
     }
   }
 
-  /// Every entry the copy `record` at `dst` brought, named at the destination: its source's tree at the source's version,
-  /// key by key. O(everything the green holds): what [`Green::head_identity_from_scratch`] takes out for each copy, which
-  /// the running sum never adds (module docs). It reads each source at its version, so it holds while the histories
-  /// reach back to every copy's source version that changed since.
+  /// Every entry the copy `record` at `dst` brought, named at the destination ([`Green::brought_entry`]): every key its
+  /// source's tree holds or held, and every key its fix names (one the source held at its version and the green no
+  /// longer knows, as a green restored after it). O(everything the green holds): what
+  /// [`Green::head_identity_from_scratch`] takes out for each copy, which the running sum never adds (module docs). It
+  /// reads each source at the version before its copy, so it holds while the histories reach back to the oldest copy
+  /// it counts.
   pub(super) fn copied_tree_entries(&self, dst: &str, record: &Appearance) -> Vec<Entry> {
-    let (src, version) = (record.source.as_str(), record.source_version);
-    self
+    let src = record.source.as_str();
+    let mut keys: BTreeSet<IdentityKey> = self
       .every_key(src)
       .into_iter()
       .filter_map(|key| {
         let rel = relative(key.path(), src)?;
-        self.entry_at(&key.renamed(&joined(dst, rel)), key.path(), version)
+        Some(key.renamed(&joined(dst, rel)))
       })
+      .collect();
+    if let Some(fix) = record.fix.as_deref() {
+      keys.extend(fixed_keys(dst, fix));
+    }
+    keys
+      .iter()
+      .filter_map(|key| self.brought_entry(key, dst, record))
       .collect()
   }
 
   /// Every key of every dimension the green holds or held in `root`'s tree, current or recorded.
-  fn every_key(&self, root: &str) -> Vec<IdentityKey> {
+  pub(super) fn every_key(&self, root: &str) -> Vec<IdentityKey> {
     let inside = |path: &String| in_tree(path, root);
     let mut keys: Vec<IdentityKey> = Vec::new();
     let files = union_keys(self.content.keys(), self.content_history.keys().cloned());

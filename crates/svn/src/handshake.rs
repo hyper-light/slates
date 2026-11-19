@@ -41,6 +41,16 @@
 //! The principal is the one the successful attempt proved, and nothing a failed attempt named is
 //! kept.
 //!
+//! **Authentication for one command** ([`Server::for_command`]; A-656). Where a command of an
+//! established session needs access its principal lacks and the client could authenticate,
+//! `svnserve` asks again in the middle of the command (`must_have_access`, `serve.c` 807-850) with
+//! `needs_username` set, since the rules must be asked again with a name (826-836): the request
+//! lists `EXTERNAL` and `CRAM-MD5` where authenticated users have the access and never `ANONYMOUS`
+//! (`send_mechs` 580-591), an `ANONYMOUS` attempt fails as unlisted (`auth` 649-690), the attempts
+//! loop as at step 4 (`internal_auth_request` 693-721), and a successful one is answered
+//! `( success ( ) )` alone: the repository's information belongs to the handshake. The session goes
+//! on as the user the attempt proved.
+//!
 //! **Evidence.** Stock Subversion 1.15.0 (r1937767, Homebrew, on the Mac Studio, 2026-11-19), `svn`
 //! against `svnserve`, every byte each way logged by a relay between them:
 //! `crates/svn/fixtures/handshake/` (`make-fixtures.py`, `SHA256SUMS`). 1.15.0's `cram.c`,
@@ -475,8 +485,8 @@ pub enum Progress<'a> {
     /// How many bytes from the start of the buffer the attempt took.
     consumed: usize,
   },
-  /// The client authenticated: its success and the repository's information are written, and the
-  /// handshake is done.
+  /// The client authenticated: its success is written, followed at the handshake by the
+  /// repository's information, and the handshake, or the authentication for one command, is done.
   Established {
     /// Who.
     principal: Principal,
@@ -488,8 +498,8 @@ pub enum Progress<'a> {
 /// What a CRAM-MD5 response's verification came to ([`Server::key`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-  /// The digest is the key's: its success and the repository's information are written, and the
-  /// handshake is done.
+  /// The digest is the key's: its success is written, followed at the handshake by the
+  /// repository's information, and the handshake, or the authentication for one command, is done.
   Established(Principal),
   /// The attempt failed and its failure is written; the client may answer again.
   Failed(AuthFailure),
@@ -540,7 +550,8 @@ impl CramKey {
   }
 }
 
-/// What the repository allows and tells, kept from [`Server::open`] for the rest of the handshake.
+/// What the repository allows and tells, kept from [`Server::open`] (or [`Server::for_command`])
+/// for the rest of the exchange.
 #[derive(Clone, Debug)]
 struct Offer {
   capabilities: ClientCapabilities,
@@ -550,6 +561,23 @@ struct Offer {
   uuid: Vec<u8>,
   root_url: Vec<u8>,
   mergeinfo: bool,
+  /// Whether the success is followed by the repository's information: at the handshake, not for one
+  /// command.
+  information: bool,
+}
+
+/// The mechanisms an authentication for one command offers ([`Server::for_command`]), as the
+/// caller finds them for the access the command needs (`send_mechs` with `needs_username`,
+/// `serve.c` 580-591): never `ANONYMOUS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandMechanisms<'a> {
+  /// The authentication realm, the handshake's.
+  pub realm: &'a [u8],
+  /// The user the connection's tunnel logged in, where it came through one and authenticated users
+  /// have the access (`EXTERNAL`).
+  pub tunnel_user: Option<&'a [u8]>,
+  /// Whether authenticated users have the access and the repository holds their keys (`CRAM-MD5`).
+  pub cram_md5: bool,
 }
 
 /// Where the handshake stands.
@@ -594,14 +622,7 @@ impl Server {
   /// # Errors
   /// None in practice: the greeting's words are the grammar's.
   pub fn new(item_bytes: usize, out: &mut Vec<u8>) -> Result<Self, Refused> {
-    let bounds = Bounds {
-      item_bytes,
-      word_bytes: LONGEST_WORD,
-      depth: CLIENT_DEPTH,
-      nodes: item_bytes
-        .checked_div(PARSED_ITEM_BYTES.max(SMALLEST_ITEM_BYTES))
-        .unwrap_or(0),
-    };
+    let bounds = client_bounds(item_bytes);
     let capabilities = SERVER_CAPABILITIES
       .iter()
       .map(|word| Value::Word(word))
@@ -625,14 +646,14 @@ impl Server {
     self.bounds
   }
 
-  /// Whether the handshake is done: the repository's information is written, and the client's next
-  /// item is a command.
+  /// Whether the handshake, or the authentication for one command, is done: its success is
+  /// written, and the client's next item is a command's.
   pub fn established(&self) -> bool {
     matches!(self.state, State::Established(_))
   }
 
-  /// The session the handshake established, once it is done; every command the connection serves
-  /// takes it.
+  /// The session the handshake established, or the one an authentication for one command left,
+  /// once it is done; every command the connection serves takes it.
   pub fn session(&self) -> Option<&Session> {
     match &self.state {
       State::Established(session) => Some(session),
@@ -714,8 +735,58 @@ impl Server {
       uuid: repository.uuid.to_vec(),
       root_url: repository.root_url.to_vec(),
       mergeinfo: repository.mergeinfo,
+      information: true,
     });
     Ok(Access::Asked)
+  }
+
+  /// An authentication for one command of the established `session`, as `must_have_access` asks for
+  /// it where the session's principal lacks the access the command needs and the client could
+  /// authenticate (`serve.c` 826-836): `internal_auth_request` with `needs_username`
+  /// (`serve.c` 693-721), its request, `( success ( ( mech ... ) realm ) )`, listing `EXTERNAL` and
+  /// `CRAM-MD5` as `mechanisms` allows each, appended to `out`. The client's attempts are then
+  /// answered as the handshake's are, `ANONYMOUS` among the unlisted, and a successful one with
+  /// `( success ( ) )` alone; established, [`Server::session`] is `session` as the user the attempt
+  /// proved. The client's items are read within `item_bytes` each.
+  ///
+  /// # Errors
+  /// `OutOfTurn` when `mechanisms` allows none, nothing written: `must_have_access` asks only where
+  /// the client could authenticate, so this is the caller's error.
+  pub fn for_command(
+    session: Session,
+    mechanisms: &CommandMechanisms<'_>,
+    item_bytes: usize,
+    out: &mut Vec<u8>,
+  ) -> Result<Self, Refused> {
+    let offered = offered_mechanisms(&Repository {
+      uuid: &session.uuid,
+      root_url: &session.root_url,
+      realm: mechanisms.realm,
+      mergeinfo: false,
+      anonymous: false,
+      tunnel_user: mechanisms.tunnel_user,
+      cram_md5: mechanisms.cram_md5,
+    });
+    if offered.is_empty() {
+      return Err(Refused::OutOfTurn);
+    }
+    let request = Value::List(vec![Value::List(offered), Value::String(mechanisms.realm)]);
+    write_response(SUCCESS, request, out)?;
+    let bounds = client_bounds(item_bytes);
+    Ok(Self {
+      state: State::Asked(Offer {
+        capabilities: session.capabilities,
+        anonymous: false,
+        tunnel_user: mechanisms.tunnel_user.map(<[u8]>::to_vec),
+        cram_md5: mechanisms.cram_md5,
+        uuid: session.uuid,
+        root_url: session.root_url,
+        mergeinfo: false,
+        information: false,
+      }),
+      parser: Parser::new(bounds),
+      bounds,
+    })
   }
 
   /// Answers the client's URL with the command failure `unserved`, appended to `out`; the handshake
@@ -915,9 +986,9 @@ impl Server {
     Ok(Progress::Failed { failure, consumed })
   }
 
-  /// The client authenticated as `principal`: `( success ( ) )` and the repository's information,
-  /// `( success ( uuid url ( [ mergeinfo ] ) ) )` (`serve.c` 4386-4392), are appended to `out`, and
-  /// the handshake is done.
+  /// The client authenticated as `principal`: `( success ( ) )` is appended to `out`, at the
+  /// handshake with the repository's information, `( success ( uuid url ( [ mergeinfo ] ) ) )`
+  /// (`serve.c` 4386-4392), and the handshake, or the authentication for one command, is done.
   fn establish(
     &mut self,
     offer: Offer,
@@ -925,17 +996,19 @@ impl Server {
     out: &mut Vec<u8>,
   ) -> Result<Principal, Refused> {
     write_response(SUCCESS, Value::List(Vec::new()), out)?;
-    let capabilities = if offer.mergeinfo {
-      vec![Value::Word(MERGEINFO)]
-    } else {
-      Vec::new()
-    };
-    let information = Value::List(vec![
-      Value::String(&offer.uuid),
-      Value::String(&offer.root_url),
-      Value::List(capabilities),
-    ]);
-    write_response(SUCCESS, information, out)?;
+    if offer.information {
+      let capabilities = if offer.mergeinfo {
+        vec![Value::Word(MERGEINFO)]
+      } else {
+        Vec::new()
+      };
+      let information = Value::List(vec![
+        Value::String(&offer.uuid),
+        Value::String(&offer.root_url),
+        Value::List(capabilities),
+      ]);
+      write_response(SUCCESS, information, out)?;
+    }
     self.state = State::Established(Session {
       principal: principal.clone(),
       capabilities: offer.capabilities,
@@ -943,6 +1016,20 @@ impl Server {
       root_url: offer.root_url,
     });
     Ok(principal)
+  }
+}
+
+/// The bounds a client's items are read within, from the bytes one may take: the longest word, the
+/// deepest list the client's messages hold, and the item count the bytes allow (module
+/// documentation, **Bounds**).
+fn client_bounds(item_bytes: usize) -> Bounds {
+  Bounds {
+    item_bytes,
+    word_bytes: LONGEST_WORD,
+    depth: CLIENT_DEPTH,
+    nodes: item_bytes
+      .checked_div(PARSED_ITEM_BYTES.max(SMALLEST_ITEM_BYTES))
+      .unwrap_or(0),
   }
 }
 
