@@ -1669,11 +1669,11 @@ impl fmt::Display for StartFault {
 #[cfg(test)]
 mod tests {
   use slates_client::ClientError;
-  use slates_ipc::protocol::{Refusal, VolumeId};
+  use slates_ipc::protocol::{ImportFault, Refusal, VolumeId};
 
   use super::{
-    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, OsCode, ProtocolFault,
-    RetryCause, Stale, TargetRefusal, Unreported, Unusable,
+    Busy, Denied, Error, Exhausted, Existing, HostFault, Invalid, Missing, Note, OsCode,
+    ProtocolFault, RetryCause, Stale, TargetRefusal, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1733,6 +1733,21 @@ mod tests {
     );
     assert!(overloaded.is_retryable());
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
+  }
+
+  /// A-678: do type a repository import's refusal as a consumer meets it, from a call that names no volume; expect an
+  /// invalid request naming the import's fault, never retried.
+  #[test]
+  fn an_import_refusal_is_typed_invalid_by_its_fault() {
+    let fault = ImportFault::Damaged {
+      path: "store/data/a.i".to_owned(),
+    };
+    let refused = ClientError::Refused(Refusal::ImportRefused {
+      fault: fault.clone(),
+    });
+    let typed = Error::of_client("i", refused, None, PAUSE_NS);
+    assert_eq!(typed, Error::Invalid(Invalid::Import(fault)));
+    assert!(!typed.is_retryable());
   }
 
   /// A volume-core refusal as a consumer meets it.
