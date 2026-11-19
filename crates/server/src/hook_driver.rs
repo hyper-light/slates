@@ -79,6 +79,8 @@ pub(crate) async fn run(
   };
   let (mut run, mut step) = HookRun::with_bound(futures::now_ns(), bound_ns, launch.words_cap);
   let mut client_gone = pin!(client_gone);
+  // Once the client's future has answered it is never polled again (a finished future must not be).
+  let mut client_left = false;
   loop {
     match step {
       Step::Done {
@@ -96,7 +98,9 @@ pub(crate) async fn run(
         step = Step::Wait { wake_at_ns: None };
       }
       Step::Wait { wake_at_ns } => {
-        let happened = hook.next(wake_at_ns, client_gone.as_mut()).await;
+        let happened = hook
+          .next(wake_at_ns, client_gone.as_mut(), &mut client_left)
+          .await;
         step = match &happened {
           Happened::Output(bytes) => run.on(Event::Output(bytes), &mut lesson),
           Happened::OutputEnded => run.on(Event::OutputEnded, &mut lesson),
@@ -246,8 +250,14 @@ impl Hook {
     Ok(hook)
   }
 
-  /// The hook's next event: what is ready now, else the first of its waits to answer.
-  async fn next(&mut self, wake_at_ns: Option<u64>, client: Pin<&mut impl Future<Output = ()>>) -> Happened {
+  /// The hook's next event: what is ready now, else the first of its waits to answer; `client_left` once the client's
+  /// future has answered, which is then not polled again.
+  async fn next(
+    &mut self,
+    wake_at_ns: Option<u64>,
+    client: Pin<&mut impl Future<Output = ()>>,
+    client_left: &mut bool,
+  ) -> Happened {
     let mut client = client;
     loop {
       self.feed();
@@ -258,7 +268,7 @@ impl Hook {
       if wake_at_ns.is_some_and(|at| now_ns >= at) {
         return Happened::Timer { now_ns };
       }
-      match self.wait(wake_at_ns, client.as_mut()).await {
+      match self.wait(wake_at_ns, client.as_mut(), client_left).await {
         Woke::Client | Woke::Refused => return Happened::ClientLeft,
         Woke::Deadline => {
           return Happened::Timer {
@@ -270,8 +280,14 @@ impl Hook {
     }
   }
 
-  /// Waits for the first of: the words readable, the input writable, the exit, the deadline, the client leaving.
-  async fn wait(&self, wake_at_ns: Option<u64>, client: Pin<&mut impl Future<Output = ()>>) -> Woke {
+  /// Waits for the first of: the words readable, the input writable, the exit, the deadline, the client leaving (asked
+  /// only while it has not answered).
+  async fn wait(
+    &self,
+    wake_at_ns: Option<u64>,
+    client: Pin<&mut impl Future<Output = ()>>,
+    client_left: &mut bool,
+  ) -> Woke {
     let words = self.words.as_ref().map(|fd| fd.as_raw_fd());
     let input = self.input.as_ref().map(|fd| fd.as_raw_fd());
     let exit = (!self.exit_seen)
@@ -316,7 +332,11 @@ impl Hook {
           Poll::Pending => {}
         }
       }
-      client.as_mut().poll(cx).map(|()| Woke::Client)
+      if !*client_left && client.as_mut().poll(cx).is_ready() {
+        *client_left = true;
+        return Poll::Ready(Woke::Client);
+      }
+      Poll::Pending
     })
     .await
   }
