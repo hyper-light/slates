@@ -51553,7 +51553,10 @@ visible to the crate); `crates/cli/tests/cli.rs` (`edge_port_before_serving` tak
   `-p slates-cli --bin slates -- the_grammar` 12 of 12; `-p slates-cli --test cli -- vcs_svn svn_listeners vcs_http`
   4 of 4 (the svn start and restart tests, and the HTTP edge's two over the shared port reader);
   `-p slates-anchor --test anchor -- held_vcs_http` 1 of 1; `cargo fmt -p slates-anchor -p slates-api -p
-  slates-server -p slates-cli -- --check` clean.
+  slates-server -p slates-cli -- --check` clean. The same commands again over main 693bc8feb, whose A-681, A-651 part
+  3 and A-655 part 2b had changed slates-server and slates-svn, and whose hg interop tests' helpers the start test now
+  shares (kiln r344, 22:55-23:03Z): 19 of 19, 39 and 4 ignored, 12 of 12, 4 of 4 (main's ignored hg test aside), 1 of
+  1, fmt clean.
 - **Owed.** The repositories' lookup (the rest of `find_repos`, a name located on its partition's shard, the
   connection moved there), the repository's sources with every call, CRAM-MD5 keys over §4.13's principals, learned
   waits (one mechanism for the three edges), the SSH tunnel's entry point; the Windows and Linux runs (main's).
