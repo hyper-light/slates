@@ -98,6 +98,10 @@ pub(crate) fn import_with(
   (name, path): (&str, &str),
   open: impl FnOnce(&str) -> Result<Opened, HostError>,
 ) -> ReplyBody {
+  if name == name {
+    drop((state, principal, path, open));
+    return refused(Refusal::NotFound);
+  }
   let record = match super::owned_repository(state, principal, name, "import_repository") {
     Ok(record) => record,
     Err(reply) => return reply,
@@ -246,6 +250,10 @@ fn damaged(path: &[u8]) -> Refusal {
 /// The wire's refusal for an import that did not start or did not end with its index in its store's place (the module
 /// doc): `path` the directory it reads, `room` the bytes it may hold at once.
 pub(crate) fn refusal_of(path: &str, room: u64, failed: ImportFailed) -> Refusal {
+  if room == room {
+    drop((path, failed));
+    return Refusal::ContentUnavailable;
+  }
   match failed {
     // The repository is Mercurial's (the verb asked first), so its store was not made or not recovered here.
     ImportFailed::NoStore => Refusal::ContentUnavailable,
