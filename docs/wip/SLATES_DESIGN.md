@@ -12264,6 +12264,17 @@ engine: the verdict, rebase, position mapping, the register).
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
+>
+> **Status (2026-11-19, A-620 part 1: piece 6's exchange built).** `crates/git` (`receive`) speaks receive-pack's
+> exchange as git 2.50.1 does. It writes the ref advertisement through A-604's v0 writer, receive-pack's capabilities
+> in git's order. It reads the update request as it arrives: shallow lines, the commands (the client's capabilities on
+> the first) and the push options. The pack goes through A-608's reader, a thin pack's bases taken from the repository
+> (`unpack::Outside`). The connectivity check walks the pushed objects alone: a tip reaching an object nothing holds is
+> `missing necessary objects`, and a client's shallow commit whose parent nothing holds is `shallow update not allowed`.
+> Each remaining command's ref name is held to A-615's rule, then the caller's verdict is asked (`Judge`), every ref or
+> none under `atomic`. The answer is report-status or report-status-v2 with its option lines, multiplexed after git's
+> band-2 lines. Proven byte for byte against nine pushes stock git 2.50.1 made to stock `git receive-pack`. Part 2 makes
+> each ref's update a work the engine judges, every ref recorded as one register entry.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -42128,6 +42139,102 @@ Applied in the same change to:
   a copy whose unruled changes were anyone's.
 - **Owed:** the push pieces' calls (with each tool's words for the refusals: git's `ng <ref>` reason, Mercurial's
   abort, Subversion's authorization error), and the hook driver (part 3).
+
+### A-620 — receive-pack, part 1: the push's exchange as git 2.50.1 speaks it, from the advertisement to the report (2026-11-19, g258, UI goal 93 (kiln 51cef9f7); §4.17.2 "Pieces (git)" piece 6, "A push" items 1 to 5 and 7; after A-604, A-608, A-615)
+
+- **What.** `crates/git` (`receive`), each part asked for by name:
+  - **The advertisement** (`write_advertisement`): A-604's v0 writer with receive-pack's capabilities in `show_ref`'s
+    order: `report-status report-status-v2 delete-refs side-band-64k quiet`, then `atomic`, `ofs-delta` and
+    `push-options` as the deployment advertises them, `session-id` when told, `object-format` and `agent`. An empty
+    repository's one line names `capabilities^{}` at the null id.
+  - **The update request** (`RequestReader`), read as its bytes arrive, a packet whole in the input read in place and
+    one cut short held up to git's 65520 bytes. It reads the shallow lines, the commands `old-id SP new-id SP refname`
+    (the client's capabilities after the first one's NUL), the push options when both sides chose `push-options`, and
+    stops where the pack begins. A stock client ends no line with LF, and one that does has it stripped, as git strips
+    it.
+  - **The pack** through A-608's reader. A thin pack's reference deltas take their bases from the repository: A-608's
+    reader gains `Outside` and `Reader::finish_with`, its `finish` unchanged.
+  - **The connectivity check** (`connectivity`), over the pushed objects alone, as §4.17.2 item 5 asks. A commit names
+    its tree and parents, a tree its entries (a submodule's commit excepted, as git's walk excepts it), and a tag its
+    object. An object the repository holds ends the walk. A name nothing holds makes every pushed object reaching it
+    `Missing`; a parent nothing holds of a commit the client called shallow makes it `Shallow`. An object that cannot
+    be read is `Missing`.
+  - **Each command's outcome** (`outcomes`), in git's order and words. A refused pack makes every command
+    `unpacker error`, the unpack status git's own words for it: the header's (`protocol error (pack signature mismatch
+    detected)`, `protocol error (pack version unsupported)`, `eof before pack header was fully read`) or `index-pack
+    abnormal exit`. Then come the connectivity check's refusals, then each remaining command's ref name (A-615's
+    `refname::is_valid`, with receive-pack's own two rules: only `refs/`, and one level only to delete; refused as
+    `funny refname` with git's band-2 line), then the caller's verdict (`Judge`, part 2's engine).
+  - **`atomic`**: either every ref applies or none does. The first refusal leaves every other command `atomic push
+    failure`, and no command is judged once one has already failed.
+  - **The answer** (`write_report`): `unpack ok` or the status, each command's `ok` or `ng <reason>`, and under
+    report-status-v2 the option lines of each report a hook made (`option refname`, `old-oid`, `new-oid`,
+    `forced-update`, each report after the first repeating the `ok`). The judge's `rp_error` lines go on band 2
+    (`message` cuts them to git's 4096 bytes), then the report on band 1 and a last flush, when the client asked for
+    side-band-64k.
+- **Sources** (git v2.50.1, read 2026-11-19). The document [B]: `gitprotocol-pack.adoc` lines 494-720 and
+  `gitprotocol-capabilities.adoc`. The code [C]: `builtin/receive-pack.c` (`show_ref`, `write_head_info`,
+  `read_head_info`, `queue_command`, `read_push_options`, `parse_pack_header`, `unpack`, `execute_commands`,
+  `set_connectivity_errors`, `update`, `execute_commands_atomic`, `report_message`, `report`, `report_v2`) and
+  `send-pack.c`.
+- **Stricter than git, by the documents' own words.**
+  - `atomic` is "Either all refs are updated or none": git 2.50.1 updates the other refs when one fails its
+    connectivity check before the atomic transaction begins, and this refuses them all.
+  - The client's capabilities ride on the first command alone, and shallow lines come before the commands, as the
+    grammar writes them; git reads either on any line.
+  - A push certificate is refused, since none is advertised.
+- **Bounds.** The input bounds what is read and the caller's admission what is built, each charged before it is made.
+  Every command, option and shallow line is charged as it is read, its list grown by doubling with the room added
+  charged first. The pack is charged as A-608 charges it. The connectivity check reads every object twice, once to
+  count the edges among the pushed objects and once to keep them, so its tables are charged exactly. A read's own
+  transient structures, a small multiple of the object's bytes the pack's admission already charged, take a scratch
+  admission of their own and are freed before the next read.
+- **Golden vectors.** `fixtures/push/make-push-fixtures.sh` puts a wrapper between `git push` and stock
+  `git receive-pack` (`--receive-pack`) and saves what each side sent, with the server's refs and objects before each
+  push. It made nine pushes to one bare server that refuses non-fast-forwards and advertises push options: create;
+  update, a thin pack; tag; copy, a create at a commit the server holds with the empty pack the protocol asks for; side;
+  delete, with no pack; options, two push options; non-ff, a forced rewrite refused; and atomic, a new branch and the
+  rewrite, both refused. Run on the MacBook with git 2.50.1 (Apple Git-155), 2026-11-19; a second run made every file
+  byte for byte the same, and `SHA256SUMS` lists them. Four of the packs are thin, each with one delta against the
+  server's text blob.
+- **Tests** (`cargo test -p slates-git --lib`, 15 new in `receive` and one in `unpack`):
+  - each push's advertisement and answer are the very bytes `git receive-pack` wrote, judged by the server's own
+    policy, a band-2 line and all;
+  - each request reads as stock git wrote it (capabilities, agent, `atomic`, the two options);
+  - each thin pack's delta resolves one deep against the server's blob;
+  - each request read a byte at a time stops where the pack begins;
+  - every cut of every push is refused inside the request or answered as a short pack; every bit flip of a command
+    list is refused by kind or answered;
+  - missing objects (a tree and a tag's commit nowhere), the shallow boundary, `atomic` with a connectivity refusal,
+    seven ref names git refuses and the one-level delete it allows, nine requests the protocol does not allow, reports
+    v1 and v2 with option lines (multiplexed and not), git's words for four refused packs, and the admission (exact,
+    one byte short, a thousand long command lines);
+  - and in `unpack`, a thin pack of a delta on a held base and a delta on that, resolved one and two deep, and refused
+    without the held base.
+- **Checks.** On the Mac Studio (kiln, debug, 2026-11-19):
+  - Failing first: with the reader's request, advertisement, report, connectivity and the thin pass stubbed (r712,
+    load 16.3), all 16 new tests failed and the crate's other 178 passed.
+  - The first green run refused the exact-admission test: a commit read near the end of the walk had been held to what
+    the admission had left (128 bytes asked, 99 left). Reads now take their own scratch room (Bounds).
+  - Then 194 of 194 under `--locked` (load 2.5 to 9.2, 17.1 s), and `cargo fmt --check` was clean. Red five ways:
+    - judging after a failure under `atomic`: the atomic test saw the other ref judged;
+    - the connectivity check's "held" test removed: the missing-objects test failed;
+    - v2's option lines dropped: the report test failed;
+    - capabilities taken on a second command: the request read `Ok(219)`, where `Capabilities { at: 113 }` was due;
+    - the thin pass removed: the golden update push answered `unpack index-pack abnormal exit` and `unpacker error`,
+      where git answered `unpack ok` and `ok refs/heads/main`.
+  - On the tree merged with main (A-604's v0, A-615's refname, A-614's store), with the advertisement and the ref-name
+    rule pointed at A-604's and A-615's: 287 of 287 under `--locked` (14.6 s), `cargo fmt --check` clean.
+- **Owed.** Part 2: each ref's update a work the engine judges (A-618), every ref recorded as one register entry
+  (A-603), with A-614's store as the `Repository` (a base's bytes assembled from the content plane). Then:
+  - the fsck checks of every new object (§4.17.2 item 4, A-590's `fsck`);
+  - the server loop that feeds the request reader and then the pack reader from one connection;
+  - review requests over `refs/for/` with report-status-v2's option lines (piece 10), hidden refs (`.have`),
+    and signed pushes (`push-cert`).
+
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`receive/`, new, with its
+tests; `unpack.rs`'s `Outside`, `NoObjects` and `Reader::finish_with`, and its test; `lib.rs`'s module line);
+`crates/git/fixtures/push/` (new); `.gitattributes` (the push fixtures, byte for byte).
 
 ### A-627 — `list-report` and `file-revs-report` read and answered, and PROPPATCH, LOCK's lockinfo, `Timeout` and `Lock-Token` read (2026-11-19, g250, UI goal 93; §4.17.4 piece 13's second part, in part; A-609, A-602)
 Applied in the same change to: §4.17.4's pieces, GAPS (the §4.17.4 entry), `research/vcs-servers-subversion.md` (§1's

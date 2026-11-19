@@ -264,6 +264,20 @@
 > encodes back byte for byte. This is main's answer to A-604's question: v0 and v2 read alike. Red first (2 of 39 v2
 > tests), then `cargo test -p slates-git --lib` 221 of 221 over main with it. Owed of A-624: `object-info` and `bundle-uri` read and
 > answered over a store trait, and the server's `packfile-uris` choice (piece 14's rest).
+> **A-620 part 1 (2026-11-19, g258; piece 6's exchange, receive-pack):** `slates-git` (`receive`) speaks
+> receive-pack's exchange as git 2.50.1 does: the advertisement (A-604's v0 writer, receive-pack's capabilities in
+> git's order), the update request read as it arrives (shallow lines, commands with the first one's capabilities, push
+> options), the pack through A-608's reader with a thin pack's bases from the repository (`unpack::Outside`,
+> `Reader::finish_with`), the connectivity check over the pushed objects alone (`missing necessary objects`, `shallow
+> update not allowed`), each remaining command's ref name (A-615's rule) and the caller's verdict (`Judge`), every ref
+> or none under `atomic` (stricter than git's code, by the capability's own words), and report-status and
+> report-status-v2 with option lines, multiplexed after git's band-2 lines. Golden vectors: nine pushes stock git
+> 2.50.1 made to stock `git receive-pack` (`fixtures/push/make-push-fixtures.sh`), answered byte for byte.
+> `cargo test -p slates-git --lib`: 16 new failing first against stubs, then 194 of 194, red five ways; 287 of 287 on
+> the tree merged with main. Owed: part 2, each ref a work the engine judges (A-618) recorded as one register entry
+> (A-603) with A-614's store as the repository; then the fsck checks of new objects, the server loop over one
+> connection, review requests over `refs/for/`, hidden refs and signed pushes. Clippy, `xtask` and the lint matrix
+> over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
