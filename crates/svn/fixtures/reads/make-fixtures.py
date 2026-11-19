@@ -13,6 +13,10 @@ relay between the two before it forwards it:
 - Stock sessions run `svn` with an empty configuration directory, non-interactive, no authentication cache.
 - Scripted sessions send the stock client's own greeting and ANONYMOUS answer (taken from the first stock session), then
   exact commands, the server's refusals among them, and close their sending half; the server answers each in turn.
+- A-613 part 2 added revisions 8 to 11 (a 10,000-byte text and its change, an empty text, a name in capitals, a path
+  added again after its deletion, a file replaced by a copy, a revision without an author, mergeinfo taken away) and
+  the sessions of get-file, list, get-location-segments, get-deleted-rev, log (with merged revisions) and
+  get-file-revs, scripted and stock (`svn cat`, `ls`, `log`, `blame`, `mergeinfo --show-revs`).
 
 Usage: python3 -I make-fixtures.py OUTDIR WORKDIR
 Writes NAME.N.client.bin and NAME.N.server.bin per connection N of each session, sessions.txt (each session's command
@@ -48,6 +52,11 @@ CHUNK = 65536
 # How long any one step may take before the run is refused.
 STEP_SECONDS = 60
 
+# A text of 1,000 numbered lines, 10,000 bytes: more than two of get-file's 4,096-byte strings.
+BIG_EIGHT = b"".join(b"line %04d\n" % number for number in range(1000))
+# The same text with its 500th line changed and one line appended, 10,010 bytes.
+BIG_NINE = BIG_EIGHT.replace(b"line 0500\n", b"LINE 0500\n") + b"line 1000\n"
+
 # The repository, revision by revision: revision properties, then rows (path, kind, action, properties or None for
 # unchanged, text or None for unchanged, copy source or None). Revision 0's date is set after the load.
 REVISION_ZERO_DATE = "2026-01-01T00:00:00.000000Z"
@@ -79,6 +88,28 @@ REVISIONS = [
     ({"svn:author": "alice", "svn:date": "2026-01-07T07:00:00.000000Z", "svn:log": "mergeinfo below"}, [
         ("trunk/dir", "dir", "change", {"svn:ignore": "*.o\n", "svn:mergeinfo": "/branches/b1/dir:3-4*"}, None, None),
         ("tags/t1", "dir", "add", None, None, ("trunk", 5)),
+    ]),
+    # A-613 part 2: a text past get-file's 4,096-byte strings, an empty text, a name in capitals for list's case
+    # folding, and a path deleted in revision 6 added again as a new line of history.
+    ({"svn:author": "carol", "svn:date": "2026-01-08T08:00:00.000000Z", "svn:log": "big, empty, again"}, [
+        ("trunk/big.txt", "file", "add", {}, BIG_EIGHT, None),
+        ("trunk/empty.txt", "file", "add", {}, b"", None),
+        ("trunk/README.TXT", "file", "add", {}, b"read me\n", None),
+        ("trunk/dir/b.txt", "file", "add", {}, b"beta again\n", None),
+    ]),
+    # A change inside a large text, for get-file-revs' delta between two texts; a file replaced by a copy, for log's
+    # R and get-deleted-rev.
+    ({"svn:author": "bob", "svn:date": "2026-01-09T09:00:00.000000Z", "svn:log": "big change, replace"}, [
+        ("trunk/big.txt", "file", "change", None, BIG_NINE, None),
+        ("branches/b1/a.txt", "file", "replace", None, None, ("trunk/a.txt", 5)),
+    ]),
+    # A revision without an author, changing a file's properties alone.
+    ({"svn:date": "2026-01-10T10:00:00.000000Z", "svn:log": "no author, props only"}, [
+        ("trunk/a.txt", "file", "change", {"color": "green"}, None, None),
+    ]),
+    # Mergeinfo taken away: log's merged revisions answer a reverse merge.
+    ({"svn:author": "alice", "svn:date": "2026-01-11T11:00:00.000000Z", "svn:log": "unmerge on the tag"}, [
+        ("tags/t1", "dir", "change", {}, None, None),
     ]),
 ]
 
@@ -299,6 +330,30 @@ SCRIPTED = {
         command("get-iprops", b"trunk/missing", (7,)),
         command("get-iprops", b"trunk/a.txt", ()),
     ],
+    "get-dir": [
+        command("get-dir", b"", (7,), "true", "true"),
+        command("get-dir", b"trunk", (3,), "false", "true", ("kind", "size")),
+        command("get-dir", b"trunk", (), "true", "false", (), "true"),
+        command("get-dir", b"branches/b1", (4,), "true", "true", ("kind", "size", "has-props", "created-rev", "time",
+                                                                  "last-author", "no-such-field")),
+        command("get-dir", b"trunk/a.txt", (), "false", "true"),
+        command("get-dir", b"trunk/missing", (), "true", "false"),
+        command("get-dir", b"trunk", (99,), "true", "true"),
+    ],
+    "get-locations": [
+        command("get-locations", b"branches/b1/a.txt", 7, (7, 4, 3, 2, 1, 0)),
+        command("get-locations", b"trunk/a.txt", 2, (7, 5, 2, 1)),
+        command("get-locations", b"tags/t1/dir", 7, (7, 5, 3)),
+        command("get-locations", b"trunk/dir/b.txt", 5, (5, 1)),
+        command("get-locations", b"trunk/dir/b.txt", 5, (6, 5)),
+        command("get-locations", b"trunk/missing", 7, (7,)),
+        command("get-locations", b"trunk", 99, (1,)),
+        command("get-locations", b"trunk", 7, ()),
+    ],
+    "hostile-locations": [
+        command("get-locations", b"trunk", 7, (b"seven",)),
+        command("get-latest-rev"),
+    ],
     "hostile-malformed": [
         command("check-path", 5, ()),
         command("get-latest-rev"),
@@ -306,6 +361,143 @@ SCRIPTED = {
     "unknown-command": [
         command("no-such-command"),
         command("get-latest-rev"),
+    ],
+    # A-613 part 2.
+    "get-file": [
+        command("get-file", b"trunk/a.txt", (2,), "true", "true"),
+        command("get-file", b"trunk/a.txt", (), "false", "true"),
+        command("get-file", b"trunk/a.txt", (), "true", "false"),
+        command("get-file", b"branches/b1/a.txt", (3,), "true", "true"),
+        command("get-file", b"trunk/big.txt", (), "false", "true"),
+        command("get-file", b"trunk/big.txt", (8,), "false", "true", "false"),
+        command("get-file", b"trunk/empty.txt", (), "true", "true"),
+        command("get-file", b"trunk/a.txt", (5,), "true", "true", "true"),
+        command("get-file", b"trunk/dir/b.txt", (5,), "false", "false", "true"),
+        command("get-file", b"trunk/a.txt", (5,), "false", "false", "false"),
+        command("get-file", b"trunk/a.txt", (10,), "true", "false"),
+        command("get-file", b"trunk", (5,), "true", "true"),
+        command("get-file", b"trunk/missing", (), "true", "true"),
+        command("get-file", b"trunk/a.txt", (99,), "true", "true"),
+        command("get-file", b"trunk/dir/b.txt", (6,), "true", "true"),
+        command("get-file", b"trunk/dir/b.txt", (8,), "true", "true"),
+        command("get-file", b"/trunk//a.txt/./", (2,), "false", "true"),
+        command("get-file", b"tags/t1/a.txt", (11,), "true", "true", "true"),
+    ],
+    "hostile-get-file": [
+        command("get-file", b"trunk/a.txt", (), "true", "true", "maybe"),
+        command("get-latest-rev"),
+    ],
+    "list": [
+        command("list", b"", (), "infinity", ("kind", "size", "has-props", "created-rev", "time", "last-author")),
+        command("list", b"", (7,), "immediates", ("kind",)),
+        command("list", b"trunk", (), "files", ()),
+        command("list", b"trunk", (), "infinity"),
+        command("list", b"trunk/a.txt", (), "infinity", ("kind", "size")),
+        command("list", b"trunk", (), "infinity", ("kind",), (b"a*", b"*.txt")),
+        command("list", b"trunk", (), "infinity", ("kind",), (b"read*",)),
+        command("list", b"trunk", (), "infinity", ("kind",), ()),
+        command("list", b"trunk", (), "empty", ("kind", "time")),
+        command("list", b"trunk/missing", (), "infinity", ("kind",)),
+        command("list", b"", (99,), "immediates", ("kind",)),
+        command("list", b"trunk", (), "unknown-word", ("kind",)),
+        command("list", b"trunk", (), "exclude", ("kind",)),
+        command("list", b"trunk", (10,), "immediates", ("last-author", "time")),
+        command("list", b"", (0,), "infinity", ("kind", "size")),
+        command("list", b"tags", (), "infinity", ("kind", "created-rev", "no-such-field")),
+    ],
+    "hostile-list": [
+        command("list", b"trunk", (), "infinity", ("kind", b"size")),
+        command("get-latest-rev"),
+    ],
+    "get-location-segments": [
+        command("get-location-segments", b"branches/b1/a.txt", (11,), (11,), (0,)),
+        command("get-location-segments", b"branches/b1/a.txt", (8,), (8,), (0,)),
+        command("get-location-segments", b"tags/t1/a.txt", (), (), ()),
+        command("get-location-segments", b"trunk", (), (), ()),
+        command("get-location-segments", b"", (), (), ()),
+        command("get-location-segments", b"trunk/dir/b.txt", (8,), (8,), (0,)),
+        command("get-location-segments", b"trunk/dir/b.txt", (5,), (5,), (0,)),
+        command("get-location-segments", b"trunk/a.txt", (11,), (6,), (3,)),
+        command("get-location-segments", b"tags/t1/a.txt", (11,), (8,), (6,)),
+        command("get-location-segments", b"tags/t1/dir", (11,), (11,), (0,)),
+        command("get-location-segments", b"trunk/a.txt", (5,), (6,), (0,)),
+        command("get-location-segments", b"trunk/a.txt", (5,), (2,), (4,)),
+        command("get-location-segments", b"trunk/missing", (), (), ()),
+        command("get-location-segments", b"trunk/a.txt", (99,), (), ()),
+        command("get-location-segments", b"trunk/a.txt", (18446744073709551615,), (3,), ()),
+        command("get-location-segments", b"trunk/a.txt", (8,), (99,), ()),
+    ],
+    "get-deleted-rev": [
+        command("get-deleted-rev", b"trunk/dir/b.txt", 5, 11),
+        command("get-deleted-rev", b"trunk/dir/b.txt", 1, 11),
+        command("get-deleted-rev", b"trunk/a.txt", 1, 11),
+        command("get-deleted-rev", b"branches/b1/a.txt", 4, 11),
+        command("get-deleted-rev", b"trunk/dir/b.txt", 11, 5),
+        command("get-deleted-rev", b"trunk/dir/b.txt", 8, 11),
+        command("get-deleted-rev", b"trunk/missing", 1, 11),
+        command("get-deleted-rev", b"trunk/a.txt", 1, 99),
+        command("get-deleted-rev", b"trunk/a.txt", 99, 1),
+        command("get-deleted-rev", b"trunk/a.txt", 18446744073709551615, 1),
+        command("get-deleted-rev", b"trunk/a.txt", 1, 18446744073709551615),
+        command("get-deleted-rev", b"tags/t1", 7, 11),
+        command("get-deleted-rev", b"branches/b1/a.txt", 3, 9),
+        command("get-deleted-rev", b"branches/b1/a.txt", 3, 8),
+        command("get-deleted-rev", b"", 0, 11),
+    ],
+    "log": [
+        command("log", (b"",), (11,), (0,), "true", "false", 0, "false", "revprops",
+                (b"svn:author", b"svn:date", b"svn:log")),
+        command("log", (b"trunk",), (11,), (0,), "true", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"branches/b1/a.txt",), (11,), (0,), "true", "false", 0, "false", "revprops", (b"svn:log",)),
+        command("log", (b"branches/b1/a.txt",), (11,), (0,), "true", "true", 0, "false", "revprops", (b"svn:log",)),
+        command("log", (b"trunk",), (0,), (11,), "false", "false", 2, "false", "revprops", (b"svn:author",)),
+        command("log", (b"trunk/a.txt", b"trunk/dir"), (11,), (0,), "true", "false", 0, "false", "revprops", ()),
+        command("log", (b"",), (11,), (0,), "false", "false", 0, "false", "revprops", (b"x-ticket", b"svn:log")),
+        command("log", (b"trunk",), (11,), (0,), "false", "false"),
+        command("log", (b"trunk",), (11,), (0,), "false", "false", 3),
+        command("log", (b"trunk",), (), (), "false", "false", 0, "false", "all-revprops", ()),
+        command("log", (), (3,), (1,), "false", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"trunk",), (99,), (0,), "false", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"trunk/missing",), (11,), (0,), "false", "false", 0, "false", "all-revprops", ()),
+        command("log", (b"trunk",), (11,), (0,), "false", "false", 4294967296, "false", "all-revprops", ()),
+        command("log", (b"tags/t1/dir",), (11,), (0,), "true", "false", 0, "false", "revprops", (b"svn:log",)),
+        command("log", (b"trunk/dir/b.txt",), (11,), (0,), "true", "false", 0, "false", "revprops", (b"svn:log",)),
+    ],
+    "log-merged": [
+        command("log", (b"trunk",), (11,), (0,), "false", "false", 0, "true", "all-revprops", ()),
+        command("log", (b"trunk",), (0,), (11,), "true", "false", 0, "true", "revprops", (b"svn:log",)),
+        command("log", (b"tags/t1",), (11,), (0,), "false", "false", 0, "true", "revprops", (b"svn:log",)),
+        command("log", (b"trunk/a.txt",), (11,), (0,), "true", "false", 0, "true", "revprops", (b"svn:log",)),
+        command("log", (b"",), (11,), (0,), "false", "false", 0, "true", "revprops", (b"svn:log",)),
+        command("log", (b"trunk/dir",), (11,), (0,), "false", "false", 2, "true", "revprops", (b"svn:log",)),
+        command("log", (b"trunk", b"tags/t1"), (11,), (0,), "false", "false", 0, "true", "revprops", (b"svn:log",)),
+    ],
+    "hostile-log-word": [
+        command("log", (b"trunk",), (11,), (0,), "false", "false", 0, "false", "bogus-word", ()),
+        command("get-latest-rev"),
+    ],
+    "hostile-log-path": [
+        command("log", (5,), (11,), (0,), "false", "false", 0, "false", "all-revprops", ()),
+        command("get-latest-rev"),
+    ],
+    "hostile-log-seven": [
+        command("log", (b"trunk",), (11,), (0,), "false", "false", 0, "false"),
+        command("get-latest-rev"),
+    ],
+    "get-file-revs": [
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/a.txt", (0,), (11,), "true"),
+        command("get-file-revs", b"branches/b1/a.txt", (0,), (8,)),
+        command("get-file-revs", b"branches/b1/a.txt", (0,), (11,), "true"),
+        command("get-file-revs", b"trunk/big.txt", (0,), (11,)),
+        command("get-file-revs", b"trunk/empty.txt", (), ()),
+        command("get-file-revs", b"trunk/a.txt", (11,), (0,)),
+        command("get-file-revs", b"trunk/a.txt", (11,), (0,), "true"),
+        command("get-file-revs", b"trunk", (0,), (11,)),
+        command("get-file-revs", b"trunk/missing", (0,), (11,)),
+        command("get-file-revs", b"trunk/a.txt", (3,), (5,)),
+        command("get-file-revs", b"trunk/a.txt", (0,), (99,)),
+        command("get-file-revs", b"tags/t1/a.txt", (0,), (11,), "true"),
     ],
 }
 
@@ -317,6 +509,16 @@ STOCK = {
     "svn-revprop-list": [["proplist", "--revprop", "-v", "-r", "3", URL]],
     "svn-info-dated": [["info", "-r", "{2026-01-03T12:00:00Z}", URL]],
     "svn-proplist-inherited": [["proplist", "-v", "--show-inherited-props", URL + "/trunk/dir"]],
+    # A-613 part 2: what the stock client asks of get-file, list, log, get-file-revs and the location segments.
+    "svn-cat": [["cat", "-r", "5", URL + "/trunk/a.txt"]],
+    "svn-cat-big": [["cat", URL + "/trunk/big.txt"]],
+    "svn-ls": [["ls", "-v", "-R", URL + "/trunk"]],
+    "svn-log": [["log", "-v", URL + "/trunk"]],
+    "svn-log-g": [["log", "-g", URL + "/trunk"]],
+    "svn-blame": [["blame", URL + "/trunk/a.txt"]],
+    "svn-blame-g": [["blame", "-g", URL + "/trunk/a.txt"]],
+    "svn-mergeinfo-eligible": [["mergeinfo", "--show-revs", "eligible", URL + "/branches/b1", URL + "/trunk"]],
+    "svn-mergeinfo-merged": [["mergeinfo", "--show-revs", "merged", URL + "/branches/b1", URL + "/trunk"]],
 }
 
 

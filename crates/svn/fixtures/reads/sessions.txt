@@ -4,11 +4,35 @@ svn-revprop-get: svn propget --revprop -r 1 svn:log svn://127.0.0.1:36913/repo -
 svn-revprop-list: svn proplist --revprop -v -r 3 svn://127.0.0.1:36913/repo -> 0 ''
 svn-info-dated: svn info -r {2026-01-03T12:00:00Z} svn://127.0.0.1:36913/repo -> 0 ''
 svn-proplist-inherited: svn proplist -v --show-inherited-props svn://127.0.0.1:36913/repo/trunk/dir -> 0 ''
+svn-cat: svn cat -r 5 svn://127.0.0.1:36913/repo/trunk/a.txt -> 0 ''
+svn-cat-big: svn cat svn://127.0.0.1:36913/repo/trunk/big.txt -> 0 ''
+svn-ls: svn ls -v -R svn://127.0.0.1:36913/repo/trunk -> 0 ''
+svn-log: svn log -v svn://127.0.0.1:36913/repo/trunk -> 0 ''
+svn-log-g: svn log -g svn://127.0.0.1:36913/repo/trunk -> 0 ''
+svn-blame: svn blame svn://127.0.0.1:36913/repo/trunk/a.txt -> 0 ''
+svn-blame-g: svn blame -g svn://127.0.0.1:36913/repo/trunk/a.txt -> 0 ''
+svn-mergeinfo-eligible: svn mergeinfo --show-revs eligible svn://127.0.0.1:36913/repo/branches/b1 svn://127.0.0.1:36913/repo/trunk -> 0 ''
+svn-mergeinfo-merged: svn mergeinfo --show-revs merged svn://127.0.0.1:36913/repo/branches/b1 svn://127.0.0.1:36913/repo/trunk -> 0 ''
 latest-and-dated: scripted, 7 commands
 revision-properties: scripted, 7 commands
 check-path: scripted, 8 commands
 stat: scripted, 7 commands
 get-mergeinfo: scripted, 9 commands
 get-iprops: scripted, 6 commands
+get-dir: scripted, 7 commands
+get-locations: scripted, 8 commands
+hostile-locations: scripted, 2 commands
 hostile-malformed: scripted, 2 commands
 unknown-command: scripted, 2 commands
+get-file: scripted, 18 commands
+hostile-get-file: scripted, 2 commands
+list: scripted, 16 commands
+hostile-list: scripted, 2 commands
+get-location-segments: scripted, 16 commands
+get-deleted-rev: scripted, 15 commands
+log: scripted, 16 commands
+log-merged: scripted, 7 commands
+hostile-log-word: scripted, 2 commands
+hostile-log-path: scripted, 2 commands
+hostile-log-seven: scripted, 2 commands
+get-file-revs: scripted, 13 commands

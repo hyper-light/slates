@@ -154,14 +154,21 @@ mod repository;
 // segments (A-597). No caller outside tests until the version-control servers' policy reads it (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]
 mod wildmatch;
-// §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597). No caller outside tests until the
-// repository record holds a policy and the servers' push paths ask it (their pieces).
+// §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
+// policy the repository's record holds (`admit`, A-622). No caller outside tests until the servers' push paths ask it
+// (their pieces: git's receive-pack, Subversion's commit editor, Mercurial's unbundle).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_policy;
 // §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside
 // tests until the servers' push paths start hooks (their pieces).
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_hooks;
+// A hook run as a process of its own over a read-only view of the work, held to `vcs_hooks`' runner (A-622 part 3):
+// Unix alone until its Windows part (a job object, `slates_ipc::win_spawn`). No caller outside tests until the servers'
+// push paths start hooks (their pieces).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod hook_driver;
 // A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
 // (A-548).
 mod reader_patience;

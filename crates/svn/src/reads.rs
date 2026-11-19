@@ -31,13 +31,17 @@
 //!
 //! The commands answered here: `get-latest-rev`, `get-dated-rev` (`svn_repos_dated_revision`'s binary search),
 //! `rev-proplist`, `rev-prop`, `check-path`, `stat` (`svn_repos_stat`), `get-mergeinfo`
-//! (`svn_repos_fs_get_mergeinfo2`) and `get-iprops` (`svn_repos_fs_get_inherited_props`). Owed with this piece:
-//! `get-file`, `get-dir`, `list`, `log` with merged revisions, `get-locations`, `get-location-segments`,
-//! `get-file-revs`, `get-deleted-rev`, `svn mergeinfo --show-revs`, and read access by the authorization rules (A-606):
-//! today every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn_repos_fs_get_mergeinfo2`), `get-iprops` (`svn_repos_fs_get_inherited_props`), `get-dir`, `get-locations`
+//! (`svn_repos_trace_node_locations`) and `get-file` (its own module, `file`). Owed with this piece: `list`, `log`
+//! with merged revisions, `get-location-segments`, `get-file-revs`, `get-deleted-rev`, and read access by the
+//! authorization rules (A-606): today every path is readable, as in an `anon-access = read` repository with no rules.
+//! (`svn mergeinfo --show-revs` is the stock client's own work over `get-mergeinfo`, `log` and the location segments,
+//! never a server command.)
 //!
 //! Bounds: an answer holds what its command names, bounded by the index and the green (a property list, a revision's
-//! properties, a request's paths and their mergeinfo); the streaming commands that follow write a slice at a time.
+//! properties, a request's paths and their mergeinfo). A command whose answer grows with the repository writes its
+//! head and hands back a [`Stream`] that writes the rest a slice at a time, in the room the caller gives each slice
+//! (module `stream`): a file's text is never held whole.
 //!
 //! No I/O, no clock, no randomness, no panic.
 
@@ -106,6 +110,42 @@ const DIRECTORY_SIZE: u64 = u64::MAX;
 /// Format: `SVN_PROP_REVISION_DATE` (`svn_props.h`).
 const DATE_PROPERTY: &[u8] = b"svn:date";
 
+/// The entry properties `get_props` adds to a node's own (`svn_props.h` `SVN_PROP_ENTRY_*`).
+/// Format: `svn:entry:committed-rev`, `svn:entry:committed-date`, `svn:entry:last-author`, `svn:entry:uuid`.
+const ENTRY_COMMITTED_REV: &[u8] = b"svn:entry:committed-rev";
+
+/// The entry property of a node's committed date.
+/// Format: `SVN_PROP_ENTRY_COMMITTED_DATE`.
+const ENTRY_COMMITTED_DATE: &[u8] = b"svn:entry:committed-date";
+
+/// The entry property of a node's last author.
+/// Format: `SVN_PROP_ENTRY_LAST_AUTHOR`.
+const ENTRY_LAST_AUTHOR: &[u8] = b"svn:entry:last-author";
+
+/// The entry property of the repository's UUID.
+/// Format: `SVN_PROP_ENTRY_UUID`.
+const ENTRY_UUID: &[u8] = b"svn:entry:uuid";
+
+/// The dirent fields a `get-dir` asks for, by their words (`protocol` §3.1.1 `dirent-field`).
+/// Format: `parse_dirent_fields` (`serve.c`): `kind`, `size`, `has-props`, `created-rev`, `time`, `last-author`; any
+/// other word is ignored, and no list asks for all.
+const DIRENT_FIELDS: [&str; 6] = [
+  "kind",
+  "size",
+  "has-props",
+  "created-rev",
+  "time",
+  "last-author",
+];
+
+/// The word `get-locations` ends its entries with.
+/// Format: `location-entry: ( rev:number abs-path:number ) | done` (`protocol` §3.1.1).
+const DONE: &str = "done";
+
+/// SVN_ERR_FS_NOT_DIRECTORY, "Can't get entries of non-directory".
+/// Format: the filesystem category's start plus 16 (`svn_error_codes.h`); recorded (fixture `get-dir`).
+const SVN_ERR_FS_NOT_DIRECTORY: u32 = 160_016;
+
 /// The revision property holding a revision's author.
 /// Format: `SVN_PROP_REVISION_AUTHOR` (`svn_props.h`).
 const AUTHOR_PROPERTY: &[u8] = b"svn:author";
@@ -128,19 +168,16 @@ const TERMINATOR: u8 = 0;
 
 /// The commands of `svnserve`'s main command set another piece answers.
 /// Format: `serve.c` `main_commands`, less the commands answered here.
-const ELSEWHERE: [&str; 24] = [
+const ELSEWHERE: [&str; 21] = [
   "reparent",
   "change-rev-prop",
   "change-rev-prop2",
   "commit",
-  "get-file",
-  "get-dir",
   "update",
   "switch",
   "status",
   "diff",
   "log",
-  "get-locations",
   "get-location-segments",
   "get-file-revs",
   "lock",
@@ -266,6 +303,8 @@ pub struct Session<'session> {
   /// The repository's path the session's URL names, canonical (`svnserve`'s `fs_path`): every path a command names is
   /// beneath it, and the paths it answers with are relative to it.
   pub base: &'session str,
+  /// The repository's UUID, which a node's properties carry as `svn:entry:uuid`.
+  pub uuid: &'session str,
 }
 
 /// What the read commands read from the green beyond the index and the mergeinfo queries' [`Contents`]: revision
@@ -276,13 +315,21 @@ pub trait Repository: Contents {
 
   /// The property list held as `identity`, every property, in any order; `None` when the green does not hold it.
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>>;
+
+  /// The bytes of the text held as `identity` from `offset`: a run of at least one byte, as long as the green holds it
+  /// in one piece (§4.17.4 item 11: a read streams from chunks, nothing is assembled whole), or none at the text's end;
+  /// `None` when the green does not hold the text.
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]>;
 }
 
 /// What the handler made of a command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
   /// Answered: its answer, or its refusal, is appended to the output.
   Answered,
+  /// Answered in part: the answer's head is appended to the output, and its rest follows a slice at a time from the
+  /// [`Stream`] ([`Stream::resume`]).
+  Streaming(Stream),
   /// Malformed: not a command, or parameters `svn_ra_svn__parse_tuple` refuses (`SVN_ERR_RA_SVN_MALFORMED_DATA`), which
   /// `svnserve` answers by ending the connection without a word. Nothing is appended; the caller ends the connection.
   Close,
@@ -312,6 +359,7 @@ pub fn answer<R: Repository + ?Sized>(
     index,
     repository,
     base: session.base,
+    uuid: session.uuid,
     out,
   };
   match *name {
@@ -323,6 +371,9 @@ pub fn answer<R: Repository + ?Sized>(
     "stat" => reads.stat(params),
     "get-mergeinfo" => reads.mergeinfo(params),
     "get-iprops" => reads.inherited(params),
+    "get-dir" => reads.directory(params),
+    "get-locations" => reads.locations(params),
+    "get-file" => reads.file(params),
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
@@ -372,6 +423,17 @@ impl Failure {
     Self::new(SVN_ERR_FS_CORRUPT, String::from("Filesystem is corrupt"))
   }
 
+  /// `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line.
+  fn value(&self) -> Value<'_> {
+    let error = Value::List(vec![
+      Value::Number(u64::from(self.code)),
+      Value::String(self.message.as_bytes()),
+      Value::String(b""),
+      Value::Number(0),
+    ]);
+    Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])])
+  }
+
   /// The refusal of an index refusal the read commands meet.
   fn of_index(refusal: &IndexRefusal) -> Self {
     match refusal {
@@ -406,6 +468,8 @@ struct Reads<'reads, R: ?Sized> {
   repository: &'reads R,
   /// The session's base path.
   base: &'reads str,
+  /// The repository's UUID.
+  uuid: &'reads str,
   /// The output.
   out: &'reads mut Vec<u8>,
 }
@@ -640,6 +704,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     self.trivial_auth()?;
     let found = self
       .existing(revision.unwrap_or(-1))
+      .and_then(|revision| self.present_for_iprops(&path, revision))
       .and_then(|revision| self.ancestors_properties(&path, revision));
     match found {
       Ok(ancestors) => {
@@ -658,18 +723,23 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
   }
 
+  /// `get_inherited_props`' check before the walk: the path must be present, else "'P' path not found".
+  fn present_for_iprops(&self, path: &str, revision: Revision) -> Result<Revision, Failure> {
+    match self.node(path, revision)? {
+      Some(_) => Ok(revision),
+      None => Err(Failure::new(
+        SVN_ERR_FS_NOT_FOUND,
+        format!("'{path}' path not found"),
+      )),
+    }
+  }
+
   /// The ancestors of `path` holding properties, root first, each by its path without the leading separator.
   fn ancestors_properties<'path>(
     &self,
     path: &'path str,
     revision: Revision,
   ) -> Result<Ancestors<'path, 'reads>, Failure> {
-    if self.node(path, revision)?.is_none() {
-      return Err(Failure::new(
-        SVN_ERR_FS_NOT_FOUND,
-        format!("'{path}' path not found"),
-      ));
-    }
     let mut found = Vec::new();
     let mut place = parent(path);
     while let Some(ancestor) = place {
@@ -688,6 +758,336 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     }
     found.reverse();
     Ok(found)
+  }
+
+  /// The ancestors of `path` holding properties, root first, each by its own path without the leading separator.
+  fn owned_ancestors(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<OwnedAncestors<'reads>, Failure> {
+    let found = self.ancestors_properties(path, revision)?;
+    Ok(
+      found
+        .into_iter()
+        .map(|(ancestor, properties)| (ancestor.to_owned(), properties))
+        .collect(),
+    )
+  }
+
+  /// `get-dir ( path [ rev ] want-props want-contents ? ( field ... ) ? want-iprops )`: the directory's properties
+  /// with its entry properties, its entries as dirents carrying the fields asked for, and its ancestors' properties
+  /// when asked (`serve.c` `get_dir`).
+  fn directory(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
+    let Some(request) = DirectoryRequest::parse(params, self.base) else {
+      return Ok(Outcome::Close);
+    };
+    self.trivial_auth()?;
+    match self.directory_answer(&request) {
+      Ok(answer) => {
+        let mut items = vec![
+          Value::Number(answer.revision),
+          owned_proplist(&answer.properties),
+        ];
+        items.push(Value::List(
+          answer.entries.iter().map(DirectoryEntry::value).collect(),
+        ));
+        if let Some(ancestors) = &answer.ancestors {
+          items.push(inherited_value(ancestors));
+        }
+        self.success(items)
+      }
+      Err(failure) => self.failure(&failure),
+    }
+  }
+
+  /// `get_dir`'s work in its order: the revision, the properties, then the entries.
+  fn directory_answer(
+    &self,
+    request: &DirectoryRequest,
+  ) -> Result<DirectoryAnswer<'reads>, Failure> {
+    let revision = self.at_or_youngest(request.revision)?;
+    let properties = if request.properties {
+      self.node_properties(&request.path, revision)?
+    } else {
+      Vec::new()
+    };
+    let ancestors = if request.inherited {
+      Some(self.owned_ancestors(&request.path, revision)?)
+    } else {
+      None
+    };
+    let entries = if request.contents {
+      self.entries(&request.path, revision, request.fields)?
+    } else {
+      Vec::new()
+    };
+    Ok(DirectoryAnswer {
+      revision,
+      properties,
+      entries,
+      ancestors,
+    })
+  }
+
+  /// A node's properties and the entry properties `get_props` adds: its committed revision, that revision's date and
+  /// author as stored, and the repository's UUID.
+  fn node_properties(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Failure> {
+    let node = self
+      .node(path, revision)?
+      .ok_or_else(|| Failure::not_found(path, revision))?;
+    let mut properties: Vec<(Vec<u8>, Vec<u8>)> = match node.properties() {
+      PropertyList::Empty => Vec::new(),
+      PropertyList::Held { identity, .. } => self
+        .repository
+        .properties(&identity)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, value)| (name.to_vec(), value.to_vec()))
+        .collect(),
+    };
+    let created = node.created_revision();
+    properties.push((
+      ENTRY_COMMITTED_REV.to_vec(),
+      created.to_string().into_bytes(),
+    ));
+    if let Some(date) = self.revision_property(created, DATE_PROPERTY) {
+      properties.push((ENTRY_COMMITTED_DATE.to_vec(), date.to_vec()));
+    }
+    if let Some(author) = self.revision_property(created, AUTHOR_PROPERTY) {
+      properties.push((ENTRY_LAST_AUTHOR.to_vec(), author.to_vec()));
+    }
+    properties.push((ENTRY_UUID.to_vec(), self.uuid.as_bytes().to_vec()));
+    Ok(properties)
+  }
+
+  /// A directory's entries as `get_dir` writes them (`svn_fs_dir_entries`): refused for an absent path and for a file.
+  fn entries(
+    &self,
+    path: &str,
+    revision: Revision,
+    fields: Fields,
+  ) -> Result<Vec<DirectoryEntry<'reads>>, Failure> {
+    let node = self
+      .node(path, revision)?
+      .ok_or_else(|| Failure::not_found(path, revision))?;
+    if node.kind() != NodeKind::Directory {
+      return Err(Failure::new(
+        SVN_ERR_FS_NOT_DIRECTORY,
+        String::from("Can't get entries of non-directory"),
+      ));
+    }
+    let names = self
+      .repository
+      .entries(path, revision)
+      .ok_or_else(Failure::corrupt)?;
+    names
+      .into_iter()
+      .map(|name| self.dirent_of(path, name, revision, fields))
+      .collect()
+  }
+
+  /// One entry's dirent: each field the request asked for, and `get_dir`'s defaults for the rest (kind `none`, size 0,
+  /// no properties, revision 0, the date of time 0).
+  fn dirent_of(
+    &self,
+    directory: &str,
+    name: String,
+    revision: Revision,
+    fields: Fields,
+  ) -> Result<DirectoryEntry<'reads>, Failure> {
+    let path = child_path(directory, &name);
+    let node = self.node(&path, revision)?.ok_or_else(Failure::corrupt)?;
+    let size = match node.kind() {
+      NodeKind::File if fields.size => node.text().map_or(0, |text| text.size),
+      _ => 0,
+    };
+    let committed = fields.reads_commit().then(|| node.created_revision());
+    Ok(DirectoryEntry {
+      name,
+      kind: fields.kind.then(|| node.kind()),
+      size,
+      has_properties: fields.has_properties && self.has_properties(&node),
+      created: committed.unwrap_or(0),
+      date: committed.and_then(|created| self.revision_property(created, DATE_PROPERTY)),
+      author: committed.and_then(|created| self.revision_property(created, AUTHOR_PROPERTY)),
+    })
+  }
+
+  /// `get-locations ( path peg-rev ( rev ... ) )`: where the node at the path in the peg revision stood in each
+  /// revision (`svn_repos_trace_node_locations`), each as `( rev path )`, then `done`, then the answer or the refusal.
+  fn locations(&mut self, params: &[Value<'_>]) -> Result<Outcome, ItemError> {
+    let Some((path, peg, revisions)) = locations_request(params, self.base) else {
+      return Ok(Outcome::Close);
+    };
+    self.trivial_auth()?;
+    let found = self.trace_locations(&path, peg, revisions);
+    if let Ok(locations) = &found {
+      for (revision, place) in locations {
+        let entry = Value::List(vec![
+          Value::Number(*revision),
+          Value::String(place.as_bytes()),
+        ]);
+        write(&entry, self.out)?;
+      }
+    }
+    write(&Value::Word(DONE), self.out)?;
+    match found {
+      Ok(_) => self.success(Vec::new()),
+      Err(failure) => self.failure(&failure),
+    }
+  }
+
+  /// `svn_repos_trace_node_locations`: the revisions younger than the peg kept while the node's line reaches back to
+  /// the same path, then each copy crossed back to its source, then the revisions where the path holds the same line.
+  fn trace_locations(
+    &self,
+    path: &str,
+    peg: i64,
+    mut revisions: Vec<i64>,
+  ) -> Result<Vec<(u64, String)>, Failure> {
+    revisions.sort_unstable_by(|left, right| right.cmp(left));
+    let mut wanted = revisions.into_iter().peekable();
+    let mut start = peg;
+    while let Some(&future) = wanted.peek().filter(|&&future| future > peg) {
+      if self.reaches_back(path, peg, future)? {
+        start = future;
+        break;
+      }
+      wanted.next();
+    }
+    let (mut place, mut revision) = (path.to_owned(), start);
+    let mut found = Vec::new();
+    while wanted.peek().is_some() {
+      let Some((appeared, previous, previous_revision)) =
+        self.previous_location(&place, revision)?
+      else {
+        break;
+      };
+      while let Some(&at) = wanted.peek().filter(|&&at| at >= appeared) {
+        found.push((
+          Revision::try_from(at).map_err(|_| Failure::revision(at))?,
+          place.clone(),
+        ));
+        wanted.next();
+      }
+      while wanted.next_if(|&at| at > previous_revision).is_some() {}
+      (place, revision) = (previous, previous_revision);
+    }
+    let line = self
+      .existing(revision)
+      .and_then(|revision| self.node(&place, revision))?;
+    for at in wanted {
+      let held = self.existing(at).and_then(|at| self.node(&place, at))?;
+      match (held, line) {
+        (Some(node), Some(line)) if node.node_id() == line.node_id() => {
+          found.push((node_revision_of(at)?, place.clone()));
+        }
+        _ => break,
+      }
+    }
+    Ok(found)
+  }
+
+  /// `check_ancestry_of_peg_path`: whether the node at `path` in `future` stood at the same path in `peg`; refused
+  /// when the path is absent in `future`, as its history cannot be opened.
+  fn reaches_back(&self, path: &str, peg: i64, future: i64) -> Result<bool, Failure> {
+    let future_revision = self.existing(future)?;
+    let node = self
+      .node(path, future_revision)?
+      .ok_or_else(|| Failure::not_found(path, future_revision))?;
+    let (mut place, mut revision) = (path.to_owned(), future);
+    while let Some((appeared, previous, previous_revision)) =
+      self.previous_location(&place, revision)?
+    {
+      if appeared <= peg {
+        break;
+      }
+      (place, revision) = (previous, previous_revision);
+    }
+    let at_peg = self.existing(peg).and_then(|peg| self.node(&place, peg))?;
+    Ok(place == path && at_peg.is_some_and(|held| held.node_id() == node.node_id()))
+  }
+
+  /// `svn_repos__prev_location`: the innermost copy relevant to `path` in `revision` (`svn_fs_closest_copy`), as the
+  /// revision it appeared in and the path and revision it was copied from, extended to `path`; `None` without one.
+  fn previous_location(
+    &self,
+    path: &str,
+    revision: i64,
+  ) -> Result<Option<(i64, String, i64)>, Failure> {
+    let revision = self.existing(revision)?;
+    let node = self
+      .node(path, revision)?
+      .ok_or_else(|| Failure::not_found(path, revision))?;
+    let Some((copied_in, copy_path)) = self.youngest_copy_root(path, revision)? else {
+      return Ok(None);
+    };
+    let Some(copied) = self.node(path, copied_in)? else {
+      return Ok(None);
+    };
+    let fresh = copied.created_revision() == copied_in && copied.predecessor().is_none();
+    if copied.node_id() != node.node_id() || fresh {
+      return Ok(None);
+    }
+    let Some((source, source_revision)) = self
+      .node(&copy_path, copied_in)?
+      .and_then(|root| root.copy_from())
+    else {
+      return Ok(None);
+    };
+    let remainder = path.strip_prefix(copy_path.as_str()).unwrap_or_default();
+    let previous = if source == ROOT {
+      remainder.to_owned()
+    } else {
+      format!("{source}{remainder}")
+    };
+    let previous = if previous.is_empty() {
+      ROOT.to_owned()
+    } else {
+      previous
+    };
+    Ok(Some((
+      i64::try_from(copied_in).unwrap_or(i64::MAX),
+      previous,
+      i64::try_from(source_revision).unwrap_or(i64::MAX),
+    )))
+  }
+
+  /// FSFS's `find_youngest_copyroot`: the youngest copy root of the path's node and its directories in `revision`, a
+  /// child's preferred over its parent's of the same revision; `None` when it is revision 0's root.
+  fn youngest_copy_root(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<(Revision, String)>, Failure> {
+    let mut youngest: Option<(Revision, String)> = None;
+    let mut chain: Vec<&str> = Vec::new();
+    let mut place = Some(path);
+    while let Some(at) = place {
+      chain.push(at);
+      place = parent(at);
+    }
+    for at in chain.into_iter().rev() {
+      let Some(node) = self.node(at, revision)? else {
+        continue;
+      };
+      let root = self
+        .index
+        .node_revision(node.copy_root())
+        .map_err(|refusal| Failure::of_index(&refusal))?;
+      if youngest
+        .as_ref()
+        .is_none_or(|(kept, _)| root.created_revision() >= *kept)
+      {
+        youngest = Some((root.created_revision(), root.created_path().to_owned()));
+      }
+    }
+    Ok(youngest.filter(|(copied_in, _)| *copied_in != 0))
   }
 
   /// An unknown command: "Unknown editor command", with no authentication request first.
@@ -764,16 +1164,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
 
   /// `( failure ( ( code message 0: 0 ) ) )`, a release build's empty file and zero line.
   fn failure(&mut self, failure: &Failure) -> Result<Outcome, ItemError> {
-    let error = Value::List(vec![
-      Value::Number(u64::from(failure.code)),
-      Value::String(failure.message.as_bytes()),
-      Value::String(b""),
-      Value::Number(0),
-    ]);
-    write(
-      &Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])]),
-      self.out,
-    )?;
+    write(&failure.value(), self.out)?;
     Ok(Outcome::Answered)
   }
 }
@@ -791,6 +1182,205 @@ enum Search {
 
 /// The ancestors of a path holding properties, each by its path without the leading separator, with its properties.
 type Ancestors<'path, 'reads> = Vec<(&'path str, Vec<(&'reads [u8], &'reads [u8])>)>;
+
+/// [`Ancestors`] with each path owned.
+type OwnedAncestors<'reads> = Vec<(String, Vec<(&'reads [u8], &'reads [u8])>)>;
+
+/// An inherited property list as `get-dir`, `get-file` and `get-iprops` write it: `( ( path ( props ) ) ... )`, the
+/// root's first.
+fn inherited_value<'value>(ancestors: &'value OwnedAncestors<'_>) -> Value<'value> {
+  Value::List(
+    ancestors
+      .iter()
+      .map(|(path, properties)| {
+        Value::List(vec![
+          Value::String(path.as_bytes()),
+          proplist(properties.clone()),
+        ])
+      })
+      .collect(),
+  )
+}
+
+/// The dirent fields a `get-dir` asks for (`SVN_DIRENT_*`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Fields {
+  /// `kind`.
+  kind: bool,
+  /// `size`.
+  size: bool,
+  /// `has-props`.
+  has_properties: bool,
+  /// `created-rev`, `time` or `last-author`: any of them reads the entry's commit (`svn_repos_get_committed_info`).
+  commit: bool,
+}
+
+impl Fields {
+  /// Every field: what a request without a list asks for.
+  fn all() -> Self {
+    Self {
+      kind: true,
+      size: true,
+      has_properties: true,
+      commit: true,
+    }
+  }
+
+  /// `parse_dirent_fields`: the fields a list of words names, other words ignored; `None` for an item that is no word.
+  fn of(words: &[Value<'_>]) -> Option<Self> {
+    let mut fields = Self::default();
+    for word in words {
+      let Value::Word(word) = word else {
+        return None;
+      };
+      let [kind, size, has_properties, created, time, author] = DIRENT_FIELDS;
+      fields.kind |= *word == kind;
+      fields.size |= *word == size;
+      fields.has_properties |= *word == has_properties;
+      fields.commit |= *word == created || *word == time || *word == author;
+    }
+    Some(fields)
+  }
+
+  /// Whether the entry's commit is read.
+  fn reads_commit(self) -> bool {
+    self.commit
+  }
+}
+
+/// A parsed `get-dir` request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryRequest {
+  /// The directory's path.
+  path: String,
+  /// The revision, the youngest when absent.
+  revision: Option<i64>,
+  /// Whether its properties are wanted.
+  properties: bool,
+  /// Whether its entries are wanted.
+  contents: bool,
+  /// The dirent fields wanted.
+  fields: Fields,
+  /// Whether its ancestors' properties are wanted.
+  inherited: bool,
+}
+
+impl DirectoryRequest {
+  /// `svn_ra_svn__parse_tuple(params, "c(?r)bb?l?B")`.
+  fn parse(params: &[Value<'_>], base: &str) -> Option<Self> {
+    let (path, revision) = path_and_revision(params, base)?;
+    let fields = match params.get(4) {
+      None => Fields::all(),
+      Some(Value::List(words)) => Fields::of(words)?,
+      Some(_) => return None,
+    };
+    let inherited = match params.get(5) {
+      None => false,
+      some => boolean(some)?,
+    };
+    Some(Self {
+      path,
+      revision,
+      properties: boolean(params.get(2))?,
+      contents: boolean(params.get(3))?,
+      fields,
+      inherited,
+    })
+  }
+}
+
+/// What `get-dir` answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryAnswer<'repository> {
+  /// The revision.
+  revision: Revision,
+  /// The directory's properties, entry properties included; none when not wanted.
+  properties: Vec<(Vec<u8>, Vec<u8>)>,
+  /// Its entries; none when not wanted.
+  entries: Vec<DirectoryEntry<'repository>>,
+  /// Its ancestors' properties, when wanted.
+  ancestors: Option<OwnedAncestors<'repository>>,
+}
+
+/// One entry of `get-dir`'s answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryEntry<'repository> {
+  /// Its name.
+  name: String,
+  /// Its kind, when asked.
+  kind: Option<NodeKind>,
+  /// A file's size, when asked; 0 otherwise.
+  size: u64,
+  /// Whether it has properties, when asked.
+  has_properties: bool,
+  /// Its created revision, when its commit was asked; 0 otherwise.
+  created: Revision,
+  /// That revision's date as stored.
+  date: Option<&'repository [u8]>,
+  /// That revision's author.
+  author: Option<&'repository [u8]>,
+}
+
+impl DirectoryEntry<'_> {
+  /// `( name kind size has-props created-rev ( date ) ( [ author ] ) )`, the date of time 0 where there is none, as
+  /// `get_dir` fills it in for a client that cannot take its absence.
+  fn value(&self) -> Value<'_> {
+    let date = self
+      .date
+      .map_or_else(|| Value::String(EPOCH_DATE.as_bytes()), Value::String);
+    Value::List(vec![
+      Value::String(self.name.as_bytes()),
+      Value::Word(self.kind.map_or(NONE_WORD, kind_word)),
+      Value::Number(self.size),
+      Value::Word(bool_word(self.has_properties)),
+      Value::Number(self.created),
+      Value::List(vec![date]),
+      Value::List(self.author.map(Value::String).into_iter().collect()),
+    ])
+  }
+}
+
+/// `svn_time_to_cstring(0)`, the date `get_dir` writes for an entry without one.
+/// Format: `TIMESTAMP_FORMAT` of time 0; recorded (fixture `get-dir`).
+const EPOCH_DATE: &str = "1970-01-01T00:00:00.000000Z";
+
+/// `svn_ra_svn__parse_tuple(params, "crl")` for `get-locations`, each revision a number.
+fn locations_request(params: &[Value<'_>], base: &str) -> Option<(String, i64, Vec<i64>)> {
+  let path = c_string(params.first())?;
+  let peg = revnum(params.get(1))?;
+  let Some(Value::List(revisions)) = params.get(2) else {
+    return None;
+  };
+  let revisions = revisions
+    .iter()
+    .map(|revision| revnum(Some(revision)))
+    .collect::<Option<Vec<i64>>>()?;
+  Some((full_path(base, path), peg, revisions))
+}
+
+/// A revision a location names, as a revision number.
+fn node_revision_of(revision: i64) -> Result<Revision, Failure> {
+  Revision::try_from(revision).map_err(|_| Failure::revision(revision))
+}
+
+/// A property list held whole as the protocol writes it, in byte order of the names.
+fn owned_proplist(properties: &[(Vec<u8>, Vec<u8>)]) -> Value<'_> {
+  proplist(
+    properties
+      .iter()
+      .map(|(name, value)| (name.as_slice(), value.as_slice()))
+      .collect(),
+  )
+}
+
+/// The path of `name` in `directory`.
+fn child_path(directory: &str, name: &str) -> String {
+  if directory == ROOT {
+    format!("{ROOT}{name}")
+  } else {
+    format!("{directory}{SEPARATOR}{name}")
+  }
+}
 
 /// A dirent as `stat` writes it, owning its formatted date.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1116,6 +1706,11 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     .wrapping_add(i64::from(month <= FEBRUARY));
   (year, month, day)
 }
+
+mod file;
+mod stream;
+
+pub use stream::{Progress, Stream};
 
 #[cfg(test)]
 mod tests;
