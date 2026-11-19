@@ -516,8 +516,6 @@ fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
 /// call one that has ended; expect each refused as the caller's, nothing written.
 #[test]
 fn a_call_without_sources_or_after_the_end_is_the_callers_error() {
-  let fixture = fixture();
-  let guards = FixtureGuards::anonymous();
   let mut connection = established();
   let mut out = Vec::new();
   let none = None::<&Sources<'_, Green, FixtureGuards>>;

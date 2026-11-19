@@ -14166,9 +14166,9 @@ and export by landing).
 > target. Held to every recorded commit connection (`crates/svn/fixtures/commit/`, 16 and bob's race) replayed from its
 > first byte through the connection, every item byte for byte but one property list `svnserve` wrote in its hash
 > table's order (`import`'s `get-dir`, compared as a set and counted; A-656 continued (1)), and to `svnserve`'s own
-> authentication for `lock-many` (the reporter's `lock-a` session), byte for byte. Owed: the lock verbs; the read
-> commands' authentication for one command with their authorization (A-606); the daemon's commit once A-655 part 2b
-> lands.
+> authentication for `lock-many` (the reporter's `lock-a` session), byte for byte; red seven ways. Owed: the lock
+> verbs; the read commands' authentication for one command with their authorization (A-606); the daemon's commit
+> once A-655 part 2b lands.
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -47434,6 +47434,13 @@ Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `cr
   work refused in the step's words; start-commit's and pre-commit's failures, the transaction a hook reads, and calls
   while a hook is due; calls out of turn; `update`'s unreadable target, authenticated and where authentication cannot
   help.
+  `cargo test --locked -p slates-svn --lib` on jupiter (Windows x86_64), 2026-11-19: red seven ways by mutation: an
+  authentication for one command whose success the repository's information follows, as the handshake's does (5 failed);
+  an interrupted `update` run again as if not just authenticated (1); a hook's pause passed over (7); the drop after a
+  refused commit ending at any item, at none, at `success` alone (1 each); and at `abort-edit` alone, which all 465
+  tests passed, since each ended its drop with `abort-edit`, until the test ending it at `success` was written, which
+  alone fails it now. Then 466 of 466 and `cargo fmt -p slates-svn -- --check` clean; the macOS run owed while the Mac
+  Studio is offline.
 - **Owed** (GAPS): the daemon's commit once A-655 part 2b appends through the repository's logs; the lock verbs; the
   read commands' authentication for one command with their authorization (A-606).
 
