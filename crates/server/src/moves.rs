@@ -2016,4 +2016,51 @@ mod tests {
       "the target's takeover could not reach a cohort its neighbourhood leaves out"
     );
   }
+
+  /// A-525 (A-291's bound on an unreported move; R3, A-414's owed list: the failover placeholder's readers). Do: on an
+  /// audit shard whose live failover delay is two liveness windows, begin two unreported moves, one three windows ago
+  /// and one a window ago, and take the shard's outgoing moves. Expect the first overdue and the second not: a frozen
+  /// volume is a volume unserved for writes, so an unreported move waits at most the failover delay the fleet itself
+  /// measures (A-363), the bound the fleet holds a dead owner's volumes to. Before, it waited the operator's ten-second
+  /// placeholder, so the first move was not yet overdue and its volume stayed frozen five times the delay.
+  #[test]
+  fn an_unreported_move_is_overdue_past_the_live_failover_delay_and_not_before() {
+    let (old, young) = crate::daemon::audit_on_shard(|s| {
+      let window = crate::daemon::LIVENESS_BUDGET_NS;
+      s.failover_ns = 2 * window;
+      let now = s.clock.monotonic_ns();
+      let unreported = |ago: u64| MoveOut {
+        to: HostId(2),
+        epoch: 0,
+        begun_ns: now.checked_sub(ago).unwrap(),
+        reported: false,
+        switched: false,
+        refused: None,
+      };
+      let (old, young) = (
+        DbVolumeId { bytes: [0x61; 16] },
+        DbVolumeId { bytes: [0x62; 16] },
+      );
+      s.moves_out.insert(old, unreported(3 * window));
+      s.moves_out.insert(young, unreported(window));
+      let moves = outgoing(s);
+      let overdue = |id: DbVolumeId| {
+        moves
+          .iter()
+          .find(|out| out.object == ObjectId(id.bytes))
+          .map(|out| out.overdue)
+      };
+      (overdue(old), overdue(young))
+    });
+    assert_eq!(
+      old,
+      Some(true),
+      "a move unreported past the live failover delay is overdue"
+    );
+    assert_eq!(
+      young,
+      Some(false),
+      "a move unreported for less than the delay is not"
+    );
+  }
 }
