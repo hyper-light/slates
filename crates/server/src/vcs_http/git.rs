@@ -24,8 +24,9 @@
 //!    push).
 //! 5. The service. One whose server half has not landed, or whose repository's store is not held here, is `503` (RFC
 //!    9110 §15.6.4: "the server is currently unable to handle the request"). upload-pack is served from a repository's
-//!    store by [`upload`] (A-640 part 2, A-625 part 3), once the server lends stores (owed); receive-pack answers `503`
-//!    until its session's entry point lands (A-654). `Unserved` answers `503` to both.
+//!    store by [`upload`] (A-640 part 2, A-625 part 3), the store lent from the owner shard's map a step at a time and
+//!    the refs lent those the principal may read (A-682); receive-pack answers `503` until its session's entry point
+//!    lands (A-654).
 //!
 //! Every refusal of steps 2 to 5 is typed ([`Refused`]) and counted under its kind in the shard's status counters.
 //!
@@ -187,36 +188,6 @@ pub(crate) trait GitServices {
   type Exchange: Exchange;
   /// Starts the service `start` names, or refuses it.
   fn start(&mut self, start: &Start<'_>) -> Result<Self::Exchange, ServiceRefused>;
-}
-
-/// The services as the server has them today: neither has its server half (upload-pack's negotiation, A-615; receive-
-/// pack's commit through the register, A-620 part 2), so each answers [`ServiceRefused::Unavailable`].
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Unserved;
-
-/// The exchange an unserved service never starts: no value has this type.
-pub(crate) enum NoExchange {}
-
-impl Exchange for NoExchange {
-  async fn body(&mut self, _run: &[u8]) -> Result<(), Failed> {
-    match *self {}
-  }
-
-  async fn body_end(&mut self) -> Result<(), Failed> {
-    match *self {}
-  }
-
-  async fn reply(&mut self, _out: &mut Vec<u8>) -> Result<bool, Failed> {
-    match *self {}
-  }
-}
-
-impl GitServices for Unserved {
-  type Exchange = NoExchange;
-
-  fn start(&mut self, _start: &Start<'_>) -> Result<NoExchange, ServiceRefused> {
-    Err(ServiceRefused::Unavailable)
-  }
 }
 
 /// A served request's exchange: the advertisement's prelude first, when it has one, then the service's.

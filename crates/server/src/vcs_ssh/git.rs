@@ -28,10 +28,11 @@
 //! channel's window, which the session refuses to exceed; what a request consumed is given back to it.
 //!
 //! **The store.** A repository whose store the lender does not hold is not served (the site's not-served words). A
-//! store that goes away mid-session ends it in the same words. A-662 holds each repository's store on its owner shard;
-//! the lender over that map is owed (A-662's owed list), and until it lands no lender holds one.
+//! store that goes away mid-session ends it in the same words. A-662 holds each repository's store on its owner shard,
+//! and the daemon's lender lends it from that map (`crate::vcs_store::upload::ShardStores`, A-682): each request's step
+//! with the refs the session's principal may read, each step after it with the objects alone.
 
-use slates_db::catalog::RepositoryId;
+use slates_db::catalog::{Principal, RepositoryId};
 use slates_git::Admission;
 use slates_git::http::Version;
 use slates_git::pktline::{self, MAX_LEN};
@@ -81,6 +82,8 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   lender: L,
   /// The repository.
   repository: RepositoryId,
+  /// The session's principal: the refs each request's step is lent are the ones it may read.
+  reader: Principal,
   /// The protocol version the client asked for (`GIT_PROTOCOL`).
   version: Version,
   /// The room each request is admitted.
@@ -100,12 +103,18 @@ pub(crate) struct UploadCommand<L: StoreLender> {
 }
 
 impl<L: StoreLender> UploadCommand<L> {
-  /// A session over the store of `repository` that `lender` lends, at protocol `version`, each request admitted `room`
-  /// bytes.
-  pub(crate) fn new(lender: L, repository: RepositoryId, version: Version, room: u64) -> Self {
+  /// A session of `reader` over the store of `repository` that `lender` lends, at protocol `version`, each request
+  /// admitted `room` bytes.
+  pub(crate) fn new(
+    lender: L,
+    (repository, reader): (RepositoryId, Principal),
+    version: Version,
+    room: u64,
+  ) -> Self {
     Self {
       lender,
       repository,
+      reader,
       version,
       room,
       input: Vec::new(),
@@ -122,6 +131,7 @@ impl<L: StoreLender> UploadCommand<L> {
     let Self {
       lender,
       repository,
+      reader,
       version,
       room,
       answer,
@@ -130,7 +140,7 @@ impl<L: StoreLender> UploadCommand<L> {
     } = self;
     let mut admission = Admission::new(*room);
     let made = lender
-      .lend(*repository, |served, packs| {
+      .lend((*repository, reader), |served, packs| {
         upload::serve(served, *version, asked, packs, &mut admission)
       })
       .ok_or_else(unheld)?;
@@ -159,7 +169,7 @@ impl<L: StoreLender> UploadCommand<L> {
       return Ok(Next::More);
     };
     let written = lender
-      .lend(*repository, |served, packs| {
+      .lend_objects(*repository, |served, packs| {
         made.write(served, packs, out, MAX_LEN)
       })
       .ok_or_else(unheld)?;

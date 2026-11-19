@@ -66,6 +66,7 @@ use crate::state::ShardState;
 
 pub(crate) mod hg_import;
 pub(crate) mod record;
+pub(crate) mod upload;
 #[cfg(test)]
 mod tests;
 

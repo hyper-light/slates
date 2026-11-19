@@ -50,12 +50,14 @@
 //! clone never holds its shard, and a drain yields after each read it drops.
 //!
 //! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
-//! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI).
+//! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
+//! upload-pack served from each repository's store on its owner shard, lent from A-662's map by
+//! `crate::vcs_store::upload::ShardStores` (A-682).
 //!
-//! **Owed** (GAPS, the §4.17 entry): the services' server
-//! halves (git's upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land;
-//! Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without until then;
-//! Subversion's site; the MCP edge onto this engine; the live `git clone` and `hg clone` over HTTPS (main's runs).
+//! **Owed** (GAPS, the §4.17 entry): receive-pack's server half (its session's entry point, A-654), which answers `503`
+//! until it lands; Mercurial's site handed A-662's stores (each kept on its owner shard), which it answers `503` without
+//! until then; Subversion's site; the MCP edge onto this engine; the live `git clone` and `hg clone` over HTTPS (main's
+//! runs).
 
 mod daemon_edge;
 pub(crate) mod git;
