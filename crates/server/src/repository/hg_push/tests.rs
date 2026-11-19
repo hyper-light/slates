@@ -149,15 +149,19 @@ impl Repository for View {
 }
 
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0
-/// 0`): its description, the one file it adds and that file's bytes, and its parent among those made before it.
-type Commit = (&'static str, &'static str, &'static [u8], Option<usize>);
+/// 0`): its description, the one file it adds and that file's bytes, its parent among those made before it, and its
+/// branch.
+type Commit = (&'static str, &'static str, &'static [u8], Option<usize>, &'static str);
 
-/// `base`, `second`, then another client's `other` and the stock push's `plain`, each on the one before `other`.
-const COMMITS: [Commit; 4] = [
-  ("base", "a", b"a\n", None),
-  ("second", "b", b"b\n", Some(0)),
-  ("other", "e", b"e\n", Some(1)),
-  ("plain", "d", b"d\n", Some(1)),
+/// `base`, `second`, then another client's `other` and the stock push's `plain`, each on `second`; then two changesets
+/// of a `stable` branch this repository's tests add, the first on `second`.
+const COMMITS: [Commit; 6] = [
+  ("base", "a", b"a\n", None, "default"),
+  ("second", "b", b"b\n", Some(0), "default"),
+  ("other", "e", b"e\n", Some(1), "default"),
+  ("plain", "d", b"d\n", Some(1), "default"),
+  ("on stable", "s", b"s\n", Some(1), "stable"),
+  ("stable again", "t", b"t\n", Some(4), "stable"),
 ];
 
 /// One changeset rebuilt: its node, first parent and text; its manifest's node, first parent and text; its file's
@@ -175,7 +179,7 @@ struct Made {
 fn history() -> Vec<Made> {
   let mut made: Vec<Made> = Vec::new();
   let mut manifests: Vec<Vec<(Vec<u8>, Node)>> = Vec::new();
-  for (description, path, bytes, parent) in COMMITS {
+  for (description, path, bytes, parent, branch) in COMMITS {
     let file = node::compute(&NULL_NODE, &NULL_NODE, bytes).unwrap();
     let mut entries = parent.map(|at| manifests[at].clone()).unwrap_or_default();
     entries.push((path.as_bytes().to_vec(), file));
@@ -187,7 +191,13 @@ fn history() -> Vec<Made> {
     let parent_manifest = parent.map_or(NULL_NODE, |at| made[at].manifest.0);
     let manifest = node::compute(&parent_manifest, &NULL_NODE, &text).unwrap();
     let p1 = parent.map_or(NULL_NODE, |at| made[at].node);
-    let changeset = format!("{}\ntest\n0 0\n{path}\n\n{description}", hex(&manifest)).into_bytes();
+    let extras = if branch == "default" {
+      String::new()
+    } else {
+      format!(" branch:{branch}")
+    };
+    let changeset =
+      format!("{}\ntest\n0 0{extras}\n{path}\n\n{description}", hex(&manifest)).into_bytes();
     made.push(Made {
       node: node::compute(&p1, &NULL_NODE, &changeset).unwrap(),
       p1,
@@ -526,6 +536,55 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
     assert_eq!(head(state, hg.root), Some(made[2].node));
     assert!(!hg.holds(&made[3].node));
     assert_eq!(hg.roots(state), BTreeSet::from([made[2].node]));
+  });
+}
+
+/// A view of the rebuilt repository's `base` and `second`, public, and the changesets `drafts` names after them, each
+/// a draft on its commit's parent and branch.
+fn view_with(made: &[Made], drafts: &[usize]) -> View {
+  let mut view = View::of(listing!("push-plain-server.txt"), listing!("push-plain-bookmarks.txt"));
+  for at in drafts {
+    let parent = COMMITS[*at].3.and_then(|parent| view.rev(&made[parent].node));
+    let branch = COMMITS[*at].4.as_bytes().to_vec();
+    view.changesets.push((made[*at].node, [parent, None], branch, Phase::Draft));
+  }
+  view
+}
+
+/// A-657, A-642 (a check of a green the push does not move compares its position). Do: on the rebuilt repository, land
+/// a first changeset on a new branch `stable` (a line made from `default`'s), then prepare a push of `plain` on
+/// `default` carrying `check:heads` (the heads it read: `stable`'s changeset alone), then land another push moving
+/// `stable`, then land the prepared push. Expect: `stable`'s line made, numbered 0; the prepared push's own line never
+/// moved, so its verdict alone would accept it, but `stable`'s position no longer what it read, so it is refused as
+/// 7.2's race, and nothing of it is applied.
+#[test]
+fn a_push_is_refused_when_a_green_it_only_checked_moved() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "heads");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let first = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[4])))],
+    };
+    assert!(hg.push(state, &first, &view_with(&made, &[])).is_ok());
+    let stable = hg.bound(state, &line_name(b"stable", 0)).unwrap();
+    assert_eq!(head(state, stable), Some(made[4].node));
+    let checked = Unbundle {
+      parts: vec![
+        taken(0, Asks::CheckHeads(vec![made[4].node])),
+        taken(1, Asks::Changegroup(changegroup(&made, &[3]))),
+      ],
+    };
+    let prepared = hg.prepare(state, &checked, &view_with(&made, &[4])).unwrap();
+    let again = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[5])))],
+    };
+    assert!(hg.push(state, &again, &view_with(&made, &[4])).is_ok());
+    assert_eq!(head(state, stable), Some(made[5].node));
+    let raced = hg.land(state, prepared).answer;
+    let words = super::RACED.to_vec();
+    assert_eq!(raced, Err(Refused::PushRaced { message: words }));
+    assert_eq!(head(state, hg.root), Some(made[1].node));
+    assert!(!hg.holds(&made[3].node));
   });
 }
 
