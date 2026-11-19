@@ -16,8 +16,8 @@ fn listed<'a>(advertisement: &Advertisement<'a>) -> Vec<(&'a [u8], Option<&'a [u
 }
 
 /// A-582 part 2, golden vectors: do decode the two advertisements stock git 2.50.1 wrote, plain and allowing
-/// `sideband-all` and `packfile-uris`, then encode them. Expect: `version 2` and each capability as git listed it, every
-/// line ending with an LF, the lookups answering as git's client does, and each stream's own bytes back.
+/// `sideband-all` and `packfile-uris`, then encode them. Expect: `version 2` and each capability as git listed it,
+/// every line ending with an LF, the lookups answering as git's client does, and each stream's own bytes back.
 #[test]
 fn stock_gits_advertisements_decode_to_their_capabilities_and_encode_back() {
   let plain = decode(ADVERTISEMENT, &mut room()).unwrap();

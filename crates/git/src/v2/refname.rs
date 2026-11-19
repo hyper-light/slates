@@ -1,5 +1,5 @@
-//! Ref names as the protocol carries them (A-582, part 2; §4.17.2 "The repository in git's terms", item 6): `HEAD`, or a
-//! name under `refs/` that git's own `check_refname_format` passes [gitprotocol-common "refname"; C: `refs.c`
+//! Ref names as the protocol carries them (A-582, part 2; §4.17.2 "The repository in git's terms", item 6): `HEAD`, or
+//! a name under `refs/` that git's own `check_refname_format` passes [gitprotocol-common "refname"; C: `refs.c`
 //! `refname_disposition`, `check_refname_component`, `check_or_sanitize_refname`, v2.50.1].
 //!
 //! The document lists the rules; git's check adds two it leaves out, which no ref git makes can break: a name has no

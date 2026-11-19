@@ -30,20 +30,22 @@
 //! no client writes (git's `oid_to_hex`, JGit, libgit2 and go-git all write lower case). A number is canonical decimal
 //! (git's `strtol` with base 0 also takes octal and `0x`). So every message this module accepts is written back byte
 //! for byte, the pkt-line lengths aside, whose digits part 1 reads in either case as git's `hexval` does and writes in
-//! lower case as git does. A ref name is `HEAD` or under `refs/` and passes `check_refname_format` ([`refname`]).
+//! lower case as git does. A ref name is `HEAD` or under `refs/` and passes `check_refname_format` (the private
+//! `refname` module).
 //!
 //! **Order is the grammar's.** `fetch`'s sections come in the document's order. git 2.50.1's `upload_pack_v2` wrote
 //! `wanted-refs` before `shallow-info`, which its own client refused ("expected 'packfile', received 'shallow-info'"),
-//! and git fixed it in `191740edaa4a` ("upload-pack: swap wanted-ref/shallow-info responses", 2026-09-16, with a test in
-//! t5703): one machine ([`fetch::Response`]) holds the order, and both the reader and the writer step it, so slates
+//! and git fixed it in `191740edaa4a` ("upload-pack: swap wanted-ref/shallow-info responses", 2026-09-16, with a test
+//! in t5703): one machine ([`fetch::Response`]) holds the order, and both the reader and the writer step it, so slates
 //! neither writes a section out of order nor reads one.
 //!
 //! **Bounds (§4.9), none of them a literal.** The input bounds every decode: each line is one pkt-line, at most
 //! [`crate::pktline::MAX_DATA`] bytes, and a value is a slice of it. What a decode builds beside the input it borrows,
-//! the lists of capabilities, arguments, refs and events, is counted in a first walk and charged exactly to the caller's
-//! [`crate::Admission`] before a second walk builds it. The format bounds the rest: a depth is git's `int`, a timestamp
-//! git's `timestamp_t`, an id the object format's length. Every refusal is a typed [`Refusal`] naming the byte where
-//! the packet at fault begins; an encode checks everything before it writes, so a refused encode writes nothing.
+//! the lists of capabilities, arguments, refs and events, is counted in a first walk and charged exactly to the
+//! caller's [`crate::Admission`] before a second walk builds it. The format bounds the rest: a depth is git's `int`, a
+//! timestamp git's `timestamp_t`, an id the object format's length. Every refusal is a typed [`Refusal`] naming the
+//! byte where the packet at fault begins; an encode checks everything before it writes, so a refused encode writes
+//! nothing.
 
 pub mod advertisement;
 pub mod fetch;

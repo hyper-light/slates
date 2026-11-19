@@ -10,8 +10,8 @@
 //! ```
 //!
 //! A command's value lists the features it supports beyond its base, separated by spaces (`fetch=shallow
-//! wait-for-done`). Clients ignore keys they do not know, so the list is read whatever its keys; each key is held to the
-//! grammar's `key`, and each value is any bytes of a text line. The document's `value` names fewer bytes than its
+//! wait-for-done`). Clients ignore keys they do not know, so the list is read whatever its keys; each key is held to
+//! the grammar's `key`, and each value is any bytes of a text line. The document's `value` names fewer bytes than its
 //! `agent` and `session-id` sections allow (`~`, `'`, `"`, `` ` `` and `|`), and its `server-option` section allows any
 //! byte but NUL and LF, which is the one rule every value here is held to.
 

@@ -51,6 +51,7 @@ pub mod out;
 pub mod pack;
 pub mod pktline;
 pub mod sideband;
+pub mod unpack;
 pub mod v0;
 pub mod v2;
 

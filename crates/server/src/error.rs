@@ -266,6 +266,15 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     // (a version not after the record's, an approval bound back, an outdated comment moved). No verb records review
     // operations yet; the review verbs (owed) type their refusals on the wire, as A-299 did the database's.
     DbError::Review(_) => volume(VolumeRefusal::Invalid),
+    // An entry of a repository's register refused at its position (A-603): made against another state of the register,
+    // a check that no longer holds there, or a state change made against another state. Each server answers its
+    // tool's words for a repository that moved under the push.
+    DbError::OutOfOrder { named, expected } => database(DatabaseRefusal::OutOfOrder {
+      named: *named,
+      expected: *expected,
+    }),
+    DbError::CheckFailed { index } => database(DatabaseRefusal::CheckFailed { index: *index }),
+    DbError::StateChanged { index } => database(DatabaseRefusal::StateChanged { index: *index }),
   }
 }
 
