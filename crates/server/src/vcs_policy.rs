@@ -2117,7 +2117,11 @@ mod tests {
     let answers: Vec<_> = cases
       .iter()
       .map(|(uid, name, right)| {
-        judged(&git, *uid, (name, *right, &Bringing::of(Some(merge), None)))
+        judged(
+          &git,
+          *uid,
+          (*name, *right, &Bringing::of(Some(merge), None)),
+        )
       })
       .collect();
     let refused = super::PushRefusal::MergeCommit {
