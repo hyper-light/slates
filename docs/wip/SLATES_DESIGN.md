@@ -38100,7 +38100,10 @@ entry), `crates/svn/src/index.rs` and `crates/svn/src/index/tests.rs` (new), `cr
   `crates/server/src/deadlines.rs` `a_declined_placement_is_asked_again_a_window_after_the_decline` (past the tick's
   first look: re-armed no sooner than a window after the decline and within half a window more). macOS never declines
   (the collapse is Linux's), so the test drives the decline the product remembers; it cannot run on main's code,
-  which has no way to remember one, so its red is by mutation (the keeper's re-arm removed, the tick's put back).
+  which has no way to remember one, so its red is by mutation (the keeper's re-arm removed, the tick's put back). The
+  Mac Studio (2026-11-19 18:44 local, load 22, debug): red by that mutation, re-armed 484 ms after the decline at the
+  tick's next look; green on a36c98b, `cargo fmt --check` clean and `slates-server --lib -- deadlines:: pressure::
+  purge_round_tests reap::` 14 of 14, re-armed 1.006 s after the decline.
 - **Left, in order.** Base hints with their delegation drain, the idle seal; then the reap loop and its tick are
   deleted, and §4.7's status says so.
 
