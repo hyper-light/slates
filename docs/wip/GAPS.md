@@ -283,8 +283,12 @@
 > moves holds it and every record before it is committed; the committed state is the greatest cut holding every record
 > whole, which holders apply at their joins. A replica reads by a vector of positions and refuses one past what it
 > applied, a log it holds no copy of, or a split cut. A takeover fences every log's quorum or none and keeps a record
-> only where every log's read holds it whole. Tests: TESTS_PENDING. Owed: the live plane (A-636 part 2: each log's
-> register on the wire, the state logs' register class, the server's takeover by this rule).
+> only where every log's read holds it whole. Tests (Windows x86_64, jupiter; the macOS run owed): red first, the nine
+> new tests failing against the module stubbed; green 17 of 17 and the db lib 153 of 153; the model test's 128
+> histories with crashes, partitions and takeovers at `f` from 0 to 2 held Agreement, NoLoss and StaleNeverCommits (465
+> records of several logs committed whole, 12 dropped whole and 25 kept and finished by takeovers, 72 split reads
+> refused); red eight ways. Owed: the live plane (A-636 part 2: each log's register on the wire, the state logs'
+> register class, the server's takeover by this rule).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the

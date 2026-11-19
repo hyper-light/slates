@@ -47025,7 +47025,31 @@ Applied in the same change to:
 - **The ledger's additions.** `Cohort::can_take_over` and `Cohort::held`; `Owner::log`, `Owner::truncate` (sound only
   for a tail no quorum committed) and `Owner::offer_again` (the owner's whole log offered again, proposing nothing).
   `Owner::take_over` makes the same checks as before, now in one place (`phase_one`).
-- **Tests.** TESTS_PENDING
+- **Tests** (`cargo test -p slates-db --lib ledger`, debug, Windows x86_64, jupiter, 2026-11-19; the Mac Studio was
+  offline, so the macOS run is owed and filed with the run requests).
+  - Red first, at 76af85355: the tests against the module with its behaviour stubbed (an append refused, nothing
+    announced, a takeover adopting and fencing nothing, every read refused). The nine new tests failed; the eight other
+    tests the filter takes passed.
+  - Green at 39dcef8e5 (merged with main b79ece5d5): 17 of 17, and the whole db lib 153 of 153. rustfmt's layout was
+    applied after it (b59f5e010, no change of behaviour).
+  - Eight scenarios, one a rule: each log commits on its own holders, a push waiting on no other log; an atomic record
+    applied at its join by every holder of both its logs; a replica's vector reads and its three refusals; a takeover
+    dropping a record no read holds whole, with what follows it; a takeover keeping and finishing a record every read
+    holds; a superseded owner committing nothing on any log; a takeover that cannot fence every log fencing none; an
+    append's refusals, nothing proposed.
+  - The model test: 128 generated histories of up to 64 steps at `f` from 0 to 2, over three greens and the four state
+    logs on the owner's two copysets, each history run twice alike (determinism). Agreement, NoLoss, StaleNeverCommits,
+    every holder's applied cut and every replica's answer held after every step. Its census: 465 records of several
+    logs committed whole and 429 of one; 310 records of several logs left waiting on an out-of-reach log's holders, and
+    5 pushes to one log committed at once while such a record waited; 149 appends refused `Moved`; 96 records of
+    superseded owners, none committed; 194 takeovers and 141 refused, with 12 records dropped whole and 25 kept and
+    finished; 1,583 records of several logs applied at a holder's join; 260 replica reads answered, 72 refused `Split`,
+    25 `NotApplied` and 530 `NotHeld`.
+  - Red eight ways by mutation (at 03a009510, slates-db rebuilt for each), each turning red the tests that name its rule
+    and the model test with them every time: a takeover keeping a record no read holds whole; a takeover's rounds not
+    asked first, so it fences logs before one refuses; a read answering a split cut; a read answering past what was
+    applied; an append not refused `Moved`; the owner never learning a log committed; the holders never applying; the
+    owner's cut not lowered to whole records.
 - **Owed (A-636 part 2).** The live plane: each log's register on the wire (the cluster plane's ledger promotion a log
   at a time, `LedgerPromise`), the state logs' register class (whose object ids a caller names here), the partition's
   records shipped a log at a time, and the server's takeover adopting a repository's logs by this rule.
