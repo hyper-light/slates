@@ -37094,7 +37094,7 @@ and:
 - **Found by the sweep, left open** (GAPS, with the bug record):
   - A restart refused any clone holding a snapshot while it still shared a file with its origin (A-561, fixed since).
     This test's first restart half found it; its restart test recovers a clone without a snapshot of its own.
-  - A clone is admitted with no entry allowance.
+  - A clone is admitted with no entry allowance (fixed since by A-572).
   - A resize leaves the entry allowance at the size the volume was made with.
   - Recovery counts a whiteout as a live entry (found by reading; fixed since by A-572).
 
@@ -37847,3 +37847,16 @@ commit a part, in order of harm.
     image (the names its directories carry that name a child) must all be equal.
   - **Evidence.** On the Mac Studio, 2026-11-19: red first with the test alone on main (3 counted live, 6 after the
     restart); green with the rule; `cargo test --locked -p slates-vfs --lib` 85 passed, 1 ignored.
+- **Part 2, a clone was admitted with no entry allowance.**
+  - **What was there.** A create's admission (`admit_dimensions`) and a restart's re-admission set a volume's entry
+    allowance. A clone's admission (`admit_clone`) set its inode allowance alone, so a clone's names had no bound until
+    a restart.
+  - **The rule.** A clone's admission sets its entry allowance as a create's does: the share of its policy, never below
+    the entries it holds, which are its snapshot's (A-549), as a restart floors it. It reserves nothing, so it is set from
+    the clone's own count once the clone exists, not before the snapshot is pinned as the version slots are.
+  - **Tests.** `a_clone_is_admitted_with_an_entry_allowance_never_below_its_snapshots_entries`
+    (`crates/server/src/verbs.rs`, `clone_admission_tests`): the clone of a snapshot holding names past its share is
+    allowed exactly its snapshot's entries, which a walk of its namespace counts; a small origin's clone gets the share;
+    none refused.
+  - **Evidence.** On the Mac Studio, 2026-11-19: red first with the rule's lines taken out (`u64::MAX` against 4,104),
+    green with them; `cargo test --locked -p slates-server --lib clone` 11 passed, 1 ignored (main's open-bug test).

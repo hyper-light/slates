@@ -8183,8 +8183,8 @@ entries where its tree holds 9 (`docs/bugs/2026-11-19-a-clones-admission-and-ent
   head, and recovery looked a head-shared entry up only among the images of the head's own inodes, which a clone's
   origin-shared files are not. No test had recovered a clone with a snapshot of its own; A-549's restart test recovers
   one without.
-- Open: a clone is admitted with no entry allowance (`admit_clone` sets the inode allowance alone, where a create and a
-  restart set both), so its namespace dimension is unbounded until a restart.
+- Fixed since by A-572 (below): a clone was admitted with no entry allowance (`admit_clone` set the inode allowance
+  alone, where a create and a restart set both), so its namespace dimension was unbounded until a restart.
 - Open: a resize moves the inode allowance with the new policy but leaves the entry allowance at the size the volume
   was made with (`verbs::resize`).
 - Fixed since by A-572 (below), found by reading: recovery counted a whiteout as a live entry (`rebuild_entries`
@@ -8208,8 +8208,11 @@ the recovery oracle and the server's recovery suite over a clone with a snapshot
   placement now counts, and is admitted, only when it names a child (`Volume::dir_place`, `dir_insert`), as
   `dir_remove` and `DirNode::live_len` already kept it. Measured before on the Mac Studio: an overlay with three
   whiteouts counted 3 entries live and 6 after a restart.
-- Open, next in this piece: a clone is admitted with no entry allowance; a resize leaves the entry allowance at the size
-  the volume was made with.
+- Fixed 2026-11-19: a clone was admitted with no entry allowance (`admit_clone` set the inode allowance alone, where a
+  create and a restart set both), so its namespace dimension was unbounded until a restart. It now gets a create's
+  share, never below the entries it holds, its snapshot's (A-549). Measured before on the Mac Studio: a clone of a
+  snapshot holding 4,104 names (a 64 KiB origin's share of 4,096 and 8 past it) carried `u64::MAX`.
+- Open, next in this piece: a resize leaves the entry allowance at the size the volume was made with.
 
 ## 8d. Phase 2 record (2026-09-05)
 
