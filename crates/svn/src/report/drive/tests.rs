@@ -11,7 +11,7 @@
 //! reports, whose drives must end and stay in the editor's order.
 
 use super::green::{
-  CHANGED, FixtureGuards, Green, guards_of, md5, normalize, repository, texts_by_md5,
+  CHANGED, FixtureGuards, Green, guards_of, normalize, repository, texts_by_md5,
 };
 use super::*;
 use crate::handshake::ClientCapabilities;

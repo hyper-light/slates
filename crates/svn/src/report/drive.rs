@@ -49,7 +49,7 @@
 //! No I/O, no clock, no randomness, no panic.
 
 #[cfg(test)]
-pub(crate) mod green;
+pub(in crate::report) mod green;
 pub(crate) mod history;
 #[cfg(test)]
 mod tests;

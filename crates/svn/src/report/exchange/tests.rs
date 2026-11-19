@@ -207,12 +207,27 @@ fn drive_span(items: &[&[u8]]) -> (usize, usize) {
   (start, start + drive.len())
 }
 
+/// The items `svnserve` writes for the handshake, before a session's first command's answer.
+const SERVER_HANDSHAKE_ITEMS: usize = 4;
+
+/// The client items before a session's first command: the handshake's answer and the
+/// authentication's.
+const CLIENT_HANDSHAKE_ITEMS: usize = 2;
+
 /// Asserts that an exchange wrote what `svnserve` wrote in its session: the items before the
-/// drive and after it byte for byte, the drive call for call in the shared form.
-fn assert_as_svnserve(name: &str, ours: &[u8], theirs: &[u8], texts: &BTreeMap<[u8; 16], Vec<u8>>) {
-  let (ours, theirs) = (items(ours), items(theirs));
+/// drive and after it byte for byte, the drive call for call in the shared form. A session without a
+/// drive is a hand-made one whose report command came first, answered right after the handshake.
+fn assert_as_svnserve(recorded: Recorded, ours: &[u8], texts: &BTreeMap<[u8; 16], Vec<u8>>) {
+  let name = recorded.name;
+  let (ours, theirs) = (items(ours), items(recorded.server));
   let ((our_start, our_end), (their_start, their_end)) = (drive_span(&ours), drive_span(&theirs));
-  let before = their_start.checked_sub(our_start).unwrap();
+  let before = if our_start == ours.len() {
+    assert_eq!(report_command(recorded).1, CLIENT_HANDSHAKE_ITEMS, "{name}: the first command");
+    SERVER_HANDSHAKE_ITEMS
+  } else {
+    their_start.checked_sub(our_start).unwrap()
+  };
+  let their_start = before + our_start;
   assert_eq!(ours[..our_start], theirs[before..their_start], "{name}: before the drive");
   let our_drive = read_drive(&ours[our_start..our_end]).calls;
   let their_drive = read_drive(&theirs[their_start..their_end]).calls;
@@ -238,7 +253,7 @@ fn every_recorded_exchange_is_answered_as_svnserve_answered_it() {
     }
     replayed += 1;
     assert!(matches!(ending, Ending::Answered | Ending::Failed(_)), "{}: {ending:?}", recorded.name);
-    assert_as_svnserve(recorded.name, &out, recorded.server, &texts);
+    assert_as_svnserve(recorded, &out, &texts);
   }
   assert_eq!(replayed, REPLAYED);
 }
