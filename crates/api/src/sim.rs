@@ -842,4 +842,79 @@ mod tests {
       Err(Error::NotFound(Missing::Volume(nowhere)))
     );
   }
+
+  /// Shape: the Unix identity one client's export is bound to (A-115).
+  const FIRST_CLIENT: u32 = 1000;
+  /// Shape: another client's identity.
+  const SECOND_CLIENT: u32 = 1001;
+
+  /// §4.6 "Kubernetes publication without privilege", A-115, A-521. Do: export a volume in the simulator to one client,
+  /// and again to another, read-only beneath a directory; detach the first export, and detach it again; destroy the
+  /// volume, then detach the second export. Expect each export an attachment of its own whose path names the volume and
+  /// its attachment, so the two clients hold two capabilities; the first ended at its detach (the second detach
+  /// `NotFound`), and the second with its volume.
+  #[test]
+  fn an_export_is_one_clients_capability_and_ends_at_its_detach() {
+    use crate::export::ExportOptions;
+    let mut sim = SimVolumes::new(MOST);
+    let work = volume(&mut sim, "work");
+    let first = sim
+      .export(work, FIRST_CLIENT, &ExportOptions::default())
+      .unwrap();
+    let narrower = ExportOptions {
+      read_only: true,
+      subtree: Some("/src".to_owned()),
+    };
+    let second = sim.export(work, SECOND_CLIENT, &narrower).unwrap();
+    assert_ne!(
+      first.attachment, second.attachment,
+      "each client its own attachment"
+    );
+    assert_ne!(first.path, second.path, "each client its own capability");
+    for exported in [&first, &second] {
+      assert!(
+        exported
+          .path
+          .starts_with(&format!("/work@{:x}.", exported.attachment)),
+        "an export's path names its volume and its attachment: {exported:?}"
+      );
+    }
+    sim.detach(first.attachment).unwrap();
+    assert_eq!(
+      sim.detach(first.attachment),
+      Err(Error::NotFound(Missing::Attachment {
+        attachment: first.attachment
+      }))
+    );
+    sim.destroy(work).unwrap();
+    assert_eq!(
+      sim.detach(second.attachment),
+      Err(Error::NotFound(Missing::Attachment {
+        attachment: second.attachment
+      })),
+      "an export ends with its volume"
+    );
+  }
+
+  /// A-521. Do: export a volume no one made; then, in a simulator with room for one volume and one attachment, export a
+  /// volume to two clients. Expect the stranger `NotFound`, holding no room, the first export made and the second refused
+  /// `Exhausted::Table`.
+  #[test]
+  fn an_export_the_daemon_would_refuse_is_refused_typed_and_holds_nothing() {
+    use crate::export::ExportOptions;
+    let mut sim = SimVolumes::new(1);
+    let nowhere = VolumeId { bytes: [0xAB; 16] };
+    assert_eq!(
+      sim.export(nowhere, FIRST_CLIENT, &ExportOptions::default()),
+      Err(Error::NotFound(Missing::Volume(nowhere)))
+    );
+    let work = volume(&mut sim, "work");
+    sim
+      .export(work, FIRST_CLIENT, &ExportOptions::default())
+      .unwrap();
+    assert_eq!(
+      sim.export(work, SECOND_CLIENT, &ExportOptions::default()),
+      Err(table(ATTACHMENTS_TABLE))
+    );
+  }
 }
