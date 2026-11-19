@@ -442,6 +442,12 @@ impl Repository {
     self.counters.get()
   }
 
+  /// The deepest delta chain the store's encoder makes: the deepest any commit's push carried, at most git's limit
+  /// (A-614 part 2's learned depth). What a store made again from its pushes' records must learn alike (A-662).
+  pub fn learned_depth(&self) -> u64 {
+    self.depth.limit()
+  }
+
   fn count(&self, change: impl FnOnce(&mut StoreCounters)) {
     let mut counters = self.counters.get();
     change(&mut counters);
