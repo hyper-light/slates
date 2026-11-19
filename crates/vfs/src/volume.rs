@@ -7885,7 +7885,7 @@ mod clone_count_tests {
 
   use super::*;
   use crate::clock::StepClock;
-  use crate::recover::Claims;
+  use crate::recover::{Claims, SharedSource};
 
   /// Shape: the test store's page, the machine's usual one.
   const PAGE: usize = 4096;
@@ -7905,7 +7905,7 @@ mod clone_count_tests {
   /// Shape: the files the origin holds at its snapshot, and the ones it makes after it.
   const BEFORE: usize = 3;
   const AFTER: usize = 5;
-  /// Shape: the files the entries test's origin holds in its subdirectory at its snapshot.
+  /// Shape: the files the entries tests' origin holds in each of its subdirectories at its snapshot.
   const INNER: usize = 2;
   /// Format: a file's and a directory's mode.
   const FILE_MODE: u32 = 0o644;
@@ -8119,15 +8119,21 @@ mod clone_count_tests {
     );
   }
 
-  /// An origin holding a directory with [`INNER`] files in it and [`BEFORE`] files beside it at its snapshot, which then
-  /// makes [`AFTER`] more files and one more in the directory, and removes one of each: the origin and the snapshot.
-  fn origin_whose_entries_changed_since_its_cut(store: &mut Store) -> (Volume, SnapshotId) {
+  /// An origin holding two directories with [`INNER`] files in each and [`BEFORE`] files beside them at its snapshot,
+  /// which then makes [`AFTER`] more files and one more in the first directory, and removes one of each, leaving the
+  /// second directory as it was: the origin, the snapshot, and that untouched directory, which the snapshot shares with
+  /// the origin's head (A-395).
+  fn origin_whose_entries_changed_since_its_cut(store: &mut Store) -> (Volume, SnapshotId, InodeNo) {
     let mut origin = Volume::create(store, config(ORIGIN_PREFIX)).unwrap();
     let root = origin.root_inode(store).unwrap();
     let inner = origin.mkdir_no(store, root, "d", DIR_MODE).unwrap();
+    let kept = origin.mkdir_no(store, root, "kept", DIR_MODE).unwrap();
     for n in 0..INNER {
       origin
         .create_file_no(store, inner, &format!("inner-{n}"), FILE_MODE)
+        .unwrap();
+      origin
+        .create_file_no(store, kept, &format!("kept-{n}"), FILE_MODE)
         .unwrap();
     }
     for n in 0..BEFORE {
@@ -8148,43 +8154,48 @@ mod clone_count_tests {
     origin.unlink_no(store, root, "before-0").unwrap();
     origin.unlink_no(store, inner, "inner-0").unwrap();
     entries_counted_as_its_tree(&origin, store, "the origin's changes since its snapshot");
-    (origin, cut)
+    (origin, cut, kept)
+  }
+
+  /// Makes a file and a directory in `clone`'s root and removes an inherited file from its directory `d`.
+  fn make_and_remove_entries(clone: &mut Volume, store: &mut Store) {
+    let root = clone.root_inode(store).unwrap();
+    let inner = clone.lookup_no(store, root, "d").unwrap().inode;
+    clone
+      .create_file_no(store, root, "clone-made", FILE_MODE)
+      .unwrap();
+    clone.unlink_no(store, inner, "inner-1").unwrap();
+    clone.mkdir_no(store, root, "e", DIR_MODE).unwrap();
   }
 
   /// A-549 (A-541's sibling). Do: clone a snapshot whose origin has since made and removed entries, in its root and in a
-  /// subdirectory; make and remove entries in the clone; snapshot the clone and clone that; give the clone an entry
-  /// allowance of one more than its namespace holds and make files until refused; then restart and clone the recovered
-  /// snapshot. After every step compare each entry count with the entries a walk of its namespace reaches. Expect them
-  /// equal at every step, and exactly one file admitted under the allowance before `NoSpace`. Before A-549 a clone
-  /// started from its origin's count at the clone, so every step was off by the origin's net change since the
-  /// snapshot, and the allowance was refused below the entries the clone held.
+  /// subdirectory; make and remove entries in the clone; snapshot the clone, make a file and clone the clone's snapshot;
+  /// then give the clone an entry allowance of one more than its namespace holds and make files until refused. After
+  /// every step compare each entry count with the entries a walk of its namespace reaches. Expect them equal at every
+  /// step, and exactly one file admitted under the allowance before `NoSpace`. Before A-549 a clone started from its
+  /// origin's count at the clone, so every step was off by the origin's net change since the snapshot (10 counted where
+  /// the tree holds 6), and the allowance was refused below the entries the clone held.
   #[test]
   fn a_clone_counts_its_snapshots_entries_whatever_its_origin_did_since() {
     let mut store = store();
-    let (mut origin, cut) = origin_whose_entries_changed_since_its_cut(&mut store);
+    let (mut origin, cut, _) = origin_whose_entries_changed_since_its_cut(&mut store);
     let mut clone = Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)).unwrap();
     entries_counted_as_its_tree(
       &clone,
       &store,
       "the clone of a snapshot its origin changed since",
     );
-    let root = clone.root_inode(&store).unwrap();
-    let inner = clone.lookup_no(&store, root, "d").unwrap().inode;
-    clone
-      .create_file_no(&mut store, root, "clone-made", FILE_MODE)
-      .unwrap();
-    clone.unlink_no(&mut store, inner, "inner-1").unwrap();
-    clone.mkdir_no(&mut store, root, "e", DIR_MODE).unwrap();
+    make_and_remove_entries(&mut clone, &mut store);
     entries_counted_as_its_tree(&clone, &store, "entries made and removed in the clone");
+    let root = clone.root_inode(&store).unwrap();
     let clone_cut = clone.snapshot(&mut store).unwrap();
     clone
       .create_file_no(&mut store, root, "after-the-clones-snapshot", FILE_MODE)
       .unwrap();
+    entries_counted_as_its_tree(&clone, &store, "a file made after the clone's snapshot");
     let clone_of_clone =
       Volume::clone_of(&store, &mut clone, clone_cut, config(CLONE_OF_CLONE_PREFIX)).unwrap();
     entries_counted_as_its_tree(&clone_of_clone, &store, "a clone of the clone's snapshot");
-    let origin_image = origin.to_image(&store, None).unwrap();
-    let clone_image = clone.to_image(&store, None).unwrap();
     let reachable = entries_reachable(&clone, &store);
     clone.set_entry_allowance(reachable + 1).unwrap();
     clone
@@ -8196,6 +8207,32 @@ mod clone_count_tests {
         Err(VfsError::NoSpace)
       ),
       "the allowance admits one entry past the namespace the clone holds, then refuses"
+    );
+  }
+
+  /// A-549. Do: clone a snapshot whose origin has made and removed entries since, make and remove entries in the clone,
+  /// then restart (rebuild the origin and the clone from their images into a store over the same RAM) and clone the
+  /// recovered origin's snapshot again. The snapshot holds a directory its origin never changed after it, which its
+  /// image shares with the origin's head (A-395), so the rebuilt snapshot reads that directory's entries from the head's
+  /// node; the test first checks the image shares it, or the count's shared arm would go untested. Expect the rebuilt
+  /// clone's entry count and the later clone's to equal the entries a walk of each namespace reaches. Before A-549 the
+  /// later clone started from the recovered origin's head count. The clone takes no snapshot of its own here: a restart
+  /// refused a clone holding one while it shared a file with its origin, a bug of its own (A-561).
+  #[test]
+  fn a_clone_of_a_recovered_snapshot_counts_its_snapshots_entries() {
+    let mut store = store();
+    let (mut origin, cut, kept) = origin_whose_entries_changed_since_its_cut(&mut store);
+    let mut clone = Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)).unwrap();
+    make_and_remove_entries(&mut clone, &mut store);
+    entries_counted_as_its_tree(&clone, &store, "entries made and removed in the clone");
+    let origin_image = origin.to_image(&store, None).unwrap();
+    let clone_image = clone.to_image(&store, None).unwrap();
+    assert!(
+      origin_image.snapshots.iter().any(|snapshot| snapshot
+        .shared
+        .iter()
+        .any(|entry| entry.number == kept.0 && matches!(entry.source, SharedSource::Head))),
+      "the snapshot's untouched directory is shared with the head, whose node its entries are read from"
     );
     let mut fresh = surviving(&store);
     let claims = Claims::prepare(&mut fresh, [&origin_image, &clone_image]).unwrap();
