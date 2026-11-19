@@ -587,8 +587,7 @@
 > Studio (2026-11-19, debug, load 3.5) and 249 of 249 merged with main, red first against stubs (21 failed), against one
 > history stock 7.2 stored five ways (`crates/hg/fixtures/import/make-import-fixtures.sh`): every text 7.2's
 > `debugdata`, every node 7.2's, five indexes equal row for row, nothing read but the files each holds. Owed of the
-> import, with later pieces: the phase roots, bookmarks and markers beside the logs (pieces 5 and 7; until then an
-> import holds every changeset, secret ones too, and must not be served); the import sliced under the shard's step
+> import, with later pieces: the import sliced under the shard's step
 > budget and resumed after a host's pending read, rather than run again; revlogs read by ranges rather than whole; a
 > text rebuilt from the one before it where its chain passes through it (7.2's revision cache), rather than from its
 > chain's base; a manifest's file nodes held to the file logs (a whole `verify`); and the server's adapter from §4.15's
@@ -603,7 +602,12 @@
 > audits them (transcribed: the first audit, written from the design's summary, took `a/.hg/b`, which 7.2 refuses), and
 > a line's move made A-618's work over its flat manifests laid out as directories named by their content; held to stock
 > 7.2's bundles (each branch head landed holding exactly what `hg cat` recorded) and hand-made changegroups breaking
-> each rule; red nine ways. Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
+> each rule; red nine ways. **Built (A-649 part 2):** the phase roots, bookmarks and markers imported as 7.2 reads them
+> (`phaseroots` strict as `_readroots`, bookmarks lenient as `bmstore`, the obsstore checked whole); the phase roots and
+> bookmarks returned typed for the register, the repository's mutable state (an import is not served before the
+> register's entry holds them); the markers kept as the index's `M` rows in the obsstore's order; red first (5 failed),
+> 261 of 261, against a history 7.2 kept with drafts, an amend, a secret changeset, bookmarks and markers
+> (`crates/hg/fixtures/state`). Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: `obsolete`'s
 > `listkeys` dump, the process around `slates hg serve --stdio`'s session, HTTP version 1, held deltas in place of full
 > texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads in place of
 > the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks they move
