@@ -62,12 +62,17 @@
 //! [`HookView::close`] gives them back, so a base pack made again or a push let go while a hook
 //! runs leaves the view's bytes as they were.
 //!
-//! **Owed** (GAPS, the §4.17 entry): part 2, the view presented to the hook driver on the owner
-//! shard (after A-662), its seals kept as derived data; a seal made where a version's fragments
-//! are encoded, when the bytes pass anyway; `packed-refs` read from the register's sorted
-//! namespace by ranges for a repository of very many refs; the cover kept as derived data, grown
-//! as versions are encoded, and the fragments after a base pack merged into larger packs, so a
-//! hook's `git` searches few indexes; main's run of stock git over a mounted view.
+//! **On the owner shard** (part 2): `slates-server`'s `git_hooks` opens the view over the
+//! repository's store, seals its packs in the shard's slices, lending each seal the room
+//! [`HookView::seal_len`] names, and hands the view to the hook driver with the variables above.
+//!
+//! **Owed** (GAPS, the §4.17 entry): part 3, the view presented at a path a hook runs in (a
+//! read-only attachment the mount edges serve a read at a time); its seals kept as derived data
+//! across views; a seal made where a version's fragments are encoded, when the bytes pass anyway;
+//! `packed-refs` read from the register's sorted namespace by ranges for a repository of very
+//! many refs; the cover kept as derived data, grown as versions are encoded, and the fragments
+//! after a base pack merged into larger packs, so a hook's `git` searches few indexes; main's run
+//! of stock git over a mounted view.
 
 use slates_vcs::{ContentId, ContentRefused, ContentStore};
 
@@ -488,6 +493,17 @@ impl HookView {
   /// A seal of the pack named `pack` begun; `None` when the view shows no such pack.
   pub fn sealing(&self, pack: &ObjectId) -> Option<Sealing> {
     self.unit(pack).map(Sealing::of)
+  }
+
+  /// The bytes a seal of the pack named `pack` keeps (the `seal` module's docs): its index, held
+  /// as content, and four for the Adler-32 of each object the pack holds whole; the store's own
+  /// framing of an index longer than its window aside. What the owner makes room for before it
+  /// makes the seal (A-665 part 2). `None` when the view shows no such pack.
+  pub fn seal_len(&self, pack: &ObjectId) -> Option<u64> {
+    let unit = self.unit(pack)?;
+    let sum = to_u64(std::mem::size_of::<u32>());
+    let sums = to_u64(unit.wholes.len()).saturating_mul(sum);
+    Some(unit.idx_len.saturating_add(sums))
   }
 
   /// Does units of `sealing`'s pass until `quantum` is spent, at least one: whether it has hashed
