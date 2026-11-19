@@ -60,7 +60,7 @@
 //! security identifier. A target on one of this daemon's own WinFsp drives is refused before any open (`OwnMount`,
 //! A-227), as the Unix walk refuses a component on one of its mounts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
@@ -73,8 +73,7 @@ use slates_vfs::inode::Fingerprint;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem as nt;
 use windows_sys::Win32::Foundation::{
-  ERROR_ALREADY_EXISTS, ERROR_DISK_FULL, ERROR_FILE_EXISTS, ERROR_FILENAME_EXCED_RANGE,
-  ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE,
+  ERROR_FILENAME_EXCED_RANGE, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE,
   NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
   STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY,
   STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -89,12 +88,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::engine::LandingTarget;
+// The errnos of the kinds the engine tells apart that a Win32 code is given (A-527), from the writer's one rule.
+use crate::windows_codes::{ERRNO_EXIST, ERRNO_NOSPC};
 
-/// Format: the errno numbers the engine tells refusals apart by (it was written over POSIX; `engine.rs`).
-const ERRNO_EXIST: i32 = 17;
-/// Format: `ENOSPC`: no room.
-const ERRNO_NOSPC: i32 = 28;
-/// Format: `EOPNOTSUPP`: the verb does not exist here.
+/// Format: `EOPNOTSUPP`: the verb does not exist here, an errno whose kind the engine tells apart (`engine.rs`).
 const ERRNO_NOTSUP: i32 = 95;
 /// Format: `EPERM`: the verb would need a privilege slates never asks for (R10).
 const ERRNO_PERM: i32 = 1;
@@ -106,10 +103,12 @@ const TEMP_ACCESS: u32 =
   FILE_GENERIC_WRITE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
 /// Format: an entry opened to be moved or removed: nothing of its data, its attributes, and `DELETE`.
 const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-/// Format: a file opened to have its attributes set (a landing's metadata entry, A-458): its attributes read and written
-/// (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`), and `FILE_WRITE_DATA`, which its batch's barrier needs to flush it
-/// (A-472: `FlushFileBuffers` "writes all the buffered information for a specified file", through a handle that "must
-/// have the GENERIC_WRITE access right"); none of its data is written.
+/// Format: a directory opened to have its attributes set (a base directory's metadata entry, A-501): its attributes read
+/// and written (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`), and `FILE_WRITE_DATA`, a directory's `FILE_ADD_FILE`,
+/// which its batch's barrier needs to flush it (A-472: `FlushFileBuffers` "writes all the buffered information for a
+/// specified file", through a handle that "must have the GENERIC_WRITE access right"); nothing in it is written. MS-FSA
+/// 2.1.5.1.2.1 refuses those rights to a read-only data file alone, never a directory. A file's metadata entry opens as
+/// `crate::windows_bits::meta_open` says (A-519).
 const CHMOD_ACCESS: u32 =
   FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
@@ -165,12 +164,16 @@ struct Temp {
 pub struct OsLand {
   host: OsHost,
   temps: BTreeMap<u64, Temp>,
+  /// The metadata entries' files opened write-through (A-519): read-only files, each set through them stored as it
+  /// returns, which no barrier flushes, since their handles may not write.
+  through: BTreeSet<u64>,
 }
 
 /// A writer's own state while it has lent its host away ([`OsLand::lend`]).
 #[derive(Debug)]
 pub struct Away {
   temps: BTreeMap<u64, Temp>,
+  through: BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for OsLand {
@@ -178,17 +181,25 @@ impl std::fmt::Debug for OsLand {
     f.debug_struct("OsLand")
       .field("host", &self.host)
       .field("temps", &self.temps.len())
+      .field("through", &self.through.len())
       .finish()
   }
 }
 
-/// A Win32 error code as the seam's refusal, in the engine's errno numbers where it tells them apart.
+/// A Win32 error code as the seam's refusal (A-527, `crate::windows_codes::refusal_of`): the errno of a kind the engine
+/// tells apart, else the Win32 code it is.
 fn code_refusal(code: u32) -> HostError {
-  match code {
-    ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => HostError::Unavailable(ERRNO_EXIST),
-    ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL => HostError::Unavailable(ERRNO_NOSPC),
-    other => HostError::Unavailable(i32::try_from(other).unwrap_or(i32::MAX)),
-  }
+  crate::windows_codes::refusal_of(code)
+}
+
+/// An I/O error of the standard library's as the seam's refusal: its OS code is a Win32 code here.
+fn io_refusal(error: &std::io::Error) -> HostError {
+  code_refusal(
+    error
+      .raw_os_error()
+      .and_then(|code| u32::try_from(code).ok())
+      .unwrap_or(0),
+  )
 }
 
 /// The calling thread's last Win32 error as the seam's refusal; read before any other call.
@@ -952,6 +963,7 @@ impl OsLand {
       Self {
         host,
         temps: BTreeMap::new(),
+        through: BTreeSet::new(),
       },
       LandingTarget {
         dir,
@@ -972,7 +984,13 @@ impl OsLand {
 
   /// Lends the host back between a sliced landing's slices (AUD-29-25); [`OsLand::resume`] takes it back.
   pub fn lend(self) -> (OsHost, Away) {
-    (self.host, Away { temps: self.temps })
+    (
+      self.host,
+      Away {
+        temps: self.temps,
+        through: self.through,
+      },
+    )
   }
 
   /// The writer again, over the host it lent and its own state.
@@ -980,6 +998,7 @@ impl OsLand {
     Self {
       host,
       temps: away.temps,
+      through: away.through,
     }
   }
 
@@ -1108,6 +1127,7 @@ impl HostFs for OsLand {
 
   fn close_file(&mut self, file: HostFile) {
     self.temps.remove(&file.0);
+    self.through.remove(&file.0);
     self.host.close_file(file);
   }
 
@@ -1217,7 +1237,7 @@ impl LandFs for OsLand {
       let at = off.saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
       let n = writer
         .seek_write(bytes.get(written..).unwrap_or_default(), at)
-        .map_err(|e| code_refusal(u32::try_from(e.raw_os_error().unwrap_or(0)).unwrap_or(0)))?;
+        .map_err(|error| io_refusal(&error))?;
       if n == 0 {
         return Err(HostError::Unavailable(ERRNO_NOSPC));
       }
@@ -1230,14 +1250,17 @@ impl LandFs for OsLand {
     write_out_file(self.file(file)?)
   }
 
+  /// The batch's barrier over its own handle of each file but a read-only file's metadata entry, which its write-through
+  /// handle stored as it was set and which may not be flushed (A-519).
   fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
     let files = files
       .iter()
+      .filter(|file| !self.through.contains(&file.0))
       .map(|file| {
         self
           .file(*file)?
           .try_clone_to_owned()
-          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+          .map_err(|error| io_refusal(&error))
       })
       .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(OsBarrier { files }))
@@ -1251,26 +1274,52 @@ impl LandFs for OsLand {
     ran
   }
 
-  /// The file opened to have its attributes set (A-458) and its batch's barrier flush it (A-472: `CHMOD_ACCESS`),
-  /// relative to its directory's handle, as a file (`FILE_NON_DIRECTORY_FILE`) and never through a link: opened with
-  /// `FILE_OPEN_REPARSE_POINT`, a reparse point is refused `NotFile`, closed again. NTFS refuses a read-only file a
-  /// handle that may write, and the entry fails alone (GAPS, A-472).
+  /// The file opened to have its attributes set (A-458) and its batch's barrier flush it (A-472), relative to its
+  /// directory's handle, as a file and never through a link (`crate::windows_bits::meta_open`): a reparse point is
+  /// refused `NotFile`, closed again. NTFS refuses a read-only file the handle that may write (MS-FSA 2.1.5.1.2.1), so
+  /// one is opened again to write its attributes alone, write-through: each set through it is stored as it returns, and
+  /// its barrier leaves it out (A-519). Any other refusal of the first open stands.
   fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
-    let opened = nt_create(
-      self.dir(dir)?,
+    let parent = self.dir(dir)?;
+    let flushed = crate::windows_bits::meta_open(false);
+    let (opened, through) = match nt_create(
+      parent,
       name,
-      CHMOD_ACCESS,
+      flushed.access,
       nt::FILE_OPEN,
-      nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      flushed.options,
       0,
-    )?;
+    ) {
+      Ok(opened) => (opened, false),
+      Err(refused) => {
+        let stored = crate::windows_bits::meta_open(true);
+        let Ok(opened) = nt_create(
+          parent,
+          name,
+          stored.access,
+          nt::FILE_OPEN,
+          stored.options,
+          0,
+        ) else {
+          return Err(refused);
+        };
+        match attributes(opened.as_handle()) {
+          Ok(held) if crate::windows_bits::read_only(held) => (opened, true),
+          _ => return Err(refused),
+        }
+      }
+    };
     if attributes(opened.as_handle())?
       & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
       != 0
     {
       return Err(HostError::NotFile);
     }
-    self.host.adopt_file(opened)
+    let file = self.host.adopt_file(opened)?;
+    if through {
+      self.through.insert(file.0);
+    }
+    Ok(file)
   }
 
   /// The directory opened to have its attributes set and its batch's barrier flush it (A-501): `CHMOD_ACCESS`, whose

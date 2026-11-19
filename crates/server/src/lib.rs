@@ -71,8 +71,6 @@ mod own_nfs;
 mod checkout;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
-// A green's replicas on the shards that may hold its works, fed by its owner (A-457, A-273 step 5a).
-mod green_replicas;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
@@ -111,6 +109,8 @@ mod callback;
 mod delegation;
 // A wait whose bound is learned from the waits it measured (RFC 6298, Karn's rule, back-off; A-431, A-442).
 mod learned_wait;
+// The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
+mod helper_runs;
 mod listing;
 mod lock_ledger;
 pub mod nfs;
@@ -131,6 +131,9 @@ pub mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
+// The deadlines of what a shard's clients leave behind (staging buffers, status captures), kept on the shard's timing
+// wheel by one keeper task (A-522).
+mod deadlines;
 // A client's hang-up, the event its death is seen at (A-475): its control socket's end of stream (Linux) or its
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;

@@ -112,6 +112,7 @@ fn removing_a_source_mount_removes_its_bindings_and_recovery_agrees() {
       admin: false,
     },
     token: [1; 16],
+    mount: None,
   };
   for record in [
     parent.clone(),
@@ -244,6 +245,7 @@ fn binding_a_bound_mount_keeps_its_identity_and_recovery_agrees() {
       admin: false,
     },
     token: [1; 16],
+    mount: None,
   };
   db.mutate(&mut segment, &Op::AttachmentAdded { record }, 0)
     .unwrap();
@@ -692,6 +694,7 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
             admin: false,
           },
           token: [0u8; 16],
+          mount: None,
         },
       }
     }
@@ -2262,6 +2265,7 @@ fn a_moved_volume_is_released_whole_and_leaves_no_tombstone() {
       admin: false,
     },
     token: [1; 16],
+    mount: None,
   };
   db.mutate(&mut segment, &Op::AttachmentAdded { record: attachment }, 0)
     .unwrap();

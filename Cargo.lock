@@ -1566,6 +1566,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-hg"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-image"
 version = "0.1.0"
 dependencies = [
@@ -1656,7 +1664,6 @@ dependencies = [
  "blake3",
  "proptest",
  "shuttle",
- "slates-mem",
  "slates-merge",
  "slates-test-seeds",
 ]
@@ -1740,6 +1747,15 @@ dependencies = [
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-svn"
+version = "0.1.0"
+dependencies = [
+ "lz4_flex",
+ "proptest",
+ "slates-test-seeds",
 ]
 
 [[package]]

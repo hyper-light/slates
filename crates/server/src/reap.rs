@@ -371,6 +371,7 @@ pub(crate) fn end_unproven(state: &mut ShardState, handle: Handle<ClientSlot>) {
     return;
   };
   cancel_watch(state, &mut client);
+  crate::deadlines::forget_seat(state, handle, &client);
   client.status_pages.clear(&mut state.store.metadata);
   if let Some(control) = state.shards.first().copied() {
     crate::daemon::release_client_id(client.client_id, control);
@@ -397,6 +398,7 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
     return false;
   };
   cancel_watch(state, &mut client);
+  crate::deadlines::forget_seat(state, handle, &client);
   client.status_pages.clear(&mut state.store.metadata);
   // The files' copies the client was handed by the direct map were let go on every shard that held them, after its
   // attachments there (`remove_on_owners`, A-188).
@@ -569,7 +571,10 @@ mod tests {
       .unwrap();
     let pid = child.id();
     crate::daemon::observe_first(daemon, move |state| {
-      let hangup = crate::hangup::Hangup::of_process(pid).unwrap();
+      let started = slates_ipc::exit_watch::ExitWatch::start_of(pid)
+        .unwrap()
+        .unwrap();
+      let hangup = crate::hangup::Hangup::of_process(pid, started).unwrap();
       seat(state, pid, hangup);
     });
     child

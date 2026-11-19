@@ -171,6 +171,10 @@ pub struct PartitionSnapshot {
   pub captured_bases: Vec<CapturedBase>,
   /// Each volume's carried capture (A-503; 2026-11-18; appended), by volume order.
   pub carried_captures: Vec<crate::catalog::CarriedCaptureRecord>,
+  /// The repositories this partition holds (§4.17.1, A-515; appended), by id order.
+  pub repositories: Vec<crate::catalog::RepositoryRecord>,
+  /// Their namespaces' bindings (§4.17.1, A-515; appended), by (repository, name) order.
+  pub repository_branches: Vec<crate::catalog::BranchRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -309,6 +313,9 @@ pub struct Partition {
   /// the snapshot here it is relative to (its mark). One entry a volume at most; an entry leaves with its volume, and its
   /// mark with its snapshot.
   carried: BTreeMap<VolumeId, (crate::catalog::CarriedRecord, Option<SnapshotId>)>,
+  /// The repositories and their namespaces (§4.17.1, A-515): repositories bounded by `caps.volumes`, bindings by the
+  /// greens each binds.
+  repositories: crate::repository::Repositories,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -436,7 +443,24 @@ impl Partition {
       grants_issued_through: 0,
       captured_bases: std::collections::BTreeSet::new(),
       carried: BTreeMap::new(),
+      repositories: crate::repository::Repositories::new(),
       tombstones: BTreeMap::new(),
+    }
+  }
+
+  /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
+  pub fn repositories(&self) -> &crate::repository::Repositories {
+    &self.repositories
+  }
+
+  /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
+  fn held(&self, id: VolumeId) -> crate::repository::Held {
+    match self.volume(id) {
+      None => crate::repository::Held::Absent,
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
     }
   }
 
@@ -1398,6 +1422,14 @@ impl Partition {
         }
         Ok(())
       }
+      // A repository's record and namespace keep §4.17.1's rules (A-515): `crate::repository`.
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self
+        .repositories
+        .check(op, self.caps.volumes, |id| self.held(id)),
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1464,6 +1496,9 @@ impl Partition {
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
+      Op::AttachmentMountSeen { id, .. } => {
+        self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound)
+      }
       // Only an attachment presenting a snapshot is re-pinned; the head is not a version to move from.
       Op::AttachmentRepinned { id, .. } => self
         .attachment(*id)
@@ -1847,6 +1882,11 @@ impl Partition {
         self.carried.insert(*volume, (carried.clone(), *mark));
         Ok(())
       }
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self.repositories.apply(op),
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -2005,6 +2045,15 @@ impl Partition {
             (None, None) => crate::catalog::AttachForm::ChosenPath { path: path.clone() },
           };
         }
+        Ok(())
+      }
+      Op::AttachmentMountSeen { id, mount } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.mount = Some(*mount);
         Ok(())
       }
       Op::AttachmentRepinned { id, snapshot } => {
@@ -2298,6 +2347,8 @@ impl Partition {
     self.lineage.remove(&id.bytes);
     self.captured_bases.retain(|captured| captured.volume != id);
     self.carried.remove(&id);
+    // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
+    self.repositories.green_removed(id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -2472,6 +2523,8 @@ impl Partition {
           },
         )
         .collect(),
+      repositories: self.repositories.repositories().cloned().collect(),
+      repository_branches: self.repositories.bindings().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2715,6 +2768,10 @@ impl Partition {
       .iter()
       .map(|record| (record.volume, (record.carried.clone(), record.mark)))
       .collect();
+    p.repositories = crate::repository::Repositories::restore(
+      &snapshot.repositories,
+      &snapshot.repository_branches,
+    )?;
     Ok(p)
   }
 

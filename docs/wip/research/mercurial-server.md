@@ -346,3 +346,32 @@ server's directory are the ones its reviewed expected-failure list starts from.
    the 7.x layout; take `01` to `03` in pushes.
 9. Every fixed number stock Mercurial uses on its serving path (§8: header length, compression levels, the stream-clone
    rule of thumb, `_maxpayload`) is a choice slates learns per deployment or replaces with a stated bound.
+
+## 12. Found while building piece 1 (A-514, 2026-11-19; 7.2's code [C], and runs of stock `hg` 7.2)
+
+- **A chunk length of 4 is refused, not empty.** `changegroup.getchunk` and `_chunklength` refuse any length `l` with
+  `0 < l <= 4` ("invalid chunk length"); only 0 is the empty chunk. A writer still emits 4 for empty sidedata
+  (`chunkheader(len(sidedata))` in `_revisiondeltatochunks`), which 7.2's own reader would refuse; sidedata is never
+  empty in practice (its serialization begins with a count).
+- **The tree-manifest list is always there from changegroup 03.** `cg3unpacker._unpackmanifests` reads a list of
+  directory groups after the root manifest unconditionally; `internals.changegroups` says the segment exists "only if
+  the 'treemanifest' param" is set. The fixtures settle it: every 03 and 04 changegroup 7.2 wrote carries the empty
+  list (one empty chunk), and 7.2's own `hg debugbundle --all` of the 03 bundle lists the changelog and the manifest and
+  no file, because it reads that empty chunk as the end of the file list.
+- **7.2's `hg debugbundle --all` fails on a changegroup 04** that carries full texts: `TypeError: object of type
+  'NoneType' has no len()` at `debugcommands.py:398` (`len(deltadata.delta)`, where a full text has no delta). Seen on
+  the first fixture run on the Mac Studio; the fixture script lists 04 bundles with the plain `debugbundle` instead.
+- **mpatch's rules are C's, not the pure module's.** `mpatch.c`'s `mpatch_decode` refuses a hunk whose start is
+  negative or past its end or whose length is negative, and a delta not consumed exactly; `mpatch_apply` refuses a
+  hunk that starts before the previous one ended or ends past the base. `pure/mpatch.py` checks less (its
+  `patchedsize` stops at `start > end` without refusing). Clients run the C version; the codec holds its rules.
+- **A part header is read loosely by 7.2.** `unbundlepart._fromheader` slices the header block, so parameter sizes
+  that run past it yield short keys and values, and bytes left after the parameters are ignored; `_initparams` keeps
+  the last of two equal keys. `internals.bundle2` says keys "MUST be unique". slates refuses all three.
+- **An interrupt reads one part, or none.** `interrupthandler.__call__` reads one part header; a header length of 0 is
+  "no part found during interruption", after which the interrupted part resumes. Nothing in the protocol bounds how
+  deep interruptions nest (each is handled by the same code, recursively in 7.2); slates walks them with a count and
+  bounds them by the request's admission.
+- **Stream parameters are matched without case.** `_processparam` looks a name up as `name.lower()`, so a lower-case
+  `compression=GZ` is processed as `Compression` is; an unknown name is ignored when its first letter is lower-case
+  and refused otherwise.

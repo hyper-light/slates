@@ -6,11 +6,11 @@
 use slates_wire::Wire;
 
 use crate::catalog::{
-  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
-  GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
-  LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
-  PlacementState, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
-  VolumeState,
+  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, BranchRecord, CompletionRecord,
+  ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
+  LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  NfsOpenRecord, PlacementState, RepositoryId, RepositoryRecord, SizeClass, SnapshotId,
+  SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -610,6 +610,45 @@ pub enum Op {
     /// Its snapshot holding that head, when it holds one.
     mark: Option<crate::catalog::SnapshotId>,
   },
+  /// A repository was created, its namespace empty (§4.17.1, A-515). Appended.
+  RepositoryCreated {
+    /// The record.
+    record: RepositoryRecord,
+  },
+  /// A branch name of a repository was bound to a green of its partition (§4.17.1, A-515). Appended.
+  RepositoryBranchAdded {
+    /// The binding.
+    record: BranchRecord,
+  },
+  /// A branch name left its repository's namespace; its green is untouched, so binding the name to it again restores
+  /// the branch (§4.17.1 "Deleting a branch", A-515). Appended.
+  RepositoryBranchRetired {
+    /// The repository.
+    repository: RepositoryId,
+    /// The name.
+    name: String,
+  },
+  /// A repository's default branch was set, or cleared with `None` (§4.17.1, A-515). Appended.
+  RepositoryDefaultSet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The branch name, bound or not yet (an unborn default).
+    branch: Option<String>,
+  },
+  /// A repository left, with every name of its namespace; its greens are untouched, each destroyed by its own verb
+  /// (§4.17.1, A-515). Appended.
+  RepositoryDestroyed {
+    /// The repository.
+    repository: RepositoryId,
+  },
+  /// A host mount's attachment was seen mounted (A-540): the kernel's id of its mount, kept in the attachment's record
+  /// so a successor's start can judge whether the kernel let that mount go while no daemon ran. Appended.
+  AttachmentMountSeen {
+    /// The attachment.
+    id: u64,
+    /// The kernel's id of its mount, as its mount table names it.
+    mount: u64,
+  },
 }
 
 impl Op {
@@ -641,6 +680,7 @@ impl Op {
       Op::AttachmentAdded { .. } => "attachment_added",
       Op::AttachmentRemoved { .. } => "attachment_removed",
       Op::AttachmentBound { .. } => "attachment_bound",
+      Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
@@ -699,6 +739,11 @@ impl Op {
       Op::BaseCaptured { .. } => "base_captured",
       Op::CaptureCarried { .. } => "capture_carried",
       Op::CaptureAdopted { .. } => "capture_adopted",
+      Op::RepositoryCreated { .. } => "repository_created",
+      Op::RepositoryBranchAdded { .. } => "repository_branch_added",
+      Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
+      Op::RepositoryDefaultSet { .. } => "repository_default_set",
+      Op::RepositoryDestroyed { .. } => "repository_destroyed",
     }
   }
 }

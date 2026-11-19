@@ -2880,6 +2880,64 @@ fn a_busy_mount_is_let_go_of_the_oss_way() {
   daemon.stop();
 }
 
+/// §4.6 A-9, A-520 (kiln's container engine): a mounted volume binds into a container through the library. Do: mount a
+/// volume through the library, bind its mount point into a container for writing and for reading, and bind a path no
+/// mount is at beside it; detach both bindings, then unmount. Expect each binding the runtime's entry at the mount point
+/// as the kernel's table records it (the mount's own path) and the destination given (`bind`, `rw` or `ro`, `private`,
+/// `nosuid`, `nodev`), each an attachment of its own, and the path beside it refused `ChosenPath(NotAMountPoint)`, as
+/// the daemon judges the table. Skips loudly unless SLATES_TEST_MOUNT is set: it makes a kernel mount.
+#[cfg(unix)]
+#[test]
+fn a_mounted_volume_binds_into_a_container_through_the_library() {
+  if std::env::var_os(MOUNT_TESTS).is_none() {
+    eprintln!("SKIP: {MOUNT_TESTS} is not set: this test makes a kernel mount");
+    return;
+  }
+  let (daemon, mut instance) = grouped("container-bind");
+  let volume = provision(&mut instance, &VolumeSpec::empty("container-bind", ROOM));
+  let point = Folder::new();
+  let mounted = instance
+    .mount(volume, &point.path, &MountOptions::default())
+    .unwrap();
+  let writable = instance
+    .bind_into_container(volume, &mounted.path, "/work", Intent::Write)
+    .unwrap();
+  let readable = instance
+    .bind_into_container(volume, &mounted.path, "/work", Intent::Read)
+    .unwrap();
+  for (bound, read_only, access) in [(&writable, false, "rw"), (&readable, true, "ro")] {
+    assert_eq!(
+      (
+        bound.binding.source.as_str(),
+        bound.binding.destination.as_str(),
+        bound.binding.read_only,
+        bound.binding.mount_type.as_str()
+      ),
+      (mounted.path.as_str(), "/work", read_only, "bind")
+    );
+    assert_eq!(
+      bound.binding.options,
+      ["bind", access, "private", "nosuid", "nodev"]
+    );
+  }
+  assert_ne!(writable.attachment, readable.attachment);
+  assert_eq!(
+    instance.bind_into_container(
+      volume,
+      &format!("{}-beside", mounted.path),
+      "/work",
+      Intent::Read
+    ),
+    Err(Error::Invalid(Invalid::ChosenPath(
+      slates_api::HostPathReason::NotAMountPoint
+    )))
+  );
+  instance.detach(writable.attachment).unwrap();
+  instance.detach(readable.attachment).unwrap();
+  slates_api::mount::unmount(&mounted.path).unwrap();
+  daemon.stop();
+}
+
 /// A volume id no instance issued (A-310's conformance cases).
 const NOWHERE: VolumeId = VolumeId { bytes: [0xAB; 16] };
 /// Shape: the simulator's bound in the conformance suite: room for every volume and attachment the suite makes.
@@ -2988,8 +3046,9 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   );
 }
 
-/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy and serve a volume no one
-/// made; detach an attachment no one made; provision an overlay of a relative folder. Expect each refused typed:
+/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy, serve and bind into a
+/// container a volume no one made; detach an attachment no one made; provision an overlay of a relative folder. Expect
+/// each refused typed:
 /// `NotFound` naming the volume, the snapshot or the attachment, and the folder `NotAbsolute`.
 fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId) {
   assert_eq!(
@@ -3011,6 +3070,12 @@ fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId
     seam
       .serve_shards(NOWHERE, Intent::Read, None)
       .map(|served| served.attachment.attachment),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  // A container bind of a volume no one made (A-520): the daemon finds the volume before it judges the form, on every
+  // platform, so the stranger is `NotFound` whatever the host offers to bind.
+  assert_eq!(
+    seam.bind_into_container(NOWHERE, "/seam/nowhere", "/work", Intent::Read),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
   );
   assert_eq!(

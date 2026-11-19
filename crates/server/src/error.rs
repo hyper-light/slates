@@ -260,6 +260,9 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::Attached { .. } => Refusal::MoveRefused {
       reason: slates_ipc::protocol::MoveRefusal::Attached,
     },
+    // A repository's namespace binds greens only, under non-empty names without NUL bytes (§4.17.1, A-515).
+    DbError::NotGreen => Refusal::NotGreen,
+    DbError::InvalidName => Refusal::InvalidName,
   }
 }
 
@@ -283,6 +286,10 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
     H::NotFile => TargetRefusal::NotFile,
     H::StaleHandle => TargetRefusal::Stale,
     H::Unavailable(errno) | H::OwnMount(errno) => TargetRefusal::Host { errno: *errno },
+    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
+    H::Win32(code) => TargetRefusal::Host {
+      errno: i32::try_from(*code).unwrap_or(i32::MAX),
+    },
     // A target is a directory host's, which never answers a pending fetch (an S3 base's, A-524); were one to, it is a
     // refusal no errno names.
     H::Pending => TargetRefusal::Host { errno: 0 },

@@ -48,6 +48,9 @@ LandingState 8 Refused
 LandingState 9 Aborted
 NamePolicy 0 Exact
 NamePolicy 1 Fold
+ObjectFormat 0 Sha1
+ObjectFormat 1 Sha256
+ObjectFormat 2 Revisions
 Op 0 VolumeCreated
 Op 1 VolumeStateChanged
 Op 2 VolumeResized
@@ -131,6 +134,12 @@ Op 79 VolumeReleased
 Op 80 BaseCaptured
 Op 81 CaptureCarried
 Op 82 CaptureAdopted
+Op 83 RepositoryCreated
+Op 84 RepositoryBranchAdded
+Op 85 RepositoryBranchRetired
+Op 86 RepositoryDefaultSet
+Op 87 RepositoryDestroyed
+Op 88 AttachmentMountSeen
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid
@@ -149,6 +158,9 @@ SealKeyOwner 5 PairReceived
 SealKeyOwner 6 PairRetired
 SizeClass 0 Bounded
 SizeClass 1 Dynamic
+VcsTool 0 Git
+VcsTool 1 Mercurial
+VcsTool 2 Subversion
 VolumeState 0 Creating
 VolumeState 1 Live
 VolumeState 2 Sealing

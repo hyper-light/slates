@@ -1548,7 +1548,7 @@ impl BarrierThread {
         }
       },
     )
-    .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))?;
+    .map_err(|error| spawn_refusal(&error))?;
     Ok(Self {
       outcome,
       thread: Some(thread),
@@ -1586,12 +1586,31 @@ fn lost_barrier() -> HostError {
 
 /// What a barrier thread gone without its outcome reads as: Windows' own number for a failed I/O,
 /// `ERROR_IO_DEVICE`, since the Windows seam reports a refusal the engine does not tell apart in Win32's codes
-/// (`slates_land::os`, A-185).
+/// (`slates_land::os`, A-185), typed as one (A-527).
 #[cfg(windows)]
 fn lost_barrier() -> HostError {
   /// Format: `ERROR_IO_DEVICE` (winerror.h).
-  const ERROR_IO_DEVICE: i32 = 1117;
-  HostError::Unavailable(ERROR_IO_DEVICE)
+  const ERROR_IO_DEVICE: u32 = 1117;
+  HostError::Win32(ERROR_IO_DEVICE)
+}
+
+/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, an errno here
+/// (A-527).
+#[cfg(unix)]
+fn spawn_refusal(error: &std::io::Error) -> HostError {
+  HostError::Unavailable(error.raw_os_error().unwrap_or(0))
+}
+
+/// A barrier thread the landing could not be given, as the seam's refusal: the OS code its error names, a Win32 code
+/// here, typed as one (A-527).
+#[cfg(windows)]
+fn spawn_refusal(error: &std::io::Error) -> HostError {
+  HostError::Win32(
+    error
+      .raw_os_error()
+      .and_then(|code| u32::try_from(code).ok())
+      .unwrap_or(0),
+  )
 }
 
 impl Drop for BarrierThread {
@@ -3156,6 +3175,10 @@ fn answer_of(error: HostError) -> HostAnswer {
     HostError::StaleHandle => HostAnswer::StaleHandle,
     // A-227: a path on a mount this daemon serves carries the platform's deadlock-avoided errno.
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => HostAnswer::Errno { errno },
+    // The reply's one number field holds a Win32 code as its own (A-527; typing it is the wire's own piece, GAPS).
+    HostError::Win32(code) => HostAnswer::Errno {
+      errno: i32::try_from(code).unwrap_or(i32::MAX),
+    },
     // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
     // a refusal no errno names.
     HostError::Pending => HostAnswer::Errno { errno: 0 },
