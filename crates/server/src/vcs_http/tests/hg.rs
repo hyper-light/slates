@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
@@ -177,20 +178,29 @@ impl Repository for Empty {
 }
 
 impl Store for Empty {
-  fn changeset_text(&self, _rev: Rev) -> Option<&[u8]> {
-    None
+  fn changeset_text(
+    &self,
+    _rev: Rev,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, slates_hg::PastAdmission> {
+    Ok(None)
   }
 
-  fn manifest(&self, _node: &Node) -> Option<Logged<'_>> {
-    None
+  fn manifest(
+    &self,
+    _node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    Ok(None)
   }
 
-  fn file(&self, _path: &[u8], _node: &Node) -> Option<Logged<'_>> {
-    None
-  }
-
-  fn file_node(&self, _manifest: &Node, _path: &[u8]) -> Option<Node> {
-    None
+  fn file(
+    &self,
+    _path: &[u8],
+    _node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    Ok(None)
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
