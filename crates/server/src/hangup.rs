@@ -11,7 +11,7 @@
 //!   `EPOLLRDHUP` ("Stream socket peer closed connection") and `EPOLLHUP`, which "epoll_wait(2) will always wait for"
 //!   [B: epoll_ctl(2)]; then a peek tells the close (zero bytes) from a stray byte. A client sends nothing on that socket
 //!   after its opening, so a byte there is a broken channel, not a live sign: ended as a hang-up is, counted apart
-//!   ([`Ended::Broke`]), since the watch could not tell its death from its bytes. (The poll it replaces took a waiting
+//!   (`Ended::Broke`), since the watch could not tell its death from its bytes. (The poll it replaces took a waiting
 //!   byte for a live client, so a client that wrote one and died was never reaped.)
 //! - **macOS: the client's process exit.** No control socket outlives a macOS rendezvous, so the watch is on the process
 //!   the claim named: `EVFILT_PROC` with `NOTE_EXIT` ("The process has exited") on a kqueue of the watch's own
