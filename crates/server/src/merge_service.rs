@@ -1338,7 +1338,10 @@ pub(crate) fn destroy_merge_volume(
     let _ = settle_green_retention(state, work.green);
   }
   crate::verbs::release_origin_snapshot(state, held.as_ref());
-  if state.greens.remove(&id).is_some() {
+  // A repository's member is retired from its lineage, what only it held released a node a unit afterwards under the
+  // shard's slice (A-575); a lone engine goes whole.
+  let removed = crate::repository::retire_member(state, id) || state.greens.remove(&id).is_some();
+  if removed {
     state.merge.attachments.retain(|_, pin| pin.green != id);
     release_green_retention(state, id);
     // Nothing of a destroyed green is left to place: its owner-side placement state goes with it, so the
@@ -1871,6 +1874,9 @@ pub enum GreenFence {
   /// its engine from that ledger: a record or an input it names is not held here, or the rebuild did not reach the
   /// adopted identity.
   LedgerUnavailable,
+  /// The green is a lineage member made at a version of another member that recovery could not rebuild there: fenced or
+  /// not rebuilt, or no longer holding that version (§4.17.1 item 4, A-575).
+  SourceUnavailable,
 }
 
 /// A green's outstanding replication (§4.16, AUD-13). The per-holder ordered positions index

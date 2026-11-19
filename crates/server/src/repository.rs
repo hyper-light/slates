@@ -59,6 +59,31 @@ fn db_format(format: ObjectFormat) -> slates_db::catalog::ObjectFormat {
   }
 }
 
+/// `op` judged by the partition's guard without recording it: a verb that records several operations judges each one a
+/// later step could refuse before its first, since what a refused verb recorded commits with its refusal.
+fn admits(state: &ShardState, op: &Op) -> Result<(), Refusal> {
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .partition()
+    .check(op, now)
+    .map_err(|error| refusal_of_db(&error))
+}
+
+/// A branch name the namespace takes: not empty, holding no NUL, not taken in `repository` (§4.17.1, A-515), judged
+/// before anything is recorded.
+fn free_name(state: &ShardState, repository: RepositoryId, name: &str) -> Result<(), Refusal> {
+  if name.is_empty() || name.contains('\0') {
+    return Err(Refusal::InvalidName);
+  }
+  match state.db.partition().repositories().branch(repository, name) {
+    Some(bound) => Err(Refusal::AlreadyExists {
+      existing: to_wire_volume(bound),
+    }),
+    None => Ok(()),
+  }
+}
+
 /// Records `op` in the verb's transaction; its refusal typed.
 fn record(state: &mut ShardState, op: &Op) -> Result<(), Refusal> {
   let now = state.clock.monotonic_ns();
@@ -161,8 +186,17 @@ fn adoptable(
   if state.greens.lineage_of(&record.id).is_some() {
     return Err(Refusal::AlreadyExists { existing: volume });
   }
-  if !state.greens.contains_key(&record.id) {
+  if !state.greens.contains_key(&record.id) || record.id.partition() != state.partition {
     return Err(Refusal::NotFound);
+  }
+  if state
+    .db
+    .partition()
+    .repositories()
+    .binding_of(record.id)
+    .is_some()
+  {
+    return Err(Refusal::AlreadyExists { existing: volume });
   }
   Ok(record.id)
 }
@@ -216,6 +250,19 @@ fn record_repository(
   ),
   adopted: Option<DbVolumeId>,
 ) -> Result<DbVolumeId, Refusal> {
+  // A new root's record is judged first: once the repository's is recorded, a refusal would leave it rootless.
+  let created = match adopted {
+    Some(_) => None,
+    None => {
+      let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
+      let named = member_name(name, default_branch, id)?;
+      let created = Op::VolumeCreated {
+        record: member_record(state, principal, (id, named), false),
+      };
+      admits(state, &created)?;
+      Some((id, created))
+    }
+  };
   record(
     state,
     &Op::RepositoryCreated {
@@ -229,15 +276,13 @@ fn record_repository(
       },
     },
   )?;
-  let root = match adopted {
-    Some(id) => id,
-    None => {
-      let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
-      let named = member_name(name, default_branch, id)?;
-      let volume = member_record(state, principal, (id, named), false);
-      record(state, &Op::VolumeCreated { record: volume })?;
+  let root = match (adopted, created) {
+    (Some(id), _) => id,
+    (None, Some((id, created))) => {
+      record(state, &created)?;
       id
     }
+    (None, None) => return Err(Refusal::NotFound),
   };
   record(
     state,
@@ -381,10 +426,20 @@ fn record_branch(
   (source, version): (DbVolumeId, u64),
   require_evidence: bool,
 ) -> Result<DbVolumeId, Refusal> {
+  // Everything a later record could refuse is judged before the first: the name, the source's membership of this
+  // lineage, the new green's record.
+  free_name(state, repository.id, name)?;
+  let member = state.db.partition().repositories().member(source).cloned();
+  if member.is_none_or(|member| member.repository != repository.id) {
+    return Err(Refusal::NotFound);
+  }
   let id = crate::verbs::fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?;
   let named = member_name(&repository.name, name, id)?;
-  let volume = member_record(state, principal, (id, named), require_evidence);
-  record(state, &Op::VolumeCreated { record: volume })?;
+  let created = Op::VolumeCreated {
+    record: member_record(state, principal, (id, named), require_evidence),
+  };
+  admits(state, &created)?;
+  record(state, &created)?;
   record(
     state,
     &Op::RepositoryGreenJoined {
@@ -507,5 +562,391 @@ pub(crate) async fn run_releases() {
       Some(Ok(None | Some(false))) => slates_rt::futures::yield_now().await,
       _ => return,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_ipc::protocol::{
+    ObjectFormat, Principal, Refusal, ReplyBody, RequestBody, VcsTool, VolumeId, VolumeRefusal,
+  };
+
+  use crate::greens::ReleaseProgress;
+  use crate::state::ShardState;
+  use crate::verbs::{dispatch, to_db_volume};
+
+  fn owner() -> Principal {
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    }
+  }
+
+  fn stranger() -> Principal {
+    Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 4321,
+    }
+  }
+
+  fn ask(state: &mut ShardState, principal: &Principal, body: RequestBody) -> ReplyBody {
+    dispatch(state, 1, principal, body)
+  }
+
+  fn refusal(reply: ReplyBody) -> Refusal {
+    match reply {
+      ReplyBody::Refused { refusal } => refusal,
+      other => panic!("not refused: {other:?}"),
+    }
+  }
+
+  fn green_of(reply: ReplyBody) -> VolumeId {
+    match reply {
+      ReplyBody::GreenCreated { id } => id,
+      other => panic!("no green: {other:?}"),
+    }
+  }
+
+  fn create(state: &mut ShardState, name: &str, default: &str) -> ReplyBody {
+    ask(
+      state,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.to_owned(),
+        tool: VcsTool::Git,
+        format: ObjectFormat::Sha1,
+        default_branch: default.to_owned(),
+        green: None,
+      },
+    )
+  }
+
+  fn branch(
+    state: &mut ShardState,
+    (repository, name, from): (&str, &str, &str),
+    version: Option<u64>,
+  ) -> ReplyBody {
+    ask(
+      state,
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: repository.to_owned(),
+        name: name.to_owned(),
+        from: from.to_owned(),
+        version,
+      },
+    )
+  }
+
+  /// Makes `green`'s next version through a work of its own, file `f` set to `bytes`; the work is destroyed after, so
+  /// no reader is left holding the green's floor. The version made.
+  fn write(state: &mut ShardState, green: VolumeId, bytes: &[u8], serial: u32) -> u64 {
+    let ReplyBody::WorkCreated { id: work, .. } = ask(
+      state,
+      &owner(),
+      RequestBody::CreateWork {
+        green,
+        name: format!("work-{serial}"),
+      },
+    ) else {
+      panic!("no work over {green:?}")
+    };
+    let held = file(state, green).map_or(0, |bytes| bytes.len() as u64);
+    let edited = ask(
+      state,
+      &owner(),
+      RequestBody::Edit {
+        work,
+        path: "/f".to_owned(),
+        at: 0,
+        delete_len: held,
+        bytes: bytes.to_vec(),
+      },
+    );
+    assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+    let submitted = ask(
+      state,
+      &owner(),
+      RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+    );
+    let ReplyBody::Submitted {
+      version: Some(version),
+      ..
+    } = submitted
+    else {
+      panic!("not accepted: {submitted:?}")
+    };
+    let destroyed = ask(state, &owner(), RequestBody::Destroy { volume: work });
+    assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+    version
+  }
+
+  /// `green`'s file `f` at its head.
+  fn file(state: &ShardState, green: VolumeId) -> Option<Vec<u8>> {
+    state
+      .greens
+      .get(&to_db_volume(green))
+      .and_then(|engine| engine.content("f").map(<[u8]>::to_vec))
+  }
+
+  /// The repository record of `name`.
+  fn repository(state: &ShardState, name: &str) -> slates_db::catalog::RepositoryId {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .map(|record| record.id)
+      .expect("the repository")
+  }
+
+  /// A-575 (§4.17.1 items 1 to 5). Do: create a repository, write two versions of its root, branch it at version 1 and
+  /// at its head, retire a branch and bind it again, and try every wrong verb: a taken repository name, an unknown
+  /// branch, a version past the head, another principal, a name with a NUL, a bind of a green outside the lineage.
+  /// Expect: each branch reads its version's bytes and the root its head's; no branch walked the lineage's maps; a
+  /// retired name leaves its green, and binding it again restores it; each wrong verb refused by its kind.
+  #[test]
+  fn branches_share_their_lineage_and_each_wrong_verb_is_refused_by_its_kind() {
+    crate::daemon::audit_on_shard(|state| {
+      let root = green_of(create(state, "linux", "main"));
+      assert_eq!(write(state, root, b"one", 1), 1);
+      assert_eq!(write(state, root, b"two", 2), 2);
+      let repo = repository(state, "linux");
+      let walked = state.greens.lineage_walked(repo);
+      let at_one = green_of(branch(state, ("linux", "topic", "main"), Some(1)));
+      let at_head = green_of(branch(state, ("linux", "head", "main"), None));
+      assert_eq!(
+        state.greens.lineage_walked(repo),
+        walked,
+        "a branch walked the lineage's maps"
+      );
+      assert_eq!(file(state, at_one).as_deref(), Some(b"one".as_slice()));
+      assert_eq!(file(state, at_head).as_deref(), Some(b"two".as_slice()));
+      assert_eq!(file(state, root).as_deref(), Some(b"two".as_slice()));
+      assert_eq!(write(state, at_one, b"ONE", 3), 1);
+      assert_eq!(file(state, at_one).as_deref(), Some(b"ONE".as_slice()));
+      assert_eq!(file(state, root).as_deref(), Some(b"two".as_slice()));
+      let retired = ask(
+        state,
+        &owner(),
+        RequestBody::RetireBranch {
+          repository: "linux".to_owned(),
+          name: "topic".to_owned(),
+        },
+      );
+      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+      assert_eq!(file(state, at_one).as_deref(), Some(b"ONE".as_slice()));
+      let bound = ask(
+        state,
+        &owner(),
+        RequestBody::BindBranch {
+          repository: "linux".to_owned(),
+          name: "topic".to_owned(),
+          green: at_one,
+        },
+      );
+      assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
+      assert!(matches!(
+        refusal(create(state, "linux", "main")),
+        Refusal::AlreadyExists { .. }
+      ));
+      assert_eq!(
+        refusal(branch(state, ("linux", "x", "nope"), None)),
+        Refusal::NotFound
+      );
+      assert!(matches!(
+        refusal(branch(state, ("linux", "x", "main"), Some(9))),
+        Refusal::UnknownBase { version: 9, .. }
+      ));
+      assert_eq!(
+        refusal(branch(state, ("linux", "bad\0name", "main"), None)),
+        Refusal::InvalidName
+      );
+      let foreign = ask(
+        state,
+        &stranger(),
+        RequestBody::CreateBranch {
+          repository: "linux".to_owned(),
+          name: "x".to_owned(),
+          from: "main".to_owned(),
+          version: None,
+        },
+      );
+      assert!(matches!(refusal(foreign), Refusal::Forbidden { .. }));
+      let lone = green_of(ask(
+        state,
+        &owner(),
+        RequestBody::CreateGreen {
+          name: "lone".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ));
+      let outside = ask(
+        state,
+        &owner(),
+        RequestBody::BindBranch {
+          repository: "linux".to_owned(),
+          name: "lone".to_owned(),
+          green: lone,
+        },
+      );
+      assert_eq!(refusal(outside), Refusal::NotFound);
+      assert_eq!(state.greens.busy_lends(), 0);
+    });
+  }
+
+  /// A-575 (§4.16 the retire sliced; §4.17.1 item 4's destroy). Do: branch a repository's root, write the branch, then
+  /// destroy the root, then the branch, and give the branch's holds back one unit at a time. Expect: the root refuses its
+  /// destroy `Pinned` while the branch lives; the branch's destroy answers at once with its engine gone and its release
+  /// owed; no unit frees more than one node; once the release is done the lineage holds what the root alone held.
+  #[test]
+  fn a_destroyed_branch_is_released_a_node_a_unit_and_its_source_is_pinned_until_then() {
+    crate::daemon::audit_on_shard(|state| {
+      let root = green_of(create(state, "kernel", "main"));
+      write(state, root, b"root bytes", 1);
+      let repo = repository(state, "kernel");
+      let alone = state.greens.lineage_nodes(repo).expect("its lineage");
+      let topic = green_of(branch(state, ("kernel", "topic", "main"), None));
+      write(state, topic, b"topic bytes", 2);
+      let pinned = ask(state, &owner(), RequestBody::Destroy { volume: root });
+      assert_eq!(
+        refusal(pinned),
+        Refusal::Volume {
+          refusal: VolumeRefusal::Pinned
+        }
+      );
+      let destroyed = ask(state, &owner(), RequestBody::Destroy { volume: topic });
+      assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+      assert!(!state.greens.contains_key(&to_db_volume(topic)));
+      assert_eq!(state.greens.releases_owed(), 1);
+      loop {
+        let before = state.greens.lineage_nodes(repo).expect("its lineage");
+        let progress = state.greens.release_unit();
+        let after = state.greens.lineage_nodes(repo).expect("its lineage");
+        assert!(before - after <= 1, "a unit freed more than one node");
+        if progress == ReleaseProgress::Done {
+          break;
+        }
+      }
+      assert_eq!(state.greens.lineage_nodes(repo), Some(alone));
+      assert_eq!(
+        file(state, root).as_deref(),
+        Some(b"root bytes".as_slice())
+      );
+    });
+  }
+
+  /// Every green of the shard rebuilt as a recovery rebuilds it, in recovery's order, into empty engines: what the shard
+  /// held before, to compare with.
+  fn recover(state: &mut ShardState) -> crate::greens::Greens {
+    let live = std::mem::take(&mut state.greens);
+    let mut records: Vec<slates_db::catalog::VolumeRecord> = state
+      .db
+      .partition()
+      .volumes()
+      .into_iter()
+      .filter(|record| matches!(record.policy.role, slates_db::catalog::Role::Green { .. }))
+      .cloned()
+      .collect();
+    records.sort_by_cached_key(|record| crate::verbs::member_rank(state, record.id));
+    for record in &records {
+      crate::verbs::rebuild_member(state, record);
+    }
+    live
+  }
+
+  /// A green's head, its identity and its file at each version from a floor.
+  type Answers = (u64, [u8; 32], Vec<Option<Vec<u8>>>);
+
+  /// What `green` answers from `floor` up ([`Answers`]).
+  fn answers(greens: &mut crate::greens::Greens, green: VolumeId, floor: u64) -> Option<Answers> {
+    let mut engine = greens.get_mut(&to_db_volume(green))?;
+    let files = (floor..=engine.head())
+      .map(|version| engine.content_at("f", version))
+      .collect();
+    Some((engine.head(), engine.head_identity(), files))
+  }
+
+  /// The oldest version both engines of `green` reconstruct: a rebuilt one begins at its checkpoint.
+  fn common_floor(
+    first: &crate::greens::Greens,
+    second: &crate::greens::Greens,
+    green: VolumeId,
+  ) -> u64 {
+    [first, second]
+      .iter()
+      .filter_map(|greens| {
+        greens
+          .get(&to_db_volume(green))
+          .map(|engine| engine.folded_below().max(engine.mappable_from()))
+      })
+      .max()
+      .unwrap_or(0)
+  }
+
+  /// A-575 (§4.17.1 item 4, a branch rebuilt the way it joined). Do: branch a repository's root at version 1, write it,
+  /// branch the branch, retire a name, write the root on past version 1 and force its checkpoint, then rebuild every
+  /// green as a recovery does; then corrupt the root's chain and rebuild again. Expect: the root's checkpoint stays at or
+  /// below version 1, the version a live branch was made at; every member reads after the rebuild as before it (head,
+  /// identity, every version); and with the root's chain corrupt, the root and every member made from it are fenced,
+  /// none served.
+  #[test]
+  fn a_recovery_rebuilds_every_member_the_way_it_joined_and_fences_what_its_source_cannot_give() {
+    crate::daemon::audit_on_shard(|state| {
+      let root = green_of(create(state, "tree", "main"));
+      write(state, root, b"v1", 1);
+      let topic = green_of(branch(state, ("tree", "topic", "main"), Some(1)));
+      write(state, topic, b"topic", 2);
+      let deep = green_of(branch(state, ("tree", "deep", "topic"), None));
+      write(state, deep, b"deep", 3);
+      let retired = ask(
+        state,
+        &owner(),
+        RequestBody::RetireBranch {
+          repository: "tree".to_owned(),
+          name: "deep".to_owned(),
+        },
+      );
+      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+      for serial in 4..10 {
+        write(state, root, format!("v{serial}").as_bytes(), serial);
+      }
+      let root_id = to_db_volume(root);
+      crate::merge_service::checkpoint_green_when(
+        state,
+        root_id,
+        crate::merge_service::Doubling::Now,
+      );
+      assert!(
+        state.db.partition().green_floor(root_id) <= 1,
+        "the root's checkpoint passed the version its branch was made at"
+      );
+      let mut live = recover(state);
+      for green in [root, topic, deep] {
+        let floor = common_floor(&state.greens, &live, green);
+        let rebuilt = answers(&mut state.greens, green, floor);
+        assert!(rebuilt.is_some(), "{green:?} not rebuilt");
+        assert_eq!(
+          rebuilt,
+          answers(&mut live, green, floor),
+          "{green:?} after the rebuild"
+        );
+      }
+      let corrupt = slates_db::op::Op::GreenAdvanced {
+        green: root_id,
+        increment: vec![0xff; 16],
+      };
+      state.db.mutate(&mut state.segment, &corrupt, 0).unwrap();
+      recover(state);
+      for green in [root, topic, deep] {
+        let id = to_db_volume(green);
+        assert!(!state.greens.contains_key(&id), "{green:?} served");
+        assert!(state.fenced_greens.contains_key(&id), "{green:?} not fenced");
+      }
+    });
   }
 }
