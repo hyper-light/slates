@@ -513,8 +513,22 @@ macro_rules! transcript_of {
   ($name:literal, $connection:literal) => {
     (
       concat!($name, ".", $connection),
-      include_bytes!(concat!("../../fixtures/reads/", $name, ".", $connection, ".client.bin")).as_slice(),
-      include_bytes!(concat!("../../fixtures/reads/", $name, ".", $connection, ".server.bin")).as_slice(),
+      include_bytes!(concat!(
+        "../../fixtures/reads/",
+        $name,
+        ".",
+        $connection,
+        ".client.bin"
+      ))
+      .as_slice(),
+      include_bytes!(concat!(
+        "../../fixtures/reads/",
+        $name,
+        ".",
+        $connection,
+        ".server.bin"
+      ))
+      .as_slice(),
     )
   };
 }
@@ -532,7 +546,11 @@ fn stock_mergeinfo_sessions_are_answered_as_svnserve_answered_them() {
     (transcript_of!("svn-mergeinfo-merged", "3"), 1),
   ];
   for ((name, client, server), commands) in sessions {
-    assert_eq!(replay(name, client, server, &["reparent"]), commands, "{name}");
+    assert_eq!(
+      replay(name, client, server, &["reparent"]),
+      commands,
+      "{name}"
+    );
   }
 }
 
@@ -660,7 +678,12 @@ fn every_fixture_has_its_recorded_sum() {
     "svn-mergeinfo-merged.3.client.bin",
     "svn-mergeinfo-merged.3.server.bin",
   ] {
-    assert!(sums.lines().any(|line| line.ends_with(&format!("  {file}"))), "{file}");
+    assert!(
+      sums
+        .lines()
+        .any(|line| line.ends_with(&format!("  {file}"))),
+      "{file}"
+    );
   }
   assert!(sums.lines().any(|line| line.ends_with("  repository.txt")));
 }
@@ -1160,7 +1183,8 @@ fn a_log_streams_a_revision_a_step() {
   let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
   assert_eq!(narrow, wide);
   assert!(narrow_slices > 12 && wide_slices == 1, "{narrow_slices}");
-  let command = b"( log ( ( 7:tags/t1 5:trunk ) ( 11 ) ( 0 ) true false 0 true all-revprops ( ) ) ) ";
+  let command =
+    b"( log ( ( 7:tags/t1 5:trunk ) ( 11 ) ( 0 ) true false 0 true all-revprops ( ) ) ) ";
   let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
   let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
   assert_eq!(narrow, wide);

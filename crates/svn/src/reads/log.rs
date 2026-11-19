@@ -39,15 +39,17 @@ mod merged;
 
 use super::history::History;
 use super::stream::{Progress, Stream};
-use crate::mergeinfo::Mergeinfo;
-use merged::{MergeinfoChanges, PathListRange, combine, outside_history, reduce_search, store_search};
-use std::collections::BTreeSet;
 use super::{
   AUTHOR_PROPERTY, DATE_PROPERTY, DONE, Failure, Outcome, ROOT, Reads, Repository, boolean,
   c_string_of, full_path, kind_word, optional_revnum,
 };
 use crate::index::{Action, ChangedPath, Revision};
+use crate::mergeinfo::Mergeinfo;
 use crate::ra_svn::{ItemError, Value, write};
+use merged::{
+  MergeinfoChanges, PathListRange, combine, outside_history, reduce_search, store_search,
+};
+use std::collections::BTreeSet;
 
 /// The revision property holding a revision's log message.
 /// Format: `SVN_PROP_REVISION_LOG` (`svn_props.h`).
@@ -500,7 +502,11 @@ impl LogStream {
     let mut children = None;
     if changed {
       let changes = if walk.merged {
-        let paths: Vec<String> = walk.histories.iter().map(|info| info.path.clone()).collect();
+        let paths: Vec<String> = walk
+          .histories
+          .iter()
+          .map(|info| info.path.clone())
+          .collect();
         reads.mergeinfo_changes(&paths, walk.current)?
       } else {
         MergeinfoChanges::default()
@@ -661,7 +667,10 @@ impl LogStream {
 
   /// `handle_merged_revisions`' last entry, revision 0 marked `invalid-revnum`, closing an entry's children; nothing
   /// when no entry with children is open (`revision_receiver`'s `stack_depth`).
-  fn end_marker<R: Repository + ?Sized>(&mut self, reads: &mut Reads<'_, R>) -> Result<(), ItemError> {
+  fn end_marker<R: Repository + ?Sized>(
+    &mut self,
+    reads: &mut Reads<'_, R>,
+  ) -> Result<(), ItemError> {
     let Some(depth) = self.receiver.stack_depth.checked_sub(1) else {
       return Ok(());
     };

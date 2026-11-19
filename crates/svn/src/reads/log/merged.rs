@@ -149,7 +149,11 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `get_combined_mergeinfo_changes`' check of one path: its inherited mergeinfo in `revision` against its previous
   /// location's (the copy's source when a copy made it in `revision`, else itself the revision before), passed over
   /// when either is missing, when neither has any, and when the inherited part is the same (issue #4022).
-  fn inherited_change(&self, path: &str, revision: Revision) -> Result<Option<MergeinfoDelta>, Failure> {
+  fn inherited_change(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<MergeinfoDelta>, Failure> {
     let signed = i64::try_from(revision).map_err(|_| Failure::corrupt())?;
     let previous = match self.previous_location(path, signed) {
       Ok(previous) => previous,
@@ -158,7 +162,8 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     };
     let (previous_path, previous_revision) = match previous {
       Some((appeared, previous_path, previous_revision)) if appeared == signed => {
-        let previous_revision = Revision::try_from(previous_revision).map_err(|_| Failure::corrupt())?;
+        let previous_revision =
+          Revision::try_from(previous_revision).map_err(|_| Failure::corrupt())?;
         (previous_path, previous_revision)
       }
       _ => (path.to_owned(), revision.saturating_sub(1)),
@@ -175,7 +180,9 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       return Ok(None);
     }
     let same = match (&inherited_before, &inherited_after) {
-      (Some(first), Some(second)) => Mergeinfo::equals(Some(first), Some(second), Compare::WithInheritance),
+      (Some(first), Some(second)) => {
+        Mergeinfo::equals(Some(first), Some(second), Compare::WithInheritance)
+      }
       (first, _) => Mergeinfo::equals(first.as_ref(), None, Compare::WithInheritance),
     };
     if same {
@@ -327,7 +334,10 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
 /// Whether `get_combined_mergeinfo_changes` passes over a refusal: a path not found or a file where a directory was
 /// expected.
 fn passed_over(failure: &Failure) -> bool {
-  matches!(failure.code, SVN_ERR_FS_NOT_FOUND | SVN_ERR_FS_NOT_DIRECTORY)
+  matches!(
+    failure.code,
+    SVN_ERR_FS_NOT_FOUND | SVN_ERR_FS_NOT_DIRECTORY
+  )
 }
 
 /// `svn_mergeinfo__mergeinfo_from_segments`: each segment with a path as the source `/path` of the revisions after its
@@ -407,14 +417,20 @@ pub(super) fn combine(mergeinfo: &Mergeinfo, reverse: bool, runs: &mut Vec<PathL
       .iter()
       .take_while(|source| source.first().0 == youngest)
       .count();
-    let next_youngest = sources.get(sharing).map_or(youngest, |source| source.first().0);
+    let next_youngest = sources
+      .get(sharing)
+      .map_or(youngest, |source| source.first().0);
     let tail = if next_youngest == youngest || youngest_end < next_youngest {
       youngest_end
     } else {
       next_youngest.saturating_sub(1)
     };
     runs.push(PathListRange {
-      paths: sources.iter().take(sharing).map(|source| source.path.clone()).collect(),
+      paths: sources
+        .iter()
+        .take(sharing)
+        .map(|source| source.path.clone())
+        .collect(),
       start: youngest,
       end: tail,
       reverse,
