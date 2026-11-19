@@ -32,14 +32,15 @@
 //!   sides one and two, stale below a base found, and both of git's exits (only stale entries left; one side exhausted
 //!   with no pending candidate). It runs over runs, not versions: entries are grouped by run bottom, each run's entries
 //!   are joined into one virtual tree over the first-parent tree (sorted in a depth-first order that a meet decides,
-//!   joined where neighbours meet), so chains meet without walking; and a merge's paint jumps along the skip tree past
-//!   every region no other entry reaches. For E entries joined in T runs: at most
-//!   4 + T(2L + 4) + 3L·E(⌈lg E⌉ + 1) + 2P visits.
+//!   joined where neighbours meet), so chains meet without walking; and a merge's paint jumps along the skip tree to
+//!   its lowest skip-tree ancestor at or above every pending entry's generation, past a region no other paint can
+//!   reach, since every version a pending entry reaches is at or below its generation. For S seeds and E entries joined
+//!   in T runs: at most 2S + T(2L + 4) + 3L·E(⌈lg E⌉ + 1) + 2P visits, S two for merge bases.
 //! - [`bisect`]: the same paint with the bad version and the good ones. Every run of candidates is a segment whose
 //!   weight grows by one a version; a merge's weight is the union of its parents' segments (bitsets over the K
 //!   segments); the answer is the exact best of git's rule, `min(weight, count - weight)` \[C: `bisect.c` 187-207\],
-//!   then the greater generation, then the lesser name. Visits as merge bases', at most P more for its merges' parents
-//!   and L more for each segment; K² bits.
+//!   then the greater generation, then the lesser name. Visits as merge bases' with S one more than the good versions,
+//!   at most P more for its merges' parents and L more for each segment; K² bits.
 //!
 //! **Typed refusals** ([`AncestryRefused`]): no such version; parents' values that are not the version's; a value that
 //! does not read as the type's or contradicts what names it; a count past `u64::MAX`; and the store's own (a question
@@ -1027,13 +1028,12 @@ impl Pending {
     Some((key, entries))
   }
 
-  /// The greatest generation of a pending entry below `generation`, or zero.
-  fn highest_below(&self, generation: u64) -> u64 {
+  /// The greatest generation of a pending entry, or zero: no pending entry, and no version one reaches, is above it.
+  fn highest(&self) -> u64 {
     self
       .generations
-      .range(..generation)
-      .next_back()
-      .map_or(0, |(below, _)| *below)
+      .last_key_value()
+      .map_or(0, |(highest, _)| *highest)
   }
 
   /// git's two exits \[C: `paint-down-to-common.adoc`, "Termination" 2 and 5\]: no new merge base can come once no entry
@@ -1253,8 +1253,10 @@ fn paint_joined(
 }
 
 /// The run's paint carried past its bottom (module docs): a merge's paint jumps, when `may_jump`, to its lowest
-/// skip-tree ancestor at or above the greatest generation still pending below it, past a region no other entry
-/// reaches; when no jump is left, its parents are painted.
+/// skip-tree ancestor at or above every pending entry's generation, past a region no other paint can reach (the
+/// region's versions are above that generation, and every version a pending entry reaches is at or below it; a bound
+/// on entries below the merge alone let paint from a higher entry meet in the region unseen, and the oracle's first
+/// run answered the root for a merge base); when no jump is left, its parents are painted.
 fn carry(
   walk: &mut Walk<'_>,
   pending: &mut Pending,
@@ -1269,8 +1271,9 @@ fn carry(
   if is_root {
     return Ok(());
   }
-  if may_jump {
-    let lowest = skip_lowest(walk, bottom, pending.highest_below(generation))?;
+  let floor = pending.highest();
+  if may_jump && floor < generation {
+    let lowest = skip_lowest(walk, bottom, floor)?;
     if lowest != bottom {
       walk.cost.jumps = walk.cost.jumps.saturating_add(1);
       return pending.add(walk, lowest, paint);
@@ -1372,8 +1375,9 @@ fn bases_in(
 /// candidates it reaches, itself included \[C: `bisect.c` 187-207, 269-270\]; then the greater generation, then the
 /// lesser name. `None` when there are no candidates. git's own stops early within a thousandth of the half and takes
 /// the first in its listing among equals; this answer is exact and the same on every tier. Its paint visits what
-/// [`merge_bases`]' does, its weights at most P more (its merges' parents), the answer at most L more for each segment
-/// tied with it; it charges the store K² bits for K segments.
+/// [`merge_bases`]' does with a seed for the bad version and each good one, two visits each; its weights at most P more
+/// (its merges' parents); the answer at most L more for each segment tied with it; it charges the store K² bits for K
+/// segments.
 pub fn bisect(
   store: &mut ContentStore,
   bad: ContentId,

@@ -633,9 +633,10 @@ fn paint_bound(cost: &QueryCost, l: u64) -> u64 {
   4 + cost.runs * (2 * l + 4) + 3 * l * entries * (ceil_lg(entries) + 1) + 2 * cost.parents
 }
 
-/// The bound on a bisect's visits (module docs): the paint's, P more, and L more for each segment.
-fn bisect_bound(cost: &QueryCost, l: u64) -> u64 {
-  paint_bound(cost, l) + cost.parents + cost.segments * l
+/// The bound on a bisect's visits (module docs): the paint's with a seed for the bad version and each of `goods` good
+/// ones, P more, and L more for each segment.
+fn bisect_bound(cost: &QueryCost, l: u64, goods: usize) -> u64 {
+  paint_bound(cost, l) + 2 * number(goods) - 2 + cost.parents + cost.segments * l
 }
 
 /// Asks whether `one` is an ancestor of `two`: the model's answer, within its bound, never opening a merge the model
@@ -745,7 +746,7 @@ fn ask_bisect(
     model.bisect(bad, goods),
     "bisect {bad} against {goods:?}"
   );
-  let bound = bisect_bound(&cost, model.l());
+  let bound = bisect_bound(&cost, model.l(), goods.len());
   assert!(
     cost.visits <= bound,
     "bisect {bad} against {goods:?}: {cost:?} past {bound}"
@@ -1000,7 +1001,10 @@ fn t_a666_a_long_linear_history_is_answered_in_logarithmic_visits() {
     midpoint.weight,
     midpoint.candidates,
   );
-  let within = (cost.visits <= bisect_bound(&cost, l), cost.visits < 1_000);
+  let within = (
+    cost.visits <= bisect_bound(&cost, l, 1),
+    cost.visits < 1_000,
+  );
   assert_eq!(
     (answer, within),
     ((65_536, 65_536, 131_071), (true, true)),
