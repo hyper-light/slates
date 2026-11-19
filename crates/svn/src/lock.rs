@@ -24,7 +24,8 @@
 //!   replaces meets every lock at or beneath it, since "for paths being added or removed, we need to hold the locks for
 //!   that path and any children of that path". Each lock met must be the committer's (`E160039`, checked first; no
 //!   principal at all is `E160034`) and its token among those the commit presented (`E160037`), wherever in the commit
-//!   the token was presented. An accepted commit then releases every presented lock whose token and owner match, the
+//!   the token was presented. The first lock that fails answers, in the order `verify_locks` meets them: the changed
+//!   paths in Subversion's path order, a path's children right after it (A-617). An accepted commit then releases every presented lock whose token and owner match, the
 //!   paths it did not change among them, unless the client asked to keep them (`svnserve/serve.c` `commit` and
 //!   `unlock_paths`).
 //! - **Expiry** (`lock.c` `lock_expired`). A lock expires once the time is past its expiry; one without an expiry never
@@ -59,6 +60,7 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::index::{Action, NodeKind, Revision, is_canonical};
@@ -597,8 +599,8 @@ impl LockTable {
   }
 
   /// Locks at the verdict (§4.17.4 item 3.4; module documentation, "At the verdict"): the work's `changes`, each a path
-  /// and what the work did to it, checked at `now` against the locks they meet, refused at the first lock in path order
-  /// that the commit may not pass. Accepted, the entries remove the expired locks the check met and, unless the commit
+  /// and what the work did to it, checked at `now` against the locks they meet, refused at the first lock the commit may
+  /// not pass in the order `verify_locks` meets them (Subversion's path order, A-617). Accepted, the entries remove the expired locks the check met and, unless the commit
   /// keeps its locks, every presented lock whose token and owner match; the merge task appends them in the verdict's
   /// one step. A refused commit records nothing.
   pub fn verdict<'c>(
@@ -609,7 +611,7 @@ impl LockTable {
   ) -> Result<Vec<LockEntry>, LockRefusal> {
     let presented: BTreeSet<&str> = commit.presented.values().map(String::as_str).collect();
     let mut removed = BTreeMap::new();
-    for lock in self.met(changes)?.into_values() {
+    for lock in self.met(changes)? {
       if lock.expired(now) {
         removed.insert(lock.path.as_str(), lock);
       } else {
@@ -723,20 +725,31 @@ impl LockTable {
     }
   }
 
-  /// The locks the work's changes meet, by path: a modified path's own lock, and every lock at or beneath a path
-  /// added, deleted or replaced (`transaction.c` `verify_locks`).
+  /// The locks the work's changes meet, each once, in the order `transaction.c` `verify_locks` meets them (3527-3593):
+  /// the changed paths in Subversion's path order (`svn_sort_compare_items_as_paths`, 3539), a modified path's own lock
+  /// and every lock at or beneath a path added, deleted or replaced, a path beneath the last one so read skipped (3564),
+  /// since its locks were met there. Beneath a path read whole, FSFS walks the lock digests in a hash table's order,
+  /// which nothing fixes; here in the same path order, the path's own lock first, as FSFS's walk sends it first.
   fn met<'c>(
     &self,
     changes: impl IntoIterator<Item = (&'c str, Action)>,
-  ) -> Result<BTreeMap<&str, &Lock>, LockRefusal> {
-    let mut met = BTreeMap::new();
-    for (path, action) in changes {
-      checked(path)?;
-      let reached: Vec<&Lock> = match action {
+  ) -> Result<Vec<&Lock>, LockRefusal> {
+    let mut met: Vec<&Lock> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut read_whole: Option<&str> = None;
+    for (path, action) in in_path_order(changes)? {
+      if read_whole.is_some_and(|whole| path == whole || relative(whole, path).is_some()) {
+        continue;
+      }
+      let mut reached: Vec<&Lock> = match action {
         Action::Modify => self.locks.get(path).into_iter().collect(),
-        Action::Add | Action::Delete | Action::Replace => self.at_or_beneath(path),
+        Action::Add | Action::Delete | Action::Replace => {
+          read_whole = Some(path);
+          self.at_or_beneath(path)
+        }
       };
-      met.extend(reached.into_iter().map(|lock| (lock.path.as_str(), lock)));
+      reached.sort_by(|first, second| path_order(&first.path, &second.path));
+      met.extend(reached.into_iter().filter(|lock| seen.insert(lock.path.as_str())));
     }
     Ok(met)
   }
@@ -912,6 +925,27 @@ fn removed_path(entry: &LockEntry) -> Option<String> {
     LockEntry::Removed { path, .. } => Some(path.clone()),
     LockEntry::Set(_) => None,
   }
+}
+
+/// The changed paths, each checked canonical (`E160005`), sorted as `verify_locks` sorts them ([`path_order`]).
+fn in_path_order<'c>(
+  changes: impl IntoIterator<Item = (&'c str, Action)>,
+) -> Result<Vec<(&'c str, Action)>, LockRefusal> {
+  let mut ordered = Vec::new();
+  for (path, action) in changes {
+    checked(path)?;
+    ordered.push((path, action));
+  }
+  ordered.sort_by(|(first, _), (second, _)| path_order(first, second));
+  Ok(ordered)
+}
+
+/// Subversion's order of two canonical paths (`path.c` `svn_path_compare_paths` 418-453, by which
+/// `svn_sort_compare_items_as_paths` sorts): "Children of paths are greater than their parents, but less than greater
+/// siblings of their parents", which is their names compared one by one (`/a/b` before `/a-b`, which byte order puts
+/// first).
+fn path_order(first: &str, second: &str) -> Ordering {
+  first.split(SEPARATOR).cmp(second.split(SEPARATOR))
 }
 
 /// `path` relative to `base` when it lies beneath it (`svn_fspath__skip_ancestor`, less the path itself).
