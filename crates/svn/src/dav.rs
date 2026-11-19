@@ -34,11 +34,15 @@
 //! - **A path holds no `.` or `..` name, and is no URL**: `dav_svn__test_canonical` passes both, and a filesystem path
 //!   with either is refused later by `svn_fs__path_valid`; a URL is never what ra_serf sends in a body.
 //!
-//! Owed (the second part of piece 13): the update-report and replay responses (the editor drives, svndiff windows in
-//! base64), PROPPATCH, LOCK and UNLOCK bodies, and the `list-report` and `file-revs-report` bodies.
+//! The second part of piece 13 (A-627): `list-report` and `file-revs-report` read and answered ([`listing`]), and
+//! PROPPATCH, LOCK's `lockinfo`, `Timeout` and `Lock-Token` read ([`locking`]). The update-report's answer is
+//! [`drive`]. Owed: the replay answer and LOCK's answer (`util_lock.c`'s `activelock`).
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+pub mod drive;
+pub mod listing;
+pub mod locking;
 pub mod request;
 pub mod response;
 mod time;

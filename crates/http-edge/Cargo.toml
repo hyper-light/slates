@@ -1,0 +1,27 @@
+[package]
+name = "slates-http-edge"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The HTTP edge's engine for slates' version-control servers (§4.17.2, A-625): one connection's request loop over slates-http as a state machine over bytes -- HTTPS through rustls, Basic and Bearer credentials, 100-continue, keep-alive, streamed bodies, typed refusals and the staged close -- holding no socket, no clock and no thread."
+
+[dependencies]
+# HTTP/1.1's request codec and reply framing (A-595).
+slates-http = { workspace = true }
+# HTTPS (§4.17.2 "Transports" item 1: "TLS is rustls over aws-lc-rs"), driven sans-io beneath the HTTP framing. Its
+# configuration crosses its API as `Arc` (D-8 exception 2): one per connection, held by that connection alone.
+rustls = { workspace = true }
+
+[dev-dependencies]
+# Self-signed certificates for the in-memory handshakes, signed through aws-lc-rs.
+rcgen = { workspace = true }
+# gzip bodies for the streaming tests, through the workspace's one deflate engine (A-607).
+flate2 = { workspace = true }
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+
+[lints]
+workspace = true

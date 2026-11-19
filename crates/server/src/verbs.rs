@@ -58,7 +58,7 @@ pub(crate) fn to_wire_volume(id: DbVolumeId) -> VolumeId {
 }
 
 /// A wire principal (as `share` names one) as the catalog's, with the host it names (A-237).
-fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Principal {
+pub(crate) fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Principal {
   match principal {
     slates_ipc::protocol::Principal::Uid { host, uid } => Principal::Uid {
       host: slates_db::HostId(*host),
@@ -2572,7 +2572,8 @@ pub fn serve(
     RequestBody::CreateRepository { name, .. } => Some(owner_of_name(name, state.shards.len())),
     RequestBody::CreateBranch { repository, .. }
     | RequestBody::BindBranch { repository, .. }
-    | RequestBody::RetireBranch { repository, .. } => {
+    | RequestBody::RetireBranch { repository, .. }
+    | RequestBody::SetRepositoryPolicy { repository, .. } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5072,6 +5073,12 @@ fn dispatch_inner(
     RequestBody::RetireBranch { repository, name } => {
       crate::repository::retire_branch(state, principal, (&repository, &name))
     }
+    RequestBody::SetRepositoryPolicy {
+      repository,
+      read,
+      rules,
+      hooks,
+    } => crate::repository::set_policy(state, principal, (&repository, read), (&rules, &hooks)),
     RequestBody::Checkout {
       green,
       base,
@@ -8510,10 +8517,9 @@ fn assemble_post_state(
       encoded_node = node.encode();
       (&encoded_node, 0)
     } else if op.kind == OpKind::SetXattr {
-      let Ok(name_index) = u16::try_from(op.at) else {
-        continue;
-      };
-      let Some(name) = doc.paths.path(name_index) else {
+      // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
+      // naming more than 65,535 paths had no value laid in.
+      let Some(name) = doc.paths.path(op.at) else {
         continue;
       };
       let Some(value) = declared_xattr(journal, path, name) else {
