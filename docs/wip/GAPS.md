@@ -453,10 +453,22 @@
 > byte is read a window at a time. Held to stock git's fixtures (`fixtures/view`) and to an oracle reading every object
 > of the store and the push back through the view's packs, counted (Windows x86_64, jupiter: red 13 of 15, then the
 > two vacuous ones made to read and red 2 of 2; green 15 of 15, the crate 462 of 462 with 4 ignored; macOS owed). Found: stock receive-pack sets
-> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unsets it (reported to main). Owed: part 2, the view presented to the hook
+> `GIT_PUSH_OPTION_COUNT=0` where `vcs_hooks` unset it (fixed, below). Owed: part 2, the view presented to the hook
 > driver on the owner shard (after A-662), seals kept as derived data; a seal made at encoding; `packed-refs` by ranges
 > from the register; the cover as derived data and fragments merged into fewer packs; main's run of stock git over a
 > mounted view.
+> **Fixed (2026-11-19, g293; found by A-665): a git hook given no push options is handed `GIT_PUSH_OPTION_COUNT=0`,**
+> as stock receive-pack 2.50.1 hands it (`cmd_receive_pack` always passes its option list, so `run_and_feed_hook` sets
+> the count; `githooks.adoc` says unset), where `vcs_hooks::push_option_env` had unset it; `EnvValue::Unset`, its one
+> producer, removed with the driver's `env_remove`. Held to A-665's recorded hooks (pre-receive, update, post-receive of
+> three pushes; Windows x86_64, jupiter: red 2 of 2 new failing, green vcs_hooks 33 of 33; the Unix driver's test
+> filed); `docs/bugs/2026-11-19-a-git-hook-without-push-options-was-handed-no-count.md`. The sweep of the other
+> hooks' variables for a stock value slates leaves unset: git's push-certificate variables are set only with a
+> certificate (`prepare_push_cert_sha1`), as slates sets none; `GIT_DIR=.` is A-665's view's, wired by its part 2;
+> Subversion's environment is its hooks-env section alone (A-623). Owed, Mercurial 7.2's: `_exthook` always sets
+> `HGPLAIN` (`1` by default, `hooks.<name>:run-with-plain`, `configitems.toml`; empty when off) and `shellenviron` sets
+> `HG` to hg's executable, both unset under slates; and the transaction's `HG_TXNID` and `HG_TXNNAME`
+> (`research/mercurial-server.md` §6), which slates' changegroup hooks lack.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -2691,25 +2703,61 @@
 > bytes: the green keeps the link on `x`, whose content changed. POSIX gives the link the old file and `x` a new one
 > (A-646: "a later file at a path the node left is another node"). A rename onto a name the work made a hard link at is
 > refused instead, typed (`PathKindConflict` from `check_no_file_directory_collision`), a file and a link at one name
-> being among the deriver's compositions owed. A-663's oracle generates neither. Owed: the replacement composed as the
-> node model says (a new node at the name, the link's node handed on as `Green::node_moves` hands one), a failing test
-> first, and the oracle's works widened to it.
+> being among the deriver's compositions owed. A-663's oracle generates neither. Since A-669 a work that wrote to the
+> old node first is refused, typed (`Unsupported`), never composed with its write lost. Owed: the replacement composed
+> as the node model says (a new node at the name, the link's node handed on as `Green::node_moves` hands one), a
+> failing test first, and the oracle's works widened to it.
 
-> **A write to a file a hard link also names is lost when the work then removes the file or renames another over it:
-> found open (2026-11-19, A-663's oracle on its first run, Windows x86_64 (jupiter), g307; §4.16 "Composition at
-> seal"; A-646's decision; `crate::increment`, `Green::hand_over`).** With the base holding `g` and a hard link `h` to
-> it, a work that appends to `g` and then removes it composes to `Unlink g` alone: the deriver drops a removed file's
-> content operations (`apply_unlink` clears them), and the green hands `g`'s node to `h` with the head's bytes
-> (`Green::hand_over` copies the home's content as the head holds it). POSIX keeps the write: `h` is the node's last
-> name and reads it, as the work's own volume does. The oracle's minimal case, `[(31, 13, 0), (22, 88, 0)]`, read `h`
-> as `<g>\n` in the green that accepted the work, in its restated journal replayed and in that journal composed again,
-> against `<g>\n<+0>\n` in the work's own order. By reading, a rename over the file (`mv f g` after the write) loses the
-> write the same way (`apply_rename` drops the replaced file's operations), and so does the case where the link is one
-> the work made to a base file; a link the work made to a file it made is refused instead (`Unsupported`,
-> `made_target_moved`). The submit is accepted without the write, so this is a lost update, not a refusal. A-663's
-> oracle generates none of them (its works never remove or replace the file of a node they wrote to while another name
-> names it). Owed: a failing test first; then the write carried to the link that inherits the node (or, until it is, a
-> typed refusal in place of the silent loss); and the oracle's works widened to it.
+> **A write to a file a hard link also names was lost when the work then removed the file or renamed another over it:
+> fixed (2026-11-19, A-669, g307; found by A-663's oracle on its first run, Windows x86_64 (jupiter); §4.16 "Composition
+> at seal"; A-646's decision; `crate::increment`, `Green::merge_handed`).** With the base holding `g` and a hard link
+> `h` to it, a work that appended to `g` and then removed it composed to `Unlink g` alone: the deriver dropped a removed
+> file's content operations (`apply_unlink` cleared them), and the green handed `g`'s node to `h` with the head's bytes
+> (`Green::hand_over`). POSIX keeps the write at `h`, as the work's own volume does; the green and the rebase did not.
+> A rename over the file (`mv f g` after the write) lost it the same way, and so did a write handed on through a rename
+> (`mv g f; echo w >> f; rm f`).
+>
+> Fixed by the rule A-646's decision now states: the link a removed or replaced home leaves its node to takes the node
+> as the version leaves it. The deriver keeps a removed file's writes and declares them at the least base link that
+> still names its node as the base did (`heirs_of_writes`, each link's node fixed when the journal makes it); the engine
+> makes that link the node's home with the writes, its mode and its attributes (`Green::merge_handed`); a rebase
+> restates the work's own form, the writes on the home and then its removal (`Green::handed_in`). Refused, typed
+> (`Unsupported`) rather than lost: a write whose node only links the work made still name, and a write to a file the
+> work then made again at its name (the entry above). Tests: five cases in `crates/merge/src/engine/restate_tests.rs`,
+> each red first, and A-663's oracle, whose works no longer leave the case out, with it in the census. Evidence (Windows
+> x86_64, jupiter, 2026-11-19; the macOS run owed): red over main's engine, the five cases and the oracle failing
+> (`cargo test --locked -p slates-merge --lib restate_tests` at 59ee404f5, 6 of 11, A-663's five passing); the first
+> green run's oracle found a link resolved through the links standing at the seal (`ln h l; rm h`), fixed in the same
+> change; green 152 of 152 over main at 0e755c9b1 (`cargo test --locked -p slates-merge --lib` at 72177dcd7, and at
+> 5f6cc2d3a with the census showing the case rather than requiring it), fmt clean; merged with main at f6ec36df2
+> (A-659's stacks), 169 of 169 at 85b5b7eee, fmt clean. Bug record:
+> `docs/bugs/2026-11-19-a-write-to-a-file-a-hard-link-names-was-lost-with-the-file.md`.
+
+> **A write to a file a later version linked was lost when the work removed the file: fixed (2026-11-19, A-670, g307;
+> found by A-669's sweep, by reading; §4.16 "The verdict"; A-646's decision; `Green::leaves_to_an_unseen_link`).** A
+> work based before a version that links `a` to `g` writes to `g` and removes it, or renames another file over it. Its
+> deriver saw no link, so the writes went with the node in its own volume; the verdict accepted the removal, since a
+> link made to a file records no change of the file, and the commit handed `g`'s node to `a` with the head's bytes.
+> The same in a stack (A-659): an upper's base, its lower's post-state, never holds a link another work made while the
+> stack was in flight, and the restated upper is judged as based on a version after that link.
+>
+> Fixed: the verdict refuses removing a file, or renaming another over it, when a link naming it now was made after
+> the work's base and no link the base had to it outlives the work, unless the increment hands the node on itself
+> (A-669): delete against modify, or rename against rename. The increment cannot say whether the work wrote, so a
+> removal without a write is refused alike; the rebased work removes the file again, the link keeping the node. A
+> stack's upper is refused alike for a link another version made under the stack (`upper_unseen_links`). A-643's
+> whole-state model states the rule; A-663's oracle heads may link a file late. Tests: four verdict cases and a stack
+> case, red first; a base link outliving the work keeps the removal accepted; A-659's stacks carry an upper's write
+> handed on to a link (the question A-669 left, answered by test, nothing to fix). Evidence (Windows x86_64, jupiter,
+> 2026-11-19; the macOS run owed): red over main's engine at cac45de71, 6 failing (the four cases, the stack case and
+> the oracle's fixed history), 14 passing; green 178 of 178 over main at 6e42e7a2c (e8c10097e), fmt clean. Bug record:
+> `docs/bugs/2026-11-19-a-write-to-a-file-a-later-version-linked-was-lost-with-the-file.md`.
+>
+> **The restatement oracle's census could be met by luck: fixed (2026-11-19, A-670, g307; main's finding on A-669's
+> runs).** Its counts rested on the generated works alone, with a random seed each run: `to_made` ran 12, 4 and 6 over
+> three runs, so a run meeting a case zero times would fail, and a case could be met by no history at all. One fixed
+> history a counted case now runs before the generated works (`fixed_histories`), so every count is met on every run,
+> and the generated works add to them.
 
 > **A rebased work's other restatements a volume refuses: found open (2026-11-19, A-663's sweep, g307, by reading;
 > §4.16 "Rebase, the only corrective path"; `Green::rebased_from`).**
