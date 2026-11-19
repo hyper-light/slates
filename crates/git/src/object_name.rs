@@ -430,6 +430,13 @@ fn hex_value(digit: Option<u8>) -> Option<u8> {
     .and_then(|value| u8::try_from(value).ok())
 }
 
+/// The name's bytes, as the object store keys and compares names (A-614: `slates_vcs::Naming::Id`).
+impl AsRef<[u8]> for ObjectId {
+  fn as_ref(&self) -> &[u8] {
+    self.as_bytes()
+  }
+}
+
 /// The two lower-case hexadecimal digits of `byte`, high first.
 fn hex_pair(byte: u8) -> [u8; 2] {
   let digit = |value: u8| HEX_DIGITS.get(usize::from(value)).copied().unwrap_or(b'0');

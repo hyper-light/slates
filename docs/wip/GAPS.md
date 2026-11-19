@@ -218,6 +218,34 @@
 > 203 of 203 (25 new), red first against a codec that refused everything (24 of 25 failed) and nine ways by mutation.
 > Owed of piece 14: serving a v0 or v1 fetch (the negotiation's state under `multi_ack`, `multi_ack_detailed` and neither, `no-done`,
 > the stateless HTTP rounds), then `packfile-uris` and `bundle-uri`.
+> **A-614 (2026-11-19, g083; piece 5's part 1):** `slates-git` keeps a repository's objects on `slates-vcs` (`store`):
+> objects in through one trait, `Entries`, which A-608's reader fits; each named once by git's rule, the store's
+> parameter, a claimed id checked against it, and a collision attack refused in git's words; held by the push until its
+> verdict. Committed, an object gets a position and its rows (a commit's with its tree and parents by position, its
+> date and its generation number); each version keeps D(k) and the green its reached set as runs of positions, computed
+> at admission by walks that stop at what the green reached (a reached tree skipped whole), a fast-forward growing the
+> set and a create or rewrite making it again from the nearest green head below, so a ref made at another's head walks
+> nothing; a version's head, root tree and any path read from rows and trees with no walk. An oracle holds the store to
+> a map model over generated histories in both formats; eleven mutations each turned tests red (`cargo test -p
+> slates-git --lib store::`, 14 of 14, Mac Studio; see A-614). Owed: part 2, the pack fragments and the base pack with
+> their learned window, depth, zlib level and rebuild point; part 3, the changed-path Bloom filters; the walks and a
+> commit sliced under the shard's budget; the versions' records as content.
+> **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
+> stock client speaks it, at git-lfs v3.8.1:
+> - the batch API's requests and verify callbacks;
+> - its answers: the basic adapter's actions with headers checked, nothing for an object held, per-object errors with
+>   LFS's codes;
+> - the locks API's bodies and its list query as Go writes it, and its answers with `next_cursor`;
+> - the pointer file, read as git-lfs's own reader reads it, canonical told apart, and written as its one encoding.
+> JSON is validated as a loop, its nesting charged to the admission; malformed JSON, unknown operations, oids that are
+> not 64 lower-case hexadecimal digits, negative sizes and numbers past Go's `int64` are refused by kind. Golden
+> vectors: git-lfs's documents verbatim, its pointer tests, and the stock git-lfs 3.8.1 client's 24 recorded exchanges
+> (`fixtures/lfs/`). `cargo test -p slates-git --lib` on the Mac Studio: 126 of 126, the 50 new failing first against
+> stubs.
+> Owed: serving it (the routes in the smart HTTP server, authorization by operation and lock owner, the object store
+> with each object's SHA-256 an index row and uploads checked against it, lock records per repository); expiries
+> learned from the deployment's token lifetimes; the stock client end to end against slates' own server (main's run);
+> Mercurial's `lfs` (§4.17.3), which moves the module to a crate both servers use.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes

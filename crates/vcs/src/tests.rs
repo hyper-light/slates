@@ -321,6 +321,40 @@ fn an_object_its_tool_will_not_name_is_refused_with_the_tools_own_reason() {
   assert_empty(&store);
 }
 
+/// A-614 (§4.17.2 "A push", item 3: a store that names each object itself holds it under that name). Do: hold bytes
+/// under the name their tool gives them, then the same bytes again, then other bytes under that name; list what the
+/// push holds. Expect: `New`, then `Again` with one hold, then `Collision` with nothing stored; the push listing its one
+/// object with its kind, root and length.
+#[test]
+fn bytes_named_by_their_caller_are_held_under_that_name() {
+  let mut store = store();
+  let mut push = Quarantine::new();
+  let bytes: &[u8] = b"a blob its store named";
+  let id = named(&GitShaped, 3, b"", bytes);
+  assert_eq!(
+    push.hold_named(&mut store, &id, 3, bytes),
+    Ok(Admitted::New)
+  );
+  assert_eq!(
+    push.hold_named(&mut store, &id, 3, bytes),
+    Ok(Admitted::Again)
+  );
+  assert_eq!(store.holders(&ContentId::of(bytes)), 1);
+  assert!(matches!(
+    push.hold_named(&mut store, &id, 3, b"other bytes"),
+    Err(AdmitRefused::Collision { .. })
+  ));
+  assert!(!store.contains(&ContentId::of(b"other bytes")));
+  let held: Vec<(Vec<u8>, u8, ContentId, u64)> = push
+    .objects()
+    .map(|(id, kind, content, len)| (id.to_vec(), kind, content, len))
+    .collect();
+  let len = u64::try_from(bytes.len()).unwrap();
+  assert_eq!(held, vec![(id, 3, ContentId::of(bytes), len)]);
+  push.abandon(&mut store).unwrap();
+  assert_empty(&store);
+}
+
 /// A-581, §4.17.1 "Objects" item 1, D-6. Do: push a git-shaped object of ten windows (a full `a` window three times)
 /// and an object equal to that window, commit both, and read the long one back through its row. Expect: the long
 /// object's row names its root, a list; its bytes read back whole by its row's length; the short object is the long
