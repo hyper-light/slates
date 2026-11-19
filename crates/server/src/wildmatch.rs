@@ -290,6 +290,7 @@ fn class(pattern: &[u8], open: usize, set: &mut ByteSet) -> Option<Member> {
 }
 
 /// A set of bytes, one bit each.
+/// Shape: the 256 byte values in four 64-bit words.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ByteSet([u64; 4]);
 
@@ -482,6 +483,7 @@ pub(crate) mod reference {
   /// The `CC_EQ` chain: whether `t_ch` is in the class `name`, or `None` for "malformed [:class:] string".
   fn class_holds(name: &[u8], c: u8) -> Option<bool> {
     let isalpha = sane(c, A);
+    // Format: the C locale's isprint is 0x20 to 0x7e; ASCII's case bit is 0x20 (`dowild` uses the C locale).
     let isprint = (0x20..=0x7e).contains(&c);
     let isspace = sane(c, S);
     Some(match name {
@@ -491,6 +493,7 @@ pub(crate) mod reference {
       b"cntrl" => sane(c, X),
       b"digit" => sane(c, D),
       b"graph" => isprint && !isspace,
+      // Format: a lower-case ASCII letter has the case bit 0x20 set, an upper-case one clear.
       b"lower" => isalpha && c & 0x20 != 0,
       b"print" => isprint,
       b"punct" => sane(c, P | R | G | U),

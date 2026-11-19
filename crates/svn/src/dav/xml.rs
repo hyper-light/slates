@@ -63,7 +63,7 @@ const BASE64_MASK: u32 = 0x3f;
 /// return and delete.
 /// Format: `libsvn_subr/xml.c` `svn_xml_is_xml_safe`; `svn_ctype_iscntrl` is bytes 0 to 31 and 127 (`ctype.c`), the
 /// same bytes as `u8::is_ascii_control`.
-const XML_SAFE_CONTROLS: [u8; 4] = [b'\t', b'\n', b'\r', b'\x7f'];
+const XML_SAFE_CONTROLS: [u8; 4] = *b"\t\n\r\x7f";
 
 /// The control characters `svn_xml_fuzzy_escape` keeps as they are.
 /// Format: `libsvn_subr/xml.c` `svn_xml_fuzzy_escape`: line feed, carriage return and tab.

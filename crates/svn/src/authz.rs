@@ -112,7 +112,7 @@ impl<'a> Principal<'a> {
   /// The principal as evaluated: the empty name is anonymous.
   fn evaluated(self) -> Self {
     match self {
-      Self::User(user) if user.is_empty() => Self::Anonymous,
+      Self::User([]) => Self::Anonymous,
       other => other,
     }
   }

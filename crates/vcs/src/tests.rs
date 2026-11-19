@@ -822,7 +822,14 @@ fn blobs() -> Vec<Vec<u8>> {
 /// commit 2, abandon 1, insert 3, get 2, seal 2, compact 2, due 1, fork 1, release 1, recreate 1.
 fn step() -> impl Strategy<Value = Step> {
   (
-    (0u8..20, 0..PUSHES, 0..INDEXES, any::<bool>(), 0..blobs().len(), 1u8..3),
+    (
+      0u8..20,
+      0..PUSHES,
+      0..INDEXES,
+      any::<bool>(),
+      0..blobs().len(),
+      1u8..3,
+    ),
     (
       proptest::bool::weighted(0.1),
       0u8..12,
