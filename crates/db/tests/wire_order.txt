@@ -170,6 +170,7 @@ Op 94 ReviewApprovalStaled
 Op 95 ReviewClosed
 Op 96 RepositoryAdvanced
 Op 97 RepositoryPolicySet
+Op 98 IdentitiesSet
 PlacementState 0 Local
 PlacementState 1 Placed
 PolicyEffect 0 Allow

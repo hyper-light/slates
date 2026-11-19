@@ -732,6 +732,12 @@ pub enum Op {
     /// The policy, its version the next.
     policy: crate::catalog::RepositoryPolicy,
   },
+  /// A principal's tool identities were set whole by its owner on the control channel (§4.13; §4.17.1 "A push is a
+  /// work" item 4; A-664), as the version after the one its setter read. Appended.
+  IdentitiesSet {
+    /// The record, its version the next.
+    record: crate::catalog::IdentityRecord,
+  },
 }
 
 impl Op {
@@ -836,6 +842,7 @@ impl Op {
       Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
       Op::RepositoryDefaultSet { .. } => "repository_default_set",
       Op::RepositoryDestroyed { .. } => "repository_destroyed",
+      Op::IdentitiesSet { .. } => "identities_set",
     }
   }
 }
