@@ -17,13 +17,19 @@
 > Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
 > the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
 > by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
-> macOS run owed). OWED: part 1's server half (after main's `slates-server` baseline on jupiter): the owner's setting on
-> the control channel (the launcher's proof, `Forbidden` on a consumer's channel, each identity held to its tool's
-> rules); a session's identities resolved once, at its first submit, from the principal's partition and kept with the
-> session (main's ruling: the owner never reads them per merge, and a change mid-session applies from the next
-> session); the submit carrying its message and the session's identities, refused at the green's owner
-> `MessageRequired` without a message and `IdentityRequired` without an identity in the repository's tool, before any
-> work is built; part 3, the made commit recorded with the version (the merge record
+> macOS run owed). Part 1's server half BUILT (`crates/server/src/identities/tests.rs`; A-664's entry has the runs, on
+> macOS arm64, the fleet's submits through sessions at f = 1 among them; Windows and Linux main's):
+> `SetIdentities` on the control channel (the launcher's proof, `Forbidden` on a consumer's channel, git's identity held
+> to `slates_git::derived::Identity`, a Mercurial user as Mercurial 7.2's `changelog.add` writes it: not empty, one
+> line, no byte it strips from either end), recorded on the principal's partition; a session's
+> identities read once, at its first submit, kept with the session and written into each submit over the client's
+> claim (main's ruling), the read waiting for room on the partition's channel and one never answered refusing the
+> submit `Overloaded`, unrecorded; every submit carrying its message (`Authorship`; `RequestBody::submit` the one
+> constructor, `with_message` the builder); the green's owner refusing `MessageRequired` and `IdentityRequired` beside
+> `EvidenceRequired`, before any work is built (the api's contract 51). OWED: the clients' surfaces
+> (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
+> message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
+> commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
 > it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
 > `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
@@ -2965,6 +2971,19 @@
 >    entries examined where the scan examined 2,000 (r960). Since part 2a it is one lookup, its last change: the links
 >    naming the node keep it rather than refuse its removal.
 > Bug record (1, 3): `docs/bugs/2026-11-19-a-rename-over-an-unchanged-link-was-refused-and-an-ipc-unlink-scanned-the-green.md`.
+
+> **A link to a node made at its target after the work's base was accepted: fixed (2026-11-19, A-676, g306; found by
+> g307's reading while fixing `hard_link_merges`; §4.16 "The verdict", A-646).** A hard link names the node at its
+> target at the work's base, and `Green::node_home` judged a file or IPC node standing at the target only by a removal
+> since the base, so one made there after the base, where none stood, was taken as the link's node: a forged link named
+> a node its work never saw (no deriver makes it, since `link(2)` answers `ENOENT` at the base). Now
+> `Green::node_stood_at` reads the base (`content_len_at`, `special_at`, never copying the file), and a node that stood
+> nowhere then is refused delete against modify, as one removed since is. Test:
+> `a_link_to_a_node_made_after_its_base_conflicts` (`crates/merge/src/engine/node_tests.rs`, a file and a FIFO). macOS
+> arm64 (Mac Studio, kiln, 2026-11-19): red with `engine.rs` as before the fix, both links accepted; green over main
+> 545181b30, `slates-merge --lib` filtered to the node, replaced-node, restate, stack and compute tests 68 of 68,
+> `--test engine` filtered to hard links 6 of 6, fmt clean; the other platforms are main's. Bug record:
+> `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md`.
 
 > **A chain entry's encoding scanned every op of the increment for each splice: fixed (2026-11-19, A-632, g267; found
 > by A-621's reading; §4.16 "Commit", `crates/merge/src/chain_entry.rs`).** `put_applied` and `take_applied` found a

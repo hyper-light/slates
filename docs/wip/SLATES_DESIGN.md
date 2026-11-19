@@ -11492,7 +11492,8 @@ against what that copy brings there.
 > - Renaming the home moves the node, and its links name it at the new path.
 > - A later file at a path the node left is another node, which no link names.
 > - A link a work makes names a node: the one at the target at the work's base (a link's home while that link stood
->   unchanged since, a file while it was not removed since), or the one the work makes.
+>   unchanged since, a file or IPC node that stood there at the base and was not removed since), or the one the work
+>   makes. A node made at the target after the base is none the work saw (A-676).
 >
 > The engine holds a node at its home and keeps every link's target there. The moves are derived in the commit from the
 > head and the version's own effects (`Green::node_moves`), never recorded: a replay derives the same, and a rebase
@@ -11508,7 +11509,10 @@ against what that copy brings there.
 > restate_tests.rs`). Since A-670 a work never hands a node to a link it never saw: removing a file, or renaming
 > another over it, is refused when a link naming it was made after the work's base and none of the base's links to it
 > outlives the work (delete against modify, rename against rename), unless the work hands the node on itself; a
-> stack's upper alike for a link another version made under the stack.
+> stack's upper alike for a link another version made under the stack. Since A-676 a link to a file or IPC node made
+> at its target after the work's base, where none stood then, is refused delete against modify
+> (`Green::node_stood_at`): the verdict had judged such a target only by a removal since, so a forged link named a node
+> its work never saw.
 
 **Splice.** For each accepted operation the new version's entry for that path gets an extent
 list built from the base version's extents with the operation's range replaced by a reference
@@ -12081,9 +12085,10 @@ is one more version, and the chain itself is never rewritten.
 > trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
 > and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
 > client pushed keeps the client's commit. Item 4's identities are kept in each principal's record (A-664 part 1,
-> `slates-db`'s `IdentityRecord`). Owed: setting them on the control channel, a session carrying them from its first
-> submit, and the refusals at submit (part 1's server half), the commit recorded with the version and admitted (part
-> 3), Mercurial's and Subversion's.
+> `slates-db`'s `IdentityRecord`), set by their owner on the control channel (`SetIdentities`), read once a session at
+> its first submit and carried by every submit with its message (`Authorship`); a repository's green refuses a submit
+> without either, `MessageRequired` or `IdentityRequired`, before any work is built (A-664 part 1). Owed: the commit
+> recorded with the version and admitted (part 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -48895,6 +48900,124 @@ the batch `encode` removed, `in_fragment` shared; `store::upload`: `handles` sha
   `Entry::Create::from`, `Unappended::Refused`, `append_declined`, `atomic_declined`, module docs),
   `receive/session.rs`, `receive/request.rs` (`RequestReader` keeps a copy), `receive/mod.rs` (`HiddenRefs for &T`),
   and their tests; GAPS (the §4.17 entry).
+
+### A-676 — A link to a node made at its target after the work's base is refused (2026-11-19, g306, UI goal 93 (kiln 51cef9f7); §4.16 "The verdict", A-646's decision; found by g307's reading)
+
+- **What was wrong.** A hard link a work makes names the node at its target at the work's base (A-646). For a file or
+  IPC node standing at the target now, `Green::node_home` asked only whether one was removed there after the base
+  (`file_removed_since`), so a node made there after the base, where nothing stood at it, answered as the link's node:
+  the link was accepted naming a node its work never saw, though `node_home`'s own doc and A-646's rule make it delete
+  against modify. No deriver makes such a link (`link(2)` answers `ENOENT` at the base, and a target the work makes is
+  its own, `made`), so only a forged or hand-built increment reached it. g307 found it by reading, fixing
+  `hard_link_merges` (8d7209388).
+- **The change.** `Green::node_stood_at(path, base)`: whether a file or an IPC node stood at the path at the base, read
+  off the histories by the one history rule and the copies (`content_len_at`, `special_at`), never by copying the file;
+  `node_home` refuses a node at the target that stood nowhere at the base, as it refuses one removed since. Exact at and
+  above the fold floor, as `special_kind_changed`'s read of the base is; the service folds only below the oldest base a
+  live reader names. A copy replacing the target after the base needs nothing new: `remove_file_now` records it in
+  `file_removed`.
+- **Tests** (macOS arm64, Mac Studio, kiln, debug, 2026-11-19). `a_link_to_a_node_made_after_its_base_conflicts`
+  (`crates/merge/src/engine/node_tests.rs`): a file, and a FIFO (`Work::fifo`), made at `made` after version 0, each
+  linked by a work based at 0; each must be refused `DeleteModify` with no link made, and the test names every kind it
+  misjudges. Red (20:05 UTC) with `engine.rs` put back to its state before the fix (main effb30ac2) in a scratch clone:
+  `cargo test --locked -p slates-merge --lib -- engine::node_tests::a_link_to_a_node_made_after_its_base_conflicts`
+  failed, both links accepted (`a file: Accepted { version: 2 }; a FIFO: Accepted { version: 2 }`). Green over main
+  effb30ac2: `cargo test --locked -p slates-merge --lib -- engine::node_tests engine::replaced_node_tests
+  engine::restate_tests engine::stack` 62 of 62. Over main 545181b30 (A-658 part 1, the verdict computed anywhere;
+  20:11 UTC): the same with `engine::compute_tests` 68 of 68; `cargo test --locked -p slates-merge --test engine --
+  hardlink hard_link` 6 of 6; `cargo fmt -p slates-merge -- --check` clean. Main's commits since, to 5c0967fb2, touch
+  nothing slates-merge builds from. Main's (§8): the other platforms, clippy and the whole suites.
+- **Applied in the same change to:** §4.16 A-646's decision (the link rule's bullet, and its status); GAPS (A-676's
+  entry after A-643's siblings); `crates/merge/src/engine.rs` (`node_home`, `node_stood_at`),
+  `crates/merge/src/engine/node_tests.rs`, `crates/merge/src/engine/replaced_node_tests.rs` (`Work::fifo`, `fifo_node`);
+  `docs/bugs/2026-11-19-a-link-to-a-node-made-after-its-base-was-accepted.md` (new).
+
+### A-664 part 1, the server half — A submit carries its message and its session's identities, and a repository's green refuses one without either before any work is built (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.13; §4.17.1 "A push is a work" item 4; after A-664 part 1's record, A-285, A-247)
+
+- **The submit carries what the commit needs** (`slates_ipc::protocol::Authorship`, appended to the six submit
+  variants): the message the client gives, and the session's tool identities (`ToolIdentities`: git's name and email,
+  Mercurial's user). `RequestBody::submit(work, evidence)` is the one way a `Submit` is made and `with_message` adds a
+  message, so a field a submit gains is not restated at its callers: 69 sites make one through it, every test's among
+  them. No second way to submit is added: a client sends a message in the request it makes (`Client::call`), and the
+  typed client's submit methods carrying one are owed with the SDKs and the CLI (`Client::submit_with_message`, which
+  sent a message without evidence beside `submit_with_evidence`, was withdrawn before landing). The api maps the two
+  refusals (`Invalid::MessageRequired`, `Invalid::IdentityRequired(VcsTool)`, `VcsTool` re-exported; contract 51).
+- **Set by the owner** (`SetIdentities`, `slates-server`'s `identities`): the launcher's act on the control channel,
+  proven by the keyed hash under its secret (`landing::identities_proof`, its own domain), refused `Forbidden` on a
+  consumer's channel whatever its proof and `GrantIssuerUnverified` without it; git's identity held to git's own rules
+  (`slates_git::derived::Identity`) and Mercurial's user to what Mercurial writes as it is: not empty, one line, and no
+  byte Mercurial strips from its ends (`identities::MERCURIAL_STRIPS`: Mercurial 7.2's `changelog.add` strips the user
+  with Python's `bytes.strip()`, then refuses an empty one or one holding a newline [C: `mercurial/changelog.py`, read
+  2026-11-19], so " Ada <a@example.com>" would be recorded as bytes no changeset of Mercurial's carries), else
+  `BadRequest` naming the part; recorded on the
+  principal's partition (a consumer's, the one its id names; any other's, the one its key's bytes hash to,
+  `verbs::owner_of_key`, the hash `owner_of_name` places a name by) as the version after the one read
+  (`PolicyChanged` from a stale read), answered `IdentitiesSet`.
+- **Read once a session** (main's ruling, 2026-11-19): at a session's first submit the channel reads the principal's
+  identities from its partition as a task, keeps them with the session (`ClientSlot::identities`), then routes the
+  submit as any request (`verbs::route_gated`, the tail of `verbs::serve` it shares); every later submit of the session
+  carries the kept identities, written over whatever the client sent. The green's owner never reads a record for a
+  merge, and a setting made mid-session applies from the next session. Every session's first submit asks one
+  partition, so the read waits for room on its channel (`xshard::call_in_shard_time_given_room`) rather than being
+  refused at a burst; a read the partition never answers refuses the submit `Overloaded`, unrecorded, as a verb that
+  never ran is (A-563), so its resend runs. Two submits a session sends before its first read returns each read, and
+  the session keeps the first read to return, so all its submits carry one set (`identities.read` counts the reads
+  made). What `verbs::serve` holds of a request before it routes it holds when the submit resumes: a revocation that
+  reached the session while the read was away refuses it `ConsumerRevoked`, and its reply's route is its own
+  (`ShardState::reply_route`), so a submit whose acceptance waits for its commit (`merge_service::defer_acceptance`,
+  f > 0) answers its own request, never a route another request left behind.
+- **Refused before any work is built** (`identities::refused_for_its_commit`, in `verbs::judge_submission` beside
+  `EvidenceRequired`, before the increment is built, on the owner whether the work's shard asked it or not, A-247): a
+  submit to a green of a repository's lineage without a message is refused `MessageRequired`, and one whose session has
+  no identity in a git or Mercurial repository's tool `IdentityRequired { tool }`. A plain green takes either. A stock
+  client's push is judged on the push path and is never a submit. Subversion's author is the principal's own name,
+  owed with its revisions.
+- **Wire** (`slates-ipc`, published): `RequestBody::SetIdentities` tag 89, `Refusal::MessageRequired` 76 and
+  `IdentityRequired` 77, `ReplyBody::IdentitiesSet` 76. The branch had appended them at 87 and 74; A-625 part 3 landed
+  first with `EnrollCredential` 87, `RevokeCredential` 88, `CredentialEnrolled` 74 and `CredentialRevoked` 75, so this
+  change's variants follow main's, and no published tag moved.
+- **Tests** (`crates/server/src/identities/tests.rs`, 13, each guard its own; `repository.rs`'s writes now submit with
+  a message and identities, `identities::authored`): a repository's green refuses a submit without a message, or with
+  an empty one, `MessageRequired` in git, Mercurial and Subversion, then accepts it at version 1; with no identity in
+  its tool `IdentityRequired` naming git, and Mercurial, then accepts it; a Subversion repository's takes one with none;
+  a plain green takes either; an agent's channel is refused `Forbidden`, a proof not the launcher's
+  `GrantIssuerUnverified`, a git name git would change `BadRequest`, and so is each Mercurial user Mercurial would
+  refuse or change (two lines, empty, a leading space, a trailing vertical tab), a stale setting `PolicyChanged`. On
+  audit daemons with seated clients: a session's claim of git's identity is written over with its own none and
+  refused, a setting made mid-session reaches the next session and not this one, two reads counted for two sessions; a
+  revocation while the read is away refuses the submit, which built nothing; a later read never replaces what a
+  session keeps; a read that returns to a seat another session (an agent's) now holds, or to one retiring, is refused
+  `NotFound`, kept by neither seat, counted by none, and builds nothing; a read the fenced partition never answers
+  refuses `Overloaded`, nothing recorded.
+- **Runs** (macOS arm64, the Mac Studio, 2026-11-19, rustc 1.98.1, debug). The first build, at 5b4a4ce26, stopped at
+  E0599: `identities::record` read the clock with `slates_vfs::clock::Clock` out of scope; the import is in this
+  change. Red first, over main b1926d201 (agents/g308-server-half 6daffdb98), the Mercurial user's test over the
+  one-line rule (the two strip checks made no-ops): `cargo test --locked -p slates-server --lib t_a664_a_mercurial_user`
+  failed, answered `[Some(BadRequest ..), Some(BadRequest ..), None, None]`, the leading space and the trailing vertical
+  tab recorded. Green over main 545181b30 (2bd393419), slates-server compiled afresh: `cargo test --locked -p
+  slates-server --lib -- identities verbs::tests deadlines::tests reap::tests repository::tests` 89 passed, 2 ignored,
+  1 failed: the 13 tests above, the tests of every module whose code or helpers this change edited, and two others the
+  filter names. The one failure, `repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log`
+  (a branch at the version the root folded is made, not refused `UnknownBase`), fails alike on main at 3329211e0
+  without this change: main's, reported. `-p slates-ipc --lib protocol::` 5 passed and 1 ignored (the health table's
+  writer), and `--test wire_order every_wire_enum` 2 of 2, the tags above published; `-p slates-api --lib --
+  the_contract_history error::` 12 of 12; `-p slates-client --lib` 7 of 7. The integration tests whose code the change
+  edited, directly or through a helper, filtered to those: `-p slates-client --test edit_and_submit` 1 of 1; `-p
+  slates-server --test daemon` 7 of 7, `--test verdict_pages` 4 of 4, `--test works_off_owner` 6 of 6 and `--test
+  fleet` 36 of 36 (276.2 s), every session's first submit there reading its identities before it is routed, at f = 1
+  too, where its acceptance waits for its commit and answers its own request; the same set passed over main b1926d201
+  and 1b480bd70. `cargo build --locked -p slates-client --example load_bench`; `cargo fmt -- --check` clean for the
+  four crates. The Windows x86_64 and Linux runs, clippy, xtask and the doc gate are main's.
+- **Owed.** The clients' surfaces (the typed client's submits carrying a message, the SDKs, the MCP and the CLI,
+  setting identities); Subversion's author; part 3 (the merge record carrying the message and the identities, and the
+  commit admitted, over A-662).
+- **Applied in the same change to:** `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`;
+  `crates/server/src/identities.rs`, `identities/tests.rs` (new), `verbs.rs` (`owner_of_key`, `refusal_name`'s two
+  arms, the submit verbs), `work_home.rs`, `state.rs`, `landing.rs`, `lib.rs`, `daemon.rs`, `deadlines.rs`, `reap.rs`,
+  `repository.rs`; `crates/api/src/error.rs`, `crates/api/src/lib.rs` (contract 51, `VcsTool`);
+  `crates/client/src/client.rs`; the submit sites of `crates/server/tests/{daemon,fleet,verdict_pages,works_off_owner}.rs`,
+  `crates/client/tests/edit_and_submit.rs`, `crates/client/examples/load_bench.rs`; §4.17.1 "A push is a work"'s
+  status; GAPS' §4.17 entry.
 
 ### A-614 part 3 — superseded by A-666: the commit rows keep no changed-path Bloom filters (2026-11-19, g083 for UI goal 93; §4.17.2 "The repository in git's terms" item 2, "Operations on the server", piece 5; A-645 "Queries by API"; A-666 parts 2 and 3)
 

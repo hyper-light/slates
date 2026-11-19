@@ -461,10 +461,7 @@ fn pipelined_round(client: &mut Client, green: VolumeId, round: u8) {
   };
   let first = client.begin(&edit("first", b'A' + round)).unwrap();
   let submit = client
-    .begin(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    })
+    .begin(&RequestBody::submit(work, Vec::new()))
     .unwrap();
   let second = client.begin(&edit("second", b'c' + round)).unwrap();
   // This one needs nothing of the owner (its file is the work's own by now), so only the work's order holds it back
@@ -569,10 +566,7 @@ fn submit_with_the_answer_lost(
 ) -> (RequestId, RequestBody) {
   client.acknowledge_all().unwrap();
   daemon.lose_next_owner_answer(owner_of(work)).unwrap();
-  let request = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let request = RequestBody::submit(work, Vec::new());
   let id = client.begin(&request).unwrap();
   await_overloaded(client, id);
   assert_eq!(client.versions(green).unwrap(), 2, "the owner moved");
@@ -628,10 +622,7 @@ fn a_conflict_whose_answer_was_lost_is_answered_as_it_was_first_judged() {
   assert_eq!(client.submit(other).unwrap(), Submitted::Accepted(2));
   client.acknowledge_all().unwrap();
   daemon.lose_next_owner_answer(owner_of(work)).unwrap();
-  let request = RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  };
+  let request = RequestBody::submit(work, Vec::new());
   let id = client.begin(&request).unwrap();
   await_overloaded(&mut client, id);
   client.edit(other, "f", 32, 4, b"BBBB").unwrap();
@@ -786,10 +777,7 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
     std::thread::yield_now();
   }
   let submit = client
-    .begin(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    })
+    .begin(&RequestBody::submit(work, Vec::new()))
     .unwrap();
   let edit = client
     .begin(&RequestBody::Edit {

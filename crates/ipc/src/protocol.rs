@@ -361,6 +361,9 @@ pub enum RequestBody {
     work: VolumeId,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// Declare a namespace or metadata operation on a work volume (§4.16): the counterpart to `Edit`'s
   /// content splice, for links, directories, modes and extended attributes.
@@ -944,6 +947,9 @@ pub enum RequestBody {
     insert: EditBytes,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// A presented landing's entries, a page at a time (§4.15 step 2: the confirmation surface shows "the full entry list
   /// on demand"): the landing a `GrantRequired` reply named, its entries' encodings from `from` (the start, then each
@@ -1003,6 +1009,9 @@ pub enum RequestBody {
     evidence: Vec<[u8; 32]>,
     /// The signature a `SubmitSigned` carried, kept through the hold and judged for the approval request (A-321).
     signature: Option<Vec<u8>>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
   /// `SubmitHeld`'s is. Appended.
@@ -1019,6 +1028,9 @@ pub enum RequestBody {
     insert: EditBytes,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
   /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
@@ -1037,6 +1049,9 @@ pub enum RequestBody {
     /// The signature over the merge's statement, when the merge is signed work (A-321): the approval carries it again,
     /// since the held submit kept nothing. Its reply is then `SubmittedSigned`.
     signature: Option<Vec<u8>>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// A `Submit` carrying a signature over its merge's statement (signed work, A-321; `slates_server::signed_work::
   /// merge_statement`, signed under the namespace `slates-work`): judged under the work's and the green's trusted
@@ -1050,6 +1065,9 @@ pub enum RequestBody {
     evidence: Vec<[u8; 32]>,
     /// The SSH signature blob (the armour's base64, decoded).
     signature: Vec<u8>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// Sets a volume's trusted signers (signed work, A-321): the public keys, in SSH wire form, whose signatures over the
   /// volume's work verify; the whole set, so a key is removed by setting the set without it. The launcher's act, proven
@@ -1253,6 +1271,23 @@ pub enum RequestBody {
     /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential-revoke" ‖ id)`.
     proof: [u8; 32],
   },
+  /// Sets a principal's tool identities whole (§4.13; §4.17.1 "A push is a work" item 4; A-664): git's author and
+  /// committer and Mercurial's user, which the commits the server makes for the principal carry. Its owner's act on
+  /// the control channel, proven by the keyed hash under the launcher's secret (`slates_server::landing::
+  /// identities_proof`): refused `Forbidden` on a consumer-bound channel whatever its proof, `GrantIssuerUnverified`
+  /// without it, `PolicyChanged` from a version the record has moved past. Each identity is held to its tool's rules
+  /// (`BadRequest` naming the part). A session reads them once, at its first submit, so a setting applies from each
+  /// session that begins after it. Answered `IdentitiesSet`. Appended.
+  SetIdentities {
+    /// The principal.
+    principal: Principal,
+    /// The identities, whole.
+    identities: ToolIdentities,
+    /// The version the setter read: 0 for a principal with none yet.
+    read: u64,
+    /// The keyed hash under the launcher's secret, over the principal, the identities and the version read.
+    proof: [u8; 32],
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -1410,6 +1445,38 @@ pub enum VcsTool {
   Mercurial,
   /// Subversion.
   Subversion,
+}
+
+/// git's author and committer of the commits the server makes for a principal (A-664): the name and the email as git
+/// writes them.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GitIdentity {
+  /// The name.
+  pub name: String,
+  /// The email: may be empty, which git writes `<>`.
+  pub email: String,
+}
+
+/// A principal's identities in the tools whose objects the server makes for it (§4.13; A-664): git's author and
+/// committer, and Mercurial's user (`Name <address>`). `None` where it has none.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolIdentities {
+  /// git's.
+  pub git: Option<GitIdentity>,
+  /// Mercurial's.
+  pub mercurial: Option<String>,
+}
+
+/// What a submit carries for the commit the server makes of its work (§4.17.1 "A push is a work" item 4; A-664): the
+/// message the client gives, and the session's tool identities. The identities are its channel's to fill: read once a
+/// session, at its first submit, from the principal's record, and written over whatever the client sent, so a merge
+/// records the principal's own identities and never a client's claim.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Authorship {
+  /// The commit's message: a green of a repository refuses a submit without one (`MessageRequired`).
+  pub message: Option<String>,
+  /// The session's identities: a green of a repository refuses a submit with none in its tool (`IdentityRequired`).
+  pub identities: ToolIdentities,
 }
 
 /// How a repository names its objects (§4.17.1 item 1; A-575), as `CreateRepository` names it: fixed at creation.
@@ -2097,6 +2164,52 @@ pub struct FailoverReport {
 }
 
 impl RequestBody {
+  /// A `Submit` of `work` naming `evidence`, with no message: the one way a `Submit` is made, its fields given once here
+  /// (A-664), so a field a submit gains is not restated at every caller. [`RequestBody::with_message`] adds a message.
+  pub fn submit(work: VolumeId, evidence: Vec<[u8; 32]>) -> RequestBody {
+    RequestBody::Submit {
+      work,
+      evidence,
+      authorship: Authorship::default(),
+    }
+  }
+
+  /// This submit carrying `message` for the commit the server makes of its work (A-664); any other request as it is.
+  #[must_use]
+  pub fn with_message(mut self, message: String) -> RequestBody {
+    if let Some(authorship) = self.authorship_mut() {
+      authorship.message = Some(message);
+    }
+    self
+  }
+
+  /// What a submit carries for the commit the server makes of its work (A-664); `None` for a request that submits
+  /// nothing.
+  pub fn authorship(&self) -> Option<&Authorship> {
+    match self {
+      RequestBody::Submit { authorship, .. }
+      | RequestBody::EditSubmit { authorship, .. }
+      | RequestBody::SubmitHeld { authorship, .. }
+      | RequestBody::EditSubmitHeld { authorship, .. }
+      | RequestBody::SubmitApproved { authorship, .. }
+      | RequestBody::SubmitSigned { authorship, .. } => Some(authorship),
+      _ => None,
+    }
+  }
+
+  /// [`RequestBody::authorship`], to change: the channel writes the session's identities here (A-664).
+  pub fn authorship_mut(&mut self) -> Option<&mut Authorship> {
+    match self {
+      RequestBody::Submit { authorship, .. }
+      | RequestBody::EditSubmit { authorship, .. }
+      | RequestBody::SubmitHeld { authorship, .. }
+      | RequestBody::EditSubmitHeld { authorship, .. }
+      | RequestBody::SubmitApproved { authorship, .. }
+      | RequestBody::SubmitSigned { authorship, .. } => Some(authorship),
+      _ => None,
+    }
+  }
+
   /// The volume a request is about, when it is about one. A green over a base is born on the base volume's owner
   /// shard, where the snapshot is walked, so `CreateGreen` names its base's volume. One rule for the daemon's routing
   /// and the client's waiting ([`Self::may_be_forwarded`]).
@@ -2185,6 +2298,7 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. }
+      | RequestBody::SetIdentities { .. }
       | RequestBody::Renew { .. } => None,
       // A credential is served on the partition its id routes to, never a volume's (A-625 part 3).
       RequestBody::EnrollCredential { .. } | RequestBody::RevokeCredential { .. } => None,
@@ -4277,6 +4391,16 @@ pub enum Refusal {
     /// The Win32 error code.
     code: u32,
   },
+  /// A submit to a green of a repository carried no message (§4.17.1 "A push is a work" item 4; A-664): the server makes
+  /// the tool's commit of the work, and a commit needs one. Refused before any work is built. Appended.
+  MessageRequired,
+  /// A submit to a green of a repository was made by a principal with no identity in the repository's tool (§4.17.1 item
+  /// 4; A-664): the commit the server makes names its author. Refused before any work is built; its owner sets the
+  /// identities (`SetIdentities`), which a session reads at its first submit. Appended.
+  IdentityRequired {
+    /// The repository's tool.
+    tool: VcsTool,
+  },
 }
 
 /// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the
@@ -5202,6 +5326,11 @@ pub enum ReplyBody {
   },
   /// A version-control credential was revoked (`RevokeCredential`, A-625 part 3). Appended.
   CredentialRevoked,
+  /// A principal's tool identities were set (`SetIdentities`, A-664): their version now. Appended.
+  IdentitiesSet {
+    /// The version now.
+    version: u64,
+  },
 }
 
 /// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by
