@@ -39703,3 +39703,49 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   detection), so they could not pass on it.
 - **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
   zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-605 — Mergeinfo: the `svn:mergeinfo` value read and written as Subversion reads and writes it, its range-list algebra transcribed, inheritance and elision, and `get-mergeinfo` over the index (2026-11-19, g262, UI goal 92; §4.17.4 item 8 and piece 9; A-500, A-553)
+Applied in the same change to: §4.17.4 (a status block; piece 9 marked built), GAPS (the §4.17.4 entry),
+`docs/wip/research/vcs-servers-subversion.md` (§11, new), `crates/svn/src/mergeinfo.rs` and
+`crates/svn/src/mergeinfo/tests.rs` (new), `crates/svn/src/lib.rs` (its `mod` line).
+- **What was there.** Item 8 said a value must parse and named `get-mergeinfo`'s three modes and the descendants found
+  by the per-directory counts. Nothing read, wrote or answered mergeinfo; the index (A-553) kept FSFS's `minfo-here` and
+  `minfo-cnt` with no reader.
+- **The decision.** Every rule is Subversion's own, read in its code at `1.14.x` `d434dc14` (notes §11, each file's
+  sha256 there). The value is read as `svn_mergeinfo_parse` reads it, as a C string, a line's last colon dividing, the
+  path canonical, revisions digits alone up to 2^31 - 1, ranges sorted and combined, a key named twice merged; every
+  refusal is a kind named by Subversion's message, answered `E200020`; a commit's check refuses a NUL first
+  (`verify_mergeinfo`). It is written as `svn_mergeinfo_to_string` writes it, paths in `svn_path_compare_paths` order.
+  The range-list algebra is transcribed, not restated: with `consider_inheritance` Subversion's walk is not exact per
+  revision (`1-10` and `3-4*,5-6` share nothing; removing `3-4*,5-6` from `1-10` removes nothing), and the stock client
+  computes `svn mergeinfo --show-revs` with it, so a server's answer equal to the client's needs it as it is; a named
+  test holds that walk. Inheritance is `svn_mergeinfo_inheritable2` then `svn_fs__append_to_merged_froms`; elision is
+  `should_elide_mergeinfo`. The queries answer as FSFS does: a path's nearest node holding mergeinfo (from its parent
+  for nearest-ancestor, none at the root; the path alone for explicit), a value that does not parse answering none and
+  ending the search (issue #3896), a row claiming mergeinfo its list lacks refused as corrupt, the descendants entered
+  only where `minfo-cnt` says mergeinfo lies beneath. The index names each node's property list and the green holds the
+  lists and the directories, read through one seam (`Contents`); the descendants are an iterator that lists at most one
+  directory a step, so the server pulls them a slice at a time under the shard's budget.
+- **Tests** (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19, on the tree merged with main 553d3d155): 111
+  of 111, 37 of them this module's, in 1.40 s. Subversion's own vectors from `mergeinfo-test.c`: 25 valid values, 26
+  broken ones each by its kind, 68 range-list merges, 15 removals and 16 differences each with and without inheritance,
+  the intersections, the merges of whole mergeinfo, the to-string cases, issues 4686's and 4840's merges, and the
+  62 × 63 single-range loop, with the per-revision check Subversion's own test leaves to do. Property tests over the
+  per-revision model Subversion's random tests use (`rl_array_t`): unions exact; inheritable lists intersected and
+  removed as sets; without inheritance a positional walk whose touching pieces join; with inheritance within the
+  per-revision bounds. Hostile values (the grammar's alphabet and any byte; every cut and bit flip of a valid value):
+  each refused, typed, or read canonically, none panicking; 100,000-range and 100,000-line values read whole. The
+  queries case by case, with their refusals (`E160013`, `E160005`, `E160006`, `E160004` twice). The oracle: a naive
+  filesystem keeping every revision's whole tree equals the index-backed queries on 256 generated histories of
+  additions, copies, deletions and property changes, every crawl listing only directories with mergeinfo beneath, its
+  census (inherited answers, unparsed values, found descendants, listings, pruned directories) all moving.
+- **Red-checked eight ways** (a mutant each on the Studio; the tests that failed): the revision limit lifted (1); the
+  union taking the smaller cover (6); an inherited value keeping its `*` ranges (4, the oracle among them); the descent
+  rule without "one, not its own" (4); issue #3896's search going on (2); a joined range non-inheritable unless both
+  pieces are (1: the without-inheritance property, which no vector of Subversion's catches); a comma ending the value
+  accepted (2); paths in byte order (2). `cargo fmt -p slates-svn --check` clean.
+- **Owed.** `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from this algebra with piece 7's
+  location segments and log (`svn_client__mergeinfo_log`'s range lists and `filter_log_entry_with_rangelist`'s judgment
+  of each log entry by its changed paths); `log`'s `include-merged-revisions` (`log.c` `fs_mergeinfo_changed`,
+  `get_combined_mergeinfo_changes`) with piece 7's log; the property's UTF-8 and CR checks with piece 7's property
+  validation (`svn_repos__validate_prop`).

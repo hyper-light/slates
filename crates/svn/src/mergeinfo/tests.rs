@@ -389,7 +389,9 @@ fn subversions_walk_passes_a_range_at_one_of_another_kind() {
   assert!(mixed.intersect(&whole, Compare::WithInheritance).is_empty());
   assert_eq!(whole.remove(&mixed, Compare::WithInheritance), whole);
   assert_eq!(
-    whole.intersect(&mixed, Compare::WithoutInheritance).to_bytes(),
+    whole
+      .intersect(&mixed, Compare::WithoutInheritance)
+      .to_bytes(),
     b"3-6"
   );
 }
