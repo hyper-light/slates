@@ -48,6 +48,7 @@ mod positions;
 mod push;
 mod repository;
 pub mod rows;
+pub mod views;
 
 pub use deltas::delta_of;
 pub use fragment::{FragmentRefused, Placed, Stored};

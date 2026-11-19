@@ -373,7 +373,11 @@ impl Repository {
   }
 
   /// The row of the object `id` names, and its root content.
-  fn indexed(&self, store: &ContentStore, id: &ObjectId) -> Option<(ObjectRow, ContentId)> {
+  pub(crate) fn indexed(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+  ) -> Option<(ObjectRow, ContentId)> {
     let found = self.index.get(store, &rows::object_key(id))?;
     let content = found.contents().next()?;
     Some((rows::decode(found.payload())?, content))

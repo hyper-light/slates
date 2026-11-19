@@ -213,8 +213,8 @@ C: deployed code). Every quotation below was read directly on 2026-11-18 from th
 - RFC 8332 and RFC 5656's key forms (RSA with SHA-2 and ECDSA keys for SSH), before the SSH server's authentication
   part. The Internet-Drafts OpenSSH names for its AES-GCM and ChaCha20-Poly1305 rules, owed here before the transport,
   were read for A-594 (§5.5).
-- git's `gitformat-bundle` and `technical/bundle-uri.adoc` before piece 14; `technical/partial-clone.adoc` and
-  `shallow.adoc` (downloaded, read only for their definitions so far) before piece 7.
+- `technical/partial-clone.adoc` and `shallow.adoc` (downloaded, read only for their definitions so far) before
+  piece 7. git's `gitformat-bundle` and `technical/bundle-uri.adoc`, owed before piece 14, were read for A-624 (§5.6).
 - GitLab Workhorse's own documentation, to confirm it is the HTTP front that drives Gitaly for git clients (§4.17.2
   names it from memory).
 
@@ -263,6 +263,47 @@ What follows for slates (A-594): every bound on a key comes from its cipher's an
 time bound is learned (§4.17.2's tunables table); the transport takes both markers, enforces strict key exchange when
 offered, and keeps its sequence-number rules exactly as the draft states, since ChaCha20-Poly1305's nonce is that
 number.
+
+### 5.6 `object-info`, `bundle-uri` and `packfile-uris` (A-624, read 2026-11-19)
+
+| Source | Revision read | sha256 (first 16 hex) |
+|---|---|---|
+| `Documentation/gitprotocol-v2.adoc`, `technical/bundle-uri.adoc`, `gitformat-bundle.adoc`, `config/bundle.adoc`, `config/uploadpack.adoc`, `config/transfer.adoc` | git `v2.50.1` | 2e7399659d1fb86a, c00e786e56cde209, 699b92c6b6a32d81, 3c817153e6f4e66f, 66ae6a63da96ef5a, 41778b268e1f27f7 |
+| `protocol-caps.c`, `bundle-uri.c`, `serve.c`, `upload-pack.c`, `builtin/pack-objects.c`, `fetch-pack.c`, `connect.c` | git `v2.50.1` | 1310c747bcf8e6a4, 30944f34d1f85e46, df0cff2ee21a974a, 17f18f0bdbdf0b88, 9815de1ae622a3ce, 885b2166a5b0258d, 4a4584b959030542 |
+| `Documentation/gitprotocol-v2.adoc`, `protocol-caps.c` | git `master` that day | 64ef6a810d28ef39, 3dc3b0ff8a5b067a |
+
+What the three rest on (quoted):
+- **`object-info`** [B: gitprotocol-v2 "object-info"]: "Object size is the only information that is currently
+  supported"; the arguments `size` and `oid <oid>`; `obj-info = obj-id SP obj-size`. [C: `protocol-caps.c`] `send_info`
+  writes nothing for a request naming no object ("if (!oid_str_list->nr) return"), the `size` line only when asked,
+  every line by `packet_writer_write` (no LF, where the grammar has one), an object it cannot find as its id and a space,
+  and each id as its client wrote it; an argument it does not know gets an `ERR` line and the request goes on
+  ("object-info: unexpected line"). [C: `serve.c`] it is advertised under `transfer.advertiseobjectinfo`, off by default;
+  nothing in 2.50.1's `fetch-pack.c`, `transport.c` or `cat-file` asks for it. [B: master] adds `type`: "Currently only
+  object size and type are supported".
+- **`bundle-uri`** [B: gitprotocol-v2 "bundle-uri"]: "A `bundle-uri` request takes no arguments"; the answer is "a list
+  of key-value pairs provided as packet lines with value `<key>=<value>`"; "Clients MUST parse the line according to the
+  above format, lines that do not conform to the format SHOULD be discarded". [C: `bundle-uri.c`] the server writes each
+  `bundle.*` key of its configuration by `packet_write_fmt("%s=%s")`, with no LF, and dies on an argument; git's client
+  (`bundle_uri_parse_line`, `bundle_list_update`) errs on a line without `=`, an empty key or value, a key outside
+  `bundle`, a version other than 1, a mode other than `all` and `any`, and a bundle's second `uri`, and ignores keys and
+  heuristics it does not know. [B: `config/bundle.adoc`] "The only value currently understood is `creationToken`". [C:
+  `connect.c` `get_remote_bundle_uri`] the client sends its capabilities, then `command=bundle-uri`, a delimiter and a
+  flush.
+- **`packfile-uris`** [B: gitprotocol-v2 "fetch"]: "Before performing the connectivity check, the client should
+  download from all given URIs"; "For each URI the server sends, it sends a hash of the pack's contents (as output by
+  git index-pack) followed by the URI". [C: `pack-objects.c` `want_object_in_pack_mtime`] an object configured by
+  `uploadpack.blobPackfileUri` is left out of the pack when its URI begins with a protocol the client listed and then
+  `:`. [C: `upload-pack.c`] the list is cleared without `sideband-all` ("if (data->uri_protocols.nr &&
+  !data->writer.use_sideband) string_list_clear"). [C: `fetch-pack.c`] the inline pack is fetched and indexed first
+  (`get_pack`); then each URI's pack is downloaded in the order listed and indexed with the inline pack's own
+  `index-pack` arguments (`--fix-thin` only under `thin-pack`), and checked against its hash ("does not match expected
+  hash").
+
+What follows for slates (A-624): `object-info` answers git's bytes from the index rows; a `bundle-uri` answer is the
+repository's list written as git writes its configuration, and read as git's client reads it; and the
+`packfile-uris` choice sends by URI only a suffix of the fetch's units that URI packs tile in order, since the inline
+pack is indexed before any URI pack can supply a base.
 
 ## 6. Policy by name pattern and the hooks' protocol (§4.17.1 shared piece 7, A-597)
 

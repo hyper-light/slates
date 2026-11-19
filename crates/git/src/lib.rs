@@ -78,5 +78,9 @@ mod fixtures;
 mod pack_fixtures;
 
 #[cfg(test)]
+#[path = "tests/v2_rest_fixtures.rs"]
+mod v2_rest_fixtures;
+
+#[cfg(test)]
 #[path = "tests/served.rs"]
 mod served;
