@@ -484,6 +484,18 @@ pub struct ShardState {
   /// Anchors that departed and whose attachments some shard has not yet ended, owed to the next look (A-222). Bounded
   /// by the fleet's members.
   pub(crate) departed_owed: Vec<u64>,
+  /// Whether the shard's reaper owes a look at departures (A-222, A-554): set on the control shard when the fleet's
+  /// members or a member's anchor changed (`crate::remote_attach::look_for_departures`), and by the deadline keeper at
+  /// a retry's deadline; the reaper takes it.
+  pub(crate) departures_owed: bool,
+  /// When the control shard looks at departures again after a look some shard did not answer (A-554): a retry window
+  /// on (`crate::deadlines::retry_window_ns`), kept by the deadline keeper; `None` while none is owed.
+  pub(crate) departures_retry_at: Option<u64>,
+  /// Whether the shard's reaper owes the reclaim of the taken-back maps whose claim is past its deadline (A-197,
+  /// A-554): set by the deadline keeper at that deadline, taken by the reaper (`crate::held_copy::reclaim_owed`). Linux
+  /// alone takes such maps back.
+  #[cfg(target_os = "linux")]
+  pub(crate) held_copies_owed: bool,
   /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
   pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.
@@ -1245,8 +1257,9 @@ pub struct ShardState {
   /// materialized into a served volume (§4.10 "Promotion and takeover" → serve): the adopted head
   /// value, kept until the manifest's archive is held (already, as a content candidate, or fetched
   /// from a recorded holder) and the volume is created under its original id, with the attempts made, which
-  /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on.
-  pub pending_materializations: BTreeMap<ObjectId, PendingVolume>,
+  /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on. A verb held for one waits
+  /// for its end, woken when its entry is removed ([`PendingMaterializations`], A-548).
+  pub pending_materializations: PendingMaterializations,
   /// On a taken-over volume's owner shard, its materialization made in turns of this shard's clock by a task of its own
   /// (g251, `fleet::make_taken`; a live log's or a placed seal's): running, with the turns it has taken, or ended, until
   /// the control shard's next attempt reads the end and forgets it. A later attempt joins a running one and never
@@ -1846,6 +1859,79 @@ fn round_advanced(seen: &mut Option<u64>, advances: u64) -> bool {
   let advanced = seen.is_some_and(|seen| seen != advances);
   *seen = Some(advances);
   advanced
+}
+
+/// The taken-over volumes awaiting materialization ([`ShardState::pending_materializations`]), and the verbs held until
+/// each one's materialization ends (A-548). An entry leaves only through [`PendingMaterializations::remove`], however
+/// its materialization ends (made, given up, or its volume tombstoned), and that removal wakes every task waiting on
+/// the object ([`PendingMaterializations::wait_for_end`]), so no held verb outlives the event it waits for and none
+/// waits on a timer. Until A-548 a held verb looked at the map each heartbeat and gave up at one liveness window.
+#[derive(Debug, Default)]
+pub struct PendingMaterializations {
+  pending: BTreeMap<ObjectId, PendingVolume>,
+  /// The tasks waiting for an object's materialization to end: one waker a task, a task that waits again replacing its
+  /// own (`will_wake`, as a volume's change waiters do), drained when the object's entry is removed. Bounded by the
+  /// tasks waiting, each a held verb's, which the shard's task arena bounds; a waiting task dropped at the shard's stop
+  /// leaves a waker that reaches nothing (the runtime's task word is generation-checked) until the object's end.
+  waiting: BTreeMap<ObjectId, Vec<std::task::Waker>>,
+}
+
+impl PendingMaterializations {
+  /// Whether `object` awaits materialization.
+  pub fn contains_key(&self, object: &ObjectId) -> bool {
+    self.pending.contains_key(object)
+  }
+
+  /// `object`'s pending materialization, if any.
+  pub fn get(&self, object: &ObjectId) -> Option<&PendingVolume> {
+    self.pending.get(object)
+  }
+
+  /// `object`'s pending materialization to change, if any.
+  pub fn get_mut(&mut self, object: &ObjectId) -> Option<&mut PendingVolume> {
+    self.pending.get_mut(object)
+  }
+
+  /// Records `object` as awaiting materialization as `pending`; the entry it replaces, if any. A replaced entry's
+  /// materialization has not ended, so no waiting task is woken.
+  pub fn insert(&mut self, object: ObjectId, pending: PendingVolume) -> Option<PendingVolume> {
+    self.pending.insert(object, pending)
+  }
+
+  /// Ends `object`'s pending materialization, however it ended, and wakes every task waiting on it: the entry, if any.
+  /// The only way an entry leaves.
+  pub fn remove(&mut self, object: &ObjectId) -> Option<PendingVolume> {
+    if let Some(waiting) = self.waiting.remove(object) {
+      for waker in waiting {
+        waker.wake();
+      }
+    }
+    self.pending.remove(object)
+  }
+
+  /// Every pending materialization, in object order.
+  pub fn iter(&self) -> impl Iterator<Item = (&ObjectId, &PendingVolume)> {
+    self.pending.iter()
+  }
+
+  /// Every pending materialization's record, in object order.
+  pub fn values(&self) -> impl Iterator<Item = &PendingVolume> {
+    self.pending.values()
+  }
+
+  /// Whether `object`'s materialization has ended (it awaits none); when it has not, `waker` is woken at its end
+  /// ([`PendingMaterializations::remove`]).
+  pub fn wait_for_end(&mut self, object: ObjectId, waker: &std::task::Waker) -> bool {
+    if !self.pending.contains_key(&object) {
+      return true;
+    }
+    let waiting = self.waiting.entry(object).or_default();
+    match waiting.iter_mut().find(|parked| parked.will_wake(waker)) {
+      Some(parked) => parked.clone_from(waker),
+      None => waiting.push(waker.clone()),
+    }
+    false
+  }
 }
 
 #[cfg(test)]

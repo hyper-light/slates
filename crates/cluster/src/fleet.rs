@@ -64,6 +64,10 @@ pub struct FleetNode {
   /// owner's bounded neighbourhood (which can happen once the scatter width exceeds the member count) is
   /// still alive and is **not** taken over.
   members: Vec<HostId>,
+  /// Whether an install changed [`FleetNode::members`] since the caller last asked
+  /// ([`take_members_changed`](FleetNode::take_members_changed), A-554): what tells the daemon's control shard to look
+  /// for hosts that left the region at once, where it looked once a liveness window.
+  members_changed: bool,
   acceptor: Acceptor,
   routing: Routing,
 }
@@ -96,6 +100,7 @@ impl FleetNode {
       membership,
       configuration,
       members,
+      members_changed: false,
       acceptor,
       routing: Routing::new(),
     }
@@ -146,7 +151,10 @@ impl FleetNode {
     if configuration.host_epoch.0 > self.configuration.host_epoch.0 {
       self.routing.forget_owned_by(self.host);
     }
-    self.members = members.to_vec();
+    if self.members.as_slice() != members {
+      self.members = members.to_vec();
+      self.members_changed = true;
+    }
     self.configuration = configuration;
     let _ = self
       .acceptor
@@ -167,6 +175,13 @@ impl FleetNode {
   /// shards, so each installs the same `(configuration, members)` the council committed.
   pub fn members(&self) -> &[HostId] {
     &self.members
+  }
+
+  /// Whether an install changed the region's members since the last call, taken (A-554): the daemon's control shard
+  /// looks for hosts that left the region on it ([`members`](FleetNode::members) is what it compares), and a repeated
+  /// install of the same members, as each period's council sync makes, asks for nothing.
+  pub fn take_members_changed(&mut self) -> bool {
+    std::mem::take(&mut self.members_changed)
   }
 
   /// The SWIM membership view — the alive set the neighbourhood tracks, and the state the live probe
@@ -372,6 +387,26 @@ mod tests {
   fn install(node: &mut FleetNode, members: &[HostId], quorum: Quorum) {
     let configuration = config(node.host(), members, quorum);
     node.install_configuration(configuration, members);
+  }
+
+  /// A-554. Do: make a node, install the members it was made with, then one admitting a host, ask twice, install those
+  /// members again, then one retiring the host, asking after each install whether the members changed. Expect: no, yes,
+  /// no once taken, no for the repeated install, yes for the retirement: the daemon looks for departed hosts on a
+  /// change of members alone, never on each period's repeated install.
+  #[test]
+  fn an_install_notes_a_change_of_members_once() {
+    let (host, peer) = (HostId(1), HostId(2));
+    let quorum = Quorum { f: 0 };
+    let mut node = FleetNode::new(host, quorum, &[]);
+    install(&mut node, &[host], quorum);
+    assert!(!node.take_members_changed(), "the members it was made with");
+    install(&mut node, &[host, peer], quorum);
+    assert!(node.take_members_changed(), "a host admitted");
+    assert!(!node.take_members_changed(), "a change is taken once");
+    install(&mut node, &[host, peer], quorum);
+    assert!(!node.take_members_changed(), "a repeated install");
+    install(&mut node, &[host], quorum);
+    assert!(node.take_members_changed(), "a host retired");
   }
 
   /// Installs `regional`'s view for `node`'s owner (used where the version must advance through real

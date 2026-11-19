@@ -54,12 +54,24 @@
 //! where the run's submits took 374 to 399 µs (BENCHMARKS, 2026-11-18). The clock is the host's common monotonic one
 //! (`slates_machine::clock::monotonic_ns`), the clock the daemon stamps its spans in.
 //!
-//! **What the harness itself may have added (the `floor` rows).** A reply not taken by a connection's drain was not
-//! there when that drain began, so it arrived after the later of that instant and its request's handing over: the
-//! attempt's `floor`, a lower bound on what the daemon and the ring took, whatever the harness's own sweep did. Each
-//! `latency` lies between its `floor` and itself, and the gap is the harness's resolution: the longest such window of
-//! the level is `max_drain_gap_ns` in the `harness` row. A tail in `latency` with none in `floor` may be the harness's;
-//! a tail in `floor` is not.
+//! **What the harness itself added (the `…_server` and `…_harness` rows; A-559).** Every slot carries its producer's
+//! stamp as it landed in its ring (`slates_ipc::slot`, "The stamp"): the client's as each request landed in the command
+//! ring, the daemon's as each reply landed in the client's ring. An attempt's harness part is the time before its
+//! request landed and after its reply did (`slates_machine::attribution`): the worker held the request, or left the
+//! reply in the ring until its sweep came to it. A latency's harness part sums its attempts' and, for an operation, a
+//! cycle or a round, the client's held sends between them (the `offered` row's `held`); its server part is the rest, a
+//! refusal's pause included. Each `latency` and `operation` row has a server row and a harness row of the same kind
+//! (`latency_server`, `latency_harness`, `operation_server`, `operation_harness`). An attempt whose stamps are missing
+//! or out of order is the server's whole (`unsplit` in the `harness` row): a daemon's time is never hidden in the
+//! harness's. Until A-559 the harness had only a lower bound on what the daemon took (the `floor` rows), and main's
+//! reading of r100 found its bad p99s in the rounds where the harness itself stalled (accepted submits' p99 29.2 ms
+//! beside a 44.0 ms window a reply could wait unseen, 0.42 ms beside 5.1 ms). The longest such window of a level stays
+//! `max_drain_gap_ns`, the sweep's own resolution.
+//!
+//! **The harness's noise floor (the `noise` row; A-559).** Before each level, as many threads as the level has workers
+//! each watch the clock for `NOISE_PROBE` with nothing between their reads (`slates_machine::bench::longest_gap_ns`):
+//! the longest gap any saw is the machine's own noise at that moment, which can stall any step of the harness and is
+//! not the daemon's. `destroy_rows` in `crates/vfs/examples/vfs_bench.rs` measures its jitter the same way.
 //!
 //! **Workers spin.** A worker sweeps its connections without pause. Parking between replies and sends, as an async
 //! client does (A-421), was measured against this and rejected: in six pairs on the Mac Studio at 1,000 clients its
@@ -69,7 +81,11 @@
 //! **The bound (the `bound` row; Ada's decision of 2026-11-18, A-297).** "1,000 clients under 1 ms" is stated at up to
 //! 10³ verdicts a second, the floor of §1.4's fleet-session row ("Increments per green volume per second: thousands").
 //! A level meets it when every kind's p99, each attempt's (`latency`) and each operation's (`operation`), is under 1 ms
-//! while the level's verdicts a second are at least 10³, with no oracle failure and no client given up or starved. The
+//! while the level's verdicts a second are at least 10³, with no oracle failure and no client given up or starved
+//! (`met\tyes`). A kind is charged only for its server part (`slates_machine::attribution::judge`, A-559): a level
+//! whose kinds' server parts are all under the bound while some kind's latency is not is harness-bound
+//! (`met\tharness`, the kinds counted in `harness_bound`), never charged to the server; one with a kind's server part
+//! at or over it misses it (`met\tno`). The
 //! kinds are every request and the cycle, a whole edit and merge (§1.4's status under A-297). The round is reported in
 //! the `latency` row and not judged (A-416): it holds as many edits and merges as its conflicts make, so its p99 grows
 //! with the conflict rate the hot set sets, not with any one request's time. The row names the worst row and kind with
@@ -81,7 +97,9 @@
 //! Rows: `refused\t<n>\t<why>` for a level whose arguments cannot be run as they say (a hot set past its share, above),
 //! which runs nothing and exits 1; `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
 //! attempt timed alone; then `operation\t…` in the same columns, each logical operation from its first attempt to its
-//! answer, refusals for now and resends included; then `floor\t…` in the same columns, each attempt's floor (above);
+//! answer, refusals for now and resends included; then `latency_server\t…`, `latency_harness\t…`, `operation_server\t…`
+//! and `operation_harness\t…` in the same columns, the parts of each (above); before the level, `noise\t<n>\t…`
+//! (above);
 //! then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1;
 //! then `bound\t<n>\t…` (above). Last, from the daemon's own report: `lost\t<counter>\t<count>` for each of its
 //! counters of a lost reply, result, release or ask; `room\t<counter>\t<count>` for its waits for room (begun and
@@ -102,6 +120,7 @@ use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, NamePolicy, ReadAt, SizeClass, VolumeId,
 };
 use slates_ipc::protocol::{EntryKind, GreenBase, MergeWindow, Refusal, ReplyBody, RequestBody};
+use slates_machine::attribution::{Exchange, Verdict, harness_part, judge};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
@@ -243,8 +262,21 @@ struct Agent {
   /// for its latency): the start of the client's time in flight.
   attempt_sent_ns: u64,
   /// When this attempt's request was in its ring: the clock read once the send returned, so the request left at or
-  /// before it. A reply's floor is measured from it ([`Worker::drain`]).
+  /// before it, and the reading its landing stamp is widened by ([`Worker::drain`]).
   handed_ns: u64,
+  /// The stamp this attempt's request landed in the command ring with (A-559; `Client::request_stamp`).
+  request_stamp: u32,
+  /// The client's harness time so far (A-559): its attempts' harness parts and its held sends, summed. A latency's
+  /// harness part is what it gained over the latency's span, from the mark below taken at the span's start.
+  harness_ns: u64,
+  /// `harness_ns` when the request in flight was first sent, the start of its `latency` (a retry under its id keeps its
+  /// first send's).
+  attempt_mark: u64,
+  /// `harness_ns` when the current operation's first attempt was sent, the start of its `operation`.
+  op_mark: u64,
+  /// `harness_ns` when the open cycle and round began, their first edit's operation's.
+  cycle_mark: u64,
+  round_mark: u64,
 }
 
 /// What a worker brings back.
@@ -257,9 +289,17 @@ struct Tally {
   /// (`AcknowledgementOwed`, `LeaseUnconfirmed`) and sent again as new, or retried under its id, is one operation whose
   /// wait includes the refusals, the pauses and the resends. `latencies` times each attempt alone.
   operations: BTreeMap<Kind, Vec<u64>>,
-  /// Each answered attempt's floor, by the kind its latency is filed under: how long after its request was in the ring
-  /// its reply was still not there, which no sweep of the harness can have added (the module's "floor").
-  floors: BTreeMap<Kind, Vec<u64>>,
+  /// Each latency's server part and harness part, by kind, recorded with it (the module's "What the harness itself
+  /// added", A-559).
+  servers: BTreeMap<Kind, Vec<u64>>,
+  harnesses: BTreeMap<Kind, Vec<u64>>,
+  /// … and each operation's.
+  operation_servers: BTreeMap<Kind, Vec<u64>>,
+  operation_harnesses: BTreeMap<Kind, Vec<u64>>,
+  /// Answered attempts whose stamps were missing or out of order, so the whole of each was the server's (A-559).
+  unsplit: u64,
+  /// The level's noise floor (the module's "The harness's noise floor", A-559), set on the level's total.
+  noise_floor_ns: u64,
   submits: Vec<SubmitEvent>,
   /// The clients that gave up, by why ([`Agent::give_up`]): a refusal the harness does not ride out, a lost connection,
   /// a retry past its patience.
@@ -294,9 +334,26 @@ struct Tally {
 }
 
 impl Tally {
-  /// Records one logical operation of `kind`, from its first send to its final answer, resends included.
+  /// Records one logical operation of `kind`, from its first send to its final answer, resends included, with no part
+  /// of it the harness's.
   fn operation_took(&mut self, kind: Kind, ns: u64) {
+    self.operation_split(kind, ns, 0);
+  }
+
+  /// [`Self::operation_took`] with `harness` of its `ns` the harness's (A-559), the rest the server's.
+  fn operation_split(&mut self, kind: Kind, ns: u64, harness: u64) {
+    let harness = harness.min(ns);
     self.operations.entry(kind).or_default().push(ns);
+    self
+      .operation_servers
+      .entry(kind)
+      .or_default()
+      .push(ns - harness);
+    self
+      .operation_harnesses
+      .entry(kind)
+      .or_default()
+      .push(harness);
   }
 
   /// Adds a worker's tally into this one.
@@ -311,9 +368,21 @@ impl Tally {
         .or_default()
         .append(&mut samples);
     }
-    for (kind, mut samples) in std::mem::take(&mut tally.floors) {
-      self.floors.entry(kind).or_default().append(&mut samples);
+    for (mine, theirs) in [
+      (&mut self.servers, &mut tally.servers),
+      (&mut self.harnesses, &mut tally.harnesses),
+      (&mut self.operation_servers, &mut tally.operation_servers),
+      (
+        &mut self.operation_harnesses,
+        &mut tally.operation_harnesses,
+      ),
+    ] {
+      for (kind, mut samples) in std::mem::take(theirs) {
+        mine.entry(kind).or_default().append(&mut samples);
+      }
     }
+    self.unsplit += tally.unsplit;
+    self.noise_floor_ns = self.noise_floor_ns.max(tally.noise_floor_ns);
     self.submits.append(&mut tally.submits);
     for (why, count) in tally.refusals {
       *self.refusals.entry(why).or_default() += count;
@@ -684,29 +753,34 @@ impl Agent {
     tally: &mut Tally,
   ) {
     let elapsed = replied_ns.saturating_sub(sent_ns);
+    // What of the attempt's latency the harness held (A-559): its harness time since the request's first send.
+    let harness = self.harness_ns.saturating_sub(self.attempt_mark);
     match (self.step, reply) {
       (_, ReplyBody::Refused { refusal }) => self.refused(&refusal, kind, tally),
       (Step::CreateWork, ReplyBody::WorkCreated { id, base }) => {
         self.work = Some(id);
         self.base = base;
         self.step = Step::Edit(0);
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
       }
       (Step::Edit(n), ReplyBody::Edited) => {
         if n == 0 && self.round_since.is_none() {
           self.cycle_since = Some(first_ns);
           self.round_since = Some(first_ns);
+          // Both begin where this edit's operation began, and so does their harness time (A-559).
+          self.cycle_mark = self.op_mark;
+          self.round_mark = self.op_mark;
         }
         self.step = if n + 1 < self.slots().len() {
           Step::Edit(n + 1)
         } else {
           Step::Append
         };
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
       }
       (Step::Append, ReplyBody::Edited) => {
         self.step = Step::Submit;
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
       }
       // An agent's work conflicts in its few slots, far under what one reply carries, so no window is ever counted past
       // the reply (A-267's `conflicts_elided`).
@@ -719,12 +793,12 @@ impl Agent {
         self.submitted(version, conflicts, (sent_ns, replied_ns), tally);
       }
       (Step::ResolveVersion, ReplyBody::Versions { head }) => {
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
         self.resolving.0 = head;
         self.step = Step::ResolveRead(0);
       }
       (Step::ResolveRead(n), ReplyBody::ReadPage { bytes, .. }) => {
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
         if bytes.len() != usize::try_from(self.windows[n].len).unwrap() {
           return self.give_up(tally, "a window's read came back short of the window");
         }
@@ -732,7 +806,7 @@ impl Agent {
         self.step = Step::ResolveEdit(n);
       }
       (Step::ResolveEdit(n), ReplyBody::Edited) => {
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
         self.step = if n + 1 < self.windows.len() {
           Step::ResolveRead(n + 1)
         } else {
@@ -745,11 +819,11 @@ impl Agent {
           version, conflicts, ..
         },
       ) => {
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
         self.rebased(version, conflicts, tally);
       }
       (Step::Reedit(n), ReplyBody::Edited) => {
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
         self.step = if n + 1 < self.slots().len() {
           Step::Reedit(n + 1)
         } else {
@@ -757,7 +831,7 @@ impl Agent {
         };
       }
       (Step::Destroy, ReplyBody::Destroyed) => {
-        record(tally, kind, elapsed);
+        record_split(tally, kind, elapsed, harness);
         self.step = Step::Done;
       }
       (step, other) => self.give_up(tally, &format!("unexpected reply at {step:?}: {other:?}")),
@@ -811,22 +885,26 @@ impl Agent {
     tally: &mut Tally,
   ) {
     let elapsed = at.1.saturating_sub(at.0);
+    // What of each span the harness held (A-559): its harness time since the span began.
+    let harness = self.harness_ns.saturating_sub(self.attempt_mark);
     if let Some(start) = self.cycle_since.take() {
       let thought = std::mem::take(&mut self.cycle_thought_ns);
-      record(
+      record_split(
         tally,
         Kind::Cycle,
         at.1.saturating_sub(start).saturating_sub(thought),
+        self.harness_ns.saturating_sub(self.cycle_mark),
       );
     }
     if version.is_some()
       && let Some(start) = self.round_since.take()
     {
       let thought = std::mem::take(&mut self.round_thought_ns);
-      record(
+      record_split(
         tally,
         Kind::Round,
         at.1.saturating_sub(start).saturating_sub(thought),
+        self.harness_ns.saturating_sub(self.round_mark),
       );
     }
     let outcome = match version {
@@ -850,7 +928,7 @@ impl Agent {
     });
     match version {
       Some(v) => {
-        record(tally, Kind::SubmitAccepted, elapsed);
+        record_split(tally, Kind::SubmitAccepted, elapsed, harness);
         self.base = v;
         self.own_len += u64::try_from(own_record(self.id, self.round).len()).unwrap();
         self.resolutions = 0;
@@ -864,7 +942,7 @@ impl Agent {
         };
       }
       None => {
-        record(tally, Kind::SubmitConflict, elapsed);
+        record_split(tally, Kind::SubmitConflict, elapsed, harness);
         self.resolutions += 1;
         if self.resolutions > MAX_RESOLUTIONS || conflicts.is_empty() {
           tally.starved += 1;
@@ -924,8 +1002,21 @@ impl Agent {
   }
 }
 
+/// Records one latency of `kind` with no part of it the harness's.
 fn record(tally: &mut Tally, kind: Kind, elapsed: u64) {
+  record_split(tally, kind, elapsed, 0);
+}
+
+/// Records one latency of `kind` with `harness` of it the harness's (A-559), the rest the server's.
+fn record_split(tally: &mut Tally, kind: Kind, elapsed: u64, harness: u64) {
+  let harness = harness.min(elapsed);
   tally.latencies.entry(kind).or_default().push(elapsed);
+  tally
+    .servers
+    .entry(kind)
+    .or_default()
+    .push(elapsed - harness);
+  tally.harnesses.entry(kind).or_default().push(harness);
 }
 
 /// How many reconnect budgets the harness keeps asking again past a retryable refusal before it gives the request up:
@@ -1107,6 +1198,7 @@ impl Worker {
           agent.inflight = Some((word, first_sent_ns, retried_kind));
           agent.attempt_sent_ns = sent;
           agent.handed_ns = handed;
+          agent.request_stamp = conn.client.request_stamp();
           conn.inflight.insert(word, a);
           self.tally.retried += 1;
           true
@@ -1127,10 +1219,15 @@ impl Worker {
     let handed = self.clock.now();
     match begun {
       Ok(id) => {
-        agent.op_since.get_or_insert(sent);
+        if agent.op_since.is_none() {
+          agent.op_since = Some(sent);
+          agent.op_mark = agent.harness_ns;
+        }
         agent.inflight = Some((id.word(), sent, kind));
         agent.attempt_sent_ns = sent;
         agent.handed_ns = handed;
+        agent.request_stamp = conn.client.request_stamp();
+        agent.attempt_mark = agent.harness_ns;
         conn.inflight.insert(id.word(), a);
         true
       }
@@ -1166,6 +1263,10 @@ impl Worker {
         continue;
       }
       self.tally.held_ns = self.tally.held_ns.saturating_add(now.saturating_sub(due));
+      // The client's own harness time too (A-559): an operation, a cycle or a round open across the hold holds it.
+      self.agents[a].harness_ns = self.agents[a]
+        .harness_ns
+        .saturating_add(now.saturating_sub(due));
       if !self.send(a) {
         kept.push(std::cmp::Reverse((now, a)));
       }
@@ -1174,8 +1275,10 @@ impl Worker {
   }
 
   /// Drains connection `c`'s ring and moves each reply's client on. Each reply is stamped after the ring was read, so
-  /// it arrived before its stamp; and it was not there when the connection's drain before began, so it arrived after
-  /// that and after its request was handed over: its floor (the module's "floor").
+  /// it arrived before its stamp; the daemon's stamp says when it landed, and the client's when its request did, which
+  /// split its latency (the module's "What the harness itself added", A-559). It was not there when the connection's
+  /// drain before began, so the window it could have waited unseen is from the later of that and its request's handing
+  /// over to its taking: the sweep's resolution (`max_drain_gap_ns`).
   fn drain(&mut self, c: usize) {
     let began = self.clock.now();
     let conn = &mut self.conns[c];
@@ -1193,10 +1296,9 @@ impl Worker {
       let Some(a) = conn.inflight.remove(&word) else {
         continue;
       };
-      let reply = match conn.client.poll_reply_word(word) {
-        Ok(Some(reply)) => reply,
+      let (reply, stamp) = match conn.client.poll_reply_stamped(word) {
+        Ok(Some(taken)) => taken,
         Ok(None) => continue,
-        Err(ClientError::Refused(refusal)) => ReplyBody::Refused { refusal },
         Err(e) => {
           self.agents[a].give_up(&mut self.tally, &format!("poll: {e}"));
           continue;
@@ -1209,7 +1311,8 @@ impl Worker {
         .tally
         .max_drain_gap_ns
         .max(now.saturating_sub(not_before.max(handed)));
-      self.take_answer(a, word, reply, (now, not_before.saturating_sub(handed)));
+      self.count_harness(a, stamp, now);
+      self.take_answer(a, word, reply, now);
     }
     // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
     // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited, never past a request
@@ -1219,11 +1322,34 @@ impl Worker {
     }
   }
 
-  /// Moves client `a` on with `reply`, the answer to its request `word`, taken by `now` and absent `floor` past its
-  /// request's handing over: a retryable refusal is resent under its id (or given up past the patience); any other
-  /// answer advances the client and, once it is final, records the logical operation from its first send, and the
-  /// attempt's floor under the kind its latency is filed under.
-  fn take_answer(&mut self, a: usize, word: u64, reply: ReplyBody, (now, floor): (u64, u64)) {
+  /// Adds client `a`'s answered attempt's harness part to its harness time (the module's "What the harness itself
+  /// added", A-559): before its request landed, by the stamp the client wrote, and after its reply landed, by `stamp`,
+  /// the daemon's, the reply taken by `now`. An attempt with no such part (a stamp missing or out of order) is counted
+  /// `unsplit`, and the whole of it is the server's.
+  fn count_harness(&mut self, a: usize, stamp: u32, now: u64) {
+    // A stamp is a reading of the host's clock itself, and the worker's instants count from the level's epoch on it.
+    let epoch = self.clock.epoch;
+    let landed = |stamp: u32, by: u64| {
+      slates_ipc::slot::landed_ns(stamp, by.saturating_add(epoch))
+        .map(|at| at.saturating_sub(epoch))
+    };
+    let agent = &mut self.agents[a];
+    let exchange = Exchange {
+      sent_ns: agent.attempt_sent_ns,
+      request_landed_ns: landed(agent.request_stamp, agent.handed_ns),
+      reply_landed_ns: landed(stamp, now),
+      taken_ns: now,
+    };
+    match harness_part(&exchange) {
+      Some(part) => agent.harness_ns = agent.harness_ns.saturating_add(part),
+      None => self.tally.unsplit += 1,
+    }
+  }
+
+  /// Moves client `a` on with `reply`, the answer to its request `word`, taken by `now`: a retryable refusal is resent
+  /// under its id (or given up past the patience); any other answer advances the client and, once it is final, records
+  /// the logical operation from its first send with its harness part (A-559).
+  fn take_answer(&mut self, a: usize, word: u64, reply: ReplyBody, now: u64) {
     let agent = &mut self.agents[a];
     let Some((_, sent_ns, kind)) = agent.inflight.take() else {
       return;
@@ -1278,13 +1404,11 @@ impl Worker {
       first.unwrap_or(sent_ns),
       &mut self.tally,
     );
-    if !refused {
-      self.tally.floors.entry(outcome).or_default().push(floor);
-      if let Some(first) = first {
-        self
-          .tally
-          .operation_took(outcome, now.saturating_sub(first));
-      }
+    if !refused && let Some(first) = first {
+      let harness = agent.harness_ns.saturating_sub(agent.op_mark);
+      self
+        .tally
+        .operation_split(outcome, now.saturating_sub(first), harness);
     }
     if agent.step != Step::Done {
       let wait = if for_now {
@@ -1631,12 +1755,15 @@ fn quantile_rows(row: &str, n: usize, samples: &mut BTreeMap<Kind, Vec<u64>>) {
 fn report(n: usize, tally: &mut Tally) {
   quantile_rows("latency", n, &mut tally.latencies);
   quantile_rows("operation", n, &mut tally.operations);
-  quantile_rows("floor", n, &mut tally.floors);
+  quantile_rows("latency_server", n, &mut tally.servers);
+  quantile_rows("latency_harness", n, &mut tally.harnesses);
+  quantile_rows("operation_server", n, &mut tally.operation_servers);
+  quantile_rows("operation_harness", n, &mut tally.operation_harnesses);
   for (why, count) in &tally.refusals {
     println!("refusal\t{n}\t{count}\t{why}");
   }
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}\tunconfirmed\t{}",
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}\tunconfirmed\t{}\tunsplit\t{}\tnoise_floor_ns\t{}",
     tally.starved,
     tally.rebase_conflicts,
     tally.max_sweep_ns,
@@ -1646,7 +1773,9 @@ fn report(n: usize, tally: &mut Tally) {
     tally.max_outage_ns,
     tally.backpressure,
     tally.retried,
-    tally.unconfirmed
+    tally.unconfirmed,
+    tally.unsplit,
+    tally.noise_floor_ns
   );
 }
 
@@ -1710,44 +1839,81 @@ fn verdicts(tally: &Tally) -> u64 {
 /// The level judged against the bound (the module's "The bound"; Ada's decision of 2026-11-18): the bound and the
 /// verdicts a second it is stated at; the level's own verdicts a second; the worst p99 of every judged kind
 /// ([`Kind::judged`]: every request and the cycle, not the round), each attempt's (`latency`) and each operation's
-/// (`operation`), with its row and kind; the clients held, time-averaged as in the `offered` row, whose wait no latency
-/// row holds; the clients given up or starved; the oracle's failures; and `met\tyes` when the level met the bound,
-/// else `met\tno`. A level that timed nothing meets nothing.
+/// (`operation`), with its row and kind; the worst p99 of their server parts, likewise (A-559); how many judged kinds
+/// were harness-bound, their latency past the bound and their server part within it; the harness's noise floor before
+/// the level; the clients held, time-averaged as in the `offered` row, whose wait no latency row holds; the clients
+/// given up or starved; the oracle's failures; and `met\tyes` when the level met the bound, `met\tharness` when only
+/// the harness's parts kept it from it (never charged to the server), else `met\tno`. A level that timed nothing
+/// meets nothing.
 fn bound_row(n: usize, wall_ns: u64, tally: &Tally, oracle_failures: u64) -> String {
   let verdicts_per_s = per_second(verdicts(tally), wall_ns);
-  let worst = [
-    ("latency", &tally.latencies),
-    ("operation", &tally.operations),
+  // Each judged kind's p99 and the same quantile of its server parts, by its row and kind.
+  let judged: Vec<(u64, u64, &str, Kind)> = [
+    ("latency", &tally.latencies, &tally.servers),
+    ("operation", &tally.operations, &tally.operation_servers),
   ]
   .into_iter()
-  .flat_map(|(row, kinds)| {
+  .flat_map(|(row, kinds, servers)| {
     kinds
       .iter()
       .filter(|(kind, _)| kind.judged())
       .map(move |(kind, samples)| {
-        let mut sorted = samples.clone();
-        sorted.sort_unstable();
-        (percentile(&sorted, BOUND_PERMILLE), row, *kind)
+        let server = servers.get(kind).map_or(0, |parts| p99_of(parts));
+        (p99_of(samples), server, row, *kind)
       })
   })
-  .max();
+  .collect();
+  let worst = judged
+    .iter()
+    .map(|(p99, _, row, kind)| (*p99, *row, *kind))
+    .max();
+  let server_worst = judged
+    .iter()
+    .map(|(_, server, row, kind)| (*server, *row, *kind))
+    .max();
+  let verdicts_of_kinds: Vec<Verdict> = judged
+    .iter()
+    .map(|(p99, server, _, _)| judge(*p99, *server, BOUND_P99_NS))
+    .collect();
+  let missed = verdicts_of_kinds.contains(&Verdict::Missed);
+  let harness_bound = verdicts_of_kinds
+    .iter()
+    .filter(|verdict| **verdict == Verdict::HarnessBound)
+    .count();
   let gave_up = tally
     .refusals
     .values()
     .fold(tally.starved, |sum, count| sum.saturating_add(*count));
-  let met = worst.is_some_and(|(p99, _, _)| p99 < BOUND_P99_NS)
+  let judgeable = !judged.is_empty()
     && verdicts_per_s >= BOUND_VERDICTS_PER_S
     && gave_up == 0
     && oracle_failures == 0;
-  let (worst_p99, worst_row, worst_kind) = worst
-    .map_or((0, "none", "none".to_owned()), |(p99, row, kind)| {
-      (p99, row, format!("{kind:?}"))
-    });
+  let met = match (judgeable, missed, harness_bound) {
+    (true, false, 0) => "yes",
+    (true, false, _) => "harness",
+    _ => "no",
+  };
+  let (worst_p99, worst_row, worst_kind) = named(worst);
+  let (server_p99, server_row, server_kind) = named(server_worst);
   format!(
-    "bound\t{n}\tp99_bound_ns\t{BOUND_P99_NS}\tverdicts_floor_per_s\t{BOUND_VERDICTS_PER_S}\tverdicts_per_s\t{verdicts_per_s}\tworst\t{worst_row}\t{worst_kind}\tworst_p99_ns\t{worst_p99}\theld\t{}\tgave_up\t{gave_up}\toracle_failures\t{oracle_failures}\tmet\t{}",
+    "bound\t{n}\tp99_bound_ns\t{BOUND_P99_NS}\tverdicts_floor_per_s\t{BOUND_VERDICTS_PER_S}\tverdicts_per_s\t{verdicts_per_s}\tworst\t{worst_row}\t{worst_kind}\tworst_p99_ns\t{worst_p99}\tserver_worst\t{server_row}\t{server_kind}\tserver_worst_p99_ns\t{server_p99}\tharness_bound\t{harness_bound}\tnoise_floor_ns\t{}\theld\t{}\tgave_up\t{gave_up}\toracle_failures\t{oracle_failures}\tmet\t{met}",
+    tally.noise_floor_ns,
     tenths(tally.held_ns, wall_ns),
-    if met { "yes" } else { "no" },
   )
+}
+
+/// A level's worst p99 with its row and its kind named, or none.
+fn named(worst: Option<(u64, &str, Kind)>) -> (u64, &str, String) {
+  worst.map_or((0, "none", "none".to_owned()), |(p99, row, kind)| {
+    (p99, row, format!("{kind:?}"))
+  })
+}
+
+/// The p99 the bound judges ([`BOUND_PERMILLE`]) of `samples`, in any order.
+fn p99_of(samples: &[u64]) -> u64 {
+  let mut sorted = samples.to_vec();
+  sorted.sort_unstable();
+  percentile(&sorted, BOUND_PERMILLE)
 }
 
 /// Judges the level (the rule is `support/load_oracle.rs`'s): every submit over `base`, the touched files' bytes before
@@ -1943,6 +2109,12 @@ fn spread(
       pause_ns: 0,
       attempt_sent_ns: 0,
       handed_ns: 0,
+      request_stamp: 0,
+      harness_ns: 0,
+      attempt_mark: 0,
+      op_mark: 0,
+      cycle_mark: 0,
+      round_mark: 0,
     });
   }
   groups
@@ -1965,6 +2137,26 @@ fn eligible_files(files: &[(String, u64)], n: usize) -> Option<Vec<(String, u64)
     return None;
   }
   Some(eligible)
+}
+
+/// Shape: how long each noise probe watches the clock before a level (the module's "The harness's noise floor", A-559):
+/// long enough to meet the OS's timer tick a few times over, as `vfs_bench`'s scheduling-jitter probe watches it.
+const NOISE_PROBE: Duration = Duration::from_millis(100);
+
+/// The harness's own noise floor now (A-559): `threads` threads, as many as the level's workers, each watching the clock
+/// at once for [`NOISE_PROBE`] with nothing between its reads (`slates_machine::bench::longest_gap_ns`), and the
+/// longest gap any of them saw.
+fn noise_floor(threads: usize) -> u64 {
+  std::thread::scope(|scope| {
+    let probes: Vec<_> = (0..threads.max(1))
+      .map(|_| scope.spawn(|| slates_machine::bench::longest_gap_ns(NOISE_PROBE)))
+      .collect();
+    probes
+      .into_iter()
+      .map(|probe| probe.join().unwrap())
+      .max()
+      .unwrap_or(0)
+  })
 }
 
 /// One load level: `n` clients over the green, `workers` threads sweeping them. Returns the oracle's failures.
@@ -2023,6 +2215,12 @@ fn level(
     "--per-connection {per_connection} exceeds the connection's in-flight bound {limit}"
   );
   let think_mean = think_mean_ns();
+  // The harness's own noise floor, measured before the level it judges (the module's "The harness's noise floor").
+  let noise_floor_ns = noise_floor(workers);
+  println!(
+    "noise\t{n}\tthreads\t{workers}\tprobe_ns\t{}\tlongest_gap_ns\t{noise_floor_ns}",
+    NOISE_PROBE.as_nanos()
+  );
   // The level's start on the host's monotonic clock, which every worker counts from (the module's "Each instant").
   let epoch = slates_machine::clock::monotonic_ns();
   let tallies: Vec<Tally> = std::thread::scope(|scope| {
@@ -2055,6 +2253,7 @@ fn level(
   for tally in tallies {
     total.absorb(tally);
   }
+  total.noise_floor_ns = noise_floor_ns;
   println!("level\t{n}\twall_ns\t{wall_ns}\tworkers\t{workers}");
   println!("{}", offered_row(n, think_mean, wall_ns, &total));
   report(n, &mut total);
@@ -2410,6 +2609,12 @@ mod tests {
       pause_ns: 0,
       attempt_sent_ns: 0,
       handed_ns: 0,
+      request_stamp: 0,
+      harness_ns: 0,
+      attempt_mark: 0,
+      op_mark: 0,
+      cycle_mark: 0,
+      round_mark: 0,
     }
   }
 
@@ -2676,6 +2881,31 @@ mod tests {
       row.contains("\tworst\tlatency\tCycle\tworst_p99_ns\t1200000\t"),
       "{row:?}"
     );
+    assert!(row.ends_with("\tmet\tno"), "{row:?}");
+  }
+
+  /// AC-9.1, A-559: a level whose accepted submits are past the bound only by the harness's part (a reply left 29 ms in
+  /// the ring by a stalled sweep, its server part 300 µs) is harness-bound, never charged to the server, and names its
+  /// server worst under the bound; the same latencies with the 29 ms the server's miss it.
+  #[test]
+  fn a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound() {
+    let mut tally = tally_of(1_000, 400_000, 90_000);
+    for _ in 0..100 {
+      record_split(&mut tally, Kind::SubmitAccepted, 29_300_000, 29_000_000);
+    }
+    let row = bound_row(1_000, SECOND_NS, &tally, 0);
+    for field in [
+      "\tworst\tlatency\tSubmitAccepted\tworst_p99_ns\t29300000\t",
+      "\tserver_worst\toperation\tSubmitAccepted\tserver_worst_p99_ns\t400000\t",
+      "\tharness_bound\t1\t",
+    ] {
+      assert!(row.contains(field), "{row:?} lacks {field:?}");
+    }
+    assert!(row.ends_with("\tmet\tharness"), "{row:?}");
+    for _ in 0..100 {
+      record(&mut tally, Kind::SubmitAccepted, 29_300_000);
+    }
+    let row = bound_row(1_000, SECOND_NS, &tally, 0);
     assert!(row.ends_with("\tmet\tno"), "{row:?}");
   }
 

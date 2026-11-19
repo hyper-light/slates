@@ -1,17 +1,24 @@
-//! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536; the
-//! event-driven reaper's pieces 2 and 3): a staging buffer expires a lease after its last use (`crate::staging`), a
+//! The deadlines of what a shard's clients leave behind, each kept on the shard's timing wheel (A-522, A-536, A-554;
+//! the event-driven reaper's pieces 2 to 4): a staging buffer expires a lease after its last use (`crate::staging`), a
 //! status capture at its absolute deadline (`crate::status_pages`), a volume's write lease at its term (D-16, the
-//! partition's lease wheel), a CLI attachment at its term's lapse (A-230, the partition's index of terms), and a destroy
-//! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again). One task a shard, the keeper, sleeps on the wheel until the earliest of them, releases what
-//! is due then, and sleeps until the next; a deadline set earlier than the one it sleeps for wakes it at once, so it
-//! re-arms. Nothing is scanned on a tick: each pass reads only the due entries of ordered indexes (the staging buffers by
-//! expiry, the seats by their capture's deadline, the lease wheel). Until A-522 and A-536 the reap loop's tick released
-//! each once a liveness window, every client's status capture asked at every tick, and a shard with none woke anyway.
+//! partition's lease wheel), a CLI attachment at its term's lapse (A-230, the partition's index of terms), a destroy
+//! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again), a grant at
+//! the first instant past its term (A-266, the grants' index of terms), and the look at what the shard owes the audit
+//! (A-265), a retry window after the record that armed it and again while anything is owed. One task a shard, the
+//! keeper, sleeps on the wheel until the earliest of them, releases what is due then, and sleeps until the next; a
+//! deadline set earlier than the one it sleeps for wakes it at once, so it re-arms. Nothing is scanned on a tick: each
+//! pass reads only the due entries of ordered indexes (the staging buffers by expiry, the seats by their capture's
+//! deadline, the lease wheel, the terms). Until A-522, A-536 and A-554 the reap loop's tick released each once a
+//! liveness window, every client's status capture asked and every grant walked at every tick, and a shard with none
+//! woke anyway.
 //!
 //! **Woken by whatever sets an earlier deadline.** The staging verbs and the status verb tell the keeper themselves
-//! ([`noted`], [`capture_set`]). A lease or a term is recorded by many paths (a take, a renewal, a replay), so the
-//! partition notes the earliest it entered and every state borrow closes by handing that to the keeper
-//! ([`after_borrow`]): two reads of an `Option` a borrow.
+//! ([`noted`], [`capture_set`]). A lease, a term or a grant is entered by many paths (a take, a renewal, a replay, an
+//! issue, a restore), so the partition and the grants table note the earliest they entered and every state borrow
+//! closes by handing that to the keeper ([`after_borrow`]): three reads of an `Option` a borrow.
+//!
+//! **A deadline its job could not end** (a record the catalog refused) is tried again the shard's retry window on
+//! ([`retry_window_ns`]), counted `deadline.stuck`, never spun on.
 //!
 //! **Bounds.** A seat is entered in the capture index once at most: a new capture replaces its entry
 //! (`StatusPages::index`), and a seat that ends takes its entry with it ([`forget_seat`]). Staging buffers are bounded by
@@ -62,6 +69,29 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   let _ended = crate::verbs::expire_lapsed_attachments(state);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
+  // A grant past its term ends, recorded expired with its audit record in one atom (A-266), at the first instant past
+  // its term (A-554); one whose record is refused stays due, and is tried again a retry window on.
+  if state
+    .landing
+    .grants
+    .next_due_ns()
+    .is_some_and(|at| at <= now)
+  {
+    crate::landing::end_expired_grants(state);
+  }
+  // What this partition owes the audit and has not had acknowledged a retry window after it was sent is sent again
+  // (A-265), at its look's deadline (A-554); the look is armed again while anything is owed.
+  if state.landing.audit_look_at.is_some_and(|at| at <= now) {
+    crate::landing::look_at_owed_audit(state, now);
+  }
+  // A look at departures some shard did not answer is asked for again at its retry (A-222, A-554): the reaper takes it.
+  if state.departures_retry_at.is_some_and(|at| at <= now) {
+    state.departures_retry_at = None;
+    crate::remote_attach::look_for_departures(state);
+  }
+  // A taken-back map no holder claimed by its claim's deadline is reclaimed by the reaper (A-197, A-554; Linux).
+  #[cfg(target_os = "linux")]
+  crate::held_copy::owe_reclaim_if_due(state, now);
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -85,6 +115,10 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.db.partition_mut().next_lease_expiry(),
     state.db.partition().next_term_lapse(),
     state.destroy_retry_at,
+    state.landing.grants.next_due_ns(),
+    state.landing.audit_look_at,
+    state.departures_retry_at,
+    claim_due(state),
   ]
   .into_iter()
   .flatten()
@@ -92,16 +126,39 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   if earliest.is_some_and(|at| at <= now) {
     state.count(DEADLINE_STUCK, 1);
   }
-  let window = crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
-  let next = armed_for(earliest, now, window);
+  let next = armed_for(earliest, now, retry_window_ns());
   state.deadline_armed = next;
   next.map(|at| at.saturating_sub(now))
 }
 
+/// Derived: the retry window (A-536, named by A-554): how long after a refusal a deadline its job could not end, or a
+/// refused record's retry (`verbs::step_destroys`), is tried again. It is the shard's window (A-455,
+/// `watchdog::watch_window_ns`): the liveness window `W`, the recovery budget by rent or buy (A-359), raised to the
+/// scheduler overrun this shard measured, never past the observation budget. A refusal's cause (a full segment, a
+/// partner's full channel) is cleared by work that a live shard shows progress on within its window, so a retry sooner
+/// meets the same refusal and spends a pass, and the watchdog would call a job held longer a stall; a host that keeps
+/// the shard off its CPU longer than `W` lengthens it as much.
+pub(crate) fn retry_window_ns() -> u64 {
+  crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns())
+}
+
+/// When the next taken-back map's claim is due (A-197, A-554; `crate::held_copy::next_claim_deadline`): Linux alone
+/// takes writable copies back from its anchor.
+#[cfg(target_os = "linux")]
+fn claim_due(state: &ShardState) -> Option<u64> {
+  crate::held_copy::next_claim_deadline(state)
+}
+
+/// When the next taken-back map's claim is due: never, where no copy is taken back (macOS and Windows, A-197).
+#[cfg(not(target_os = "linux"))]
+fn claim_due(_state: &ShardState) -> Option<u64> {
+  None
+}
+
 /// When the keeper sleeps until, given the earliest deadline its pass left: that deadline, or, for one still past after
-/// the pass (a job that could not end it: a record the catalog refused), `window` after `now`, so it is tried again a
-/// window on and never spun on. The red check of a retry the keeper never took found the spin: the watchdog ended the
-/// test daemon, its shard 3.5 s on its CPU without a step (A-536).
+/// the pass (a job that could not end it: a record the catalog refused), `window` after `now` ([`retry_window_ns`]), so
+/// it is tried again a window on and never spun on. The red check of a retry the keeper never took found the spin: the
+/// watchdog ended the test daemon, its shard 3.5 s on its CPU without a step (A-536).
 fn armed_for(earliest: Option<u64>, now: u64, window: u64) -> Option<u64> {
   earliest.map(|at| {
     if at <= now {
@@ -113,18 +170,26 @@ fn armed_for(earliest: Option<u64>, now: u64, window: u64) -> Option<u64> {
 }
 
 /// Format: the counter of the keeper's passes that left a deadline past due (a job's record refused), each tried again a
-/// window later ([`armed_for`]).
+/// retry window later ([`armed_for`], [`retry_window_ns`]).
 const DEADLINE_STUCK: &str = "deadline.stuck";
 
-/// Closes every state borrow (`state::try_with_state`): a lease or a CLI attachment's term the borrow entered to lapse
-/// before the deadline the keeper sleeps for wakes it, so it re-arms (A-536). The keeper's own pass notes the leases it
-/// renews, after it armed for them, so they wake nothing.
+/// Closes every state borrow (`state::try_with_state`): a lease, a CLI attachment's term or a grant the borrow entered
+/// to lapse before the deadline the keeper sleeps for wakes it, so it re-arms (A-536, A-554). The keeper's own pass
+/// notes the leases it renews, after it armed for them, so they wake nothing.
 pub(crate) fn after_borrow(state: &mut ShardState) {
+  // The fleet's members changed: the control shard's reaper looks for hosts that left (A-222, A-554).
+  if state.fleet.take_members_changed() {
+    crate::remote_attach::look_for_departures(state);
+  }
   let partition = state.db.partition_mut();
-  let earliest = [partition.take_noted_lease(), partition.take_noted_term()]
-    .into_iter()
-    .flatten()
-    .min();
+  let earliest = [
+    partition.take_noted_lease(),
+    partition.take_noted_term(),
+    state.landing.grants.take_noted(),
+  ]
+  .into_iter()
+  .flatten()
+  .min();
   if let Some(at) = earliest {
     noted(state, at);
   }
@@ -307,6 +372,169 @@ mod tests {
     daemon.stop();
     let taken = taken.expect("the retry was kept within half a liveness window");
     println!("a destroy's retry due in {SOON_NS} ns kept {taken:?} after it was set");
+  }
+
+  /// Shape: the landing the grant test presents, by its id.
+  const LANDING: u64 = 7;
+
+  /// A landing presented to [`principal`] and awaiting its grant, as the landing verb leaves one (§4.15 step 3): what
+  /// `landing::issue_grant` binds.
+  fn awaiting() -> crate::landing::Awaiting {
+    crate::landing::Awaiting {
+      manifest: [7; 32],
+      binding: slates_land::grant::GrantBinding {
+        consumer: principal().key().into_boxed_slice(),
+        volume: [9; 16],
+        snapshot: 1,
+        target: slates_land::grant::TargetIdentity {
+          key: "/landing".into(),
+          device: 1,
+          inode: 2,
+        },
+      },
+      volume: VolumeId { bytes: [9; 16] },
+      snapshot: slates_db::catalog::SnapshotId { value: 1 },
+      target: "/landing".to_owned(),
+      principal: principal(),
+      client: 1,
+      entries: Vec::new(),
+      conflicts: std::collections::BTreeMap::new(),
+    }
+  }
+
+  /// A-554 (grants off the tick). Do: on a one-shard daemon, present a landing awaiting its grant and issue the grant
+  /// under the volume's policy with a term of a tenth of a liveness window, as a bypass presentation does; look until it
+  /// has left the shard's table and the durable one and its expiry is in the audit. Expect: ended within half a window,
+  /// by the keeper at the first instant past its term, recorded and audited in one atom (A-266). The reap loop's tick,
+  /// which ended grants past their term before, runs once a window.
+  #[test]
+  fn a_grant_past_its_term_ends_at_its_term_without_a_tick() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let begun = Instant::now();
+    let grant = crate::daemon::observe_first(&daemon, |state| {
+      state.landing.awaiting.insert(LANDING, awaiting());
+      crate::landing::issue_grant(
+        state,
+        &principal(),
+        LANDING,
+        (slates_ipc::protocol::GrantScope::Once, SOON_NS),
+        crate::landing::Issuer::Policy,
+      )
+      .unwrap()
+    });
+    let ended = look_until(&daemon, begun, move |state| {
+      state
+        .landing
+        .grants
+        .get(slates_land::grant::GrantId(grant))
+        .is_none()
+        && state.db.partition().grant(grant).is_none()
+        && state.db.partition().audit().any(|record| {
+          record.grant == Some(grant) && record.kind == slates_db::catalog::AuditKind::GrantExpired
+        })
+    });
+    daemon.stop();
+    let ended = ended.expect("the grant ended and was audited within half a liveness window");
+    println!("a grant with a {SOON_NS} ns term ended {ended:?} after it was issued");
+  }
+
+  /// Shape: the certificate anchors and member ids of the two peers the departure test's control shard learns: one that
+  /// stays a member and one that leaves.
+  const STAYING_ANCHOR: u64 = 0x51_0001;
+  /// Shape: see [`STAYING_ANCHOR`].
+  const STAYING_MEMBER: u64 = 0x51_0002;
+  /// Shape: see [`STAYING_ANCHOR`].
+  const LEAVING_ANCHOR: u64 = 0x1e_0001;
+  /// Shape: see [`STAYING_ANCHOR`].
+  const LEAVING_MEMBER: u64 = 0x1e_0002;
+  /// Shape: how long the departure test waits for the control shard to count the leaving peer among the members: a
+  /// window and a half, past the reap loop's first look a window into the start.
+  const COUNTED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2 * 3;
+
+  /// A-554 (departed hosts off the tick; A-222). Do: on a one-shard daemon, learn two peers (each anchor's member id,
+  /// as the control shard learns them on contact), configure both members beside the node, and record an attachment of
+  /// one of the leaving peer's clients on a volume here; wait until the control shard counts the leaving peer's anchor
+  /// among the members'; then install a configuration without it, as the council's commit of its retirement does, and
+  /// look until the attachment is gone. Expect: ended within half a window of the install, by a look the change itself
+  /// asked for. The reap loop's tick looked once a window, and its look was what counted the peer, so the install that
+  /// followed it waited a whole window for the next.
+  #[test]
+  fn a_departed_hosts_attachment_ends_when_the_fleet_lets_it_go_without_a_tick() {
+    use slates_db::HostId;
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let attachment = crate::daemon::observe_first(&daemon, |state| {
+      for (anchor, member) in [
+        (STAYING_ANCHOR, STAYING_MEMBER),
+        (LEAVING_ANCHOR, LEAVING_MEMBER),
+      ] {
+        state.learned_members.insert(
+          HostId(anchor),
+          crate::state::LearnedMember {
+            boot_nonce: 1,
+            host: HostId(member),
+            previous: None,
+          },
+        );
+      }
+      let local = state.fleet.host();
+      let configuration = state.fleet.configuration().clone();
+      state.fleet.install_configuration(
+        configuration,
+        &[local, HostId(STAYING_MEMBER), HostId(LEAVING_MEMBER)],
+      );
+      let volume = crate::verbs::to_db_volume(created(state, "departing"));
+      let record = state.db.partition().volume(volume).unwrap().clone();
+      let id = crate::verbs::next_attachment_id(state);
+      let now = state.clock.monotonic_ns();
+      let added = slates_db::Op::AttachmentAdded {
+        record: slates_db::catalog::AttachmentRecord {
+          id,
+          volume: record.id,
+          consumer: slates_db::catalog::Consumer::Remote {
+            host: LEAVING_ANCHOR,
+            client: 1,
+          },
+          snapshot: None,
+          form: slates_db::catalog::AttachForm::Root,
+          principal: record.owner.clone(),
+          rights: crate::verbs::rights_of(&record, &record.owner),
+          token: [0; 16],
+          mount: None,
+        },
+      };
+      state.db.mutate(&mut state.segment, &added, now).unwrap();
+      id
+    });
+    // The control shard's count of the members' anchors is what a departure is judged against (A-222); the test waits
+    // for it to name the leaving peer before the peer leaves.
+    let begun = Instant::now();
+    while !crate::daemon::observe_first(&daemon, |state| {
+      state.configured_members.contains(&LEAVING_ANCHOR)
+    }) {
+      assert!(
+        begun.elapsed() < Duration::from_nanos(COUNTED_WITHIN_NS),
+        "the control shard counted the leaving peer among the members"
+      );
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    }
+    let retired = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      let local = state.fleet.host();
+      let configuration = state.fleet.configuration().clone();
+      state
+        .fleet
+        .install_configuration(configuration, &[local, HostId(STAYING_MEMBER)]);
+    });
+    let ended = look_until(&daemon, retired, move |state| {
+      state.db.partition().attachment(attachment).is_none()
+    });
+    daemon.stop();
+    let ended = ended.expect("the departed peer's attachment ended within half a liveness window");
+    println!(
+      "a departed peer's attachment ended {ended:?} after the configuration without it was installed"
+    );
   }
 
   /// A volume named `name` that [`principal`] creates on `state`'s shard, through the verb: its id.
