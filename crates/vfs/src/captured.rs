@@ -1035,6 +1035,49 @@ mod tests {
     assert_eq!(units, 2);
   }
 
+  /// A-577. Do: lay out an origin, snapshot it, clone the snapshot, make a file in the clone, then take the clone's
+  /// image for recovery and its standalone image. Expect the recovery image to carry what the clone shares with its
+  /// origin by number only, and the standalone image to hold every inode the clone's head reaches, the shared ones
+  /// included, root and all, sharing none and naming no origin, as a volume never cloned holds itself: a live log's
+  /// successor lays the tree out from it with no origin beside it. Before A-577 a live clone's whole records were its
+  /// recovery image, and a successor's rebuild found no tree under its root.
+  #[test]
+  fn a_clones_standalone_image_holds_every_inode_its_head_reaches_and_shares_none() {
+    let mut store = store();
+    let mut origin = volume(&mut store);
+    lay_out_the_origin(&mut store, &mut origin);
+    let captured = origin.snapshot(&mut store).unwrap();
+    let mut clone =
+      Volume::clone_without_base(&store, &mut origin, captured, volume_config()).unwrap();
+    file(&mut clone, &mut store, "/", "made", b"made");
+    let recovery = clone.to_image(&store, None).unwrap();
+    let standalone = clone.to_standalone_image(&store, None).unwrap();
+    assert!(
+      !recovery.origin_shared.is_empty(),
+      "recovery carries what the clone shares by number"
+    );
+    let numbers = |image: &crate::recover::VolumeImage| {
+      image
+        .inodes
+        .iter()
+        .map(|inode| inode.no)
+        .collect::<std::collections::BTreeSet<u64>>()
+    };
+    let mut reached = numbers(&recovery);
+    reached.extend(recovery.origin_shared.iter().copied());
+    assert_eq!(
+      numbers(&standalone),
+      reached,
+      "every inode the head reaches"
+    );
+    assert!(standalone.origin_shared.is_empty(), "nothing shared");
+    assert_eq!(standalone.origin_epoch, None, "no origin named");
+    assert!(
+      numbers(&standalone).contains(&standalone.root_no),
+      "its root among them"
+    );
+  }
+
   /// What a tree holds at a path, each kind: a file with its size, a directory, a symlink with its target, the root,
   /// and nothing at a missing name or beneath a file.
   #[test]

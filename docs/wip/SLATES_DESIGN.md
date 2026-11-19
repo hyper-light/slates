@@ -7693,6 +7693,15 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
 > (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
 >
+> **A clone of a live volume is answered once its own log holds it (2026-11-19, A-577).** A clone of a live-shipped
+> volume is live-shipped too, and its `Clone` answered on its origin's log, which the clone did not change; its record,
+> a copy of its origin's, named the origin's head, so nothing of it shipped until its own first seal; and its log's
+> whole records were its recovery image, which names its inherited tree by number, so a successor with no origin found
+> no root to lay out. Now a clone's registers start at the creation head, a live log's whole records stand alone (every
+> inode, content and all), its reply waits for its own first whole entry durable on `f` holders (on the cross-partition
+> path too, after its alias), and its status reports the window its seals leave until its new log has answered at a
+> whole entry. A-577's entry measures the cost: one entry, the clone's whole image, one round trip.
+>
 > **The held replies' bound is met before a verb runs (2026-11-18).** A shard holds at most `awaiting_bound` such
 > replies (its client seats times ring slots). A recorded verb that could be held (one that changes a live-shipped
 > volume, or a destroy while `f > 0`) meets that bound before it runs (`live_ship::refuse_over_bound`, from
@@ -39057,6 +39066,69 @@ paragraph), the bug record `docs/bugs/2026-11-19-a-shards-stream-on-a-volume-los
     was clean.
 - **Still owed** (GAPS): the guest device's and the WinFsp mount's forms of the same answer, and a relinquish (A-362)
   that waits for a stream ended before its next turn.
+
+### A-577 — A live clone is answered only once its first whole entry is durable on f + 1 members, its log holds its whole tree, and its status reports its window until then (2026-11-19, g267, UI goal 84; §4.10 "Live shipping", §4.8 "Promotion and takeover", AC-8.3; A-200, A-236, A-240, A-565)
+
+- **What was there** (`docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, found settling
+  A-565). A clone of a live-shipped volume is live-shipped too. Three faults met in it:
+  - its `Clone` reply waited on its origin's log (`verbs::replicated_waits` took the verb's own volume), which the clone
+    did not change, so it was answered while nothing of it was held elsewhere, and its status read a zero window;
+  - its record was a copy of its origin's, naming the origin's head at the origin's sequence, so no head of it shipped
+    until its own first seal: the fleet did not know it, and at `f > 0` its log could never answer
+    (`live_ship::head_placed`), so its writes waited until the held-reply bound refused them;
+  - its log's whole records were its recovery image, which names what it shares with its origin snapshot by number only
+    (`VolumeImage::origin_shared`), restored at recovery from the origin beside it: a successor rebuilding it from its
+    log, with no origin, found no root to lay out, or a tree short of every untouched inherited file. A-565's settlement
+    ("a live clone's first write ships its whole image, inherited tree included") was wrong: measured here, the whole
+    entry of a clone of one 4,096-byte file was 370 bytes.
+- **The rule.**
+  - A clone is a new object: its registers start at the creation head (head none, sequence 0), with no takeover record
+    and no live holders copied from its origin (`verbs::publish_clone_as`), so the record plane ships its catalog and
+    creation head as a new volume's, and the fleet knows it at once.
+  - A live log's whole records stand alone: every inode the head reaches, content and all (`Volume::to_standalone_image`,
+    the image `live_ship::whole_record` builds every whole record and install image from). A clone's later full records
+    (after it diverges an inherited inode) still name its shared inodes by number; a rebuild keeps those, with their
+    content runs, from the image before it (`live_ship::keep_shared`), and is refused
+    `fleet.live.takeover_refused.shared` when that image lacks one, never served short of it.
+  - The `Clone` reply waits for the clone's own log (`replicated_waits`: a `Cloned` reply's volume): its first whole
+    entry, which the Clone's own publication appends (a clone never published is not clean), durable on `f` holders,
+    behind the gates every live write waits for: its catalog naming its holders placed (A-240), its creation head placed,
+    every candidate's key covered. A clone named on another partition (A-236) commits its outcome with its request kept in
+    flight (`image::commit_in_flight`), settles its alias, then answers or holds its reply for the same durability
+    (`image::answer_in_flight`), so its alias is still confirmed before its reply.
+  - Its status: a log begun new on its owner holds nothing a takeover finds until it answers a writer at a whole entry
+    (`LiveVolume::nothing_answered`, cleared for good in `live_ship::resolve`); until then, and for a live volume whose
+    log never shipped (no holders recorded, not rebuilt from a log: a volume just made live too), `verbs::at_risk_ns`
+    reports the window its seals leave, its whole age before a seal is placed, never zero.
+- **What the reply costs (measured, then derived).** The reply waits for exactly one entry, position 0, the clone's whole
+  image, and is answered at the first acknowledgement from `f` of its holders: one round trip
+  (`a_live_clones_reply_waits_for_one_acknowledged_whole_image`, `f = 1`, two holders: waiting at position 0 before one
+  holder's acknowledgement, nothing after it). For a clone of one 4,096-byte file of incompressible bytes that image is
+  4,757 bytes: the file and its tree's metadata, sealed. Derived from the gates, not measured here: before that
+  round the fleet must know the clone, as for any new live volume's first write: the record plane ships its catalog
+  (with its holders) at its next period and its creation head the period after the catalog is placed
+  (`fleet::unplaced_heads`; a period is `HEARTBEAT_NS`, 100 ms), and the entry ships once the catalog is placed (A-240).
+  So in a fleet a live clone's reply waits up to two record periods and their round trips, then the image's round trip
+  and transfer: about 200 ms at the 100 ms period, where it waited for nothing and claimed what it did not hold.
+- **Tests.** `a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable` (`crates/server/src/verbs.rs`, the test
+  parked with A-565, un-ignored); `a_fresh_clone_ships_its_creation_head_at_once` (`crates/server/src/fleet.rs`);
+  `a_live_clones_reply_waits_for_one_acknowledged_whole_image` and
+  `a_clones_full_record_keeps_what_it_shares_from_the_image_before_it` (`crates/server/src/live_ship.rs`);
+  `a_clones_standalone_image_holds_every_inode_its_head_reaches_and_shares_none` (`crates/vfs/src/captured.rs`).
+  Red first on the Mac Studio (2026-11-19, `cargo test --locked -p slates-server --lib` and `-p slates-vfs --lib`): with
+  the reply on the origin's log, the clone's record a copy of its origin's, the status's rule off, whole records the
+  recovery image, the merge keeping nothing and the vfs image sharing, 0 of 4 server tests and 0 of 1 vfs test passed,
+  each at its own assertion; with them, 83 of 83 over the server lib's A-577, A-565 and A-544 tests and its `clone`,
+  `alias`, `carry::`, `moves::`, `catalog::`, `landing::`, `fleet::`, `live_ship::` and `image::` tests, and 16 of 16
+  over the vfs lib's `captured::`, delta, image, recover and clone tests.
+- **Owed.** The record plane shipping a new live volume's catalog and creation head on demand rather than at its period
+  (as A-255 ships a merge catalog), which would bring the reply to its entries' rounds; an image merged as a clone
+  (`image::run_merge`) still answers before its live clone's log holds it; the fleet's own test of the window (a live
+  origin cloned, its owner killed before the clone is written, the successor serving it whole), filed for main.
+
+Applied in the same change to: §4.10's live shipping status (a paragraph after "Slice two"), GAPS (the entry closed),
+the bug record, `crates/vfs` (`recover.rs`: `to_standalone_image`), `crates/server` (`verbs.rs`, `image.rs`,
+`live_ship.rs`, `fleet.rs`, `carry.rs` tests).
 
 ### A-575 — A repository's greens are one lineage on its partition: the repository verbs, a member lent for one borrow, a member's release sliced, and memberships recovered from the log and the snapshot (2026-11-19, g261 for UI goal 91; §4.17.1 items 1 to 5 and shared piece 1's last part; §4.16 "The state's maps"; D-28; A-515, A-534)
 Applied in the same change to: §4.16 (the subsection's status), §4.17.1 (a status block, the pieces list's item 1), GAPS

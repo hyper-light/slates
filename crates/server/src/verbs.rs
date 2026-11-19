@@ -2857,7 +2857,10 @@ type ReplicatedWait = (DbVolumeId, u64);
 /// its tombstone placed at `f + 1` (`live_ship::tombstone_target`). A destroy never waits on the live log: it publishes
 /// no content to make durable, and its teardown refuses whatever waits on the log `NotFound`, which had told a client
 /// its successful destroy had not happened; and answered before its tombstone was placed, an owner lost at once left a
-/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`).
+/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`). A clone waits on its own log,
+/// not its origin's (A-577): the verb's volume is the origin, which the clone did not change, while a live clone's whole
+/// image is its own log's first entry, which its publication just appended; answered before it, a clone was lost to one
+/// owner loss at `f = 1` with the client told it existed.
 fn replicated_waits(
   state: &ShardState,
   volume: Option<DbVolumeId>,
@@ -2875,6 +2878,10 @@ fn replicated_waits(
   if label != 1 || matches!(reply, ReplyBody::Refused { .. }) {
     return (None, None);
   }
+  let volume = match reply {
+    ReplyBody::Cloned { id } => to_db_volume(*id),
+    _ => volume,
+  };
   let live = crate::live_ship::durable_target(state, volume).map(|target| (volume, target));
   (live, None)
 }
@@ -9973,7 +9980,8 @@ pub(crate) const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
 /// Makes a clone whose name hashes to `name_partition`, another partition (A-236, `slates_db::alias::CLONE_STEPS`):
 /// the alias reserved at the name's partition, the clone made here beside its origin with its completion record, and
 /// the alias confirmed (or released, when the clone could not be made) before the reply. The reply is deferred to a
-/// task of this shard, so a retry meanwhile joins it.
+/// task of this shard, so a retry meanwhile joins it; a live clone's completion and reply wait for its first whole
+/// entry durable on `f` candidates as well (A-577).
 fn clone_named_elsewhere(
   state: &mut ShardState,
   principal: &Principal,
@@ -10014,13 +10022,15 @@ fn clone_named_elsewhere(
         reason: "the name's shard did not answer its reservation".to_owned(),
       })
     });
+    // The clone made and committed, its request kept in flight while its alias settles (a retry joins it); a live clone's
+    // completion waits too, for its first whole entry durable on `f` candidates (A-577).
     let made = crate::state::with_state(|s| {
-      crate::image::complete(s, request, |s| match &reserved {
+      crate::image::commit_in_flight(s, request, id, |s| match &reserved {
         Err(refusal) => refused(refusal.clone()),
         Ok(()) => clone_as(s, &principal, (volume, snapshot, &name), id),
       })
     });
-    let Some((reply, route)) = made else {
+    let Some((reply, target)) = made else {
       return;
     };
     if reserved.is_ok() {
@@ -10040,7 +10050,9 @@ fn clone_named_elsewhere(
         let _ = crate::state::with_state(|s| s.count(ALIAS_STEP_UNTAKEN, 1));
       }
     }
-    let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
+    // Answered after its alias, as every clone is: at once, or held for the clone's durability (A-577).
+    let _ =
+      crate::state::with_state(|s| crate::image::answer_in_flight(s, request, id, (reply, target)));
   })
 }
 
@@ -10366,6 +10378,15 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
+  // A clone is a new object (A-577): its head register starts at the creation head, naming no content, as a new
+  // volume's does, so the record plane ships it at once and the fleet knows the clone. Copied from its origin, its head
+  // named the origin's snapshot at the origin's sequence, none of the clone's, and nothing of it shipped until its own
+  // first seal: at `f > 0` a live clone's log could never answer, and a takeover never found it. Nor was the clone
+  // taken over, and nothing of its log has shipped: its own shipper records its holders.
+  new_record.head = DbSnapshotId::default();
+  new_record.epoch = 0;
+  new_record.taken_over = None;
+  new_record.policy.live_holders = None;
   // A clone of a captured base holds its whole tree and reads no base directory (A-291), and is born with its capture's
   // record, naming no head yet (A-544): a successor that adopts a head no record is for refuses its landing by kind.
   let captured = state
@@ -12904,7 +12925,9 @@ fn newest_placed_seal<'a>(
 
 /// The window an owner loss would lose of `record`'s volume now (AC-8.3), on this host's monotonic clock:
 /// - zero for a live-shipped volume in a fleet, whose writes are durable on its holders before they are answered
-///   (A-200);
+///   (A-200), once its log holds the volume where a takeover finds it: a log begun here, a new live clone's or a volume
+///   just made live, holds nothing until it answers at a whole entry, and its window is the rules below until then
+///   (A-577, `live_ship::holds_nothing_yet`);
 /// - zero for a volume that is exactly its head snapshot when that snapshot is `placed`, the newest seal on `f + 1`
 ///   hosts;
 /// - otherwise the age of `placed`, the edits after which live on the owner alone;
@@ -12919,7 +12942,10 @@ fn at_risk_ns(
   unchanged_since_head: bool,
   placed: Option<&SnapshotRecord>,
 ) -> Option<u64> {
-  if record.policy.live_shipped && state.fleet.configuration().quorum.f > 0 {
+  if record.policy.live_shipped
+    && state.fleet.configuration().quorum.f > 0
+    && !crate::live_ship::holds_nothing_yet(state, record.id)
+  {
     return Some(0);
   }
   // The shard's clock is the host's monotonic clock (`HostClock`), read here without borrowing it mutably.
@@ -21412,16 +21438,14 @@ mod tests {
     });
   }
 
-  /// The open bug `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, filed with A-565, red
-  /// until fixed. Do: on a shard, make a volume, ship it live, snapshot it and clone the snapshot (the clone is
+  /// A-577 (`docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, written failing and parked
+  /// with A-565). Do: on a shard, make a volume, ship it live, snapshot it and clone the snapshot (the clone is
   /// live-shipped as its origin is), give the clone's log the state it holds before any of it reaches a holder (`f = 1`,
   /// its first whole entry owed), and ask what the Clone's reply waits for. Expect the clone's first whole entry, position
-  /// 0: a verb on a live volume answers once what it published is durable on `f` candidates (A-200). Today the reply
-  /// waits on the verb's own volume, the origin, whose log the Clone did not change, so a Clone answers while nothing of
-  /// the clone is held anywhere else; its owner lost then, the successor finds no log and no seal of it and serves it
-  /// empty.
+  /// 0: a verb on a live volume answers once what it published is durable on `f` candidates (A-200). Before, the reply
+  /// waited on the verb's own volume, the origin, whose log the Clone did not change, so a Clone answered while nothing of
+  /// the clone was held anywhere else; its owner lost then, the successor found no log and no seal of it.
   #[test]
-  #[ignore = "open bug docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md: red until fixed"]
   fn a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable() {
     let (waits, clone) = crate::daemon::audit_on_shard(|state| {
       let owner = Principal::Uid {

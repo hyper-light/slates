@@ -83,18 +83,22 @@
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
 
-> **Open (g267, 2026-11-19, found settling A-565): a live clone is answered before any of it is durable.** A clone of a
-> live-shipped volume is live-shipped too, but the `Clone` verb's reply waits on its origin's log
-> (`verbs::replicated_waits` takes the verb's own volume), which the clone did not change, so the clone is answered while
-> nothing of it is held anywhere else, and its status reports a zero loss window. At `f = 1` an owner lost before the
-> clone's first write is durable leaves a successor with no log of it (`live_ship::fetch`: `Ok(None)`) and no seal (a
-> fresh clone's head is its origin's), serving it empty: an acknowledged clone lost, against A-200's promise. Writes are
-> not lost (a live clone's first write ships its whole image, inherited tree included, and waits for it). Not affected:
-> kiln's fleet workspaces (never live-shipped; their status reports their whole age at risk until a seal is placed).
-> **Owed:** the clone's reply held for its first whole entry, `durable_target` naming it from the clone's making, and the
-> loss report zero only once the log holds a durable whole entry; the failing test is written and parked
-> (`a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable`, `crates/server/src/verbs.rs`). Record:
-> `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`.
+> **Fixed (g267, 2026-11-19, A-577; found settling A-565): a live clone was answered before any of it was durable.** A
+> clone of a live-shipped volume is live-shipped too, but its `Clone` reply waited on its origin's log, and its record,
+> a copy of its origin's, named the origin's head, so nothing of it shipped until its own first seal: at `f = 1` an owner
+> lost before the clone's first write was durable left a successor with no log and no seal of it, an acknowledged clone
+> lost, its status reading a zero window; at `f > 0` its writes waited until the held-reply bound refused them; and
+> its log's whole records were its recovery image, which names its inherited tree by number, so a rebuild from the log
+> found no root to lay out. Now a clone's registers start at the creation head (the fleet knows it at once), a live
+> log's whole records stand alone (`Volume::to_standalone_image`; a later full record's shared inodes kept from the
+> image before it, `live_ship::keep_shared`), its reply waits for its own first whole entry durable on `f` holders
+> (after its alias on the cross-partition path), and its status reports the window its seals leave until its new log has
+> answered at a whole entry. The reply's cost: one entry, the clone's whole image,
+> answered at one round trip to `f` holders, behind the record plane's placement of its catalog and creation head (up to
+> two record periods for a clone the fleet does not know yet). **Owed:** an image merged as a clone
+> (`image::run_merge`) still answers before its live clone's log holds it; the record plane shipping a new live volume's
+> catalog and creation head on demand rather than at its period; the fleet's own test of the window (filed for main).
+> Record: `docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
@@ -1229,7 +1233,8 @@
 >   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
 >   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
->   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is the open bug above);
+>   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is answered only once its log
+>   holds it since A-577);
 >   (3) a kind
 >   change (a file made a directory) lands as a removal and a making the class order meets as `TypeChanged`; a symlink
 >   pointed elsewhere does not land over the old one, as an overlay's does not; (4) the server's own test landing a

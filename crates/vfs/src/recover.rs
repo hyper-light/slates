@@ -1505,12 +1505,43 @@ impl Volume {
     store: &Store,
     host: Option<&mut dyn crate::host::HostFs>,
   ) -> Result<VolumeImage, VfsError> {
+    self.image_with(store, host, false)
+  }
+
+  /// This volume's image standing alone (A-577): as [`Volume::to_image`], but a clone's head is captured whole, every
+  /// inode it reaches included, with no origin epoch and nothing shared by number. Recovery restores what a clone shares
+  /// with its origin snapshot from the origin beside it; a live log's successor holds no origin, so a live log's whole
+  /// records are this. For a volume that is no clone it is [`Volume::to_image`]'s exactly.
+  pub fn to_standalone_image(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+  ) -> Result<VolumeImage, VfsError> {
+    self.image_with(store, host, true)
+  }
+
+  /// [`Volume::to_image`], or with `standalone` [`Volume::to_standalone_image`].
+  fn image_with(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    standalone: bool,
+  ) -> Result<VolumeImage, VfsError> {
     let base = match (&self.base, host) {
       (Some(plane), Some(host)) => Some(plane.image(host)?),
       (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
       (None, _) => None,
     };
-    let (inodes, origin_shared) = self.capture_head(store)?;
+    let (inodes, origin_shared) = if standalone {
+      (self.capture_tree(store, self.inode_root)?, Vec::new())
+    } else {
+      self.capture_head(store)?
+    };
+    let origin_epoch = if standalone {
+      None
+    } else {
+      self.origin_epoch.map(|e| e.0)
+    };
     let snapshots = self.capture_snapshots(store)?;
     let root_no = store
       .dirs
@@ -1528,7 +1559,7 @@ impl Volume {
       next_counter: self.recorded_counter(store),
       // And the live counter beside it (A-578): the numbers between the two are what a successor never had.
       live_counter: self.next_counter,
-      origin_epoch: self.origin_epoch.map(|e| e.0),
+      origin_epoch,
       quota: quota_image(&self.quota),
       root_no: root_no.0,
       last_snapshot: self.last_snapshot.map(snap_ref),
