@@ -393,6 +393,106 @@ fn a_part_only_partly_wanted_is_left_and_its_wanted_objects_encoded() {
   repository.release(&mut store).unwrap();
 }
 
+/// A ref whose history a client holds at version 0, then rewritten twice: version 1 a new root over a file `p`,
+/// version 2 that file edited (a reference delta against version 1's in its fragment), version 3 a new root again
+/// keeping version 2's file and adding `q`, so version 1's file is in neither the client's history nor the wanted one.
+/// Every version encoded; the repository and each version's objects.
+fn rewritten_twice(format: ObjectFormat, store: &mut ContentStore) -> (Repository, Vec<Vec<Made>>) {
+  let mut repository = Repository::new(format);
+  let mut versions: Vec<Vec<Made>> = Vec::new();
+  let files = [
+    (&b"o"[..], text(200, &[7])),
+    (&b"p"[..], text(200, &[])),
+    (&b"p"[..], text(200, &[100])),
+  ];
+  for (version, (name, content)) in files.into_iter().enumerate() {
+    let file = blob(format, &content);
+    let root = tree(format, &[(Mode::File, name, file.id)]);
+    let parents: Vec<ObjectId> = (version == 2)
+      .then(|| versions[1][0].id)
+      .into_iter()
+      .collect();
+    let head = commit(
+      format,
+      root.id,
+      &parents,
+      u64::try_from(version).unwrap() + 1,
+    );
+    versions.push(vec![head, root, file]);
+  }
+  let (kept, added) = (versions[2][2].clone(), blob(format, b"added\n"));
+  let root = tree(
+    format,
+    &[(Mode::File, b"p", kept.id), (Mode::File, b"q", added.id)],
+  );
+  versions.push(vec![commit(format, root.id, &[], 4), root, kept, added]);
+  for (version, objects) in versions.iter().enumerate() {
+    let head = objects[0].id;
+    push_and_move(&mut repository, store, objects.clone(), &[(1, Some(head))]).unwrap();
+    repository
+      .encode_fragments(store, (1, version), &mut Ticks(0), EXCHANGE)
+      .unwrap();
+  }
+  (repository, versions)
+}
+
+/// A-639 (a part the cover takes reads no base from outside the pack: across a rewrite its version's bases may be in
+/// neither side's history). Do: answer, thin, a client holding version 0 of a ref rewritten twice since, the wanted
+/// objects one by one: version 3's commit and tree, and the two files it holds, one of them version 2's, kept as a delta
+/// against version 1's file. Expect: read back with the client's objects as bases, exactly those four objects, each
+/// once; the delta against version 1's file, which neither side holds, sent whole.
+#[test]
+fn a_part_the_cover_takes_names_no_base_that_neither_side_holds() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let (repository, versions) = rewritten_twice(format, &mut store);
+  let (_, blobs) = repository.fragments(1, 2).unwrap();
+  assert_eq!(blobs[0].stored, crate::store::Stored::Reference);
+  let wanted: BTreeSet<ObjectId> = versions[3].iter().map(|made| made.id).collect();
+  let positions = wanted
+    .iter()
+    .map(|id| repository.object(&store, id).unwrap().position)
+    .collect();
+  let mut answer = Answer::objects(&Positions::of(positions));
+  answer.thin = true;
+  let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
+  let read = read_back(format, &pack, &Held::of(&versions[0])).unwrap();
+  assert_eq!(once(&read), wanted);
+  assert!(counters.made_whole >= 1, "{counters:?}");
+  repository.release(&mut store).unwrap();
+}
+
+/// Main's run (A-639): packs the stream answers, each `<name> <hex>` on a line of standard output, for git itself to
+/// read: `clone` (version 2's closure, self-contained), `base` (version 0's closure: the client's repository),
+/// `thin` (versions 1 and 2 for a client holding version 0, thin), `no-ofs` (the clone for a client without
+/// `ofs-delta`). Each decoded and given to `git index-pack --strict --stdin` in a fresh bare repository, the thin
+/// one with `--fix-thin` in the repository `base` was indexed into; then `git verify-pack -v` on each.
+#[test]
+#[ignore = "main's run: git index-pack and verify-pack over the stream's packs"]
+fn upload_packs_for_git_index_pack() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let (repository, _) = three_versions(format, &mut store, true);
+  let clone = Answer::objects(repository.reached(1).unwrap());
+  let mut no_ofs = clone.clone();
+  no_ofs.ofs = false;
+  let base = Answer::objects(repository.brought(1, 0).unwrap());
+  let packs = [
+    ("clone", clone),
+    ("base", base),
+    ("thin", run_answer(true, None)),
+    ("no-ofs", no_ofs),
+  ];
+  let mut lines = String::new();
+  for (name, answer) in packs {
+    let (pack, _) = streamed(&repository, &store, answer, u64::MAX);
+    let hex: String = pack.iter().map(|byte| format!("{byte:02x}")).collect();
+    lines.push_str(&format!("{name} {hex}\n"));
+  }
+  std::io::Write::write_all(&mut std::io::stdout(), lines.as_bytes()).unwrap();
+  repository.release(&mut store).unwrap();
+}
+
 /// A-639 (the stream holds no borrow between turns; a base pack made again under it is refused, never mixed). Do:
 /// answer a clone of a ref whose base pack holds offset deltas to a client without `ofs-delta`, a unit a turn, and make
 /// the base pack again at a newer version as soon as the stream reads one of its parts entry by entry. Expect: a later
