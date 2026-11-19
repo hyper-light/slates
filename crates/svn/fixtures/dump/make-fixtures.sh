@@ -13,7 +13,7 @@
 # properties of the root (an empty Node-path); a directory copied, a file copied as it was and copied then changed, a
 # copy made from an older revision; a file and a directory deleted; a file and a directory replaced without history and
 # replaced by a copy (svnadmin writes that as a delete record and an add record), one of them changed after the copy;
-# a server-side tag; a merge, which sets svn:mergeinfo; revision properties beyond the three, a multi-line log and an
+# a server-side tag; a merged change, which sets svn:mergeinfo; revision properties beyond the three, a multi-line log and an
 # empty one.
 #
 # Deterministic: no configuration but this script's (a fresh HOME and configuration directory), a fixed UUID (the one
@@ -121,12 +121,14 @@ svn update -q
 svn copy -q -m 'r9: a tag' "$URL/trunk" "$URL/tags/v1"
 svn update -q
 
-# r10 and r11: a change on the branch, then the branch merged to trunk, which sets svn:mergeinfo.
+# r10 and r11: a change on the branch, then that change merged to trunk, which sets svn:mergeinfo. The merge names
+# its revision: an automatic merge of the whole branch reads the branch's replaced history (r6) and conflicts on
+# trunk/bin.dat, which r6 replaced too.
 printf 'a change on the branch\n' >> branches/b1/a.txt
 svn commit -q -m 'r10: a change on the branch'
 svn update -q
-svn merge -q "$URL/branches/b1" trunk
-svn commit -q -m 'r11: the branch merged to trunk'
+svn merge -q -c 10 "$URL/branches/b1" trunk
+svn commit -q -m 'r11: the branch change merged to trunk'
 svn update -q
 
 # r12: a copy from an older revision, with an empty log message.
