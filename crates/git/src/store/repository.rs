@@ -707,8 +707,16 @@ impl Repository {
       return Ok(false);
     }
     let floor = self.generation(store, push, &ancestor)?;
+    let top = self.generation(store, push, &head)?;
+    if head == ancestor || top <= floor {
+      self.count(|counters| {
+        counters.decided_without_walk = counters.decided_without_walk.saturating_add(1);
+      });
+      return Ok(head == ancestor);
+    }
+    self.count(|counters| counters.descent_walks = counters.descent_walks.saturating_add(1));
     let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
-    let mut heap = BinaryHeap::from([(self.generation(store, push, &head)?, head)]);
+    let mut heap = BinaryHeap::from([(top, head)]);
     while let Some((generation, id)) = heap.pop() {
       if id == ancestor {
         return Ok(true);

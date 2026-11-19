@@ -38,11 +38,25 @@
 //! **Bounds.** The walks read rows, and the bytes of the commits they judge, as the store's own walks do; slicing them
 //! under the shard's budget and charging their sets is the store's owed item (module docs), not done here.
 
+use std::collections::{BTreeSet, BinaryHeap};
+
 use slates_vcs::ContentStore;
 
-use super::{Repository, StoreRefused};
+use super::{Chain, Positions, Repository, StoreRefused};
+use crate::Admission;
 use crate::object_name::ObjectId;
+use crate::objects::commit::Commit;
 use crate::store::Push;
+
+/// Format: the first line of an SSH signature's armour (OpenSSH `PROTOCOL.sshsig`; gpg-interface.c's `ssh_sigs`).
+const SSH_ARMOUR: &[u8] = b"-----BEGIN SSH SIGNATURE-----";
+/// Format: the first lines of an OpenPGP signature's armour (gpg-interface.c's `openpgp_sigs`).
+const OPENPGP_ARMOURS: [&[u8]; 2] = [
+  b"-----BEGIN PGP SIGNATURE-----",
+  b"-----BEGIN PGP MESSAGE-----",
+];
+/// Format: the first line of an X.509 signature's armour (gpg-interface.c's `x509_sigs`).
+const X509_ARMOUR: &[u8] = b"-----BEGIN SIGNED MESSAGE-----";
 
 /// How a move changes its ref (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,37 +101,150 @@ pub enum Unsigned<R> {
 }
 
 impl Repository {
-  /// How moving `green` to `to` changes it: the stub answers a fast-forward (A-644, tests first).
+  /// Refuses a push of another format, or one not sealed: its commits' generation numbers are not known yet, and a
+  /// zero would read as no descendant of anything.
+  fn ready(&self, push: &Push) -> Result<(), StoreRefused> {
+    self.same_format(push)?;
+    if push.is_sealed() {
+      Ok(())
+    } else {
+      Err(StoreRefused::Unsealed)
+    }
+  }
+
+  /// How moving `green` to `to` (`None` deletes it) changes it, judged against the green's own current head (module
+  /// docs).
   pub fn change(
     &self,
-    _store: &ContentStore,
-    _push: &Push,
-    _green: u64,
-    _to: Option<ObjectId>,
+    store: &ContentStore,
+    push: &Push,
+    green: u64,
+    to: Option<ObjectId>,
   ) -> Result<Change, StoreRefused> {
-    Ok(Change::FastForward)
+    self.ready(push)?;
+    let Some(to) = to else {
+      return Ok(Change::Delete);
+    };
+    let Some(position) = self.chains.get(&green).and_then(Chain::head) else {
+      return Ok(Change::Create);
+    };
+    let head = self
+      .id_at(store, position)
+      .ok_or(StoreRefused::Unreadable { id: to })?;
+    Ok(if self.fast_forward(store, push, to, head)? {
+      Change::FastForward
+    } else {
+      Change::Rewrite
+    })
   }
 
-  /// The first merge commit a move brings: the stub finds none (A-644, tests first).
+  /// The first merge commit moving `green` to `to` brings to it (module docs): a commit with more than one parent.
   pub fn merge_commit(
     &self,
-    _store: &ContentStore,
-    _push: &Push,
-    _green: u64,
-    _to: ObjectId,
+    store: &ContentStore,
+    push: &Push,
+    green: u64,
+    to: ObjectId,
   ) -> Result<Option<ObjectId>, StoreRefused> {
+    self.judge_brought(store, push, (green, to), |id, parents| {
+      Ok((parents.len() > 1).then_some(id))
+    })
+  }
+
+  /// The first commit moving `green` to `to` brings to it that no key `signers` trusts signed, and why (module docs).
+  pub fn unsigned_commit<S: CommitSigners>(
+    &self,
+    store: &ContentStore,
+    push: &Push,
+    green: u64,
+    to: ObjectId,
+    signers: &S,
+  ) -> Result<Option<(ObjectId, Unsigned<S::Refused>)>, StoreRefused> {
+    self.judge_brought(store, push, (green, to), |id, _| {
+      let why = self.signature_refused(store, push, &id, signers)?;
+      Ok(why.map(|why| (id, why)))
+    })
+  }
+
+  /// The commits moving `green` to `to` brings to it, each handed to `judge` with its parents until one answers (module
+  /// docs): newest generation first, ties by the greater id, each once, stopping at the commits the green's current
+  /// head reaches.
+  fn judge_brought<T>(
+    &self,
+    store: &ContentStore,
+    push: &Push,
+    (green, to): (u64, ObjectId),
+    mut judge: impl FnMut(ObjectId, &[ObjectId]) -> Result<Option<T>, StoreRefused>,
+  ) -> Result<Option<T>, StoreRefused> {
+    self.ready(push)?;
+    let Some(start) = self.peel(store, push, to)? else {
+      return Ok(None);
+    };
+    let reached = self.chains.get(&green).map(|chain| &chain.reached);
+    let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut heap = BinaryHeap::from([(self.generation(store, push, &start)?, start)]);
+    while let Some((_, id)) = heap.pop() {
+      if !seen.insert(id) || self.reached_by(store, reached, &id) {
+        continue;
+      }
+      let parents = self.parents(store, push, &id)?;
+      self.count(|counters| counters.brought_judged = counters.brought_judged.saturating_add(1));
+      if let Some(found) = judge(id, &parents)? {
+        return Ok(Some(found));
+      }
+      for parent in parents {
+        heap.push((self.generation(store, push, &parent)?, parent));
+      }
+    }
     Ok(None)
   }
 
-  /// The first commit a move brings that no trusted key signed: the stub finds none (A-644, tests first).
-  pub fn unsigned_commit<S: CommitSigners>(
+  /// Whether `id` is an indexed object `reached` holds.
+  fn reached_by(&self, store: &ContentStore, reached: Option<&Positions>, id: &ObjectId) -> bool {
+    reached.is_some_and(|reached| {
+      self
+        .object(store, id)
+        .is_some_and(|row| reached.contains(row.position))
+    })
+  }
+
+  /// Why the commit `id` is not one a key `signers` trusts signed, or none where one did (module docs).
+  fn signature_refused<S: CommitSigners>(
     &self,
-    _store: &ContentStore,
-    _push: &Push,
-    _green: u64,
-    _to: ObjectId,
-    _signers: &S,
-  ) -> Result<Option<(ObjectId, Unsigned<S::Refused>)>, StoreRefused> {
-    Ok(None)
+    store: &ContentStore,
+    push: &Push,
+    id: &ObjectId,
+    signers: &S,
+  ) -> Result<Option<Unsigned<S::Refused>>, StoreRefused> {
+    let place = self
+      .locate(store, push, id)
+      .ok_or(StoreRefused::Missing { id: *id })?;
+    let bytes = Repository::bytes_of(store, id, &place)?;
+    let commit = Commit::parse(&bytes, &mut Admission::new(store.room()))
+      .map_err(|_| StoreRefused::Malformed { id: *id })?;
+    let mut signature = Vec::new();
+    if !commit.write_signature(self.format, &mut signature) {
+      return Ok(Some(Unsigned::Missing));
+    }
+    if signature.starts_with(SSH_ARMOUR) {
+      let mut payload = Vec::new();
+      commit.write_signed_payload(&mut payload);
+      return Ok(
+        signers
+          .verify(&signature, &payload)
+          .err()
+          .map(Unsigned::Ssh),
+      );
+    }
+    let openpgp = OPENPGP_ARMOURS
+      .iter()
+      .any(|first| signature.starts_with(first));
+    Ok(Some(if openpgp {
+      Unsigned::OpenPgp
+    } else if signature.starts_with(X509_ARMOUR) {
+      Unsigned::X509
+    } else {
+      Unsigned::Unknown
+    }))
   }
 }

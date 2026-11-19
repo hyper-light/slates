@@ -20,6 +20,9 @@ use crate::out::Out;
 const SHA1_SIGNATURE: &[u8] = b"gpgsig";
 /// Format: the header a SHA-256 repository's commit signature is in.
 const SHA256_SIGNATURE: &[u8] = b"gpgsig-sha256";
+/// Format: what every signature header's line begins with: commit.c's `parse_buffer_signed_by_header` leaves each such
+/// header out of what a signature covers, whatever follows (`starts_with(line, "gpgsig")`).
+const SIGNATURE_PREFIX: &[u8] = b"gpgsig";
 /// Format: the headers git gives a meaning of its own to; any other is an extra header (gitformat-signature).
 const KNOWN: [&[u8]; 8] = [
   b"tree",
@@ -115,8 +118,14 @@ impl<'a> Commit<'a> {
   /// Writes the signature a verifier reads (A-644): every header of `format`'s repository's own signature name, each
   /// unfolded, in order, as commit.c's `parse_buffer_signed_by_header` gathers them; whether there was one. Two such
   /// headers are one signature of both, which no armour reads as one, so a verifier refuses it.
-  pub fn write_signature(&self, _format: ObjectFormat, _out: &mut impl Out) -> bool {
-    false
+  pub fn write_signature(&self, format: ObjectFormat, out: &mut impl Out) -> bool {
+    let name = signature_name(format);
+    let mut signed = false;
+    for header in self.headers.iter().filter(|header| header.name == name) {
+      header.unfold(out);
+      signed = true;
+    }
+    signed
   }
 
   /// The `mergetag` headers: each a whole tag object, which [`Header::unfold`] writes out.
@@ -145,7 +154,7 @@ impl<'a> Commit<'a> {
   /// other header so named (A-644: a payload that kept one would verify what git does not).
   pub fn write_signed_payload(&self, out: &mut impl Out) {
     for header in &self.headers {
-      if header.name != SHA1_SIGNATURE && header.name != SHA256_SIGNATURE {
+      if !header.name.starts_with(SIGNATURE_PREFIX) {
         header.write(out);
       }
     }

@@ -19,7 +19,7 @@
 //! stock server protecting `main` this way (and two to a SHA-256 one), its update hook speaking these words; the tests
 //! answer each push from A-614's store and compare every byte.
 
-use super::Declined;
+use super::{Declined, message};
 use crate::object_name::ObjectId;
 use crate::store::{CommitSigners, Unsigned};
 
@@ -36,40 +36,93 @@ pub const HOOK_DECLINED: &[u8] = b"hook declined";
 /// one `xread` of it a packet).
 pub const HOOK_PIECE: usize = 128;
 
-/// The refusal the stub gives every protected branch's question (A-644, tests first): no words.
-fn unworded() -> Declined {
+/// What git answers a non-fast-forward of `name` it refuses.
+pub fn non_fast_forward(name: &[u8]) -> Declined {
+  declined_by_git(
+    NON_FAST_FORWARD,
+    &[
+      b"denying non-fast-forward ",
+      name,
+      b" (you should pull first)",
+    ],
+  )
+}
+
+/// What git answers a delete of `name` it refuses.
+pub fn deletion_prohibited(name: &[u8]) -> Declined {
+  declined_by_git(DELETION_PROHIBITED, &[b"denying ref deletion for ", name])
+}
+
+/// What git answers when an update hook refuses `name` with `words` (the hook's output, as it wrote it).
+pub fn hook_declined(name: &[u8], words: Vec<u8>) -> Declined {
   Declined {
-    reason: Vec::new(),
-    hook: Vec::new(),
-    message: None,
+    reason: HOOK_DECLINED.to_vec(),
+    hook: words,
+    message: Some(message(&[b"hook declined to update ", name].concat())),
   }
 }
 
-/// What git answers a non-fast-forward of `name` it refuses: the stub's none.
-pub fn non_fast_forward(_name: &[u8]) -> Declined {
-  unworded()
+/// The refusal of a merge commit `commit` a move of `name` brings, where the branch keeps a linear history.
+pub fn merge_commit(name: &[u8], commit: &ObjectId) -> Declined {
+  let hex = commit.to_string();
+  let text = [
+    b"denying merge commit ",
+    hex.as_bytes(),
+    b" on ",
+    name,
+    b" (linear history required)",
+  ]
+  .concat();
+  hook_declined(name, message(&text))
 }
 
-/// What git answers a delete of `name` it refuses: the stub's none.
-pub fn deletion_prohibited(_name: &[u8]) -> Declined {
-  unworded()
-}
-
-/// What git answers when an update hook refuses `name` with `words`: the stub's none.
-pub fn hook_declined(_name: &[u8], _words: Vec<u8>) -> Declined {
-  unworded()
-}
-
-/// The refusal of a merge commit: the stub's none.
-pub fn merge_commit(_name: &[u8], _commit: &ObjectId) -> Declined {
-  unworded()
-}
-
-/// The refusal of a commit no trusted key signed: the stub's none.
+/// The refusal of a commit `commit` a move of `name` brings that no trusted key signed, and why, where the branch keeps
+/// signed commits.
 pub fn unsigned_commit<S: CommitSigners>(
-  _name: &[u8],
-  _commit: &ObjectId,
-  _why: &Unsigned<S::Refused>,
+  name: &[u8],
+  commit: &ObjectId,
+  why: &Unsigned<S::Refused>,
 ) -> Declined {
-  unworded()
+  let hex = commit.to_string();
+  let text = match why {
+    Unsigned::Missing => [
+      b"denying unsigned commit ",
+      hex.as_bytes(),
+      b" on ",
+      name,
+      b" (signed commits required)",
+    ]
+    .concat(),
+    other => [
+      b"denying commit ",
+      hex.as_bytes(),
+      b" on ",
+      name,
+      b": ",
+      unsigned_words::<S>(other),
+      b" (signed commits required)",
+    ]
+    .concat(),
+  };
+  hook_declined(name, message(&text))
+}
+
+/// Why a signature was refused, after naming its commit.
+fn unsigned_words<S: CommitSigners>(why: &Unsigned<S::Refused>) -> &'static [u8] {
+  match why {
+    Unsigned::Missing => b"it is not signed",
+    Unsigned::OpenPgp => b"its signature is OpenPGP, which this server does not verify",
+    Unsigned::X509 => b"its signature is X.509, which this server does not verify",
+    Unsigned::Unknown => b"its signature is in no format git signs with",
+    Unsigned::Ssh(refused) => S::words(refused),
+  }
+}
+
+/// A refusal git makes itself: `reason`, after its `rp_error` line of `parts`.
+fn declined_by_git(reason: &[u8], parts: &[&[u8]]) -> Declined {
+  Declined {
+    reason: reason.to_vec(),
+    hook: Vec::new(),
+    message: Some(message(&parts.concat())),
+  }
 }

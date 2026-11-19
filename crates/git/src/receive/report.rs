@@ -7,6 +7,7 @@
 //! git sent on band 2 as it worked: a hook's words in the pieces git reads them in, and the `rp_error` lines (A-644).
 //! The answer ends with a flush of its own.
 
+use super::protected::HOOK_PIECE;
 use super::{Declined, Outcome, Received, Refusal, Reported, unpack_words};
 use crate::object_name::ObjectId;
 use crate::out::Out;
@@ -79,6 +80,9 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
 /// What git sends on band 2 of a refused command: a hook's words in the pieces `copy_to_sideband` reads them in, then
 /// the `rp_error` line.
 fn write_band_two(declined: &Declined, out: &mut impl Out) {
+  for piece in declined.hook.chunks(HOOK_PIECE) {
+    sideband::write(Band::Progress, piece, out);
+  }
   if let Some(line) = &declined.message {
     sideband::write(Band::Progress, line, out);
   }
