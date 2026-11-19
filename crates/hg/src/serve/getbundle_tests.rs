@@ -56,7 +56,7 @@ type Log = HashMap<Node, Kept>;
 /// The test's [`Store`]: a served view with its changeset texts, its manifest and file logs, and its markers, each
 /// marker alone in a payload of its own.
 #[derive(Clone, Debug, Default)]
-struct Served {
+pub(crate) struct Served {
   history: History,
   changesets: HashMap<Node, Vec<u8>>,
   manifests: Log,
@@ -543,7 +543,7 @@ fn every_session_getbundle_answers_as_mercurial_meant_it() {
 }
 
 /// The answers the SSH version 1 session gives a client's bytes, one per request, then the empty line that ends it.
-fn serve_whole(served: &Served, client: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn serve_whole(served: &Served, client: &[u8]) -> Vec<Vec<u8>> {
   let input = [client, b"\n"].concat();
   let mut rest = input.as_slice();
   let mut answers = Vec::new();
@@ -1205,8 +1205,27 @@ fn parts(served: &Served, asked: &Asked<'_>) -> Vec<Sent> {
     .collect()
 }
 
+/// Each captured session's client bytes with the store it asked: the served view the script dumped before it, holding
+/// what 7.2 had sent up to and including that session's `getbundle`.
+pub(crate) fn session_stores() -> Vec<(Served, &'static [u8])> {
+  let mut served = Served::default();
+  let mut stores = Vec::new();
+  for session in SESSIONS {
+    served.history = captured(session.state, session.bookmarks);
+    let requests = requests(session.client);
+    let theirs = answers(session.server, &requests);
+    let at = requests
+      .iter()
+      .position(|(command, _)| *command == b"getbundle")
+      .unwrap();
+    served.take(theirs[at]);
+    stores.push((served.clone(), session.client));
+  }
+  stores
+}
+
 /// The store the clone asked, rebuilt from 7.2's answer.
-fn cloned() -> Served {
+pub(crate) fn cloned() -> Served {
   let [session, ..] = SESSIONS;
   let mut served = Served {
     history: captured(session.state, session.bookmarks),
