@@ -790,9 +790,12 @@ impl Volume {
     })
   }
 
-  /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) (D-5). The clone's
+  /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) in the snapshot's size (D-5). The clone's
   /// policy is the origin's; its inode counter continues from the origin's so numbers stay
-  /// unique across both. An overlay's clone reads the origin's base directories as the origin does.
+  /// unique across both. An overlay's clone reads the origin's base directories as the origin does. A file the
+  /// snapshot froze held with no name left is carried with an orphan record (A-532), so the clone reclaims it as it
+  /// reclaims any orphan: at its last reference's release (a restored guest's), or at a restart's settle when nothing
+  /// holds it. Nothing of the clone's was secured for it, since its content stays the snapshot's.
   pub fn clone_of(
     store: &Store,
     origin: &mut Volume,
@@ -845,6 +848,7 @@ impl Volume {
       snap.epoch,
       snap.referenced_bytes,
     );
+    let carried: BTreeMap<InodeNo, u64> = snap.orphans.iter().map(|no| (*no, 0)).collect();
     let _ = config.clock.monotonic_ns();
     Ok(Volume {
       prefix: config.prefix,
@@ -886,7 +890,7 @@ impl Volume {
       replayed: std::collections::BTreeSet::new(),
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
-      orphans: BTreeMap::new(),
+      orphans: carried,
       takeover_holders: BTreeSet::new(),
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
@@ -2874,7 +2878,8 @@ impl Volume {
 
   // ------------------------------------------------------------------ snapshots and clones
 
-  /// Takes a snapshot: one record; O(1).
+  /// Takes a snapshot: one record, O(1) in the volume's size. It keeps the head's orphans then, the files held open
+  /// with no name left, which its tree freezes and a clone of it carries (A-532).
   pub fn snapshot(&mut self, store: &mut Store) -> Result<SnapshotId, VfsError> {
     self.live()?;
     let record = Snapshot {
@@ -2888,6 +2893,7 @@ impl Volume {
       referenced_bytes: self.bytes.total(),
       seq: self.journal.head_seq(),
       identity: None,
+      orphans: self.orphans.keys().copied().collect(),
     };
     let handle = self.snapshots.insert(record)?;
     let id = SnapshotId {
