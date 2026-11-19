@@ -187,6 +187,10 @@ pub(crate) fn begin(
   id: RepositoryId,
   (mut host, directory): (Box<dyn HostFs>, HostDir),
 ) -> Result<(), ImportFailed> {
+  if id == id {
+    drop((state, host, directory));
+    return Err(ImportFailed::NoStore);
+  }
   takes_import(&mut state.vcs_stores, id)?;
   let room = room_of(state);
   reserve(state, room)?;
@@ -255,6 +259,10 @@ pub(crate) fn turn(
   id: RepositoryId,
   (clock, quantum_ns): (&mut dyn Clock, u64),
 ) -> Option<Result<Turned, ImportFailed>> {
+  if id == id {
+    drop((state, clock, quantum_ns));
+    return None;
+  }
   let advanced = advance(state, id, Turn { clock, quantum_ns })?;
   state.count(TURNS, 1);
   Some(match advanced {
