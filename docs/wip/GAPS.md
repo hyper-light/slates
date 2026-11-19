@@ -30,9 +30,8 @@
 > `Admission` first) and side-band-64k (bands 1 to 3, `sideband-all`), pure codecs with every length checked against
 > git's 65520 and the bytes left, golden vectors stock git 2.50.1 wrote and read on its own wire
 > (`crates/git/fixtures/make-fixtures.sh`), and every cut, every bit flip and the lengths past the caps refused by kind
-> (`cargo test -p slates-git --lib`, 14 of 14). Owed in A-582's next parts, in order: protocol v2's messages (the
-> capability advertisement, `ls-refs`, `fetch` and its sections: acknowledgments, shallow-info, wanted-refs,
-> packfile-uris, packfile); a pack entry's header with `OBJ_OFS_DELTA` and `OBJ_REF_DELTA` and the delta instructions
+> (`cargo test -p slates-git --lib`, 14 of 14). Owed in A-582's next parts, in order: protocol v2's messages (built,
+> part 2 below); a pack entry's header with `OBJ_OFS_DELTA` and `OBJ_REF_DELTA` and the delta instructions
 > with an applier; idx v2; and the pack stream, which needs a deflate engine chosen by measurement (§4.17.2 piece 3).
 > The captured packs and indexes for those parts are in the fixtures already.
 > **A-575 (2026-11-19):** piece 1 is built: the repository verbs (`CreateRepository`, `CreateBranch`, `BindBranch`,
@@ -53,6 +52,21 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-582 part 2 (2026-11-19, g296; protocol v2's messages):** `slates-git` (`v2`) reads and writes the capability
+> advertisement, the command request (one `command=` line among the client's capabilities in any order, a delimiter or
+> none, a flush alone as the end), `ls-refs`'s arguments and answer, and `fetch`'s seventeen arguments (git's ranges and
+> its rules between them) and its response, whose five sections one machine keeps in the document's order for the
+> reader and the writer alike (git 2.50.1 wrote wanted-refs first, which its own client refused; git fixed it in
+> `191740edaa4a`). Decoding is lossless (each line keeps its LF or its lack, ids are lower-case hexadecimal, numbers
+> canonical decimal), so every advertisement, request and answer stock git 2.50.1 wrote or read is written back byte for
+> byte; every cut, every bit flip and lines past a packet are refused by kind; admissions are charged exactly first.
+> `cargo test -p slates-git --lib`: 59 of 59 (37 new) on the Mac Studio, the 32 message tests all red with the codecs
+> stubbed, and red four ways. Owed: `object-info` and `bundle-uri` (refused as unknown commands until then, so a server
+> must not advertise them); a request checked against the server's own advertisement (`serve.c`'s command and
+> capability check, `upload-pack.c`'s `allow_*` for `filter`, `want-ref`, `sideband-all`, `packfile-uris`); the server's
+> refusals as `ERR` lines and band-3 errors; a duplicate `want-ref` (a protocol error) caught where the server maps
+> names to refs; the server keeping clients alive on band 2, never with git's empty band-1 packet before the packfile;
+> clippy and the cross-target lint over `src/v2` (main's run request).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's

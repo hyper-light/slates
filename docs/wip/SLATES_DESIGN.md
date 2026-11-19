@@ -38998,6 +38998,86 @@ drop waking it); `crates/server` (`base_wait`: `ShardCell` and `spawn_driver`); 
 Applied in the same change to: §4.17.2 (its status), GAPS (the §4.17 entry), `crates/git` (new), `Cargo.lock`,
 `.gitattributes` (the binary fixtures), `unsafe-budget.toml` (`slates-git = 0`).
 
+**Part 2 (2026-11-19, g296, UI goal 92): protocol v2's messages** (`crates/git/src/v2`; §4.17.2 "The wire" and "A
+fetch"). Pure functions over bytes, as part 1: every list a decode builds is counted in a first walk and charged exactly
+to the caller's `Admission` before a second walk builds it; every encode is checked whole, into a `Measure`, before it
+writes, so a refused encode writes nothing; every refusal is a typed `v2::Refusal` naming the byte where the packet at
+fault begins. Sources, read 2026-11-19 at the revision the golden vectors' git shipped: `gitprotocol-v2.adoc` at v2.50.1
+(SHA-256 `2e739965…`; master `e1ec09b2`, which `research/vcs-servers.md` cites, differs only in `object-info` and
+`promisor-remote`) and `gitprotocol-common.adoc` [B]; git v2.50.1's `serve.c`, `ls-refs.c`, `upload-pack.c`,
+`fetch-pack.c`, `connect.c`, `pkt-line.c`, `sideband.c` and `refs.c` [C].
+
+- **The advertisement** (`v2::advertisement`): `version 2`, one capability a line, a flush. A key is held to the
+  grammar's `key`; a value is any bytes but NUL and LF, the rule the document gives server options, since its `value`
+  grammar names fewer bytes than its own `agent` and `session-id` sections allow. Lookups answer as git's client does
+  (`server_supports_v2`, `server_supports_feature`), and the object format is SHA-1 when none is named.
+- **The request** (`v2::request`): one `command=` line and the client's capabilities in the order sent, since
+  `serve.c` reads the command after them too and git's own `bundle-uri` client sends it so; a delimiter where there is
+  one, since `serve.c` reads a flush right after the head as a command with no arguments; the arguments; the flush. A
+  flush alone ends the client's requests. A client's capabilities are `serve.c`'s that are not commands (`agent`,
+  `server-option`, `object-format`, `session-id`, `promisor-remote`); `object-format` must name a format, and the last
+  one names the arguments' format, as `serve.c` keeps the last. The commands are `ls-refs` and `fetch`. `whole_len` says
+  when the bytes that have arrived hold a whole request (the first flush always ends one), so nothing caps a request but
+  its bytes and the admission.
+- **ls-refs** (`v2::ls_refs`): `peel`, `symrefs`, `unborn` and `ref-prefix <prefix>`, any prefix, the empty one too,
+  which git reads as matching every ref. Its answer is one ref a line: an id or `unborn`, a name, then at most one
+  `symref-target:` and one `peeled:` in either order, as git's client reads them; written whole, or a ref at a time
+  (`write_ref`) for a server streaming one. `ls-refs.c` stops honouring prefixes past 65536; that is a server's choice,
+  since the document lets a server show refs no prefix matches, and is left to the server's piece.
+- **fetch** (`v2::fetch`): its seventeen arguments; a depth positive and within git's `int` (whose largest is
+  `INFINITE_DEPTH`, what `--unshallow` sends); a time any but `timestamp_t`'s largest, revision.c's "no limit";
+  `filter` and `packfile-uris` once each, as git dies on a second; `deepen` never beside `deepen-since` or `deepen-not`,
+  which the document says "Cannot be used with" it. The response is read and written as events through one machine
+  (`Response`): acknowledgments (`NAK` or `ACK`s, never both, then `ready`, after which a delimiter and the pack follow,
+  and without which a flush ends the response), shallow-info, wanted-refs, packfile-uris and the packfile, each section
+  later than the one before; bands where the response carries them, in the packfile always and everywhere under
+  `sideband-all`; progress anywhere it may come; a band-3 error ending the stream.
+- **Lossless.** A line's trailing LF is optional, and stock git writes both forms in one exchange: its client writes
+  `command=fetch`, its capabilities and its flags without one and `want`, `have` and `done` with one; its server writes
+  `shallow <id>` without one. So each line records how it ended. Where git's reader is laxer than the grammar, slates is
+  strict, so a decode loses nothing and every message it accepts is written back byte for byte, the pkt-line length
+  digits aside, which part 1 reads in either case. Ids are lower-case hexadecimal only (gitprotocol-common's `HEXDIG`):
+  git's `get_oid_hex` also reads upper case and ignores what follows an id, which no client writes (git, JGit, libgit2
+  and go-git all write lower case). Numbers are canonical decimal, where git's `strtol` with base 0 also reads octal and
+  `0x`. A text line holds no NUL, where git's C readers would end its string, and no LF but its last byte. A ref name is
+  `HEAD` or under `refs/` and passes `check_refname_format`, whose rules add two to the document's list: no empty
+  component and no component ending `.lock`.
+- **The order, settled by git.** git 2.50.1's `upload_pack_v2` wrote wanted-refs before shallow-info, against the
+  document's grammar and its own client: `fetch-pack.c` reads shallow-info first, so a shallow fetch by `want-ref` died
+  "expected 'packfile', received 'shallow-info'". git fixed it in `191740edaa4a` ("upload-pack: swap wanted-ref/
+  shallow-info responses", 2026-09-16, merged 2026-10-04, with a test in t5703). slates reads and writes the document's
+  order, and its writer cannot write another.
+- **Keepalives.** git's `create_pack_file` keeps a waiting client alive with `0005\1`, an empty band-1 packet, where the
+  document says `0005\2`. Before the packfile section git's own client reads an empty band-1 packet as an empty line
+  where a section's name must stand, and dies; this decoder refuses it there too (`UnknownSection`). A slates server
+  keeps a client alive on band 2, which every client reads as progress wherever it comes.
+- **Tests** (`cargo test -p slates-git --lib`: 37 new, 59 in all). Every advertisement, request and answer stock git
+  2.50.1 wrote or read is decoded by its message's decoder and encoded back to its bytes. git's own client's forms are
+  read and written back: no LF on the head and the flags, capabilities before the command, no delimiter, SHA-256. Every
+  kind of refusal is checked at its byte. Every cut of every stream is `Truncated` inside a packet or `Unfinished`
+  between packets, never a message. Every bit flip of every stream is refused by kind at a place inside it, or read back
+  to exactly its bytes; a tally asserts the flips reach twelve kinds of refusal. Lines filling a packet are read whole,
+  and one byte longer is refused with nothing written. Admissions are refused one item short with nothing charged, and
+  spent exactly. A writer refuses git 2.50.1's order with nothing written. Two property tests: any `fetch` request
+  written decodes back to itself, and any stream of the grammar's words and arbitrary bytes, decoded as every message,
+  is refused by kind or read back exactly.
+- **Checks** (Mac Studio M3 Ultra, debug, kiln r526 and r535, 2026-11-19, load 4 to 13): 59 of 59, `cargo fmt --check`
+  clean. Failing first: with the eight message functions and the response machine's `read` and `write` stubbed to
+  refuse, in the Studio's clone and never the tree, all 32 message tests failed. Red four ways, one guard at a time, in
+  the Studio's clone:
+  - sections taken in any order between delimiters failed the order test;
+  - upper-case ids accepted failed four tests (the id, request and answer refusals, and the bit flips);
+  - every line written with an LF failed eight, among them the golden round trips, through git's `shallow` line;
+  - the response's events left uncharged failed its admission test.
+- **Next** (GAPS): `object-info` and `bundle-uri`, refused as unknown commands until then, so a server advertises
+  neither; a request checked against the server's own advertisement, as `serve.c` checks the command and capabilities
+  and `upload-pack.c`'s `allow_*` check `filter`, `want-ref`, `sideband-all` and `packfile-uris`; the `ERR` line and a
+  band-3 error carrying a server's refusals; then A-582's remaining parts as listed above.
+
+Part 2 applied in the same change to: §4.17.2 (its status; "The wire": `ls-refs=unborn`, as git advertises it, since
+`symrefs`, `peel` and `ref-prefix` are the command's base arguments, which need no feature [B: gitprotocol-v2 "ls-refs";
+C: `ls-refs.c` `ls_refs_advertise`]), GAPS (the §4.17 entry), `crates/git` (`src/v2`, new; its `mod` line in `lib.rs`).
+
 ### A-589 — The fleet's own test of a captured clone moved twice: whole on each new owner, never stale on an old one, landed on the last against its capture (2026-11-19, g230, UI goal 90; §4.10 "Ownership follows the writer", §4.15 `capture_base` and "Plan"; the test A-503 filed for main)
 Applied in the same change to: GAPS (g267's captured-clone status: the test written, its run owed),
 `crates/server/tests/fleet.rs` (the test and its helpers beside A-583's; `assert_the_agents_changes_landed_alone` now
