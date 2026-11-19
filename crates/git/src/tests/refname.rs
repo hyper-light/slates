@@ -197,8 +197,8 @@ proptest! {
     let prefix: &[u8] = [&b""[..], b"refs/", b"refs/heads/", b"HEAD"][prefix];
     let name = [prefix, &tail[..]].concat();
     let expected = name == b"HEAD" || (name.starts_with(b"refs/") && git_check_refname_format(&name));
-    prop_assert_eq!(is_valid(&name), expected, "{name:?}");
+    prop_assert_eq!(is_valid(&name), expected, "name {:?}", name);
     let under_tags = [&b"refs/tags/"[..], &tail[..]].concat();
-    prop_assert_eq!(tag_name_is_valid(&tail), git_check_refname_format(&under_tags), "{tail:?}");
+    prop_assert_eq!(tag_name_is_valid(&tail), git_check_refname_format(&under_tags), "tag name {:?}", tail);
   }
 }
