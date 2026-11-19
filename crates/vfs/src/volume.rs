@@ -1673,7 +1673,7 @@ impl Volume {
         // Unpinned disk bytes need the host: `Overlay::read` serves them.
         let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
-          return Err(VfsError::BaseUnavailable(0));
+          return Err(VfsError::BaseUnavailable(None));
         }
         for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
@@ -7164,7 +7164,7 @@ pub(crate) fn read_frozen_body(
       }
       let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
       if unpinned {
-        return Err(VfsError::BaseUnavailable(0));
+        return Err(VfsError::BaseUnavailable(None));
       }
       for e in overlapping(&b.pinned, off, read_end) {
         store.content.read_extent_into(e, off, out)?;

@@ -6810,19 +6810,8 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       used_as: slates_ipc::protocol::OwnMountUse::Base,
     },
-    slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: code,
-    },
-    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
-    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: i32::try_from(code).unwrap_or(i32::MAX),
-    },
-    _ => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: 0,
-    },
+    // The code in the variant of its numbering (A-539).
+    other => crate::error::base_unavailable(path.to_owned(), other.code()),
   }
 }
 
@@ -18286,7 +18275,7 @@ fn replay_one(
           .with_host(host)
           .write(&mut state.store, inode, record.offset, &record.bytes)
       }
-      None => Err(slates_vfs::VfsError::BaseUnavailable(0)),
+      None => Err(slates_vfs::VfsError::BaseUnavailable(None)),
     }
   } else {
     slot

@@ -242,9 +242,9 @@ fn await_learned() -> Result<(), HostError> {
   let started = std::time::Instant::now();
   while gate.learning.load(Ordering::Acquire) > 0 {
     if started.elapsed() >= budget {
-      return Err(HostError::Unavailable(
+      return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::AGAIN.raw_os_error(),
-      ));
+      )));
     }
     std::thread::yield_now();
   }
@@ -281,12 +281,12 @@ fn fresh_tag() -> Result<u64, HostError> {
     rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
     rustix::fs::Mode::empty(),
   )
-  .map_err(|e| HostError::Unavailable(e.raw_os_error()))?;
+  .map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
   let mut bytes = [0u8; TAG_BYTES];
   let read =
-    rustix::io::read(&source, &mut bytes).map_err(|e| HostError::Unavailable(e.raw_os_error()))?;
+    rustix::io::read(&source, &mut bytes).map_err(|e| HostError::Unavailable(slates_vfs::host::OsCode::Errno(e.raw_os_error())))?;
   if read != TAG_BYTES {
-    return Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()));
+    return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(rustix::io::Errno::IO.raw_os_error())));
   }
   Ok(u64::from_le_bytes(bytes))
 }
@@ -363,7 +363,7 @@ mod linux {
     match e {
       rustix::io::Errno::NOENT => HostError::NotFound,
       rustix::io::Errno::NOTDIR => HostError::NotDirectory,
-      other => HostError::Unavailable(other.raw_os_error()),
+      other => HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error())),
     }
   }
 
@@ -384,9 +384,9 @@ mod linux {
       .lines()
       .find_map(|line| line.strip_prefix("mnt_id:"))
       .and_then(|id| id.trim().parse::<u64>().ok())
-      .ok_or(HostError::Unavailable(
+      .ok_or(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::NOSYS.raw_os_error(),
-      ))
+      )))
   }
 
   /// Whether mount `id` is this daemon's: recorded, or (not yet recorded) named by its tag in the kernel's table.
@@ -595,9 +595,9 @@ mod linux {
     followed: usize,
   ) -> Result<OwnedFd, HostError> {
     if followed > MAX_SYMLINKS {
-      return Err(HostError::Unavailable(
+      return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
         rustix::io::Errno::LOOP.raw_os_error(),
-      ));
+      )));
     }
     let target = rustix::fs::readlinkat(link, c"", Vec::new()).map_err(unavailable)?;
     let target = Path::new(OsStr::from_bytes(target.as_bytes()));
@@ -671,7 +671,7 @@ mod macos {
     match e {
       rustix::io::Errno::NOENT => HostError::NotFound,
       rustix::io::Errno::NOTDIR => HostError::NotDirectory,
-      other => HostError::Unavailable(other.raw_os_error()),
+      other => HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error())),
     }
   }
 
@@ -761,9 +761,9 @@ mod macos {
       if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
         followed = followed.saturating_add(1);
         if followed > MAX_SYMLINKS {
-          return Err(HostError::Unavailable(
+          return Err(HostError::Unavailable(slates_vfs::host::OsCode::Errno(
             rustix::io::Errno::LOOP.raw_os_error(),
-          ));
+          )));
         }
         let target =
           rustix::fs::readlinkat(&at, name.as_os_str(), Vec::new()).map_err(unavailable)?;

@@ -121,9 +121,10 @@ impl std::fmt::Display for OsCode {
   }
 }
 
-/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. A refusal the host gives a number is
-/// typed by the numbering it is in (A-527): an errno (`Unavailable`) or a Win32 error code (`Win32`), so a reader that
-/// tells refusals apart by an errno's number never reads a Win32 code as the errno of the same number.
+/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. The kinds the landing tells apart
+/// are named here (A-539): a name that exists, no room, a verb the filesystem lacks; each writer reads its platform's
+/// numbers into them, so no reader compares a number across platforms. Every refusal the host gives a number carries it
+/// typed by its numbering ([`OsCode`], A-527).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
   /// The entry does not exist (any more).
@@ -143,13 +144,8 @@ pub enum HostError {
   /// The verb does not exist on this filesystem: an exchange or a clone it lacks (`EOPNOTSUPP`, `ENOTSUP`, a rename
   /// flag's `EINVAL`; Windows' own), by the code the host named it with (A-539).
   Unsupported(OsCode),
-  /// The host cannot serve it: the errno, POSIX's numbering (Linux, macOS, and a Windows refusal the writer gives the
-  /// kind of an errno the landing tells apart: a name that exists, a full disk, a verb the filesystem lacks).
-  Unavailable(i32),
-  /// The host cannot serve it: the Win32 error code (Windows), in Win32's own numbering, never read as an errno (A-527):
-  /// 17 is `ERROR_NOT_SAME_DEVICE` there and `EEXIST` in POSIX, 122 `ERROR_INSUFFICIENT_BUFFER` there and Linux's
-  /// `EDQUOT`.
-  Win32(u32),
+  /// Anything else the host cannot serve, by the code it named, typed by its numbering (A-527, A-539).
+  Unavailable(OsCode),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
   /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
   /// deadlock avoided by.
@@ -166,14 +162,26 @@ impl std::fmt::Display for HostError {
       Self::Exists(code) => write!(f, "the name exists ({code})"),
       Self::NoSpace(code) => write!(f, "no room ({code})"),
       Self::Unsupported(code) => write!(f, "not supported here ({code})"),
-      Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
-      Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
+      Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
     }
   }
 }
 
 impl std::error::Error for HostError {}
+
+impl HostError {
+  /// The code a refusal names, typed by its numbering: every kind but the typed ones the host names no number for (not
+  /// found, not a directory, not a file, a stale handle); a mount of this daemon's names the errno its platform names a
+  /// deadlock avoided by.
+  pub fn code(&self) -> Option<OsCode> {
+    match self {
+      Self::Exists(code) | Self::NoSpace(code) | Self::Unsupported(code) | Self::Unavailable(code) => Some(*code),
+      Self::OwnMount(errno) => Some(OsCode::Errno(*errno)),
+      Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle => None,
+    }
+  }
+}
 
 /// The seam. Every call is relative to a handle the host handed out, never to a path string,
 /// so a rename of the base directory by the user changes nothing (§4.4).

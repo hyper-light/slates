@@ -267,7 +267,7 @@ fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) 
   for path in ["/src/lib.rs", "/src/mod.rs"] {
     assert_eq!(
       read_all(vol, host, store, path),
-      Err(VfsError::BaseUnavailable(GONE_ERRNO)),
+      Err(VfsError::BaseUnavailable(Some(slates_vfs::host::OsCode::native(GONE_ERRNO)))),
       "{path}, an untouched base entry of the gone directory, refuses typed"
     );
   }
@@ -282,7 +282,7 @@ fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) 
   assert!(
     matches!(
       vol.with_host(host).readdir(store, src),
-      Err(VfsError::BaseUnavailable(GONE_ERRNO))
+      Err(VfsError::BaseUnavailable(Some(slates_vfs::host::OsCode::native(GONE_ERRNO))))
     ),
     "listing the gone directory refuses rather than show part of it"
   );
@@ -376,7 +376,7 @@ fn an_overlay_whose_base_directory_another_replaced_never_serves_the_other() {
   let mut recovered = recovered.expect("a replaced base directory costs only its own entries");
   assert_eq!(
     read_all(&mut recovered, &mut host, &mut after, "/src/lib.rs"),
-    Err(VfsError::BaseUnavailable(GONE_ERRNO)),
+    Err(VfsError::BaseUnavailable(Some(slates_vfs::host::OsCode::native(GONE_ERRNO)))),
     "the other directory's file is never served as the recorded one"
   );
 }
@@ -637,7 +637,7 @@ fn a_drift_recheck_the_host_refuses_is_reported_unverified() {
   host.fail(
     slates_vfs::host::sim::SimVerb::OpenFile,
     "/src/lib.rs",
-    slates_vfs::host::HostError::Unavailable(5),
+    slates_vfs::host::HostError::Unavailable(slates_vfs::host::OsCode::Errno(5)),
     u32::MAX,
   );
   let status = vol.with_host(&mut host).status(&mut store).unwrap();
@@ -2478,12 +2478,12 @@ fn a_rename_over_a_base_directory_sees_outsider_children_and_refuses_on_a_host_f
     .with_host(&mut faulty)
     .mkdir(&mut fresh_store, fresh_root, "src", 0o755)
     .unwrap();
-  faulty.fail(SimVerb::OpenDir, "/target", HostError::Unavailable(5), 1);
+  faulty.fail(SimVerb::OpenDir, "/target", HostError::Unavailable(slates_vfs::host::OsCode::Errno(5)), 1);
   assert_eq!(
     fresh
       .with_host(&mut faulty)
       .rename(&mut fresh_store, fresh_root, "src", fresh_root, "target"),
-    Err(VfsError::BaseUnavailable(5))
+    Err(VfsError::BaseUnavailable(Some(slates_vfs::host::OsCode::Errno(5))))
   );
   assert!(
     fresh
@@ -3132,7 +3132,7 @@ fn drifting_overlay() -> (SimHost, Store, Volume) {
     host.fail(
       slates_vfs::host::sim::SimVerb::OpenFile,
       &format!("/d{}/f{f}", f % 4),
-      slates_vfs::host::HostError::Unavailable(5),
+      slates_vfs::host::HostError::Unavailable(slates_vfs::host::OsCode::Errno(5)),
       u32::MAX,
     );
   }

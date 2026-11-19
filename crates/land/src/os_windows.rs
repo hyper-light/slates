@@ -73,7 +73,7 @@ use slates_vfs::inode::Fingerprint;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem as nt;
 use windows_sys::Win32::Foundation::{
-  ERROR_FILENAME_EXCED_RANGE, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE,
+  ERROR_FILENAME_EXCED_RANGE, ERROR_IO_DEVICE, GetLastError, HANDLE,
   NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
   STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY,
   STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -88,13 +88,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::engine::LandingTarget;
-// The errnos of the kinds the engine tells apart that a Win32 code is given (A-527), from the writer's one rule.
-use crate::windows_codes::{ERRNO_EXIST, ERRNO_NOSPC};
-
-/// Format: `EOPNOTSUPP`: the verb does not exist here, an errno whose kind the engine tells apart (`engine.rs`).
-const ERRNO_NOTSUP: i32 = 95;
-/// Format: `EPERM`: the verb would need a privilege slates never asks for (R10).
-const ERRNO_PERM: i32 = 1;
+// The kinds the landing tells apart, named by the writer's one rule for a Win32 code (A-527, A-539).
+use crate::windows_codes::{ALREADY_EXISTS, DISK_FULL, NOT_SUPPORTED, unsupported};
+use slates_vfs::host::OsCode;
 /// Format: every share mode, so a handle the writer holds never blocks a user's read, write, rename or delete.
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// Format: a temporary's access: written, its attributes and times set, moved and flushed (`DELETE` to rename it), and
@@ -218,7 +214,7 @@ fn status_refusal(status: NTSTATUS) -> HostError {
     | STATUS_OBJECT_NAME_INVALID => HostError::NotFound,
     STATUS_NOT_A_DIRECTORY => HostError::NotDirectory,
     STATUS_FILE_IS_A_DIRECTORY => HostError::NotFile,
-    STATUS_OBJECT_NAME_COLLISION => HostError::Unavailable(ERRNO_EXIST),
+    STATUS_OBJECT_NAME_COLLISION => HostError::Exists(OsCode::Win32(ALREADY_EXISTS)),
     other => {
       // SAFETY: a pure translation of a status value; it reads and writes no memory of ours.
       code_refusal(unsafe { RtlNtStatusToDosError(other) })
@@ -449,13 +445,13 @@ fn cluster_bytes(on: BorrowedHandle<'_>) -> Result<u64, HostError> {
   }
   u64::from(size.SectorsPerAllocationUnit)
     .checked_mul(u64::from(size.BytesPerSector))
-    .ok_or(HostError::Unavailable(ERRNO_NOTSUP))
+    .ok_or(unsupported(NOT_SUPPORTED))
 }
 
 /// Sets the end of the file `file` to `end` bytes (`FileEndOfFileInfo`): grown with zeros, or cut.
 fn set_end(file: BorrowedHandle<'_>, end: u64) -> Result<(), HostError> {
   let info = windows_sys::Win32::Storage::FileSystem::FILE_END_OF_FILE_INFO {
-    EndOfFile: i64::try_from(end).map_err(|_| HostError::Unavailable(ERRNO_NOSPC))?,
+    EndOfFile: i64::try_from(end).map_err(|_| HostError::NoSpace(OsCode::Win32(DISK_FULL)))?,
   };
   let size = u32::try_from(size_of_val(&info)).unwrap_or(0);
   // SAFETY: `file` is open with `FILE_WRITE_DATA`; `info` is a filled record of the class named, of the size passed.
@@ -485,7 +481,7 @@ fn duplicate_extents(
   use windows_sys::Win32::System::Ioctl::{
     DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
   };
-  let at = |value: u64| i64::try_from(value).map_err(|_| HostError::Unavailable(ERRNO_NOTSUP));
+  let at = |value: u64| i64::try_from(value).map_err(|_| unsupported(NOT_SUPPORTED));
   let region = DUPLICATE_EXTENTS_DATA {
     FileHandle: source.as_raw_handle().cast(),
     SourceFileOffset: at(offset)?,
@@ -535,14 +531,14 @@ fn clone_refusal(code: u32) -> HostError {
     | ERROR_INVALID_FUNCTION
     | ERROR_BLOCK_TOO_MANY_REFERENCES
     | ERROR_NOT_SAME_DEVICE
-    | ERROR_INVALID_PARAMETER => HostError::Unavailable(ERRNO_NOTSUP),
+    | ERROR_INVALID_PARAMETER => unsupported(code),
     other => code_refusal(other),
   }
 }
 
 /// Sets `buffer` (an `IO_REPARSE_TAG_SYMLINK` `REPARSE_DATA_BUFFER`) as the reparse point of the empty object `object`,
-/// opened as itself (`FILE_OPEN_REPARSE_POINT`) with [`LINK_ACCESS`]: refused `EPERM` where NTFS refuses the caller the
-/// link privilege (`ERROR_PRIVILEGE_NOT_HELD`), as every link was refused before A-438, otherwise in Windows' own code.
+/// opened as itself (`FILE_OPEN_REPARSE_POINT`) with [`LINK_ACCESS`]: refused in Windows' own code, the link privilege's
+/// `ERROR_PRIVILEGE_NOT_HELD` among them (A-539: as the Win32 code it is, never an errno's).
 fn set_reparse(object: BorrowedHandle<'_>, buffer: &[u8]) -> Result<(), HostError> {
   let length = u32::try_from(buffer.len()).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
   let mut returned = 0u32;
@@ -568,11 +564,7 @@ fn set_reparse(object: BorrowedHandle<'_>, buffer: &[u8]) -> Result<(), HostErro
     .raw_os_error()
     .and_then(|code| u32::try_from(code).ok())
     .unwrap_or(0);
-  Err(if code == ERROR_PRIVILEGE_NOT_HELD {
-    HostError::Unavailable(ERRNO_PERM)
-  } else {
-    code_refusal(code)
-  })
+  Err(code_refusal(code))
 }
 
 /// Runs `make` (a link's buffer set) on this thread under a copy of the process's token with
@@ -739,7 +731,7 @@ fn give_bits(
   if crate::windows_bits::held(attributes(object)?, volume, made) {
     Ok(())
   } else {
-    Err(HostError::Unavailable(ERRNO_NOTSUP))
+    Err(unsupported(NOT_SUPPORTED))
   }
 }
 
@@ -1169,7 +1161,7 @@ impl LandFs for OsLand {
   ) -> Result<HostFile, HostError> {
     let parent = self.dir(dir)?;
     let cluster = cluster_bytes(parent)?;
-    let unshareable = |_| HostError::Unavailable(ERRNO_NOTSUP);
+    let unshareable = |_| unsupported(NOT_SUPPORTED);
     let end = crate::block_clone::clone_end(len, cluster).map_err(unshareable)?;
     let regions = crate::block_clone::clone_regions(len, cluster).map_err(unshareable)?;
     let source = self.file(from)?;
@@ -1239,7 +1231,7 @@ impl LandFs for OsLand {
         .seek_write(bytes.get(written..).unwrap_or_default(), at)
         .map_err(|error| io_refusal(&error))?;
       if n == 0 {
-        return Err(HostError::Unavailable(ERRNO_NOSPC));
+        return Err(HostError::NoSpace(OsCode::Win32(DISK_FULL)));
       }
       written = written.saturating_add(n);
     }
@@ -1406,7 +1398,7 @@ impl LandFs for OsLand {
 
   fn exchange(&mut self, dir: HostDir, _a: &str, _b: &str) -> Result<(), HostError> {
     self.dir(dir)?;
-    Err(HostError::Unavailable(ERRNO_NOTSUP))
+    Err(unsupported(NOT_SUPPORTED))
   }
 
   fn rename_noreplace(

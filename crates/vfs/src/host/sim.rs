@@ -9,8 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind,
-  LandCapabilities, LandFs, WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, LandCapabilities, LandFs, OsCode, WatchState,
 };
 use crate::inode::Fingerprint;
 
@@ -487,13 +486,13 @@ impl SimHost {
   fn write_step(&mut self) -> Result<(), HostError> {
     self.tick();
     if self.crashed {
-      return Err(HostError::Unavailable(SIM_EIO));
+      return Err(HostError::Unavailable(OsCode::Errno(SIM_EIO)));
     }
     if let Some(at) = self.crash_at
       && self.write_steps >= at
     {
       self.crashed = true;
-      return Err(HostError::Unavailable(SIM_EIO));
+      return Err(HostError::Unavailable(OsCode::Errno(SIM_EIO)));
     }
     self.write_steps = self.write_steps.saturating_add(1);
     Ok(())
@@ -1099,16 +1098,16 @@ impl LandFs for SimHost {
   ) -> Result<HostFile, HostError> {
     if !self.reflink_supported {
       self.dir_parts(dir)?;
-      return Err(HostError::Unavailable(SIM_EOPNOTSUPP));
+      return Err(HostError::Unsupported(OsCode::Errno(SIM_EOPNOTSUPP)));
     }
-    let len = usize::try_from(len).map_err(|_| HostError::Unavailable(SIM_EINVAL))?;
+    let len = usize::try_from(len).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
     let shared = match self.opens.get(&from.0) {
       Some(Open::Temp { node, .. }) => node
         .bytes
         .get(..len)
-        .ok_or(HostError::Unavailable(SIM_EINVAL))?
+        .ok_or(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?
         .to_vec(),
-      Some(Open::File { .. }) => return Err(HostError::Unavailable(SIM_EINVAL)),
+      Some(Open::File { .. }) => return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL))),
       _ => return Err(HostError::StaleHandle),
     };
     let temp = self.create_temp(dir, name)?;
@@ -1150,7 +1149,7 @@ impl LandFs for SimHost {
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError> {
     self.write_step()?;
     let now = self.now_ns;
-    let off = usize::try_from(off).map_err(|_| HostError::Unavailable(SIM_EINVAL))?;
+    let off = usize::try_from(off).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
     let (node_ino, placed) = match self.opens.get_mut(&file.0) {
       Some(Open::Temp { node, placed }) => {
         write_into(&mut node.bytes, off, bytes)?;
@@ -1158,7 +1157,7 @@ impl LandFs for SimHost {
         node.ctime_ns = now;
         (node.ino, placed.clone())
       }
-      Some(Open::File { .. }) => return Err(HostError::Unavailable(SIM_EINVAL)),
+      Some(Open::File { .. }) => return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL))),
       _ => return Err(HostError::StaleHandle),
     };
     self.temp_changed(node_ino);
@@ -1365,7 +1364,7 @@ impl LandFs for SimHost {
       .node(&parts)
       .is_some_and(|p| p.children.contains_key(name))
     {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     // A named temporary moves to `name` (the same inode, its one name after; the move changes its ctime, as a rename
     // does); an unnamed one is linked for the first time.
@@ -1399,7 +1398,7 @@ impl LandFs for SimHost {
   fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError> {
     self.write_step()?;
     if !self.exchange_supported {
-      return Err(HostError::Unavailable(SIM_EINVAL));
+      return Err(HostError::Unsupported(OsCode::Errno(SIM_EINVAL)));
     }
     let parts = self.dir_parts(dir)?;
     let now = self.now_ns;
@@ -1437,7 +1436,7 @@ impl LandFs for SimHost {
       return Err(HostError::NotFound);
     }
     if self.node(&t).is_some() {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let now = self.now_ns;
     SimHost::rename(
@@ -1481,7 +1480,7 @@ impl LandFs for SimHost {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
     if self.node(&parts).is_some() {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let path = format!("/{}", parts.join("/"));
     SimHost::mkdir(self, &path);
@@ -1498,7 +1497,7 @@ impl LandFs for SimHost {
     match self.node(&parts) {
       None => return Err(HostError::NotFound),
       Some(n) if n.kind != HostKind::Dir => return Err(HostError::NotDirectory),
-      Some(n) if !n.children.is_empty() => return Err(HostError::Unavailable(SIM_EINVAL)),
+      Some(n) if !n.children.is_empty() => return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL))),
       Some(_) => {}
     }
     let path = format!("/{}", parts.join("/"));
@@ -1519,7 +1518,7 @@ impl LandFs for SimHost {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
     if self.node(&parts).is_some() {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let path = format!("/{}", parts.join("/"));
     SimHost::symlink(self, &path, target);
@@ -1568,13 +1567,13 @@ impl SimHost {
 fn write_into(file: &mut Vec<u8>, off: usize, bytes: &[u8]) -> Result<(), HostError> {
   let end = off
     .checked_add(bytes.len())
-    .ok_or(HostError::Unavailable(SIM_EINVAL))?;
+    .ok_or(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
   if file.len() < end {
     file.resize(end, 0);
   }
   file
     .get_mut(off..end)
-    .ok_or(HostError::Unavailable(SIM_EINVAL))?
+    .ok_or(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?
     .copy_from_slice(bytes);
   Ok(())
 }
