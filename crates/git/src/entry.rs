@@ -243,9 +243,9 @@ fn representation(
     return Ok(Some((Representation::Whole(kind), 0)));
   }
   match code {
-    OBJ_OFS_DELTA => Ok(
-      base_offset(rest, at)?.map(|(base, took)| (Representation::OfsDelta { base }, took)),
-    ),
+    OBJ_OFS_DELTA => {
+      Ok(base_offset(rest, at)?.map(|(base, took)| (Representation::OfsDelta { base }, took)))
+    }
     OBJ_REF_DELTA => Ok(
       rest
         .get(..format.raw_len())
@@ -267,9 +267,7 @@ fn base_offset(bytes: &[u8], at: u64) -> Result<Option<(u64, usize)>, Refusal> {
   let mut took = 1usize;
   let mut byte = first;
   while byte & MORE != 0 {
-    offset = offset
-      .checked_add(1)
-      .ok_or(Refusal::OffsetTooLong { at })?;
+    offset = offset.checked_add(1).ok_or(Refusal::OffsetTooLong { at })?;
     if offset.checked_shr(SHIFT_MAX).unwrap_or(0) != 0 {
       return Err(Refusal::OffsetTooLong { at });
     }

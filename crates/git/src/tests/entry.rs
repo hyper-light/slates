@@ -72,8 +72,16 @@ fn every_entry_stock_git_packed_reads_as_its_listing_says_and_writes_back_to_its
       assert_eq!(header, listed_header(&pack, entry), "{name} {:?}", entry.id);
       assert_eq!(u64::MAX - admission.left(), entry.size, "{name}: charged");
       assert!(begins_zlib_stream(&bytes[len..]), "{name} {:?}", entry.id);
-      assert_eq!(written(header, entry.offset), bytes[..len], "{name} {:?}", entry.id);
-      assert_eq!(written_len(header, entry.offset), Ok(u64::try_from(len).unwrap()));
+      assert_eq!(
+        written(header, entry.offset),
+        bytes[..len],
+        "{name} {:?}",
+        entry.id
+      );
+      assert_eq!(
+        written_len(header, entry.offset),
+        Ok(u64::try_from(len).unwrap())
+      );
     }
   }
 }
@@ -89,11 +97,27 @@ fn a_header_is_not_whole_until_its_last_byte_arrives_and_a_cut_charges_nothing()
       let (header, len) = read_listed(&pack, entry);
       let mut admission = Admission::new(entry.size);
       for cut in 0..len {
-        let read_cut = read(&bytes[..cut], entry.offset, ObjectFormat::Sha1, &mut admission);
-        assert_eq!(read_cut, Ok(None), "{} {:?} cut at {cut}", pack.name, entry.id);
+        let read_cut = read(
+          &bytes[..cut],
+          entry.offset,
+          ObjectFormat::Sha1,
+          &mut admission,
+        );
+        assert_eq!(
+          read_cut,
+          Ok(None),
+          "{} {:?} cut at {cut}",
+          pack.name,
+          entry.id
+        );
         assert_eq!(admission.left(), entry.size, "nothing charged");
       }
-      let whole = read(&bytes[..len], entry.offset, ObjectFormat::Sha1, &mut admission);
+      let whole = read(
+        &bytes[..len],
+        entry.offset,
+        ObjectFormat::Sha1,
+        &mut admission,
+      );
       assert_eq!(whole, Ok(Some((header, len))));
       assert_eq!(admission.left(), 0);
     }
@@ -124,7 +148,10 @@ fn judge_flip(bytes: &[u8], at: u64, bit: usize) -> Flipped {
       assert!(len <= flipped.len(), "bit {bit}: read past the bytes");
       Flipped::Read
     }
-    Err(Refusal::Type { at: place, code: refused }) => {
+    Err(Refusal::Type {
+      at: place,
+      code: refused,
+    }) => {
       assert_eq!((place, refused), (at, code), "bit {bit}");
       assert!(code == 0 || code == 5, "bit {bit}: type {code} refused");
       Flipped::Type
@@ -178,9 +205,18 @@ fn an_offset_delta_whose_base_is_not_between_the_packs_header_and_itself_is_refu
   let offset = entry.offset - pack.entry(entry.base.unwrap()).offset;
   assert_eq!(offset, 576);
   for at in 0..=600 {
-    let read_at = read(pack.starting_at(entry), at, ObjectFormat::Sha1, &mut unbounded());
+    let read_at = read(
+      pack.starting_at(entry),
+      at,
+      ObjectFormat::Sha1,
+      &mut unbounded(),
+    );
     if at < PACK_HEADER_LEN + offset {
-      assert_eq!(read_at, Err(Refusal::BaseBeforePack { at, offset }), "at {at}");
+      assert_eq!(
+        read_at,
+        Err(Refusal::BaseBeforePack { at, offset }),
+        "at {at}"
+      );
     } else {
       let (header, _) = read_at.unwrap().unwrap();
       let base = at - offset;

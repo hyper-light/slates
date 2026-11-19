@@ -18,7 +18,10 @@ fn files() -> Vec<(ObjectId, Vec<u8>)> {
   (1..=3)
     .map(|commit| {
       let text = text_at_commit(commit);
-      (name_of(ObjectFormat::Sha1, Kind::Blob, &text).unwrap(), text)
+      (
+        name_of(ObjectFormat::Sha1, Kind::Blob, &text).unwrap(),
+        text,
+      )
     })
     .collect()
 }
@@ -56,7 +59,11 @@ fn applied(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, Refusal> {
       Ok(out)
     }
     Err(refusal) => {
-      assert!(out.is_empty(), "{refusal:?}, yet {} bytes written", out.len());
+      assert!(
+        out.is_empty(),
+        "{refusal:?}, yet {} bytes written",
+        out.len()
+      );
       Err(refusal)
     }
   }
@@ -72,8 +79,18 @@ fn each_captured_delta_is_the_one_both_packs_carry_for_its_object() {
   for pack in packs() {
     for (hex, delta) in DELTAS {
       let entry = pack.entry(named(hex));
-      assert_eq!(pack.zlib_trailer(entry), adler32(delta), "{} {hex}", pack.name);
-      assert_eq!(entry.size, u64::try_from(delta.len()).unwrap(), "{} {hex}", pack.name);
+      assert_eq!(
+        pack.zlib_trailer(entry),
+        adler32(delta),
+        "{} {hex}",
+        pack.name
+      );
+      assert_eq!(
+        entry.size,
+        u64::try_from(delta.len()).unwrap(),
+        "{} {hex}",
+        pack.name
+      );
       let expected = Sizes {
         source: object_size(entry.base.unwrap()),
         target: object_size(entry.id),
@@ -94,10 +111,18 @@ fn rebuilt(entry: &Listed, file: &[u8], made: &[(ObjectId, Vec<u8>)], packs: &[P
     return file.to_vec();
   };
   let (_, source) = made.iter().find(|(name, _)| *name == base).unwrap();
-  let (_, delta) = DELTAS.iter().find(|(hex, _)| named(hex) == entry.id).unwrap();
+  let (_, delta) = DELTAS
+    .iter()
+    .find(|(hex, _)| named(hex) == entry.id)
+    .unwrap();
   let mut admission = Admission::new(object_size(entry.id));
   let target = apply(source, delta, &mut admission).unwrap();
-  assert_eq!(admission.left(), 0, "{:?}: charged exactly its size", entry.id);
+  assert_eq!(
+    admission.left(),
+    0,
+    "{:?}: charged exactly its size",
+    entry.id
+  );
   target
 }
 
@@ -118,12 +143,19 @@ fn each_delta_applied_to_its_base_rebuilds_the_object_git_named() {
       continue;
     };
     let content = rebuilt(entry, file, &made, &packs);
-    assert_eq!(name_of(ObjectFormat::Sha1, Kind::Blob, &content), Ok(entry.id));
+    assert_eq!(
+      name_of(ObjectFormat::Sha1, Kind::Blob, &content),
+      Ok(entry.id)
+    );
     assert_eq!(&content, file);
     made.push((entry.id, content));
   }
   assert_eq!(made.len(), 3, "the three files, each listed");
-  let deltas: Vec<&Listed> = pack.listing.iter().filter(|entry| entry.base.is_some()).collect();
+  let deltas: Vec<&Listed> = pack
+    .listing
+    .iter()
+    .filter(|entry| entry.base.is_some())
+    .collect();
   assert_eq!(deltas.len(), 2);
   let on_a_delta = deltas
     .iter()
@@ -148,6 +180,53 @@ fn gits_deltas_read_to_instructions_that_write_back_to_their_very_bytes() {
       }
     }
     assert_eq!(out, delta, "{hex}");
+  }
+}
+
+/// A-582 part 3 (golden vectors, read by hand from the captured bytes; `gitformat-pack.adoc` 113-167). Do: read each
+/// delta stock git wrote. Expect: the sizes and the instructions git chose, each where git put it.
+/// - `671f3c00`, the second commit's file (10900 bytes), from `adab45a6`, the third's (10904 bytes, stored whole), which
+///   spells line 7 `seven`: copy the first 323 bytes, through line 7's `line `; copy 53 bytes from 865, the `7 of a text
+///   ... delta\nline ` that lines 17 and 18 hold; copy the rest from 380, line 8's `8` on. No insert at all.
+/// - `41debd46`, the first commit's file (10892 bytes), from `671f3c00`, which spells line 100 `one hundred`: copy the
+///   first 5342 bytes, through line 100's `line `; insert `100`; copy 54 bytes from 5793, the ` of a text ...
+///   delta\nline 10` that lines 108 and 109 hold; copy the rest from 5407, line 101's last digit on.
+#[test]
+fn each_delta_stock_git_wrote_reads_as_the_instructions_git_chose() {
+  let copy = |offset, len| Instruction::Copy { offset, len };
+  let expected: [(&str, Sizes, Vec<(u64, Instruction<'_>)>); 2] = [
+    (
+      "41debd467a3aa189a01c4e1dc6896eb686b604dc",
+      Sizes {
+        source: 10900,
+        target: 10892,
+      },
+      vec![
+        (4, copy(0, 5342)),
+        (7, Instruction::Insert(b"100")),
+        (11, copy(5793, 54)),
+        (15, copy(5407, 5493)),
+      ],
+    ),
+    (
+      "671f3c002c093979f501d6de93e127eb46d77a63",
+      Sizes {
+        source: 10904,
+        target: 10900,
+      },
+      vec![
+        (4, copy(0, 323)),
+        (7, copy(865, 53)),
+        (11, copy(380, 10524)),
+      ],
+    ),
+  ];
+  for (hex, expected_sizes, instructions) in expected {
+    let (_, delta) = DELTAS.iter().find(|(name, _)| *name == hex).unwrap();
+    assert_eq!(sizes(delta), Ok((expected_sizes, 4)), "{hex}");
+    let read: Vec<(u64, Instruction<'_>)> =
+      Instructions::new(delta, 4).map(Result::unwrap).collect();
+    assert_eq!(read, instructions, "{hex}");
   }
 }
 
@@ -204,17 +283,23 @@ fn every_bit_flip_of_a_delta_stock_git_wrote_is_refused_by_kind_or_makes_its_dec
   }
   assert!(seen.contains(&"applied"), "{seen:?}");
   assert!(seen.contains(&"SourceSize"), "{seen:?}");
-  let inside = ["CopyOutsideSource", "PastTarget", "ShortOfTarget", "Truncated", "Reserved"];
+  let inside = [
+    "CopyOutsideSource",
+    "PastTarget",
+    "ShortOfTarget",
+    "Truncated",
+    "Reserved",
+  ];
   assert!(seen.iter().any(|kind| inside.contains(kind)), "{seen:?}");
   assert!(!seen.contains(&"PastAdmission"), "apply_to charges nothing");
 }
 
 /// A-582 part 3 (`patch-delta.c` 23-90 and `delta.h` 89-102: every rule git holds a delta to). Do: apply deltas built
 /// by hand, each breaking one rule: under git's four bytes; a size cut short; sizes past 64 bits, by a group that loses
-/// bits and by a zero group past bit 63; the reserved byte zero; a source of another length; a copy past the source's
-/// end, and one past both the source's end and the target's; a copy's operand and an insert's bytes cut short; an
-/// insert, and a copy, past the target; and instructions short of it. Expect: each refused by its own kind, naming
-/// where it stopped, with nothing written.
+/// bits and by a zero group past bit 63; the reserved byte zero, first and after the target is whole; a source of
+/// another length; a copy past the source's end, and one past both the source's end and the target's; a copy's operand
+/// and an insert's bytes cut short; an insert, and a copy, past the target; and instructions short of it. Expect: each
+/// refused by its own kind, naming where it stopped, with nothing written.
 #[test]
 fn each_rule_git_holds_a_delta_to_is_a_refusal_of_its_own_kind() {
   let hello: &[u8] = b"hello";
@@ -225,10 +310,23 @@ fn each_rule_git_holds_a_delta_to_is_a_refusal_of_its_own_kind() {
   let cases: Vec<(&[u8], Vec<u8>, Refusal)> = vec![
     (hello, vec![], Refusal::TooShort { len: 0 }),
     (hello, vec![0x05, 0x01, 0x01], Refusal::TooShort { len: 3 }),
-    (hello, vec![0x05, 0x80, 0x80, 0x80], Refusal::Truncated { at: 1 }),
+    (
+      hello,
+      vec![0x05, 0x80, 0x80, 0x80],
+      Refusal::Truncated { at: 1 },
+    ),
     (hello, past_64, Refusal::SizeTooLong { at: 0 }),
     (hello, zero_past_63, Refusal::SizeTooLong { at: 0 }),
-    (b"x", delta(1, 1, &[0x00]), Refusal::Reserved { at: 2 }),
+    (
+      b"x",
+      delta(1, 1, &[0x00, 0x00]),
+      Refusal::Reserved { at: 2 },
+    ),
+    (
+      b"x",
+      delta(1, 1, &[0x01, b'x', 0x00]),
+      Refusal::Reserved { at: 4 },
+    ),
     (
       b"hell",
       delta(5, 1, &[0x01, b'a']),
@@ -257,8 +355,16 @@ fn each_rule_git_holds_a_delta_to_is_a_refusal_of_its_own_kind() {
         source: 5,
       },
     ),
-    (hello, delta(5, 3, &[0x91, 0x03]), Refusal::Truncated { at: 2 }),
-    (hello, delta(5, 3, &[0x03, b'a']), Refusal::Truncated { at: 2 }),
+    (
+      hello,
+      delta(5, 3, &[0x91, 0x03]),
+      Refusal::Truncated { at: 2 },
+    ),
+    (
+      hello,
+      delta(5, 3, &[0x03, b'a']),
+      Refusal::Truncated { at: 2 },
+    ),
     (
       hello,
       delta(5, 2, &[0x03, b'a', b'b', b'c']),
@@ -316,7 +422,11 @@ fn a_copy_whose_size_is_zero_copies_0x10000_bytes() {
     (vec![0x81, 0x01], 1),
   ] {
     let target = applied(&source, &delta(0x10001, 0x10000, &instruction)).unwrap();
-    assert_eq!(target, source[offset..offset + 0x10000], "{instruction:02x?}");
+    assert_eq!(
+      target,
+      source[offset..offset + 0x10000],
+      "{instruction:02x?}"
+    );
   }
   let mut out = Vec::new();
   write_copy(0, 0x10000, &mut out).unwrap();
@@ -328,16 +438,26 @@ fn a_copy_whose_size_is_zero_copies_0x10000_bytes() {
 /// charged; then made, the admission spent exactly; the refused delta charging nothing.
 #[test]
 fn a_target_past_its_admission_is_refused_before_it_is_made() {
-  let delta = delta(5, 11, &[0x90, 0x05, 0x06, b' ', b'w', b'o', b'r', b'l', b'd']);
+  let delta = delta(
+    5,
+    11,
+    &[0x90, 0x05, 0x06, b' ', b'w', b'o', b'r', b'l', b'd'],
+  );
   let mut short = Admission::new(10);
   let past = PastAdmission {
     asked: 11,
     left: 10,
   };
-  assert_eq!(apply(b"hello", &delta, &mut short), Err(Refusal::PastAdmission(past)));
+  assert_eq!(
+    apply(b"hello", &delta, &mut short),
+    Err(Refusal::PastAdmission(past))
+  );
   assert_eq!(short.left(), 10, "nothing charged");
   let mut exact = Admission::new(11);
-  assert_eq!(apply(b"hello", &delta, &mut exact), Ok(b"hello world".to_vec()));
+  assert_eq!(
+    apply(b"hello", &delta, &mut exact),
+    Ok(b"hello world".to_vec())
+  );
   assert_eq!(exact.left(), 0);
   let mut roomy = Admission::new(100);
   let refused = apply(b"hell", &delta, &mut roomy);
@@ -370,7 +490,11 @@ fn the_writers_say_each_instruction_in_the_fewest_bytes_and_refuse_what_the_form
     (0xff, 0x100, vec![0xa1, 0xff, 0x01]),
     (0x0100_0000, 0xff_ffff, vec![0xf8, 0x01, 0xff, 0xff, 0xff]),
     (0xffff_ffff, 0x1_0000, vec![0x8f, 0xff, 0xff, 0xff, 0xff]),
-    (0x01_0203, 0x1_0001, vec![0xd7, 0x03, 0x02, 0x01, 0x01, 0x01]),
+    (
+      0x01_0203,
+      0x1_0001,
+      vec![0xd7, 0x03, 0x02, 0x01, 0x01, 0x01],
+    ),
   ] {
     let mut out = Vec::new();
     write_copy(offset, len, &mut out).unwrap();

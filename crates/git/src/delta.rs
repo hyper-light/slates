@@ -223,7 +223,9 @@ fn size(delta: &[u8], at: usize) -> Result<(u64, usize), Refusal> {
   let mut shift = 0u32;
   let mut next = at;
   loop {
-    let byte = *delta.get(next).ok_or(Refusal::Truncated { at: to_u64(at) })?;
+    let byte = *delta
+      .get(next)
+      .ok_or(Refusal::Truncated { at: to_u64(at) })?;
     next = next.saturating_add(1);
     let group = u64::from(byte & LOW);
     let placed = group
