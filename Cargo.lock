@@ -241,6 +241,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -301,6 +310,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -443,6 +453,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "hyper-datagram"
@@ -624,6 +643,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]
@@ -1631,6 +1660,7 @@ name = "slates-git"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "crc32fast",
  "proptest",
  "sha1-checked",
  "slates-test-seeds",
@@ -1648,6 +1678,7 @@ name = "slates-hg"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "sha1-checked",
  "slates-test-seeds",
 ]
 
@@ -1829,10 +1860,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-ssh"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "proptest",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-svn"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "lz4_flex",
+ "md-5",
  "proptest",
  "slates-test-seeds",
 ]
@@ -1854,6 +1896,15 @@ dependencies = [
  "rustls",
  "slates-machine",
  "slates-rt",
+ "slates-test-seeds",
+]
+
+[[package]]
+name = "slates-vcs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proptest",
  "slates-test-seeds",
 ]
 

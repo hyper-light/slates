@@ -1445,3 +1445,195 @@ pub struct BranchRecord {
   /// The green.
   pub green: VolumeId,
 }
+
+/// A review comment on a request (§4.17.1 "Works over works", shared piece 6; A-596): anchored to a path, the whole lines
+/// a byte range covers, and the version of the request it stands on (the version of the green whose versions are the
+/// request's updates). It moves forward with the request by the engine's position mapping
+/// (`slates_merge::engine::Green::reanchor`), its lines unchanged; once a change meets them it is outdated where it last
+/// stood, never moved again (`crate::review`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCommentRecord {
+  /// The repository whose request it is on.
+  pub repository: RepositoryId,
+  /// The request: the volume whose versions are the request's updates.
+  pub request: VolumeId,
+  /// Its number among the request's comments, from one.
+  pub id: u64,
+  /// Who wrote it.
+  pub author: Principal,
+  /// The path it is on, as the request names it.
+  pub path: String,
+  /// The first byte of its lines in the version it stands on.
+  pub start: u64,
+  /// The bytes its lines cover there, through the last one's newline (or the text's end).
+  pub len: u64,
+  /// The version it stands on: the one it was written on, or the one it was last moved to.
+  pub version: u64,
+  /// The version whose change outdated it, once one has: it stands where it last stood (`start` and `len` at
+  /// `version`) and never moves again.
+  pub outdated_at: Option<u64>,
+  /// What it says.
+  pub body: String,
+}
+
+/// An approval of a request (§4.17.1, shared piece 6; A-596): bound to the version of the request its approver saw, and
+/// stale once a later change meets what the repository's policy says an approval covers (`crate::review`). A standing
+/// approval is the evidence a policy counts.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewApprovalRecord {
+  /// The repository whose request it is on.
+  pub repository: RepositoryId,
+  /// The request: the volume whose versions are the request's updates.
+  pub request: VolumeId,
+  /// Who approved.
+  pub approver: Principal,
+  /// The version of the request it saw.
+  pub version: u64,
+  /// The version whose change made it stale, once one has.
+  pub stale_at: Option<u64>,
+}
+
+/// A check an entry of a repository's register makes (§4.17.1 shared piece 2, A-603): read at the entry's register
+/// position, before any of the entry's own changes and in the step that commits it, so it holds at exactly the position
+/// the entry takes. A check that does not hold refuses the whole entry.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryCheck {
+  /// A green is at `version`: a head the client saw that the entry does not move is unchanged (Mercurial's
+  /// `check:heads` and `unbundle`'s `heads`, §4.17.3 decision 6).
+  Head {
+    /// The green.
+    green: VolumeId,
+    /// The version it must be at.
+    version: u64,
+  },
+  /// The names starting with `prefix` bind exactly `bound`, in name order: no name under it was added, retired or bound
+  /// to another green. Where a range of names holds the heads, this with a `Head` check for each green it lists says
+  /// every head is unchanged.
+  Names {
+    /// The prefix; empty for every name of the repository.
+    prefix: String,
+    /// Every name under it and the green it binds, in name order.
+    bound: Vec<NameBinding>,
+  },
+}
+
+/// A name and the green it binds, as a [`RepositoryCheck::Names`] lists them (A-603).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NameBinding {
+  /// The name.
+  pub name: String,
+  /// The green it binds.
+  pub green: VolumeId,
+}
+
+/// A green's next version as an entry of its repository's register commits it (A-603): the bytes are the green's chain
+/// entry, the merge crate's encoding, held opaquely as `Op::GreenAdvanced` holds them, so a recovery replays them into
+/// the green as it replays every other version.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GreenVersion {
+  /// The green: a member of the entry's repository.
+  pub green: VolumeId,
+  /// The version: the one after the green's head, or after its version earlier in the same entry.
+  pub version: u64,
+  /// The chain entry.
+  pub entry: Vec<u8>,
+}
+
+/// A change of a repository's namespace as an entry of its register carries it (§4.17.1 item 3, A-603): creating a
+/// branch, deleting one and moving the default are entries of the register, so two clients creating one name race on
+/// one append and one of them is refused.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum NameChange {
+  /// `name` binds `green`, a member of the repository that no name binds, under a name the repository does not hold.
+  Bind {
+    /// The name.
+    name: String,
+    /// The green.
+    green: VolumeId,
+  },
+  /// `name` leaves the namespace; its green stays a member, so binding the name to it again restores the branch.
+  Retire {
+    /// The name.
+    name: String,
+  },
+  /// The default branch becomes `branch`, bound or not yet (an unborn default), or none.
+  Default {
+    /// The branch's name.
+    branch: Option<String>,
+  },
+}
+
+/// A change of a repository's own state, carried beside its greens' versions and namespace changes (§4.17.1 shared
+/// piece 2; §4.17.3 decisions 3 and 4; A-603): moved in the same step as the push that moves it, or alone. Each is made
+/// against the state at the entry's position and refused if that state is not the one it was made against, so a replay
+/// applies exactly what the owner judged.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum StateChange {
+  /// `node` becomes a root of phase `phase` (Mercurial's phase roots, kept as Mercurial keeps them): refused when it is
+  /// one already.
+  PhaseRootAdded {
+    /// The phase, as the tool numbers it.
+    phase: u8,
+    /// The node.
+    node: Vec<u8>,
+  },
+  /// `node` stops being a root of phase `phase`: refused when it is not one.
+  PhaseRootRemoved {
+    /// The phase.
+    phase: u8,
+    /// The node.
+    node: Vec<u8>,
+  },
+  /// An obsolescence marker, in its encoded form, kept for good in the order the register received it (Mercurial keeps
+  /// every marker it receives): refused when the repository holds it already.
+  MarkerAdded {
+    /// The marker's bytes.
+    marker: Vec<u8>,
+  },
+}
+
+/// One entry of a repository's register (§4.17.1 item 2, shared piece 2; A-603): what one step commits of a repository,
+/// all of it or none. Its checks are read at its position; then its members join, its greens' versions are committed,
+/// its names change and its state moves, each part in its order and each item judged against what the items before it
+/// left, so git's atomic push ("Either all refs are updated or none") and a Mercurial push that adds changesets, moves
+/// bookmarks, phases and markers are each one durable step.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryEntry {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The register position the entry takes: the register's next, so its entries are dense from 0.
+  pub position: u64,
+  /// What must hold at the position, before the entry's own changes.
+  pub checks: Vec<RepositoryCheck>,
+  /// Greens joining the repository's lineage, in order.
+  pub joined: Vec<MemberRecord>,
+  /// The greens' versions the entry commits, in order.
+  pub versions: Vec<GreenVersion>,
+  /// The namespace's changes, in order.
+  pub names: Vec<NameChange>,
+  /// The repository's own state's changes, in order.
+  pub state: Vec<StateChange>,
+}
+
+/// A phase root of a repository (§4.17.3 decision 3, A-603): `node` is a root of phase `phase`.
+#[derive(Wire, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhaseRoot {
+  /// The phase, as the tool numbers it.
+  pub phase: u8,
+  /// The node.
+  pub node: Vec<u8>,
+}
+
+/// A repository's register as a partition snapshot carries it (A-603): the position its next entry takes, and the
+/// repository's own state.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct RegisterRecord {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The position the next entry takes.
+  pub next: u64,
+  /// The phase roots, in (phase, node) order.
+  pub phase_roots: Vec<PhaseRoot>,
+  /// The obsolescence markers, in the order the register received them.
+  pub markers: Vec<Vec<u8>>,
+}

@@ -44,11 +44,12 @@ pub mod ops_doc;
 pub mod origin;
 pub mod ptrie;
 pub mod range;
+pub mod review;
 pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
-pub use engine::{ConflictWindow, Green, Increment, Outcome};
+pub use engine::{ConflictWindow, Green, Increment, Outcome, ReanchorRefused, Reanchored};
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
