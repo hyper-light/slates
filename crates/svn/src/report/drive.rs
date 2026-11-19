@@ -49,7 +49,7 @@
 //! No I/O, no clock, no randomness, no panic.
 
 #[cfg(test)]
-mod green;
+pub(crate) mod green;
 pub(crate) mod history;
 #[cfg(test)]
 mod tests;
@@ -579,14 +579,15 @@ enum Frame {
   File(Box<FileFrame>),
 }
 
-/// What a step reads.
-struct Sources<'s, R: ?Sized, G: ?Sized> {
-  /// The index.
-  index: &'s Index,
-  /// The green.
-  repository: &'s R,
-  /// The session's guards.
-  guards: &'s G,
+/// What a drive reads: the index, the green and the session's guards.
+#[derive(Debug)]
+pub struct Sources<'s, R: ?Sized, G: ?Sized> {
+  /// The index (A-553).
+  pub index: &'s Index,
+  /// The green: entries, property lists, revision properties and texts.
+  pub repository: &'s R,
+  /// The session's locks and read access.
+  pub guards: &'s G,
 }
 
 /// A drive answering one finished report (module documentation).
