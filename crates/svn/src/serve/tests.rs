@@ -8,13 +8,14 @@
 //! lists as sets: `svnserve` writes them in APR's seeded hash order), its drive call for call; up to
 //! the first command slates does not serve yet, which must be answered as one `svnserve` does not
 //! know. Stock `svnserve` 1.15.0's recorded commits are replayed the same way in `commit`
-//! (`crates/svn/fixtures/commit/`, through `svnserve -t`), every item byte for byte. Beside them:
-//! `reparent` inside and outside the repository, commands not served yet, items that are no
-//! command, calls without the repository's sources, the smallest budget, what the connection waits
-//! for, a tunnel's user, a repository that admits no one; the authentication for one command
-//! (`must_have_access`) for `update` and `commit`, where it helps and where it cannot; a commit
-//! answered with the revision made, and refused at `close-edit` in the drive's words and as not
-//! made yet, the client's commands then dropped until `abort-edit`; and calls out of turn.
+//! (`crates/svn/fixtures/commit/`, through `svnserve -t`), every item byte for byte but one
+//! property list in that order, counted. Beside them: `reparent` inside and outside the repository,
+//! commands not served yet, items that are no command, calls without the repository's sources, the
+//! smallest budget, what the connection waits for, a tunnel's user, a repository that admits no
+//! one; the authentication for one command (`must_have_access`) for `update` and `commit`, where it
+//! helps and where it cannot; a commit answered with the revision made, and refused at `close-edit`
+//! in the drive's words and as not made yet, the client's commands then dropped until `abort-edit`
+//! or `success`; and calls out of turn.
 
 use super::*;
 use crate::index::{Action, Index};
@@ -947,6 +948,45 @@ fn an_anonymous_commit_authenticates_for_write_and_an_unmade_work_is_refused() {
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
   let principal = connection.session().map(|session| &session.principal);
   assert_eq!(principal, Some(&alice_principal));
+}
+
+/// A-656 (`editorp.c` 1193-1208: after a failure the client's commands are read until `abort-edit`
+/// or `success`): commit through a tunnel as alice; drive `newdir`; refuse the accepted work as the
+/// owner refuses every one until A-655 part 2b; send a stray editor command, then `success`; ask
+/// for the youngest revision; expect the stray item dropped without a word, `success` ending the
+/// edit without one as `abort-edit` does, and the youngest revision answered.
+#[test]
+fn a_refused_commits_commands_are_dropped_until_the_clients_success_too() {
+  let fixture = fixture();
+  let alice = FixtureGuards::default();
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  send(&fixture, &alice, &mut connection, COMMIT_NEWDIR)
+    .1
+    .unwrap();
+  connection
+    .commit(start(), &fixture.sources(&alice), &mut Vec::new())
+    .unwrap();
+  drive_newdir(&fixture, &alice, &mut connection);
+  connection
+    .not_committed(&Uncommitted::NotServed, &mut Vec::new())
+    .unwrap();
+  let stray = "( close-dir ( 2:d0 ) ) ";
+  let (out, turn) = send(&fixture, &alice, &mut connection, stray.as_bytes());
+  let took = Turn::Took {
+    consumed: stray.len(),
+  };
+  assert_eq!((out.as_str(), turn), ("", Ok(format!("{took:?}"))));
+  assert_eq!(connection.waiting(), Waiting::Edit);
+  let (out, _) = send(&fixture, &alice, &mut connection, b"( success ( ) ) ");
+  assert_eq!(out, "");
+  assert_eq!(connection.waiting(), Waiting::Command);
+  let (out, _) = send(
+    &fixture,
+    &alice,
+    &mut connection,
+    b"( get-latest-rev ( ) ) ",
+  );
+  assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
 }
 
 /// A-656 with A-655 (`must_have_access` 840-844 for `commit`): commit anonymously where users hold
