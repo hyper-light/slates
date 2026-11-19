@@ -54,7 +54,8 @@
 //!   VMM the whole content object (A-135). A refusal is an errno its guest's mapping returns.
 //!
 //! **Teardown.** The peer closing its end, a frame refused as hostile, an error on the stream, a `detach`, a
-//! revocation, the volume's destroy and the daemon's stop all end the attachment the same way ([`ended`]): its
+//! revocation, the volume's destroy, its loss to a successor ([`superseded`], A-584) and the daemon's stop all end the
+//! attachment the same way ([`ended`]): its
 //! references are swept through the bridge (a guest sends no forget per reference at its end), its registry entry
 //! revoked and drained, its descriptor closed, and its record removed as a recorded operation. Anything but the stream
 //! itself ends the stream first ([`end_stream`]), so the task wakes on its own readiness and ends the rest; the stream
@@ -1500,6 +1501,17 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
 /// One turn of `stream`: the owed reply out first; then, while the owner may serve the volume, one frame taken and
 /// answered, its reply out as far as the stream takes it.
 fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
+  // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced at a later epoch, A-338, or
+  // yielded at this host's re-admission, A-334) ends its stream as a revoked one ends (A-584, A-346's form for this
+  // route): nothing more answered from the copy the successor's writes passed, and nothing of its guest's maps written
+  // into it, so this comes before an ending's write-back. Found here for a stream the loss was learned before it was
+  // made, and for one over a fence kept across a restart (A-344); [`superseded`] ends the rest at the loss.
+  if crate::verbs::lost_to_a_successor(s, stream.volume) {
+    if !stream.ending {
+      s.count(SUPERSEDED_ENDED, 1);
+    }
+    return Turned::Ended;
+  }
   // An ending stream first writes back its guest's stores through its maps (step 3), once, then ends.
   if stream.ending && !stream.dax.ingesting() && !begin_end_ingest(s, stream) {
     return Turned::Ended;
@@ -2623,6 +2635,25 @@ pub(crate) fn end_stream(s: &mut ShardState, attachment: u64) {
   stream.ending = true;
   if !end::end(&stream.stream) {
     s.count(END_REFUSED, 1);
+  }
+}
+
+/// Ends every stream this shard serves of `volume`, which this node has just lost to a successor (A-584; its log fenced
+/// at a later epoch, A-338, or yielded at this host's re-admission, A-334), as a revocation ends one ([`end_stream`]):
+/// its device reads the end, and its task, woken by it, ends the rest without writing its guest's maps into the copy the
+/// successor's writes passed ([`turn_with`]). The stream's form of the `NFS3ERR_STALE` an NFS mount of the volume
+/// answers and of the end a FUSE mount meets (A-346). Before, such a stream went on answering its guest from this
+/// node's copy, or, behind the lease gate, held its requests for good.
+pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
+  let streams: Vec<u64> = s
+    .shards_streams
+    .iter()
+    .filter(|(_, stream)| stream.volume == volume && !stream.ending)
+    .map(|(attachment, _)| *attachment)
+    .collect();
+  for attachment in streams {
+    end_stream(s, attachment);
+    s.count(SUPERSEDED_ENDED, 1);
   }
 }
 
