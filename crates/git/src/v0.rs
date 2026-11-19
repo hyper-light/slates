@@ -1194,9 +1194,11 @@ fn check_ref(reference: &AdvertisedRef<'_>, format: ObjectFormat) -> Result<(), 
   if let Some(peeled) = reference.peeled {
     same_format(peeled, format)?;
   }
+  let name_at = format.hex_len().saturating_add(1);
+  check_name(reference.name, name_at).map_err(WriteRefusal::Line)?;
   if !is_ref_name(reference.name) {
     return Err(WriteRefusal::Line(LineRefusal::Name {
-      at: to_u64(format.hex_len().saturating_add(1)),
+      at: to_u64(name_at),
     }));
   }
   Ok(())

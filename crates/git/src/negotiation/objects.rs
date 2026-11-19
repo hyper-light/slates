@@ -5,8 +5,11 @@
 //! 1. **Commits.** The walk paints the wants answered by no run (and the parents of commits a cut made whole) as wanted,
 //!    and the common haves, peeled to commits (and the commits a cut made whole, and the wants a run answers, whose
 //!    histories the runs carry) as had. The commits to send are those wanted and not had.
-//! 2. **Left out.** The trees of the edge commits, each had parent of a commit sent, and the trees and blobs a have
-//!    names that is no commit, are what the client holds: nothing in them is sent.
+//! 2. **Left out.** The trees of the edge commits, each had parent of a commit sent; the trees of the client's shallow
+//!    commits a cut made whole, which the client holds (git's `send_unshallow` adds each to `extra_edge_obj`, whose
+//!    trees `pack-objects` leaves out); and the trees and blobs a have names that is no commit: nothing in them is
+//!    sent. (A-640 part 3 found the second missing: git's own `--deepen` fetch, served, sent the shallow commit's blobs
+//!    again.)
 //! 3. **Trees and blobs.** Each sent commit's root tree is opened at depth 0, its entries at depth 1, and so on; a tree
 //!    or blob is sent when nothing left out holds it and the filter admits it at the least depth it is met at. A tree met
 //!    again shallower is opened again, as git's `tree:` filter reopens it; under any other filter each tree opens once.
@@ -112,8 +115,8 @@ fn commit_of<S: Graph>(graph: &S, node: S::Node) -> Option<S::Node> {
   peel(graph, node).filter(|peeled| graph.commit(*peeled).is_some())
 }
 
-/// What the client holds of trees and blobs: everything in the edge commits' trees and in the haves that are no
-/// commits.
+/// What the client holds of trees and blobs: everything in the edge commits' trees, in the trees of the commits a cut
+/// made whole, and in the haves that are no commits.
 fn left_out<S: Graph>(
   graph: &S,
   sides: &Sides<'_, S::Node>,
@@ -132,6 +135,11 @@ fn left_out<S: Graph>(
       if let Some(row) = graph.commit(parent) {
         mark(graph, row.tree, &mut held, admission)?;
       }
+    }
+  }
+  for whole in &sides.cut.haves {
+    if let Some(row) = graph.commit(*whole) {
+      mark(graph, row.tree, &mut held, admission)?;
     }
   }
   for have in sides.common.iter().filter_map(|node| peel(graph, *node)) {

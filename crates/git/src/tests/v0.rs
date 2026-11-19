@@ -1859,14 +1859,31 @@ fn line_format(line: &ClientLine<'_>) -> ObjectFormat {
   }
 }
 
-/// A ref a generated advertisement may hold: its name not a peeled line's, maybe a peeled object.
+/// A ref a generated advertisement may hold: a name its ref-name rule takes, maybe a peeled object.
 fn any_ref(format: ObjectFormat) -> impl Strategy<Value = OwnedRef> {
   (
     any_id(format),
-    proptest::collection::vec(any_word_byte(), 1..24)
-      .prop_filter("not a peeled line's name", |name| !name.ends_with(b"^{}")),
+    any_ref_name(),
     proptest::option::of(any_id(format)),
   )
+}
+
+/// A name an advertised ref may have (A-640: held to git's ref-name rule): `HEAD`, or one to three components under
+/// `refs/`, each of letters, digits, `-` and `_`.
+fn any_ref_name() -> impl Strategy<Value = Vec<u8>> {
+  let byte = prop_oneof![b'a'..=b'z', b'0'..=b'9', Just(b'-'), Just(b'_')];
+  let component = proptest::collection::vec(byte, 1..8);
+  prop_oneof![
+    1 => Just(b"HEAD".to_vec()),
+    8 => proptest::collection::vec(component, 1..4).prop_map(|components| {
+      let mut name = b"refs".to_vec();
+      for component in components {
+        name.push(b'/');
+        name.extend(component);
+      }
+      name
+    }),
+  ]
 }
 
 /// An advertisement's parts: its version, its capabilities with an `object-format` naming its format added last, its

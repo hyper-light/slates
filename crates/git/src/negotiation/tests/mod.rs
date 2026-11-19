@@ -726,8 +726,8 @@ fn oracle_sent(
     .collect()
 }
 
-/// What the oracle leaves out: everything in the trees of the sent commits' unsent parents, and in the haves that are
-/// no commits.
+/// What the oracle leaves out: everything in the trees of the sent commits' unsent parents and of the commits a cut made
+/// whole (git's `extra_edge_obj`), and in the haves that are no commits.
 fn oracle_left_out(
   graph: &TestGraph,
   common: &[u32],
@@ -743,6 +743,9 @@ fn oracle_left_out(
     {
       left_out.extend(graph.reach([graph.objects[at(*parent)].tree]));
     }
+  }
+  for whole in &cut.haves {
+    left_out.extend(graph.reach([graph.objects[at(*whole)].tree]));
   }
   for have in common.iter().filter_map(|node| peeled(graph, *node)) {
     if graph.objects[at(have)].kind != Kind::Commit {

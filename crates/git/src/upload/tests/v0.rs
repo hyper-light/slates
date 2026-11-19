@@ -409,6 +409,31 @@ fn no_done_sends_the_pack_after_ready_without_done() {
   assert!(names.contains(&id(TIP)) && !names.contains(&id(TWO)) && !names.contains(&id(ONE)));
 }
 
+/// A-640 part 3 (`get_common_commits` says `ready` at a flush only when no have was lacked): do send, under
+/// `multi_ack_detailed`, a have the repository lacks and then one that alone would make it ready, then a flush. Expect:
+/// `ACK common` for the held one and `NAK`, with no `ready` and no pack.
+#[test]
+fn a_lacked_have_keeps_a_flush_from_ready() {
+  let fixture = repository();
+  let lacked = "86e52f206da93ad5319625df790d3a5ed9f57f60";
+  let request = [
+    pkt(format!("want {TIP} multi_ack_detailed side-band-64k\n").as_bytes()),
+    b"0000".to_vec(),
+    pkt(format!("have {lacked}\n").as_bytes()),
+    pkt(format!("have {TWO}\n").as_bytes()),
+    b"0000".to_vec(),
+  ]
+  .concat();
+  let (bytes, answer) = answered(&fixture, Version::V0, Asked::Request(&request));
+  assert_eq!(answer.refusal(), None);
+  let expected = [
+    pkt(format!("ACK {TWO} common\n").as_bytes()),
+    pkt(b"NAK\n"),
+  ]
+  .concat();
+  assert_eq!(bytes, expected);
+}
+
 /// A-640 part 3 (the request held to the advertisement and its grammar): do send a capability never advertised, a
 /// SHA-256 object format, a have before the wants' flush, bytes after `done`, and a request with no flush. Expect: each
 /// refused, in an `ERR` line.
