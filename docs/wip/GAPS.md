@@ -95,8 +95,8 @@
 > verdict findings, below, are open.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
-> piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) (2026-11-19; UI goals 91 and
-> 92; owner g291).** Built on §4.17.1: a named branch's
+> piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes built (A-588) and its revlog reader (A-611)
+> (2026-11-19; UI goals 91 to 93; owner g291).** Built on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -130,10 +130,16 @@
 > collision attack refused by kind; proven by `cargo test -p slates-hg --lib`, 158 of 158 on the Mac Studio
 > (2026-11-19, debug, load 3.0), against every revision of one repository stock `hg` 7.2 stored, made twice byte for
 > byte alike (`crates/hg/fixtures/objects/make-object-fixtures.sh`: texts by `hg debugdata`, logs by `hg debugindex
-> --debug`, 7.2's own readings), and SHAttered's two prefixes. Owed, in order, after §4.17.1's seven pieces: (1, rest)
-> compressed streams (`GZ`, `BZ`, `ZS`; A-598, g079) on A-607's engines; (3, rest) the index's tables, then import of
-> a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines (flate2 over zlib-rs, and zstd),
-> its tests holding inflated bytes; (4) read serving; (5) pushes; (6) the
+> --debug`, 7.2's own readings), and SHAttered's two prefixes. **Built (A-611):** the import's revlog reader: version
+> 1 inline and split, version 2 and the changelog's version 2 behind their dockets, chunks raw, zlib (flate2 over
+> zlib-rs) and zstd with every byte charged to the admission and every stream ending exactly at its chunk's end, chains
+> rebuilt through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`,
+> 166 of 166 on the Mac Studio (2026-11-19), against 158 files stock `hg` 7.2 stored in five repositories (zstd, zlib,
+> split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
+> (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). Owed, in order, after §4.17.1's seven pieces: (1, rest)
+> compressed streams (`GZ`, `BZ`, `ZS`; A-598, g079) on A-607's engines; (3, rest) the index's tables on A-581's
+> `slates-vcs`, then the import's walk of a store (the fncache, the path encodings, a version 2 store's file index) and
+> censored, ellipsis and externally stored revisions; (4) read serving; (5) pushes; (6) the
 > changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
 > (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
 > and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run

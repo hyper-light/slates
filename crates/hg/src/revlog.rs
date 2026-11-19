@@ -19,14 +19,14 @@
 //! flate2 over zlib-rs and zstd the workspace's crate (A-607); every byte inflated is charged to the caller's
 //! admission as it is made, and a stream that does not end exactly at the chunk's end is refused.
 //!
-//! **A text** is its chain's base chunk patched by each later chunk in order (7.2's `_deltachain`: an empty delta passed
-//! over), through slates-hg's own delta applier, every patched text charged to the admission; it must be as long as its
-//! entry says and hash to its node with its parents' nodes (`node::check`, SHA-1 with collision detection).
+//! **A text** is its chain's base chunk patched by each later chunk in order (7.2's `_deltachain`: an empty delta
+//! passed over), through slates-hg's own delta applier, every patched text charged to the admission; it must be as long
+//! as its entry says and hash to its node with its parents' nodes (`node::check`, SHA-1 with collision detection).
 //!
 //! **Stricter than 7.2, on purpose.** Anything 7.2 would read as garbage or loop on is refused by kind: a negative
-//! length (7.2's inline scan would step backwards), an inline entry whose offset disagrees with the chunks before it,
-//! a base or a parent after its revision, a chunk past its file, bytes after a compressed stream, version 0, and
-//! revision flags whose texts do not hash to their nodes (censored, ellipsis, externally stored: owed with their pieces).
+//! length (7.2's inline scan would step backwards), an inline entry whose offset disagrees with the chunks before it, a
+//! base or a parent after its revision, a chunk past its file, bytes after a compressed stream, version 0, and revision
+//! flags whose texts do not hash to their nodes (censored, ellipsis, externally stored: owed with their pieces).
 
 use std::io::{Read, Write};
 
@@ -297,15 +297,20 @@ fn number(bytes: &[u8], at: usize, rev: u32) -> Result<u32, Refused> {
 
 /// Reads a version 2 docket.
 pub fn read_docket(bytes: &[u8]) -> Result<Docket<'_>, Refused> {
-  let fixed = bytes.get(..DOCKET_FIXED).ok_or(Refused::Truncated {
-    what: "a docket",
-  })?;
+  let fixed = bytes
+    .get(..DOCKET_FIXED)
+    .ok_or(Refused::Truncated { what: "a docket" })?;
   let header = be32(fixed, 0).ok_or(Refused::Truncated { what: "a docket" })?;
   let sizes = HEADER_BYTES.saturating_add(DOCKET_FIELDS);
   let counts = fixed
     .get(HEADER_BYTES..sizes)
     .ok_or(Refused::Truncated { what: "a docket" })?;
-  let size = |at: usize| be64(fixed, sizes.saturating_add(at.saturating_mul(DOCKET_SIZE_BYTES)));
+  let size = |at: usize| {
+    be64(
+      fixed,
+      sizes.saturating_add(at.saturating_mul(DOCKET_SIZE_BYTES)),
+    )
+  };
   let (index_end, data_end, sidedata_end) = (size(0), size(2), size(4));
   let default_header = fixed.last().copied();
   let mut rest = bytes.get(DOCKET_FIXED..).unwrap_or_default();
@@ -318,7 +323,8 @@ pub fn read_docket(bytes: &[u8]) -> Result<Docket<'_>, Refused> {
     let mut older_lengths = 0_usize;
     for _ in 0..older {
       let record = take(&mut rest, DOCKET_OLD_ID)?;
-      older_lengths = older_lengths.saturating_add(usize::from(record.first().copied().unwrap_or_default()));
+      older_lengths =
+        older_lengths.saturating_add(usize::from(record.first().copied().unwrap_or_default()));
     }
     take(&mut rest, older_lengths)?;
   }
@@ -340,9 +346,9 @@ pub fn read_docket(bytes: &[u8]) -> Result<Docket<'_>, Refused> {
 
 /// The next `count` bytes of a docket's ids.
 fn take<'b>(rest: &mut &'b [u8], count: usize) -> Result<&'b [u8], Refused> {
-  let (taken, after) = rest
-    .split_at_checked(count)
-    .ok_or(Refused::Truncated { what: "a docket's ids" })?;
+  let (taken, after) = rest.split_at_checked(count).ok_or(Refused::Truncated {
+    what: "a docket's ids",
+  })?;
   *rest = after;
   Ok(taken)
 }
@@ -371,7 +377,11 @@ pub struct Revlog<'a> {
 impl<'a> Revlog<'a> {
   /// Opens a version 1 revlog: its `.i` and, when it is not inline, its `.d` (empty otherwise). An inline index's
   /// entry positions are found once and charged to `admission`.
-  pub fn open(index: &'a [u8], data: &'a [u8], admission: &mut Admission) -> Result<Revlog<'a>, Refused> {
+  pub fn open(
+    index: &'a [u8],
+    data: &'a [u8],
+    admission: &mut Admission,
+  ) -> Result<Revlog<'a>, Refused> {
     if index.is_empty() {
       return Ok(Revlog {
         format: Format::V1,
@@ -412,7 +422,11 @@ impl<'a> Revlog<'a> {
   }
 
   /// Opens a version 2 revlog or a changelog of version 2 from its docket and the index and data files it names.
-  pub fn open_docketed(docket: &Docket<'_>, index: &'a [u8], data: &'a [u8]) -> Result<Revlog<'a>, Refused> {
+  pub fn open_docketed(
+    docket: &Docket<'_>,
+    index: &'a [u8],
+    data: &'a [u8],
+  ) -> Result<Revlog<'a>, Refused> {
     let header = docket.header;
     let format = match header & VERSION_MASK {
       VERSION_2 => Format::V2,
@@ -470,7 +484,10 @@ impl<'a> Revlog<'a> {
         .copied()
         .ok_or(Refused::NoRevision { rev })?
     } else {
-      usize::try_from(rev).ok().and_then(|rev| rev.checked_mul(size)).ok_or(Refused::NoRevision { rev })?
+      usize::try_from(rev)
+        .ok()
+        .and_then(|rev| rev.checked_mul(size))
+        .ok_or(Refused::NoRevision { rev })?
     };
     at.checked_add(size)
       .and_then(|end| self.index.get(at..end))
@@ -526,24 +543,33 @@ impl<'a> Revlog<'a> {
     };
     let after = |value: u32| value != NONE && value >= rev;
     if entry.base > rev || entry.base == NONE {
-      return Err(Refused::Corrupt { what: "a base after its revision", rev });
+      return Err(Refused::Corrupt {
+        what: "a base after its revision",
+        rev,
+      });
     }
     if after(entry.p1) || after(entry.p2) {
-      return Err(Refused::Corrupt { what: "a parent after its revision", rev });
+      return Err(Refused::Corrupt {
+        what: "a parent after its revision",
+        rev,
+      });
     }
     Ok(entry)
   }
 
   /// Revision `rev`'s chunk as stored.
   fn segment(&self, rev: u32, entry: &Entry) -> Result<&'a [u8], Refused> {
-    let mut start = usize::try_from(entry.offset).map_err(|_| Refused::Truncated { what: "a chunk" })?;
+    let mut start =
+      usize::try_from(entry.offset).map_err(|_| Refused::Truncated { what: "a chunk" })?;
     if self.inline {
       let entries = usize::try_from(rev)
         .ok()
         .and_then(|rev| rev.checked_add(1))
         .and_then(|count| count.checked_mul(ENTRY_V1))
         .ok_or(Refused::Truncated { what: "a chunk" })?;
-      start = start.checked_add(entries).ok_or(Refused::Truncated { what: "a chunk" })?;
+      start = start
+        .checked_add(entries)
+        .ok_or(Refused::Truncated { what: "a chunk" })?;
     }
     usize::try_from(entry.compressed)
       .ok()
@@ -552,14 +578,20 @@ impl<'a> Revlog<'a> {
       .ok_or(Refused::Truncated { what: "a chunk" })
   }
 
-  /// Revision `rev`'s chunk, decompressed: a full text or a delta. Its bytes are charged to `admission` as they are made.
+  /// Revision `rev`'s chunk, decompressed: a full text or a delta. Its bytes are charged to `admission` as they are
+  /// made.
   pub fn chunk(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
     let entry = self.entry(rev)?;
     self.chunk_of(rev, &entry, admission)
   }
 
   /// A chunk, decompressed, of an entry read already.
-  fn chunk_of(&self, rev: u32, entry: &Entry, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
+  fn chunk_of(
+    &self,
+    rev: u32,
+    entry: &Entry,
+    admission: &mut Admission,
+  ) -> Result<Vec<u8>, Refused> {
     let stored = self.segment(rev, entry)?;
     let route = match entry.mode {
       Mode::Plain => None,
@@ -597,7 +629,10 @@ impl<'a> Revlog<'a> {
       at = if self.general_delta {
         entry.base
       } else {
-        at.checked_sub(1).ok_or(Refused::Corrupt { what: "a chain past the first revision", rev: at })?
+        at.checked_sub(1).ok_or(Refused::Corrupt {
+          what: "a chain past the first revision",
+          rev: at,
+        })?
       };
     }
     chain.reverse();
@@ -609,7 +644,10 @@ impl<'a> Revlog<'a> {
   pub fn text(&self, rev: u32, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
     let entry = self.entry(rev)?;
     if entry.flags & UNHASHED_FLAGS != 0 {
-      return Err(Refused::Flags { rev, flags: entry.flags });
+      return Err(Refused::Flags {
+        rev,
+        flags: entry.flags,
+      });
     }
     let chain = self.chain(rev, admission)?;
     let mut text: Option<Vec<u8>> = None;
@@ -649,7 +687,10 @@ fn whole_entries(len: usize, size: usize) -> Result<u32, Refused> {
     .checked_div(size)
     .and_then(|count| u32::try_from(count).ok())
     .filter(|count| *count != NONE)
-    .ok_or(Refused::Corrupt { what: "more revisions than a number names", rev: NONE })
+    .ok_or(Refused::Corrupt {
+      what: "more revisions than a number names",
+      rev: NONE,
+    })
 }
 
 /// An inline index's revisions, walked as 7.2's `_inline_scan` walks them: each entry then its chunk, every length
@@ -667,17 +708,23 @@ fn scan_inline(index: &[u8], mut positions: Option<&mut Vec<usize>>) -> Result<u
       .ok_or(Refused::Truncated { what: "an entry" })?;
     let compressed = length(entry, V1_FIELDS[1], rev)?;
     if offset_of(entry, 0, rev)? != offset {
-      return Err(Refused::Corrupt { what: "an offset unlike the chunks before it", rev });
+      return Err(Refused::Corrupt {
+        what: "an offset unlike the chunks before it",
+        rev,
+      });
     }
     offset = offset.saturating_add(u64::from(compressed));
     at = at
       .checked_add(ENTRY_V1)
       .and_then(|at| at.checked_add(usize::try_from(compressed).ok()?))
       .ok_or(Refused::Truncated { what: "a chunk" })?;
-    rev = rev.checked_add(1).filter(|rev| *rev != NONE).ok_or(Refused::Corrupt {
-      what: "more revisions than a number names",
-      rev,
-    })?;
+    rev = rev
+      .checked_add(1)
+      .filter(|rev| *rev != NONE)
+      .ok_or(Refused::Corrupt {
+        what: "more revisions than a number names",
+        rev,
+      })?;
   }
   if at != index.len() {
     return Err(Refused::Truncated { what: "a chunk" });
@@ -715,7 +762,10 @@ fn mode(modes: u8, rev: u32) -> Result<Mode, Refused> {
     0 => Ok(Mode::Plain),
     1 => Ok(Mode::Default),
     2 => Ok(Mode::Inline),
-    _ => Err(Refused::Corrupt { what: "an unknown compression mode", rev }),
+    _ => Err(Refused::Corrupt {
+      what: "an unknown compression mode",
+      rev,
+    }),
   }
 }
 
@@ -751,7 +801,11 @@ impl Write for Charged<'_> {
 }
 
 /// Reads a decoder to its end, every byte charged to `admission` before it is kept.
-fn read_charged(rev: u32, reader: &mut impl Read, admission: &mut Admission) -> Result<Vec<u8>, Refused> {
+fn read_charged(
+  rev: u32,
+  reader: &mut impl Read,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refused> {
   let mut sink = Charged {
     out: Vec::new(),
     admission,
@@ -766,33 +820,15 @@ fn read_charged(rev: u32, reader: &mut impl Read, admission: &mut Admission) -> 
   }
 }
 
-/// A zlib chunk inflated whole, the stream reporting its end exactly at the chunk's end: a stream cut short, or bytes
-/// after it, are refused. The output's room starts at the chunk's own length and doubles while the stream runs, each
-/// reservation charged to `admission` before it is made.
+/// A zlib chunk inflated whole: a stream cut short is refused by flate2's reader ("incomplete deflate stream"), and one
+/// that ends before the chunk does by its count of the bytes it took.
 fn inflate_zlib(rev: u32, stored: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refused> {
-  let mut inflater = flate2::Decompress::new(true);
-  let mut out: Vec<u8> = Vec::new();
-  let mut room = stored.len().max(1);
-  loop {
-    admission.charge(crate::read::to_u64(room))?;
-    out.reserve_exact(room);
-    let consumed = usize::try_from(inflater.total_in()).map_err(|_| Refused::Inflate { rev })?;
-    let input = stored.get(consumed..).ok_or(Refused::Inflate { rev })?;
-    let (before_in, before_out) = (inflater.total_in(), inflater.total_out());
-    let status = inflater
-      .decompress_vec(input, &mut out, flate2::FlushDecompress::Finish)
-      .map_err(|_| Refused::Inflate { rev })?;
-    if status == flate2::Status::StreamEnd {
-      if inflater.total_in() != crate::read::to_u64(stored.len()) {
-        return Err(Refused::Inflate { rev });
-      }
-      return Ok(out);
-    }
-    if inflater.total_in() == before_in && inflater.total_out() == before_out && out.len() < out.capacity() {
-      return Err(Refused::Inflate { rev });
-    }
-    room = out.capacity();
+  let mut reader = flate2::bufread::ZlibDecoder::new(stored);
+  let out = read_charged(rev, &mut reader, admission)?;
+  if reader.total_in() != crate::read::to_u64(stored.len()) {
+    return Err(Refused::Inflate { rev });
   }
+  Ok(out)
 }
 
 /// A zstd chunk decompressed: one frame, ending exactly at the chunk's end.

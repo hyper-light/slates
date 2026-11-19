@@ -36,12 +36,21 @@ fn node(hex: &str) -> Node {
 fn listing(name: &str) -> Vec<Vec<(String, String)>> {
   let text = core::str::from_utf8(file(name)).unwrap();
   let mut lines = text.lines();
-  let header: Vec<String> = lines.next().unwrap().split_whitespace().map(str::to_string).collect();
+  let header: Vec<String> = lines
+    .next()
+    .unwrap()
+    .split_whitespace()
+    .map(str::to_string)
+    .collect();
   lines
     .map(|line| {
       let fields: Vec<&str> = line.split_whitespace().collect();
       assert_eq!(fields.len(), header.len(), "{name}: {line}");
-      header.iter().cloned().zip(fields.iter().map(|field| field.to_string())).collect()
+      header
+        .iter()
+        .cloned()
+        .zip(fields.iter().map(|field| field.to_string()))
+        .collect()
     })
     .collect()
 }
@@ -53,7 +62,11 @@ fn column<'r>(row: &'r [(String, String)], name: &str) -> &'r str {
 
 /// A listing's revision number: -1 is none.
 fn rev_of(value: &str) -> u32 {
-  if value == "-1" { NONE } else { value.parse().unwrap() }
+  if value == "-1" {
+    NONE
+  } else {
+    value.parse().unwrap()
+  }
 }
 
 /// A repository's revlog, opened as its format asks.
@@ -91,7 +104,11 @@ fn every_revision_reads_as_7_2_stored_it() {
     for (stem, name) in LOGS {
       let log = open(repository, stem);
       let rows = listing(&format!("{repository}-{name}.index"));
-      assert_eq!(usize::try_from(log.len()).unwrap(), rows.len(), "{repository} {name}");
+      assert_eq!(
+        usize::try_from(log.len()).unwrap(),
+        rows.len(),
+        "{repository} {name}"
+      );
       for row in &rows {
         let rev: u32 = column(row, "rev").parse().unwrap();
         let entry = log.entry(rev).unwrap();
@@ -126,18 +143,28 @@ fn every_revision_reads_as_7_2_stored_it() {
         );
         assert_eq!(found, wanted, "{repository} {name} {rev}");
         let text = log.text(rev, &mut room()).unwrap();
-        assert_eq!(text, file(&format!("{name}-{rev}.txt")), "{repository} {name} {rev}");
+        assert_eq!(
+          text,
+          file(&format!("{name}-{rev}.txt")),
+          "{repository} {name} {rev}"
+        );
         let chain = log.chain(rev, &mut room()).unwrap();
         seen.longest_chain = seen.longest_chain.max(chain.len());
         seen.generaldelta |= entry.base != rev && entry.base.checked_add(1) != Some(rev);
         if V1_REPOSITORIES.contains(repository) && entry.compressed > 0 {
-          seen.headers.push(first_stored_byte(repository, stem, &log, rev));
+          seen
+            .headers
+            .push(first_stored_byte(repository, stem, &log, rev));
         }
       }
     }
   }
   for header in [b'x', b'(', b'u'] {
-    assert!(seen.headers.contains(&header), "a chunk headed {}", char::from(header));
+    assert!(
+      seen.headers.contains(&header),
+      "a chunk headed {}",
+      char::from(header)
+    );
   }
   assert!(seen.longest_chain > 1 && seen.generaldelta);
   let snapshots = core::str::from_utf8(file("zstd-grow.chain"))
@@ -171,7 +198,11 @@ fn dockets_name_their_files() {
       let data = file(&format!("{repository}-{stem}.dat"));
       assert_eq!(
         (docket.index_end, docket.data_end, docket.default_header),
-        (u64::try_from(index.len()).unwrap(), u64::try_from(data.len()).unwrap(), b'(')
+        (
+          u64::try_from(index.len()).unwrap(),
+          u64::try_from(data.len()).unwrap(),
+          b'('
+        )
       );
     }
   }
@@ -207,12 +238,17 @@ fn versions_7_2_would_not_read_are_refused() {
   docket[..4].copy_from_slice(&1_u32.to_be_bytes());
   let read = revlog::read_docket(&docket).unwrap();
   assert_eq!(
-    Revlog::open_docketed(&read, file("v2-data_grow.idx"), file("v2-data_grow.dat")).map(|log| log.len()),
+    Revlog::open_docketed(&read, file("v2-data_grow.idx"), file("v2-data_grow.dat"))
+      .map(|log| log.len()),
     Err(Refused::Version { header: 1 })
   );
   let split = file("split-data_grow.i");
   assert!(matches!(
-    Revlog::open(&split[..split.len() - 1], file("split-data_grow.d"), &mut room()),
+    Revlog::open(
+      &split[..split.len() - 1],
+      file("split-data_grow.d"),
+      &mut room()
+    ),
     Err(Refused::Truncated { .. })
   ));
 }
@@ -227,30 +263,57 @@ fn damaged_revlogs_are_refused_by_kind() {
   let second = usize::try_from(log.entry(0).unwrap().compressed).unwrap() + 64;
   let mut negative = clean.clone();
   negative[second + 8..second + 12].copy_from_slice(&(-5_i32).to_be_bytes());
-  assert!(matches!(Revlog::open(&negative, &[], &mut room()), Err(Refused::Corrupt { rev: 1, .. })));
+  assert!(matches!(
+    Revlog::open(&negative, &[], &mut room()),
+    Err(Refused::Corrupt { rev: 1, .. })
+  ));
   let mut moved = clean.clone();
   moved[second + 5] ^= 1;
-  assert!(matches!(Revlog::open(&moved, &[], &mut room()), Err(Refused::Corrupt { rev: 1, .. })));
+  assert!(matches!(
+    Revlog::open(&moved, &[], &mut room()),
+    Err(Refused::Corrupt { rev: 1, .. })
+  ));
   let mut later_base = clean.clone();
   later_base[second + 16..second + 20].copy_from_slice(&5_i32.to_be_bytes());
   let read = Revlog::open(&later_base, &[], &mut room()).unwrap();
-  assert!(matches!(read.entry(1), Err(Refused::Corrupt { rev: 1, .. })));
+  assert!(matches!(
+    read.entry(1),
+    Err(Refused::Corrupt { rev: 1, .. })
+  ));
   let mut later_parent = clean.clone();
   later_parent[second + 24..second + 28].copy_from_slice(&1_i32.to_be_bytes());
   let read = Revlog::open(&later_parent, &[], &mut room()).unwrap();
-  assert!(matches!(read.entry(1), Err(Refused::Corrupt { rev: 1, .. })));
+  assert!(matches!(
+    read.entry(1),
+    Err(Refused::Corrupt { rev: 1, .. })
+  ));
   let mut wrong_node = clean.clone();
   wrong_node[32] ^= 1;
   let read = Revlog::open(&wrong_node, &[], &mut room()).unwrap();
-  assert!(matches!(read.text(0, &mut room()), Err(Refused::Node { rev: 0, .. })));
+  assert!(matches!(
+    read.text(0, &mut room()),
+    Err(Refused::Node { rev: 0, .. })
+  ));
   let mut unknown = clean.clone();
   unknown[64] = b'?';
   let read = Revlog::open(&unknown, &[], &mut room()).unwrap();
-  assert_eq!(read.text(0, &mut room()), Err(Refused::Compression { rev: 0, header: b'?' }));
+  assert_eq!(
+    read.text(0, &mut room()),
+    Err(Refused::Compression {
+      rev: 0,
+      header: b'?'
+    })
+  );
   let mut censored = clean.clone();
   censored[6] |= 0x80;
   let read = Revlog::open(&censored, &[], &mut room()).unwrap();
-  assert_eq!(read.text(0, &mut room()), Err(Refused::Flags { rev: 0, flags: 0x8000 }));
+  assert_eq!(
+    read.text(0, &mut room()),
+    Err(Refused::Flags {
+      rev: 0,
+      flags: 0x8000
+    })
+  );
 }
 
 /// An inline revlog of one revision whose chunk is `chunk` (a full text of `len` bytes, no parents).
@@ -258,7 +321,14 @@ fn one_revision(chunk: &[u8], len: u32) -> Vec<u8> {
   let mut index = Vec::new();
   index.extend_from_slice(&0x0003_0001_u32.to_be_bytes());
   index.extend_from_slice(&[0; 4]);
-  for field in [i32::try_from(chunk.len()).unwrap(), i32::try_from(len).unwrap(), 0, 0, -1, -1] {
+  for field in [
+    i32::try_from(chunk.len()).unwrap(),
+    i32::try_from(len).unwrap(),
+    0,
+    0,
+    -1,
+    -1,
+  ] {
     index.extend_from_slice(&field.to_be_bytes());
   }
   index.extend_from_slice(&[0; 32]);
@@ -284,11 +354,21 @@ fn a_compressed_chunk_must_end_exactly() {
     let (chunk, len) = first_chunk(name);
     let whole = one_revision(&chunk, len);
     let log = Revlog::open(&whole, &[], &mut room()).unwrap();
-    assert_eq!(log.chunk(0, &mut room()).map(|text| text.len()), Ok(usize::try_from(len).unwrap()));
-    for damaged in [[chunk.as_slice(), b"!"].concat(), chunk[..chunk.len() - 1].to_vec()] {
+    assert_eq!(
+      log.chunk(0, &mut room()).map(|text| text.len()),
+      Ok(usize::try_from(len).unwrap())
+    );
+    for damaged in [
+      [chunk.as_slice(), b"!"].concat(),
+      chunk[..chunk.len() - 1].to_vec(),
+    ] {
       let index = one_revision(&damaged, len);
       let log = Revlog::open(&index, &[], &mut room()).unwrap();
-      assert_eq!(log.chunk(0, &mut room()), Err(Refused::Inflate { rev: 0 }), "{name}");
+      assert_eq!(
+        log.chunk(0, &mut room()),
+        Err(Refused::Inflate { rev: 0 }),
+        "{name}"
+      );
     }
   }
 }

@@ -20,6 +20,13 @@
 #                   texts are compared with these byte for byte (`cmp`, the script stops on a difference)
 #   R-requires.txt   the store's requirements
 # Last it prints every file's SHA-256.
+#
+# Run on the Mac Studio (macOS 26.4, arm64), 2026-11-19, with uv's Mercurial 7.2 from PyPI on CPython 3.12, through
+# kiln (sync off), from a clone of the branch, exactly:
+#   D=$(mktemp -d ~/.cache/g291-a611.XXXXXX) && mkdir "$D/out" && bash crates/hg/fixtures/revlogs/make-revlog-fixtures.sh "$D/out"
+# Its first run (816910c28) stopped at the v2 repository, which needs `storage.fileindex.slow-path=allow`; its second
+# (d92b1f39d) made 300-byte texts for which 7.2 wrote full snapshots only; its third (59bbf094, 04:32 UTC) made these
+# 158 files, every SHA-256 printed there and checked equal here after the copy.
 set -euo pipefail
 OUT=$(cd "$1" && pwd)
 export HGPLAIN=1 HGRCPATH= HGENCODING=utf-8 PYTHONHASHSEED=0 TZ=UTC LC_ALL=C
