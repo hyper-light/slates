@@ -791,10 +791,12 @@ struct Census {
   made_again: u64,
   /// A link to a file the work made.
   to_made: u64,
-  /// A write to a file another name names, then the file removed (`echo w >> g; rm g`; A-669).
+  /// A write to a file another name names, then the file removed (`echo w >> g; rm g`; A-669). Shown, not required,
+  /// with the next: a work meets them only with `LINK` still standing and no link of its own left alone to the node
+  /// (the deriver refuses that, typed), so a run of 256 works met them twice and once (Windows x86_64, jupiter,
+  /// 2026-11-19); their unit tests hold them on every run.
   handed_removed: u64,
-  /// A write to a file another name names, then another file renamed over it (`echo w >> g; mv f g`; A-669). Shown,
-  /// not required: the works meet it a few times a run, and its own test holds it.
+  /// A write to a file another name names, then another file renamed over it (`echo w >> g; mv f g`; A-669).
   handed_replaced: u64,
   /// Works whose four readings agreed (shown, not required).
   agreed: u64,
@@ -833,7 +835,6 @@ impl Census {
       self.removed,
       self.made_again,
       self.to_made,
-      self.handed_removed,
     ]
     .iter()
     .all(|&count| count > 0)
@@ -1093,8 +1094,8 @@ impl Draft {
 /// own operations in their own order over the head, the green that accepts it, its restated journal replayed over the
 /// head, and the green that accepts that journal composed again; and the census to show every case met: a link before
 /// a rename over its name, before and after its node's rename, before its node's removal, made again where the base's
-/// stood, to a file the work made, and a write handed on to a link when its file is removed (and, shown, when another
-/// is renamed over it).
+/// stood, and to a file the work made; and, shown, a write handed on to a link when its file is removed or another is
+/// renamed over it.
 #[test]
 fn every_restated_work_reads_as_its_own_order() {
   let census = RefCell::new(Census::default());
