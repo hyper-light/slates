@@ -1154,12 +1154,23 @@ pub struct ShardState {
   /// one sampler): they are sent only when they change, so a daemon at rest sends none. Every shard's hold and debt
   /// start at zero at boot, and so does this. Bounded by the shards.
   pub(crate) pressure_sent: Vec<(u64, u64)>,
+  /// The pressure sampler's task on the control shard (A-570, `crate::pressure::sampler`), woken when it is asked to
+  /// sample (`crate::pressure::ask`); `None` elsewhere and before it starts.
+  pub(crate) pressure_task: Option<slates_rt::TaskId>,
+  /// Whether the sampler was asked to sample since it last looked (A-570): a reading a test put in the host's place,
+  /// which stands for the kernel's report.
+  pub(crate) pressure_asked: bool,
   /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
   /// shard; `None` until a process installs it (and on every other shard).
   pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
   /// Test support: this shard refuses every NFSv4 purge sent to it (`Daemon::inject_nfs_purge_refusal`), as an owner
   /// that cannot make the drop durable does, so a test can leave a purge owed across a restart.
   pub(crate) nfs_purges_refused: bool,
+  /// When the deadline keeper next hands a purge round to the reaper (A-570, `crate::nfs::note_purges`): at once at a
+  /// start whose partition owes purges, a retry window on while the NFSv4 table owes any; `None` while none is owed.
+  pub(crate) nfs_purge_at: Option<u64>,
+  /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
+  pub(crate) nfs_purge_owed: bool,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder
