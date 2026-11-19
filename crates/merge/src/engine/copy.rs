@@ -529,16 +529,6 @@ fn outer_of<'a>(
     .map(|(outer, spec)| (outer.as_str(), spec))
 }
 
-/// The path in its copy's source that `path`, in this increment's copies' trees, stands for: the innermost copy's
-/// source's own path for its destination, the same place beneath it otherwise. `path` itself outside every copy (never,
-/// for the paths the split hands over).
-fn source_of(copies: &BTreeMap<String, CopySpec>, path: &str) -> String {
-  innermost(copies, path).map_or_else(
-    || path.to_owned(),
-    |(dst, spec)| joined(&spec.source, relative(path, dst).unwrap_or_default()),
-  )
-}
-
 /// Takes out of `map` the entries whose path `inside` holds.
 fn split_map<V>(
   map: &mut BTreeMap<String, V>,
@@ -1161,7 +1151,7 @@ impl Green {
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
-      bytes,
+      Some(bytes),
       whole,
       ContentSource::Created(ops.to_vec()),
     )))
@@ -1183,7 +1173,7 @@ impl Green {
     let whole = vec![insert_whole(bytes.len() as u64)];
     Ok(Some(Effect::SetContent(
       path.to_owned(),
-      bytes,
+      Some(bytes),
       whole,
       ContentSource::Copied(from.to_owned(), ops.to_vec()),
     )))
