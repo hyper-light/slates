@@ -1616,6 +1616,9 @@ mod tests {
     let edges = edge_rx.recv_timeout(SCENARIO_WAIT).unwrap();
     let clients = client_rx.recv_timeout(SCENARIO_WAIT).unwrap();
     rt.shutdown().unwrap();
+    eprintln!(
+      "the learned bound {bound_ns} ns; the edge saw {edges:?}; the clients saw {clients:?}"
+    );
     for (edge_saw, client_saw) in edges.iter().zip(&clients).take(2) {
       assert_eq!(edge_saw.proof, Proof::Gone, "{edge_saw:?}");
       assert!(

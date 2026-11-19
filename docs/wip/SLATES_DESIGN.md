@@ -9177,12 +9177,17 @@ for listings and streams; `AbortSignal` cancellation; ESM/CJS; the typed addon o
 client channel.
 
 > **Status (2026-10-01, AUD-29-23/24).** The loopback HTTP edge runs on one slates shard with every
-> bound stated (RFC 9112 line and field limits, the message bound, the client's derived deadline, the
-> daemon's derived `clients_per_shard` connections) and authorizes before dispatch: `Host` and `Origin`
+> bound stated (RFC 9112 line and field limits, the message bound, the daemon's derived `clients_per_shard`
+> connections, and since A-523 the bound a connection gets to show the bearer, learned from the edge's own reads)
+> and authorizes before dispatch: `Host` and `Origin`
 > must name the loopback edge, the target is `/mcp`, the body `application/json`, and a 128-bit bearer
 > token minted at start is required. Stdio lines share the message bound. A refusal ends its connection in stages
 > (RFC 9112 §9.6), so the client reads it rather than a reset. Both transports are served on every platform since
-> A-183 (2026-10-26). Owed: servable roots enrolled by a human (§4.13).
+> A-183 (2026-10-26). Since A-523 (2026-11-19) a connection that has not shown the bearer gets, from its acceptance,
+> as long as an honest client takes to show it (RFC 6298 over the bearer holders' arrivals) and is cut off unanswered
+> there; one that has shown it waits while it lives. Until then every wait ran to the client's reply deadline, a
+> fixed second. Owed: servable roots enrolled by a human (§4.13); a listen stream's keep-alive period, still half
+> the reply deadline.
 
 **MCP server.** `slates mcp`: stdio and loopback Streamable HTTP; the 2026-07-28 stateless
 protocol with per-request `_meta`, `server/discover`, `resultType`, `ttlMs`/`cacheScope`,
@@ -35842,6 +35847,39 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   `a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound` (a stand-in daemon holding its challenge 1.5 s),
   `slates-client --lib` 8 of 8; red with a fixed one-second step bound put back: `OsRefused { call: "recv route", code:
   Some(35) }` after 1.01 s.
+- **The CLI's MCP edge** (`slates_mcp::http`; §4.12, AUD-29-23). Its request read, a kept-alive connection's wait
+  for the next request and a refusal's drain each ran to the reply deadline (`HttpEdge::deadline_ns`). The read comes
+  before the bearer check, on a loopback port any local user reaches, so a silent or slow local sender held a slot for
+  that second, and a token holder's kept-alive connection was closed once idle that long.
+  - *Before the bearer.* A connection is any local user's until a complete field line carrying the edge's bearer has
+    arrived on it (scanned as the head arrives, one rule with `authorize`). From its acceptance it gets as long as an
+    honest client takes to show the bearer, fixed then; its first request, a refusal and the refusal's drain end at
+    that instant, and it is cut off there unanswered, its slot freed. The slot count is `clients_per_shard`, as before.
+  - *The bound, learned* (`Arrivals`). RFC 6298 §2's estimator (the transport's `RttEstimator`, now a dependency of
+    `slates-mcp`) over each bearer holder's time from acceptance to bearer. Its tail is `SRTT + max(G, 4·RTTVAR)`,
+    `G` being the shard's timer tick (`HttpEdge::tick_ns`, from the profile) or, when longer, its measured scheduler
+    lateness. Only a bearer holder's arrival is a sample, so no other local user moves the bound either way; a
+    connection cut off is none (Karn's rule). Before the first arrival the bound is RFC 9002 §6.2.2's initial probe
+    timeout (666 ms, A-471's prior). After `n` arrivals the next outlasts all of them with chance `1/(n+1)` whatever
+    their distribution (Rényi's record indicator, as A-363 prices a lateness past every one seen), so the prior keeps
+    that share of its excess over the tail: half after one arrival, a thousandth after 999. That guards the first
+    honest clients, whose few samples RFC 6298 alone would trust at once (`3R` after one).
+  - *After the bearer.* The connection is the token holder's: the rest of its request, its next request when kept
+    alive and the drain after a refusal of its own wait while it lives, until it closes or a read fails. A body past
+    the bound is drained whole, so its client reads the `413`.
+  - *Owed* (GAPS). A listen stream's keep-alive period is still half the reply deadline
+    (`slates_mcp::http::listen_keep_alive_ns`), the edge's old idle bound. An honest client cut off before its bearer
+    arrived looks like any other sender, so its cut-off teaches the bound nothing.
+  - *Checks* (Mac Studio, debug, 2026-11-19, load 22 to 26). `slates-mcp --lib` 19 of 19 with
+    `the_bound_starts_at_the_prior_and_falls_to_the_tail_of_the_honest_arrivals`,
+    `only_a_complete_field_line_carrying_the_bearer_proves_a_connection` and
+    `a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for` (a
+    silent and a dribbling sender cut off at the 67.7 ms bound nine 1 ms arrivals taught, a token holder whose request
+    came twice the bound later read whole). Red with the old fixed second put back: "the learned bound: 1000000000
+    ns", and the prior check 1,000,000,000 against 666,000,000. Red with the bearer ignored: the token holder cut
+    off, `EdgeSaw { proof: Gone, request: None, ended_ns: 69781917 }`. The integration suite's
+    `the_mcp_surface_serves_the_tools` now opens a bearerless head beside the idle connection, both to end unanswered,
+    and holds the token holder's slow body open to the end (main's to run).
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
@@ -35851,7 +35889,10 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   `a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline` and
   `an_answered_or_resending_call_never_looks_and_no_call_names_no_wake`; the driver suite's
   `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline` (red before A-523 by its design, a call ending a
-  second after it was sent; main's to run).
+  second after it was sent; main's to run). The ring slot's walk
+  (`a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling`) is split into its steps (`walk`,
+  `step`, `assert_park`), each check kept, since main's clippy gate found it past the cognitive-complexity bound (12
+  of 10, 2026-11-19); `slates-client --lib` 8 of 8 after.
 - **Checks (the driver's tick).** On the Mac Studio (debug, 2026-11-18, load 15 to 19): `slates-ipc --lib` 62 of 62
   (1 ignored), `slates-client --lib` 7 of 7; red with the old timer put back (the next wake at the reply deadline's
   remainder): "the timer wakes 969925625 ns on, the call's own wait, not the old deadline's remainder".
