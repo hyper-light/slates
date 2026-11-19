@@ -640,6 +640,59 @@ fn a_history_list_holds_every_creation_and_deletion_at_its_path() {
   assert!(index.history("/never").unwrap().is_empty());
 }
 
+/// A-652 (`tree.c` `copy_helper`, `dag.c` `svn_fs_fs__dag_copy`): do replace `/trunk/README` by a copy of the very
+/// node-revision it holds, then `/trunk` by a copy of its own, a revision each, the deletion first as `svnadmin load` and
+/// a client's `delete-entry` then `add-file` make it. Expect each a copy, as FSFS makes one once its destination holds
+/// no node: its source's line, a fresh copy identity, its own copy root, the node-revision it replaced its predecessor
+/// and one more predecessor, created in its revision, related to what it replaced, and what stood beneath the directory
+/// standing beneath it again as the same node-revisions.
+#[test]
+fn a_replacement_by_a_copy_of_the_node_it_replaces_is_a_copy() {
+  let mut index = trunk();
+  let file = at(&index, "/trunk/README", 1);
+  let (file_id, file_line, file_copy, file_count) =
+    (file.id(), file.node_id(), file.copy_id(), file.predecessor_count());
+  let second = commit(
+    &mut index,
+    vec![replaced_by_copy("/trunk/README", NodeKind::File, "/trunk/README", 1)],
+  );
+  assert_a_copy_of(&index, "/trunk/README", second, (file_id, file_line, file_copy, file_count));
+  assert_eq!(
+    index.relation(("/trunk/README", second), ("/trunk/README", 1)).unwrap(),
+    NodeRelation::CommonAncestor
+  );
+  let directory = at(&index, "/trunk", second);
+  let replaced = (directory.id(), directory.node_id(), directory.copy_id(), directory.predecessor_count());
+  let a_c = at(&index, "/trunk/lib/a.c", second).id();
+  let third = commit(
+    &mut index,
+    vec![replaced_by_copy("/trunk", NodeKind::Directory, "/trunk", second)],
+  );
+  assert_a_copy_of(&index, "/trunk", third, replaced);
+  assert_eq!(at(&index, "/trunk/lib/a.c", third).id(), a_c);
+  assert_eq!(revisions(index.history("/trunk/README").unwrap()), [1, second]);
+}
+
+/// The node at `path` in `revision` is a copy made in that revision of the node-revision `replaced` names (its id, node
+/// identity, copy identity and predecessor count), copied from its own path in the revision before.
+fn assert_a_copy_of(
+  index: &Index,
+  path: &str,
+  revision: Revision,
+  (id, line, copy, count): (NodeRevisionId, NodeId, CopyId, u64),
+) {
+  let node = at(index, path, revision);
+  assert_eq!((node.node_id(), node.predecessor()), (line, Some(id)));
+  assert_ne!(node.copy_id(), copy);
+  assert_eq!(node.copy_root(), node.id());
+  assert_eq!(node.predecessor_count(), count + 1);
+  assert_eq!(
+    (node.created_path(), node.created_revision()),
+    (path, revision)
+  );
+  assert_eq!(node.copy_from(), Some((path, revision - 1)));
+}
+
 /// A-553 (module documentation, "Reading"): a deleted directory leaves nothing beneath it, a later copy over the same
 /// path brings back its source's node-revisions, and a revision's own replacement of a directory decides what its own
 /// later rows find beneath it.
@@ -831,13 +884,6 @@ fn a_row_its_revision_cannot_hold_is_refused_and_changes_nothing() {
     (
       vec![copied("/x", file, "/trunk", 1)],
       kind_mismatch("/x"),
-      160_004,
-    ),
-    (
-      vec![replaced_by_copy("/trunk", directory, "/trunk", 1)],
-      IndexRefusal::CopyOntoItself {
-        path: "/trunk".to_owned(),
-      },
       160_004,
     ),
     (
@@ -1075,9 +1121,10 @@ pub(crate) struct Census {
   /// Copies, and copies into their own source's subtree.
   copies: usize,
   self_copies: usize,
-  /// Deletions and replacements.
+  /// Deletions and replacements, and replacements by a copy of the very node-revision they replace.
   deletions: usize,
   replacements: usize,
+  replaced_by_itself: usize,
   /// Revisions with no rows.
   empty: usize,
   /// Index answers created at another path than the one asked: paths beneath a copy.
@@ -1104,6 +1151,7 @@ impl Census {
     self.self_copies += other.self_copies;
     self.deletions += other.deletions;
     self.replacements += other.replacements;
+    self.replaced_by_itself += other.replaced_by_itself;
     self.empty += other.empty;
     self.beneath_copies += other.beneath_copies;
     self.mergeinfo_beneath += other.mergeinfo_beneath;
@@ -1401,6 +1449,12 @@ impl Txn<'_> {
       }
       Action::Replace => {
         self.census.replacements += 1;
+        let replaced = self.tree[&change.path];
+        if let Some(source) = &change.copy_from
+          && self.fs.at(source.revision, &source.path) == replaced
+        {
+          self.census.replaced_by_itself += 1;
+        }
         self.delete(&change.path);
         self.add(change);
       }
@@ -1677,14 +1731,12 @@ impl Txn<'_> {
     Some(deleted(&path, self.kind(&path)))
   }
 
-  /// A replacement of an untouched path by a new node or by a copy that does not land on its own node-revision.
+  /// A replacement of an untouched path by a new node or by a copy, its own node-revision's among them (A-652): the
+  /// deletion comes first, so FSFS's `copy_helper` finds no node at the destination and copies.
   fn replacement(&self, wish: &Wish, rows: &[ChangedPath]) -> Option<ChangedPath> {
     let path = self.untouched(wish, rows)?;
     if wish.flags & 16 != 0 {
-      let row = self.copy_of(wish, path.clone(), Action::Replace)?;
-      let source = row.copy_from.as_ref()?;
-      let same = self.fs.at(source.revision, &source.path) == self.tree[&path];
-      return (!same).then_some(row);
+      return self.copy_of(wish, path, Action::Replace);
     }
     let kind = if wish.flags & 32 != 0 {
       NodeKind::Directory
@@ -2146,6 +2198,7 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     census.self_copies,
     census.deletions,
     census.replacements,
+    census.replaced_by_itself,
     census.empty,
     census.beneath_copies,
     census.mergeinfo_beneath,
