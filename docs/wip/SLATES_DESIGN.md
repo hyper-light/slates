@@ -8306,8 +8306,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `crates/server/tests/fuse_mount.rs`, the supersession injected as each path brings it (`Daemon::inject_superseded`).
 >   An idle volume's mount learns of it at the re-admission's yield (A-334), with no write to meet a holder's fence:
 >   the gates read `verbs::lost_to_a_successor` (the fenced log or the yield), and the yield ends the volume's FUSE
->   mounts at once (`an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale`). The guest device, the Shards
->   stream and the WinFsp mount still hold or serve such a volume (GAPS).
+>   mounts at once (`an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale`). A Shards stream ends as a
+>   revoked one does since A-584 (2026-11-19): at the loss and at the yield (`shards::superseded`), and at its next
+>   turn over a kept fence, its device reading the end and its resync given up, nothing of its guest's maps written
+>   into the stale copy. The guest device and the WinFsp mount still hold or serve such a volume (GAPS).
 > - **A superseded owner shipped on and starved its own takeover round (fixed 2026-11-18, A-349).** The nemesis (seed
 >   6876545201569229162, both Linux arches, 5 of 6 rounds) gave up two objects within tolerance. Its owner, isolated,
 >   superseded and admitted again, still sent each holder its fenced log's entries every record period, each refused
@@ -38534,3 +38536,38 @@ the rebuild), `crates/vfs/src/delta.rs` (`VolumeDelta::live_counter`, `delta`, `
   Studio (debug, 2026-11-19, load 19 to 23): `slates-vfs --lib` 90 of 90 (1 ignored), `slates-bridge-core --lib` 40 of
   40; red with the unrecorded counters dropped at the rebuild: the first test failed at its naming, its refusal holding;
   red with the ceiling's check removed: the hostile image rebuilt.
+
+### A-584 — A Shards stream whose volume this node lost to a successor ends as a revoked one does (2026-11-19, g234, UI goal 91: what Shards' kiln work needs of slates; A-346's sibling; §4.6 the Shards form, §4.8 "Leases and reads", AUD-29-84)
+Applied in the same change to: §4.8 "Leases and reads"'s status (the superseded owner's mounts), GAPS (A-346's entry: the
+stream's sibling fixed, what Shards must do and test; A-362's owed wait; the restore candidate under A-303's
+paragraph), the bug record `docs/bugs/2026-11-19-a-shards-stream-on-a-volume-lost-to-a-successor-held-its-guest.md`, and
+`crates/server/src/{shards,live_ship,readmission,daemon}.rs`.
+- **What was there.** A-346 made an owner that lost a volume to a successor answer its NFS mounts `NFS3ERR_STALE` and
+  end its FUSE mounts as revoked ones. That holds whether the loss was learned at a holder's answer, at the
+  re-admission's yield, or from a fence kept across a restart. A Shards stream applied only the lease gate: it held
+  its guest's requests while the lease did not hold, or answered them from the stale copy once the lease confirmed.
+- **The triage that chose it.** Every item g268's list owes Shards has its slates side built, and the rest is Shards'
+  own: its device's half of the resync, its ACL server, its Linux and macOS lane, the revision bump, the WHP patches,
+  and `shards restore` taking a served share. Shards' record (aa819b058, `docs/design/architecture.md`) says
+  `shards restore` takes no `--slates-fs-fd` yet. A save and then a restore onto the unchanged volume needs nothing new
+  of slates. The one soft gap, which snapshot a restore onto a changed volume must clone, is recorded in GAPS as a
+  candidate and not built (main's decision).
+- **The rule.** A stream whose volume this node lost to a successor ends as a revocation ends one. It ends at the
+  loss, when the fence is learned or the volume yielded (`shards::superseded`, beside `fuse::superseded`). A stream made
+  after the loss, or one over a fence kept across a restart, ends at its next turn. Its device reads its end and its
+  resync channel's, nothing more is answered from the copy, and none of its guest's mapped stores is written into it:
+  the check comes before an ending's write-back. Each stream ended is counted once, `shards.superseded_ended`.
+- **What Shards must do and test.** Nothing new to build: its device takes a stream's end as its share's end, and no
+  resync follows, since the channel is given up with the stream. Owed with its fleet runs: a guest over a stream whose
+  owner loses the volume sees its share end, and its orchestrator attaches anew on the successor.
+- **Tests.** `a_stream_whose_volume_this_node_lost_to_a_successor_ends_unanswered` (`crates/server/src/shards.rs`, lib,
+  Unix). Two streams are attached, one volume's loss is learned and the other's is kept untold, and each is sent a
+  SAVE as Shards' device sends one. Both must meet the stream's end, both records must be gone, and two ends must be
+  counted.
+- **Evidence.** On the Mac Studio, 2026-11-19:
+  - Red with the test alone on main: the told stream's SAVE was neither answered nor ended within the test's 60 s wait.
+  - Green with the rule, in 0.79 s.
+  - `cargo test --locked -p slates-server --lib -- shards:: live_ship:: readmission::` passed 31 of 31, and `cargo fmt`
+    was clean.
+- **Still owed** (GAPS): the guest device's and the WinFsp mount's forms of the same answer, and a relinquish (A-362)
+  that waits for a stream ended before its next turn.

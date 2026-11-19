@@ -404,7 +404,9 @@
 >   `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`) and
 >   `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key` (`crates/db/tests/model.rs`, with the step in
 >   the db model's histories). Still owed: a guest device or Shards stream serving the stale copy is ended, not waited
->   for, since the adopted state takes the id at once.
+>   for, since the adopted state takes the id at once. Since A-584 (2026-11-19) a Shards stream is ended when the loss
+>   is learned or yielded, and its next turn ends it without writing its guest's maps anywhere; a relinquish that runs
+>   before that turn still does not wait for it, with the guest device's.
 > - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
 >   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
 >   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
@@ -430,9 +432,19 @@
 >   learned fence makes). Held by `an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale`
 >   (`crates/server/tests/fleet.rs`). The FUSE half has no Linux test of its own: the yield calls what
 >   `a_held_descriptor_on_a_superseded_volume_reads_nothing_more` drives.
-> - **Owed (siblings):** the guest device (`crate::virtiofs`), the Shards stream (`crate::shards`) and the WinFsp mount
->   (`crate::winfsp`) still apply only the lease gate (`verbs::live_tree_fenced`) to such a volume, so each holds its
->   requests or, its lease confirmed, serves the copy; each needs its own form of this answer.
+> - **Fixed (A-584, 2026-11-19, goal 91): the Shards stream.** It ends as a revoked stream does, the device reading its
+>   end and its resync channel's, at the moment the owner learns its fence or yields the volume (`shards::superseded`,
+>   beside `fuse::superseded`) and at its next turn over a fence kept across a restart, before any write-back of its
+>   guest's maps, counted `shards.superseded_ended`. Held by
+>   `a_stream_whose_volume_this_node_lost_to_a_successor_ends_unanswered` (`crates/server/src/shards.rs`, the loss
+>   told and kept). Red before on the Mac Studio: the lease gate held the told stream's SAVE unanswered past the test's
+>   60 s wait (`docs/bugs/2026-11-19-a-shards-stream-on-a-volume-lost-to-a-successor-held-its-guest.md`). **What
+>   Shards must do and test:** nothing new to build, since its device already takes a stream's end as its share's end
+>   (no resync follows: the channel is given up with it); owed with its fleet runs, a guest over a stream whose owner
+>   loses the volume sees its share end, and its orchestrator attaches anew on the successor.
+> - **Owed (siblings):** the guest device (`crate::virtiofs`) and the WinFsp mount (`crate::winfsp`) still apply only
+>   the lease gate (`verbs::live_tree_fenced`) to such a volume, so each holds its requests or, its lease confirmed,
+>   serves the copy; each needs its own form of this answer.
 
 > **A live log forked at its owner's warm restart: kept and resumed past every position it may have shipped (2026-11-18,
 > A-344, §4.10, §4.8 "Recovery"; g230; found by A-343's probes).** The shipper lived in the owner shard's memory alone.
@@ -948,6 +960,12 @@
 > nothing holds it, and a clone made after a restart carries them again. Proven by the vfs lib tests (the let-go, and a
 > restart rebuilt beside the origin); the server's restore over a clone and a real daemon's restart of one are filed
 > for main. A clone made for a restore not yet come keeps its carried files only until a restart.
+> **Candidate (A-584's triage, 2026-11-19; recorded, not built, by main's decision):** a RESTORE onto a volume changed
+> since the cut, or of a guest that held a file with no name, needs a clone of the cut's snapshot, and nothing outside
+> the tables, which are opaque to Shards, tells the caller which snapshot that is: the refusal (`RESTORE_ELSEWHERE`)
+> names neither the volume nor the snapshot. A save and then a restore onto the volume unchanged since the cut needs
+> nothing more, so Shards' `shards restore` taking a served share and its real-VM test of one need nothing new of
+> slates.
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
