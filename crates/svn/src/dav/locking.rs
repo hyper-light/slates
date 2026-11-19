@@ -255,7 +255,8 @@ pub struct LockInfo {
 
 /// Reads a LOCK body's `D:lockinfo` as `dav_lock_parse_lockinfo` reads it (module documentation, "A LOCK").
 pub fn lockinfo(body: &[u8], bounds: &Bounds) -> Result<LockInfo, MethodRefusal> {
-  let document = xml::parse_document(body, bounds).map_err(|refusal| MethodRefusal::Body(refusal.into()))?;
+  let document =
+    xml::parse_document(body, bounds).map_err(|refusal| MethodRefusal::Body(refusal.into()))?;
   read_lockinfo(&document)
 }
 
@@ -314,9 +315,10 @@ fn take_lockinfo_child(
 /// namespace the body declared from the last, then its quoted text, or `/>` for none. Refused holding an element or
 /// an attribute other than `xml:lang`.
 fn owner(element: &Element, document: &Document) -> Result<Owner, MethodRefusal> {
-  let attributed = element.attributes.iter().any(|attribute| {
-    !(attribute.namespace == XML_NAMESPACE && attribute.name == "lang")
-  });
+  let attributed = element
+    .attributes
+    .iter()
+    .any(|attribute| !(attribute.namespace == XML_NAMESPACE && attribute.name == "lang"));
   if attributed || element.elements().next().is_some() {
     return Err(MethodRefusal::OwnerMarkup);
   }
@@ -327,7 +329,10 @@ fn owner(element: &Element, document: &Document) -> Result<Owner, MethodRefusal>
     .iter()
     .position(|known| *known == quoted_namespace)
     .filter(|_| !element.namespace.is_empty())
-    .map_or_else(|| element.name.clone(), |index| format!("ns{index}:{}", element.name));
+    .map_or_else(
+      || element.name.clone(),
+      |index| format!("ns{index}:{}", element.name),
+    );
   let mut written = format!("<{name}");
   if let Some(lang) = lang(element).or_else(|| lang(&document.root)) {
     written.push_str(&format!(" xml:lang=\"{}\"", quote(lang, true)));
@@ -372,12 +377,18 @@ pub fn timeout(header: Option<&str>, now: AprTime) -> Result<Option<AprTime>, Me
       let refused = || MethodRefusal::Timeout {
         value: header.to_owned(),
       };
-      let now_seconds = now.0.checked_div(MICROSECONDS_PER_SECOND).ok_or_else(refused)?;
+      let now_seconds = now
+        .0
+        .checked_div(MICROSECONDS_PER_SECOND)
+        .ok_or_else(refused)?;
       let at = now_seconds.checked_add(atol(seconds)).ok_or_else(refused)?;
       if at == 0 {
         return Ok(None);
       }
-      let micros = at.max(now_seconds).checked_mul(MICROSECONDS_PER_SECOND).ok_or_else(refused)?;
+      let micros = at
+        .max(now_seconds)
+        .checked_mul(MICROSECONDS_PER_SECOND)
+        .ok_or_else(refused)?;
       return Ok(Some(AprTime(micros)));
     }
   }
@@ -567,7 +578,10 @@ pub fn lock_request(
   let document = if request.body.is_empty() {
     None
   } else {
-    Some(xml::parse_document(request.body, bounds).map_err(|refusal| MethodRefusal::Body(refusal.into()))?)
+    Some(
+      xml::parse_document(request.body, bounds)
+        .map_err(|refusal| MethodRefusal::Body(refusal.into()))?,
+    )
   };
   let depth_zero = lock_depth(request.depth)?;
   parent_is_directory(request.path, head)?;
@@ -592,10 +606,15 @@ pub fn lock_request(
   };
   let lock_request = LockRequest {
     user: Some(user.to_owned()),
-    comment: info.owner.as_ref().map(|owner| owner.text.clone().into_bytes()),
+    comment: info
+      .owner
+      .as_ref()
+      .map(|owner| owner.text.clone().into_bytes()),
     is_dav_comment: false,
     expires,
-    steal: request.options.is_some_and(|options| options.contains(LOCK_STEAL)),
+    steal: request
+      .options
+      .is_some_and(|options| options.contains(LOCK_STEAL)),
     targets: BTreeMap::from([(request.path.to_owned(), target)]),
   };
   Ok(LockPlan {
@@ -658,7 +677,13 @@ pub fn lock_answer(
     Err(refusal) => return Ok(lock_refused(refusal, filesystem)),
   };
   let token = escape_cdata(lock.token.as_str());
-  let activelock = activelock(plan.depth_zero, plan.owner_element.as_deref(), lock.expires, &token, now);
+  let activelock = activelock(
+    plan.depth_zero,
+    plan.owner_element.as_deref(),
+    lock.expires,
+    &token,
+    now,
+  );
   let body = format!(
     "{XML_HEADER}<D:prop xmlns:D=\"DAV:\">\n<D:lockdiscovery>\n{activelock}\n</D:lockdiscovery>\n</D:prop>"
   );
@@ -666,7 +691,10 @@ pub fn lock_answer(
     status: HTTP_OK,
     headers: vec![
       ("X-SVN-Creation-Date", svn_time(lock.created)?),
-      ("X-SVN-Lock-Owner", header_value("X-SVN-Lock-Owner", &lock.owner)?),
+      (
+        "X-SVN-Lock-Owner",
+        header_value("X-SVN-Lock-Owner", &lock.owner)?,
+      ),
       ("Lock-Token", format!("<{token}>")),
       ("Content-Type", String::from(DAV_XML_CONTENT_TYPE)),
     ],
@@ -696,7 +724,10 @@ pub fn lockdiscovery(lock: Option<&Lock>, now: AprTime) -> Result<Discovery, Dav
     if lock.is_dav_comment {
       comment.to_owned()
     } else {
-      format!("<D:owner xmlns:D=\"DAV:\">{}</D:owner>", quote(comment, true))
+      format!(
+        "<D:owner xmlns:D=\"DAV:\">{}</D:owner>",
+        quote(comment, true)
+      )
     }
   });
   let token = escape_cdata(lock.token.as_str());
@@ -705,7 +736,10 @@ pub fn lockdiscovery(lock: Option<&Lock>, now: AprTime) -> Result<Discovery, Dav
     property: format!("<D:lockdiscovery>{activelock}</D:lockdiscovery>\n"),
     headers: vec![
       ("X-SVN-Creation-Date", svn_time(lock.created)?),
-      ("X-SVN-Lock-Owner", header_value("X-SVN-Lock-Owner", &lock.owner)?),
+      (
+        "X-SVN-Lock-Owner",
+        header_value("X-SVN-Lock-Owner", &lock.owner)?,
+      ),
     ],
   })
 }
@@ -734,7 +768,9 @@ pub fn unlock_request(
   let token = lock_token(header).ok_or_else(|| MethodRefusal::MalformedLockToken {
     header: header.to_owned(),
   })?;
-  let break_lock = request.options.is_some_and(|options| options.contains(LOCK_BREAK));
+  let break_lock = request
+    .options
+    .is_some_and(|options| options.contains(LOCK_BREAK));
   let Some(lock) = table.get_lock(request.path, now) else {
     return Err(MethodRefusal::NoOutstandingLock {
       path: request.path.to_owned(),
@@ -780,13 +816,17 @@ pub fn unlock_answer(
 fn unlock_refused(request: &UnlockRequest, refusal: &LockRefusal, filesystem: &str) -> HttpAnswer {
   let code = refusal.subversion_code();
   match refusal {
-    LockRefusal::NoUser { .. } => {
-      error_answer(HTTP_NOT_IMPLEMENTED, false, DAV_ERR_LOCK_SAVE_LOCK, ANONYMOUS_UNLOCK)
-    }
+    LockRefusal::NoUser { .. } => error_answer(
+      HTTP_NOT_IMPLEMENTED,
+      false,
+      DAV_ERR_LOCK_SAVE_LOCK,
+      ANONYMOUS_UNLOCK,
+    ),
     LockRefusal::OwnerMismatch { owner, .. } => {
       let user = request.user.as_deref().unwrap_or_default();
-      let message =
-        format!("User '{user}' is trying to use a lock owned by '{owner}' in filesystem '{filesystem}'");
+      let message = format!(
+        "User '{user}' is trying to use a lock owned by '{owner}' in filesystem '{filesystem}'"
+      );
       error_answer(convert_status(code), true, code, &message)
     }
     _ => error_answer(convert_status(code), false, code, UNLOCK_FAILED),
@@ -803,7 +843,8 @@ fn lock_refused(refusal: &LockRefusal, filesystem: &str) -> HttpAnswer {
     };
   }
   let code = refusal.subversion_code();
-  let message = lock_error_message(refusal, filesystem).unwrap_or_else(|| String::from(LOCK_FAILED));
+  let message =
+    lock_error_message(refusal, filesystem).unwrap_or_else(|| String::from(LOCK_FAILED));
   error_answer(convert_status(code), true, code, &message)
 }
 
@@ -817,10 +858,16 @@ fn lock_error_message(refusal: &LockRefusal, filesystem: &str) -> Option<String>
       "Path '{path}' is already locked by user '{owner}' in filesystem '{filesystem}'"
     )),
     LockRefusal::NotFound { path } => Some(format!("Path '{path}' doesn't exist in HEAD revision")),
-    LockRefusal::OutOfDate { path } => Some(format!("Lock failed: newer version of '{path}' exists")),
+    LockRefusal::OutOfDate { path } => {
+      Some(format!("Lock failed: newer version of '{path}' exists"))
+    }
     LockRefusal::NoSuchRevision { revision } => Some(format!("No such revision {revision}")),
-    LockRefusal::NotFile { path } => Some(format!("'{path}' is not a file in filesystem '{filesystem}'")),
-    LockRefusal::NoSuchLock { path } => Some(format!("No lock on path '{path}' in filesystem '{filesystem}'")),
+    LockRefusal::NotFile { path } => Some(format!(
+      "'{path}' is not a file in filesystem '{filesystem}'"
+    )),
+    LockRefusal::NoSuchLock { path } => Some(format!(
+      "No lock on path '{path}' in filesystem '{filesystem}'"
+    )),
     LockRefusal::TokenNotPresented { path } => Some(format!(
       "Cannot verify lock on path '{path}'; no matching lock-token available"
     )),
@@ -875,7 +922,13 @@ fn error_answer(status: u16, tagged: bool, code: u32, message: &str) -> HttpAnsw
 
 /// One `D:activelock` as `dav_lock_get_activelock` writes it: a write lock, exclusive, its depth, its owner element as
 /// kept, the seconds left, and its token.
-fn activelock(depth_zero: bool, owner: Option<&str>, expires: Option<AprTime>, token: &str, now: AprTime) -> String {
+fn activelock(
+  depth_zero: bool,
+  owner: Option<&str>,
+  expires: Option<AprTime>,
+  token: &str,
+  now: AprTime,
+) -> String {
   let depth = if depth_zero { "0" } else { "infinity" };
   format!(
     "<D:activelock>\n<D:locktype><D:write/></D:locktype>\n<D:lockscope><D:exclusive/></D:lockscope>\n\
@@ -893,7 +946,10 @@ fn timeout_text(expires: Option<AprTime>, now: AprTime) -> String {
   match at {
     None | Some(0) => String::from("Infinite"),
     Some(at) => {
-      let now_seconds = now.0.checked_div(MICROSECONDS_PER_SECOND).unwrap_or_default();
+      let now_seconds = now
+        .0
+        .checked_div(MICROSECONDS_PER_SECOND)
+        .unwrap_or_default();
       format!("Second-{}", at.saturating_sub(now_seconds).max(0))
     }
   }
@@ -906,7 +962,10 @@ fn escape_cdata(text: &str) -> String {
 
 /// A header's value, refused holding a control character other than tab, as httpd refuses one.
 fn header_value(name: &'static str, value: &str) -> Result<String, DavRefusal> {
-  if value.bytes().any(|byte| byte.is_ascii_control() && byte != b'\t') {
+  if value
+    .bytes()
+    .any(|byte| byte.is_ascii_control() && byte != b'\t')
+  {
     return Err(DavRefusal::Unwritable {
       what: name,
       value: value.to_owned(),

@@ -52,7 +52,11 @@ fn filled(byte: u8, count: u64) -> Window {
 }
 
 /// A node's facts.
-fn facts<'a>(repository_path: &'a str, created_revision: Revision, sha1: Option<&str>) -> Facts<'a> {
+fn facts<'a>(
+  repository_path: &'a str,
+  created_revision: Revision,
+  sha1: Option<&str>,
+) -> Facts<'a> {
   Facts {
     repository_path,
     created_revision,
@@ -90,7 +94,10 @@ fn unbase64(text: &str) -> Vec<u8> {
   let mut held = 0u32;
   let mut out = Vec::new();
   for character in text.bytes().filter(|character| *character != b'=') {
-    let value = alphabet.iter().position(|known| *known == character).unwrap();
+    let value = alphabet
+      .iter()
+      .position(|known| *known == character)
+      .unwrap();
     bits = (bits << 6) | u32::try_from(value).unwrap();
     held += 6;
     if held >= 8 {
@@ -112,9 +119,7 @@ fn between<'w>(written: &'w str, start: &str, end: &str) -> &'w str {
 fn update_drive() -> String {
   let mut drive = update(true, true, false);
   drive.target_revision(5).unwrap();
-  drive
-    .open_root(Some(4), &facts("/trunk", 5, None))
-    .unwrap();
+  drive.open_root(Some(4), &facts("/trunk", 5, None)).unwrap();
   drive
     .change_property("svn:entry:committed-rev", Some(b"5"))
     .unwrap();
@@ -131,7 +136,12 @@ fn update_drive() -> String {
   drive.close_file(digest(HELLO_MD5)).unwrap();
   let copied = facts("/trunk/d", 5, None);
   drive
-    .add(NodeKind::Directory, "trunk/d", Some(("/trunk/c", 3)), &copied)
+    .add(
+      NodeKind::Directory,
+      "trunk/d",
+      Some(("/trunk/c", 3)),
+      &copied,
+    )
     .unwrap();
   drive.close_directory().unwrap();
   update_drive_rest(drive)
@@ -141,7 +151,12 @@ fn update_drive() -> String {
 /// named base, then a deletion with no revision, an absent file, and the close.
 fn update_drive_rest(mut drive: Drive) -> String {
   drive
-    .open(NodeKind::File, "trunk/g.txt", Some(3), &facts("/trunk/g.txt", 4, None))
+    .open(
+      NodeKind::File,
+      "trunk/g.txt",
+      Some(3),
+      &facts("/trunk/g.txt", 4, None),
+    )
     .unwrap();
   drive.change_property("bin", Some(&[0xff])).unwrap();
   drive.change_property("old", None).unwrap();
@@ -164,7 +179,8 @@ fn update_drive_rest(mut drive: Drive) -> String {
 /// deletion's missing revision as -1.
 #[test]
 fn an_update_drive_is_written_as_update_c_writes_it() {
-  let two_windows = crate::dav::listing::delta(&[filled(b'x', 5), filled(b'y', 7)], Version::Zero).unwrap();
+  let two_windows =
+    crate::dav::listing::delta(&[filled(b'x', 5), filled(b'y', 7)], Version::Zero).unwrap();
   let expected = [
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
     "<S:update-report xmlns:S=\"svn:\" xmlns:V=\"http://subversion.tigris.org/xmlns/dav/\" xmlns:D=\"DAV:\" ",
@@ -219,7 +235,9 @@ fn hrefs_name_revision_roots_by_httpv2_and_a_targeted_anchor_has_none() {
     drive.close_directory().unwrap();
     String::from_utf8(drive.finish().unwrap()).unwrap()
   };
-  assert!(open(false).contains("<S:open-directory rev=\"2\">\n<D:checked-in><D:href>/!svn/rvr/2/trunk/x%20y</D:href>"));
+  assert!(open(false).contains(
+    "<S:open-directory rev=\"2\">\n<D:checked-in><D:href>/!svn/rvr/2/trunk/x%20y</D:href>"
+  ));
   assert!(open(true).contains("<S:open-directory rev=\"2\">\n</S:open-directory>\n"));
 }
 
@@ -299,16 +317,20 @@ fn a_replay_of_nothing_writes_what_replay_c_writes_for_it() {
   let mut no_deltas = Drive::replay(Version::Zero, ROOM);
   no_deltas.open_root(None, &NO_FACTS).unwrap();
   no_deltas.change_property("", None).unwrap();
-  no_deltas
-    .add(NodeKind::File, "f", None, &NO_FACTS)
-    .unwrap();
+  no_deltas.add(NodeKind::File, "f", None, &NO_FACTS).unwrap();
   no_deltas.apply_textdelta(None).unwrap();
   no_deltas.textdelta_end().unwrap();
   no_deltas.close_file([0; 16]).unwrap();
   no_deltas.close_directory().unwrap();
   let written = String::from_utf8(no_deltas.finish().unwrap()).unwrap();
-  assert!(written.contains("<S:change-dir-prop name=\"\" del=\"true\"/>\n"), "{written}");
-  assert!(written.contains("<S:apply-textdelta>U1ZOAA==</S:apply-textdelta>\n<S:close-file/>\n"), "{written}");
+  assert!(
+    written.contains("<S:change-dir-prop name=\"\" del=\"true\"/>\n"),
+    "{written}"
+  );
+  assert!(
+    written.contains("<S:apply-textdelta>U1ZOAA==</S:apply-textdelta>\n<S:close-file/>\n"),
+    "{written}"
+  );
 }
 
 /// A delta's base64 as one replay answer writes it, its windows given one at a time.
@@ -333,7 +355,12 @@ fn replay_delta(windows: &[Window], version: Version) -> String {
 /// once.
 #[test]
 fn a_streamed_delta_decodes_to_its_windows_however_they_were_split() {
-  let windows = [filled(b'a', 1), filled(b'b', 2), filled(b'c', 300), filled(b'd', 4)];
+  let windows = [
+    filled(b'a', 1),
+    filled(b'b', 2),
+    filled(b'c', 300),
+    filled(b'd', 4),
+  ];
   for count in 1..=windows.len() {
     let given = windows.get(..count).unwrap();
     decodes_back(given, Version::Zero);
@@ -348,7 +375,10 @@ fn decodes_back(given: &[Window], version: Version) {
   let text = replay_delta(given, version);
   let (decoded_version, decoded) = decode_all(&unbase64(&text)).unwrap();
   assert_eq!((decoded_version, decoded.as_slice()), (version, given));
-  let target: Vec<u8> = given.iter().flat_map(|window| window.new_data.clone()).collect();
+  let target: Vec<u8> = given
+    .iter()
+    .flat_map(|window| window.new_data.clone())
+    .collect();
   assert_eq!(apply_all(b"", &decoded).unwrap(), target);
 }
 
@@ -363,14 +393,25 @@ fn outside_send_all_mode_texts_are_fetched_and_an_addition_s_properties_wait() {
   drive.target_revision(5).unwrap();
   drive.open_root(Some(4), &facts("/trunk", 5, None)).unwrap();
   let added = facts("/trunk/n.txt", 5, Some(HELLO_SHA1));
-  drive.add(NodeKind::File, "trunk/n.txt", None, &added).unwrap();
-  drive.change_property("svn:eol-style", Some(b"native")).unwrap();
+  drive
+    .add(NodeKind::File, "trunk/n.txt", None, &added)
+    .unwrap();
+  drive
+    .change_property("svn:eol-style", Some(b"native"))
+    .unwrap();
   drive.apply_textdelta(None).unwrap();
   drive.window(&hello()).unwrap();
   drive.textdelta_end().unwrap();
   drive.close_file(digest(HELLO_MD5)).unwrap();
   let copied = facts("/trunk/c", 5, None);
-  drive.add(NodeKind::Directory, "trunk/c", Some(("/trunk/d", 3)), &copied).unwrap();
+  drive
+    .add(
+      NodeKind::Directory,
+      "trunk/c",
+      Some(("/trunk/d", 3)),
+      &copied,
+    )
+    .unwrap();
   drive.change_property("gone", None).unwrap();
   drive.change_property("kept", Some(b"v")).unwrap();
   drive.close_directory().unwrap();
@@ -380,7 +421,9 @@ fn outside_send_all_mode_texts_are_fetched_and_an_addition_s_properties_wait() {
 /// The opened file of [`outside_send_all_mode_texts_are_fetched_and_an_addition_s_properties_wait`], and its checks.
 fn outside_send_all_rest(mut drive: Drive) {
   let opened = facts("/trunk/g.txt", 4, Some(HELLO_SHA1));
-  drive.open(NodeKind::File, "trunk/g.txt", Some(3), &opened).unwrap();
+  drive
+    .open(NodeKind::File, "trunk/g.txt", Some(3), &opened)
+    .unwrap();
   drive.change_property("p", Some(b"v")).unwrap();
   drive.apply_textdelta(Some(digest(BASE_MD5))).unwrap();
   drive.window(&hello()).unwrap();
@@ -391,15 +434,22 @@ fn outside_send_all_rest(mut drive: Drive) {
   let md5 = format!("<S:prop><V:md5-checksum>{HELLO_MD5}</V:md5-checksum></S:prop>");
   let expected_pieces = [
     "xmlns:D=\"DAV:\"  >\n".to_owned(),
-    format!("<D:checked-in><D:href>/repo/!svn/ver/5/trunk/n.txt</D:href></D:checked-in>\n{md5}</S:add-file>\n"),
+    format!(
+      "<D:checked-in><D:href>/repo/!svn/ver/5/trunk/n.txt</D:href></D:checked-in>\n{md5}</S:add-file>\n"
+    ),
     "</D:checked-in>\n<S:remove-prop name=\"gone\"/>\n</S:add-directory>\n".to_owned(),
     "<S:set-prop name=\"p\">v</S:set-prop>\n".to_owned(),
-    format!("<S:fetch-file base-checksum=\"{BASE_MD5}\" sha1-checksum=\"{HELLO_SHA1}\"/>\n{md5}</S:open-file>\n"),
+    format!(
+      "<S:fetch-file base-checksum=\"{BASE_MD5}\" sha1-checksum=\"{HELLO_SHA1}\"/>\n{md5}</S:open-file>\n"
+    ),
   ];
   for piece in &expected_pieces {
     assert!(written.contains(piece.as_str()), "{piece} in {written}");
   }
-  assert!(!written.contains("txdelta") && !written.contains("native") && !written.contains("kept"), "{written}");
+  assert!(
+    !written.contains("txdelta") && !written.contains("native") && !written.contains("kept"),
+    "{written}"
+  );
 }
 
 /// What `setup` meets on a fresh replay drive.
@@ -420,16 +470,70 @@ fn each_call_out_of_the_drive_s_order_is_refused_by_kind() {
     drive.add(NodeKind::File, "f", None, &NO_FACTS)
   };
   let cases: [(Result<(), DavRefusal>, &str); 10] = [
-    (refused(|d| { d.open_root(None, &NO_FACTS)?; d.open_root(None, &NO_FACTS) }), "open-root"),
-    (refused(|d| d.add(NodeKind::File, "f", None, &NO_FACTS)), "add"),
+    (
+      refused(|d| {
+        d.open_root(None, &NO_FACTS)?;
+        d.open_root(None, &NO_FACTS)
+      }),
+      "open-root",
+    ),
+    (
+      refused(|d| d.add(NodeKind::File, "f", None, &NO_FACTS)),
+      "add",
+    ),
     (refused(|d| d.change_property("p", None)), "change-property"),
-    (refused(|d| { d.open_root(None, &NO_FACTS)?; d.apply_textdelta(None) }), "apply-textdelta"),
-    (refused(|d| { file(d)?; d.apply_textdelta(None)?; d.textdelta_end()?; d.apply_textdelta(None) }), "apply-textdelta"),
-    (refused(|d| { file(d)?; d.window(&hello()) }), "window"),
-    (refused(|d| { file(d)?; d.textdelta_end() }), "textdelta-end"),
-    (refused(|d| { file(d)?; d.close_directory() }), "close-directory"),
-    (refused(|d| { file(d)?; d.apply_textdelta(None)?; d.close_file([0; 16]) }), "close-file"),
-    (refused(|d| { file(d)?; d.close_edit() }), "close-edit"),
+    (
+      refused(|d| {
+        d.open_root(None, &NO_FACTS)?;
+        d.apply_textdelta(None)
+      }),
+      "apply-textdelta",
+    ),
+    (
+      refused(|d| {
+        file(d)?;
+        d.apply_textdelta(None)?;
+        d.textdelta_end()?;
+        d.apply_textdelta(None)
+      }),
+      "apply-textdelta",
+    ),
+    (
+      refused(|d| {
+        file(d)?;
+        d.window(&hello())
+      }),
+      "window",
+    ),
+    (
+      refused(|d| {
+        file(d)?;
+        d.textdelta_end()
+      }),
+      "textdelta-end",
+    ),
+    (
+      refused(|d| {
+        file(d)?;
+        d.close_directory()
+      }),
+      "close-directory",
+    ),
+    (
+      refused(|d| {
+        file(d)?;
+        d.apply_textdelta(None)?;
+        d.close_file([0; 16])
+      }),
+      "close-file",
+    ),
+    (
+      refused(|d| {
+        file(d)?;
+        d.close_edit()
+      }),
+      "close-edit",
+    ),
   ];
   for (result, call) in cases {
     assert_eq!(result, order(call));
@@ -446,7 +550,10 @@ fn an_aborted_or_unfinished_drive_sends_nothing() {
   assert_eq!(aborted.finish(), Err(DavRefusal::Aborted));
   let mut open = Drive::replay(Version::Zero, ROOM);
   open.open_root(None, &NO_FACTS).unwrap();
-  assert_eq!(open.finish(), Err(DavRefusal::DriveOrder { call: "finish" }));
+  assert_eq!(
+    open.finish(),
+    Err(DavRefusal::DriveOrder { call: "finish" })
+  );
 }
 
 /// A-627 (hostile values): do open update answers under root paths and special URIs a URL cannot carry as they are,
@@ -468,13 +575,26 @@ fn unwritable_uri_spaces_and_answers_past_their_room_are_refused() {
     };
     Drive::update(update, Version::Zero, ROOM).map(|_| ())
   };
-  for (root, special) in [("/repo/", "!svn"), ("repo", "!svn"), ("/re po", "!svn"), ("/a/../b", "!svn"), ("/repo", "!s/vn"), ("/repo", "")] {
-    assert!(matches!(open(root, special), Err(DavRefusal::Unwritable { .. })), "{root} {special}");
+  for (root, special) in [
+    ("/repo/", "!svn"),
+    ("repo", "!svn"),
+    ("/re po", "!svn"),
+    ("/a/../b", "!svn"),
+    ("/repo", "!s/vn"),
+    ("/repo", ""),
+  ] {
+    assert!(
+      matches!(open(root, special), Err(DavRefusal::Unwritable { .. })),
+      "{root} {special}"
+    );
   }
   assert_eq!(open("/", "!svn"), Ok(()));
   let mut small = Drive::replay(Version::Zero, 100);
   small.open_root(None, &NO_FACTS).unwrap();
-  assert!(matches!(small.open(NodeKind::Directory, &"d".repeat(64), None, &NO_FACTS), Err(DavRefusal::OutputRoom { .. })));
+  assert!(matches!(
+    small.open(NodeKind::Directory, &"d".repeat(64), None, &NO_FACTS),
+    Err(DavRefusal::OutputRoom { .. })
+  ));
 }
 
 /// A-627 (`close_helper`'s kept removals, held against the room): do keep a copied addition's removals outside
@@ -494,7 +614,14 @@ fn kept_removals_are_held_against_the_room() {
   };
   let mut drive = Drive::update(update, Version::Zero, 700).unwrap();
   drive.open_root(Some(1), &facts("/", 1, None)).unwrap();
-  drive.add(NodeKind::Directory, "c", Some(("/d", 1)), &facts("/c", 1, None)).unwrap();
+  drive
+    .add(
+      NodeKind::Directory,
+      "c",
+      Some(("/d", 1)),
+      &facts("/c", 1, None),
+    )
+    .unwrap();
   let mut kept = 0;
   let refusal = loop {
     match drive.change_property(&format!("property-{kept:04}"), None) {
@@ -502,7 +629,10 @@ fn kept_removals_are_held_against_the_room() {
       Err(refusal) => break refusal,
     }
   };
-  assert!(matches!(refusal, DavRefusal::OutputRoom { .. }) && kept > 0, "{kept} {refusal:?}");
+  assert!(
+    matches!(refusal, DavRefusal::OutputRoom { .. }) && kept > 0,
+    "{kept} {refusal:?}"
+  );
 }
 
 /// A-627 (a client parses the drive): do read both answers back with the reader; expect each well formed, rooted at
@@ -531,23 +661,52 @@ fn both_answers_read_back_as_well_formed_xml() {
 fn replay_calls(hello: &Window) -> Vec<Call<'_>> {
   vec![
     Call::TargetRevision(7),
-    Call::OpenRoot { base: None, node: NO_FACTS },
-    Call::Open { kind: NodeKind::Directory, path: "trunk", base: None, node: NO_FACTS },
-    Call::ChangeProperty { name: "svn:mergeinfo", value: Some(b"/b:3".as_slice()) },
+    Call::OpenRoot {
+      base: None,
+      node: NO_FACTS,
+    },
+    Call::Open {
+      kind: NodeKind::Directory,
+      path: "trunk",
+      base: None,
+      node: NO_FACTS,
+    },
+    Call::ChangeProperty {
+      name: "svn:mergeinfo",
+      value: Some(b"/b:3".as_slice()),
+    },
     Call::Add {
       kind: NodeKind::File,
       path: "trunk/new <&>.txt",
       copy_from: Some(("/trunk/old.txt", 6)),
       node: NO_FACTS,
     },
-    Call::ChangeProperty { name: "svn:eol-style", value: None },
-    Call::ApplyTextDelta { base_md5: Some(digest(BASE_MD5)) },
+    Call::ChangeProperty {
+      name: "svn:eol-style",
+      value: None,
+    },
+    Call::ApplyTextDelta {
+      base_md5: Some(digest(BASE_MD5)),
+    },
     Call::Window(hello),
     Call::TextDeltaEnd,
-    Call::CloseFile { md5: digest(HELLO_MD5) },
-    Call::Delete { path: "trunk/gone", revision: None },
-    Call::Absent { kind: NodeKind::File, path: "trunk/secret" },
-    Call::Add { kind: NodeKind::Directory, path: "trunk/d", copy_from: None, node: NO_FACTS },
+    Call::CloseFile {
+      md5: digest(HELLO_MD5),
+    },
+    Call::Delete {
+      path: "trunk/gone",
+      revision: None,
+    },
+    Call::Absent {
+      kind: NodeKind::File,
+      path: "trunk/secret",
+    },
+    Call::Add {
+      kind: NodeKind::Directory,
+      path: "trunk/d",
+      copy_from: None,
+      node: NO_FACTS,
+    },
     Call::CloseDirectory,
     Call::CloseDirectory,
     Call::CloseDirectory,
@@ -566,7 +725,10 @@ fn one_drive_of_calls_feeds_both_answers() {
   for call in replay_calls(&hello) {
     replay.call(call).unwrap();
   }
-  assert_eq!(String::from_utf8(replay.finish().unwrap()).unwrap(), replay_drive());
+  assert_eq!(
+    String::from_utf8(replay.finish().unwrap()).unwrap(),
+    replay_drive()
+  );
   let mut update = update(true, true, false);
   for call in replay_calls(&hello) {
     update.call(call).unwrap();
@@ -582,7 +744,11 @@ fn one_drive_of_calls_feeds_both_answers() {
     assert!(written.contains(piece), "{piece} in {written}");
   }
   let mut aborted = Drive::replay(Version::Zero, ROOM);
-  for call in replay_calls(&hello).into_iter().take(4).chain([Call::AbortEdit]) {
+  for call in replay_calls(&hello)
+    .into_iter()
+    .take(4)
+    .chain([Call::AbortEdit])
+  {
     aborted.call(call).unwrap();
   }
   assert_eq!(aborted.finish(), Err(DavRefusal::Aborted));

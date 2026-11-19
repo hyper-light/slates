@@ -401,10 +401,12 @@ impl Drive {
     order(self.driving() && on_file, "apply-textdelta")?;
     let dropped = matches!(&self.answer, Answer::Update(update) if !update.send_all);
     if let Answer::Replay = self.answer {
-      self.body.push(&match hex_digest(&base_md5.unwrap_or_default()) {
-        Some(hex) => format!("<S:apply-textdelta checksum=\"{hex}\">"),
-        None => String::from("<S:apply-textdelta>"),
-      })?;
+      self
+        .body
+        .push(&match hex_digest(&base_md5.unwrap_or_default()) {
+          Some(hex) => format!("<S:apply-textdelta checksum=\"{hex}\">"),
+          None => String::from("<S:apply-textdelta>"),
+        })?;
     }
     if let Some(node) = self.opened.last_mut() {
       node.text_changed = true;
@@ -513,10 +515,7 @@ impl Drive {
     if self.stage == Stage::Aborted {
       return Err(DavRefusal::Aborted);
     }
-    order(
-      self.opened.is_empty() && self.delta.is_none(),
-      "finish",
-    )?;
+    order(self.opened.is_empty() && self.delta.is_none(), "finish")?;
     self.body.push(match self.answer {
       Answer::Update(_) => "</S:update-report>\n",
       Answer::Replay => "</S:editor-report>\n",
@@ -568,10 +567,7 @@ impl Drive {
   fn close_node(&mut self, kind: NodeKind, call: &'static str) -> Result<Opened, DavRefusal> {
     let last = self.opened.last().is_some_and(|node| node.kind == kind);
     order(self.driving() && self.delta.is_none() && last, call)?;
-    let node = self
-      .opened
-      .pop()
-      .ok_or(DavRefusal::DriveOrder { call })?;
+    let node = self.opened.pop().ok_or(DavRefusal::DriveOrder { call })?;
     let kept: usize = node.removed_props.iter().map(String::len).sum();
     self.reserved = self.reserved.saturating_sub(kept);
     Ok(node)
@@ -648,8 +644,15 @@ fn hex_digest<const N: usize>(digest: &[u8; N]) -> Option<String> {
   let (_, lower) = HEX_DIGITS;
   let mut text = String::with_capacity(N.saturating_mul(2));
   for byte in digest {
-    for nibble in [byte.checked_shr(NIBBLE_BITS).unwrap_or(0), byte & NIBBLE_MASK] {
-      text.push(lower.get(usize::from(nibble)).map_or('0', |digit| char::from(*digit)));
+    for nibble in [
+      byte.checked_shr(NIBBLE_BITS).unwrap_or(0),
+      byte & NIBBLE_MASK,
+    ] {
+      text.push(
+        lower
+          .get(usize::from(nibble))
+          .map_or('0', |digit| char::from(*digit)),
+      );
     }
   }
   Some(text)
@@ -670,8 +673,15 @@ fn uri_encode(path: &str) -> Cow<'_, str> {
       continue;
     }
     text.push('%');
-    for nibble in [byte.checked_shr(NIBBLE_BITS).unwrap_or(0), byte & NIBBLE_MASK] {
-      text.push(upper.get(usize::from(nibble)).map_or('0', |digit| char::from(*digit)));
+    for nibble in [
+      byte.checked_shr(NIBBLE_BITS).unwrap_or(0),
+      byte & NIBBLE_MASK,
+    ] {
+      text.push(
+        upper
+          .get(usize::from(nibble))
+          .map_or('0', |digit| char::from(*digit)),
+      );
     }
   }
   Cow::Owned(text)

@@ -172,11 +172,17 @@ fn the_captured_locks_are_exclusive_write_locks_with_their_comments() {
   };
   assert_eq!(
     lockinfo(LOCK, &ROOMY),
-    Ok(lock("editing it", "<ns0:owner xmlns:ns0=\"DAV:\">editing it</ns0:owner>"))
+    Ok(lock(
+      "editing it",
+      "<ns0:owner xmlns:ns0=\"DAV:\">editing it</ns0:owner>"
+    ))
   );
   assert_eq!(
     lockinfo(LOCK_STEAL, &ROOMY),
-    Ok(lock("x < y & \"z\"", "<ns0:owner xmlns:ns0=\"DAV:\">x &lt; y &amp; \"z\"</ns0:owner>"))
+    Ok(lock(
+      "x < y & \"z\"",
+      "<ns0:owner xmlns:ns0=\"DAV:\">x &lt; y &amp; \"z\"</ns0:owner>"
+    ))
   );
 }
 
@@ -190,10 +196,16 @@ fn an_owner_is_echoed_with_every_declared_namespace_and_its_language() {
   let owner = lockinfo(body, &ROOMY).unwrap().owner.unwrap();
   let element = "<ns0:owner xml:lang=\"en\" xmlns:ns2=\"urn:y&amp;\" xmlns:ns1=\"urn:z\" xmlns:ns0=\"DAV:\">\
     a&amp;b</ns0:owner>";
-  assert_eq!((owner.text.as_str(), owner.element.as_str()), ("a&b", element));
+  assert_eq!(
+    (owner.text.as_str(), owner.element.as_str()),
+    ("a&b", element)
+  );
   let empty = b"<lockinfo xmlns=\"DAV:\"><owner/><lockscope><exclusive/></lockscope></lockinfo>";
   let owner = lockinfo(empty, &ROOMY).unwrap().owner.unwrap();
-  assert_eq!((owner.text.as_str(), owner.element.as_str()), ("", "<ns0:owner xmlns:ns0=\"DAV:\"/>"));
+  assert_eq!(
+    (owner.text.as_str(), owner.element.as_str()),
+    ("", "<ns0:owner xmlns:ns0=\"DAV:\"/>")
+  );
 }
 
 /// A-627 (a body cut anywhere): do decode every proper prefix of the PROPPATCH and both LOCK bodies; expect each
@@ -231,7 +243,16 @@ fn timeouts_read_as_mod_dav_reads_them() {
     "Second--1795067456",
   ]
   .map(|header| timeout(Some(header), NOW));
-  let expected = [at(60), Ok(None), at(0), at(5), at(0), Ok(None), at(7), Ok(None)];
+  let expected = [
+    at(60),
+    Ok(None),
+    at(0),
+    at(5),
+    at(0),
+    Ok(None),
+    at(7),
+    Ok(None),
+  ];
   assert_eq!(read, expected);
   assert_eq!(timeout(None, NOW), Ok(None));
 }
@@ -244,9 +265,12 @@ fn a_timeout_past_what_apr_time_t_holds_is_refused() {
     let refused = timeout(Some(header), NOW).unwrap_err();
     assert_eq!(
       (refused.http_status(), refused),
-      (HTTP_BAD_REQUEST, MethodRefusal::Timeout {
-        value: header.to_owned()
-      })
+      (
+        HTTP_BAD_REQUEST,
+        MethodRefusal::Timeout {
+          value: header.to_owned()
+        }
+      )
     );
   }
 }
@@ -255,10 +279,23 @@ fn a_timeout_past_what_apr_time_t_holds_is_refused() {
 /// unbracketed one, a lone bracket and an empty pair; expect the tokens, none, none and the empty token.
 #[test]
 fn lock_tokens_read_as_mod_dav_reads_them() {
-  let read = ["<opaquelocktoken:abc>", " <opaquelocktoken:abc> ", "opaquelocktoken:abc", "<", "<>"].map(lock_token);
+  let read = [
+    "<opaquelocktoken:abc>",
+    " <opaquelocktoken:abc> ",
+    "opaquelocktoken:abc",
+    "<",
+    "<>",
+  ]
+  .map(lock_token);
   assert_eq!(
     read,
-    [Some("opaquelocktoken:abc"), Some("opaquelocktoken:abc"), None, None, Some("")]
+    [
+      Some("opaquelocktoken:abc"),
+      Some("opaquelocktoken:abc"),
+      None,
+      None,
+      Some("")
+    ]
   );
 }
 
@@ -267,7 +304,15 @@ fn lock_tokens_read_as_mod_dav_reads_them() {
 /// for `--force`, the depth infinity the absent header means, and the owner element kept for the answer.
 #[test]
 fn the_recorded_locks_are_read_into_the_lock_table_s_requests() {
-  let read = |head, body| lock_request(&recorded_lock(head, body, Some("alice")), &Head, NOW, &ROOMY).unwrap();
+  let read = |head, body| {
+    lock_request(
+      &recorded_lock(head, body, Some("alice")),
+      &Head,
+      NOW,
+      &ROOMY,
+    )
+    .unwrap()
+  };
   let plan = |comment: &str, element: &str, steal: bool| LockPlan {
     request: LockRequest {
       user: Some("alice".to_owned()),
@@ -282,11 +327,19 @@ fn the_recorded_locks_are_read_into_the_lock_table_s_requests() {
   };
   assert_eq!(
     read(LOCK_HEAD, LOCK),
-    plan("editing it", "<ns0:owner xmlns:ns0=\"DAV:\">editing it</ns0:owner>", false)
+    plan(
+      "editing it",
+      "<ns0:owner xmlns:ns0=\"DAV:\">editing it</ns0:owner>",
+      false
+    )
   );
   assert_eq!(
     read(LOCK_STEAL_HEAD, LOCK_STEAL),
-    plan("x < y & \"z\"", "<ns0:owner xmlns:ns0=\"DAV:\">x &lt; y &amp; \"z\"</ns0:owner>", true)
+    plan(
+      "x < y & \"z\"",
+      "<ns0:owner xmlns:ns0=\"DAV:\">x &lt; y &amp; \"z\"</ns0:owner>",
+      true
+    )
   );
 }
 
@@ -308,7 +361,13 @@ fn judged(plan: &LockPlan, table: &LockTable, room: usize) -> HttpAnswer {
 /// timeout, and the token, followed by the blank line its two line feeds make and no line feed after `D:prop`.
 #[test]
 fn a_lock_is_answered_as_mod_dav_answers_it() {
-  let plan = lock_request(&recorded_lock(LOCK_HEAD, LOCK, Some("alice")), &Head, NOW, &ROOMY).unwrap();
+  let plan = lock_request(
+    &recorded_lock(LOCK_HEAD, LOCK, Some("alice")),
+    &Head,
+    NOW,
+    &ROOMY,
+  )
+  .unwrap();
   let answer = judged(&plan, &LockTable::new(), 1);
   let token = "opaquelocktoken:00000000-0000-4000-8000-000000000000";
   let body = [
@@ -321,7 +380,10 @@ fn a_lock_is_answered_as_mod_dav_answers_it() {
   let expected = HttpAnswer {
     status: 200,
     headers: vec![
-      ("X-SVN-Creation-Date", "2026-11-19T05:50:56.123456Z".to_owned()),
+      (
+        "X-SVN-Creation-Date",
+        "2026-11-19T05:50:56.123456Z".to_owned(),
+      ),
       ("X-SVN-Lock-Owner", "alice".to_owned()),
       ("Lock-Token", format!("<{token}>")),
       ("Content-Type", "text/xml; charset=\"utf-8\"".to_owned()),
@@ -344,7 +406,10 @@ fn a_lock_with_a_depth_and_a_timeout_names_both() {
   assert_eq!(plan.request.expires, Some(AprTime(week)));
   let body = String::from_utf8(judged(&plan, &LockTable::new(), 1).body).unwrap();
   assert!(body.contains("<D:depth>0</D:depth>\n"), "{body}");
-  assert!(body.contains("<D:timeout>Second-604800</D:timeout>\n"), "{body}");
+  assert!(
+    body.contains("<D:timeout>Second-604800</D:timeout>\n"),
+    "{body}"
+  );
 }
 
 /// A LOCK of `path` as alice, `body` its body.
@@ -386,15 +451,63 @@ fn each_lock_refused_before_the_table_has_mod_dav_s_status() {
     let refused = lock_request(&http, &Head, NOW, &ROOMY).unwrap_err();
     assert_eq!((refused.http_status(), refused), (status, expected));
   };
-  checked(lock_of("/trunk/f.txt", &bodies[0]), MethodRefusal::UnknownElement { name: "foo".to_owned() }, 412);
-  checked(lock_of("/trunk/f.txt", &bodies[1]), MethodRefusal::UnknownElement { name: "locktype".to_owned() }, 412);
-  checked(lock_of("/trunk/f.txt", &bodies[2]), MethodRefusal::UnknownElement { name: "owner".to_owned() }, 412);
-  checked(lock_of("/trunk/f.txt", &bodies[3]), MethodRefusal::OwnerMarkup, 400);
-  checked(lock_of("/trunk/f.txt", &bodies[4]), MethodRefusal::NotExclusive, 400);
-  checked(lock_of("/trunk/f.txt", &bodies[5]), MethodRefusal::NotWrite, 400);
-  checked(lock_of("/trunk/missing.txt", &bodies[6]), MethodRefusal::Nonexistent { path: "/trunk/missing.txt".to_owned() }, 405);
-  checked(lock_of("/nope/f.txt", &bodies[6]), MethodRefusal::ParentMissing { path: "/nope/f.txt".to_owned() }, 409);
-  checked(lock_of("/trunk/f.txt/x", &bodies[6]), MethodRefusal::ParentMissing { path: "/trunk/f.txt/x".to_owned() }, 409);
+  checked(
+    lock_of("/trunk/f.txt", &bodies[0]),
+    MethodRefusal::UnknownElement {
+      name: "foo".to_owned(),
+    },
+    412,
+  );
+  checked(
+    lock_of("/trunk/f.txt", &bodies[1]),
+    MethodRefusal::UnknownElement {
+      name: "locktype".to_owned(),
+    },
+    412,
+  );
+  checked(
+    lock_of("/trunk/f.txt", &bodies[2]),
+    MethodRefusal::UnknownElement {
+      name: "owner".to_owned(),
+    },
+    412,
+  );
+  checked(
+    lock_of("/trunk/f.txt", &bodies[3]),
+    MethodRefusal::OwnerMarkup,
+    400,
+  );
+  checked(
+    lock_of("/trunk/f.txt", &bodies[4]),
+    MethodRefusal::NotExclusive,
+    400,
+  );
+  checked(
+    lock_of("/trunk/f.txt", &bodies[5]),
+    MethodRefusal::NotWrite,
+    400,
+  );
+  checked(
+    lock_of("/trunk/missing.txt", &bodies[6]),
+    MethodRefusal::Nonexistent {
+      path: "/trunk/missing.txt".to_owned(),
+    },
+    405,
+  );
+  checked(
+    lock_of("/nope/f.txt", &bodies[6]),
+    MethodRefusal::ParentMissing {
+      path: "/nope/f.txt".to_owned(),
+    },
+    409,
+  );
+  checked(
+    lock_of("/trunk/f.txt/x", &bodies[6]),
+    MethodRefusal::ParentMissing {
+      path: "/trunk/f.txt/x".to_owned(),
+    },
+    409,
+  );
   checked(lock_of("/trunk/f.txt", b""), MethodRefusal::Refresh, 400);
   let root = MethodRefusal::Body(DavRefusal::UnexpectedRoot {
     expected: "lockinfo",
@@ -419,8 +532,18 @@ fn each_header_refused_before_the_table(body: &[u8]) {
     (refused.http_status(), refused)
   });
   let expected = [
-    (400, MethodRefusal::Depth { value: "1".to_owned() }),
-    (400, MethodRefusal::VersionName { value: "abc".to_owned() }),
+    (
+      400,
+      MethodRefusal::Depth {
+        value: "1".to_owned(),
+      },
+    ),
+    (
+      400,
+      MethodRefusal::VersionName {
+        value: "abc".to_owned(),
+      },
+    ),
     (501, MethodRefusal::Anonymous),
   ];
   assert_eq!(refusals, expected);
@@ -432,8 +555,14 @@ fn each_header_refused_before_the_table(body: &[u8]) {
 fn a_hostile_lock_body_is_refused_before_it_is_read() {
   let laughs = b"<!DOCTYPE lockinfo [<!ENTITY a \"aaaa\">]><lockinfo xmlns=\"DAV:\"><owner>&a;</owner></lockinfo>";
   let refused = lock_request(&lock_of("/trunk/f.txt", laughs), &Head, NOW, &ROOMY).unwrap_err();
-  assert!(matches!(&refused, MethodRefusal::Body(DavRefusal::Xml(_))) && refused.http_status() == 400, "{refused:?}");
-  let small = Bounds { body_bytes: 8, ..ROOMY };
+  assert!(
+    matches!(&refused, MethodRefusal::Body(DavRefusal::Xml(_))) && refused.http_status() == 400,
+    "{refused:?}"
+  );
+  let small = Bounds {
+    body_bytes: 8,
+    ..ROOMY
+  };
   let refused = lock_request(&lock_of("/trunk/f.txt", LOCK), &Head, NOW, &small).unwrap_err();
   assert_eq!(refused.http_status(), 413);
 }
@@ -456,7 +585,11 @@ fn bobs_table() -> LockTable {
 
 /// An error answer's body: the Subversion error's element when `tagged`, its code and message.
 fn error_body(tagged: bool, code: u32, message: &str) -> Vec<u8> {
-  let element = if tagged { " xmlns:C=\"svn:\">\n<C:error/>\n" } else { ">\n" };
+  let element = if tagged {
+    " xmlns:C=\"svn:\">\n<C:error/>\n"
+  } else {
+    ">\n"
+  };
   format!("{ERROR_START}{element}<m:human-readable errcode=\"{code}\">\n{message}\n</m:human-readable>\n</D:error>\n")
     .into_bytes()
 }
@@ -465,7 +598,13 @@ fn error_body(tagged: bool, code: u32, message: &str) -> Vec<u8> {
 /// steal it; expect the first 423 with FSFS's message in an svn error, and the stolen lock answered 200.
 #[test]
 fn a_held_lock_is_answered_423_with_fsfs_s_message_unless_stolen() {
-  let plan = lock_request(&recorded_lock(LOCK_HEAD, LOCK, Some("alice")), &Head, NOW, &ROOMY).unwrap();
+  let plan = lock_request(
+    &recorded_lock(LOCK_HEAD, LOCK, Some("alice")),
+    &Head,
+    NOW,
+    &ROOMY,
+  )
+  .unwrap();
   let answer = judged(&plan, &bobs_table(), 2);
   let message = "Path '/trunk/f.txt' is already locked by user 'bob' in filesystem 'repo'";
   let expected = HttpAnswer {
@@ -474,7 +613,13 @@ fn a_held_lock_is_answered_423_with_fsfs_s_message_unless_stolen() {
     body: error_body(true, 160_035, message),
   };
   assert_eq!(answer, expected);
-  let steal = lock_request(&recorded_lock(LOCK_STEAL_HEAD, LOCK_STEAL, Some("alice")), &Head, NOW, &ROOMY).unwrap();
+  let steal = lock_request(
+    &recorded_lock(LOCK_STEAL_HEAD, LOCK_STEAL, Some("alice")),
+    &Head,
+    NOW,
+    &ROOMY,
+  )
+  .unwrap();
   assert_eq!(judged(&steal, &bobs_table(), 2).status, 200);
 }
 
@@ -492,17 +637,53 @@ fn each_guard_refusal_of_a_lock_is_answered_as_append_locks_answers_it() {
     (answer.status, String::from_utf8(answer.body).unwrap())
   };
   let cases = [
-    (answered("/trunk", None, 1), 500, error_body(true, 160_017, "'/trunk' is not a file in filesystem 'repo'")),
-    (answered("/trunk/f.txt", Some("2"), 1), 500, error_body(true, 160_042, "Lock failed: newer version of '/trunk/f.txt' exists")),
-    (answered("/trunk/f.txt", Some("9"), 1), 404, error_body(true, 160_006, "No such revision 9")),
-    (answered("/trunk/f.txt", None, 0), 500, error_body(true, 160_000, "Failed to create new lock.")),
+    (
+      answered("/trunk", None, 1),
+      500,
+      error_body(true, 160_017, "'/trunk' is not a file in filesystem 'repo'"),
+    ),
+    (
+      answered("/trunk/f.txt", Some("2"), 1),
+      500,
+      error_body(
+        true,
+        160_042,
+        "Lock failed: newer version of '/trunk/f.txt' exists",
+      ),
+    ),
+    (
+      answered("/trunk/f.txt", Some("9"), 1),
+      404,
+      error_body(true, 160_006, "No such revision 9"),
+    ),
+    (
+      answered("/trunk/f.txt", None, 0),
+      500,
+      error_body(true, 160_000, "Failed to create new lock."),
+    ),
   ];
   for ((status, written), expected_status, expected_body) in cases {
-    assert_eq!((status, written.into_bytes()), (expected_status, expected_body));
+    assert_eq!(
+      (status, written.into_bytes()),
+      (expected_status, expected_body)
+    );
   }
   let plan = lock_request(&lock_of("/trunk/f.txt", &body), &Head, NOW, &ROOMY).unwrap();
-  let anonymous = lock_answer(&plan, Err(&LockRefusal::NoUser { path: None }), NOW, FILESYSTEM).unwrap();
-  assert_eq!((anonymous.status, anonymous.headers.len(), anonymous.body.len()), (501, 0, 0));
+  let anonymous = lock_answer(
+    &plan,
+    Err(&LockRefusal::NoUser { path: None }),
+    NOW,
+    FILESYSTEM,
+  )
+  .unwrap();
+  assert_eq!(
+    (
+      anonymous.status,
+      anonymous.headers.len(),
+      anonymous.body.len()
+    ),
+    (501, 0, 0)
+  );
 }
 
 /// A-627 (`dav_method_unlock`, `get_locks`, `remove_lock`): do read the recorded UNLOCKs against bob's lock, as bob,
@@ -516,7 +697,11 @@ fn the_recorded_unlocks_are_judged_and_answered_as_mod_dav_svn_answers_them() {
     let decision = table.unlock(&request, NOW);
     match decision {
       Err(refusal) => unlock_answer(&request, Err(&refusal), FILESYSTEM),
-      Ok(decision) => unlock_answer(&request, decision.answers.first().unwrap().1.as_ref().map(|_| ()), FILESYSTEM),
+      Ok(decision) => unlock_answer(
+        &request,
+        decision.answers.first().unwrap().1.as_ref().map(|_| ()),
+        FILESYSTEM,
+      ),
     }
   };
   let done = HttpAnswer {
@@ -531,7 +716,10 @@ fn the_recorded_unlocks_are_judged_and_answered_as_mod_dav_svn_answers_them() {
   };
   let mismatch = "User 'alice' is trying to use a lock owned by 'bob' in filesystem 'repo'";
   assert_eq!(answer(UNLOCK_HEAD, Some("bob")), done);
-  assert_eq!(answer(UNLOCK_HEAD, Some("alice")), refused(423, error_body(true, 160_039, mismatch)));
+  assert_eq!(
+    answer(UNLOCK_HEAD, Some("alice")),
+    refused(423, error_body(true, 160_039, mismatch))
+  );
   assert_eq!(answer(UNLOCK_BREAK_HEAD, Some("alice")), done);
   let anonymous = error_body(false, 405, "Anonymous lock removal is not allowed.");
   assert_eq!(answer(UNLOCK_BREAK_HEAD, None), refused(501, anonymous));
@@ -548,14 +736,59 @@ fn each_unlock_refused_before_the_table_has_mod_dav_s_status() {
   expiring.apply(&LockEntry::Set(lock)).unwrap();
   let held = bobs_table();
   let bracketed = format!("<{RECORDED_TOKEN}>");
-  let unlock = |path, user, token| UnlockHttp { path, user, lock_token: token, options: None };
+  let unlock = |path, user, token| UnlockHttp {
+    path,
+    user,
+    lock_token: token,
+    options: None,
+  };
   let cases = [
-    (unlock("/trunk/f.txt", Some("bob"), None), &held, MethodRefusal::NoLockToken, 400),
-    (unlock("/trunk/f.txt", Some("bob"), Some(RECORDED_TOKEN)), &held, MethodRefusal::MalformedLockToken { header: RECORDED_TOKEN.to_owned() }, 400),
-    (unlock("/trunk/f.txt", Some("bob"), Some("<opaquelocktoken:other>")), &held, MethodRefusal::TokenMismatch { path: "/trunk/f.txt".to_owned() }, 400),
-    (unlock("/trunk", Some("bob"), Some(bracketed.as_str())), &held, MethodRefusal::NoOutstandingLock { path: "/trunk".to_owned() }, 400),
-    (unlock("/trunk/f.txt", Some("bob"), Some(bracketed.as_str())), &expiring, MethodRefusal::NoOutstandingLock { path: "/trunk/f.txt".to_owned() }, 400),
-    (unlock("/trunk/f.txt", None, Some(bracketed.as_str())), &held, MethodRefusal::AnonymousUnlock { owner: "bob".to_owned() }, 403),
+    (
+      unlock("/trunk/f.txt", Some("bob"), None),
+      &held,
+      MethodRefusal::NoLockToken,
+      400,
+    ),
+    (
+      unlock("/trunk/f.txt", Some("bob"), Some(RECORDED_TOKEN)),
+      &held,
+      MethodRefusal::MalformedLockToken {
+        header: RECORDED_TOKEN.to_owned(),
+      },
+      400,
+    ),
+    (
+      unlock("/trunk/f.txt", Some("bob"), Some("<opaquelocktoken:other>")),
+      &held,
+      MethodRefusal::TokenMismatch {
+        path: "/trunk/f.txt".to_owned(),
+      },
+      400,
+    ),
+    (
+      unlock("/trunk", Some("bob"), Some(bracketed.as_str())),
+      &held,
+      MethodRefusal::NoOutstandingLock {
+        path: "/trunk".to_owned(),
+      },
+      400,
+    ),
+    (
+      unlock("/trunk/f.txt", Some("bob"), Some(bracketed.as_str())),
+      &expiring,
+      MethodRefusal::NoOutstandingLock {
+        path: "/trunk/f.txt".to_owned(),
+      },
+      400,
+    ),
+    (
+      unlock("/trunk/f.txt", None, Some(bracketed.as_str())),
+      &held,
+      MethodRefusal::AnonymousUnlock {
+        owner: "bob".to_owned(),
+      },
+      403,
+    ),
   ];
   for (http, table, expected, status) in cases {
     let refused = unlock_request(&http, table, NOW).unwrap_err();
@@ -572,9 +805,14 @@ fn an_unlock_s_other_refusal_is_answered_failed_to_remove_a_lock() {
     break_lock: false,
     targets: BTreeMap::new(),
   };
-  let refusal = LockRefusal::PathSyntax { path: "//x".to_owned() };
+  let refusal = LockRefusal::PathSyntax {
+    path: "//x".to_owned(),
+  };
   let answer = unlock_answer(&request, Err(&refusal), FILESYSTEM);
-  assert_eq!((answer.status, answer.body), (500, error_body(false, 160_005, "Failed to remove a lock.")));
+  assert_eq!(
+    (answer.status, answer.body),
+    (500, error_body(false, 160_005, "Failed to remove a lock."))
+  );
 }
 
 /// A-627 (`props.c` `dav_insert_coreprop`, `svn_lock_to_dav_lock`, `get_locks`): do discover no lock, bob's lock (its
@@ -597,11 +835,16 @@ fn a_lock_is_discovered_as_get_locks_reports_it() {
     "<D:lockdiscovery><D:activelock>\n<D:locktype><D:write/></D:locktype>\n",
     "<D:lockscope><D:exclusive/></D:lockscope>\n<D:depth>0</D:depth>\n",
     "<D:owner xmlns:D=\"DAV:\">a&lt;b</D:owner><D:timeout>Infinite</D:timeout>\n<D:locktoken>\n",
-    &format!("<D:href>{RECORDED_TOKEN}</D:href>\n</D:locktoken>\n</D:activelock>\n</D:lockdiscovery>\n"),
+    &format!(
+      "<D:href>{RECORDED_TOKEN}</D:href>\n</D:locktoken>\n</D:activelock>\n</D:lockdiscovery>\n"
+    ),
   ]
   .concat();
   let headers = vec![
-    ("X-SVN-Creation-Date", "2026-11-19T05:50:56.123456Z".to_owned()),
+    (
+      "X-SVN-Creation-Date",
+      "2026-11-19T05:50:56.123456Z".to_owned(),
+    ),
     ("X-SVN-Lock-Owner", "bob".to_owned()),
   ];
   assert_eq!(found, Discovery { property, headers });
@@ -614,20 +857,37 @@ fn discovered_timeouts_and_dav_comments(lock: &mut Lock) {
   lock.is_dav_comment = true;
   lock.expires = Some(AprTime(NOW.0 + 100 * MICROSECONDS_PER_SECOND));
   let property = lockdiscovery(Some(lock), NOW).unwrap().property;
-  assert!(property.contains("<D:depth>0</D:depth>\n<D:owner xmlns:D=\"DAV:\">x</D:owner><D:timeout>Second-100</D:timeout>"), "{property}");
+  assert!(
+    property.contains(
+      "<D:depth>0</D:depth>\n<D:owner xmlns:D=\"DAV:\">x</D:owner><D:timeout>Second-100</D:timeout>"
+    ),
+    "{property}"
+  );
   let later = AprTime(NOW.0 + 101 * MICROSECONDS_PER_SECOND);
   let property = lockdiscovery(Some(lock), later).unwrap().property;
-  assert!(property.contains("<D:timeout>Second-0</D:timeout>"), "{property}");
+  assert!(
+    property.contains("<D:timeout>Second-0</D:timeout>"),
+    "{property}"
+  );
 }
 
 /// A-627 (a client reads the answers): do read LOCK's answer and a PROPFIND's multistatus holding the discovery back
 /// with the reader; expect both well formed, and the token the `D:href` holds, as ra_serf reads it.
 #[test]
 fn the_lock_answers_read_back_as_well_formed_xml() {
-  let plan = lock_request(&recorded_lock(LOCK_STEAL_HEAD, LOCK_STEAL, Some("alice")), &Head, NOW, &ROOMY).unwrap();
+  let plan = lock_request(
+    &recorded_lock(LOCK_STEAL_HEAD, LOCK_STEAL, Some("alice")),
+    &Head,
+    NOW,
+    &ROOMY,
+  )
+  .unwrap();
   let answer = judged(&plan, &LockTable::new(), 1);
   let root = xml::parse(&answer.body, &ROOMY).unwrap();
-  assert_eq!((root.namespace.as_str(), root.name.as_str()), ("DAV:", "prop"));
+  assert_eq!(
+    (root.namespace.as_str(), root.name.as_str()),
+    ("DAV:", "prop")
+  );
   let lock = bobs_table().get_lock("/trunk/f.txt", NOW).unwrap().clone();
   let discovery = lockdiscovery(Some(&lock), NOW).unwrap();
   let propstat = crate::dav::response::Propstat {
@@ -635,7 +895,8 @@ fn the_lock_answers_read_back_as_well_formed_xml() {
     props: vec![discovery.property],
   };
   let multistatus =
-    crate::dav::response::multistatus(&[("/repo/trunk/f.txt".to_owned(), vec![propstat])], 1 << 16).unwrap();
+    crate::dav::response::multistatus(&[("/repo/trunk/f.txt".to_owned(), vec![propstat])], 1 << 16)
+      .unwrap();
   let read = xml::parse(&multistatus, &ROOMY).unwrap();
   let href = read
     .elements()
@@ -654,12 +915,24 @@ fn the_lock_answers_read_back_as_well_formed_xml() {
 /// than written into a header.
 #[test]
 fn a_lock_owner_holding_a_line_break_is_never_written_into_a_header() {
-  let plan = lock_request(&recorded_lock(LOCK_HEAD, LOCK, Some("alice")), &Head, NOW, &ROOMY).unwrap();
+  let plan = lock_request(
+    &recorded_lock(LOCK_HEAD, LOCK, Some("alice")),
+    &Head,
+    NOW,
+    &ROOMY,
+  )
+  .unwrap();
   let mut lock = bobs_table().get_lock("/trunk/f.txt", NOW).unwrap().clone();
   lock.owner = "bob\r\nX-Injected: 1".to_owned();
   assert!(matches!(
     lock_answer(&plan, Ok(&lock), NOW, FILESYSTEM),
-    Err(DavRefusal::Unwritable { what: "X-SVN-Lock-Owner", .. })
+    Err(DavRefusal::Unwritable {
+      what: "X-SVN-Lock-Owner",
+      ..
+    })
   ));
-  assert!(matches!(lockdiscovery(Some(&lock), NOW), Err(DavRefusal::Unwritable { .. })));
+  assert!(matches!(
+    lockdiscovery(Some(&lock), NOW),
+    Err(DavRefusal::Unwritable { .. })
+  ));
 }
