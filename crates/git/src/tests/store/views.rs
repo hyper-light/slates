@@ -367,7 +367,8 @@ fn expected(entries: &[(&[u8], EntryKind, ObjectId)]) -> Vec<TreeEntry> {
 /// 100700, 100775, a typeless 644, 100644, 100755) beside a symbolic link and the committed tree as a subtree, and read
 /// both trees and a blob through the push's view. Expect: each entry's kind as git read its mode (`git ls-tree`, and
 /// `git ls-files -s` after `git read-tree`, 2026-11-19: 100644, 100644, 100755, 100755, 160000, 100644, 100755), the
-/// committed tree read from the index and the pushed one from the push, and the blob's length and exact bytes.
+/// committed tree read from the index and the pushed one from the push, and the blob's length and exact bytes; the
+/// pushed tree, longer than a window, assembled, and the committed tree and both blobs lent as kept.
 #[test]
 fn a_pushed_tree_reads_its_modes_as_gits_tree_walk_does() {
   let (mut store, mut repository) = empty();
@@ -427,7 +428,16 @@ fn a_pushed_tree_reads_its_modes_as_gits_tree_walk_does() {
   assert_eq!(view.blob_len(key(blobs[0])), Ok(wide(inner.len())));
   assert_eq!(view.blob(key(blobs[0])).as_deref(), Ok(inner));
   assert_eq!(view.blob(key(link)).as_deref(), Ok(&b"target"[..]));
-  assert!(view.counters().lent_as_kept >= 4, "{:?}", view.counters());
+  let counters = ViewCounters {
+    lent_as_kept: 3,
+    assembled: 1,
+    lent_again: 0,
+  };
+  assert_eq!(
+    view.counters(),
+    counters,
+    "the pushed tree spans two windows"
+  );
   drop(view);
   push.abandon(&mut store).unwrap();
 }
