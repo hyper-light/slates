@@ -1,0 +1,1 @@
+( 2 ( edit-pipeline svndiff1 accepts-svndiff2 absent-entries depth mergeinfo log-revprops ) 23:svn://127.0.0.1:58678/r 39:SVN/1.15.0 (aarch64-apple-darwin25.6.0) ( ) ) ( CRAM-MD5 ( ) ) 40:jrandom d0fb7f0b31406761ac260bc5fcb2abe5 ( change-rev-prop2 ( 1 11:slates:note ( ) ( true ) ) ) 
