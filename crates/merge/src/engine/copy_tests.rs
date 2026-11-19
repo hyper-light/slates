@@ -416,6 +416,29 @@ fn a_copy_of_the_root_brings_every_path_beneath_its_destination() {
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
 }
 
+/// A-664 part 3 (a reader of the change index takes a copy's tree from the head: the index names the copy at its
+/// destination alone). Do: copy `trunk` at version 1 to `branches/x`, then ask `copied_after` of the destination, a
+/// path beneath it, the source and a path beside it. Expect: the destination and the path beneath it copied after
+/// version 1 and not after version 2, the copy's own; the source and the path beside it never.
+#[test]
+fn a_copy_is_named_for_every_path_of_its_tree_after_the_version_before_it() {
+  let mut green = trunk();
+  accept(
+    &mut green,
+    Work::exclusive().copy("trunk", "branches/x", 1),
+    2,
+  );
+  let asked = [
+    green.copied_after("branches/x", 1),
+    green.copied_after("branches/x/d/b", 1),
+    green.copied_after("branches/x", 2),
+    green.copied_after("branches/x/d/b", 2),
+    green.copied_after("trunk/a", 1),
+    green.copied_after("branches/y", 1),
+  ];
+  assert_eq!(asked, [true, true, false, false, false, false]);
+}
+
 /// A-586 and A-626 (the verdict's refusals, each naming the destination by kind). Do: against a green holding a trunk,
 /// a hard link under `h`, a file under `taken`, a trunk changed after version 1 and a path removed after version 3,
 /// submit each refused copy: among them a second copy onto a place the first copy's tree fills, and replaces of a tree
