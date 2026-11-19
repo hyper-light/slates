@@ -360,6 +360,35 @@ the protocol document byte-identical to `d434dc14`'s above; `svnserve/serve.c` `
   1.14.1 fixed (issue 4762). Log's revision access [B: `svn_repos.h` 4365-4377; C: `log.c` 114-221]: `none` when no
   changed path is readable, `partial` (`svn:date` and `svn:author` only, and the readable changed paths) when some are,
   `full` otherwise.
+- **Authorization, read whole for A-606 (2026-11-19, g229)**, at the same revision; sha256 prefixes: `authz_parse.c`
+  `65dfe8189bc612e4`, `authz.c` `77d8cab538643c77`, `authz_info.c` `5f9ff5bbaaf9e187`, `authz.h` `8042f6925f6712a6`
+  (C); `libsvn_subr/config_file.c` `0de5f15f23270f73`, `ctype.c` `8c00533a27dc55f5`, `string.c` `62b5ad96280ba127`
+  (C: the file's lines, whitespace, member lists); `tests/libsvn_repos/authz-test.c` `6eaefc582403bf7e`, `authz.rules`
+  `faed4da16fc20b00`, `authz.groups` `7436b89c876dd1e8`, `repos-test.c` `40e945d3228d791c`, `libsvn_repos/repos.c`
+  `d5b563ff1363880f` (the `conf/authz` `svnadmin create` writes), `tools/server-side/svnauthz.c` `f62113915e696068`;
+  APR 1.7.5 (tag object `ee3f7c40`) `strings/apr_fnmatch.c` `12788315aebe9455` and `test/testfnmatch.c`
+  `28b79467bb826dba` (C); the 1.10 and 1.14 release notes (`7c7a34f5bee69657`, `cb16ff08aa5519d6`) and the book's
+  path-based authorization page (`9b976e3a8e2792e6`), B. Trunk at `fd4e82b` (2026-11-07) has the same `lookup`, and
+  its parser differs in comments alone, so Subversion 1.15 behaves as 1.14.x here.
+  - The precedence [C: `authz.c` 904-1011, 1277-1418]: per (user, repository) the rules that apply are folded into a
+    tree of path segments; the deepest level of the path an applying rule matches decides, and among the rules
+    matching that level the one with the highest sequence number (defined last) wins (`combine_access`); a `**` node is
+    matched again at every level and at its own (`add_next_node`); a rule ending in `**` eclipses the earlier rules
+    beneath its prefix (`trim_tree`); a global and a repository rule for one path give way to the repository's when it
+    matches the user (`create_user_authz`, 932-958: issue 4762). A recursive question is the least access over the
+    subtrees of the level's nodes ("Potential because we don't verify that the respective paths actually exist").
+  - Where the code departs from its own documentation: (1) `lookup` strips `/` to the empty string and walks it as
+    one empty segment (1284-1319), so `[:glob:/*]` (`add_next_node(... ->any)`, 1354, for any segment, the empty one
+    too) decides the root although `authz.h` 210 says `*` "Matches any single non-empty path segment"; (2) for the
+    same reason a recursive question at the root weighs only rules an empty segment matches: with `[/] * = rw` and
+    `[/secret] * =`, a recursive read at `/` is granted, and a commit that copies `/` (a recursive read of its source,
+    `commit.c`) would pass over `/secret`; (3) a suffix match reverses the segment in place (1375) and nothing restores
+    it, so the next node of the same level meets it reversed (`[:glob:/*.secret]` beside `[:glob:/**/public]` leaves
+    `/public` unmatched and matches `/cilbup`); (4) `parse_rule_path` returns the root for any path whose first segment
+    is empty (`authz_parse.c` 505-512), so `[//secret]` is the root's rule, though the next lines say "A path with two
+    consecutive slashes is not canonical". Two more outcomes depend on hash order: group expansion
+    (`expand_group_callback`, 1062-1127) detects a cycle only through the group it expands first and otherwise
+    recurses until its stack runs out, and several refusals in one file are reported in hash order.
 
 ## 8. The reference servers' shape (what the comparison is against)
 
