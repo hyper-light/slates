@@ -796,9 +796,19 @@ fn value_at(view: &HookView, root: &[u8], name: &str) -> Vec<u8> {
     .1
 }
 
+/// Format: git's `PATH_SEP`, which `env_append` quotes a value for holding: `:` on POSIX systems
+/// (`git-compat-util.h`).
+#[cfg(not(windows))]
+const SEPARATOR: &str = ":";
+
+/// Format: `PATH_SEP` on Windows (`compat/mingw.h`).
+#[cfg(windows)]
+const SEPARATOR: &str = ";";
+
 /// A-665 (`env_append`'s quoting). Do: ask a quarantined view for its environment at a root
-/// holding `:`, then at one holding `:`, a double quote, a byte past ASCII and a tab. Expect: the
-/// alternates' value quoted as `quote_c_style` quotes it, the quarantine's own as it is.
+/// holding the platform's `PATH_SEP`, then at one holding it, a double quote, a byte past ASCII and
+/// a tab. Expect: the alternates' value quoted as `quote_c_style` quotes it, the quarantine's own as
+/// it is.
 #[test]
 fn an_alternates_path_holding_the_separator_is_quoted_as_git_quotes_it() {
   let (repository, mut store) = served_encoded();
@@ -810,12 +820,14 @@ fn an_alternates_path_holding_the_separator_is_quoted_as_git_quotes_it() {
     Some(Pushed::Quarantined(&push)),
   );
   let alternates = "GIT_ALTERNATE_OBJECT_DIRECTORIES";
-  let plain = value_at(&view, b"/srv/a:b", alternates);
-  assert_eq!(plain, b"\"/srv/a:b/./objects\"");
-  let odd = b"/srv/a:\"\xc3\xa9\tb";
-  let quoted = value_at(&view, odd, alternates);
-  assert_eq!(quoted, b"\"/srv/a:\\\"\\303\\251\\tb/./objects\"");
-  assert!(value_at(&view, odd, "GIT_QUARANTINE_PATH").starts_with(odd));
+  let plain = format!("/srv/a{SEPARATOR}b");
+  let expected = format!("\"/srv/a{SEPARATOR}b/./objects\"");
+  assert_eq!(value_at(&view, plain.as_bytes(), alternates), expected.as_bytes());
+  let mut odd = format!("/srv/a{SEPARATOR}\"").into_bytes();
+  odd.extend_from_slice(b"\xc3\xa9\tb");
+  let expected = format!("\"/srv/a{SEPARATOR}\\\"\\303\\251\\tb/./objects\"");
+  assert_eq!(value_at(&view, &odd, alternates), expected.as_bytes());
+  assert!(value_at(&view, &odd, "GIT_QUARANTINE_PATH").starts_with(&odd));
   view.close(&mut store).unwrap();
   push.abandon(&mut store).unwrap();
 }
