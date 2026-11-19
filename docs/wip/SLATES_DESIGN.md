@@ -11924,6 +11924,17 @@ engine: the verdict, rebase, position mapping, the register).
 > detection (RustCrypto's `sha1-checked`, detection on and safe hash off as `git_SHA1DCInit`), which refuses git's own
 > t0013 SHAttered vector by type and names its plain SHA-1 as git's refusal does; and SHA-256 through aws-lc-rs. Proven
 > against every object type and the empty blob as stock git 2.50.1 named them in a SHA-1 and a SHA-256 repository.
+>
+> **Status (2026-11-19, A-591: the pack index and a pack's header and trailer built).** `crates/git` (`pack`,
+> `pack::idx`) reads a pack's header as a stream delivers it: `PACK` is refused at its first wrong byte, versions 2 and
+> 3 are read, and the count follows. It checks a whole pack's trailer before any byte it guards, and writes a pack's
+> header at version 2 and its trailer as the bytes stream out. It decodes the index, version 2, in place once the
+> index's own checksum holds: the fanout never goes down and agrees with the ids, the ids strictly ascend, the 8-byte
+> table is whole and every large offset names one of its entries, and no offset lies inside a pack's header. It holds an
+> index to its pack as `git verify-pack` does, short of inflating (one count, one trailer, the objects back to back,
+> each CRC32 over its bytes), and writes an index byte for byte as git 2.50.1 does. Every checksum runs through
+> `object_name` (A-600); the CRC32 is zlib's, through `crc32fast`, the crate flate2 computes it with. Proven against the
+> packs, indexes and `verify-pack -v` listings stock git 2.50.1 wrote, one of them with its 8-byte table in use.
 
 **Role.** Serve stock git clients, and clients built on other git libraries, over smart HTTP and SSH: fetch and clone
 by protocol v2, push by the receive-pack exchange, with the repository held in slates as §4.17.1 states. Protocol v2's
@@ -39288,3 +39299,91 @@ Applied in the same change to:
   - with the pack-only refusal folded into the unknown one, `ofs-delta` read as `Unknown`;
   - with the size not charged, a header naming 100 bytes read under an admission of 99.
 - **Owed of piece 2** (others' parts): a pack entry's header and the delta instructions with an applier.
+
+### A-591 — git's pack index, version 2, and a pack's header and trailer, read and written as git 2.50.1 does (2026-11-19, g293, UI goal 92; §4.17.2 "Pieces (git)" pieces 2 and 3, "The repository in git's terms" item 4; after A-600)
+Applied in the same change to:
+- §4.17.2's status and GAPS (the §4.17 entry);
+- `crates/git` (`pack.rs` and `pack/idx.rs`, new; their tests `tests/pack.rs` and `tests/pack_idx.rs`; the golden
+  vectors `fixtures/ofs-large.idx`, `sha256.pack`, `sha256.idx` and their `verify-pack` listings, with
+  `make-index-fixtures.sh`; `lib.rs`'s `mod` line; `Cargo.toml`);
+- the workspace manifest and lock (`crc32fast` 1.5.5, whose one dependency, `cfg-if`, was there already; nothing else
+  re-resolved).
+- **A pack's header and trailer** [B: `gitformat-pack.adoc`; C: `pack.h`, `index-pack.c`'s `parse_pack_header`,
+  `packfile.c`'s `open_packed_git_1`; git v2.50.1, each string cited here checked against its source on 2026-11-19].
+  `read_header` reads the twelve bytes as a stream delivers them: a signature byte other than `PACK`'s is refused as
+  soon as it arrives, a version other than 2 and 3 as soon as its four bytes have, and the answer is `None` until the
+  count has arrived. `check` holds a whole pack in memory: it must be at least a header and a trailer long, and its
+  trailer must be the checksum of every byte before it, verified before any of them is read; then its header is read.
+  `Writer` writes git's header at version 2 and the trailer computed as the objects pass, so a fetch's pack needs no
+  second pass (§4.17.2 "A fetch", item 3).
+- **The index** [B: `gitformat-pack.adoc`, "Version 2 pack-*.idx files"; C: `pack-write.c`'s `write_idx_file` and
+  `need_large_offset`, `packfile.c`'s `load_idx` and `nth_packed_object_offset`, `pack-check.c`'s `verify_packfile`].
+  `Idx::decode` verifies the index's own checksum first, then the magic `\377tOc` and version 2, then the layout:
+  - the fanout never goes down (git's "non-monotonic index");
+  - the file is exactly as long as its count and its 8-byte table make it, the table whole entries and at most one
+    fewer than the objects (git's "wrong index v2 file size");
+  - the ids strictly ascend, a duplicate refused apart from a step down;
+  - each fanout count is the number of ids whose first byte is at most its byte;
+  - every large offset names an entry of the table, and no offset lies inside a pack's header.
+  It then answers by position and by id in place, building nothing: the fanout narrows a lookup, then a binary search.
+  `Idx::check_pack` holds an index to its pack as `git verify-pack` does short of inflating. It checks one hash, one
+  count and one trailer, in `open_packed_git_1`'s order. It orders the objects by offset in a table charged to the
+  caller's admission first, and refuses an offset at or past the trailer, two objects at one offset, or bytes after the
+  header no object covers. Each object's CRC32 is taken over its span, from its offset to the next object's, the last
+  to the trailer, as `verify_packfile` takes it. `write` writes an index as `write_idx_file` does: the entries sorted by
+  id in place, every check made before the first byte, an offset past 2^31 - 1 in the 8-byte table, and that table's
+  entries numbered in id order.
+- **Stricter than git, where git trusts files it wrote.** A server reads indexes it did not write (an imported
+  repository's, piece 15), so each of these is refused by kind, though git's reader passes it:
+  - a large offset naming a slot past its table (git's `check_pack_index_ptr` keeps only the read inside the file);
+  - a fanout that disagrees with the ids;
+  - an 8-byte table that is not whole entries;
+  - an offset inside a pack's header;
+  - a duplicate id, as git refuses one only when strict.
+  The writer refuses whatever the reader refuses, so it never writes an index slates would not read. Version 1, which
+  has no magic, is refused as `Magic`; slates writes version 2 only.
+- **Checksums** run through `object_name::Hasher` (A-600), so a SHA-1 checksum runs git's collision detection as an
+  object name does, and a checksum whose input carries a known attack's disturbance is refused by kind (`Collision`).
+  git 2.50.1 hashes its own files' checksums with `unsafe_hash_algo` (`csum-file.c`), which `hash.h` makes the
+  collision-detecting SHA-1 unless a build names a separate fast one, so a default build of git refuses such a checksum
+  too. No published collision begins with a pack's or an index's first bytes, so no golden vector reaches that refusal.
+- **The CRC32 and its crate.** Each index entry keeps zlib's CRC32 (the IEEE polynomial, reflected; `index-pack.c`
+  takes zlib's `crc32()` over each entry's bytes as they are used), and slates had
+  only CRC32C (`slates_wire::crc32c`). Main approved `crc32fast` (2026-11-19) for one reason: it is the crate flate2
+  itself computes zlib's CRC32 with, and flate2 enters the workspace anyway (A-595's gzip bodies, piece 3's objects), so
+  it brings no code the tree would not hold. Its `std` feature picks ARMv8's CRC instructions or x86-64's carry-less
+  multiply at run time, with a table for the rest, and slates-git keeps no `unsafe` of its own.
+- **Golden vectors.** The packs, indexes and `git verify-pack -v` listings A-582's `make-fixtures.sh` captured
+  (`ofs` and `ref`, SHA-1, with offset and with reference deltas), and `make-index-fixtures.sh`'s, run with git 2.50.1
+  (Apple Git-155) on 2026-11-19:
+  - `ofs-large.idx`, `ofs.pack`'s index made by `git index-pack --index-version=2,0x200`, git's own switch (its
+    t5302 uses `--index-version=2,0x40000`) that puts the eight objects past 0x200 in the 8-byte table, since no small
+    pack has an offset past 2^31 - 1;
+  - `sha256.pack`, `sha256.idx` and their listing, the same history in a SHA-256 repository.
+  The same day each index was made again by hand with the same git on another Mac, byte for byte, and both listings
+  came out again exactly. The empty pack's bytes are `git pack-objects --stdout < /dev/null`'s (trailer `029d0882…`).
+- **Tests** (`cargo test -p slates-git --lib`, Mac Studio M3 Ultra, 2026-11-19 03:52Z, debug, load 20.6 at the start:
+  54 of 54, the 32 new among them; `cargo fmt --check` clean). Red first: on the Studio's clone alone, never committed,
+  the eight entry points were stubbed to answers that build nothing, and 32 of 32 new tests failed. The tests:
+  - each index reads as git listed it, every object found at git's offset and spanning git's size-in-pack, the 8-byte
+    table read for `ofs-large.idx`, the pack held and the exact room charged;
+  - each index is written back byte for byte, `ofs-large.idx` at git's forced limit, from entries handed over in
+    reverse; each pack is written back byte for byte, and the empty pack is git's;
+  - every single-bit flip of a SHA-1 and a SHA-256 pack and index is refused by its checksum, before its header is read;
+  - the brief's hostile set, each re-signed so only the change is judged: a fanout that goes down, a count past the
+    file, offsets past the pack (at the trailer, at 2^31 - 1, at 2^40 through the table), a large index one past its
+    table and into a table of none, and a bit flipped in each checksum (the pack's trailer, the index's own, and its
+    copy of the pack's: refused by the index's checksum, and once re-signed refused against the pack);
+  - and the rest by kind: truncation at every length short of the smallest file, another magic and version, a table of
+    the wrong size, unsorted and duplicated ids, a miscounting fanout, offsets in the header, a pack not the index's
+    (another pack, the other hash, another count), a wrong CRC32, shared offsets, bytes before the first object, a check
+    past its admission, and the writer's refusals;
+  - two proptests: a model (a map from id to CRC32 and offset) that any entries written in any order decode to, every id
+    found and an absent one not; and an oracle pack of opaque objects whose index, made from their spans, holds, and
+    with one CRC32 changed is refused naming that object.
+- **Owed.** The pack reader (piece 3): entries, inflation and deltas, the trailer checked as a stream arrives, and an
+  index's ids checked against its pack's objects. `Idx::decode` and `Idx::check_pack` run whole, hashing and CRC-ing
+  every byte in one call, so a caller on a shard gives them what its slice admits; a sliced form comes with the import
+  of a repository on disk (piece 15), which also remakes a version 1 index from its pack. `pack::HEADER_LEN` and g258's
+  draft `entry::PACK_HEADER_LEN` (A-582 part 3) are one number: whichever lands second points at the other's (main,
+  2026-11-19).

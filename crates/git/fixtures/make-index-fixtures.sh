@@ -13,9 +13,9 @@
 # hand with the same git on another Mac, each index made again byte for byte, and `git verify-pack -v` listed
 # `ofs-large.idx` and `sha256.idx` again exactly as recorded.
 #
-# Sources: git's Documentation/gitformat-pack.txt (idx v2: "large offsets are encoded as an index into the next table
-# with the msbit set"; "in SHA-256 repositories, these values are computed using SHA-256") and git-index-pack.txt
-# (`--index-version`).
+# Sources (git v2.50.1): Documentation/gitformat-pack.adoc (idx v2: "large offsets are encoded as an index into the
+# next table with the msbit set"; "in SHA-256 repositories, these values are computed using SHA-256"),
+# git-index-pack.adoc (`--index-version`) and t/t5302-pack-index.sh (`--index-version=2,0x40000`).
 set -euo pipefail
 OUT=$(cd "$1" && pwd)
 unset GIT_CONFIG_PARAMETERS GIT_DIR GIT_WORK_TREE

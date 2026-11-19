@@ -53,6 +53,20 @@
 > object type and the empty blob as stock git 2.50.1 named them in both formats (`fixtures/objects`,
 > `make-object-fixtures.sh`). `cargo test -p slates-git --lib`: 22 of 22, red three ways. Owed of piece 2: a pack
 > entry's header and the delta instructions (others' parts).
+> **A-591 (2026-11-19, g293; the pack index and a pack's header and trailer):** `slates-git` reads a pack's header as a
+> stream delivers it and checks a whole pack's trailer before what it guards; it writes a pack's header and trailer as
+> the bytes pass. It decodes the index, version 2, in place once its own checksum holds, refusing by kind a fanout that
+> goes down or miscounts, unsorted or duplicated ids, a file not the length its count and 8-byte table make it, a large
+> offset past its table and an offset inside a pack's header; it holds an index to its pack as `git verify-pack` does
+> short of inflating (count, trailer, objects back to back, each CRC32 over its span, through `crc32fast`, flate2's own
+> CRC crate), and writes an index byte for byte as git 2.50.1 does. Golden vectors: the `ofs`, `ref`, `ofs-large` (the
+> 8-byte table in use) and SHA-256 packs, indexes and listings (`make-index-fixtures.sh`). `cargo test -p slates-git
+> --lib`: 54 of 54 on the Mac Studio, the 32 new failing first against stubs. This is A-582's owed "idx v2". Owed: the
+> pack reader (piece 3: entries, inflation, deltas, the streamed trailer, ids checked against objects); a sliced decode
+> and check for a large pack, with the import of a repository on disk (piece 15), which also remakes version 1 indexes;
+> a vector that reaches the checksums' collision refusal (no published collision begins with `PACK` or `\377tOc`);
+> `pack::HEADER_LEN` and g258's `entry::PACK_HEADER_LEN` made one (whichever lands second). Clippy, `xtask` and the
+> lint matrix over the change are main's (run requests).
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545);
 > piece 2 built, the protocol codecs (A-569) (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's

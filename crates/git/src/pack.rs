@@ -1,7 +1,7 @@
 //! A pack's header and trailer (A-591; §4.17.2 "Pieces (git)", pieces 2 and 3: "checking the trailer"), and its
 //! index, [`idx`].
 //!
-//! **The format** [B: git's `gitformat-pack.txt`, "pack-*.pack files have the following format"; C: `pack.h`,
+//! **The format** [B: git's `gitformat-pack.adoc`, "pack-*.pack files have the following format"; C: `pack.h`,
 //! `index-pack.c`'s `parse_pack_header`, `packfile.c`'s `open_packed_git_1`; git 2.50.1, read 2026-11-19]. A pack opens
 //! with a header of twelve bytes: the signature `PACK`, a version, and the number of objects that follow, the last two
 //! 4-byte numbers in network order. git "currently accepts version number 2 or 3 but generates version 2 only", and
@@ -22,8 +22,10 @@
 //!
 //! **Checksums** are taken through [`Hasher`] (A-600), the hash the crate names objects with, so a SHA-1 checksum runs
 //! git's collision detection too. A checksum whose input carries a known attack's disturbance is refused by kind
-//! ([`Refusal::Collision`]), as a default build of git dies on it. No published collision begins with a pack's first
-//! bytes, so no golden vector reaches that refusal (GAPS, the §4.17 entry).
+//! ([`Refusal::Collision`]). git 2.50.1 hashes its files' checksums with `unsafe_hash_algo` (`csum-file.c`), which
+//! `hash.h` makes the collision-detecting SHA-1 unless a build names a separate fast one, so a default build of git
+//! dies on such a checksum too. No published collision begins with a pack's first bytes, so no golden vector reaches
+//! that refusal (GAPS, the §4.17 entry).
 //!
 //! **Hostile input (§4.9).** Every byte is untrusted. Each refusal is a typed variant naming where it stopped. Nothing
 //! here allocates beyond the hash's own state.

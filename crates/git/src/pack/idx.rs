@@ -1,7 +1,7 @@
 //! The pack index, version 2 (A-591; §4.17.2 "Pieces (git)", pieces 2 and 3, and "The repository in git's terms",
 //! item 4, "each entry's CRC32 kept").
 //!
-//! **The format** [B: git's `gitformat-pack.txt`, "Version 2 pack-*.idx files support packs larger than 4 GiB"; C:
+//! **The format** [B: git's `gitformat-pack.adoc`, "Version 2 pack-*.idx files support packs larger than 4 GiB"; C:
 //! `pack-write.c`'s `write_idx_file` and `need_large_offset`, `packfile.c`'s `load_idx` and
 //! `nth_packed_object_offset`, `pack-check.c`'s `verify_packfile`; git 2.50.1, read 2026-11-19]. For a pack of n
 //! objects, every number in network order:
