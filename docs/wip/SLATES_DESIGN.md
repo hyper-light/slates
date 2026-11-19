@@ -35679,6 +35679,12 @@ GAPS (R3's class C, the mount-hardening row, the host-mount entry), `crates/brid
   longer of its wait when a tick first judged it and the client's wake estimate, each later look at twice the time
   waited, the timer naming the earliest. A call answered before its first look asks nothing; a departure is seen within
   the time waited. Every place a call's clock restarts (`Call::rearm`) restarts its schedule.
+- **The synchronous send's wait for a ring slot** (`Client::send`, `RoomWait`). On a full command ring the wait spun
+  for a whole reply deadline, a second of a core, then asked the daemon's liveness at each deadline and paced its tries
+  at a tenth of it. Now it spins for the client's wake estimate (the daemon drains its ring in microseconds), then
+  parks, each pause twice the last from the wake estimate and never past the next look, the looks on A-443's doubling.
+  A wait of `t` wakes about `log2(t / wake)` times; a slot that frees wakes nothing, so it is found at the next try,
+  within the time already waited (owed in GAPS: the daemon waking a client that waits for room).
 - **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
   last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
   the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
