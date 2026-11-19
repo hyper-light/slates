@@ -58,6 +58,15 @@ head where 7.2 refuses it as raced. What a client did with the extra head was no
   ending a head through it; a generated oracle over histories moving between two branches with merges of any earlier
   revisions; the oracle's non-vacuity, histories from fixed seeds where the old rule and 7.2's differ.
 
+## Evidence
+
+Windows x86_64 (jupiter), 2026-11-19, kiln, debug, rustc 1.98.1, each run in a clone and target of its own (the Mac
+Studio was offline): `cargo test --locked -p slates-hg --lib`. Red, the tests alone against the old rule
+(`agents/g300-a667-branch-heads-red`, 5c88fd3e9): 276 passed, 6 failed, the five new tests and A-619's corrected
+oracle, each answering the old rule's extra heads (g304's history `[0, 1, 2]` where 7.2's heads are `[1, 2]`). First
+green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone. Green (87690ec64): 284 of 284. The macOS run is
+owed.
+
 ## Apart from 7.2, on purpose
 
 7.2's walk takes a shortcut where one head is known and one parent is on the branch (`branchmap.py` lines 478-483:

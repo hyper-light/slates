@@ -917,7 +917,13 @@ fn descends(view: &View, later: usize, rev: usize) -> bool {
       return true;
     }
     if !std::mem::replace(&mut seen[next], true) {
-      stack.extend(view.changesets[next].parents.iter().flatten().map(|parent| at(*parent)));
+      stack.extend(
+        view.changesets[next]
+          .parents
+          .iter()
+          .flatten()
+          .map(|parent| at(*parent)),
+      );
     }
   }
   false

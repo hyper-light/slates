@@ -46593,9 +46593,13 @@ Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::disco
 - **Siblings.** `check:updated-heads` read the same function and is fixed with it; `check:heads` reads topological
   heads, as 7.2 does; `reject_new_heads` (open topological heads on the branch) and the push's head count (topological
   heads added and removed) have no caller yet and are owed with the landing; the push classifier is not built.
-- **Tests (pending the Studio's run; it was offline when this was written).** Red: branch
-  `agents/g300-a667-branch-heads-red` (the tests alone, against the old rule). Green: g304's history, the two measured
-  histories, a closed head kept and ending a head through it, a generated oracle over histories moving between two
-  branches with merges of any earlier revisions, and its non-vacuity from fixed seeds.
+- **Tests (Windows x86_64, jupiter, 2026-11-19, kiln, debug, rustc 1.98.1; the Mac Studio was offline).** Red: branch
+  `agents/g300-a667-branch-heads-red` (5c88fd3e9, the tests alone, against the old rule), `cargo test --locked -p
+  slates-hg --lib` 276 passed and 6 failed, the five new tests and A-619's corrected oracle, each answering the old
+  rule's extra heads. First green (e4bd2f3a1): 283 of 284, A-641's push-check oracle failing alone, which stated the old
+  rule too and is corrected. Green: 284 of 284 at 87690ec64 (main's 278 and A-667's six), in a target directory of its
+  own; rustfmt's layout from those runs. The tests: g304's history, the two measured histories, a closed head kept and
+  ending a head through it, a generated oracle over histories moving between two branches with merges of any earlier
+  revisions, and its non-vacuity from fixed seeds. Owed: the same run on macOS.
 - **Owed.** An obsolete changeset the served view shows is never a head in 7.2 (lines 351-358) and its ancestors are
   ended through it (lines 469-476); the served view carries no obsolescence yet.

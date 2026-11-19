@@ -680,10 +680,10 @@
 > any branches, so `default` 0, `stable` 1, `default` 2 answered `default`'s heads 0 and 2 where 7.2 answers 2, in
 > `branchmap` and `check:updated-heads`. A-619's and A-641's oracles stated the same rule, so they certified it. Now the
 > rule is 7.2's, a branch walked only where its candidates have children on other branches and a parent from another
-> branch lies above them, closed heads kept; red first, then green
-> (`docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`). Apart from 7.2 on purpose: a merge
-> whose parent on its branch is an ancestor of its other parent, where 7.2 keeps a head by its cache's history. Owed: an
-> obsolete changeset the served view shows is never a head in 7.2; the view carries no obsolescence yet.
+> branch lies above them, closed heads kept; red first (6 failed), then 284 of 284 on Windows x86_64 (jupiter), macOS
+> owed (`docs/bugs/2026-11-19-hg-branch-heads-were-judged-by-a-child-on-the-branch.md`). Apart from 7.2 on purpose: a
+> merge whose parent on its branch is an ancestor of its other parent, where 7.2 keeps a head by its cache's history.
+> Owed: an obsolete changeset the served view shows is never a head in 7.2; the view carries no obsolescence yet.
 
 > **Fixed (g267, 2026-11-19, A-577; found settling A-565): a live clone was answered before any of it was durable.** A
 > clone of a live-shipped volume is live-shipped too, but its `Clone` reply waited on its origin's log, and its record,
