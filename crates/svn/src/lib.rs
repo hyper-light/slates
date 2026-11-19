@@ -22,5 +22,6 @@
 pub mod commit;
 pub mod index;
 pub mod lock;
+pub mod mergeinfo;
 pub mod ra_svn;
 pub mod svndiff;

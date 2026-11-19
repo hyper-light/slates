@@ -11769,6 +11769,27 @@ is one more version, and the chain itself is never rewritten.
   windows.
 
 **Works over works: review requests and their trees.**
+
+> **Status (2026-11-19, A-596; shared piece 6).** Review records are built in the engine and the metadata database; the
+> server's review verbs are owed. A request's versions are the versions of the volume its records name, the green its
+> updates are held as. A comment is anchored to a path, the whole lines a byte range covers
+> (`slates_merge::review::line_range`) and one such version. `Green::reanchor` (`crates/merge/src/engine/reanchor.rs`)
+> follows it to a later version through each change the green recorded to its path, by one pure step
+> (`slates_merge::review::move_through`, the position mapping of §4.16): a change that meets its bytes outdates it
+> (`LinesChanged`); one before it shifts it; the moved range must still cover whole lines of the new text, which two of
+> its bytes decide, or text was joined to its first or last line (`LinesJoined`); and a removal of its file, or a delta
+> that does not account for the file's change of length (a rename onto the file records the new bytes as one insert),
+> outdates it as `FileReplaced`. It never moves an outdated comment again, and costs the path's own changes since the
+> comment's version, never a whole file or the tree; a version below the fold floor is refused, typed. Following a
+> renamed file waits for the engine's path remapping (the verdict answers a work's edit of a renamed-away file
+> `DeleteModify`). An approval binds to the version its approver saw; `Reviews::staled_by` makes stale the standing
+> approvals a policy predicate names (A-597's matcher plugs in), and the standing ones are the evidence a policy counts.
+> The records are the repository's partition's (`crates/db/src/review.rs`): six operations, guarded then applied, carried
+> by the snapshot, charged to the merge byte budget, each refusal typed (`ReviewRefusal`). The oracle holds the walk to a
+> diff of the whole texts over generated histories, and found two verdict defects, filed in GAPS with parked tests: a
+> work based before its file was replaced is spliced into the replacement, and a truncate based before an append drops
+> the appended bytes. Owed: the server's verbs (write, move each comment as its request gets a version, approve, stale,
+> close), their wire refusals typed, and a comment's version held as a live reader of its green's fold floor.
 - A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
   unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
   approvals; and the evidence the policy requires (status checks, signatures).
@@ -11900,7 +11921,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
 4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
    client-fidelity test (an accepted push's paths hold exactly the client's bytes).
 5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
-6. Review records: comments anchored and moved by position mapping; approvals as evidence.
+6. Review records: comments anchored and moved by position mapping; approvals as evidence (built in the engine and the
+   metadata database, A-596; the server's review verbs owed).
 7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
    commit, under learned deadlines.
 
@@ -12725,6 +12747,19 @@ and export by landing).
 > ra_svn server (piece 7), the lock hooks (piece 11), DAV's LOCK and UNLOCK (piece 13), the entries' encoding in the
 > repository's register, the head view over the index, and the room derived from the shard's (item 12).
 >
+> **Status (2026-11-19, A-605).** Built: mergeinfo (`slates-svn`'s `mergeinfo`, piece 9, item 8): the `svn:mergeinfo`
+> value read as `svn_mergeinfo_parse` reads it (every refusal by Subversion's own message, answered `E200020`; at commit
+> a NUL inside the value refused first, as `verify_mergeinfo` does) and written as `svn_mergeinfo_to_string` writes it;
+> the range-list algebra transcribed from `mergeinfo.c` (union, intersection, removal, difference, equality, each with
+> `consider_inheritance`), since Subversion's walk is not exact per revision when inheritance is compared and the stock
+> client computes with it; inheritance and elision; and `get-mergeinfo`'s answers over the index (explicit, inherited,
+> nearest-ancestor; descendants found by the index's counts, a crawl the server pulls a slice at a time; a value that
+> does not parse answering none, issue #3896). Held to `mergeinfo-test.c`'s vectors, to the per-revision model wherever
+> Subversion's algebra is exact, and to a naive filesystem on generated histories. Owed: `svn mergeinfo --show-revs`'s
+> eligible and merged revisions, composed from this algebra with piece 7's location segments and log
+> (`libsvn_client/mergeinfo.c` `svn_client__mergeinfo_log`, `filter_log_entry_with_rangelist`); the property's UTF-8 and
+> CR checks at commit, which are piece 7's property validation (`svn_repos__validate_prop`).
+>
 > **Status (2026-11-19, A-592).** Built: the commit rule (`slates-svn`'s `commit`, piece 5, items 3.2 to 3.4): the
 > drive's out-of-date test (`check_out_of_date`, `commit.c`'s); and the verdict at `close-edit` (`verdict`): FSFS's
 > `merge()` stated on the index, over the work's transaction as the index's own builder makes it on its base
@@ -13159,7 +13194,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 7. The ra_svn server: the greeting and authentication; the plain reads; the reporter (update, switch, status, diff,
    checkout); commit; log, locations, segments, file revisions, deleted revision, replay; revision properties.
 8. Locks (built, A-602: the table, the guards of its verbs and the verdict's check, with FSFS's lock rules as its
-   oracle). 9. Mergeinfo queries. 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
+   oracle). 9. Mergeinfo queries (built, A-605; the eligible and merged revisions owed with piece 7's segments and
+   log). 10. Authorization. 11. Hooks and `svnlook`. 12. The `svn+ssh` tunnel command.
 13. HTTPv2 with TLS and its authentication, then DeltaV version 1.
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
@@ -39705,6 +39741,128 @@ refusals and piece 3), `crates/hg` (`changeset`, `manifest`, `filerev` and `node
   detection), so they could not pass on it.
 - **Owed of piece 3.** The index's tables on §4.17.1's shared tables; then an existing store's import, its zlib and
   zstd revlog chunks inflated by A-607's engines, its tests holding inflated bytes.
+
+### A-605 — Mergeinfo: the `svn:mergeinfo` value read and written as Subversion reads and writes it, its range-list algebra transcribed, inheritance and elision, and `get-mergeinfo` over the index (2026-11-19, g262, UI goal 92; §4.17.4 item 8 and piece 9; A-500, A-553)
+Applied in the same change to: §4.17.4 (a status block; piece 9 marked built), GAPS (the §4.17.4 entry),
+`docs/wip/research/vcs-servers-subversion.md` (§11, new), `crates/svn/src/mergeinfo.rs` and
+`crates/svn/src/mergeinfo/tests.rs` (new), `crates/svn/src/lib.rs` (its `mod` line).
+- **What was there.** Item 8 said a value must parse and named `get-mergeinfo`'s three modes and the descendants found
+  by the per-directory counts. Nothing read, wrote or answered mergeinfo; the index (A-553) kept FSFS's `minfo-here` and
+  `minfo-cnt` with no reader.
+- **The decision.** Every rule is Subversion's own, read in its code at `1.14.x` `d434dc14` (notes §11, each file's
+  sha256 there). The value is read as `svn_mergeinfo_parse` reads it, as a C string, a line's last colon dividing, the
+  path canonical, revisions digits alone up to 2^31 - 1, ranges sorted and combined, a key named twice merged; every
+  refusal is a kind named by Subversion's message, answered `E200020`; a commit's check refuses a NUL first
+  (`verify_mergeinfo`). It is written as `svn_mergeinfo_to_string` writes it, paths in `svn_path_compare_paths` order.
+  The range-list algebra is transcribed, not restated: with `consider_inheritance` Subversion's walk is not exact per
+  revision (`1-10` and `3-4*,5-6` share nothing; removing `3-4*,5-6` from `1-10` removes nothing), and the stock client
+  computes `svn mergeinfo --show-revs` with it, so a server's answer equal to the client's needs it as it is; a named
+  test holds that walk. Inheritance is `svn_mergeinfo_inheritable2` then `svn_fs__append_to_merged_froms`; elision is
+  `should_elide_mergeinfo`. The queries answer as FSFS does: a path's nearest node holding mergeinfo (from its parent
+  for nearest-ancestor, none at the root; the path alone for explicit), a value that does not parse answering none and
+  ending the search (issue #3896), a row claiming mergeinfo its list lacks refused as corrupt, the descendants entered
+  only where `minfo-cnt` says mergeinfo lies beneath. The index names each node's property list and the green holds the
+  lists and the directories, read through one seam (`Contents`); the descendants are an iterator that lists at most one
+  directory a step, so the server pulls them a slice at a time under the shard's budget.
+- **Tests** (the Mac Studio, `cargo test -p slates-svn --lib`, 2026-11-19, on the tree merged with main 553d3d155): 111
+  of 111, 37 of them this module's, in 1.40 s. Subversion's own vectors from `mergeinfo-test.c`: 25 valid values, 26
+  broken ones each by its kind, 68 range-list merges, 15 removals and 16 differences each with and without inheritance,
+  the intersections, the merges of whole mergeinfo, the to-string cases, issues 4686's and 4840's merges, and the
+  62 × 63 single-range loop, with the per-revision check Subversion's own test leaves to do. Property tests over the
+  per-revision model Subversion's random tests use (`rl_array_t`): unions exact; inheritable lists intersected and
+  removed as sets; without inheritance a positional walk whose touching pieces join; with inheritance within the
+  per-revision bounds. Hostile values (the grammar's alphabet and any byte; every cut and bit flip of a valid value):
+  each refused, typed, or read canonically, none panicking; 100,000-range and 100,000-line values read whole. The
+  queries case by case, with their refusals (`E160013`, `E160005`, `E160006`, `E160004` twice). The oracle: a naive
+  filesystem keeping every revision's whole tree equals the index-backed queries on 256 generated histories of
+  additions, copies, deletions and property changes, every crawl listing only directories with mergeinfo beneath, its
+  census (inherited answers, unparsed values, found descendants, listings, pruned directories) all moving.
+- **Red-checked eight ways** (a mutant each on the Studio; the tests that failed): the revision limit lifted (1); the
+  union taking the smaller cover (6); an inherited value keeping its `*` ranges (4, the oracle among them); the descent
+  rule without "one, not its own" (4); issue #3896's search going on (2); a joined range non-inheritable unless both
+  pieces are (1: the without-inheritance property, which no vector of Subversion's catches); a comma ending the value
+  accepted (2); paths in byte order (2). `cargo fmt -p slates-svn --check` clean.
+- **Owed.** `svn mergeinfo --show-revs`'s eligible and merged revisions, composed from this algebra with piece 7's
+  location segments and log (`svn_client__mergeinfo_log`'s range lists and `filter_log_entry_with_rangelist`'s judgment
+  of each log entry by its changed paths); `log`'s `include-merged-revisions` (`log.c` `fs_mergeinfo_changed`,
+  `get_combined_mergeinfo_changes`) with piece 7's log; the property's UTF-8 and CR checks with piece 7's property
+  validation (`svn_repos__validate_prop`).
+
+### A-596 — review records: comments followed by position mapping, approvals bound to the version they saw (2026-11-19, g267, UI goal 92; §4.17.1 "Works over works" and shared piece 6; §4.16 "Position mapping")
+Applied in the same change to:
+- §4.17.1's "Works over works" status and its pieces list (item 6); GAPS (the §4.17 entry, and two verdict findings,
+  open);
+- `crates/merge` (`review.rs` and `engine/reanchor.rs` with its tests, new; `map.rs`: `effect_of` visible to the crate;
+  `engine.rs` and `lib.rs` declare them);
+- `crates/db` (`review.rs`, new; `catalog.rs`: `ReviewCommentRecord`, `ReviewApprovalRecord`; `op.rs`: six operations
+  appended, published by hand in `tests/wire_order.txt` as `Op` 90 to 95; `error.rs`: `DbError::Review` and
+  `ReviewRefusal`; `partition.rs`: the records' guard, apply and budget, the snapshot's `review_comments` and
+  `review_approvals` appended, and their restore; `lib.rs`);
+- `crates/server` (`error.rs`: a review refusal answers `VolumeRefusal::Invalid` until the review verbs type theirs on
+  the wire, as A-299 did the database's).
+- **A comment's anchor.** A path, a run of whole lines held as the byte range they cover, from the first line's first
+  byte through the last line's newline (or the text's end), and a version of the request: the version of the green the
+  records name. `line_range` turns a client's lines into the range, and `lines_of` turns the range back into lines at
+  the version it stands on.
+- **One step** (`move_through`). Through one later version's canonical delta on the path:
+  - a change that meets the range outdates it, `LinesChanged`;
+  - a change before it shifts it; the moved range must still cover whole lines of the new text, judged from the byte
+    before it, its last byte and the text's length (`covers_whole_lines`), or text was joined to its first or last
+    line, `LinesJoined`. The edge rule lets an insert at the range's first byte shift it and one at its end leave it,
+    and a change to the newline just before it does not meet it, so bytes alone would move a comment onto a line that
+    now holds other text too;
+  - a delta that does not account for the file's change of length is no edit of the old bytes, `FileReplaced`. Every
+    delta the verdict records for an edit accounts for it, since an accepted op set fits its base (`fits_base`); a
+    rename onto the file records the new bytes as one insert at its start, which does not.
+- **The walk** (`Green::reanchor`). From the comment's version to a later one, through the path's content history
+  after it: a removal is `FileReplaced`; each change's delta on the path is that version's ops; each judgement reads two
+  bytes from the history value the walk holds. So it costs the path's own changes in between, never a whole file, another
+  path or the tree. Refused, typed: past the head, backward, below the fold floor or the checkpoint the green was
+  restored at (the texts are gone), and a range that is not whole lines at the comment's version.
+- **Approvals.** One an approver, bound to the version it saw. The approver's approval at an earlier version, or at one
+  before the change that made the standing one stale, is refused (`Behind`), so an approval never binds back.
+  `Reviews::staled_by` returns the operations that make stale the standing approvals, bound to an earlier version, that
+  the policy predicate names; a stale one is not made stale again (`Stale`). `Reviews::standing` is the evidence a policy
+  counts.
+- **The records.** On the repository's partition, guarded then applied (`crates/db/src/partition.rs`'s pattern):
+  `ReviewCommented`, `ReviewCommentMoved`, `ReviewCommentOutdated`, `ReviewApproved`, `ReviewApprovalStaled` and
+  `ReviewClosed`. A comment moves only forward and an outdated one never again; a new record is neither outdated nor
+  stale; comment numbers count from one (`next_comment`). Their bytes are charged to the merge byte budget and refused at
+  it as the merge plane's `Capacity`. They leave with their review's close and with their repository, and a snapshot
+  carries them, its restore refusing a record of a repository it does not carry.
+- **Tests** (debug, Mac Studio, 2026-11-19, kiln r504 and r529; load 9.7 to 12.4):
+  - `cargo test -p slates-merge --lib -- review:: engine::reanchor`: 7 of 7, 2 ignored (the findings);
+  - `cargo test -p slates-db --lib -- review:: repository:: partition:: replay::`: 11 of 11;
+  - `cargo test -p slates-server --lib -- error::`: 3 of 3;
+  - `cargo fmt -p slates-merge -p slates-db -p slates-server -- --check`: clean.
+
+  The oracle (`a_comment_follows_its_lines_as_a_diff_of_whole_texts_does_over_every_history`) runs generated histories
+  over a two-file green. Works are based at the head or behind it and make every line edit (whole lines inserted,
+  deleted or replaced; text inserted in a line or before its first byte; a line split, or joined to the next by a
+  deleted or overwritten newline; text appended), or unlink, re-create, rename onto or rename away the commented file.
+  Comments are written at versions the green reconstructs, and folds come at generated floors. Every comment is
+  followed to every later version and equals a diff of the whole texts the green held at each commit, line by line:
+  the same lines, the same version and reason when outdated, refused below the floor. A census asserts every answer was
+  met. The partition's model test holds every answer and the whole record state to the rules over generated histories,
+  and goes on from a partition rebuilt from its snapshot after every step. Red (r504), with each rule taken out at once
+  (the whole-lines judgement, the length check, the overlap's answer, the fold's refusal, the removal, the outdated and
+  behind rules, the restore's byte count, the repository's release): every one of the 7 merge and 4 db tests failed.
+- **Findings** (the oracle's; filed in GAPS, each a parked test red on r529):
+  - a work based before its file was replaced is spliced into the replacement: its ops shift past the replacement's
+    one-insert delta and land at the new file's end (`a_work_based_before_its_file_was_replaced_conflicts`: accepted,
+    the re-made file `<9>\nx`);
+  - a truncate based before an append removes the appended bytes: it meets the append only at its edge, and the splice
+    truncates to the head's end (`a_truncate_based_before_an_append_keeps_the_appended_bytes`: accepted, the file
+    `<1>\n`, the append gone).
+
+  The oracle bases neither case until the verdict is fixed, and a comment's step refuses to follow the truncate's
+  delta, which states four bytes where eight left.
+- **Owed.**
+  - The server's review verbs: write, move each comment as its request gets a version, approve, stale by A-597's
+    matcher, and close the review with its request. Their wire refusals typed, with the contract's next number.
+  - A comment's version held as a live reader of its green's fold floor.
+  - Following a renamed file, with the engine's path remapping.
+  - The two findings' fix in the verdict.
 
 ### A-592 — The Subversion commit rule as a pure function: the drive's out-of-date test, and FSFS's merge at commit stated on the index, then the lock table's check, held to FSFS's own code transcribed (2026-11-19, g268 for UI goal 92; §4.17.4 items 3.2 to 3.4 and piece 5; A-553, A-602)
 Applied in the same change to: §4.17.4 (a status block; item 3.3 rule 2's lazy copy; piece 5 marked built), GAPS (the
