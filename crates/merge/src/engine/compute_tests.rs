@@ -196,7 +196,11 @@ impl Edit {
       Edit::Rename(_, to) if FILES[*to] != file && !at.dir(FILES[*to]) => {
         draft.naming(OpKind::Rename, FILES[*to], file);
       }
-      Edit::Mode(_, mode) => draft.op(OpKind::SetMode, file, (0, u64::from(MODES[*mode]), u64::MAX)),
+      Edit::Mode(_, mode) => draft.op(
+        OpKind::SetMode,
+        file,
+        (0, u64::from(MODES[*mode]), u64::MAX),
+      ),
       Edit::Attribute(_, name, value) => draft.attribute(file, NAMES[*name], value),
       Edit::Link(_) if !at.holds(LINK) => draft.naming(OpKind::Link, LINK, file),
       _ => {}
@@ -232,7 +236,9 @@ fn overwrite(draft: &mut Draft, at: &At, path: &str, (offset, bytes): (u8, &[u8]
     return;
   };
   let start = u64::from(offset) % len;
-  let fits = usize::try_from(len - start).unwrap_or(usize::MAX).min(bytes.len());
+  let fits = usize::try_from(len - start)
+    .unwrap_or(usize::MAX)
+    .min(bytes.len());
   if fits > 0 {
     draft.content(OpKind::Overwrite, path, start, &bytes[..fits]);
   }
@@ -293,8 +299,14 @@ fn bytes() -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn edit() -> impl Strategy<Value = Edit> {
-  (0..10u8, 0..FILES.len(), 0..FILES.len(), any::<u8>(), bytes()).prop_map(
-    |(kind, file, other, offset, bytes)| match kind {
+  (
+    0..10u8,
+    0..FILES.len(),
+    0..FILES.len(),
+    any::<u8>(),
+    bytes(),
+  )
+    .prop_map(|(kind, file, other, offset, bytes)| match kind {
       0 => Edit::Write(file, bytes),
       1 => Edit::Overwrite(file, offset, bytes),
       2 => Edit::Insert(file, offset, bytes),
@@ -305,8 +317,7 @@ fn edit() -> impl Strategy<Value = Edit> {
       7 => Edit::Head(bytes),
       8 => Edit::Directory(other % DIRS.len(), offset.is_multiple_of(2)),
       _ => Edit::Link(file),
-    },
-  )
+    })
 }
 
 /// One step of a generated history: a work based `back` versions behind the head, or the work of an earlier step sent
@@ -411,7 +422,11 @@ impl Pair {
   ) -> Result<(), TestCaseError> {
     let rebased = self.copy.rebase(inc);
     census.rebased_behind += u64::from(behind && matches!(rebased, Rebased::Rebased { .. }));
-    prop_assert_eq!(rebased, self.owner.rebase(inc), "the copy rebased otherwise");
+    prop_assert_eq!(
+      rebased,
+      self.owner.rebase(inc),
+      "the copy rebased otherwise"
+    );
     Ok(())
   }
 
@@ -422,7 +437,11 @@ impl Pair {
       .commit_judged(held)
       .map_err(|moved| TestCaseError::fail(format!("{moved:?}")))?;
     prop_assert_eq!(self.copy.apply_recorded(inc, &applied), version);
-    prop_assert_eq!(seen(&mut self.copy), seen(&mut self.owner), "the copy differs");
+    prop_assert_eq!(
+      seen(&mut self.copy),
+      seen(&mut self.owner),
+      "the copy differs"
+    );
     Ok(())
   }
 }
@@ -465,7 +484,10 @@ fn same_accept(
   census: &mut Census,
 ) -> Result<Judged, TestCaseError> {
   census.accepted += 1;
-  same_answer((computed.at(), computed.applied()), (held.at(), Some(held.applied())))?;
+  same_answer(
+    (computed.at(), computed.applied()),
+    (held.at(), Some(held.applied())),
+  )?;
   Ok(held)
 }
 
@@ -545,8 +567,15 @@ fn computing_changes_nothing_and_keeps_no_conflict() {
   assert_eq!((first.at(), first.applied()), (1, again.applied()));
   assert!(first.applied().is_some_and(|applied| !applied.is_empty()));
   let conflict = green.compute(&conflicting(&green)).expect("computed");
-  assert!(conflict.windows().is_some_and(|windows| !windows.is_empty()));
-  assert_eq!((seen(&mut green), green.rejected_cache()), (before, (0, 0, 0)));
+  assert!(
+    conflict
+      .windows()
+      .is_some_and(|windows| !windows.is_empty())
+  );
+  assert_eq!(
+    (seen(&mut green), green.rejected_cache()),
+    (before, (0, 0, 0))
+  );
 }
 
 /// A-658 (the owner keeps what it answers). Do: judge, as the owner, the conflicting work of
@@ -580,7 +609,10 @@ fn a_copy_behind_the_works_base_refuses_it_typed() {
   let (owner, copy) = owner_and_copy();
   let ahead = work(&owner, 2, &[Edit::Write(2, b"three".to_vec())], 3);
   let refused = ComputeRefused::BaseAhead { base: 2, head: 1 };
-  assert_eq!(copy.compute(&ahead).map(|computed| computed.at()), Err(refused));
+  assert_eq!(
+    copy.compute(&ahead).map(|computed| computed.at()),
+    Err(refused)
+  );
   assert_eq!(copy.rebase(&ahead), Rebased::BaseAhead { base: 2, head: 1 });
 }
 
@@ -593,7 +625,10 @@ fn a_green_restored_past_the_works_base_refuses_it_typed() {
   let restored = Green::restore(origin(), &checkpoint);
   let behind = work(&owner, 1, &[Edit::Write(2, b"four".to_vec())], 4);
   let unavailable = ComputeRefused::BaseUnavailable { base: 1, floor: 2 };
-  assert_eq!(restored.compute(&behind).map(|computed| computed.at()), Err(unavailable));
+  assert_eq!(
+    restored.compute(&behind).map(|computed| computed.at()),
+    Err(unavailable)
+  );
 }
 
 /// A-658 (the owner refuses a base it never made). Do: judge, submit and rebase, on the owner at version 1, a work
@@ -609,7 +644,13 @@ fn the_owner_answers_a_base_past_its_head_unknown() {
   };
   let unknown = |judgment: Judgment| matches!(judgment, Judgment::BaseUnavailable { base: 5, .. });
   assert!(unknown(green.judge(&ahead)), "judged a base past the head");
-  assert!(matches!(green.submit(&ahead), Outcome::BaseUnavailable { base: 5, .. }));
-  assert_eq!(green.rebase(&ahead), Rebased::BaseAhead { base: 5, head: 1 });
+  assert!(matches!(
+    green.submit(&ahead),
+    Outcome::BaseUnavailable { base: 5, .. }
+  ));
+  assert_eq!(
+    green.rebase(&ahead),
+    Rebased::BaseAhead { base: 5, head: 1 }
+  );
   assert_eq!(seen(&mut green), before);
 }

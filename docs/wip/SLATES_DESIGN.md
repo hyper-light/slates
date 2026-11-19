@@ -46358,7 +46358,23 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   `Judgment::BaseUnavailable`, the service's `UnknownBase`), and the rebase `Rebased::BaseAhead` (`UnknownBase` at the
   server's `map_rebase`). The server never sent such a work, since a work's base is a version its green made, so no
   answer on the wire changes.
-- **Tests** (`crates/merge/src/engine/compute_tests.rs`). EVIDENCE PENDING (the Studio was offline).
+- **Tests** (`crates/merge/src/engine/compute_tests.rs`). Run on Windows x86_64, jupiter (kiln, 2026-11-19, debug, a
+  fresh clone of the pushed branch, its own target directory, `CARGO_BUILD_JOBS=4`): the Mac Studio was offline, so the
+  macOS run is owed to main's lanes.
+  - The oracle: generated histories of works (files written whole, overwritten, inserted into, removed and renamed;
+    modes, attributes and the root's head set; a directory made or removed; a hard link made), based at the head or up
+    to three versions behind, some sent again. Before every verdict a copy rebuilt from the owner's chain entries alone
+    computes the owner's judgment (the head, what the chain records, the windows, a version accepted before) and the
+    owner's rebase; computing leaves the copy as it was; after every commit both read the same state. Its census
+    requires accepts, works sent again, conflicts, works behind the head and rebases of them.
+  - Beside it: computing applies nothing and keeps no conflict, the same result twice; the owner keeps in its cache the
+    conflict it answers; a copy behind the work's base refuses `BaseAhead`, and its rebase answers so; a green restored
+    past the base refuses `BaseUnavailable`; the owner answers a base past its head unknown, and its rebase `BaseAhead`.
+  - Red first at 508eabb64, with `Green::compute` a stub that refused everything and the old judge and rebase:
+    `cargo test --locked -p slates-merge --lib compute_tests` failed 6 of 6, each for its own reason.
+  - Green on the tree merged with main (0ef8e9741): `cargo test --locked -p slates-merge --lib` 147 of 147 in 78 s
+    (main's Windows baseline at 018d32ba2: 141 of 141); rustfmt's layout applied from jupiter's `cargo fmt`. SERVER RUN
+    PENDING.
 - **Owed.** Part 2, the owner's commit by position (`Green::judge_computed`): the owner's caches and floor, the
   position check, and when the green moved, judging again only what the change index names in the versions since the
   position, held equal to the serial verdict by an oracle over generated concurrent histories. Then the fleet's route:

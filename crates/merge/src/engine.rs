@@ -4337,7 +4337,9 @@ impl Green {
   /// A verdict this green computed at its head, held by its owner: a conflict kept in the rejected-result cache, as a
   /// submit keeps one.
   fn held(&mut self, computed: Computed) -> Judgment {
-    let Computed { id, at, reached, .. } = computed;
+    let Computed {
+      id, at, reached, ..
+    } = computed;
     match reached {
       Reached::Before(version) => Judgment::AcceptedBefore { version },
       Reached::Accepted { effects, applied } => Judgment::Accepted(Judged {
@@ -5152,9 +5154,9 @@ mod reanchor;
 pub use reanchor::{ReanchorRefused, Reanchored};
 
 #[cfg(test)]
-mod judge_tests;
-#[cfg(test)]
 mod compute_tests;
+#[cfg(test)]
+mod judge_tests;
 #[cfg(test)]
 mod node_exclusive_tests;
 
