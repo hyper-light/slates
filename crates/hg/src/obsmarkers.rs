@@ -417,9 +417,9 @@ fn read_v1<'a>(cursor: &mut Cursor<'a>) -> Result<Marker<'a>, Refusal> {
 
 /// The sum of format 1's metadata sizes: the length of the keys and values they describe.
 fn sum_of(sizes: &[u8]) -> usize {
-  sizes
-    .iter()
-    .fold(0, |total: usize, size| total.saturating_add(usize::from(*size)))
+  sizes.iter().fold(0, |total: usize, size| {
+    total.saturating_add(usize::from(*size))
+  })
 }
 
 /// The length of a payload of `markers` in `format`, for a caller that charges it before encoding; refused as
@@ -533,8 +533,7 @@ fn check_v1(marker: &Marker<'_>) -> Result<(), &'static str> {
   )?;
   check_v1_parents(marker)?;
   require(
-    sizes.len().is_multiple_of(SIZE_PAIR_LEN)
-      && u8::try_from(sizes.len() / SIZE_PAIR_LEN).is_ok(),
+    sizes.len().is_multiple_of(SIZE_PAIR_LEN) && u8::try_from(sizes.len() / SIZE_PAIR_LEN).is_ok(),
     "metadata sizes are byte pairs, at most 255",
   )?;
   require(
@@ -552,10 +551,7 @@ fn check_v1_parents(marker: &Marker<'_>) -> Result<(), &'static str> {
   let Some(parents) = marker.parent_nodes() else {
     return Ok(());
   };
-  require(
-    parents.remainder().is_empty(),
-    "parents are whole nodes",
-  )?;
+  require(parents.remainder().is_empty(), "parents are whole nodes")?;
   require(
     parents.len() <= usize::from(MAX_PARENTS),
     "a marker records at most two parents",
@@ -733,8 +729,17 @@ mod tests {
     assert!(out.is_empty());
     let whole = [marker(b"date:0 0\0\0user:test")];
     encode(Format::V0, &whole, &mut out).unwrap();
-    assert_eq!(encoded_len(Format::V0, &whole), Ok(u64::try_from(out.len()).unwrap()));
-    let read: Vec<_> = decode(&out).unwrap().iter().next().unwrap().entries().collect();
+    assert_eq!(
+      encoded_len(Format::V0, &whole),
+      Ok(u64::try_from(out.len()).unwrap())
+    );
+    let read: Vec<_> = decode(&out)
+      .unwrap()
+      .iter()
+      .next()
+      .unwrap()
+      .entries()
+      .collect();
     let expected: [(&[u8], &[u8]); 2] = [(b"date", b"0 0"), (b"user", b"test")];
     assert_eq!(read, expected);
   }

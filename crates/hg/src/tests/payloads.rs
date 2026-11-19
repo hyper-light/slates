@@ -264,7 +264,8 @@ fn the_modern_push_names_what_the_client_saw_and_what_it_moves() {
 /// client amended, the amended draft as its successor, and 7.2's metadata, the payload encoded back to its bytes.
 #[test]
 fn the_modern_push_carries_the_amends_marker() {
-  let (_, markers) = markers_round_trip(&payload_of(payloads::PUSH_MODERN, b"obsmarkers"));
+  let payload = payload_of(payloads::PUSH_MODERN, b"obsmarkers");
+  let (_, markers) = markers_round_trip(&payload);
   let [marker] = markers.as_slice() else {
     panic!("one marker")
   };

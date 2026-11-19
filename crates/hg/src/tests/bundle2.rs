@@ -440,10 +440,7 @@ fn bytes_after_the_end_are_refused() {
 }
 
 /// The encoding of a stream of `parts` and `events`, or its refusal.
-fn try_encode(
-  parts: Vec<Part<'static>>,
-  events: Vec<Event<'static>>,
-) -> Result<(), EncodeRefusal> {
+fn try_encode(parts: Vec<Part<'static>>, events: Vec<Event<'static>>) -> Result<(), EncodeRefusal> {
   Bundle2 {
     params: Vec::new(),
     parts,

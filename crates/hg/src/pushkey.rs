@@ -213,10 +213,7 @@ impl Decimal {
 
 impl core::fmt::Write for Decimal {
   fn write_str(&mut self, text: &str) -> core::fmt::Result {
-    let end = self
-      .len
-      .checked_add(text.len())
-      .ok_or(core::fmt::Error)?;
+    let end = self.len.checked_add(text.len()).ok_or(core::fmt::Error)?;
     let room = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
     for (slot, byte) in room.iter_mut().zip(text.as_bytes()) {
       *slot = *byte;
