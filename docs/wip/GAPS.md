@@ -1238,6 +1238,14 @@
 > (`Sources::now`), where it had asked the caller's `Guards::lock_token`; `Guards` removed. Red then green (macOS
 > arm64, Mac Studio, 130 of 130). Owed: the commit drive's second compile of `Policy::authz`; the Windows run and
 > red-checks (main's).
+> Its instant tested, 2026-11-19: a lock with an expiry binds at its expiry and lapses a microsecond past it (`lock.c`
+> `lock_expired`, strictly past). An update through the connection from a working copy holding the lock's token
+> writes, byte for byte, a never-expiring lock's update at the expiry (the token kept) and an empty table's past it
+> (the token taken away) (`an_update_keeps_a_lock_until_it_expires_and_takes_its_token_away_after`); alice's commit
+> naming bob's lock is refused `E160039` at `apply-textdelta` at the expiry and taken past it
+> (`a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after`). Both passed at once, no drive change (macOS
+> arm64, Mac Studio, over main `3612d1ef9`: `cargo test --locked -p slates-svn --lib -- commit:: serve:: lock::
+> report::` 132 of 132, fmt clean). Owed: the Windows run and red-checks (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
