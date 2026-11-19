@@ -23,9 +23,10 @@
 > the verbs that create repositories and their greens (a repository's greens in one lineage on their owner shard, a
 > branch made through the register with shared piece 2 and replayed by holders from the same record, a branch
 > recovered over its source at its version rather than over an origin); the record's replication in a fleet (with
-> piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (g292, A-542's second half) grafts
-> on these maps and needs a per-prefix appearance record under the one history rule. The integration suites, clippy
-> and `xtask` over the change are main's (run requests).
+> piece 2); a retire's release sliced under the shard's budget. Subversion's `Copy` (A-542's second half) grafts on
+> these maps, recorded by a per-prefix appearance record under the one history rule: built as A-586 (g295,
+> 2026-11-19; its owed items in the §4.17.4 entry). The integration suites, clippy and `xtask` over the change are main's
+> (run requests).
 > **A-582 (2026-11-19, g251b; part 1):** git's piece 1 is built: `crates/git` (`slates-git`), pkt-lines (data, flush,
 > delimiter, response end; a reader that waits for a packet's last byte; a whole stream's decode charged to an
 > `Admission` first) and side-band-64k (bands 1 to 3, `sideband-all`), pure codecs with every length checked against
@@ -220,7 +221,8 @@
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads
 > (A-545) and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3's objects and nodes
-> built (A-588) (2026-11-19; UI goals 91 and 92; owners g291, and g079 for A-598).** Built on §4.17.1: a named branch's
+> built (A-588) and its revlog reader (A-611) (2026-11-19; UI goals 91 to 93; owners g291, and g079 for A-598).** Built
+> on §4.17.1: a named branch's
 > heads are lines, each a green; bookmarks are greens; phases only move toward public, and a public changeset is never
 > dropped or rewritten; markers are kept and exchanged; topics are review requests; a stock push is judged whole-file
 > and answered with Mercurial's own race abort, and rebase on push is a line's policy for clients with pushback and
@@ -264,11 +266,17 @@
 > first against stubbed engines (14 of its 16 tests failed), against the five compressed bundles stock `hg` 7.2 wrote
 > (`crates/hg/fixtures/compressed/make-compressed-fixtures.sh`, `SHA256SUMS`), each made plain to exactly the bundle
 > 7.2 wrote uncompressed, and 7.2's server's zstd answer to a `getbundle`; every cut, a bit flipped at every place,
-> unknown engines and bytes after a stream refused by kind. Owed, in order, after §4.17.1's seven pieces: (3, rest) the
-> index's tables, then import of a repository directory, its zlib and zstd revlog chunks inflated by A-607's engines
-> (flate2 over zlib-rs, and zstd), its tests holding inflated bytes; (4) read serving, the `0.2` answers compressed by
-> A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the shard's step
-> budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
+> unknown engines and bytes after a stream refused by kind. **Built (A-611):** the import's revlog reader: version 1
+> inline and split, version 2 and the changelog's version 2 behind their dockets, chunks raw, zlib (flate2 over zlib-rs)
+> and zstd with every byte charged to the admission and every stream ending exactly at its chunk's end, chains rebuilt
+> through slates-hg's applier, every text's length and node checked; proven by `cargo test -p slates-hg --lib`, 182 of
+> 182 on the Mac Studio (2026-11-19, merged with A-598), against 158 files stock `hg` 7.2 stored in five repositories
+> (zstd, zlib, split, version 2, the changelog's version 2), sparse-revlog's intermediate snapshots among their chains
+> (`crates/hg/fixtures/revlogs/make-revlog-fixtures.sh`). Owed, in order, after §4.17.1's seven pieces: (3, rest) the
+> index's tables on A-581's `slates-vcs`, then the import's walk of a store (the fncache, the path encodings, a version
+> 2 store's file index) and censored, ellipsis and externally stored revisions; (4) read serving, the `0.2` answers
+> compressed by A-598's engines at the learned level; (5) pushes, a compressed bundle inflated in slices within the
+> shard's step budget (A-598's inflater runs a stream whole in one call, bounded by the admission); (6) the
 > changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view
 > (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles
 > and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
@@ -379,8 +387,16 @@
 > (2026-11-19): node-exclusive operations in the merge engine, built. A-542's second half, part 1 (2026-11-19): Copy's
 > maps, every map of a green's state copying a path's tree by reference on A-534's radix tree, O(the paths' lengths), no
 > walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, see A-542).
-> Owed, in order: the engine's `Copy` operation (part 2: an appearance record, change-index and `last_changed` entries
-> by prefix; the identity hash, hard links and the root's copy to settle, see A-542); the administration verbs
+> A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its destination (an appearance
+> record, one change-index and one `last_changed` entry), read by the latest copy above a key, the identity one entry a
+> copy, hard links refused by kind, the root a source and never a destination, a branch made before a copy cutting it,
+> a review comment on a copied file moving with it (A-596); held to a reference green that copies key by key (`cargo
+> test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from A-586: a checkpoint of a green
+> holding a copy (its tree listed, the identity's sum carried; `None` today, the chain kept whole), a rebase restating
+> a copy (the deriver's `VolumeOp::Copy`), a copy from a version its source changed after (refused today), Subversion's
+> replace with history, moves and second copies into a copied tree in one increment, the server's change-index
+> consumers treating a copy's destination as its tree, and a Merkle identity over the radix trees (weighed in A-586).
+> Owed, in order: the administration verbs
 > (`svnadmin`, the dump round trip); the ra_svn server's commands (its greeting and authentication built, A-599), with
 > the lock verbs; hooks and `svnlook`; the `svn+ssh` tunnel; HTTPv2 and DeltaV; review. Main's: the Python suite over
 > `svn://` and `http://`, the differential run against `svnserve`, and the measurements of §4.17.4 item 13. No speed is
