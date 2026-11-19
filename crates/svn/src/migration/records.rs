@@ -1,19 +1,34 @@
-//! A repository's records as the migration verbs read and write them (A-628): the Subversion index (A-553), each
-//! revision's properties, every text and property list held once by its content identity, and the repository's UUID,
-//! within a room its caller gives. A revision is made by a [`Transaction`], which applies one action at a time as FSFS
-//! applies the calls `load-fs-vtable.c` makes and records the changed paths FSFS would (`transaction.c` `fold_change`),
-//! then commits them to the index as one revision.
+//! A repository's records (A-628): the Subversion index (A-553), each revision's properties, every text and property
+//! list held once by its content identity, the lock table (A-602) and the repository's UUID, within a room its caller
+//! gives. A dump's revision is made by a [`Transaction`], which applies one action at a time as FSFS applies the calls
+//! `load-fs-vtable.c` makes and records the changed paths FSFS would (`transaction.c` `fold_change`).
+//!
+//! **The commit step** (A-655), one for a client's commit and an import's revision alike: [`Repository::check`]
+//! judges a [`RevisionToCommit`] against the records and changes nothing, so its owner checks a revision before its log
+//! records it; [`Repository::apply`] commits what was checked, so the owner applies it after, and a recovery that
+//! checks and applies the logged revision again reaches the same records ([`Repository::commit`] is the two at once).
+//! Checked, in order: the revision's head is the youngest ("Transaction out of date" otherwise, as FSFS's
+//! `commit_body` answers a transaction whose base moved, `transaction.c` 3784-3786; the owner's step judges a moved work
+//! again by position before it comes here, as `svn_fs_fs__commit_txn` merges again); its lock entries apply; every
+//! text and property list its rows name is held by the records or brought by the revision; its properties and new
+//! contents fit the room; the index takes its rows ([`Index::plan`]). A refused revision changes nothing.
+//!
+//! A repository is also the drive's [`Green`] (A-617): it reads the texts and property lists it holds and names new
+//! ones as it keeps them, so a client's drive and its commit run over one set of records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::MigrationRefusal;
 use super::paths::{ROOT, ancestors_deepest_first, beneath};
-use super::properties::{decode, encode, mergeinfo};
+use super::properties::{decode, encode, entries, mergeinfo};
+use crate::commit::drive::Green;
+use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::dump::{Md5, Sha1, Uuid};
 use crate::index::{
-  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, Revision,
-  RevisionRecord, Text,
+  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, Planned, PropertyList,
+  Revision, RevisionRecord, Text,
 };
+use crate::lock::{LockEntry, LockTable};
 
 /// A node's or a revision's properties: names to values, sorted by name, every byte kept.
 pub type Properties = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -52,6 +67,8 @@ pub struct Repository {
   revision_properties: Vec<Properties>,
   /// Every text and property list a node-revision names, by content identity.
   contents: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The locks (A-602).
+  locks: LockTable,
   /// The transactions begun, which numbers the next one (FSFS's `txn-current`).
   transactions: u64,
   /// The room the records are held within.
@@ -75,10 +92,16 @@ impl Repository {
       index: Index::new(),
       revision_properties: vec![properties],
       contents: BTreeMap::new(),
+      locks: LockTable::new(),
       transactions: 0,
       room,
       held,
     })
+  }
+
+  /// The lock table.
+  pub fn locks(&self) -> &LockTable {
+    &self.locks
   }
 
   /// The repository's UUID.
@@ -178,38 +201,226 @@ impl Repository {
     })
   }
 
-  /// Commits `transaction` as the next revision with `properties` as its revision properties: its changed paths
-  /// appended to the index and the contents they name kept, or nothing changed when it is refused.
-  pub(super) fn commit(
-    &mut self,
+  /// The revision `transaction` makes with `properties` as its revision properties, exactly the stream's: the changed
+  /// paths FSFS records for it and the contents they name that the repository does not hold, made on the youngest
+  /// revision, with no lock entries; what the import commits through the step.
+  pub(super) fn revision_of(
+    &self,
     mut transaction: Transaction,
     properties: Properties,
-  ) -> Result<Revision, MigrationRefusal> {
+  ) -> Result<RevisionToCommit, MigrationRefusal> {
     let changes = transaction.rows(self)?;
     let fresh = transaction.take_fresh_contents(self, &changes)?;
-    let added = fresh
-      .iter()
-      .try_fold(properties_bytes(&properties)?, |total, (_, bytes)| {
-        total.checked_add(u64::try_from(bytes.len()).ok()?)
-      })
-      .ok_or(MigrationRefusal::Corrupt)?;
-    let held = self
-      .held
-      .checked_add(added)
-      .ok_or(MigrationRefusal::Corrupt)?;
-    check_room(held, self.room)?;
-    let record = RevisionRecord {
-      transaction: transaction.name,
-      changes,
-    };
-    let revision = self
-      .index
-      .append(record, self.room.entries)
-      .map_err(MigrationRefusal::Index)?;
+    Ok(RevisionToCommit {
+      head: transaction.base,
+      record: RevisionRecord {
+        transaction: transaction.name,
+        changes,
+      },
+      properties,
+      contents: fresh.into_iter().collect(),
+      lock_entries: Vec::new(),
+    })
+  }
+
+  /// The commit step's check (the module documentation): `revision` judged against the records, nothing changed. The
+  /// answer is what [`Repository::apply`] commits.
+  ///
+  /// # Errors
+  /// [`StepRefusal::OutOfDate`] when the youngest revision is not the revision's head; [`StepRefusal::Lock`] for a lock
+  /// entry the table does not take; [`StepRefusal::Corrupt`] for a text or property list the rows name that neither the
+  /// records nor the revision hold; [`StepRefusal::Room`] past the room's bytes; the index's refusal of the rows, its
+  /// room's among them.
+  pub fn check(&self, revision: RevisionToCommit) -> Result<Checked, StepRefusal> {
+    let youngest = self.youngest();
+    if revision.head != youngest {
+      return Err(StepRefusal::OutOfDate {
+        head: revision.head,
+        youngest,
+      });
+    }
+    self
+      .locks
+      .check_entries(&revision.lock_entries)
+      .map_err(StepRefusal::Lock)?;
+    let fresh = self.fresh(&revision.record.changes, revision.contents)?;
+    self.grown(&revision.properties, &fresh)?;
+    let planned = self.index.plan(revision.record, self.room.entries)?;
+    Ok(Checked {
+      planned,
+      properties: revision.properties,
+      fresh,
+      lock_entries: revision.lock_entries,
+    })
+  }
+
+  /// The commit step's apply: commits what [`Repository::check`] checked as the next revision, its rows appended to
+  /// the index, its new contents and its properties kept and its lock entries applied, and answers its number.
+  ///
+  /// # Errors
+  /// [`StepRefusal::OutOfDate`] when a revision was committed since the check, and every refusal of the check's that a
+  /// change since could bring (a lock entry, the room); refused, nothing changes.
+  pub fn apply(&mut self, checked: Checked) -> Result<Revision, StepRefusal> {
+    let Checked {
+      planned,
+      properties,
+      fresh,
+      lock_entries,
+    } = checked;
+    let youngest = self.youngest();
+    if planned.revision() != youngest.checked_add(1).ok_or(StepRefusal::Corrupt)? {
+      return Err(StepRefusal::OutOfDate {
+        head: planned.revision().saturating_sub(1),
+        youngest,
+      });
+    }
+    self
+      .locks
+      .check_entries(&lock_entries)
+      .map_err(StepRefusal::Lock)?;
+    let held = self.grown(&properties, &fresh)?;
+    // Checked just above against these very records, so neither refuses; a refusal would still be answered, typed.
+    let revision = self.index.commit_planned(planned)?;
+    self
+      .locks
+      .apply_all(&lock_entries)
+      .map_err(StepRefusal::Lock)?;
     self.contents.extend(fresh);
     self.revision_properties.push(properties);
     self.held = held;
     Ok(revision)
+  }
+
+  /// The commit step whole: [`Repository::check`], then [`Repository::apply`].
+  ///
+  /// # Errors
+  /// Each refusal of [`Repository::check`]'s; refused, nothing changes.
+  pub fn commit(&mut self, revision: RevisionToCommit) -> Result<Revision, StepRefusal> {
+    let checked = self.check(revision)?;
+    self.apply(checked)
+  }
+
+  /// Applies the entries a lock verb's guard decided (A-602), all of them or none.
+  ///
+  /// # Errors
+  /// The lock table's refusal of an entry it does not take; refused, nothing changes.
+  pub fn apply_lock_entries(&mut self, entries: &[LockEntry]) -> Result<(), StepRefusal> {
+    self.locks.apply_all(entries).map_err(StepRefusal::Lock)
+  }
+
+  /// The texts and property lists `changes` name that the records do not hold, taken from `brought`; refused when one
+  /// is held by neither.
+  fn fresh(
+    &self,
+    changes: &[ChangedPath],
+    mut brought: BTreeMap<ContentIdentity, Vec<u8>>,
+  ) -> Result<BTreeMap<ContentIdentity, Vec<u8>>, StepRefusal> {
+    let mut fresh = BTreeMap::new();
+    for identity in named(changes) {
+      if self.contents.contains_key(&identity) {
+        continue;
+      }
+      let bytes = brought.remove(&identity).ok_or(StepRefusal::Corrupt)?;
+      fresh.insert(identity, bytes);
+    }
+    Ok(fresh)
+  }
+
+  /// The bytes the records would hold with `properties` and `fresh` added, refused past the room.
+  fn grown(
+    &self,
+    properties: &Properties,
+    fresh: &BTreeMap<ContentIdentity, Vec<u8>>,
+  ) -> Result<u64, StepRefusal> {
+    let added = fresh
+      .values()
+      .try_fold(
+        properties_bytes(properties).map_err(|_| StepRefusal::Corrupt)?,
+        |total, bytes| total.checked_add(u64::try_from(bytes.len()).ok()?),
+      )
+      .ok_or(StepRefusal::Corrupt)?;
+    let held = self.held.checked_add(added).ok_or(StepRefusal::Corrupt)?;
+    if held > self.room.bytes {
+      return Err(StepRefusal::Room {
+        needed: held,
+        room: self.room.bytes,
+      });
+    }
+    Ok(held)
+  }
+}
+
+/// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]
+/// commits, so long as the repository did not change since.
+#[derive(Debug)]
+pub struct Checked {
+  /// The index's plan of its rows.
+  planned: Planned,
+  /// Its revision properties.
+  properties: Properties,
+  /// The texts and property lists its rows name that the repository does not hold.
+  fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// Its lock entries.
+  lock_entries: Vec<LockEntry>,
+}
+
+impl Checked {
+  /// The revision it commits as.
+  pub fn revision(&self) -> Revision {
+    self.planned.revision()
+  }
+
+  /// Its changed-path rows, sorted by path.
+  pub fn changes(&self) -> &[ChangedPath] {
+    self.planned.changes()
+  }
+
+  /// Its revision properties.
+  pub fn properties(&self) -> &Properties {
+    &self.properties
+  }
+
+  /// The texts and property lists its rows name that the repository does not hold, by content identity.
+  pub fn fresh(&self) -> &BTreeMap<ContentIdentity, Vec<u8>> {
+    &self.fresh
+  }
+
+  /// Its lock entries.
+  pub fn lock_entries(&self) -> &[LockEntry] {
+    &self.lock_entries
+  }
+}
+
+/// Every text and property list `changes` name, by content identity, each once.
+fn named(changes: &[ChangedPath]) -> BTreeSet<ContentIdentity> {
+  let mut named = BTreeSet::new();
+  for change in changes {
+    if let Some(text) = change.text {
+      named.insert(text.identity);
+    }
+    if let Some(PropertyList::Held { identity, .. }) = change.properties {
+      named.insert(identity);
+    }
+  }
+  named
+}
+
+impl Green for Repository {
+  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
+    self.content(identity)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.content(identity).and_then(entries)
+  }
+
+  fn name_text(&self, text: &[u8]) -> ContentIdentity {
+    *blake3::hash(text).as_bytes()
+  }
+
+  fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
+    let list: Properties = properties.iter().cloned().collect();
+    *blake3::hash(&encode(&list)).as_bytes()
   }
 }
 
@@ -568,17 +779,8 @@ impl Transaction {
     repository: &Repository,
     changes: &[ChangedPath],
   ) -> Result<Vec<(ContentIdentity, Vec<u8>)>, MigrationRefusal> {
-    let mut named = BTreeSet::new();
-    for change in changes {
-      if let Some(text) = change.text {
-        named.insert(text.identity);
-      }
-      if let Some(PropertyList::Held { identity, .. }) = change.properties {
-        named.insert(identity);
-      }
-    }
     let mut fresh = Vec::new();
-    for identity in named {
+    for identity in named(changes) {
       if repository.content(&identity).is_none() {
         let bytes = self
           .pending
