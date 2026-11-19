@@ -15217,6 +15217,15 @@ per-iteration budget (§4.3), and the replicas that serve them are A-273's and A
   over one dump, the clients' working copies then compared whole (bytes, `svn status`, `svn info -R`,
   `svn proplist -R -v`) and both repositories' `svnadmin dump` compared.
 
+> **Status (2026-11-19, item 14's first scripted sessions; g307).** Built: `crates/cli/tests/svn_interop.rs`, stock
+> `svn` 1.15 against a real anchor over each route (`--vcs-svn`, `--vcs-http`, `--vcs-ssh`): a round trip (checkout,
+> commit, a second checkout, commit, update, log) and a lock session (lock, another copy's commit refused with the
+> head unchanged, unlock, commit), each held first to stock `svnserve -t` 1.15.0 over scratch FSFS repositories (the
+> control, run wherever the tools are present: passing on the Mac Studio, 2026-11-19). The slates legs are ignored
+> until the pieces each waits on land (GAPS, §4.17.4's entry); the `svn://` and `svn+ssh://` legs lock nothing until
+> ra_svn's lock verbs are served. Owed: the session over one dump with the working copies and both repositories'
+> `svnadmin dump` compared whole, and Subversion's own suite.
+
 *Failure matrix* (beyond §4.17.1's). A client gone during a drive: the work is released and nothing commits (over HTTP,
 at its idle bound). The owner lost after `close-edit`: the submit retries by the increment's identity (§4.16); a client
 that heard nothing finds its revision by `svn update`, which brings its own edits back as the incoming change. A text or

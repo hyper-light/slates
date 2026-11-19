@@ -1374,6 +1374,22 @@
 > (`a_commit_naming_a_lock_meets_it_until_it_expires_and_not_after`). Both passed at once, no drive change (macOS
 > arm64, Mac Studio, over main `3612d1ef9`: `cargo test --locked -p slates-svn --lib -- commit:: serve:: lock::
 > report::` 132 of 132, fmt clean). Owed: the Windows run and red-checks (main's).
+> Stock svn's interop tests (2026-11-19, g307, main's piece for UI goal 93; item 14's first scripted sessions):
+> `crates/cli/tests/svn_interop.rs` runs a round trip (a fresh repository checked out, a file committed, a second
+> checkout, an edit committed from it, the first copy updated, the log read with `--xml --verbose`) and a lock session
+> (a lock, another copy's commit refused with the head unchanged, an unlock, that commit again) as stock `svn` 1.15,
+> skipping loudly without it. The control runs both against stock `svnserve -t` 1.15.0 through `svn`'s own tunnel over
+> scratch FSFS repositories, so every step's expectation is Subversion's own: macOS arm64 (Mac Studio, kiln r293 over
+> main `e25799e8c`), `cargo test --locked -p slates-cli --test svn_interop` 1 passed (the control, 11.2 s) and 4
+> ignored, fmt clean. Each slates leg is ignored naming what it waits on, and run with `--ignored` each failed at its
+> first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
+> `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
+> yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
+> A-681's reads and commits (g297), A-686 (g258) and A-685, and its lock session on A-681's `LOCK` and `UNLOCK`;
+> `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
+> no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
+> differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
+> the file is Unix-only, as `tests/cli.rs` is).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`
