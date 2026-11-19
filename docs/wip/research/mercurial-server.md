@@ -460,3 +460,47 @@ server's directory are the ones its reviewed expected-failure list starts from.
 - **The captures are reproducible but for the HTTP heads.** The SSH captures depend only on the script's fixed
   configuration; the HTTP requests carry the run's port (`host`) and the answers its date (`Date`), so those heads
   differ from run to run and the tests read only their fields.
+
+## 15. Found while building piece 3's objects and nodes (A-588, 2026-11-19; 7.2's code [C] from Homebrew's 7.2 and its PyPI source distribution, and runs of stock `hg` 7.2 on the Mac Studio, `fixtures/objects`)
+
+- **7.2 hashes nodes with SHA-1 collision detection.** `utils/hashutil.py` takes `sha1 = sha1dc.sha1` whenever its C
+  extension imports and falls back to `hashlib.sha1` only when it does not; `utils/storageutil.py`'s
+  `hashrevisionsha1` hashes every node through it. Homebrew's 7.2 ships `sha1dc.cpython-314-darwin.so`, and both
+  fixture runs of the PyPI 7.2 through `uvx` printed `hashutil.sha1 is <class 'sha1dc.sha1'>`. The binding
+  (`thirdparty/sha1dc/cext.c`, read from `mercurial-7.2.tar.gz`, SHA-256 `a250227e…`) calls `SHA1DCInit` and then
+  `SHA1DCSetSafeHash(&(self->ctx), 0)`, "We don't want "safe" sha1s ... We just want to detect collisions", and its
+  `finalize` raises `OverflowError("sha1 collision attack detected")` when `SHA1DCFinal` reports one, so a revision
+  whose hashing shows a known attack ends 7.2's push. slates-hg hashes through `sha1-checked` configured the same way
+  (A-600's crate, git's configuration too). No public collision has 7.2's framing: the first forty bytes it hashes are
+  the two parents in ascending order, and SHAttered's prefix opens with a higher twenty bytes (`%PDF-1.3…`) than its
+  next twenty (` obj\n<</Width…`), so the detection is proven on the hash itself.
+- **A copy, as `filelog.renamed` reads it.** None unless the revision's first parent is null ("When creating a copy or
+  move we set filelog parents to null"), and none unless the block names both keys: "copy and copyrev occur in pairs.
+  In rare cases due to old bugs, one can occur without the other. So ensure both are present to flag as a copy"
+  (`filelog.py`). Half a pair is no copy, not an error, so a store from those old versions imports.
+- **7.2 reorders some file revisions' parents on the way in** (`revlogutils/rewrite.py` `filter_delta_issue6528`,
+  `_has_bad_parents`, on by default as `storage.revlog.issue6528.fix-incoming`): a revision with a metadata block and
+  one null parent gets the null parent first; one without a block gets it second. Mercurial 5.8 had written some the
+  other way round (issue6528). The node is unchanged, since it hashes the parents in order of value. Changegroup `04`
+  carries a separate flag for a revision with a block (`REVIDX_HASMETA`, bit 11, "used only by filelog") and swaps such
+  a revision's parents the other way in `emitrevisions`, so the rule a reader applies depends on the version it reads.
+- **An empty user corrupts a changeset text.** 7.2's writer refuses one: "An empty username or a username with a "\n"
+  will make the revision text contain two "\n\n" sequences -> corrupt repository since read cannot unpack the revision"
+  (`changelog.add`); and `readfiles` cuts a text at its first `\n\n`, which an empty user line would be, while
+  `changelogrevision` reads the files after the date line, so the two readers would disagree.
+- **The extras' escapes, run through 7.2's own `_string_unescape` (Python 3.14.7, Homebrew's 7.2).** The item
+  `k:\t\x41\101\'\q\777\\\0\\0` reads `k:` and tab, `A`, `A`, `'`, `\q` kept as it is (a `DeprecationWarning`, not an
+  error), `\777` as the byte `0xFF` (CPython keeps an octal escape's low byte), `\\` and NUL, `\\` and `0`: the `\0`
+  fix-up pairs backslashes from the left before `escape_decode` reads the rest. `decodeextra` of `branch:a\0branch:b`
+  is `{branch: b}`: a key given twice keeps the later value.
+- **7.2's C manifest reader refuses four things at parse time** (`cext/manifest.c` `find_lines`): an entry whose path
+  is empty, a text not ending in a newline, a line under 42 bytes, and paths not strictly ascending by `strcmp`; a node
+  that is not forty hexadecimal digits, or a flag other than `l`, `t` and `x`, fails only when the entry is read.
+  slates-hg refuses all of these when the text is read, and upper-case digits and the tree flag `t` too, so every text
+  it reads writes back to its bytes.
+- **`debugdata` and `debugindex`.** `hg debugdata -c|-m|FILE REV` writes a revision's raw text (`rawdata`, a file
+  revision's metadata block included): the 30 texts were byte for byte the ones the storage API's `revision()` gave.
+  `hg debugindex --debug` lists a header and seventeen columns per revision (`rev`, `rank`, `linkrev`, `nodeid`,
+  `p1-rev`, `p1-nodeid`, `p2-rev`, `p2-nodeid`, `full-size`, `delta-base`, `flags`, `comp-mode`, `data-offset`,
+  `chunk-size`, `sd-comp-mode`, `sidedata-offset`, `sd-chunk-size`); every text's length equalled its `full-size`, and
+  no revision had a flag.
