@@ -172,6 +172,34 @@ fn accept(green: &mut Green, work: &Work, id: u64) -> u64 {
   }
 }
 
+/// A-655 part 2b (`Green::beneath`: what a Subversion deletion names). Do: over `trunk`, list what stands beneath
+/// `trunk`, beneath `trunk/d`, beneath a file and beneath nothing; copy `trunk` to `branch` and list beneath `branch`.
+/// Expect: every file and directory beneath each, deepest first, the path itself left out; none beneath a file or an
+/// absent path; the copy's graft listed as the source's tree at its new place.
+#[test]
+fn t_a655_beneath_lists_a_tree_deepest_first_a_copys_graft_among_them() {
+  let mut green = trunk();
+  let tree = |at: &str| -> Vec<(String, bool)> {
+    [("d/b", false), ("d", true), ("c", false), ("a", false)]
+      .iter()
+      .map(|(path, directory)| (format!("{at}/{path}"), *directory))
+      .collect()
+  };
+  assert_eq!(green.beneath("trunk"), tree("trunk"));
+  assert_eq!(
+    green.beneath("trunk/d"),
+    vec![("trunk/d/b".to_owned(), false)]
+  );
+  assert_eq!(
+    (green.beneath("trunk/a"), green.beneath("gone")),
+    (Vec::new(), Vec::new())
+  );
+  let mut copy = Work::exclusive();
+  copy.copy("trunk", "branch", 1);
+  accept(&mut green, &copy, 2);
+  assert_eq!(green.beneath("branch"), tree("branch"));
+}
+
 /// The paths and classes of a conflict, or none for any other outcome.
 fn windows(outcome: &Outcome) -> Option<Vec<(String, MergeConflictClass)>> {
   match outcome {

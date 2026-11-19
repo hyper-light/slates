@@ -9,7 +9,7 @@ use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, IndexRefusal, NodeKind, PropertyList, RevisionRecord, Text,
 };
-use crate::lock::{AprTime, Lock, LockEntry, LockRefusal, LockToken};
+use crate::lock::{AprTime, CommitLocks, Lock, LockEntry, LockRefusal, LockToken};
 use crate::migration::properties::encode;
 use crate::migration::{Repository, Room};
 
@@ -284,4 +284,42 @@ fn a_revision_past_the_room_is_refused_whole() {
     "{refusal:?}"
   );
   assert_eq!(few.youngest(), 0);
+}
+
+/// A-655 part 2b (`transaction.c` `commit_body` 3797: `verify_locks` runs at the commit, over the table as it stands).
+/// Do: commit revision 1; bob locks the file; check alice's edit, judged when no lock stood (no entries, her commit
+/// presenting no token), through the step's check of a work; then bob's, presenting his token. Expect: alice's refused
+/// as the drive refuses a lock another holds, "User 'alice' does not own lock on path '/trunk/a.txt' (currently locked
+/// by 'bob')" (`E160039`), the repository as it was; bob's checked with the lock's release as the step's own entry, and
+/// committed as revision 2.
+#[test]
+fn t_a655_the_steps_check_of_a_work_verifies_the_locks_as_they_stand() {
+  let mut repository = created();
+  repository.commit(first()).unwrap();
+  repository
+    .apply_lock_entries(&[LockEntry::Set(bobs_lock())])
+    .unwrap();
+  let before = snapshot(&repository);
+  let alice = CommitLocks {
+    user: Some("alice".to_owned()),
+    ..CommitLocks::default()
+  };
+  let refusal = repository
+    .check_work(edit(1, b"beta\n", Vec::new()), &alice, AprTime(1))
+    .unwrap_err();
+  let words = "User 'alice' does not own lock on path '/trunk/a.txt' (currently locked by 'bob')";
+  let answered = (refusal.subversion_code(), refusal.message());
+  assert_eq!(answered, (160_039, words.to_owned()));
+  assert_eq!(snapshot(&repository), before);
+  let token = bobs_lock().token.as_str().to_owned();
+  let bob = CommitLocks {
+    user: Some("bob".to_owned()),
+    presented: BTreeMap::from([(FILE.to_owned(), token)]),
+    keep: false,
+  };
+  let checked = repository
+    .check_work(edit(1, b"beta\n", Vec::new()), &bob, AprTime(1))
+    .unwrap();
+  assert_eq!(checked.lock_entries(), release().as_slice());
+  assert_eq!(repository.apply(checked), Ok(2));
 }

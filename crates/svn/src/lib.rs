@@ -10,7 +10,8 @@
 //! out-of-date test and FSFS's merge at commit stated on that index, whether a work built on a base revision commits on
 //! the head or which conflict refuses it, its lock check the table's ([`commit`], A-592), and what a version records, one
 //! revision value a client's commit or an imported dump revision is made into and one step commits
-//! ([`commit::revision`], A-655); the HTTP side's bodies, the
+//! ([`commit::revision`], A-655), and the record its owner's log holds of it ([`commit::record`], A-655 part 2b); the
+//! HTTP side's bodies, the
 //! XML stock clients send over `http://` and `mod_dav_svn` answers, read within bounds and written byte for byte
 //! ([`dav`], A-609); authorization, the authz file read as Subversion reads it and evaluated with its precedence for
 //! each principal ([`authz`], A-606); the dump format, Subversion's portable stream of a repository's history, read as

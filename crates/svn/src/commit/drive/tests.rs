@@ -292,10 +292,16 @@ fn recorded_date(server: &[Read<'_>]) -> String {
 }
 
 /// Commits an accepted work through the commit step at the instant `svnserve` dated it, and writes `svnserve`'s
-/// answer from what the revision records: its number, its date and its author.
+/// answer from what the revision records: its number, its date and its author. Its record (A-655 part 2b) reads back
+/// as the revision whole.
 fn commit_work(replay: &mut Replay, work: Work, date: &str, out: &mut Vec<u8>) {
   let now = crate::dav::request::svn_time(date).unwrap();
   let revision = RevisionToCommit::of_work(work, now).unwrap();
+  let record = crate::commit::record::Record::Revision(revision.clone());
+  assert_eq!(
+    crate::commit::record::Record::decode(&record.encode()),
+    Ok(record)
+  );
   let dated = revision.date().unwrap().to_owned();
   let author = revision.author().map(str::to_owned);
   let number = replay.repository.commit(revision).unwrap();
@@ -1479,6 +1485,77 @@ fn a_revision_judged_at_a_moved_head_is_refused_by_the_records() {
   assert_eq!(
     (replay.repository.youngest(), changed),
     (4, vec!["/trunk/project/sub".to_owned()])
+  );
+}
+
+/// The commit locks of a drive of alice's, as [`alice_setup`] gives them.
+fn alices_locks() -> CommitLocks {
+  alice_setup("/", Vec::new()).locks
+}
+
+/// A-655 part 2b (`tree.c` `svn_fs_fs__commit_txn` 2255-2310: FSFS merges a transaction whose base moved again with the
+/// youngest and commits it). Do: over the repository after `edit`, accept a property change of `/trunk/project` and one
+/// of `/trunk/project/sub`, both judged at revision 3; commit the second; check the first through the step's check of a
+/// work (`check_work`) and apply it. Expect: the first merged again at revision 4, no conflict found (the head changed
+/// a node beneath the directory whose properties it changes, keeping its identities), committed as revision 5 on
+/// revision 4, its rows its own.
+#[test]
+fn t_a655_a_work_judged_at_a_moved_head_is_merged_again_and_lands() {
+  let mut replay = replayed_until("edit-large");
+  let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
+  let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
+  let now = AprTime(1_795_073_195_123_456);
+  let second = RevisionToCommit::of_work(second, now).unwrap();
+  assert_eq!(replay.repository.commit(second), Ok(4));
+  let first = RevisionToCommit::of_work(first, now).unwrap();
+  let rows = first.record.changes.clone();
+  let checked = replay
+    .repository
+    .check_work(first, &alices_locks(), now)
+    .unwrap();
+  assert_eq!(checked.revision(), 5);
+  assert_eq!(replay.repository.apply(checked), Ok(5));
+  let committed = replay.repository.index().changes(5).unwrap().to_vec();
+  let mut sorted = rows;
+  sorted.sort_by(|left, right| left.path.cmp(&right.path));
+  assert_eq!(committed, sorted);
+}
+
+/// A-655 part 2b (`tree.c` `merge()` 1946, rule 3, met by the merge again). Do: over the repository after `edit`, accept
+/// two property changes of `/trunk/project`, both judged at revision 3; commit the second; check the first through
+/// `check_work`. Expect: refused as the drive's verdict refuses it, "Conflict at '/trunk/project'" (`E160024`), the
+/// head having changed the directory's property list since; the repository at revision 4.
+#[test]
+fn t_a655_a_moved_work_that_conflicts_is_refused_in_the_verdicts_words() {
+  let mut replay = replayed_until("edit-large");
+  let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
+  let second = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
+  let now = AprTime(1_795_073_195_123_456);
+  let second = RevisionToCommit::of_work(second, now).unwrap();
+  assert_eq!(replay.repository.commit(second), Ok(4));
+  let first = RevisionToCommit::of_work(first, now).unwrap();
+  let refusal = replay
+    .repository
+    .check_work(first, &alices_locks(), now)
+    .unwrap_err();
+  let conflict = CommitRefusal::Conflict {
+    path: "/trunk/project".to_owned(),
+    kind: crate::commit::ConflictKind::PropertiesChanged,
+  };
+  let answered = (refusal.subversion_code(), refusal.message());
+  assert_eq!(
+    answered,
+    (160_024, "Conflict at '/trunk/project'".to_owned())
+  );
+  assert_eq!(
+    (refusal, replay.repository.youngest()),
+    (
+      StepRefusal::Verdict {
+        refusal: conflict,
+        user: Some("alice".to_owned()),
+      },
+      4
+    )
   );
 }
 
