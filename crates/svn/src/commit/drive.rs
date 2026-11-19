@@ -176,6 +176,14 @@ const SVN_ERR_BASE: u32 = 200_000;
 /// Format: the ra_svn category's start, 120,000 + 18 × 5,000 = 210,000, plus 1.
 const SVN_ERR_RA_SVN_UNKNOWN_CMD: u32 = 210_001;
 
+/// `SVN_ERR_RA_NOT_AUTHORIZED`: a commit the principal may not make.
+/// Format: the ra category's start, 120,000 + 10 × 5,000 = 170,000, plus 1 (`svn_error_codes.h`).
+const SVN_ERR_RA_NOT_AUTHORIZED: u32 = 170_001;
+
+/// `SVN_ERR_RA_NOT_AUTHORIZED`'s own words, which `svnserve` writes for the error it makes without a message
+/// (`error_create_and_log(SVN_ERR_RA_NOT_AUTHORIZED, NULL, NULL, b)`, `svn_err_best_message`).
+const NOT_AUTHORIZED: &str = "Authorization failed";
+
 /// `SVN_ERR_RA_SVN_REQUEST_SIZE`: a work past its room.
 /// Format: the ra_svn category's start plus 9 (`svn_error_codes.h` 1601-1602).
 const SVN_ERR_RA_SVN_REQUEST_SIZE: u32 = 210_009;
@@ -382,7 +390,11 @@ impl std::fmt::Debug for Begun {
 }
 
 /// The one entry point for `commit` (A-655; the svn:// connection task, A-656, calls it with the command's
-/// parameters).
+/// parameters, then hands the drive every item that follows): reads them as `serve.c` reads them (A-617 part 2a);
+/// decides the principal's access as `must_have_access` does (`serve.c` 807-850): allowed, the trivial authentication
+/// request; an anonymous session that could authenticate for write, [`Begun::Authenticate`]; else "Authorization
+/// failed"; then the lock tokens (`add_lock_tokens`), then `( success ( ) )`, the drive set up with the principal's
+/// compiled rules and the revision properties.
 ///
 /// # Errors
 /// [`ItemError`] when an answer cannot be written, which none here can give.
@@ -392,8 +404,47 @@ pub fn commit(
   start: Start,
   out: &mut Vec<u8>,
 ) -> Result<Begun, ItemError> {
-  let _ = (params, session, start, out);
-  Ok(Begun::Close)
+  let Ok(request) = CommitRequest::read(params) else {
+    return Ok(Begun::Close);
+  };
+  let sends_tokens = request
+    .rest
+    .as_ref()
+    .is_some_and(|rest| !rest.lock_tokens.is_empty());
+  if may_write(session, None, sends_tokens) {
+    if !start.authenticated_now {
+      write(&trivial_auth(), out)?;
+    }
+  } else if session.user.is_none()
+    && session.authenticated == Access::Write
+    && session.can_authenticate
+    && !start.authenticated_now
+  {
+    return Ok(Begun::Authenticate);
+  } else {
+    write_failure_words(SVN_ERR_RA_NOT_AUTHORIZED, NOT_AUTHORIZED, out)?;
+    return Ok(Begun::Answered);
+  }
+  let Some(locks) = presented_locks(&request, session, out)? else {
+    return Ok(Begun::Answered);
+  };
+  write(
+    &Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]),
+    out,
+  )?;
+  let principal = Principal::named(session.user.map(str::as_bytes));
+  let setup = Setup {
+    base_path: session.base_path.to_owned(),
+    repository_url: session.repository_url.to_owned(),
+    filesystem: session.filesystem.to_owned(),
+    transaction: start.transaction,
+    locks,
+    now: start.now,
+    room: start.room,
+    rules: session.authz.map(|(authz, name)| authz.rules(name, principal)),
+    revision_properties: revision_properties(&request, session.user),
+  };
+  Ok(Begun::Driving(Box::new(Drive::new(setup))))
 }
 
 /// Why a command was refused, each written as `svnserve` writes it ([`DriveRefusal::subversion_code`],
@@ -646,6 +697,9 @@ pub struct Work {
   pub record: RevisionRecord,
   /// The lock entries the verdict decided, the presented locks released among them.
   pub lock_entries: Vec<LockEntry>,
+  /// The revision's properties but its date: the client's, or `svn:log` alone, and `svn:author` the principal's
+  /// (`serve.c` 1526-1541).
+  pub revision_properties: Vec<(Vec<u8>, Vec<u8>)>,
   /// The texts the work made, by identity.
   pub texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists the work made, by identity, each sorted by name.
@@ -759,20 +813,14 @@ fn md5_of(bytes: &[u8]) -> Result<[u8; 16], DriveRefusal> {
   Ok(digests.finish()?.0)
 }
 
-/// Answers `commit` up to its drive (`serve.c` `commit` 1512-1555): the trivial authentication request of a session
-/// already authenticated, then the lock tokens read as `add_lock_tokens` reads them, each path joined to the session's,
-/// then `( success ( ) )`. Returns the commit's locks, or `None` when the tokens were refused, the failure written and
-/// the command over. A session that must authenticate for write first is the connection task's (A-599's handshake).
-///
-/// # Errors
-/// [`ItemError`] when an answer cannot be written, which none here can give.
-pub fn begin(
+/// The lock tokens a commit presents, read as `add_lock_tokens` reads them (`serve.c` 1360-1409): each path joined to
+/// the session's, which the principal must be named and allowed to write. Returns the commit's locks, or `None` when
+/// they were refused, the failure written and the command over.
+fn presented_locks(
   request: &CommitRequest<'_, '_>,
-  base_path: &str,
-  user: Option<&str>,
+  session: &Session<'_>,
   out: &mut Vec<u8>,
 ) -> Result<Option<CommitLocks>, ItemError> {
-  write(&trivial_auth(), out)?;
   let tokens = match request.lock_tokens() {
     Ok(tokens) => tokens,
     Err(refusal) => {
@@ -789,17 +837,38 @@ pub fn begin(
       )?;
       return Ok(None);
     };
-    presented.insert(joined(base_path, &relative(path)), token.to_owned());
+    let full = joined(session.base_path, &relative(path));
+    if !may_write(session, Some(&full), true) {
+      write_failure_words(SVN_ERR_RA_NOT_AUTHORIZED, NOT_AUTHORIZED, out)?;
+      return Ok(None);
+    }
+    presented.insert(full, token.to_owned());
   }
-  write(
-    &Value::List(vec![Value::Word(SUCCESS), Value::List(Vec::new())]),
-    out,
-  )?;
   Ok(Some(CommitLocks {
-    user: user.map(str::to_owned),
+    user: session.user.map(str::to_owned),
     presented,
     keep: request.keep_locks(),
   }))
+}
+
+/// `lookup_access` for a write (`serve.c` 760-791): the session's level from `svnserve.conf`, then the rules, at
+/// `path` or, for none, anywhere in the repository (`svn_repos_authz_check_access` with no path), then a name when
+/// one is needed.
+fn may_write(session: &Session<'_>, path: Option<&str>, needs_username: bool) -> bool {
+  let level = if session.user.is_some() {
+    session.authenticated
+  } else {
+    session.anonymous
+  };
+  let ruled = session.authz.is_none_or(|(authz, name)| {
+    let rules = authz.rules(name, Principal::named(session.user.map(str::as_bytes)));
+    let granted = match path {
+      None => rules.access_anywhere(),
+      Some(path) => RepositoryPath::new(path.as_bytes()).map_or(Access::None, |at| rules.access(at)),
+    };
+    granted == Access::Write
+  });
+  level == Access::Write && ruled && (!needs_username || session.user.is_some())
 }
 
 /// The revision properties a commit records but its date (`serve.c` 1526-1541): the client's, or its log message
@@ -1820,6 +1889,7 @@ impl Drive {
     Ok(Outcome::Accepted(Box::new(Work {
       record,
       lock_entries,
+      revision_properties: std::mem::take(&mut self.setup.revision_properties),
       texts: std::mem::take(&mut self.texts),
       property_lists: std::mem::take(&mut self.property_lists),
     })))
