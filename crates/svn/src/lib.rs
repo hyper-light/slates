@@ -18,5 +18,6 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod index;
+pub mod mergeinfo;
 pub mod ra_svn;
 pub mod svndiff;
