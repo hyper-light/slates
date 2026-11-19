@@ -174,6 +174,12 @@ mod hook_driver;
 // by their hash, on the partition each id routes to; the enroll and revoke verbs the issuer proves, and the lookup the
 // HTTP and SSH edges authenticate through. Public for the issuer's proofs, the token's text and the key line's reading.
 pub mod credentials;
+// Subversion's hooks as the server runs them (A-661): the glue between the Subversion server's call points and the hook
+// driver, Unix alone with it. No caller outside tests until the commit drive and the svn:// connection task call it
+// (A-655, A-656) and DAV's LOCK and UNLOCK (A-661's next part).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod svn_hooks;
 // The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
 // each phase's wait learned, the bounds derived from the shard's budget, git's site, a connection moved to its
 // repository's shard, and the daemon's start. Upload-pack's store lender has no caller outside tests until each

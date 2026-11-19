@@ -514,6 +514,11 @@ struct EmptyRepository {
 #[derive(Clone, Copy, Debug)]
 struct NoPacks;
 
+/// What `NoPacks` answers were a pack begun: an admission with nothing left, asked for a byte.
+fn nothing_to_pack() -> PackRefused {
+  PackRefused::PastAdmission(slates_git::PastAdmission { asked: 1, left: 0 })
+}
+
 impl PackSource for NoPacks {
   type Pack = ();
 
@@ -523,7 +528,7 @@ impl PackSource for NoPacks {
     _plan: &PackPlan<'_>,
     _admission: &mut slates_git::Admission,
   ) -> Result<(), PackRefused> {
-    Err(PackRefused::Stalled)
+    Err(nothing_to_pack())
   }
 
   fn write(
@@ -533,7 +538,7 @@ impl PackSource for NoPacks {
     _out: &mut Vec<u8>,
     _room: usize,
   ) -> Result<bool, PackRefused> {
-    Err(PackRefused::Stalled)
+    Err(nothing_to_pack())
   }
 }
 
