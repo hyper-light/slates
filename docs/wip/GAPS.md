@@ -13,26 +13,34 @@
 > green's version without a walk (maps shared by identity in the engine); the verbs that create repositories and their
 > greens; the record's replication in a fleet (with piece 2).
 
-> **§4.17.3 the Mercurial server: designed (A-499); piece 1's framings built (2026-11-19, A-514; UI goal 91; owner
-> g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks are greens; phases only move
-> toward public, and a public changeset is never dropped or rewritten; markers are kept and exchanged; topics are review
-> requests; a stock push is judged whole-file and answered with Mercurial's own race abort, and rebase on push is a
-> line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code and hg-evolve 12.0.0
-> (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2, bundle1, changegroups
-> `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input, every structure
-> counted and charged exactly to the caller's admission before it is built, no recursion; proven by `cargo test -p
-> slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden vectors stock `hg`
-> 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle` lists it, every text
-> rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed, four tests failed).
-> Owed, in order, after §4.17.1's seven pieces: (1, rest) the parts' payloads (phase-heads, bookmarks, the check parts,
-> markers, pushkey values), and compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired (D-17); (2) the SSH and
-> HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory; (4) read serving; (5)
-> pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the
-> revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog;
-> (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the
-> differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup
-> `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed
-> is claimed until main measures it.
+> **§4.17.3 the Mercurial server: designed (A-499); piece 1 built, its framings (A-514) and its part payloads (A-545)
+> (2026-11-19; UI goal 91; owner g291).** Built on §4.17.1: a named branch's heads are lines, each a green; bookmarks
+> are greens; phases only move toward public, and a public changeset is never dropped or rewritten; markers are kept and
+> exchanged; topics are review requests; a stock push is judged whole-file and answered with Mercurial's own race abort,
+> and rebase on push is a line's policy for clients with pushback and markers. From Mercurial 7.2's documents and code
+> and hg-evolve 12.0.0 (`research/mercurial-server.md`). **Built (A-514):** `crates/hg` decodes and encodes bundle2,
+> bundle1, changegroups `01` to `05` and their deltas, every length read as 7.2 reads it and checked against the input,
+> every structure counted and charged exactly to the caller's admission before it is built, no recursion; proven by
+> `cargo test -p slates-hg --lib`, 39 of 39 on the Mac Studio (2026-11-19, debug, load 18.9 to 26.4), against golden
+> vectors stock `hg` 7.2 made (`crates/hg/fixtures/make-fixtures.sh`): each bundle decodes as 7.2's own `debugbundle`
+> lists it, every text rebuilds from its deltas, each encodes back to its bytes; red-checked once (three guards removed,
+> four tests failed). **Built (A-545):** the part payloads (`phase-heads` and `check:phases`, `bookmarks` and
+> `check:bookmarks`, `check:heads` and `check:updated-heads`, markers in formats 0 and 1, pushkey requests and replies,
+> listkeys lines and namespace nodes), nothing allocated in decoding, every encoder's exact length given before it
+> writes; proven by `cargo test -p slates-hg --lib`, 80 of 80 on the Mac Studio (2026-11-19, debug, load 18.7), against
+> golden vectors stock `hg` 7.2 made twice, byte for byte alike but the replies' cut
+> (`crates/hg/fixtures/payloads/make-payload-fixtures.sh`): three pushes over SSH captured on the wire, the server's
+> replies and `listkeys phases` answers, two obsstores. Main's clippy and xtask findings in the crate are folded in (the
+> no-panic root attribute among them); clippy and xtask are main's to rerun. Measured on stock 7.2 and recorded
+> (research §13): its C and pure marker readers disagree on a marker's size and on parent counts 0 and past 3. Owed, in
+> order, after §4.17.1's seven pieces: (1, rest) compressed streams (`GZ`, `BZ`, `ZS`) once the engines are wired
+> (D-17); (2) the SSH and HTTP version 1 codecs; (3) the objects and the index, and import of a repository directory;
+> (4) read serving; (5) pushes; (6) the changesets the server makes, and rebase on push; (7) markers and topics; (8)
+> access and hooks; (9) the revlog view (stream clones, inline clone bundles, the hooks' repository); (10) narrow,
+> ellipsis and remotefilelog; (11) largefiles and lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own
+> suite through a shim, the differential run against `hg serve`, a 6.x client, then the measurements. Open: whether a
+> 6.x client's changegroup `04` is the old sidedata layout (read from the document, not from 6.x code; the older-client
+> run checks it). No speed is claimed until main measures it.
 
 > **Open (A-510, 2026-11-18): kiln saw a Slates instance serve on for two minutes after a fire-and-exit `SIGTERM`; Slates'
 > own stop does not wait on the sender.** kiln's K5 real-instance test (g267, kiln r407, the Mac Studio) sent its anchor
@@ -3440,6 +3448,28 @@
 >     the daemon's reply was written; and one kept off right after its drain's clock read still stamps the reply it
 >     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
 >     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
+>
+>     **The harness splits each latency by the producers' stamps, measures its own noise, and charges the server only
+>     for its own part (2026-11-19, g083, A-559).** Main's reading of r100: the rounds with a bad p99 were the rounds
+>     where `load_bench` itself stalled (accepted submits' p99 29.2 and 22.9 ms beside sweeps of 33.8 and 37.5 ms and
+>     unseen windows of 44.0 and 37.6 ms; 2.7 and 0.42 ms beside 11.0 and 5.1 ms). Every slot now carries its
+>     producer's stamp in the four bytes that were padding (`slates_ipc::slot`, "The stamp": the low 32 bits of the
+>     host's monotonic clock as the slot was written, the lowest bit set so zero is unstamped), so the client knows when
+>     its request landed and the daemon's reply landed, not only when the sweep took it. An attempt's harness part is
+>     the time before its request landed and after its reply did (`slates_machine::attribution::harness_part`); a
+>     latency's sums its attempts' and its client's held sends; the server part is the rest. The `floor` rows are
+>     replaced by `latency_server`, `latency_harness`, `operation_server` and `operation_harness`; an attempt with a stamp
+>     missing or out of order is the server's whole (`unsplit`). Before each level, as many threads as it has workers
+>     watch the clock for 100 ms (`slates_machine::bench::longest_gap_ns`, `destroy_rows`' probe), and the longest gap
+>     is the level's noise floor (the `noise` row). The `bound` row judges each kind by its server part
+>     (`slates_machine::attribution::judge`): `met\tharness` when every server part is under the bound and some latency
+>     is not, never charged to the server, `met\tno` when a server part is at or over it. Tests, failing first:
+>     `slates-machine`'s attribution rule (a reply a stalled sweep left in the ring is the harness's time; an unstamped
+>     or disordered exchange keeps its whole latency the server's; a quantile charged only for its server part), the
+>     slot's stamp (widened back to its landing within a wrap; zero and a pre-clock landing are none; carried through a
+>     write and a read), and the bench's own (`a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`).
+>     **Owed (main's):** the bench and the suites compiled and run (the example is no `--lib` target), and the A/B again
+>     on a quiet machine with the split rows.
 >
 >     **Where a slow request's time goes (2026-11-18, g083's trace diagnostic, never on main).** Each attempt the
 >     harness timed was joined with every span the daemon's shards held for its request (each shard's sink sized to

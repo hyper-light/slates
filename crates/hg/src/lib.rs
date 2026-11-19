@@ -5,9 +5,10 @@
 //! parameters and chunked payloads; the legacy bundle1 (`HG10`) is one changegroup. A changegroup carries the
 //! revisions of the changelog, the manifests and every file, each a delta against a base the receiver holds or
 //! receives earlier. This crate reads and writes the three framings ([`bundle2`], [`bundle1`], [`changegroup`]) and
-//! the deltas inside them ([`delta`]), byte for byte as Mercurial 7.2 writes them, and nothing more: it hashes no node
-//! (piece 3), runs no compression engine (a stream compressed with `GZ`, `BZ` or `ZS` is refused by kind until the
-//! engines are wired, D-17), and handles no part (piece 5).
+//! the deltas inside them ([`delta`]), and the part payloads a push and a pull carry ([`phases`], [`bookmarks`],
+//! [`heads`], [`obsmarkers`], [`pushkey`]; A-545), byte for byte as Mercurial 7.2 writes them, and nothing more: it
+//! hashes no node (piece 3), runs no compression engine (a stream compressed with `GZ`, `BZ` or `ZS` is refused by kind
+//! until the engines are wired, D-17), and handles no part (piece 5).
 //!
 //! **Sources** (read 2026-11-18 and 2026-11-19; `docs/wip/research/mercurial-server.md`). Mercurial 7.2's
 //! `internals.bundle2`, `internals.bundles` and `internals.changegroups` [B], and its code [C], which is what clients
@@ -32,14 +33,28 @@
 //! own `hg debugbundle` listing of each. `fixtures/make-fixtures.sh` made them, run once on the Mac Studio on
 //! 2026-11-19 with Mercurial 7.2 from PyPI through `uvx`; its header names the exact command. The tests decode each
 //! bundle, hold every revision's nodes, parents, link and delta length to 7.2's listing, rebuild every file's text
-//! from the deltas, and encode each bundle back to its own bytes.
+//! from the deltas, and encode each bundle back to its own bytes. `fixtures/payloads/` (A-545) holds what 7.2's client
+//! sent and its server answered in three pushes over SSH, captured on the wire, and two obsstores 7.2 wrote, made by
+//! `fixtures/payloads/make-payload-fixtures.sh` the same way; every part payload in them is decoded to what 7.2's
+//! listings and logs say and encoded back to its bytes.
+
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt;
+// out-of-bounds indexing and slicing are denied workspace-wide.
+// The panic rule: a print macro panics on a refused write, and this crate prints nothing.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod admission;
+pub mod bookmarks;
 pub mod bundle1;
 pub mod bundle2;
 pub mod changegroup;
 pub mod delta;
+pub mod heads;
+pub mod obsmarkers;
 mod out;
+pub mod phases;
+pub mod pushkey;
 mod read;
 
 pub use admission::{Admission, PastAdmission};
@@ -70,3 +85,7 @@ pub struct Truncated {
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 pub(crate) mod fixtures;
+
+#[cfg(test)]
+#[path = "tests/payloads.rs"]
+mod payload_tests;

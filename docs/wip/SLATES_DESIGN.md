@@ -5062,7 +5062,8 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 **Data model.**
 ```rust
-#[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
+#[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, request: u64, payload: [u8; 40],
+                                   stamp: u32 /* the producer's clock, low 32 bits, as it wrote the slot (A-559) */ }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
 struct ClientRegion { magic, version /* 3 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
                      spin_ns: u32, spin_shift: u32,
@@ -5161,7 +5162,11 @@ well-known name.
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
 after a lost reply returns the original result; deadlines are remaining budgets; cancellation is
-a slot kind.
+a slot kind. Each slot carries its producer's stamp (A-559): the low 32 bits of the host's monotonic clock as the slot
+was written, the lowest bit set so zero reads as unstamped, which whoever takes it widens back to the full reading
+(`slates_ipc::slot::landed_ns`, from any reading within 2³² ns, about 4.3 s, after it). So a client knows when its
+request landed in the command ring and when its reply landed in its own, not only when it took it, and a caller's
+latency splits into the daemon's part and its own (`slates_machine::attribution`).
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
@@ -11938,6 +11943,19 @@ signature verification).
 > golden vectors stock Mercurial 7.2 made (`crates/hg/fixtures`, the command in `make-fixtures.sh`): each bundle decodes
 > as 7.2's own `debugbundle` lists it, every text rebuilds from its deltas, each encodes back to its bytes. Still owed
 > from piece 1: the parts' own payloads (phase-heads, bookmarks, the check parts, markers, pushkey values).
+>
+> **Status (2026-11-19, A-545: piece 1's part payloads built).** `slates-hg` also decodes and encodes what a push and a
+> pull carry inside their parts: `phase-heads` and `check:phases` (24-byte entries, each phase 7.2 defines), `bookmarks`
+> and `check:bookmarks` (a node, a 16-bit name length and the name; every bit set for "no bookmark"), `check:heads` and
+> `check:updated-heads` (whole nodes), obsolescence markers in formats 0 and 1 (an `obsmarkers` payload and an obsstore
+> alike), and pushkey: a `pushkey` part's request, the `reply:pushkey` part 7.2's server writes, and the listkeys
+> encoding, a namespace's values read as nodes. Nothing is allocated in decoding; every encoder gives its exact length
+> before it writes, so its caller charges its admission first, and writes nothing on a refusal. Proven against golden
+> vectors stock 7.2 made (`crates/hg/fixtures/payloads`, the command in `make-payload-fixtures.sh`): three pushes over
+> SSH captured on the wire, the server's replies and its answers to the `listkeys phases` after each, and two
+> obsstores; each payload decodes as 7.2's listings and logs say and encodes back to its bytes. The crate root now
+> carries the no-panic attribute (`arithmetic_side_effects` denied outside tests). Still owed from piece 1: compressed
+> streams, once the D-17 engines are wired.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -12301,8 +12319,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
 1. The bundle2 and changegroup codecs, pure and cfg-free: the `HG20` stream (parameters, parts, chunked payloads,
    interrupts), changegroup `01` to `05` headers and segments, bdiff hunks applied, phase-heads, bookmarks, the check
    parts, markers in formats 0 and 1, and pushkey values; golden vectors made by stock `hg` 7.2 (`hg bundle --type
-   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, `crates/hg`): the framings,
-   bundle1 and the deltas; owed: the parts' payloads, from phase-heads to pushkey values.
+   none-v2`, `hg debugbundle`), hostile-input tests and round-trip properties. Built (A-514, A-545, `crates/hg`): the
+   framings, bundle1, the deltas and the parts' payloads; owed: compressed streams (`GZ`, `BZ`, `ZS`, D-17).
 2. The protocol codecs, pure: SSH version 1 framing (commands, arguments, dictionaries, chunked input, the error form),
    HTTP version 1 requests (query, `X-HgArg-<N>`, `X-HgArgs-Post`), the `0.1` and `0.2` media types, the capabilities
    string and the bundle2 capability blob, and `batch` escaping.
@@ -37065,6 +37083,121 @@ platform; `src/s3/host.rs`: the S3 base's errnos typed), `crates/land` (`src/os.
   suites and the xwin check (the Windows writer's rule, the deadlock and over-long codes), the anchor's cross-process
   test `a_segment_from_before_typed_host_codes_is_refused_at_start`, the land integration suites over
   `Outcome::Failed { code: Option<OsCode> }`, and clippy.
+
+### A-559 — Every slot carries its producer's stamp, so a harness splits each latency into the daemon's part and its own, measures its own noise, and charges the server only for the server's part (2026-11-19, goal 87 via g083; §4.7 "Data model", "Protocol"; A-297, A-416, A-528)
+
+Applied in the same change to: §4.7 ("Data model", the slot; "Protocol", the stamp); GAPS (the 1,000-client bound's
+entry); `crates/ipc/src/slot.rs` (`Slot::stamp`, `stamp_now`, `landed_ns`, the format), `crates/ipc/src/endpoint.rs`
+(each push stamped, `Reply::stamp`, `ClientEnd::request_stamp`), `crates/ipc/src/protocol.rs` (a bulk slot keeps its
+stamp through `owned`), `crates/client/src/client.rs` (`Client::poll_reply_stamped`, `request_stamp`; the pending
+replies keep their stamps), `crates/machine/src/attribution.rs` (new: `Exchange`, `harness_part`, `Verdict`, `judge`),
+`crates/machine/src/bench.rs` (`longest_gap_ns`), and `crates/client/examples/load_bench.rs` (the split, the `noise`
+row, the bound's verdict).
+
+- **What was measured.** Main's reading of r100's harness lines (the Mac Studio, 2026-11-19, 1,000 clients, without
+  the replicas): the rounds with a bad p99 were the rounds where `load_bench` itself stalled. Accepted submits' p99 was
+  29.2 ms beside a longest sweep of 33.8 ms and a longest window of 44.0 ms in which a reply's arrival could not be
+  placed (a 20 ms think, round 1), 22.9 ms beside 37.5 and 37.6 ms (round 3), and 2.7 and 0.42 ms beside 11.0 and
+  3.8 ms and 7.6 and 5.1 ms. The harness stamped a reply when its sweep took it, so its own stalls were in every
+  latency, and the bound charged them to the server.
+- **The stamp.** The slot's last four bytes were padding. Each producer now writes there the low 32 bits of the host's
+  monotonic clock (`slates_machine::clock::monotonic_ns`, the clock the daemon stamps its spans in) as it writes the
+  slot, with the lowest bit set, so a slot no producer stamped reads zero (`slates_ipc::slot::stamp_now`). The client
+  stamps its requests and the daemon its replies alike, one rule at the one push each end makes. Whoever takes a slot
+  widens the stamp back to the clock's full reading from any reading taken within 2³² ns (about 4.3 s) after it, to
+  within the nanosecond the set bit may add (`landed_ns`). A producer of the layout before writes zero there, which
+  reads as no stamp, so a client and a daemon of the two layouts still talk.
+- **The split.** An answered attempt's harness part is the time from its sending to its request's landing and from its
+  reply's landing to its taking (`slates_machine::attribution::harness_part`); its server part is the rest. With a stamp
+  missing or the instants out of order there is no harness part, and the whole latency is the server's. The bench sums
+  each client's attempts' harness parts and its held sends, so an operation, a cycle and a round each have theirs over
+  their own span; its rows `latency_server`, `latency_harness`, `operation_server` and `operation_harness` replace the
+  `floor` rows, which held only a lower bound on what the daemon took.
+- **The noise floor.** Before each level the bench runs as many threads as the level has workers, each watching the
+  clock for 100 ms with nothing between its reads (`slates_machine::bench::longest_gap_ns`, the probe `destroy_rows`
+  in `crates/vfs/examples/vfs_bench.rs` uses), and reports the longest gap any saw (the `noise` row, and in the
+  `harness` and `bound` rows).
+- **The verdict.** A judged kind is charged only for its server part (`slates_machine::attribution::judge`): its server
+  part's p99 at or over the bound misses it; its latency's p99 over the bound with its server part's under it is
+  harness-bound; both under, it is met. A level is `met\tyes` when every judged kind is met at the stated rate with no
+  failure, `met\tharness` when none missed and some kind was harness-bound (counted in `harness_bound`), never charged to
+  the server, and `met\tno` otherwise.
+- **Tests.** Failing first on the Mac Studio (debug, r52, 2026-11-19): `slates-machine`'s three attribution tests
+  against stub functions (`None` for every harness part, `Met` for every verdict) failed, the stalled-sweep reply read
+  as no harness part where 29.005 ms was, and a server part past the bound read as met. Green with the rule (r80):
+  `cargo test --locked -p slates-machine --lib attribution` 3 of 3 and `bench::` 4 of 4 (the noise probe's own test),
+  `-p slates-ipc --lib` 69 passed and 1 ignored (the slot's four stamp tests among them: widened back within a wrap,
+  zero and a pre-clock landing none, carried through a write and a read, a stamp taken now between the readings around
+  it), `-p slates-client --lib` 8 of 8, and `-p slates-server --lib` 485 passed and 3 ignored, every daemon in them
+  replying through stamped slots; rustfmt's layout taken. The bench is an example, compiled and run by main: its new
+  unit test is `a_level_past_the_bound_only_by_the_harnesss_part_is_harness_bound`.
+- **Owed (main's).** The example and the suites built and run, the lint matrix, and the A/B again on a quiet machine
+  reading the split rows.
+
+### A-545 — Mercurial's part payloads decoded and encoded and held to what stock Mercurial 7.2 sent and wrote: phases, bookmarks, the check parts, obsolescence markers in both formats, pushkey (2026-11-19, g291 for UI goal 91; §4.17.3 piece 1; §4.9; A-514, A-16)
+Applied in the same change to: §4.17.3 (its status and piece 1), `crates/hg` (`phases`, `bookmarks`, `heads`,
+`obsmarkers` and `pushkey`, new; the crate root's no-panic attribute; `bundle2`'s parameter sizes read as pairs; four
+tests split, a test type named, the fixtures' node parser; `fixtures/payloads/` and its `make-payload-fixtures.sh`),
+`.gitattributes` (every bundle under `crates/hg/fixtures` binary), GAPS (the §4.17.3 entry),
+`research/mercurial-server.md` (§13).
+- **What it does.** Reads and writes the payloads inside a push's and a pull's parts, byte for byte as 7.2 writes them:
+  `phase-heads` and `check:phases` (entries `>i20s`: public 0, draft 1, secret 2, archived 32, internal 96; any other
+  phase refused by kind, where 7.2 fails with a `KeyError`), `bookmarks` and `check:bookmarks` (`>20sH` and the name;
+  every bit set means "no bookmark"; an encode refuses a node equal to that marker and a name past 16 bits),
+  `check:heads` and `check:updated-heads` (whole nodes), markers in format 0 (`>BIB20s`, `key:value` metadata joined
+  by NUL) and format 1 (`>IdhHBBB`, nodes of 20 bytes or, flagged, 32, sized metadata), and pushkey: a `pushkey`
+  part's four mandatory parameters in 7.2's order, the `reply:pushkey` part 7.2's server writes (a mandatory type,
+  advisory `in-reply-to` and `return`, the numbers' text written into a fixed buffer the part borrows), the listkeys
+  encoding (`key\tvalue` lines, read as Python's `splitlines()` cuts them, each holding exactly one tab), and a
+  namespace's values as nodes. Handling the parts (whether a check holds, what a bookmark move does) is piece 5's;
+  converting markers between the formats, and the `obsolete` pushkey namespace, are piece 7's.
+- **From the sources (7.2's code [C], read 2026-11-19 in the wheel `uvx` installs; `research/mercurial-server.md` §4
+  and §13).** `phases.binarydecode` and `bookmarks.binarydecode` refuse a short last entry; `_fm0decodemeta`
+  (`obsolete.py:291`) splits each entry at its first `:`; 7.2 reads format 1 with the C reader when it is built
+  (`obsolete.py:459`) and the pure one otherwise, and the two disagree, measured on stock 7.2: a size past a marker's
+  fields is skipped by the C reader and fails the pure one, a parent count of 0 is no parent data to the C reader and
+  recorded-and-none to the pure one, a count of 4 is no parent data to the C reader and fails the pure one. A push
+  carries `phase-heads` only for heads it publishes (`_pushb2phaseheads`, `exchange.py:1046`), so a getbundle is where
+  each phase's heads travel; the client asks `listkeys phases` after every push (`_pushsyncphase`, `exchange.py:1346`);
+  the reply's parameters are advisory (`bundle2_part_handlers.py:438`); the phases namespace lists its draft roots
+  beside `publishing`.
+- **Stricter than 7.2, on purpose.** A format 1 marker whose size is not exactly its fields, so both of 7.2's readers
+  would read it alike; a parent count past 3; a format 0 marker flagged SHA-256 (7.2 reads 20-byte nodes under it, and
+  its writer refuses one); a format 0 metadata entry with no `:`, refused on decode and on encode; a listkeys line
+  without exactly one tab. A parent count of 0, which 7.2 writes, is kept as written and read as the pure reader reads
+  it.
+- **Caps, none a literal.** Decoding allocates nothing: a payload is checked whole, then read in place, so the payload
+  is the cap. Every encoder has its `encoded_len` (`listkeys_encoded_len` for listkeys), the exact length through the
+  same writer, so a caller charges its admission before it allocates; a refused encode writes nothing.
+- **Golden vectors.** `crates/hg/fixtures/payloads`, made on the Mac Studio (macOS 26.4, arm64) on 2026-11-19 by stock
+  Mercurial 7.2 from PyPI through `uvx` (CPython 3.12.16) with, from a clone of the branch, exactly:
+  `OUT=$(mktemp -d ~/.cache/g291-payload.XXXXXX) && crates/hg/fixtures/payloads/make-payload-fixtures.sh "$OUT"`.
+  Three pushes over SSH version 1 to a non-publishing server, captured by an ssh stand-in: the modern one (bookmarks,
+  the check parts, changegroup `03`, markers), the legacy one (`devel.legacy.exchange=bookmarks,phases`: pushkey
+  parts) and one to a `concurrent-push-mode = strict` server (`check:heads`); the server's replies and its answers to
+  the `listkeys phases` after each; two obsstores of the same three markers (an amend, a prune recording its parent, a
+  split with its own date and user) in formats 0 and 1; 7.2's `debugbundle --all` and `debugobsolete` of each. The
+  first run cut each reply at the end of the server's output, so the next response trailed the stream, which 7.2's
+  reader stops before and this codec refuses (3 of 78 tests failed on it); the second, cutting where the stream ends,
+  made every other file byte for byte alike, and the 24 files' SHA-256 matched after the copy.
+- **Main's gate findings in the crate folded in (adacachy and jupiter, 2026-11-19).** The crate root's
+  `#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]`, beside the print macros denied; every operation
+  outside tests was already checked or a division by a nonzero constant. `chunks_exact` with a constant size gone from
+  the crate (`as_chunks`). The two tests at cognitive complexity 11 split (bundle2's malformed streams; changegroups
+  `03` and `04`), and the new tests kept under 10 by the same count. The generated part's type named; the fixtures'
+  node parser without string slicing. Clippy and xtask are main's to rerun.
+- **Tests (Mac Studio, 2026-11-19, kiln, debug, load 18.7).** `cargo test --locked -p slates-hg --lib`: 80 of 80 in
+  1.0 s; `cargo fmt -p slates-hg -- --check` clean. Golden: the getbundle's `phase-heads` as 7.2 lists each phase's
+  heads, and its marker; the modern push's check parts, bookmark and marker; the legacy push's pushkey requests, each
+  part rebuilt equal to the one sent, and its check parts; the strict push's `check:heads`; the server's
+  `reply:pushkey` parts rebuilt equal to 7.2's, and its `reply:changegroup`; the `listkeys phases` answers; both
+  obsstores against `debugobsolete`; every payload and every captured stream encoded back to its bytes at the length
+  its `encoded_len` gave. Hostile: payloads cut inside an entry, unknown phases (`u32::MAX` among them), names longer
+  than their length says, markers misread by either 7.2 reader, every cut of both obsstores, every bit of the format 1
+  obsstore flipped, listkeys lines with no tab or two, arbitrary bytes (property tests), and a reply at the widest
+  numbers. Not red-checked (one unit-test run, CLAUDE.md §8): each hostile test asserts its refusal's kind and place.
+- **Owed.** Compressed streams (D-17); the markers' conversion between the formats and the `obsolete` namespace's
+  base85 `dump` keys, with the exchange (piece 7); the parts' handlers (piece 5).
 
 ### A-554 — Grants, the owed audit, departed hosts and held copies leave the reap loop's tick, each at its own deadline or event (2026-11-19, goal 86, g255; the event-driven reaper's piece 4; §4.7; A-265, A-266, A-222, A-197, A-475, A-522, A-536)
 
