@@ -5252,7 +5252,9 @@ drops.
 > reply deadline still paces the waits that cannot see the departure yet (the async driver's tick, the wait for a slot
 > on a full ring, a delivery's read, the macOS route's claim steps), each owed in GAPS. A park a look ends (its
 > timeout the look's, the daemon then found alive) is counted as its own kind, `ClientEnd::parks_ended_by_looks`, beside
-> the replies and the unanswered wakes, and teaches the wake estimate nothing (A-506).
+> the replies and the unanswered wakes, and teaches the wake estimate nothing (A-506). The async driver's calls keep
+> the same schedule (`slates_ipc::looks`, A-523): each asks the daemon's liveness at its looks, where until A-523 it
+> asked at every reply deadline.
 
 > **Status (2026-11-18, A-468): a client whose daemon is gone reconnects while its instance's rendezvous has a holder,
 > and fails `DaemonGone` at once when it has none.** Until A-468 a reconnect was tried for the reconnect budget (`T + W`,
@@ -35551,3 +35553,29 @@ refusals typed by platform).
   `slates-land --lib` 45 passed, the writer ignored; `slates-vfs --lib -- host::` 10 of 10; `slates-server --lib --
   landing::` 12 of 12, the server compiled on macOS with its mappings; `cargo fmt` laid the test out. Windows only,
   filed for main: the land suites and the Windows base host compiled and run there, with the xwin check and clippy.
+
+### A-523 — The rest of class C: the waits that borrowed the reply deadline wait on their peer or their own event, or on a schedule made of their own wait (2026-11-18, UI goal 86 via g251b; R3's class C; §4.7 "Failure matrix"; A-232, A-443, A-456, A-468)
+
+- **What was there.** After C-b, five waits still borrowed the client's reply deadline (`Deadlines::reply_ns`, the
+  anchor's liveness budget, a fixed second): the async driver's tick, the synchronous send's wait for a slot on a full
+  ring, a delivery's read, the macOS route's claim steps and the CLI's MCP edge.
+- **The async driver's tick.** Each call the driver owns asked the daemon's liveness once it had waited a reply
+  deadline, and again a deadline later; the binding's timer (`Driver::next_wake_ns`) named that deadline. A call whose
+  daemon died waited up to the second to learn it. Now each call keeps A-443's doubling (`slates_ipc::looks::Looks`,
+  moved out of the reply wait's private code so both keep one schedule): its first look once it has waited twice the
+  longer of its wait when a tick first judged it and the client's wake estimate, each later look at twice the time
+  waited, the timer naming the earliest. A call answered before its first look asks nothing; a departure is seen within
+  the time waited. Every place a call's clock restarts (`Call::rearm`) restarts its schedule.
+- **The driver suite under A-468.** `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` stopped its
+  last daemon while its anchor still held the rendezvous and expected `DaemonGone`; since A-468 a reconnect waits while
+  the rendezvous has a holder, so its death phase now lets the rendezvous go (`Anchor::let_go`) and holds it again for
+  the third daemon.
+- **Tests.** `slates_ipc::looks` (the schedule's walk, moved from the reply wait, and
+  `a_schedule_not_yet_judged_names_its_first_look_without_fixing_it`); the driver's
+  `a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline` and
+  `an_answered_or_resending_call_never_looks_and_no_call_names_no_wake`; the driver suite's
+  `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline` (red before A-523 by its design, a call ending a
+  second after it was sent; main's to run).
+- **Checks (the driver's tick).** On the Mac Studio (debug, 2026-11-18, load 15 to 19): `slates-ipc --lib` 62 of 62
+  (1 ignored), `slates-client --lib` 7 of 7; red with the old timer put back (the next wake at the reply deadline's
+  remainder): "the timer wakes 969925625 ns on, the call's own wait, not the old deadline's remainder".

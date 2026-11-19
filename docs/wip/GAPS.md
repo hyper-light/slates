@@ -4063,11 +4063,16 @@
 >   `Connecting::next_poll_ns`, the client's reconnect and its driver's recovery). A Windows claim's wait under a live
 >   anchor (at least it) and the further one for a claim the daemon took to answer went with A-468, below. Owed in
 >   C-b: the reply deadline's other users,
->   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
->   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
->   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
->   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
->   borrows the reply deadline for its own. macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
+>   each a wait that cannot see the departure yet: the wait for a slot on a full ring (a slot that frees wakes nothing),
+>   a delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
+>   borrows the reply deadline for its own. The async driver's tick since A-523 (2026-11-18, g251b; the rest of class
+>   C): each call asked the daemon's liveness at every reply deadline (a second); it now asks on A-443's doubling
+>   (`slates_ipc::looks`, shared with the synchronous reply wait), first at twice the longer of its wait when first
+>   judged and the client's wake estimate, so a departure is seen within the time waited and a call answered sooner
+>   asks nothing (`a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline`; the driver
+>   suite's `a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline`, main's to run). Still owed for the async
+>   loops: the departure as an event (Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge
+>   thread waiting beside the process handle could each tell the loop at once). macOS's `MOUNT_CALL_DEADLINE` since A-517 (2026-11-18, g251b; C-b's third
 >   part): the mount's MOUNT call for the root handle (`slates_bridge_nfs::client::exchange`) bounded each of its
 >   connect, send and receive by one liveness budget, so a live daemon that answered later failed the mount; it now
 >   waits while its connection lives, as the hard NFS mount it makes does (Apple's `mount_nfs(8)`), a daemon gone
