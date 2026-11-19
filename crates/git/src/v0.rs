@@ -322,8 +322,12 @@ impl<'a> Capabilities<'a> {
 
   /// Reads a list that begins `at` bytes into its line.
   fn read_at(list: &'a [u8], at: usize) -> Result<Capabilities<'a>, LineRefusal> {
-    let _ = (list, at, check_capability, entries);
-    Err(LineRefusal::Unknown)
+    for (offset, entry) in entries(list) {
+      check_capability(split_capability(entry), at.saturating_add(offset))?;
+    }
+    Ok(Capabilities {
+      source: Source::Wire(list),
+    })
   }
 
   /// The capabilities in their order.
@@ -716,15 +720,41 @@ impl<'a> ClientLine<'a> {
   /// Reads the line a data packet's `data` carry, its object names in `format`: refused by kind when it is no client
   /// line.
   pub fn read(data: &'a [u8], format: ObjectFormat) -> Result<ClientLine<'a>, LineRefusal> {
-    let _ = (data, format);
-    Err(LineRefusal::Unknown)
+    let line = chomp(data);
+    let (word, rest) = split_word(line);
+    let Some(rest) = rest else {
+      return match word {
+        DONE => Ok(ClientLine::Done),
+        WANT | HAVE | SHALLOW | DEEPEN | DEEPEN_SINCE | DEEPEN_NOT | FILTER | ERR => {
+          Err(LineRefusal::Form {
+            at: to_u64(line.len()),
+          })
+        }
+        _ => Err(LineRefusal::Unknown),
+      };
+    };
+    let at = argument_at(word);
+    match word {
+      WANT => read_want(rest, at, format),
+      HAVE => only_id(rest, at, format).map(ClientLine::Have),
+      SHALLOW => only_id(rest, at, format).map(ClientLine::Shallow),
+      DEEPEN => read_depth(rest, at).map(ClientLine::Deepen),
+      DEEPEN_SINCE => read_time(rest, at).map(ClientLine::DeepenSince),
+      DEEPEN_NOT => check_name(rest, at).map(|()| ClientLine::DeepenNot(rest)),
+      FILTER => check_spec(rest, at).map(|()| ClientLine::Filter(rest)),
+      ERR => check_text(rest, at).map(|()| ClientLine::Error(rest)),
+      DONE => Err(LineRefusal::Form {
+        at: to_u64(DONE.len()),
+      }),
+      _ => Err(LineRefusal::Unknown),
+    }
   }
 
   /// Writes the line in one data packet as git's `fetch-pack` writes it. Refused, nothing written, when a part is one
   /// [`ClientLine::read`] would refuse, or the line is past a packet's data.
   pub fn write(&self, out: &mut impl Out) -> Result<(), WriteRefusal> {
-    let _ = out;
-    Err(WriteRefusal::Format)
+    self.check().map_err(WriteRefusal::Line)?;
+    put_line(out, |line| self.put(line))
   }
 
   /// Checks the parts a reader would refuse.
@@ -869,16 +899,36 @@ impl<'a> ServerLine<'a> {
   /// Reads the line a data packet's `data` carry, its object names in `format`: refused by kind when it is no server
   /// line.
   pub fn read(data: &'a [u8], format: ObjectFormat) -> Result<ServerLine<'a>, LineRefusal> {
-    let _ = (data, format);
-    Err(LineRefusal::Unknown)
+    let line = chomp(data);
+    let (word, rest) = split_word(line);
+    let Some(rest) = rest else {
+      return match word {
+        NAK => Ok(ServerLine::Nak),
+        ACK | ERR => Err(LineRefusal::Form {
+          at: to_u64(line.len()),
+        }),
+        _ => Err(LineRefusal::Unknown),
+      };
+    };
+    let at = argument_at(word);
+    match word {
+      ACK => read_ack(rest, at, format),
+      ERR => check_text(rest, at).map(|()| ServerLine::Error(rest)),
+      NAK => Err(LineRefusal::Form {
+        at: to_u64(NAK.len()),
+      }),
+      _ => Err(LineRefusal::Unknown),
+    }
   }
 
   /// Writes the line in one data packet as git's `upload-pack` writes it: `ACK` and `NAK` ended by LF
   /// (`get_common_commits`), `ERR` without (`packet_writer_error`). Refused, nothing written, for an error's text a
   /// reader would refuse or one past a packet's data.
   pub fn write(&self, out: &mut impl Out) -> Result<(), WriteRefusal> {
-    let _ = out;
-    Err(WriteRefusal::Format)
+    if let ServerLine::Error(text) = self {
+      check_text(text, argument_at(ERR)).map_err(WriteRefusal::Line)?;
+    }
+    put_line(out, |line| self.put(line))
   }
 
   /// Writes the line's bytes.
@@ -1025,16 +1075,41 @@ impl<'a> Advertisement<'a> {
     bytes: &'a [u8],
     admission: &mut Admission,
   ) -> Result<Option<(Advertisement<'a>, usize)>, Refusal> {
-    let _ = (bytes, admission, walk_advertisement);
-    Ok(None)
+    let Some(walked) = walk_advertisement(bytes, &mut |_| {})? else {
+      return Ok(None);
+    };
+    let room = to_u64(core::mem::size_of::<AdvertisedRef<'a>>())
+      .saturating_mul(to_u64(walked.refs))
+      .saturating_add(
+        to_u64(core::mem::size_of::<ObjectId>()).saturating_mul(to_u64(walked.shallows)),
+      );
+    admission.charge(room).map_err(Refusal::PastAdmission)?;
+    let mut refs: Vec<AdvertisedRef<'a>> = Vec::with_capacity(walked.refs);
+    let mut shallows = Vec::with_capacity(walked.shallows);
+    walk_advertisement(bytes, &mut |entry| match entry {
+      Entry::Ref(reference) => refs.push(reference),
+      Entry::Peeled(id) => {
+        if let Some(tag) = refs.last_mut() {
+          tag.peeled = Some(id);
+        }
+      }
+      Entry::Shallow(id) => shallows.push(id),
+    })?;
+    let advertisement = Advertisement {
+      version: walked.version,
+      capabilities: walked.capabilities,
+      refs,
+      shallows,
+    };
+    Ok(Some((advertisement, walked.took)))
   }
 
   /// Writes the advertisement as git's `upload-pack` and `receive-pack` write it, its flush included: the refs in the
   /// order given (the serving piece sorts them, as the document asks). Refused, nothing written, when a part is one
   /// [`Advertisement::decode`] would refuse, or a line is past a packet's data.
   pub fn write(&self, out: &mut impl Out) -> Result<(), WriteRefusal> {
-    let _ = out;
-    Err(WriteRefusal::Format)
+    self.encode(&mut Measure::default())?;
+    self.encode(out)
   }
 
   /// Writes every line, checking each part first.
@@ -1405,16 +1480,29 @@ impl ShallowUpdate {
     format: ObjectFormat,
     admission: &mut Admission,
   ) -> Result<Option<(ShallowUpdate, usize)>, Refusal> {
-    let _ = (bytes, format, admission, walk_shallow_update);
-    Ok(None)
+    let Some(counted) = walk_shallow_update(bytes, format, &mut |_| {})? else {
+      return Ok(None);
+    };
+    admission
+      .charge_items::<ObjectId>(counted.shallow.saturating_add(counted.unshallow))
+      .map_err(Refusal::PastAdmission)?;
+    let mut update = ShallowUpdate {
+      shallow: Vec::with_capacity(counted.shallow),
+      unshallow: Vec::with_capacity(counted.unshallow),
+    };
+    walk_shallow_update(bytes, format, &mut |line| match line {
+      ShallowLine::Shallow(id) => update.shallow.push(id),
+      ShallowLine::Unshallow(id) => update.unshallow.push(id),
+    })?;
+    Ok(Some((update, counted.took)))
   }
 
   /// Writes the shallow-update as git's `upload-pack` writes it: each `shallow` line, then each `unshallow` line, no
   /// LF on either (`send_shallow`, `send_unshallow`), then a flush. Refused, nothing written, when its object names
   /// are not all in one format.
   pub fn write(&self, out: &mut impl Out) -> Result<(), WriteRefusal> {
-    let _ = out;
-    Err(WriteRefusal::Format)
+    self.encode(&mut Measure::default())?;
+    self.encode(out)
   }
 
   /// Writes every line, checking each name's format first.
