@@ -1,4 +1,4 @@
-//! A push's `unbundle`, part 1 (A-641; §4.17.3 "Push" steps 1, 4 and 7, piece 5): what a client's bundle2 asks, read
+//! A push's `unbundle` (A-641; §4.17.3 "Push" steps 1 to 4 and 7, piece 5), part 1: what a client's bundle2 asks, read
 //! part by part as 7.2's part handlers read it ([`read`]); the race checks it carries, judged against the served view
 //! the push read ([`check`]); and the reply 7.2's server writes for each outcome ([`reply`]). Part 2: its changegroup
 //! verified against what the repository holds ([`verify`]), and the work each line's or bookmark's move makes, its

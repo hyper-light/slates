@@ -499,12 +499,18 @@
 > (`crates/hg/fixtures/push/make-push-fixtures.sh`: three races made by sending a recorded session again after another
 > client moved a head, a bookmark or a phase; a new head refused by 7.2's own `reject_new_heads`; an unknown part and
 > parameter), every reply byte for byte, and a naive oracle of the four checks over generated histories; red six ways.
+> **Built (A-641 part 2):** the changegroup verified against what the repository holds as 7.2's `addgroup` and
+> `server.validate` check it, paths audited as 7.2's `pathauditor` audits them (transcribed: the first audit, written
+> from the design's summary, took `a/.hg/b`, which 7.2 refuses), and a line's move made A-618's work over its flat
+> manifests laid out as directories named by their content; held to stock 7.2's bundles (each branch head landed
+> holding exactly what `hg cat` recorded) and hand-made changegroups breaking each rule; red nine ways.
 > Owed, in order, after §4.17.1's seven pieces: (3, rest) the import into the index, version 2's file index, and
 > censored, ellipsis and externally stored revisions; (4, rest) read serving: `obsolete`'s `listkeys` dump, `slates hg
 > serve --stdio`'s loop (a bundle2 request's abort answered as an `error:abort` part), HTTP version 1, held deltas in
 > place of full texts, the `0.2` answers compressed by A-598's engines at the learned level, and the index's kept heads
-> in place of the walks over the whole view; (5, rest) pushes: the changegroup verified and its changesets classified
-> into works (lines, bookmarks), each through A-618's builder over the flat manifests' paths; the landing, each moved
+> in place of the walks over the whole view; (5, rest) pushes: the changesets classified into the lines and bookmarks
+> they move (decisions 1 and 2), each move's work made by part 2's `tree::work`, a `Held` over the repository's index,
+> part 2's refusals in Mercurial's words; the landing, each moved
 > green appended at the position the push read and the greens the checks read compared there (A-642), phases and
 > bookmarks in the same landing, through a trait until g261's rebuilt entry and A-635's verdict over several works land;
 > the policy (`vcs_policy::admit`) and the hooks at their points; the pushkey namespaces' compare and swap; a compressed

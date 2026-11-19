@@ -12993,6 +12993,24 @@ signature verification).
 > verified and classified into works through A-618's builder, the landing on each green's log through a trait (A-642,
 > A-635), phases and bookmarks in the same landing, the policy and the hooks at their points, and the bundle read in
 > slices.
+>
+> **Status (2026-11-19, A-641 part 2: a push's changegroup verified, and a line's move a work).** `push::verify`
+> checks a push's changegroup against what the repository holds, through a `Held` trait (each log's texts by node),
+> as 7.2's `revlog.addgroup` and `server.validate` do: each group taken in order, a node its log holds passed over (so
+> a push repeated after a lost answer brings nothing new), every other revision's parents and delta base found in its
+> log or earlier in its group, its text rebuilt by the applier and hashed to its node (sha1dc), a manifest's or file
+> revision's link a changeset of the push or the repository, every new changeset's manifest and every file node a
+> new manifest names beside its first parent's present; a flag, a tree manifest and a path 7.2's `pathauditor`
+> refuses are refused, the audit transcribed with its four faults (a trailing separator; a drive, `..`, an absolute
+> path, `.hg` at the top or a Windows short name of it; `.hg` further down, a nested repository; and what a slates
+> path cannot hold). `push::tree` lays a flat manifest out as directories, each named by BLAKE3 over what it holds,
+> and is A-618's `PushObjects` over them, a file's blob its revision's bytes without the metadata block, `x` an
+> executable and `l` a link; `tree::work` makes a line's or bookmark's move from a version to a changeset A-618's
+> work, its head the changeset's node. Proven against stock 7.2's bundles of one repository in versions 01 to 03
+> (each branch head landed on an empty green holding exactly what `hg cat` recorded at it; `default` moved version by
+> version through a merge and a new directory; the same bundle again bringing nothing; version 01's deltas resolved
+> against what the repository held), and against hand-made changegroups breaking each rule. Owed: which lines and
+> bookmarks a push moves (decisions 1 and 2), and the landing (part 3).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -13393,8 +13411,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    HTTP.
 5. Pushes on the shared pieces: works from `unbundle` (decisions 1, 2 and 6), the race checks, phases, bookmarks, the
    register entry and the reply. Built (A-641 part 1, `crates/hg` `push`): the bundle read as 7.2's handlers read it,
-   the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts; owed: the
-   works, the landing on each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
+   the race checks in 7.2's words and order, `unbundle`'s `heads` argument, and the reply's and errors' parts. Built
+   (A-641 part 2, `push::verify`, `push::tree`): the changegroup verified against the repository, and a move's work
+   through A-618's builder over laid-out flat manifests; owed: which lines and bookmarks a push moves, the landing on
+   each green's log (A-642), phases and bookmarks in it, the policy and the hooks.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -44239,3 +44259,36 @@ Applied in the same change to:
   bundle read in slices within the shard's step budget.
 - **Applied in the same change to:** §4.17.3's status (this part) and piece 5's line; GAPS' §4.17.3 entry (built and
   owed); `research/mercurial-server.md` §20; `crates/hg/src/lib.rs` (the `push` module line).
+
+### A-641 part 2 — a push's changegroup verified against what the repository holds, and a line's move made A-618's work over its flat manifests laid out as directories (2026-11-19, g301, UI goal 93 (kiln 51cef9f7); §4.17.3 "Push" steps 2 and 3, decision 6 and piece 5; §4.17.1 "A push is a work" items 2 to 4; A-588, A-618, A-641 part 1)
+
+- **What.** `crates/hg/src/push/verify.rs`: `verify(&ChangegroupPart, &impl Held, &mut Admission) -> Result<Verified,
+  Unverified>`, the `Held` trait (each log's full texts by node: the repository's index answers it, part 3), and
+  `audit`. `crates/hg/src/push/tree.rs`: `Trees` (A-618's `PushObjects` over manifests laid out as directories),
+  `Move` and `work(&Move, &Green, (&Verified, &impl Held), room, &mut Admission) -> Result<Built, WorkRefused>`.
+  slates-hg now depends on slates-merge (as slates-git does, A-638) and blake3.
+- **Read from 7.2's code** (the wheel uv installs, the Mac Studio, 2026-11-19): `revlog.py` 3831-3848 (`addgroup`: a
+  node the log holds passed over, "this can happen if two branches make the same change"; "unknown parent"; "unknown
+  delta base"); `changegroup.py` 2896 ("missing file data for %s:%s - run hg verify"); `pathutil.py` 87-118
+  (SHA-256 `57d84583…`: the auditor's four checks in order) and `encoding.py` 56-76 (`47900298…`: `hfsignoreclean`'s
+  sixteen code points). The first audit written here, from the design's summary, took `a/.hg/b`; 7.2's code refuses
+  it as a nested repository, and the test now holds the transcription.
+- **Decided.** A revision with any flag is refused (censored, ellipsis and externally stored handling owed, piece 10);
+  a tree manifest is refused; a drive is refused on every platform (7.2 finds one only on Windows; R8); empty and `.`
+  components, NUL and bytes not UTF-8 are refused as not held, which 7.2 takes. A directory's name is BLAKE3 in
+  key-derivation mode over its entries (32 bytes, never a file node's 20), so two versions' trees compare by identity
+  and an unchanged directory is passed over unread; laying a manifest out is one pass over it (an index of
+  directories kept with the manifest log would make it the changed paths' alone: owed with piece 3's rows).
+- **Evidence** (Mac Studio, kiln, debug): `cargo test --locked -p slates-hg --lib` 237 of 237 at a47a715a8 (load
+  10.6), `cargo fmt` clean. The first build's one failure was a real fault: a file log whose every revision the
+  repository held was reported as new (the repeated push's test), fixed. Red nine ways in disposable copies, each
+  turning only its guarding tests red: the node check skipped, links always known, missing files tolerated (one test
+  each); directory names blind to their entries' ids (2: the laid-out tree's skip count and a fixture line's move);
+  held revisions taken again (2); an executable laid out as a plain file (1); the nested-repository check, the HFS+
+  cleaning and the short names each removed (1 each).
+- **Owed** (part 3 on): which lines and bookmarks a push moves (decision 1's new line, merged lines, a new branch;
+  decision 2's bookmarks), the landing through a trait of A-642's shape with the race checks' positions, phases
+  (publishing), the pushkey namespaces, the policy and the hooks, a `Held` over the repository's index, and the words
+  of part 2's refusals in a reply.
+- **Applied in the same change to:** §4.17.3's status (part 2) and piece 5's line; GAPS' §4.17.3 entry;
+  `research/mercurial-server.md` §20; `crates/hg/Cargo.toml` and `Cargo.lock` (slates-merge, blake3).

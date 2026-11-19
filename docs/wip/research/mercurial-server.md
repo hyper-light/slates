@@ -670,3 +670,13 @@ server's directory are the ones its reviewed expected-failure list starts from.
   stand-in without naming a capture, the stand-in failed on the missing name, and the script took their exit status
   255 for a refused push, so each replay found the server unmoved and was accepted (`reply:changegroup` 1). The
   stand-in now records only a named capture, and only a recorded push may be refused.
+- **Part 2's verification** (A-641 part 2): `revlog.py` 3831-3848 (`addgroup` passes over a node its log holds,
+  "this can happen if two branches make the same change", and raises "unknown parent" and "unknown delta base");
+  `changegroup.py` 2896 ("missing file data for %s:%s - run hg verify", under `server.validate`).
+- **The path audit** (`pathutil.py` 87-118, SHA-256 `57d845838cc47f2f…`; `encoding.py` 56-76, `47900298a9ce5928…`):
+  "path ends in directory separator" for a trailing separator; "path contains illegal component" for
+  `os.path.splitdrive(path)[0]`, a first component `.hg`, `.hg.` or empty, any `..`, or a Windows short name of `.hg`
+  (`first.upper() in [b"HG", b"HG8B6C"]` before `~` and digits); "path '%s' is inside nested repo %r" for `.hg` or
+  `.hg.` as any later component, the components before it joined. Each comparison is `_lowerclean`'s: Python's
+  ASCII-only `lower()`, then `hfsignoreclean`, which removes the UTF-8 of U+200C to U+200F, U+202A to U+202E, U+206A
+  to U+206F and U+FEFF. 7.2 applies it to a working copy's writes, not to a push.
