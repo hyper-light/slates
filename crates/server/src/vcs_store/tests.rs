@@ -353,7 +353,7 @@ impl Live {
   fn new() -> Live {
     Live {
       content: ContentStore::new(BUDGET, WINDOW).expect("a content store"),
-      store: GitStore::new(FORMAT),
+      store: GitStore::new(FORMAT, WINDOW),
       records: Vec::new(),
       heads: BTreeMap::new(),
       greens: BTreeMap::new(),
@@ -479,7 +479,7 @@ impl Live {
   /// The store made again from the records alone, as a recovery makes it.
   fn recovered(&self) -> Result<Live, ReplayRefused> {
     let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
-    let mut store = GitStore::new(FORMAT);
+    let mut store = GitStore::new(FORMAT, WINDOW);
     for record in &self.records {
       replay_git(&mut content, &mut store, record)?;
     }

@@ -1,7 +1,8 @@
 //! A-614's D(k) and reached sets as a type of derived data (A-647 part 2): every version's value derived through
 //! `slates-vcs`'s mechanism from its parents' values is the store's own D(k) and reached set, and is, identity for
-//! identity, the value the store kept from its admission as it committed; and (A-647 part 3) the store serves every
-//! version's two sets from that value alone.
+//! identity, the value the store kept from its admission as it committed; (A-647 part 3) the store serves every
+//! version's two sets from that value alone; and (A-647 part 4) a version's value adds to the store only the nodes no
+//! earlier set had, so what it stores is bound by what it brought, never by what it reaches.
 
 use std::collections::BTreeSet;
 use std::mem::size_of;
@@ -156,7 +157,7 @@ proptest! {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
     let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
     let mut model = Model::new(format);
-    let mut ty = ReachSets::declare(Mode::Eager);
+    let mut ty = ReachSets::declare(WINDOW, Mode::Eager);
     let (mut kept, mut derived) = (Derivations::new(), Derivations::new());
     for op in &ops {
       let before = versions(&real.repository);
@@ -218,7 +219,7 @@ fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
   assert_eq!(parents((2, 0)), Some(Vec::new()));
   assert_eq!(parents((1, 3)), Some(vec![(1, 2), (2, 0)]));
   assert_eq!(parents((1, 4)), None);
-  let mut ty = ReachSets::declare(Mode::Lazy);
+  let mut ty = ReachSets::declare(WINDOW, Mode::Lazy);
   let mut values = Derivations::new();
   let root = read_to_end(&mut values, &mut ty, &repository, &mut store, (1, 3)).unwrap();
   assert_eq!(values.counters().derived, 5);
@@ -239,7 +240,7 @@ fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
 #[test]
 fn t_a647_the_reach_type_refuses_by_kind() {
   let (mut store, repository) = rewritten();
-  let mut ty = ReachSets::declare(Mode::Lazy);
+  let mut ty = ReachSets::declare(WINDOW, Mode::Lazy);
   let foreign = store.put_derived(&[], b"not two sets").unwrap().identity;
   let mut values = Derivations::new();
   let first = read_to_end(&mut values, &mut ty, &repository, &mut store, (1, 0)).unwrap();
@@ -272,72 +273,96 @@ fn t_a647_the_reach_type_refuses_by_kind() {
   );
 }
 
-/// The little-endian bytes of `value`.
-fn word(value: u64) -> Vec<u8> {
-  value.to_le_bytes().to_vec()
-}
-
-/// A set's bytes: its count of runs, then each run's start and end.
-fn set_bytes(runs: &[(u64, u64)]) -> Vec<u8> {
-  let mut bytes = word(runs.len() as u64);
+/// A leaf of `runs`, each relative to its block, naming `names`, held once by the caller.
+fn leaf(store: &mut ContentStore, runs: &[(u64, u64)], names: &[ContentId]) -> ContentId {
+  let mut payload = b"L".to_vec();
   for (start, end) in runs {
-    bytes.extend(word(*start));
-    bytes.extend(word(*end));
+    payload.extend(start.to_le_bytes());
+    payload.extend(end.to_le_bytes());
   }
-  bytes
+  store.put_derived(names, &payload).unwrap().identity
 }
 
-/// A value of the type's form holding `bytes` as its sets' object and saying its length is `len`, held once by the
-/// caller.
-fn value_of(store: &mut ContentStore, bytes: &[u8], len: u64) -> ContentId {
-  let object = store.put_object(bytes).unwrap();
-  let node = store.put_derived(&[object], &word(len)).unwrap().identity;
-  store.release(&object).unwrap();
-  node
+/// An inner node of `level` and `bitmap` naming `names`, held once by the caller.
+fn inner(store: &mut ContentStore, level: u8, bitmap: &[u8], names: &[ContentId]) -> ContentId {
+  let payload = [b"I".as_slice(), &[level], bitmap].concat();
+  store.put_derived(names, &payload).unwrap().identity
 }
 
-/// A-647 parts 2 and 3, hostile values. Do: read values whose sets' object is not two sets kept one way (a count past
-/// the bytes, runs out of order, touching or empty, a byte left over, a byte short), and nodes not of the value's form
-/// (the sets' bytes in the node itself, as part 2 kept them; two objects named; a length past the object's; a length
-/// cut short). Expect: each refused, never read past its end, and the sound value read back.
+/// A value naming `names`, its payload `present`, then a shape of `block` and `fanout`, held once by the caller.
+fn value(
+  store: &mut ContentStore,
+  names: &[ContentId],
+  present: u8,
+  shape: (u64, u64),
+) -> ContentId {
+  let mut payload = vec![b'V', present];
+  payload.extend(shape.0.to_le_bytes());
+  payload.extend(shape.1.to_le_bytes());
+  store.put_derived(names, &payload).unwrap().identity
+}
+
+/// A-647 parts 2 to 4, hostile values. Do: read, in a store of nodes made by hand with a shape of blocks of four
+/// positions and two children a node, a sound value (a reached set of two leaves under a node of level 1, D(k) a leaf),
+/// then values broken one way each: the value's own node (another tag, a bit past the two sets, a set its bits name
+/// missing or one more named, a block odd, a single child a node, a payload cut short), a leaf (runs out of order,
+/// touching, empty, past its block, a byte left over, a name), and an inner node (of level 0, a bitmap of another
+/// length, a bit past the children, a bit with no child, a child of another level, no child at all). Expect: the
+/// sound value reads back as its sets; every broken one is refused, never read past its end.
 #[test]
 fn t_a647_a_hostile_reach_value_is_refused() {
   let mut store = store();
-  let good = [set_bytes(&[(0, 2), (4, 5)]), set_bytes(&[(4, 5)])].concat();
-  let hostile = [
-    [set_bytes(&[(0, 2)]), word(u64::MAX)].concat(),
-    [set_bytes(&[(4, 5), (0, 2)]), set_bytes(&[])].concat(),
-    [set_bytes(&[(0, 2), (2, 3)]), set_bytes(&[])].concat(),
-    [set_bytes(&[(3, 3)]), set_bytes(&[])].concat(),
-    [good.clone(), vec![0]].concat(),
-    good[..good.len() - 1].to_vec(),
+  let shape = (4, 2);
+  let (low, high) = (
+    leaf(&mut store, &[(0, 2)], &[]),
+    leaf(&mut store, &[(1, 3)], &[]),
+  );
+  let tree = inner(&mut store, 1, &[0b11], &[low, high]);
+  let one = leaf(&mut store, &[(1, 2)], &[]);
+  let sound = value(&mut store, &[tree, one], 3, shape);
+  let sets = Sets::read(&store, &sound).unwrap();
+  assert_eq!(sets.reached.iter().collect::<Vec<_>>(), [0, 1, 5, 6]);
+  assert_eq!(sets.brought.iter().collect::<Vec<_>>(), [1]);
+  let mut tagged = value(&mut store, &[tree, one], 3, shape);
+  let payload = store.derived(&tagged).unwrap().payload().to_vec();
+  tagged = store
+    .put_derived(&[tree, one], &[b"X".as_slice(), &payload[1..]].concat())
+    .unwrap()
+    .identity;
+  let short = store
+    .put_derived(&[tree, one], &[b'V', 3, 4, 0, 0, 0, 0, 0, 0, 0])
+    .unwrap()
+    .identity;
+  let leaves = [
+    leaf(&mut store, &[(2, 3), (0, 1)], &[]),
+    leaf(&mut store, &[(0, 1), (1, 2)], &[]),
+    leaf(&mut store, &[(1, 1)], &[]),
+    leaf(&mut store, &[(0, 5)], &[]),
+    store.put_derived(&[], b"L\x01").unwrap().identity,
+    leaf(&mut store, &[(0, 1)], &[one]),
   ];
-  for bytes in &hostile {
-    let root = value_of(&mut store, bytes, bytes.len() as u64);
-    assert_eq!(Sets::read(&store, &root), None, "{bytes:?}");
+  let inners = [
+    inner(&mut store, 0, &[0b1], &[low]),
+    inner(&mut store, 1, &[0b1, 0], &[low]),
+    inner(&mut store, 1, &[0b101], &[low, high]),
+    inner(&mut store, 1, &[0b11], &[low]),
+    inner(&mut store, 2, &[0b1], &[low]),
+    inner(&mut store, 1, &[0], &[]),
+  ];
+  let mut broken = vec![
+    tagged,
+    value(&mut store, &[tree, one], 7, shape),
+    value(&mut store, &[tree], 3, shape),
+    value(&mut store, &[tree, one], 1, shape),
+    value(&mut store, &[tree, one], 3, (3, 2)),
+    value(&mut store, &[tree, one], 3, (4, 1)),
+    short,
+  ];
+  for node in leaves.into_iter().chain(inners) {
+    broken.push(value(&mut store, &[node], 1, shape));
   }
-  let len = good.len() as u64;
-  let root = value_of(&mut store, &good, len);
-  let sets = Sets::read(&store, &root).unwrap();
-  assert_eq!((sets.reached.len(), sets.brought.len()), (3, 1));
-  let object = store.put_object(&good).unwrap();
-  let forms = [
-    store.put_derived(&[], &good).unwrap().identity,
-    store
-      .put_derived(&[object, object], &word(len))
-      .unwrap()
-      .identity,
-    store
-      .put_derived(&[object], &word(len + 1))
-      .unwrap()
-      .identity,
-    store
-      .put_derived(&[object], &word(len)[..7])
-      .unwrap()
-      .identity,
-  ];
-  for (way, node) in forms.iter().enumerate() {
-    assert_eq!(Sets::read(&store, node), None, "form {way}");
+  for (way, root) in broken.iter().enumerate() {
+    assert_eq!(Sets::read(&store, root), None, "broken way {way}");
   }
 }
 

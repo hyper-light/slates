@@ -1463,9 +1463,10 @@ fn put_values(
   store: &mut ContentStore,
   planned: &[Planned],
 ) -> Result<Vec<ContentId>, StoreRefused> {
+  let shape = reach::shape_of(store.window())?;
   let mut values = Vec::with_capacity(planned.len());
   for version in planned {
-    match version.sets.put(store) {
+    match version.sets.put(store, shape) {
       Ok(value) => values.push(value),
       Err(refused) => {
         give_back(store, &values)?;

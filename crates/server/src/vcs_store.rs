@@ -169,12 +169,12 @@ pub(crate) struct GitStore {
 }
 
 impl GitStore {
-  /// An empty store of `format`.
-  fn new(format: ObjectFormat) -> GitStore {
+  /// An empty store of `format`, its values' trees shaped by `window`, its content store's (A-647 part 4).
+  fn new(format: ObjectFormat, window: usize) -> GitStore {
     GitStore {
       repository: Repository::new(format),
       derivations: Derivations::new(),
-      reach: ReachSets::declare(Mode::Eager),
+      reach: ReachSets::declare(window, Mode::Eager),
       paths: None,
       heads: BTreeMap::new(),
       versions: BTreeMap::new(),
@@ -432,9 +432,10 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
     let content = ContentStore::new(stores.charged, window).map_err(|_| Unmade)?;
     stores.content = Some(content);
   }
+  let window = stores.content.as_ref().map_or(window, ContentStore::window);
   let store = match record.tool {
     VcsTool::Git => {
-      let mut git = GitStore::new(git_format(record.format).ok_or(Unmade)?);
+      let mut git = GitStore::new(git_format(record.format).ok_or(Unmade)?, window);
       // The map splits by the content store's own window, which its type's name carries (A-647).
       git.paths = stores
         .content
