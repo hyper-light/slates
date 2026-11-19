@@ -14378,6 +14378,17 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > Owed: the read-only FSFS-layout view at REPOS (after A-647); the server's calls at commit, lock, unlock and
 > revision-property change, a lock whose token the hook wrote past the cap refused in Subversion's words among them;
 > a dangling link told apart; no core dumps; the Windows driver.
+>
+> **Status (2026-11-19, A-661 part 1: the hook glue).** `crates/server`'s `svn_hooks` is what every Subversion call
+> point runs its hooks through. `run` finds the hook the repository's policy configures at the input's point, runs it
+> with the driver over the caller's view, and answers what `svnserve` tells the client (`svn_told`), the run's lesson
+> for the hook's times, and pre-lock's token. `verdict` is what the commit drive resumes with: `Ok`, the refusal's
+> chain, or nothing once the client left, so the change does not go on. A point with no hook answers as `svnserve`
+> does, running nothing. The call points, agreed through main on 2026-11-19: the drive pauses for start-commit at
+> `open-root`, after its revision check, and for pre-commit at `close-edit`, before the verdict (`Step::Hook`,
+> `Drive::resume`; g268, A-655); the `svn://` task runs those, and post-commit after its append, whose words are
+> `commit-info`'s `post-commit-err` (g234, A-656); the lock hooks wrap A-602's check on `lock-many` and `unlock-many`
+> and on DAV's LOCK and UNLOCK, DAV's wiring A-661's next part once g298's serving lands. @@TESTS@@
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -46321,3 +46332,26 @@ Applied in the same change to: §4.17.4's status (A-655, part 1), GAPS (the §4.
   check` and the doc gate are main's (the run-request queue).
 - **Owed.** Part 2: the owner's commit step through A-635's `RepositoryLogs::append`, at the position the commit read
   (`Moved` answered as `svnserve`'s out-of-date), which a dump's import drives too (A-652 part 3).
+
+### A-661 part 1 — Subversion's hook glue: the hook a point's record configures, run by the driver, answered in svnserve's words, and the call points agreed (2026-11-19, g229, UI goal 93; §4.17.4 item 9; after A-648, with A-655 and A-656)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17 entry); `crates/server` (`svn_hooks.rs` and its
+tests, new; `lib.rs`).
+
+- **The glue.** `svn_hooks::run(site, input, bound, client_gone)` takes the input a caller built for its point (the
+  builders of A-623, the environment the record gives, A-648), finds the hook the repository's policy configures at
+  that point (Subversion keeps one a point), and runs it with the driver over the caller's view, held to the hook's
+  learned bound and ended with the client. It answers `SvnHookRan`: what `svnserve` tells its client (`svn_told`), the
+  run's lesson for the hook's times, which the caller keeps, and pre-lock's token (`svn_lock_token`). A point with no
+  hook answers at once as `svnserve` does: nothing, but pre-revprop-change's `E165006`.
+- **The verdict.** `SvnHookRan::verdict` is what an admission point's caller resumes with: `Ok` to go on, the
+  refusal's chain (each error's number and message, outermost first), or nothing once the client left, so that no
+  change goes on for a client that is gone. An observing point's failure is no refusal.
+- **The call points**, agreed through main and relayed to each owner: the commit drive pauses for start-commit at
+  `open-root`, after its revision check and with the transaction named, and for pre-commit at `close-edit`, before the
+  verdict (`Step::Hook`, `Due::{StartCommit, PreCommit}`, `Drive::resume`; g268, A-655); the `svn://` connection task
+  runs those, and post-commit after its append, whose words are `commit-info`'s `post-commit-err` (g234, A-656); the
+  lock hooks run around A-602's check on `lock-many` and `unlock-many` and on DAV's LOCK and UNLOCK, pre-lock per path
+  with its token the lock's, post-lock once with the paths locked.
+- **Tests** @@TESTS@@
+- **Owed.** DAV's LOCK and UNLOCK wired through the glue (A-661's next part, once g298's DAV serving lands); the hook
+  times' table that keeps each hook's learned bound (A-622's list).

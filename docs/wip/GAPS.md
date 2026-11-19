@@ -270,6 +270,12 @@
 > deadline, client), its exit read without reaping so the group's kill stays its own, its child always reaped. Server
 > lib tests 42 of 42 on the Mac Studio with the test binary re-invoked as the hook, red three ways. Owed: the Windows
 > driver (a job object), the Linux launcher's namespace (§4.6), the push pieces' calls, the hook times' table.
+> **A-661 part 1 (2026-11-19, g229; §4.17.4 item 9, the hook glue):** `svn_hooks::run` runs the hook the record
+> configures at a Subversion point and answers `svnserve`'s words, the lesson and pre-lock's token; `verdict` is the
+> commit drive's resume. Call points agreed through main: the drive's `Step::Hook` at `open-root` and `close-edit`
+> (g268), the `svn://` task's runs and post-commit after its append (g234), the lock hooks around A-602's check on
+> ra_svn and DAV. @@TESTS@@ Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times'
+> table.
 > **A-648 (2026-11-19, g229; §4.17.4 item 9, the gaps A-623 found):** the record names Subversion's nine points
 > (`HookPointName` 8 to 13 in `slates_db` and the protocol, both wire orders) and holds a Subversion repository's
 > hooks-env in its policy (refused by section, `DatabaseRefusal` 11, when no hook's environment can carry it or the
