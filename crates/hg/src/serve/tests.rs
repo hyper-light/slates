@@ -835,13 +835,23 @@ fn forked(shared: u32, local_only: u32, remote_only: u32) -> (History, History) 
 
 /// A-619 (set discovery, non-vacuity): do run 7.2's discovery from a local history of 300 changesets whose last 100
 /// the remote lacks, against a remote that holds 60 the local lacks, sampling 4 nodes at first and 8 after. Expect it to
-/// find exactly the 200 shared changesets, and the counters to show the sampled rounds were taken: more than the head
-/// exchange, more nodes asked than the heads.
+/// find exactly the 200 shared changesets (its common heads hold the shared line's last, and, as 7.2's `basesheads`
+/// removes only direct parents, may hold earlier common bases beside it), and the counters to show the sampled rounds
+/// were taken: more than the head exchange, more nodes asked than the heads.
 #[test]
 fn set_discovery_takes_its_sampled_rounds() {
   let (local, remote) = forked(200, 100, 60);
   let found = find_common_heads(&local, &remote, 4, 8);
-  assert_eq!(found.common, BTreeSet::from([node_for(200)]));
+  let revs: Vec<Rev> = found
+    .common
+    .iter()
+    .filter_map(|node| local.rev(node))
+    .collect();
+  assert_eq!(
+    ancestors(&local, &revs),
+    (0..200).collect::<BTreeSet<Rev>>()
+  );
+  assert!(found.common.contains(&node_for(200)));
   assert!(found.incoming);
   assert!(found.rounds >= 3, "rounds: {}", found.rounds);
   assert!(found.asked > 1, "asked: {}", found.asked);
@@ -954,4 +964,123 @@ fn hostile_lists_unknown_nodes_and_broken_graphs_are_refused_by_kind() {
     pull::outgoing(&broken, &hex(&broken.revs[3].node), b"", &mut room()),
     Err(Refusal::Graph { rev: 2 })
   );
+}
+
+/// The probe of stock `hg serve --stdio` 7.2 (`fixtures/serve/make-serve-fixtures.sh`): the served view it answered
+/// from, oldest first, its bookmarks, what the probe wrote, and what the server answered.
+const PROBE_STATE: &str = include_str!("../../fixtures/serve/state-probe.txt");
+const PROBE_BOOKMARKS: &str = include_str!("../../fixtures/serve/bookmarks-probe.txt");
+const PROBE_CLIENT: &[u8] = include_bytes!("../../fixtures/serve/probe.client");
+const PROBE_SERVER: &[u8] = include_bytes!("../../fixtures/serve/probe.server");
+
+/// The repository the probe asked: each state line a node, its two parents, its phase, `1` where it closes its branch,
+/// then `|` and its branch; non-publishing, as the script's hgrc says.
+fn probed() -> History {
+  let node = |hex: &str| pushkey::hex_node(hex.as_bytes()).unwrap().unwrap();
+  let mut history = History::default();
+  for line in PROBE_STATE.lines() {
+    let (fields, branch) = line.split_once('|').unwrap();
+    let fields: Vec<&str> = fields.split(' ').collect();
+    let parent = |hex: &str| (node(hex) != NULL_NODE).then(|| history.rev(&node(hex)).unwrap());
+    let parents = [parent(fields[1]), parent(fields[2])];
+    let phase = if fields[3] == "public" {
+      Phase::Public
+    } else {
+      Phase::Draft
+    };
+    history.push(Changeset {
+      node: node(fields[0]),
+      parents,
+      branch: branch.as_bytes().to_vec(),
+      closes: fields[4] == "1",
+      phase,
+    });
+  }
+  for line in PROBE_BOOKMARKS.lines() {
+    let (hex, name) = line.split_once(' ').unwrap();
+    history
+      .bookmarks
+      .push((name.as_bytes().to_vec(), node(hex)));
+  }
+  history
+}
+
+/// A line and the bytes after it.
+fn split_line(bytes: &[u8]) -> (&[u8], &[u8]) {
+  let at = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+  (&bytes[..at], &bytes[at + 1..])
+}
+
+/// The probe's requests as SSH version 1 carries them: a command's name on its line, then each argument its key, its
+/// length and its bytes, and `known`'s empty dictionary (`* 0`).
+fn probe_requests(mut client: &[u8]) -> Vec<(String, Vec<u8>)> {
+  let mut requests = Vec::new();
+  while !client.is_empty() {
+    let (name, rest) = split_line(client);
+    let name = String::from_utf8(name.to_vec()).unwrap();
+    client = rest;
+    let mut argument = Vec::new();
+    if ["known", "between", "branches", "listkeys"].contains(&name.as_str()) {
+      let (header, rest) = split_line(client);
+      let len: usize = std::str::from_utf8(header)
+        .unwrap()
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+      argument = rest[..len].to_vec();
+      client = &rest[len..];
+      if name == "known" {
+        let (dictionary, rest) = split_line(client);
+        assert_eq!(dictionary, b"* 0");
+        client = rest;
+      }
+    }
+    requests.push((name, argument));
+  }
+  requests
+}
+
+/// The server's answers: each its length on a line, then its bytes.
+fn probe_answers(mut server: &[u8]) -> Vec<Vec<u8>> {
+  let mut answers = Vec::new();
+  while !server.is_empty() {
+    let (len, rest) = split_line(server);
+    let len: usize = std::str::from_utf8(len).unwrap().parse().unwrap();
+    answers.push(rest[..len].to_vec());
+    server = &rest[len..];
+  }
+  answers
+}
+
+/// AC-HG.1 (golden), A-619: do answer, from the repository stock `hg serve --stdio` 7.2 served (non-publishing; two
+/// named branches, a closed head on a branch whose name needs quoting, a merge, drafts, an amended draft whose
+/// predecessor is hidden, two bookmarks), each request its probe sent: `heads`; `known` of held, unknown and null
+/// nodes; `between` from the tip to the null node, to an ancestor, and the null pair; `branches`; `branchmap`; and
+/// `listkeys` of `namespaces`, `bookmarks` and `phases`. Expect nine answers, each byte for byte as 7.2's (its branch
+/// cache's order here the names' order, which this answer keeps).
+#[test]
+fn every_probe_request_is_answered_as_mercurial_answered_it() {
+  let history = probed();
+  let requests = probe_requests(PROBE_CLIENT);
+  let answers = probe_answers(PROBE_SERVER);
+  assert_eq!(requests.len(), 9);
+  assert_eq!(answers.len(), requests.len());
+  for ((command, argument), expected) in requests.iter().zip(&answers) {
+    let got = answer(|room, out| match command.as_str() {
+      "heads" => discovery::heads(&history, room, out),
+      "known" => discovery::known(&history, argument, room, out),
+      "between" => discovery::between(&history, argument, room, out),
+      "branches" => discovery::branches(&history, argument, room, out),
+      "branchmap" => discovery::branchmap(&history, room, out),
+      "listkeys" => pull::listkeys(&history, argument, room, out),
+      other => panic!("the probe sent no {other}"),
+    });
+    assert_eq!(
+      String::from_utf8_lossy(&got),
+      String::from_utf8_lossy(expected),
+      "{command}"
+    );
+  }
 }
