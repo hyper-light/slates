@@ -6676,6 +6676,17 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-19, A-564: an owner that cannot answer is never read as no volume).** A verb forwarded to its
+> volume's owner shard was answered `NotFound` when the owner's state refused it. That happened from another node:
+> `call_in_shard_time`'s `None` became `NotFound` in `named_if_unshared`. It happened on the same node too, where a
+> refused owner borrow became `NotFound`. So a volume on a fenced owner read as absent. The owner's refusal is now
+> answered by its kind (`call_owner`, `refusal_of_access`):
+> - a fenced owner (or a retention check that fences it) answers `ConsensusRecoveryUnavailable`;
+> - a call that did not run answers `Overloaded`, not started.
+>
+> (`a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`;
+> `docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`).
+
 > **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
 > forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
 > again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
@@ -10272,6 +10283,35 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > take a host refusal for an absence; recovery over an S3 base; the read-ahead from the
 > measured bandwidth-delay product; the platform's trust roots and name resolution; and the N=1 differential through
 > `SimS3`.
+
+> **Status (2026-11-19, A-555: a request waits for the fetch it met).** Built:
+> - The pending answer names its fetch: `HostError::Pending(FetchId)` and `VfsError::BasePending(FetchId)`. `S3Host`
+>   names one fetch for a directory's listing (every page of it) and one for each run of a file's chunks; a call that
+>   misses on what is under way is answered under that fetch's name, and `S3Host::landed` says which fetch a landing
+>   settled.
+> - The shard's base waits (`crates/server/src/base_wait.rs`): a request whose host call met a pending fetch, noted
+>   where the slot's host is lent to it (`Lens`), parks on its volume and that fetch; the fetch's landing
+>   (`base_wait::land`, the fetch driver's entry) wakes those requests alone, and each runs again from its start, since
+>   a pending answer changed nothing. The waits are bounded by the shard's client credit (`clients_per_shard × slots`,
+>   the bound the lease waiters and the told replies keep): a request past it is answered its pending refusal at once,
+>   counted `base.wait.full`. A request waits at most the failover delay in all, the most a reply is held, then is
+>   answered the same, counted `base.wait.overdue`; `base.wait.parked` and `base.wait.landed` are the non-vacuity counts.
+> - The hold: what a fetch lands is never shed while requests are parked on it (`S3Host::hold_for_waiters` at a
+>   request's parking, `S3Host::release_held` at the last one's leaving), so a woken request finds what it waited for
+>   whatever lands meanwhile; a landing the unheld cache cannot make room for is not kept (`HostCounts::unkept`), and
+>   its own requests fetch it again once they run. This closes A-524's owed hold (GAPS A-464).
+> - NFS: a call answered `NFS3ERR_JUKEBOX` after it met a pending base waits on its volume's owner shard and is served
+>   again (`nfs::serve_local_fetched`, for a local call and a forwarded one alike). The bridges answer a request that
+>   could not wait with the retry: FUSE `EAGAIN`, NFS `NFS3ERR_JUKEBOX` (NFSv4 `NFS4ERR_DELAY`), never `EIO` or a server
+>   fault.
+> - A slot's base host is one `BaseHost` (`crates/base/src/base_host.rs`): a host directory or an S3 base. A landing
+>   writes a host directory only; an overlay over an S3 base keeps its host in its slot and a landing into its base is
+>   refused `BaseUnavailable`.
+>
+> Owed (GAPS A-464): parking a FUSE request (Linux: the request held off the device and dispatched again when its
+> fetch lands; it is answered `EAGAIN` until then); WinFsp's answer (its catch-all today), the Shards streams, slates'
+> own virtio-fs device and the typed channel's verbs (answered `Unpublished`, retryable); and the volume over an S3 base
+> (the wire's create, the credential's hand-off, the fetch driver), with the rest of A-524's owed list.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -38142,3 +38182,85 @@ and `pending_changes` through them), and the bug record
   `cargo test --locked -p slates-bridge-fuse --lib coherence` 14 of 14 and the library whole 36 of 36; rustfmt changes
   nothing. The Linux channel's glue is not compiled on macOS: its build, its unit tests and the takeover tests are
   main's (Linux).
+
+### A-555 — A request that meets a pending S3 base waits for the fetch it met, and is served again when that one lands (2026-11-19, goal g268, UI goal 90; Mantle's CP-T10.5; §4.15 "An S3 base"; §4.6; R3, R8; A-79, A-354, A-375, A-464, A-524)
+Applied in the same change to: `crates/vfs` (`host::FetchId`; `HostError::Pending` and `VfsError::BasePending` name
+their fetch; the base plane's two mappings); `crates/base` (`s3::host`: a fetch's name per listing and per chunk run,
+`landed` reporting the fetch it settled, `hold_for_waiters` and `release_held`, the cache passing over held items and
+counting a landing it could not keep, `HostCounts::unkept`; `base_host`: `BaseHost`, a slot's host directory or S3
+base); `crates/server` (`base_wait`, new; `state`'s slot host as `BaseHost` and the shard's `base_waits` and
+`nfs_pending_base`; `nfs`'s lens at the export, `serve_local_fetched` for local and forwarded calls; `verbs` and
+`landing` over `BaseHost`; `error`); `crates/bridge-fuse` (`errno`: `EAGAIN`) and `crates/bridge-nfs` (`nfsstat_of`:
+`NFS3ERR_JUKEBOX`), each with its unit test; `crates/land` (the pending arm); §4.15's status; GAPS (A-464's entry).
+Also main's clippy findings in A-524's code, fixed here: `listed_bytes`' size sum saturates; the host's test helpers
+`settle` and `read_whole` refuse rather than panic or unwrap inside a `Result`; the two long host tests and
+`SimS3::page`, `time::unix_of` and `time::ns_of_iso8601` split into their steps, unchanged in what they answer; the
+oracle's tree a type alias.
+
+- **Why.** An S3 base's host answers from what it has fetched, and a miss is a pending answer (A-524). Until now a
+  FUSE request that met one was answered `EIO` and an NFS call `NFS3ERR_SERVERFAULT`, so the first read of every base
+  file failed; and nothing said which fetch a request needed, so nothing could wake it when that fetch landed.
+- **A pending answer names its fetch.** One name a directory's listing (every page), one a run of chunks; a call that
+  misses on what is under way gets the name of the fetch bringing it, so every request that met a fetch waits under one
+  name, and `landed` says which fetch settled. A request learns the name through a lens at the point the slot's host is
+  lent to it (`base_wait::Lens`), because the transports' bridges answer a volume refusal on their own wire.
+- **Parked on the fetch, woken by it alone.** The shard keeps the waits by volume and fetch; a fetch's landing wakes its
+  own waits and none other, and each request runs again from its start: its pending answer changed nothing, so running
+  it again is running it once, and an NFS call's records (A-127, A-128) take the answer of the run that answered.
+- **Held until its waiters ran.** A woken request runs a turn after the landing; another landing in between could shed
+  what it waited for through a small cache, and with every request missing in turn none would progress (GAPS A-464's
+  owed hold). So the host never sheds what a fetch landed while requests are parked on it, and a landing the unheld cache
+  cannot make room for is not kept: its own requests fetch it again once they run, by when the holds that kept it out
+  are let go. A request that comes after its fetch settled does not park: it runs again at once.
+- **Bounded (R3, learned or shared, never a number).** The waits are the shard's client credit at most, the bound every
+  parked set on a shard keeps (`lease_wait`, `told`, `work_home`); past it a request is answered its retry at once. A
+  request waits at most the failover delay in all, the most a reply is held (A-354, A-375); each fetch is itself bounded
+  by the store client's learned waits (A-471), so a store that does not answer settles its fetch with a refusal first.
+- **Rejected.** Waking every request of a volume at any of its fetches' landings: a request then ran once per landing
+  on the volume, not once per its own. Answering `EAGAIN`/`JUKEBOX` without parking: an NFSv3 client backs off for
+  seconds on `JUKEBOX` (4,033 ms measured for one macOS write, A-79), where a fetch lands in a round trip. Holding
+  landed items by time (one round trip after landing): a starved shard's waiters could still lose them, and a quick
+  one's would keep them past need.
+- **Owed.** Parking a FUSE request (Linux, `crates/server/src/fuse.rs` and the channel: the request held off the device
+  and dispatched again when its fetch lands); the other transports' answers and waits (WinFsp, the Shards streams,
+  slates' virtio-fs device, the typed channel's verbs); and the volume over an S3 base itself (the wire's create, the
+  credential's hand-off, the fetch driver that calls `base_wait::land`), with A-524's other owed items.
+- **Evidence.** Mac Studio (debug, 2026-11-19). Red first, today's behaviour put back on a scratch copy: before the
+  merge (kiln r128) the FUSE lookup answered `EIO` and the NFS call `NFS3ERR_SERVERFAULT`, and with held items shed the
+  host's hold test kept `b.bin` beside nothing; on the merged tree (r241) with no wake a landing woke none of its
+  requests (`(0, 0, 0)` where `(0, 0, 1)` was due), with no bound a second request parked (`Parked(1)` where `Full`
+  was due), with no release `b.bin`'s chunk was still not kept (2 unkept where 1 was due), and with held items shed both
+  hold tests kept it at once (0 where 1 was due). Green on the merged tree (r241): `cargo test --locked -p
+  slates-server --lib -- base_wait error::` 6 of 6, `-p slates-base --lib -- s3` 55 of 55, `-p slates-vfs --lib --
+  base::` 4 of 4, `-p slates-land --lib -- engine` 2 of 2, `-p slates-bridge-fuse --lib -- bridge::tests` 1 of 1,
+  `-p slates-bridge-nfs --lib -- procedures::tests` 1 of 1, `cargo fmt --check` clean.
+
+### A-564 — A verb for a volume whose owner shard refuses its state is answered by the refusal's kind, never `NotFound` (2026-11-19, goal 85 via g225; §4.8 "Lookup"; found by A-557; A-394)
+
+- **What was there.** A verb for a volume runs on its owner shard. From another node, `serve_forward` called the owner
+  through `xshard::call_in_shard_time`, whose `None` means not sent, given up, or the owner's borrow refused, and
+  `named_if_unshared` turned that `None` into `NotFound`. On the same node, `send_forward`'s task turned a refused owner
+  borrow into `NotFound`. A fenced owner refuses every borrow; a failed consensus publication fences the control shard,
+  which owns a partition of the volumes. So a volume on a fenced owner read as absent.
+- **The rule.** "The answer comes from the current owner and is authoritative" (§4.8 "Lookup"): an owner that did not
+  answer is never read as an answer of no volume. `refusal_of_access` answers a refused borrow by its kind:
+  - fenced, or closed by the retention check that fences, is `ConsensusRecoveryUnavailable`, the refusal a failed
+    publication answers;
+  - no state, or a borrow already held, is `Overloaded`, not started.
+
+  `call_owner` runs a forward's work on its owner with `try_with_state`, waits in the owner's own time, and answers a
+  call not sent or given up `Overloaded`. Every path of `serve_forward` uses them: a read, a write and its deferred
+  completion, `PromoteRegion`, and the partition lookup on the serving shard. So does `send_forward`'s owner task.
+  `NotFound` stays the answer for a partition no shard of this node holds.
+- **Test.** `a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found`
+  (`crates/server/src/verbs.rs`): a volume on the second shard of two, that shard fenced, its status asked from a
+  client on the control shard and as a verb forwarded from another node. Red before the fix: the same-node ask
+  answered `NotFound` (0.75 s, Mac Studio). Green: both asks `ConsensusRecoveryUnavailable`. Seventeen nearby tests
+  still pass.
+- **Not changed.** `remote_attach::serve_unforwardable` answers `Overloaded` for any call that has no answer, a fenced
+  owner included: retryable, and never `NotFound`.
+
+Applied in the same change to: §4.8 "Lookup" (its status), GAPS (a new entry after A-394's), `crates/server/src/verbs.rs`
+(`serve_forward`, `refusal_of_access`, `call_owner`, `answer_forwarded_write`, `await_deferred_completion`,
+`named_if_unshared`, `send_forward`, the test and its helpers), the bug record
+`docs/bugs/2026-11-19-a-volume-on-a-fenced-owner-read-as-absent.md`.

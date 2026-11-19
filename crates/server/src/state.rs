@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use slates_anchor::AnchorSegment;
-use slates_base::OsHost;
+use slates_base::BaseHost;
 use slates_db::Db;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_db::register::{Acceptor, ObjectId};
@@ -95,8 +95,9 @@ pub struct VolumeSlot {
   pub name: String,
   /// The volume.
   pub volume: Volume,
-  /// The read-only host of the base directory, for an overlay.
-  pub host: Option<OsHost>,
+  /// The read-only host of the overlay's base, for an overlay: a host directory, or the objects under an S3 base's
+  /// prefix (A-555).
+  pub host: Option<BaseHost>,
   /// The reservation, for a bounded volume.
   pub reservation: Option<slates_mem::budget::Reservation>,
   /// The inode-version reservation (§4.2 inode dimension): the volume's logical inode allowance
@@ -401,6 +402,10 @@ pub struct ShardState {
   /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
   /// call so a file-state change it makes carries the compound's record in its own transaction.
   pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
+  /// The fetch the NFS call this shard is serving right now met pending, with the volume whose base names it (A-555):
+  /// set by the call's export when a host call of the call was answered pending, taken by the call's serve once it
+  /// returns, so the call parks on that fetch (`crate::base_wait`). `None` between calls.
+  pub(crate) nfs_pending_base: Option<(VolumeId, slates_vfs::host::FetchId)>,
   /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
   /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
   /// replies are sent. At most a turn's mutations per held connection on this shard.
@@ -839,6 +844,9 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
+  /// Requests parked until the S3 base fetch they met lands (`crate::base_wait`; §4.15 "An S3 base", A-555), bounded by
+  /// the shard's client credit.
+  pub(crate) base_waits: crate::base_wait::BaseWaits,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request

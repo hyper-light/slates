@@ -16,6 +16,9 @@
 //!
 //! Evidence for the primitives: `research/disk-source-of-truth.md` §4 (verified per
 //! platform), and the timestamp-granularity table there for the racy rule.
+//!
+//! An overlay's base may instead be the objects under an S3 base's prefix ([`s3`], §4.15 "An S3 base"): a volume's slot
+//! holds either kind as one [`BaseHost`] (A-555).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -24,6 +27,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod base_host;
 pub mod own_mounts;
 pub mod s3;
 #[cfg(unix)]
@@ -93,6 +97,7 @@ pub(crate) fn windows_mode_and_bits(attributes: u32) -> (u32, u16) {
   (mode, WindowsAttributes::kept(attributes, kind).bits())
 }
 
+pub use base_host::BaseHost;
 #[cfg(unix)]
 pub use unix::OsHost;
 #[cfg(windows)]
