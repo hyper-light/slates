@@ -123,8 +123,9 @@ revision or copy named, at the lines given; the copies' sha256 (first 16 hex) ar
     one side exhausted with no pending candidate), run over runs instead of commits. Entries are grouped by run
     bottom; each run's entries become one virtual tree over the first-parent tree (sorted in a depth-first order
     decided by skew-jump lowest common ancestors, joined at the lowest common ancestors of neighbours), so chains meet
-    without walking; a merge's paint jumps along the skip tree past every region no other entry reaches (the region a
-    dominator closes). Reads are O(E lg E lg n) for E entries, E at most two plus the parents of the merges opened.
+    without walking; a merge's paint jumps along the skip tree to its lowest skip-tree ancestor at or above every
+    pending entry's generation, past a region the dominator closes and no other paint can reach. Reads are
+    O(E lg E lg n) for E entries, E at most two plus the parents of the merges opened and the jumps.
   - bisect's midpoint: the same paint with bad and good, every run of candidates a segment whose weight grows by one a
     version, merges' weights from the union of their parents' segments (bitsets over segments), the exact best by
     `min(weight, count - weight)`, then the greater generation, then the lesser name. Reads are O(E lg E lg n), with
